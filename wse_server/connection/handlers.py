@@ -263,7 +263,7 @@ class WSEHandler:
         payload = message_data.get("p", {})
 
         client_version = payload.get("client_version", "unknown")
-        protocol_version = payload.get("protocol_version", 2)
+        protocol_version = payload.get("protocol_version", 1)
         features = payload.get("features", {})
         capabilities = payload.get("capabilities", [])
 
@@ -951,7 +951,7 @@ class WSEHandler:
                     # Otherwise send with minimal wrapping
                     seq = self.connection.get_next_sequence()
                     transformed = {
-                        "v": 2,
+                        "v": 1,
                         "id": event.get(
                             "event_id", event.get("id", str(asyncio.get_event_loop().time()))
                         ),

@@ -212,7 +212,7 @@ class WSEConnection:
     event_bus: Any  # EventBusProtocol
 
     # Configuration
-    protocol_version: int = 2
+    protocol_version: int = 1
     compression_enabled: bool = True
     encryption_enabled: bool = False
     message_signing_enabled: bool = False
@@ -222,7 +222,7 @@ class WSEConnection:
     signed_message_types: frozenset = field(default_factory=lambda: DEFAULT_SIGNED_MESSAGE_TYPES)
 
     # Server info (for server_hello)
-    server_version: str = "1.0.2"
+    server_version: str = "1.0.3"
     server_welcome_message: str = "Welcome to WSE"
 
     # Connection state

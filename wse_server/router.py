@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 log = logging.getLogger("wse.router")
 
 # Protocol version for the wire format
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 1
 
 
 # =============================================================================
@@ -136,7 +136,7 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
     async def websocket_endpoint(
         websocket: WebSocket,
         client_version: str | None = Query("unknown", description="Client version"),
-        protocol_version: int | None = Query(2, description="Protocol version"),
+        protocol_version: int | None = Query(1, description="Protocol version"),
         topics: str | None = Query(None, description="Initial topics to subscribe"),
         compression: bool | None = Query(True, description="Enable compression"),
         encryption: bool | None = Query(False, description="Enable encryption"),
@@ -152,7 +152,7 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
         client_version:
             Client application version string for diagnostics.
         protocol_version:
-            Wire protocol version (default ``2``).
+            Wire protocol version (default ``1``).
         topics:
             Comma-separated list of initial topics to subscribe.
         compression:

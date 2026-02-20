@@ -168,7 +168,7 @@ class TestStats:
 
 class TestPackUnpack:
     def test_json_pack_unpack_roundtrip(self, compression_manager):
-        event = {"t": "test", "p": {"key": "value"}, "v": 2}
+        event = {"t": "test", "p": {"key": "value"}, "v": 1}
         packed = compression_manager.pack_event(event, use_msgpack=False)
         unpacked = compression_manager.unpack_event(packed, is_msgpack=False)
         assert unpacked == event

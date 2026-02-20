@@ -96,7 +96,7 @@ class TestEventMetadata:
         meta = EventMetadata(
             event_id="custom_id",
             timestamp=now,
-            version=2,
+            version=1,
             priority=EventPriority.CRITICAL,
             ttl=60,
             correlation_id="cor_123",
@@ -109,7 +109,7 @@ class TestEventMetadata:
         )
         assert meta.event_id == "custom_id"
         assert meta.timestamp == now
-        assert meta.version == 2
+        assert meta.version == 1
         assert meta.priority == EventPriority.CRITICAL
         assert meta.ttl == 60
         assert meta.correlation_id == "cor_123"

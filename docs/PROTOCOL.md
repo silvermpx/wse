@@ -1,6 +1,6 @@
 # WSE Wire Protocol Specification
 
-Version: 2.0
+Version: 1.0
 
 ## Message Format
 
@@ -15,7 +15,7 @@ All WSE messages are JSON objects with the following structure:
   "p": {
     "key": "value"
   },
-  "v": 2
+  "v": 1
 }
 ```
 
@@ -23,7 +23,7 @@ All WSE messages are JSON objects with the following structure:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `v` | `int` | Protocol version (currently `2`) |
+| `v` | `int` | Protocol version (currently `1`) |
 | `id` | `string` | Unique message ID (UUID v7) |
 | `t` | `string` | Event type (e.g., `status_update`) |
 | `ts` | `string` | ISO 8601 timestamp with timezone |
@@ -52,9 +52,9 @@ Messages are prefixed with a category identifier before the JSON payload:
 ### Wire Format
 
 ```
-WSE{"t":"server_ready","p":{...},"v":2}
-S{"t":"resource_snapshot","p":{...},"v":2}
-U{"t":"status_update","p":{...},"v":2}
+WSE{"t":"server_ready","p":{...},"v":1}
+S{"t":"resource_snapshot","p":{...},"v":1}
+U{"t":"status_update","p":{...},"v":1}
 ```
 
 The client must strip the prefix before JSON parsing:
@@ -106,7 +106,7 @@ M:<msgpack-encoded-data>
 ### 1. Connect
 
 ```
-Client -> Server: WebSocket UPGRADE /wse?token=<JWT>&compression=true&protocol_version=2
+Client -> Server: WebSocket UPGRADE /wse?token=<JWT>&compression=true&protocol_version=1
 Server -> Client: 101 Switching Protocols
 ```
 
@@ -118,7 +118,7 @@ Immediately after connection:
 WSE{"t":"server_ready","p":{
   "message": "Connection established",
   "details": {
-    "version": 2,
+    "version": 1,
     "features": {
       "compression": true,
       "encryption": false,
@@ -179,13 +179,13 @@ U{"t":"status_update","p":{
 Server sends heartbeat every 15 seconds:
 
 ```json
-WSE{"t":"heartbeat","p":{"timestamp":1708441800000,"sequence":42},"v":2}
+WSE{"t":"heartbeat","p":{"timestamp":1708441800000,"sequence":42},"v":1}
 ```
 
 Server also sends JSON PING for latency measurement:
 
 ```json
-WSE{"t":"PING","p":{"timestamp":1708441800000},"v":2}
+WSE{"t":"PING","p":{"timestamp":1708441800000},"v":1}
 ```
 
 Client responds with:
@@ -237,8 +237,8 @@ Protocol negotiation:
 {
   "t": "client_hello",
   "p": {
-    "client_version": "2.0.0",
-    "protocol_version": 2,
+    "client_version": "1.0.0",
+    "protocol_version": 1,
     "features": {
       "compression": true,
       "batch_messages": true
@@ -302,7 +302,7 @@ U{"t":"batch","p":{
 Critical operations are signed with JWT:
 
 ```json
-U{"t":"action_completed","p":{...},"sig":"eyJhbGciOiJIUzI1NiJ9...","v":2}
+U{"t":"action_completed","p":{...},"sig":"eyJhbGciOiJIUzI1NiJ9...","v":1}
 ```
 
 The `sig` field contains a JWT with:

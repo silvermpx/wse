@@ -59,7 +59,7 @@ WSE uses selective message signing: only critical operations are signed, not dat
 
 ```json
 {
-  "v": 2,
+  "v": 1,
   "t": "action_completed",
   "p": {"item_id": "abc123", "status": "done"},
   "sig": "eyJhbGciOiJIUzI1NiJ9.eyJoYXNoIjoiYWJjZGVmLi4uIiwic2lnbmVkX2F0IjoxNzA4NDQxODAwfQ.xxxxx"

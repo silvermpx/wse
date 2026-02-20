@@ -137,8 +137,8 @@ export class MessageProcessor {
   // ---------------------------------------------------------------------------
 
   private handleEventVersion(message: WSMessage): void {
-    // Client supports event versions 1-2
-    const CLIENT_SUPPORTED_VERSION = 2;
+    // Client supports event version 1
+    const CLIENT_SUPPORTED_VERSION = 1;
 
     if (message.event_version && message.event_version > CLIENT_SUPPORTED_VERSION) {
       logger.warn(

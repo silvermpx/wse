@@ -224,11 +224,11 @@ React Components                         PubSub Bus (Redis)
                                          Dead Letter Queue
 ```
 
-**Wire format (v2):**
+**Wire format (v1):**
 
 ```json
 {
-  "v": 2,
+  "v": 1,
   "id": "019503a1-...",
   "t": "price_update",
   "ts": "2026-01-15T10:30:00Z",

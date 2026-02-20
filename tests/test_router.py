@@ -23,8 +23,8 @@ from wse_server.router import (
 
 
 class TestProtocolVersion:
-    def test_version_is_2(self):
-        assert PROTOCOL_VERSION == 2
+    def test_version_is_1(self):
+        assert PROTOCOL_VERSION == 1
 
 
 # =========================================================================

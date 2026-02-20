@@ -18,14 +18,14 @@ from wse_server.connection.transformer import EventTransformer
 class TestPassThrough:
     def test_already_transformed_event_passes_through(self, transformer):
         event = {
-            "v": 2,
+            "v": 1,
             "t": "test_event",
             "p": {"key": "value"},
             "id": "evt_001",
             "ts": "2025-01-01T00:00:00Z",
         }
         result = transformer.transform_for_ws(event, sequence=42)
-        assert result["v"] == 2
+        assert result["v"] == 1
         assert result["t"] == "test_event"
         assert result["p"] == {"key": "value"}
         assert result["id"] == "evt_001"
@@ -33,7 +33,7 @@ class TestPassThrough:
 
     def test_adds_seq_to_already_transformed(self, transformer):
         event = {
-            "v": 2,
+            "v": 1,
             "t": "test",
             "p": {},
             "id": "e1",
@@ -190,10 +190,10 @@ class TestEnvelopeFormat:
         assert "id" in result
         assert "seq" in result
 
-    def test_version_is_2(self, transformer):
+    def test_version_is_1(self, transformer):
         event = {"event_type": "Test", "payload": {}}
         result = transformer.transform_for_ws(event, sequence=1)
-        assert result["v"] == 2
+        assert result["v"] == 1
 
     def test_seq_from_parameter(self, transformer):
         event = {"event_type": "Test", "payload": {}}

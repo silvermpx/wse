@@ -9,11 +9,11 @@ EventTransformer for WSE (standalone)
 Transforms internal events to WebSocket-compatible format.
 
 Architecture:
-    Internal Event --> EventTransformer --> WebSocket Event (v2)
+    Internal Event --> EventTransformer --> WebSocket Event (v1)
 
-WebSocket Event Format (v2):
+WebSocket Event Format (v1):
     {
-        "v": 2,                          # Protocol version
+        "v": 1,                          # Protocol version
         "id": "evt_123",                 # Event ID
         "t": "order_update",             # Event type (mapped from internal)
         "ts": "2025-01-13T...",          # Timestamp (ISO 8601)
