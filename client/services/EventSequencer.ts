@@ -1,5 +1,5 @@
 // =============================================================================
-// WebSocket Event System - Event Sequencer
+// WebSocket Engine - Event Sequencer
 // =============================================================================
 
 import { logger } from '../utils/logger';

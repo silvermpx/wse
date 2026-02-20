@@ -1,5 +1,5 @@
 # =============================================================================
-# WSE — WebSocket Event System
+# WSE — WebSocket Engine
 # Rust-accelerated security (SHA-256, HMAC-SHA256, message signing)
 # =============================================================================
 

@@ -1,5 +1,5 @@
 // =============================================================================
-// WebSocket Event System - Offline Queue (IndexedDB)
+// WebSocket Engine - Offline Queue (IndexedDB)
 // =============================================================================
 
 export interface OfflineQueueConfig {

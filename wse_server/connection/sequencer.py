@@ -1,5 +1,5 @@
 # =============================================================================
-# WSE — WebSocket Event System
+# WSE — WebSocket Engine
 # Rust-accelerated event sequencer (delegates to RustEventSequencer)
 # =============================================================================
 

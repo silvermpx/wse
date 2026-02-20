@@ -1,4 +1,4 @@
-"""WSE -- WebSocket Event System for real-time applications."""
+"""WSE -- WebSocket Engine for real-time applications."""
 
 from .router import SnapshotProvider, WSEConfig, create_wse_router
 

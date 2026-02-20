@@ -1,5 +1,5 @@
 // =============================================================================
-// WebSocket Event System - Event Handlers Wrapper
+// WebSocket Engine - Event Handlers Wrapper
 // =============================================================================
 
 import { registerAllHandlers } from './index';

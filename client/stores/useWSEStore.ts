@@ -1,5 +1,5 @@
 // =============================================================================
-// WebSocket Event System - WSE Store (Zustand)
+// WebSocket Engine - WSE Store (Zustand)
 // =============================================================================
 
 import { create } from 'zustand';

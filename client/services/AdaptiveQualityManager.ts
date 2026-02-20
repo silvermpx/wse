@@ -1,5 +1,5 @@
 // =============================================================================
-// WebSocket Event System - Adaptive Quality Manager
+// WebSocket Engine - Adaptive Quality Manager
 // =============================================================================
 //
 // Adapts application behavior based on WebSocket connection quality.

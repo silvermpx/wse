@@ -1,5 +1,5 @@
 # =============================================================================
-# WSE — WebSocket Event System
+# WSE — WebSocket Engine
 # Rust-accelerated priority message queue (delegates to RustPriorityMessageQueue)
 # =============================================================================
 

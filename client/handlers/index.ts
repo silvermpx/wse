@@ -1,5 +1,5 @@
 // =============================================================================
-// WebSocket Event System - Event Handler Registry
+// WebSocket Engine - Event Handler Registry
 // =============================================================================
 //
 // This is an empty registry shell. Applications register their own domain-specific

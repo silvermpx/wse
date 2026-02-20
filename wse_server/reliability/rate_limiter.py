@@ -1,5 +1,5 @@
 # =============================================================================
-# WSE — WebSocket Event System
+# WSE — WebSocket Engine
 # Rust-accelerated rate limiter (delegates TokenBucket to RustTokenBucket)
 # =============================================================================
 

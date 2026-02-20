@@ -1,5 +1,5 @@
 // =============================================================================
-// WebSocket Event System - Message Queue Store (Zustand)
+// WebSocket Engine - Message Queue Store (Zustand)
 // =============================================================================
 
 import { create } from 'zustand';

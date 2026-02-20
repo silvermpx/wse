@@ -1,5 +1,5 @@
 // =============================================================================
-// WebSocket Event System - useWSE Hook
+// WebSocket Engine - useWSE Hook
 // =============================================================================
 
 import { useEffect, useRef, useCallback, useMemo } from 'react';

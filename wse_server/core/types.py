@@ -1,11 +1,11 @@
 # =============================================================================
-# WSE — WebSocket Event System
+# WSE — WebSocket Engine
 # =============================================================================
 
 """
 WSE Core Types
 
-Type definitions for WebSocket Event System:
+Type definitions for WebSocket Engine:
 - EventPriority: Priority levels for events
 - DeliveryGuarantee: Delivery semantics
 - EventHandler: Protocol for event handlers

@@ -1,5 +1,5 @@
 // =============================================================================
-// WebSocket Event System - Connection Pool
+// WebSocket Engine - Connection Pool
 // =============================================================================
 
 import { logger } from '../utils/logger';

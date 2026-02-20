@@ -1,5 +1,5 @@
 // =============================================================================
-// WebSocket Event System - Event Transformer
+// WebSocket Engine - Event Transformer
 // =============================================================================
 
 import { WSMessage } from '../types';

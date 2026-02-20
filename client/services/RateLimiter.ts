@@ -1,5 +1,5 @@
 // =============================================================================
-// WebSocket Event System - Rate Limiter
+// WebSocket Engine - Rate Limiter
 // =============================================================================
 
 export class RateLimiter {

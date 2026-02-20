@@ -1,5 +1,5 @@
 // =============================================================================
-// WebSocket Event System - Network Monitor
+// WebSocket Engine - Network Monitor
 // =============================================================================
 
 import { NetworkDiagnostics, ConnectionQuality } from '../types';

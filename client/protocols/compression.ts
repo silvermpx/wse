@@ -1,5 +1,5 @@
 // =============================================================================
-// WebSocket Event System - Compression & MessagePack
+// WebSocket Engine - Compression & MessagePack
 // =============================================================================
 
 import pako from 'pako';

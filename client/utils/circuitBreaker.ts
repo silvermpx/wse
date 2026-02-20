@@ -1,5 +1,5 @@
 // =============================================================================
-// WebSocket Event System - Circuit Breaker
+// WebSocket Engine - Circuit Breaker
 // =============================================================================
 
 import { CircuitBreakerState } from '../types';

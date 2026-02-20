@@ -1,5 +1,5 @@
 // =============================================================================
-// WebSocket Event System - Security Manager
+// WebSocket Engine - Security Manager
 // =============================================================================
 
 import { logger } from './logger';
