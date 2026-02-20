@@ -1,4 +1,4 @@
-# WSE — WebSocket Engine
+# WSE -- WebSocket Engine
 
 **A complete, out-of-the-box solution for building reactive interfaces with React and Python.**
 
@@ -74,21 +74,91 @@ That's it. Your React app receives real-time updates from your Python backend.
 
 Everything listed below works the moment you install. No extra setup.
 
-**Reactive Interface** -- real-time data flow from Python to React, with a single hook (`useWSE`) and a publish call on the server. Events appear in your components instantly.
+### Reactive Interface
 
-**Auto-Reconnection** -- exponential backoff with jitter. Connection drops? The client reconnects automatically. No lost messages thanks to offline queue with IndexedDB persistence.
+Real-time data flow from Python to React. One hook (`useWSE`) on the client, one `publish()` call on the server. Events appear in your components instantly.
 
-**End-to-End Encryption** -- AES-256-GCM per channel, HMAC-SHA256 message signing. Encrypted before it leaves the server, decrypted in the browser. No plaintext on the wire.
+### Auto-Reconnection
 
-**Message Ordering** -- sequence numbers with gap detection and reordering buffer. Messages arrive in order, even under high load or network instability.
+Exponential backoff with jitter. Connection drops? The client reconnects automatically. No lost messages -- offline queue with IndexedDB persistence stores messages while disconnected and replays them on reconnect.
 
-**Authentication** -- JWT-based with configurable claims. Per-connection, per-topic access control. Plug in your own auth handler or use the built-in one.
+### End-to-End Encryption
 
-**Health Monitoring** -- connection quality scoring, latency tracking, circuit breaker. Your UI knows when the connection is degraded and can react accordingly.
+AES-256-GCM per channel, HMAC-SHA256 message signing. Encrypted before it leaves the server, decrypted in the browser. No plaintext on the wire. Pluggable encryption and token providers via Python protocols.
 
-**Scaling** -- Redis pub/sub for multi-process fan-out. Run multiple server workers behind a load balancer. Clients get messages from any worker.
+### Message Ordering
 
-**Rust Performance** -- compression, sequencing, filtering, rate limiting, and the WebSocket server itself are implemented in Rust via PyO3. Python API stays the same. Rust accelerates transparently.
+Sequence numbers with gap detection and reordering buffer. Messages arrive in order even under high load or network instability. Out-of-order messages are buffered and delivered once the gap fills.
+
+### Authentication
+
+JWT-based with configurable claims. Per-connection, per-topic access control. Plug in your own auth handler or use the built-in one. Cookie-based token extraction for seamless browser auth.
+
+### Health Monitoring
+
+Connection quality scoring (excellent / good / fair / poor), latency tracking, jitter analysis, packet loss detection. Your UI knows when the connection is degraded and can react accordingly.
+
+### Scaling
+
+Redis pub/sub for multi-process fan-out. Run multiple server workers behind a load balancer. Clients get messages from any worker. Fire-and-forget delivery with sub-millisecond latency.
+
+### Rust Performance
+
+Compression, sequencing, filtering, rate limiting, and the WebSocket server itself are implemented in Rust via PyO3. Python API stays the same. Rust accelerates transparently.
+
+---
+
+## Full Feature List
+
+### Server (Python + Rust)
+
+| Feature | Description |
+|---------|-------------|
+| **Drain Mode** | Batch-polling inbound events from Rust. One GIL acquisition per batch (up to 256 messages) instead of per-message Python callbacks. Condvar-based wakeup for zero busy-wait. |
+| **Write Coalescing** | Outbound pipeline: `feed()` + batch `try_recv()` + single `flush()`. Reduces syscalls under load by coalescing multiple messages into one write. |
+| **Ping/Pong in Rust** | Heartbeat handled entirely in Rust with zero Python round-trips. Configurable intervals. TCP_NODELAY on accept for minimal latency. |
+| **5-Level Priority Queue** | CRITICAL(10), HIGH(8), NORMAL(5), LOW(3), BACKGROUND(1). Smart dropping under backpressure: lower-priority messages are dropped first. Batch dequeue ordered by priority. |
+| **Dead Letter Queue** | Redis-backed DLQ for failed messages. 7-day TTL, 1000-message cap per channel. Manual replay via `replay_dlq_message()`. Prometheus metrics for DLQ size and replay count. |
+| **MongoDB-like Filters** | 14 operators: `$eq`, `$ne`, `$gt`, `$lt`, `$gte`, `$lte`, `$in`, `$nin`, `$regex`, `$exists`, `$contains`, `$startswith`, `$endswith`. Logical: `$and`, `$or`. Dot-notation for nested fields (`payload.price`). Compiled regex cache. |
+| **Event Sequencer** | Monotonic sequence numbers with AHashSet dedup. Size-based and age-based eviction. Gap detection on both server and client. |
+| **Compression** | Flate2 zlib with configurable levels (1-9). Adaptive threshold -- only compress when payload exceeds size limit. Binary mode via msgpack (rmp-serde) for 30% smaller payloads. |
+| **Rate Limiter** | Atomic token-bucket rate limiter in Rust. Per-connection rate enforcement. 100K tokens capacity, 10K tokens/sec refill. |
+| **Message Deduplication** | AHashSet-backed dedup with bounded queue. Prevents duplicate delivery across reconnections and Redis fan-out. |
+| **Wire Envelope** | Protocol v2: `{t, id, ts, seq, p, v}`. Generic payload extraction with automatic type conversion (UUID, datetime, Enum, bytes to JSON-safe primitives). Latency tracking (`latency_ms` field). |
+| **Snapshot Provider** | Protocol for initial state delivery. Implement `get_snapshot(user_id, topics)` and clients receive current state immediately on subscribe -- no waiting for the next publish cycle. |
+| **Circuit Breaker** | Three-state machine (CLOSED / OPEN / HALF_OPEN). Sliding-window failure tracking. Automatic recovery probes. Prevents cascade failures when downstream services are unhealthy. |
+| **Message Categories** | `S` (snapshot), `U` (update), `WSE` (system). Category prefixing for client-side routing and filtering. |
+| **PubSub Bus** | Redis pub/sub with PSUBSCRIBE pattern matching. orjson fast-path serialization. Custom JSON encoder for UUID, datetime, Decimal. Non-blocking handler invocation. |
+| **Pluggable Security** | `EncryptionProvider` and `TokenProvider` protocols. Bring your own encryption or token signing. Default: HMAC-SHA256 with auto-generated secrets. Rust-accelerated SHA-256 and HMAC. |
+| **Connection Metrics** | Prometheus-compatible stubs for: messages sent/received, publish latency, DLQ size, handler errors, circuit breaker state. Drop-in Prometheus integration or use the built-in stubs. |
+
+### Client (React + TypeScript)
+
+| Feature | Description |
+|---------|-------------|
+| **useWSE Hook** | Single React hook for the entire WebSocket lifecycle. Accepts topics, endpoints, auth tokens. Returns `isConnected`, `connectionHealth`, connection controls. |
+| **Connection Pool** | Multi-endpoint support with health-scored failover. Three load-balancing strategies: weighted-random, least-connections, round-robin. Automatic health checks with latency tracking. |
+| **Adaptive Quality Manager** | Adjusts React Query defaults based on connection quality. Excellent: `staleTime: Infinity` (pure WebSocket). Poor: aggressive polling fallback. Dispatches `wse:quality-change` events. Optional QueryClient integration. |
+| **Offline Queue** | IndexedDB-backed persistent queue. Messages are stored when disconnected and replayed on reconnect, ordered by priority. Configurable max size and TTL. |
+| **Network Monitor** | Real-time latency, jitter, and packet-loss analysis. Determines connection quality (excellent / good / fair / poor). Generates diagnostic suggestions. |
+| **Event Sequencer** | Client-side sequence validation with gap detection. Out-of-order buffer for reordering. Duplicate detection via seen-ID window with age-based eviction. |
+| **Circuit Breaker** | Client-side circuit breaker for connection attempts. Prevents reconnection storms when the server is down. Configurable failure threshold and recovery timeout. |
+| **Compression + msgpack** | Client-side decompression (pako zlib) and msgpack decoding. Automatic detection of binary vs JSON frames. |
+| **Zustand Stores** | `useWSEStore` for connection state, latency history, diagnostics. `useMessageQueueStore` for message buffering with priority. Lightweight, no boilerplate. |
+| **Rate Limiter** | Client-side token-bucket rate limiter for outbound messages. Prevents flooding the server. |
+| **Security Manager** | Client-side HMAC verification and optional decryption. Validates message integrity before dispatching to handlers. |
+
+---
+
+## Performance
+
+Rust-accelerated engine via PyO3. Benchmarked on Apple M3, single process, 1KB JSON.
+
+| Mode | Throughput | Latency (p50) | Latency (p99) |
+|------|-----------|---------------|---------------|
+| **Rust (binary)** | **1,100,000 msg/s** | **0.009 ms** | **0.04 ms** |
+| **Rust (JSON)** | **285,000 msg/s** | **0.03 ms** | **0.15 ms** |
+| Pure Python | 106,000 msg/s | 0.09 ms | 0.4 ms |
 
 ---
 
@@ -102,18 +172,6 @@ WSE works for any real-time communication between frontend and backend:
 - **Chat and messaging** -- group chats, DMs, typing indicators, read receipts
 - **IoT and telemetry** -- device status, real-time metrics, command and control
 - **Gaming** -- game state sync, leaderboards, matchmaking updates
-
----
-
-## Performance
-
-Rust-accelerated engine via PyO3. Benchmarked on Apple M3, single process, 1KB JSON.
-
-| Mode | Throughput | Latency (p50) | Latency (p99) |
-|------|-----------|---------------|---------------|
-| **Rust (binary)** | **1,100,000 msg/s** | **0.009 ms** | **0.04 ms** |
-| **Rust (JSON)** | **285,000 msg/s** | **0.03 ms** | **0.15 ms** |
-| Pure Python | 106,000 msg/s | 0.09 ms | 0.4 ms |
 
 ---
 
@@ -141,18 +199,29 @@ Client (React + TypeScript)              Server (Python + Rust)
 useWSE hook                              FastAPI Router (/wse)
     |                                        |
     v                                        v
-ConnectionManager                        Rust Engine (PyO3)
-    |  (auto-reconnect,                      |  (compress, sequence,
-    |   circuit breaker)                     |   filter, rate limit)
+ConnectionPool                           Rust Engine (PyO3)
+    |  (multi-endpoint,                      |  (drain mode,
+    |   health scoring)                      |   write coalescing)
     v                                        v
-MessageProcessor                         EventTransformer
-    |  (decompress, verify,                  |  (wire envelope,
-    |   sequence, dispatch)                  |   msgpack/JSON)
+ConnectionManager                        EventTransformer
+    |  (auto-reconnect,                      |  (wire envelope,
+    |   circuit breaker)                     |   type conversion)
     v                                        v
-Zustand Store                            PubSub Bus
-    |                                        |
+MessageProcessor                         PriorityQueue
+    |  (decompress, verify,                  |  (5 levels,
+    |   sequence, dispatch)                  |   smart dropping)
     v                                        v
-React Components                         Redis (multi-process)
+AdaptiveQualityManager                   Sequencer + Dedup
+    |  (quality scoring,                     |  (AHashSet,
+    |   React Query tuning)                  |   gap detection)
+    v                                        v
+Zustand Store                            Compression + Rate Limiter
+    |                                        |  (flate2, token bucket)
+    v                                        v
+React Components                         PubSub Bus (Redis)
+                                             |
+                                             v
+                                         Dead Letter Queue
 ```
 
 **Wire format (v2):**
@@ -197,15 +266,18 @@ Both packages are standalone. No shared dependencies between server and client.
 
 | Component | Technology | Purpose |
 |-----------|-----------|---------|
-| Rust engine | PyO3 + maturin | Compression, sequencing, filtering, rate limiting |
+| Rust engine | PyO3 + maturin | Compression, sequencing, filtering, rate limiting, WebSocket server |
 | Server framework | FastAPI + Starlette | ASGI WebSocket handling |
 | Serialization | orjson (Rust) | Zero-copy JSON |
 | Binary protocol | msgpack (rmp-serde) | 30% smaller payloads |
 | Encryption | AES-256-GCM (Rust) | Per-channel E2E encryption |
+| Message signing | HMAC-SHA256 (Rust) | Per-message integrity verification |
 | Authentication | PyJWT | Token verification |
-| Pub/Sub backbone | Redis Streams | Multi-process fan-out |
+| Pub/Sub backbone | Redis Pub/Sub | Multi-process fan-out |
+| Dead Letter Queue | Redis Lists | Failed message recovery |
 | Client state | Zustand | Lightweight React store |
 | Client hooks | React 18+ | useWSE hook with TypeScript |
+| Offline storage | IndexedDB | Persistent offline queue |
 | Build system | maturin | Rust+Python hybrid wheels |
 
 ---
