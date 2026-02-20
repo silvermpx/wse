@@ -290,9 +290,7 @@ class TestSigningWithTokenProvider:
         payload = {"test": "data"}
         sig = await sm.sign_message(payload)
 
-        result = await sm.verify_signature(
-            {"payload": payload, "signature": sig}
-        )
+        result = await sm.verify_signature({"payload": payload, "signature": sig})
         assert result is not None
         assert "hash" in result
 
@@ -406,9 +404,7 @@ class TestKeyRotation:
         sig = await sm.sign_message({"data": "test"})
         await sm.rotate_keys()
 
-        result = await sm.verify_signature(
-            {"payload": {"data": "test"}, "signature": sig}
-        )
+        result = await sm.verify_signature({"payload": {"data": "test"}, "signature": sig})
         assert result is None
 
 
@@ -457,10 +453,12 @@ class TestUtilities:
     @pytest.mark.asyncio
     async def test_initialize_sets_flags(self):
         sm = SecurityManager()
-        await sm.initialize({
-            "encryption_enabled": True,
-            "message_signing_enabled": True,
-        })
+        await sm.initialize(
+            {
+                "encryption_enabled": True,
+                "message_signing_enabled": True,
+            }
+        )
         assert sm.encryption_enabled is True
         assert sm.message_signing_enabled is True
 

@@ -3,6 +3,7 @@
 When a client connects and subscribes to topics, WSE can send an initial
 snapshot of the current state. Implement the SnapshotProvider protocol.
 """
+
 from typing import Any
 
 

@@ -18,6 +18,7 @@ log = logging.getLogger("wse.security")
 # Protocols for pluggable security providers
 # =============================================================================
 
+
 @runtime_checkable
 class EncryptionProvider(Protocol):
     """Protocol for pluggable encryption.
@@ -63,6 +64,7 @@ class TokenProvider(Protocol):
 # SecurityManager
 # =============================================================================
 
+
 class SecurityManager:
     """Handles WebSocket message encryption and signing.
 
@@ -107,8 +109,8 @@ class SecurityManager:
 
     async def initialize(self, config: dict[str, Any]) -> None:
         """Initialize security with configuration"""
-        self.encryption_enabled = config.get('encryption_enabled', False)
-        self.message_signing_enabled = config.get('message_signing_enabled', False)
+        self.encryption_enabled = config.get("encryption_enabled", False)
+        self.message_signing_enabled = config.get("message_signing_enabled", False)
 
         if self.encryption_enabled:
             if self._encryption_provider:
@@ -196,7 +198,7 @@ class SecurityManager:
             if isinstance(data, dict):
                 payload_str = json.dumps(data, sort_keys=True, default=str)
             elif isinstance(data, bytes):
-                payload_str = data.decode('utf-8')
+                payload_str = data.decode("utf-8")
             else:
                 payload_str = str(data)
 
@@ -390,11 +392,13 @@ class SecurityManager:
     def get_security_info(self) -> dict[str, Any]:
         """Get security configuration info"""
         return {
-            'encryption_enabled': self.encryption_enabled,
-            'encryption_algorithm': self.cipher_suite if self.encryption_enabled else None,
-            'encryption_provider': type(self._encryption_provider).__name__ if self._encryption_provider else None,
-            'token_provider': type(self._token_provider).__name__ if self._token_provider else None,
-            'message_signing_enabled': self.message_signing_enabled,
-            'session_key_rotation': self.key_rotation_interval,
-            'last_key_rotation': self.last_key_rotation,
+            "encryption_enabled": self.encryption_enabled,
+            "encryption_algorithm": self.cipher_suite if self.encryption_enabled else None,
+            "encryption_provider": type(self._encryption_provider).__name__
+            if self._encryption_provider
+            else None,
+            "token_provider": type(self._token_provider).__name__ if self._token_provider else None,
+            "message_signing_enabled": self.message_signing_enabled,
+            "session_key_rotation": self.key_rotation_interval,
+            "last_key_rotation": self.last_key_rotation,
         }

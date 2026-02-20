@@ -25,8 +25,10 @@ from typing import Any, Protocol
 # Enums
 # ---------------------------------------------------------------------------
 
+
 class EventPriority(Enum):
     """Event priority levels"""
+
     CRITICAL = 10
     HIGH = 8
     NORMAL = 5
@@ -36,6 +38,7 @@ class EventPriority(Enum):
 
 class DeliveryGuarantee(Enum):
     """Event delivery guarantees"""
+
     AT_MOST_ONCE = "at_most_once"
     AT_LEAST_ONCE = "at_least_once"
     EXACTLY_ONCE = "exactly_once"
@@ -44,6 +47,7 @@ class DeliveryGuarantee(Enum):
 # ---------------------------------------------------------------------------
 # Protocols
 # ---------------------------------------------------------------------------
+
 
 class EventHandler(Protocol):
     """Protocol for event handlers"""
@@ -55,9 +59,11 @@ class EventHandler(Protocol):
 # Dataclasses
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class EventMetadata:
     """Metadata for events"""
+
     event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     version: int = 1
@@ -75,6 +81,7 @@ class EventMetadata:
 @dataclass
 class Subscription:
     """Represents an event subscription"""
+
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     subscriber_id: str = ""
     topics: set[str] = field(default_factory=set)
@@ -97,6 +104,7 @@ class Subscription:
 @dataclass
 class SubscriptionStats:
     """Statistics for a subscription"""
+
     messages_received: int = 0
     messages_processed: int = 0
     messages_failed: int = 0

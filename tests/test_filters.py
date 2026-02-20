@@ -135,33 +135,23 @@ class TestComparison:
 class TestIn:
     def test_in_match(self):
         event = {"status": "filled"}
-        assert EventFilter.matches(
-            event, {"status": {"$in": ["filled", "partial"]}}
-        ) is True
+        assert EventFilter.matches(event, {"status": {"$in": ["filled", "partial"]}}) is True
 
     def test_in_no_match(self):
         event = {"status": "cancelled"}
-        assert EventFilter.matches(
-            event, {"status": {"$in": ["filled", "partial"]}}
-        ) is False
+        assert EventFilter.matches(event, {"status": {"$in": ["filled", "partial"]}}) is False
 
     def test_in_with_numbers(self):
         event = {"qty": 100}
-        assert EventFilter.matches(
-            event, {"qty": {"$in": [50, 100, 200]}}
-        ) is True
+        assert EventFilter.matches(event, {"qty": {"$in": [50, 100, 200]}}) is True
 
     def test_in_empty_list(self):
         event = {"status": "filled"}
-        assert EventFilter.matches(
-            event, {"status": {"$in": []}}
-        ) is False
+        assert EventFilter.matches(event, {"status": {"$in": []}}) is False
 
     def test_in_with_none_value(self):
         event = {"status": None}
-        assert EventFilter.matches(
-            event, {"status": {"$in": [None, "filled"]}}
-        ) is True
+        assert EventFilter.matches(event, {"status": {"$in": [None, "filled"]}}) is True
 
 
 # =========================================================================
@@ -209,9 +199,7 @@ class TestRegex:
 
     def test_regex_full_pattern(self):
         event = {"email": "user@example.com"}
-        assert EventFilter.matches(
-            event, {"email": {"$regex": r"^[\w.]+@[\w.]+\.\w+$"}}
-        ) is True
+        assert EventFilter.matches(event, {"email": {"$regex": r"^[\w.]+@[\w.]+\.\w+$"}}) is True
 
     def test_regex_numeric_coerced_to_str(self):
         event = {"code": 404}
@@ -226,39 +214,27 @@ class TestRegex:
 class TestStringOperators:
     def test_contains_match(self):
         event = {"description": "Order filled at market price"}
-        assert EventFilter.matches(
-            event, {"description": {"$contains": "filled"}}
-        ) is True
+        assert EventFilter.matches(event, {"description": {"$contains": "filled"}}) is True
 
     def test_contains_no_match(self):
         event = {"description": "Order placed"}
-        assert EventFilter.matches(
-            event, {"description": {"$contains": "filled"}}
-        ) is False
+        assert EventFilter.matches(event, {"description": {"$contains": "filled"}}) is False
 
     def test_startswith_match(self):
         event = {"symbol": "AAPL"}
-        assert EventFilter.matches(
-            event, {"symbol": {"$startswith": "AA"}}
-        ) is True
+        assert EventFilter.matches(event, {"symbol": {"$startswith": "AA"}}) is True
 
     def test_startswith_no_match(self):
         event = {"symbol": "GOOG"}
-        assert EventFilter.matches(
-            event, {"symbol": {"$startswith": "AA"}}
-        ) is False
+        assert EventFilter.matches(event, {"symbol": {"$startswith": "AA"}}) is False
 
     def test_endswith_match(self):
         event = {"filename": "report.pdf"}
-        assert EventFilter.matches(
-            event, {"filename": {"$endswith": ".pdf"}}
-        ) is True
+        assert EventFilter.matches(event, {"filename": {"$endswith": ".pdf"}}) is True
 
     def test_endswith_no_match(self):
         event = {"filename": "report.csv"}
-        assert EventFilter.matches(
-            event, {"filename": {"$endswith": ".pdf"}}
-        ) is False
+        assert EventFilter.matches(event, {"filename": {"$endswith": ".pdf"}}) is False
 
 
 # =========================================================================
@@ -269,15 +245,11 @@ class TestStringOperators:
 class TestNestedFields:
     def test_simple_nested(self):
         event = {"payload": {"symbol": "AAPL", "price": 150.0}}
-        assert EventFilter.matches(
-            event, {"payload.symbol": "AAPL"}
-        ) is True
+        assert EventFilter.matches(event, {"payload.symbol": "AAPL"}) is True
 
     def test_simple_nested_no_match(self):
         event = {"payload": {"symbol": "AAPL"}}
-        assert EventFilter.matches(
-            event, {"payload.symbol": "GOOG"}
-        ) is False
+        assert EventFilter.matches(event, {"payload.symbol": "GOOG"}) is False
 
     def test_deep_nested(self):
         event = {
@@ -288,15 +260,11 @@ class TestNestedFields:
                 }
             }
         }
-        assert EventFilter.matches(
-            event, {"metadata.user.role": "admin"}
-        ) is True
+        assert EventFilter.matches(event, {"metadata.user.role": "admin"}) is True
 
     def test_nested_with_operator(self):
         event = {"payload": {"price": 150.0}}
-        assert EventFilter.matches(
-            event, {"payload.price": {"$gt": 100.0}}
-        ) is True
+        assert EventFilter.matches(event, {"payload.price": {"$gt": 100.0}}) is True
 
     def test_nested_missing_intermediate(self):
         event = {"data": "flat"}
@@ -310,9 +278,10 @@ class TestNestedFields:
 
     def test_nested_with_in_operator(self):
         event = {"metadata": {"user_id": "user_123"}}
-        assert EventFilter.matches(
-            event, {"metadata.user_id": {"$in": ["user_123", "user_456"]}}
-        ) is True
+        assert (
+            EventFilter.matches(event, {"metadata.user_id": {"$in": ["user_123", "user_456"]}})
+            is True
+        )
 
 
 # =========================================================================

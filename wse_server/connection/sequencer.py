@@ -28,6 +28,7 @@ class _SeenIdsProxy:
 @dataclass
 class SequencedEvent:
     """Event with sequence information"""
+
     event_id: str
     sequence: int
     timestamp: object  # datetime
@@ -100,10 +101,7 @@ class EventSequencer:
             return self._rust.is_duplicate(event_id)
 
     async def process_sequenced_event(
-            self,
-            topic: str,
-            sequence: int,
-            event: dict[str, Any]
+        self, topic: str, sequence: int, event: dict[str, Any]
     ) -> list[dict[str, Any]] | None:
         """
         Process an event with a sequence number.

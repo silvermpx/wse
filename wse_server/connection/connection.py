@@ -16,6 +16,7 @@ from typing import Any, Protocol, runtime_checkable
 
 try:
     import orjson
+
     ORJSON_AVAILABLE = True
 except ImportError:
     ORJSON_AVAILABLE = False
@@ -48,6 +49,7 @@ log = logging.getLogger("wse.connection")
 # Check if Prometheus metrics are available
 try:
     from prometheus_client import Counter  # noqa: F401
+
     METRICS_AVAILABLE = True
 except ImportError:
     METRICS_AVAILABLE = False
@@ -61,16 +63,25 @@ COMPRESSION_THRESHOLD = 1024  # bytes
 MAX_MESSAGE_SIZE = 1024 * 1024  # 1MB - reject messages larger than this
 
 # Event types that should never be filtered during startup grace period (O(1) lookup)
-_NEVER_FILTER_TYPES = frozenset({
-    'server_ready', 'subscription_update', 'error',
-    'connection_state_change', 'server_hello', 'health_check_response',
-    'heartbeat', 'PONG', 'snapshot_complete',
-})
+_NEVER_FILTER_TYPES = frozenset(
+    {
+        "server_ready",
+        "subscription_update",
+        "error",
+        "connection_state_change",
+        "server_hello",
+        "health_check_response",
+        "heartbeat",
+        "PONG",
+        "snapshot_complete",
+    }
+)
 
 
 # =============================================================================
 # WebSocket Protocol (framework-agnostic)
 # =============================================================================
+
 
 @runtime_checkable
 class WebSocketProtocol(Protocol):
@@ -88,6 +99,7 @@ class WebSocketProtocol(Protocol):
 
 class WebSocketState(Enum):
     """WebSocket connection states (mirrors Starlette for compatibility)"""
+
     CONNECTING = 0
     CONNECTED = 1
     DISCONNECTED = 2
@@ -95,6 +107,7 @@ class WebSocketState(Enum):
 
 class ConnectionState(Enum):
     """WebSocket connection states matching frontend"""
+
     PENDING = "pending"
     CONNECTING = "connecting"
     CONNECTED = "connected"
@@ -107,6 +120,7 @@ class ConnectionState(Enum):
 # =============================================================================
 # Event Bus Protocol (pluggable pub/sub)
 # =============================================================================
+
 
 @runtime_checkable
 class EventBusProtocol(Protocol):
@@ -129,6 +143,7 @@ class EventBusProtocol(Protocol):
 # JSON Serialization
 # =============================================================================
 
+
 class DateTimeEncoder(json.JSONEncoder):
     """Custom JSON encoder that handles datetime objects and other types."""
 
@@ -139,11 +154,11 @@ class DateTimeEncoder(json.JSONEncoder):
             return str(obj)
         elif isinstance(obj, Enum):
             return obj.value
-        elif hasattr(obj, '__dict__'):
+        elif hasattr(obj, "__dict__"):
             try:
                 obj_dict = {}
                 for key, value in obj.__dict__.items():
-                    if key.startswith('_'):
+                    if key.startswith("_"):
                         continue
                     if isinstance(value, (str, int, float, bool, list, dict, type(None))):
                         obj_dict[key] = value
@@ -161,8 +176,8 @@ def _orjson_default(obj):
         return str(obj)
     if isinstance(obj, Enum):
         return obj.value
-    if hasattr(obj, '__dict__'):
-        return {k: v for k, v in obj.__dict__.items() if not k.startswith('_')}
+    if hasattr(obj, "__dict__"):
+        return {k: v for k, v in obj.__dict__.items() if not k.startswith("_")}
     raise TypeError(f"Type {type(obj)} is not JSON serializable")
 
 
@@ -185,6 +200,7 @@ DEFAULT_SIGNED_MESSAGE_TYPES: frozenset[str] = frozenset()
 # =============================================================================
 # WSEConnection
 # =============================================================================
+
 
 @dataclass
 class WSEConnection:
@@ -216,7 +232,9 @@ class WSEConnection:
     metrics: ConnectionMetrics = field(default_factory=ConnectionMetrics)
     circuit_breaker: CircuitBreaker = field(init=False)
     rate_limiter: RateLimiter = field(init=False)
-    message_queue: PriorityMessageQueue = field(default_factory=lambda: PriorityMessageQueue(batch_size=10))
+    message_queue: PriorityMessageQueue = field(
+        default_factory=lambda: PriorityMessageQueue(batch_size=10)
+    )
     compression_manager: CompressionManager = field(default_factory=CompressionManager)
     security_manager: SecurityManager = field(default_factory=SecurityManager)
     network_analyzer: NetworkQualityAnalyzer = field(default_factory=NetworkQualityAnalyzer)
@@ -267,7 +285,7 @@ class WSEConnection:
             reset_timeout_seconds=30,
             half_open_max_calls=5,
             window_size=50,
-            failure_rate_threshold=0.3
+            failure_rate_threshold=0.3,
         )
         self.circuit_breaker = CircuitBreaker(cb_config)
 
@@ -276,10 +294,7 @@ class WSEConnection:
             capacity=1000,
             refill_rate=100.0,
         )
-        self.rate_limiter = RateLimiter(
-            name=f"wse_{self.conn_id}",
-            config=rl_config
-        )
+        self.rate_limiter = RateLimiter(name=f"wse_{self.conn_id}", config=rl_config)
 
     def add_cleanup_hook(self, hook) -> None:
         """Register an async callable to run during cleanup."""
@@ -297,10 +312,12 @@ class WSEConnection:
             ws_connections_total.labels(user_id=self.user_id).inc()
             ws_connections_active.inc()
 
-        await self.security_manager.initialize({
-            'encryption_enabled': self.encryption_enabled,
-            'message_signing_enabled': True  # Always enable for selective signing capability
-        })
+        await self.security_manager.initialize(
+            {
+                "encryption_enabled": self.encryption_enabled,
+                "message_signing_enabled": True,  # Always enable for selective signing capability
+            }
+        )
 
         self._queue_event = asyncio.Event()
         self._start_background_tasks()
@@ -326,15 +343,18 @@ class WSEConnection:
                 log.debug("Skipping state change notification during initial connection")
                 return
 
-            await self.send_message({
-                't': 'connection_state_change',
-                'p': {
-                    'old_state': old_state.value,
-                    'new_state': state.value,
-                    'timestamp': datetime.now(UTC).isoformat(),
-                    'connection_id': self.conn_id
-                }
-            }, priority=10)
+            await self.send_message(
+                {
+                    "t": "connection_state_change",
+                    "p": {
+                        "old_state": old_state.value,
+                        "new_state": state.value,
+                        "timestamp": datetime.now(UTC).isoformat(),
+                        "connection_id": self.conn_id,
+                    },
+                },
+                priority=10,
+            )
 
     async def mark_initial_sync_complete(self) -> None:
         """Mark that initial sync is complete to stop filtering old events"""
@@ -348,7 +368,7 @@ class WSEConnection:
             self._heartbeat_loop(),
             self._health_check_loop(),
             self._metrics_collection_loop(),
-            self._sequence_cleanup_loop()
+            self._sequence_cleanup_loop(),
         ]
 
         if self.debug_mode:
@@ -377,7 +397,7 @@ class WSEConnection:
 
     def _is_ws_connected(self) -> bool:
         """Check if the underlying WebSocket is still connected."""
-        state = getattr(self.ws, 'client_state', None)
+        state = getattr(self.ws, "client_state", None)
         if state is None:
             return True  # Assume connected if state not available
         # Support Starlette WebSocketState enum or our own
@@ -385,8 +405,9 @@ class WSEConnection:
             return state.value == WebSocketState.CONNECTED.value or state.name == "CONNECTED"
         return state == WebSocketState.CONNECTED
 
-    async def send_message(self, message: dict[str, Any], priority: int = 5,
-                           _bypass_rate_limit: bool = False) -> bool:
+    async def send_message(
+        self, message: dict[str, Any], priority: int = 5, _bypass_rate_limit: bool = False
+    ) -> bool:
         """Queue a message for sending with format normalization"""
         if not self._running:
             return False
@@ -394,24 +415,24 @@ class WSEConnection:
         # Startup filtering: skip stale events during grace period
         if not self.initial_sync_complete:
             if time.time() - self.connection_start_time < self.startup_grace_period:
-                event_type = message.get('t', '')
+                event_type = message.get("t", "")
                 if event_type and event_type not in _NEVER_FILTER_TYPES:
-                    msg_ts = message.get('_wse_received_at')
+                    msg_ts = message.get("_wse_received_at")
                     if msg_ts and (time.time() - msg_ts) > 10:
                         return False
 
-        message['_wse_received_at'] = time.time()
+        message["_wse_received_at"] = time.time()
 
-        message_type = message.get('t') or message.get('type', 'unknown')
-        message_id = message.get('id', 'unknown')
+        message_type = message.get("t") or message.get("type", "unknown")
+        message_id = message.get("id", "unknown")
         log.debug(f"[WSE_QUEUE] Event: {message_type}, ID: {message_id}, Priority: {priority}")
 
         # Normalize message format for frontend compatibility
-        if 'type' in message and 't' not in message:
-            message['t'] = message.pop('type')
+        if "type" in message and "t" not in message:
+            message["t"] = message.pop("type")
 
-        if 'payload' in message and 'p' not in message:
-            message['p'] = message.pop('payload')
+        if "payload" in message and "p" not in message:
+            message["p"] = message.pop("payload")
 
         # Check rate limit
         if not _bypass_rate_limit and not await self.rate_limiter.acquire():
@@ -420,19 +441,19 @@ class WSEConnection:
             return False
 
         # Add message ID if not present
-        if 'id' not in message:
-            message['id'] = str(uuid.uuid4())
+        if "id" not in message:
+            message["id"] = str(uuid.uuid4())
 
-        if 'seq' not in message:
-            message['seq'] = self.get_next_sequence()
+        if "seq" not in message:
+            message["seq"] = self.get_next_sequence()
 
-        if 'v' not in message:
-            message['v'] = self.protocol_version
-        if 'ts' not in message:
-            message['ts'] = datetime.now(UTC).isoformat()
+        if "v" not in message:
+            message["v"] = self.protocol_version
+        if "ts" not in message:
+            message["ts"] = datetime.now(UTC).isoformat()
 
         if self.debug_mode:
-            event_type = message.get('t', 'unknown')
+            event_type = message.get("t", "unknown")
             self.event_count[event_type] = self.event_count.get(event_type, 0) + 1
 
         result = await self.message_queue.enqueue(message, priority)
@@ -451,14 +472,17 @@ class WSEConnection:
                 f"Message size {message_size} exceeds limit {MAX_MESSAGE_SIZE} bytes, rejecting"
             )
             self.metrics.protocol_errors += 1
-            await self.send_message({
-                't': 'error',
-                'p': {
-                    'code': 'MESSAGE_TOO_LARGE',
-                    'message': f'Message size {message_size} exceeds maximum allowed size of {MAX_MESSAGE_SIZE} bytes',
-                    'max_size': MAX_MESSAGE_SIZE
-                }
-            }, priority=10)
+            await self.send_message(
+                {
+                    "t": "error",
+                    "p": {
+                        "code": "MESSAGE_TOO_LARGE",
+                        "message": f"Message size {message_size} exceeds maximum allowed size of {MAX_MESSAGE_SIZE} bytes",
+                        "max_size": MAX_MESSAGE_SIZE,
+                    },
+                },
+                priority=10,
+            )
             return None
 
         self.metrics.messages_received += 1
@@ -470,7 +494,7 @@ class WSEConnection:
             self.network_analyzer.record_bytes(byte_count)
 
             if METRICS_AVAILABLE:
-                ws_messages_received_total.labels(message_type='binary').inc()
+                ws_messages_received_total.labels(message_type="binary").inc()
                 ws_bytes_received_total.inc(byte_count)
 
             return await self._parse_binary_message(data)
@@ -480,7 +504,7 @@ class WSEConnection:
             self.network_analyzer.record_bytes(byte_count)
 
             if METRICS_AVAILABLE:
-                ws_messages_received_total.labels(message_type='text').inc()
+                ws_messages_received_total.labels(message_type="text").inc()
                 ws_bytes_received_total.inc(byte_count)
 
             return self._parse_text_message(data)
@@ -488,14 +512,14 @@ class WSEConnection:
     def _parse_text_message(self, data: str) -> dict[str, Any] | None:
         """Parse text message with special handling"""
         _prefix = data[:9].upper()
-        if _prefix.startswith('WSE:PING') or _prefix.startswith('PING'):
+        if _prefix.startswith("WSE:PING") or _prefix.startswith("PING"):
             self.network_analyzer.record_packet_received()
-            return {'type': 'ping', 'raw': data}
+            return {"type": "ping", "raw": data}
 
-        if data.startswith('WSE:PONG:') or data.startswith('PONG:'):
+        if data.startswith("WSE:PONG:") or data.startswith("PONG:"):
             try:
                 self.network_analyzer.record_packet_received()
-                timestamp = int(data.split(':')[-1])
+                timestamp = int(data.split(":")[-1])
                 latency = int(datetime.now().timestamp() * 1000) - timestamp
                 self.metrics.record_latency(latency)
                 self.network_analyzer.record_latency(latency)
@@ -506,17 +530,17 @@ class WSEConnection:
 
         try:
             json_data = data
-            if data.startswith('WSE{'):
+            if data.startswith("WSE{"):
                 json_data = data[3:]
-            elif data.startswith('S{') or data.startswith('U{'):
+            elif data.startswith("S{") or data.startswith("U{"):
                 json_data = data[1:]
 
             parsed = orjson.loads(json_data) if ORJSON_AVAILABLE else json.loads(json_data)
 
-            if 'type' in parsed and 't' not in parsed:
-                parsed['t'] = parsed.pop('type')
-            if 'payload' in parsed and 'p' not in parsed:
-                parsed['p'] = parsed.pop('payload')
+            if "type" in parsed and "t" not in parsed:
+                parsed["t"] = parsed.pop("type")
+            if "payload" in parsed and "p" not in parsed:
+                parsed["p"] = parsed.pop("payload")
             return parsed
         except (json.JSONDecodeError, Exception):
             self.metrics.protocol_errors += 1
@@ -528,7 +552,7 @@ class WSEConnection:
         try:
             log.debug(f"Parsing binary message: {len(data)} bytes, first 10: {data[:10].hex()}")
 
-            if data.startswith(b'C:'):
+            if data.startswith(b"C:"):
                 decompressed = self.compression_manager.decompress(data[2:])
                 self.metrics.compression_hits += 1
                 if ORJSON_AVAILABLE:
@@ -536,14 +560,15 @@ class WSEConnection:
                 else:
                     parsed = json.loads(decompressed)
                 log.debug(
-                    f"Decompressed C: prefixed: {len(data)} -> {len(decompressed)} bytes, type: {parsed.get('t')}")
+                    f"Decompressed C: prefixed: {len(data)} -> {len(decompressed)} bytes, type: {parsed.get('t')}"
+                )
                 return self._normalize_message_format(parsed)
 
-            elif data.startswith(b'M:'):
+            elif data.startswith(b"M:"):
                 parsed = self.compression_manager.unpack_msgpack(data[2:])
                 return self._normalize_message_format(parsed)
 
-            elif data.startswith(b'E:') and self.encryption_enabled:
+            elif data.startswith(b"E:") and self.encryption_enabled:
                 decrypted = await self.security_manager.decrypt_message(data[2:])
                 if decrypted:
                     parsed = orjson.loads(decrypted) if ORJSON_AVAILABLE else json.loads(decrypted)
@@ -563,86 +588,101 @@ class WSEConnection:
 
     def _normalize_message_format(self, message: dict[str, Any]) -> dict[str, Any]:
         """Normalize message format for consistency"""
-        if 'type' in message and 't' not in message:
-            message['t'] = message.pop('type')
-        if 'payload' in message and 'p' not in message:
-            message['p'] = message.pop('payload')
+        if "type" in message and "t" not in message:
+            message["t"] = message.pop("type")
+        if "payload" in message and "p" not in message:
+            message["p"] = message.pop("payload")
         return message
 
     async def _send_raw_message(self, message: dict[str, Any]) -> None:
         """Send a message through the WebSocket with proper formatting"""
         send_start_time = time.time()
         now_utc = datetime.now(UTC)
-        message_type = message.get('t', 'unknown')
-        message.get('priority', 5)
+        message_type = message.get("t", "unknown")
+        message.get("priority", 5)
 
         try:
             if not self._running or not self._is_ws_connected():
                 return
 
             # Calculate WSE processing time for observability
-            wse_received_at = message.pop('_wse_received_at', None)
+            wse_received_at = message.pop("_wse_received_at", None)
             if wse_received_at:
                 wse_processing_ms = int((time.time() - wse_received_at) * 1000)
-                message['wse_processing_ms'] = wse_processing_ms
+                message["wse_processing_ms"] = wse_processing_ms
 
-                event_type = message.get('t')
-                high_freq_types = ('quote_update', 'bar_update', 'trade_update', 'orderbook_update', 'PONG')
+                event_type = message.get("t")
+                high_freq_types = (
+                    "quote_update",
+                    "bar_update",
+                    "trade_update",
+                    "orderbook_update",
+                    "PONG",
+                )
                 if event_type not in high_freq_types:
                     if wse_processing_ms > 100:
-                        log.warning(f"High WSE processing time: {wse_processing_ms}ms for {event_type}")
+                        log.warning(
+                            f"High WSE processing time: {wse_processing_ms}ms for {event_type}"
+                        )
                     elif wse_processing_ms > 50:
-                        log.debug(f"Elevated WSE processing time: {wse_processing_ms}ms for {event_type}")
+                        log.debug(
+                            f"Elevated WSE processing time: {wse_processing_ms}ms for {event_type}"
+                        )
 
-            if 'v' not in message:
-                message['v'] = self.protocol_version
-            if 'ts' not in message:
-                message['ts'] = now_utc.isoformat()
+            if "v" not in message:
+                message["v"] = self.protocol_version
+            if "ts" not in message:
+                message["ts"] = now_utc.isoformat()
 
             # Selective message signing
-            message_type = message.get('t', '')
-            should_sign = (
-                self.message_signing_enabled or
-                message_type in self.signed_message_types
-            )
+            message_type = message.get("t", "")
+            should_sign = self.message_signing_enabled or message_type in self.signed_message_types
 
             if should_sign:
                 signature = await self.security_manager.sign_message(message)
                 if signature:
-                    message['sig'] = signature
+                    message["sig"] = signature
                     log.debug(f"Signed message type: {message_type} (sig length: {len(signature)})")
                 else:
                     log.warning(f"Failed to sign message type: {message_type}")
 
             # Message category prefix
-            msg_category = message.pop('_msg_cat', None)
+            msg_category = message.pop("_msg_cat", None)
             if msg_category is None:
-                msg_type = message.get('t', '')
-                if '_snapshot' in msg_type or 'snapshot_' in msg_type:
-                    msg_category = 'S'
-                elif msg_type in ('server_ready', 'server_hello', 'client_hello_ack',
-                                  'connection_state_change', 'subscription_update',
-                                  'snapshot_complete', 'error', 'pong', 'PONG'):
-                    msg_category = 'WSE'
+                msg_type = message.get("t", "")
+                if "_snapshot" in msg_type or "snapshot_" in msg_type:
+                    msg_category = "S"
+                elif msg_type in (
+                    "server_ready",
+                    "server_hello",
+                    "client_hello_ack",
+                    "connection_state_change",
+                    "subscription_update",
+                    "snapshot_complete",
+                    "error",
+                    "pong",
+                    "PONG",
+                ):
+                    msg_category = "WSE"
                 else:
-                    msg_category = 'U'
+                    msg_category = "U"
 
             # Reorder keys: t first, v last (easier to read in logs)
             wire = {}
-            if 't' in message:
-                wire['t'] = message['t']
+            if "t" in message:
+                wire["t"] = message["t"]
             for k, val in message.items():
-                if k not in ('t', 'v'):
+                if k not in ("t", "v"):
                     wire[k] = val
-            if 'v' in message:
-                wire['v'] = message['v']
+            if "v" in message:
+                wire["v"] = message["v"]
 
             # Serialize to bytes directly (avoid bytes->str->bytes round-trip)
             if ORJSON_AVAILABLE:
                 json_bytes = orjson.dumps(wire, default=_orjson_default)
             else:
-                json_bytes = json.dumps(wire, cls=DateTimeEncoder).encode('utf-8')
-            data_bytes = msg_category.encode('ascii') + json_bytes
+                json_bytes = json.dumps(wire, cls=DateTimeEncoder).encode("utf-8")
+            data_bytes = msg_category.encode("ascii") + json_bytes
 
             log.debug(
                 f"[WSE_SENDING] Event: {message_type}, "
@@ -651,17 +691,21 @@ class WSEConnection:
             )
 
             should_compress = (
-                self.compression_enabled and
-                len(data_bytes) > self.compression_threshold and
-                not message.get('encrypted', False)
+                self.compression_enabled
+                and len(data_bytes) > self.compression_threshold
+                and not message.get("encrypted", False)
             )
 
             # Encrypt if enabled
-            if self.encryption_enabled and message.get('encrypted', False):
+            if self.encryption_enabled and message.get("encrypted", False):
                 encrypted = await self.security_manager.encrypt_message(data_bytes)
                 if encrypted:
                     byte_count = len(encrypted) + 2
-                    await self.ws.send_bytes(b'E:' + encrypted.encode('utf-8') if isinstance(encrypted, str) else b'E:' + encrypted)
+                    await self.ws.send_bytes(
+                        b"E:" + encrypted.encode("utf-8")
+                        if isinstance(encrypted, str)
+                        else b"E:" + encrypted
+                    )
                     self.metrics.bytes_sent += byte_count
                     if METRICS_AVAILABLE:
                         ws_bytes_sent_total.inc(byte_count)
@@ -680,7 +724,7 @@ class WSEConnection:
                     compressed = self.compression_manager.compress(data_bytes)
 
                 byte_count = len(compressed) + 2
-                await self.ws.send_bytes(b'C:' + compressed)
+                await self.ws.send_bytes(b"C:" + compressed)
                 self.metrics.compression_hits += 1
                 self.metrics.bytes_sent += byte_count
                 if METRICS_AVAILABLE:
@@ -697,7 +741,7 @@ class WSEConnection:
                     f"Ratio: {compression_ratio:.2f}"
                 )
             else:
-                await self.ws.send_text(data_bytes.decode('utf-8'))
+                await self.ws.send_text(data_bytes.decode("utf-8"))
                 self.metrics.bytes_sent += len(data_bytes)
                 if METRICS_AVAILABLE:
                     ws_bytes_sent_total.inc(len(data_bytes))
@@ -734,13 +778,10 @@ class WSEConnection:
                 batch = await self.message_queue.dequeue_batch()
 
                 if batch:
-                    if self.client_features.get('batch_messages', False) and len(batch) > 1:
+                    if self.client_features.get("batch_messages", False) and len(batch) > 1:
                         batch_message = {
-                            't': 'batch',
-                            'p': {
-                                'messages': [msg for _, msg in batch],
-                                'count': len(batch)
-                            }
+                            "t": "batch",
+                            "p": {"messages": [msg for _, msg in batch], "count": len(batch)},
                         }
                         await self._send_raw_message(batch_message)
                     else:
@@ -752,8 +793,7 @@ class WSEConnection:
                         self._queue_event.clear()
                         with contextlib.suppress(TimeoutError):
                             await asyncio.wait_for(
-                                self._queue_event.wait(),
-                                timeout=self.batch_timeout
+                                self._queue_event.wait(), timeout=self.batch_timeout
                             )
                     else:
                         await asyncio.sleep(self.batch_timeout)
@@ -771,21 +811,24 @@ class WSEConnection:
             try:
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
 
-                await self.send_message({
-                    't': 'heartbeat',
-                    'p': {
-                        'timestamp': int(datetime.now().timestamp() * 1000),
-                        'sequence': self.sequence_number
-                    }
-                }, priority=10)
+                await self.send_message(
+                    {
+                        "t": "heartbeat",
+                        "p": {
+                            "timestamp": int(datetime.now().timestamp() * 1000),
+                            "sequence": self.sequence_number,
+                        },
+                    },
+                    priority=10,
+                )
 
                 if self._running and self.ws and self._is_ws_connected():
                     try:
                         self.network_analyzer.record_packet_sent()
                         ping_msg = {
-                            't': 'PING',
-                            'p': {'timestamp': int(datetime.now().timestamp() * 1000)},
-                            'v': self.protocol_version
+                            "t": "PING",
+                            "p": {"timestamp": int(datetime.now().timestamp() * 1000)},
+                            "v": self.protocol_version,
                         }
                         ping_data = "WSE" + _json_dumps(ping_msg)
                         await self.ws.send_text(ping_data)
@@ -823,25 +866,33 @@ class WSEConnection:
                     await self.set_state(ConnectionState.DEGRADED)
                     if self.circuit_breaker.can_execute():
                         log.info(f"Circuit breaker for {self.conn_id} transitioning to HALF_OPEN")
-                elif cb_state["state"] == "CLOSED" and self.connection_state == ConnectionState.DEGRADED:
+                elif (
+                    cb_state["state"] == "CLOSED"
+                    and self.connection_state == ConnectionState.DEGRADED
+                ):
                     await self.set_state(ConnectionState.CONNECTED)
 
-                if diagnostics['quality'] in ['poor', 'fair']:
-                    await self.send_message({
-                        't': 'connection_quality',
-                        'p': {
-                            'quality': diagnostics['quality'],
-                            'suggestions': diagnostics['suggestions'],
-                            'metrics': self.metrics.to_dict(),
-                            'jitter': diagnostics['jitter'],
-                            'packet_loss': diagnostics['packet_loss']
-                        }
-                    }, priority=8)
+                if diagnostics["quality"] in ["poor", "fair"]:
+                    await self.send_message(
+                        {
+                            "t": "connection_quality",
+                            "p": {
+                                "quality": diagnostics["quality"],
+                                "suggestions": diagnostics["suggestions"],
+                                "metrics": self.metrics.to_dict(),
+                                "jitter": diagnostics["jitter"],
+                                "packet_loss": diagnostics["packet_loss"],
+                            },
+                        },
+                        priority=8,
+                    )
 
                 if self.debug_mode:
-                    log.debug(f"Health check - Quality: {diagnostics['quality']}, "
-                              f"Jitter: {diagnostics['jitter']}ms, "
-                              f"Packet loss: {diagnostics['packet_loss']}%")
+                    log.debug(
+                        f"Health check - Quality: {diagnostics['quality']}, "
+                        f"Jitter: {diagnostics['jitter']}ms, "
+                        f"Packet loss: {diagnostics['packet_loss']}%"
+                    )
 
             except asyncio.CancelledError:
                 break
@@ -858,7 +909,9 @@ class WSEConnection:
                 await asyncio.sleep(METRICS_INTERVAL)
 
                 current_messages = self.metrics.messages_received + self.metrics.messages_sent
-                self.metrics.message_rate = (current_messages - last_message_count) / METRICS_INTERVAL
+                self.metrics.message_rate = (
+                    current_messages - last_message_count
+                ) / METRICS_INTERVAL
                 last_message_count = current_messages
 
                 current_bytes = self.metrics.bytes_received + self.metrics.bytes_sent
@@ -867,19 +920,29 @@ class WSEConnection:
 
                 if self.metrics.compression_hits > 0:
                     total_original = self.metrics.bytes_sent / (self.metrics.compression_ratio or 1)
-                    self.metrics.compression_ratio = self.metrics.bytes_sent / total_original if total_original > 0 else 1
+                    self.metrics.compression_ratio = (
+                        self.metrics.bytes_sent / total_original if total_original > 0 else 1
+                    )
 
                 if METRICS_AVAILABLE:
                     queue_stats = self.message_queue.get_stats()
-                    ws_queue_size.labels(connection_id=self.conn_id, priority='total').set(queue_stats['size'])
-                    ws_queue_backpressure.labels(connection_id=self.conn_id).set(1 if queue_stats['backpressure'] else 0)
-                    for priority, dropped in queue_stats.get('dropped_by_priority', {}).items():
-                        ws_queue_dropped_total.labels(connection_id=self.conn_id, priority=str(priority)).inc(dropped)
+                    ws_queue_size.labels(connection_id=self.conn_id, priority="total").set(
+                        queue_stats["size"]
+                    )
+                    ws_queue_backpressure.labels(connection_id=self.conn_id).set(
+                        1 if queue_stats["backpressure"] else 0
+                    )
+                    for priority, dropped in queue_stats.get("dropped_by_priority", {}).items():
+                        ws_queue_dropped_total.labels(
+                            connection_id=self.conn_id, priority=str(priority)
+                        ).inc(dropped)
 
-                log.info(f"Connection {self.conn_id} metrics - "
-                         f"Rate: {self.metrics.message_rate:.2f} msg/s, "
-                         f"Bandwidth: {self.metrics.bandwidth:.2f} B/s, "
-                         f"Compression: {self.metrics.compression_ratio:.2f}")
+                log.info(
+                    f"Connection {self.conn_id} metrics - "
+                    f"Rate: {self.metrics.message_rate:.2f} msg/s, "
+                    f"Bandwidth: {self.metrics.bandwidth:.2f} B/s, "
+                    f"Compression: {self.metrics.compression_ratio:.2f}"
+                )
 
             except asyncio.CancelledError:
                 break
@@ -925,22 +988,27 @@ class WSEConnection:
         """Send rate limit warning to client."""
         rl_status = self.rate_limiter.get_status()
 
-        await self.send_message({
-            't': 'rate_limit_warning',
-            'p': {
-                'message': 'Rate limit exceeded. Please slow down your requests.',
-                'code': 'RATE_LIMIT_EXCEEDED',
-                'limit': rl_status.get('capacity', 1000),
-                'window': 1.0,
-                'retry_after': 1.0,
-                'current_usage': rl_status.get('capacity', 1000) - rl_status.get('available_tokens', 0),
-                'stats': {
-                    'tokens_remaining': rl_status.get('available_tokens', 0),
-                    'refill_rate': rl_status.get('refill_rate', 100),
-                    'capacity': rl_status.get('capacity', 1000)
-                }
-            }
-        }, priority=10, _bypass_rate_limit=True)
+        await self.send_message(
+            {
+                "t": "rate_limit_warning",
+                "p": {
+                    "message": "Rate limit exceeded. Please slow down your requests.",
+                    "code": "RATE_LIMIT_EXCEEDED",
+                    "limit": rl_status.get("capacity", 1000),
+                    "window": 1.0,
+                    "retry_after": 1.0,
+                    "current_usage": rl_status.get("capacity", 1000)
+                    - rl_status.get("available_tokens", 0),
+                    "stats": {
+                        "tokens_remaining": rl_status.get("available_tokens", 0),
+                        "refill_rate": rl_status.get("refill_rate", 100),
+                        "capacity": rl_status.get("capacity", 1000),
+                    },
+                },
+            },
+            priority=10,
+            _bypass_rate_limit=True,
+        )
 
     async def cleanup(self) -> None:
         """Clean up connection resources"""
@@ -950,7 +1018,7 @@ class WSEConnection:
 
         if METRICS_AVAILABLE:
             ws_connections_active.dec()
-            ws_disconnections_total.labels(reason='normal').inc()
+            ws_disconnections_total.labels(reason="normal").inc()
 
         # Cancel all tasks
         for task in self._tasks:

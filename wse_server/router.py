@@ -172,11 +172,13 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
         origin = websocket.headers.get("origin", "")
         if config.allowed_origins and origin and origin not in config.allowed_origins:
             log.warning("Rejected WebSocket connection from disallowed origin: %s", origin)
-            await websocket.send_json({
-                "v": PROTOCOL_VERSION,
-                "t": "error",
-                "p": {"code": "ORIGIN_NOT_ALLOWED", "message": "Origin not allowed"},
-            })
+            await websocket.send_json(
+                {
+                    "v": PROTOCOL_VERSION,
+                    "t": "error",
+                    "p": {"code": "ORIGIN_NOT_ALLOWED", "message": "Origin not allowed"},
+                }
+            )
             await websocket.close(code=4403, reason="Origin not allowed")
             return
         log.debug("WebSocket connection origin: %s", origin or "(none)")
@@ -203,18 +205,20 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
             if user_id is None:
                 log.warning("WebSocket authentication failed (IP: %s)", client_ip)
                 with contextlib.suppress(Exception):
-                    await websocket.send_json({
-                        "t": "error",
-                        "p": {
-                            "message": "Authentication failed",
-                            "code": "AUTH_FAILED",
-                            "recoverable": False,
-                            "details": {
-                                "timestamp": datetime.now(UTC).isoformat(),
-                                "hint": "Please ensure you are logged in and try again",
+                    await websocket.send_json(
+                        {
+                            "t": "error",
+                            "p": {
+                                "message": "Authentication failed",
+                                "code": "AUTH_FAILED",
+                                "recoverable": False,
+                                "details": {
+                                    "timestamp": datetime.now(UTC).isoformat(),
+                                    "hint": "Please ensure you are logged in and try again",
+                                },
                             },
-                        },
-                    })
+                        }
+                    )
                 await websocket.close(code=4401, reason="Authentication required")
                 return
         else:
@@ -246,15 +250,17 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
         if not app:
             log.error("Cannot access app state from WebSocket scope")
             with contextlib.suppress(Exception):
-                await websocket.send_json({
-                    "t": "error",
-                    "p": {
-                        "message": "Server configuration error",
-                        "code": "SERVER_ERROR",
-                        "recoverable": False,
-                        "details": {"timestamp": datetime.now(UTC).isoformat()},
-                    },
-                })
+                await websocket.send_json(
+                    {
+                        "t": "error",
+                        "p": {
+                            "message": "Server configuration error",
+                            "code": "SERVER_ERROR",
+                            "recoverable": False,
+                            "details": {"timestamp": datetime.now(UTC).isoformat()},
+                        },
+                    }
+                )
             await websocket.close(code=1011, reason="Server configuration error")
             return
 
@@ -266,15 +272,17 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
         except Exception as exc:
             log.error("Failed to get event bus: %s: %s", type(exc).__name__, exc, exc_info=True)
             with contextlib.suppress(Exception):
-                await websocket.send_json({
-                    "t": "error",
-                    "p": {
-                        "message": "Failed to initialize event bus",
-                        "code": "INIT_ERROR",
-                        "recoverable": False,
-                        "details": {"timestamp": datetime.now(UTC).isoformat()},
-                    },
-                })
+                await websocket.send_json(
+                    {
+                        "t": "error",
+                        "p": {
+                            "message": "Failed to initialize event bus",
+                            "code": "INIT_ERROR",
+                            "recoverable": False,
+                            "details": {"timestamp": datetime.now(UTC).isoformat()},
+                        },
+                    }
+                )
             await websocket.close(code=1011, reason="Event bus initialization failed")
             return
 
@@ -363,10 +371,12 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
 
             if initial_topics:
                 log.info("Initial subscription topics for %s: %s", conn_id, initial_topics)
-                await message_handler.handle_subscription({
-                    "t": "subscription",
-                    "p": {"action": "subscribe", "topics": initial_topics},
-                })
+                await message_handler.handle_subscription(
+                    {
+                        "t": "subscription",
+                        "p": {"action": "subscribe", "topics": initial_topics},
+                    }
+                )
 
             log.info("WebSocket %s connected and initialized successfully", conn_id)
 
@@ -413,9 +423,7 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
                     connection.circuit_breaker.record_failure()
 
                     if connection.circuit_breaker.get_state_sync() == "OPEN":
-                        log.warning(
-                            "Circuit breaker OPEN for %s, closing connection", conn_id
-                        )
+                        log.warning("Circuit breaker OPEN for %s, closing connection", conn_id)
                         with contextlib.suppress(Exception):
                             await connection.send_message(
                                 {
@@ -424,9 +432,7 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
                                         "message": "Server error - circuit breaker activated",
                                         "code": "CIRCUIT_BREAKER_OPEN",
                                         "recoverable": False,
-                                        "details": {
-                                            "timestamp": datetime.now(UTC).isoformat()
-                                        },
+                                        "details": {"timestamp": datetime.now(UTC).isoformat()},
                                     },
                                 },
                                 priority=10,
@@ -443,15 +449,17 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
                 exc_info=True,
             )
             with contextlib.suppress(Exception):
-                await websocket.send_json({
-                    "t": "error",
-                    "p": {
-                        "message": "Connection initialization failed",
-                        "code": "INIT_ERROR",
-                        "recoverable": False,
-                        "details": {"timestamp": datetime.now(UTC).isoformat()},
-                    },
-                })
+                await websocket.send_json(
+                    {
+                        "t": "error",
+                        "p": {
+                            "message": "Connection initialization failed",
+                            "code": "INIT_ERROR",
+                            "recoverable": False,
+                            "details": {"timestamp": datetime.now(UTC).isoformat()},
+                        },
+                    }
+                )
 
         finally:
             # Unregister from WSEManager
@@ -476,9 +484,7 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
             # Log final metrics
             try:
                 metrics = connection.metrics.to_dict()
-                duration = (
-                    datetime.now(UTC) - connection.metrics.connected_since
-                ).total_seconds()
+                duration = (datetime.now(UTC) - connection.metrics.connected_since).total_seconds()
                 log.info(
                     "WebSocket %s closed -- Duration: %.1fs, "
                     "Messages: %d/%d, Compression ratio: %.2f",
@@ -567,7 +573,10 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
                 {"size": 500, "data": "x" * 500},
                 {"size": 1500, "data": "x" * 1500},
                 {"size": 2000, "data": "".join(str(i % 10) for i in range(2000))},
-                {"size": 5000, "data": json.dumps({"test": "data" * 100, "array": list(range(1000))})},
+                {
+                    "size": 5000,
+                    "data": json.dumps({"test": "data" * 100, "array": list(range(1000))}),
+                },
             ]
 
             results = []
@@ -582,16 +591,18 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
                     decompressed = cm.decompress(compressed)
                     decompression_success = decompressed == data
 
-                    results.append({
-                        "original_size": original_size,
-                        "compressed_size": compressed_size,
-                        "compression_ratio": round(ratio, 3),
-                        "saved_bytes": original_size - compressed_size,
-                        "saved_percentage": round((1 - ratio) * 100, 1),
-                        "decompression_success": decompression_success,
-                        "should_compress": cm.should_compress(data),
-                        "beneficial": ratio < 0.9,
-                    })
+                    results.append(
+                        {
+                            "original_size": original_size,
+                            "compressed_size": compressed_size,
+                            "compression_ratio": round(ratio, 3),
+                            "saved_bytes": original_size - compressed_size,
+                            "saved_percentage": round((1 - ratio) * 100, 1),
+                            "decompression_success": decompression_success,
+                            "should_compress": cm.should_compress(data),
+                            "beneficial": ratio < 0.9,
+                        }
+                    )
                 except Exception as exc:
                     results.append({"original_size": original_size, "error": str(exc)})
 

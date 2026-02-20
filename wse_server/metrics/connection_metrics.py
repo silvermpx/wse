@@ -15,16 +15,22 @@ log = logging.getLogger("wse.metrics")
 # Metric Stubs (No-op for now, can add Prometheus later)
 # =============================================================================
 
+
 class MetricStub:
     """Stub metric that does nothing"""
+
     def labels(self, *args, **kwargs):
         return self
+
     def inc(self, value=1):
         pass
+
     def dec(self, value=1):
         pass
+
     def set(self, value):
         pass
+
     def observe(self, value):
         pass
 
@@ -56,6 +62,7 @@ dlq_replayed_total = MetricStub()
 # =============================================================================
 # Connection Metrics
 # =============================================================================
+
 
 @dataclass
 class ConnectionMetrics:
@@ -128,8 +135,12 @@ class ConnectionMetrics:
             "protocol_errors": self.protocol_errors,
             "compression_hits": self.compression_hits,
             "last_activity": self.last_activity.isoformat() if self.last_activity else None,
-            "last_message_sent": self.last_message_sent.isoformat() if self.last_message_sent else None,
-            "last_message_received": self.last_message_received.isoformat() if self.last_message_received else None,
+            "last_message_sent": self.last_message_sent.isoformat()
+            if self.last_message_sent
+            else None,
+            "last_message_received": self.last_message_received.isoformat()
+            if self.last_message_received
+            else None,
             "compression_ratio": self.compression_ratio,
             "message_rate": self.message_rate,
             "bandwidth": self.bandwidth,
@@ -139,6 +150,7 @@ class ConnectionMetrics:
 # =============================================================================
 # Network Quality Analyzer
 # =============================================================================
+
 
 @dataclass
 class NetworkQualityAnalyzer:
@@ -210,13 +222,19 @@ class NetworkQualityAnalyzer:
         jitter = 0.0
         if len(self.latency_samples) > 1:
             mean = avg_latency
-            variance = sum((x - mean) ** 2 for x in self.latency_samples) / len(self.latency_samples)
-            jitter = variance ** 0.5
+            variance = sum((x - mean) ** 2 for x in self.latency_samples) / len(
+                self.latency_samples
+            )
+            jitter = variance**0.5
 
         # Generate suggestions based on quality
         suggestions = []
         if quality == "poor":
-            suggestions = ["Check network connection", "Reduce message frequency", "Enable compression"]
+            suggestions = [
+                "Check network connection",
+                "Reduce message frequency",
+                "Enable compression",
+            ]
         elif quality == "fair":
             suggestions = ["Consider enabling compression", "Monitor connection stability"]
 

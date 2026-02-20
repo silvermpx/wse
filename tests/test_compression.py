@@ -26,11 +26,13 @@ class TestCompressDecompress:
         assert decompressed == data
 
     def test_roundtrip_json_payload(self, compression_manager):
-        payload = json.dumps({
-            "t": "order_update",
-            "p": {"symbol": "AAPL", "price": 150.25, "qty": 100},
-            "ts": "2025-01-01T00:00:00Z",
-        }).encode("utf-8")
+        payload = json.dumps(
+            {
+                "t": "order_update",
+                "p": {"symbol": "AAPL", "price": 150.25, "qty": 100},
+                "ts": "2025-01-01T00:00:00Z",
+            }
+        ).encode("utf-8")
         # Pad to exceed threshold
         padded = payload + b" " * 2000
         compressed = compression_manager.compress(padded)
@@ -190,18 +192,21 @@ class TestPackUnpack:
 class TestSerializeForMsgpack:
     def test_uuid_serialization(self):
         import uuid
+
         u = uuid.uuid4()
         result = CompressionManager._serialize_for_msgpack(u)
         assert result == str(u)
 
     def test_datetime_serialization(self):
         from datetime import datetime
+
         dt = datetime(2025, 1, 1, tzinfo=UTC)
         result = CompressionManager._serialize_for_msgpack(dt)
         assert "2025-01-01" in result
 
     def test_date_serialization(self):
         from datetime import date
+
         d = date(2025, 6, 15)
         result = CompressionManager._serialize_for_msgpack(d)
         assert result == "2025-06-15"

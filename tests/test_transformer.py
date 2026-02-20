@@ -101,10 +101,12 @@ class TestEventTypeMap:
         assert result["t"] == "new_ws_type"
 
     def test_register_event_types_bulk(self, transformer):
-        transformer.register_event_types({
-            "TypeA": "type_a",
-            "TypeB": "type_b",
-        })
+        transformer.register_event_types(
+            {
+                "TypeA": "type_a",
+                "TypeB": "type_b",
+            }
+        )
         event_a = {"event_type": "TypeA", "payload": {}}
         event_b = {"event_type": "TypeB", "payload": {}}
         assert transformer.transform_for_ws(event_a, sequence=1)["t"] == "type_a"

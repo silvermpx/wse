@@ -13,6 +13,7 @@ from wse_server._accel import RustPriorityMessageQueue
 @dataclass
 class QueuedMessage:
     """Message in the queue"""
+
     message: dict[str, Any]
     priority: int
     timestamp: float

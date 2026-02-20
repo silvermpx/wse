@@ -73,9 +73,7 @@ class CircuitBreaker[T]:
         """Execute *func* with circuit breaker protection."""
         async with self._lock:
             if not self._can_execute():
-                raise CircuitBreakerOpenError(
-                    f"Circuit breaker {self.name} is OPEN"
-                )
+                raise CircuitBreakerOpenError(f"Circuit breaker {self.name} is OPEN")
 
         start_time = time.monotonic()
 
@@ -91,8 +89,7 @@ class CircuitBreaker[T]:
             # Certain exception types should not count as failures.
             if self._should_ignore_exception(e):
                 logger.debug(
-                    "Circuit breaker %s: ignoring %s "
-                    "(client-side error, not counted as failure)",
+                    "Circuit breaker %s: ignoring %s (client-side error, not counted as failure)",
                     self.name,
                     type(e).__name__,
                 )
@@ -126,9 +123,7 @@ class CircuitBreaker[T]:
                 "failure_count": self._failure_count,
                 "success_count": self._success_count,
                 "last_failure_time": (
-                    self._last_failure_time.isoformat()
-                    if self._last_failure_time
-                    else None
+                    self._last_failure_time.isoformat() if self._last_failure_time else None
                 ),
             }
 
@@ -212,9 +207,7 @@ class CircuitBreaker[T]:
                 if self._success_count >= self.config.success_threshold:
                     await self._transition_to_closed()
 
-    async def _on_failure(
-        self, duration: float, error_details: str | None = None
-    ) -> None:
+    async def _on_failure(self, duration: float, error_details: str | None = None) -> None:
         async with self._lock:
             if self._call_metrics is not None:
                 self._call_metrics.append((False, duration))
@@ -223,9 +216,7 @@ class CircuitBreaker[T]:
             self._last_failure_time = datetime.now(UTC)
 
             if error_details:
-                logger.debug(
-                    "Circuit breaker %s failure: %s", self.name, error_details
-                )
+                logger.debug("Circuit breaker %s failure: %s", self.name, error_details)
 
             if self._state == CircuitState.HALF_OPEN:
                 await self._transition_to_open()
@@ -257,9 +248,7 @@ class CircuitBreaker[T]:
     def _should_attempt_reset(self) -> bool:
         if self._last_failure_time is None:
             return True
-        elapsed = (
-            datetime.now(UTC) - self._last_failure_time
-        ).total_seconds()
+        elapsed = (datetime.now(UTC) - self._last_failure_time).total_seconds()
         return elapsed >= self.config.reset_timeout_seconds
 
     async def _transition_to_closed(self) -> None:
@@ -270,9 +259,7 @@ class CircuitBreaker[T]:
         logger.info("circuit_breaker_closed for %s", self.name)
 
         if self.cache_manager:
-            await self.cache_manager.set(
-                f"circuit_breaker:{self.name}:state", "CLOSED", ttl=3600
-            )
+            await self.cache_manager.set(f"circuit_breaker:{self.name}:state", "CLOSED", ttl=3600)
 
     async def _transition_to_open(self) -> None:
         self._state = CircuitState.OPEN
@@ -280,9 +267,7 @@ class CircuitBreaker[T]:
         logger.warning("circuit_breaker_opened for %s", self.name)
 
         if self.cache_manager:
-            await self.cache_manager.set(
-                f"circuit_breaker:{self.name}:state", "OPEN", ttl=3600
-            )
+            await self.cache_manager.set(f"circuit_breaker:{self.name}:state", "OPEN", ttl=3600)
 
 
 # --------------------------------------------------------------------- #
@@ -333,8 +318,6 @@ def get_all_circuit_breaker_metrics() -> dict[str, dict[str, Any]]:
         try:
             metrics[name] = breaker.get_metrics()
         except Exception as e:
-            logger.error(
-                "Error getting metrics for circuit breaker %s: %s", name, e
-            )
+            logger.error("Error getting metrics for circuit breaker %s: %s", name, e)
             metrics[name] = {"error": str(e)}
     return metrics

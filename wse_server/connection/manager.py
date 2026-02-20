@@ -20,6 +20,7 @@ log = logging.getLogger("wse.manager")
 @dataclass
 class ConnectionInfo:
     """Information about a WebSocket connection"""
+
     connection: WSEConnection
     user_id: str
     ip_address: str
@@ -92,11 +93,7 @@ class WSEManager:
         return info.connection
 
     async def add_connection(
-            self,
-            connection: WSEConnection,
-            ip_address: str,
-            client_version: str,
-            protocol_version: int
+        self, connection: WSEConnection, ip_address: str, client_version: str, protocol_version: int
     ) -> bool:
         """Add a new connection.
 
@@ -134,7 +131,9 @@ class WSEManager:
                     old_connection = self._remove_connection_unlocked(oldest_conn_id)
                     old_conn_id = oldest_conn_id
                 else:
-                    log.warning(f"User {user_id} exceeded max connections but no old connection found")
+                    log.warning(
+                        f"User {user_id} exceeded max connections but no old connection found"
+                    )
                     return False
 
             # Add the new connection (same lock acquisition -- atomic swap)
@@ -145,7 +144,7 @@ class WSEManager:
                 connected_at=datetime.now(UTC),
                 last_activity=datetime.now(UTC),
                 client_version=client_version,
-                protocol_version=protocol_version
+                protocol_version=protocol_version,
             )
 
             self.connections[conn_id] = info
@@ -224,9 +223,7 @@ class WSEManager:
 
             avg_connections_per_user = 0
             if active_users > 0:
-                total_user_connections = sum(
-                    len(conns) for conns in self.user_connections.values()
-                )
+                total_user_connections = sum(len(conns) for conns in self.user_connections.values())
                 avg_connections_per_user = total_user_connections / active_users
 
             version_distribution = {}
@@ -240,19 +237,21 @@ class WSEManager:
                 protocol_distribution[protocol] = protocol_distribution.get(protocol, 0) + 1
 
             return {
-                'active_connections': active_connections,
-                'active_users': active_users,
-                'active_ips': active_ips,
-                'total_connections': self.total_connections,
-                'total_messages_sent': self.total_messages_sent,
-                'total_messages_received': self.total_messages_received,
-                'avg_connections_per_user': round(avg_connections_per_user, 2),
-                'max_connections_per_user': self.max_connections_per_user,
-                'client_versions': version_distribution,
-                'protocol_versions': protocol_distribution
+                "active_connections": active_connections,
+                "active_users": active_users,
+                "active_ips": active_ips,
+                "total_connections": self.total_connections,
+                "total_messages_sent": self.total_messages_sent,
+                "total_messages_received": self.total_messages_received,
+                "avg_connections_per_user": round(avg_connections_per_user, 2),
+                "max_connections_per_user": self.max_connections_per_user,
+                "client_versions": version_distribution,
+                "protocol_versions": protocol_distribution,
             }
 
-    async def check_rate_limits(self, user_id: str, ip_address: str, is_premium: bool = False) -> bool:
+    async def check_rate_limits(
+        self, user_id: str, ip_address: str, is_premium: bool = False
+    ) -> bool:
         """Check if the connection is rate-limited"""
         if user_id not in self.user_rate_limiters:
             if is_premium:
@@ -269,8 +268,7 @@ class WSEManager:
                 )
 
             self.user_rate_limiters[user_id] = RateLimiter(
-                name=f"wse_user_{user_id}",
-                config=config
+                name=f"wse_user_{user_id}", config=config
             )
 
         if ip_address not in self.ip_rate_limiters:
@@ -281,8 +279,7 @@ class WSEManager:
             )
 
             self.ip_rate_limiters[ip_address] = RateLimiter(
-                name=f"wse_ip_{ip_address}",
-                config=config
+                name=f"wse_ip_{ip_address}", config=config
             )
 
         user_allowed = await self.user_rate_limiters[user_id].acquire()
@@ -312,22 +309,22 @@ class WSEManager:
                         self._remove_connection_unlocked(conn_id)
 
                     user_ids_to_remove = [
-                        uid for uid in self.user_rate_limiters
-                        if uid not in self.user_connections
+                        uid for uid in self.user_rate_limiters if uid not in self.user_connections
                     ]
                     for uid in user_ids_to_remove:
                         del self.user_rate_limiters[uid]
 
                     ip_addresses_to_remove = [
-                        ip for ip in self.ip_rate_limiters
-                        if ip not in self.ip_connections
+                        ip for ip in self.ip_rate_limiters if ip not in self.ip_connections
                     ]
                     for ip in ip_addresses_to_remove:
                         del self.ip_rate_limiters[ip]
 
                     if user_ids_to_remove or ip_addresses_to_remove:
-                        log.info(f"Cleaned up {len(user_ids_to_remove)} user rate limiters "
-                                 f"and {len(ip_addresses_to_remove)} IP rate limiters")
+                        log.info(
+                            f"Cleaned up {len(user_ids_to_remove)} user rate limiters "
+                            f"and {len(ip_addresses_to_remove)} IP rate limiters"
+                        )
 
             except asyncio.CancelledError:
                 break

@@ -275,9 +275,7 @@ class TestCircuitBreaker:
 
     @pytest.mark.asyncio
     async def test_timeout_seconds_overrides_reset_timeout(self):
-        config = CircuitBreakerConfig(
-            name="compat", timeout_seconds=120.0
-        )
+        config = CircuitBreakerConfig(name="compat", timeout_seconds=120.0)
         cb = CircuitBreaker(config)
         assert cb.config.reset_timeout_seconds == 120
 
@@ -453,9 +451,7 @@ class TestRateLimiter:
         assert "refill_rate" in status
 
     def test_get_status_sliding_window(self):
-        config = RateLimiterConfig(
-            algorithm="sliding_window", capacity=10, time_window=60
-        )
+        config = RateLimiterConfig(algorithm="sliding_window", capacity=10, time_window=60)
         rl = RateLimiter(name="sw_status", config=config)
         status = rl.get_status()
         assert status["algorithm"] == "sliding_window"

@@ -50,6 +50,7 @@ from uuid import UUID
 
 try:
     import orjson
+
     ORJSON_AVAILABLE = True
 except ImportError:
     ORJSON_AVAILABLE = False
@@ -156,11 +157,11 @@ class PubSubBus:
             "pubsub_listener",
             CircuitBreakerConfig(
                 name="pubsub_listener",
-                failure_threshold=10,      # Open after 10 failures
+                failure_threshold=10,  # Open after 10 failures
                 reset_timeout_seconds=60,  # Try recovery after 60s
-                half_open_max_calls=3,     # Test with 3 calls
-                success_threshold=3        # Close after 3 successes
-            )
+                half_open_max_calls=3,  # Test with 3 calls
+                success_threshold=3,  # Close after 3 successes
+            ),
         )
 
         # Exponential backoff state
@@ -195,13 +196,17 @@ class PubSubBus:
 
             # NOTE: Listener task will be started on first subscription
             # (redis-py listen() terminates immediately if no subscriptions exist)
-            log.info("[PUBSUB_BUS] PubSubBus initialized - listener will start on first subscription")
+            log.info(
+                "[PUBSUB_BUS] PubSubBus initialized - listener will start on first subscription"
+            )
 
         except Exception as e:
             log.error(f"Failed to initialize PubSubBus: {e}", exc_info=True)
             raise
 
-    async def publish(self, topic: str, event: dict[str, Any], priority: Any = None, ttl: int = None) -> None:
+    async def publish(
+        self, topic: str, event: dict[str, Any], priority: Any = None, ttl: int = None
+    ) -> None:
         """
         Publish event to Redis Pub/Sub (broadcast to ALL instances)
 
@@ -225,8 +230,8 @@ class PubSubBus:
         start_time = time.time()
 
         # Generate or extract event ID for tracking
-        event_id = event.get('id') or event.get('event_id') or str(uuid.uuid4())
-        event_type = event.get('event_type') or event.get('t') or 'unknown'
+        event_id = event.get("id") or event.get("event_id") or str(uuid.uuid4())
+        event_type = event.get("event_type") or event.get("t") or "unknown"
 
         log.debug(f"[PUBSUB_PUBLISH_START] Event: {event_type}, ID: {event_id}, Topic: {topic}")
 
@@ -237,22 +242,25 @@ class PubSubBus:
             # Add priority to event metadata if provided (for priority queue)
             priority_str = "default"
             if priority is not None:
-                if 'metadata' not in event:
-                    event['metadata'] = {}
-                event['metadata']['priority'] = priority.value if hasattr(priority, 'value') else priority
-                priority_str = priority.name if hasattr(priority, 'name') else str(priority)
+                if "metadata" not in event:
+                    event["metadata"] = {}
+                event["metadata"]["priority"] = (
+                    priority.value if hasattr(priority, "value") else priority
+                )
+                priority_str = priority.name if hasattr(priority, "name") else str(priority)
 
             # Add event ID to metadata for tracking
-            if 'metadata' not in event:
-                event['metadata'] = {}
-            event['metadata']['event_id'] = event_id
-            event['metadata']['published_at'] = datetime.now(UTC).isoformat()
+            if "metadata" not in event:
+                event["metadata"] = {}
+            event["metadata"]["event_id"] = event_id
+            event["metadata"]["published_at"] = datetime.now(UTC).isoformat()
 
             # Serialize event to JSON
             if ORJSON_AVAILABLE:
                 message = orjson.dumps(event, default=_orjson_default).decode()
             else:
                 import json
+
                 message = json.dumps(event, default=str)
             message_size = len(message)
 
@@ -276,7 +284,9 @@ class PubSubBus:
         except Exception as e:
             log.error(f"Failed to publish to {topic}: {e}", exc_info=True)
 
-    async def subscribe(self, pattern: str, handler: Callable, connection_id: str | None = None) -> str:
+    async def subscribe(
+        self, pattern: str, handler: Callable, connection_id: str | None = None
+    ) -> str:
         """
         Subscribe to topic using SUBSCRIBE (exact) or PSUBSCRIBE (wildcard)
 
@@ -315,7 +325,7 @@ class PubSubBus:
             # Only subscribe to Redis if this is the FIRST handler for this channel
             already_subscribed = channel_pattern in self.subscriptions
             if not already_subscribed:
-                is_pattern = '*' in pattern or '?' in pattern
+                is_pattern = "*" in pattern or "?" in pattern
                 if is_pattern:
                     await self.pubsub.psubscribe(channel_pattern)
                     log.debug(f"Subscribed to pattern (PSUBSCRIBE): {channel_pattern}")
@@ -324,7 +334,9 @@ class PubSubBus:
                     log.debug(f"Subscribed to exact topic (SUBSCRIBE): {channel_pattern}")
                 self.subscriptions[channel_pattern] = {}
             else:
-                log.debug(f"Adding handler to existing channel: {channel_pattern} (now {len(self.subscriptions[channel_pattern]) + 1} handlers)")
+                log.debug(
+                    f"Adding handler to existing channel: {channel_pattern} (now {len(self.subscriptions[channel_pattern]) + 1} handlers)"
+                )
 
             # Store handler (multiple handlers per channel supported)
             self.subscriptions[channel_pattern][subscription_id] = handler
@@ -381,13 +393,17 @@ class PubSubBus:
             if not handlers:
                 del self.subscriptions[channel_pattern]
 
-                is_pattern = '*' in pattern or '?' in pattern
+                is_pattern = "*" in pattern or "?" in pattern
                 if is_pattern:
                     await self.pubsub.punsubscribe(channel_pattern)
-                    log.info(f"Unsubscribed from pattern (PUNSUBSCRIBE): {channel_pattern} (last handler)")
+                    log.info(
+                        f"Unsubscribed from pattern (PUNSUBSCRIBE): {channel_pattern} (last handler)"
+                    )
                 else:
                     await self.pubsub.unsubscribe(channel_pattern)
-                    log.info(f"Unsubscribed from exact topic (UNSUBSCRIBE): {channel_pattern} (last handler)")
+                    log.info(
+                        f"Unsubscribed from exact topic (UNSUBSCRIBE): {channel_pattern} (last handler)"
+                    )
             else:
                 log.info(f"Removed handler from {channel_pattern}, {len(handlers)} remaining")
 
@@ -419,7 +435,9 @@ class PubSubBus:
             except Exception as e:
                 log.error(f"Error bulk-unsubscribing {sub_id} for connection {connection_id}: {e}")
 
-        log.info(f"[PUBSUB_BUS] Bulk unsubscribed {removed}/{len(sub_ids)} handlers for connection {connection_id}")
+        log.info(
+            f"[PUBSUB_BUS] Bulk unsubscribed {removed}/{len(sub_ids)} handlers for connection {connection_id}"
+        )
         return removed
 
     async def _listen_loop(self) -> None:
@@ -445,7 +463,7 @@ class PubSubBus:
                 # Execute through circuit breaker
                 message = await self._circuit_breaker.call(self._get_message_with_timeout)
 
-                if message and message.get('type') in ['pmessage', 'message']:
+                if message and message.get("type") in ["pmessage", "message"]:
                     # Process message
                     await self._process_message(message)
 
@@ -469,7 +487,7 @@ class PubSubBus:
                 # Exponential backoff with jitter
                 delay = min(
                     self._backoff_delay * (self._backoff_factor ** (self._consecutive_errors - 1)),
-                    self._max_backoff
+                    self._max_backoff,
                 )
 
                 # Add jitter (+/-20%)
@@ -479,7 +497,7 @@ class PubSubBus:
                 log.error(
                     f"PubSubBus listener error (attempt {self._consecutive_errors}): {e}. "
                     f"Retrying in {delay:.2f}s...",
-                    exc_info=True
+                    exc_info=True,
                 )
 
                 await asyncio.sleep(delay)
@@ -491,16 +509,22 @@ class PubSubBus:
     async def _process_message(self, message: dict) -> None:
         """Process a single Pub/Sub message"""
         # Handle pattern messages (PSUBSCRIBE)
-        if message['type'] == 'pmessage':
+        if message["type"] == "pmessage":
             # Handle both bytes and str (redis-py async returns str in newer versions)
-            pattern_data = message['pattern']
-            pattern = pattern_data.decode('utf-8') if isinstance(pattern_data, bytes) else pattern_data
+            pattern_data = message["pattern"]
+            pattern = (
+                pattern_data.decode("utf-8") if isinstance(pattern_data, bytes) else pattern_data
+            )
 
-            data_bytes = message['data']
-            data_str = data_bytes.decode('utf-8') if isinstance(data_bytes, bytes) else data_bytes
+            data_bytes = message["data"]
+            data_str = data_bytes.decode("utf-8") if isinstance(data_bytes, bytes) else data_bytes
 
             try:
-                event = orjson.loads(data_str) if ORJSON_AVAILABLE else __import__('json').loads(data_str)
+                event = (
+                    orjson.loads(data_str)
+                    if ORJSON_AVAILABLE
+                    else __import__("json").loads(data_str)
+                )
             except Exception as e:
                 log.error(f"Failed to deserialize pmessage: {e}")
                 return
@@ -521,19 +545,25 @@ class PubSubBus:
                 log.warning(f"No handler for pattern: {pattern}")
 
         # Handle exact topic messages (SUBSCRIBE)
-        elif message['type'] == 'message':
+        elif message["type"] == "message":
             # Handle both bytes and str (redis-py async returns str in newer versions)
-            channel_data = message['channel']
-            channel = channel_data.decode('utf-8') if isinstance(channel_data, bytes) else channel_data
+            channel_data = message["channel"]
+            channel = (
+                channel_data.decode("utf-8") if isinstance(channel_data, bytes) else channel_data
+            )
 
-            data_bytes = message['data']
-            data_str = data_bytes.decode('utf-8') if isinstance(data_bytes, bytes) else data_bytes
+            data_bytes = message["data"]
+            data_str = data_bytes.decode("utf-8") if isinstance(data_bytes, bytes) else data_bytes
 
             log.debug(f"[PUBSUB_BUS] Received message on channel: {channel}")
 
             try:
-                event = orjson.loads(data_str) if ORJSON_AVAILABLE else __import__('json').loads(data_str)
-                event_type = event.get('event_type') or event.get('t') or 'unknown'
+                event = (
+                    orjson.loads(data_str)
+                    if ORJSON_AVAILABLE
+                    else __import__("json").loads(data_str)
+                )
+                event_type = event.get("event_type") or event.get("t") or "unknown"
                 log.debug(f"PubSubBus message event_type: {event_type}")
             except Exception as e:
                 log.error(f"Failed to deserialize message: {e}")
@@ -544,7 +574,9 @@ class PubSubBus:
 
             if handlers:
                 self._messages_received += 1
-                log.debug(f"PubSubBus invoking {len(handlers)} handler(s) for {channel}, total received: {self._messages_received}")
+                log.debug(
+                    f"PubSubBus invoking {len(handlers)} handler(s) for {channel}, total received: {self._messages_received}"
+                )
 
                 # Prometheus metrics
                 pubsub_received_total.labels(pattern=channel).inc()
@@ -553,7 +585,9 @@ class PubSubBus:
                 for handler in list(handlers.values()):
                     asyncio.create_task(self._safe_invoke_handler(handler, event))
             else:
-                log.warning(f"No handler for channel: {channel}, available channels: {list(self.subscriptions.keys())}")
+                log.warning(
+                    f"No handler for channel: {channel}, available channels: {list(self.subscriptions.keys())}"
+                )
 
     async def _safe_invoke_handler(self, handler: Callable, event: dict) -> None:
         """
@@ -567,12 +601,12 @@ class PubSubBus:
             - Catches all exceptions to prevent handler errors from crashing listener
             - Logs errors for debugging
         """
-        event_type = event.get('event_type', event.get('type', 'unknown'))
-        event_id = event.get('event_id', event.get('_metadata', {}).get('event_id', 'unknown'))
+        event_type = event.get("event_type", event.get("type", "unknown"))
+        event_id = event.get("event_id", event.get("_metadata", {}).get("event_id", "unknown"))
 
         # Extract event ID from metadata if available
-        if 'metadata' in event and 'event_id' in event['metadata']:
-            event_id = event['metadata']['event_id']
+        if "metadata" in event and "event_id" in event["metadata"]:
+            event_id = event["metadata"]["event_id"]
 
         handler_start_time = time.time()
 
@@ -581,28 +615,29 @@ class PubSubBus:
             await handler(event)
 
             handler_latency_ms = (time.time() - handler_start_time) * 1000
-            log.debug(f"[HANDLER_SUCCESS] Event: {event_type}, ID: {event_id}, Latency: {handler_latency_ms:.2f}ms")
+            log.debug(
+                f"[HANDLER_SUCCESS] Event: {event_type}, ID: {event_id}, Latency: {handler_latency_ms:.2f}ms"
+            )
         except Exception as e:
             self._handler_errors += 1
             log.error(
                 f"[PUBSUB_ERROR] Handler error (total: {self._handler_errors}) for {event_type}: {e}",
-                exc_info=True
+                exc_info=True,
             )
 
             # Prometheus metrics
             error_type_str = type(e).__name__
             pubsub_handler_errors_total.labels(
-                pattern=event.get('channel', 'unknown'),
-                error_type=error_type_str
+                pattern=event.get("channel", "unknown"), error_type=error_type_str
             ).inc()
 
             # Send to Dead Letter Queue
             await self._send_to_dlq(
-                channel=event.get('channel', 'unknown'),
+                channel=event.get("channel", "unknown"),
                 message=event,
                 error_type="handler_exception",
                 error_details=str(e),
-                message_id=event_id
+                message_id=event_id,
             )
 
     async def _send_to_dlq(
@@ -611,7 +646,7 @@ class PubSubBus:
         message: Any,
         error_type: str,
         error_details: str,
-        message_id: str | None = None
+        message_id: str | None = None,
     ) -> None:
         """Send failed message to Dead Letter Queue"""
         if not self._dlq_enabled:
@@ -628,7 +663,7 @@ class PubSubBus:
                 "error_type": error_type,
                 "error_details": error_details,
                 "timestamp": now.isoformat(),
-                "retry_count": 0
+                "retry_count": 0,
             }
 
             # Store in Redis List
@@ -667,14 +702,18 @@ class PubSubBus:
             entries = await self.redis_client.lrange(dlq_key, 0, -1)
             for _i, entry_json in enumerate(entries):
                 entry = json.loads(entry_json)
-                if entry.get('message_id') == message_id:
+                if entry.get("message_id") == message_id:
                     # Remove from DLQ
                     await self.redis_client.lrem(dlq_key, 1, entry_json)
 
                     # Republish to original channel
-                    original_message = entry['message']
-                    channel_to_publish = f"wse:{channel}" if not channel.startswith('wse:') else channel
-                    await self.redis_client.publish(channel_to_publish, json.dumps(original_message, cls=WSEJSONEncoder))
+                    original_message = entry["message"]
+                    channel_to_publish = (
+                        f"wse:{channel}" if not channel.startswith("wse:") else channel
+                    )
+                    await self.redis_client.publish(
+                        channel_to_publish, json.dumps(original_message, cls=WSEJSONEncoder)
+                    )
 
                     # Prometheus metrics
                     dlq_replayed_total.labels(channel=channel).inc()
@@ -718,8 +757,8 @@ class PubSubBus:
             try:
                 all_channels = list(self.subscriptions.keys())
                 # Separate glob patterns (PSUBSCRIBE) from exact channels (SUBSCRIBE)
-                patterns_to_unsub = [p for p in all_channels if '*' in p or '?' in p]
-                channels_to_unsub = [p for p in all_channels if '*' not in p and '?' not in p]
+                patterns_to_unsub = [p for p in all_channels if "*" in p or "?" in p]
+                channels_to_unsub = [p for p in all_channels if "*" not in p and "?" not in p]
                 if patterns_to_unsub:
                     await self.pubsub.punsubscribe(*patterns_to_unsub)
                 if channels_to_unsub:
@@ -750,7 +789,7 @@ class PubSubBus:
             "messages_published": self._messages_published,
             "messages_received": self._messages_received,
             "handler_errors": self._handler_errors,
-            "redis_pool": "shared"  # Using global Redis pool
+            "redis_pool": "shared",  # Using global Redis pool
         }
 
 

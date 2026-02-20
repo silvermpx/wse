@@ -1,4 +1,5 @@
 """Example: JWT authentication handler for WSE."""
+
 import logging
 
 logger = logging.getLogger("wse.examples.auth")
