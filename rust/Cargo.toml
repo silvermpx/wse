@@ -21,7 +21,7 @@ ahash = "0.8.12"
 uuid = { version = "1.21.0", features = ["v7"] }
 chrono = { version = "0.4.43", features = ["serde"] }
 regex = "1.12.3"
-tokio = { version = "1.49.0", features = ["full"] }
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "sync", "net", "time"] }
 tokio-tungstenite = "0.28.0"
 futures-util = "0.3.32"
 

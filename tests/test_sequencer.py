@@ -1,15 +1,15 @@
 """Tests for EventSequencer."""
 
-import asyncio
-import sys
 import os
+import sys
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from server.connection.sequencer import EventSequencer, SequencedEvent
+from datetime import UTC
 
+from wse_server.connection.sequencer import EventSequencer, SequencedEvent
 
 # =========================================================================
 # SequencedEvent dataclass
@@ -18,9 +18,9 @@ from server.connection.sequencer import EventSequencer, SequencedEvent
 
 class TestSequencedEvent:
     def test_creation(self):
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         evt = SequencedEvent(
             event_id="e1",
             sequence=1,

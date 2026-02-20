@@ -18,9 +18,7 @@ fn is_clean_primitive(obj: &Bound<'_, PyAny>) -> bool {
 
 #[inline]
 fn is_clean_shallow(obj: &Bound<'_, PyAny>) -> bool {
-    is_clean_primitive(obj)
-        || obj.is_instance_of::<PyList>()
-        || obj.is_instance_of::<PyDict>()
+    is_clean_primitive(obj) || obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyDict>()
 }
 
 fn dict_needs_conversion(dict: &Bound<'_, PyDict>) -> bool {
@@ -73,15 +71,13 @@ fn convert_value(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> 
     }
 
     // UUID (has `hex` attr that is a 32-char string)
-    if obj.hasattr("hex")? {
-        if let Ok(hex_val) = obj.getattr("hex") {
-            if let Ok(hex_str) = hex_val.extract::<String>() {
-                if hex_str.len() == 32 {
-                    let s = obj.str()?;
-                    return Ok(s.into_any().unbind());
-                }
-            }
-        }
+    if obj.hasattr("hex")?
+        && let Ok(hex_val) = obj.getattr("hex")
+        && let Ok(hex_str) = hex_val.extract::<String>()
+        && hex_str.len() == 32
+    {
+        let s = obj.str()?;
+        return Ok(s.into_any().unbind());
     }
 
     // datetime/date (has isoformat + year)
@@ -134,15 +130,13 @@ fn ensure_str(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         return Ok(PyString::new(py, &s).into_any().unbind());
     }
 
-    if obj.hasattr("hex")? {
-        if let Ok(hex_val) = obj.getattr("hex") {
-            if let Ok(hex_str) = hex_val.extract::<String>() {
-                if hex_str.len() == 32 {
-                    let s = obj.str()?;
-                    return Ok(s.into_any().unbind());
-                }
-            }
-        }
+    if obj.hasattr("hex")?
+        && let Ok(hex_val) = obj.getattr("hex")
+        && let Ok(hex_str) = hex_val.extract::<String>()
+        && hex_str.len() == 32
+    {
+        let s = obj.str()?;
+        return Ok(s.into_any().unbind());
     }
 
     if obj.hasattr("isoformat")? && obj.hasattr("year")? {
@@ -182,8 +176,8 @@ fn dict_get<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<Bound<
 /// Returns None if parsing fails or the timestamp is not available.
 fn compute_latency_ms(timestamp_str: &str) -> Option<i64> {
     // Handle 'Z' suffix -> '+00:00'
-    let normalized = if timestamp_str.ends_with('Z') {
-        format!("{}+00:00", &timestamp_str[..timestamp_str.len() - 1])
+    let normalized = if let Some(stripped) = timestamp_str.strip_suffix('Z') {
+        format!("{}+00:00", stripped)
     } else {
         timestamp_str.to_string()
     };
@@ -242,10 +236,8 @@ fn extract_payload<'py>(
 
     // Ensure event_type is set if type is provided
     let has_event_type = result.contains("event_type")?;
-    if !has_event_type {
-        if let Some(type_val) = dict_get(&result, "type")? {
-            result.set_item("event_type", type_val)?;
-        }
+    if !has_event_type && let Some(type_val) = dict_get(&result, "type")? {
+        result.set_item("event_type", type_val)?;
     }
 
     Ok(result)
@@ -286,8 +278,7 @@ pub fn rust_transform_event<'py>(
 
     // 1. Resolve event_type
     let raw_event_type: String = {
-        let val = dict_get(event, "event_type")?
-            .or(dict_get(event, "type")?);
+        let val = dict_get(event, "event_type")?.or(dict_get(event, "type")?);
         match val {
             Some(v) => {
                 let converted: Py<PyAny> = ensure_str(py, &v)?;
@@ -317,9 +308,7 @@ pub fn rust_transform_event<'py>(
         from_meta.or(from_event)
     };
 
-    let event_latency_ms: Option<i64> = event_timestamp_str
-        .as_deref()
-        .and_then(compute_latency_ms);
+    let event_latency_ms: Option<i64> = event_timestamp_str.as_deref().and_then(compute_latency_ms);
 
     // 4. Resolve event ID
     let event_id: String = {

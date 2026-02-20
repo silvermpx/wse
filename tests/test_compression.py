@@ -1,16 +1,17 @@
 """Tests for CompressionManager."""
 
 import json
-import sys
 import os
+import sys
 import zlib
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from server.connection.compression import CompressionManager
+from datetime import UTC
 
+from wse_server.connection.compression import CompressionManager
 
 # =========================================================================
 # Compress / Decompress roundtrip
@@ -194,8 +195,8 @@ class TestSerializeForMsgpack:
         assert result == str(u)
 
     def test_datetime_serialization(self):
-        from datetime import datetime, timezone
-        dt = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        from datetime import datetime
+        dt = datetime(2025, 1, 1, tzinfo=UTC)
         result = CompressionManager._serialize_for_msgpack(dt)
         assert "2025-01-01" in result
 

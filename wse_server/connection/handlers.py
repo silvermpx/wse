@@ -6,9 +6,10 @@ import asyncio
 import logging
 import time
 from collections import OrderedDict
-from datetime import datetime, timezone
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
+from collections.abc import Callable, Coroutine
+from datetime import UTC, datetime
 from enum import Enum
+from typing import Any
 
 from .connection import ConnectionState
 
@@ -27,7 +28,7 @@ PRIORITY_BACKGROUND = 1
 # =============================================================================
 
 # A handler is an async callable that takes a message dict
-HandlerFunc = Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]
+HandlerFunc = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
 
 
 # =============================================================================
@@ -44,9 +45,9 @@ class SubscriptionHook:
     async def on_subscribe(
         self,
         connection: Any,
-        topics: List[str],
-        success_topics: List[str],
-        failed_topics: List[Dict[str, Any]],
+        topics: list[str],
+        success_topics: list[str],
+        failed_topics: list[dict[str, Any]],
     ) -> None:
         """Called after successful subscribe action."""
         pass
@@ -54,9 +55,9 @@ class SubscriptionHook:
     async def on_unsubscribe(
         self,
         connection: Any,
-        topics: List[str],
-        success_topics: List[str],
-        failed_topics: List[Dict[str, Any]],
+        topics: list[str],
+        success_topics: list[str],
+        failed_topics: list[dict[str, Any]],
     ) -> None:
         """Called after successful unsubscribe action."""
         pass
@@ -86,8 +87,8 @@ class WSEHandler:
     def __init__(
         self,
         connection,
-        topic_normalizer: Optional[Callable[[str, str], str]] = None,
-        snapshot_provider: Optional[Any] = None,
+        topic_normalizer: Callable[[str, str], str] | None = None,
+        snapshot_provider: Any | None = None,
     ):
         """
         Args:
@@ -99,10 +100,10 @@ class WSEHandler:
         self.connection = connection
         self._topic_normalizer = topic_normalizer
         self._snapshot_provider = snapshot_provider
-        self._subscription_hooks: List[SubscriptionHook] = []
+        self._subscription_hooks: list[SubscriptionHook] = []
 
         # Core message type handlers
-        self.handlers: Dict[str, HandlerFunc] = {
+        self.handlers: dict[str, HandlerFunc] = {
             # Ping / Pong
             'ping': self.handle_ping,
             'PING': self.handle_ping,
@@ -157,7 +158,7 @@ class WSEHandler:
         self.handlers[message_type] = handler
         log.debug(f"Registered handler for message type: {message_type}")
 
-    def register_many(self, handlers: Dict[str, HandlerFunc]) -> None:
+    def register_many(self, handlers: dict[str, HandlerFunc]) -> None:
         """Bulk-register handlers."""
         self.handlers.update(handlers)
         log.debug(f"Registered {len(handlers)} handlers: {list(handlers.keys())}")
@@ -174,7 +175,7 @@ class WSEHandler:
     # Message routing
     # -----------------------------------------------------------------
 
-    async def handle_message(self, message_data: Dict[str, Any]) -> None:
+    async def handle_message(self, message_data: dict[str, Any]) -> None:
         """Route message to appropriate handler with enhanced error handling"""
         if not message_data:
             return
@@ -206,7 +207,7 @@ class WSEHandler:
             log.warning(f"Unknown message type: {msg_type}")
             await self._publish_client_message(msg_type, message_data)
 
-    def _normalize_message_format(self, message_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_message_format(self, message_data: dict[str, Any]) -> dict[str, Any]:
         """Normalize message format to use 't' and 'p' consistently"""
         if 'type' in message_data and 't' not in message_data:
             message_data['t'] = message_data.pop('type')
@@ -251,7 +252,7 @@ class WSEHandler:
         self.connection.metrics.record_latency(latency)
         self.connection.network_analyzer.record_latency(latency)
 
-    async def handle_pong(self, message_data: Dict[str, Any]) -> None:
+    async def handle_pong(self, message_data: dict[str, Any]) -> None:
         """Handle pong response from client"""
         payload = message_data.get('p', {})
         if 'server_timestamp' in payload:
@@ -262,7 +263,7 @@ class WSEHandler:
     # Connection management
     # -----------------------------------------------------------------
 
-    async def handle_client_hello(self, message_data: Dict[str, Any]) -> None:
+    async def handle_client_hello(self, message_data: dict[str, Any]) -> None:
         """Handle client hello message for protocol negotiation"""
         payload = message_data.get('p', {})
 
@@ -295,13 +296,13 @@ class WSEHandler:
                     'health_check': True,
                     'metrics': True,
                 },
-                'server_time': datetime.now(timezone.utc).isoformat(),
+                'server_time': datetime.now(UTC).isoformat(),
                 'connection_id': self.connection.conn_id,
                 'message': self.connection.server_welcome_message,
             }
         }, priority=PRIORITY_HIGH)
 
-    async def handle_connection_state_request(self, message_data: Dict[str, Any]) -> None:
+    async def handle_connection_state_request(self, message_data: dict[str, Any]) -> None:
         """Handle connection state request"""
         state = getattr(self.connection, 'connection_state', ConnectionState.CONNECTED)
 
@@ -324,7 +325,7 @@ class WSEHandler:
     # Subscription management (generic)
     # -----------------------------------------------------------------
 
-    async def handle_subscription(self, message_data: Dict[str, Any]) -> None:
+    async def handle_subscription(self, message_data: dict[str, Any]) -> None:
         """Handle subscription management with enhanced feedback"""
         payload = message_data.get('p', {})
         action = payload.get('action')
@@ -431,7 +432,7 @@ class WSEHandler:
                     'max_topics': 100,
                     'current_topics': len(self.connection.subscriptions)
                 },
-                'timestamp': datetime.now(timezone.utc).isoformat()
+                'timestamp': datetime.now(UTC).isoformat()
             }
         }, priority=PRIORITY_NORMAL)
 
@@ -439,7 +440,7 @@ class WSEHandler:
     # Sync request (generic)
     # -----------------------------------------------------------------
 
-    async def handle_sync_request(self, message_data: Dict[str, Any]) -> None:
+    async def handle_sync_request(self, message_data: dict[str, Any]) -> None:
         """Handle sync request for initial data.
 
         The generic handler sends a snapshot_complete message.  Domain-specific
@@ -462,7 +463,7 @@ class WSEHandler:
                 'details': {
                     'sequence': self.connection.sequence_number,
                     'topics': topics,
-                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'timestamp': datetime.now(UTC).isoformat(),
                     'last_sequence_processed': last_sequence,
                     'connection_id': self.connection.conn_id
                 }
@@ -478,7 +479,7 @@ class WSEHandler:
     # Batch handling
     # -----------------------------------------------------------------
 
-    async def handle_batch_message(self, message_data: Dict[str, Any]) -> None:
+    async def handle_batch_message(self, message_data: dict[str, Any]) -> None:
         """Handle batch of messages from client"""
         payload = message_data.get('p', {})
         messages = payload.get('messages', [])
@@ -516,7 +517,7 @@ class WSEHandler:
     # Health and metrics
     # -----------------------------------------------------------------
 
-    async def handle_health_check(self, message_data: Dict[str, Any]) -> None:
+    async def handle_health_check(self, message_data: dict[str, Any]) -> None:
         """Handle health check request with comprehensive diagnostics"""
         diagnostics = self.connection.network_analyzer.analyze()
         cb_metrics = self.connection.circuit_breaker.get_metrics()
@@ -525,7 +526,7 @@ class WSEHandler:
         await self.connection.send_message({
             't': 'health_check_response',
             'p': {
-                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'timestamp': datetime.now(UTC).isoformat(),
                 'server_time': int(datetime.now().timestamp() * 1000),
                 'connection_id': self.connection.conn_id,
                 'status': 'healthy',
@@ -557,9 +558,9 @@ class WSEHandler:
             }
         }, priority=PRIORITY_HIGH)
 
-        self.connection.metrics.last_health_check = datetime.now(timezone.utc)
+        self.connection.metrics.last_health_check = datetime.now(UTC)
 
-    async def handle_health_check_response(self, message_data: Dict[str, Any]) -> None:
+    async def handle_health_check_response(self, message_data: dict[str, Any]) -> None:
         """Process health check response from client with quality assessment"""
         payload = message_data.get('p', {})
 
@@ -584,7 +585,7 @@ class WSEHandler:
                     }
                 }, priority=PRIORITY_HIGH)
 
-    def _get_quality_recommendations(self, quality: str, diagnostics: Dict[str, Any]) -> Dict[str, Any]:
+    def _get_quality_recommendations(self, quality: str, diagnostics: dict[str, Any]) -> dict[str, Any]:
         """Generate quality improvement recommendations"""
         suggestions = []
         settings = {
@@ -618,7 +619,7 @@ class WSEHandler:
             'settings': settings
         }
 
-    async def handle_metrics_request(self, message_data: Dict[str, Any]) -> None:
+    async def handle_metrics_request(self, message_data: dict[str, Any]) -> None:
         """Handle metrics request with comprehensive stats"""
         event_bus_stats = self.connection.event_bus.get_metrics()
         sequence_stats = await self.connection.event_sequencer.get_buffer_stats()
@@ -626,7 +627,7 @@ class WSEHandler:
         await self.connection.send_message({
             't': 'metrics_response',
             'p': {
-                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'timestamp': datetime.now(UTC).isoformat(),
                 'connection_id': self.connection.conn_id,
                 'connection_stats': self.connection.metrics.to_dict(),
                 'subscriptions': {
@@ -643,11 +644,11 @@ class WSEHandler:
                 'compression_stats': self.connection.compression_manager.get_stats(),
                 'security': self.connection.security_manager.get_security_info(),
                 'uptime': (datetime.now(
-                    timezone.utc) - self.connection.metrics.connected_since).total_seconds() if self.connection.metrics.connected_since else 0
+                    UTC) - self.connection.metrics.connected_since).total_seconds() if self.connection.metrics.connected_since else 0
             }
         })
 
-    async def handle_metrics_response(self, message_data: Dict[str, Any]) -> None:
+    async def handle_metrics_response(self, message_data: dict[str, Any]) -> None:
         """Handle metrics response from client"""
         payload = message_data.get('p', {})
 
@@ -665,7 +666,7 @@ class WSEHandler:
     # Configuration
     # -----------------------------------------------------------------
 
-    async def handle_config_request(self, message_data: Dict[str, Any]) -> None:
+    async def handle_config_request(self, message_data: dict[str, Any]) -> None:
         """Handle configuration request"""
         await self.connection.send_message({
             't': 'config_response',
@@ -686,7 +687,7 @@ class WSEHandler:
             }
         }, priority=PRIORITY_HIGH)
 
-    async def handle_config_update(self, message_data: Dict[str, Any]) -> None:
+    async def handle_config_update(self, message_data: dict[str, Any]) -> None:
         """Handle configuration update request with validation"""
         payload = message_data.get('p', {})
         updated_settings = {}
@@ -725,7 +726,7 @@ class WSEHandler:
             'p': {
                 'success': True,
                 'updated_settings': updated_settings,
-                'timestamp': datetime.now(timezone.utc).isoformat()
+                'timestamp': datetime.now(UTC).isoformat()
             }
         }, priority=PRIORITY_HIGH)
 
@@ -733,7 +734,7 @@ class WSEHandler:
     # Priority message
     # -----------------------------------------------------------------
 
-    async def handle_priority_message(self, message_data: Dict[str, Any]) -> None:
+    async def handle_priority_message(self, message_data: dict[str, Any]) -> None:
         """Handle priority message from client"""
         payload = message_data.get('p', {})
         priority = message_data.get('pri', message_data.get('priority', PRIORITY_NORMAL))
@@ -750,7 +751,7 @@ class WSEHandler:
                 'ttl': payload.get('ttl'),
                 'user_id': self.connection.user_id,
                 'conn_id': self.connection.conn_id,
-                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'timestamp': datetime.now(UTC).isoformat(),
                 'correlation_id': message_data.get('cid')
             },
         )
@@ -759,7 +760,7 @@ class WSEHandler:
     # Debug / diagnostics
     # -----------------------------------------------------------------
 
-    async def handle_debug_request(self, message_data: Dict[str, Any]) -> None:
+    async def handle_debug_request(self, message_data: dict[str, Any]) -> None:
         """Handle debug information request"""
         debug_info = {
             'connection_id': self.connection.conn_id,
@@ -798,7 +799,7 @@ class WSEHandler:
             'p': debug_info
         }, priority=PRIORITY_HIGH)
 
-    async def handle_sequence_stats_request(self, message_data: Dict[str, Any]) -> None:
+    async def handle_sequence_stats_request(self, message_data: dict[str, Any]) -> None:
         """Handle sequence statistics request"""
         stats = await self.connection.event_sequencer.get_buffer_stats()
 
@@ -811,7 +812,7 @@ class WSEHandler:
     # Security / encryption
     # -----------------------------------------------------------------
 
-    async def handle_encryption_request(self, message_data: Dict[str, Any]) -> None:
+    async def handle_encryption_request(self, message_data: dict[str, Any]) -> None:
         """Handle encryption setup request"""
         payload = message_data.get('p', {})
         action = payload.get('action', 'status')
@@ -857,7 +858,7 @@ class WSEHandler:
                 'p': info
             }, priority=PRIORITY_HIGH)
 
-    async def handle_key_rotation_request(self, message_data: Dict[str, Any]) -> None:
+    async def handle_key_rotation_request(self, message_data: dict[str, Any]) -> None:
         """Handle key rotation request"""
         if self.connection.encryption_enabled:
             await self.connection.security_manager.rotate_keys()
@@ -868,7 +869,7 @@ class WSEHandler:
                 'p': {
                     'success': True,
                     'new_public_key': new_key,
-                    'timestamp': datetime.now(timezone.utc).isoformat()
+                    'timestamp': datetime.now(UTC).isoformat()
                 }
             }, priority=PRIORITY_HIGH)
         else:
@@ -893,7 +894,7 @@ class WSEHandler:
         # Track events by message ID to prevent duplicates
         processed_event_ids: OrderedDict = OrderedDict()
 
-        async def handler(event: Dict[str, Any]) -> None:
+        async def handler(event: dict[str, Any]) -> None:
             """Handle events from the event bus and forward to WebSocket"""
             try:
                 if not self.connection._running:
@@ -926,7 +927,7 @@ class WSEHandler:
                         'v': 2,
                         'id': event.get('event_id', event.get('id', str(asyncio.get_event_loop().time()))),
                         't': event_type.lower(),
-                        'ts': event.get('timestamp', datetime.now(timezone.utc).isoformat()),
+                        'ts': event.get('timestamp', datetime.now(UTC).isoformat()),
                         'seq': seq,
                         'p': event.get('payload', event),
                     }
@@ -940,7 +941,7 @@ class WSEHandler:
 
         return handler
 
-    async def _send_error(self, message: str, code: str, details: Optional[str] = None,
+    async def _send_error(self, message: str, code: str, details: str | None = None,
                           recoverable: bool = True) -> None:
         """Send an error message to client with standard format"""
         error_message = {
@@ -950,7 +951,7 @@ class WSEHandler:
                 'code': code,
                 'details': details,
                 'recoverable': recoverable,
-                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'timestamp': datetime.now(UTC).isoformat(),
                 'connection_id': self.connection.conn_id,
                 'severity': 'error' if not recoverable else 'warning'
             }
@@ -959,7 +960,7 @@ class WSEHandler:
         log.error(f"Sending error to client: {code} - {message}")
         await self.connection.send_message(error_message, priority=PRIORITY_HIGH)
 
-    async def _publish_client_message(self, msg_type: str, message_data: Dict[str, Any]) -> None:
+    async def _publish_client_message(self, msg_type: str, message_data: dict[str, Any]) -> None:
         """Publish unknown message types to event bus for custom handling"""
         await self.connection.event_bus.publish(
             f"client:{self.connection.user_id}:messages",
@@ -968,7 +969,7 @@ class WSEHandler:
                 'payload': message_data.get('p', {}),
                 'user_id': self.connection.user_id,
                 'conn_id': self.connection.conn_id,
-                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'timestamp': datetime.now(UTC).isoformat(),
                 'raw_message': message_data,
                 'client_version': self.connection.client_version,
                 'protocol_version': self.connection.protocol_version

@@ -88,7 +88,7 @@ impl RustPriorityQueue {
         let items: Vec<Py<PyAny>> = (0..count)
             .filter_map(|_| self.heap.pop().map(|item| item.message))
             .collect();
-        Ok(PyList::new(py, items)?)
+        PyList::new(py, items)
     }
 
     fn len(&self) -> usize {
@@ -269,7 +269,10 @@ impl RustPriorityMessageQueue {
                 if let Some(entry) = self.queues[idx].pop_front() {
                     let tuple = PyTuple::new(
                         py,
-                        &[priority.into_pyobject(py)?.into_any(), entry.message.into_bound(py)],
+                        &[
+                            priority.into_pyobject(py)?.into_any(),
+                            entry.message.into_bound(py),
+                        ],
                     )?;
                     batch.push(tuple);
                     self.size = self.size.saturating_sub(1);

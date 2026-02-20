@@ -1,23 +1,17 @@
 """Common fixtures for WSE standalone tests."""
 
 import asyncio
-import sys
-import os
+import contextlib
 
 import pytest
 
-# Add server package to path so imports work without installation
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-from server.reliability.config import CircuitBreakerConfig, RateLimiterConfig
-from server.reliability.circuit_breaker import CircuitBreaker, CircuitState
-from server.reliability.rate_limiter import RateLimiter
-from server.connection.compression import CompressionManager
-from server.connection.security import SecurityManager
-from server.connection.transformer import EventTransformer
-from server.connection.sequencer import EventSequencer
-from server.core.types import EventPriority, Subscription, EventMetadata
-
+from wse_server.connection.compression import CompressionManager
+from wse_server.connection.security import SecurityManager
+from wse_server.connection.sequencer import EventSequencer
+from wse_server.connection.transformer import EventTransformer
+from wse_server.reliability.circuit_breaker import CircuitBreaker
+from wse_server.reliability.config import CircuitBreakerConfig, RateLimiterConfig
+from wse_server.reliability.rate_limiter import RateLimiter
 
 # ---------------------------------------------------------------------------
 # Circuit Breaker fixtures
@@ -130,7 +124,5 @@ async def sequencer():
     yield seq
     # Cancel the background cleanup task to avoid warnings
     seq._cleanup_task.cancel()
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await seq._cleanup_task
-    except asyncio.CancelledError:
-        pass

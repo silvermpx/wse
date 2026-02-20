@@ -4,16 +4,16 @@
 # =============================================================================
 
 import asyncio
-from typing import Dict, List, Tuple, Any
 from dataclasses import dataclass
+from typing import Any
 
-from server._accel import RustPriorityMessageQueue
+from wse_server._accel import RustPriorityMessageQueue
 
 
 @dataclass
 class QueuedMessage:
     """Message in the queue"""
-    message: Dict[str, Any]
+    message: dict[str, Any]
     priority: int
     timestamp: float
     retry_count: int = 0
@@ -37,7 +37,7 @@ class PriorityMessageQueue:
         return self._rust.size
 
     @property
-    def priority_distribution(self) -> Dict[int, int]:
+    def priority_distribution(self) -> dict[int, int]:
         """Counts of messages at each priority level."""
         return dict(self._rust.get_stats().get("priority_distribution", {}))
 
@@ -49,11 +49,11 @@ class PriorityMessageQueue:
         return self._rust.get_stats().get("oldest_message_age", 0.0)
 
     @property
-    def dropped_count(self) -> Dict[int, int]:
+    def dropped_count(self) -> dict[int, int]:
         """Counts of dropped messages keyed by priority level."""
         return dict(self._rust.get_stats().get("dropped_by_priority", {}))
 
-    async def enqueue(self, message: Dict[str, Any], priority: int = 5) -> bool:
+    async def enqueue(self, message: dict[str, Any], priority: int = 5) -> bool:
         """
         Add a message to the queue with priority-based dropping.
 
@@ -68,7 +68,7 @@ class PriorityMessageQueue:
         async with self._lock:
             return self._rust.enqueue(message, priority)
 
-    async def dequeue_batch(self) -> List[Tuple[int, Dict[str, Any]]]:
+    async def dequeue_batch(self) -> list[tuple[int, dict[str, Any]]]:
         """Get a batch of messages ordered by priority"""
         async with self._lock:
             # Rust returns list of (priority, message) tuples
@@ -78,6 +78,6 @@ class PriorityMessageQueue:
         """Clear all queues (synchronous - for emergency shutdown)"""
         self._rust.clear()
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get queue statistics"""
         return dict(self._rust.get_stats())

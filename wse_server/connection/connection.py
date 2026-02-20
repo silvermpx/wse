@@ -4,15 +4,15 @@
 
 import asyncio
 import json
-import uuid
-import time
 import logging
-from datetime import datetime, timezone, date
-from typing import Dict, Any, Optional, Set, Union, List, Protocol, runtime_checkable
-from dataclasses import dataclass, field
+import time
+import uuid
 from collections import deque
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum
+from typing import Any, Protocol, runtime_checkable
 
 try:
     import orjson
@@ -20,26 +20,34 @@ try:
 except ImportError:
     ORJSON_AVAILABLE = False
 
-from ..reliability.circuit_breaker import CircuitBreaker
-from ..reliability.rate_limiter import RateLimiter
-from ..reliability.config import CircuitBreakerConfig, RateLimiterConfig
+import contextlib
+
 from ..metrics.connection_metrics import (
-    ConnectionMetrics, NetworkQualityAnalyzer,
-    ws_connections_active, ws_connections_total, ws_disconnections_total,
-    ws_messages_sent_total, ws_messages_received_total,
-    ws_message_send_latency_seconds, ws_bytes_sent_total, ws_bytes_received_total,
-    ws_queue_size, ws_queue_dropped_total, ws_queue_backpressure,
+    ConnectionMetrics,
+    NetworkQualityAnalyzer,
+    ws_bytes_received_total,
+    ws_bytes_sent_total,
+    ws_connections_active,
+    ws_connections_total,
+    ws_disconnections_total,
+    ws_messages_received_total,
+    ws_queue_backpressure,
+    ws_queue_dropped_total,
+    ws_queue_size,
 )
+from ..reliability.circuit_breaker import CircuitBreaker
+from ..reliability.config import CircuitBreakerConfig, RateLimiterConfig
+from ..reliability.rate_limiter import RateLimiter
 from .compression import CompressionManager
-from .security import SecurityManager
 from .queue import PriorityMessageQueue
+from .security import SecurityManager
 from .sequencer import EventSequencer
 
 log = logging.getLogger("wse.connection")
 
 # Check if Prometheus metrics are available
 try:
-    from prometheus_client import Counter
+    from prometheus_client import Counter  # noqa: F401
     METRICS_AVAILABLE = True
 except ImportError:
     METRICS_AVAILABLE = False
@@ -112,9 +120,9 @@ class EventBusProtocol(Protocol):
 
     async def unsubscribe_connection(self, connection_id: str) -> int: ...
 
-    async def publish(self, topic: str, event: Dict[str, Any], **kwargs) -> None: ...
+    async def publish(self, topic: str, event: dict[str, Any], **kwargs) -> None: ...
 
-    def get_metrics(self) -> Dict[str, Any]: ...
+    def get_metrics(self) -> dict[str, Any]: ...
 
 
 # =============================================================================
@@ -127,9 +135,7 @@ class DateTimeEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, (datetime, date)):
             return obj.isoformat()
-        elif isinstance(obj, Decimal):
-            return str(obj)
-        elif isinstance(obj, uuid.UUID):
+        elif isinstance(obj, (Decimal, uuid.UUID)):
             return str(obj)
         elif isinstance(obj, Enum):
             return obj.value
@@ -160,7 +166,7 @@ def _orjson_default(obj):
     raise TypeError(f"Type {type(obj)} is not JSON serializable")
 
 
-def _json_dumps(data: Dict[str, Any]) -> str:
+def _json_dumps(data: dict[str, Any]) -> str:
     """Serialize dict to JSON string using orjson if available, stdlib fallback."""
     if ORJSON_AVAILABLE:
         return orjson.dumps(data, default=_orjson_default).decode()
@@ -172,12 +178,8 @@ def _json_dumps(data: Dict[str, Any]) -> str:
 # =============================================================================
 
 # Default set of message types that should be signed for integrity.
-# Users can override via WSEConnection constructor.
-DEFAULT_SIGNED_MESSAGE_TYPES = frozenset({
-    'order_placed', 'order_filled', 'order_cancelled', 'order_update', 'order_rejected',
-    'trade_executed', 'position_opened', 'position_closed', 'position_update',
-    'account_withdrawal', 'account_transfer', 'account_funding',
-})
+# Empty by default -- configure via WSEConnection constructor for your domain.
+DEFAULT_SIGNED_MESSAGE_TYPES: frozenset[str] = frozenset()
 
 
 # =============================================================================
@@ -221,15 +223,15 @@ class WSEConnection:
     event_sequencer: EventSequencer = field(default_factory=EventSequencer)
 
     # State
-    subscriptions: Set[str] = field(default_factory=set)
-    subscription_ids: Dict[str, str] = field(default_factory=dict)
-    pending_subscriptions: Set[str] = field(default_factory=set)
-    failed_subscriptions: Set[str] = field(default_factory=set)
+    subscriptions: set[str] = field(default_factory=set)
+    subscription_ids: dict[str, str] = field(default_factory=dict)
+    pending_subscriptions: set[str] = field(default_factory=set)
+    failed_subscriptions: set[str] = field(default_factory=set)
 
     # Client information
-    client_features: Dict[str, bool] = field(default_factory=dict)
+    client_features: dict[str, bool] = field(default_factory=dict)
     client_version: str = "unknown"
-    client_capabilities: List[str] = field(default_factory=list)
+    client_capabilities: list[str] = field(default_factory=list)
 
     # Sequencing
     sequence_number: int = 0
@@ -238,12 +240,12 @@ class WSEConnection:
 
     # Control
     _running: bool = True
-    _tasks: Set[asyncio.Task] = field(default_factory=set)
+    _tasks: set[asyncio.Task] = field(default_factory=set)
     _last_activity: float = field(default_factory=time.time)
 
     # Debug mode
     debug_mode: bool = field(default=False)
-    event_count: Dict[str, int] = field(default_factory=dict)
+    event_count: dict[str, int] = field(default_factory=dict)
 
     # Startup filtering
     initial_sync_complete: bool = field(default=False)
@@ -251,10 +253,10 @@ class WSEConnection:
     connection_start_time: float = field(default_factory=time.time)
 
     # Cleanup hook -- users can register an async callable that runs on cleanup
-    _cleanup_hooks: List[Any] = field(default_factory=list)
+    _cleanup_hooks: list[Any] = field(default_factory=list)
 
     # Sender loop wakeup event
-    _queue_event: Optional[asyncio.Event] = field(default=None)
+    _queue_event: asyncio.Event | None = field(default=None)
 
     def __post_init__(self):
         """Initialize components that need configuration"""
@@ -287,7 +289,7 @@ class WSEConnection:
         """Initialize the connection with state management"""
         await self.set_state(ConnectionState.CONNECTING)
 
-        self.metrics.connected_since = datetime.now(timezone.utc)
+        self.metrics.connected_since = datetime.now(UTC)
         self.metrics.connection_attempts += 1
         self.metrics.successful_connections += 1
 
@@ -329,7 +331,7 @@ class WSEConnection:
                 'p': {
                     'old_state': old_state.value,
                     'new_state': state.value,
-                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'timestamp': datetime.now(UTC).isoformat(),
                     'connection_id': self.conn_id
                 }
             }, priority=10)
@@ -383,7 +385,7 @@ class WSEConnection:
             return state.value == WebSocketState.CONNECTED.value or state.name == "CONNECTED"
         return state == WebSocketState.CONNECTED
 
-    async def send_message(self, message: Dict[str, Any], priority: int = 5,
+    async def send_message(self, message: dict[str, Any], priority: int = 5,
                            _bypass_rate_limit: bool = False) -> bool:
         """Queue a message for sending with format normalization"""
         if not self._running:
@@ -427,7 +429,7 @@ class WSEConnection:
         if 'v' not in message:
             message['v'] = self.protocol_version
         if 'ts' not in message:
-            message['ts'] = datetime.now(timezone.utc).isoformat()
+            message['ts'] = datetime.now(UTC).isoformat()
 
         if self.debug_mode:
             event_type = message.get('t', 'unknown')
@@ -439,7 +441,7 @@ class WSEConnection:
             self._queue_event.set()
         return result
 
-    async def handle_incoming(self, data: Union[str, bytes]) -> Optional[Dict[str, Any]]:
+    async def handle_incoming(self, data: str | bytes) -> dict[str, Any] | None:
         """Handle incoming WebSocket message and return parsed data"""
         self._last_activity = time.time()
 
@@ -460,7 +462,7 @@ class WSEConnection:
             return None
 
         self.metrics.messages_received += 1
-        self.metrics.last_message_received = datetime.now(timezone.utc)
+        self.metrics.last_message_received = datetime.now(UTC)
 
         if isinstance(data, bytes):
             byte_count = len(data)
@@ -483,7 +485,7 @@ class WSEConnection:
 
             return self._parse_text_message(data)
 
-    def _parse_text_message(self, data: str) -> Optional[Dict[str, Any]]:
+    def _parse_text_message(self, data: str) -> dict[str, Any] | None:
         """Parse text message with special handling"""
         _prefix = data[:9].upper()
         if _prefix.startswith('WSE:PING') or _prefix.startswith('PING'):
@@ -509,22 +511,19 @@ class WSEConnection:
             elif data.startswith('S{') or data.startswith('U{'):
                 json_data = data[1:]
 
-            if ORJSON_AVAILABLE:
-                parsed = orjson.loads(json_data)
-            else:
-                parsed = json.loads(json_data)
+            parsed = orjson.loads(json_data) if ORJSON_AVAILABLE else json.loads(json_data)
 
             if 'type' in parsed and 't' not in parsed:
                 parsed['t'] = parsed.pop('type')
             if 'payload' in parsed and 'p' not in parsed:
                 parsed['p'] = parsed.pop('payload')
             return parsed
-        except (json.JSONDecodeError, Exception) as e:
+        except (json.JSONDecodeError, Exception):
             self.metrics.protocol_errors += 1
             log.warning(f"Invalid JSON received: {data[:100]}")
             return None
 
-    async def _parse_binary_message(self, data: bytes) -> Optional[Dict[str, Any]]:
+    async def _parse_binary_message(self, data: bytes) -> dict[str, Any] | None:
         """Parse binary message with compression and encryption support"""
         try:
             log.debug(f"Parsing binary message: {len(data)} bytes, first 10: {data[:10].hex()}")
@@ -547,20 +546,14 @@ class WSEConnection:
             elif data.startswith(b'E:') and self.encryption_enabled:
                 decrypted = await self.security_manager.decrypt_message(data[2:])
                 if decrypted:
-                    if ORJSON_AVAILABLE:
-                        parsed = orjson.loads(decrypted)
-                    else:
-                        parsed = json.loads(decrypted)
+                    parsed = orjson.loads(decrypted) if ORJSON_AVAILABLE else json.loads(decrypted)
                     return self._normalize_message_format(parsed)
                 else:
                     self.metrics.protocol_errors += 1
                     return None
 
             else:
-                if ORJSON_AVAILABLE:
-                    parsed = orjson.loads(data)
-                else:
-                    parsed = json.loads(data)
+                parsed = orjson.loads(data) if ORJSON_AVAILABLE else json.loads(data)
                 return self._normalize_message_format(parsed)
 
         except Exception as e:
@@ -568,7 +561,7 @@ class WSEConnection:
             log.error(f"Failed to parse binary message: {e}")
             return None
 
-    def _normalize_message_format(self, message: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_message_format(self, message: dict[str, Any]) -> dict[str, Any]:
         """Normalize message format for consistency"""
         if 'type' in message and 't' not in message:
             message['t'] = message.pop('type')
@@ -576,12 +569,12 @@ class WSEConnection:
             message['p'] = message.pop('payload')
         return message
 
-    async def _send_raw_message(self, message: Dict[str, Any]) -> None:
+    async def _send_raw_message(self, message: dict[str, Any]) -> None:
         """Send a message through the WebSocket with proper formatting"""
         send_start_time = time.time()
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(UTC)
         message_type = message.get('t', 'unknown')
-        priority = message.get('priority', 5)
+        message.get('priority', 5)
 
         try:
             if not self._running or not self._is_ws_connected():
@@ -665,7 +658,7 @@ class WSEConnection:
 
             # Encrypt if enabled
             if self.encryption_enabled and message.get('encrypted', False):
-                encrypted = await self.security_manager.encrypt_message(data)
+                encrypted = await self.security_manager.encrypt_message(data_bytes)
                 if encrypted:
                     byte_count = len(encrypted) + 2
                     await self.ws.send_bytes(b'E:' + encrypted.encode('utf-8') if isinstance(encrypted, str) else b'E:' + encrypted)
@@ -674,11 +667,11 @@ class WSEConnection:
                         ws_bytes_sent_total.inc(byte_count)
                     log.debug(f"Sent encrypted message: {len(data_bytes)} -> {byte_count} bytes")
                 else:
-                    await self.ws.send_text(data)
+                    await self.ws.send_bytes(data_bytes)
                     self.metrics.bytes_sent += len(data_bytes)
                     if METRICS_AVAILABLE:
                         ws_bytes_sent_total.inc(len(data_bytes))
-                    log.warning("Encryption failed, sent as plain text")
+                    log.warning("Encryption failed, sent as plain bytes")
 
             elif should_compress:
                 if len(data_bytes) > 10240:
@@ -751,19 +744,17 @@ class WSEConnection:
                         }
                         await self._send_raw_message(batch_message)
                     else:
-                        for priority, message in batch:
+                        for _priority, message in batch:
                             await self._send_raw_message(message)
                 else:
                     # Event-based wakeup instead of fixed sleep
                     if self._queue_event:
                         self._queue_event.clear()
-                        try:
+                        with contextlib.suppress(TimeoutError):
                             await asyncio.wait_for(
                                 self._queue_event.wait(),
                                 timeout=self.batch_timeout
                             )
-                        except asyncio.TimeoutError:
-                            pass
                     else:
                         await asyncio.sleep(self.batch_timeout)
 

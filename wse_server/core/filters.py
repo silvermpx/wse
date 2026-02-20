@@ -39,10 +39,10 @@ Nested Fields:
     ```
 """
 
-from typing import Any, Dict
 import logging
+from typing import Any
 
-from server._accel import rust_match_event
+from wse_server._accel import rust_match_event
 
 log = logging.getLogger("wse.filters")
 
@@ -55,7 +55,7 @@ class EventFilter:
     """
 
     @staticmethod
-    def matches(event: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
+    def matches(event: dict[str, Any], criteria: dict[str, Any]) -> bool:
         """Check if an event matches filter criteria"""
         return rust_match_event(event, criteria)
 

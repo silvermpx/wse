@@ -5,20 +5,17 @@ WebSocket connections, and do NOT require Redis.  They test the factory
 function, configuration defaults, and protocol definitions.
 """
 
-import sys
 import os
-
-import pytest
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from server.router import (
-    create_wse_router,
-    WSEConfig,
-    SnapshotProvider,
+from wse_server.router import (
     PROTOCOL_VERSION,
+    SnapshotProvider,
+    WSEConfig,
+    create_wse_router,
 )
-
 
 # =========================================================================
 # PROTOCOL_VERSION

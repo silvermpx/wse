@@ -1,11 +1,10 @@
 """Example: JWT authentication handler for WSE."""
 import logging
-from typing import Optional
 
 logger = logging.getLogger("wse.examples.auth")
 
 
-async def jwt_auth_handler(websocket) -> Optional[str]:
+async def jwt_auth_handler(websocket) -> str | None:
     """
     Example auth handler using PyJWT.
 
@@ -14,7 +13,7 @@ async def jwt_auth_handler(websocket) -> Optional[str]:
 
     Install: pip install pyjwt[crypto]
     """
-    import jwt  # noqa: local import for optional dependency
+    import jwt  # noqa: E402 - local import for optional dependency
 
     SECRET_KEY = "your-secret-key"  # Load from environment in production
     ALGORITHM = "HS256"

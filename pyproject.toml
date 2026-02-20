@@ -64,14 +64,15 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/wse-server/wse"
-Documentation = "https://github.com/wse-server/wse/tree/main/docs"
-Repository = "https://github.com/wse-server/wse"
-Issues = "https://github.com/wse-server/wse/issues"
+Homepage = "https://github.com/silvermpx/wse"
+Documentation = "https://github.com/silvermpx/wse/tree/main/docs"
+Repository = "https://github.com/silvermpx/wse"
+Issues = "https://github.com/silvermpx/wse/issues"
+Changelog = "https://github.com/silvermpx/wse/releases"
 
 [tool.maturin]
 features = ["pyo3/extension-module", "pyo3/abi3-py312"]
-module-name = "server._wse_accel"
+module-name = "wse_server._wse_accel"
 manifest-path = "rust/Cargo.toml"
 
 [tool.ruff]
@@ -80,6 +81,12 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "SIM", "TCH"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"wse_server/examples/*" = ["F401", "F821", "N806"]
+"wse_server/reliability/circuit_breaker.py" = ["SIM102"]
+"wse_server/connection/connection.py" = ["SIM102"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

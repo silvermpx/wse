@@ -4,12 +4,13 @@
 # =============================================================================
 
 import asyncio
-import time
-from typing import Optional, Any
-from abc import ABC, abstractmethod
 import logging
+import time
+from abc import ABC, abstractmethod
+from typing import Any
 
-from server._accel import RustTokenBucket
+from wse_server._accel import RustTokenBucket
+
 from .config import RateLimiterConfig
 
 logger = logging.getLogger("wse.rate_limiter")
@@ -43,7 +44,7 @@ class TokenBucket(RateLimiterAlgorithm):
     Delegates to RustTokenBucket for the acquire logic.
     """
 
-    def __init__(self, capacity: int, refill_rate: float, initial_tokens: Optional[int] = None):
+    def __init__(self, capacity: int, refill_rate: float, initial_tokens: int | None = None):
         self.capacity = capacity
         self.refill_rate = refill_rate
         self._rust = RustTokenBucket(
@@ -113,11 +114,11 @@ class RateLimiter:
     def __init__(
         self,
         name: str = "default",
-        config: Optional[RateLimiterConfig] = None,
+        config: RateLimiterConfig | None = None,
         *,
         # Legacy compat parameters
-        max_requests: Optional[int] = None,
-        time_window: Optional[int] = None,
+        max_requests: int | None = None,
+        time_window: int | None = None,
     ):
         self.name = name
 

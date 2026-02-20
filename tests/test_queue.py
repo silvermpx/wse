@@ -1,15 +1,13 @@
 """Tests for PriorityMessageQueue."""
 
-import asyncio
-import sys
 import os
+import sys
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from server.connection.queue import PriorityMessageQueue, QueuedMessage
-
+from wse_server.connection.queue import PriorityMessageQueue, QueuedMessage
 
 # =========================================================================
 # QueuedMessage dataclass

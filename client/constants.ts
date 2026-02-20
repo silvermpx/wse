@@ -7,7 +7,7 @@
 // ---------------------------------------------------------------------------
 
 export const WS_PROTOCOL_VERSION = 2;
-export const WS_CLIENT_VERSION = '2.0.0';
+export const WS_CLIENT_VERSION = '1.0.0';
 
 // ---------------------------------------------------------------------------
 // Connection Constants

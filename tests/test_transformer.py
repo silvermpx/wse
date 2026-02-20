@@ -1,17 +1,14 @@
 """Tests for EventTransformer."""
 
-import sys
 import os
+import sys
 import uuid as uuid_module
-from datetime import datetime, date, timezone
+from datetime import UTC, date, datetime
 from enum import Enum
-
-import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from server.connection.transformer import EventTransformer
-
+from wse_server.connection.transformer import EventTransformer
 
 # =========================================================================
 # Default pass-through behavior
@@ -326,7 +323,7 @@ class TestTypeSerialization:
         assert result["p"]["user_id"] == str(uid)
 
     def test_datetime_in_payload(self, transformer):
-        dt = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        dt = datetime(2025, 6, 15, 12, 0, 0, tzinfo=UTC)
         event = {
             "event_type": "Test",
             "payload": {"created_at": dt},
@@ -426,7 +423,7 @@ class TestSafeDecodeBytes:
 class TestLatency:
     def test_latency_included_when_timestamp_present(self, transformer):
         # Use a timestamp slightly in the past
-        ts = datetime.now(timezone.utc).isoformat()
+        ts = datetime.now(UTC).isoformat()
         event = {
             "event_type": "Test",
             "timestamp": ts,

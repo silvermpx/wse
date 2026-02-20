@@ -42,9 +42,10 @@ import logging
 import random
 import time
 import uuid
-from typing import Callable, Dict, Set, Any, Optional
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 from uuid import UUID
 
 try:
@@ -53,17 +54,18 @@ try:
 except ImportError:
     ORJSON_AVAILABLE = False
 
-from ..reliability.circuit_breaker import get_circuit_breaker, CircuitBreakerConfig
+import contextlib
+
 from ..metrics.connection_metrics import (
+    dlq_messages_total,
+    dlq_replayed_total,
+    dlq_size,
+    pubsub_handler_errors_total,
+    pubsub_publish_latency_seconds,
     pubsub_published_total,
     pubsub_received_total,
-    pubsub_publish_latency_seconds,
-    pubsub_handler_errors_total,
-    pubsub_listener_errors_total,
-    dlq_messages_total,
-    dlq_size,
-    dlq_replayed_total,
 )
+from ..reliability.circuit_breaker import CircuitBreakerConfig, get_circuit_breaker
 
 log = logging.getLogger("wse.pubsub")
 
@@ -125,19 +127,19 @@ class PubSubBus:
             raise ValueError("redis_client is required")
 
         self.redis_client = redis_client
-        self.pubsub: Optional[Any] = None  # redis.asyncio.client.PubSub
+        self.pubsub: Any | None = None  # redis.asyncio.client.PubSub
 
         # Subscriptions: pattern -> {subscription_id: handler}
         # Multiple handlers per channel (one per WSE connection)
-        self.subscriptions: Dict[str, Dict[str, Callable]] = {}
+        self.subscriptions: dict[str, dict[str, Callable]] = {}
 
         # Connection tracking: connection_id -> set of subscription_ids
         # Used for bulk cleanup on disconnect (prevents orphaned handlers)
-        self._connection_handlers: Dict[str, Set[str]] = {}
+        self._connection_handlers: dict[str, set[str]] = {}
 
         # State
         self._running = False
-        self._listener_task: Optional[asyncio.Task] = None
+        self._listener_task: asyncio.Task | None = None
 
         # Metrics
         self._messages_published = 0
@@ -199,7 +201,7 @@ class PubSubBus:
             log.error(f"Failed to initialize PubSubBus: {e}", exc_info=True)
             raise
 
-    async def publish(self, topic: str, event: Dict[str, Any], priority: Any = None, ttl: int = None) -> None:
+    async def publish(self, topic: str, event: dict[str, Any], priority: Any = None, ttl: int = None) -> None:
         """
         Publish event to Redis Pub/Sub (broadcast to ALL instances)
 
@@ -244,7 +246,7 @@ class PubSubBus:
             if 'metadata' not in event:
                 event['metadata'] = {}
             event['metadata']['event_id'] = event_id
-            event['metadata']['published_at'] = datetime.now(timezone.utc).isoformat()
+            event['metadata']['published_at'] = datetime.now(UTC).isoformat()
 
             # Serialize event to JSON
             if ORJSON_AVAILABLE:
@@ -486,7 +488,7 @@ class PubSubBus:
         """Get message with timeout (for circuit breaker wrapping)"""
         return await self.pubsub.get_message(timeout=1.0)
 
-    async def _process_message(self, message: Dict) -> None:
+    async def _process_message(self, message: dict) -> None:
         """Process a single Pub/Sub message"""
         # Handle pattern messages (PSUBSCRIBE)
         if message['type'] == 'pmessage':
@@ -553,7 +555,7 @@ class PubSubBus:
             else:
                 log.warning(f"No handler for channel: {channel}, available channels: {list(self.subscriptions.keys())}")
 
-    async def _safe_invoke_handler(self, handler: Callable, event: Dict) -> None:
+    async def _safe_invoke_handler(self, handler: Callable, event: dict) -> None:
         """
         Safely invoke handler with error handling
 
@@ -609,7 +611,7 @@ class PubSubBus:
         message: Any,
         error_type: str,
         error_details: str,
-        message_id: Optional[str] = None
+        message_id: str | None = None
     ) -> None:
         """Send failed message to Dead Letter Queue"""
         if not self._dlq_enabled:
@@ -617,7 +619,7 @@ class PubSubBus:
 
         try:
             dlq_key = f"{self._dlq_prefix}{channel}"
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
 
             dlq_entry = {
                 "channel": channel,
@@ -663,7 +665,7 @@ class PubSubBus:
         try:
             # Find message in DLQ
             entries = await self.redis_client.lrange(dlq_key, 0, -1)
-            for i, entry_json in enumerate(entries):
+            for _i, entry_json in enumerate(entries):
                 entry = json.loads(entry_json)
                 if entry.get('message_id') == message_id:
                     # Remove from DLQ
@@ -708,10 +710,8 @@ class PubSubBus:
         # Cancel listener task
         if self._listener_task:
             self._listener_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._listener_task
-            except asyncio.CancelledError:
-                pass
 
         # Unsubscribe all channels/patterns and close PubSub
         if self.pubsub:
@@ -736,7 +736,7 @@ class PubSubBus:
             f"Handler errors: {self._handler_errors}"
         )
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         """
         Get PubSubBus metrics
 

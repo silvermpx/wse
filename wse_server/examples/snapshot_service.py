@@ -3,7 +3,7 @@
 When a client connects and subscribes to topics, WSE can send an initial
 snapshot of the current state. Implement the SnapshotProvider protocol.
 """
-from typing import Any, Dict, List
+from typing import Any
 
 
 class ExampleSnapshotProvider:
@@ -17,7 +17,7 @@ class ExampleSnapshotProvider:
     def __init__(self, db=None):
         self.db = db
 
-    async def get_snapshot(self, user_id: str, topics: List[str]) -> Dict[str, Any]:
+    async def get_snapshot(self, user_id: str, topics: list[str]) -> dict[str, Any]:
         """
         Return initial state for the given topics.
 

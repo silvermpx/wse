@@ -1,21 +1,17 @@
 """Tests for SecurityManager."""
 
-import asyncio
-import json
-import sys
 import os
-import time
+import sys
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from server.connection.security import (
-    SecurityManager,
+from wse_server.connection.security import (
     EncryptionProvider,
+    SecurityManager,
     TokenProvider,
 )
-
 
 # =========================================================================
 # Stub providers for testing

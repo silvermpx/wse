@@ -16,12 +16,12 @@ use std::io::Write;
 #[pyfunction]
 pub fn rust_compress(py: Python, data: &[u8], level: i32) -> PyResult<Py<PyBytes>> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level as u32));
-    encoder
-        .write_all(data)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("compression write error: {e}")))?;
-    let compressed = encoder
-        .finish()
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("compression finish error: {e}")))?;
+    encoder.write_all(data).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("compression write error: {e}"))
+    })?;
+    let compressed = encoder.finish().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("compression finish error: {e}"))
+    })?;
     Ok(PyBytes::new(py, &compressed).unbind())
 }
 
@@ -29,12 +29,12 @@ pub fn rust_compress(py: Python, data: &[u8], level: i32) -> PyResult<Py<PyBytes
 #[pyfunction]
 pub fn rust_decompress(py: Python, data: &[u8]) -> PyResult<Py<PyBytes>> {
     let mut decoder = ZlibDecoder::new(Vec::new());
-    decoder
-        .write_all(data)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("decompression write error: {e}")))?;
-    let decompressed = decoder
-        .finish()
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("decompression finish error: {e}")))?;
+    decoder.write_all(data).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("decompression write error: {e}"))
+    })?;
+    let decompressed = decoder.finish().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("decompression finish error: {e}"))
+    })?;
     Ok(PyBytes::new(py, &decompressed).unbind())
 }
 
@@ -124,15 +124,13 @@ fn py_to_rmpv(obj: &Bound<'_, PyAny>) -> PyResult<rmpv::Value> {
     }
 
     // UUID (has `hex` attr that is a 32-char string)
-    if obj.hasattr("hex")? {
-        if let Ok(hex_val) = obj.getattr("hex") {
-            if let Ok(hex_str) = hex_val.extract::<String>() {
-                if hex_str.len() == 32 {
-                    let s = obj.str()?.to_string();
-                    return Ok(rmpv::Value::String(s.into()));
-                }
-            }
-        }
+    if obj.hasattr("hex")?
+        && let Ok(hex_val) = obj.getattr("hex")
+        && let Ok(hex_str) = hex_val.extract::<String>()
+        && hex_str.len() == 32
+    {
+        let s = obj.str()?.to_string();
+        return Ok(rmpv::Value::String(s.into()));
     }
 
     // datetime/date (has isoformat + year)
@@ -208,8 +206,9 @@ fn rmpv_to_py<'py>(py: Python<'py>, val: &rmpv::Value) -> PyResult<Bound<'py, Py
 fn py_dict_to_json_bytes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     let rmpv_val = py_to_rmpv(obj)?;
     let json_val = rmpv_to_serde_json(&rmpv_val);
-    serde_json::to_vec(&json_val)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("JSON serialization failed: {e}")))
+    serde_json::to_vec(&json_val).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("JSON serialization failed: {e}"))
+    })
 }
 
 /// Convert rmpv::Value -> serde_json::Value for JSON fallback serialization.
@@ -226,19 +225,13 @@ fn rmpv_to_serde_json(val: &rmpv::Value) -> serde_json::Value {
                 serde_json::Value::Number(serde_json::Number::from(0))
             }
         }
-        rmpv::Value::F32(f) => {
-            serde_json::Number::from_f64(*f as f64)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
-        }
-        rmpv::Value::F64(f) => {
-            serde_json::Number::from_f64(*f)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
-        }
-        rmpv::Value::String(s) => {
-            serde_json::Value::String(s.as_str().unwrap_or("").to_string())
-        }
+        rmpv::Value::F32(f) => serde_json::Number::from_f64(*f as f64)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        rmpv::Value::F64(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        rmpv::Value::String(s) => serde_json::Value::String(s.as_str().unwrap_or("").to_string()),
         rmpv::Value::Binary(b) => {
             // Encode binary as base64 or hex in JSON context
             serde_json::Value::String(hex::encode(b))
@@ -258,9 +251,7 @@ fn rmpv_to_serde_json(val: &rmpv::Value) -> serde_json::Value {
             }
             serde_json::Value::Object(map)
         }
-        rmpv::Value::Ext(_, data) => {
-            serde_json::Value::String(hex::encode(data))
-        }
+        rmpv::Value::Ext(_, data) => serde_json::Value::String(hex::encode(data)),
     }
 }
 
@@ -355,17 +346,17 @@ impl RustCompressionManager {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(lvl));
         if let Err(e) = encoder.write_all(data) {
             self.compression_failures += 1;
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                format!("compression write error: {e}"),
-            ));
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "compression write error: {e}"
+            )));
         }
         let compressed = match encoder.finish() {
             Ok(c) => c,
             Err(e) => {
                 self.compression_failures += 1;
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("compression finish error: {e}"),
-                ));
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "compression finish error: {e}"
+                )));
             }
         };
 
@@ -384,17 +375,17 @@ impl RustCompressionManager {
         let mut decoder = ZlibDecoder::new(Vec::new());
         if let Err(e) = decoder.write_all(data) {
             self.decompression_failures += 1;
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                format!("decompression write error: {e}"),
-            ));
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "decompression write error: {e}"
+            )));
         }
         let decompressed = match decoder.finish() {
             Ok(d) => d,
             Err(e) => {
                 self.decompression_failures += 1;
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("decompression finish error: {e}"),
-                ));
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "decompression finish error: {e}"
+                )));
             }
         };
 
@@ -403,22 +394,24 @@ impl RustCompressionManager {
     }
 
     /// Pack a Python dict using msgpack with custom serialization for UUID/datetime/Enum.
-    fn pack_msgpack<'py>(&self, py: Python<'py>, data: &Bound<'py, PyDict>) -> PyResult<Py<PyBytes>> {
+    fn pack_msgpack<'py>(
+        &self,
+        py: Python<'py>,
+        data: &Bound<'py, PyDict>,
+    ) -> PyResult<Py<PyBytes>> {
         let rmpv_val = py_to_rmpv(data.as_any())?;
         let mut buf = Vec::new();
-        rmpv::encode::write_value(&mut buf, &rmpv_val)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                format!("msgpack packing failed: {e}"),
-            ))?;
+        rmpv::encode::write_value(&mut buf, &rmpv_val).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("msgpack packing failed: {e}"))
+        })?;
         Ok(PyBytes::new(py, &buf).unbind())
     }
 
     /// Unpack msgpack bytes to a Python dict.
     fn unpack_msgpack<'py>(&self, py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
-        let val = rmpv::decode::read_value(&mut &data[..])
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                format!("msgpack unpacking failed: {e}"),
-            ))?;
+        let val = rmpv::decode::read_value(&mut &data[..]).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("msgpack unpacking failed: {e}"))
+        })?;
         rmpv_to_py(py, &val)
     }
 
@@ -461,10 +454,10 @@ impl RustCompressionManager {
     ) -> PyResult<Bound<'py, PyAny>> {
         if is_msgpack {
             // Try msgpack first
-            if let Ok(val) = rmpv::decode::read_value(&mut &data[..]) {
-                if let Ok(py_obj) = rmpv_to_py(py, &val) {
-                    return Ok(py_obj);
-                }
+            if let Ok(val) = rmpv::decode::read_value(&mut &data[..])
+                && let Ok(py_obj) = rmpv_to_py(py, &val)
+            {
+                return Ok(py_obj);
             }
 
             // Fall back to JSON with multiple encodings

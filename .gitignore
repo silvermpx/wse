@@ -12,7 +12,7 @@ build/
 
 # Rust
 rust/target/
-rust/Cargo.lock
+# rust/Cargo.lock is committed for reproducible builds
 
 # Virtual environments
 .venv/

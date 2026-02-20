@@ -39,14 +39,15 @@ Usage:
 """
 
 import logging
-from typing import Any, Callable, Dict, Optional, Union
+from collections.abc import Callable
+from typing import Any
 
-from server._accel import rust_transform_event
+from wse_server._accel import rust_transform_event
 
 log = logging.getLogger("wse.transformer")
 
 # Type alias for payload transformer functions
-PayloadTransformer = Callable[[Dict[str, Any]], Dict[str, Any]]
+PayloadTransformer = Callable[[dict[str, Any]], dict[str, Any]]
 
 
 class EventTransformer:
@@ -69,11 +70,11 @@ class EventTransformer:
 
     def __init__(
         self,
-        event_type_map: Optional[Dict[str, str]] = None,
-        payload_transformers: Optional[Dict[str, PayloadTransformer]] = None,
+        event_type_map: dict[str, str] | None = None,
+        payload_transformers: dict[str, PayloadTransformer] | None = None,
     ):
-        self._event_type_map: Dict[str, str] = event_type_map or {}
-        self._payload_transformers: Dict[str, PayloadTransformer] = payload_transformers or {}
+        self._event_type_map: dict[str, str] = event_type_map or {}
+        self._payload_transformers: dict[str, PayloadTransformer] = payload_transformers or {}
 
     # -----------------------------------------------------------------
     # Public helpers for registering custom mappings at runtime
@@ -83,7 +84,7 @@ class EventTransformer:
         """Register a single internal -> WebSocket event type mapping."""
         self._event_type_map[internal_type] = ws_type
 
-    def register_event_types(self, mapping: Dict[str, str]) -> None:
+    def register_event_types(self, mapping: dict[str, str]) -> None:
         """Bulk-register internal -> WebSocket event type mappings."""
         self._event_type_map.update(mapping)
 
@@ -97,7 +98,7 @@ class EventTransformer:
     # Core transformation
     # -----------------------------------------------------------------
 
-    def transform_for_ws(self, event: Dict[str, Any], sequence: int = 0) -> Dict[str, Any]:
+    def transform_for_ws(self, event: dict[str, Any], sequence: int = 0) -> dict[str, Any]:
         """Transform internal event to WebSocket format.
 
         Delegates the heavy lifting to Rust (type mapping, value
@@ -120,7 +121,7 @@ class EventTransformer:
     # -----------------------------------------------------------------
 
     @staticmethod
-    def safe_decode_bytes(data: Union[str, bytes, Any]) -> str:
+    def safe_decode_bytes(data: str | bytes | Any) -> str:
         """Safely decode bytes to string with fallback encodings."""
         if isinstance(data, str):
             return data

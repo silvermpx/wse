@@ -1001,10 +1001,10 @@ export function useWSE(
               encryptionEnabled: finalConfig.security.encryptionEnabled,
               messageSigningEnabled: finalConfig.security.messageSignature,
             });
-            logger.info('SecurityManager initialized',
-              `encryption=${finalConfig.security.encryptionEnabled}`,
-              `signing=${finalConfig.security.messageSignature}`
-            );
+            logger.info('SecurityManager initialized', {
+              encryption: finalConfig.security.encryptionEnabled,
+              signing: finalConfig.security.messageSignature,
+            });
           } catch (secError) {
             logger.warn('SecurityManager initialization failed:', secError);
           }

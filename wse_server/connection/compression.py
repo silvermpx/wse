@@ -7,10 +7,10 @@ import asyncio
 import logging
 from datetime import date, datetime
 from enum import Enum
-from typing import Any, Dict
+from typing import Any
 from uuid import UUID
 
-from server._accel import RustCompressionManager
+from wse_server._accel import RustCompressionManager
 
 log = logging.getLogger("wse.compression")
 
@@ -32,7 +32,7 @@ class CompressionManager:
         )
 
     @property
-    def stats(self) -> Dict[str, Any]:
+    def stats(self) -> dict[str, Any]:
         """Direct access to stats dict (for backward compat)."""
         return dict(self._rust.get_stats())
 
@@ -57,15 +57,15 @@ class CompressionManager:
         """Decompress data with better error handling"""
         return self._rust.decompress(data)
 
-    def pack_msgpack(self, data: Dict[str, Any]) -> bytes:
+    def pack_msgpack(self, data: dict[str, Any]) -> bytes:
         """Pack data using msgpack with custom serializer for UUID/datetime/Enum support"""
         return self._rust.pack_msgpack(data)
 
-    def unpack_msgpack(self, data: bytes) -> Dict[str, Any]:
+    def unpack_msgpack(self, data: bytes) -> dict[str, Any]:
         """Unpack msgpack data"""
         return self._rust.unpack_msgpack(data)
 
-    def pack_event(self, event: Dict[str, Any], use_msgpack: bool = True) -> bytes:
+    def pack_event(self, event: dict[str, Any], use_msgpack: bool = True) -> bytes:
         """Pack event to bytes with proper serialization (msgpack with JSON fallback)
 
         Args:
@@ -77,7 +77,7 @@ class CompressionManager:
         """
         return self._rust.pack_event(event, use_msgpack)
 
-    def unpack_event(self, data: bytes, is_msgpack: bool = True) -> Dict[str, Any]:
+    def unpack_event(self, data: bytes, is_msgpack: bool = True) -> dict[str, Any]:
         """Unpack event from bytes with robust error handling
 
         Args:
@@ -89,7 +89,7 @@ class CompressionManager:
         """
         return self._rust.unpack_event(data, is_msgpack)
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get compression statistics"""
         return dict(self._rust.get_stats())
 

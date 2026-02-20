@@ -5,15 +5,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, runtime_checkable
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from fastapi import APIRouter, Query, Request, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 log = logging.getLogger("wse.router")
 
@@ -35,7 +39,7 @@ class SnapshotProvider(Protocol):
     for the next publish cycle.
     """
 
-    async def get_snapshot(self, user_id: str, topics: List[str]) -> Dict[str, Any]:
+    async def get_snapshot(self, user_id: str, topics: list[str]) -> dict[str, Any]:
         """Return a dict keyed by topic with the latest state for *user_id*."""
         ...
 
@@ -83,10 +87,10 @@ class WSEConfig:
             When ``None`` only in-process PubSubBus is used.
     """
 
-    auth_handler: Callable[[WebSocket], Awaitable[Optional[str]]] | None = None
+    auth_handler: Callable[[WebSocket], Awaitable[str | None]] | None = None
     snapshot_provider: Any | None = None  # SnapshotProvider protocol
-    default_topics: List[str] = field(default_factory=list)
-    allowed_origins: List[str] = field(default_factory=list)
+    default_topics: list[str] = field(default_factory=list)
+    allowed_origins: list[str] = field(default_factory=list)
     max_message_size: int = 1_048_576  # 1 MB
     heartbeat_interval: float = 15.0
     idle_timeout: float = 90.0
@@ -131,12 +135,12 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
     @router.websocket("/wse")
     async def websocket_endpoint(
         websocket: WebSocket,
-        client_version: Optional[str] = Query("unknown", description="Client version"),
-        protocol_version: Optional[int] = Query(2, description="Protocol version"),
-        topics: Optional[str] = Query(None, description="Initial topics to subscribe"),
-        compression: Optional[bool] = Query(True, description="Enable compression"),
-        encryption: Optional[bool] = Query(False, description="Enable encryption"),
-        message_signing: Optional[bool] = Query(
+        client_version: str | None = Query("unknown", description="Client version"),
+        protocol_version: int | None = Query(2, description="Protocol version"),
+        topics: str | None = Query(None, description="Initial topics to subscribe"),
+        compression: bool | None = Query(True, description="Enable compression"),
+        encryption: bool | None = Query(False, description="Enable encryption"),
+        message_signing: bool | None = Query(
             False,
             description="Selective signing for critical operations (Binance/Coinbase pattern)",
         ),
@@ -187,7 +191,7 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
         )
 
         # ----- Authentication -----
-        user_id: Optional[str] = None
+        user_id: str | None = None
 
         if config.auth_handler is not None:
             try:
@@ -198,7 +202,7 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
 
             if user_id is None:
                 log.warning("WebSocket authentication failed (IP: %s)", client_ip)
-                try:
+                with contextlib.suppress(Exception):
                     await websocket.send_json({
                         "t": "error",
                         "p": {
@@ -206,13 +210,11 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
                             "code": "AUTH_FAILED",
                             "recoverable": False,
                             "details": {
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "timestamp": datetime.now(UTC).isoformat(),
                                 "hint": "Please ensure you are logged in and try again",
                             },
                         },
                     })
-                except Exception:
-                    pass
                 await websocket.close(code=4401, reason="Authentication required")
                 return
         else:
@@ -243,18 +245,16 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
 
         if not app:
             log.error("Cannot access app state from WebSocket scope")
-            try:
+            with contextlib.suppress(Exception):
                 await websocket.send_json({
                     "t": "error",
                     "p": {
                         "message": "Server configuration error",
                         "code": "SERVER_ERROR",
                         "recoverable": False,
-                        "details": {"timestamp": datetime.now(timezone.utc).isoformat()},
+                        "details": {"timestamp": datetime.now(UTC).isoformat()},
                     },
                 })
-            except Exception:
-                pass
             await websocket.close(code=1011, reason="Server configuration error")
             return
 
@@ -265,18 +265,16 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
             log.debug("PubSubBus obtained successfully")
         except Exception as exc:
             log.error("Failed to get event bus: %s: %s", type(exc).__name__, exc, exc_info=True)
-            try:
+            with contextlib.suppress(Exception):
                 await websocket.send_json({
                     "t": "error",
                     "p": {
                         "message": "Failed to initialize event bus",
                         "code": "INIT_ERROR",
                         "recoverable": False,
-                        "details": {"timestamp": datetime.now(timezone.utc).isoformat()},
+                        "details": {"timestamp": datetime.now(UTC).isoformat()},
                     },
                 })
-            except Exception:
-                pass
             await websocket.close(code=1011, reason="Event bus initialization failed")
             return
 
@@ -298,7 +296,7 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
         )
 
         # Create message handler, optionally with snapshot provider
-        handler_kwargs: Dict[str, Any] = {}
+        handler_kwargs: dict[str, Any] = {}
         if config.snapshot_provider is not None:
             handler_kwargs["snapshot_provider"] = config.snapshot_provider
         message_handler = WSEHandler(connection, **handler_kwargs)
@@ -339,7 +337,7 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
                                 "metrics": True,
                             },
                             "connection_id": conn_id,
-                            "server_time": datetime.now(timezone.utc).isoformat(),
+                            "server_time": datetime.now(UTC).isoformat(),
                             "user_id": user_id,
                             "endpoints": {
                                 "primary": (
@@ -357,7 +355,7 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
             )
 
             # ----- Initial topic subscription -----
-            initial_topics: List[str] = []
+            initial_topics: list[str] = []
             if topics:
                 initial_topics = [t.strip() for t in topics.split(",") if t.strip()]
             if not initial_topics:
@@ -391,7 +389,7 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
                         log.info("WebSocket %s disconnect message received", conn_id)
                         break
 
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Normal -- allows checking _running flag
                     continue
 
@@ -418,7 +416,7 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
                         log.warning(
                             "Circuit breaker OPEN for %s, closing connection", conn_id
                         )
-                        try:
+                        with contextlib.suppress(Exception):
                             await connection.send_message(
                                 {
                                     "t": "error",
@@ -427,14 +425,12 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
                                         "code": "CIRCUIT_BREAKER_OPEN",
                                         "recoverable": False,
                                         "details": {
-                                            "timestamp": datetime.now(timezone.utc).isoformat()
+                                            "timestamp": datetime.now(UTC).isoformat()
                                         },
                                     },
                                 },
                                 priority=10,
                             )
-                        except Exception:
-                            pass
                         await websocket.close(code=1011, reason="Server error")
                         break
 
@@ -446,18 +442,16 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
                 exc,
                 exc_info=True,
             )
-            try:
+            with contextlib.suppress(Exception):
                 await websocket.send_json({
                     "t": "error",
                     "p": {
                         "message": "Connection initialization failed",
                         "code": "INIT_ERROR",
                         "recoverable": False,
-                        "details": {"timestamp": datetime.now(timezone.utc).isoformat()},
+                        "details": {"timestamp": datetime.now(UTC).isoformat()},
                     },
                 })
-            except Exception:
-                pass
 
         finally:
             # Unregister from WSEManager
@@ -476,16 +470,14 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
 
             # Close WebSocket if still open
             if websocket.client_state != WebSocketState.DISCONNECTED:
-                try:
+                with contextlib.suppress(Exception):
                     await websocket.close(code=1000, reason="Normal closure")
-                except Exception:
-                    pass
 
             # Log final metrics
             try:
                 metrics = connection.metrics.to_dict()
                 duration = (
-                    datetime.now(timezone.utc) - connection.metrics.connected_since
+                    datetime.now(UTC) - connection.metrics.connected_since
                 ).total_seconds()
                 log.info(
                     "WebSocket %s closed -- Duration: %.1fs, "
@@ -504,7 +496,7 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
     # ------------------------------------------------------------------ #
 
     @router.get("/wse/health")
-    async def websocket_health_check(request: Request) -> Dict[str, Any]:
+    async def websocket_health_check(request: Request) -> dict[str, Any]:
         """Health check endpoint for the WebSocket service."""
         try:
             pubsub_bus = getattr(request.app.state, "pubsub_bus", None)
@@ -513,7 +505,7 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
                     "status": "unhealthy",
                     "websocket_service": "error",
                     "error": "PubSubBus not available",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                 }
 
             metrics = pubsub_bus.get_metrics()
@@ -523,14 +515,14 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
                 "status": "healthy" if is_healthy else "unhealthy",
                 "websocket_service": "active",
                 "pubsub_bus": metrics,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
             }
         except Exception as exc:
             log.error("Health check failed: %s: %s", type(exc).__name__, exc, exc_info=True)
             return {
                 "status": "unhealthy",
                 "websocket_service": "error",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
             }
 
     # ------------------------------------------------------------------ #
@@ -540,7 +532,7 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
     if config.enable_debug:
 
         @router.get("/wse/debug")
-        async def websocket_debug_info(request: Request) -> Dict[str, Any]:
+        async def websocket_debug_info(request: Request) -> dict[str, Any]:
             """Debug endpoint to inspect WebSocket service status."""
             try:
                 pubsub_bus = getattr(request.app.state, "pubsub_bus", None)
@@ -555,17 +547,17 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
                     "heartbeat_interval": config.heartbeat_interval,
                     "idle_timeout": config.idle_timeout,
                     "max_message_size": config.max_message_size,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                 }
             except Exception as exc:
                 log.error("Debug endpoint error: %s: %s", type(exc).__name__, exc, exc_info=True)
                 return {
                     "status": "error",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                 }
 
         @router.get("/wse/compression-test")
-        async def compression_test() -> Dict[str, Any]:
+        async def compression_test() -> dict[str, Any]:
             """Diagnostics endpoint to verify compression behaviour."""
             from .connection.compression import CompressionManager
 

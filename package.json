@@ -1,15 +1,24 @@
 {
   "name": "wse-client",
   "version": "1.0.0",
-  "description": "React client for WSE (WebSocket Event System). Type-safe hooks with automatic reconnection.",
-  "main": "client/index.ts",
-  "types": "client/index.ts",
+  "description": "WSE (WebSocket Engine) React client. Type-safe hooks, auto-reconnect, offline queue, E2E encryption.",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
   "files": [
-    "client/"
+    "dist/"
   ],
   "scripts": {
     "build": "tsc",
     "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build",
     "test": "vitest"
   },
   "keywords": [
@@ -18,22 +27,44 @@
     "hooks",
     "real-time",
     "events",
-    "pubsub"
+    "pubsub",
+    "encryption",
+    "rust",
+    "zustand"
   ],
+  "author": "silvermpx",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/silvermpx/wse.git",
+    "directory": "client"
+  },
+  "homepage": "https://github.com/silvermpx/wse",
+  "bugs": {
+    "url": "https://github.com/silvermpx/wse/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false,
+  "publishConfig": {
+    "provenance": true
+  },
   "dependencies": {
-    "pako": "^2.1.0",
-    "@msgpack/msgpack": "^3.0.0"
+    "@msgpack/msgpack": "^3.0.0",
+    "pako": "^2.1.0"
   },
   "peerDependencies": {
     "react": ">=18",
     "zustand": ">=4"
   },
   "devDependencies": {
-    "typescript": ">=5",
-    "react": "^18.3.1",
-    "zustand": "^4.5.0",
+    "@types/node": "^25.3.0",
+    "@types/pako": "^2.0.4",
     "@types/react": "^18.3.0",
-    "vitest": "^2.0.0"
+    "react": "^18.3.1",
+    "typescript": ">=5",
+    "vitest": "^2.0.0",
+    "zustand": "^4.5.0"
   }
 }

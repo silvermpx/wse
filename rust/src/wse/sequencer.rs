@@ -62,10 +62,10 @@ impl RustSequencer {
         }
 
         // Evict oldest if at capacity.
-        if self.seen_ids.len() >= self.window_size {
-            if let Some((oldest_id, _)) = self.seen_ids_order.pop_front() {
-                self.seen_ids.remove(&oldest_id);
-            }
+        if self.seen_ids.len() >= self.window_size
+            && let Some((oldest_id, _)) = self.seen_ids_order.pop_front()
+        {
+            self.seen_ids.remove(&oldest_id);
         }
 
         let owned = event_id.to_owned();
@@ -195,10 +195,10 @@ impl RustEventSequencer {
         }
 
         // Evict the oldest when the queue is at capacity.
-        if self.seen_ids_queue.len() >= self.window_size {
-            if let Some(old_id) = self.seen_ids_queue.pop_front() {
-                self.seen_ids.remove(&old_id);
-            }
+        if self.seen_ids_queue.len() >= self.window_size
+            && let Some(old_id) = self.seen_ids_queue.pop_front()
+        {
+            self.seen_ids.remove(&old_id);
         }
 
         let owned = event_id.to_owned();
@@ -233,7 +233,8 @@ impl RustEventSequencer {
 
         // Initialize topic tracking on first event.
         if !self.expected_sequences.contains_key(&topic_owned) {
-            self.expected_sequences.insert(topic_owned.clone(), sequence + 1);
+            self.expected_sequences
+                .insert(topic_owned.clone(), sequence + 1);
             self.buffered_events.insert(topic_owned, BTreeMap::new());
 
             let result = PyList::new(py, [event.clone()])?;
@@ -293,7 +294,7 @@ impl RustEventSequencer {
 
                 self.buffered_events
                     .entry(topic_owned)
-                    .or_insert_with(BTreeMap::new)
+                    .or_default()
                     .insert(sequence, buffered);
 
                 Ok(py.None().into_bound(py))
@@ -398,26 +399,26 @@ impl RustEventSequencer {
             .sum();
 
         for (topic, &expected) in &self.expected_sequences {
-            if let Some(buffered) = self.buffered_events.get(topic) {
-                if !buffered.is_empty() {
-                    let sequences: Vec<u64> = buffered.keys().copied().collect();
-                    let gap_size = sequences.first().map_or(0, |&first| first - expected);
+            if let Some(buffered) = self.buffered_events.get(topic)
+                && !buffered.is_empty()
+            {
+                let sequences: Vec<u64> = buffered.keys().copied().collect();
+                let gap_size = sequences.first().map_or(0, |&first| first - expected);
 
-                    let oldest_age = buffered
-                        .values()
-                        .map(|e| now.duration_since(e.timestamp).as_secs_f64())
-                        .fold(0.0_f64, f64::max);
+                let oldest_age = buffered
+                    .values()
+                    .map(|e| now.duration_since(e.timestamp).as_secs_f64())
+                    .fold(0.0_f64, f64::max);
 
-                    let topic_dict = PyDict::new(py);
-                    topic_dict.set_item("expected_sequence", expected)?;
-                    topic_dict.set_item("buffered_count", buffered.len())?;
-                    let seqs_list = PyList::new(py, &sequences)?;
-                    topic_dict.set_item("buffered_sequences", seqs_list)?;
-                    topic_dict.set_item("gap_size", gap_size)?;
-                    topic_dict.set_item("oldest_buffered_age", oldest_age)?;
+                let topic_dict = PyDict::new(py);
+                topic_dict.set_item("expected_sequence", expected)?;
+                topic_dict.set_item("buffered_count", buffered.len())?;
+                let seqs_list = PyList::new(py, &sequences)?;
+                topic_dict.set_item("buffered_sequences", seqs_list)?;
+                topic_dict.set_item("gap_size", gap_size)?;
+                topic_dict.set_item("oldest_buffered_age", oldest_age)?;
 
-                    topics_dict.set_item(topic, topic_dict)?;
-                }
+                topics_dict.set_item(topic, topic_dict)?;
             }
         }
 
@@ -475,4 +476,3 @@ impl RustEventSequencer {
         }
     }
 }
-

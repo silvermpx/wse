@@ -5,9 +5,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any
 
-from fastapi import WebSocket
+if TYPE_CHECKING:
+    from fastapi import WebSocket
 
 log = logging.getLogger("wse.dependencies")
 
@@ -55,7 +56,7 @@ def get_pubsub_bus(websocket: WebSocket) -> Any:
     return bus
 
 
-def get_app_service(websocket: WebSocket, attr_name: str) -> Optional[Any]:
+def get_app_service(websocket: WebSocket, attr_name: str) -> Any | None:
     """Resolve an arbitrary service from ``app.state`` by attribute name.
 
     Returns ``None`` when the attribute does not exist (fail-soft).

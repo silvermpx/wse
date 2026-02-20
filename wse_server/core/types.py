@@ -15,11 +15,11 @@ Type definitions for WebSocket Event System:
 """
 
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
-from typing import Any, Callable, Dict, Optional, Protocol, Set
-
+from typing import Any, Protocol
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -48,7 +48,7 @@ class DeliveryGuarantee(Enum):
 class EventHandler(Protocol):
     """Protocol for event handlers"""
 
-    async def __call__(self, event: Dict[str, Any]) -> None: ...
+    async def __call__(self, event: dict[str, Any]) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -59,17 +59,17 @@ class EventHandler(Protocol):
 class EventMetadata:
     """Metadata for events"""
     event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     version: int = 1
     priority: EventPriority = EventPriority.NORMAL
-    ttl: Optional[int] = None  # seconds
-    correlation_id: Optional[str] = None
-    causation_id: Optional[str] = None
-    source: Optional[str] = None
+    ttl: int | None = None  # seconds
+    correlation_id: str | None = None
+    causation_id: str | None = None
+    source: str | None = None
     compressed: bool = False
     encrypted: bool = False
-    user_id: Optional[str] = None
-    connection_id: Optional[str] = None
+    user_id: str | None = None
+    connection_id: str | None = None
 
 
 @dataclass
@@ -77,21 +77,21 @@ class Subscription:
     """Represents an event subscription"""
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     subscriber_id: str = ""
-    topics: Set[str] = field(default_factory=set)
+    topics: set[str] = field(default_factory=set)
     handler: EventHandler = None
-    filters: Dict[str, Any] = field(default_factory=dict)
-    transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    filters: dict[str, Any] = field(default_factory=dict)
+    transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     active: bool = True
     delivery_guarantee: DeliveryGuarantee = DeliveryGuarantee.AT_LEAST_ONCE
     max_retries: int = 3
     retry_delay: float = 1.0
-    dead_letter_topic: Optional[str] = None
+    dead_letter_topic: str | None = None
     batch_size: int = 100
     batch_timeout: float = 0.1
     # CRITICAL: Track last delivered to prevent duplicates
-    last_delivered_id: Optional[str] = None
-    last_delivery_time: Optional[datetime] = None
+    last_delivered_id: str | None = None
+    last_delivery_time: datetime | None = None
 
 
 @dataclass
@@ -103,7 +103,7 @@ class SubscriptionStats:
     messages_filtered: int = 0
     messages_transformed: int = 0
     messages_duplicate: int = 0
-    last_message_at: Optional[datetime] = None
+    last_message_at: datetime | None = None
     average_processing_time: float = 0.0
     total_processing_time: float = 0.0
 

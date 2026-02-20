@@ -3,15 +3,16 @@
 # =============================================================================
 
 import asyncio
+import contextlib
 import logging
 import time
-from typing import Dict, Set, Optional, List, Any
-from datetime import datetime, timezone
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
 
-from .connection import WSEConnection
-from ..reliability.rate_limiter import RateLimiter
 from ..reliability.config import RateLimiterConfig
+from ..reliability.rate_limiter import RateLimiter
+from .connection import WSEConnection
 
 log = logging.getLogger("wse.manager")
 
@@ -37,15 +38,15 @@ class WSEManager:
     """
 
     def __init__(self, max_connections_per_user: int = 1):
-        self.connections: Dict[str, ConnectionInfo] = {}
-        self.user_connections: Dict[str, Set[str]] = {}
-        self.ip_connections: Dict[str, Set[str]] = {}
+        self.connections: dict[str, ConnectionInfo] = {}
+        self.user_connections: dict[str, set[str]] = {}
+        self.ip_connections: dict[str, set[str]] = {}
 
         self.max_connections_per_user = max_connections_per_user
 
         # Create rate limiters for users and IPs
-        self.user_rate_limiters: Dict[str, RateLimiter] = {}
-        self.ip_rate_limiters: Dict[str, RateLimiter] = {}
+        self.user_rate_limiters: dict[str, RateLimiter] = {}
+        self.ip_rate_limiters: dict[str, RateLimiter] = {}
 
         # Metrics
         self.total_connections = 0
@@ -55,7 +56,7 @@ class WSEManager:
         self._lock = asyncio.Lock()
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
-    def _remove_connection_unlocked(self, conn_id: str) -> Optional[WSEConnection]:
+    def _remove_connection_unlocked(self, conn_id: str) -> WSEConnection | None:
         """Remove a connection from tracking without acquiring the lock.
         MUST be called while holding self._lock.
         Returns the removed WSEConnection (for cleanup outside lock), or None."""
@@ -141,8 +142,8 @@ class WSEManager:
                 connection=connection,
                 user_id=user_id,
                 ip_address=ip_address,
-                connected_at=datetime.now(timezone.utc),
-                last_activity=datetime.now(timezone.utc),
+                connected_at=datetime.now(UTC),
+                last_activity=datetime.now(UTC),
                 client_version=client_version,
                 protocol_version=protocol_version
             )
@@ -173,7 +174,7 @@ class WSEManager:
                     timeout=3.0,
                 )
                 log.info(f"Closed old connection {old_conn_id} WebSocket")
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 log.warning(
                     f"Timeout closing old connection {old_conn_id} WebSocket "
                     f"(client likely already disconnected)"
@@ -188,7 +189,7 @@ class WSEManager:
         async with self._lock:
             self._remove_connection_unlocked(conn_id)
 
-    async def get_user_connections(self, user_id: str) -> List[WSEConnection]:
+    async def get_user_connections(self, user_id: str) -> list[WSEConnection]:
         """Get all connections for a user"""
         async with self._lock:
             conn_ids = self.user_connections.get(user_id, set())
@@ -200,7 +201,7 @@ class WSEManager:
 
             return connections
 
-    async def broadcast_to_user(self, user_id: str, message: Dict[str, Any]) -> int:
+    async def broadcast_to_user(self, user_id: str, message: dict[str, Any]) -> int:
         """Broadcast message to all user connections"""
         connections = await self.get_user_connections(user_id)
         sent_count = 0
@@ -214,7 +215,7 @@ class WSEManager:
 
         return sent_count
 
-    async def get_stats(self) -> Dict[str, Any]:
+    async def get_stats(self) -> dict[str, Any]:
         """Get manager statistics"""
         async with self._lock:
             active_users = len(self.user_connections)
@@ -289,10 +290,7 @@ class WSEManager:
             return False
 
         ip_allowed = await self.ip_rate_limiters[ip_address].acquire()
-        if not ip_allowed:
-            return False
-
-        return True
+        return ip_allowed
 
     async def _cleanup_loop(self):
         """Periodically clean up stale connections"""
@@ -339,14 +337,12 @@ class WSEManager:
     async def shutdown(self):
         """Shutdown the manager"""
         self._cleanup_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await self._cleanup_task
-        except asyncio.CancelledError:
-            pass
 
 
 # Global instance
-_ws_manager: Optional[WSEManager] = None
+_ws_manager: WSEManager | None = None
 
 
 def get_ws_manager() -> WSEManager:

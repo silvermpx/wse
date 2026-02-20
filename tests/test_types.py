@@ -1,21 +1,20 @@
 """Tests for WSE core types."""
 
-import sys
 import os
-from datetime import datetime, timezone
+import sys
+from datetime import UTC, datetime
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from server.core.types import (
-    EventPriority,
+from wse_server.core.types import (
     DeliveryGuarantee,
     EventMetadata,
+    EventPriority,
     Subscription,
     SubscriptionStats,
 )
-
 
 # =========================================================================
 # EventPriority
@@ -93,7 +92,7 @@ class TestEventMetadata:
         assert meta.connection_id is None
 
     def test_custom_values(self):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         meta = EventMetadata(
             event_id="custom_id",
             timestamp=now,
@@ -234,6 +233,6 @@ class TestSubscriptionStats:
 
     def test_last_message_at(self):
         stats = SubscriptionStats()
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         stats.last_message_at = now
         assert stats.last_message_at == now

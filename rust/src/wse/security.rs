@@ -8,11 +8,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// Compute HMAC-SHA256 of data using the given key.
 /// Returns raw bytes (32 bytes).
 #[pyfunction]
-pub fn rust_hmac_sha256<'py>(
-    py: Python<'py>,
-    key: &[u8],
-    data: &[u8],
-) -> PyResult<Py<PyBytes>> {
+pub fn rust_hmac_sha256<'py>(py: Python<'py>, key: &[u8], data: &[u8]) -> PyResult<Py<PyBytes>> {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
     let result = mac.finalize().into_bytes();

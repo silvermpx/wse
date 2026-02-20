@@ -28,27 +28,27 @@ pub fn rust_match_event(
     }
 
     // Handle top-level $and / $or
-    if let Some(and_val) = criteria.get_item("$and")? {
-        if let Ok(list) = and_val.extract::<Bound<'_, PyList>>() {
-            for item in list.iter() {
-                let sub: &Bound<'_, PyDict> = item.cast()?;
-                if !rust_match_event(py, event, sub)? {
-                    return Ok(false);
-                }
+    if let Some(and_val) = criteria.get_item("$and")?
+        && let Ok(list) = and_val.extract::<Bound<'_, PyList>>()
+    {
+        for item in list.iter() {
+            let sub: &Bound<'_, PyDict> = item.cast()?;
+            if !rust_match_event(py, event, sub)? {
+                return Ok(false);
             }
-            return Ok(true);
         }
+        return Ok(true);
     }
-    if let Some(or_val) = criteria.get_item("$or")? {
-        if let Ok(list) = or_val.extract::<Bound<'_, PyList>>() {
-            for item in list.iter() {
-                let sub: &Bound<'_, PyDict> = item.cast()?;
-                if rust_match_event(py, event, sub)? {
-                    return Ok(true);
-                }
+    if let Some(or_val) = criteria.get_item("$or")?
+        && let Ok(list) = or_val.extract::<Bound<'_, PyList>>()
+    {
+        for item in list.iter() {
+            let sub: &Bound<'_, PyDict> = item.cast()?;
+            if rust_match_event(py, event, sub)? {
+                return Ok(true);
             }
-            return Ok(false);
         }
+        return Ok(false);
     }
 
     for (key_obj, expected) in criteria.iter() {

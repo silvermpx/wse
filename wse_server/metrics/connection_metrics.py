@@ -2,11 +2,11 @@
 # WSE — WebSocket Event System
 # =============================================================================
 
+import logging
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, Any, Optional
-from datetime import datetime, timezone
-import logging
+from datetime import UTC, datetime
+from typing import Any
 
 log = logging.getLogger("wse.metrics")
 
@@ -62,8 +62,8 @@ class ConnectionMetrics:
     """Metrics for a single WebSocket connection"""
 
     connection_id: str = ""
-    connected_at: Optional[datetime] = None
-    connected_since: Optional[datetime] = None
+    connected_at: datetime | None = None
+    connected_since: datetime | None = None
     messages_sent: int = 0
     messages_received: int = 0
     bytes_sent: int = 0
@@ -75,15 +75,15 @@ class ConnectionMetrics:
     messages_dropped: int = 0
     protocol_errors: int = 0
     compression_hits: int = 0
-    last_activity: Optional[datetime] = None
-    last_message_sent: Optional[datetime] = None
-    last_message_received: Optional[datetime] = None
+    last_activity: datetime | None = None
+    last_message_sent: datetime | None = None
+    last_message_received: datetime | None = None
     last_error_message: str = ""
     compression_ratio: float = 1.0
     message_rate: float = 0.0
     bandwidth: float = 0.0
     latency_samples: deque = field(default_factory=lambda: deque(maxlen=100))
-    last_health_check: Optional[datetime] = None
+    last_health_check: datetime | None = None
 
     @property
     def avg_latency(self) -> float:
@@ -94,14 +94,14 @@ class ConnectionMetrics:
     def record_message_sent(self, size: int = 0):
         self.messages_sent += 1
         self.bytes_sent += size
-        self.last_activity = datetime.now(timezone.utc)
-        self.last_message_sent = datetime.now(timezone.utc)
+        self.last_activity = datetime.now(UTC)
+        self.last_message_sent = datetime.now(UTC)
 
     def record_message_received(self, size: int = 0):
         self.messages_received += 1
         self.bytes_received += size
-        self.last_activity = datetime.now(timezone.utc)
-        self.last_message_received = datetime.now(timezone.utc)
+        self.last_activity = datetime.now(UTC)
+        self.last_message_received = datetime.now(UTC)
 
     def record_error(self):
         self.errors += 1
@@ -110,7 +110,7 @@ class ConnectionMetrics:
         """Record a latency sample (deque auto-evicts oldest when maxlen reached)"""
         self.latency_samples.append(latency_ms)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert metrics to dictionary for logging/serialization"""
         return {
             "connection_id": self.connection_id,
@@ -191,7 +191,7 @@ class NetworkQualityAnalyzer:
         else:
             return 0.2
 
-    def analyze(self) -> Dict[str, Any]:
+    def analyze(self) -> dict[str, Any]:
         """Analyze network quality and return diagnostics"""
         score = self.quality_score
         avg_latency = self.average_latency

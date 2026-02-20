@@ -1,23 +1,22 @@
 """Tests for WSE reliability infrastructure (CircuitBreaker + RateLimiter)."""
 
 import asyncio
-import sys
 import os
+import sys
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from server.reliability.config import CircuitBreakerConfig, RateLimiterConfig
-from server.reliability.circuit_breaker import (
+from wse_server.reliability.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerOpenError,
     CircuitState,
-    get_circuit_breaker,
     _circuit_breakers,
+    get_circuit_breaker,
 )
-from server.reliability.rate_limiter import RateLimiter, TokenBucket, SlidingWindow
-
+from wse_server.reliability.config import CircuitBreakerConfig, RateLimiterConfig
+from wse_server.reliability.rate_limiter import RateLimiter, SlidingWindow, TokenBucket
 
 # =========================================================================
 # CircuitBreakerConfig

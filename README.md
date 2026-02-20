@@ -1,79 +1,24 @@
 # WSE — WebSocket Engine
 
-**Up to 1.1M msg/s. End-to-end encrypted. Rust-accelerated.**
+**Real-time React + Python, out of the box.**
 
-<!-- badges: pypi, npm, ci, coverage, license -->
+Install two packages. Connect your FastAPI backend to your React frontend. Live data in minutes, not weeks.
 
----
-
-## Performance
-
-Rust-accelerated engine via PyO3. Benchmarked on Apple M3 Max, single process, 1KB JSON.
-
-| Mode | Throughput | Latency (p50) | Latency (p99) |
-|------|-----------|---------------|---------------|
-| **Rust (binary)** | **1,100,000 msg/s** | **0.009 ms** | **0.04 ms** |
-| **Rust (JSON)** | **285,000 msg/s** | **0.03 ms** | **0.15 ms** |
-| Pure Python | 106,000 msg/s | 0.09 ms | 0.4 ms |
-
-Compared to alternatives:
-
-| Library | Throughput | Encrypted | Priority Queue | Offline Queue |
-|---------|-----------|-----------|----------------|---------------|
-| **WSE** | **1.1M msg/s** | AES-256-GCM | Yes (5-level) | Yes (IndexedDB) |
-| ws (Node) | ~50K msg/s | No | No | No |
-| Socket.IO | ~25K msg/s | No | No | No |
-| SSE | ~10K msg/s | No | No | No |
-
-See [benchmarks/](benchmarks/) and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for methodology.
+[![CI](https://github.com/silvermpx/wse/actions/workflows/ci.yml/badge.svg)](https://github.com/silvermpx/wse/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/wse-server)](https://pypi.org/project/wse-server/)
+[![npm](https://img.shields.io/npm/v/wse-client)](https://www.npmjs.com/package/wse-client)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
 
-## Installation
+## What is WSE?
 
-```bash
-# Server (Python) — includes prebuilt Rust engine
-pip install wse-server
+WSE is a production-ready WebSocket engine that connects Python backends to React frontends in real time. It handles everything you'd otherwise build yourself: reconnection, authentication, encryption, message ordering, offline queues, health monitoring.
 
-# Client (React/TypeScript)
-npm install wse-client
-```
+**Server:** `pip install wse-server` -- FastAPI router, 4 lines to set up.
+**Client:** `npm install wse-client` -- React hook, works with Zustand.
 
-Prebuilt wheels for Linux (x86_64, aarch64), macOS (x86_64, arm64), and Windows (x86_64).
-Python 3.12+ (ABI3 stable — one wheel per platform).
-
----
-
-## Features
-
-**Rust-Accelerated Engine**
-- Compression (zlib via flate2), sequencing, filtering, rate limiting — all in Rust
-- PyO3 native module — no subprocess, no FFI overhead
-- Python API unchanged — drop-in acceleration
-
-**Security**
-- End-to-end AES-256-GCM encryption per channel
-- HMAC-SHA256 message signing
-- JWT authentication with configurable claims
-- Per-connection scope enforcement
-
-**Reliability**
-- Automatic reconnection with exponential backoff + jitter
-- Sequence numbers with gap detection and out-of-order buffering
-- Circuit breaker with configurable threshold
-- Offline queue with IndexedDB persistence
-- Connection health monitoring with adaptive quality
-
-**Scaling**
-- Redis pub/sub for multi-process fan-out
-- Horizontal scaling across workers with shared state
-- Per-topic subscription — clients receive only what they need
-
-**Developer Experience**
-- 4-line server setup with FastAPI
-- React hook with full TypeScript types
-- Zustand store integration
-- Protocol versioning (v2) for backward compatibility
+The engine is Rust-accelerated via PyO3. Up to **1.1M msg/s** burst throughput (single process, binary mode). 285K msg/s sustained with JSON.
 
 ---
 
@@ -89,61 +34,136 @@ app = FastAPI()
 
 wse = create_wse_router(WSEConfig(
     redis_url="redis://localhost:6379",
-    encryption_key="your-32-byte-key-here...",
 ))
 
 app.include_router(wse, prefix="/wse")
-```
 
-Publish from anywhere:
-
-```python
-await wse.publish("prices", {"symbol": "AAPL", "price": 187.42})
+# Publish from anywhere in your app
+await wse.publish("notifications", {"text": "Order shipped!", "order_id": 42})
 ```
 
 ### Client (React)
 
-```typescript
+```tsx
 import { useWSE } from 'wse-client';
 
-function PriceDisplay() {
-  const wse = useWSE(authToken, ['prices'], {
+function Dashboard() {
+  const { isConnected, connectionHealth } = useWSE({
+    topics: ['notifications', 'live_data'],
     endpoints: ['ws://localhost:8000/wse'],
   });
 
   useEffect(() => {
     const handler = (e: CustomEvent) => {
-      console.log('Price update:', e.detail);
+      console.log('New notification:', e.detail);
     };
-    window.addEventListener('price_update', handler);
-    return () => window.removeEventListener('price_update', handler);
+    window.addEventListener('notifications', handler);
+    return () => window.removeEventListener('notifications', handler);
   }, []);
 
-  return <div>Status: {wse.connectionHealth}</div>;
+  return <div>Status: {connectionHealth}</div>;
 }
 ```
+
+That's it. Your React app now receives real-time updates from your Python backend.
+
+---
+
+## Use Cases
+
+- **Live dashboards** -- stock prices, sensor data, analytics, monitoring panels
+- **Notifications** -- order updates, alerts, system events pushed to the browser
+- **Collaborative apps** -- shared state, cursors, document editing, whiteboarding
+- **Chat and messaging** -- group chats, DMs, typing indicators, read receipts
+- **IoT and telemetry** -- device status, real-time metrics, command and control
+- **Gaming** -- game state sync, leaderboards, matchmaking updates
+
+---
+
+## Performance
+
+Rust-accelerated engine via PyO3. Benchmarked on Apple M3 Max, single process, 1KB JSON.
+
+| Mode | Throughput | Latency (p50) | Latency (p99) |
+|------|-----------|---------------|---------------|
+| **Rust (binary)** | **1,100,000 msg/s** | **0.009 ms** | **0.04 ms** |
+| **Rust (JSON)** | **285,000 msg/s** | **0.03 ms** | **0.15 ms** |
+| Pure Python | 106,000 msg/s | 0.09 ms | 0.4 ms |
+
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for methodology and reproducibility.
+
+---
+
+## Features
+
+**Rust-Accelerated Core**
+- Compression, sequencing, filtering, rate limiting -- all in Rust via PyO3
+- Zero-copy JSON with orjson, binary protocol with msgpack
+- Python API stays the same -- Rust accelerates transparently
+
+**Security**
+- End-to-end AES-256-GCM encryption per channel
+- HMAC-SHA256 message signing and integrity verification
+- JWT authentication with configurable claims
+- Per-connection topic-level access control
+
+**Reliability**
+- Automatic reconnection with exponential backoff + jitter
+- Sequence numbers with gap detection and reordering buffer
+- Circuit breaker with configurable failure threshold
+- Offline queue with IndexedDB persistence (messages survive page reload)
+- Connection health monitoring with adaptive quality scoring
+
+**Scaling**
+- Redis pub/sub for multi-process fan-out
+- Horizontal scaling across workers with shared state
+- Per-topic subscriptions -- clients receive only what they subscribe to
+
+**Developer Experience**
+- 4-line server setup with FastAPI
+- React hook (`useWSE`) with full TypeScript types
+- Zustand store integration for state management
+- Protocol versioning (v2) for backward compatibility
+- Priority queues (5 levels) for message ordering
+
+---
+
+## Installation
+
+```bash
+# Server (Python) -- includes prebuilt Rust engine
+pip install wse-server
+
+# Client (React/TypeScript)
+npm install wse-client
+```
+
+Prebuilt wheels for Linux (x86_64, aarch64), macOS (Intel, Apple Silicon), and Windows.
+Python 3.12+ (ABI3 stable -- one wheel per platform).
 
 ---
 
 ## Architecture
 
 ```
-Client (React/TypeScript)              Server (Python + Rust)
----------------------                  ---------------------
+Client (React + TypeScript)              Server (Python + Rust)
+========================                 ========================
 
-useWSE hook                            FastAPI Router
-    |                                      |
-    v                                      v
-ConnectionManager                      Rust WSE Server
-    |                                      |
-    v                                      v
-MessageProcessor                       EventTransformer (Rust)
-    |                                      |
-    v                                      v
-Zustand Store                          PubSub Bus
-    |                                      |
-    v                                      v
-React Components                       Redis Streams (optional)
+useWSE hook                              FastAPI Router (/wse)
+    |                                        |
+    v                                        v
+ConnectionManager                        Rust Engine (PyO3)
+    |  (auto-reconnect,                      |  (compress, sequence,
+    |   circuit breaker)                     |   filter, rate limit)
+    v                                        v
+MessageProcessor                         EventTransformer
+    |  (decompress, verify,                  |  (wire envelope,
+    |   sequence, dispatch)                  |   msgpack/JSON)
+    v                                        v
+Zustand Store                            PubSub Bus
+    |                                        |
+    v                                        v
+React Components                         Redis (multi-process)
 ```
 
 **Wire format (v2):**
@@ -159,32 +179,16 @@ React Components                       Redis Streams (optional)
 }
 ```
 
-Category prefixes on the wire: `WSE{` (system), `S{` (snapshot), `U{` (update).
-
 ---
 
 ## Packages
 
 | Package | Registry | Language | Install |
 |---------|----------|----------|---------|
-| `wse-server` | PyPI | Python + Rust | `pip install wse-server` |
-| `wse-client` | npm | TypeScript + React | `npm install wse-client` |
+| `wse-server` | [PyPI](https://pypi.org/project/wse-server/) | Python + Rust | `pip install wse-server` |
+| `wse-client` | [npm](https://www.npmjs.com/package/wse-client) | TypeScript + React | `npm install wse-client` |
 
-Both packages are standalone — no shared dependencies between server and client.
-
----
-
-## When NOT to Use WSE
-
-| Use case | Better tool | Why |
-|----------|-------------|-----|
-| Simple chat rooms | Socket.IO | Built-in rooms, namespaces, broadcast |
-| Service-to-service RPC | gRPC | Schema enforcement, bidirectional streaming |
-| Message queues | RabbitMQ, Kafka | Persistent queues, consumer groups |
-| Static dashboards | SSE | Simpler protocol, no WebSocket overhead |
-| File uploads | HTTP multipart | WebSocket not designed for large binaries |
-
-WSE is for: real-time UI updates, live data feeds, monitoring dashboards, collaborative state sync, and high-throughput server-to-client event delivery.
+Both packages are standalone. No shared dependencies between server and client.
 
 ---
 
@@ -210,9 +214,9 @@ WSE is for: real-time UI updates, live data feeds, monitoring dashboards, collab
 | Binary protocol | msgpack (rmp-serde) | 30% smaller payloads |
 | Encryption | AES-256-GCM (Rust) | Per-channel E2E encryption |
 | Authentication | PyJWT | Token verification |
-| Pub/Sub backbone | Redis Streams | Multi-process fan-out, replay |
+| Pub/Sub backbone | Redis Streams | Multi-process fan-out |
 | Client state | Zustand | Lightweight React store |
-| Client hooks | React 18+ | useWSE hook |
+| Client hooks | React 18+ | useWSE hook with TypeScript |
 | Build system | maturin | Rust+Python hybrid wheels |
 
 ---

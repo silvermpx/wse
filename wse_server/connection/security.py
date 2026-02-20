@@ -4,12 +4,12 @@
 # =============================================================================
 
 import json
+import logging
 import secrets
 import time
-from typing import Optional, Dict, Any, Union, Protocol, runtime_checkable
-import logging
+from typing import Any, Protocol, runtime_checkable
 
-from server._accel import rust_sha256, rust_hmac_sha256, rust_sign_message
+from wse_server._accel import rust_hmac_sha256, rust_sha256
 
 log = logging.getLogger("wse.security")
 
@@ -31,7 +31,7 @@ class EncryptionProvider(Protocol):
         """Encrypt plaintext data and return ciphertext (e.g. base64-encoded)."""
         ...
 
-    def decrypt(self, encrypted_data: str) -> Optional[str]:
+    def decrypt(self, encrypted_data: str) -> str | None:
         """Decrypt ciphertext and return plaintext, or None on failure."""
         ...
 
@@ -48,13 +48,13 @@ class TokenProvider(Protocol):
     def create_token(
         self,
         subject: str,
-        claims: Dict[str, Any],
-        expires_delta: Optional[int] = None,
+        claims: dict[str, Any],
+        expires_delta: int | None = None,
     ) -> str:
         """Create a signed token string."""
         ...
 
-    def decode_token(self, token: str) -> Optional[Dict[str, Any]]:
+    def decode_token(self, token: str) -> dict[str, Any] | None:
         """Decode and verify a token.  Return claims dict or None."""
         ...
 
@@ -78,14 +78,14 @@ class SecurityManager:
 
     def __init__(
         self,
-        encryption_provider: Optional[EncryptionProvider] = None,
-        token_provider: Optional[TokenProvider] = None,
+        encryption_provider: EncryptionProvider | None = None,
+        token_provider: TokenProvider | None = None,
     ):
         self.encryption_enabled = False
         self.message_signing_enabled = False
-        self.cipher_suite: Optional[str] = None
-        self.key_rotation_interval: Optional[int] = 3600  # seconds
-        self.last_key_rotation: Optional[float] = None
+        self.cipher_suite: str | None = None
+        self.key_rotation_interval: int | None = 3600  # seconds
+        self.last_key_rotation: float | None = None
 
         # Pluggable providers
         self._encryption_provider = encryption_provider
@@ -96,8 +96,8 @@ class SecurityManager:
 
     def configure(
         self,
-        encryption_provider: Optional[EncryptionProvider] = None,
-        token_provider: Optional[TokenProvider] = None,
+        encryption_provider: EncryptionProvider | None = None,
+        token_provider: TokenProvider | None = None,
     ) -> None:
         """Hot-swap security providers at runtime."""
         if encryption_provider is not None:
@@ -105,7 +105,7 @@ class SecurityManager:
         if token_provider is not None:
             self._token_provider = token_provider
 
-    async def initialize(self, config: Dict[str, Any]) -> None:
+    async def initialize(self, config: dict[str, Any]) -> None:
         """Initialize security with configuration"""
         self.encryption_enabled = config.get('encryption_enabled', False)
         self.message_signing_enabled = config.get('message_signing_enabled', False)
@@ -129,7 +129,7 @@ class SecurityManager:
     # Encryption
     # -----------------------------------------------------------------
 
-    async def encrypt_message(self, data: Union[str, bytes, dict]) -> Optional[str]:
+    async def encrypt_message(self, data: str | bytes | dict) -> str | None:
         """Encrypt message using the configured EncryptionProvider.
 
         Returns None when encryption is disabled or no provider is set.
@@ -153,7 +153,7 @@ class SecurityManager:
             log.error(f"Encryption failed: {e}")
             return None
 
-    async def decrypt_message(self, encrypted_data: str) -> Optional[Union[str, Dict[str, Any]]]:
+    async def decrypt_message(self, encrypted_data: str) -> str | dict[str, Any] | None:
         """Decrypt message using the configured EncryptionProvider."""
         if not self.encryption_enabled:
             return None
@@ -179,7 +179,7 @@ class SecurityManager:
     # Message signing  (Rust-accelerated SHA-256 + HMAC-SHA256)
     # -----------------------------------------------------------------
 
-    async def sign_message(self, data: Union[str, bytes, dict]) -> Optional[str]:
+    async def sign_message(self, data: str | bytes | dict) -> str | None:
         """Sign a message for integrity verification.
 
         Uses TokenProvider if available, otherwise falls back to built-in
@@ -228,7 +228,7 @@ class SecurityManager:
             log.error(f"Message signing failed: {e}")
             return None
 
-    async def verify_signature(self, signed_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    async def verify_signature(self, signed_data: dict[str, Any]) -> dict[str, Any] | None:
         """Verify message signature.
 
         Supports both TokenProvider-issued tokens and built-in HMAC strings.
@@ -325,7 +325,7 @@ class SecurityManager:
         sig = rust_hmac_sha256(self._hmac_secret, message).hex()
         return f"{user_id}:{conn_id}:{issued_at}:{nonce}:{sig}"
 
-    async def verify_session_token(self, token: str) -> Optional[Dict[str, Any]]:
+    async def verify_session_token(self, token: str) -> dict[str, Any] | None:
         """Verify and decode session token."""
         if self._token_provider:
             decoded = self._token_provider.decode_token(token)
@@ -379,7 +379,7 @@ class SecurityManager:
         self.last_key_rotation = time.time()
         log.info("Security keys rotated")
 
-    async def get_public_key(self) -> Optional[str]:
+    async def get_public_key(self) -> str | None:
         """Get public key for key exchange (placeholder for provider-based impl)."""
         return None
 
@@ -387,7 +387,7 @@ class SecurityManager:
         """Set server public key for key exchange (placeholder)."""
         pass
 
-    def get_security_info(self) -> Dict[str, Any]:
+    def get_security_info(self) -> dict[str, Any]:
         """Get security configuration info"""
         return {
             'encryption_enabled': self.encryption_enabled,

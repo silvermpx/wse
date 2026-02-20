@@ -2,8 +2,7 @@
 # WSE — WebSocket Event System
 # =============================================================================
 
-from dataclasses import dataclass, field
-from typing import Optional, Tuple, Type
+from dataclasses import dataclass
 
 
 @dataclass
@@ -31,10 +30,10 @@ class CircuitBreakerConfig:
     success_threshold: int = 3
     reset_timeout_seconds: int = 30
     half_open_max_calls: int = 3
-    window_size: Optional[int] = None
-    failure_rate_threshold: Optional[float] = None
-    timeout_seconds: Optional[float] = None
-    ignored_exception_types: Optional[Tuple[Type[BaseException], ...]] = None
+    window_size: int | None = None
+    failure_rate_threshold: float | None = None
+    timeout_seconds: float | None = None
+    ignored_exception_types: tuple[type[BaseException], ...] | None = None
 
 
 @dataclass
@@ -53,6 +52,6 @@ class RateLimiterConfig:
     algorithm: str = "token_bucket"
     capacity: int = 100
     refill_rate: float = 10.0
-    initial_tokens: Optional[int] = None
-    max_requests: Optional[int] = None
-    time_window: Optional[int] = None
+    initial_tokens: int | None = None
+    max_requests: int | None = None
+    time_window: int | None = None

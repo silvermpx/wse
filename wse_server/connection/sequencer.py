@@ -4,11 +4,12 @@
 # =============================================================================
 
 import asyncio
-from typing import Dict, Optional, Any, List
-from dataclasses import dataclass
+import contextlib
 import logging
+from dataclasses import dataclass
+from typing import Any
 
-from server._accel import RustEventSequencer
+from wse_server._accel import RustEventSequencer
 
 log = logging.getLogger("wse.sequencer")
 
@@ -31,7 +32,7 @@ class SequencedEvent:
     sequence: int
     timestamp: object  # datetime
     topic: str
-    payload: Dict[str, Any]
+    payload: dict[str, Any]
 
 
 class EventSequencer:
@@ -67,19 +68,19 @@ class EventSequencer:
     @property
     def seen_ids(self) -> set:
         """Return set of currently tracked event IDs (for test compat)."""
-        stats = self._rust.get_sequence_stats()
+        self._rust.get_sequence_stats()
         # Rust doesn't expose raw seen_ids set, but tracks count.
         # For test compat, return a set-like object. Tests only check `in`.
         return _SeenIdsProxy(self._rust)
 
     @property
-    def expected_sequences(self) -> Dict[str, int]:
+    def expected_sequences(self) -> dict[str, int]:
         stats = self._rust.get_sequence_stats()
         topics = stats.get("topics", {})
         return {topic: info["expected"] for topic, info in topics.items()}
 
     @property
-    def buffered_events(self) -> Dict[str, Any]:
+    def buffered_events(self) -> dict[str, Any]:
         stats = self._rust.get_buffer_stats()
         topics = stats.get("topics", {})
         return {topic: info.get("buffered_sequences", []) for topic, info in topics.items()}
@@ -102,8 +103,8 @@ class EventSequencer:
             self,
             topic: str,
             sequence: int,
-            event: Dict[str, Any]
-    ) -> Optional[List[Dict[str, Any]]]:
+            event: dict[str, Any]
+    ) -> list[dict[str, Any]] | None:
         """
         Process an event with a sequence number.
         Returns a list of events that can be delivered (maintaining order).
@@ -114,17 +115,17 @@ class EventSequencer:
             # or a list of events when they can be delivered.
             return result
 
-    async def reset_sequence(self, topic: Optional[str] = None) -> None:
+    async def reset_sequence(self, topic: str | None = None) -> None:
         """Reset sequence for a specific topic or all topics"""
         async with self._lock:
             self._rust.reset_sequence(topic)
 
-    async def get_sequence_stats(self) -> Dict[str, Any]:
+    async def get_sequence_stats(self) -> dict[str, Any]:
         """Get detailed sequence statistics"""
         async with self._lock:
             return dict(self._rust.get_sequence_stats())
 
-    async def get_buffer_stats(self) -> Dict[str, Any]:
+    async def get_buffer_stats(self) -> dict[str, Any]:
         """Get statistics about buffered events (frontend compatible)"""
         async with self._lock:
             return dict(self._rust.get_buffer_stats())
@@ -161,10 +162,8 @@ class EventSequencer:
     async def shutdown(self):
         """Shutdown the sequencer"""
         self._cleanup_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await self._cleanup_task
-        except asyncio.CancelledError:
-            pass
 
         stats = self._rust.get_sequence_stats()
         log.info(

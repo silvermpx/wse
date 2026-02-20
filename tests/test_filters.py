@@ -1,14 +1,11 @@
 """Tests for EventFilter."""
 
-import sys
 import os
-
-import pytest
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from server.core.filters import EventFilter
-
+from wse_server.core.filters import EventFilter
 
 # =========================================================================
 # Exact match

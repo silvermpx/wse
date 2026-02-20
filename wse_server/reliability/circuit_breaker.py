@@ -3,12 +3,13 @@
 # =============================================================================
 
 import asyncio
-import time
-from datetime import datetime, timezone
-from enum import Enum, auto
-from typing import TypeVar, Generic, Callable, Optional, Any, Dict
-from collections import deque
 import logging
+import time
+from collections import deque
+from collections.abc import Callable
+from datetime import UTC, datetime
+from enum import Enum, auto
+from typing import Any, TypeVar
 
 from .config import CircuitBreakerConfig
 
@@ -25,7 +26,7 @@ class CircuitState(Enum):
     HALF_OPEN = auto()
 
 
-class CircuitBreaker(Generic[T]):
+class CircuitBreaker[T]:
     """Circuit Breaker implementation.
 
     State machine: CLOSED -> OPEN -> HALF_OPEN -> CLOSED.
@@ -40,7 +41,7 @@ class CircuitBreaker(Generic[T]):
     def __init__(
         self,
         config: CircuitBreakerConfig,
-        cache_manager: Optional[Any] = None,
+        cache_manager: Any | None = None,
     ):
         self.name = config.name
         self.config = config
@@ -50,11 +51,11 @@ class CircuitBreaker(Generic[T]):
         self._state = CircuitState.CLOSED
         self._failure_count = 0
         self._success_count = 0
-        self._last_failure_time: Optional[datetime] = None
+        self._last_failure_time: datetime | None = None
         self._half_open_calls = 0
 
         # Sliding-window metrics (optional)
-        self._call_metrics: Optional[deque] = None
+        self._call_metrics: deque | None = None
         if config.window_size:
             self._call_metrics = deque(maxlen=config.window_size)
 
@@ -112,14 +113,14 @@ class CircuitBreaker(Generic[T]):
         """Record a successful call (fire-and-forget)."""
         asyncio.create_task(self._on_success(0))
 
-    def record_failure(self, error_details: Optional[str] = None) -> None:
+    def record_failure(self, error_details: str | None = None) -> None:
         """Record a failed call (fire-and-forget)."""
         asyncio.create_task(self._on_failure(0, error_details))
 
-    async def get_state(self) -> Dict[str, Any]:
+    async def get_state(self) -> dict[str, Any]:
         """Return current state and metrics."""
         async with self._lock:
-            state_info: Dict[str, Any] = {
+            state_info: dict[str, Any] = {
                 "name": self.name,
                 "state": self._state.name,
                 "failure_count": self._failure_count,
@@ -141,7 +142,7 @@ class CircuitBreaker(Generic[T]):
 
             return state_info
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         """Return lightweight metrics dict (sync)."""
         return {
             "name": self.name,
@@ -179,10 +180,7 @@ class CircuitBreaker(Generic[T]):
             "auth failed",
             "authentication",
         )
-        if any(kw in error_msg for kw in auth_keywords):
-            return True
-
-        return False
+        return bool(any(kw in error_msg for kw in auth_keywords))
 
     def _can_execute(self) -> bool:
         if self._state == CircuitState.CLOSED:
@@ -215,14 +213,14 @@ class CircuitBreaker(Generic[T]):
                     await self._transition_to_closed()
 
     async def _on_failure(
-        self, duration: float, error_details: Optional[str] = None
+        self, duration: float, error_details: str | None = None
     ) -> None:
         async with self._lock:
             if self._call_metrics is not None:
                 self._call_metrics.append((False, duration))
 
             self._failure_count += 1
-            self._last_failure_time = datetime.now(timezone.utc)
+            self._last_failure_time = datetime.now(UTC)
 
             if error_details:
                 logger.debug(
@@ -260,7 +258,7 @@ class CircuitBreaker(Generic[T]):
         if self._last_failure_time is None:
             return True
         elapsed = (
-            datetime.now(timezone.utc) - self._last_failure_time
+            datetime.now(UTC) - self._last_failure_time
         ).total_seconds()
         return elapsed >= self.config.reset_timeout_seconds
 
@@ -298,7 +296,7 @@ class CircuitBreakerOpenError(Exception):
     def __init__(
         self,
         message: str,
-        retry_after: Optional[int] = None,
+        retry_after: int | None = None,
     ):
         super().__init__(message)
         self.retry_after = retry_after
@@ -312,13 +310,13 @@ class CircuitBreakerError(Exception):
 # Global registry
 # --------------------------------------------------------------------- #
 
-_circuit_breakers: Dict[str, CircuitBreaker] = {}
+_circuit_breakers: dict[str, CircuitBreaker] = {}
 
 
 def get_circuit_breaker(
     name: str,
-    config: Optional[CircuitBreakerConfig] = None,
-    cache_manager: Optional[Any] = None,
+    config: CircuitBreakerConfig | None = None,
+    cache_manager: Any | None = None,
 ) -> CircuitBreaker:
     """Get or create a named circuit breaker instance."""
     if name not in _circuit_breakers:
@@ -328,9 +326,9 @@ def get_circuit_breaker(
     return _circuit_breakers[name]
 
 
-def get_all_circuit_breaker_metrics() -> Dict[str, Dict[str, Any]]:
+def get_all_circuit_breaker_metrics() -> dict[str, dict[str, Any]]:
     """Return metrics for every registered circuit breaker."""
-    metrics: Dict[str, Dict[str, Any]] = {}
+    metrics: dict[str, dict[str, Any]] = {}
     for name, breaker in _circuit_breakers.items():
         try:
             metrics[name] = breaker.get_metrics()
