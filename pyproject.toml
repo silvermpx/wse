@@ -7,7 +7,8 @@ name = "wse-server"
 version = "1.0.0"
 description = "Real-time WebSocket engine for Python. Up to 1.1M msg/s. End-to-end encrypted. Rust-accelerated."
 readme = "README.md"
-license = "MIT"
+license = { text = "MIT" }
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 authors = [
     { name = "WSE Contributors" },
