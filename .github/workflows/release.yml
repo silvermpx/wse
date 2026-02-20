@@ -108,7 +108,7 @@ jobs:
           - os: macos-14
             python: '3.12'
             target: macos-aarch64-apple-darwin
-          - os: macos-13
+          - os: macos-latest
             python: '3.12'
             target: macos-x86_64-apple-darwin
           - os: windows-latest
