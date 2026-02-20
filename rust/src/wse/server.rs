@@ -902,7 +902,7 @@ impl RustWSEServer {
         }
 
         // v goes last
-        map.insert("v".to_string(), serde_json::Value::Number(2.into()));
+        map.insert("v".to_string(), serde_json::Value::Number(1.into()));
 
         // Serialize
         let json_str = serde_json::to_string(&serde_json::Value::Object(map))

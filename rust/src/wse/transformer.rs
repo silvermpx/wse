@@ -351,7 +351,7 @@ pub fn rust_transform_event<'py>(
     envelope.set_item("ts", PyString::new(py, &timestamp))?;
     envelope.set_item("seq", sequence)?;
     envelope.set_item("p", payload_converted)?;
-    envelope.set_item("v", 2)?;
+    envelope.set_item("v", 1)?;
 
     // 8. Preserve original event type
     if raw_event_type != ws_event_type {
