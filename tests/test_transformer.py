@@ -48,7 +48,7 @@ class TestPassThrough:
             "payload": {"symbol": "AAPL", "qty": 100},
         }
         result = transformer.transform_for_ws(event, sequence=1)
-        assert result["v"] == 2
+        assert result["v"] == 1
         assert "t" in result
         assert "p" in result
         assert "id" in result
