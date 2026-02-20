@@ -169,3 +169,38 @@ jobs:
         with:
           generate_release_notes: true
           files: dist/*
+
+  # ---------------------------------------------------------------------------
+  # Publish wse-client to npm
+  # ---------------------------------------------------------------------------
+  publish-npm:
+    name: Publish to npm
+    needs: [publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Sync version from tag
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          npm version "$TAG" --no-git-tag-version --allow-same-version
+
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
