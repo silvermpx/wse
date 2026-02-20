@@ -1,8 +1,8 @@
 # WSE — WebSocket Engine
 
-**Real-time React + Python, out of the box.**
+**A complete, out-of-the-box solution for building reactive interfaces with React and Python.**
 
-Install two packages. Connect your FastAPI backend to your React frontend. Live data in minutes, not weeks.
+Two packages. Four lines of code. Your frontend and backend talk in real time.
 
 [![CI](https://github.com/silvermpx/wse/actions/workflows/ci.yml/badge.svg)](https://github.com/silvermpx/wse/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/wse-server)](https://pypi.org/project/wse-server/)
@@ -11,14 +11,15 @@ Install two packages. Connect your FastAPI backend to your React frontend. Live 
 
 ---
 
-## What is WSE?
+## Why WSE?
 
-WSE is a production-ready WebSocket engine that connects Python backends to React frontends in real time. It handles everything you'd otherwise build yourself: reconnection, authentication, encryption, message ordering, offline queues, health monitoring.
+Building real-time features between React and Python is painful. You need WebSocket handling, reconnection logic, message ordering, authentication, encryption, offline support, health monitoring. That's weeks of work before you ship a single feature.
 
-**Server:** `pip install wse-server` -- FastAPI router, 4 lines to set up.
-**Client:** `npm install wse-client` -- React hook, works with Zustand.
+**WSE gives you all of this out of the box.**
 
-The engine is Rust-accelerated via PyO3. Up to **1.1M msg/s** burst throughput (single process, binary mode). 285K msg/s sustained with JSON.
+Install `wse-server` on your backend, `wse-client` on your frontend. Everything works immediately: auto-reconnection, message encryption, sequence ordering, offline queues, health monitoring. No configuration required for the defaults. Override what you need.
+
+The engine is Rust-accelerated via PyO3. Up to **1.1M msg/s** burst throughput. 285K msg/s sustained with JSON.
 
 ---
 
@@ -65,15 +66,39 @@ function Dashboard() {
 }
 ```
 
-That's it. Your React app now receives real-time updates from your Python backend.
+That's it. Your React app receives real-time updates from your Python backend.
+
+---
+
+## What You Get Out of the Box
+
+Everything listed below works the moment you install. No extra setup.
+
+**Reactive Interface** -- real-time data flow from Python to React, with a single hook (`useWSE`) and a publish call on the server. Events appear in your components instantly.
+
+**Auto-Reconnection** -- exponential backoff with jitter. Connection drops? The client reconnects automatically. No lost messages thanks to offline queue with IndexedDB persistence.
+
+**End-to-End Encryption** -- AES-256-GCM per channel, HMAC-SHA256 message signing. Encrypted before it leaves the server, decrypted in the browser. No plaintext on the wire.
+
+**Message Ordering** -- sequence numbers with gap detection and reordering buffer. Messages arrive in order, even under high load or network instability.
+
+**Authentication** -- JWT-based with configurable claims. Per-connection, per-topic access control. Plug in your own auth handler or use the built-in one.
+
+**Health Monitoring** -- connection quality scoring, latency tracking, circuit breaker. Your UI knows when the connection is degraded and can react accordingly.
+
+**Scaling** -- Redis pub/sub for multi-process fan-out. Run multiple server workers behind a load balancer. Clients get messages from any worker.
+
+**Rust Performance** -- compression, sequencing, filtering, rate limiting, and the WebSocket server itself are implemented in Rust via PyO3. Python API stays the same. Rust accelerates transparently.
 
 ---
 
 ## Use Cases
 
+WSE works for any real-time communication between frontend and backend:
+
 - **Live dashboards** -- stock prices, sensor data, analytics, monitoring panels
 - **Notifications** -- order updates, alerts, system events pushed to the browser
-- **Collaborative apps** -- shared state, cursors, document editing, whiteboarding
+- **Collaborative apps** -- shared cursors, document editing, whiteboarding
 - **Chat and messaging** -- group chats, DMs, typing indicators, read receipts
 - **IoT and telemetry** -- device status, real-time metrics, command and control
 - **Gaming** -- game state sync, leaderboards, matchmaking updates
@@ -82,49 +107,13 @@ That's it. Your React app now receives real-time updates from your Python backen
 
 ## Performance
 
-Rust-accelerated engine via PyO3. Benchmarked on Apple M3 Max, single process, 1KB JSON.
+Rust-accelerated engine via PyO3. Benchmarked on Apple M3, single process, 1KB JSON.
 
 | Mode | Throughput | Latency (p50) | Latency (p99) |
 |------|-----------|---------------|---------------|
 | **Rust (binary)** | **1,100,000 msg/s** | **0.009 ms** | **0.04 ms** |
 | **Rust (JSON)** | **285,000 msg/s** | **0.03 ms** | **0.15 ms** |
 | Pure Python | 106,000 msg/s | 0.09 ms | 0.4 ms |
-
-See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for methodology and reproducibility.
-
----
-
-## Features
-
-**Rust-Accelerated Core**
-- Compression, sequencing, filtering, rate limiting -- all in Rust via PyO3
-- Zero-copy JSON with orjson, binary protocol with msgpack
-- Python API stays the same -- Rust accelerates transparently
-
-**Security**
-- End-to-end AES-256-GCM encryption per channel
-- HMAC-SHA256 message signing and integrity verification
-- JWT authentication with configurable claims
-- Per-connection topic-level access control
-
-**Reliability**
-- Automatic reconnection with exponential backoff + jitter
-- Sequence numbers with gap detection and reordering buffer
-- Circuit breaker with configurable failure threshold
-- Offline queue with IndexedDB persistence (messages survive page reload)
-- Connection health monitoring with adaptive quality scoring
-
-**Scaling**
-- Redis pub/sub for multi-process fan-out
-- Horizontal scaling across workers with shared state
-- Per-topic subscriptions -- clients receive only what they subscribe to
-
-**Developer Experience**
-- 4-line server setup with FastAPI
-- React hook (`useWSE`) with full TypeScript types
-- Zustand store integration for state management
-- Protocol versioning (v2) for backward compatibility
-- Priority queues (5 levels) for message ordering
 
 ---
 
