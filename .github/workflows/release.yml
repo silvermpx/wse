@@ -108,9 +108,6 @@ jobs:
           - os: macos-14
             python: '3.12'
             target: macos-aarch64-apple-darwin
-          - os: macos-latest
-            python: '3.12'
-            target: macos-x86_64-apple-darwin
           - os: windows-latest
             python: '3.12'
             target: windows-x86_64-pc-windows-msvc
@@ -134,7 +131,10 @@ jobs:
           pip install pytest pytest-asyncio httpx
 
       - name: Run tests
-        run: pytest tests/ -v --tb=short
+        shell: bash
+        run: |
+          rm -rf wse_server/
+          pytest tests/ -v --tb=short
 
   # ---------------------------------------------------------------------------
   # Publish to PyPI (trusted publishing via OIDC)
