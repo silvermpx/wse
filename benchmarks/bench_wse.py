@@ -1,4 +1,4 @@
-"""WSE (WebSocket Events) Performance Benchmark.
+"""WSE (WebSocket Engine) Performance Benchmark.
 
 Tests:
 1. Connection latency (time to connect + auth + server_ready)
