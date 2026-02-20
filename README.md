@@ -19,7 +19,7 @@ Building real-time features between React and Python is painful. You need WebSoc
 
 Install `wse-server` on your backend, `wse-client` on your frontend. Everything works immediately: auto-reconnection, message encryption, sequence ordering, offline queues, health monitoring. No configuration required for the defaults. Override what you need.
 
-The engine is Rust-accelerated via PyO3. Up to **1.1M msg/s** burst throughput. 285K msg/s sustained with JSON.
+The engine is Rust-accelerated via PyO3. Up to **1M msg/s** burst throughput. 285K msg/s sustained with JSON.
 
 ---
 
@@ -156,7 +156,7 @@ Rust-accelerated engine via PyO3. Benchmarked on Apple M3, single process, 1KB J
 
 | Mode | Throughput | Latency (p50) | Latency (p99) |
 |------|-----------|---------------|---------------|
-| **Rust (binary)** | **1,100,000 msg/s** | **0.009 ms** | **0.04 ms** |
+| **Rust (binary)** | **1,000,000 msg/s** | **0.009 ms** | **0.04 ms** |
 | **Rust (JSON)** | **285,000 msg/s** | **0.03 ms** | **0.15 ms** |
 | Pure Python | 106,000 msg/s | 0.09 ms | 0.4 ms |
 

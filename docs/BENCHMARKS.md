@@ -19,7 +19,7 @@
 
 | Mode | Messages | Time | Rate | Per Message |
 |------|----------|------|------|-------------|
-| **Rust binary (msgpack)** | 10,000 | 0.009 s | **1,100,000 msg/s** | 0.0009 ms |
+| **Rust binary (msgpack)** | 10,000 | 0.009 s | **1,000,000 msg/s** | 0.0009 ms |
 | **Rust JSON** | 10,000 | 0.035 s | **285,000 msg/s** | 0.0035 ms |
 | Pure Python JSON | 1,000 | 0.009 s | 106,000 msg/s | 0.009 ms |
 
@@ -120,7 +120,7 @@ Key observations:
 
 | Feature | WSE (Rust) | WSE (Python) | Socket.IO | ws (Node.js) | Pusher |
 |---------|-----------|-------------|-----------|--------------|--------|
-| Throughput (msg/s) | **1.1M** | 106K | ~25K | ~50K | N/A |
+| Throughput (msg/s) | **1M** | 106K | ~25K | ~50K | N/A |
 | Connection latency | 23 ms | 23 ms | ~50 ms | ~10 ms | ~100 ms |
 | Ping RTT | 0.11 ms | 0.11 ms | ~1 ms | ~0.1 ms | N/A |
 | Compression | zlib (Rust) | zlib + msgpack | per-msg deflate | per-msg deflate | N/A |
@@ -139,7 +139,7 @@ Key observations:
 |-------|-----------|-------------|
 | Initial (unoptimized) | 34,000 msg/s | Baseline |
 | After Python optimization (9 fixes) | 106,000 msg/s | **3.1x** |
-| After Rust acceleration | 1,100,000 msg/s | **10.4x** (vs Python optimized) |
+| After Rust acceleration | 1,000,000 msg/s | **10.4x** (vs Python optimized) |
 
 ### Python Optimization Highlights
 
