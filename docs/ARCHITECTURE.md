@@ -1,0 +1,334 @@
+# WSE Architecture
+
+## Overview
+
+WSE follows a layered architecture with clear separation between transport, protocol, and application concerns. The system supports horizontal scaling through Redis Pub/Sub coordination.
+
+## Backend Architecture
+
+```
+server/
+├── wse_router.py              # FastAPI WebSocket endpoint + HTTP endpoints
+├── dependencies.py            # Dependency injection (snapshot service)
+├── core/
+│   ├── pubsub_bus.py          # Redis Pub/Sub coordination (multi-instance)
+│   ├── types.py               # EventPriority enum
+│   ├── event_mappings.py      # Domain event -> WSE event type mappings
+│   ├── event_transformer.py   # Domain event -> WSE message transformation
+│   └── event_filters.py       # Event filtering rules
+├── websocket/
+│   ├── wse_connection.py      # Connection state, send/receive, background tasks
+│   ├── wse_handlers.py        # Message routing and handler implementations
+│   ├── wse_manager.py         # Connection registry (all active connections)
+│   ├── wse_queue.py           # 5-level priority message queue
+│   ├── wse_compression.py     # zlib + msgpack compression
+│   ├── wse_security.py        # Fernet encryption + JWT signing
+│   └── wse_event_sequencer.py # Sequence tracking and gap detection
+└── services/
+    └── snapshot_service.py    # Full state snapshot provider
+```
+
+### Component Responsibilities
+
+#### WSE Router (`wse_router.py`)
+
+Entry point for WebSocket connections. Handles:
+- WebSocket accept and JWT authentication (multi-source: query, header, cookie)
+- Connection initialization with feature negotiation
+- Main message receive loop with timeout-based polling
+- Graceful shutdown with cleanup
+
+HTTP endpoints:
+- `GET /wse/health` - Service health check
+- `GET /wse/debug` - Debug information (subscriptions, PubSub metrics)
+- `GET /wse/compression-test` - Compression effectiveness test
+
+#### WSE Connection (`wse_connection.py`)
+
+Manages a single WebSocket connection lifecycle:
+
+**Background tasks** (started on initialization):
+1. **Sender loop** - Dequeues from priority queue, sends via WebSocket
+2. **Heartbeat loop** - 15s interval heartbeat + JSON PING for latency
+3. **Health check loop** - 30s interval idle detection + circuit breaker check
+4. **Metrics collection loop** - 60s interval rate/bandwidth calculation
+5. **Sequence cleanup loop** - 5min interval sequencer maintenance
+
+**Message flow (outbound)**:
+```
+send_message() -> rate limit check -> format normalization -> priority queue
+    -> sender_loop() -> _send_raw_message() -> sign -> serialize (orjson)
+    -> compress/encrypt -> WebSocket.send_text/send_bytes
+```
+
+**Message flow (inbound)**:
+```
+WebSocket.receive() -> handle_incoming() -> size validation
+    -> text: _parse_text_message() (strip prefix, orjson parse)
+    -> binary: _parse_binary_message() (C:/E:/M: prefix handling)
+    -> normalize format -> WSEHandler.handle_message()
+```
+
+**Serialization**: Uses `orjson` for 3-5x faster JSON serialization/deserialization compared to stdlib `json`. Custom `_orjson_default` handler for `Decimal` and `Enum` types (orjson natively handles `datetime`, `UUID`, `int`, `float`).
+
+#### WSE Handlers (`wse_handlers.py`)
+
+Routes incoming messages to handler methods. Supports 25+ message types:
+
+| Category | Types |
+|----------|-------|
+| Ping/Pong | `ping`, `PING`, `pong`, `PONG` |
+| Connection | `client_hello`, `connection_state_request` |
+| Subscription | `subscription`, `subscription_update` |
+| Sync | `sync_request` |
+| Health | `health_check`, `health_check_request`, `health_check_response` |
+| Metrics | `metrics_request`, `metrics_response` |
+| Config | `config_update`, `config_request` |
+| Messages | `priority_message`, `batch_message` |
+| Debug | `debug_handlers`, `debug_request`, `sequence_stats_request` |
+| Security | `encryption_request`, `key_rotation_request` |
+| System | `system_status_request` |
+
+Unknown message types are published to the event bus for custom handling.
+
+**Event handler factory** (`_create_event_handler`):
+- Creates a closure per subscription that bridges PubSub events to WebSocket
+- Implements deduplication via `OrderedDict` (FIFO, 5000 entry limit)
+- Detects pre-formatted WSE messages vs raw domain events
+- Transforms raw events via `EventTransformer`
+
+#### Priority Queue (`wse_queue.py`)
+
+5-level async priority queue with backpressure:
+
+```
+CRITICAL (10) -> heartbeat, server_ready, errors
+HIGH     (8)  -> health checks, config responses
+NORMAL   (5)  -> most events (default)
+LOW      (3)  -> background updates
+BACKGROUND(1) -> telemetry, stats
+```
+
+When full (1000 messages):
+1. Drop BACKGROUND messages first
+2. Drop LOW messages
+3. Drop NORMAL messages
+4. HIGH/CRITICAL are never dropped unless queue is entirely HIGH/CRITICAL
+
+#### PubSubBus (`pubsub_bus.py`)
+
+Redis Pub/Sub for multi-instance coordination:
+
+```
+Publisher (any instance) -> Redis PUBLISH wse:user:123:events -> All instances
+    -> Each instance checks local connections -> Sends to matching WebSockets
+```
+
+Features:
+- **SUBSCRIBE** for exact topics, **PSUBSCRIBE** for wildcard patterns
+- **Circuit breaker** with exponential backoff (1.5x factor, 60s max)
+- **Dead Letter Queue** for failed handler invocations (Redis List, 7-day TTL)
+- **Connection-scoped cleanup** via `unsubscribe_connection(conn_id)`
+- All handlers invoked as `asyncio.create_task()` (non-blocking)
+
+#### Compression (`wse_compression.py`)
+
+| Method | When Used | Benefit |
+|--------|-----------|---------|
+| zlib (sync) | Messages < 10 KB | Low latency |
+| zlib (async) | Messages > 10 KB | Non-blocking |
+| msgpack | Binary protocol clients | 30-50% smaller than JSON |
+
+Default threshold: 1024 bytes. Compression level: 6 (balanced speed/ratio).
+
+#### Security (`wse_security.py`)
+
+| Feature | Implementation |
+|---------|----------------|
+| Encryption | Fernet (symmetric) |
+| Message signing | JWT with SHA-256 payload hash + nonce |
+| Session tokens | 24-hour access tokens per connection |
+| Channel encryption | Per-channel tokens with 1-hour expiry |
+
+Selective signing: Only critical operations are signed. Data updates and status messages skip signing for performance.
+
+---
+
+## Frontend Architecture
+
+```
+client/
+├── index.ts                    # Public API exports
+├── types.ts                    # TypeScript interfaces and types
+├── constants.ts                # Protocol constants, event maps
+├── hooks/
+│   └── useWSE.ts               # Main React hook (single entry point)
+├── stores/
+│   ├── useWSEStore.ts          # Zustand store (connection state, metrics)
+│   └── useMessageQueueStore.ts # Message queue state
+├── services/
+│   ├── ConnectionManager.ts    # WebSocket lifecycle management
+│   ├── MessageProcessor.ts     # Inbound message parsing and routing
+│   ├── ConnectionPool.ts       # Multi-endpoint connection pooling
+│   ├── NetworkMonitor.ts       # Online/offline detection
+│   ├── RateLimiter.ts          # Client-side rate limiting
+│   ├── OfflineQueue.ts         # IndexedDB persistence for offline messages
+│   ├── EventSequencer.ts       # Sequence gap detection
+│   └── AdaptiveQualityManager.ts # Dynamic quality adjustment
+├── protocols/
+│   ├── compression.ts          # zlib decompression (pako)
+│   └── transformer.ts          # Domain event -> CustomEvent mapping
+├── handlers/
+│   ├── index.ts                # Handler registry
+│   └── EventHandlers.ts        # Generic event handling
+└── utils/
+    ├── logger.ts               # Structured logging with levels
+    ├── circuitBreaker.ts       # Client-side circuit breaker
+    └── security.ts             # AES-GCM encryption, HMAC signing, ECDH key exchange
+```
+
+### useWSE Hook
+
+The `useWSE` hook is the single entry point for all WSE functionality:
+
+```typescript
+const {
+  isConnected,        // boolean - connection status
+  connectionState,    // ConnectionState enum
+  subscribe,          // (topics: string[]) => void
+  unsubscribe,        // (topics: string[]) => void
+  sendMessage,        // (message: any) => void
+  lastMessage,        // last received message
+  metrics,            // connection metrics
+  diagnostics,        // network diagnostics
+} = useWSE(config);
+```
+
+Configuration:
+```typescript
+interface WSEConfig {
+  endpoints: string[];          // WebSocket URLs
+  reconnection?: {
+    maxRetries?: number;        // default: Infinity
+    initialDelay?: number;      // default: 1000ms
+    maxDelay?: number;          // default: 30000ms
+    backoffMultiplier?: number; // default: 1.5
+  };
+  security?: {
+    encryption?: boolean;       // default: false
+    signing?: boolean;          // default: false
+  };
+  performance?: {
+    compression?: boolean;      // default: true
+    batchSize?: number;         // default: 10
+    batchTimeout?: number;      // default: 100ms
+  };
+  offline?: {
+    enabled?: boolean;          // default: true
+    maxSize?: number;           // default: 1000
+  };
+  diagnostics?: {
+    enabled?: boolean;          // default: true
+  };
+}
+```
+
+### State Management Pattern
+
+```
+Server data (snapshots, updates)  ->  React Query + WSE cache merge
+Local UI state (toggles, forms)   ->  useState
+Persisted UI state (preferences)  ->  Zustand
+```
+
+React Query integration (TkDodo pattern):
+```typescript
+// staleTime: Infinity - WSE controls all updates
+const { data } = useQuery({
+  queryKey: ['resources'],
+  queryFn: fetchResources,
+  staleTime: Infinity,
+});
+
+// WSE merges into React Query cache
+useEffect(() => {
+  const handler = (e: CustomEvent) => {
+    queryClient.setQueryData(['resources'], (old) => ({
+      ...old,
+      ...e.detail,
+    }));
+  };
+  window.addEventListener('resource_update', handler);
+  return () => window.removeEventListener('resource_update', handler);
+}, [queryClient]);
+```
+
+### Message Processing Pipeline
+
+```
+WebSocket.onmessage
+    -> Binary: check C:/E:/M: prefix -> decompress/decrypt/unpack
+    -> Text: strip WSE/S/U prefix -> JSON.parse
+    -> Deduplication check (message ID)
+    -> Sequence check (gap detection)
+    -> Handler registry lookup by event type
+    -> Domain handler (custom handlers per event type)
+    -> window.dispatchEvent(new CustomEvent(eventType, { detail: payload }))
+    -> React Query cache merge (via event listener)
+```
+
+---
+
+## Multi-Instance Scaling
+
+```
+                    Load Balancer
+                   /      |      \
+              Instance A  B       C
+                 |        |       |
+              Redis Pub/Sub (shared)
+                 |        |       |
+              User 1    User 2  User 3
+```
+
+Each instance:
+1. Accepts WebSocket connections from its assigned users
+2. Subscribes to Redis channels for connected users
+3. Receives ALL published events via Redis broadcast
+4. Checks if the target user is connected to THIS instance
+5. Sends to local WebSocket if connected, ignores otherwise
+
+Event flow:
+```
+Domain Event (any instance)
+    -> WSE Publisher -> PubSubBus.publish()
+    -> Redis PUBLISH wse:user:123:events
+    -> ALL instances receive via SUBSCRIBE/PSUBSCRIBE
+    -> Instance with user 123 connected -> sends to WebSocket
+    -> Other instances -> silently ignore
+```
+
+## Metrics
+
+### Prometheus Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `ws_connections_active` | Gauge | Current active connections |
+| `ws_connections_total` | Counter | Total connections (by user) |
+| `ws_disconnections_total` | Counter | Disconnections (by reason) |
+| `ws_messages_sent_total` | Counter | Messages sent (by type, priority) |
+| `ws_messages_received_total` | Counter | Messages received (by type) |
+| `ws_message_send_latency_seconds` | Histogram | Send latency (by priority) |
+| `ws_bytes_sent_total` | Counter | Total bytes sent |
+| `ws_bytes_received_total` | Counter | Total bytes received |
+| `ws_queue_size` | Gauge | Queue depth (by connection, priority) |
+| `ws_queue_dropped_total` | Counter | Dropped messages (by connection, priority) |
+| `ws_queue_backpressure` | Gauge | Backpressure indicator |
+| `pubsub_published_total` | Counter | PubSub publishes (by topic, priority) |
+| `pubsub_received_total` | Counter | PubSub receives (by pattern) |
+| `pubsub_publish_latency_seconds` | Histogram | PubSub publish latency |
+| `pubsub_handler_errors_total` | Counter | Handler errors (by pattern, error type) |
+| `dlq_messages_total` | Counter | Dead letter queue entries |
+| `dlq_size` | Gauge | DLQ size (by channel) |
+| `dlq_replayed_total` | Counter | DLQ replayed messages |
