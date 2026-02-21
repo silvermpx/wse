@@ -534,6 +534,46 @@ impl RustCompressionManager {
 }
 
 // ---------------------------------------------------------------------------
+// Public: serde_json::Value -> rmpv::Value conversion (used by server.rs)
+// ---------------------------------------------------------------------------
+
+/// Convert serde_json::Value to rmpv::Value for msgpack serialization.
+/// Used by send_event() when a connection requests msgpack format.
+pub fn serde_json_to_rmpv(val: &serde_json::Value) -> rmpv::Value {
+    match val {
+        serde_json::Value::Null => rmpv::Value::Nil,
+        serde_json::Value::Bool(b) => rmpv::Value::Boolean(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                rmpv::Value::Integer(rmpv::Integer::from(i))
+            } else if let Some(u) = n.as_u64() {
+                rmpv::Value::Integer(rmpv::Integer::from(u))
+            } else if let Some(f) = n.as_f64() {
+                rmpv::Value::F64(f)
+            } else {
+                rmpv::Value::Nil
+            }
+        }
+        serde_json::Value::String(s) => rmpv::Value::String(s.clone().into()),
+        serde_json::Value::Array(arr) => {
+            rmpv::Value::Array(arr.iter().map(serde_json_to_rmpv).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let pairs: Vec<(rmpv::Value, rmpv::Value)> = map
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        rmpv::Value::String(k.clone().into()),
+                        serde_json_to_rmpv(v),
+                    )
+                })
+                .collect();
+            rmpv::Value::Map(pairs)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 

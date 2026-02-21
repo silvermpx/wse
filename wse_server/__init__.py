@@ -2,5 +2,5 @@
 
 from .router import SnapshotProvider, WSEConfig, create_wse_router
 
-__version__ = "1.0.3"
+__version__ = "1.1.0"
 __all__ = ["create_wse_router", "WSEConfig", "SnapshotProvider"]

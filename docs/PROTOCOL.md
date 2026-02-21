@@ -93,13 +93,29 @@ Encryption uses:
 - **IV**: 12 bytes (96 bits), unique per message
 - **Key exchange**: ECDH P-256
 
+### Binary Mode: JSON (default since v1.1)
+
+All JSON messages are sent as WebSocket binary frames instead of text frames. This eliminates UTF-8 validation overhead in the WebSocket layer, providing 5-15% higher throughput. The payload format is identical — category prefix followed by JSON — but delivered in a binary frame.
+
+Clients should handle both text and binary frames containing JSON for backward compatibility.
+
 ### Binary Mode: MessagePack
 
-For ultra-compact serialization, `M:` prefix indicates msgpack:
+For compact serialization, `M:` prefix indicates msgpack-encoded data:
 
 ```
 M:<msgpack-encoded-data>
 ```
+
+To opt in, connect with `?format=msgpack` query parameter:
+
+```
+ws://host:port/wse?format=msgpack
+```
+
+When enabled, all outbound messages from the server use msgpack instead of JSON. The msgpack payload contains the same fields (`t`, `p`, `id`, `ts`, `seq`, `v`) but encoded with MessagePack. No category prefix is used — the `M:` header replaces it.
+
+Requires `@msgpack/msgpack` (JS) or `msgpack` (Python) on the client side.
 
 ## Connection Lifecycle
 

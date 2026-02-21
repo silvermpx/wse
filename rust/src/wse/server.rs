@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use super::compression::serde_json_to_rmpv;
 use ahash::AHashSet;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
@@ -37,6 +38,7 @@ use uuid::Uuid;
 
 struct ConnectionHandle {
     tx: mpsc::UnboundedSender<Message>,
+    use_msgpack: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +109,8 @@ struct SharedState {
     drain_mode: AtomicBool,
     inbound_queue: std::sync::Mutex<std::collections::VecDeque<InboundEvent>>,
     inbound_condvar: std::sync::Condvar,
+    // Per-connection format preference (sync access for send_event on Python thread)
+    conn_formats: std::sync::Mutex<HashMap<String, bool>>,
 }
 
 unsafe impl Send for SharedState {}
@@ -123,6 +127,7 @@ impl SharedState {
             drain_mode: AtomicBool::new(false),
             inbound_queue: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(4096)),
             inbound_condvar: std::sync::Condvar::new(),
+            conn_formats: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -313,6 +318,8 @@ fn message_category(msg_type: &str) -> &'static str {
 async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<SharedState>) {
     let cookies = Arc::new(std::sync::Mutex::new(String::new()));
     let cookies_clone = cookies.clone();
+    let wants_msgpack = Arc::new(std::sync::Mutex::new(false));
+    let wants_msgpack_clone = wants_msgpack.clone();
 
     let ws_stream = match tokio_tungstenite::accept_hdr_async(
         stream,
@@ -321,6 +328,12 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                 && let Ok(s) = cv.to_str()
             {
                 *cookies_clone.lock().unwrap() = s.to_string();
+            }
+            // Extract ?format=msgpack from query string
+            if let Some(query) = req.uri().query() {
+                if query.contains("format=msgpack") {
+                    *wants_msgpack_clone.lock().unwrap() = true;
+                }
             }
             Ok(response)
         },
@@ -335,6 +348,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     };
 
     let cookie_str = cookies.lock().unwrap().clone();
+    let use_msgpack = *wants_msgpack.lock().unwrap();
     let conn_id: Arc<String> = Arc::new(Uuid::now_v7().to_string());
     let (write_half, read_half) = ws_stream.split();
     let mut read_half = read_half;
@@ -350,7 +364,18 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
             let _ = write_half.close().await;
             return;
         }
-        conns.insert((*conn_id).clone(), ConnectionHandle { tx: tx.clone() });
+        conns.insert(
+            (*conn_id).clone(),
+            ConnectionHandle {
+                tx: tx.clone(),
+                use_msgpack,
+            },
+        );
+    }
+    // Store format preference for sync access from send_event()
+    if use_msgpack {
+        let mut formats = state.conn_formats.lock().unwrap();
+        formats.insert((*conn_id).clone(), true);
     }
 
     // Fire on_connect (drain mode: push to queue; callback mode: call Python)
@@ -553,6 +578,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     {
         let mut conns = state.connections.write().await;
         conns.remove(&*conn_id);
+    }
+    {
+        let mut formats = state.conn_formats.lock().unwrap();
+        formats.remove(&*conn_id);
     }
     if drain {
         state.push_inbound(InboundEvent::Disconnect {
@@ -904,27 +933,23 @@ impl RustWSEServer {
         // v goes last
         map.insert("v".to_string(), serde_json::Value::Number(1.into()));
 
-        // Serialize
-        let json_str = serde_json::to_string(&serde_json::Value::Object(map))
-            .map_err(|e| PyRuntimeError::new_err(format!("JSON error: {e}")))?;
+        // Check if this connection wants msgpack
+        let use_msgpack = {
+            let formats = self.shared.conn_formats.lock().unwrap();
+            formats.get(conn_id).copied().unwrap_or(false)
+        };
 
-        // Category prefix + payload
-        let category = message_category(&msg_type);
-        let payload_str = format!("{}{}", category, json_str);
-        let payload_bytes = payload_str.as_bytes();
         let byte_count;
 
-        if compression_threshold > 0 && payload_bytes.len() > compression_threshold {
-            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-            encoder
-                .write_all(payload_bytes)
-                .map_err(|e| PyRuntimeError::new_err(format!("Compress error: {e}")))?;
-            let compressed = encoder
-                .finish()
-                .map_err(|e| PyRuntimeError::new_err(format!("Compress finish: {e}")))?;
-            let mut final_bytes = Vec::with_capacity(compressed.len() + 2);
-            final_bytes.extend_from_slice(b"C:");
-            final_bytes.extend_from_slice(&compressed);
+        if use_msgpack {
+            // Msgpack path: M: prefix + rmpv serialize (binary frame)
+            let rmpv_val = serde_json_to_rmpv(&serde_json::Value::Object(map));
+            let mut buf = Vec::new();
+            rmpv::encode::write_value(&mut buf, &rmpv_val)
+                .map_err(|e| PyRuntimeError::new_err(format!("Msgpack error: {e}")))?;
+            let mut final_bytes = Vec::with_capacity(buf.len() + 2);
+            final_bytes.extend_from_slice(b"M:");
+            final_bytes.extend_from_slice(&buf);
             byte_count = final_bytes.len();
             cmd_tx
                 .send(ServerCommand::SendPrebuilt {
@@ -933,13 +958,43 @@ impl RustWSEServer {
                 })
                 .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         } else {
-            byte_count = payload_str.len();
-            cmd_tx
-                .send(ServerCommand::SendPrebuilt {
-                    conn_id: conn_id.to_owned(),
-                    message: Message::Text(payload_str.into()),
-                })
-                .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
+            // JSON path: serialize + category prefix
+            let json_str = serde_json::to_string(&serde_json::Value::Object(map))
+                .map_err(|e| PyRuntimeError::new_err(format!("JSON error: {e}")))?;
+
+            let category = message_category(&msg_type);
+            let payload_str = format!("{}{}", category, json_str);
+            let payload_bytes = payload_str.as_bytes();
+
+            if compression_threshold > 0 && payload_bytes.len() > compression_threshold {
+                // Compressed: C: prefix + zlib (binary frame)
+                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+                encoder
+                    .write_all(payload_bytes)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Compress error: {e}")))?;
+                let compressed = encoder
+                    .finish()
+                    .map_err(|e| PyRuntimeError::new_err(format!("Compress finish: {e}")))?;
+                let mut final_bytes = Vec::with_capacity(compressed.len() + 2);
+                final_bytes.extend_from_slice(b"C:");
+                final_bytes.extend_from_slice(&compressed);
+                byte_count = final_bytes.len();
+                cmd_tx
+                    .send(ServerCommand::SendPrebuilt {
+                        conn_id: conn_id.to_owned(),
+                        message: Message::Binary(final_bytes.into()),
+                    })
+                    .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
+            } else {
+                // Uncompressed JSON: binary frame (skips UTF-8 validation overhead)
+                byte_count = payload_str.len();
+                cmd_tx
+                    .send(ServerCommand::SendPrebuilt {
+                        conn_id: conn_id.to_owned(),
+                        message: Message::Binary(payload_str.into_bytes().into()),
+                    })
+                    .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
+            }
         }
 
         Ok(byte_count)
