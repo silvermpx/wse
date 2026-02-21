@@ -29,7 +29,7 @@ The Rust server extracts the `access_token` cookie from the HTTP upgrade headers
 
 On success, the server sends `server_ready` directly from Rust and pushes an `AuthConnect` event to the drain queue with the validated `user_id`. Python receives the pre-validated user ID and skips JWT decode entirely.
 
-**Performance:** 0.01ms per JWT decode in Rust vs ~0.85ms in Python (85x faster). Connection latency drops from ~23ms to 0.47ms median.
+**Performance:** 0.01ms per JWT decode in Rust vs ~0.85ms in Python (85x faster). Connection latency drops from ~23ms to 0.53ms median.
 
 #### Python JWT (fallback)
 

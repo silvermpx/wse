@@ -19,7 +19,7 @@ Client connects -> Rust WebSocket handshake -> Rust extracts cookie
 -> Python does async setup (subscriptions, snapshots)
 ```
 
-**Connection latency improvement:** Median 0.47ms (was ~23ms with Python JWT). 19x faster.
+**Connection latency improvement:** Median 0.53ms (was ~23ms with Python JWT). 27x faster.
 
 ### E2E Encryption: AES-GCM-256 + ECDH P-256
 
@@ -47,7 +47,7 @@ New Python classes:
 
 ### Connection Latency Optimization
 
-Backend handshake latency reduced by 19x (median 23ms -> 0.47ms):
+Backend handshake latency reduced by 27x (median 23ms -> 0.53ms):
 
 - **Rust JWT validation** — JWT decoded entirely in Rust during WebSocket handshake, zero GIL acquisition on the connection critical path
 - **OnceLock handshake** — replaced 2x `Arc<Mutex>` with a single `OnceLock<HandshakeResult>` in the WebSocket accept callback. Eliminates 4 lock operations per connection.

@@ -19,7 +19,7 @@ Building real-time features between React and Python is painful. You need WebSoc
 
 Install `wse-server` on your backend, `wse-client` on your frontend. Everything works immediately: auto-reconnection, message encryption, sequence ordering, offline queues, health monitoring. No configuration required for the defaults. Override what you need.
 
-The engine is Rust-accelerated via PyO3. Up to **1M msg/s** burst throughput. 132K msg/s sustained. Sub-millisecond connection latency (0.47ms median) with Rust JWT authentication.
+The engine is Rust-accelerated via PyO3. Up to **1M msg/s** burst throughput. 129K msg/s sustained. Sub-millisecond connection latency (0.53ms median) with Rust JWT authentication.
 
 ---
 
@@ -152,16 +152,16 @@ Compression, sequencing, filtering, rate limiting, and the WebSocket server itse
 
 ## Performance
 
-Rust-accelerated engine via PyO3. Benchmarked on Apple M3, single process.
+Rust-accelerated engine via PyO3. Benchmarked on Apple M2, single process.
 
 | Metric | Result |
 |--------|--------|
 | **Burst throughput** | **1,000,000 msg/s** (msgpack) |
-| **Sustained throughput** | **132,000 msg/s** (JSON, 5s) |
-| **Connection latency** | **0.47 ms** median (Rust JWT) |
-| **Ping RTT** | **0.14 ms** median |
-| **64KB messages** | **40,604 msg/s** (2.5 GB/s) |
-| **Concurrent (50 senders)** | **126,481 msg/s** |
+| **Sustained throughput** | **129,000 msg/s** (JSON, 10s) |
+| **Connection latency** | **0.53 ms** median (Rust JWT) |
+| **Ping RTT** | **0.09 ms** median |
+| **64KB messages** | **39,267 msg/s** (2.5 GB/s) |
+| **Concurrent (50 senders)** | **129,867 msg/s** |
 
 ---
 
