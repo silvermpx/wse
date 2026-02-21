@@ -561,12 +561,7 @@ pub fn serde_json_to_rmpv(val: &serde_json::Value) -> rmpv::Value {
         serde_json::Value::Object(map) => {
             let pairs: Vec<(rmpv::Value, rmpv::Value)> = map
                 .iter()
-                .map(|(k, v)| {
-                    (
-                        rmpv::Value::String(k.clone().into()),
-                        serde_json_to_rmpv(v),
-                    )
-                })
+                .map(|(k, v)| (rmpv::Value::String(k.clone().into()), serde_json_to_rmpv(v)))
                 .collect();
             rmpv::Value::Map(pairs)
         }
