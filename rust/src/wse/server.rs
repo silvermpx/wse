@@ -38,7 +38,6 @@ use uuid::Uuid;
 
 struct ConnectionHandle {
     tx: mpsc::UnboundedSender<Message>,
-    use_msgpack: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -330,10 +329,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                 *cookies_clone.lock().unwrap() = s.to_string();
             }
             // Extract ?format=msgpack from query string
-            if let Some(query) = req.uri().query() {
-                if query.contains("format=msgpack") {
-                    *wants_msgpack_clone.lock().unwrap() = true;
-                }
+            if let Some(query) = req.uri().query()
+                && query.contains("format=msgpack")
+            {
+                *wants_msgpack_clone.lock().unwrap() = true;
             }
             Ok(response)
         },
@@ -364,13 +363,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
             let _ = write_half.close().await;
             return;
         }
-        conns.insert(
-            (*conn_id).clone(),
-            ConnectionHandle {
-                tx: tx.clone(),
-                use_msgpack,
-            },
-        );
+        conns.insert((*conn_id).clone(), ConnectionHandle { tx: tx.clone() });
     }
     // Store format preference for sync access from send_event()
     if use_msgpack {
