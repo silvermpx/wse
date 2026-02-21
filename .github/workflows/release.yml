@@ -105,6 +105,9 @@ jobs:
           - os: ubuntu-latest
             python: '3.13'
             target: linux-x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            python: '3.14'
+            target: linux-x86_64-unknown-linux-gnu
           - os: macos-14
             python: '3.12'
             target: macos-aarch64-apple-darwin

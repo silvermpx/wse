@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.1.1 (2026-02-21)
+
+### CI/CD
+
+- Added Python 3.14 to test matrix (CI + Release)
+- Fixed cargo fmt and clippy warnings
+
 ## v1.1.0 (2026-02-21)
 
 ### Binary Frames for JSON
