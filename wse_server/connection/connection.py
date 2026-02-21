@@ -1033,6 +1033,10 @@ class WSEConnection:
             except Exception as e:
                 log.error(f"Error in cleanup hook for {self.conn_id}: {e}")
 
+        # Clean up encryption keys for this connection
+        if hasattr(self.security_manager, "remove_connection"):
+            self.security_manager.remove_connection(self.conn_id)
+
         # Bulk unsubscribe all handlers
         try:
             removed = await self.event_bus.unsubscribe_connection(self.conn_id)

@@ -1,5 +1,87 @@
 # Changelog
 
+## v1.2.0 (2026-02-22)
+
+### Rust JWT Authentication
+
+Pure Rust HS256 JWT encode/decode module, eliminating Python JWT libraries from the connection critical path:
+
+- **`rust_jwt_encode(claims, secret)`** — HS256 JWT creation with base64url encoding
+- **`rust_jwt_decode(token, secret, issuer, audience)`** — JWT validation with signature verification, expiry check, issuer/audience claims
+- **Zero-GIL handshake authentication** — when `jwt_secret` is configured, the Rust server validates JWT cookies during the WebSocket handshake and sends `server_ready` directly from Rust, before any Python code runs
+- **`InboundEvent::AuthConnect`** — new drain queue event type for Rust-authenticated connections. Python receives `user_id` directly and skips JWT decode entirely
+- **Cookie extraction in Rust** — `access_token` parsed from HTTP cookie header using zero-copy string operations during handshake
+
+**Connection flow with Rust JWT:**
+```
+Client connects -> Rust WebSocket handshake -> Rust extracts cookie
+-> Rust JWT decode (0.01ms) -> Rust sends server_ready -> push AuthConnect to drain
+-> Python does async setup (subscriptions, snapshots)
+```
+
+**Connection latency improvement:** Median 0.47ms (was ~23ms with Python JWT). 19x faster.
+
+### E2E Encryption: AES-GCM-256 + ECDH P-256
+
+Full end-to-end encryption with ECDH key exchange, matching the frontend `security.ts` implementation exactly:
+
+- **Rust-accelerated AES-GCM-256** encrypt/decrypt via `aes-gcm` crate (`rust_aes_gcm_encrypt`, `rust_aes_gcm_decrypt`)
+- **ECDH P-256 key exchange** via `p256` crate (`rust_ecdh_generate_keypair`, `rust_ecdh_derive_shared_secret`)
+- **HKDF-SHA256** key derivation with salt=`wse-encryption`, info=`aes-gcm-key` (matching frontend)
+- **Per-connection session keys** — each connection gets its own ECDH keypair and derived AES-256 key
+- Wire format: `E:` prefix + 12-byte IV + AES-GCM ciphertext + 16-byte auth tag
+
+**Key exchange flow:**
+
+1. Server generates ECDH keypair, sends public key (65 bytes SEC1) in `server_ready`
+2. Client sends its public key in `client_hello`
+3. Both derive shared AES-256 key via ECDH + HKDF
+4. All subsequent `E:`-prefixed messages use this key
+
+New Python classes:
+
+- `AesGcmProvider` — built-in `EncryptionProvider` implementation with per-connection keys
+- `SecurityManager.generate_keypair(conn_id)` — ECDH keypair generation
+- `SecurityManager.derive_session_key(conn_id, peer_pk)` — session key derivation
+- `SecurityManager.remove_connection(conn_id)` — cleanup on disconnect
+
+### Connection Latency Optimization
+
+Backend handshake latency reduced by 19x (median 23ms -> 0.47ms):
+
+- **Rust JWT validation** — JWT decoded entirely in Rust during WebSocket handshake, zero GIL acquisition on the connection critical path
+- **OnceLock handshake** — replaced 2x `Arc<Mutex>` with a single `OnceLock<HandshakeResult>` in the WebSocket accept callback. Eliminates 4 lock operations per connection.
+- **DashMap for conn_formats** — replaced `std::sync::Mutex<HashMap>` with lock-free `DashMap` for msgpack format tracking. One fewer lock acquisition during connection registration.
+- **spawn_blocking for on_connect** — Python `on_connect` callback now runs in a background thread via `tokio::task::spawn_blocking` instead of blocking the async connection setup.
+- **SIMD via target-cpu=native** — `.cargo/config.toml` enables native CPU features (AVX2/NEON) for faster zlib compression, HTTP header parsing, and HashMap operations.
+
+### Large Message Throughput
+
+64KB message throughput improved from 8K msg/s to 40K+ msg/s (5x improvement, 2.5 GB/s bandwidth):
+
+- Binary frame path optimization in Rust transport
+- Reduced allocation overhead for large payloads
+- Direct buffer flush without intermediate copies
+
+### Selective Message Signing
+
+Configurable set of message types that are always signed for integrity, regardless of the global `message_signing_enabled` flag:
+
+- `DEFAULT_SIGNED_MESSAGE_TYPES` — empty `frozenset` by default (configure for your domain)
+- `WSEConnection(signed_message_types=frozenset({...}))` — pass your critical types
+- Logic: sign if `message_signing_enabled` OR `message_type in signed_message_types`
+- Signature format: `hash:timestamp:nonce:hmac` (or JWT via TokenProvider)
+
+### Test Suite
+
+- **Rust tests**: 15 inline tests — JWT encode/decode (10 tests), AES-GCM roundtrip, wrong-key rejection, ECDH symmetry, HKDF derivation, HMAC determinism
+- **Python tests**: 100 security tests (was 48) — added JWT encode/decode, Rust crypto, ECDH, AesGcmProvider, SecurityManager ECDH, and full E2E encryption tests
+- **Full suite**: 376+ tests passing
+
+### Dependencies
+
+New Rust crates: `aes-gcm 0.10`, `p256 0.13` (with `ecdh` feature), `hkdf 0.12`, `dashmap 6`, `base64 0.22`
+
 ## v1.1.1 (2026-02-21)
 
 ### CI/CD

@@ -1,0 +1,16 @@
+# Enable SIMD optimizations for local builds.
+# zlib-rs: AVX2/NEON adler32, crc32, deflate matching
+# httparse: AVX2/NEON header scanning (inside tungstenite)
+# ahash: AES-NI hardware hashing
+#
+# NOTE: Binaries are tied to the CPU they're compiled on.
+# CI release builds must NOT use target-cpu=native.
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]

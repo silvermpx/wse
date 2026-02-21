@@ -148,7 +148,6 @@ export class ConnectionManager {
     if (this.ws) {
       logger.info('[ConnectionManager] Disconnecting existing connection');
       this.disconnect();
-      await new Promise(resolve => setTimeout(resolve, 100));
     }
 
     const now = Date.now();
@@ -225,7 +224,6 @@ export class ConnectionManager {
         logger.info('[ConnectionManager] Closing existing WebSocket connection');
         this.ws.close();
         this.ws = null;
-        await new Promise(resolve => setTimeout(resolve, 100));
       }
 
       this.onStateChange(ConnectionState.CONNECTING);

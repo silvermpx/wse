@@ -5,17 +5,65 @@
 - **Hardware**: Apple M3 Max (16 cores)
 - **OS**: macOS 15.3.2
 - **Python**: 3.14
-- **Rust**: 1.84+ (PyO3 0.23, maturin 1.8)
+- **Rust**: 1.84+ (PyO3 0.28, maturin 1.8)
 - **Server**: FastAPI + Granian (ASGI)
 - **Network**: localhost (127.0.0.1)
-- **Single connection**: Benchmarks measure single-client throughput
 - **Compression**: Disabled for throughput tests (raw protocol performance)
 
 ---
 
-## Rust-Accelerated Results
+## v1.2 Results (Rust Transport + JWT)
 
-### Burst Throughput
+### Connection Latency
+
+Time from WebSocket connect to receiving `server_ready` (includes TCP handshake, HTTP upgrade, JWT validation, connection registration).
+
+| Metric | v1.2 (Rust JWT) | v1.0 (Python JWT) | Improvement |
+|--------|----------------|-------------------|-------------|
+| **Mean** | **1.25 ms** | 23.12 ms | **19x** |
+| **Median** | **0.47 ms** | 21.81 ms | **46x** |
+| p95 | 15.33 ms | 34.82 ms | 2.3x |
+| Min | 0.29 ms | 18.08 ms | 62x |
+
+### Ping/Pong RTT
+
+| Metric | v1.2 | v1.0 |
+|--------|------|------|
+| **Mean** | **0.17 ms** | 0.14 ms |
+| **Median** | **0.14 ms** | 0.11 ms |
+| p95 | 0.32 ms | 0.19 ms |
+| p99 | 0.56 ms | 0.38 ms |
+
+### Throughput
+
+| Test | v1.2 Rate | v1.0 Rate | Improvement |
+|------|----------|----------|-------------|
+| **Burst (5000 msgs)** | **121,654 msg/s** | 106,180 msg/s | 1.15x |
+| **Sustained (5s)** | **132,013 msg/s** | ~85,000 msg/s | 1.55x |
+| **Concurrent (50 senders)** | **126,481 msg/s** | N/A | — |
+| **Binary 1KB** | **102,459 msg/s** | N/A | — |
+
+### Large Message Performance
+
+| Size | v1.2 Rate | v1.2 Bandwidth | v1.0 Rate | v1.0 Bandwidth | Improvement |
+|------|----------|----------------|----------|----------------|-------------|
+| 64 KB | **40,604 msg/s** | **2.5 GB/s** | 8,229 msg/s | 514 MB/s | **5x** |
+| 16 KB | 75,187 msg/s | 1.2 GB/s | 27,624 msg/s | 432 MB/s | 2.7x |
+| 4 KB | 98,231 msg/s | 385 MB/s | 82,248 msg/s | 324 MB/s | 1.2x |
+| 1 KB | 121,654 msg/s | 116 MB/s | 105,882 msg/s | 106 MB/s | 1.15x |
+
+### Rapid Connect/Disconnect
+
+| Metric | v1.2 | v1.0 | Improvement |
+|--------|------|------|-------------|
+| **Mean** | **1.16 ms** | 21.49 ms | **19x** |
+| Median | 0.82 ms | 20.29 ms | 25x |
+| Min | 0.41 ms | 16.28 ms | 40x |
+| Max | 3.89 ms | 28.24 ms | 7x |
+
+---
+
+## Burst Throughput (Rust Engine)
 
 | Mode | Messages | Time | Rate | Per Message |
 |------|----------|------|------|-------------|
@@ -23,7 +71,7 @@
 | **Rust JSON** | 10,000 | 0.035 s | **285,000 msg/s** | 0.0035 ms |
 | Pure Python JSON | 1,000 | 0.009 s | 106,000 msg/s | 0.009 ms |
 
-### Sustained Throughput (60s)
+## Sustained Throughput (Rust Engine, 60s)
 
 | Mode | Rate | Latency (p50) | Latency (p99) |
 |------|------|---------------|---------------|
@@ -31,10 +79,11 @@
 | **Rust JSON** | **180,000 msg/s** | 0.03 ms | 0.15 ms |
 | Pure Python JSON | 85,000 msg/s | 0.09 ms | 0.4 ms |
 
-### Rust Acceleration by Component
+## Rust Acceleration by Component
 
 | Component | Pure Python | Rust | Speedup |
 |-----------|------------|------|---------|
+| JWT decode (HS256) | 850 us | 10 us | **85x** |
 | Compression (1KB zlib) | 12 us | 1.8 us | **6.7x** |
 | Event transform | 45 us | 3 us | **15x** |
 | Sequence + dedup | 8 us | 0.3 us | **27x** |
@@ -45,11 +94,9 @@
 
 ---
 
-## Pure Python Baseline Results
+## Pure Python Baseline Results (v1.0)
 
-### Test 1: Connection Latency (20 rounds)
-
-Time from WebSocket connect to receiving `server_ready` message (includes TCP handshake, HTTP upgrade, JWT auth, subscription setup, and snapshot delivery).
+### Connection Latency (20 rounds)
 
 | Metric | Value |
 |--------|-------|
@@ -59,9 +106,7 @@ Time from WebSocket connect to receiving `server_ready` message (includes TCP ha
 | Min | 18.08 ms |
 | Max | 45.28 ms |
 
-### Test 2: Ping/Pong RTT (100 rounds)
-
-WebSocket-level ping/pong round-trip time.
+### Ping/Pong RTT (100 rounds)
 
 | Metric | Value |
 |--------|-------|
@@ -69,36 +114,8 @@ WebSocket-level ping/pong round-trip time.
 | Median | 0.11 ms |
 | p95 | 0.19 ms |
 | p99 | 0.38 ms |
-| Min | 0.08 ms |
-| Max | 1.82 ms |
 
-### Test 3: Client-to-Server Throughput (1000 messages)
-
-Raw message send rate from client to server (small JSON messages).
-
-| Metric | Value |
-|--------|-------|
-| Messages | 1,000 |
-| Time | 0.009 s |
-| Rate | **106,180 msg/sec** |
-| Per message | 0.009 ms |
-
-### Test 4: Rapid Connect/Disconnect (10 sequential)
-
-Sequential connect -> receive first message -> disconnect cycles.
-
-| Metric | Value |
-|--------|-------|
-| Connections | 10/10 |
-| Mean | 21.49 ms |
-| Median | 20.29 ms |
-| Min | 16.28 ms |
-| Max | 28.24 ms |
-| Total | 214 ms |
-
-### Test 5: Message Size Impact (200 messages per size)
-
-Throughput and bandwidth at different message sizes.
+### Message Size Impact (200 messages per size)
 
 | Size | Rate | Bandwidth | Per Message |
 |------|------|-----------|-------------|
@@ -109,11 +126,6 @@ Throughput and bandwidth at different message sizes.
 | 16,413 B | 27,624 msg/s | 432.2 MB/s | 0.036 ms |
 | 65,565 B | 8,229 msg/s | 514.3 MB/s | 0.122 ms |
 
-Key observations:
-- **No throughput cliff at 4 KB** (common with other WebSocket libraries)
-- Linear bandwidth scaling up to 64 KB
-- Peak bandwidth: 514 MB/s at 64 KB messages
-
 ---
 
 ## Comparison with Alternatives
@@ -121,8 +133,10 @@ Key observations:
 | Feature | WSE (Rust) | WSE (Python) | Socket.IO | ws (Node.js) | Pusher |
 |---------|-----------|-------------|-----------|--------------|--------|
 | Throughput (msg/s) | **1M** | 106K | ~25K | ~50K | N/A |
-| Connection latency | 23 ms | 23 ms | ~50 ms | ~10 ms | ~100 ms |
-| Ping RTT | 0.11 ms | 0.11 ms | ~1 ms | ~0.1 ms | N/A |
+| Connection latency | **0.47 ms** | 23 ms | ~50 ms | ~10 ms | ~100 ms |
+| 64KB throughput | **40K msg/s** | 8K msg/s | ~2K | ~5K | N/A |
+| Ping RTT | 0.14 ms | 0.11 ms | ~1 ms | ~0.1 ms | N/A |
+| JWT auth | Rust (0.01ms) | Python | N/A | N/A | N/A |
 | Compression | zlib (Rust) | zlib + msgpack | per-msg deflate | per-msg deflate | N/A |
 | Priority queue | 5-level (Rust) | 5-level | No | No | No |
 | Circuit breaker | Yes | Yes | No | No | No |
@@ -135,11 +149,12 @@ Key observations:
 
 ## Performance Optimization History
 
-| Phase | Throughput | Improvement |
-|-------|-----------|-------------|
-| Initial (unoptimized) | 34,000 msg/s | Baseline |
-| After Python optimization (9 fixes) | 106,000 msg/s | **3.1x** |
-| After Rust acceleration | 1,000,000 msg/s | **10.4x** (vs Python optimized) |
+| Phase | Throughput | Connection Latency | Improvement |
+|-------|-----------|-------------------|-------------|
+| Initial (unoptimized) | 34,000 msg/s | ~50 ms | Baseline |
+| After Python optimization (9 fixes) | 106,000 msg/s | 23 ms | **3.1x** throughput |
+| After Rust acceleration (v1.0) | 1,000,000 msg/s | 23 ms | **10.4x** throughput |
+| After Rust JWT + transport (v1.2) | 1,000,000 msg/s | **0.47 ms** | **19x** latency, **5x** large msg |
 
 ### Python Optimization Highlights
 
@@ -151,11 +166,13 @@ Key observations:
 
 ### Rust Acceleration Highlights
 
-1. **flate2 compression**: 6.7x faster than Python zlib
-2. **AHashSet dedup**: 27x faster duplicate detection
-3. **BinaryHeap priority queue**: 25x faster message ordering
-4. **Zero-copy transforms**: 15x faster event envelope construction
-5. **Atomic rate limiter**: 40x faster token bucket
+1. **Rust JWT in handshake**: 19x faster connection setup (GIL eliminated from critical path)
+2. **flate2 compression**: 6.7x faster than Python zlib
+3. **AHashSet dedup**: 27x faster duplicate detection
+4. **BinaryHeap priority queue**: 25x faster message ordering
+5. **Zero-copy transforms**: 15x faster event envelope construction
+6. **Atomic rate limiter**: 40x faster token bucket
+7. **Large message path**: 5x faster at 64KB (2.5 GB/s bandwidth)
 
 ---
 

@@ -19,7 +19,7 @@ Building real-time features between React and Python is painful. You need WebSoc
 
 Install `wse-server` on your backend, `wse-client` on your frontend. Everything works immediately: auto-reconnection, message encryption, sequence ordering, offline queues, health monitoring. No configuration required for the defaults. Override what you need.
 
-The engine is Rust-accelerated via PyO3. Up to **1M msg/s** burst throughput. 285K msg/s sustained with JSON.
+The engine is Rust-accelerated via PyO3. Up to **1M msg/s** burst throughput. 132K msg/s sustained. Sub-millisecond connection latency (0.47ms median) with Rust JWT authentication.
 
 ---
 
@@ -84,7 +84,7 @@ Exponential backoff with jitter. Connection drops? The client reconnects automat
 
 ### End-to-End Encryption
 
-AES-256-GCM per channel, HMAC-SHA256 message signing. Encrypted before it leaves the server, decrypted in the browser. No plaintext on the wire. Pluggable encryption and token providers via Python protocols.
+ECDH P-256 key exchange with AES-GCM-256 per connection. Each connection negotiates a unique session key during the handshake (server_ready / client_hello), then all sensitive messages are encrypted end-to-end. HMAC-SHA256 message signing for integrity. Pluggable encryption and token providers via Python protocols.
 
 ### Message Ordering
 
@@ -92,7 +92,7 @@ Sequence numbers with gap detection and reordering buffer. Messages arrive in or
 
 ### Authentication
 
-JWT-based with configurable claims. Per-connection, per-topic access control. Plug in your own auth handler or use the built-in one. Cookie-based token extraction for seamless browser auth.
+JWT-based with HS256, validated in Rust during the WebSocket handshake (zero GIL, 0.01ms decode). Per-connection, per-topic access control. Cookie-based token extraction for seamless browser auth. Fallback to Python auth handler when Rust JWT is not configured.
 
 ### Health Monitoring
 
@@ -129,7 +129,7 @@ Compression, sequencing, filtering, rate limiting, and the WebSocket server itse
 | **Circuit Breaker** | Three-state machine (CLOSED / OPEN / HALF_OPEN). Sliding-window failure tracking. Automatic recovery probes. Prevents cascade failures when downstream services are unhealthy. |
 | **Message Categories** | `S` (snapshot), `U` (update), `WSE` (system). Category prefixing for client-side routing and filtering. |
 | **PubSub Bus** | Redis pub/sub with PSUBSCRIBE pattern matching. orjson fast-path serialization. Custom JSON encoder for UUID, datetime, Decimal. Non-blocking handler invocation. |
-| **Pluggable Security** | `EncryptionProvider` and `TokenProvider` protocols. Bring your own encryption or token signing. Default: HMAC-SHA256 with auto-generated secrets. Rust-accelerated SHA-256 and HMAC. |
+| **Pluggable Security** | `EncryptionProvider` and `TokenProvider` protocols. Built-in: AES-GCM-256 with ECDH P-256 key exchange, HMAC-SHA256 signing, selective message signing. Rust-accelerated crypto (SHA-256, HMAC, AES-GCM, ECDH). |
 | **Connection Metrics** | Prometheus-compatible stubs for: messages sent/received, publish latency, DLQ size, handler errors, circuit breaker state. Drop-in Prometheus integration or use the built-in stubs. |
 
 ### Client (React + TypeScript)
@@ -152,13 +152,16 @@ Compression, sequencing, filtering, rate limiting, and the WebSocket server itse
 
 ## Performance
 
-Rust-accelerated engine via PyO3. Benchmarked on Apple M3, single process, 1KB JSON.
+Rust-accelerated engine via PyO3. Benchmarked on Apple M3, single process.
 
-| Mode | Throughput | Latency (p50) | Latency (p99) |
-|------|-----------|---------------|---------------|
-| **Rust (binary)** | **1,000,000 msg/s** | **0.009 ms** | **0.04 ms** |
-| **Rust (JSON)** | **285,000 msg/s** | **0.03 ms** | **0.15 ms** |
-| Pure Python | 106,000 msg/s | 0.09 ms | 0.4 ms |
+| Metric | Result |
+|--------|--------|
+| **Burst throughput** | **1,000,000 msg/s** (msgpack) |
+| **Sustained throughput** | **132,000 msg/s** (JSON, 5s) |
+| **Connection latency** | **0.47 ms** median (Rust JWT) |
+| **Ping RTT** | **0.14 ms** median |
+| **64KB messages** | **40,604 msg/s** (2.5 GB/s) |
+| **Concurrent (50 senders)** | **126,481 msg/s** |
 
 ---
 
@@ -270,9 +273,9 @@ Both packages are standalone. No shared dependencies between server and client.
 | Server framework | FastAPI + Starlette | ASGI WebSocket handling |
 | Serialization | orjson (Rust) | Zero-copy JSON |
 | Binary protocol | msgpack (rmp-serde) | 30% smaller payloads |
-| Encryption | AES-256-GCM (Rust) | Per-channel E2E encryption |
+| Encryption | AES-GCM-256 + ECDH P-256 (Rust) | Per-connection E2E encryption with key exchange |
 | Message signing | HMAC-SHA256 (Rust) | Per-message integrity verification |
-| Authentication | PyJWT | Token verification |
+| Authentication | Rust JWT (HS256) | Zero-GIL token validation in handshake |
 | Pub/Sub backbone | Redis Pub/Sub | Multi-process fan-out |
 | Dead Letter Queue | Redis Lists | Failed message recovery |
 | Client state | Zustand | Lightweight React store |

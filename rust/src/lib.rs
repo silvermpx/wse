@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 
+mod jwt;
 mod wse;
 
 /// WSE Rust acceleration module.
@@ -34,6 +35,24 @@ fn _wse_accel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(wse::security::rust_hmac_sha256, m)?)?;
     m.add_function(wrap_pyfunction!(wse::security::rust_sha256, m)?)?;
     m.add_function(wrap_pyfunction!(wse::security::rust_sign_message, m)?)?;
+
+    // AES-GCM-256 encryption
+    m.add_function(wrap_pyfunction!(wse::security::rust_aes_gcm_encrypt, m)?)?;
+    m.add_function(wrap_pyfunction!(wse::security::rust_aes_gcm_decrypt, m)?)?;
+
+    // ECDH P-256 key exchange
+    m.add_function(wrap_pyfunction!(
+        wse::security::rust_ecdh_generate_keypair,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        wse::security::rust_ecdh_derive_shared_secret,
+        m
+    )?)?;
+
+    // JWT encode/decode
+    m.add_function(wrap_pyfunction!(jwt::rust_jwt_decode, m)?)?;
+    m.add_function(wrap_pyfunction!(jwt::rust_jwt_encode, m)?)?;
 
     // WebSocket server
     m.add_class::<wse::server::RustWSEServer>()?;

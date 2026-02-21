@@ -18,7 +18,9 @@ use std::thread;
 use std::time::Duration;
 
 use super::compression::serde_json_to_rmpv;
+use crate::jwt::{self, JwtConfig, parse_cookie_value};
 use ahash::AHashSet;
+use dashmap::DashMap;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use futures_util::{SinkExt, StreamExt};
@@ -50,6 +52,12 @@ enum InboundEvent {
     Connect {
         conn_id: String,
         cookies: String,
+    },
+    /// Rust validated JWT from cookie — user_id already resolved.
+    /// Python can skip JWT decode and go straight to connection setup.
+    AuthConnect {
+        conn_id: String,
+        user_id: String,
     },
     Message {
         conn_id: String,
@@ -108,15 +116,17 @@ struct SharedState {
     drain_mode: AtomicBool,
     inbound_queue: std::sync::Mutex<std::collections::VecDeque<InboundEvent>>,
     inbound_condvar: std::sync::Condvar,
-    // Per-connection format preference (sync access for send_event on Python thread)
-    conn_formats: std::sync::Mutex<HashMap<String, bool>>,
+    // Per-connection format preference (lock-free sync access for send_event)
+    conn_formats: DashMap<String, bool>,
+    // JWT config: when set, Rust validates JWT in handshake (zero GIL)
+    jwt_config: Option<JwtConfig>,
 }
 
 unsafe impl Send for SharedState {}
 unsafe impl Sync for SharedState {}
 
 impl SharedState {
-    fn new(max_connections: usize) -> Self {
+    fn new(max_connections: usize, jwt_config: Option<JwtConfig>) -> Self {
         Self {
             connections: RwLock::new(HashMap::new()),
             max_connections,
@@ -126,7 +136,8 @@ impl SharedState {
             drain_mode: AtomicBool::new(false),
             inbound_queue: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(4096)),
             inbound_condvar: std::sync::Condvar::new(),
-            conn_formats: std::sync::Mutex::new(HashMap::new()),
+            conn_formats: DashMap::new(),
+            jwt_config,
         }
     }
 
@@ -311,29 +322,66 @@ fn message_category(msg_type: &str) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// JWT helper functions (used by handle_connection)
+// ---------------------------------------------------------------------------
+
+/// Build a JSON error message for auth failures.
+fn build_error_json(code: &str, message: &str) -> String {
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    format!(
+        r#"WSE{{"t":"error","p":{{"code":"{}","message":"{}","timestamp":"{}"}},"v":1}}"#,
+        code, message, ts,
+    )
+}
+
+/// Build server_ready JSON message (sent immediately from Rust after JWT validation).
+fn build_server_ready(conn_id: &str, user_id: &str) -> String {
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let msg_id = Uuid::now_v7().to_string();
+    format!(
+        concat!(
+            r#"WSE{{"t":"server_ready","id":"{}","ts":"{}","seq":1,"p":{{"#,
+            r#""message":"Connection established (Rust transport)","details":{{"#,
+            r#""version":1,"features":{{"compression":true,"encryption":false,"#,
+            r#""batching":true,"priority_queue":true,"circuit_breaker":true,"#,
+            r#""rust_transport":true,"rust_jwt":true}},"#,
+            r#""connection_id":"{}","server_time":"{}","user_id":"{}"}}}},"v":1}}"#,
+        ),
+        msg_id, ts, conn_id, ts, user_id,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
 
 async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<SharedState>) {
-    let cookies = Arc::new(std::sync::Mutex::new(String::new()));
-    let cookies_clone = cookies.clone();
-    let wants_msgpack = Arc::new(std::sync::Mutex::new(false));
-    let wants_msgpack_clone = wants_msgpack.clone();
+    // Lock-free handshake: OnceLock captures cookie + format in the callback
+    struct HandshakeResult {
+        cookies: String,
+        wants_msgpack: bool,
+    }
+    let handshake_data: Arc<std::sync::OnceLock<HandshakeResult>> =
+        Arc::new(std::sync::OnceLock::new());
+    let hd_clone = handshake_data.clone();
 
     let ws_stream = match tokio_tungstenite::accept_hdr_async(
         stream,
         move |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
-            if let Some(cv) = req.headers().get("cookie")
-                && let Ok(s) = cv.to_str()
-            {
-                *cookies_clone.lock().unwrap() = s.to_string();
-            }
-            // Extract ?format=msgpack from query string
-            if let Some(query) = req.uri().query()
-                && query.contains("format=msgpack")
-            {
-                *wants_msgpack_clone.lock().unwrap() = true;
-            }
+            let cookies = req
+                .headers()
+                .get("cookie")
+                .and_then(|cv| cv.to_str().ok())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let wants_msgpack = req
+                .uri()
+                .query()
+                .is_some_and(|q| q.contains("format=msgpack"));
+            let _ = hd_clone.set(HandshakeResult {
+                cookies,
+                wants_msgpack,
+            });
             Ok(response)
         },
     )
@@ -346,14 +394,82 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         }
     };
 
-    let cookie_str = cookies.lock().unwrap().clone();
-    let use_msgpack = *wants_msgpack.lock().unwrap();
+    let (cookie_str, use_msgpack) = handshake_data
+        .get()
+        .map(|hd| (hd.cookies.clone(), hd.wants_msgpack))
+        .unwrap_or_default();
     let conn_id: Arc<String> = Arc::new(Uuid::now_v7().to_string());
     let (write_half, read_half) = ws_stream.split();
     let mut read_half = read_half;
     let mut write_half = write_half;
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     let drain = state.drain_mode.load(Ordering::Relaxed);
+
+    // ── JWT validation in Rust (zero GIL) ──────────────────────────────────
+    // When jwt_config is set, validate JWT from cookie BEFORE registering.
+    // On success: send server_ready immediately, push AuthConnect to drain queue.
+    // On failure: send error + close — connection never registered.
+    let rust_auth_user_id: Option<String> = if let Some(ref jwt_cfg) = state.jwt_config {
+        let token = parse_cookie_value(&cookie_str, "access_token");
+        match token {
+            Some(tok) => match jwt::jwt_decode(tok, jwt_cfg) {
+                Ok(claims) => {
+                    if let Some(user_id) = claims.get("sub").and_then(|s| s.as_str()) {
+                        Some(user_id.to_string())
+                    } else {
+                        let err = build_error_json("AUTH_FAILED", "Token missing user ID");
+                        let _ = tx.send(Message::Text(err.into()));
+                        let _ = tx.send(Message::Close(None));
+                        let write_task = tokio::spawn(async move {
+                            while let Some(msg) = rx.recv().await {
+                                if write_half.feed(msg).await.is_err() {
+                                    break;
+                                }
+                            }
+                            let _ = write_half.flush().await;
+                            let _ = write_half.close().await;
+                        });
+                        let _ = write_task.await;
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let err = build_error_json("AUTH_FAILED", &format!("{e}"));
+                    let _ = tx.send(Message::Text(err.into()));
+                    let _ = tx.send(Message::Close(None));
+                    let write_task = tokio::spawn(async move {
+                        while let Some(msg) = rx.recv().await {
+                            if write_half.feed(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        let _ = write_half.flush().await;
+                        let _ = write_half.close().await;
+                    });
+                    let _ = write_task.await;
+                    return;
+                }
+            },
+            None => {
+                let err = build_error_json("AUTH_REQUIRED", "No access_token cookie");
+                let _ = tx.send(Message::Text(err.into()));
+                let _ = tx.send(Message::Close(None));
+                let write_task = tokio::spawn(async move {
+                    while let Some(msg) = rx.recv().await {
+                        if write_half.feed(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = write_half.flush().await;
+                    let _ = write_half.close().await;
+                });
+                let _ = write_task.await;
+                return;
+            }
+        }
+    } else {
+        None // No JWT config — delegate auth to Python
+    };
 
     // Register connection
     {
@@ -365,26 +481,43 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         }
         conns.insert((*conn_id).clone(), ConnectionHandle { tx: tx.clone() });
     }
-    // Store format preference for sync access from send_event()
+    // Store format preference for lock-free access from send_event()
     if use_msgpack {
-        let mut formats = state.conn_formats.lock().unwrap();
-        formats.insert((*conn_id).clone(), true);
+        state.conn_formats.insert((*conn_id).clone(), true);
     }
 
-    // Fire on_connect (drain mode: push to queue; callback mode: call Python)
+    // If Rust validated JWT, send server_ready IMMEDIATELY (zero GIL)
+    if let Some(ref user_id) = rust_auth_user_id {
+        let server_ready = build_server_ready(&conn_id, user_id);
+        let _ = tx.send(Message::Text(server_ready.into()));
+    }
+
+    // Fire on_connect (drain mode: push to queue; callback mode: background task)
     if drain {
-        state.push_inbound(InboundEvent::Connect {
-            conn_id: (*conn_id).clone(),
-            cookies: cookie_str.clone(),
-        });
+        if let Some(user_id) = rust_auth_user_id {
+            // Rust validated JWT — send AuthConnect (Python skips JWT decode)
+            state.push_inbound(InboundEvent::AuthConnect {
+                conn_id: (*conn_id).clone(),
+                user_id,
+            });
+        } else {
+            // No JWT config — send cookies for Python to validate
+            state.push_inbound(InboundEvent::Connect {
+                conn_id: (*conn_id).clone(),
+                cookies: cookie_str.clone(),
+            });
+        }
     } else {
         let cb_guard = state.on_connect.read().await;
         if let Some(ref cb) = *cb_guard {
             let cb_clone = Python::try_attach(|py| cb.clone_ref(py)).expect("GIL attach failed");
-            let cid = Arc::clone(&conn_id);
+            let cid = (*conn_id).clone();
             let ck = cookie_str.clone();
             drop(cb_guard);
-            fire_on_connect(&cb_clone, &cid, &ck);
+            // Fire in background — don't block connection setup on GIL
+            tokio::task::spawn_blocking(move || {
+                fire_on_connect(&cb_clone, &cid, &ck);
+            });
         }
     }
 
@@ -572,10 +705,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         let mut conns = state.connections.write().await;
         conns.remove(&*conn_id);
     }
-    {
-        let mut formats = state.conn_formats.lock().unwrap();
-        formats.remove(&*conn_id);
-    }
+    state.conn_formats.remove(&*conn_id);
     if drain {
         state.push_inbound(InboundEvent::Disconnect {
             conn_id: (*conn_id).clone(),
@@ -584,9 +714,12 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         let cb_guard = state.on_disconnect.read().await;
         if let Some(ref cb) = *cb_guard {
             let cb_clone = Python::try_attach(|py| cb.clone_ref(py)).expect("GIL attach failed");
-            let cid = Arc::clone(&conn_id);
+            let cid = (*conn_id).clone();
             drop(cb_guard);
-            fire_on_disconnect(&cb_clone, &cid);
+            // Fire in background — don't block cleanup on GIL
+            tokio::task::spawn_blocking(move || {
+                fire_on_disconnect(&cb_clone, &cid);
+            });
         }
     }
     drop(tx);
@@ -677,12 +810,31 @@ pub struct RustWSEServer {
 #[pymethods]
 impl RustWSEServer {
     #[new]
-    #[pyo3(signature = (host, port, max_connections = 1000))]
-    fn new(host: String, port: u16, max_connections: usize) -> Self {
+    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None))]
+    fn new(
+        host: String,
+        port: u16,
+        max_connections: usize,
+        jwt_secret: Option<Vec<u8>>,
+        jwt_issuer: Option<String>,
+        jwt_audience: Option<String>,
+    ) -> Self {
+        let jwt_config = jwt_secret.map(|secret| {
+            eprintln!(
+                "[WSE] JWT auth enabled (issuer={}, audience={})",
+                jwt_issuer.as_deref().unwrap_or("none"),
+                jwt_audience.as_deref().unwrap_or("none"),
+            );
+            JwtConfig {
+                secret,
+                issuer: jwt_issuer.unwrap_or_default(),
+                audience: jwt_audience.unwrap_or_default(),
+            }
+        });
         Self {
             host,
             port,
-            shared: Arc::new(SharedState::new(max_connections)),
+            shared: Arc::new(SharedState::new(max_connections, jwt_config)),
             cmd_tx: None,
             thread_handle: None,
             running: Arc::new(AtomicBool::new(false)),
@@ -926,11 +1078,13 @@ impl RustWSEServer {
         // v goes last
         map.insert("v".to_string(), serde_json::Value::Number(1.into()));
 
-        // Check if this connection wants msgpack
-        let use_msgpack = {
-            let formats = self.shared.conn_formats.lock().unwrap();
-            formats.get(conn_id).copied().unwrap_or(false)
-        };
+        // Check if this connection wants msgpack (lock-free DashMap read)
+        let use_msgpack = self
+            .shared
+            .conn_formats
+            .get(conn_id)
+            .map(|v| *v)
+            .unwrap_or(false);
 
         let byte_count;
 
@@ -1073,8 +1227,9 @@ impl RustWSEServer {
     /// Drain up to max_count inbound events. Blocks up to timeout_ms waiting
     /// for at least one event. Returns list of (event_type, conn_id, data) tuples.
     ///
-    /// event_type: "connect" | "msg" | "raw" | "bin" | "disconnect"
-    /// data: dict (for "msg"), str (for "connect"=cookies, "raw"), bytes (for "bin"), None (for "disconnect")
+    /// event_type: "connect" | "auth_connect" | "msg" | "raw" | "bin" | "disconnect"
+    /// data: str (for "connect"=cookies, "auth_connect"=user_id, "raw"),
+    ///       dict (for "msg"), bytes (for "bin"), None (for "disconnect")
     ///
     /// GIL is released while waiting on condvar, acquired once for batch conversion.
     #[pyo3(signature = (max_count = 256, timeout_ms = 50))]
@@ -1111,6 +1266,17 @@ impl RustWSEServer {
                             "connect".into_pyobject(py).unwrap().into_any(),
                             conn_id.as_str().into_pyobject(py).unwrap().into_any(),
                             cookies.as_str().into_pyobject(py).unwrap().into_any(),
+                        ],
+                    )?;
+                    list.append(tuple)?;
+                }
+                InboundEvent::AuthConnect { conn_id, user_id } => {
+                    let tuple = PyTuple::new(
+                        py,
+                        &[
+                            "auth_connect".into_pyobject(py).unwrap().into_any(),
+                            conn_id.as_str().into_pyobject(py).unwrap().into_any(),
+                            user_id.as_str().into_pyobject(py).unwrap().into_any(),
                         ],
                     )?;
                     list.append(tuple)?;

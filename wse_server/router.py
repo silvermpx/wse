@@ -325,38 +325,49 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
             log.debug("Connection %s registered with WSEManager", conn_id)
 
             # ----- Send server_ready -----
+            # Generate ECDH keypair if encryption is enabled
+            encryption_public_key = None
+            if encryption:
+                import base64
+                raw_pk = connection.security_manager.generate_keypair(conn_id)
+                encryption_public_key = base64.b64encode(raw_pk).decode("ascii")
+
+            server_ready_details: dict[str, Any] = {
+                "version": protocol_version,
+                "client_version": client_version,
+                "features": {
+                    "compression": compression,
+                    "encryption": encryption,
+                    "batching": True,
+                    "priority_queue": True,
+                    "circuit_breaker": True,
+                    "offline_queue": False,
+                    "message_signing": connection.security_manager.message_signing_enabled,
+                    "health_check": True,
+                    "metrics": True,
+                },
+                "connection_id": conn_id,
+                "server_time": datetime.now(UTC).isoformat(),
+                "user_id": user_id,
+                "endpoints": {
+                    "primary": (
+                        f"ws://{websocket.client.host}/ws/events"
+                        if websocket.client
+                        else None
+                    ),
+                    "health_check_interval": 30_000,
+                    "heartbeat_interval": int(config.heartbeat_interval * 1000),
+                },
+            }
+            if encryption_public_key:
+                server_ready_details["encryption_public_key"] = encryption_public_key
+
             await connection.send_message(
                 {
                     "t": "server_ready",
                     "p": {
                         "message": "Connection established",
-                        "details": {
-                            "version": protocol_version,
-                            "client_version": client_version,
-                            "features": {
-                                "compression": compression,
-                                "encryption": encryption,
-                                "batching": True,
-                                "priority_queue": True,
-                                "circuit_breaker": True,
-                                "offline_queue": False,
-                                "message_signing": connection.security_manager.message_signing_enabled,
-                                "health_check": True,
-                                "metrics": True,
-                            },
-                            "connection_id": conn_id,
-                            "server_time": datetime.now(UTC).isoformat(),
-                            "user_id": user_id,
-                            "endpoints": {
-                                "primary": (
-                                    f"ws://{websocket.client.host}/ws/events"
-                                    if websocket.client
-                                    else None
-                                ),
-                                "health_check_interval": 30_000,
-                                "heartbeat_interval": int(config.heartbeat_interval * 1000),
-                            },
-                        },
+                        "details": server_ready_details,
                     },
                 },
                 priority=10,

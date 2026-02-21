@@ -4,7 +4,36 @@
 
 ### JWT Token Authentication
 
-WSE authenticates connections via JWT tokens. The server checks multiple sources in order:
+WSE authenticates connections via JWT tokens using HS256 (HMAC-SHA256). Two authentication paths are available:
+
+#### Rust JWT (recommended, v1.2+)
+
+When `jwt_secret` is configured on the `RustWSEServer`, JWT validation happens entirely in Rust during the WebSocket handshake — zero Python involvement, zero GIL acquisition:
+
+```python
+server = RustWSEServer(
+    host="0.0.0.0",
+    port=5006,
+    max_connections=10000,
+    jwt_secret=b"your-secret-key",
+    jwt_issuer="your-app",      # optional: validate iss claim
+    jwt_audience="your-api",    # optional: validate aud claim
+)
+```
+
+The Rust server extracts the `access_token` cookie from the HTTP upgrade headers and validates:
+1. HS256 signature (constant-time comparison)
+2. `exp` claim (reject expired tokens)
+3. `iss` claim (if `jwt_issuer` configured)
+4. `aud` claim (if `jwt_audience` configured)
+
+On success, the server sends `server_ready` directly from Rust and pushes an `AuthConnect` event to the drain queue with the validated `user_id`. Python receives the pre-validated user ID and skips JWT decode entirely.
+
+**Performance:** 0.01ms per JWT decode in Rust vs ~0.85ms in Python (85x faster). Connection latency drops from ~23ms to 0.47ms median.
+
+#### Python JWT (fallback)
+
+When `jwt_secret` is not configured, the server falls back to Python-based JWT validation via the `auth_handler` callback. The server checks multiple sources in order:
 
 1. **Query parameter**: `?token=<JWT>` (preferred for WebSocket)
 2. **Authorization header**: `Authorization: Bearer <JWT>`
@@ -20,7 +49,7 @@ Token requirements:
 }
 ```
 
-On authentication failure:
+On authentication failure (both paths):
 - Server sends `error` message with code `AUTH_FAILED`
 - Connection closed with code `4401`
 

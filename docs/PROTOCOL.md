@@ -1,6 +1,6 @@
 # WSE Wire Protocol Specification
 
-Version: 1.0
+Version: 1 (Rust transport)
 
 ## Message Format
 
@@ -25,7 +25,7 @@ All WSE messages are JSON objects with the following structure:
 |-------|------|-------------|
 | `v` | `int` | Protocol version (currently `1`) |
 | `id` | `string` | Unique message ID (UUID v7) |
-| `t` | `string` | Event type (e.g., `status_update`) |
+| `t` | `string` | Event type (e.g., `broker_connection_update`) |
 | `ts` | `string` | ISO 8601 timestamp with timezone |
 | `seq` | `int` | Monotonically increasing sequence number |
 | `p` | `object` | Event payload (type-specific data) |
@@ -46,15 +46,15 @@ Messages are prefixed with a category identifier before the JSON payload:
 | Prefix | Category | Description | Examples |
 |--------|----------|-------------|----------|
 | `WSE` | System | Protocol-level messages | `server_ready`, `PING`, `PONG`, `error` |
-| `S` | Snapshot | Full state snapshots | `resource_snapshot`, `user_data_snapshot` |
-| `U` | Update | Incremental updates | `status_update`, `data_update` |
+| `S` | Snapshot | Full state snapshots | `broker_connection_snapshot`, `broker_account_snapshot` |
+| `U` | Update | Incremental updates | `broker_connection_update`, `balance_update` |
 
 ### Wire Format
 
 ```
 WSE{"t":"server_ready","p":{...},"v":1}
-S{"t":"resource_snapshot","p":{...},"v":1}
-U{"t":"status_update","p":{...},"v":1}
+S{"t":"broker_connection_snapshot","p":{...},"v":1}
+U{"t":"broker_connection_update","p":{...},"v":1}
 ```
 
 The client must strip the prefix before JSON parsing:
@@ -82,16 +82,37 @@ The client detects the `C:` prefix, strips it, decompresses with zlib, and parse
 
 ### Binary Mode: Encryption
 
-When encryption is enabled, the server sends a binary frame with `E:` prefix:
+When encryption is enabled, messages are sent as binary frames with `E:` prefix:
 
 ```
-E:<IV (12 bytes)><AES-GCM encrypted data>
+E:<IV (12 bytes)><AES-GCM ciphertext + 16-byte auth tag>
 ```
 
-Encryption uses:
-- **Algorithm**: AES-GCM-256
-- **IV**: 12 bytes (96 bits), unique per message
-- **Key exchange**: ECDH P-256
+Encryption spec:
+
+| Parameter | Value |
+|-----------|-------|
+| Algorithm | AES-GCM-256 |
+| IV | 12 bytes (96 bits), random per message |
+| Auth tag | 16 bytes (128 bits), appended to ciphertext |
+| Key exchange | ECDH P-256 with HKDF-SHA256 |
+| HKDF salt | `wse-encryption` (UTF-8 bytes) |
+| HKDF info | `aes-gcm-key` (UTF-8 bytes) |
+| HKDF hash | SHA-256 |
+| Derived key | 32 bytes (256 bits) |
+
+**Key exchange flow:**
+
+1. Server generates ECDH P-256 keypair during connection setup
+2. Server sends its public key (65 bytes, uncompressed SEC1) in `server_ready`
+3. Client generates its own ECDH keypair
+4. Client derives shared secret from server's public key
+5. Client sends its public key in `client_hello`
+6. Server derives the same shared secret from client's public key
+7. Both sides run HKDF to get the AES-256 key
+8. All subsequent `E:`-prefixed messages use this key
+
+The plaintext inside the encrypted envelope is the full message including category prefix (e.g. `U{...}`).
 
 ### Binary Mode: JSON (default since v1.1)
 
@@ -122,37 +143,62 @@ Requires `@msgpack/msgpack` (JS) or `msgpack` (Python) on the client side.
 ### 1. Connect
 
 ```
-Client -> Server: WebSocket UPGRADE /wse?token=<JWT>&compression=true&protocol_version=1
-Server -> Client: 101 Switching Protocols
+Client → Rust Server (port 5006): WebSocket UPGRADE /wse
+  Cookie: access_token=<JWT>
+Server → Client: 101 Switching Protocols
 ```
 
-### 2. Server Ready
+Authentication is via HTTP-only `access_token` cookie (same as REST API). No query parameter needed.
 
-Immediately after connection:
+### 2. Authentication
+
+Two paths depending on server configuration:
+
+**Rust JWT (when `jwt_secret` is configured):**
+1. Rust extracts `access_token` from cookie header during handshake
+2. Rust validates JWT signature, expiry, issuer, audience
+3. On success: Rust sends `server_ready` immediately (zero GIL)
+4. Rust pushes `AuthConnect{conn_id, user_id}` to drain queue
+5. Python receives pre-validated user_id, sets up subscriptions and snapshots
+
+**Python fallback (when `jwt_secret` is not configured):**
+1. Rust pushes raw `Connect{conn_id, cookies}` to drain queue
+2. Python extracts and validates JWT from cookies
+3. Python sends `server_ready` after validation
+
+The Rust JWT path eliminates GIL acquisition from the connection critical path, reducing median connection latency from ~23ms to 0.47ms.
+
+### 3. Server Ready
+
+Sent after authentication succeeds (from Rust when JWT is configured, from Python otherwise):
 
 ```json
-WSE{"t":"server_ready","p":{
-  "message": "Connection established",
+WSE{"v":1,"t":"server_ready","p":{
+  "message": "Connection established (Rust transport)",
   "details": {
     "version": 1,
     "features": {
       "compression": true,
-      "encryption": false,
+      "encryption": true,
       "batching": true,
       "priority_queue": true,
       "circuit_breaker": true,
-      "message_signing": false,
-      "health_check": true,
-      "metrics": true
+      "rust_transport": true,
+      "rust_jwt": true
     },
-    "connection_id": "ws_f186cd9d_019c53c4",
+    "connection_id": "rs_f186cd9d_019c53c4",
     "server_time": "2026-02-20T15:30:00.000Z",
-    "user_id": "019c53c4-abcd-7def-8901-234567890abc"
+    "user_id": "019c53c4-abcd-7def-8901-234567890abc",
+    "encryption_public_key": "<base64-encoded 65-byte ECDH P-256 public key>"
   }
 }}
 ```
 
-### 3. Auto-Subscribe
+When `encryption` is `true`, the `encryption_public_key` field contains the server's ECDH P-256 public key (65 bytes, uncompressed SEC1, base64-encoded). The client uses this to derive the shared AES-256 key.
+
+When `rust_jwt` is `true`, JWT validation was performed by the Rust server during the handshake (before this message was sent). The `user_id` field is the validated subject from the JWT.
+
+### 4. Auto-Subscribe
 
 Server automatically subscribes the connection to default topics and sends subscription confirmation:
 
@@ -160,37 +206,37 @@ Server automatically subscribes the connection to default topics and sends subsc
 U{"t":"subscription_update","p":{
   "action": "subscribe",
   "success": true,
-  "topics": ["notifications", "data_events", ...],
+  "topics": ["broker_connection_events", "broker_account_events", ...],
   "success_topics": [...],
   "active_subscriptions": [...]
 }}
 ```
 
-### 4. Snapshots
+### 5. Snapshots
 
 After subscription, server sends full state snapshots:
 
 ```json
-S{"t":"resource_snapshot","p":{
-  "resources": [...],
+S{"t":"broker_connection_snapshot","p":{
+  "connections": [...],
   "count": 2,
   "timestamp": "2026-02-20T15:30:00.123Z"
 }}
 ```
 
-### 5. Incremental Updates
+### 6. Incremental Updates
 
 Real-time updates follow snapshots:
 
 ```json
-U{"t":"status_update","p":{
-  "resource_id": "...",
+U{"t":"broker_connection_update","p":{
+  "broker_connection_id": "...",
   "connected": true,
   "response_time_ms": 45
 }}
 ```
 
-### 6. Heartbeat
+### 7. Heartbeat
 
 Server sends heartbeat every 15 seconds:
 
@@ -210,7 +256,7 @@ Client responds with:
 {"t":"PONG","p":{"client_timestamp":1708441800000,"server_timestamp":1708441800050}}
 ```
 
-### 7. Disconnect
+### 8. Disconnect
 
 - **Idle timeout**: Server closes after 90s of inactivity (code 1000)
 - **Circuit breaker**: Server closes after too many errors (code 1011)
@@ -226,7 +272,7 @@ Client responds with:
   "t": "subscription",
   "p": {
     "action": "subscribe",
-    "topics": ["notifications", "data_updates"]
+    "topics": ["trading_updates", "market_data"]
   }
 }
 ```
@@ -239,30 +285,35 @@ Request initial data snapshots:
 {
   "t": "sync_request",
   "p": {
-    "topics": ["notifications", "data_events"],
-    "include_snapshots": true
+    "topics": ["broker_connection_events", "broker_account_events"],
+    "include_snapshots": true,
+    "include_positions": false
   }
 }
 ```
 
 ### Client Hello
 
-Protocol negotiation:
+Protocol negotiation. When encryption is enabled, includes the client's ECDH public key:
 
 ```json
 {
   "t": "client_hello",
   "p": {
-    "client_version": "1.0.0",
-    "protocol_version": 1,
+    "client_version": "2.0.0",
+    "protocol_version": 2,
     "features": {
       "compression": true,
-      "batch_messages": true
+      "batch_messages": true,
+      "encryption": true
     },
-    "capabilities": ["compression", "encryption", "batching"]
+    "capabilities": ["compression", "encryption", "batching"],
+    "encryption_public_key": "<base64-encoded 65-byte ECDH P-256 public key>"
   }
 }
 ```
+
+Once the server receives `client_hello` with `encryption_public_key`, it derives the shared AES-256 key. All subsequent messages from both sides may be sent as `E:`-prefixed encrypted binary frames.
 
 ### Config Update
 
@@ -306,8 +357,8 @@ When the client supports batching (`batch_messages: true` in features), the serv
 ```json
 U{"t":"batch","p":{
   "messages": [
-    {"t":"data_update","p":{...}},
-    {"t":"status_update","p":{...}}
+    {"t":"balance_update","p":{...}},
+    {"t":"position_update","p":{...}}
   ],
   "count": 2
 }}
@@ -315,20 +366,23 @@ U{"t":"batch","p":{
 
 ## Message Signing
 
-Critical operations are signed with JWT:
+Messages matching a configurable set of types are signed for integrity verification. The set is empty by default — configure via `signed_message_types` in the connection constructor. When `message_signing_enabled` is `True`, all messages are signed.
 
 ```json
-U{"t":"action_completed","p":{...},"sig":"eyJhbGciOiJIUzI1NiJ9...","v":1}
+U{"t":"my_critical_event","p":{...},"sig":"<hash>:<timestamp>:<nonce>:<hmac>","v":1}
 ```
 
-The `sig` field contains a JWT with:
+The `sig` field contains an HMAC-SHA256 signature (or JWT when a TokenProvider is configured):
 - `hash`: SHA-256 hash of the JSON-serialized payload
 - `signed_at`: Unix timestamp
 - `nonce`: Random 16-byte hex string
+- `signature`: HMAC-SHA256 of `hash:signed_at:nonce`
 
-### Signed Message Types
+Example signed types (domain-specific, not built into WSE):
 
-Configure which event types require signing based on your application's security requirements. Typical candidates include state-changing operations, financial transactions, and configuration changes.
+```
+order_placed, order_filled, trade_executed, position_update, ...
+```
 
 ## Error Codes
 
@@ -357,12 +411,13 @@ Configure which event types require signing based on your application's security
 
 ## Default Topics
 
-Configure default topics for your application. Example topics:
-
 | Topic | Description |
 |-------|-------------|
-| `notifications` | User notification events |
-| `data_events` | Data lifecycle events |
-| `user_events` | User account events |
+| `broker_connection_events` | Broker connection lifecycle events |
+| `broker_account_events` | Account sync and update events |
+| `user_account_events` | User account events |
 | `system_events` | System-wide announcements |
 | `monitoring_events` | Monitoring and diagnostics |
+| `trading_updates` | Real-time balance/order/position updates |
+| `market_data` | Real-time bar/quote updates for charts |
+| `ai_strategy_events` | AI strategy training/inference events |

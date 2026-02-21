@@ -80,7 +80,7 @@ let globalWSEInstance: GlobalWSEInstance | null = null;
 // GLOBAL CONNECTION LOCK - prevents multiple simultaneous connections
 let isGloballyConnecting = false;
 let lastConnectionAttemptTime = 0;
-const MIN_CONNECTION_INTERVAL = 2000;
+const MIN_CONNECTION_INTERVAL = 500;
 
 // Circuit breaker check interval
 let circuitBreakerCheckInterval: NodeJS.Timeout | null = null;
@@ -756,18 +756,13 @@ export function useWSE(
     if (!initialSyncSentRef.current) {
       initialSyncSentRef.current = true;
 
-      setTimeout(() => {
-        sendMessage('subscription_update', {
-          action: 'subscribe',
-          topics,
-        }, { priority: MessagePriority.HIGH });
+      sendMessage('subscription_update', {
+        action: 'subscribe',
+        topics,
+      }, { priority: MessagePriority.HIGH });
 
-        // Request initial snapshot after subscription
-        setTimeout(() => {
-          logger.info('Requesting initial snapshot after subscription');
-          requestSnapshot(topics, 3, 1000);
-        }, 500);
-      }, 200);
+      // Request snapshot immediately after subscription
+      requestSnapshot(topics, 3, 1000);
     }
 
     store.setActiveTopics(topics);

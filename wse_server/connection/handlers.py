@@ -260,6 +260,8 @@ class WSEHandler:
 
     async def handle_client_hello(self, message_data: dict[str, Any]) -> None:
         """Handle client hello message for protocol negotiation"""
+        import base64
+
         payload = message_data.get("p", {})
 
         client_version = payload.get("client_version", "unknown")
@@ -275,6 +277,20 @@ class WSEHandler:
         log.info(f"Client hello received - Version: {client_version}, Protocol: {protocol_version}")
         log.debug(f"Client features: {features}")
         log.debug(f"Client capabilities: {capabilities}")
+
+        # ECDH key exchange: derive session key from client's public key
+        client_encryption_pk = payload.get("encryption_public_key")
+        if client_encryption_pk and self.connection.encryption_enabled:
+            try:
+                peer_pk_bytes = base64.b64decode(client_encryption_pk)
+                conn_id = self.connection.conn_id
+                ok = self.connection.security_manager.derive_session_key(conn_id, peer_pk_bytes)
+                if ok:
+                    log.info(f"E2E encryption established for {conn_id}")
+                else:
+                    log.warning(f"ECDH key derivation failed for {conn_id}")
+            except Exception as e:
+                log.error(f"ECDH key exchange error: {e}")
 
         await self.connection.send_message(
             {
@@ -835,6 +851,8 @@ class WSEHandler:
 
     async def handle_encryption_request(self, message_data: dict[str, Any]) -> None:
         """Handle encryption setup request"""
+        import base64
+
         payload = message_data.get("p", {})
         action = payload.get("action", "status")
 
@@ -848,18 +866,24 @@ class WSEHandler:
                 )
                 self.connection.encryption_enabled = True
 
-            public_key = payload.get("public_key")
-            if public_key:
-                await self.connection.security_manager.set_server_public_key(public_key)
+            conn_id = self.connection.conn_id
 
-            server_key = await self.connection.security_manager.get_public_key()
+            # Generate ECDH keypair and send our public key
+            raw_pk = self.connection.security_manager.generate_keypair(conn_id)
+            server_key_b64 = base64.b64encode(raw_pk).decode("ascii")
+
+            # If client sent their public key, derive session key immediately
+            client_pk = payload.get("public_key")
+            if client_pk:
+                peer_pk_bytes = base64.b64decode(client_pk)
+                self.connection.security_manager.derive_session_key(conn_id, peer_pk_bytes)
 
             await self.connection.send_message(
                 {
                     "t": "encryption_response",
                     "p": {
                         "enabled": True,
-                        "public_key": server_key,
+                        "public_key": server_key_b64,
                         "algorithms": {
                             "encryption": "AES-GCM-256",
                             "signing": "HMAC-SHA256",
@@ -883,17 +907,27 @@ class WSEHandler:
             )
 
     async def handle_key_rotation_request(self, message_data: dict[str, Any]) -> None:
-        """Handle key rotation request"""
+        """Handle key rotation request.
+
+        Generates a new ECDH keypair and sends the public key.
+        Client must respond with its new public key to complete the rotation.
+        """
+        import base64
+
         if self.connection.encryption_enabled:
             await self.connection.security_manager.rotate_keys()
-            new_key = await self.connection.security_manager.get_public_key()
+
+            # Generate new ECDH keypair for re-keying
+            conn_id = self.connection.conn_id
+            raw_pk = self.connection.security_manager.generate_keypair(conn_id)
+            new_key_b64 = base64.b64encode(raw_pk).decode("ascii")
 
             await self.connection.send_message(
                 {
                     "t": "key_rotation_response",
                     "p": {
                         "success": True,
-                        "new_public_key": new_key,
+                        "new_public_key": new_key_b64,
                         "timestamp": datetime.now(UTC).isoformat(),
                     },
                 },

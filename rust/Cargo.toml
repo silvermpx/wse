@@ -18,7 +18,12 @@ hmac = "0.12.1"
 sha2 = "0.10.9"
 hex = "0.4"
 ahash = "0.8.12"
+dashmap = "6"
+aes-gcm = "0.10"
+p256 = { version = "0.13", features = ["ecdh", "jwk"] }
+hkdf = "0.12"
 uuid = { version = "1.21.0", features = ["v7"] }
+base64 = "0.22"
 chrono = { version = "0.4.43", features = ["serde"] }
 regex = "1.12.3"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "sync", "net", "time"] }
