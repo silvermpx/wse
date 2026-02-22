@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.3.2 (2026-02-22)
+
+### Bug Fixes
+
+- Fixed Python client packaging: `__init__.py` now exports public API (`connect`, `AsyncWSEClient`, `SyncWSEClient`, `WSEEvent`, all error types)
+
 ## v1.3.1 (2026-02-22)
 
 ### Documentation
