@@ -142,6 +142,89 @@ Small message (93 bytes) throughput with 10 workers — approaches half a millio
 
 ---
 
+## v1.2 Results — AMD EPYC 7502P (64 cores, 128 GB)
+
+**Hardware**: AMD EPYC 7502P, 64 cores / 128 threads, 128 GB RAM, Ubuntu 24.04.
+Minimal benchmark server (Rust WSE + JWT auth, no FastAPI/DB overhead).
+
+### Worker Scaling Summary
+
+| Workers | Sustained JSON | Sustained MsgPack | Burst (93B) | Per Worker | Stddev |
+|---------|---------------|-------------------|-------------|------------|--------|
+| **64** | **2,045K msg/s** | **2,072K msg/s** | 1,557K | 31,943 | 0.3% |
+| 80 | 2,014K msg/s | 2,036K msg/s | 1,675K | 25,143 | 0.3% |
+| 128 | 2,013K msg/s | 2,041K msg/s | 1,836K | 15,662 | 0.7% |
+
+**2M msg/s is the single-server ceiling.** 64 workers = optimal for sustained throughput.
+
+### Connection Latency (64 workers x 5 rounds)
+
+| Metric | Value |
+|--------|-------|
+| Mean | 10.69 ms |
+| **Median** | **2.60 ms** |
+| p95 | 25.35 ms |
+| p99 | 48.15 ms |
+| Min | 0.65 ms |
+
+### Ping/Pong RTT (64 connections x 20 pings)
+
+| Metric | Value |
+|--------|-------|
+| Mean | 0.29 ms |
+| **Median** | **0.26 ms** |
+| p95 | 0.52 ms |
+| Min | 0.10 ms |
+
+### Message Size Impact (64 workers)
+
+| Size | Rate | Bandwidth | Workers |
+|------|------|-----------|---------|
+| 93 B | **1,557K msg/s** | 138 MB/s | 64/64 |
+| 285 B | **1,678K msg/s** | 456 MB/s | 64/64 |
+| 1 KB | **1,382K msg/s** | 1.4 GB/s | 64/64 |
+| 4 KB | **1,214K msg/s** | 4.8 GB/s | 64/64 |
+| 16 KB | **732K msg/s** | 11.5 GB/s | 64/64 |
+| 64 KB | **256K msg/s** | **16.0 GB/s** | 64/64 |
+
+### Sustained JSON (64 workers x 5s)
+
+10.2M total messages, stddev 0.3%.
+
+| Second | Rate |
+|--------|------|
+| 1 | 2,038K msg/s |
+| 2 | 2,048K msg/s |
+| 3 | 2,041K msg/s |
+| 4 | 2,043K msg/s |
+| 5 | 2,055K msg/s |
+| **Average** | **2,045K msg/s** |
+
+### Sustained MsgPack (64 workers x 5s)
+
+10.4M total messages, stddev 0.5%.
+
+| Second | Rate |
+|--------|------|
+| 1 | 2,075K msg/s |
+| 2 | 2,070K msg/s |
+| 3 | 2,073K msg/s |
+| 4 | 2,056K msg/s |
+| 5 | 2,085K msg/s |
+| **Average** | **2,072K msg/s** |
+
+### M2 vs EPYC Comparison
+
+| Metric | M2 (10w) | EPYC (64w) | Speedup |
+|--------|---------|-----------|---------|
+| Sustained JSON | 356K | **2,045K** | **5.7x** |
+| Sustained MsgPack | 345K | **2,072K** | **6.0x** |
+| Burst JSON | 488K | **1,836K** | **3.8x** |
+| 64KB throughput | 10.2 GB/s | **16.0 GB/s** | **1.6x** |
+| Connection latency | 2.20 ms | 2.60 ms | ~same |
+
+---
+
 ## Rust Acceleration by Component
 
 | Component | Pure Python | Rust | Speedup |
@@ -197,10 +280,12 @@ Small message (93 bytes) throughput with 10 workers — approaches half a millio
 | Feature | WSE (Rust) | WSE (Python) | Socket.IO | ws (Node.js) |
 |---------|-----------|-------------|-----------|--------------|
 | Single client sustained | **113K msg/s** | ~85K | ~25K | ~50K |
-| 10-worker sustained | **356K msg/s** | N/A | N/A | N/A |
-| 10-worker burst (JSON) | **488K msg/s** | N/A | N/A | N/A |
+| 10-worker sustained (M2) | **356K msg/s** | N/A | N/A | N/A |
+| 64-worker sustained (EPYC) | **2,045K msg/s** | N/A | N/A | N/A |
+| Burst (M2, 10w) | **488K msg/s** | N/A | N/A | N/A |
+| Burst (EPYC, 128w) | **1,836K msg/s** | N/A | N/A | N/A |
 | Connection latency | **0.53 ms** | 23 ms | ~50 ms | ~10 ms |
-| 64KB throughput (10w) | **10.2 GB/s** | 514 MB/s | N/A | N/A |
+| 64KB throughput (EPYC, 64w) | **16.0 GB/s** | 514 MB/s | N/A | N/A |
 | Ping RTT | 0.09 ms | 0.11 ms | ~1 ms | ~0.1 ms |
 | JWT auth | Rust (0.01ms) | Python | N/A | N/A |
 | Wire formats | JSON + MsgPack | JSON + MsgPack | JSON | JSON |
@@ -222,8 +307,10 @@ Small message (93 bytes) throughput with 10 workers — approaches half a millio
 | After Python optimization (9 fixes) | 106,000 msg/s | 23 ms | **3.1x** throughput |
 | After Rust acceleration (v1.0) | 113,000 msg/s | 23 ms | **1.07x** throughput |
 | After Rust JWT + transport (v1.2) | 113,000 msg/s | **0.53 ms** | **27x** latency, **5x** large msg |
-| Multi-process (10 workers, v1.2) | **356,000 msg/s** sustained | 2.20 ms median | **3.1x** vs single client |
-| Multi-process burst (v1.2) | **488,000 msg/s** | — | **~0.5M msg/s** |
+| Multi-process (10 workers, M2) | **356,000 msg/s** sustained | 2.20 ms median | **3.1x** vs single client |
+| Multi-process burst (M2) | **488,000 msg/s** | — | **~0.5M msg/s** |
+| **EPYC 7502P (64 workers)** | **2,045,000 msg/s** sustained | 2.60 ms median | **5.7x** vs M2 10w |
+| **EPYC 7502P (64w, MsgPack)** | **2,072,000 msg/s** sustained | — | **~2M msg/s** |
 
 ### Python Optimization Highlights
 

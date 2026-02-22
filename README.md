@@ -19,7 +19,7 @@ Building real-time features between React and Python is painful. You need WebSoc
 
 Install `wse-server` on your backend, `wse-client` on your frontend. Everything works immediately: auto-reconnection, message encryption, sequence ordering, offline queues, health monitoring. No configuration required for the defaults. Override what you need.
 
-The engine is Rust-accelerated via PyO3. Up to **0.5M msg/s** JSON burst throughput (10 workers, Apple M2). 350K+ msg/s sustained. Sub-millisecond connection latency (0.53ms median) with Rust JWT authentication.
+The engine is Rust-accelerated via PyO3. Up to **2M msg/s** sustained throughput on AMD EPYC (64 cores). **0.5M msg/s** burst on Apple M2 (8 cores). Sub-millisecond connection latency (0.53ms median) with Rust JWT authentication.
 
 ---
 
@@ -152,7 +152,9 @@ Compression, sequencing, filtering, rate limiting, and the WebSocket server itse
 
 ## Performance
 
-Rust-accelerated engine via PyO3. Benchmarked on Apple M2 (8 cores), localhost.
+Rust-accelerated engine via PyO3. Benchmarked on localhost.
+
+### Apple M2 (8 cores)
 
 | Metric | Single Client | 10 Workers |
 |--------|--------------|------------|
@@ -162,6 +164,17 @@ Rust-accelerated engine via PyO3. Benchmarked on Apple M2 (8 cores), localhost.
 | **Connection latency** | **0.53 ms** median | 2.20 ms median |
 | **Ping RTT** | **0.09 ms** median | 0.18 ms median |
 | **64KB messages** | 43K msg/s (2.7 GB/s) | **164K msg/s (10.2 GB/s)** |
+
+### AMD EPYC 7502P (64 cores, 128 GB)
+
+| Metric | 64 Workers | 128 Workers |
+|--------|-----------|-------------|
+| **Sustained throughput (JSON)** | **2,045,000 msg/s** | 2,013,000 msg/s |
+| **Sustained throughput (MsgPack)** | **2,072,000 msg/s** | 2,041,000 msg/s |
+| **Burst throughput (JSON)** | 1,557,000 msg/s | **1,836,000 msg/s** |
+| **Connection latency** | 2.60 ms median | 2.96 ms median |
+| **Ping RTT** | 0.26 ms median | 0.41 ms median |
+| **64KB messages** | **256K msg/s (16.0 GB/s)** | 238K msg/s (14.9 GB/s) |
 
 See [BENCHMARKS.md](docs/BENCHMARKS.md) for full results and methodology.
 
