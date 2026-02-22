@@ -63,6 +63,16 @@ Backend handshake latency reduced by 27x (median 23ms -> 0.53ms):
 - Reduced allocation overhead for large payloads
 - Direct buffer flush without intermediate copies
 
+### Inbound MsgPack Parsing in Rust
+
+Binary frames from msgpack-connected clients are now parsed entirely in Rust:
+
+- Connections with `?format=msgpack` are tracked in `conn_formats` DashMap
+- Binary frames from msgpack connections: `rmpv::decode::read_value` -> `rmpv_to_serde_json` -> `normalize_json_keys` -> `InboundEvent::Message` (pre-parsed dict)
+- Python drain queue receives dicts regardless of wire format (JSON or MsgPack)
+- Non-msgpack binary frames continue as `InboundEvent::Binary` (raw bytes)
+- Callback mode also parses msgpack to Python dicts via `json_to_pyobj`
+
 ### Selective Message Signing
 
 Configurable set of message types that are always signed for integrity, regardless of the global `message_signing_enabled` flag:

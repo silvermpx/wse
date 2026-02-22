@@ -277,25 +277,43 @@ Minimal benchmark server (Rust WSE + JWT auth, no FastAPI/DB overhead).
 
 ## Comparison with Alternatives
 
-| Feature | WSE (Rust) | WSE (Python) | Socket.IO | ws (Node.js) |
-|---------|-----------|-------------|-----------|--------------|
-| Single client sustained | **113K msg/s** | ~85K | ~25K | ~50K |
-| 10-worker sustained (M2) | **356K msg/s** | N/A | N/A | N/A |
-| 64-worker sustained (EPYC) | **2,045K msg/s** | N/A | N/A | N/A |
-| Burst (M2, 10w) | **488K msg/s** | N/A | N/A | N/A |
-| Burst (EPYC, 128w) | **1,836K msg/s** | N/A | N/A | N/A |
-| Connection latency | **0.53 ms** | 23 ms | ~50 ms | ~10 ms |
-| 64KB throughput (EPYC, 64w) | **16.0 GB/s** | 514 MB/s | N/A | N/A |
-| Ping RTT | 0.09 ms | 0.11 ms | ~1 ms | ~0.1 ms |
-| JWT auth | Rust (0.01ms) | Python | N/A | N/A |
-| Wire formats | JSON + MsgPack | JSON + MsgPack | JSON | JSON |
-| Compression | zlib (Rust) | zlib + msgpack | per-msg deflate | per-msg deflate |
-| Priority queue | 5-level (Rust) | 5-level | No | No |
-| Circuit breaker | Yes | Yes | No | No |
-| Offline queue | IndexedDB | IndexedDB | No | No |
-| Multi-instance | Redis Pub/Sub | Redis Pub/Sub | Redis adapter | Manual |
-| E2E encryption | AES-GCM-256 | AES-GCM-256 | No | No |
-| Message signing | HMAC-SHA256 | HMAC-SHA256 | No | No |
+### Throughput
+
+All alternatives primarily benchmark fan-out (server broadcasts to clients) or idle connection count,
+not inbound throughput (clients sending to server). WSE benchmarks measure inbound throughput,
+the harder and more realistic workload. Numbers below are from published sources.
+
+| Metric | WSE v1.2 | Centrifugo | uWebSockets | Socket.IO | ws (Node.js) |
+|--------|---------|------------|-------------|-----------|--------------|
+| **Inbound sustained** | **2,045K msg/s** (EPYC 64w) | Not published | Not published | Not published | 19K echo RT/s |
+| **Inbound sustained** | **356K msg/s** (M2 10w) | — | — | — | — |
+| **Single client** | **113K msg/s** | — | — | ~10K | ~19K echo |
+| **Fan-out (broadcast)** | N/A | 500K msg/s (20 pods + 5 Redis) | 120K msg/s (4 cores) | 30K msg/s (4 cores) | 13K (i7) |
+| **Connection count** | 5K tested | 1M (K8s cluster) | 120K (4 cores) | 30K (4 cores) | 100K+ |
+| **Connection latency** | **0.53 ms** | Not published | Not published | ~50 ms | ~10 ms |
+| **Ping RTT** | **0.09 ms** | Not published | Not published | ~1 ms | ~0.1 ms |
+
+Sources: Centrifugo 1M blog, ezioda004 uWS vs Socket.IO benchmark (AWS c5a.xlarge),
+Hashrocket WebSocket Shootout (i7-4790K), Lemire ws benchmark (Xeon Gold).
+
+### Features
+
+| Feature | WSE | Centrifugo | uWebSockets | Socket.IO | ws |
+|---------|-----|------------|-------------|-----------|-----|
+| Language | Python + Rust | Go | C++ | Node.js | Node.js |
+| JWT auth in handshake | Rust (0.01ms) | Go | No | No | No |
+| Wire formats | JSON + MsgPack | JSON + Protobuf | JSON | JSON | JSON |
+| Compression | zlib (Rust) | — | per-msg deflate | per-msg deflate | per-msg deflate |
+| Priority queue | 5-level (Rust) | No | No | No | No |
+| Circuit breaker | Client + Server | No | No | No | No |
+| Offline queue | IndexedDB | No | No | No | No |
+| E2E encryption | AES-GCM-256 + ECDH | No | No | No | No |
+| Message signing | HMAC-SHA256 | HMAC-SHA256 | No | No | No |
+| Message ordering | Sequence + gap detect | Sequence numbers | No | No | No |
+| Dead letter queue | Redis-backed | No | No | No | No |
+| Multi-instance | Redis Pub/Sub | Redis/Nats/Tarantool | Manual | Redis adapter | Manual |
+| Health monitoring | Quality scoring | No | No | No | No |
+| React integration | useWSE hook + Zustand | JS client | No | React adapter | No |
 
 ---
 
