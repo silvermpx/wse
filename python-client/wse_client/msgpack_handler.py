@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._logging import logger
 
 try:
     import msgpack

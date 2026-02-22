@@ -2,14 +2,11 @@
 
 import pytest
 
-try:
-    from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key, SECP256R1
-    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-    HAS_CRYPTO = True
-except ImportError:
-    HAS_CRYPTO = False
+import importlib.util
 
 from wse_client.security import SecurityManager
+
+HAS_CRYPTO = importlib.util.find_spec("cryptography") is not None
 
 
 @pytest.mark.skipif(not HAS_CRYPTO, reason="cryptography not installed")
@@ -84,7 +81,7 @@ class TestSecurityManager:
         sm = SecurityManager()
         server = SecurityManager()
 
-        sm_pub = sm.generate_keypair()
+        sm.generate_keypair()
         server_pub = server.generate_keypair()
 
         sm.derive_shared_secret(server_pub)
@@ -98,9 +95,9 @@ class TestSecurityManager:
         server = SecurityManager()
         wrong = SecurityManager()
 
-        client_pub = client.generate_keypair()
+        client.generate_keypair()
         server_pub = server.generate_keypair()
-        wrong_pub = wrong.generate_keypair()
+        wrong.generate_keypair()
 
         client.derive_shared_secret(server_pub)
         wrong.derive_shared_secret(server_pub)  # Different shared secret
@@ -108,5 +105,6 @@ class TestSecurityManager:
         encrypted = client.encrypt("secret message")
 
         from wse_client.errors import WSEEncryptionError
+
         with pytest.raises(WSEEncryptionError):
             wrong.decrypt(encrypted)

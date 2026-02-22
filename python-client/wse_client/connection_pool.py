@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-from ._logging import logger
 from .types import LoadBalancingStrategy
 
 
@@ -147,9 +146,7 @@ class ConnectionPool:
         return eps[-1].url
 
     def _select_least_connections(self) -> str:
-        return min(
-            self._endpoints.values(), key=lambda ep: ep.active_connections
-        ).url
+        return min(self._endpoints.values(), key=lambda ep: ep.active_connections).url
 
     def _select_round_robin(self) -> str:
         urls = list(self._endpoints.keys())

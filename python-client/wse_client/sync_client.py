@@ -103,9 +103,7 @@ class SyncWSEClient:
         """Disconnect and stop the background thread."""
         self._running = False
         if self._loop and self._client:
-            asyncio.run_coroutine_threadsafe(
-                self._client.disconnect(), self._loop
-            )
+            asyncio.run_coroutine_threadsafe(self._client.disconnect(), self._loop)
         # Signal queue consumers
         try:
             self._event_queue.put_nowait(None)
@@ -232,9 +230,7 @@ class SyncWSEClient:
 
         return decorator
 
-    def on_any(
-        self, fn: Callable[[WSEEvent], Any]
-    ) -> Callable[[WSEEvent], Any]:
+    def on_any(self, fn: Callable[[WSEEvent], Any]) -> Callable[[WSEEvent], Any]:
         """Register wildcard handler."""
         self._wildcard_handlers.append(fn)
         return fn

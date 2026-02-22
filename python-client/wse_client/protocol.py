@@ -32,7 +32,6 @@ from .constants import (
     ZLIB_MAGIC,
     ZLIB_METHODS,
 )
-from .errors import WSEProtocolError
 from .types import MessageCategory, WSEEvent
 
 if TYPE_CHECKING:
@@ -41,17 +40,32 @@ if TYPE_CHECKING:
     from .security import SecurityManager
 
 # System message types -> WSE prefix
-_SYSTEM_TYPES = frozenset({
-    "client_hello", "subscription_update", "PING", "PONG",
-    "health_check_response", "sync_response", "metrics_response",
-    "debug_request", "config_request", "config_update_request",
-    "encryption_request", "key_rotation_request", "batch",
-})
+_SYSTEM_TYPES = frozenset(
+    {
+        "client_hello",
+        "subscription_update",
+        "PING",
+        "PONG",
+        "health_check_response",
+        "sync_response",
+        "metrics_response",
+        "debug_request",
+        "config_request",
+        "config_update_request",
+        "encryption_request",
+        "key_rotation_request",
+        "batch",
+    }
+)
 
 # Sync/snapshot message types -> S prefix
-_SYNC_TYPES = frozenset({
-    "sync_request", "request_snapshot", "snapshot_request",
-})
+_SYNC_TYPES = frozenset(
+    {
+        "sync_request",
+        "request_snapshot",
+        "snapshot_request",
+    }
+)
 
 try:
     import orjson

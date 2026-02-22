@@ -47,16 +47,18 @@ class TestTextDecoding:
 
     def test_full_envelope(self):
         codec = _make_codec()
-        data = json.dumps({
-            "t": "test",
-            "p": {"key": "value"},
-            "id": "evt-123",
-            "seq": 42,
-            "ts": "2024-01-01T00:00:00Z",
-            "v": 1,
-            "pri": 8,
-            "cid": "corr-1",
-        })
+        data = json.dumps(
+            {
+                "t": "test",
+                "p": {"key": "value"},
+                "id": "evt-123",
+                "seq": 42,
+                "ts": "2024-01-01T00:00:00Z",
+                "v": 1,
+                "pri": 8,
+                "cid": "corr-1",
+            }
+        )
         event = codec.decode(data)
         assert event.type == "test"
         assert event.id == "evt-123"
@@ -66,15 +68,17 @@ class TestTextDecoding:
 
     def test_batch_message(self):
         codec = _make_codec()
-        data = json.dumps({
-            "t": "batch",
-            "p": {
-                "messages": [
-                    {"t": "a", "p": {"n": 1}},
-                    {"t": "b", "p": {"n": 2}},
-                ]
-            },
-        })
+        data = json.dumps(
+            {
+                "t": "batch",
+                "p": {
+                    "messages": [
+                        {"t": "a", "p": {"n": 1}},
+                        {"t": "b", "p": {"n": 2}},
+                    ]
+                },
+            }
+        )
         result = codec.decode(data)
         assert isinstance(result, list)
         assert len(result) == 2
@@ -169,9 +173,7 @@ class TestEncoding:
 
     def test_priority_and_correlation(self):
         codec = _make_codec()
-        encoded = codec.encode(
-            "cmd", {"x": 1}, priority=10, correlation_id="req-1"
-        )
+        encoded = codec.encode("cmd", {"x": 1}, priority=10, correlation_id="req-1")
         parsed = json.loads(encoded[1:])  # Strip U prefix
         assert parsed["pri"] == 10
         assert parsed["cid"] == "req-1"

@@ -22,9 +22,7 @@ class TestTokenBucketRateLimiter:
         assert rl.available_tokens == 2.0
 
     def test_refill_over_time(self):
-        rl = TokenBucketRateLimiter(
-            capacity=10, refill_rate=100, refill_interval=0.1
-        )
+        rl = TokenBucketRateLimiter(capacity=10, refill_rate=100, refill_interval=0.1)
         rl.try_consume(10)
         assert rl.available_tokens == 0.0
 

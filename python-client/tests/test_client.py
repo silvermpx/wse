@@ -1,8 +1,7 @@
 """Tests for AsyncWSEClient (unit tests with mocked WebSocket)."""
 
-import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -88,9 +87,7 @@ class TestSend:
 
     @pytest.mark.asyncio
     async def test_send_with_retry_retries_on_failure(self, client):
-        client._connection.send = AsyncMock(
-            side_effect=[False, False, True]
-        )
+        client._connection.send = AsyncMock(side_effect=[False, False, True])
         ok = await client.send_with_retry("test", {}, max_retries=3)
         assert ok is True
         assert client._connection.send.call_count == 3
@@ -204,6 +201,7 @@ class TestSystemHandlers:
 
     def test_pong_records_latency(self, client):
         import time
+
         ts = time.time() * 1000 - 50  # 50ms ago
         event = WSEEvent(
             type="PONG",
@@ -297,15 +295,17 @@ class TestMessageProcessing:
         assert client._event_queue.qsize() == 1
 
     def test_batch_message_unwrapped(self, client):
-        batch = json.dumps({
-            "t": "batch",
-            "p": {
-                "messages": [
-                    {"t": "a", "p": {"n": 1}, "id": "b1"},
-                    {"t": "b", "p": {"n": 2}, "id": "b2"},
-                ],
-            },
-        })
+        batch = json.dumps(
+            {
+                "t": "batch",
+                "p": {
+                    "messages": [
+                        {"t": "a", "p": {"n": 1}, "id": "b1"},
+                        {"t": "b", "p": {"n": 2}, "id": "b2"},
+                    ],
+                },
+            }
+        )
         client._on_raw_message(batch)
         assert client._event_queue.qsize() == 2
 

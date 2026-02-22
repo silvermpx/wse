@@ -67,17 +67,17 @@ ZLIB_METHODS = (0x01, 0x5E, 0x9C, 0xDA)
 
 # -- Quality thresholds --------------------------------------------------------
 
-QUALITY_EXCELLENT_LATENCY = 50.0   # ms
+QUALITY_EXCELLENT_LATENCY = 50.0  # ms
 QUALITY_EXCELLENT_JITTER = 25.0
-QUALITY_EXCELLENT_LOSS = 0.1       # % (matches TS EXCELLENT_LOSS)
+QUALITY_EXCELLENT_LOSS = 0.1  # % (matches TS EXCELLENT_LOSS)
 
 QUALITY_GOOD_LATENCY = 150.0
 QUALITY_GOOD_JITTER = 50.0
-QUALITY_GOOD_LOSS = 1.0            # % (matches TS GOOD_LOSS)
+QUALITY_GOOD_LOSS = 1.0  # % (matches TS GOOD_LOSS)
 
 QUALITY_FAIR_LATENCY = 300.0
 QUALITY_FAIR_JITTER = 100.0
-QUALITY_FAIR_LOSS = 3.0            # % (matches TS FAIR_LOSS)
+QUALITY_FAIR_LOSS = 3.0  # % (matches TS FAIR_LOSS)
 
 # -- Batching ------------------------------------------------------------------
 
@@ -106,7 +106,7 @@ WS_CLOSE_SERVER_OVERLOAD = 4503
 
 SEND_MAX_RETRIES = 5
 SEND_RETRY_BASE_DELAY = 0.1  # seconds (100ms)
-SEND_RETRY_MAX_DELAY = 2.0   # seconds
+SEND_RETRY_MAX_DELAY = 2.0  # seconds
 
 # -- Snapshot retry ------------------------------------------------------------
 

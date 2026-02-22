@@ -1,9 +1,7 @@
 """Tests for circuit breaker."""
 
 import time
-from unittest.mock import patch
 
-import pytest
 
 from wse_client.circuit_breaker import CircuitBreaker
 from wse_client.types import CircuitBreakerState
@@ -35,9 +33,7 @@ class TestCircuitBreaker:
         assert cb.can_execute() is True
 
     def test_closes_after_success_threshold(self):
-        cb = CircuitBreaker(
-            failure_threshold=2, reset_timeout=0.1, success_threshold=2
-        )
+        cb = CircuitBreaker(failure_threshold=2, reset_timeout=0.1, success_threshold=2)
         cb.record_failure()
         cb.record_failure()
         time.sleep(0.15)

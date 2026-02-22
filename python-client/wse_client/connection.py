@@ -34,10 +34,6 @@ from .constants import (
     IDLE_TIMEOUT,
     PROTOCOL_VERSION,
     RECONNECT_ABSOLUTE_CAP,
-    RECONNECT_BASE_DELAY,
-    RECONNECT_FACTOR,
-    RECONNECT_MAX_ATTEMPTS,
-    RECONNECT_MAX_DELAY,
     WS_CLOSE_AUTH_EXPIRED,
     WS_CLOSE_AUTH_FAILED,
     WS_CLOSE_GOING_AWAY,
@@ -49,7 +45,6 @@ from .errors import (
     WSEAuthError,
     WSECircuitBreakerError,
     WSEConnectionError,
-    WSERateLimitError,
     WSETimeoutError,
 )
 from .types import ConnectionState, MessagePriority, ReconnectConfig, ReconnectMode
@@ -186,9 +181,7 @@ class ConnectionManager:
             )
         except asyncio.TimeoutError:
             self._set_state(ConnectionState.ERROR)
-            raise WSETimeoutError(
-                f"Connection timed out after {CONNECTION_TIMEOUT}s"
-            )
+            raise WSETimeoutError(f"Connection timed out after {CONNECTION_TIMEOUT}s")
         except Exception as exc:
             self._set_state(ConnectionState.ERROR)
             raise WSEConnectionError(f"Failed to connect: {exc}") from exc
@@ -458,8 +451,11 @@ class ConnectionManager:
             return
 
         # Auth failures -> no retry
-        if code in (WS_CLOSE_AUTH_FAILED, WS_CLOSE_AUTH_EXPIRED,
-                     WS_CLOSE_POLICY_VIOLATION):
+        if code in (
+            WS_CLOSE_AUTH_FAILED,
+            WS_CLOSE_AUTH_EXPIRED,
+            WS_CLOSE_POLICY_VIOLATION,
+        ):
             self._set_state(ConnectionState.ERROR)
             self._token = None
             logger.error("Auth/policy failure (code %d): %s", code, reason)
@@ -481,9 +477,7 @@ class ConnectionManager:
 
         cfg = self._reconnect_cfg
         if cfg.max_attempts > 0 and self._reconnect_attempts >= cfg.max_attempts:
-            logger.error(
-                "Max reconnect attempts (%d) reached", cfg.max_attempts
-            )
+            logger.error("Max reconnect attempts (%d) reached", cfg.max_attempts)
             self._set_state(ConnectionState.ERROR)
             return
 
@@ -549,7 +543,7 @@ class ConnectionManager:
             delay = cfg.base_delay * _fib(min(attempt, 10))
         else:
             # Exponential / Adaptive
-            delay = cfg.base_delay * (cfg.factor ** attempt)
+            delay = cfg.base_delay * (cfg.factor**attempt)
 
         delay = min(delay, cfg.max_delay)
 

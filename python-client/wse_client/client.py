@@ -20,8 +20,6 @@ from .circuit_breaker import CircuitBreaker
 from .compression import CompressionHandler
 from .connection import ConnectionManager
 from .constants import (
-    BATCH_SIZE,
-    BATCH_TIMEOUT,
     CLIENT_VERSION,
     PROTOCOL_VERSION,
     SEND_MAX_RETRIES,
@@ -30,7 +28,7 @@ from .constants import (
     SNAPSHOT_MAX_RETRIES,
     SNAPSHOT_RETRY_DELAY,
 )
-from .errors import WSEConnectionError, WSEError
+from .errors import WSEConnectionError
 from .event_sequencer import EventSequencer
 from .network_monitor import NetworkMonitor
 from .protocol import MessageCodec
@@ -41,7 +39,6 @@ from .types import (
     ConnectionStats,
     MessagePriority,
     ReconnectConfig,
-    ReconnectMode,
     WSEEvent,
 )
 
@@ -50,12 +47,22 @@ EventHandler = Callable[[WSEEvent], Any]
 AsyncEventHandler = Callable[[WSEEvent], Awaitable[Any]]
 
 # System events consumed internally (not forwarded to user iterator)
-_INTERNAL_ONLY_EVENTS = frozenset({
-    "server_ready", "server_hello", "subscription_update",
-    "health_check", "config_update", "PONG", "pong",
-    "heartbeat", "PING", "sync_request", "metrics_request",
-    "priority_message",
-})
+_INTERNAL_ONLY_EVENTS = frozenset(
+    {
+        "server_ready",
+        "server_hello",
+        "subscription_update",
+        "health_check",
+        "config_update",
+        "PONG",
+        "pong",
+        "heartbeat",
+        "PING",
+        "sync_request",
+        "metrics_request",
+        "priority_message",
+    }
+)
 
 
 class AsyncWSEClient:
@@ -98,8 +105,8 @@ class AsyncWSEClient:
         )
 
         # Callback handlers: type -> list of handlers
-        self._handlers: dict[str, list[EventHandler | AsyncEventHandler]] = (
-            defaultdict(list)
+        self._handlers: dict[str, list[EventHandler | AsyncEventHandler]] = defaultdict(
+            list
         )
         self._wildcard_handlers: list[EventHandler | AsyncEventHandler] = []
 
@@ -303,12 +310,15 @@ class AsyncWSEClient:
                 return True
 
             delay = min(
-                SEND_RETRY_BASE_DELAY * (2 ** attempt),
+                SEND_RETRY_BASE_DELAY * (2**attempt),
                 SEND_RETRY_MAX_DELAY,
             )
             logger.debug(
                 "Send retry %d/%d for '%s' in %.1fs",
-                attempt + 1, max_retries, type, delay,
+                attempt + 1,
+                max_retries,
+                type,
+                delay,
             )
             try:
                 await asyncio.sleep(delay)
@@ -377,9 +387,7 @@ class AsyncWSEClient:
             self._stats.messages_sent += 1
         return ok
 
-    async def request_snapshot(
-        self, topics: list[str] | None = None
-    ) -> bool:
+    async def request_snapshot(self, topics: list[str] | None = None) -> bool:
         """Request a state snapshot with retry (matches TS requestSnapshot)."""
         if self._snapshot_requested:
             return True
@@ -402,10 +410,12 @@ class AsyncWSEClient:
                 self._snapshot_requested = True
                 return True
 
-            delay = SNAPSHOT_RETRY_DELAY * (2 ** attempt)
+            delay = SNAPSHOT_RETRY_DELAY * (2**attempt)
             logger.debug(
                 "Snapshot request retry %d/%d in %.1fs",
-                attempt + 1, SNAPSHOT_MAX_RETRIES, delay,
+                attempt + 1,
+                SNAPSHOT_MAX_RETRIES,
+                delay,
             )
             try:
                 await asyncio.sleep(delay)
@@ -418,9 +428,7 @@ class AsyncWSEClient:
     async def recv(self, timeout: float | None = None) -> WSEEvent:
         """Receive a single event (explicit pull)."""
         if timeout is not None:
-            event = await asyncio.wait_for(
-                self._event_queue.get(), timeout=timeout
-            )
+            event = await asyncio.wait_for(self._event_queue.get(), timeout=timeout)
         else:
             event = await self._event_queue.get()
 
@@ -534,9 +542,7 @@ class AsyncWSEClient:
 
         # Sequence
         if event.sequence is not None:
-            ordered = self._sequencer.process_sequenced_event(
-                event.sequence, event
-            )
+            ordered = self._sequencer.process_sequenced_event(event.sequence, event)
             if ordered is None:
                 return  # Buffered, not yet deliverable
             for evt in ordered:
@@ -630,12 +636,16 @@ class AsyncWSEClient:
             logger.error("Auth failed: %s", message)
         elif code == "RATE_LIMIT_EXCEEDED" or "Rate limit" in message:
             retry_after = p.get("retry_after") or p.get("retryAfter", 0)
-            logger.warning("Rate limit exceeded (retry after %ss): %s", retry_after, message)
+            logger.warning(
+                "Rate limit exceeded (retry after %ss): %s", retry_after, message
+            )
         elif code == "SUBSCRIPTION_FAILED":
             topics = p.get("details", {}).get("topics", [])
             logger.warning("Subscription failed for %s: %s", topics, message)
         elif code in ("PROTOCOL_ERROR", "INVALID_MESSAGE"):
-            logger.error("Critical error [%s]: %s (recoverable=%s)", code, message, recoverable)
+            logger.error(
+                "Critical error [%s]: %s (recoverable=%s)", code, message, recoverable
+            )
         elif severity == "fatal":
             logger.error("Fatal server error [%s]: %s", code, message)
         else:
@@ -730,7 +740,6 @@ class AsyncWSEClient:
         asyncio.ensure_future(self._respond_metrics_request())
 
     async def _respond_metrics_request(self) -> None:
-        stats = self.get_stats()
         diag = self._network_monitor.analyze()
         await self.send(
             "metrics_response",

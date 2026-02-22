@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
-from typing import Any
 
 from ._logging import logger
 
@@ -20,7 +19,6 @@ try:
         ECDH,
         SECP256R1,
         EllipticCurvePrivateKey,
-        EllipticCurvePublicKey,
         generate_private_key,
     )
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM

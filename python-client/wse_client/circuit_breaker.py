@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Awaitable, Callable, TypeVar
+from typing import Awaitable, Callable, TypeVar
 
 from .constants import (
     CIRCUIT_BREAKER_SUCCESS_THRESHOLD,

@@ -110,7 +110,9 @@ class EventSequencer:
         """Remove out-of-order buffered events older than max_age."""
         now = time.monotonic()
         cutoff = now - self._max_age
-        expired = [seq for seq, (_, ts) in self._out_of_order_buffer.items() if ts < cutoff]
+        expired = [
+            seq for seq, (_, ts) in self._out_of_order_buffer.items() if ts < cutoff
+        ]
         for seq in expired:
             del self._out_of_order_buffer[seq]
 
