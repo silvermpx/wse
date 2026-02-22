@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use super::compression::serde_json_to_rmpv;
+use super::compression::{rmpv_to_serde_json, serde_json_to_rmpv};
 use crate::jwt::{self, JwtConfig, parse_cookie_value};
 use ahash::AHashSet;
 use dashmap::DashMap;
@@ -673,23 +673,73 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                 }
             }
             Message::Binary(data) => {
+                // Check if this connection uses msgpack (lock-free DashMap read)
+                let is_msgpack = state
+                    .conn_formats
+                    .get(&*conn_id)
+                    .map(|v| *v)
+                    .unwrap_or(false);
+
                 if drain {
-                    state.push_inbound(InboundEvent::Binary {
-                        conn_id: (*conn_id).clone(),
-                        data: data.to_vec(),
-                    });
+                    if is_msgpack {
+                        // Parse msgpack in Rust → push pre-parsed dict (same as JSON text path)
+                        match rmpv::decode::read_value(&mut &data[..]) {
+                            Ok(rmpv_val) => {
+                                let json_val = rmpv_to_serde_json(&rmpv_val);
+                                let json_val = normalize_json_keys(json_val);
+                                state.push_inbound(InboundEvent::Message {
+                                    conn_id: (*conn_id).clone(),
+                                    value: json_val,
+                                });
+                            }
+                            Err(_) => {
+                                // Not valid msgpack — pass raw bytes
+                                state.push_inbound(InboundEvent::Binary {
+                                    conn_id: (*conn_id).clone(),
+                                    data: data.to_vec(),
+                                });
+                            }
+                        }
+                    } else {
+                        state.push_inbound(InboundEvent::Binary {
+                            conn_id: (*conn_id).clone(),
+                            data: data.to_vec(),
+                        });
+                    }
                 } else if let Some(ref cb) = cached_on_message {
                     let cb_arc = cb.clone();
                     let cid = Arc::clone(&conn_id);
                     let d = data.to_vec();
-                    tokio::task::spawn_blocking(move || {
-                        Python::try_attach(|py| {
-                            let py_bytes = PyBytes::new(py, &d);
-                            if let Err(e) = cb_arc.call1(py, (&**cid, py_bytes)) {
-                                eprintln!("[WSE] on_message (binary) error: {e}");
-                            }
+                    if is_msgpack {
+                        // Parse msgpack and pass as dict to callback (same as JSON text)
+                        tokio::task::spawn_blocking(move || {
+                            Python::try_attach(|py| match rmpv::decode::read_value(&mut &d[..]) {
+                                Ok(rmpv_val) => {
+                                    let json_val = rmpv_to_serde_json(&rmpv_val);
+                                    let json_val = normalize_json_keys(json_val);
+                                    let py_obj = json_to_pyobj(py, &json_val);
+                                    if let Err(e) = cb_arc.call1(py, (&**cid, py_obj)) {
+                                        eprintln!("[WSE] on_message (msgpack) error: {e}");
+                                    }
+                                }
+                                Err(_) => {
+                                    let py_bytes = PyBytes::new(py, &d);
+                                    if let Err(e) = cb_arc.call1(py, (&**cid, py_bytes)) {
+                                        eprintln!("[WSE] on_message (binary) error: {e}");
+                                    }
+                                }
+                            });
                         });
-                    });
+                    } else {
+                        tokio::task::spawn_blocking(move || {
+                            Python::try_attach(|py| {
+                                let py_bytes = PyBytes::new(py, &d);
+                                if let Err(e) = cb_arc.call1(py, (&**cid, py_bytes)) {
+                                    eprintln!("[WSE] on_message (binary) error: {e}");
+                                }
+                            });
+                        });
+                    }
                 }
             }
             Message::Ping(payload) => {

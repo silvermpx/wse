@@ -212,7 +212,8 @@ fn py_dict_to_json_bytes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
 }
 
 /// Convert rmpv::Value -> serde_json::Value for JSON fallback serialization.
-fn rmpv_to_serde_json(val: &rmpv::Value) -> serde_json::Value {
+/// Also used by server.rs to convert inbound msgpack to serde_json::Value.
+pub fn rmpv_to_serde_json(val: &rmpv::Value) -> serde_json::Value {
     match val {
         rmpv::Value::Nil => serde_json::Value::Null,
         rmpv::Value::Boolean(b) => serde_json::Value::Bool(*b),
