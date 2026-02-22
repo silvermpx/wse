@@ -182,7 +182,7 @@ class TestRustECDH:
         assert isinstance(private_key, bytes)
         assert isinstance(public_key, bytes)
         assert len(private_key) == 32  # P-256 scalar
-        assert len(public_key) == 65   # uncompressed SEC1 point
+        assert len(public_key) == 65  # uncompressed SEC1 point
 
     def test_public_key_uncompressed_prefix(self):
         _, public_key = rust_ecdh_generate_keypair()
@@ -816,6 +816,7 @@ class TestE2EEncryption:
         raw = base64.b64decode(encrypted)
         decrypted_bytes = rust_aes_gcm_decrypt(bytes(client_aes_key), raw)
         import json
+
         decrypted = json.loads(decrypted_bytes.decode("utf-8"))
         assert decrypted["t"] == "order_placed"
         assert decrypted["p"]["symbol"] == "AAPL"

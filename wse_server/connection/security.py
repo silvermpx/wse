@@ -167,7 +167,7 @@ class SecurityManager:
 
         # Per-connection ECDH state
         self._conn_private_keys: dict[str, bytes] = {}  # conn_id -> private key
-        self._conn_public_keys: dict[str, bytes] = {}   # conn_id -> our public key
+        self._conn_public_keys: dict[str, bytes] = {}  # conn_id -> our public key
 
         # Fallback HMAC secret (auto-generated, used when no TokenProvider)
         self._hmac_secret: bytes = secrets.token_bytes(32)
@@ -257,9 +257,7 @@ class SecurityManager:
     # Encryption
     # -----------------------------------------------------------------
 
-    async def encrypt_message(
-        self, data: str | bytes | dict, conn_id: str = ""
-    ) -> str | None:
+    async def encrypt_message(self, data: str | bytes | dict, conn_id: str = "") -> str | None:
         """Encrypt message using the active encryption provider.
 
         Returns base64-encoded ciphertext, or None if disabled/no key.

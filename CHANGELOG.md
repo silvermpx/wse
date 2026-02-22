@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.2.1 (2026-02-22)
+
+### Benchmark Suite
+
+- Added multi-process benchmark (`benchmarks/bench_wse_multiprocess.py`) — stress-tests with N parallel workers, 9 test categories including sustained load and msgpack
+- Added standalone benchmark server (`benchmarks/bench_server.py`) — minimal Rust WSE with JWT auth, no database needed
+- Fixed code formatting (ruff)
+- Fixed README protocol version (v1, not v2)
+
 ## v1.2.0 (2026-02-22)
 
 ### Rust JWT Authentication

@@ -124,7 +124,7 @@ Compression, sequencing, filtering, rate limiting, and the WebSocket server itse
 | **Compression** | Flate2 zlib with configurable levels (1-9). Adaptive threshold -- only compress when payload exceeds size limit. Binary mode via msgpack (rmp-serde) for 30% smaller payloads. |
 | **Rate Limiter** | Atomic token-bucket rate limiter in Rust. Per-connection rate enforcement. 100K tokens capacity, 10K tokens/sec refill. |
 | **Message Deduplication** | AHashSet-backed dedup with bounded queue. Prevents duplicate delivery across reconnections and Redis fan-out. |
-| **Wire Envelope** | Protocol v2: `{t, id, ts, seq, p, v}`. Generic payload extraction with automatic type conversion (UUID, datetime, Enum, bytes to JSON-safe primitives). Latency tracking (`latency_ms` field). |
+| **Wire Envelope** | Protocol v1: `{t, id, ts, seq, p, v}`. Generic payload extraction with automatic type conversion (UUID, datetime, Enum, bytes to JSON-safe primitives). Latency tracking (`latency_ms` field). |
 | **Snapshot Provider** | Protocol for initial state delivery. Implement `get_snapshot(user_id, topics)` and clients receive current state immediately on subscribe -- no waiting for the next publish cycle. |
 | **Circuit Breaker** | Three-state machine (CLOSED / OPEN / HALF_OPEN). Sliding-window failure tracking. Automatic recovery probes. Prevents cascade failures when downstream services are unhealthy. |
 | **Message Categories** | `S` (snapshot), `U` (update), `WSE` (system). Category prefixing for client-side routing and filtering. |

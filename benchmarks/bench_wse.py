@@ -18,13 +18,11 @@ import asyncio
 import json
 import statistics
 import time
-from datetime import datetime
-
 import zlib
+from datetime import datetime
 
 import httpx
 import websockets
-
 
 # -- Config ------------------------------------------------------------------
 
@@ -34,6 +32,7 @@ DEFAULT_LOGIN_URL = "/auth/login"
 
 
 # -- WSE Protocol helper -----------------------------------------------------
+
 
 def decode_wse_message(msg) -> dict | None:
     """Decode a WSE message (handles WSE prefix, C: compression, E: encryption)."""
@@ -53,15 +52,20 @@ def decode_wse_message(msg) -> dict | None:
 
 # -- Auth helper -------------------------------------------------------------
 
-async def get_jwt_token(host: str, port: int, login_url: str,
-                        email: str, password: str) -> str | None:
+
+async def get_jwt_token(
+    host: str, port: int, login_url: str, email: str, password: str
+) -> str | None:
     """Login and get JWT access token."""
     url = f"http://{host}:{port}{login_url}"
     async with httpx.AsyncClient() as client:
-        resp = await client.post(url, json={
-            "email": email,
-            "password": password,
-        })
+        resp = await client.post(
+            url,
+            json={
+                "email": email,
+                "password": password,
+            },
+        )
         if resp.status_code == 200:
             data = resp.json()
             token = data.get("access_token") or data.get("token")
@@ -81,11 +85,12 @@ async def get_jwt_token(host: str, port: int, login_url: str,
 
 # -- Test 1: Connection Latency ----------------------------------------------
 
+
 async def bench_connection_latency(host: str, port: int, token: str, rounds: int = 20):
     """Measure time from connect to receiving server_ready."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Test 1: Connection Latency ({rounds} rounds)")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     latencies = []
     for i in range(rounds):
@@ -102,13 +107,13 @@ async def bench_connection_latency(host: str, port: int, token: str, rounds: int
                         latencies.append((t1 - t0) * 1000)
                         break
         except Exception as e:
-            print(f"  Round {i+1}: FAILED ({e})")
+            print(f"  Round {i + 1}: FAILED ({e})")
 
     if latencies:
         print(f"  Rounds:  {len(latencies)}/{rounds}")
         print(f"  Mean:    {statistics.mean(latencies):.2f} ms")
         print(f"  Median:  {statistics.median(latencies):.2f} ms")
-        print(f"  p95:     {sorted(latencies)[int(len(latencies)*0.95)]:.2f} ms")
+        print(f"  p95:     {sorted(latencies)[int(len(latencies) * 0.95)]:.2f} ms")
         print(f"  Min:     {min(latencies):.2f} ms")
         print(f"  Max:     {max(latencies):.2f} ms")
     return latencies
@@ -116,11 +121,12 @@ async def bench_connection_latency(host: str, port: int, token: str, rounds: int
 
 # -- Test 2: Ping/Pong RTT --------------------------------------------------
 
+
 async def bench_ping_pong_rtt(host: str, port: int, token: str, rounds: int = 100):
     """Measure WebSocket ping/pong round-trip time."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Test 2: Ping/Pong RTT ({rounds} rounds)")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     uri = f"ws://{host}:{port}/wse?token={token}&compression=false"
     latencies = []
@@ -131,7 +137,7 @@ async def bench_ping_pong_rtt(host: str, port: int, token: str, rounds: int = 10
             await asyncio.wait_for(ws.recv(), timeout=5)
             await asyncio.sleep(0.1)
 
-            for i in range(rounds):
+            for _i in range(rounds):
                 t0 = time.perf_counter()
                 pong = await ws.ping()
                 await pong
@@ -145,8 +151,8 @@ async def bench_ping_pong_rtt(host: str, port: int, token: str, rounds: int = 10
         print(f"  Rounds:  {len(latencies)}/{rounds}")
         print(f"  Mean:    {statistics.mean(latencies):.2f} ms")
         print(f"  Median:  {statistics.median(latencies):.2f} ms")
-        print(f"  p95:     {sorted(latencies)[int(len(latencies)*0.95)]:.2f} ms")
-        print(f"  p99:     {sorted(latencies)[int(len(latencies)*0.99)]:.2f} ms")
+        print(f"  p95:     {sorted(latencies)[int(len(latencies) * 0.95)]:.2f} ms")
+        print(f"  p99:     {sorted(latencies)[int(len(latencies) * 0.99)]:.2f} ms")
         print(f"  Min:     {min(latencies):.2f} ms")
         print(f"  Max:     {max(latencies):.2f} ms")
     return latencies
@@ -154,11 +160,12 @@ async def bench_ping_pong_rtt(host: str, port: int, token: str, rounds: int = 10
 
 # -- Test 3: Message Send Throughput -----------------------------------------
 
+
 async def bench_send_throughput(host: str, port: int, token: str, n_messages: int = 1000):
     """Measure how fast client can send messages to server."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Test 3: Client->Server Throughput ({n_messages} messages)")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     uri = f"ws://{host}:{port}/wse?token={token}&compression=false"
     msg = json.dumps({"action": "ping", "ts": "2026-01-01T00:00:00Z"})
@@ -179,7 +186,7 @@ async def bench_send_throughput(host: str, port: int, token: str, n_messages: in
             print(f"  Messages: {n_messages}")
             print(f"  Time:     {elapsed:.3f}s")
             print(f"  Rate:     {rps:,.0f} msg/sec")
-            print(f"  Per msg:  {elapsed/n_messages*1000:.3f} ms")
+            print(f"  Per msg:  {elapsed / n_messages * 1000:.3f} ms")
             return rps
 
     except Exception as e:
@@ -189,11 +196,12 @@ async def bench_send_throughput(host: str, port: int, token: str, n_messages: in
 
 # -- Test 4: Rapid Connect/Disconnect ----------------------------------------
 
+
 async def bench_concurrent_connections(host: str, port: int, token: str, n_conns: int = 10):
     """Test rapid connect/disconnect cycles."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Test 4: Rapid Connect/Disconnect ({n_conns} sequential)")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     uri = f"ws://{host}:{port}/wse?token={token}&compression=false"
     times = []
@@ -202,11 +210,11 @@ async def bench_concurrent_connections(host: str, port: int, token: str, n_conns
         t0 = time.perf_counter()
         try:
             async with websockets.connect(uri, open_timeout=5) as ws:
-                msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                await asyncio.wait_for(ws.recv(), timeout=5)
                 t1 = time.perf_counter()
                 times.append((t1 - t0) * 1000)
         except Exception as e:
-            print(f"  Conn {i+1}: FAILED ({e})")
+            print(f"  Conn {i + 1}: FAILED ({e})")
 
     if times:
         print(f"  Connections: {len(times)}/{n_conns}")
@@ -220,11 +228,12 @@ async def bench_concurrent_connections(host: str, port: int, token: str, n_conns
 
 # -- Test 5: Message Size Impact ---------------------------------------------
 
+
 async def bench_message_sizes(host: str, port: int, token: str):
     """Test send performance with different message sizes (fresh connection per size)."""
-    print(f"\n{'='*60}")
-    print(f"Test 5: Message Size Impact")
-    print(f"{'='*60}")
+    print(f"\n{'=' * 60}")
+    print("Test 5: Message Size Impact")
+    print(f"{'=' * 60}")
 
     sizes = [64, 256, 1024, 4096, 16384, 65536]
     n_per_size = 200
@@ -237,7 +246,7 @@ async def bench_message_sizes(host: str, port: int, token: str):
                 while True:
                     try:
                         await asyncio.wait_for(ws.recv(), timeout=0.5)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         break
 
                 payload = json.dumps({"action": "ping", "data": "x" * size})
@@ -251,13 +260,16 @@ async def bench_message_sizes(host: str, port: int, token: str):
                 elapsed = t1 - t0
                 rps = n_per_size / elapsed
                 throughput_mb = (actual_size * n_per_size) / elapsed / 1024 / 1024
-                print(f"  {actual_size:>6} bytes: {rps:>8,.0f} msg/s | {throughput_mb:>6.1f} MB/s | {elapsed/n_per_size*1000:.3f} ms/msg")
+                print(
+                    f"  {actual_size:>6} bytes: {rps:>8,.0f} msg/s | {throughput_mb:>6.1f} MB/s | {elapsed / n_per_size * 1000:.3f} ms/msg"
+                )
 
         except Exception as e:
             print(f"  {size:>6} bytes: ERROR - {e}")
 
 
 # -- Main --------------------------------------------------------------------
+
 
 async def main(host: str, port: int, login_url: str, email: str, password: str):
     print("=" * 60)
@@ -281,22 +293,21 @@ async def main(host: str, port: int, login_url: str, email: str, password: str):
     await bench_concurrent_connections(host, port, token)
     await bench_message_sizes(host, port, token)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("  Benchmark complete")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="WSE Benchmark")
-    parser.add_argument("--host", default=DEFAULT_HOST,
-                        help="Server host (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT,
-                        help="Server port (default: 5005)")
-    parser.add_argument("--login-url", default=DEFAULT_LOGIN_URL,
-                        help="Login endpoint path (default: /auth/login)")
-    parser.add_argument("--email", required=True,
-                        help="Login email for authentication")
-    parser.add_argument("--password", required=True,
-                        help="Login password for authentication")
+    parser.add_argument("--host", default=DEFAULT_HOST, help="Server host (default: 127.0.0.1)")
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT, help="Server port (default: 5005)"
+    )
+    parser.add_argument(
+        "--login-url", default=DEFAULT_LOGIN_URL, help="Login endpoint path (default: /auth/login)"
+    )
+    parser.add_argument("--email", required=True, help="Login email for authentication")
+    parser.add_argument("--password", required=True, help="Login password for authentication")
     args = parser.parse_args()
     asyncio.run(main(args.host, args.port, args.login_url, args.email, args.password))

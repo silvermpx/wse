@@ -329,6 +329,7 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
             encryption_public_key = None
             if encryption:
                 import base64
+
                 raw_pk = connection.security_manager.generate_keypair(conn_id)
                 encryption_public_key = base64.b64encode(raw_pk).decode("ascii")
 
@@ -351,9 +352,7 @@ def create_wse_router(config: WSEConfig) -> APIRouter:
                 "user_id": user_id,
                 "endpoints": {
                     "primary": (
-                        f"ws://{websocket.client.host}/ws/events"
-                        if websocket.client
-                        else None
+                        f"ws://{websocket.client.host}/ws/events" if websocket.client else None
                     ),
                     "health_check_interval": 30_000,
                     "heartbeat_interval": int(config.heartbeat_interval * 1000),
