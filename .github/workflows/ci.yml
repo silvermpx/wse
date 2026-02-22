@@ -35,6 +35,38 @@ jobs:
       - run: npm run build
 
   # ---------------------------------------------------------------------------
+  # Python client: lint + tests
+  # ---------------------------------------------------------------------------
+  python-client:
+    name: Python Client (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13', '3.14']
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: 'pip'
+
+      - name: Install
+        run: |
+          pip install -e "python-client[all,dev]"
+
+      - name: Ruff check
+        run: ruff check python-client/
+
+      - name: Ruff format
+        run: ruff format --check python-client/
+
+      - name: Run tests
+        run: pytest python-client/tests/ -v --tb=short
+
+  # ---------------------------------------------------------------------------
   # Python server: lint + type-check
   # ---------------------------------------------------------------------------
   lint:
