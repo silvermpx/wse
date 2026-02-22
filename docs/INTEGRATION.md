@@ -380,6 +380,93 @@ function ItemList() {
 
 ---
 
+## Python Client Integration
+
+The Python client (`wse-client` on PyPI) connects to WSE from backend services, CLI tools, scripts, and integration tests.
+
+### Install
+
+```bash
+pip install wse-client            # Core (websockets only)
+pip install wse-client[crypto]    # + ECDH/AES-GCM encryption
+pip install wse-client[all]       # + crypto + msgpack + orjson
+```
+
+### Async Client
+
+```python
+from wse_client import connect
+
+async with connect("ws://localhost:5006/wse", token="your-jwt") as client:
+    await client.subscribe(["notifications", "live_data"])
+    async for event in client:
+        print(event.type, event.payload)
+```
+
+### Sync Client
+
+```python
+from wse_client import SyncWSEClient
+
+client = SyncWSEClient("ws://localhost:5006/wse", token="your-jwt")
+client.connect()
+client.subscribe(["notifications"])
+
+event = client.recv(timeout=5.0)
+print(event.type, event.payload)
+
+client.close()
+```
+
+### Callback Pattern
+
+```python
+from wse_client import AsyncWSEClient
+
+client = AsyncWSEClient("ws://localhost:5006/wse", token="your-jwt")
+
+@client.on("notifications")
+def handle_notification(event):
+    print(f"Notification: {event.payload}")
+
+@client.on("price_update")
+def handle_price(event):
+    print(f"Price: {event.payload['symbol']} = {event.payload['price']}")
+```
+
+### Use Cases
+
+| Use Case | Pattern |
+|----------|---------|
+| **Microservice-to-microservice** | AsyncWSEClient in FastAPI lifespan |
+| **CLI tool** | SyncWSEClient with `recv()` loop |
+| **Integration tests** | AsyncWSEClient with `async with` context manager |
+| **Data pipeline** | AsyncWSEClient async iterator with batch processing |
+| **Monitoring** | Callback pattern with `@client.on()` handlers |
+
+### Python Client Configuration
+
+```python
+from wse_client import AsyncWSEClient
+from wse_client.types import ReconnectConfig, LoadBalancingStrategy
+
+client = AsyncWSEClient(
+    url="ws://localhost:5006/wse",
+    token="your-jwt",
+    reconnect=ReconnectConfig(
+        max_attempts=-1,            # Infinite retries (default)
+        base_delay=1.0,             # 1s initial delay
+        max_delay=30.0,             # 30s max delay
+        factor=1.5,                 # Backoff multiplier
+    ),
+    endpoints=["ws://primary:5006/wse", "ws://fallback:5006/wse"],
+    load_balancing=LoadBalancingStrategy.WEIGHTED_RANDOM,
+    queue_size=10000,               # Event queue size
+)
+```
+
+---
+
 ## Configuration Reference
 
 ### Backend Environment Variables

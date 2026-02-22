@@ -1,11 +1,12 @@
 # WSE -- WebSocket Engine
 
-**A complete, out-of-the-box solution for building reactive interfaces with React and Python.**
+**A complete, out-of-the-box solution for real-time communication between React, Python, and backend services.**
 
-Two packages. Four lines of code. Your frontend and backend talk in real time.
+Three packages. Four lines of code. Your frontend and backend talk in real time.
 
 [![CI](https://github.com/silvermpx/wse/actions/workflows/ci.yml/badge.svg)](https://github.com/silvermpx/wse/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/wse-server)](https://pypi.org/project/wse-server/)
+[![PyPI - Server](https://img.shields.io/pypi/v/wse-server)](https://pypi.org/project/wse-server/)
+[![PyPI - Client](https://img.shields.io/pypi/v/wse-client)](https://pypi.org/project/wse-client/)
 [![npm](https://img.shields.io/npm/v/wse-client)](https://www.npmjs.com/package/wse-client)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -17,7 +18,7 @@ Building real-time features between React and Python is painful. You need WebSoc
 
 **WSE gives you all of this out of the box.**
 
-Install `wse-server` on your backend, `wse-client` on your frontend. Everything works immediately: auto-reconnection, message encryption, sequence ordering, offline queues, health monitoring. No configuration required for the defaults. Override what you need.
+Install `wse-server` on your backend, `wse-client` on your frontend (React or Python). Everything works immediately: auto-reconnection, message encryption, sequence ordering, offline queues, health monitoring. No configuration required for the defaults. Override what you need.
 
 The engine is Rust-accelerated via PyO3. Up to **2M msg/s** sustained throughput on AMD EPYC (64 cores). **0.5M msg/s** burst on Apple M2 (8 cores). Sub-millisecond connection latency (0.53ms median) with Rust JWT authentication.
 
@@ -94,6 +95,19 @@ function Dashboard() {
 ```
 
 That's it. Your React app receives real-time updates from your Python backend.
+
+### Client (Python)
+
+```python
+from wse_client import connect
+
+async with connect("ws://localhost:5006/wse", token="your-jwt") as client:
+    await client.subscribe(["notifications", "live_data"])
+    async for event in client:
+        print(event.type, event.payload)
+```
+
+Same wire protocol, same features. Use the Python client for backend-to-backend communication, microservices, CLI tools, integration tests, or any non-browser use case.
 
 ---
 
@@ -177,6 +191,20 @@ Compression, sequencing, filtering, rate limiting, and the WebSocket server itse
 | **Rate Limiter** | Client-side token-bucket rate limiter for outbound messages. Prevents flooding the server. |
 | **Security Manager** | Client-side HMAC verification and optional decryption. Validates message integrity before dispatching to handlers. |
 
+### Client (Python)
+
+| Feature | Description |
+|---------|-------------|
+| **Async + Sync API** | `AsyncWSEClient` with async context manager and async iterator. `SyncWSEClient` wrapper for threaded/synchronous code. |
+| **Connection Manager** | Auto-reconnection with 4 strategies (exponential, linear, fibonacci, adaptive). Jitter, configurable max attempts. Heartbeat with PING/PONG. |
+| **Connection Pool** | Multi-endpoint support with health scoring. Weighted-random, least-connections, round-robin load balancing. |
+| **Circuit Breaker** | Three-state machine (CLOSED / OPEN / HALF_OPEN). Prevents reconnection storms. |
+| **Rate Limiter** | Client-side token-bucket rate limiter for outbound messages. |
+| **Event Sequencer** | Duplicate detection (10K ID window) and out-of-order reordering buffer. |
+| **Network Monitor** | Latency, jitter, packet loss analysis. Connection quality scoring. |
+| **Security** | ECDH P-256 key exchange, AES-GCM-256 encryption, HMAC-SHA256 signing. Wire-compatible with server and TypeScript client. |
+| **Compression + msgpack** | Zlib decompression and msgpack decoding. Automatic binary frame detection. |
+
 ---
 
 ## Performance
@@ -230,47 +258,47 @@ pip install wse-server
 
 # Client (React/TypeScript)
 npm install wse-client
+
+# Client (Python) -- pure Python, no Rust required
+pip install wse-client
 ```
 
-Prebuilt wheels for Linux (x86_64, aarch64), macOS (Intel, Apple Silicon), and Windows.
-Python 3.12+ (ABI3 stable -- one wheel per platform).
+Server: prebuilt wheels for Linux (x86_64, aarch64), macOS (Intel, Apple Silicon), and Windows. Python 3.12+ (ABI3 stable -- one wheel per platform).
+
+Python client: pure Python, Python 3.11+. Optional extras: `pip install wse-client[crypto]` for encryption, `pip install wse-client[all]` for everything.
 
 ---
 
 ## Architecture
 
 ```
-Client (React + TypeScript)              Server (Python + Rust)
-========================                 ========================
+React Client (TypeScript)       Python Client              Server (Python + Rust)
+========================        ========================   ========================
 
-useWSE hook                              FastAPI Router (/wse)
-    |                                     -- OR --
-    v                                    RustWSEServer (standalone :5006)
-ConnectionPool                               |
-    |  (multi-endpoint,                      v
-    |   health scoring)              Rust Engine (PyO3)
-    |  (multi-endpoint,                      |  (drain mode,
-    |   health scoring)                      |   write coalescing)
-    v                                        v
-ConnectionManager                        EventTransformer
-    |  (auto-reconnect,                      |  (wire envelope,
-    |   circuit breaker)                     |   type conversion)
-    v                                        v
-MessageProcessor                         PriorityQueue
-    |  (decompress, verify,                  |  (5 levels,
-    |   sequence, dispatch)                  |   smart dropping)
-    v                                        v
-AdaptiveQualityManager                   Sequencer + Dedup
-    |  (quality scoring,                     |  (AHashSet,
-    |   React Query tuning)                  |   gap detection)
-    v                                        v
-Zustand Store                            Compression + Rate Limiter
-    |                                        |  (flate2, token bucket)
-    v                                        v
-React Components                         PubSub Bus (Redis)
-                                             |
-                                             v
-                                         Dead Letter Queue
+useWSE hook                     AsyncWSEClient             FastAPI Router (/wse)
+    |                               |                        -- OR --
+    v                               v                      RustWSEServer (:5006)
+ConnectionPool                  ConnectionPool                  |
+    |  (multi-endpoint,             |  (multi-endpoint,         v
+    |   health scoring)             |   health scoring)   Rust Engine (PyO3)
+    v                               v                          |
+ConnectionManager               ConnectionManager              v
+    |  (auto-reconnect,             |  (auto-reconnect,   EventTransformer
+    |   circuit breaker)            |   circuit breaker)       |
+    v                               v                          v
+MessageProcessor                MessageCodec              PriorityQueue
+    |  (decompress, verify,         |  (decompress,            |
+    |   sequence, dispatch)         |   sequence, dedup)       v
+    v                               v                     Sequencer + Dedup
+AdaptiveQualityManager          NetworkMonitor                 |
+    |                               |  (quality scoring,       v
+    v                               |   latency, jitter)  Compression + Rate Limiter
+Zustand Store                       v                          |
+    |                           Event handlers /               v
+    v                           async iterator            PubSub Bus (Redis)
+React Components                                               |
+                                                               v
+                                                          Dead Letter Queue
 ```
 
 **Wire format (v1):**
@@ -294,8 +322,9 @@ React Components                         PubSub Bus (Redis)
 |---------|----------|----------|---------|
 | `wse-server` | [PyPI](https://pypi.org/project/wse-server/) | Python + Rust | `pip install wse-server` |
 | `wse-client` | [npm](https://www.npmjs.com/package/wse-client) | TypeScript + React | `npm install wse-client` |
+| `wse-client` | [PyPI](https://pypi.org/project/wse-client/) | Python | `pip install wse-client` |
 
-Both packages are standalone. No shared dependencies between server and client.
+All packages are standalone. No shared dependencies between server and clients.
 
 ---
 
@@ -327,6 +356,7 @@ Both packages are standalone. No shared dependencies between server and client.
 | Client state | Zustand | Lightweight React store |
 | Client hooks | React 18+ | useWSE hook with TypeScript |
 | Offline storage | IndexedDB | Persistent offline queue |
+| Python client | websockets + cryptography | Async/sync WebSocket client |
 | Build system | maturin | Rust+Python hybrid wheels |
 
 ---

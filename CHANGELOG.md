@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.3.1 (2026-02-22)
+
+### Documentation
+
+- Added Python client to main README (quick start, feature table, architecture diagram, installation)
+- Added Python client architecture section to ARCHITECTURE.md
+- Added Python client integration guide to INTEGRATION.md (async, sync, callback patterns, configuration)
+- Fixed ruff lint errors across Python client (unused imports, formatting)
+
 ## v1.3.0 (2026-02-22)
 
 ### Python Client (NEW)

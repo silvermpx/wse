@@ -325,6 +325,61 @@ WebSocket.onmessage
 
 ---
 
+## Python Client Architecture
+
+```
+python-client/
+├── wse_client/
+│   ├── __init__.py            # Public API: connect(), AsyncWSEClient, SyncWSEClient
+│   ├── client.py              # AsyncWSEClient (async context manager, async iterator)
+│   ├── sync_client.py         # SyncWSEClient (threaded wrapper for sync code)
+│   ├── connection.py          # ConnectionManager (lifecycle, reconnect, heartbeat)
+│   ├── protocol.py            # MessageCodec (prefix strip, JSON parse, envelope)
+│   ├── compression.py         # zlib compress/decompress
+│   ├── msgpack_handler.py     # msgpack encode/decode (optional dep)
+│   ├── security.py            # ECDH P-256, AES-GCM-256, HMAC-SHA256
+│   ├── circuit_breaker.py     # CLOSED/OPEN/HALF_OPEN state machine
+│   ├── rate_limiter.py        # Token bucket
+│   ├── event_sequencer.py     # Dedup + out-of-order buffering
+│   ├── connection_pool.py     # Multi-endpoint, health scoring, 3 LB strategies
+│   ├── network_monitor.py     # Latency/jitter/quality analysis
+│   ├── types.py               # Enums, dataclasses (WSEEvent, ConnectionState)
+│   ├── errors.py              # WSEError hierarchy
+│   └── constants.py           # Protocol version, timeouts, thresholds
+└── tests/
+    └── test_*.py              # Unit tests for all modules
+```
+
+### AsyncWSEClient
+
+Primary interface. Async context manager + async iterator:
+
+```python
+async with connect("ws://localhost:5006/wse", token="jwt") as client:
+    await client.subscribe(["notifications"])
+    async for event in client:
+        print(event.type, event.payload)
+```
+
+### Message Processing Pipeline
+
+```
+WebSocket.recv()
+    -> Binary: check C:/E:/M: prefix -> decompress/decrypt/unpack
+    -> Text: strip WSE/S/U prefix -> json.loads (or orjson)
+    -> Deduplication check (event ID, 10K window)
+    -> Sequence check (gap detection, reorder buffer)
+    -> System handler dispatch (server_ready, error, PONG, etc.)
+    -> User handler callbacks (@client.on("type"))
+    -> Async iterator queue (async for event in client)
+```
+
+### Wire Compatibility
+
+The Python client speaks the same wire protocol as the TypeScript client. All prefix formats, binary frame detection, encryption handshake, and message envelope are identical. A Python client can connect to the same server as React clients simultaneously.
+
+---
+
 ## Multi-Instance Scaling
 
 ```
