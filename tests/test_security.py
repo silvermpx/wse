@@ -742,7 +742,7 @@ class TestSecurityManagerECDH:
     def test_derive_session_key_success(self):
         sm = SecurityManager()
         # Server generates keypair
-        server_pk = sm.generate_keypair("conn1")
+        sm.generate_keypair("conn1")
         # Client generates keypair (simulated)
         client_sk, client_pk = rust_ecdh_generate_keypair()
         # Server derives session key from client's public key
