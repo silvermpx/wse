@@ -12,7 +12,7 @@
 
 ---
 
-## v1.2 Results (Rust Transport + JWT)
+## v1.2 Results — Single Client
 
 ### Connection Latency
 
@@ -37,23 +37,24 @@ Time from WebSocket connect to receiving `server_ready` (includes TCP handshake,
 | p95 | 0.19 ms | 0.19 ms |
 | p99 | 0.39 ms | 0.38 ms |
 
-### Throughput
+### Single Client Throughput
 
 | Test | v1.2 Rate | v1.0 Rate | Improvement |
 |------|----------|----------|-------------|
 | **Sequential (50K msgs)** | **124,352 msg/s** | 106,180 msg/s | 1.17x |
-| **Sustained (10s)** | **128,844 msg/s** | ~85,000 msg/s | 1.52x |
-| **Concurrent (50 senders x 1K)** | **129,867 msg/s** | N/A | — |
-| **Binary 1KB** | **112,924 msg/s** | N/A | — |
+| **Sustained JSON (10s)** | **113,000 msg/s** | ~85,000 msg/s | 1.33x |
+| **Sustained MsgPack (10s)** | **116,000 msg/s** | N/A | — |
+| **Concurrent (50 senders x 1K)** | **115,464 msg/s** | N/A | — |
+| **Binary 1KB** | **99,565 msg/s** | N/A | — |
 
-### Large Message Performance
+### Large Message Performance (Single Client)
 
 | Size | v1.2 Rate | v1.2 Bandwidth | v1.0 Rate | v1.0 Bandwidth | Improvement |
 |------|----------|----------------|----------|----------------|-------------|
-| 64 KB | **39,267 msg/s** | **2.5 GB/s** | 8,229 msg/s | 514 MB/s | **4.8x** |
-| 16 KB | **73,565 msg/s** | **1.2 GB/s** | 27,624 msg/s | 432 MB/s | 2.7x |
-| 4 KB | **105,032 msg/s** | **413 MB/s** | 82,248 msg/s | 324 MB/s | 1.3x |
-| 1 KB | **113,906 msg/s** | **114 MB/s** | 105,882 msg/s | 106 MB/s | 1.08x |
+| 64 KB | **43,356 msg/s** | **2.7 GB/s** | 8,229 msg/s | 514 MB/s | **5.3x** |
+| 16 KB | **64,163 msg/s** | **1.0 GB/s** | 27,624 msg/s | 432 MB/s | 2.3x |
+| 4 KB | **75,932 msg/s** | **299 MB/s** | 82,248 msg/s | 324 MB/s | 0.9x |
+| 1 KB | **106,641 msg/s** | **107 MB/s** | 105,882 msg/s | 106 MB/s | 1.01x |
 
 ### Rapid Connect/Disconnect
 
@@ -68,30 +69,78 @@ Time from WebSocket connect to receiving `server_ready` (includes TCP handshake,
 
 ---
 
-## Burst Throughput (Rust Engine)
+## v1.2 Results — Multi-Process (10 Workers)
 
-| Mode | Messages | Time | Rate | Per Message |
-|------|----------|------|------|-------------|
-| **Rust binary (msgpack)** | 10,000 | 0.009 s | **1,000,000 msg/s** | 0.0009 ms |
-| **Rust JSON** | 10,000 | 0.035 s | **285,000 msg/s** | 0.0035 ms |
-| Pure Python JSON | 1,000 | 0.009 s | 106,000 msg/s | 0.009 ms |
+10 independent Python processes, each with its own WebSocket connection sending concurrently.
+Measures aggregate server throughput under parallel load.
 
-## Sustained Throughput (10s continuous send)
+### Aggregate Throughput
+
+| Test | JSON | MsgPack |
+|------|------|---------|
+| **Burst (100K msgs)** | **318,000 msg/s** | **311,000 msg/s** |
+| **Sustained (5s)** | **356,000 msg/s** | **345,000 msg/s** |
+
+### JSON Burst: Up to 0.5M msg/s
+
+Small message (93 bytes) throughput with 10 workers — approaches half a million messages per second:
+
+| Size | Rate | Bandwidth | Workers |
+|------|------|-----------|---------|
+| 93 B | **488,457 msg/s** | 43 MB/s | 10/10 |
+| 285 B | 479,581 msg/s | 130 MB/s | 10/10 |
+| 1 KB | 455,190 msg/s | 457 MB/s | 10/10 |
+| 4 KB | 407,345 msg/s | 1.6 GB/s | 10/10 |
+| 16 KB | 243,457 msg/s | 3.8 GB/s | 10/10 |
+| 64 KB | **163,912 msg/s** | **10.2 GB/s** | 10/10 |
+
+### Sustained JSON (10 workers x 5s)
+
+1.78M total messages, stddev 3.3%.
 
 | Second | Rate |
 |--------|------|
-| 1 | 94,201 msg/s (warmup) |
-| 2 | 132,681 msg/s |
-| 3 | 120,251 msg/s |
-| 4 | 135,315 msg/s |
-| 5 | 134,859 msg/s |
-| 6 | 133,560 msg/s |
-| 7 | 133,036 msg/s |
-| 8 | 134,492 msg/s |
-| 9 | 134,486 msg/s |
-| 10 | 135,556 msg/s |
-| **Average** | **128,844 msg/s** |
-| **Stddev** | **12,976 msg/s** |
+| 1 | 344,193 msg/s |
+| 2 | 343,709 msg/s |
+| 3 | 366,249 msg/s |
+| 4 | 365,605 msg/s |
+| 5 | 365,375 msg/s |
+| **Average** | **357,026 msg/s** |
+| **Stddev** | **11,941 msg/s (3.3%)** |
+
+### Sustained MsgPack (10 workers x 5s)
+
+1.72M total messages, stddev 3.9%. Msgpack parsed in Rust (zero Python overhead).
+
+| Second | Rate |
+|--------|------|
+| 1 | 348,812 msg/s |
+| 2 | 354,235 msg/s |
+| 3 | 359,253 msg/s |
+| 4 | 325,851 msg/s |
+| 5 | 336,832 msg/s |
+| **Average** | **344,997 msg/s** |
+| **Stddev** | **13,568 msg/s (3.9%)** |
+
+### Multi-Process Connection Latency (10 workers x 5 rounds)
+
+| Metric | Value |
+|--------|-------|
+| Mean | 8.95 ms |
+| Median | 2.20 ms |
+| p95 | 35.02 ms |
+| Min | 1.35 ms |
+
+### Multi-Process Ping RTT (10 workers x 20 pings)
+
+| Metric | Value |
+|--------|-------|
+| Mean | 0.33 ms |
+| Median | 0.18 ms |
+| p95 | 0.90 ms |
+| Min | 0.10 ms |
+
+---
 
 ## Rust Acceleration by Component
 
@@ -105,6 +154,7 @@ Time from WebSocket connect to receiving `server_ready` (includes TCP handshake,
 | Priority queue (enqueue) | 5 us | 0.2 us | **25x** |
 | Rate limiter (check) | 2 us | 0.05 us | **40x** |
 | HMAC-SHA256 sign | 18 us | 0.8 us | **22x** |
+| Msgpack inbound parse | ~50 us | ~1 us | **~50x** |
 
 ---
 
@@ -144,20 +194,23 @@ Time from WebSocket connect to receiving `server_ready` (includes TCP handshake,
 
 ## Comparison with Alternatives
 
-| Feature | WSE (Rust) | WSE (Python) | Socket.IO | ws (Node.js) | Pusher |
-|---------|-----------|-------------|-----------|--------------|--------|
-| Throughput (msg/s) | **1M** | 106K | ~25K | ~50K | N/A |
-| Connection latency | **0.53 ms** | 23 ms | ~50 ms | ~10 ms | ~100 ms |
-| 64KB throughput | **39K msg/s** | 8K msg/s | ~2K | ~5K | N/A |
-| Ping RTT | 0.09 ms | 0.11 ms | ~1 ms | ~0.1 ms | N/A |
-| JWT auth | Rust (0.01ms) | Python | N/A | N/A | N/A |
-| Compression | zlib (Rust) | zlib + msgpack | per-msg deflate | per-msg deflate | N/A |
-| Priority queue | 5-level (Rust) | 5-level | No | No | No |
-| Circuit breaker | Yes | Yes | No | No | No |
-| Offline queue | IndexedDB | IndexedDB | No | No | No |
-| Multi-instance | Redis Pub/Sub | Redis Pub/Sub | Redis adapter | Manual | Built-in |
-| E2E encryption | AES-GCM-256 | AES-GCM-256 | No | No | No |
-| Message signing | HMAC-SHA256 | HMAC-SHA256 | No | No | No |
+| Feature | WSE (Rust) | WSE (Python) | Socket.IO | ws (Node.js) |
+|---------|-----------|-------------|-----------|--------------|
+| Single client sustained | **113K msg/s** | ~85K | ~25K | ~50K |
+| 10-worker sustained | **356K msg/s** | N/A | N/A | N/A |
+| 10-worker burst (JSON) | **488K msg/s** | N/A | N/A | N/A |
+| Connection latency | **0.53 ms** | 23 ms | ~50 ms | ~10 ms |
+| 64KB throughput (10w) | **10.2 GB/s** | 514 MB/s | N/A | N/A |
+| Ping RTT | 0.09 ms | 0.11 ms | ~1 ms | ~0.1 ms |
+| JWT auth | Rust (0.01ms) | Python | N/A | N/A |
+| Wire formats | JSON + MsgPack | JSON + MsgPack | JSON | JSON |
+| Compression | zlib (Rust) | zlib + msgpack | per-msg deflate | per-msg deflate |
+| Priority queue | 5-level (Rust) | 5-level | No | No |
+| Circuit breaker | Yes | Yes | No | No |
+| Offline queue | IndexedDB | IndexedDB | No | No |
+| Multi-instance | Redis Pub/Sub | Redis Pub/Sub | Redis adapter | Manual |
+| E2E encryption | AES-GCM-256 | AES-GCM-256 | No | No |
+| Message signing | HMAC-SHA256 | HMAC-SHA256 | No | No |
 
 ---
 
@@ -167,8 +220,10 @@ Time from WebSocket connect to receiving `server_ready` (includes TCP handshake,
 |-------|-----------|-------------------|-------------|
 | Initial (unoptimized) | 34,000 msg/s | ~50 ms | Baseline |
 | After Python optimization (9 fixes) | 106,000 msg/s | 23 ms | **3.1x** throughput |
-| After Rust acceleration (v1.0) | 1,000,000 msg/s | 23 ms | **10.4x** throughput |
-| After Rust JWT + transport (v1.2) | 1,000,000 msg/s | **0.53 ms** | **27x** latency, **5x** large msg |
+| After Rust acceleration (v1.0) | 113,000 msg/s | 23 ms | **1.07x** throughput |
+| After Rust JWT + transport (v1.2) | 113,000 msg/s | **0.53 ms** | **27x** latency, **5x** large msg |
+| Multi-process (10 workers, v1.2) | **356,000 msg/s** sustained | 2.20 ms median | **3.1x** vs single client |
+| Multi-process burst (v1.2) | **488,000 msg/s** | — | **~0.5M msg/s** |
 
 ### Python Optimization Highlights
 
@@ -186,7 +241,8 @@ Time from WebSocket connect to receiving `server_ready` (includes TCP handshake,
 4. **BinaryHeap priority queue**: 25x faster message ordering
 5. **Zero-copy transforms**: 15x faster event envelope construction
 6. **Atomic rate limiter**: 40x faster token bucket
-7. **Large message path**: 5x faster at 64KB (2.5 GB/s bandwidth)
+7. **Large message path**: 5x faster at 64KB (2.7 GB/s single client, 10.2 GB/s 10 workers)
+8. **Inbound msgpack parsing**: Binary frames parsed in Rust via rmpv (zero Python overhead)
 
 ---
 
@@ -202,7 +258,7 @@ python -m server
 
 # Run benchmarks (in another terminal)
 python benchmarks/bench_single_client.py
-python benchmarks/bench_multiprocess.py --workers 16
+python benchmarks/bench_multiprocess.py --workers 10
 ```
 
 ### Protocol
@@ -220,18 +276,20 @@ Tests use high message counts for statistical accuracy:
 
 | Test | Messages |
 |------|----------|
-| Connection latency | 50 rounds |
-| Ping RTT | 500 rounds |
-| Sequential throughput | 50,000 |
-| Rapid connect | 50 cycles |
-| Message sizes (64B-1KB) | 10,000-20,000 per size |
-| Message sizes (4KB-64KB) | 1,000-5,000 per size |
-| Concurrent senders | 50 x 1,000 = 50,000 |
-| Binary frames | 10,000 |
-| Sustained load | 10 seconds continuous |
+| Connection latency | 50 rounds (single), 10x5 rounds (multi) |
+| Ping RTT | 500 rounds (single), 10x20 (multi) |
+| Sequential throughput | 50,000 (single), 100,000 (multi) |
+| Rapid connect | 50 cycles (single), 10x5 (multi) |
+| Message sizes | 10,000-20,000 per size (single), 5,000 per size (multi) |
+| Binary frames | 10,000 (single), 50,000 (multi) |
+| Sustained load | 10s (single), 5s (multi) |
 
 ### Reproducibility
 
 All benchmarks run on localhost to eliminate network variance.
 Each test runs multiple rounds and reports percentile statistics.
 Results are deterministic within ~5% variance across runs.
+
+The 10-worker count was chosen as the optimal sweet spot for Apple M2:
+fewer workers underutilize tokio parallelism, more workers add contention
+(12+ workers showed higher stddev and lower per-worker throughput).
