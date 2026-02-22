@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wse-client"
+version = "1.3.0"
+description = "Python client for WSE (WebSocket Engine) -- real-time event streaming"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "silvermpx" }]
+keywords = ["websocket", "real-time", "event-streaming", "wse"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet",
+    "Topic :: Software Development :: Libraries",
+    "Framework :: AsyncIO",
+    "Typing :: Typed",
+]
+dependencies = [
+    "websockets>=13.0",
+]
+
+[project.optional-dependencies]
+crypto = ["cryptography>=43.0"]
+msgpack = ["msgpack>=1.0"]
+orjson = ["orjson>=3.10"]
+all = [
+    "cryptography>=43.0",
+    "msgpack>=1.0",
+    "orjson>=3.10",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/silvermpx/wse"
+Documentation = "https://github.com/silvermpx/wse/tree/main/python-client"
+Repository = "https://github.com/silvermpx/wse"
+Issues = "https://github.com/silvermpx/wse/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["wse_client"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88

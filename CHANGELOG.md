@@ -1,5 +1,30 @@
 # Changelog
 
+## v1.3.0 (2026-02-22)
+
+### Python Client (NEW)
+
+Full-featured async Python client (`wse-client`) with feature parity to the TypeScript client:
+
+- **AsyncWSEClient** — async context manager, async iterator, callback pattern
+- **SyncWSEClient** — thread-safe synchronous wrapper with `run_forever()`
+- **Wire protocol** — full binary frame support (zlib, msgpack, AES-GCM encrypted)
+- **Security** — ECDH P-256 key exchange, AES-GCM-256 encryption, HMAC-SHA256 signing
+- **Resilience** — circuit breaker, token bucket rate limiter, reconnect with 4 strategies
+- **Connection pool** — multi-endpoint with health scoring, 3 load balancing strategies
+- **Network monitor** — latency/jitter/packet-loss quality analysis
+- **Event sequencer** — deduplication + out-of-order buffering
+
+### Bug Fixes
+
+- Fixed PING/PONG timestamp extraction for WSE-prefixed frames
+- Fixed IV cache overflow (evict oldest half instead of clear-all)
+- Fixed double-dispatch of user event handlers in system handler chain
+- Fixed SyncWSEClient.connect() silently succeeding on connection failure
+- Fixed batch messages missing timestamp field
+- Fixed plain-text PONG not updating NetworkMonitor latency
+- Fixed connection pool `_preferred_endpoint` initialization
+
 ## v1.2.2 (2026-02-22)
 
 ### Documentation

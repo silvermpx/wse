@@ -41,3 +41,6 @@ node_modules/
 
 # Maturin
 *.whl
+
+# Internal docs (not for release)
+docs/internal/
