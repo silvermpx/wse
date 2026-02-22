@@ -25,7 +25,9 @@ The engine is Rust-accelerated via PyO3. Up to **2M msg/s** sustained throughput
 
 ## Quick Start
 
-### Server (Python)
+### Server (Python) -- Router Mode
+
+Embed WSE into your existing FastAPI app on the same port:
 
 ```python
 from fastapi import FastAPI
@@ -42,6 +44,31 @@ app.include_router(wse, prefix="/wse")
 # Publish from anywhere in your app
 await wse.publish("notifications", {"text": "Order shipped!", "order_id": 42})
 ```
+
+### Server (Python) -- Standalone Mode
+
+Run the Rust WebSocket server on a dedicated port for maximum throughput:
+
+```python
+from wse_server._wse_accel import RustWSEServer
+
+server = RustWSEServer(
+    "0.0.0.0", 5006,
+    max_connections=10000,
+    jwt_secret=b"your-secret-key",     # Rust JWT validation in handshake
+    jwt_issuer="your-app",
+    jwt_audience="your-api",
+)
+server.start()
+
+# Drain inbound events in a background thread
+while True:
+    events = server.drain_inbound(256, 50)  # batch size, timeout ms
+    for event in events:
+        handle(event)
+```
+
+Standalone mode gives you a dedicated Rust tokio runtime on its own port -- no FastAPI overhead, no GIL on the hot path. This is how WSE achieves 2M msg/s.
 
 ### Client (React)
 
@@ -217,9 +244,11 @@ Client (React + TypeScript)              Server (Python + Rust)
 ========================                 ========================
 
 useWSE hook                              FastAPI Router (/wse)
-    |                                        |
-    v                                        v
-ConnectionPool                           Rust Engine (PyO3)
+    |                                     -- OR --
+    v                                    RustWSEServer (standalone :5006)
+ConnectionPool                               |
+    |  (multi-endpoint,                      v
+    |   health scoring)              Rust Engine (PyO3)
     |  (multi-endpoint,                      |  (drain mode,
     |   health scoring)                      |   write coalescing)
     v                                        v

@@ -6,7 +6,7 @@
 - **OS**: macOS 15.3.2
 - **Python**: 3.14
 - **Rust**: 1.84+ (PyO3 0.28, maturin 1.8)
-- **Server**: FastAPI + Granian (ASGI)
+- **Mode**: Standalone (`RustWSEServer` on dedicated port, no FastAPI overhead)
 - **Network**: localhost (127.0.0.1)
 - **Compression**: Disabled for throughput tests (raw protocol performance)
 
@@ -145,7 +145,7 @@ Small message (93 bytes) throughput with 10 workers — approaches half a millio
 ## v1.2 Results — AMD EPYC 7502P (64 cores, 128 GB)
 
 **Hardware**: AMD EPYC 7502P, 64 cores / 128 threads, 128 GB RAM, Ubuntu 24.04.
-Minimal benchmark server (Rust WSE + JWT auth, no FastAPI/DB overhead).
+**Mode**: Standalone (RustWSEServer on dedicated port, no FastAPI/DB overhead).
 
 ### Worker Scaling Summary
 
@@ -355,11 +355,11 @@ Hashrocket WebSocket Shootout (i7-4790K), Lemire ws benchmark (Xeon Gold).
 
 ### Tool
 
-Custom Python benchmark using `websockets` library and `httpx` for authentication.
+Custom Python benchmark using `websockets` library. All benchmarks run against the standalone `RustWSEServer` (dedicated port, Rust JWT auth in handshake, no FastAPI/DB overhead).
 
 ```bash
-# Start the server
-python -m server
+# Start the benchmark server (standalone mode)
+python benchmarks/bench_server.py
 
 # Run benchmarks (in another terminal)
 python benchmarks/bench_single_client.py
@@ -368,9 +368,9 @@ python benchmarks/bench_multiprocess.py --workers 10
 
 ### Protocol
 
-1. Authenticate via HTTP to get JWT token
-2. Connect to `ws://host:port/wse` with `access_token` cookie
-3. Wait for `server_ready` message (Rust JWT validation)
+1. Connect to `ws://host:port/wse` with `access_token` cookie (JWT)
+2. Rust validates JWT during WebSocket handshake (zero GIL)
+3. Receive `server_ready` message (sent from Rust, before Python runs)
 4. Drain buffered messages (snapshots, subscriptions)
 5. Run test-specific workload
 6. Collect timing statistics

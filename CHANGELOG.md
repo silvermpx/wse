@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.2.2 (2026-02-22)
+
+### Documentation
+
+- Added standalone mode (`RustWSEServer`) documentation to README, Architecture, Integration Guide, and Benchmarks
+- Documented both deployment modes: Router (embedded FastAPI) and Standalone (dedicated Rust server)
+- Clarified that all benchmarks use standalone mode
+- Updated benchmark methodology section with standalone server instructions
+- Cleaned up PROTOCOL.md — replaced domain-specific examples with generic ones
+
 ## v1.2.1 (2026-02-22)
 
 ### Benchmark Suite

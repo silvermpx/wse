@@ -4,7 +4,53 @@
 
 WSE follows a layered architecture with clear separation between transport, protocol, and application concerns. The system supports horizontal scaling through Redis Pub/Sub coordination.
 
-## Backend Architecture
+## Deployment Modes
+
+WSE supports two deployment modes:
+
+### Router Mode (embedded in FastAPI)
+
+Mount WSE as a FastAPI router on the same port as your existing app. Best for prototyping, small-to-medium workloads, and when you want a single process.
+
+```python
+from fastapi import FastAPI
+from wse_server import create_wse_router, WSEConfig
+
+app = FastAPI()
+wse = create_wse_router(WSEConfig(redis_url="redis://localhost:6379"))
+app.include_router(wse, prefix="/wse")
+```
+
+### Standalone Mode (dedicated Rust server)
+
+Run `RustWSEServer` on its own port for maximum throughput. The entire WebSocket server runs in a Rust tokio runtime — no FastAPI overhead, no GIL on the hot path. This is how WSE achieves 2M msg/s.
+
+```python
+from wse_server._wse_accel import RustWSEServer
+
+server = RustWSEServer(
+    "0.0.0.0", 5006,
+    max_connections=10000,
+    jwt_secret=b"your-secret-key",
+    jwt_issuer="your-app",
+    jwt_audience="your-api",
+)
+server.start()
+
+# Drain inbound events in a background thread
+while True:
+    events = server.drain_inbound(256, 50)  # batch size, timeout ms
+    for event in events:
+        handle(event)
+```
+
+Standalone mode gives you a dedicated Rust tokio runtime. JWT validation, ping/pong, rate limiting, compression, and the WebSocket transport itself all run in Rust with zero GIL acquisition.
+
+All benchmarks (including the 2M msg/s EPYC results) use standalone mode.
+
+---
+
+## Backend Architecture (Router Mode)
 
 ```
 server/

@@ -25,7 +25,7 @@ All WSE messages are JSON objects with the following structure:
 |-------|------|-------------|
 | `v` | `int` | Protocol version (currently `1`) |
 | `id` | `string` | Unique message ID (UUID v7) |
-| `t` | `string` | Event type (e.g., `broker_connection_update`) |
+| `t` | `string` | Event type (e.g., `user_update`, `chat_message`) |
 | `ts` | `string` | ISO 8601 timestamp with timezone |
 | `seq` | `int` | Monotonically increasing sequence number |
 | `p` | `object` | Event payload (type-specific data) |
@@ -46,15 +46,15 @@ Messages are prefixed with a category identifier before the JSON payload:
 | Prefix | Category | Description | Examples |
 |--------|----------|-------------|----------|
 | `WSE` | System | Protocol-level messages | `server_ready`, `PING`, `PONG`, `error` |
-| `S` | Snapshot | Full state snapshots | `broker_connection_snapshot`, `broker_account_snapshot` |
-| `U` | Update | Incremental updates | `broker_connection_update`, `balance_update` |
+| `S` | Snapshot | Full state snapshots | `user_snapshot`, `channel_snapshot` |
+| `U` | Update | Incremental updates | `user_update`, `chat_message` |
 
 ### Wire Format
 
 ```
 WSE{"t":"server_ready","p":{...},"v":1}
-S{"t":"broker_connection_snapshot","p":{...},"v":1}
-U{"t":"broker_connection_update","p":{...},"v":1}
+S{"t":"user_snapshot","p":{...},"v":1}
+U{"t":"user_update","p":{...},"v":1}
 ```
 
 The client must strip the prefix before JSON parsing:
@@ -206,7 +206,7 @@ Server automatically subscribes the connection to default topics and sends subsc
 U{"t":"subscription_update","p":{
   "action": "subscribe",
   "success": true,
-  "topics": ["broker_connection_events", "broker_account_events", ...],
+  "topics": ["notifications", "chat_messages", ...],
   "success_topics": [...],
   "active_subscriptions": [...]
 }}
@@ -217,8 +217,8 @@ U{"t":"subscription_update","p":{
 After subscription, server sends full state snapshots:
 
 ```json
-S{"t":"broker_connection_snapshot","p":{
-  "connections": [...],
+S{"t":"user_snapshot","p":{
+  "users": [...],
   "count": 2,
   "timestamp": "2026-02-20T15:30:00.123Z"
 }}
@@ -229,10 +229,10 @@ S{"t":"broker_connection_snapshot","p":{
 Real-time updates follow snapshots:
 
 ```json
-U{"t":"broker_connection_update","p":{
-  "broker_connection_id": "...",
-  "connected": true,
-  "response_time_ms": 45
+U{"t":"user_update","p":{
+  "user_id": "...",
+  "status": "online",
+  "last_seen": "2026-02-20T15:30:00.123Z"
 }}
 ```
 
@@ -272,7 +272,7 @@ Client responds with:
   "t": "subscription",
   "p": {
     "action": "subscribe",
-    "topics": ["trading_updates", "market_data"]
+    "topics": ["notifications", "chat_messages"]
   }
 }
 ```
@@ -285,9 +285,8 @@ Request initial data snapshots:
 {
   "t": "sync_request",
   "p": {
-    "topics": ["broker_connection_events", "broker_account_events"],
-    "include_snapshots": true,
-    "include_positions": false
+    "topics": ["notifications", "chat_messages"],
+    "include_snapshots": true
   }
 }
 ```
@@ -357,8 +356,8 @@ When the client supports batching (`batch_messages: true` in features), the serv
 ```json
 U{"t":"batch","p":{
   "messages": [
-    {"t":"balance_update","p":{...}},
-    {"t":"position_update","p":{...}}
+    {"t":"notification","p":{...}},
+    {"t":"chat_message","p":{...}}
   ],
   "count": 2
 }}
@@ -381,7 +380,7 @@ The `sig` field contains an HMAC-SHA256 signature (or JWT when a TokenProvider i
 Example signed types (domain-specific, not built into WSE):
 
 ```
-order_placed, order_filled, trade_executed, position_update, ...
+payment_completed, account_transfer, config_change, ...
 ```
 
 ## Error Codes
@@ -409,15 +408,15 @@ order_placed, order_filled, trade_executed, position_update, ...
 | 1011 | Server error / circuit breaker |
 | 4401 | Authentication required |
 
-## Default Topics
+## Topics
+
+Topics are application-defined. WSE does not enforce any topic names — define topics that match your domain. Examples:
 
 | Topic | Description |
 |-------|-------------|
-| `broker_connection_events` | Broker connection lifecycle events |
-| `broker_account_events` | Account sync and update events |
-| `user_account_events` | User account events |
+| `notifications` | User notifications |
+| `chat_messages` | Chat room messages |
 | `system_events` | System-wide announcements |
-| `monitoring_events` | Monitoring and diagnostics |
-| `trading_updates` | Real-time balance/order/position updates |
-| `market_data` | Real-time bar/quote updates for charts |
-| `ai_strategy_events` | AI strategy training/inference events |
+| `user_presence` | Online/offline status updates |
+
+Configure default topics via `auto_subscribe_topics` in your WSE router setup.

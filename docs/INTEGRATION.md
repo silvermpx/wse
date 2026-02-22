@@ -2,7 +2,57 @@
 
 This guide covers integrating WSE into a new project. WSE is designed as a self-contained module that can be extracted and reused.
 
-## Backend Integration
+## Deployment Modes
+
+WSE supports two deployment modes. Choose based on your performance requirements.
+
+### Router Mode (embedded in FastAPI)
+
+Mount WSE as a FastAPI router on the same port as your app. Simplest setup — one process, one port.
+
+```python
+from fastapi import FastAPI
+from wse_server import create_wse_router, WSEConfig
+
+app = FastAPI()
+wse = create_wse_router(WSEConfig(redis_url="redis://localhost:6379"))
+app.include_router(wse, prefix="/wse")
+
+# Publish from anywhere
+await wse.publish("notifications", {"text": "Hello!"})
+```
+
+### Standalone Mode (dedicated Rust server)
+
+Run `RustWSEServer` on its own port for maximum throughput. The WebSocket server runs entirely in a Rust tokio runtime — no FastAPI overhead, no GIL on the hot path. This is how WSE achieves 2M msg/s on EPYC.
+
+```python
+from wse_server._wse_accel import RustWSEServer
+
+server = RustWSEServer(
+    "0.0.0.0", 5006,
+    max_connections=10000,
+    jwt_secret=b"your-secret-key",
+    jwt_issuer="your-app",
+    jwt_audience="your-api",
+)
+server.start()
+
+while True:
+    events = server.drain_inbound(256, 50)
+    for event in events:
+        handle(event)
+```
+
+With standalone mode:
+- JWT validation happens in Rust during the WebSocket handshake (0.01ms)
+- `server_ready` is sent from Rust before Python runs
+- Python receives pre-validated events via `drain_inbound()` (batch polling, one GIL acquisition per batch)
+- Ping/pong, rate limiting, compression all run in Rust
+
+---
+
+## Router Mode Integration
 
 ### Prerequisites
 
