@@ -321,7 +321,11 @@ export function useWSE(
   // ---------------------------------------------------------------------------
 
   const startCircuitBreakerCheck = useCallback(() => {
-    if (circuitBreakerCheckInterval) return;
+    // Clear any existing interval so updated validToken closure is used
+    if (circuitBreakerCheckInterval) {
+      clearInterval(circuitBreakerCheckInterval);
+      circuitBreakerCheckInterval = null;
+    }
 
     circuitBreakerCheckInterval = setInterval(() => {
       store.checkCircuitBreakerTimeout();
@@ -658,7 +662,7 @@ export function useWSE(
 
         if (eventType === 'heartbeat') {
           throttleMs = 5000;
-        } else if (eventType.includes('snapshot') || eventType === 'server_ready' || eventType === 'server_hello') {
+        } else if (eventType.includes('snapshot') || eventType === 'server_ready' || eventType === 'server_hello' || eventType === 'error' || eventType === 'subscription_update') {
           throttleMs = 0;
         } else if (eventType === 'health_check' || eventType === 'health_check_response') {
           throttleMs = 10000;

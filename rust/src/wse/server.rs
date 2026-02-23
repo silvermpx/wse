@@ -118,6 +118,8 @@ struct SharedState {
     inbound_condvar: std::sync::Condvar,
     // Per-connection format preference (lock-free sync access for send_event)
     conn_formats: DashMap<String, bool>,
+    // Per-connection rate limiter state (cleaned up on disconnect)
+    conn_rates: std::sync::Mutex<HashMap<String, PerConnRate>>,
     // JWT config: when set, Rust validates JWT in handshake (zero GIL)
     jwt_config: Option<JwtConfig>,
 }
@@ -137,6 +139,7 @@ impl SharedState {
             inbound_queue: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(4096)),
             inbound_condvar: std::sync::Condvar::new(),
             conn_formats: DashMap::new(),
+            conn_rates: std::sync::Mutex::new(HashMap::new()),
             jwt_config,
         }
     }
@@ -338,17 +341,32 @@ fn build_error_json(code: &str, message: &str) -> String {
 fn build_server_ready(conn_id: &str, user_id: &str) -> String {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let msg_id = Uuid::now_v7().to_string();
-    format!(
-        concat!(
-            r#"WSE{{"t":"server_ready","id":"{}","ts":"{}","seq":1,"p":{{"#,
-            r#""message":"Connection established (Rust transport)","details":{{"#,
-            r#""version":1,"features":{{"compression":true,"encryption":false,"#,
-            r#""batching":true,"priority_queue":true,"circuit_breaker":true,"#,
-            r#""rust_transport":true,"rust_jwt":true}},"#,
-            r#""connection_id":"{}","server_time":"{}","user_id":"{}"}}}},"v":1}}"#,
-        ),
-        msg_id, ts, conn_id, ts, user_id,
-    )
+    let val = serde_json::json!({
+        "t": "server_ready",
+        "id": msg_id,
+        "ts": ts,
+        "seq": 1,
+        "p": {
+            "message": "Connection established (Rust transport)",
+            "details": {
+                "version": 1,
+                "features": {
+                    "compression": true,
+                    "encryption": false,
+                    "batching": true,
+                    "priority_queue": true,
+                    "circuit_breaker": true,
+                    "rust_transport": true,
+                    "rust_jwt": true
+                },
+                "connection_id": conn_id,
+                "server_time": ts,
+                "user_id": user_id
+            }
+        },
+        "v": 1
+    });
+    format!("WSE{val}")
 }
 
 // ---------------------------------------------------------------------------
@@ -781,6 +799,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         conns.remove(&*conn_id);
     }
     state.conn_formats.remove(&*conn_id);
+    { state.conn_rates.lock().unwrap().remove(&*conn_id); }
     if drain {
         state.push_inbound(InboundEvent::Disconnect {
             conn_id: (*conn_id).clone(),
@@ -879,7 +898,6 @@ pub struct RustWSEServer {
     thread_handle: Option<thread::JoinHandle<()>>,
     running: Arc<AtomicBool>,
     dedup: Arc<std::sync::Mutex<DeduplicationState>>,
-    conn_rates: Arc<std::sync::Mutex<HashMap<String, PerConnRate>>>,
 }
 
 #[pymethods]
@@ -918,7 +936,6 @@ impl RustWSEServer {
                 queue: std::collections::VecDeque::with_capacity(50_000),
                 max_entries: 50_000,
             })),
-            conn_rates: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -1089,7 +1106,7 @@ impl RustWSEServer {
 
         // #8: Per-connection rate limiter (token bucket)
         {
-            let mut rates = self.conn_rates.lock().unwrap();
+            let mut rates = self.shared.conn_rates.lock().unwrap();
             let state = rates
                 .entry(conn_id.to_owned())
                 .or_insert_with(|| PerConnRate {
