@@ -802,7 +802,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         conns.remove(&*conn_id);
     }
     state.conn_formats.remove(&*conn_id);
-    { state.conn_rates.lock().unwrap().remove(&*conn_id); }
+    {
+        state.conn_rates.lock().unwrap().remove(&*conn_id);
+    }
     state.connection_count.fetch_sub(1, Ordering::Relaxed);
     if drain {
         state.push_inbound(InboundEvent::Disconnect {
