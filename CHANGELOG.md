@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.3.7 (2026-02-24)
+
+### Performance Fix (Rust Server)
+
+- **Replaced `Mutex<VecDeque>` with `crossbeam-channel` in drain mode** — eliminates lock contention when N Tokio tasks push to the inbound queue simultaneously. `try_send()` is lock-free (atomic CAS), replacing `Mutex::lock()` which blocked Tokio worker threads under high concurrency.
+- **Bounded inbound queue** — added `max_inbound_queue_size` (default 65536) to prevent OOM under sustained load. When full, new events are dropped (back-pressure) instead of unbounded growth.
+- **Drain mode throughput now matches non-drain mode** — benchmarked at 6.9M msg/s at 1000 connections (was 178K msg/s with Mutex, 38x improvement). Zero overhead from the channel.
+
+### Dependencies
+
+- Added `crossbeam-channel 0.5` (lock-free MPMC bounded channel)
+
 ## v1.3.6 (2026-02-23)
 
 ### Bug Fixes (Python Client)

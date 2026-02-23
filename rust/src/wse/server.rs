@@ -20,6 +20,7 @@ use std::time::Duration;
 use super::compression::{rmpv_to_serde_json, serde_json_to_rmpv};
 use crate::jwt::{self, JwtConfig, parse_cookie_value};
 use ahash::AHashSet;
+use crossbeam_channel::{Receiver as CBReceiver, Sender as CBSender, TrySendError, bounded};
 use dashmap::DashMap;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
@@ -111,10 +112,13 @@ struct SharedState {
     on_connect: RwLock<Option<Py<PyAny>>>,
     on_message: RwLock<Option<Py<PyAny>>>,
     on_disconnect: RwLock<Option<Py<PyAny>>>,
-    // Drain mode: when active, inbound events go to queue instead of callbacks
+    // Drain mode: when active, inbound events go to channel instead of callbacks
     drain_mode: AtomicBool,
-    inbound_queue: std::sync::Mutex<std::collections::VecDeque<InboundEvent>>,
-    inbound_condvar: std::sync::Condvar,
+    // Lock-free bounded channel: Tokio tasks send (non-blocking), Python drains
+    inbound_tx: CBSender<InboundEvent>,
+    inbound_rx: CBReceiver<InboundEvent>,
+    // Counter for dropped events (observability)
+    inbound_dropped: AtomicU64,
     // Per-connection format preference (lock-free sync access for send_event)
     conn_formats: DashMap<String, bool>,
     // Per-connection rate limiter state (cleaned up on disconnect)
@@ -129,7 +133,12 @@ unsafe impl Send for SharedState {}
 unsafe impl Sync for SharedState {}
 
 impl SharedState {
-    fn new(max_connections: usize, jwt_config: Option<JwtConfig>) -> Self {
+    fn new(
+        max_connections: usize,
+        jwt_config: Option<JwtConfig>,
+        max_inbound_queue_size: usize,
+    ) -> Self {
+        let (tx, rx) = bounded(max_inbound_queue_size);
         Self {
             connections: RwLock::new(HashMap::new()),
             max_connections,
@@ -137,8 +146,9 @@ impl SharedState {
             on_message: RwLock::new(None),
             on_disconnect: RwLock::new(None),
             drain_mode: AtomicBool::new(false),
-            inbound_queue: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(4096)),
-            inbound_condvar: std::sync::Condvar::new(),
+            inbound_tx: tx,
+            inbound_rx: rx,
+            inbound_dropped: AtomicU64::new(0),
             conn_formats: DashMap::new(),
             conn_rates: std::sync::Mutex::new(HashMap::new()),
             connection_count: AtomicUsize::new(0),
@@ -146,11 +156,12 @@ impl SharedState {
         }
     }
 
-    /// Push an event to the drain queue and wake the drain caller.
+    /// Push an event to the drain channel (lock-free, non-blocking).
+    /// When channel is full, drops the event and increments counter.
     fn push_inbound(&self, event: InboundEvent) {
-        let mut queue = self.inbound_queue.lock().unwrap();
-        queue.push_back(event);
-        self.inbound_condvar.notify_one();
+        if let Err(TrySendError::Full(_)) = self.inbound_tx.try_send(event) {
+            self.inbound_dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -905,7 +916,7 @@ pub struct RustWSEServer {
 #[pymethods]
 impl RustWSEServer {
     #[new]
-    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None))]
+    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, max_inbound_queue_size = 131072))]
     fn new(
         host: String,
         port: u16,
@@ -913,6 +924,7 @@ impl RustWSEServer {
         jwt_secret: Option<Vec<u8>>,
         jwt_issuer: Option<String>,
         jwt_audience: Option<String>,
+        max_inbound_queue_size: usize,
     ) -> Self {
         let jwt_config = jwt_secret.map(|secret| {
             eprintln!(
@@ -929,7 +941,11 @@ impl RustWSEServer {
         Self {
             host,
             port,
-            shared: Arc::new(SharedState::new(max_connections, jwt_config)),
+            shared: Arc::new(SharedState::new(
+                max_connections,
+                jwt_config,
+                max_inbound_queue_size,
+            )),
             cmd_tx: None,
             thread_handle: None,
             running: Arc::new(AtomicBool::new(false)),
@@ -1316,7 +1332,7 @@ impl RustWSEServer {
     /// data: str (for "connect"=cookies, "auth_connect"=user_id, "raw"),
     ///       dict (for "msg"), bytes (for "bin"), None (for "disconnect")
     ///
-    /// GIL is released while waiting on condvar, acquired once for batch conversion.
+    /// GIL is released while waiting on channel, acquired once for batch conversion.
     #[pyo3(signature = (max_count = 256, timeout_ms = 50))]
     fn drain_inbound(
         &self,
@@ -1324,20 +1340,29 @@ impl RustWSEServer {
         max_count: usize,
         timeout_ms: u64,
     ) -> PyResult<Py<PyList>> {
-        // Collect events with GIL released (condvar wait happens without GIL)
+        // Collect events with GIL released (channel recv happens without GIL)
         let events: Vec<InboundEvent> = py.detach(|| {
-            let mut guard = self.shared.inbound_queue.lock().unwrap();
-            if guard.is_empty() {
-                let timeout = Duration::from_millis(timeout_ms);
-                let (new_guard, _) = self
-                    .shared
-                    .inbound_condvar
-                    .wait_timeout(guard, timeout)
-                    .unwrap();
-                guard = new_guard;
+            let mut events = Vec::with_capacity(max_count.min(4096));
+
+            // First event: block with timeout (efficient — no busy wait)
+            match self
+                .shared
+                .inbound_rx
+                .recv_timeout(Duration::from_millis(timeout_ms))
+            {
+                Ok(event) => events.push(event),
+                Err(_) => return events, // Timeout or disconnected
             }
-            let count = guard.len().min(max_count);
-            guard.drain(..count).collect()
+
+            // Drain remaining without blocking (batch read)
+            while events.len() < max_count {
+                match self.shared.inbound_rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(_) => break,
+                }
+            }
+
+            events
         });
 
         // Convert all events to Python in one GIL hold
@@ -1415,5 +1440,15 @@ impl RustWSEServer {
             }
         }
         Ok(list.unbind())
+    }
+
+    /// Number of inbound events dropped due to queue overflow (drain mode).
+    fn inbound_dropped_count(&self) -> u64 {
+        self.shared.inbound_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Current inbound queue depth.
+    fn inbound_queue_depth(&self) -> usize {
+        self.shared.inbound_rx.len()
     }
 }
