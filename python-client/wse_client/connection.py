@@ -313,13 +313,16 @@ class ConnectionManager:
         except ConnectionClosedOK:
             logger.debug("WebSocket closed normally")
             self._ws = None
-            if self._ws_cm:
-                cm = self._ws_cm
-                self._ws_cm = None
-                self._fire_task(cm.__aexit__(None, None, None))
             if self._heartbeat_task:
                 self._heartbeat_task.cancel()
                 self._heartbeat_task = None
+            cm = self._ws_cm
+            self._ws_cm = None
+            if cm:
+                try:
+                    await cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
             self._set_state(ConnectionState.DISCONNECTED)
         except ConnectionClosedError as exc:
             self._handle_close_code(exc.code, exc.reason)
@@ -582,6 +585,20 @@ class ConnectionManager:
 
     async def _force_reconnect(self) -> None:
         """Tear down and reconnect immediately."""
+        # Cancel tasks FIRST (before closing socket) to avoid spurious
+        # exceptions in _recv_loop triggering unintended reconnect paths.
+        tasks_to_await: list[asyncio.Task[None]] = []
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            tasks_to_await.append(self._heartbeat_task)
+            self._heartbeat_task = None
+        if self._recv_task:
+            self._recv_task.cancel()
+            tasks_to_await.append(self._recv_task)
+            self._recv_task = None
+        if tasks_to_await:
+            await asyncio.gather(*tasks_to_await, return_exceptions=True)
+
         if self._ws_cm:
             try:
                 await self._ws_cm.__aexit__(None, None, None)
@@ -595,13 +612,6 @@ class ConnectionManager:
             except Exception:
                 pass
             self._ws = None
-
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            self._heartbeat_task = None
-        if self._recv_task:
-            self._recv_task.cancel()
-            self._recv_task = None
 
         self._schedule_reconnect()
 
@@ -618,7 +628,7 @@ class ConnectionManager:
         if cfg.mode == ReconnectMode.LINEAR:
             delay = cfg.base_delay + attempt * 1.0
         elif cfg.mode == ReconnectMode.FIBONACCI:
-            delay = cfg.base_delay * _fib(min(attempt, 10))
+            delay = cfg.base_delay * _fib(min(attempt + 1, 10))
         else:
             # Exponential / Adaptive
             delay = cfg.base_delay * (cfg.factor**attempt)

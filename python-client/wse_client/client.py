@@ -317,21 +317,22 @@ class AsyncWSEClient:
             if ok:
                 return True
 
-            delay = min(
-                SEND_RETRY_BASE_DELAY * (2**attempt),
-                SEND_RETRY_MAX_DELAY,
-            )
-            logger.debug(
-                "Send retry %d/%d for '%s' in %.1fs",
-                attempt + 1,
-                max_retries,
-                type,
-                delay,
-            )
-            try:
-                await asyncio.sleep(delay)
-            except asyncio.CancelledError:
-                return False
+            if attempt < max_retries - 1:
+                delay = min(
+                    SEND_RETRY_BASE_DELAY * (2**attempt),
+                    SEND_RETRY_MAX_DELAY,
+                )
+                logger.debug(
+                    "Send retry %d/%d for '%s' in %.1fs",
+                    attempt + 1,
+                    max_retries,
+                    type,
+                    delay,
+                )
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    return False
 
         logger.warning("Send failed after %d retries for '%s'", max_retries, type)
         return False
@@ -417,17 +418,18 @@ class AsyncWSEClient:
                 self._snapshot_requested = True
                 return True
 
-            delay = SNAPSHOT_RETRY_DELAY * (2**attempt)
-            logger.debug(
-                "Snapshot request retry %d/%d in %.1fs",
-                attempt + 1,
-                SNAPSHOT_MAX_RETRIES,
-                delay,
-            )
-            try:
-                await asyncio.sleep(delay)
-            except asyncio.CancelledError:
-                return False
+            if attempt < SNAPSHOT_MAX_RETRIES - 1:
+                delay = SNAPSHOT_RETRY_DELAY * (2**attempt)
+                logger.debug(
+                    "Snapshot request retry %d/%d in %.1fs",
+                    attempt + 1,
+                    SNAPSHOT_MAX_RETRIES,
+                    delay,
+                )
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    return False
 
         logger.warning("Snapshot request failed after %d retries", SNAPSHOT_MAX_RETRIES)
         return False
@@ -531,7 +533,7 @@ class AsyncWSEClient:
         if isinstance(data, bytes):
             self._stats.bytes_received += len(data)
         else:
-            self._stats.bytes_received += len(data)
+            self._stats.bytes_received += len(data.encode("utf-8"))
 
         result = self._codec.decode(data)
         if result is None:

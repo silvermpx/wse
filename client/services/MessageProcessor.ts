@@ -58,10 +58,10 @@ export class MessageProcessor {
   setConnectionManager(manager: any): void {
     this.connectionManager = manager;
 
-    // Process pending server ready if we have it
+    // Process pending server ready if we have it (only fire callback, don't re-send client_hello)
     if (this.serverReadyProcessed && this.serverReadyDetails && manager) {
       logger.info('Processing pending server ready details');
-      manager.handleServerReady(this.serverReadyDetails);
+      manager.processPendingServerReady();
       this.serverReadyDetails = null; // Clear after processing
     }
   }
@@ -675,7 +675,7 @@ export class MessageProcessor {
 
   public processPendingServerReady(): void {
     if (this.serverReadyProcessed && this.serverReadyDetails && this.connectionManager) {
-      this.connectionManager.handleServerReady(this.serverReadyDetails);
+      this.connectionManager.processPendingServerReady();
       this.serverReadyDetails = null;
     }
   }

@@ -29,6 +29,12 @@
 - Fixed double PONG latency recording: removed transport-layer `_record_pong_latency` for JSON PONGs (single recording via `_handle_pong_event`)
 - Fixed `ConnectionClosedOK` resource leak: `_ws_cm.__aexit__()` now called on server-initiated clean close (TCP socket was orphaned)
 - Fixed stale `_recv_task` reference: cleared to `None` in `_handle_close_code` after task exits
+- Fixed `_force_reconnect` task cancellation order: cancel and await tasks BEFORE closing WebSocket (was closing socket first, causing spurious exceptions in recv loop)
+- Fixed `send_with_retry` sleeping after last failed attempt (unnecessary 2s delay before returning False)
+- Fixed `request_snapshot` sleeping after last failed attempt (same pattern)
+- Fixed Fibonacci reconnect zero-delay on first attempt: `_fib(0)=0` → now uses `_fib(attempt+1)` so first delay is `base_delay * 1`
+- Fixed `ConnectionClosedOK` handler: `__aexit__` now awaited directly instead of fire-and-forget (was cancelled by `disconnect()`)
+- Fixed `_on_raw_message` text frame byte counting: `len(str)` → `len(str.encode("utf-8"))` for accurate stats
 
 ### Bug Fixes (TypeScript Client)
 
@@ -36,7 +42,7 @@
 - Fixed binary frame prefix stripping in `processBinaryMessage`: category prefix (`WSE{`/`S{`/`U{`) stripped before JSON.parse in step 4 (was falling through to "unknown format" error)
 - Fixed key rotation breaking ECDH encryption: `rotateKeys()` now skips when shared secret exists
 - Fixed `beforeunload` listener accumulating on HMR: handler tracked on `globalThis`, removed before re-add
-- Fixed `processPendingServerReady` calling full `handleServerReady` (caused duplicate `client_hello`): now only fires `onServerReady` callback
+- Fixed `processPendingServerReady` calling full `handleServerReady` (caused duplicate `client_hello`): now only fires `onServerReady` callback in both `ConnectionManager` and `MessageProcessor`
 - Fixed `clientHelloRetryTimer` leak: tracked and cleared in `clearAllTimers()`
 - Fixed `server_ready`/`server_hello` throttled at 500ms: now zero-throttle (reconnect handshake was silently blocked)
 - Fixed `messagesSent` metric double-counted: removed duplicate increment from `processBatch` (already counted in `ConnectionManager.send`)
@@ -46,6 +52,8 @@
 - Fixed `processTextMessage` missing array prefix handling: added `WSE[`/`S[`/`U[` stripping (was silently dropping array-prefixed text frames)
 - Fixed `ConnectionPool` initial health-check timer leak: stored and cleared in `destroy()`
 - Fixed `getBestEndpoint` unnecessary optional chaining: removed `?.` on guaranteed-non-empty array
+- Fixed stale `validToken` closure in circuit breaker interval: clear old interval before creating new one (was using stale token after rotation)
+- Fixed `error` and `subscription_update` messages silently dropped by 500ms throttle: added to zero-throttle list
 
 ### Bug Fixes (Rust Server)
 
@@ -54,6 +62,8 @@
 - Fixed auth fallback: server now reads `Authorization: Bearer <token>` header when no `access_token` cookie present (enables Python/API client auth)
 - Fixed `Bearer` prefix matching: now case-insensitive per RFC 7235 (accepts `bearer`, `BEARER`, etc.)
 - Fixed JWT expiration boundary: `now >= exp` per RFC 7519 (was `now > exp`, accepting tokens at exact expiration second)
+- Fixed `conn_rates` memory leak: per-connection rate limiter state now cleaned up on disconnect (was growing unbounded)
+- Fixed JSON injection in `build_server_ready`: user_id from JWT `sub` claim now properly escaped via `serde_json` (was raw format string interpolation)
 
 ### Documentation
 
