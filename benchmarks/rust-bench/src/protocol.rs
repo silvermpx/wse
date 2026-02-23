@@ -230,12 +230,12 @@ pub fn build_payload(size: usize) -> String {
             }
         });
         let base_str = base.to_string();
-        if base_str.len() >= size {
+        if base_str.len() + 20 >= size {
             return base_str;
         }
         // Add padding
         let padding_needed = size - base_str.len() - 20; // account for "data":"..."
-        let padding: String = "x".repeat(padding_needed.max(1));
+        let padding: String = "x".repeat(padding_needed);
         let padded = serde_json::json!({
             "t": "trade_update",
             "p": {
