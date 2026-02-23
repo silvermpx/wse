@@ -79,12 +79,17 @@ pub struct JwtConfig {
 /// Returns the payload as a serde_json::Value on success.
 /// Validates: signature, algorithm, expiration, issuer, audience.
 pub fn jwt_decode(token: &str, config: &JwtConfig) -> Result<serde_json::Value, JwtError> {
-    jwt_decode_inner(
-        token,
-        &config.secret,
-        Some(&config.issuer),
-        Some(&config.audience),
-    )
+    let issuer = if config.issuer.is_empty() {
+        None
+    } else {
+        Some(config.issuer.as_str())
+    };
+    let audience = if config.audience.is_empty() {
+        None
+    } else {
+        Some(config.audience.as_str())
+    };
+    jwt_decode_inner(token, &config.secret, issuer, audience)
 }
 
 /// Core decode logic, shared between internal and PyO3 paths.
@@ -134,10 +139,12 @@ fn jwt_decode_inner(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    // exp — required, reject expired tokens
-    if let Some(exp) = payload.get("exp").and_then(|e| e.as_i64())
-        && now > exp
-    {
+    // exp — required, reject tokens without expiration
+    let exp = payload
+        .get("exp")
+        .and_then(|e| e.as_i64())
+        .ok_or(JwtError::TokenExpired)?;
+    if now >= exp {
         return Err(JwtError::TokenExpired);
     }
 
@@ -565,6 +572,40 @@ mod tests {
 
         // No issuer/audience validation
         let result = jwt_decode_inner(&token, &secret, None, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn decode_rejects_missing_exp() {
+        let config = test_config();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "iss": "sqv",
+            "aud": "sqv-api",
+        });
+
+        let token = jwt_encode(&claims, &config.secret).unwrap();
+        let result = jwt_decode(&token, &config);
+        assert!(matches!(result, Err(JwtError::TokenExpired)));
+    }
+
+    #[test]
+    fn decode_skips_validation_when_issuer_audience_empty() {
+        let secret = test_secret();
+        let config = JwtConfig {
+            secret: secret.clone(),
+            issuer: String::new(),
+            audience: String::new(),
+        };
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+            "iss": "any-issuer",
+            "aud": "any-audience",
+        });
+
+        let token = jwt_encode(&claims, &secret).unwrap();
+        let result = jwt_decode(&token, &config);
         assert!(result.is_ok());
     }
 

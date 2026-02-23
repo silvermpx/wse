@@ -296,13 +296,13 @@ export class MessageProcessor {
     let msgCategory: 'WSE' | 'S' | 'U' | null = null;
     let jsonData = data;
 
-    if (data.startsWith('WSE{')) {
+    if (data.startsWith('WSE{') || data.startsWith('WSE[')) {
       msgCategory = 'WSE';
       jsonData = data.substring(3);
-    } else if (data.startsWith('S{')) {
+    } else if (data.startsWith('S{') || data.startsWith('S[')) {
       msgCategory = 'S';
       jsonData = data.substring(1);
-    } else if (data.startsWith('U{')) {
+    } else if (data.startsWith('U{') || data.startsWith('U[')) {
       msgCategory = 'U';
       jsonData = data.substring(1);
     }
@@ -420,9 +420,15 @@ export class MessageProcessor {
       }
     }
 
-    // 4. Try as JSON first
+    // 4. Try as JSON (strip category prefix -- server sends binary frames
+    //    with WSE{, S{, U{ prefix for uncompressed JSON)
     try {
-      const text = new TextDecoder().decode(data);
+      let text = new TextDecoder().decode(data);
+      if (text.startsWith('WSE{') || text.startsWith('WSE[')) {
+        text = text.slice(3);
+      } else if (text.startsWith('S{') || text.startsWith('U{') || text.startsWith('S[') || text.startsWith('U[')) {
+        text = text.slice(1);
+      }
       if (text.startsWith('{') || text.startsWith('[')) {
         const parsed = JSON.parse(text);
         logger.debug('Parsed as plain JSON:', parsed.t);
@@ -1115,7 +1121,16 @@ export class MessageProcessor {
 
     this.processing = true;
     try {
-      await this.processBatch();
+      const messages = await this.processBatch();
+      if (messages.length > 0) {
+        if (this.connectionManager) {
+          for (const msg of messages) {
+            this.connectionManager.send(msg);
+          }
+        } else {
+          logger.warn(`Dropped ${messages.length} messages: connectionManager unavailable`);
+        }
+      }
     } finally {
       this.processing = false;
     }
@@ -1150,9 +1165,6 @@ export class MessageProcessor {
         ts: new Date().toISOString(),
         pri: msg.priority,
       }));
-
-      const store = useWSEStore.getState();
-      store.incrementMetric('messagesSent', wsMessages.length);
 
       return wsMessages;
 

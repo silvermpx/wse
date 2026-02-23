@@ -2,11 +2,37 @@
 
 ## Authentication
 
-### JWT Token Authentication
+### Authentication Methods by Client Type
 
-WSE authenticates connections via JWT tokens using HS256 (HMAC-SHA256). Two authentication paths are available:
+WSE supports three authentication methods, chosen based on client type:
 
-#### Rust JWT (recommended, v1.2+)
+| Client Type | Method | How |
+|-------------|--------|-----|
+| **Browser (TS/React)** | HTTP-only Cookie | `access_token` cookie with `httpOnly + secure + sameSite=Lax` |
+| **Backend (Python)** | Cookie + Authorization header | Sends both; server reads whichever is available |
+| **API / CLI** | Authorization header | `Authorization: Bearer <JWT>` |
+
+**Why cookies for browsers (OWASP recommended):**
+- Browsers **cannot** set custom headers (`Authorization`) during the WebSocket upgrade handshake — the `new WebSocket(url)` API has no header parameter
+- HTTP-only cookies are immune to XSS (JavaScript cannot read them)
+- `sameSite=Lax` prevents CSRF on cross-origin requests
+- `secure` ensures HTTPS-only transmission
+- Cookies are automatically attached to the WebSocket upgrade request by the browser
+
+**Why NOT query parameters:**
+- Query strings leak in server access logs, browser history, and referrer headers
+- WSE does NOT recommend `?token=<JWT>` for production use
+
+### Server-Side Token Extraction Order
+
+The Rust server reads authentication credentials in this order:
+
+1. **HTTP-only cookie**: `access_token` from the `Cookie` header (primary — covers browsers)
+2. **Authorization header**: `Authorization: Bearer <JWT>` (fallback — covers backend clients)
+
+Both paths use HS256 (HMAC-SHA256) JWT validation.
+
+### Rust JWT (recommended, v1.2+)
 
 When `jwt_secret` is configured on the `RustWSEServer`, JWT validation happens entirely in Rust during the WebSocket handshake — zero Python involvement, zero GIL acquisition:
 
@@ -31,14 +57,12 @@ On success, the server sends `server_ready` directly from Rust and pushes an `Au
 
 **Performance:** 0.01ms per JWT decode in Rust vs ~0.85ms in Python (85x faster). Connection latency drops from ~23ms to 0.53ms median.
 
-#### Python JWT (fallback)
+### Python JWT (fallback)
 
-When `jwt_secret` is not configured, the server falls back to Python-based JWT validation via the `auth_handler` callback. The server checks multiple sources in order:
+When `jwt_secret` is not configured, the server falls back to Python-based JWT validation via the `auth_handler` callback. The server checks:
 
-1. **Query parameter**: `?token=<JWT>` (preferred for WebSocket)
-2. **Authorization header**: `Authorization: Bearer <JWT>`
-3. **HTTP-only cookie**: `access_token` cookie
-4. **Scope cookies**: Starlette `scope.cookies` (fallback)
+1. **HTTP-only cookie**: `access_token` cookie (primary)
+2. **Authorization header**: `Authorization: Bearer <JWT>` (fallback)
 
 Token requirements:
 ```json
@@ -52,6 +76,31 @@ Token requirements:
 On authentication failure (both paths):
 - Server sends `error` message with code `AUTH_FAILED`
 - Connection closed with code `4401`
+
+### Client Authentication Examples
+
+**Browser (TS/React client):**
+```typescript
+// Cookie is set by your login endpoint:
+// Set-Cookie: access_token=<JWT>; HttpOnly; Secure; SameSite=Lax; Max-Age=900
+// The browser attaches it automatically on WebSocket upgrade
+const ws = new WebSocket('wss://host:port/wse');
+```
+
+**Python client (backend):**
+```python
+from wse_client import connect
+
+async with connect("ws://localhost:5006/wse", token="<JWT>") as client:
+    # Sends JWT as both Cookie and Authorization header
+    await client.subscribe(["events"])
+```
+
+**API client (curl/httpie):**
+```bash
+# Authorization header only
+wscat -c "ws://localhost:5006/wse" -H "Authorization: Bearer <JWT>"
+```
 
 ### Refresh Token Grace Period
 

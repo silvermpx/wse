@@ -399,6 +399,14 @@ export class SecurityManager {
   }
 
   async rotateKeys(): Promise<void> {
+    // Skip rotation if ECDH shared secret is active -- rotating would
+    // replace the ECDH-derived key with a random one, breaking encryption
+    // since the server still has the old shared secret.
+    if (this.sharedSecret) {
+      logger.debug('Skipping key rotation (ECDH session active)');
+      return;
+    }
+
     logger.info('Rotating cryptographic keys');
 
     try {

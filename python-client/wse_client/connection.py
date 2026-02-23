@@ -13,10 +13,7 @@ import json as _json
 import random
 import time
 
-try:
-    from uuid import uuid7
-except ImportError:
-    from uuid_extensions import uuid7
+from uuid import uuid4
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -88,6 +85,7 @@ class ConnectionManager:
         self._on_message = on_message
         self._on_state_change = on_state_change
         self._on_pong: Callable[[float], Any] | None = None  # latency callback
+        self._on_ping_sent: Callable[[], Any] | None = None
 
         # State
         self._ws_cm: Any | None = None  # websocket context manager
@@ -187,18 +185,30 @@ class ConnectionManager:
                 url,
                 additional_headers=headers,
                 max_size=2**20,  # 1 MB
-                open_timeout=CONNECTION_TIMEOUT,
+                open_timeout=None,  # asyncio.wait_for handles timeout
             )
             self._ws = await asyncio.wait_for(
                 self._ws_cm.__aenter__(),
                 timeout=CONNECTION_TIMEOUT,
             )
         except asyncio.TimeoutError:
+            ws_cm = self._ws_cm
             self._ws_cm = None
+            if ws_cm is not None:
+                try:
+                    await ws_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
             self._set_state(ConnectionState.ERROR)
             raise WSETimeoutError(f"Connection timed out after {CONNECTION_TIMEOUT}s")
         except Exception as exc:
+            ws_cm = self._ws_cm
             self._ws_cm = None
+            if ws_cm is not None:
+                try:
+                    await ws_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
             self._set_state(ConnectionState.ERROR)
             raise WSEConnectionError(f"Failed to connect: {exc}") from exc
 
@@ -218,18 +228,22 @@ class ConnectionManager:
         self._client_hello_sent = False
         self._connection_id = None
 
+        # Cancel tasks and await completion before closing the socket
+        tasks_to_await: list[asyncio.Task[Any]] = []
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
+            tasks_to_await.append(self._heartbeat_task)
             self._heartbeat_task = None
-
         if self._recv_task:
             self._recv_task.cancel()
+            tasks_to_await.append(self._recv_task)
             self._recv_task = None
-
-        # Cancel background tasks
         for task in self._background_tasks:
             task.cancel()
+            tasks_to_await.append(task)
         self._background_tasks.clear()
+        if tasks_to_await:
+            await asyncio.gather(*tasks_to_await, return_exceptions=True)
 
         if self._ws_cm:
             try:
@@ -298,6 +312,14 @@ class ConnectionManager:
                 self._handle_raw_message(message)
         except ConnectionClosedOK:
             logger.debug("WebSocket closed normally")
+            self._ws = None
+            if self._ws_cm:
+                cm = self._ws_cm
+                self._ws_cm = None
+                self._fire_task(cm.__aexit__(None, None, None))
+            if self._heartbeat_task:
+                self._heartbeat_task.cancel()
+                self._heartbeat_task = None
             self._set_state(ConnectionState.DISCONNECTED)
         except ConnectionClosedError as exc:
             self._handle_close_code(exc.code, exc.reason)
@@ -334,17 +356,9 @@ class ConnectionManager:
                 return
 
             # WSE-prefixed PONG message (JSON format from Rust server)
+            # Forward to client layer — _handle_pong_event records latency once
             if '"t":"PONG"' in data or '"t": "PONG"' in data:
                 self._last_pong = time.monotonic()
-                try:
-                    json_str = data[3:] if data.startswith("WSE") else data
-                    parsed = _json.loads(json_str)
-                    client_ts = parsed.get("p", {}).get("client_timestamp")
-                    if client_ts:
-                        self._record_pong_latency(str(client_ts))
-                except Exception:
-                    pass
-                # Forward to client layer for NetworkMonitor update
                 if self._on_message:
                     self._on_message(data)
                 return
@@ -423,7 +437,7 @@ class ConnectionManager:
                     },
                     "connection_id": self._connection_id,
                 },
-                "id": str(uuid7()),
+                "id": str(uuid4()),
                 "ts": datetime.now(UTC).isoformat(),
                 "v": PROTOCOL_VERSION,
                 "pri": MessagePriority.CRITICAL,
@@ -467,15 +481,17 @@ class ConnectionManager:
                     await self._force_reconnect()
                     return
 
-            # Send PING
+            # Send PING (lowercase -- Rust server fast-path checks "ping")
             ping_msg = {
-                "t": "PING",
+                "t": "ping",
                 "p": {"timestamp": int(time.time() * 1000)},
                 "v": PROTOCOL_VERSION,
             }
             payload = f"WSE{_json.dumps(ping_msg, separators=(',', ':'))}"
             ok = await self.send(payload)
-            if not ok:
+            if ok and self._on_ping_sent:
+                self._on_ping_sent()
+            elif not ok:
                 logger.debug("PING send failed")
 
     # -- Internal: reconnection -----------------------------------------------
@@ -485,15 +501,20 @@ class ConnectionManager:
         logger.debug("WebSocket closed: code=%d reason=%s", code, reason)
 
         self._ws = None
-        self._ws_cm = None
         self._server_ready = False
         self._client_hello_sent = False
+        # Schedule ws_cm cleanup (async, but we're in sync context)
+        if self._ws_cm:
+            cm = self._ws_cm
+            self._ws_cm = None
+            self._fire_task(cm.__aexit__(None, None, None))
 
         # Cancel old tasks to prevent duplicate loops
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
             self._heartbeat_task = None
         # recv_task already exited (it raised ConnectionClosedError)
+        self._recv_task = None
 
         # Normal close or going away
         if code in (WS_CLOSE_NORMAL, WS_CLOSE_GOING_AWAY):
@@ -561,7 +582,14 @@ class ConnectionManager:
 
     async def _force_reconnect(self) -> None:
         """Tear down and reconnect immediately."""
-        if self._ws:
+        if self._ws_cm:
+            try:
+                await self._ws_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._ws_cm = None
+            self._ws = None
+        elif self._ws:
             try:
                 await self._ws.close(WS_CLOSE_GOING_AWAY, "Reconnecting")
             except Exception:

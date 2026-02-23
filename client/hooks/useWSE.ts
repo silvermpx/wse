@@ -120,9 +120,12 @@ if ((globalThis as any).__wse_cleanup_interval) {
 const cleanupInterval = setInterval(cleanupProcessedEvents, 30000);
 (globalThis as any).__wse_cleanup_interval = cleanupInterval;
 
-// Cleanup on module unload
+// Cleanup on module unload -- handle HMR by removing previous listener
 if (typeof window !== 'undefined') {
-  window.addEventListener('beforeunload', () => {
+  if ((globalThis as any).__wse_beforeunload_handler) {
+    window.removeEventListener('beforeunload', (globalThis as any).__wse_beforeunload_handler);
+  }
+  const beforeUnloadHandler = () => {
     clearInterval(cleanupInterval);
     delete (globalThis as any).__wse_cleanup_interval;
 
@@ -130,7 +133,9 @@ if (typeof window !== 'undefined') {
       logger.info('[useWSE] Window unload - cleaning up global instance');
       destroyGlobalInstance();
     }
-  });
+  };
+  (globalThis as any).__wse_beforeunload_handler = beforeUnloadHandler;
+  window.addEventListener('beforeunload', beforeUnloadHandler);
 }
 
 // Global connection start time tracking
@@ -272,6 +277,7 @@ export function useWSE(
   const snapshotRequestedRef = useRef(false);
   const handlersReadyRef = useRef(false);
   const reconnectAttemptsRef = useRef(0);
+  const pendingRetryTimersRef = useRef(new Set<() => void>());
   const initialSyncSentRef = useRef(false);
 
   // Track current token to detect changes
@@ -470,8 +476,10 @@ export function useWSE(
 
       const retryCount = 5;
       let attempts = 0;
+      let cancelled = false;
 
       const tryToSend = () => {
+        if (cancelled) return;
         attempts++;
 
         if (attempts > retryCount) {
@@ -506,12 +514,15 @@ export function useWSE(
           }
         }
 
+        if (cancelled) return;
         const delay = Math.min(100 * Math.pow(2, attempts - 1), 2000);
         logger.debug(`Retrying ${type} in ${delay}ms (attempt ${attempts}/${retryCount})`);
         setTimeout(tryToSend, delay);
       };
 
-      setTimeout(tryToSend, 100);
+      const timerId = setTimeout(tryToSend, 100);
+      // Cancel retry loop on component cleanup
+      pendingRetryTimersRef.current.add(() => { cancelled = true; clearTimeout(timerId); });
       return;
     }
 
@@ -577,7 +588,13 @@ export function useWSE(
         }
 
         try {
-          const text = new TextDecoder().decode(data);
+          let text = new TextDecoder().decode(data);
+          // Strip category prefix (same as text path)
+          if (text.startsWith('WSE{') || text.startsWith('WSE[')) {
+            text = text.slice(3);
+          } else if (text.startsWith('S{') || text.startsWith('U{') || text.startsWith('S[') || text.startsWith('U[')) {
+            text = text.slice(1);
+          }
           parsed = JSON.parse(text);
         } catch {
           processor.processIncoming(data).catch(error => {
@@ -641,7 +658,7 @@ export function useWSE(
 
         if (eventType === 'heartbeat') {
           throttleMs = 5000;
-        } else if (eventType.includes('snapshot')) {
+        } else if (eventType.includes('snapshot') || eventType === 'server_ready' || eventType === 'server_hello') {
           throttleMs = 0;
         } else if (eventType === 'health_check' || eventType === 'health_check_response') {
           throttleMs = 10000;
@@ -944,6 +961,10 @@ export function useWSE(
         diagnosticsInterval = null;
       }
 
+      // Cancel pending sendMessage retry timers
+      pendingRetryTimersRef.current.forEach(cancel => cancel());
+      pendingRetryTimersRef.current.clear();
+
       connectionManagerRef.current = null;
       messageProcessorRef.current = null;
       networkMonitorRef.current = null;
@@ -1015,9 +1036,7 @@ export function useWSE(
           finalConfig.endpoints,
           finalConfig.reconnection,
           (data) => stableCallbacks.current.onMessage?.(data),
-          (state) => {
-            handleStateChange(state);
-          },
+          (state) => stableCallbacks.current.onStateChange?.(state),
           (details) => stableCallbacks.current.onServerReady?.(details),
           cmConfig
         );

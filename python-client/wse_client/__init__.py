@@ -27,11 +27,11 @@ from .types import (
 )
 
 
-async def connect(
+def connect(
     url: str,
     **kwargs,
 ) -> AsyncWSEClient:
-    """Connect to a WSE server and return a ready client.
+    """Create a WSE client (use as async context manager).
 
     Usage::
 
@@ -40,9 +40,7 @@ async def connect(
             async for event in client:
                 print(event.type, event.payload)
     """
-    client = AsyncWSEClient(url, **kwargs)
-    await client.connect()
-    return client
+    return AsyncWSEClient(url, **kwargs)
 
 
 __all__ = [

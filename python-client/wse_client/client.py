@@ -11,10 +11,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-try:
-    from uuid import uuid7
-except ImportError:
-    from uuid_extensions import uuid7
+from uuid import uuid4
 from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable
@@ -146,6 +143,7 @@ class AsyncWSEClient:
         )
 
         self._connection._on_pong = self._on_transport_pong
+        self._connection._on_ping_sent = lambda: self._network_monitor.record_ping()
         self._server_ready_event = asyncio.Event()
         self._connected = False
 
@@ -348,7 +346,7 @@ class AsyncWSEClient:
             item = {
                 "t": msg_type,
                 "p": msg_payload,
-                "id": str(uuid7()),
+                "id": str(uuid4()),
                 "seq": self._sequencer.get_next_sequence(),
                 "v": PROTOCOL_VERSION,
                 "ts": datetime.now(UTC).isoformat(),
@@ -806,7 +804,7 @@ class AsyncWSEClient:
 
     def _handle_pong_event(self, event: WSEEvent) -> None:
         """Handle PONG events — record latency in NetworkMonitor."""
-        ts = event.payload.get("timestamp")
+        ts = event.payload.get("client_timestamp") or event.payload.get("timestamp")
         if ts and isinstance(ts, (int, float)):
             latency = time.time() * 1000 - ts
             if 0 <= latency < 60000:  # Sanity: <60s
@@ -832,6 +830,6 @@ class AsyncWSEClient:
             self._server_ready_event.clear()
             self._snapshot_requested = False
         elif state == ConnectionState.CONNECTED:
-            self._network_monitor.record_ping()
+            pass  # record_ping() is called per-heartbeat via on_ping_sent
         elif state == ConnectionState.DISCONNECTED:
             self._server_ready_event.clear()

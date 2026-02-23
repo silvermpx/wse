@@ -360,6 +360,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     struct HandshakeResult {
         cookies: String,
         wants_msgpack: bool,
+        authorization: Option<String>,
     }
     let handshake_data: Arc<std::sync::OnceLock<HandshakeResult>> =
         Arc::new(std::sync::OnceLock::new());
@@ -378,9 +379,15 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                 .uri()
                 .query()
                 .is_some_and(|q| q.contains("format=msgpack"));
+            let authorization = req
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
             let _ = hd_clone.set(HandshakeResult {
                 cookies,
                 wants_msgpack,
+                authorization,
             });
             Ok(response)
         },
@@ -394,9 +401,15 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         }
     };
 
-    let (cookie_str, use_msgpack) = handshake_data
+    let (cookie_str, use_msgpack, auth_header) = handshake_data
         .get()
-        .map(|hd| (hd.cookies.clone(), hd.wants_msgpack))
+        .map(|hd| {
+            (
+                hd.cookies.clone(),
+                hd.wants_msgpack,
+                hd.authorization.clone(),
+            )
+        })
         .unwrap_or_default();
     let conn_id: Arc<String> = Arc::new(Uuid::now_v7().to_string());
     let (write_half, read_half) = ws_stream.split();
@@ -406,11 +419,20 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     let drain = state.drain_mode.load(Ordering::Relaxed);
 
     // ── JWT validation in Rust (zero GIL) ──────────────────────────────────
-    // When jwt_config is set, validate JWT from cookie BEFORE registering.
+    // When jwt_config is set, validate JWT from cookie or Authorization header.
     // On success: send server_ready immediately, push AuthConnect to drain queue.
     // On failure: send error + close — connection never registered.
     let rust_auth_user_id: Option<String> = if let Some(ref jwt_cfg) = state.jwt_config {
-        let token = parse_cookie_value(&cookie_str, "access_token");
+        let token = parse_cookie_value(&cookie_str, "access_token").or_else(|| {
+            auth_header.as_deref().and_then(|h| {
+                // RFC 7235: auth-scheme is case-insensitive
+                if h.len() > 7 && h[..7].eq_ignore_ascii_case("bearer ") {
+                    Some(&h[7..])
+                } else {
+                    None
+                }
+            })
+        });
         match token {
             Some(tok) => match jwt::jwt_decode(tok, jwt_cfg) {
                 Ok(claims) => {
@@ -451,7 +473,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                 }
             },
             None => {
-                let err = build_error_json("AUTH_REQUIRED", "No access_token cookie");
+                let err = build_error_json(
+                    "AUTH_REQUIRED",
+                    "No access_token cookie or Authorization header",
+                );
                 let _ = tx.send(Message::Text(err.into()));
                 let _ = tx.send(Message::Close(None));
                 let write_task = tokio::spawn(async move {
