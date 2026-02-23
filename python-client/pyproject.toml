@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wse-client"
-version = "1.3.3"
+version = "1.3.4"
 description = "Python client for WSE (WebSocket Engine) -- real-time event streaming"
 readme = "README.md"
 license = "MIT"
