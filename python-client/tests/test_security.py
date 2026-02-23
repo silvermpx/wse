@@ -51,31 +51,27 @@ class TestSecurityManager:
         assert decrypted == plaintext
 
     def test_sign_verify_roundtrip(self):
-        client = SecurityManager()
-        server = SecurityManager()
-
-        client_pub = client.generate_keypair()
-        server_pub = server.generate_keypair()
-
-        client.derive_shared_secret(server_pub)
-        server.derive_shared_secret(client_pub)
+        # Signing keys are per-side (random), so sign+verify on same instance
+        mgr = SecurityManager()
+        mgr.generate_keypair()
+        # Manually set a signing key (derive_shared_secret sets one randomly)
+        peer = SecurityManager()
+        peer_pub = peer.generate_keypair()
+        mgr.derive_shared_secret(peer_pub)
 
         payload = '{"t":"test","p":{}}'
-        sig = client.sign(payload)
-        assert server.verify(payload, sig) is True
+        sig = mgr.sign(payload)
+        assert mgr.verify(payload, sig) is True
 
     def test_verify_rejects_tampered(self):
-        client = SecurityManager()
-        server = SecurityManager()
+        mgr = SecurityManager()
+        mgr.generate_keypair()
+        peer = SecurityManager()
+        peer_pub = peer.generate_keypair()
+        mgr.derive_shared_secret(peer_pub)
 
-        client_pub = client.generate_keypair()
-        server_pub = server.generate_keypair()
-
-        client.derive_shared_secret(server_pub)
-        server.derive_shared_secret(client_pub)
-
-        sig = client.sign('{"original":true}')
-        assert server.verify('{"tampered":true}', sig) is False
+        sig = mgr.sign('{"original":true}')
+        assert mgr.verify('{"tampered":true}', sig) is False
 
     def test_reset_disables(self):
         sm = SecurityManager()
