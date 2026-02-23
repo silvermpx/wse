@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.3.8 (2026-02-24)
+
+### Bug Fixes (Rust Server)
+
+- Fixed `push_inbound` only counting `Full` errors — now counts all send failures including channel disconnect during shutdown (was silently dropping events without incrementing `inbound_dropped`)
+- Fixed inconsistent queue size cap between standalone (uncapped) and embedded (65536) — both now cap at 131072
+
 ## v1.3.7 (2026-02-24)
 
 ### Performance Fix (Rust Server)

@@ -20,7 +20,7 @@ use std::time::Duration;
 use super::compression::{rmpv_to_serde_json, serde_json_to_rmpv};
 use crate::jwt::{self, JwtConfig, parse_cookie_value};
 use ahash::AHashSet;
-use crossbeam_channel::{Receiver as CBReceiver, Sender as CBSender, TrySendError, bounded};
+use crossbeam_channel::{Receiver as CBReceiver, Sender as CBSender, bounded};
 use dashmap::DashMap;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
@@ -138,7 +138,8 @@ impl SharedState {
         jwt_config: Option<JwtConfig>,
         max_inbound_queue_size: usize,
     ) -> Self {
-        let (tx, rx) = bounded(max_inbound_queue_size);
+        let cap = max_inbound_queue_size.min(131072);
+        let (tx, rx) = bounded(cap);
         Self {
             connections: RwLock::new(HashMap::new()),
             max_connections,
@@ -159,7 +160,7 @@ impl SharedState {
     /// Push an event to the drain channel (lock-free, non-blocking).
     /// When channel is full, drops the event and increments counter.
     fn push_inbound(&self, event: InboundEvent) {
-        if let Err(TrySendError::Full(_)) = self.inbound_tx.try_send(event) {
+        if self.inbound_tx.try_send(event).is_err() {
             self.inbound_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
