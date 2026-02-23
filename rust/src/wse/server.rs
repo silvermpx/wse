@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -102,7 +102,6 @@ enum ServerCommand {
     BroadcastBytes { data: Vec<u8> },
     Disconnect { conn_id: String },
     GetConnections { reply: oneshot::Sender<Vec<String>> },
-    GetConnectionCount { reply: oneshot::Sender<usize> },
     Shutdown,
 }
 
@@ -120,6 +119,8 @@ struct SharedState {
     conn_formats: DashMap<String, bool>,
     // Per-connection rate limiter state (cleaned up on disconnect)
     conn_rates: std::sync::Mutex<HashMap<String, PerConnRate>>,
+    // Atomic connection count (lock-free read from Python without GIL blocking)
+    connection_count: AtomicUsize,
     // JWT config: when set, Rust validates JWT in handshake (zero GIL)
     jwt_config: Option<JwtConfig>,
 }
@@ -140,6 +141,7 @@ impl SharedState {
             inbound_condvar: std::sync::Condvar::new(),
             conn_formats: DashMap::new(),
             conn_rates: std::sync::Mutex::new(HashMap::new()),
+            connection_count: AtomicUsize::new(0),
             jwt_config,
         }
     }
@@ -523,6 +525,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
             return;
         }
         conns.insert((*conn_id).clone(), ConnectionHandle { tx: tx.clone() });
+        state.connection_count.fetch_add(1, Ordering::Relaxed);
     }
     // Store format preference for lock-free access from send_event()
     if use_msgpack {
@@ -800,6 +803,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     }
     state.conn_formats.remove(&*conn_id);
     { state.conn_rates.lock().unwrap().remove(&*conn_id); }
+    state.connection_count.fetch_sub(1, Ordering::Relaxed);
     if drain {
         state.push_inbound(InboundEvent::Disconnect {
             conn_id: (*conn_id).clone(),
@@ -869,10 +873,6 @@ async fn process_commands(
             ServerCommand::GetConnections { reply } => {
                 let conns = state.connections.read().await;
                 let _ = reply.send(conns.keys().cloned().collect());
-            }
-            ServerCommand::GetConnectionCount { reply } => {
-                let conns = state.connections.read().await;
-                let _ = reply.send(conns.len());
             }
             ServerCommand::Shutdown => {
                 let conns = state.connections.read().await;
@@ -1265,17 +1265,8 @@ impl RustWSEServer {
 
     // -- query / management -------------------------------------------------
 
-    fn get_connection_count(&self) -> PyResult<usize> {
-        let tx = self
-            .cmd_tx
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
-        let (reply_tx, reply_rx) = oneshot::channel();
-        tx.send(ServerCommand::GetConnectionCount { reply: reply_tx })
-            .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
-        reply_rx
-            .blocking_recv()
-            .map_err(|_| PyRuntimeError::new_err("Reply dropped"))
+    fn get_connection_count(&self) -> usize {
+        self.shared.connection_count.load(Ordering::Relaxed)
     }
 
     fn get_connections(&self) -> PyResult<Vec<String>> {
