@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.3.5 (2026-02-23)
+## v1.3.6 (2026-02-23)
 
 ### Bug Fixes (Python Client)
 
