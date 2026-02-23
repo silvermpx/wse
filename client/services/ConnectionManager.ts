@@ -61,6 +61,7 @@ export class ConnectionManager {
 
   // Client hello retry tracking
   private clientHelloRetries = 0;
+  private clientHelloRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly MAX_CLIENT_HELLO_RETRIES = 10;
 
   // Connection pool
@@ -383,6 +384,11 @@ export class ConnectionManager {
       clearTimeout(this.tokenRefreshTimer);
       this.tokenRefreshTimer = null;
     }
+
+    if (this.clientHelloRetryTimer) {
+      clearTimeout(this.clientHelloRetryTimer);
+      this.clientHelloRetryTimer = null;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -411,17 +417,8 @@ export class ConnectionManager {
   private async refreshTokenWithRetry(): Promise<void> {
     if (this.isDestroyed || !this.refreshAuthTokenFn) return;
 
-    if (this.tokenRefreshAttempts >= MAX_TOKEN_REFRESH_ATTEMPTS) {
-      logger.error('[ConnectionManager] Max token refresh attempts exceeded');
-      this.disconnect();
-      window.dispatchEvent(new CustomEvent('authTokenExpired', {
-        detail: {
-          error: 'Max token refresh attempts exceeded',
-          attempts: this.tokenRefreshAttempts
-        }
-      }));
-      return;
-    }
+    // Reset per-invocation counter (prevent permanent block from prior failures)
+    this.tokenRefreshAttempts = 0;
 
     for (let attempt = 0; attempt < MAX_TOKEN_REFRESH_ATTEMPTS; attempt++) {
       try {
@@ -740,7 +737,10 @@ export class ConnectionManager {
 
   processPendingServerReady(): void {
     if (this.serverReadyProcessed && this.serverReadyDetails && !this.isDestroyed) {
-      this.handleServerReady(this.serverReadyDetails);
+      // Only fire onServerReady callback (don't re-process the full handleServerReady)
+      if (this.onServerReady) {
+        this.onServerReady(this.serverReadyDetails);
+      }
     }
   }
 
@@ -787,7 +787,7 @@ export class ConnectionManager {
     } else if (!this.isDestroyed && this.clientHelloRetries < this.MAX_CLIENT_HELLO_RETRIES) {
       this.clientHelloRetries++;
       logger.warn(`[ConnectionManager] Failed to send client hello, retrying in 1s (attempt ${this.clientHelloRetries}/${this.MAX_CLIENT_HELLO_RETRIES})`);
-      setTimeout(() => this.sendClientHello(), 1000);
+      this.clientHelloRetryTimer = setTimeout(() => this.sendClientHello(), 1000);
     } else if (this.clientHelloRetries >= this.MAX_CLIENT_HELLO_RETRIES) {
       logger.error('[ConnectionManager] Max client hello retries reached, giving up');
     }
@@ -916,7 +916,7 @@ export class ConnectionManager {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         try {
           const pingMessage = {
-            t: 'PING',
+            t: 'ping',
             p: { timestamp: Date.now() },
             v: WS_PROTOCOL_VERSION
           };

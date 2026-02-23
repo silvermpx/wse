@@ -100,8 +100,9 @@ class SecurityManager:
             info=HKDF_INFO,
         ).derive(shared_secret)
 
-        # Signing key = SHA256(shared_secret)
-        self._signing_key = hashlib.sha256(shared_secret).digest()
+        # Signing key = random (matches TS client behavior; server uses
+        # application-provided key, not derived from ECDH shared secret)
+        self._signing_key = os.urandom(32)
         self._enabled = True
         self._iv_cache = {}
         logger.debug("Encryption enabled (AES-GCM-256)")

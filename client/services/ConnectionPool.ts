@@ -61,6 +61,7 @@ export class ConnectionPool {
   };
 
   private healthCheckTimer: NodeJS.Timeout | null = null;
+  private initialHealthCheckTimer: NodeJS.Timeout | null = null;
   private roundRobinIndex = 0;
   private healthCheckInProgress = false;
 
@@ -96,7 +97,7 @@ export class ConnectionPool {
         throw new Error('No endpoints available');
       }
       allEndpoints.sort((a, b) => b[1].score - a[1].score);
-      return allEndpoints[0]?.[0];
+      return allEndpoints[0][0];
     }
 
     if (this.preferredEndpoint) {
@@ -310,6 +311,10 @@ export class ConnectionPool {
   destroy(): void {
     this.isDestroyed = true;
 
+    if (this.initialHealthCheckTimer) {
+      clearTimeout(this.initialHealthCheckTimer);
+      this.initialHealthCheckTimer = null;
+    }
     if (this.healthCheckTimer) {
       clearInterval(this.healthCheckTimer);
       this.healthCheckTimer = null;
@@ -428,7 +433,8 @@ export class ConnectionPool {
   private startHealthMonitoring(): void {
     if (this.healthCheckTimer || this.isDestroyed || this.config.healthCheckInterval <= 0) return;
 
-    setTimeout(() => {
+    this.initialHealthCheckTimer = setTimeout(() => {
+      this.initialHealthCheckTimer = null;
       if (!this.isDestroyed) {
         this.performHealthCheck().catch(error => {
           logger.error('Initial health check failed:', error);

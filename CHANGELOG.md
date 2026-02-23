@@ -6,10 +6,10 @@
 
 - Fixed auth: send JWT as both Cookie and Authorization header (Rust server reads Cookie)
 - Fixed PONG handling: parse WSE JSON PONG format from Rust server (was only handling colon-prefix)
-- Fixed WebSocket resource leak: proper `__aexit__` cleanup on disconnect
+- Fixed WebSocket resource leak: proper `__aexit__` cleanup in `_force_reconnect` and `_handle_close_code`
 - Fixed `server_ready` parsing: read `connection_id` from nested `details` object
 - Fixed asyncio task GC: all `ensure_future` calls now tracked in `_background_tasks` set
-- Fixed uuid4 → uuid7 in protocol.py, connection.py, client.py
+- Fixed uuid7 → uuid4 for Python 3.11-3.14 compatibility (uuid7 is stdlib only in 3.14)
 - Fixed `send_batch` mutating codec sequence directly (now uses sequencer)
 - Fixed background tasks not cancelled on disconnect (heartbeat, listener loops)
 - Fixed `SyncWSEClient._connect_error` not initialized in `__init__`
@@ -19,6 +19,45 @@
 - Fixed event sequencer window: 1,000 → 10,000 (matching TS client)
 - Fixed CLIENT_VERSION constant out of date
 - Fixed `max_attempts=0` treated as infinite retries
+- Fixed PING case mismatch: send lowercase `"ping"` (Rust server fast-path checks lowercase only)
+- Fixed `connect()` factory: sync return (no await), prevents double-connect with `async with`
+- Fixed `_handle_pong_event`: read `client_timestamp` key (was reading `timestamp`, Rust server uses `client_timestamp`)
+- Fixed `ConnectionClosedOK` handler: cancel heartbeat task and clear `_ws` (was leaving zombie heartbeat loop)
+- Fixed resource leak on timeout: call `__aexit__` on ws context manager when `asyncio.wait_for` times out
+- Fixed `disconnect()` race condition: await cancelled tasks before closing WebSocket (tasks could trigger spurious reconnect)
+- Removed dead code block in `_force_reconnect` (duplicate unreachable `_ws_cm` check)
+- Fixed double PONG latency recording: removed transport-layer `_record_pong_latency` for JSON PONGs (single recording via `_handle_pong_event`)
+- Fixed `ConnectionClosedOK` resource leak: `_ws_cm.__aexit__()` now called on server-initiated clean close (TCP socket was orphaned)
+- Fixed stale `_recv_task` reference: cleared to `None` in `_handle_close_code` after task exits
+
+### Bug Fixes (TypeScript Client)
+
+- Fixed binary frame prefix stripping in `handleIncomingMessage`: server sends uncompressed JSON as binary with `WSE{`/`S{`/`U{` prefix — now stripped before parse (was bypassing age filter and dedup)
+- Fixed binary frame prefix stripping in `processBinaryMessage`: category prefix (`WSE{`/`S{`/`U{`) stripped before JSON.parse in step 4 (was falling through to "unknown format" error)
+- Fixed key rotation breaking ECDH encryption: `rotateKeys()` now skips when shared secret exists
+- Fixed `beforeunload` listener accumulating on HMR: handler tracked on `globalThis`, removed before re-add
+- Fixed `processPendingServerReady` calling full `handleServerReady` (caused duplicate `client_hello`): now only fires `onServerReady` callback
+- Fixed `clientHelloRetryTimer` leak: tracked and cleared in `clearAllTimers()`
+- Fixed `server_ready`/`server_hello` throttled at 500ms: now zero-throttle (reconnect handshake was silently blocked)
+- Fixed `messagesSent` metric double-counted: removed duplicate increment from `processBatch` (already counted in `ConnectionManager.send`)
+- Fixed `sendMessage` retry timer leak: cancel pending retry timers on cleanup (was leaking closures after unmount)
+- Fixed `tokenRefreshAttempts` not reset between calls: second invocation permanently blocked token refresh
+- Fixed `handleStateChange` stale closure: routed through `stableCallbacks.current` (consistent with `onMessage`/`onServerReady`)
+- Fixed `processTextMessage` missing array prefix handling: added `WSE[`/`S[`/`U[` stripping (was silently dropping array-prefixed text frames)
+- Fixed `ConnectionPool` initial health-check timer leak: stored and cleared in `destroy()`
+- Fixed `getBestEndpoint` unnecessary optional chaining: removed `?.` on guaranteed-non-empty array
+
+### Bug Fixes (Rust Server)
+
+- Fixed JWT validation: empty issuer/audience config now skips validation (was passing `Some("")` which rejected all tokens)
+- Fixed JWT exp required: tokens without `exp` claim are now rejected (were accepted indefinitely)
+- Fixed auth fallback: server now reads `Authorization: Bearer <token>` header when no `access_token` cookie present (enables Python/API client auth)
+- Fixed `Bearer` prefix matching: now case-insensitive per RFC 7235 (accepts `bearer`, `BEARER`, etc.)
+- Fixed JWT expiration boundary: `now >= exp` per RFC 7519 (was `now > exp`, accepting tokens at exact expiration second)
+
+### Documentation
+
+- Updated SECURITY.md: documented cookie-based auth as primary method for browsers (OWASP recommended), added client-type auth matrix, added examples for browser/Python/API clients
 
 ## v1.3.2 (2026-02-22)
 
