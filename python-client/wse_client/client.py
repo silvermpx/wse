@@ -10,7 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import time
-import uuid
+
+try:
+    from uuid import uuid7
+except ImportError:
+    from uuid_extensions import uuid7
 from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable
@@ -121,6 +125,7 @@ class AsyncWSEClient:
         # Batch buffer
         self._batch_buffer: list[str] = []
         self._batch_task: asyncio.Task[None] | None = None
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
         # Snapshot dedup
         self._snapshot_requested = False
@@ -216,6 +221,11 @@ class AsyncWSEClient:
     async def disconnect(self) -> None:
         """Disconnect gracefully."""
         self._connected = False
+
+        # Cancel background tasks
+        for task in self._background_tasks:
+            task.cancel()
+        self._background_tasks.clear()
 
         # Cancel batch flush
         if self._batch_task:
@@ -335,12 +345,11 @@ class AsyncWSEClient:
 
         batch_items = []
         for msg_type, msg_payload in messages:
-            self._codec._sequence += 1
             item = {
                 "t": msg_type,
                 "p": msg_payload,
-                "id": str(uuid.uuid4()),
-                "seq": self._codec._sequence,
+                "id": str(uuid7()),
+                "seq": self._sequencer.get_next_sequence(),
                 "v": PROTOCOL_VERSION,
                 "ts": datetime.now(UTC).isoformat(),
             }
@@ -575,6 +584,12 @@ class AsyncWSEClient:
             except (asyncio.QueueEmpty, asyncio.QueueFull):
                 pass
 
+    def _fire_task(self, coro: Any) -> None:
+        """Schedule a coroutine with a strong reference to prevent GC."""
+        task = asyncio.ensure_future(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     def _invoke_handlers(self, event: WSEEvent) -> None:
         """Call registered handlers for this event type."""
         handlers = self._handlers.get(event.type, []) + self._wildcard_handlers
@@ -582,14 +597,16 @@ class AsyncWSEClient:
             try:
                 result = handler(event)
                 if asyncio.iscoroutine(result):
-                    asyncio.ensure_future(result)
+                    self._fire_task(result)
             except Exception as exc:
                 logger.error("Handler error for '%s': %s", event.type, exc)
 
     # -- System event handlers ------------------------------------------------
 
     def _handle_server_ready(self, event: WSEEvent) -> None:
-        conn_id = event.payload.get("connection_id")
+        conn_id = event.payload.get("connection_id") or event.payload.get(
+            "details", {}
+        ).get("connection_id")
         self._connection.handle_server_ready(conn_id)
         self._server_ready_event.set()
         self._snapshot_requested = False
@@ -653,7 +670,7 @@ class AsyncWSEClient:
         # User handlers invoked by _dispatch_event fall-through (not internal-only)
 
     def _handle_health_check(self, event: WSEEvent) -> None:
-        asyncio.ensure_future(self._respond_health_check())
+        self._fire_task(self._respond_health_check())
 
     async def _respond_health_check(self) -> None:
         stats = self.get_stats()
@@ -720,7 +737,7 @@ class AsyncWSEClient:
 
     def _handle_sync_request(self, event: WSEEvent) -> None:
         """Respond to server sync request with current client state."""
-        asyncio.ensure_future(self._respond_sync_request())
+        self._fire_task(self._respond_sync_request())
 
     async def _respond_sync_request(self) -> None:
         await self.send(
@@ -737,7 +754,7 @@ class AsyncWSEClient:
 
     def _handle_metrics_request(self, event: WSEEvent) -> None:
         """Respond to server metrics request."""
-        asyncio.ensure_future(self._respond_metrics_request())
+        self._fire_task(self._respond_metrics_request())
 
     async def _respond_metrics_request(self) -> None:
         diag = self._network_monitor.analyze()

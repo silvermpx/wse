@@ -60,7 +60,7 @@ class SecurityManager:
         self._aes_key: bytes | None = None
         self._signing_key: bytes | None = None
         self._enabled = False
-        self._iv_cache: set[bytes] = set()
+        self._iv_cache: dict[bytes, None] = {}  # ordered dict for FIFO eviction
 
     @property
     def is_enabled(self) -> bool:
@@ -103,7 +103,7 @@ class SecurityManager:
         # Signing key = SHA256(shared_secret)
         self._signing_key = hashlib.sha256(shared_secret).digest()
         self._enabled = True
-        self._iv_cache.clear()
+        self._iv_cache = {}
         logger.debug("Encryption enabled (AES-GCM-256)")
 
     # -- AES-GCM-256 encrypt / decrypt ----------------------------------------
@@ -164,16 +164,17 @@ class SecurityManager:
         for _ in range(100):
             iv = os.urandom(GCM_IV_LEN)
             if iv not in self._iv_cache:
-                self._iv_cache.add(iv)
-                # Evict oldest half to limit memory while preserving recent IVs
+                self._iv_cache[iv] = None
+                # Evict oldest half (dict preserves insertion order in Python 3.7+)
                 if len(self._iv_cache) > 10_000:
-                    to_remove = list(self._iv_cache)[:5_000]
-                    self._iv_cache.difference_update(to_remove)
+                    keys = list(self._iv_cache)[:5_000]
+                    for k in keys:
+                        del self._iv_cache[k]
                 return iv
 
         # Extremely unlikely fallback
         iv = os.urandom(GCM_IV_LEN)
-        self._iv_cache.add(iv)
+        self._iv_cache[iv] = None
         return iv
 
     def reset(self) -> None:
@@ -182,4 +183,4 @@ class SecurityManager:
         self._aes_key = None
         self._signing_key = None
         self._enabled = False
-        self._iv_cache.clear()
+        self._iv_cache = {}
