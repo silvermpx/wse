@@ -12,7 +12,11 @@ import asyncio
 import json as _json
 import random
 import time
-import uuid
+
+try:
+    from uuid import uuid7
+except ImportError:
+    from uuid_extensions import uuid7
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -86,6 +90,7 @@ class ConnectionManager:
         self._on_pong: Callable[[float], Any] | None = None  # latency callback
 
         # State
+        self._ws_cm: Any | None = None  # websocket context manager
         self._ws: websockets.asyncio.client.ClientConnection | None = None
         self._state = ConnectionState.DISCONNECTED
         self._is_connecting = False
@@ -102,6 +107,13 @@ class ConnectionManager:
         self._recv_task: asyncio.Task[None] | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+
+    def _fire_task(self, coro: Any) -> None:
+        """Schedule a coroutine with a strong reference to prevent GC."""
+        task = asyncio.ensure_future(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     # -- Properties -----------------------------------------------------------
 
@@ -162,27 +174,31 @@ class ConnectionManager:
         """Low-level WebSocket open with auth headers."""
         headers = dict(self._extra_headers)
 
-        # Auth: bearer token in header (unless "cookie" mode)
+        # Auth: cookie for Rust server + Authorization header as fallback
         if self._token and self._token != "cookie":
+            headers["Cookie"] = f"access_token={self._token}"
             headers["Authorization"] = f"Bearer {self._token}"
 
         # Build URL with query params
         url = self._build_url(topics)
 
         try:
+            self._ws_cm = websockets.asyncio.client.connect(
+                url,
+                additional_headers=headers,
+                max_size=2**20,  # 1 MB
+                open_timeout=CONNECTION_TIMEOUT,
+            )
             self._ws = await asyncio.wait_for(
-                websockets.asyncio.client.connect(
-                    url,
-                    additional_headers=headers,
-                    max_size=2**20,  # 1 MB
-                    open_timeout=CONNECTION_TIMEOUT,
-                ).__aenter__(),
+                self._ws_cm.__aenter__(),
                 timeout=CONNECTION_TIMEOUT,
             )
         except asyncio.TimeoutError:
+            self._ws_cm = None
             self._set_state(ConnectionState.ERROR)
             raise WSETimeoutError(f"Connection timed out after {CONNECTION_TIMEOUT}s")
         except Exception as exc:
+            self._ws_cm = None
             self._set_state(ConnectionState.ERROR)
             raise WSEConnectionError(f"Failed to connect: {exc}") from exc
 
@@ -210,12 +226,23 @@ class ConnectionManager:
             self._recv_task.cancel()
             self._recv_task = None
 
-        if self._ws:
+        # Cancel background tasks
+        for task in self._background_tasks:
+            task.cancel()
+        self._background_tasks.clear()
+
+        if self._ws_cm:
+            try:
+                await self._ws_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._ws_cm = None
+        elif self._ws:
             try:
                 await self._ws.close(WS_CLOSE_NORMAL, "Client disconnect")
             except Exception:
                 pass
-            self._ws = None
+        self._ws = None
 
         self._set_state(ConnectionState.DISCONNECTED)
 
@@ -297,18 +324,34 @@ class ConnectionManager:
             # Server-initiated PING -> respond with PONG immediately
             if data.startswith("WSE:PING:"):
                 ts = data[9:]  # skip "WSE:PING:"
-                asyncio.ensure_future(self._send_pong(ts))
+                self._fire_task(self._send_pong(ts))
                 self._last_pong = time.monotonic()
                 return
             if data.startswith("PING:"):
                 ts = data[5:]  # skip "PING:"
-                asyncio.ensure_future(self._send_pong(ts))
+                self._fire_task(self._send_pong(ts))
                 self._last_pong = time.monotonic()
+                return
+
+            # WSE-prefixed PONG message (JSON format from Rust server)
+            if '"t":"PONG"' in data or '"t": "PONG"' in data:
+                self._last_pong = time.monotonic()
+                try:
+                    json_str = data[3:] if data.startswith("WSE") else data
+                    parsed = _json.loads(json_str)
+                    client_ts = parsed.get("p", {}).get("client_timestamp")
+                    if client_ts:
+                        self._record_pong_latency(str(client_ts))
+                except Exception:
+                    pass
+                # Forward to client layer for NetworkMonitor update
+                if self._on_message:
+                    self._on_message(data)
                 return
 
             # WSE-prefixed PING message (JSON format)
             if '"t":"PING"' in data or '"t": "PING"' in data:
-                asyncio.ensure_future(self._respond_ping_json(data))
+                self._fire_task(self._respond_ping_json(data))
                 self._last_pong = time.monotonic()
                 return
 
@@ -356,7 +399,7 @@ class ConnectionManager:
         if connection_id:
             self._connection_id = connection_id
         if not self._client_hello_sent:
-            asyncio.ensure_future(self._send_client_hello())
+            self._fire_task(self._send_client_hello())
 
     async def _send_client_hello(self) -> None:
         """Send the client_hello handshake message with retry."""
@@ -380,7 +423,7 @@ class ConnectionManager:
                     },
                     "connection_id": self._connection_id,
                 },
-                "id": str(uuid.uuid4()),
+                "id": str(uuid7()),
                 "ts": datetime.now(UTC).isoformat(),
                 "v": PROTOCOL_VERSION,
                 "pri": MessagePriority.CRITICAL,
@@ -442,8 +485,15 @@ class ConnectionManager:
         logger.debug("WebSocket closed: code=%d reason=%s", code, reason)
 
         self._ws = None
+        self._ws_cm = None
         self._server_ready = False
         self._client_hello_sent = False
+
+        # Cancel old tasks to prevent duplicate loops
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
+        # recv_task already exited (it raised ConnectionClosedError)
 
         # Normal close or going away
         if code in (WS_CLOSE_NORMAL, WS_CLOSE_GOING_AWAY):
@@ -476,7 +526,7 @@ class ConnectionManager:
             return
 
         cfg = self._reconnect_cfg
-        if cfg.max_attempts > 0 and self._reconnect_attempts >= cfg.max_attempts:
+        if cfg.max_attempts >= 0 and self._reconnect_attempts >= cfg.max_attempts:
             logger.error("Max reconnect attempts (%d) reached", cfg.max_attempts)
             self._set_state(ConnectionState.ERROR)
             return
@@ -487,7 +537,7 @@ class ConnectionManager:
             "Reconnecting in %.1fs (attempt %d/%s)",
             delay,
             self._reconnect_attempts + 1,
-            cfg.max_attempts if cfg.max_attempts > 0 else "inf",
+            cfg.max_attempts if cfg.max_attempts >= 0 else "inf",
         )
 
         self._reconnect_task = asyncio.ensure_future(self._reconnect_after(delay))

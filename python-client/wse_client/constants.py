@@ -6,7 +6,7 @@
 # =============================================================================
 
 PROTOCOL_VERSION = 1
-CLIENT_VERSION = "1.3.0"
+CLIENT_VERSION = "1.3.3"
 
 # -- Timing (seconds) --------------------------------------------------------
 
@@ -38,7 +38,7 @@ RATE_LIMIT_REFILL_INTERVAL = 1.0
 
 # -- Sequencing ----------------------------------------------------------------
 
-SEQUENCE_WINDOW_SIZE = 1_000
+SEQUENCE_WINDOW_SIZE = 10_000
 MAX_OUT_OF_ORDER = 100
 DUPLICATE_MAX_AGE = 300.0  # 5 minutes
 

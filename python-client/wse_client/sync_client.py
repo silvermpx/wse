@@ -74,6 +74,7 @@ class SyncWSEClient:
         self._client: AsyncWSEClient | None = None
         self._running = False
         self._connected_event = threading.Event()
+        self._connect_error: Exception | None = None
 
     # -- Lifecycle ------------------------------------------------------------
 
@@ -103,7 +104,13 @@ class SyncWSEClient:
         """Disconnect and stop the background thread."""
         self._running = False
         if self._loop and self._client:
-            asyncio.run_coroutine_threadsafe(self._client.disconnect(), self._loop)
+            future = asyncio.run_coroutine_threadsafe(
+                self._client.disconnect(), self._loop
+            )
+            try:
+                future.result(timeout=5.0)
+            except Exception:
+                pass
         # Signal queue consumers
         try:
             self._event_queue.put_nowait(None)

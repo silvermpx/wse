@@ -15,7 +15,11 @@
 from __future__ import annotations
 
 import json
-import uuid
+
+try:
+    from uuid import uuid7
+except ImportError:
+    from uuid_extensions import uuid7
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -132,7 +136,7 @@ class MessageCodec:
         message: dict[str, Any] = {
             "t": type,
             "p": payload,
-            "id": str(uuid.uuid4()),
+            "id": str(uuid7()),
             "seq": self._sequence,
             "ts": datetime.now(UTC).isoformat(),
             "v": PROTOCOL_VERSION,

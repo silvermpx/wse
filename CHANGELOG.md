@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.3.3 (2026-02-23)
+
+### Bug Fixes (Python Client)
+
+- Fixed auth: send JWT as both Cookie and Authorization header (Rust server reads Cookie)
+- Fixed PONG handling: parse WSE JSON PONG format from Rust server (was only handling colon-prefix)
+- Fixed WebSocket resource leak: proper `__aexit__` cleanup on disconnect
+- Fixed `server_ready` parsing: read `connection_id` from nested `details` object
+- Fixed asyncio task GC: all `ensure_future` calls now tracked in `_background_tasks` set
+- Fixed uuid4 → uuid7 in protocol.py, connection.py, client.py
+- Fixed `send_batch` mutating codec sequence directly (now uses sequencer)
+- Fixed background tasks not cancelled on disconnect (heartbeat, listener loops)
+- Fixed `SyncWSEClient._connect_error` not initialized in `__init__`
+- Fixed `SyncWSEClient.close()` not waiting for disconnect completion
+- Fixed reconnect not cancelling old heartbeat task (duplicate loops)
+- Fixed IV cache using unordered `set` (now `dict` for FIFO eviction)
+- Fixed event sequencer window: 1,000 → 10,000 (matching TS client)
+- Fixed CLIENT_VERSION constant out of date
+- Fixed `max_attempts=0` treated as infinite retries
+
 ## v1.3.2 (2026-02-22)
 
 ### Bug Fixes
