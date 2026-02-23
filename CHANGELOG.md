@@ -64,6 +64,7 @@
 - Fixed JWT expiration boundary: `now >= exp` per RFC 7519 (was `now > exp`, accepting tokens at exact expiration second)
 - Fixed `conn_rates` memory leak: per-connection rate limiter state now cleaned up on disconnect (was growing unbounded)
 - Fixed JSON injection in `build_server_ready`: user_id from JWT `sub` claim now properly escaped via `serde_json` (was raw format string interpolation)
+- Replaced `get_connection_count()` channel round-trip with `AtomicUsize` — zero GIL, zero blocking, nanosecond reads from Python async handlers
 
 ### Documentation
 
