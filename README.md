@@ -172,6 +172,7 @@ Compression, sequencing, filtering, rate limiting, and the WebSocket server itse
 | **PubSub Bus** | Redis pub/sub with PSUBSCRIBE pattern matching. orjson fast-path serialization. Custom JSON encoder for UUID, datetime, Decimal. Non-blocking handler invocation. |
 | **Pluggable Security** | `EncryptionProvider` and `TokenProvider` protocols. Built-in: AES-GCM-256 with ECDH P-256 key exchange, HMAC-SHA256 signing, selective message signing. Rust-accelerated crypto (SHA-256, HMAC, AES-GCM, ECDH). |
 | **Rust JWT Authentication** | HS256 JWT validation in Rust during the WebSocket handshake. Zero GIL acquisition on the connection critical path. 0.01ms decode (85x faster than Python). Cookie extraction and `server_ready` sent from Rust before Python runs. |
+| **Lock-Free Server Queries** | `get_connection_count()` uses `AtomicUsize` — zero GIL, zero blocking, safe to call from async Python handlers. No channel round-trip to the tokio runtime. |
 | **Inbound MsgPack** | Binary frames from msgpack clients are parsed in Rust via rmpv. Python receives pre-parsed dicts regardless of wire format. Zero Python overhead for msgpack connections. |
 | **Connection Metrics** | Prometheus-compatible stubs for: messages sent/received, publish latency, DLQ size, handler errors, circuit breaker state. Drop-in Prometheus integration or use the built-in stubs. |
 
