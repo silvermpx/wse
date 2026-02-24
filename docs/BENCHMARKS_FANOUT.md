@@ -143,24 +143,6 @@ With N Server B instances on separate machines, capacity scales linearly:
 
 ---
 
-## Comparison with Alternatives
-
-| Server | Fan-out Throughput | Max Tested | Language | Redis Multi-Instance |
-|--------|-------------------|-----------|----------|---------------------|
-| **WSE** | **2.1M del/s** (broadcast) | **500K conns** | Python + Rust | Yes (1.04M del/s) |
-| uWebSockets | 120K msg/s (4 cores) | 120K conns | C++ | No |
-| Centrifugo | 500K msg/s (20 pods K8s) | 1M conns (cluster) | Go | Yes (Redis/Nats) |
-| Socket.IO | 30K msg/s (4 cores) | 30K conns | Node.js | Yes (Redis adapter) |
-| Phoenix Channels | ~200K msg/s (est.) | 2M conns (cluster) | Elixir | N/A (built-in PubSub) |
-
-Sources: Centrifugo 1M blog, ezioda004 uWS benchmark (AWS c5a.xlarge),
-Hashrocket WebSocket Shootout, Phoenix 2M connections blog.
-
-WSE achieves C++-level fan-out throughput from a single process while being a Python
-library with a Rust core — no separate Go/C++ server to deploy.
-
----
-
 ## Reproducing
 
 ### Test 8: Single-Instance Broadcast
