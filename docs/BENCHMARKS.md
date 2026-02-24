@@ -7,7 +7,7 @@ Each client has its own detailed results page.
 
 | Client | Language | Max Connections Tested | Peak Throughput | Details |
 |--------|----------|----------------------|-----------------|---------|
-| **wse-bench** | Rust (tokio) | **100,000** | **20.5M msg/s** | [Rust Client Results](BENCHMARKS_RUST_CLIENT.md) |
+| **wse-bench** | Rust (tokio) | **500,000** | **20.5M msg/s** | [Rust Client Results](BENCHMARKS_RUST_CLIENT.md) |
 | **bench_brutal.py** | Python (sync) | 1,000 | 6.9M msg/s | [Python Client Results](BENCHMARKS_PYTHON_CLIENT.md) |
 | **bench_multiprocess.py** | Python (multi-proc) | 128 | 2.1M msg/s | [Python Client Results](BENCHMARKS_PYTHON_CLIENT.md) |
 
@@ -19,7 +19,7 @@ than Python could measure.
 
 ## Server Hardware
 
-Primary test environment: AMD EPYC 7502P (64 cores, 128 threads), 128 GB RAM, Ubuntu 24.04.
+Primary test environment: AMD EPYC 7502P (32 cores, 64 threads), 128 GB RAM, Ubuntu 24.04.
 Client and server on the same machine (loopback, zero network noise). M2 MacBook used
 for development benchmarks.
 
@@ -36,11 +36,11 @@ full Python wrapper with drain_mode, JWT auth, the whole stack.
 | Peak throughput (compressed) | **20.5M msg/s** | Rust client, 500 conns |
 | Peak message rate | **19.4M msg/s** | Rust client, 64B payload |
 | Throughput at 100K conns | **9.1M msg/s** (1.6 GB/s) | Rust client |
-| Max concurrent connections | **100,000** (0 errors) | Rust client |
+| Max concurrent connections | **500,000** (0 errors) | Rust client |
 | Connection accept rate | **15,020 conn/s** | Rust client, 2K tier |
 | Ping RTT at low load | **1 ms** p50 | Rust client, 100 conns |
 | Peak bandwidth | **19.9 GB/s** | Rust client, 16KB msgs |
-| Sustained hold (100K, 30s) | **100% survival** | Rust client |
+| Sustained hold (100K conns, 30s) | **100% survival** | Rust client |
 | drain_mode overhead | **< 2%** | Python client comparison |
 
 ---
@@ -77,7 +77,7 @@ measure inbound throughput — the harder and more realistic workload.
 | **Inbound sustained** | **2.0M msg/s** (Python 64w) | -- | -- | -- | -- |
 | **Single client** | **113K msg/s** | -- | -- | ~10K | ~19K echo |
 | **Fan-out (broadcast)** | N/A | 500K msg/s (20 pods) | 120K msg/s (4 cores) | 30K msg/s | 13K (i7) |
-| **Connection count** | **100K tested** | 1M (K8s cluster) | 120K (4 cores) | 30K (4 cores) | 100K+ |
+| **Connection count** | **500K tested** | 1M (K8s cluster) | 120K (4 cores) | 30K (4 cores) | 100K+ |
 | **Connection latency** | **0.53 ms** (single) | Not published | Not published | ~50 ms | ~10 ms |
 | **Ping RTT** | **0.09 ms** (single) | Not published | Not published | ~1 ms | ~0.1 ms |
 
