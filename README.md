@@ -20,7 +20,7 @@ Building real-time features between React and Python is painful. You need WebSoc
 
 Install `wse-server` on your backend, `wse-client` on your frontend (React or Python). Everything works immediately: auto-reconnection, message encryption, sequence ordering, offline queues, health monitoring. No configuration required for the defaults. Override what you need.
 
-The engine is Rust-accelerated via PyO3. **2M msg/s** point-to-point, **2.1M deliveries/s** fan-out broadcast, **500K concurrent connections** with zero message loss -- benchmarked on AMD EPYC 7502P (32 cores). Multi-instance horizontal scaling via Redis pub/sub. Sub-millisecond connection latency with Rust JWT authentication.
+The engine is Rust-accelerated via PyO3. **14M msg/s** JSON, **30M msg/s** binary, **2.1M deliveries/s** fan-out, **500K concurrent connections** with zero message loss -- benchmarked on AMD EPYC 7502P. Multi-instance horizontal scaling via Redis pub/sub. Sub-millisecond latency (0.38ms) with Rust JWT authentication.
 
 ---
 
@@ -211,44 +211,82 @@ Compression, sequencing, filtering, rate limiting, and the WebSocket server itse
 
 ## Performance
 
-Rust-accelerated engine via PyO3. All numbers below from AMD EPYC 7502P (32 cores, 128 GB).
+Rust-accelerated engine via PyO3. AMD EPYC 7502P (32 cores, 128 GB), Ubuntu 24.04, localhost.
 
-### Point-to-Point Throughput
+### Highlights
 
-| Metric | 64 Workers | 128 Workers |
-|--------|-----------|-------------|
-| **Sustained throughput (JSON)** | **2,045,000 msg/s** | 2,013,000 msg/s |
-| **Sustained throughput (MsgPack)** | **2,072,000 msg/s** | 2,041,000 msg/s |
-| **Burst throughput (JSON)** | 1,557,000 msg/s | **1,836,000 msg/s** |
-| **Connection latency** | 2.60 ms median | 2.96 ms median |
-| **Ping RTT** | 0.26 ms median | 0.41 ms median |
-| **64KB messages** | **256K msg/s (16.0 GB/s)** | 238K msg/s (14.9 GB/s) |
+| Metric | Value | Details |
+|--------|-------|---------|
+| **Peak throughput** | **14.2M msg/s** | JSON, Rust client, 500 connections |
+| **Peak binary** | **30M msg/s** | MsgPack/compressed, Rust client |
+| **Fan-out broadcast** | **2.1M deliveries/s** | Single-instance, zero message loss |
+| **Max connections** | **500,000** | Zero errors, zero gaps at every tier |
+| **Multi-instance** | **1.04M del/s per node** | Redis pub/sub, linear horizontal scaling |
+| **Connection latency** | **0.38 ms** median | Rust JWT auth in handshake |
+| **Accept rate** | **15,020 conn/s** | Sustained connection establishment |
+| **Memory per conn** | **4.4 KB** | Rust core static overhead |
 
-### Fan-out Broadcast
+### Point-to-Point (Rust Native Client)
 
-Server broadcasts to N subscribers. Zero message loss at every tier.
+| Payload | Throughput | Bandwidth |
+|---------|-----------|-----------|
+| 64 bytes | **19.4M msg/s** | 1.2 GB/s |
+| 256 bytes | **12.5M msg/s** | 3.1 GB/s |
+| 1 KB | **10.3M msg/s** | 10.0 GB/s |
+| 16 KB | **1.2M msg/s** | **19.9 GB/s** |
+| 64 KB | **284K msg/s** | **18.2 GB/s** |
 
-| Subscribers | Deliveries/s | Bandwidth | Gaps |
-|-------------|-------------|-----------|------|
-| 10 | **2.1M** | 295 MB/s | 0 |
-| 1,000 | 1.4M | 185 MB/s | 0 |
-| 10,000 | 1.2M | 163 MB/s | 0 |
-| 100,000 | 1.7M | 234 MB/s | 0 |
-| 500,000 | 1.4M | 128 MB/s | 0 |
+### Point-to-Point (Python Multi-Process, 64 Workers)
 
-### Multi-Instance (Redis)
+| Metric | JSON | MsgPack |
+|--------|------|---------|
+| **Sustained** | **2,045,000 msg/s** | **2,072,000 msg/s** |
+| **Burst** | 1,557,000 msg/s | 1,836,000 msg/s |
+| **64KB messages** | 256K msg/s (16.0 GB/s) | -- |
+| **Ping RTT** | 0.26 ms median | -- |
 
-Two server processes coordinated via Redis pub/sub. Publisher on Server A, subscribers on Server B.
+### Point-to-Point (TypeScript/Node.js, 64 Processes)
 
-| Subscribers (Server B) | Deliveries/s | Gaps |
-|-------------------------|-------------|------|
+| Format | Throughput | Scaling |
+|--------|-----------|---------|
+| JSON | **7.0M msg/s** | 97% linear |
+| MsgPack | **7.9M msg/s** | +13% over JSON |
+
+### Fan-out Broadcast (Single-Instance)
+
+Server broadcasts to N subscribers. **Zero message loss at every tier.**
+
+| Subscribers | Deliveries/s | Bandwidth | p50 Latency |
+|-------------|-------------|-----------|-------------|
+| 10 | **2.1M** | 295 MB/s | 0.005 ms |
+| 1,000 | 1.4M | 185 MB/s | -- |
+| 10,000 | 1.2M | 163 MB/s | -- |
+| 100,000 | 1.7M | 234 MB/s | -- |
+| **500,000** | **1.4M** | 128 MB/s | -- |
+
+### Multi-Instance Fan-out (Redis Pub/Sub)
+
+Publish on Server A, fans out to N subscribers on Server B. Redis 8.6, pipelined PUBLISH (64 commands/batch).
+
+| Subscribers | Deliveries/s | Gaps |
+|-------------|-------------|------|
 | 10 | 448K | 0 |
-| 500 | **1.04M** | 0 |
+| **500** | **1.04M** | 0 |
 | 5,000 | 778K | 0 |
 
-Capacity scales linearly: 2 instances = ~2M del/s, 3 instances = ~3M del/s.
+Capacity scales linearly with instances: 2 nodes = ~2M del/s, 3 nodes = ~3M del/s.
 
-See [BENCHMARKS.md](docs/BENCHMARKS.md) and [Fan-out Benchmarks](docs/BENCHMARKS_FANOUT.md) for full results and methodology.
+### Rust Acceleration vs Python
+
+| Component | Speedup | Rust | Python |
+|-----------|---------|------|--------|
+| JWT decode (HS256) | **85x** | 10 us | 850 us |
+| Msgpack parsing | **~50x** | -- | -- |
+| Rate limiter | **40x** | -- | -- |
+| HMAC-SHA256 | **22x** | -- | -- |
+| Compression (zlib) | **6.7x** | -- | -- |
+
+See benchmark docs for full results: [Overview](docs/BENCHMARKS.md) | [Rust Client](docs/BENCHMARKS_RUST_CLIENT.md) | [TypeScript Client](docs/BENCHMARKS_TS_CLIENT.md) | [Python Client](docs/BENCHMARKS_PYTHON_CLIENT.md) | [Fan-out](docs/BENCHMARKS_FANOUT.md)
 
 ---
 
