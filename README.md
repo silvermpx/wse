@@ -20,7 +20,7 @@ Building real-time features between React and Python is painful. You need WebSoc
 
 Install `wse-server` on your backend, `wse-client` on your frontend (React or Python). Everything works immediately: auto-reconnection, message encryption, sequence ordering, offline queues, health monitoring. No configuration required for the defaults. Override what you need.
 
-The engine is Rust-accelerated via PyO3. **14M msg/s** JSON, **30M msg/s** binary, **2.1M deliveries/s** fan-out, **500K concurrent connections** with zero message loss -- benchmarked on AMD EPYC 7502P. Multi-instance horizontal scaling via Redis pub/sub. Sub-millisecond latency (0.38ms) with Rust JWT authentication.
+The engine is Rust-accelerated via PyO3. **14M msg/s** JSON, **30M msg/s** binary, **2.1M deliveries/s** fan-out, **500K concurrent connections** with zero message loss -- benchmarked on AMD EPYC 7502P. Multi-instance horizontal scaling via Redis pub/sub. Sub-millisecond latency (0.38 ms) with Rust JWT authentication.
 
 ---
 
@@ -221,7 +221,6 @@ Rust-accelerated engine via PyO3. AMD EPYC 7502P (32 cores, 128 GB), Ubuntu 24.0
 | **Peak binary** | **30M msg/s** | MsgPack/compressed, Rust client |
 | **Fan-out broadcast** | **2.1M deliveries/s** | Single-instance, zero message loss |
 | **Max connections** | **500,000** | Zero errors, zero gaps at every tier |
-| **Multi-instance** | **1.04M del/s per node** | Redis pub/sub, linear horizontal scaling |
 | **Connection latency** | **0.38 ms** median | Rust JWT auth in handshake |
 | **Accept rate** | **15,020 conn/s** | Sustained connection establishment |
 | **Memory per conn** | **4.4 KB** | Rust core static overhead |
@@ -263,18 +262,6 @@ Server broadcasts to N subscribers. **Zero message loss at every tier.**
 | 10,000 | 1.2M | 163 MB/s | -- |
 | 100,000 | 1.7M | 234 MB/s | -- |
 | **500,000** | **1.4M** | 128 MB/s | -- |
-
-### Multi-Instance Fan-out (Redis Pub/Sub)
-
-Publish on Server A, fans out to N subscribers on Server B. Redis 8.6, pipelined PUBLISH (64 commands/batch).
-
-| Subscribers | Deliveries/s | Gaps |
-|-------------|-------------|------|
-| 10 | 448K | 0 |
-| **500** | **1.04M** | 0 |
-| 5,000 | 778K | 0 |
-
-Capacity scales linearly with instances: 2 nodes = ~2M del/s, 3 nodes = ~3M del/s.
 
 ### Rust Acceleration vs Python
 
