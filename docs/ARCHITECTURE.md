@@ -23,7 +23,7 @@ app.include_router(wse, prefix="/wse")
 
 ### Standalone Mode (dedicated Rust server)
 
-Run `RustWSEServer` on its own port for maximum throughput. The entire WebSocket server runs in a Rust tokio runtime — no FastAPI overhead, no GIL on the hot path. This is how WSE achieves 2M msg/s.
+Run `RustWSEServer` on its own port for maximum throughput. The entire WebSocket server runs in a Rust tokio runtime — no FastAPI overhead, no GIL on the hot path. This is how WSE achieves 13M msg/s on JSON.
 
 ```python
 from wse_server._wse_accel import RustWSEServer
@@ -46,7 +46,7 @@ while True:
 
 Standalone mode gives you a dedicated Rust tokio runtime. JWT validation, ping/pong, rate limiting, compression, and the WebSocket transport itself all run in Rust with zero GIL acquisition.
 
-All benchmarks (including the 2M msg/s EPYC results) use standalone mode.
+All benchmarks (including the 13M msg/s JSON on EPYC) use standalone mode.
 
 ---
 
