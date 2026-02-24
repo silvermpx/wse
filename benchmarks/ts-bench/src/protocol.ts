@@ -37,9 +37,9 @@ export async function connectAndHandshake(
         });
         ws.send(hello, (err) => {
           if (err) { clearTimeout(timer); reject(err); return; }
+          clearTimeout(timer);
+          resolve(ws);
         });
-        clearTimeout(timer);
-        resolve(ws);
       }
     });
 
@@ -85,9 +85,9 @@ export async function connectAndHandshakeFrom(
         });
         ws.send(hello, (err) => {
           if (err) { clearTimeout(timer); reject(err); return; }
+          clearTimeout(timer);
+          resolve(ws);
         });
-        clearTimeout(timer);
-        resolve(ws);
       }
     });
 

@@ -1,6 +1,6 @@
 # r/Python Showcase Post
 
-**Title:** I built WSE — Rust-accelerated WebSocket engine for Python (2M msg/s, E2E encrypted)
+**Title:** I built WSE — Rust-accelerated WebSocket engine for Python (14M msg/s JSON, 30M binary, 500K connections)
 
 ---
 
@@ -27,7 +27,17 @@ config = WSEConfig(
 app.include_router(create_wse_router(config))
 ```
 
-2M msg/s on epyc, 0.5M+ on a macbook m2. e2e encryption (ecdh p-256 + aes-gcm-256), zlib, msgpack, pub/sub, dedup, circuit breaker, rate limiting.
+after a massive stress testing session on an epyc 7502p (64 threads, 128 GB), the original 2M msg/s turned out to be the python client bottleneck, not the server. built a rust benchmark client to find the real ceiling:
+
+- **14.2M msg/s** json, **30M msg/s** binary (msgpack/zlib)
+- **500K simultaneous connections** with zero failures
+- **19.9 GB/s** peak bandwidth
+- **0.38ms** ping latency at 100 connections
+- 100% connection survival holding 100K connections for 30 seconds
+
+also tested with python (64 processes, 6.9M msg/s) and typescript/node.js (64 processes, 7.0M msg/s). full results with per-tier breakdowns: [rust](https://github.com/silvermpx/wse/blob/main/docs/BENCHMARKS_RUST_CLIENT.md) | [python](https://github.com/silvermpx/wse/blob/main/docs/BENCHMARKS_PYTHON_CLIENT.md) | [typescript](https://github.com/silvermpx/wse/blob/main/docs/BENCHMARKS_TS_CLIENT.md)
+
+e2e encryption (ecdh p-256 + aes-gcm-256), zlib, msgpack, pub/sub, dedup, circuit breaker, rate limiting.
 
 has ts/react and python clients:
 
@@ -57,8 +67,10 @@ https://github.com/silvermpx/wse
 
 ## First Comment
 
-some context on the architecture: wse has two modes. "router mode" embeds into your fastapi app on the same port — zero config, good for prototyping. "standalone mode" runs a separate rust tokio server with no python on the hot path at all — that's where the 2M numbers come from.
+some context on the architecture: wse has two modes. "router mode" embeds into your fastapi app on the same port — zero config, good for prototyping. "standalone mode" runs a separate rust tokio server with no python on the hot path at all — that's where the 14M/30M numbers come from.
 
-the optimization journey was fun. biggest wins were orjson (3-5x faster json), moving from per-message callbacks to batch drain (3-4x), and putting jwt in rust (connection latency went from 23ms to 0.53ms). the last one was the most satisfying — just removing python from the handshake entirely.
+the optimization journey was fun. biggest wins were orjson (3-5x faster json), moving from per-message callbacks to batch drain (3-4x), putting jwt in rust (connection latency went from 23ms to 0.53ms), and replacing the mutex drain queue with crossbeam-channel (12.8x at 100 connections, fixed stalls at 1000+). the last two were the most satisfying — just removing python from hot paths entirely.
+
+the stress testing was a whole thing. started with python clients and thought 2M msg/s was the ceiling. built a rust bench client and the server immediately jumped to 14M json. binary formats (msgpack, zlib) hit 30M. pushed connections up to 500K on 128 GB ram with zero failures. then tested with node.js too — 7M msg/s across 64 processes. the bottleneck was always the client, never the server.
 
 happy to go deep on any of this.

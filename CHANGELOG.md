@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.3.9 (2026-02-24)
+
+### Benchmarks
+
+- **TypeScript benchmark client** (`benchmarks/ts-bench/`) — 7-test suite matching the Rust bench, measuring Node.js consumer performance: 116K msg/s single-process, 7.0M msg/s at 64 processes (97% linear scaling), 64K+ stable connections, 100% hold survival
+- **Rust benchmark client** (`benchmarks/rust-bench/`) — confirmed 14.2M msg/s JSON, 30M msg/s binary, 500K connections with zero failures on EPYC 7502P
+- **Full cross-client benchmark documentation** — Rust, Python, and TypeScript results with per-tier breakdowns, latency percentiles, payload size matrices, and format comparisons
+
+### Bug Fixes (TypeScript Benchmark)
+
+- Fixed `connectAndHandshake` resolving before `client_hello` send callback fires (send errors were silently swallowed)
+- Fixed `server_version` stuck at 1.2.2 in `WSEConnection` config (now synced with release version)
+
 ## v1.3.8 (2026-02-24)
 
 ### Bug Fixes (Rust Server)
