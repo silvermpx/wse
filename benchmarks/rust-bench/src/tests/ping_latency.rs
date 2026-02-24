@@ -106,7 +106,7 @@ async fn ping_loop(mut ws: WsStream) -> (LatencyHistogram, WsStream) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while let Ok(Some(Ok(msg))) = tokio::time::timeout_at(deadline, ws.next()).await {
             if let Some(parsed) = protocol::parse_wse_message(&msg) {
-                if protocol::extract_pong_timestamp(&parsed).is_some() {
+                if protocol::is_pong(&parsed) {
                     let actual_rtt = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()

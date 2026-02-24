@@ -171,7 +171,7 @@ async fn hold_loop(
                     match tokio::time::timeout_at(pong_deadline, ws.next()).await {
                         Ok(Some(Ok(msg))) => {
                             if let Some(parsed) = protocol::parse_wse_message(&msg) {
-                                if protocol::extract_pong_timestamp(&parsed).is_some() {
+                                if protocol::is_pong(&parsed) {
                                     let rtt_ms = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap()
