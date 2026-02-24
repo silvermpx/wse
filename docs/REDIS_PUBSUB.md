@@ -111,17 +111,28 @@ count = server.get_topic_subscriber_count("user:123:events")
 
 ### Publishing
 
+Two publish methods — local and Redis:
+
 ```python
-# Publish via Redis (multi-instance fan-out)
+# Local fan-out to topic subscribers (NO Redis, single instance)
+# Use this for domain events: market data, balance updates, trade fills
+server.publish_local("bars:AAPL", '{"t":"bar","p":{"c":185.50}}')
+
+# Redis fan-out (multi-instance horizontal scaling ONLY)
+# Use this ONLY when running multiple WSE instances behind a load balancer
 server.publish("user:123:events", '{"t":"balance_update","p":{"equity":50000}}')
 ```
 
+**`publish_local(topic, data)`** dispatches to local topic subscribers directly.
+No Redis connection required. Same topic matching (exact + glob).
+Speed: same as broadcast (~2.1M deliveries/s).
+
+**`publish(topic, data)`** sends via Redis for cross-instance delivery.
 The `publish()` method:
 1. Sends `RedisCommand::Publish` to the listener task via unbounded channel
 2. Listener retries up to 3 times (100ms, 200ms delays)
 3. On final failure, pushes to Dead Letter Queue
-
-**Note:** `publish()` requires `connect_redis()` first. Without Redis, use `broadcast()` or `send_event()` for local-only delivery.
+Speed: ~13K published messages/s (Redis round-trip bottleneck).
 
 ### Health Monitoring
 
@@ -241,21 +252,22 @@ server.publish("user:123:balance", json.dumps(payload))
 
 Domain publishers call `server.publish()` instead of `pubsub_bus.publish()`. The `wse:` prefix is added automatically by the Rust server.
 
-## Dual-Mode Operation
+## API Methods
 
-The server works in two modes simultaneously:
+| Method | Redis? | Speed | Use Case |
+|--------|--------|-------|----------|
+| `broadcast(data)` | No | ~2.1M del/s | All connections (system announcements) |
+| `send_event(conn_id, event)` | No | Direct | One specific connection |
+| `publish_local(topic, data)` | No | ~2.1M del/s | Topic fan-out, single instance (market data, domain events) |
+| `publish(topic, data)` | Yes | ~13K msg/s | Horizontal scaling ONLY (multi-instance coordination) |
+| `subscribe_connection()` | No | - | Register topic interest |
+| `unsubscribe_connection()` | No | - | Remove topic interest |
 
-| Operation | Requires Redis | Use Case |
-|-----------|---------------|----------|
-| `broadcast(data)` | No | Send to ALL local connections |
-| `send_event(conn_id, event)` | No | Send to ONE connection |
-| `publish(topic, data)` | Yes | Multi-instance fan-out via Redis |
-| `subscribe_connection()` | No* | Register topic interest |
-| `unsubscribe_connection()` | No* | Remove topic interest |
-
-*Subscriptions are stored locally. Redis delivers messages that match subscriptions.
-
-Start without Redis for development, add `connect_redis()` for production multi-instance.
+**Decision guide:**
+- Single server? Use `broadcast()` or `publish_local()`. No Redis needed.
+- Multiple servers behind LB? Add `connect_redis()` + use `publish()`.
+- Domain events (market data, trades, balances)? Always `publish_local()`.
+- Redis is for orchestration only, never for single-instance message routing.
 
 ## Wire Format
 
