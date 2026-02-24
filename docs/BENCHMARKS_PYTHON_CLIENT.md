@@ -155,7 +155,7 @@ Small message (93 bytes) throughput approaches half a million messages per secon
 
 ## Multi-Process (EPYC 7502P, 64 Workers)
 
-Same multi-process methodology, scaled to 64 cores.
+Same multi-process methodology, scaled to 64 threads (32 cores).
 
 ### Worker Scaling
 
@@ -424,7 +424,7 @@ bottleneck — the Python client is the limiting factor at these throughput leve
 
 The Python client tops out at ~6.9M msg/s with 1,000 connections. Beyond this, the
 asyncio event loop and GIL become the ceiling, not the server. Max practical connections
-is around 1,000 (1 OS process per connection on 64 cores). Async Python caps at ~1.5M
+is around 1,000 (1 OS process per connection on 64 threads). Async Python caps at ~1.5M
 msg/s regardless of connection count.
 
 To find the true server ceiling, we built a native Rust benchmark client (`wse-bench`).

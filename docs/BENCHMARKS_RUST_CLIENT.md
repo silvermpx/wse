@@ -9,7 +9,7 @@ This is the first time we've been able to push the server past the Python overhe
 
 ## Hardware
 
-AMD EPYC 7502P (64 cores, 128 threads), 128 GB RAM, Ubuntu 24.04.
+AMD EPYC 7502P (32 cores, 64 threads), 128 GB RAM, Ubuntu 24.04.
 Client and server on the same machine (loopback, zero network noise).
 
 Server: `bench_server.py` with `RustWSEServer` — same maturin-compiled binary as production,
@@ -222,30 +222,40 @@ total PINGs. The server holds 100K connections for 30 seconds without any degrad
 
 ## Test 7: Connection Limit
 
-Binary search for the maximum number of stable connections. Starts at 1K, doubles
-until failure, then narrows down.
+Binary search for the maximum number of stable connections. Server configured with
+`--max-connections 500000`, client probes exponentially then binary-searches to find
+the ceiling.
 
-| Phase | Target | Result | Errors |
-|-------|--------|--------|--------|
-| Probe | 1,000 | OK | 0 |
-| Probe | 2,000 | OK | 0 |
-| Probe | 4,000 | OK | 0 |
-| Probe | 8,000 | OK | 0 |
-| Probe | 16,000 | OK | 0 |
-| Probe | 32,000 | OK | 0 |
-| Probe | 64,000 | OK | 0 |
-| Probe | 128,000 | FAIL | 28,000 (21.9%) |
-| Search | 96,000 | OK | 0 |
-| Search | 112,000 | FAIL | 12,000 (10.7%) |
-| Search | 104,000 | OK | 4,000 |
-| Search | 108,000 | FAIL | 8,000 (7.4%) |
-| Search | 106,000 | FAIL | 6,000 (5.7%) |
-| Search | 105,000 | OK | 5,000 |
+| Phase | Target | Accept Rate | Errors | Source IPs |
+|-------|--------|-------------|--------|------------|
+| Probe | 1,000 | 7,580/s | 0 | 1 |
+| Probe | 2,000 | 11,726/s | 0 | 1 |
+| Probe | 4,000 | 11,536/s | 0 | 1 |
+| Probe | 8,000 | 11,596/s | 0 | 1 |
+| Probe | 16,000 | 11,887/s | 0 | 1 |
+| Probe | 32,000 | 11,585/s | 0 | 1 |
+| Probe | 64,000 | 4,183/s | 0 | 2 |
+| Probe | 128,000 | 4,087/s | 0 | 3 |
+| Probe | 256,000 | 3,684/s | 0 | 5 |
+| Search | 378,000 | 3,228/s | 0 | 7 |
+| Search | 439,000 | 3,044/s | 0 | 8 |
+| Search | 469,500 | 2,766/s | 0 | 8 |
+| Search | 484,500 | 2,748/s | 0 | 9 |
+| Search | 492,000 | 2,768/s | 0 | 9 |
+| Search | 496,000 | 2,746/s | 0 | 9 |
+| Search | 498,000 | 2,778/s | 0 | 9 |
+| Search | **499,000** | **2,780/s** | **0** | 9 |
 
-**Max stable connections: ~105,000.** The server was configured with
-`--max-connections 100000`, so the ~5K errors above 100K are the server's own
-limit rejecting connections. A retest with a higher server limit will reveal
-the true hardware/OS ceiling.
+**Max stable connections: ~500,000** (limited by server config, not hardware).
+Zero errors at every tier. The server accepted every single connection through
+the full JWT-authenticated handshake up to the config limit.
+
+Accept rate drops above 64K due to multi-IP source binding (each source IP
+provides ~60K ephemeral ports). At 499K connections the accept rate is still
+a solid 2,780 connections/second.
+
+Memory at 500K: server + client consumed ~123 GB of the 128 GB available, with
+30 GB spilling into swap. On a 256 GB machine the server could go higher.
 
 ---
 
@@ -253,7 +263,7 @@ the true hardware/OS ceiling.
 
 1. **13.5M msg/s peak** (JSON), **20.5M msg/s** (compressed) — the true server ceiling is 2-3x what the Python client showed
 2. **19.9 GB/s peak bandwidth** at 16KB payloads
-3. **100K concurrent connections** with zero failures across all tests
+3. **500K concurrent connections** with zero failures — limited only by available RAM (128 GB)
 4. **100% connection survival** for 30 seconds at every tier including 100K
 5. **Compressed > JSON > MsgPack** for inbound throughput (zlib is 50-98% faster than JSON)
 6. **The bottleneck was always the client** — Python's asyncio/GIL limited us, not the Rust server core
@@ -271,7 +281,7 @@ cargo build --release
 
 # Start the server (separate terminal)
 cd /root/wse && source venv/bin/activate
-DRAIN_MODE=1 python benchmarks/bench_server.py --max-connections 100000
+DRAIN_MODE=1 python benchmarks/bench_server.py --max-connections 500000
 
 # Run the full suite (all 7 tests)
 ulimit -n 500000
@@ -285,7 +295,7 @@ ulimit -n 500000
 ./target/release/wse-bench --test throughput --tiers 100,1000 --duration 3
 
 # Connection limit only
-./target/release/wse-bench --test connection-limit --max-connections 200000
+./target/release/wse-bench --test connection-limit --max-connections 500000
 ```
 
 ---
