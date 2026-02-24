@@ -63,7 +63,6 @@ pub async fn connect_and_handshake(
 }
 
 /// Connect with a specific source address (for >64K connections).
-#[allow(dead_code)]
 pub async fn connect_and_handshake_from(
     host: &str,
     port: u16,
@@ -253,7 +252,12 @@ pub fn build_payload(size: usize) -> String {
     }
 }
 
+/// Max ports per source IP (with some headroom for the server's own port).
+const PORTS_PER_IP: usize = 60_000;
+
 /// Connect N websockets in batches, returning established connections.
+/// For N > PORTS_PER_IP, automatically uses multiple loopback source IPs
+/// (127.0.0.1, 127.0.0.2, ...) to avoid ephemeral port exhaustion.
 pub async fn connect_batch(
     host: &str,
     port: u16,
@@ -262,8 +266,10 @@ pub async fn connect_batch(
     batch_size: usize,
     uri_params: &str,
 ) -> Vec<WsStream> {
+    let use_multi_ip = n > PORTS_PER_IP && host == "127.0.0.1";
     let mut connections = Vec::with_capacity(n);
     let mut errors = 0usize;
+    let mut conn_idx = 0usize;
 
     for start in (0..n).step_by(batch_size) {
         let end = (start + batch_size).min(n);
@@ -274,9 +280,24 @@ pub async fn connect_batch(
             let host = host.to_string();
             let token = token.to_string();
             let params = uri_params.to_string();
-            handles.push(tokio::spawn(async move {
-                connect_and_handshake(&host, port, &token, &params, 15).await
-            }));
+
+            if use_multi_ip {
+                // Distribute connections across 127.0.0.X source IPs
+                let ip_idx = (conn_idx / PORTS_PER_IP) as u8 + 1; // 1, 2, 3, ...
+                let source_ip: SocketAddr =
+                    format!("127.0.0.{}:0", ip_idx).parse().unwrap();
+                conn_idx += 1;
+                handles.push(tokio::spawn(async move {
+                    connect_and_handshake_from(
+                        &host, port, &token, &params, source_ip, 15,
+                    )
+                    .await
+                }));
+            } else {
+                handles.push(tokio::spawn(async move {
+                    connect_and_handshake(&host, port, &token, &params, 15).await
+                }));
+            }
         }
 
         let results = futures_util::future::join_all(handles).await;
@@ -294,12 +315,23 @@ pub async fn connect_batch(
         }
     }
 
-    eprintln!(
-        "\r    Connected: {}/{} ({} failed)            ",
-        connections.len(),
-        n,
-        errors
-    );
+    if use_multi_ip {
+        let ips_used = (n / PORTS_PER_IP) + 1;
+        eprintln!(
+            "\r    Connected: {}/{} ({} failed, {} source IPs)            ",
+            connections.len(),
+            n,
+            errors,
+            ips_used
+        );
+    } else {
+        eprintln!(
+            "\r    Connected: {}/{} ({} failed)            ",
+            connections.len(),
+            n,
+            errors
+        );
+    }
 
     connections
 }
