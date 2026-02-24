@@ -102,7 +102,7 @@ enum ServerCommand {
     SendPrebuilt { conn_id: String, message: Message },
     BroadcastText { data: String },
     BroadcastBytes { data: Vec<u8> },
-    PublishLocal { topic: String, data: String },
+    BroadcastLocal { topic: String, data: String },
     Disconnect { conn_id: String },
     GetConnections { reply: oneshot::Sender<Vec<String>> },
     Shutdown,
@@ -903,7 +903,7 @@ async fn process_commands(
                     let _ = h.tx.send(Message::Binary(data.clone().into()));
                 }
             }
-            ServerCommand::PublishLocal { topic, data } => {
+            ServerCommand::BroadcastLocal { topic, data } => {
                 // Fan-out to topic subscribers without Redis round-trip.
                 // Same dedup logic as dispatch_to_subscribers in redis_pubsub.
                 let conns = state.connections.read().await;
@@ -1322,7 +1322,7 @@ impl RustWSEServer {
         Ok(byte_count)
     }
 
-    fn broadcast(&self, data: &str) -> PyResult<()> {
+    fn broadcast_all(&self, data: &str) -> PyResult<()> {
         let tx = self
             .cmd_tx
             .as_ref()
@@ -1334,7 +1334,7 @@ impl RustWSEServer {
         Ok(())
     }
 
-    fn broadcast_bytes(&self, data: &[u8]) -> PyResult<()> {
+    fn broadcast_all_bytes(&self, data: &[u8]) -> PyResult<()> {
         let tx = self
             .cmd_tx
             .as_ref()
@@ -1592,14 +1592,13 @@ impl RustWSEServer {
         Ok(())
     }
 
-    /// Publish to topic subscribers locally without Redis round-trip.
-    /// Use this for single-instance fan-out (e.g., market data to frontend).
-    fn publish_local(&self, topic: &str, data: &str) -> PyResult<()> {
+    /// Fan-out to topic subscribers locally without Redis round-trip.
+    fn broadcast_local(&self, topic: &str, data: &str) -> PyResult<()> {
         let tx = self
             .cmd_tx
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
-        tx.send(ServerCommand::PublishLocal {
+        tx.send(ServerCommand::BroadcastLocal {
             topic: topic.to_owned(),
             data: data.to_owned(),
         })
@@ -1607,17 +1606,24 @@ impl RustWSEServer {
         Ok(())
     }
 
-    /// Publish via Redis (for multi-instance coordination).
-    fn publish(&self, topic: &str, data: &str) -> PyResult<()> {
+    /// Fan-out locally + Redis PUBLISH for multi-instance coordination.
+    fn broadcast(&self, topic: &str, data: &str) -> PyResult<()> {
+        // Local dispatch
+        if let Some(ref tx) = self.cmd_tx {
+            let _ = tx.send(ServerCommand::BroadcastLocal {
+                topic: topic.to_owned(),
+                data: data.to_owned(),
+            });
+        }
+        // Redis publish (for multi-instance)
         let guard = self.shared.redis_cmd_tx.lock().unwrap();
-        let tx = guard
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Redis not connected"))?;
-        tx.send(RedisCommand::Publish {
-            channel: format!("wse:{topic}"),
-            payload: data.to_owned(),
-        })
-        .map_err(|_| PyRuntimeError::new_err("Redis command channel closed"))?;
+        if let Some(ref tx) = *guard {
+            tx.send(RedisCommand::Publish {
+                channel: format!("wse:{topic}"),
+                payload: data.to_owned(),
+            })
+            .map_err(|_| PyRuntimeError::new_err("Redis command channel closed"))?;
+        }
         Ok(())
     }
 

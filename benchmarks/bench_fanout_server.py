@@ -5,8 +5,8 @@ Rust benchmark client (wse-bench --test fanout-broadcast/fanout-pubsub/fanout-mu
 connects and measures receive throughput.
 
 Modes:
-  broadcast  -- server.broadcast() to ALL connections (no Redis)
-  pubsub     -- server.publish() via Redis to subscribed connections
+  broadcast  -- server.broadcast_all() to ALL connections (no Redis)
+  pubsub     -- server.broadcast() via Redis to subscribed connections
   subscribe  -- subscribe-only mode for multi-instance test (Server B)
 
 Usage:
@@ -79,9 +79,9 @@ def publish_loop(server, mode: str, stop_event: threading.Event):
 
         try:
             if mode == "broadcast":
-                server.broadcast(msg)
+                server.broadcast_all(msg)
             elif mode == "pubsub":
-                server.publish(BENCH_TOPIC, msg)
+                server.broadcast(BENCH_TOPIC, msg)
                 # Yield GIL so drain_loop can process subscribe events
                 if seq % 100 == 0:
                     time.sleep(0)

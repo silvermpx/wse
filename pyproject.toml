@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "wse-server"
-version = "1.4.0"
+version = "1.4.1"
 description = "Rust-powered WebSocket engine for Python. Up to 14M msg/s JSON, 30M binary (MsgPack/zlib). Zero-GIL JWT. E2E encrypted."
 readme = "README.md"
 license = { text = "MIT" }

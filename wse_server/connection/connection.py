@@ -222,7 +222,7 @@ class WSEConnection:
     signed_message_types: frozenset = field(default_factory=lambda: DEFAULT_SIGNED_MESSAGE_TYPES)
 
     # Server info (for server_hello)
-    server_version: str = "1.3.9"
+    server_version: str = "1.4.1"
     server_welcome_message: str = "Welcome to WSE"
 
     # Connection state
