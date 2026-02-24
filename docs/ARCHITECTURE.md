@@ -382,6 +382,8 @@ The Python client speaks the same wire protocol as the TypeScript client. All pr
 
 ## Multi-Instance Scaling
 
+See **[REDIS_PUBSUB.md](REDIS_PUBSUB.md)** for full Rust standalone Redis Pub/Sub documentation (reliability, circuit breaker, DLQ, metrics, PyO3 API).
+
 ```
                     Load Balancer
                    /      |      \
@@ -399,7 +401,8 @@ Each instance:
 4. Checks if the target user is connected to THIS instance
 5. Sends to local WebSocket if connected, ignores otherwise
 
-Event flow:
+### Router Mode (Python PubSubBus)
+
 ```
 Domain Event (any instance)
     -> WSE Publisher -> PubSubBus.publish()
@@ -408,6 +411,19 @@ Domain Event (any instance)
     -> Instance with user 123 connected -> sends to WebSocket
     -> Other instances -> silently ignore
 ```
+
+### Standalone Mode (Rust redis_pubsub)
+
+```
+Domain Event (any instance)
+    -> server.publish("user:123:events", payload)
+    -> Rust listener_task -> Redis PUBLISH wse:user:123:events
+    -> ALL instances receive via PSUBSCRIBE wse:*
+    -> dispatch_to_subscribers() -> exact + glob match
+    -> ConnectionHandle.tx -> WebSocket
+```
+
+Standalone mode includes: auto-reconnect with exponential backoff, circuit breaker (10 failures / 60s reset), publish retry (3 attempts), Dead Letter Queue (1000 entries), AtomicU64 metrics.
 
 ## Metrics
 

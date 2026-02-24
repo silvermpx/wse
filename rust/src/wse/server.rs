@@ -18,10 +18,11 @@ use std::thread;
 use std::time::Duration;
 
 use super::compression::{rmpv_to_serde_json, serde_json_to_rmpv};
+use super::redis_pubsub::{DeadLetterQueue, RedisCommand, RedisMetrics};
 use crate::jwt::{self, JwtConfig, parse_cookie_value};
 use ahash::AHashSet;
 use crossbeam_channel::{Receiver as CBReceiver, Sender as CBSender, bounded};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use futures_util::{SinkExt, StreamExt};
@@ -39,8 +40,8 @@ use uuid::Uuid;
 // Internal types
 // ---------------------------------------------------------------------------
 
-struct ConnectionHandle {
-    tx: mpsc::UnboundedSender<Message>,
+pub(crate) struct ConnectionHandle {
+    pub(crate) tx: mpsc::UnboundedSender<Message>,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +108,7 @@ enum ServerCommand {
 }
 
 struct SharedState {
-    connections: RwLock<HashMap<String, ConnectionHandle>>,
+    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     max_connections: usize,
     on_connect: RwLock<Option<Py<PyAny>>>,
     on_message: RwLock<Option<Py<PyAny>>>,
@@ -127,6 +128,11 @@ struct SharedState {
     connection_count: AtomicUsize,
     // JWT config: when set, Rust validates JWT in handshake (zero GIL)
     jwt_config: Option<JwtConfig>,
+    topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
+    conn_topics: DashMap<String, DashSet<String>>,
+    redis_cmd_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<RedisCommand>>>,
+    redis_metrics: Arc<RedisMetrics>,
+    redis_dlq: Arc<std::sync::Mutex<DeadLetterQueue>>,
 }
 
 unsafe impl Send for SharedState {}
@@ -141,7 +147,7 @@ impl SharedState {
         let cap = max_inbound_queue_size.min(131072);
         let (tx, rx) = bounded(cap);
         Self {
-            connections: RwLock::new(HashMap::new()),
+            connections: Arc::new(RwLock::new(HashMap::new())),
             max_connections,
             on_connect: RwLock::new(None),
             on_message: RwLock::new(None),
@@ -154,6 +160,9 @@ impl SharedState {
             conn_rates: std::sync::Mutex::new(HashMap::new()),
             connection_count: AtomicUsize::new(0),
             jwt_config,
+            topic_subscribers: Arc::new(DashMap::new()),
+            conn_topics: DashMap::new(),
+            redis_cmd_tx: std::sync::Mutex::new(None),
         }
     }
 
@@ -817,6 +826,19 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     {
         state.conn_rates.lock().unwrap().remove(&*conn_id);
     }
+    // Pub/Sub cleanup: remove connection from all subscribed topics
+    if let Some((_, topics)) = state.conn_topics.remove(&*conn_id) {
+        for topic_ref in topics.iter() {
+            let topic = topic_ref.clone();
+            if let Some(subscribers) = state.topic_subscribers.get(&topic) {
+                subscribers.remove(&*conn_id);
+                if subscribers.is_empty() {
+                    drop(subscribers);
+                    state.topic_subscribers.remove(&topic);
+                }
+            }
+        }
+    }
     state.connection_count.fetch_sub(1, Ordering::Relaxed);
     if drain {
         state.push_inbound(InboundEvent::Disconnect {
@@ -912,6 +934,7 @@ pub struct RustWSEServer {
     thread_handle: Option<thread::JoinHandle<()>>,
     running: Arc<AtomicBool>,
     dedup: Arc<std::sync::Mutex<DeduplicationState>>,
+    redis_rt_handle: Option<tokio::runtime::Handle>,
 }
 
 #[pymethods]
@@ -955,6 +978,7 @@ impl RustWSEServer {
                 queue: std::collections::VecDeque::with_capacity(50_000),
                 max_entries: 50_000,
             })),
+            redis_rt_handle: None,
         }
     }
 
@@ -992,6 +1016,8 @@ impl RustWSEServer {
         let port = self.port;
         let running = self.running.clone();
         let shared = self.shared.clone();
+        let (rt_handle_tx, rt_handle_rx) =
+            std::sync::mpsc::sync_channel::<tokio::runtime::Handle>(1);
 
         let handle = thread::Builder::new()
             .name("wse-tokio-rt".into())
@@ -1003,6 +1029,7 @@ impl RustWSEServer {
                         return;
                     }
                 };
+                let _ = rt_handle_tx.send(rt.handle().clone());
                 rt.block_on(async move {
                     let bind_addr = format!("{host}:{port}");
                     let listener = match TcpListener::bind(&bind_addr).await {
@@ -1043,12 +1070,18 @@ impl RustWSEServer {
             })
             .map_err(|e| PyRuntimeError::new_err(format!("Spawn error: {e}")))?;
         self.thread_handle = Some(handle);
+        self.redis_rt_handle = rt_handle_rx.recv().ok();
         Ok(())
     }
 
     fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
         if !self.running.load(Ordering::SeqCst) {
             return Ok(());
+        }
+        if let Ok(guard) = self.shared.redis_cmd_tx.lock()
+            && let Some(ref tx) = *guard
+        {
+            let _ = tx.send(RedisCommand::Shutdown);
         }
         if let Some(ref tx) = self.cmd_tx {
             let _ = tx.send(ServerCommand::Shutdown);
@@ -1443,13 +1476,105 @@ impl RustWSEServer {
         Ok(list.unbind())
     }
 
-    /// Number of inbound events dropped due to queue overflow (drain mode).
     fn inbound_dropped_count(&self) -> u64 {
         self.shared.inbound_dropped.load(Ordering::Relaxed)
     }
 
-    /// Current inbound queue depth.
     fn inbound_queue_depth(&self) -> usize {
         self.shared.inbound_rx.len()
+    }
+
+    // -- Redis Pub/Sub --------------------------------------------------------
+
+    fn connect_redis(&self, url: String) -> PyResult<()> {
+        let rt_handle = self
+            .redis_rt_handle
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Server not started"))?;
+
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<RedisCommand>();
+        *self.shared.redis_cmd_tx.lock().unwrap() = Some(cmd_tx);
+
+        let connections = self.shared.connections.clone();
+        let topic_subscribers = self.shared.topic_subscribers.clone();
+        rt_handle.spawn(super::redis_pubsub::listener_task(
+            url,
+            connections,
+            topic_subscribers,
+            cmd_rx,
+        ));
+        Ok(())
+    }
+
+    fn subscribe_connection(&self, conn_id: &str, topics: Vec<String>) -> PyResult<()> {
+        for topic in &topics {
+            self.shared
+                .topic_subscribers
+                .entry(topic.clone())
+                .or_default()
+                .insert(conn_id.to_owned());
+            self.shared
+                .conn_topics
+                .entry(conn_id.to_owned())
+                .or_default()
+                .insert(topic.clone());
+        }
+        Ok(())
+    }
+
+    #[pyo3(signature = (conn_id, topics = None))]
+    fn unsubscribe_connection(&self, conn_id: &str, topics: Option<Vec<String>>) -> PyResult<()> {
+        match topics {
+            Some(topics) => {
+                for topic in &topics {
+                    if let Some(subscribers) = self.shared.topic_subscribers.get(topic) {
+                        subscribers.remove(conn_id);
+                        if subscribers.is_empty() {
+                            drop(subscribers);
+                            self.shared.topic_subscribers.remove(topic);
+                        }
+                    }
+                    if let Some(conn_entry) = self.shared.conn_topics.get(conn_id) {
+                        conn_entry.remove(topic);
+                    }
+                }
+            }
+            None => {
+                if let Some((_, topics)) = self.shared.conn_topics.remove(conn_id) {
+                    for topic_ref in topics.iter() {
+                        let topic = topic_ref.clone();
+                        if let Some(subscribers) = self.shared.topic_subscribers.get(&topic) {
+                            subscribers.remove(conn_id);
+                            if subscribers.is_empty() {
+                                drop(subscribers);
+                                self.shared.topic_subscribers.remove(&topic);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn publish(&self, topic: &str, data: &str) -> PyResult<()> {
+        let guard = self.shared.redis_cmd_tx.lock().unwrap();
+        let tx = guard
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Redis not connected"))?;
+        tx.send(RedisCommand::Publish {
+            channel: format!("wse:{topic}"),
+            payload: data.to_owned(),
+        })
+        .map_err(|_| PyRuntimeError::new_err("Redis command channel closed"))?;
+        Ok(())
+    }
+
+    fn get_topic_subscriber_count(&self, topic: &str) -> usize {
+        self.shared
+            .topic_subscribers
+            .get(topic)
+            .map(|s| s.len())
+            .unwrap_or(0)
     }
 }
