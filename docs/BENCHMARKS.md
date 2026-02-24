@@ -7,7 +7,7 @@ Each client has its own detailed results page.
 
 | Client | Language | Max Connections Tested | Peak Throughput | Details |
 |--------|----------|----------------------|-----------------|---------|
-| **wse-bench** | Rust (tokio) | **100,000** | **13.3M msg/s** | [Rust Client Results](BENCHMARKS_RUST_CLIENT.md) |
+| **wse-bench** | Rust (tokio) | **100,000** | **20.5M msg/s** | [Rust Client Results](BENCHMARKS_RUST_CLIENT.md) |
 | **bench_brutal.py** | Python (sync) | 1,000 | 6.9M msg/s | [Python Client Results](BENCHMARKS_PYTHON_CLIENT.md) |
 | **bench_multiprocess.py** | Python (multi-proc) | 128 | 2.1M msg/s | [Python Client Results](BENCHMARKS_PYTHON_CLIENT.md) |
 
@@ -32,12 +32,15 @@ full Python wrapper with drain_mode, JWT auth, the whole stack.
 
 | Metric | Value | Source |
 |--------|-------|--------|
-| Peak throughput | **13.3M msg/s** (2.3 GB/s) | Rust client, 500 conns |
-| Throughput at 100K conns | **9.5M msg/s** (1.7 GB/s) | Rust client |
+| Peak throughput (JSON) | **13.5M msg/s** (2.4 GB/s) | Rust client, 100 conns |
+| Peak throughput (compressed) | **20.5M msg/s** | Rust client, 500 conns |
+| Peak message rate | **19.4M msg/s** | Rust client, 64B payload |
+| Throughput at 100K conns | **9.1M msg/s** (1.6 GB/s) | Rust client |
 | Max concurrent connections | **100,000** (0 errors) | Rust client |
-| Connection accept rate | **15,469 conn/s** | Rust client, 20K tier |
+| Connection accept rate | **15,020 conn/s** | Rust client, 2K tier |
 | Ping RTT at low load | **1 ms** p50 | Rust client, 100 conns |
-| Peak bandwidth | **16.0 GB/s** | Python client, 64KB msgs |
+| Peak bandwidth | **19.9 GB/s** | Rust client, 16KB msgs |
+| Sustained hold (100K, 30s) | **100% survival** | Rust client |
 | drain_mode overhead | **< 2%** | Python client comparison |
 
 ---
@@ -70,7 +73,7 @@ measure inbound throughput — the harder and more realistic workload.
 
 | Metric | WSE | Centrifugo | uWebSockets | Socket.IO | ws (Node.js) |
 |--------|-----|------------|-------------|-----------|--------------|
-| **Inbound sustained** | **13.3M msg/s** (Rust client) | Not published | Not published | Not published | 19K echo RT/s |
+| **Inbound sustained** | **20.5M msg/s** (Rust client) | Not published | Not published | Not published | 19K echo RT/s |
 | **Inbound sustained** | **2.0M msg/s** (Python 64w) | -- | -- | -- | -- |
 | **Single client** | **113K msg/s** | -- | -- | ~10K | ~19K echo |
 | **Fan-out (broadcast)** | N/A | 500K msg/s (20 pods) | 120K msg/s (4 cores) | 30K msg/s | 13K (i7) |
@@ -114,7 +117,8 @@ Hashrocket WebSocket Shootout (i7-4790K), Lemire ws benchmark (Xeon Gold).
 | Multi-process burst (M2) | **488,000 msg/s** | -- | ~0.5M msg/s |
 | EPYC 7502P (64w, Python) | **2,045,000 msg/s** | 2.60 ms | 5.7x vs M2 |
 | EPYC 7502P (64w, MsgPack) | **2,072,000 msg/s** | -- | ~2M msg/s |
-| **Rust client (wse-bench)** | **13,300,000 msg/s** | -- | **6.4x vs Python** |
+| **Rust client (JSON)** | **13,500,000 msg/s** | -- | **6.6x vs Python** |
+| **Rust client (compressed)** | **20,500,000 msg/s** | -- | **10x vs Python** |
 
 ### Python Optimization Highlights
 
