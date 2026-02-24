@@ -154,3 +154,53 @@ fn format_bytes(n: usize) -> String {
         format!("{} B", n)
     }
 }
+
+/// Print a markdown-style table for fan-out test results.
+pub fn print_fanout_table(results: &[TierResult]) {
+    println!("\n  | Subscribers | Deliveries/s | Per-Sub msg/s | MB/s   | p50     | p95     | p99     | Gaps |");
+    println!("  |------------|-------------|--------------|--------|---------|---------|---------|------|");
+    for r in results {
+        let msg_s = if r.duration_secs > 0.0 {
+            r.messages_received as f64 / r.duration_secs
+        } else {
+            0.0
+        };
+        let per_sub = if r.connected > 0 {
+            msg_s / r.connected as f64
+        } else {
+            0.0
+        };
+        let mb_s = r
+            .extra
+            .get("mb_per_sec")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let gaps = r
+            .extra
+            .get("seq_gaps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let (p50, p95, p99) = if let Some(ref lat) = r.latency {
+            (
+                format!("{:.2}ms", lat.p50),
+                format!("{:.2}ms", lat.p95),
+                format!("{:.2}ms", lat.p99),
+            )
+        } else {
+            ("N/A".into(), "N/A".into(), "N/A".into())
+        };
+
+        println!(
+            "  | {:>10} | {:>11} | {:>12.0} | {:>6.1} | {:>7} | {:>7} | {:>7} | {:>4} |",
+            format_num(r.tier),
+            format_num(msg_s as usize),
+            per_sub,
+            mb_s,
+            p50,
+            p95,
+            p99,
+            gaps,
+        );
+    }
+}

@@ -50,6 +50,10 @@ pub struct Cli {
     /// Connection batch size (how many to open concurrently)
     #[arg(long, default_value_t = 500)]
     pub batch_size: usize,
+
+    /// Second server port (for multi-instance fan-out test)
+    #[arg(long)]
+    pub port2: Option<u16>,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +65,9 @@ pub enum TestName {
     FormatComparison,
     SustainedHold,
     ConnectionLimit,
+    FanoutBroadcast,
+    FanoutPubsub,
+    FanoutMulti,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +87,12 @@ impl Cli {
             TestName::ConnectionStorm | TestName::ConnectionLimit => EXTENDED_TIERS.to_vec(),
             TestName::SustainedHold => vec![1_000, 5_000, 10_000, 30_000, 50_000],
             TestName::FormatComparison => vec![100, 1_000, 5_000, 10_000],
+            TestName::FanoutBroadcast => {
+                vec![10, 100, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000]
+            }
+            TestName::FanoutPubsub | TestName::FanoutMulti => {
+                vec![10, 100, 500, 1_000, 2_000, 5_000, 10_000, 20_000]
+            }
             _ => DEFAULT_TIERS.to_vec(),
         }
     }

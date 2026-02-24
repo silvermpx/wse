@@ -88,6 +88,15 @@ async fn run_single_test(cli: &Cli, test: TestName) {
         TestName::ConnectionLimit => {
             tests::connection_limit::run(cli).await;
         }
+        TestName::FanoutBroadcast => {
+            tests::fanout_broadcast::run(cli).await;
+        }
+        TestName::FanoutPubsub => {
+            tests::fanout_pubsub::run(cli).await;
+        }
+        TestName::FanoutMulti => {
+            tests::fanout_multi::run(cli).await;
+        }
     }
 }
 

@@ -1,5 +1,8 @@
 pub mod connection_limit;
 pub mod connection_storm;
+pub mod fanout_broadcast;
+pub mod fanout_multi;
+pub mod fanout_pubsub;
 pub mod format_comparison;
 pub mod ping_latency;
 pub mod size_matrix;
