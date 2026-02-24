@@ -135,6 +135,7 @@ def main():
         jwt_issuer=JWT_ISSUER,
         jwt_audience=JWT_AUDIENCE,
     )
+    server.enable_drain_mode()
     server.start()
     print(f"[fanout-server] Rust WSE on :{args.port} (mode={args.mode})")
 

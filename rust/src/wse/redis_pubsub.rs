@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use ahash::AHashSet;
 use dashmap::{DashMap, DashSet};
 use futures_util::StreamExt;
 use tokio::sync::{RwLock, mpsc};
@@ -132,10 +133,14 @@ async fn dispatch_to_subscribers(
 ) {
     let conns = connections.read().await;
     let mut delivered: u64 = 0;
+    let mut seen = AHashSet::new();
 
     if let Some(conn_ids) = topic_subscribers.get(topic) {
         for conn_id_ref in conn_ids.iter() {
-            if let Some(handle) = conns.get(conn_id_ref.key()) {
+            let cid = conn_id_ref.key().clone();
+            if seen.insert(cid.clone())
+                && let Some(handle) = conns.get(&cid)
+            {
                 if handle
                     .tx
                     .send(Message::Text(payload.to_owned().into()))
@@ -153,7 +158,10 @@ async fn dispatch_to_subscribers(
         let pattern = entry.key();
         if (pattern.contains('*') || pattern.contains('?')) && glob_match(pattern, topic) {
             for conn_id_ref in entry.value().iter() {
-                if let Some(handle) = conns.get(conn_id_ref.key()) {
+                let cid = conn_id_ref.key().clone();
+                if seen.insert(cid.clone())
+                    && let Some(handle) = conns.get(&cid)
+                {
                     if handle
                         .tx
                         .send(Message::Text(payload.to_owned().into()))
@@ -177,8 +185,8 @@ async fn dispatch_to_subscribers(
 // PUBLISH with retry (3 attempts: 100ms, 200ms delays between retries)
 // ---------------------------------------------------------------------------
 
-const PUBLISH_RETRY_DELAYS: [Duration; 2] =
-    [Duration::from_millis(100), Duration::from_millis(200)];
+const PUBLISH_MAX_ATTEMPTS: usize = 3;
+const PUBLISH_RETRY_DELAYS: &[Duration] = &[Duration::from_millis(100), Duration::from_millis(200)];
 
 async fn publish_with_retry(
     pub_conn: &mut redis::aio::MultiplexedConnection,
@@ -186,10 +194,10 @@ async fn publish_with_retry(
     payload: &str,
     metrics: &RedisMetrics,
     dlq: &std::sync::Mutex<DeadLetterQueue>,
-) {
+) -> bool {
     let mut last_err = String::new();
 
-    for attempt in 0..3 {
+    for attempt in 0..PUBLISH_MAX_ATTEMPTS {
         let result: Result<(), redis::RedisError> = redis::cmd("PUBLISH")
             .arg(channel)
             .arg(payload)
@@ -199,29 +207,36 @@ async fn publish_with_retry(
         match result {
             Ok(()) => {
                 metrics.messages_published.fetch_add(1, Ordering::Relaxed);
-                return;
+                return true;
             }
             Err(e) => {
                 last_err = e.to_string();
-                if attempt < 2 {
-                    tokio::time::sleep(PUBLISH_RETRY_DELAYS[attempt]).await;
+                if let Some(delay) = PUBLISH_RETRY_DELAYS.get(attempt) {
+                    tokio::time::sleep(*delay).await;
                 }
             }
         }
     }
 
     metrics.publish_errors.fetch_add(1, Ordering::Relaxed);
-    eprintln!("[WSE-Redis] Publish failed after 3 attempts: {last_err}");
+    eprintln!("[WSE-Redis] Publish failed after retries: {last_err}");
     dlq.lock().unwrap().push(DlqEntry {
         channel: channel.to_owned(),
         payload: payload.to_owned(),
         error: last_err,
     });
+    false
 }
 
 // ---------------------------------------------------------------------------
 // Inner connection loop
 // ---------------------------------------------------------------------------
+
+/// Outcome from connect_and_run: either clean shutdown or error.
+enum RunOutcome {
+    Shutdown,
+    Error(String),
+}
 
 async fn connect_and_run(
     url: &str,
@@ -251,57 +266,103 @@ async fn connect_and_run(
     metrics.connected.store(true, Ordering::Relaxed);
     eprintln!("[WSE-Redis] Connected, listening on wse:*");
 
-    let msg_stream = pubsub.into_on_message();
-    tokio::pin!(msg_stream);
+    // Use a shutdown signal to coordinate the two tasks.
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
-    let mut pub_breaker = CircuitBreaker::new();
-
-    loop {
-        tokio::select! {
-            biased;
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    Some(RedisCommand::Publish { channel, payload }) => {
-                        if pub_breaker.can_execute() {
-                            publish_with_retry(
-                                &mut pub_conn, &channel, &payload, metrics, dlq,
-                            ).await;
-                            pub_breaker.record_success();
+    // --- Publish task: reads commands from cmd_rx, publishes to Redis ---
+    let pub_metrics = metrics;
+    let pub_dlq = dlq;
+    let pub_task = async {
+        let mut breaker = CircuitBreaker::new();
+        loop {
+            match cmd_rx.recv().await {
+                Some(RedisCommand::Publish { channel, payload }) => {
+                    if breaker.can_execute() {
+                        if publish_with_retry(
+                            &mut pub_conn,
+                            &channel,
+                            &payload,
+                            pub_metrics,
+                            pub_dlq,
+                        )
+                        .await
+                        {
+                            breaker.record_success();
                         } else {
-                            metrics.publish_errors.fetch_add(1, Ordering::Relaxed);
-                            dlq.lock().unwrap().push(DlqEntry {
-                                channel,
-                                payload,
-                                error: "Circuit breaker open".to_string(),
-                            });
+                            breaker.record_failure();
                         }
-                    }
-                    Some(RedisCommand::Shutdown) | None => {
-                        eprintln!("[WSE-Redis] Shutting down");
-                        metrics.connected.store(false, Ordering::Relaxed);
-                        return Ok(());
+                    } else {
+                        pub_metrics.publish_errors.fetch_add(1, Ordering::Relaxed);
+                        pub_dlq.lock().unwrap().push(DlqEntry {
+                            channel,
+                            payload,
+                            error: "Circuit breaker open".to_string(),
+                        });
                     }
                 }
-            }
-            msg = msg_stream.next() => {
-                match msg {
-                    Some(msg) => {
-                        metrics.messages_received.fetch_add(1, Ordering::Relaxed);
-                        let channel_name = msg.get_channel_name().to_string();
-                        let topic = channel_name.strip_prefix("wse:").unwrap_or(&channel_name);
-                        if let Ok(payload) = msg.get_payload::<String>() {
-                            dispatch_to_subscribers(
-                                connections, topic_subscribers, topic, &payload, metrics,
-                            ).await;
-                        }
-                    }
-                    None => {
-                        metrics.connected.store(false, Ordering::Relaxed);
-                        return Err("Message stream ended".to_string());
-                    }
+                Some(RedisCommand::Shutdown) | None => {
+                    return RunOutcome::Shutdown;
                 }
             }
         }
+    };
+
+    // --- Subscribe task: reads from Redis PSUBSCRIBE, dispatches to WebSocket ---
+    let msg_stream = pubsub.into_on_message();
+    tokio::pin!(msg_stream);
+    let sub_metrics = metrics;
+
+    let sub_task = async {
+        loop {
+            match msg_stream.next().await {
+                Some(msg) => {
+                    sub_metrics
+                        .messages_received
+                        .fetch_add(1, Ordering::Relaxed);
+                    let channel_name = msg.get_channel_name().to_string();
+                    let topic = channel_name.strip_prefix("wse:").unwrap_or(&channel_name);
+                    if let Ok(payload) = msg.get_payload::<String>() {
+                        dispatch_to_subscribers(
+                            connections,
+                            topic_subscribers,
+                            topic,
+                            &payload,
+                            sub_metrics,
+                        )
+                        .await;
+                    }
+                }
+                None => {
+                    return RunOutcome::Error("Message stream ended".to_string());
+                }
+            }
+        }
+    };
+
+    // Run both tasks concurrently. First one to finish determines outcome.
+    // Drop shutdown_tx so _shutdown_rx in the other branch knows to stop.
+    let outcome = tokio::select! {
+        result = pub_task => {
+            drop(shutdown_tx);
+            result
+        }
+        result = sub_task => {
+            drop(shutdown_tx);
+            result
+        }
+        // If external shutdown arrives via the channel
+        _ = shutdown_rx.recv() => {
+            RunOutcome::Shutdown
+        }
+    };
+
+    metrics.connected.store(false, Ordering::Relaxed);
+    match outcome {
+        RunOutcome::Shutdown => {
+            eprintln!("[WSE-Redis] Shutting down");
+            Ok(())
+        }
+        RunOutcome::Error(e) => Err(e),
     }
 }
 
@@ -343,9 +404,26 @@ pub(crate) async fn listener_task(
         )
         .await
         {
-            Ok(()) => return,
+            Ok(()) => return, // Clean shutdown
             Err(e) => {
-                conn_breaker.record_failure();
+                // connected was set to true inside connect_and_run if connection succeeded,
+                // then back to false before returning Err. We check was_connected_before
+                // to see if it was false (meaning connect_and_run established a connection
+                // that later dropped). Since connect_and_run sets connected=true on success
+                // and false on error, the only way to detect a "was connected" state is
+                // to check if connect_and_run set it to true at some point. We use a
+                // separate flag returned from connect_and_run.
+                //
+                // Simpler: if the error message is about stream ending (not connection
+                // failure), we were connected. But let's just always try to reset on
+                // reconnectable errors that got past the initial connection phase.
+                let was_connected = !e.starts_with("Failed to");
+                if was_connected {
+                    backoff.reset();
+                    conn_breaker.record_success();
+                } else {
+                    conn_breaker.record_failure();
+                }
                 metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
                 let delay = backoff.next_delay();
                 eprintln!(
