@@ -114,30 +114,31 @@ async function sendLoop(
   const msgSize = msgBuf.length;
 
   return new Promise((resolve) => {
+    let resolved = false;
+    function done() {
+      if (!resolved) { resolved = true; resolve({ count, bytes, ws }); }
+    }
+
     function send() {
       while (Date.now() < deadline) {
-        // Check backpressure — if buffered amount is too high, wait
         if ((ws as any).bufferedAmount > 16 * 1024 * 1024) {
           setTimeout(send, 1);
           return;
         }
 
-        const ok = ws.send(msgBuf, { binary: false }, (err) => {
-          if (err) {
-            resolve({ count, bytes, ws });
-          }
+        ws.send(msgBuf, { binary: false }, (err) => {
+          if (err) done();
         });
 
         count++;
         bytes += msgSize;
 
-        // Yield to event loop periodically
         if (count % 1000 === 0) {
           setImmediate(send);
           return;
         }
       }
-      resolve({ count, bytes, ws });
+      done();
     }
 
     send();

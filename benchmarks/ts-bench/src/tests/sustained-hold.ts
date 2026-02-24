@@ -110,10 +110,12 @@ async function holdLoop(
 
   return new Promise((resolve) => {
     let dead = false;
+    let interval: ReturnType<typeof setInterval>;
 
     ws.on('close', () => {
       if (!dead) {
         dead = true;
+        clearInterval(interval);
         onDisconnect();
         resolve({ hist, ws, pingCount });
       }
@@ -122,12 +124,13 @@ async function holdLoop(
     ws.on('error', () => {
       if (!dead) {
         dead = true;
+        clearInterval(interval);
         onDisconnect();
         resolve({ hist, ws, pingCount });
       }
     });
 
-    const interval = setInterval(async () => {
+    interval = setInterval(async () => {
       if (dead || Date.now() >= deadline) {
         clearInterval(interval);
         if (!dead) resolve({ hist, ws, pingCount });
@@ -167,20 +170,32 @@ async function holdLoop(
 
 function waitForPongHold(ws: protocol.WsConnection, timeoutMs: number): Promise<boolean> {
   return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      ws.removeListener('message', handler);
-      resolve(false);
-    }, timeoutMs);
+    let resolved = false;
+    function done(result: boolean) {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        ws.removeListener('message', handler);
+        ws.removeListener('close', onClose);
+        ws.removeListener('error', onError);
+        resolve(result);
+      }
+    }
+
+    const timer = setTimeout(() => done(false), timeoutMs);
 
     function handler(data: WebSocket.RawData) {
       const parsed = protocol.parseWseMessage(data);
       if (parsed && protocol.isPong(parsed)) {
-        clearTimeout(timer);
-        ws.removeListener('message', handler);
-        resolve(true);
+        done(true);
       }
     }
 
+    function onClose() { done(false); }
+    function onError() { done(false); }
+
     ws.on('message', handler);
+    ws.on('close', onClose);
+    ws.on('error', onError);
   });
 }
