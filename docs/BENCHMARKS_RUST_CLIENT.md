@@ -288,4 +288,4 @@ ulimit -n 500000
 
 ---
 
-*Tested February 24, 2026. WSE v1.3.8, wse-bench v0.1.0.*
+*Tested February 24, 2026. WSE v1.3.9, wse-bench v0.1.0.*

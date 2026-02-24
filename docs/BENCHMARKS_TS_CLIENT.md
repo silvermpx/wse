@@ -276,4 +276,4 @@ wait
 
 ---
 
-*Tested February 24, 2026. WSE v1.3.8, wse-ts-bench v0.1.0, Node.js 22.22.0.*
+*Tested February 24, 2026. WSE v1.3.9, wse-ts-bench v0.1.0, Node.js 22.22.0.*
