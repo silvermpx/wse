@@ -75,6 +75,7 @@ def publish_loop(server, mode: str, stop_event: threading.Event):
     published = 0
     start = time.time()
     last_report = start
+    interval_count = 0
 
     while not stop_event.is_set():
         ts_us = int(time.time() * 1_000_000)
@@ -85,6 +86,9 @@ def publish_loop(server, mode: str, stop_event: threading.Event):
                 server.broadcast(msg)
             elif mode == "pubsub":
                 server.publish(BENCH_TOPIC, msg)
+                # Yield GIL so drain_loop can process subscribe events
+                if seq % 100 == 0:
+                    time.sleep(0)
             else:
                 # subscribe mode: no publishing
                 time.sleep(1)
@@ -95,19 +99,21 @@ def publish_loop(server, mode: str, stop_event: threading.Event):
 
         seq += 1
         published += 1
+        interval_count += 1
 
-        # Report stats every 5 seconds
+        # Report stats every 5 seconds (per-interval rate, not cumulative)
         now = time.time()
         if now - last_report >= 5.0:
-            elapsed = now - start
-            rate = published / elapsed
+            interval_secs = now - last_report
+            interval_rate = interval_count / interval_secs
             conns = server.get_connection_count()
             print(
-                f"[fanout-server] {published:,} published ({rate:,.0f}/s), "
+                f"[fanout-server] {published:,} total ({interval_rate:,.0f}/s last {interval_secs:.0f}s), "
                 f"{conns} connections",
                 file=sys.stderr,
             )
             last_report = now
+            interval_count = 0
 
 
 def main():

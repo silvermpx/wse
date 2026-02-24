@@ -86,24 +86,33 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         )
         .await;
 
-        let msg_per_sec = result.total_received as f64 / result.elapsed;
+        let deliveries_per_sec = result.total_received as f64 / result.elapsed;
         let mb_per_sec = result.total_bytes as f64 / result.elapsed / 1_000_000.0;
-        let per_sub = msg_per_sec / actual as f64;
-        let loss = result.total_gaps.load(Ordering::Relaxed);
+        let published_per_sec = deliveries_per_sec / actual as f64;
+        let raw_gaps = result.total_gaps.load(Ordering::Relaxed);
+        let unique_gaps = if actual > 0 {
+            raw_gaps / actual as u64
+        } else {
+            raw_gaps
+        };
 
         println!("    Duration:       {:.2}s", result.elapsed);
         println!(
-            "    Received:       {} ({}/s cross-instance fan-out)",
-            stats::fmt_num(result.total_received),
-            stats::fmt_rate(msg_per_sec)
+            "    Published:      {}/s (Server A -> Redis -> Server B)",
+            stats::fmt_rate(published_per_sec)
+        );
+        println!(
+            "    Deliveries:     {}/s (fan-out: {} x {} subs)",
+            stats::fmt_rate(deliveries_per_sec),
+            stats::fmt_rate(published_per_sec),
+            actual
         );
         println!(
             "    Bandwidth:      {}/s",
             stats::fmt_bytes_per_sec(result.total_bytes as f64 / result.elapsed)
         );
-        println!("    Per-subscriber: {:.0} msg/s", per_sub);
-        if loss > 0 {
-            println!("    Seq gaps:       {}", loss);
+        if unique_gaps > 0 {
+            println!("    Seq gaps:       ~{} unique messages lost", unique_gaps);
         }
 
         if !result.latency.is_empty() {
@@ -116,7 +125,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             connected: actual,
             errors: n - actual,
             duration_secs: result.elapsed,
-            messages_sent: 0,
+            messages_sent: (published_per_sec * result.elapsed) as u64,
             messages_received: result.total_received,
             bytes_sent: 0,
             latency: if result.latency.is_empty() {
@@ -125,10 +134,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
                 Some(LatencySummary::from_histogram(&result.latency))
             },
             extra: serde_json::json!({
-                "fanout_msg_per_sec": msg_per_sec,
-                "per_subscriber_msg_s": per_sub,
+                "published_per_sec": published_per_sec,
+                "deliveries_per_sec": deliveries_per_sec,
                 "mb_per_sec": mb_per_sec,
-                "seq_gaps": loss,
+                "seq_gaps": unique_gaps,
             }),
         });
 

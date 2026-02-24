@@ -88,7 +88,9 @@ impl Cli {
             TestName::SustainedHold => vec![1_000, 5_000, 10_000, 30_000, 50_000],
             TestName::FormatComparison => vec![100, 1_000, 5_000, 10_000],
             TestName::FanoutBroadcast => {
-                vec![10, 100, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000]
+                vec![
+                    10, 100, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000,
+                ]
             }
             TestName::FanoutPubsub | TestName::FanoutMulti => {
                 vec![10, 100, 500, 1_000, 2_000, 5_000, 10_000, 20_000]

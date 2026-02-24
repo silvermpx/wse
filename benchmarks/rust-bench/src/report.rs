@@ -157,19 +157,29 @@ fn format_bytes(n: usize) -> String {
 
 /// Print a markdown-style table for fan-out test results.
 pub fn print_fanout_table(results: &[TierResult]) {
-    println!("\n  | Subscribers | Deliveries/s | Per-Sub msg/s | MB/s   | p50     | p95     | p99     | Gaps |");
-    println!("  |------------|-------------|--------------|--------|---------|---------|---------|------|");
+    println!(
+        "\n  | Subscribers | Published/s | Deliveries/s | MB/s   | p50     | p95     | p99     | Gaps |"
+    );
+    println!(
+        "  |------------|------------|-------------|--------|---------|---------|---------|------|"
+    );
     for r in results {
-        let msg_s = if r.duration_secs > 0.0 {
+        let deliveries_s = if r.duration_secs > 0.0 {
             r.messages_received as f64 / r.duration_secs
         } else {
             0.0
         };
-        let per_sub = if r.connected > 0 {
-            msg_s / r.connected as f64
-        } else {
-            0.0
-        };
+        let published_s = r
+            .extra
+            .get("published_per_sec")
+            .and_then(|v| v.as_f64())
+            .unwrap_or_else(|| {
+                if r.connected > 0 {
+                    deliveries_s / r.connected as f64
+                } else {
+                    0.0
+                }
+            });
         let mb_s = r
             .extra
             .get("mb_per_sec")
@@ -192,10 +202,10 @@ pub fn print_fanout_table(results: &[TierResult]) {
         };
 
         println!(
-            "  | {:>10} | {:>11} | {:>12.0} | {:>6.1} | {:>7} | {:>7} | {:>7} | {:>4} |",
+            "  | {:>10} | {:>10} | {:>11} | {:>6.1} | {:>7} | {:>7} | {:>7} | {:>4} |",
             format_num(r.tier),
-            format_num(msg_s as usize),
-            per_sub,
+            format_num(published_s as usize),
+            format_num(deliveries_s as usize),
             mb_s,
             p50,
             p95,

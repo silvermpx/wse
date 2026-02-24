@@ -48,26 +48,47 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         }
 
         let actual = connections.len();
+        if actual < n / 2 {
+            println!(
+                "    SKIPPED: only {}/{} connected (server max-connections too low?)",
+                actual, n
+            );
+            protocol::close_all(connections).await;
+            continue;
+        }
+        if actual < n {
+            println!("    WARNING: {}/{} connected", actual, n);
+        }
         let result = measure_fanout(connections, Duration::from_secs(cli.duration)).await;
 
-        let msg_per_sec = result.total_received as f64 / result.elapsed;
+        let deliveries_per_sec = result.total_received as f64 / result.elapsed;
         let mb_per_sec = result.total_bytes as f64 / result.elapsed / 1_000_000.0;
-        let per_sub = msg_per_sec / actual as f64;
-        let loss = result.total_gaps.load(Ordering::Relaxed);
+        let published_per_sec = deliveries_per_sec / actual as f64;
+        let raw_gaps = result.total_gaps.load(Ordering::Relaxed);
+        // Gaps are counted per-subscriber; normalize to unique message gaps
+        let unique_gaps = if actual > 0 {
+            raw_gaps / actual as u64
+        } else {
+            raw_gaps
+        };
 
         println!("    Duration:       {:.2}s", result.elapsed);
         println!(
-            "    Received:       {} ({}/s fan-out)",
-            stats::fmt_num(result.total_received),
-            stats::fmt_rate(msg_per_sec)
+            "    Published:      {}/s (unique messages from server)",
+            stats::fmt_rate(published_per_sec)
+        );
+        println!(
+            "    Deliveries:     {}/s (fan-out: {} x {} subs)",
+            stats::fmt_rate(deliveries_per_sec),
+            stats::fmt_rate(published_per_sec),
+            actual
         );
         println!(
             "    Bandwidth:      {}/s",
             stats::fmt_bytes_per_sec(result.total_bytes as f64 / result.elapsed)
         );
-        println!("    Per-subscriber: {:.0} msg/s", per_sub);
-        if loss > 0 {
-            println!("    Seq gaps:       {}", loss);
+        if unique_gaps > 0 {
+            println!("    Seq gaps:       ~{} unique messages lost", unique_gaps);
         }
 
         if !result.latency.is_empty() {
@@ -80,7 +101,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             connected: actual,
             errors: n - actual,
             duration_secs: result.elapsed,
-            messages_sent: 0,
+            messages_sent: (published_per_sec * result.elapsed) as u64,
             messages_received: result.total_received,
             bytes_sent: 0,
             latency: if result.latency.is_empty() {
@@ -89,10 +110,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
                 Some(LatencySummary::from_histogram(&result.latency))
             },
             extra: serde_json::json!({
-                "fanout_msg_per_sec": msg_per_sec,
-                "per_subscriber_msg_s": per_sub,
+                "published_per_sec": published_per_sec,
+                "deliveries_per_sec": deliveries_per_sec,
                 "mb_per_sec": mb_per_sec,
-                "seq_gaps": loss,
+                "seq_gaps": unique_gaps,
             }),
         });
 
@@ -120,10 +141,14 @@ pub(crate) async fn measure_fanout(connections: Vec<WsStream>, duration: Duratio
     let total_gaps = Arc::new(AtomicU64::new(0));
     let latency = Arc::new(Mutex::new(LatencyHistogram::new()));
 
-    // Warmup: drain queued messages (server_ready, early broadcasts).
-    // 1 second lets the server stabilize and fill TCP buffers.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Warmup: 2s for server to stabilize + drain buffered messages.
+    // Warmup happens BEFORE spawning tasks so all tasks start at the same time.
+    // Connections are already established (connect_batch done), server is publishing.
+    let warmup = Duration::from_secs(2);
+    tokio::time::sleep(warmup).await;
 
+    // All tasks share the same deadline so measurement window is identical.
+    let deadline = tokio::time::Instant::now() + duration;
     let start = tokio::time::Instant::now();
     let mut handles = Vec::with_capacity(actual);
 
@@ -134,7 +159,7 @@ pub(crate) async fn measure_fanout(connections: Vec<WsStream>, duration: Duratio
         let lat = latency.clone();
 
         handles.push(tokio::spawn(receive_loop(
-            ws, duration, recv, bytes, gaps, lat,
+            ws, deadline, recv, bytes, gaps, lat,
         )));
     }
 
@@ -169,13 +194,12 @@ pub(crate) async fn measure_fanout(connections: Vec<WsStream>, duration: Duratio
 
 pub(crate) async fn receive_loop(
     mut ws: WsStream,
-    duration: Duration,
+    deadline: tokio::time::Instant,
     total_received: Arc<AtomicU64>,
     total_bytes: Arc<AtomicU64>,
     total_gaps: Arc<AtomicU64>,
     latency: Arc<Mutex<LatencyHistogram>>,
 ) -> WsStream {
-    let deadline = tokio::time::Instant::now() + duration;
     let mut local_received = 0u64;
     let mut local_bytes = 0u64;
     let mut local_gaps = 0u64;
