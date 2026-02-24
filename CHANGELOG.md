@@ -1,5 +1,41 @@
 # Changelog
 
+## v1.4.0 (2026-02-24)
+
+### Redis Pub/Sub (NEW)
+
+Built-in Redis Pub/Sub module for multi-instance horizontal scaling:
+
+- **`publish(topic, data)`** — cross-instance message delivery via Redis with pipelined PUBLISH (up to 64 commands per round-trip, ~45K msg/s with Redis 8.6)
+- **`publish_local(topic, data)`** — single-instance topic fan-out without Redis (~2.1M del/s)
+- **`subscribe_connection(conn_id, topics)`** — topic subscriptions with exact match and glob patterns (`*`, `?`)
+- **PSUBSCRIBE wse:\*** — automatic Redis subscription, `wse:` prefix stripped for local topic routing
+- **Deduplication** — connections matching both exact and wildcard patterns receive messages once
+
+### Reliability
+
+- **Auto-reconnection** with exponential backoff (1s initial, 1.5x multiplier, 60s max, +/-20% jitter)
+- **Circuit breaker** — two breakers (connection + publish), 10-failure threshold, 60s reset, HALF_OPEN probe with 3 test calls
+- **Dead Letter Queue** — in-memory ring buffer (1000 entries), populated on publish failure or circuit breaker open, drained via `get_dlq_entries()`
+- **Pipelined publish with retry** — batches up to 64 PUBLISH commands, retries 3x (100ms, 200ms delays), then DLQ
+
+### Health Monitoring
+
+- **`health_snapshot()`** — full server health dict: connections, queue depth, Redis status, all metrics, uptime
+- **`redis_connected()`** — Redis connection status (bool)
+- **Metrics** — AtomicU64 counters: messages received/published/delivered/dropped, publish errors, reconnect count
+
+### Server Improvements
+
+- **Idle connection timeout** — configurable per-connection timeout (default 300s), reset on any message or ping
+- **Server uptime tracking** — `started_at` tracked, exposed in `health_snapshot()`
+
+### Fan-out Benchmarks
+
+- **Single-instance broadcast**: 2.1M deliveries/s, 500K connections, zero message loss
+- **Multi-instance (Redis 8.6)**: 1.04M deliveries/s peak at 500 subscribers, zero gaps
+- **Fan-out benchmark suite** — `bench_fanout_server.py` (broadcast/pubsub/subscribe modes) + `wse-bench --test fanout-broadcast/fanout-multi`
+
 ## v1.3.9 (2026-02-24)
 
 ### Benchmarks

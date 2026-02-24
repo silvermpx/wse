@@ -38,7 +38,7 @@ server.publish("user:123:events", payload)     # PyO3 call
 RedisCommand::Publish → cmd_tx (unbounded channel)
     |
     v
-listener_task → publish_with_retry → Redis PUBLISH wse:user:123:events
+listener_task → publish_pipeline (batched) → Redis PUBLISH wse:user:123:events
     |
     v
 Redis broadcasts to ALL subscriber instances
@@ -130,9 +130,10 @@ Speed: same as broadcast (~2.1M deliveries/s).
 **`publish(topic, data)`** sends via Redis for cross-instance delivery.
 The `publish()` method:
 1. Sends `RedisCommand::Publish` to the listener task via unbounded channel
-2. Listener retries up to 3 times (100ms, 200ms delays)
-3. On final failure, pushes to Dead Letter Queue
-Speed: ~13K published messages/s (Redis round-trip bottleneck).
+2. Listener batches up to 64 commands and pipelines them in a single Redis round-trip
+3. Retries the pipeline up to 3 times (100ms, 200ms delays)
+4. On final failure, pushes all messages in batch to Dead Letter Queue
+Speed: ~45K published messages/s (Redis 8.6 with io-threads and pipelining).
 
 ### Health Monitoring
 
@@ -214,15 +215,24 @@ Failed publishes are stored in an in-memory ring buffer:
 - Populated on: publish retry exhaustion, circuit breaker open, Redis disconnected
 - Drained via: `server.get_dlq_entries()` (returns and removes all entries)
 
-### Publish Retry
+### Pipelined Publish with Retry
 
-Each PUBLISH command is retried up to 3 times:
+PUBLISH commands are batched for throughput. The listener task drains up to 64
+pending commands from the channel and sends them in a single Redis pipeline:
 
 ```
-Attempt 1 → fail → wait 100ms
-Attempt 2 → fail → wait 200ms
-Attempt 3 → fail → DLQ + increment publish_errors metric
+cmd_rx.recv()      ← blocking wait for first command
+cmd_rx.try_recv()  ← non-blocking drain of pending (up to 64)
+    |
+    v
+redis::pipe() + N x PUBLISH → single round-trip
+    |
+    ├── Success → metrics += N
+    └── Fail → retry (100ms, 200ms delays), then DLQ all N messages
 ```
+
+This reduces Redis round-trips from N to 1 per batch, yielding ~45K msg/s vs ~13K
+with sequential PUBLISH. Requires Redis 8.6+ with io-threads for best performance.
 
 ### Metrics
 
@@ -245,7 +255,7 @@ All metrics are lock-free `AtomicU64` counters:
 | `broadcast(data)` | No | ~2.1M del/s | All connections (system announcements) |
 | `send_event(conn_id, event)` | No | Direct | One specific connection |
 | `publish_local(topic, data)` | No | ~2.1M del/s | Topic fan-out, single instance (market data, domain events) |
-| `publish(topic, data)` | Yes | ~13K msg/s | Horizontal scaling ONLY (multi-instance coordination) |
+| `publish(topic, data)` | Yes | ~45K msg/s | Horizontal scaling ONLY (multi-instance coordination) |
 | `subscribe_connection()` | No | - | Register topic interest |
 | `unsubscribe_connection()` | No | - | Remove topic interest |
 

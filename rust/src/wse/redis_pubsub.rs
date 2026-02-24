@@ -182,31 +182,33 @@ async fn dispatch_to_subscribers(
 }
 
 // ---------------------------------------------------------------------------
-// PUBLISH with retry (3 attempts: 100ms, 200ms delays between retries)
+// PUBLISH with pipelining + retry
 // ---------------------------------------------------------------------------
 
+const MAX_PIPELINE_SIZE: usize = 64;
 const PUBLISH_MAX_ATTEMPTS: usize = 3;
 const PUBLISH_RETRY_DELAYS: &[Duration] = &[Duration::from_millis(100), Duration::from_millis(200)];
 
-async fn publish_with_retry(
+async fn publish_pipeline(
     pub_conn: &mut redis::aio::MultiplexedConnection,
-    channel: &str,
-    payload: &str,
+    batch: &[(String, String)],
     metrics: &RedisMetrics,
     dlq: &std::sync::Mutex<DeadLetterQueue>,
 ) -> bool {
     let mut last_err = String::new();
+    let count = batch.len() as u64;
 
     for attempt in 0..PUBLISH_MAX_ATTEMPTS {
-        let result: Result<(), redis::RedisError> = redis::cmd("PUBLISH")
-            .arg(channel)
-            .arg(payload)
-            .query_async(pub_conn)
-            .await;
+        let mut pipe = redis::pipe();
+        for (channel, payload) in batch {
+            pipe.cmd("PUBLISH").arg(channel).arg(payload).ignore();
+        }
 
-        match result {
+        match pipe.query_async::<()>(pub_conn).await {
             Ok(()) => {
-                metrics.messages_published.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .messages_published
+                    .fetch_add(count, Ordering::Relaxed);
                 return true;
             }
             Err(e) => {
@@ -218,13 +220,16 @@ async fn publish_with_retry(
         }
     }
 
-    metrics.publish_errors.fetch_add(1, Ordering::Relaxed);
-    eprintln!("[WSE-Redis] Publish failed after retries: {last_err}");
-    dlq.lock().unwrap().push(DlqEntry {
-        channel: channel.to_owned(),
-        payload: payload.to_owned(),
-        error: last_err,
-    });
+    metrics.publish_errors.fetch_add(count, Ordering::Relaxed);
+    eprintln!("[WSE-Redis] Pipeline publish failed after retries ({count} msgs): {last_err}");
+    let mut guard = dlq.lock().unwrap();
+    for (channel, payload) in batch {
+        guard.push(DlqEntry {
+            channel: channel.clone(),
+            payload: payload.clone(),
+            error: last_err.clone(),
+        });
+    }
     false
 }
 
@@ -269,41 +274,59 @@ async fn connect_and_run(
     // Use a shutdown signal to coordinate the two tasks.
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
-    // --- Publish task: reads commands from cmd_rx, publishes to Redis ---
+    // --- Publish task: batches commands from cmd_rx, pipelines to Redis ---
     let pub_metrics = metrics;
     let pub_dlq = dlq;
     let pub_task = async {
         let mut breaker = CircuitBreaker::new();
+        let mut batch: Vec<(String, String)> = Vec::with_capacity(MAX_PIPELINE_SIZE);
+
         loop {
+            // Wait for first message (blocking)
             match cmd_rx.recv().await {
                 Some(RedisCommand::Publish { channel, payload }) => {
-                    if breaker.can_execute() {
-                        if publish_with_retry(
-                            &mut pub_conn,
-                            &channel,
-                            &payload,
-                            pub_metrics,
-                            pub_dlq,
-                        )
-                        .await
-                        {
-                            breaker.record_success();
-                        } else {
-                            breaker.record_failure();
-                        }
-                    } else {
-                        pub_metrics.publish_errors.fetch_add(1, Ordering::Relaxed);
-                        pub_dlq.lock().unwrap().push(DlqEntry {
-                            channel,
-                            payload,
-                            error: "Circuit breaker open".to_string(),
-                        });
-                    }
+                    batch.push((channel, payload));
                 }
                 Some(RedisCommand::Shutdown) | None => {
                     return RunOutcome::Shutdown;
                 }
             }
+
+            // Drain as many pending messages as available (non-blocking)
+            while batch.len() < MAX_PIPELINE_SIZE {
+                match cmd_rx.try_recv() {
+                    Ok(RedisCommand::Publish { channel, payload }) => {
+                        batch.push((channel, payload));
+                    }
+                    Ok(RedisCommand::Shutdown) => {
+                        return RunOutcome::Shutdown;
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            // Pipeline the batch
+            if breaker.can_execute() {
+                if publish_pipeline(&mut pub_conn, &batch, pub_metrics, pub_dlq).await {
+                    breaker.record_success();
+                } else {
+                    breaker.record_failure();
+                }
+            } else {
+                let count = batch.len() as u64;
+                pub_metrics
+                    .publish_errors
+                    .fetch_add(count, Ordering::Relaxed);
+                let mut guard = pub_dlq.lock().unwrap();
+                for (channel, payload) in &batch {
+                    guard.push(DlqEntry {
+                        channel: channel.clone(),
+                        payload: payload.clone(),
+                        error: "Circuit breaker open".to_string(),
+                    });
+                }
+            }
+            batch.clear();
         }
     };
 

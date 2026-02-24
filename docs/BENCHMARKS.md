@@ -8,6 +8,7 @@ Each client has its own detailed results page.
 | Client | Language | Max Connections Tested | Peak Throughput | Details |
 |--------|----------|----------------------|-----------------|---------|
 | **wse-bench** | Rust (tokio) | **500,000** | **30M msg/s** | [Rust Client Results](BENCHMARKS_RUST_CLIENT.md) |
+| **wse-bench** (fan-out) | Rust (tokio) | **500,000** | **2.1M del/s** | [Fan-out Results](BENCHMARKS_FANOUT.md) |
 | **bench_brutal.py** | Python (sync) | 1,000 | 6.9M msg/s | [Python Client Results](BENCHMARKS_PYTHON_CLIENT.md) |
 | **bench_multiprocess.py** | Python (multi-proc) | 128 | 2.1M msg/s | [Python Client Results](BENCHMARKS_PYTHON_CLIENT.md) |
 
@@ -34,6 +35,8 @@ full Python wrapper with drain_mode, JWT auth, the whole stack.
 |--------|-------|--------|
 | Peak throughput (JSON) | **14.2M msg/s** (2.5 GB/s) | Rust client, 500 conns |
 | Peak throughput (binary) | **30M msg/s** | Rust client, 100 conns |
+| Fan-out broadcast | **2.1M del/s** | 500K subs, 0 gaps |
+| Fan-out multi-instance | **1.04M del/s** | Redis 8.6, pipelined, 0 gaps |
 | Peak message rate | **19.4M msg/s** | Rust client, 64B payload |
 | Throughput at 50K conns | **13.8M msg/s** (2.4 GB/s) | Rust client |
 | Max concurrent connections | **500,000** (0 errors) | Rust client |
@@ -76,7 +79,7 @@ measure inbound throughput — the harder and more realistic workload.
 | **Inbound sustained** | **20.5M msg/s** (Rust client) | Not published | Not published | Not published | 19K echo RT/s |
 | **Inbound sustained** | **2.0M msg/s** (Python 64w) | -- | -- | -- | -- |
 | **Single client** | **113K msg/s** | -- | -- | ~10K | ~19K echo |
-| **Fan-out (broadcast)** | N/A | 500K msg/s (20 pods) | 120K msg/s (4 cores) | 30K msg/s | 13K (i7) |
+| **Fan-out (broadcast)** | **2.1M del/s** (1 proc) | 500K msg/s (20 pods) | 120K msg/s (4 cores) | 30K msg/s | 13K (i7) |
 | **Connection count** | **500K tested** | 1M (K8s cluster) | 120K (4 cores) | 30K (4 cores) | 100K+ |
 | **Connection latency** | **0.53 ms** (single) | Not published | Not published | ~50 ms | ~10 ms |
 | **Ping RTT** | **0.09 ms** (single) | Not published | Not published | ~1 ms | ~0.1 ms |
@@ -174,4 +177,4 @@ cd benchmarks/rust-bench && cargo build --release
 
 ---
 
-*Tested February 2026. WSE v1.3.8, wse-bench v0.1.0.*
+*Tested February 2026. WSE v1.3.9, wse-bench v0.1.0.*
