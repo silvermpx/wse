@@ -29,6 +29,9 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         let mut all_latencies: Vec<f64> = Vec::with_capacity(n);
         let mut connections = Vec::with_capacity(n);
 
+        let use_multi_ip = n > 60_000 && cli.host == "127.0.0.1";
+        let mut conn_idx = 0usize;
+
         for start in (0..n).step_by(batch_size) {
             let end = (start + batch_size).min(n);
             let chunk = end - start;
@@ -39,27 +42,53 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
                 let port = cli.port;
                 let tok = token.clone();
                 let err_count = errors.clone();
-                handles.push(tokio::spawn(async move {
-                    let t0 = Instant::now();
-                    match protocol::connect_and_handshake(
-                        &host,
-                        port,
-                        &tok,
-                        "compression=false&protocol_version=1",
-                        15,
-                    )
-                    .await
-                    {
-                        Ok(ws) => {
-                            let lat_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                            Ok((ws, lat_ms))
+
+                if use_multi_ip {
+                    let ip_idx = (conn_idx / 60_000) as u8 + 1;
+                    let source_addr: std::net::SocketAddr =
+                        format!("127.0.0.{}:0", ip_idx).parse().unwrap();
+                    conn_idx += 1;
+                    handles.push(tokio::spawn(async move {
+                        let t0 = Instant::now();
+                        match protocol::connect_and_handshake_from(
+                            &host, port, &tok,
+                            "compression=false&protocol_version=1",
+                            source_addr, 15,
+                        )
+                        .await
+                        {
+                            Ok(ws) => {
+                                let lat_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                Ok((ws, lat_ms))
+                            }
+                            Err(_) => {
+                                err_count.fetch_add(1, Ordering::Relaxed);
+                                Err(())
+                            }
                         }
-                        Err(_) => {
-                            err_count.fetch_add(1, Ordering::Relaxed);
-                            Err(())
+                    }));
+                } else {
+                    conn_idx += 1;
+                    handles.push(tokio::spawn(async move {
+                        let t0 = Instant::now();
+                        match protocol::connect_and_handshake(
+                            &host, port, &tok,
+                            "compression=false&protocol_version=1",
+                            15,
+                        )
+                        .await
+                        {
+                            Ok(ws) => {
+                                let lat_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                Ok((ws, lat_ms))
+                            }
+                            Err(_) => {
+                                err_count.fetch_add(1, Ordering::Relaxed);
+                                Err(())
+                            }
                         }
-                    }
-                }));
+                    }));
+                }
             }
 
             let batch_results = futures_util::future::join_all(handles).await;
