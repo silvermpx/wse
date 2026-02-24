@@ -196,13 +196,12 @@ pub fn build_ping() -> String {
     .to_string()
 }
 
-/// Check if a parsed message is a PONG and extract the client_timestamp.
-pub fn extract_pong_timestamp(msg: &serde_json::Value) -> Option<u64> {
-    if msg.get("t")?.as_str()? == "pong" {
-        msg.get("p")?.get("client_timestamp")?.as_u64()
-    } else {
-        None
-    }
+/// Check if a parsed message is a PONG (server sends uppercase "PONG").
+pub fn is_pong(msg: &serde_json::Value) -> bool {
+    msg.get("t")
+        .and_then(|t| t.as_str())
+        .map(|t| t.eq_ignore_ascii_case("pong"))
+        .unwrap_or(false)
 }
 
 /// Build a generic message payload of approximately `size` bytes.
