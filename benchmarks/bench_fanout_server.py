@@ -14,11 +14,7 @@ Usage:
     python benchmarks/bench_fanout_server.py --mode broadcast
     wse-bench --test fanout-broadcast
 
-    # Test 9: Fan-out Pub/Sub (Redis, single server)
-    python benchmarks/bench_fanout_server.py --mode pubsub --redis-url redis://localhost:6379
-    wse-bench --test fanout-pubsub
-
-    # Test 10: Multi-Instance Fan-out (two servers)
+    # Test 9: Multi-Instance Fan-out (two servers + Redis)
     python benchmarks/bench_fanout_server.py --mode pubsub --port 5006 --redis-url redis://localhost:6379
     python benchmarks/bench_fanout_server.py --mode subscribe --port 5007 --redis-url redis://localhost:6379
     wse-bench --test fanout-multi --port 5006 --port2 5007

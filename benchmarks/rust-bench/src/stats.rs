@@ -9,8 +9,8 @@ pub struct LatencyHistogram {
 impl LatencyHistogram {
     pub fn new() -> Self {
         Self {
-            // 1us to 60s, 3 significant digits
-            inner: Histogram::new_with_bounds(1, 60_000_000, 3).unwrap(),
+            // 1us to 300s, 3 significant digits (fan-out stress tests can buffer 100s+)
+            inner: Histogram::new_with_bounds(1, 300_000_000, 3).unwrap(),
         }
     }
 

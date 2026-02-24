@@ -84,7 +84,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             actual
         );
         println!(
-            "    Bandwidth:      {}/s",
+            "    Bandwidth:      {}",
             stats::fmt_bytes_per_sec(result.total_bytes as f64 / result.elapsed)
         );
         if unique_gaps > 0 {

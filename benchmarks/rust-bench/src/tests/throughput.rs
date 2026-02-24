@@ -83,7 +83,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             stats::fmt_rate(msg_per_sec)
         );
         println!(
-            "    Bandwidth: {}/s",
+            "    Bandwidth: {}",
             stats::fmt_bytes_per_sec(bytes as f64 / elapsed)
         );
         println!("    Per-connection: {:.0} msg/s", per_conn);
