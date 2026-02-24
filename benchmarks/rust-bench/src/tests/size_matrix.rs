@@ -128,13 +128,10 @@ async fn matrix_send_loop(
     let deadline = tokio::time::Instant::now() + duration;
     let mut local_sent = 0u64;
     let mut local_bytes = 0u64;
+    let msg = Message::Text(payload.to_string().into());
 
     while tokio::time::Instant::now() < deadline {
-        if ws
-            .send(Message::Text(payload.to_string().into()))
-            .await
-            .is_err()
-        {
+        if ws.send(msg.clone()).await.is_err() {
             break;
         }
         local_sent += 1;

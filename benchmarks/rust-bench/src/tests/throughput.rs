@@ -83,8 +83,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             stats::fmt_rate(msg_per_sec)
         );
         println!(
-            "    Bandwidth: {} ({}/s)",
-            stats::fmt_bytes_per_sec(bytes as f64 / elapsed),
+            "    Bandwidth: {}/s",
             stats::fmt_bytes_per_sec(bytes as f64 / elapsed)
         );
         println!("    Per-connection: {:.0} msg/s", per_conn);
@@ -124,13 +123,10 @@ async fn send_loop(
     let deadline = tokio::time::Instant::now() + duration;
     let mut local_sent = 0u64;
     let mut local_bytes = 0u64;
+    let msg = Message::Text(payload.to_string().into());
 
     while tokio::time::Instant::now() < deadline {
-        if ws
-            .send(Message::Text(payload.to_string().into()))
-            .await
-            .is_err()
-        {
+        if ws.send(msg.clone()).await.is_err() {
             break;
         }
         local_sent += 1;

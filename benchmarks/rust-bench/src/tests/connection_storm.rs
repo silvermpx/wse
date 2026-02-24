@@ -44,16 +44,23 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
                 let err_count = errors.clone();
 
                 if use_multi_ip {
-                    let ip_idx = (conn_idx / 60_000) as u8 + 1;
+                    let ip_idx = (conn_idx / 60_000) + 1;
+                    assert!(
+                        ip_idx <= 254,
+                        "exceeded 127.0.0.254 — too many connections for loopback"
+                    );
                     let source_addr: std::net::SocketAddr =
                         format!("127.0.0.{}:0", ip_idx).parse().unwrap();
                     conn_idx += 1;
                     handles.push(tokio::spawn(async move {
                         let t0 = Instant::now();
                         match protocol::connect_and_handshake_from(
-                            &host, port, &tok,
+                            &host,
+                            port,
+                            &tok,
                             "compression=false&protocol_version=1",
-                            source_addr, 15,
+                            source_addr,
+                            15,
                         )
                         .await
                         {
@@ -72,7 +79,9 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
                     handles.push(tokio::spawn(async move {
                         let t0 = Instant::now();
                         match protocol::connect_and_handshake(
-                            &host, port, &tok,
+                            &host,
+                            port,
+                            &tok,
                             "compression=false&protocol_version=1",
                             15,
                         )

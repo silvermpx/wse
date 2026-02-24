@@ -109,7 +109,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             errors: disc_count,
             duration_secs: elapsed,
             messages_sent: total_pings,
-            messages_received: total_pings - disc_count as u64,
+            messages_received: total_pings.saturating_sub(disc_count as u64),
             bytes_sent: 0,
             latency: if merged.is_empty() {
                 None
@@ -152,6 +152,7 @@ async fn hold_loop(
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as u64;
+                let t0 = tokio::time::Instant::now();
 
                 let ping = serde_json::json!({
                     "t": "ping",
@@ -172,12 +173,8 @@ async fn hold_loop(
                         Ok(Some(Ok(msg))) => {
                             if let Some(parsed) = protocol::parse_wse_message(&msg) {
                                 if protocol::is_pong(&parsed) {
-                                    let rtt_ms = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap()
-                                        .as_millis() as u64;
-                                    let rtt = rtt_ms.saturating_sub(now_ms) as f64;
-                                    hist.record_ms(rtt);
+                                    let rtt_us = t0.elapsed().as_micros() as u64;
+                                    hist.record_us(rtt_us.max(1));
                                     break;
                                 }
                             }
