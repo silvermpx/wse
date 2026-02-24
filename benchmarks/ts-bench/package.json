@@ -1,0 +1,23 @@
+{
+  "name": "wse-ts-bench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "tsx src/main.ts",
+    "build": "tsc",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "hdr-histogram-js": "^3.0.0",
+    "@msgpack/msgpack": "^3.0.0",
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "tsx": "^4.19.0",
+    "@types/ws": "^8.5.13",
+    "@types/node": "^22.10.0"
+  }
+}
