@@ -101,6 +101,10 @@ async function matrixSendLoop(
   const msgSize = msgBuf.length;
 
   return new Promise((resolve) => {
+    let resolved = false;
+    function done() {
+      if (!resolved) { resolved = true; resolve({ count, bytes, ws }); }
+    }
     function send() {
       while (Date.now() < deadline) {
         if ((ws as any).bufferedAmount > 16 * 1024 * 1024) {
@@ -108,7 +112,7 @@ async function matrixSendLoop(
           return;
         }
         ws.send(msgBuf, { binary: false }, (err) => {
-          if (err) resolve({ count, bytes, ws });
+          if (err) done();
         });
         count++;
         bytes += msgSize;
@@ -117,7 +121,7 @@ async function matrixSendLoop(
           return;
         }
       }
-      resolve({ count, bytes, ws });
+      done();
     }
     send();
   });

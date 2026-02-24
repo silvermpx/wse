@@ -35,7 +35,9 @@ export async function connectAndHandshake(
           t: 'client_hello',
           p: { client_version: 'wse-ts-bench/0.1.0', protocol_version: 1 },
         });
-        ws.send(hello);
+        ws.send(hello, (err) => {
+          if (err) { clearTimeout(timer); reject(err); return; }
+        });
         clearTimeout(timer);
         resolve(ws);
       }
@@ -81,7 +83,9 @@ export async function connectAndHandshakeFrom(
           t: 'client_hello',
           p: { client_version: 'wse-ts-bench/0.1.0', protocol_version: 1 },
         });
-        ws.send(hello);
+        ws.send(hello, (err) => {
+          if (err) { clearTimeout(timer); reject(err); return; }
+        });
         clearTimeout(timer);
         resolve(ws);
       }
@@ -292,9 +296,9 @@ export async function closeAll(connections: WsConnection[]): Promise<void> {
           resolve();
           return;
         }
-        ws.on('close', () => resolve());
+        const timer = setTimeout(() => resolve(), 2000);
+        ws.on('close', () => { clearTimeout(timer); resolve(); });
         ws.close();
-        setTimeout(() => resolve(), 2000);
       })
   );
   await Promise.allSettled(promises);

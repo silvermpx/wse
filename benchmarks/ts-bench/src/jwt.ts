@@ -11,6 +11,7 @@ export function generateBenchToken(secret: Buffer, subject: string): string {
     sub: subject,
     iss: 'wse-bench',
     aud: 'wse-bench',
+    iat: now,
     exp: now + 3600,
   };
   const payload = base64url(Buffer.from(JSON.stringify(claims)));
