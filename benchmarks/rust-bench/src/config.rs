@@ -66,7 +66,6 @@ pub enum TestName {
     SustainedHold,
     ConnectionLimit,
     FanoutBroadcast,
-    FanoutPubsub,
     FanoutMulti,
 }
 
@@ -92,7 +91,7 @@ impl Cli {
                     10, 100, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000,
                 ]
             }
-            TestName::FanoutPubsub | TestName::FanoutMulti => {
+            TestName::FanoutMulti => {
                 vec![10, 100, 500, 1_000, 2_000, 5_000, 10_000, 20_000]
             }
             _ => DEFAULT_TIERS.to_vec(),

@@ -102,6 +102,7 @@ enum ServerCommand {
     SendPrebuilt { conn_id: String, message: Message },
     BroadcastText { data: String },
     BroadcastBytes { data: Vec<u8> },
+    PublishLocal { topic: String, data: String },
     Disconnect { conn_id: String },
     GetConnections { reply: oneshot::Sender<Vec<String>> },
     Shutdown,
@@ -163,6 +164,8 @@ impl SharedState {
             topic_subscribers: Arc::new(DashMap::new()),
             conn_topics: DashMap::new(),
             redis_cmd_tx: std::sync::Mutex::new(None),
+            redis_metrics: Arc::new(RedisMetrics::new()),
+            redis_dlq: Arc::new(std::sync::Mutex::new(DeadLetterQueue::new(1000))),
         }
     }
 
@@ -900,6 +903,31 @@ async fn process_commands(
                     let _ = h.tx.send(Message::Binary(data.clone().into()));
                 }
             }
+            ServerCommand::PublishLocal { topic, data } => {
+                // Fan-out to topic subscribers without Redis round-trip.
+                // Same dedup logic as dispatch_to_subscribers in redis_pubsub.
+                let conns = state.connections.read().await;
+                if let Some(conn_ids) = state.topic_subscribers.get(&topic) {
+                    for conn_id_ref in conn_ids.iter() {
+                        if let Some(handle) = conns.get(conn_id_ref.key()) {
+                            let _ = handle.tx.send(Message::Text(data.clone().into()));
+                        }
+                    }
+                }
+                // Glob pattern matching for wildcard subscribers
+                for entry in state.topic_subscribers.iter() {
+                    let pattern = entry.key();
+                    if (pattern.contains('*') || pattern.contains('?'))
+                        && super::redis_pubsub::glob_match(pattern, &topic)
+                    {
+                        for conn_id_ref in entry.value().iter() {
+                            if let Some(handle) = conns.get(conn_id_ref.key()) {
+                                let _ = handle.tx.send(Message::Text(data.clone().into()));
+                            }
+                        }
+                    }
+                }
+            }
             ServerCommand::Disconnect { conn_id } => {
                 let conns = state.connections.read().await;
                 if let Some(h) = conns.get(&conn_id) {
@@ -935,6 +963,7 @@ pub struct RustWSEServer {
     running: Arc<AtomicBool>,
     dedup: Arc<std::sync::Mutex<DeduplicationState>>,
     redis_rt_handle: Option<tokio::runtime::Handle>,
+    started_at: Option<std::time::Instant>,
 }
 
 #[pymethods]
@@ -979,6 +1008,7 @@ impl RustWSEServer {
                 max_entries: 50_000,
             })),
             redis_rt_handle: None,
+            started_at: None,
         }
     }
 
@@ -1071,6 +1101,7 @@ impl RustWSEServer {
             .map_err(|e| PyRuntimeError::new_err(format!("Spawn error: {e}")))?;
         self.thread_handle = Some(handle);
         self.redis_rt_handle = rt_handle_rx.recv().ok();
+        self.started_at = Some(std::time::Instant::now());
         Ok(())
     }
 
@@ -1497,11 +1528,15 @@ impl RustWSEServer {
 
         let connections = self.shared.connections.clone();
         let topic_subscribers = self.shared.topic_subscribers.clone();
+        let metrics = self.shared.redis_metrics.clone();
+        let dlq = self.shared.redis_dlq.clone();
         rt_handle.spawn(super::redis_pubsub::listener_task(
             url,
             connections,
             topic_subscribers,
             cmd_rx,
+            metrics,
+            dlq,
         ));
         Ok(())
     }
@@ -1557,6 +1592,22 @@ impl RustWSEServer {
         Ok(())
     }
 
+    /// Publish to topic subscribers locally without Redis round-trip.
+    /// Use this for single-instance fan-out (e.g., market data to frontend).
+    fn publish_local(&self, topic: &str, data: &str) -> PyResult<()> {
+        let tx = self
+            .cmd_tx
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
+        tx.send(ServerCommand::PublishLocal {
+            topic: topic.to_owned(),
+            data: data.to_owned(),
+        })
+        .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
+        Ok(())
+    }
+
+    /// Publish via Redis (for multi-instance coordination).
     fn publish(&self, topic: &str, data: &str) -> PyResult<()> {
         let guard = self.shared.redis_cmd_tx.lock().unwrap();
         let tx = guard
@@ -1576,5 +1627,79 @@ impl RustWSEServer {
             .get(topic)
             .map(|s| s.len())
             .unwrap_or(0)
+    }
+
+    fn redis_connected(&self) -> bool {
+        self.shared.redis_metrics.connected.load(Ordering::Relaxed)
+    }
+
+    fn health_snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let m = &self.shared.redis_metrics;
+        let dict = PyDict::new(py);
+        dict.set_item(
+            "connections",
+            self.shared.connection_count.load(Ordering::Relaxed),
+        )?;
+        dict.set_item("inbound_queue_depth", self.shared.inbound_rx.len())?;
+        dict.set_item(
+            "inbound_dropped",
+            self.shared.inbound_dropped.load(Ordering::Relaxed),
+        )?;
+        dict.set_item("redis_connected", m.connected.load(Ordering::Relaxed))?;
+        dict.set_item(
+            "redis_messages_received",
+            m.messages_received.load(Ordering::Relaxed),
+        )?;
+        dict.set_item(
+            "redis_messages_published",
+            m.messages_published.load(Ordering::Relaxed),
+        )?;
+        dict.set_item(
+            "redis_messages_delivered",
+            m.messages_delivered.load(Ordering::Relaxed),
+        )?;
+        dict.set_item(
+            "redis_messages_dropped",
+            m.messages_dropped.load(Ordering::Relaxed),
+        )?;
+        dict.set_item(
+            "redis_publish_errors",
+            m.publish_errors.load(Ordering::Relaxed),
+        )?;
+        dict.set_item(
+            "redis_reconnect_count",
+            m.reconnect_count.load(Ordering::Relaxed),
+        )?;
+        dict.set_item(
+            "redis_dlq_size",
+            self.shared
+                .redis_dlq
+                .try_lock()
+                .map(|dlq| dlq.len())
+                .unwrap_or(0),
+        )?;
+        dict.set_item(
+            "uptime_secs",
+            self.started_at
+                .map(|s| s.elapsed().as_secs_f64())
+                .unwrap_or(0.0),
+        )?;
+        Ok(dict.unbind())
+    }
+
+    fn get_dlq_entries(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let entries = match self.shared.redis_dlq.try_lock() {
+            Ok(mut dlq) => dlq.drain_all(),
+            Err(_) => Vec::new(),
+        };
+        let list = PyList::empty(py);
+        for entry in &entries {
+            let d = PyDict::new(py);
+            d.set_item("channel", &entry.channel)?;
+            d.set_item("payload", &entry.payload)?;
+            d.set_item("error", &entry.error)?;
+            list.append(d)?;
+        }
+        Ok(list.unbind())
     }
 }

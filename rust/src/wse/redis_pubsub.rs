@@ -92,7 +92,7 @@ impl DeadLetterQueue {
 // Glob matching
 // ---------------------------------------------------------------------------
 
-fn glob_match(pattern: &str, text: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     let pb = pattern.as_bytes();
     let tb = text.as_bytes();
     let (mut pi, mut ti) = (0usize, 0usize);

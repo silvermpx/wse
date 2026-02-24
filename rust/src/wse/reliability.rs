@@ -55,7 +55,14 @@ impl CircuitBreaker {
                     false
                 }
             }
-            CircuitState::HalfOpen => self.half_open_calls < self.half_open_max_calls,
+            CircuitState::HalfOpen => {
+                if self.half_open_calls < self.half_open_max_calls {
+                    self.half_open_calls += 1;
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 
