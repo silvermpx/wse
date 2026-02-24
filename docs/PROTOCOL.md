@@ -395,8 +395,6 @@ payment_completed, account_transfer, config_change, ...
 | `HANDLER_ERROR` | Server-side handler error (recoverable) |
 | `CIRCUIT_BREAKER_OPEN` | Too many errors, connection closing |
 | `ENCRYPTION_REQUIRED` | Operation requires encryption |
-| `SYNC_ERROR` | Snapshot sync failed |
-| `SNAPSHOT_ERROR` | Individual snapshot failed |
 | `SERVER_ERROR` | Internal server error |
 | `INIT_ERROR` | Connection initialization failed |
 

@@ -33,17 +33,28 @@ Embed WSE into your existing FastAPI app on the same port:
 ```python
 from fastapi import FastAPI
 from wse_server import create_wse_router, WSEConfig
+import redis.asyncio as redis
 
 app = FastAPI()
 
+redis_client = redis.Redis(host="localhost", port=6379, decode_responses=False)
+
 wse = create_wse_router(WSEConfig(
-    redis_url="redis://localhost:6379",
+    redis_client=redis_client,
 ))
 
 app.include_router(wse, prefix="/wse")
+```
 
-# Publish from anywhere in your app
-await wse.publish("notifications", {"text": "Order shipped!", "order_id": 42})
+Publish events from anywhere in your app via the PubSub bus:
+
+```python
+bus = app.state.pubsub_bus
+
+await bus.publish(
+    topic="notifications",
+    event={"event_type": "order_shipped", "order_id": 42, "text": "Order shipped!"},
+)
 ```
 
 ### Server (Python) -- Standalone Mode
@@ -279,14 +290,69 @@ See benchmark docs for full results: [Overview](docs/BENCHMARKS.md) | [Rust Clie
 
 ## Use Cases
 
-WSE works for any real-time communication between frontend and backend:
+### Live Dashboards
 
-- **Live dashboards** -- stock prices, sensor data, analytics, monitoring panels
-- **Notifications** -- order updates, alerts, system events pushed to the browser
-- **Collaborative apps** -- shared cursors, document editing, whiteboarding
-- **Chat and messaging** -- group chats, DMs, typing indicators, read receipts
-- **IoT and telemetry** -- device status, real-time metrics, command and control
-- **Gaming** -- game state sync, leaderboards, matchmaking updates
+Push price updates, sensor data, or analytics to the browser in real time.
+
+```python
+# Server: push price updates
+await bus.publish(
+    topic="prices",
+    event={"event_type": "price_update", "symbol": "AAPL", "price": 187.42},
+)
+```
+
+```tsx
+// React: consume them
+window.addEventListener('price_update', (e: CustomEvent) => {
+  updateChart(e.detail.symbol, e.detail.price);
+});
+```
+
+### Notifications
+
+Push order updates, alerts, or system events to specific users.
+
+```python
+# Server: notify a specific user
+await bus.publish(
+    topic=f"user:{user_id}:events",
+    event={"event_type": "order_shipped", "order_id": 42, "text": "Your order shipped!"},
+)
+```
+
+```tsx
+// React: show a toast
+window.addEventListener('order_shipped', (e: CustomEvent) => {
+  showToast(e.detail.text);
+});
+```
+
+### Chat and Messaging
+
+Group chats, DMs, typing indicators, read receipts. Enable encryption for privacy.
+
+```python
+# Server: broadcast a chat message
+await bus.publish(
+    topic=f"chat:{channel_id}",
+    event={"event_type": "message_sent", "text": body.text, "author": user.name},
+)
+```
+
+```python
+# Python client: listen for messages
+async with connect("ws://localhost:5006/wse", token=jwt) as client:
+    await client.subscribe([f"chat:{channel_id}"])
+    async for event in client:
+        print(f"{event.payload['author']}: {event.payload['text']}")
+```
+
+### Other Use Cases
+
+- **Collaborative editing** -- shared cursors, document changes, conflict detection via sequence numbers
+- **IoT and telemetry** -- device status, sensor metrics, command and control. Use LOW priority for telemetry, HIGH for alerts
+- **Gaming** -- game state sync, leaderboards, matchmaking. Use msgpack binary protocol for lower latency
 
 ---
 

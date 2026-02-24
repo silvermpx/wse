@@ -26,7 +26,14 @@ from .types import ConnectionQuality, NetworkDiagnostics
 
 
 class NetworkMonitor:
-    """Track network quality from heartbeat round-trip times."""
+    """Latency, jitter, and packet loss analysis from heartbeat RTTs.
+
+    Classifies connection quality as EXCELLENT / GOOD / FAIR / POOR
+    based on configurable thresholds.
+
+    Args:
+        window_size: Number of recent latency samples to keep (default 50).
+    """
 
     def __init__(self, window_size: int = 50) -> None:
         self._window_size = window_size

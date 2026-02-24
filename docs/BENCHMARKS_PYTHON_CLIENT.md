@@ -439,13 +439,13 @@ Results: [BENCHMARKS_RUST_CLIENT.md](BENCHMARKS_RUST_CLIENT.md).
 python benchmarks/bench_server.py
 
 # Single-client benchmarks
-python benchmarks/bench_single_client.py
+python benchmarks/bench_wse.py
 
 # Multi-process benchmarks (M2: 10 workers, EPYC: 64 workers)
-python benchmarks/bench_multiprocess.py --workers 10
+python benchmarks/bench_wse_multiprocess.py --workers 10
 
 # Brutal concurrency (EPYC)
-python benchmarks/bench_brutal.py --connections 1000 --duration 5
+python benchmarks/bench_brutal.py --token <JWT> --tiers 100,500,1000 --duration 5
 ```
 
 ---

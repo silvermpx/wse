@@ -19,12 +19,15 @@ T = TypeVar("T")
 
 
 class CircuitBreaker:
-    """Circuit breaker matching client/utils/circuitBreaker.ts.
+    """Three-state circuit breaker to prevent reconnection storms.
 
-    States:
-        CLOSED   -> normal operation, failures counted
-        OPEN     -> rejecting all calls, waiting for timeout
-        HALF_OPEN -> allowing one probe call to test recovery
+    CLOSED -> normal, failures counted. OPEN -> all calls rejected
+    until *reset_timeout*. HALF_OPEN -> one probe call allowed.
+
+    Args:
+        failure_threshold: Failures before the circuit opens (default 5).
+        reset_timeout: Seconds before probing recovery (default 60).
+        success_threshold: Successes in HALF_OPEN to close again (default 3).
     """
 
     def __init__(

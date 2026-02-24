@@ -69,7 +69,17 @@ _INTERNAL_ONLY_EVENTS = frozenset(
 class AsyncWSEClient:
     """Async WSE client with context manager and async iterator support.
 
-    Usage::
+    Args:
+        url: WebSocket server URL, e.g. ``"ws://localhost:5006/wse"``.
+        token: JWT token for authentication (sent as Cookie + Authorization).
+        topics: Topics to auto-subscribe after connecting.
+        reconnect: Reconnection config. Defaults to exponential backoff,
+            infinite retries.
+        extra_headers: Additional HTTP headers for the handshake.
+        queue_size: Max events buffered for the async iterator. When full,
+            oldest events are dropped. Default 1000.
+
+    Example::
 
         async with AsyncWSEClient("ws://localhost:5006/wse", token="jwt") as client:
             await client.subscribe(["notifications"])
@@ -287,7 +297,17 @@ class AsyncWSEClient:
         priority: int = MessagePriority.NORMAL,
         correlation_id: str | None = None,
     ) -> bool:
-        """Send a message to the server."""
+        """Send a message to the server.
+
+        Args:
+            type: Event type string, e.g. ``"update_settings"``.
+            payload: Message data dict (default: empty).
+            priority: See :class:`~wse_client.types.MessagePriority`.
+            correlation_id: Optional ID to correlate request/response.
+
+        Returns:
+            True if sent, False if disconnected or rate-limited.
+        """
         encoded = self._codec.encode(
             type,
             payload or {},
@@ -309,7 +329,18 @@ class AsyncWSEClient:
         correlation_id: str | None = None,
         max_retries: int = SEND_MAX_RETRIES,
     ) -> bool:
-        """Send with exponential backoff retry (matches TS sendMessage retry)."""
+        """Send with exponential backoff retry.
+
+        Args:
+            type: Event type string.
+            payload: Message data dict.
+            priority: See :class:`~wse_client.types.MessagePriority`.
+            correlation_id: Optional correlation ID.
+            max_retries: Max attempts (default 5).
+
+        Returns:
+            True if sent within the retry budget, False otherwise.
+        """
         for attempt in range(max_retries):
             ok = await self.send(
                 type, payload, priority=priority, correlation_id=correlation_id
@@ -338,7 +369,14 @@ class AsyncWSEClient:
         return False
 
     async def send_batch(self, messages: list[tuple[str, dict[str, Any]]]) -> bool:
-        """Send multiple messages in a single batch frame."""
+        """Send multiple messages in a single batch frame.
+
+        Args:
+            messages: List of ``(type, payload)`` tuples.
+
+        Returns:
+            True if the batch was sent.
+        """
         if not messages:
             return True
 
@@ -366,7 +404,14 @@ class AsyncWSEClient:
         return ok
 
     async def subscribe(self, topics: list[str]) -> bool:
-        """Subscribe to topics."""
+        """Subscribe to one or more topics.
+
+        Args:
+            topics: Topic names, e.g. ``["notifications", "live_data"]``.
+
+        Returns:
+            True if the subscription message was sent.
+        """
         new_topics = [t for t in topics if t not in self._subscribed_topics]
         if not new_topics:
             return True
@@ -383,7 +428,14 @@ class AsyncWSEClient:
         return ok
 
     async def unsubscribe(self, topics: list[str]) -> bool:
-        """Unsubscribe from topics."""
+        """Unsubscribe from one or more topics.
+
+        Args:
+            topics: Topic names to unsubscribe from.
+
+        Returns:
+            True if the unsubscribe message was sent.
+        """
         msg = self._codec.encode(
             "subscription_update",
             {"action": "unsubscribe", "topics": topics},
@@ -396,7 +448,17 @@ class AsyncWSEClient:
         return ok
 
     async def request_snapshot(self, topics: list[str] | None = None) -> bool:
-        """Request a state snapshot with retry (matches TS requestSnapshot)."""
+        """Request a state snapshot from the server.
+
+        The server replies with current state for the given topics so the
+        client doesn't have to wait for the next publish.
+
+        Args:
+            topics: Topics to snapshot. Defaults to subscribed topics.
+
+        Returns:
+            True if the request was sent.
+        """
         if self._snapshot_requested:
             return True
 
@@ -435,7 +497,18 @@ class AsyncWSEClient:
         return False
 
     async def recv(self, timeout: float | None = None) -> WSEEvent:
-        """Receive a single event (explicit pull)."""
+        """Receive a single event (alternative to async iteration).
+
+        Args:
+            timeout: Max seconds to wait. ``None`` blocks indefinitely.
+
+        Returns:
+            The next :class:`~wse_client.types.WSEEvent`.
+
+        Raises:
+            WSEConnectionError: If the connection is closed.
+            asyncio.TimeoutError: If *timeout* expires.
+        """
         if timeout is not None:
             event = await asyncio.wait_for(self._event_queue.get(), timeout=timeout)
         else:
@@ -463,9 +536,15 @@ class AsyncWSEClient:
     def on(
         self, event_type: str
     ) -> Callable[[EventHandler | AsyncEventHandler], EventHandler | AsyncEventHandler]:
-        """Decorator to register an event handler.
+        """Decorator to register an event handler for a specific topic.
 
-        Usage::
+        Args:
+            event_type: Event type to listen for, e.g. ``"notifications"``.
+
+        Returns:
+            Decorator that registers the function.
+
+        Example::
 
             @client.on("notifications")
             async def handle(event: WSEEvent):

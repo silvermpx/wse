@@ -87,7 +87,17 @@ except ImportError:
 
 
 class MessageCodec:
-    """Encode/decode WSE wire protocol messages."""
+    """Encode and decode WSE wire protocol messages.
+
+    Handles JSON text frames, zlib-compressed frames, msgpack binary,
+    and AES-GCM encrypted frames. See ``docs/PROTOCOL.md`` for the
+    wire format specification.
+
+    Args:
+        compression: Zlib compression handler.
+        security: AES-GCM encryption handler, or ``None`` to disable.
+        msgpack: MsgPack handler, or ``None`` to disable binary protocol.
+    """
 
     def __init__(
         self,

@@ -102,10 +102,6 @@ async with connect("ws://localhost:5006/wse", token="<JWT>") as client:
 wscat -c "ws://localhost:5006/wse" -H "Authorization: Bearer <JWT>"
 ```
 
-### Refresh Token Grace Period
-
-If the access token expired within the last 60 seconds, WSE attempts to use the `refresh_token` cookie as a short grace-period fallback. This prevents unnecessary reconnections during token refresh cycles while limiting the window of exposure. Refresh tokens older than this grace period are rejected.
-
 ## Transport Security
 
 ### TLS
@@ -163,7 +159,6 @@ WSE supports optional E2E encryption using Web Crypto API:
 | Key Exchange | ECDH P-256 |
 | Key Derivation | HKDF-SHA256 |
 | Signing | HMAC-SHA256 |
-| Password KDF | PBKDF2 (600,000 iterations) |
 
 **Key exchange flow:**
 1. Client generates ECDH P-256 key pair

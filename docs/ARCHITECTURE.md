@@ -15,9 +15,11 @@ Mount WSE as a FastAPI router on the same port as your existing app. Best for pr
 ```python
 from fastapi import FastAPI
 from wse_server import create_wse_router, WSEConfig
+import redis.asyncio as redis
 
 app = FastAPI()
-wse = create_wse_router(WSEConfig(redis_url="redis://localhost:6379"))
+redis_client = redis.Redis(host="localhost", port=6379, decode_responses=False)
+wse = create_wse_router(WSEConfig(redis_client=redis_client))
 app.include_router(wse, prefix="/wse")
 ```
 
@@ -53,30 +55,35 @@ All benchmarks (including the 14M msg/s JSON on EPYC) use standalone mode.
 ## Backend Architecture (Router Mode)
 
 ```
-server/
-├── wse_router.py              # FastAPI WebSocket endpoint + HTTP endpoints
+wse_server/
+├── router.py                  # FastAPI WebSocket endpoint + HTTP endpoints
 ├── dependencies.py            # Dependency injection (snapshot service)
+├── _accel.py                  # Rust acceleration wrapper
+├── _wse_accel.abi3.so         # Prebuilt Rust binary (PyO3/maturin)
 ├── core/
-│   ├── pubsub_bus.py          # Redis Pub/Sub coordination (multi-instance)
+│   ├── pubsub.py              # Redis Pub/Sub coordination (multi-instance)
 │   ├── types.py               # EventPriority enum
-│   ├── event_mappings.py      # Domain event -> WSE event type mappings
-│   ├── event_transformer.py   # Domain event -> WSE message transformation
-│   └── event_filters.py       # Event filtering rules
-├── websocket/
-│   ├── wse_connection.py      # Connection state, send/receive, background tasks
-│   ├── wse_handlers.py        # Message routing and handler implementations
-│   ├── wse_manager.py         # Connection registry (all active connections)
-│   ├── wse_queue.py           # 5-level priority message queue
-│   ├── wse_compression.py     # zlib + msgpack compression
-│   ├── wse_security.py        # Fernet encryption + JWT signing
-│   └── wse_event_sequencer.py # Sequence tracking and gap detection
-└── services/
-    └── snapshot_service.py    # Full state snapshot provider
+│   └── filters.py             # Event filtering rules
+├── connection/
+│   ├── connection.py          # Connection state, send/receive, background tasks
+│   ├── handlers.py            # Message routing and handler implementations
+│   ├── manager.py             # Connection registry (all active connections)
+│   ├── queue.py               # 5-level priority message queue
+│   ├── compression.py         # zlib + msgpack compression
+│   ├── security.py            # Fernet encryption + JWT signing
+│   ├── sequencer.py           # Sequence tracking and gap detection
+│   └── transformer.py         # Domain event -> WSE message transformation
+├── reliability/
+│   ├── circuit_breaker.py     # Per-connection circuit breaker
+│   ├── rate_limiter.py        # Token bucket rate limiter
+│   └── config.py              # Reliability configuration
+└── metrics/
+    └── connection_metrics.py  # Per-connection rate/bandwidth metrics
 ```
 
 ### Component Responsibilities
 
-#### WSE Router (`wse_router.py`)
+#### WSE Router (`router.py`)
 
 Entry point for WebSocket connections. Handles:
 - WebSocket accept and JWT authentication (multi-source: query, header, cookie)
@@ -89,7 +96,7 @@ HTTP endpoints:
 - `GET /wse/debug` - Debug information (subscriptions, PubSub metrics)
 - `GET /wse/compression-test` - Compression effectiveness test
 
-#### WSE Connection (`wse_connection.py`)
+#### WSE Connection (`connection/connection.py`)
 
 Manages a single WebSocket connection lifecycle:
 
@@ -117,7 +124,7 @@ WebSocket.receive() -> handle_incoming() -> size validation
 
 **Serialization**: Uses `orjson` for 3-5x faster JSON serialization/deserialization compared to stdlib `json`. Custom `_orjson_default` handler for `Decimal` and `Enum` types (orjson natively handles `datetime`, `UUID`, `int`, `float`).
 
-#### WSE Handlers (`wse_handlers.py`)
+#### WSE Handlers (`connection/handlers.py`)
 
 Routes incoming messages to handler methods. Supports 25+ message types:
 
@@ -143,7 +150,7 @@ Unknown message types are published to the event bus for custom handling.
 - Detects pre-formatted WSE messages vs raw domain events
 - Transforms raw events via `EventTransformer`
 
-#### Priority Queue (`wse_queue.py`)
+#### Priority Queue (`connection/queue.py`)
 
 5-level async priority queue with backpressure:
 
@@ -161,7 +168,7 @@ When full (1000 messages):
 3. Drop NORMAL messages
 4. HIGH/CRITICAL are never dropped unless queue is entirely HIGH/CRITICAL
 
-#### PubSubBus (`pubsub_bus.py`)
+#### PubSubBus (`core/pubsub.py`)
 
 Redis Pub/Sub for multi-instance coordination:
 
@@ -177,7 +184,7 @@ Features:
 - **Connection-scoped cleanup** via `unsubscribe_connection(conn_id)`
 - All handlers invoked as `asyncio.create_task()` (non-blocking)
 
-#### Compression (`wse_compression.py`)
+#### Compression (`connection/compression.py`)
 
 | Method | When Used | Benefit |
 |--------|-----------|---------|
@@ -187,7 +194,7 @@ Features:
 
 Default threshold: 1024 bytes. Compression level: 6 (balanced speed/ratio).
 
-#### Security (`wse_security.py`)
+#### Security (`connection/security.py`)
 
 | Feature | Implementation |
 |---------|----------------|
@@ -416,7 +423,7 @@ Domain Event (any instance)
 
 ```
 Domain Event (any instance)
-    -> server.publish("user:123:events", payload)
+    -> server.broadcast("user:123:events", payload)
     -> Rust listener_task -> Redis PUBLISH wse:user:123:events
     -> ALL instances receive via PSUBSCRIBE wse:*
     -> dispatch_to_subscribers() -> exact + glob match

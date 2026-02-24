@@ -15,7 +15,16 @@ from .types import WSEEvent
 
 
 class EventSequencer:
-    """Duplicate detection and out-of-order event buffering."""
+    """Duplicate detection and out-of-order event reordering.
+
+    Tracks seen message IDs in a sliding window and buffers events
+    that arrive ahead of their expected sequence number.
+
+    Args:
+        window_size: Dedup window size (default 10 000).
+        max_out_of_order: Max sequence gap before resetting (default 100).
+        max_age: Seconds before expiring old entries (default 300).
+    """
 
     def __init__(
         self,

@@ -4,7 +4,7 @@ Server broadcasts messages to N subscribers. Measures delivery throughput,
 message loss (sequence gaps), and end-to-end latency.
 
 Two modes tested:
-- **Single-Instance Broadcast** (Test 8) — `server.broadcast()` directly to all connections, no Redis
+- **Single-Instance Broadcast** (Test 8) — `server.broadcast_all()` directly to all connections, no Redis
 - **Multi-Instance Redis Pub/Sub** (Test 9) — publish on Server A -> Redis -> Server B -> N subscribers
 
 ## Hardware
@@ -58,7 +58,7 @@ published per second, but the same total deliveries.
 Peak deliveries: **2.1M/s** at 10 subscribers. Sustained ~1.3-1.7M/s across all tiers.
 
 **Zero message loss at every tier** — not a single sequence gap from 10 to 500,000
-subscribers. The Rust broadcast path (`server.broadcast()`) writes to all connections
+subscribers. The Rust broadcast path (`server.broadcast_all()`) writes to all connections
 atomically with no fan-out queue drops.
 
 ### Latency (low subscriber counts)
@@ -92,7 +92,7 @@ Two separate server processes coordinated via Redis:
 ```
 Server A (port 5006, pubsub mode)
     |
-    | server.publish("bench_topic", msg)
+    | server.broadcast("bench_topic", msg)
     v
   Redis PUBLISH wse:bench_topic
     |

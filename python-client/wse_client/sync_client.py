@@ -26,18 +26,26 @@ from .types import (
 class SyncWSEClient:
     """Blocking / thread-based WSE client.
 
-    Usage::
+    Runs an :class:`AsyncWSEClient` on a background thread. All public
+    methods are thread-safe and block until complete.
+
+    Args:
+        url: WebSocket server URL, e.g. ``"ws://localhost:5006/wse"``.
+        token: JWT token for authentication.
+        topics: Topics to auto-subscribe after connecting.
+        reconnect: Reconnection config.
+        extra_headers: Additional HTTP headers for the handshake.
+        queue_size: Max events buffered for ``recv()`` (default 1000).
+
+    Example (pull)::
 
         client = SyncWSEClient("ws://localhost:5006/wse", token="jwt")
         client.connect()
         client.subscribe(["notifications"])
-
         event = client.recv(timeout=5.0)
-        print(event.type, event.payload)
-
         client.close()
 
-    Or with callbacks::
+    Example (callbacks)::
 
         @client.on("notifications")
         def handle(event):
@@ -142,6 +150,14 @@ class SyncWSEClient:
         return future.result(timeout=5.0)
 
     def subscribe(self, topics: list[str]) -> bool:
+        """Subscribe to topics. Blocks until sent.
+
+        Args:
+            topics: Topic names to subscribe to.
+
+        Returns:
+            True if sent, False if not connected.
+        """
         if not self._loop or not self._client:
             return False
         future = asyncio.run_coroutine_threadsafe(
@@ -150,6 +166,14 @@ class SyncWSEClient:
         return future.result(timeout=5.0)
 
     def unsubscribe(self, topics: list[str]) -> bool:
+        """Unsubscribe from topics. Blocks until sent.
+
+        Args:
+            topics: Topic names to unsubscribe from.
+
+        Returns:
+            True if sent, False if not connected.
+        """
         if not self._loop or not self._client:
             return False
         future = asyncio.run_coroutine_threadsafe(
@@ -186,6 +210,14 @@ class SyncWSEClient:
         return future.result(timeout=10.0)
 
     def request_snapshot(self, topics: list[str] | None = None) -> bool:
+        """Request a state snapshot. Blocks until sent.
+
+        Args:
+            topics: Topics to snapshot. Defaults to subscribed topics.
+
+        Returns:
+            True if sent, False if not connected.
+        """
         if not self._loop or not self._client:
             return False
         future = asyncio.run_coroutine_threadsafe(
@@ -214,7 +246,18 @@ class SyncWSEClient:
     # -- Receive --------------------------------------------------------------
 
     def recv(self, timeout: float | None = None) -> WSEEvent:
-        """Receive next event (blocks)."""
+        """Receive the next event. Blocks until available.
+
+        Args:
+            timeout: Max seconds to wait. ``None`` blocks indefinitely.
+
+        Returns:
+            The next :class:`~wse_client.types.WSEEvent`.
+
+        Raises:
+            WSETimeoutError: If *timeout* expires.
+            WSEConnectionError: If the connection is closed.
+        """
         try:
             event = self._event_queue.get(timeout=timeout)
         except queue.Empty:

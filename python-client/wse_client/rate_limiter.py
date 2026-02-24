@@ -14,7 +14,13 @@ from .constants import (
 
 
 class TokenBucketRateLimiter:
-    """Token bucket rate limiter matching client/services/RateLimiter.ts."""
+    """Token bucket rate limiter for outbound messages.
+
+    Args:
+        capacity: Max tokens in the bucket (default 1000).
+        refill_rate: Tokens added per refill interval (default 100).
+        refill_interval: Seconds between refills (default 1.0).
+    """
 
     def __init__(
         self,

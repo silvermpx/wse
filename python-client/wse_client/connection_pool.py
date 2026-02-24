@@ -55,6 +55,12 @@ class ConnectionPool:
         endpoints: list[str],
         strategy: LoadBalancingStrategy = LoadBalancingStrategy.WEIGHTED_RANDOM,
     ) -> None:
+        """Initialize the connection pool.
+
+        Args:
+            endpoints: WebSocket URLs to load-balance across.
+            strategy: Load balancing strategy (default: weighted-random).
+        """
         self._strategy = strategy
         self._endpoints: dict[str, EndpointHealth] = {
             url: EndpointHealth(url=url) for url in endpoints

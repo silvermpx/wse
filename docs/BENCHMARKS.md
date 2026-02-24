@@ -10,7 +10,7 @@ Each client has its own detailed results page.
 | **wse-bench** | Rust (tokio) | **500,000** | **30M msg/s** | [Rust Client Results](BENCHMARKS_RUST_CLIENT.md) |
 | **wse-bench** (fan-out) | Rust (tokio) | **500,000** | **2.1M del/s** | [Fan-out Results](BENCHMARKS_FANOUT.md) |
 | **bench_brutal.py** | Python (sync) | 1,000 | 6.9M msg/s | [Python Client Results](BENCHMARKS_PYTHON_CLIENT.md) |
-| **bench_multiprocess.py** | Python (multi-proc) | 128 | 2.1M msg/s | [Python Client Results](BENCHMARKS_PYTHON_CLIENT.md) |
+| **bench_wse_multiprocess.py** | Python (multi-proc) | 128 | 2.1M msg/s | [Python Client Results](BENCHMARKS_PYTHON_CLIENT.md) |
 
 The Rust client removed the Python overhead and revealed the true server ceiling.
 The Python client was always the bottleneck — the server had roughly 2x more headroom
@@ -162,9 +162,9 @@ Rust validates JWT during WebSocket handshake -> receive `server_ready` -> send
 Python client:
 ```bash
 python benchmarks/bench_server.py
-python benchmarks/bench_single_client.py
-python benchmarks/bench_multiprocess.py --workers 64
-python benchmarks/bench_brutal.py --connections 1000 --duration 5
+python benchmarks/bench_wse.py
+python benchmarks/bench_wse_multiprocess.py --workers 64
+python benchmarks/bench_brutal.py --token <JWT> --tiers 100,500,1000 --duration 5
 ```
 
 Rust client:

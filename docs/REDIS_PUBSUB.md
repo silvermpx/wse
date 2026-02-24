@@ -4,9 +4,9 @@
 
 The Rust standalone server includes a built-in Redis Pub/Sub module for multi-instance horizontal scaling. When multiple WSE server instances run behind a load balancer, Redis coordinates message delivery across all instances.
 
-**Without Redis:** Single-instance mode. `broadcast()` and `send_event()` deliver to local connections only.
+**Without Redis:** Single-instance mode. `broadcast_all()`, `broadcast_local()`, and `send_event()` deliver to local connections only.
 
-**With Redis:** Multi-instance mode. `publish()` sends via Redis, all instances receive and fan-out to their local connections.
+**With Redis:** Multi-instance mode. `broadcast()` sends via Redis, all instances receive and fan-out to their local connections.
 
 ```
 Instance A                Instance B                Instance C
@@ -32,7 +32,7 @@ Instance A                Instance B                Instance C
 Python domain code
     |
     v
-server.publish("user:123:events", payload)     # PyO3 call
+server.broadcast("user:123:events", payload)    # PyO3 call
     |
     v
 RedisCommand::Publish → cmd_tx (unbounded channel)
@@ -111,29 +111,30 @@ count = server.get_topic_subscriber_count("user:123:events")
 
 ### Publishing
 
-Two publish methods — local and Redis:
+Two topic dispatch methods -- local and Redis:
 
 ```python
 # Local fan-out to topic subscribers (NO Redis, single instance)
 # Use this for domain events: market data, balance updates, trade fills
-server.publish_local("bars:AAPL", '{"t":"bar","p":{"c":185.50}}')
+server.broadcast_local("bars:AAPL", '{"t":"bar","p":{"c":185.50}}')
 
 # Redis fan-out (multi-instance horizontal scaling ONLY)
 # Use this ONLY when running multiple WSE instances behind a load balancer
-server.publish("user:123:events", '{"t":"balance_update","p":{"equity":50000}}')
+server.broadcast("user:123:events", '{"t":"balance_update","p":{"equity":50000}}')
 ```
 
-**`publish_local(topic, data)`** dispatches to local topic subscribers directly.
+**`broadcast_local(topic, data)`** dispatches to local topic subscribers directly.
 No Redis connection required. Same topic matching (exact + glob).
-Speed: same as broadcast (~2.1M deliveries/s).
+Speed: ~2.1M deliveries/s.
 
-**`publish(topic, data)`** sends via Redis for cross-instance delivery.
-The `publish()` method:
+**`broadcast(topic, data)`** dispatches locally AND sends via Redis for cross-instance delivery.
+The Redis path:
 1. Sends `RedisCommand::Publish` to the listener task via unbounded channel
 2. Listener batches up to 64 commands and pipelines them in a single Redis round-trip
 3. Retries the pipeline up to 3 times (100ms, 200ms delays)
 4. On final failure, pushes all messages in batch to Dead Letter Queue
 Speed: ~45K published messages/s (Redis 8.6 with io-threads and pipelining).
+If Redis is not connected, only local dispatch happens.
 
 ### Health Monitoring
 
@@ -252,17 +253,28 @@ All metrics are lock-free `AtomicU64` counters:
 
 | Method | Redis? | Speed | Use Case |
 |--------|--------|-------|----------|
-| `broadcast(data)` | No | ~2.1M del/s | All connections (system announcements) |
+| `broadcast_all(data)` | No | ~2.1M del/s | All connections (system announcements) |
+| `broadcast_all_bytes(data)` | No | ~2.1M del/s | All connections (binary payload) |
 | `send_event(conn_id, event)` | No | Direct | One specific connection |
-| `publish_local(topic, data)` | No | ~2.1M del/s | Topic fan-out, single instance (market data, domain events) |
-| `publish(topic, data)` | Yes | ~45K msg/s | Horizontal scaling ONLY (multi-instance coordination) |
+| `send(conn_id, data)` | No | Direct | Send text to one connection |
+| `send_bytes(conn_id, data)` | No | Direct | Send binary to one connection |
+| `broadcast_local(topic, data)` | No | ~2.1M del/s | Topic fan-out, single instance (market data, domain events) |
+| `broadcast(topic, data)` | Local + Redis | ~45K msg/s | Topic fan-out with horizontal scaling |
 | `subscribe_connection()` | No | - | Register topic interest |
 | `unsubscribe_connection()` | No | - | Remove topic interest |
+| `disconnect(conn_id)` | No | - | Disconnect a specific connection |
+| `get_connections()` | No | - | List connected connection IDs |
+| `is_running()` | No | - | Check if server is running |
+| `enable_drain_mode()` | No | - | Enable inbound event drain mode |
+| `drain_inbound(max, timeout_ms)` | No | - | Retrieve batched inbound events |
+| `inbound_queue_depth()` | No | - | Current inbound queue size |
+| `inbound_dropped_count()` | No | - | Count of dropped inbound messages |
+| `set_callbacks(on_connect, on_message, on_disconnect)` | No | - | Set Python event callbacks |
 
 **Decision guide:**
-- Single server? Use `broadcast()` or `publish_local()`. No Redis needed.
-- Multiple servers behind LB? Add `connect_redis()` + use `publish()`.
-- Domain events (market data, trades, balances)? Always `publish_local()`.
+- Single server? Use `broadcast_all()` or `broadcast_local()`. No Redis needed.
+- Multiple servers behind LB? Add `connect_redis()` + use `broadcast()`.
+- Domain events (market data, trades, balances)? Always `broadcast_local()`.
 - Redis is for orchestration only, never for single-instance message routing.
 
 ## Wire Format

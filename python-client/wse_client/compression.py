@@ -10,7 +10,12 @@ from .constants import COMPRESSION_LEVEL, COMPRESSION_THRESHOLD
 
 
 class CompressionHandler:
-    """zlib compression/decompression matching the server's Rust flate2."""
+    """Zlib compression/decompression, wire-compatible with the server's Rust flate2.
+
+    Args:
+        threshold: Minimum payload size in bytes to compress (default 1024).
+        level: Zlib compression level 1--9 (default 6).
+    """
 
     def __init__(
         self,
