@@ -20,7 +20,7 @@ Building real-time features between React and Python is painful. You need WebSoc
 
 Install `wse-server` on your backend, `wse-client` on your frontend (React or Python). Everything works immediately: auto-reconnection, message encryption, sequence ordering, offline queues, health monitoring. No configuration required for the defaults. Override what you need.
 
-The engine is Rust-accelerated via PyO3. Up to **14M msg/s** JSON, **30M msg/s** compressed — benchmarked on AMD EPYC 7502P (32 cores) with the Rust stress-test client ([results](docs/BENCHMARKS_RUST_CLIENT.md)). Sub-millisecond connection latency (0.38ms median) with Rust JWT authentication.
+The engine is Rust-accelerated via PyO3. **2M msg/s** point-to-point, **2.1M deliveries/s** fan-out broadcast, **500K concurrent connections** with zero message loss -- benchmarked on AMD EPYC 7502P (32 cores). Multi-instance horizontal scaling via Redis pub/sub. Sub-millisecond connection latency with Rust JWT authentication.
 
 ---
 
@@ -141,7 +141,7 @@ Connection quality scoring (excellent / good / fair / poor), latency tracking, j
 
 ### Scaling
 
-Redis pub/sub for multi-process fan-out. Run multiple server workers behind a load balancer. Clients get messages from any worker. Fire-and-forget delivery with sub-millisecond latency.
+Redis pub/sub for multi-instance fan-out. Run N server instances behind a load balancer -- publish on any instance, all subscribers receive the message regardless of which instance they're connected to. Pipelined PUBLISH (up to 64 per round-trip), circuit breaker, exponential backoff with jitter, dead letter queue for failed messages. Capacity scales linearly with instances: tested up to 1.04M deliveries/s per instance.
 
 ### Rust Performance
 
@@ -169,7 +169,8 @@ Compression, sequencing, filtering, rate limiting, and the WebSocket server itse
 | **Snapshot Provider** | Protocol for initial state delivery. Implement `get_snapshot(user_id, topics)` and clients receive current state immediately on subscribe -- no waiting for the next publish cycle. |
 | **Circuit Breaker** | Three-state machine (CLOSED / OPEN / HALF_OPEN). Sliding-window failure tracking. Automatic recovery probes. Prevents cascade failures when downstream services are unhealthy. |
 | **Message Categories** | `S` (snapshot), `U` (update), `WSE` (system). Category prefixing for client-side routing and filtering. |
-| **PubSub Bus** | Redis pub/sub with PSUBSCRIBE pattern matching. orjson fast-path serialization. Custom JSON encoder for UUID, datetime, Decimal. Non-blocking handler invocation. |
+| **Multi-Instance Orchestration** | Horizontal scaling via Redis pub/sub. Publish on any instance, all subscribers receive the message. Pipelined PUBLISH (64 commands/batch, 3 retries), circuit breaker (10-fail threshold, 60s reset), exponential backoff with jitter, dead letter queue (1000-entry ring buffer). 1.04M deliveries/s per instance, linear scaling with N instances. |
+| **PubSub Bus** | Redis pub/sub with PSUBSCRIBE pattern matching. Glob wildcard topic routing (`user:*:events`). orjson fast-path serialization. Non-blocking handler invocation. |
 | **Pluggable Security** | `EncryptionProvider` and `TokenProvider` protocols. Built-in: AES-GCM-256 with ECDH P-256 key exchange, HMAC-SHA256 signing, selective message signing. Rust-accelerated crypto (SHA-256, HMAC, AES-GCM, ECDH). |
 | **Rust JWT Authentication** | HS256 JWT validation in Rust during the WebSocket handshake. Zero GIL acquisition on the connection critical path. 0.01ms decode (85x faster than Python). Cookie extraction and `server_ready` sent from Rust before Python runs. |
 | **Lock-Free Server Queries** | `get_connection_count()` uses `AtomicUsize` — zero GIL, zero blocking, safe to call from async Python handlers. No channel round-trip to the tokio runtime. |
@@ -210,20 +211,9 @@ Compression, sequencing, filtering, rate limiting, and the WebSocket server itse
 
 ## Performance
 
-Rust-accelerated engine via PyO3. Benchmarked on localhost.
+Rust-accelerated engine via PyO3. All numbers below from AMD EPYC 7502P (32 cores, 128 GB).
 
-### Apple M2 (8 cores)
-
-| Metric | Single Client | 10 Workers |
-|--------|--------------|------------|
-| **Sustained throughput (JSON)** | 113,000 msg/s | **356,000 msg/s** |
-| **Sustained throughput (MsgPack)** | 116,000 msg/s | **345,000 msg/s** |
-| **Burst throughput (JSON)** | 106,000 msg/s | **488,000 msg/s** |
-| **Connection latency** | **0.53 ms** median | 2.20 ms median |
-| **Ping RTT** | **0.09 ms** median | 0.18 ms median |
-| **64KB messages** | 43K msg/s (2.7 GB/s) | **164K msg/s (10.2 GB/s)** |
-
-### AMD EPYC 7502P (64 cores, 128 GB)
+### Point-to-Point Throughput
 
 | Metric | 64 Workers | 128 Workers |
 |--------|-----------|-------------|
@@ -234,7 +224,31 @@ Rust-accelerated engine via PyO3. Benchmarked on localhost.
 | **Ping RTT** | 0.26 ms median | 0.41 ms median |
 | **64KB messages** | **256K msg/s (16.0 GB/s)** | 238K msg/s (14.9 GB/s) |
 
-See [BENCHMARKS.md](docs/BENCHMARKS.md) for full results and methodology.
+### Fan-out Broadcast
+
+Server broadcasts to N subscribers. Zero message loss at every tier.
+
+| Subscribers | Deliveries/s | Bandwidth | Gaps |
+|-------------|-------------|-----------|------|
+| 10 | **2.1M** | 295 MB/s | 0 |
+| 1,000 | 1.4M | 185 MB/s | 0 |
+| 10,000 | 1.2M | 163 MB/s | 0 |
+| 100,000 | 1.7M | 234 MB/s | 0 |
+| 500,000 | 1.4M | 128 MB/s | 0 |
+
+### Multi-Instance (Redis)
+
+Two server processes coordinated via Redis pub/sub. Publisher on Server A, subscribers on Server B.
+
+| Subscribers (Server B) | Deliveries/s | Gaps |
+|-------------------------|-------------|------|
+| 10 | 448K | 0 |
+| 500 | **1.04M** | 0 |
+| 5,000 | 778K | 0 |
+
+Capacity scales linearly: 2 instances = ~2M del/s, 3 instances = ~3M del/s.
+
+See [BENCHMARKS.md](docs/BENCHMARKS.md) and [Fan-out Benchmarks](docs/BENCHMARKS_FANOUT.md) for full results and methodology.
 
 ---
 
