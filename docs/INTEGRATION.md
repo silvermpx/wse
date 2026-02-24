@@ -24,7 +24,7 @@ await wse.publish("notifications", {"text": "Hello!"})
 
 ### Standalone Mode (dedicated Rust server)
 
-Run `RustWSEServer` on its own port for maximum throughput. The WebSocket server runs entirely in a Rust tokio runtime — no FastAPI overhead, no GIL on the hot path. This is how WSE achieves 2M msg/s on EPYC.
+Run `RustWSEServer` on its own port for maximum throughput. The WebSocket server runs entirely in a Rust tokio runtime — no FastAPI overhead, no GIL on the hot path. This is how WSE achieves 13M msg/s JSON on EPYC.
 
 ```python
 from wse_server._wse_accel import RustWSEServer
