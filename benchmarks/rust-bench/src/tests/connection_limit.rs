@@ -54,7 +54,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         return results;
     }
 
-    if first_failure > max {
+    if first_failure == max && last_success >= max / 2 {
         println!("\n    All probes succeeded up to max ({}).", max);
         return results;
     }

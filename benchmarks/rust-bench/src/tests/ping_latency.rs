@@ -88,6 +88,7 @@ async fn ping_loop(mut ws: WsStream) -> (LatencyHistogram, WsStream) {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
+        let t0 = tokio::time::Instant::now();
 
         let ping_msg = serde_json::json!({
             "t": "ping",
@@ -107,12 +108,8 @@ async fn ping_loop(mut ws: WsStream) -> (LatencyHistogram, WsStream) {
         while let Ok(Some(Ok(msg))) = tokio::time::timeout_at(deadline, ws.next()).await {
             if let Some(parsed) = protocol::parse_wse_message(&msg) {
                 if protocol::is_pong(&parsed) {
-                    let actual_rtt = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as u64;
-                    let rtt = actual_rtt.saturating_sub(now_ms) as f64;
-                    hist.record_ms(rtt);
+                    let rtt_us = t0.elapsed().as_micros() as u64;
+                    hist.record_us(rtt_us.max(1));
                     break;
                 }
             }

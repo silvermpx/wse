@@ -283,15 +283,15 @@ pub async fn connect_batch(
 
             if use_multi_ip {
                 // Distribute connections across 127.0.0.X source IPs
-                let ip_idx = (conn_idx / PORTS_PER_IP) as u8 + 1; // 1, 2, 3, ...
-                let source_ip: SocketAddr =
-                    format!("127.0.0.{}:0", ip_idx).parse().unwrap();
+                let ip_idx = (conn_idx / PORTS_PER_IP) + 1; // 1, 2, 3, ...
+                assert!(
+                    ip_idx <= 254,
+                    "exceeded 127.0.0.254 — too many connections for loopback"
+                );
+                let source_ip: SocketAddr = format!("127.0.0.{}:0", ip_idx).parse().unwrap();
                 conn_idx += 1;
                 handles.push(tokio::spawn(async move {
-                    connect_and_handshake_from(
-                        &host, port, &token, &params, source_ip, 15,
-                    )
-                    .await
+                    connect_and_handshake_from(&host, port, &token, &params, source_ip, 15).await
                 }));
             } else {
                 handles.push(tokio::spawn(async move {
