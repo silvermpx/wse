@@ -183,7 +183,7 @@ listener_task()    ← outer loop (reconnects with backoff)
     └── Reset backoff on successful connection
 ```
 
-**Config (matches Python PubSubBus):**
+**Config:**
 - Initial delay: 1s
 - Multiplier: 1.5x
 - Max delay: 60s
@@ -237,20 +237,6 @@ All metrics are lock-free `AtomicU64` counters:
 | `publish_errors` | Failed PUBLISH after all retries |
 | `reconnect_count` | Redis reconnection attempts |
 | `connected` | Current connection status (bool) |
-
-## Integration Pattern (SQV)
-
-Current SQV uses Python publishers. Migration path to Rust pub/sub:
-
-```python
-# Before (Python PubSubBus):
-await pubsub_bus.publish("wse:user:123:balance", json.dumps(payload))
-
-# After (Rust server):
-server.publish("user:123:balance", json.dumps(payload))
-```
-
-Domain publishers call `server.publish()` instead of `pubsub_bus.publish()`. The `wse:` prefix is added automatically by the Rust server.
 
 ## API Methods
 
