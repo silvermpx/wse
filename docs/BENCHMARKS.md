@@ -7,7 +7,7 @@ Each client has its own detailed results page.
 
 | Client | Language | Max Connections Tested | Peak Throughput | Details |
 |--------|----------|----------------------|-----------------|---------|
-| **wse-bench** | Rust (tokio) | **500,000** | **20.5M msg/s** | [Rust Client Results](BENCHMARKS_RUST_CLIENT.md) |
+| **wse-bench** | Rust (tokio) | **500,000** | **30M msg/s** | [Rust Client Results](BENCHMARKS_RUST_CLIENT.md) |
 | **bench_brutal.py** | Python (sync) | 1,000 | 6.9M msg/s | [Python Client Results](BENCHMARKS_PYTHON_CLIENT.md) |
 | **bench_multiprocess.py** | Python (multi-proc) | 128 | 2.1M msg/s | [Python Client Results](BENCHMARKS_PYTHON_CLIENT.md) |
 
@@ -32,13 +32,13 @@ full Python wrapper with drain_mode, JWT auth, the whole stack.
 
 | Metric | Value | Source |
 |--------|-------|--------|
-| Peak throughput (JSON) | **13.5M msg/s** (2.4 GB/s) | Rust client, 100 conns |
-| Peak throughput (compressed) | **20.5M msg/s** | Rust client, 500 conns |
+| Peak throughput (JSON) | **14.2M msg/s** (2.5 GB/s) | Rust client, 500 conns |
+| Peak throughput (binary) | **30M msg/s** | Rust client, 100 conns |
 | Peak message rate | **19.4M msg/s** | Rust client, 64B payload |
-| Throughput at 100K conns | **9.1M msg/s** (1.6 GB/s) | Rust client |
+| Throughput at 50K conns | **13.8M msg/s** (2.4 GB/s) | Rust client |
 | Max concurrent connections | **500,000** (0 errors) | Rust client |
 | Connection accept rate | **15,020 conn/s** | Rust client, 2K tier |
-| Ping RTT at low load | **1 ms** p50 | Rust client, 100 conns |
+| Ping RTT at low load | **0.38 ms** p50 | Rust client, 100 conns |
 | Peak bandwidth | **19.9 GB/s** | Rust client, 16KB msgs |
 | Sustained hold (100K conns, 30s) | **100% survival** | Rust client |
 | drain_mode overhead | **< 2%** | Python client comparison |

@@ -20,7 +20,7 @@ Building real-time features between React and Python is painful. You need WebSoc
 
 Install `wse-server` on your backend, `wse-client` on your frontend (React or Python). Everything works immediately: auto-reconnection, message encryption, sequence ordering, offline queues, health monitoring. No configuration required for the defaults. Override what you need.
 
-The engine is Rust-accelerated via PyO3. Up to **13M msg/s** JSON, **20M msg/s** compressed — benchmarked on AMD EPYC 7502P (32 cores) with the Rust stress-test client ([results](docs/BENCHMARKS_RUST_CLIENT.md)). Sub-millisecond connection latency (0.53ms median) with Rust JWT authentication.
+The engine is Rust-accelerated via PyO3. Up to **14M msg/s** JSON, **30M msg/s** compressed — benchmarked on AMD EPYC 7502P (32 cores) with the Rust stress-test client ([results](docs/BENCHMARKS_RUST_CLIENT.md)). Sub-millisecond connection latency (0.38ms median) with Rust JWT authentication.
 
 ---
 
@@ -69,7 +69,7 @@ while True:
         handle(event)
 ```
 
-Standalone mode gives you a dedicated Rust tokio runtime on its own port -- no FastAPI overhead, no GIL on the hot path. This is how WSE achieves 13M msg/s on JSON.
+Standalone mode gives you a dedicated Rust tokio runtime on its own port -- no FastAPI overhead, no GIL on the hot path. This is how WSE achieves 14M msg/s on JSON.
 
 ### Client (React)
 
