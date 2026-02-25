@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,7 +10,7 @@ use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::reliability::{CircuitBreaker, ExponentialBackoff};
@@ -295,18 +295,15 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
 // Fan-out dispatch (delegates to parallel fan-out helpers in server.rs)
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn cluster_dispatch(
-    connections: &RwLock<HashMap<String, ConnectionHandle>>,
+pub(crate) fn cluster_dispatch(
+    connections: &DashMap<String, ConnectionHandle>,
     topic_subscribers: &DashMap<String, DashSet<String>>,
     topic: &str,
     payload: &str,
     metrics: &Arc<ClusterMetrics>,
 ) {
     let frame = super::server::WsFrame::PreFramed(super::server::pre_frame_text(payload));
-    let senders = {
-        let conns = connections.read().await;
-        super::server::collect_topic_senders(&conns, topic_subscribers, topic)
-    };
+    let senders = super::server::collect_topic_senders(connections, topic_subscribers, topic);
     super::server::fanout_to_senders_with_metrics(senders, frame, metrics);
 }
 
@@ -357,7 +354,7 @@ async fn peer_writer(
 async fn peer_reader(
     mut reader: OwnedReadHalf,
     peer_write_tx: mpsc::Sender<BytesMut>,
-    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
+    connections: Arc<DashMap<String, ConnectionHandle>>,
     topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
     cancel: CancellationToken,
     metrics: Arc<ClusterMetrics>,
@@ -401,8 +398,7 @@ async fn peer_reader(
                 if let Ok(mut t) = last_activity.lock() {
                     *t = Instant::now();
                 }
-                cluster_dispatch(&connections, &topic_subscribers, &topic, &payload, &metrics)
-                    .await;
+                cluster_dispatch(&connections, &topic_subscribers, &topic, &payload, &metrics);
             }
             Some(ClusterFrame::Ping) => {
                 if let Ok(mut t) = last_activity.lock() {
@@ -472,7 +468,7 @@ async fn peer_connection_task(
     peer_addr: String,
     instance_id: String,
     mut data_rx: mpsc::Receiver<BytesMut>,
-    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
+    connections: Arc<DashMap<String, ConnectionHandle>>,
     topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
     metrics: Arc<ClusterMetrics>,
     global_cancel: CancellationToken,
@@ -688,7 +684,7 @@ pub(crate) async fn cluster_manager(
     peers: Vec<String>,
     instance_id: String,
     mut cmd_rx: mpsc::Receiver<ClusterCommand>,
-    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
+    connections: Arc<DashMap<String, ConnectionHandle>>,
     topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
     metrics: Arc<ClusterMetrics>,
     dlq: Arc<std::sync::Mutex<ClusterDlq>>,

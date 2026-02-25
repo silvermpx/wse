@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -7,7 +7,7 @@ use super::reliability::{CircuitBreaker, ExponentialBackoff};
 use super::server::ConnectionHandle;
 use dashmap::{DashMap, DashSet};
 use futures_util::StreamExt;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -130,18 +130,15 @@ pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
 // Fan-out dispatch
 // ---------------------------------------------------------------------------
 
-async fn dispatch_to_subscribers(
-    connections: &RwLock<HashMap<String, ConnectionHandle>>,
+fn dispatch_to_subscribers(
+    connections: &DashMap<String, ConnectionHandle>,
     topic_subscribers: &DashMap<String, DashSet<String>>,
     topic: &str,
     payload: &str,
     metrics: &Arc<RedisMetrics>,
 ) {
     let frame = super::server::WsFrame::PreFramed(super::server::pre_frame_text(payload));
-    let senders = {
-        let conns = connections.read().await;
-        super::server::collect_topic_senders(&conns, topic_subscribers, topic)
-    };
+    let senders = super::server::collect_topic_senders(connections, topic_subscribers, topic);
     super::server::fanout_to_senders_with_metrics(senders, frame, metrics);
 }
 
@@ -209,7 +206,7 @@ enum RunOutcome {
 
 async fn connect_and_run(
     url: &str,
-    connections: &RwLock<HashMap<String, ConnectionHandle>>,
+    connections: &DashMap<String, ConnectionHandle>,
     topic_subscribers: &DashMap<String, DashSet<String>>,
     cmd_rx: &mut mpsc::UnboundedReceiver<RedisCommand>,
     metrics: &Arc<RedisMetrics>,
@@ -315,8 +312,7 @@ async fn connect_and_run(
                             topic,
                             &payload,
                             sub_metrics,
-                        )
-                        .await;
+                        );
                     }
                 }
                 None => {
@@ -359,7 +355,7 @@ async fn connect_and_run(
 
 pub(crate) async fn listener_task(
     url: String,
-    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
+    connections: Arc<DashMap<String, ConnectionHandle>>,
     topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
     mut cmd_rx: mpsc::UnboundedReceiver<RedisCommand>,
     metrics: Arc<RedisMetrics>,
