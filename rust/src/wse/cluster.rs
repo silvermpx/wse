@@ -11,7 +11,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{RwLock, mpsc};
-use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_util::sync::CancellationToken;
 
 use super::reliability::{CircuitBreaker, ExponentialBackoff};
@@ -303,12 +302,12 @@ pub(crate) async fn cluster_dispatch(
     payload: &str,
     metrics: &Arc<ClusterMetrics>,
 ) {
-    let msg = Message::Text(payload.to_owned().into());
+    let frame = super::server::WsFrame::PreFramed(super::server::pre_frame_text(payload));
     let senders = {
         let conns = connections.read().await;
         super::server::collect_topic_senders(&conns, topic_subscribers, topic)
     };
-    super::server::fanout_to_senders_with_metrics(senders, msg, metrics);
+    super::server::fanout_to_senders_with_metrics(senders, frame, metrics);
 }
 
 // ---------------------------------------------------------------------------

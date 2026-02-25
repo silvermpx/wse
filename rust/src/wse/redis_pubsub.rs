@@ -3,13 +3,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use super::reliability::{CircuitBreaker, ExponentialBackoff};
+use super::server::ConnectionHandle;
 use dashmap::{DashMap, DashSet};
 use futures_util::StreamExt;
 use tokio::sync::{RwLock, mpsc};
-use tokio_tungstenite::tungstenite::protocol::Message;
-
-use super::reliability::{CircuitBreaker, ExponentialBackoff};
-use super::server::ConnectionHandle;
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -139,12 +137,12 @@ async fn dispatch_to_subscribers(
     payload: &str,
     metrics: &Arc<RedisMetrics>,
 ) {
-    let msg = Message::Text(payload.to_owned().into());
+    let frame = super::server::WsFrame::PreFramed(super::server::pre_frame_text(payload));
     let senders = {
         let conns = connections.read().await;
         super::server::collect_topic_senders(&conns, topic_subscribers, topic)
     };
-    super::server::fanout_to_senders_with_metrics(senders, msg, metrics);
+    super::server::fanout_to_senders_with_metrics(senders, frame, metrics);
 }
 
 // ---------------------------------------------------------------------------

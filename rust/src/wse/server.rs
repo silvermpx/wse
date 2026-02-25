@@ -22,6 +22,7 @@ use super::compression::{rmpv_to_serde_json, serde_json_to_rmpv};
 use super::redis_pubsub::{DeadLetterQueue, RedisCommand, RedisMetrics};
 use crate::jwt::{self, JwtConfig, parse_cookie_value};
 use ahash::AHashSet;
+use bytes::{BufMut, Bytes, BytesMut};
 use crossbeam_channel::{Receiver as CBReceiver, Sender as CBSender, bounded};
 use dashmap::{DashMap, DashSet};
 use flate2::Compression;
@@ -30,6 +31,7 @@ use futures_util::{SinkExt, StreamExt};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
 use tokio::sync::{RwLock, mpsc, oneshot};
@@ -41,8 +43,67 @@ use uuid::Uuid;
 // Internal types
 // ---------------------------------------------------------------------------
 
+/// Frame types sent through per-connection channels.
+/// `Msg` goes through tungstenite's framing pipeline (per-connection sends, control frames).
+/// `PreFramed` contains complete WebSocket wire bytes that bypass tungstenite entirely
+/// (broadcasts -- constructed once, sent to all connections).
+#[derive(Clone)]
+pub(crate) enum WsFrame {
+    Msg(Message),
+    PreFramed(Bytes),
+}
+
 pub(crate) struct ConnectionHandle {
-    pub(crate) tx: mpsc::UnboundedSender<Message>,
+    pub(crate) tx: mpsc::UnboundedSender<WsFrame>,
+}
+
+// ---------------------------------------------------------------------------
+// Pre-framed WebSocket encoding (server-to-client, no masking per RFC 6455)
+// ---------------------------------------------------------------------------
+
+/// Encode a complete WebSocket frame: header + payload.
+/// Server-to-client frames are NOT masked, so all connections receive identical bytes.
+fn encode_ws_frame(opcode: u8, payload: &[u8]) -> Bytes {
+    let len = payload.len();
+    let header_len = if len < 126 {
+        2
+    } else if len < 65536 {
+        4
+    } else {
+        10
+    };
+    let mut buf = BytesMut::with_capacity(header_len + len);
+    buf.put_u8(0x80 | opcode); // FIN=1 + opcode
+    if len < 126 {
+        buf.put_u8(len as u8);
+    } else if len < 65536 {
+        buf.put_u8(126);
+        buf.put_u16(len as u16);
+    } else {
+        buf.put_u8(127);
+        buf.put_u64(len as u64);
+    }
+    buf.extend_from_slice(payload);
+    buf.freeze()
+}
+
+pub(crate) fn pre_frame_text(data: &str) -> Bytes {
+    encode_ws_frame(0x01, data.as_bytes())
+}
+
+pub(crate) fn pre_frame_binary(data: &[u8]) -> Bytes {
+    encode_ws_frame(0x02, data)
+}
+
+/// Clone a TcpStream by duplicating the file descriptor.
+/// Returns (original, clone) -- both refer to the same socket.
+fn clone_tcp_stream(stream: TcpStream) -> std::io::Result<(TcpStream, TcpStream)> {
+    let std_stream = stream.into_std()?;
+    let std_clone = std_stream.try_clone()?;
+    Ok((
+        TcpStream::from_std(std_stream)?,
+        TcpStream::from_std(std_clone)?,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +477,15 @@ fn build_server_ready(conn_id: &str, user_id: &str) -> String {
 // ---------------------------------------------------------------------------
 
 async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<SharedState>) {
+    // Clone the TCP stream FD for pre-framed raw writes (bypasses tungstenite).
+    let (stream, raw_write) = match clone_tcp_stream(stream) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("[WSE] Failed to clone TCP stream for {addr}: {e}");
+            return;
+        }
+    };
+
     // Lock-free handshake: OnceLock captures cookie + format in the callback
     struct HandshakeResult {
         cookies: String,
@@ -475,7 +545,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     let (write_half, read_half) = ws_stream.split();
     let mut read_half = read_half;
     let mut write_half = write_half;
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    let mut raw_write = raw_write;
+    let (tx, mut rx) = mpsc::unbounded_channel::<WsFrame>();
     let drain = state.drain_mode.load(Ordering::Relaxed);
 
     // ── JWT validation in Rust (zero GIL) ──────────────────────────────────
@@ -500,11 +571,13 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                         Some(user_id.to_string())
                     } else {
                         let err = build_error_json("AUTH_FAILED", "Token missing user ID");
-                        let _ = tx.send(Message::Text(err.into()));
-                        let _ = tx.send(Message::Close(None));
+                        let _ = tx.send(WsFrame::Msg(Message::Text(err.into())));
+                        let _ = tx.send(WsFrame::Msg(Message::Close(None)));
                         let write_task = tokio::spawn(async move {
-                            while let Some(msg) = rx.recv().await {
-                                if write_half.feed(msg).await.is_err() {
+                            while let Some(frame) = rx.recv().await {
+                                if let WsFrame::Msg(msg) = frame
+                                    && write_half.feed(msg).await.is_err()
+                                {
                                     break;
                                 }
                             }
@@ -517,11 +590,13 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                 }
                 Err(e) => {
                     let err = build_error_json("AUTH_FAILED", &format!("{e}"));
-                    let _ = tx.send(Message::Text(err.into()));
-                    let _ = tx.send(Message::Close(None));
+                    let _ = tx.send(WsFrame::Msg(Message::Text(err.into())));
+                    let _ = tx.send(WsFrame::Msg(Message::Close(None)));
                     let write_task = tokio::spawn(async move {
-                        while let Some(msg) = rx.recv().await {
-                            if write_half.feed(msg).await.is_err() {
+                        while let Some(frame) = rx.recv().await {
+                            if let WsFrame::Msg(msg) = frame
+                                && write_half.feed(msg).await.is_err()
+                            {
                                 break;
                             }
                         }
@@ -537,11 +612,13 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                     "AUTH_REQUIRED",
                     "No access_token cookie or Authorization header",
                 );
-                let _ = tx.send(Message::Text(err.into()));
-                let _ = tx.send(Message::Close(None));
+                let _ = tx.send(WsFrame::Msg(Message::Text(err.into())));
+                let _ = tx.send(WsFrame::Msg(Message::Close(None)));
                 let write_task = tokio::spawn(async move {
-                    while let Some(msg) = rx.recv().await {
-                        if write_half.feed(msg).await.is_err() {
+                    while let Some(frame) = rx.recv().await {
+                        if let WsFrame::Msg(msg) = frame
+                            && write_half.feed(msg).await.is_err()
+                        {
                             break;
                         }
                     }
@@ -575,7 +652,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     // If Rust validated JWT, send server_ready IMMEDIATELY (zero GIL)
     if let Some(ref user_id) = rust_auth_user_id {
         let server_ready = build_server_ready(&conn_id, user_id);
-        let _ = tx.send(Message::Text(server_ready.into()));
+        let _ = tx.send(WsFrame::Msg(Message::Text(server_ready.into())));
     }
 
     // Fire on_connect (drain mode: push to queue; callback mode: background task)
@@ -607,23 +684,58 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         }
     }
 
-    // Write task with coalescing
+    // Write task with coalescing + pre-framed broadcast support.
+    // `write_half` handles tungstenite Messages (per-connection sends, control frames).
+    // `raw_write` handles pre-framed bytes (broadcasts) written directly to TCP.
     let write_task = tokio::spawn(async move {
         loop {
-            let msg = match rx.recv().await {
-                Some(m) => m,
+            let frame = match rx.recv().await {
+                Some(f) => f,
                 None => break,
             };
-            if write_half.feed(msg).await.is_err() {
-                break;
+
+            let mut tung_dirty = false;
+            let mut ok = true;
+
+            // Process first frame
+            match frame {
+                WsFrame::Msg(msg) => {
+                    if write_half.feed(msg).await.is_err() {
+                        break;
+                    }
+                    tung_dirty = true;
+                }
+                WsFrame::PreFramed(bytes) => {
+                    // tungstenite buffer is clean at start of batch
+                    if raw_write.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                }
             }
-            let mut feed_ok = true;
+
+            // Coalescing: drain pending frames
             let mut count = 1u32;
-            while count < 64 {
+            while ok && count < 64 {
                 match rx.try_recv() {
-                    Ok(msg) => {
+                    Ok(WsFrame::Msg(msg)) => {
                         if write_half.feed(msg).await.is_err() {
-                            feed_ok = false;
+                            ok = false;
+                            break;
+                        }
+                        tung_dirty = true;
+                        count += 1;
+                    }
+                    Ok(WsFrame::PreFramed(bytes)) => {
+                        // Must flush tungstenite before raw write
+                        if tung_dirty {
+                            if write_half.flush().await.is_err() {
+                                ok = false;
+                                break;
+                            }
+                            tung_dirty = false;
+                        }
+                        if raw_write.write_all(&bytes).await.is_err() {
+                            ok = false;
                             break;
                         }
                         count += 1;
@@ -631,7 +743,15 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                     Err(_) => break,
                 }
             }
-            if !feed_ok || write_half.flush().await.is_err() {
+
+            if !ok {
+                break;
+            }
+            // Final flush: tungstenite if dirty, raw_write always (ensure TCP send)
+            if tung_dirty && write_half.flush().await.is_err() {
+                break;
+            }
+            if raw_write.flush().await.is_err() {
                 break;
             }
         }
@@ -705,7 +825,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                     server_ts,
                                     server_ts.saturating_sub(timestamp).max(0)
                                 );
-                                let _ = tx.send(Message::Text(pong.into()));
+                                let _ = tx.send(WsFrame::Msg(Message::Text(pong.into())));
                                 continue;
                             }
                             if t_val == "pong" || t_val == "PONG" {
@@ -829,7 +949,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                 }
             }
             Message::Ping(payload) => {
-                let _ = tx.send(Message::Pong(payload));
+                let _ = tx.send(WsFrame::Msg(Message::Pong(payload)));
             }
             Message::Close(_) => break,
             Message::Pong(_) | Message::Frame(_) => {}
@@ -889,7 +1009,7 @@ pub(crate) fn collect_topic_senders(
     conns: &HashMap<String, ConnectionHandle>,
     topic_subscribers: &DashMap<String, DashSet<String>>,
     topic: &str,
-) -> Vec<mpsc::UnboundedSender<Message>> {
+) -> Vec<mpsc::UnboundedSender<WsFrame>> {
     let mut seen = AHashSet::new();
     let mut senders = Vec::new();
 
@@ -928,27 +1048,27 @@ pub(crate) fn collect_topic_senders(
 
 /// Fan-out a pre-built message to collected sender handles.
 /// Parallel when above threshold, sequential otherwise.
-fn fanout_to_senders(senders: Vec<mpsc::UnboundedSender<Message>>, msg: Message) {
+fn fanout_to_senders(senders: Vec<mpsc::UnboundedSender<WsFrame>>, frame: WsFrame) {
     let n = senders.len();
     if n == 0 {
         return;
     }
     if n < PARALLEL_FANOUT_THRESHOLD {
         for tx in &senders {
-            let _ = tx.send(msg.clone());
+            let _ = tx.send(frame.clone());
         }
     } else {
         let mut iter = senders.into_iter();
         loop {
-            let chunk: Vec<mpsc::UnboundedSender<Message>> =
+            let chunk: Vec<mpsc::UnboundedSender<WsFrame>> =
                 iter.by_ref().take(FANOUT_CHUNK_SIZE).collect();
             if chunk.is_empty() {
                 break;
             }
-            let chunk_msg = msg.clone();
+            let chunk_frame = frame.clone();
             tokio::spawn(async move {
                 for tx in &chunk {
-                    let _ = tx.send(chunk_msg.clone());
+                    let _ = tx.send(chunk_frame.clone());
                 }
             });
         }
@@ -965,8 +1085,8 @@ pub(crate) trait FanoutMetrics: Send + Sync + 'static {
 /// Takes Arc<M> where M implements FanoutMetrics, enabling spawned tasks
 /// to update metrics with 'static lifetime.
 pub(crate) fn fanout_to_senders_with_metrics<M: FanoutMetrics>(
-    senders: Vec<mpsc::UnboundedSender<Message>>,
-    msg: Message,
+    senders: Vec<mpsc::UnboundedSender<WsFrame>>,
+    frame: WsFrame,
     metrics: &Arc<M>,
 ) {
     let n = senders.len();
@@ -977,7 +1097,7 @@ pub(crate) fn fanout_to_senders_with_metrics<M: FanoutMetrics>(
         let mut d = 0u64;
         let mut f = 0u64;
         for tx in &senders {
-            if tx.send(msg.clone()).is_ok() {
+            if tx.send(frame.clone()).is_ok() {
                 d += 1;
             } else {
                 f += 1;
@@ -990,18 +1110,18 @@ pub(crate) fn fanout_to_senders_with_metrics<M: FanoutMetrics>(
     } else {
         let mut iter = senders.into_iter();
         loop {
-            let chunk: Vec<mpsc::UnboundedSender<Message>> =
+            let chunk: Vec<mpsc::UnboundedSender<WsFrame>> =
                 iter.by_ref().take(FANOUT_CHUNK_SIZE).collect();
             if chunk.is_empty() {
                 break;
             }
-            let chunk_msg = msg.clone();
+            let chunk_frame = frame.clone();
             let m = metrics.clone();
             tokio::spawn(async move {
                 let mut d = 0u64;
                 let mut f = 0u64;
                 for tx in &chunk {
-                    if tx.send(chunk_msg.clone()).is_ok() {
+                    if tx.send(chunk_frame.clone()).is_ok() {
                         d += 1;
                     } else {
                         f += 1;
@@ -1029,49 +1149,49 @@ async fn process_commands(
             ServerCommand::SendText { conn_id, data } => {
                 let conns = state.connections.read().await;
                 if let Some(h) = conns.get(&conn_id) {
-                    let _ = h.tx.send(Message::Text(data.into()));
+                    let _ = h.tx.send(WsFrame::Msg(Message::Text(data.into())));
                 }
             }
             ServerCommand::SendBytes { conn_id, data } => {
                 let conns = state.connections.read().await;
                 if let Some(h) = conns.get(&conn_id) {
-                    let _ = h.tx.send(Message::Binary(data.into()));
+                    let _ = h.tx.send(WsFrame::Msg(Message::Binary(data.into())));
                 }
             }
             ServerCommand::SendPrebuilt { conn_id, message } => {
                 let conns = state.connections.read().await;
                 if let Some(h) = conns.get(&conn_id) {
-                    let _ = h.tx.send(message);
+                    let _ = h.tx.send(WsFrame::Msg(message));
                 }
             }
             ServerCommand::BroadcastText { data } => {
-                let msg = Message::Text(data.into());
-                let senders: Vec<mpsc::UnboundedSender<Message>> = {
+                let frame = WsFrame::PreFramed(pre_frame_text(&data));
+                let senders: Vec<mpsc::UnboundedSender<WsFrame>> = {
                     let conns = state.connections.read().await;
                     conns.values().map(|h| h.tx.clone()).collect()
                 };
-                fanout_to_senders(senders, msg);
+                fanout_to_senders(senders, frame);
             }
             ServerCommand::BroadcastBytes { data } => {
-                let msg = Message::Binary(data.into());
-                let senders: Vec<mpsc::UnboundedSender<Message>> = {
+                let frame = WsFrame::PreFramed(pre_frame_binary(&data));
+                let senders: Vec<mpsc::UnboundedSender<WsFrame>> = {
                     let conns = state.connections.read().await;
                     conns.values().map(|h| h.tx.clone()).collect()
                 };
-                fanout_to_senders(senders, msg);
+                fanout_to_senders(senders, frame);
             }
             ServerCommand::BroadcastLocal { topic, data } => {
-                let msg = Message::Text(data.into());
+                let frame = WsFrame::PreFramed(pre_frame_text(&data));
                 let senders = {
                     let conns = state.connections.read().await;
                     collect_topic_senders(&conns, &state.topic_subscribers, &topic)
                 };
-                fanout_to_senders(senders, msg);
+                fanout_to_senders(senders, frame);
             }
             ServerCommand::Disconnect { conn_id } => {
                 let conns = state.connections.read().await;
                 if let Some(h) = conns.get(&conn_id) {
-                    let _ = h.tx.send(Message::Close(None));
+                    let _ = h.tx.send(WsFrame::Msg(Message::Close(None)));
                 }
             }
             ServerCommand::GetConnections { reply } => {
@@ -1081,7 +1201,7 @@ async fn process_commands(
             ServerCommand::Shutdown => {
                 let conns = state.connections.read().await;
                 for h in conns.values() {
-                    let _ = h.tx.send(Message::Close(None));
+                    let _ = h.tx.send(WsFrame::Msg(Message::Close(None)));
                 }
                 break;
             }
@@ -2012,5 +2132,64 @@ impl RustWSEServer {
             list.append(d)?;
         }
         Ok(list.unbind())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_ws_frame_small() {
+        // Text frame, 5-byte payload "hello"
+        let frame = encode_ws_frame(0x01, b"hello");
+        assert_eq!(frame[0], 0x81); // FIN=1 + opcode=text
+        assert_eq!(frame[1], 5); // payload length
+        assert_eq!(&frame[2..], b"hello");
+        assert_eq!(frame.len(), 7); // 2-byte header + 5 payload
+    }
+
+    #[test]
+    fn test_encode_ws_frame_medium() {
+        // 200-byte payload (uses 2-byte extended length)
+        let data = vec![0x42u8; 200];
+        let frame = encode_ws_frame(0x02, &data);
+        assert_eq!(frame[0], 0x82); // FIN=1 + opcode=binary
+        assert_eq!(frame[1], 126); // extended 16-bit length marker
+        assert_eq!(u16::from_be_bytes([frame[2], frame[3]]), 200);
+        assert_eq!(&frame[4..], &data[..]);
+        assert_eq!(frame.len(), 204); // 4-byte header + 200 payload
+    }
+
+    #[test]
+    fn test_encode_ws_frame_large() {
+        // 70000-byte payload (uses 8-byte extended length)
+        let data = vec![0xAA; 70000];
+        let frame = encode_ws_frame(0x01, &data);
+        assert_eq!(frame[0], 0x81);
+        assert_eq!(frame[1], 127); // extended 64-bit length marker
+        let len = u64::from_be_bytes(frame[2..10].try_into().unwrap());
+        assert_eq!(len, 70000);
+        assert_eq!(frame.len(), 10 + 70000);
+    }
+
+    #[test]
+    fn test_pre_frame_text() {
+        let frame = pre_frame_text("hi");
+        assert_eq!(frame[0], 0x81); // text opcode
+        assert_eq!(frame[1], 2);
+        assert_eq!(&frame[2..], b"hi");
+    }
+
+    #[test]
+    fn test_pre_frame_binary() {
+        let frame = pre_frame_binary(&[1, 2, 3]);
+        assert_eq!(frame[0], 0x82); // binary opcode
+        assert_eq!(frame[1], 3);
+        assert_eq!(&frame[2..], &[1, 2, 3]);
     }
 }
