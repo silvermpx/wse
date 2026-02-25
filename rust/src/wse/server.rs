@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use super::cluster::{ClusterCommand, ClusterDlq, ClusterMetrics};
 use super::compression::{rmpv_to_serde_json, serde_json_to_rmpv};
 use super::redis_pubsub::{DeadLetterQueue, RedisCommand, RedisMetrics};
 use crate::jwt::{self, JwtConfig, parse_cookie_value};
@@ -134,6 +135,10 @@ struct SharedState {
     redis_cmd_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<RedisCommand>>>,
     redis_metrics: Arc<RedisMetrics>,
     redis_dlq: Arc<std::sync::Mutex<DeadLetterQueue>>,
+    // Cluster protocol
+    cluster_cmd_tx: std::sync::Mutex<Option<mpsc::Sender<ClusterCommand>>>,
+    cluster_metrics: Arc<ClusterMetrics>,
+    cluster_dlq: Arc<std::sync::Mutex<ClusterDlq>>,
 }
 
 unsafe impl Send for SharedState {}
@@ -166,6 +171,9 @@ impl SharedState {
             redis_cmd_tx: std::sync::Mutex::new(None),
             redis_metrics: Arc::new(RedisMetrics::new()),
             redis_dlq: Arc::new(std::sync::Mutex::new(DeadLetterQueue::new(1000))),
+            cluster_cmd_tx: std::sync::Mutex::new(None),
+            cluster_metrics: Arc::new(ClusterMetrics::new()),
+            cluster_dlq: Arc::new(std::sync::Mutex::new(ClusterDlq::new(1000))),
         }
     }
 
@@ -962,7 +970,7 @@ pub struct RustWSEServer {
     thread_handle: Option<thread::JoinHandle<()>>,
     running: Arc<AtomicBool>,
     dedup: Arc<std::sync::Mutex<DeduplicationState>>,
-    redis_rt_handle: Option<tokio::runtime::Handle>,
+    rt_handle: Option<tokio::runtime::Handle>,
     started_at: Option<std::time::Instant>,
 }
 
@@ -1007,7 +1015,7 @@ impl RustWSEServer {
                 queue: std::collections::VecDeque::with_capacity(50_000),
                 max_entries: 50_000,
             })),
-            redis_rt_handle: None,
+            rt_handle: None,
             started_at: None,
         }
     }
@@ -1100,7 +1108,7 @@ impl RustWSEServer {
             })
             .map_err(|e| PyRuntimeError::new_err(format!("Spawn error: {e}")))?;
         self.thread_handle = Some(handle);
-        self.redis_rt_handle = rt_handle_rx.recv().ok();
+        self.rt_handle = rt_handle_rx.recv().ok();
         self.started_at = Some(std::time::Instant::now());
         Ok(())
     }
@@ -1109,6 +1117,13 @@ impl RustWSEServer {
         if !self.running.load(Ordering::SeqCst) {
             return Ok(());
         }
+        // Shutdown cluster
+        if let Ok(guard) = self.shared.cluster_cmd_tx.lock()
+            && let Some(ref tx) = *guard
+        {
+            let _ = tx.try_send(ClusterCommand::Shutdown);
+        }
+        // Shutdown Redis
         if let Ok(guard) = self.shared.redis_cmd_tx.lock()
             && let Some(ref tx) = *guard
         {
@@ -1518,8 +1533,14 @@ impl RustWSEServer {
     // -- Redis Pub/Sub --------------------------------------------------------
 
     fn connect_redis(&self, url: String) -> PyResult<()> {
+        // Mutual exclusion: error if cluster is connected
+        if self.shared.cluster_cmd_tx.lock().unwrap().is_some() {
+            return Err(PyRuntimeError::new_err(
+                "Cannot connect Redis: Cluster is already connected. Use one backend at a time.",
+            ));
+        }
         let rt_handle = self
-            .redis_rt_handle
+            .rt_handle
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Server not started"))?;
 
@@ -1540,6 +1561,63 @@ impl RustWSEServer {
         ));
         Ok(())
     }
+
+    // -- Cluster Protocol -----------------------------------------------------
+
+    fn connect_cluster(&self, peers: Vec<String>) -> PyResult<()> {
+        // Mutual exclusion: error if Redis is connected
+        if self.shared.redis_cmd_tx.lock().unwrap().is_some() {
+            return Err(PyRuntimeError::new_err(
+                "Cannot connect cluster: Redis is already connected. Use one backend at a time.",
+            ));
+        }
+        if self.shared.cluster_cmd_tx.lock().unwrap().is_some() {
+            return Err(PyRuntimeError::new_err("Cluster already connected"));
+        }
+
+        let rt_handle = self
+            .rt_handle
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Server not started"))?;
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ClusterCommand>(131072);
+        *self.shared.cluster_cmd_tx.lock().unwrap() = Some(cmd_tx);
+
+        let instance_id = uuid::Uuid::now_v7().to_string();
+        let connections = self.shared.connections.clone();
+        let topic_subscribers = self.shared.topic_subscribers.clone();
+        let metrics = self.shared.cluster_metrics.clone();
+        let dlq = self.shared.cluster_dlq.clone();
+
+        rt_handle.spawn(super::cluster::cluster_manager(
+            peers,
+            instance_id,
+            cmd_rx,
+            connections,
+            topic_subscribers,
+            metrics,
+            dlq,
+        ));
+
+        Ok(())
+    }
+
+    fn cluster_connected(&self) -> bool {
+        self.shared
+            .cluster_metrics
+            .connected_peers
+            .load(Ordering::Relaxed)
+            > 0
+    }
+
+    fn cluster_peers_count(&self) -> u64 {
+        self.shared
+            .cluster_metrics
+            .connected_peers
+            .load(Ordering::Relaxed)
+    }
+
+    // -- Topic subscriptions --------------------------------------------------
 
     fn subscribe_connection(&self, conn_id: &str, topics: Vec<String>) -> PyResult<()> {
         for topic in &topics {
@@ -1606,16 +1684,29 @@ impl RustWSEServer {
         Ok(())
     }
 
-    /// Fan-out locally + Redis PUBLISH for multi-instance coordination.
+    /// Fan-out locally + cluster/Redis PUBLISH for multi-instance coordination.
     fn broadcast(&self, topic: &str, data: &str) -> PyResult<()> {
-        // Local dispatch
+        // Local dispatch (always)
         if let Some(ref tx) = self.cmd_tx {
             let _ = tx.send(ServerCommand::BroadcastLocal {
                 topic: topic.to_owned(),
                 data: data.to_owned(),
             });
         }
-        // Redis publish (for multi-instance)
+
+        // Cluster publish (if connected)
+        let cluster_guard = self.shared.cluster_cmd_tx.lock().unwrap();
+        if let Some(ref tx) = *cluster_guard {
+            tx.try_send(ClusterCommand::Publish {
+                topic: topic.to_owned(),
+                payload: data.to_owned(),
+            })
+            .map_err(|_| PyRuntimeError::new_err("Cluster command channel full"))?;
+            return Ok(());
+        }
+        drop(cluster_guard);
+
+        // Redis publish (fallback, if connected)
         let guard = self.shared.redis_cmd_tx.lock().unwrap();
         if let Some(ref tx) = *guard {
             tx.send(RedisCommand::Publish {
@@ -1684,6 +1775,45 @@ impl RustWSEServer {
                 .map(|dlq| dlq.len())
                 .unwrap_or(0),
         )?;
+        // Cluster metrics
+        let cm = &self.shared.cluster_metrics;
+        dict.set_item(
+            "cluster_connected",
+            cm.connected_peers.load(Ordering::Relaxed) > 0,
+        )?;
+        dict.set_item(
+            "cluster_peer_count",
+            cm.connected_peers.load(Ordering::Relaxed),
+        )?;
+        dict.set_item(
+            "cluster_messages_sent",
+            cm.messages_sent.load(Ordering::Relaxed),
+        )?;
+        dict.set_item(
+            "cluster_messages_received",
+            cm.messages_received.load(Ordering::Relaxed),
+        )?;
+        dict.set_item(
+            "cluster_messages_dropped",
+            cm.messages_dropped.load(Ordering::Relaxed),
+        )?;
+        dict.set_item("cluster_bytes_sent", cm.bytes_sent.load(Ordering::Relaxed))?;
+        dict.set_item(
+            "cluster_bytes_received",
+            cm.bytes_received.load(Ordering::Relaxed),
+        )?;
+        dict.set_item(
+            "cluster_reconnect_count",
+            cm.reconnect_count.load(Ordering::Relaxed),
+        )?;
+        dict.set_item(
+            "cluster_dlq_size",
+            self.shared
+                .cluster_dlq
+                .try_lock()
+                .map(|d| d.len())
+                .unwrap_or(0),
+        )?;
         dict.set_item(
             "uptime_secs",
             self.started_at
@@ -1703,6 +1833,23 @@ impl RustWSEServer {
             let d = PyDict::new(py);
             d.set_item("channel", &entry.channel)?;
             d.set_item("payload", &entry.payload)?;
+            d.set_item("error", &entry.error)?;
+            list.append(d)?;
+        }
+        Ok(list.unbind())
+    }
+
+    fn get_cluster_dlq_entries(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let entries = match self.shared.cluster_dlq.try_lock() {
+            Ok(mut dlq) => dlq.drain_all(),
+            Err(_) => Vec::new(),
+        };
+        let list = PyList::empty(py);
+        for entry in &entries {
+            let d = PyDict::new(py);
+            d.set_item("topic", &entry.topic)?;
+            d.set_item("payload", &entry.payload)?;
+            d.set_item("peer_addr", &entry.peer_addr)?;
             d.set_item("error", &entry.error)?;
             list.append(d)?;
         }
