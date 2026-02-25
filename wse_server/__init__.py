@@ -16,5 +16,5 @@ initial state to clients on connect.
 
 from .router import SnapshotProvider, WSEConfig, create_wse_router
 
-__version__ = "1.4.3"
+__version__ = "1.4.4"
 __all__ = ["create_wse_router", "WSEConfig", "SnapshotProvider"]
