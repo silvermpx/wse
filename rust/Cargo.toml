@@ -31,7 +31,7 @@ redis = { version = "0.27", default-features = false, features = ["tokio-comp", 
 tokio-tungstenite = "0.28.0"
 futures-util = "0.3.32"
 crossbeam-channel = "0.5"
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 socket2 = { version = "0.6", features = ["all"] }
 bytes = "1"
 

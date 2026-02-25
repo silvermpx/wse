@@ -912,12 +912,16 @@ async fn process_commands(
                 }
             }
             ServerCommand::BroadcastLocal { topic, data } => {
-                // Fan-out to topic subscribers without Redis round-trip.
-                // Same dedup logic as dispatch_to_subscribers in redis_pubsub.
+                // Fan-out to topic subscribers with dedup (AHashSet prevents
+                // duplicate delivery when a connection matches both exact and glob).
                 let conns = state.connections.read().await;
+                let mut seen = AHashSet::new();
                 if let Some(conn_ids) = state.topic_subscribers.get(&topic) {
                     for conn_id_ref in conn_ids.iter() {
-                        if let Some(handle) = conns.get(conn_id_ref.key()) {
+                        let cid = conn_id_ref.key();
+                        if seen.insert(cid.clone())
+                            && let Some(handle) = conns.get(cid)
+                        {
                             let _ = handle.tx.send(Message::Text(data.clone().into()));
                         }
                     }
@@ -929,7 +933,10 @@ async fn process_commands(
                         && super::redis_pubsub::glob_match(pattern, &topic)
                     {
                         for conn_id_ref in entry.value().iter() {
-                            if let Some(handle) = conns.get(conn_id_ref.key()) {
+                            let cid = conn_id_ref.key();
+                            if seen.insert(cid.clone())
+                                && let Some(handle) = conns.get(cid)
+                            {
                                 let _ = handle.tx.send(Message::Text(data.clone().into()));
                             }
                         }
@@ -1140,6 +1147,8 @@ impl RustWSEServer {
             }
         }
         self.cmd_tx = None;
+        *self.shared.cluster_cmd_tx.lock().unwrap() = None;
+        *self.shared.redis_cmd_tx.lock().unwrap() = None;
         Ok(())
     }
 
@@ -1694,9 +1703,9 @@ impl RustWSEServer {
             });
         }
 
-        // Cluster publish (if connected)
-        let cluster_guard = self.shared.cluster_cmd_tx.lock().unwrap();
-        if let Some(ref tx) = *cluster_guard {
+        // Cluster publish (if connected) -- clone sender to avoid holding mutex
+        let cluster_tx = self.shared.cluster_cmd_tx.lock().unwrap().clone();
+        if let Some(tx) = cluster_tx {
             tx.try_send(ClusterCommand::Publish {
                 topic: topic.to_owned(),
                 payload: data.to_owned(),
@@ -1704,7 +1713,6 @@ impl RustWSEServer {
             .map_err(|_| PyRuntimeError::new_err("Cluster command channel full"))?;
             return Ok(());
         }
-        drop(cluster_guard);
 
         // Redis publish (fallback, if connected)
         let guard = self.shared.redis_cmd_tx.lock().unwrap();
@@ -1790,8 +1798,8 @@ impl RustWSEServer {
             cm.messages_sent.load(Ordering::Relaxed),
         )?;
         dict.set_item(
-            "cluster_messages_received",
-            cm.messages_received.load(Ordering::Relaxed),
+            "cluster_messages_delivered",
+            cm.messages_delivered.load(Ordering::Relaxed),
         )?;
         dict.set_item(
             "cluster_messages_dropped",

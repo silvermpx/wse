@@ -1,10 +1,7 @@
-// Types will be used in subsequent tasks (peer management, server integration)
-#![allow(dead_code)]
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ahash::AHashSet;
 use bytes::{Buf, BufMut, BytesMut};
@@ -74,7 +71,7 @@ pub(crate) enum ClusterCommand {
 
 pub(crate) struct ClusterMetrics {
     pub messages_sent: AtomicU64,
-    pub messages_received: AtomicU64,
+    pub messages_delivered: AtomicU64,
     pub messages_dropped: AtomicU64,
     pub bytes_sent: AtomicU64,
     pub bytes_received: AtomicU64,
@@ -86,7 +83,7 @@ impl ClusterMetrics {
     pub fn new() -> Self {
         Self {
             messages_sent: AtomicU64::new(0),
-            messages_received: AtomicU64::new(0),
+            messages_delivered: AtomicU64::new(0),
             messages_dropped: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
@@ -140,10 +137,18 @@ impl ClusterDlq {
 // Wire protocol encoding
 // ---------------------------------------------------------------------------
 
-/// Encode a MSG frame into buf.
+/// Encode a MSG frame into buf. Returns false if topic exceeds 64KB.
 /// Format: [u8 type][u8 flags][u16 LE topic_len][u32 LE payload_len][topic][payload]
-pub(crate) fn encode_msg(buf: &mut BytesMut, topic: &str, payload: &str) {
+pub(crate) fn encode_msg(buf: &mut BytesMut, topic: &str, payload: &str) -> bool {
     let topic_bytes = topic.as_bytes();
+    if topic_bytes.len() > u16::MAX as usize {
+        eprintln!(
+            "[WSE-Cluster] Topic too long ({} bytes, max {}), dropping message",
+            topic_bytes.len(),
+            u16::MAX
+        );
+        return false;
+    }
     let payload_bytes = payload.as_bytes();
     buf.reserve(8 + topic_bytes.len() + payload_bytes.len());
     buf.put_u8(MsgType::Msg as u8);
@@ -152,6 +157,7 @@ pub(crate) fn encode_msg(buf: &mut BytesMut, topic: &str, payload: &str) {
     buf.put_u32_le(payload_bytes.len() as u32);
     buf.put_slice(topic_bytes);
     buf.put_slice(payload_bytes);
+    true
 }
 
 /// Encode a PING frame (header only, 8 bytes).
@@ -303,7 +309,7 @@ pub(crate) async fn cluster_dispatch(
                     .send(Message::Text(payload.to_owned().into()))
                     .is_ok()
                 {
-                    metrics.messages_received.fetch_add(1, Ordering::Relaxed);
+                    metrics.messages_delivered.fetch_add(1, Ordering::Relaxed);
                 } else {
                     metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
                 }
@@ -327,7 +333,7 @@ pub(crate) async fn cluster_dispatch(
                         .send(Message::Text(payload.to_owned().into()))
                         .is_ok()
                     {
-                        metrics.messages_received.fetch_add(1, Ordering::Relaxed);
+                        metrics.messages_delivered.fetch_add(1, Ordering::Relaxed);
                     } else {
                         metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
                     }
@@ -388,6 +394,7 @@ async fn peer_reader(
     topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
     cancel: CancellationToken,
     metrics: Arc<ClusterMetrics>,
+    last_activity: Arc<std::sync::Mutex<Instant>>,
 ) {
     let mut len_buf = [0u8; 4];
 
@@ -424,16 +431,24 @@ async fn peer_reader(
         // Decode and dispatch
         match decode_frame(frame_buf) {
             Some(ClusterFrame::Msg { topic, payload }) => {
+                if let Ok(mut t) = last_activity.lock() {
+                    *t = Instant::now();
+                }
                 cluster_dispatch(&connections, &topic_subscribers, &topic, &payload, &metrics)
                     .await;
             }
             Some(ClusterFrame::Ping) => {
+                if let Ok(mut t) = last_activity.lock() {
+                    *t = Instant::now();
+                }
                 let mut pong = BytesMut::new();
                 encode_pong(&mut pong);
                 let _ = peer_write_tx.send(pong).await;
             }
             Some(ClusterFrame::Pong) => {
-                // Liveness confirmed (heartbeat task tracks via channel activity)
+                if let Ok(mut t) = last_activity.lock() {
+                    *t = Instant::now();
+                }
             }
             Some(ClusterFrame::Shutdown) => {
                 eprintln!("[WSE-Cluster] Peer sent SHUTDOWN");
@@ -454,11 +469,23 @@ async fn peer_reader(
 // Heartbeat task
 // ---------------------------------------------------------------------------
 
-async fn heartbeat_task(peer_write_tx: mpsc::Sender<BytesMut>, cancel: CancellationToken) {
+async fn heartbeat_task(
+    peer_write_tx: mpsc::Sender<BytesMut>,
+    cancel: CancellationToken,
+    last_activity: Arc<std::sync::Mutex<Instant>>,
+) {
     let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+    let timeout = Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                // Check if peer is dead (no activity for HEARTBEAT_TIMEOUT_SECS)
+                if let Ok(t) = last_activity.lock()
+                    && t.elapsed() > timeout
+                {
+                    eprintln!("[WSE-Cluster] Peer heartbeat timeout ({}s no activity)", timeout.as_secs());
+                    break;
+                }
                 let mut ping = BytesMut::new();
                 encode_ping(&mut ping);
                 if peer_write_tx.send(ping).await.is_err() {
@@ -569,28 +596,25 @@ async fn peer_connection_task(
             }
         }
 
-        // Read HELLO response
+        // Read HELLO response (full read under single timeout)
         let mut reader_temp = reader;
-        let mut len_buf = [0u8; 4];
-        let hello_ok = match tokio::time::timeout(
-            Duration::from_secs(5),
-            reader_temp.read_exact(&mut len_buf),
-        )
+        let hello_ok = match tokio::time::timeout(Duration::from_secs(5), async {
+            let mut len_buf = [0u8; 4];
+            reader_temp.read_exact(&mut len_buf).await?;
+            let frame_len = u32::from_be_bytes(len_buf) as usize;
+            if frame_len == 0 || frame_len > MAX_FRAME_SIZE {
+                return Ok::<bool, std::io::Error>(false);
+            }
+            let mut frame_buf = BytesMut::zeroed(frame_len);
+            reader_temp.read_exact(&mut frame_buf).await?;
+            Ok(matches!(
+                decode_frame(frame_buf),
+                Some(ClusterFrame::Hello { .. })
+            ))
+        })
         .await
         {
-            Ok(Ok(_)) => {
-                let frame_len = u32::from_be_bytes(len_buf) as usize;
-                if frame_len > 0 && frame_len <= MAX_FRAME_SIZE {
-                    let mut frame_buf = BytesMut::zeroed(frame_len);
-                    if reader_temp.read_exact(&mut frame_buf).await.is_ok() {
-                        matches!(decode_frame(frame_buf), Some(ClusterFrame::Hello { .. }))
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
+            Ok(Ok(result)) => result,
             _ => false,
         };
 
@@ -613,6 +637,7 @@ async fn peer_connection_task(
         // Spawn reader, writer, heartbeat with child cancellation token
         let peer_cancel = global_cancel.child_token();
         let (peer_write_tx, peer_write_rx) = mpsc::channel::<BytesMut>(PER_PEER_CHANNEL_CAP);
+        let last_activity = Arc::new(std::sync::Mutex::new(Instant::now()));
 
         let writer_handle = tokio::spawn(peer_writer(
             peer_write_rx,
@@ -628,10 +653,14 @@ async fn peer_connection_task(
             topic_subscribers.clone(),
             peer_cancel.clone(),
             metrics.clone(),
+            last_activity.clone(),
         ));
 
-        let heartbeat_handle =
-            tokio::spawn(heartbeat_task(peer_write_tx.clone(), peer_cancel.clone()));
+        let heartbeat_handle = tokio::spawn(heartbeat_task(
+            peer_write_tx.clone(),
+            peer_cancel.clone(),
+            last_activity,
+        ));
 
         // Forward data from cluster manager to this peer's writer
         loop {
@@ -734,7 +763,9 @@ pub(crate) async fn cluster_manager(
         match cmd {
             Some(ClusterCommand::Publish { topic, payload }) => {
                 let mut frame_data = BytesMut::new();
-                encode_msg(&mut frame_data, &topic, &payload);
+                if !encode_msg(&mut frame_data, &topic, &payload) {
+                    continue;
+                }
 
                 for (peer_addr, tx) in &peer_txs {
                     if tx.try_send(frame_data.clone()).is_err() {
@@ -754,11 +785,21 @@ pub(crate) async fn cluster_manager(
             }
             Some(ClusterCommand::Shutdown) | None => {
                 eprintln!("[WSE-Cluster] Manager shutting down");
-                // Send SHUTDOWN frame to all peers before cancelling
+                // Send SHUTDOWN frame to all peers with brief timeout
                 let mut shutdown_data = BytesMut::new();
                 encode_shutdown(&mut shutdown_data);
-                for (_, tx) in &peer_txs {
-                    let _ = tx.try_send(shutdown_data.clone());
+                for (peer_addr, tx) in &peer_txs {
+                    match tokio::time::timeout(
+                        Duration::from_millis(500),
+                        tx.send(shutdown_data.clone()),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        _ => {
+                            eprintln!("[WSE-Cluster] Could not send SHUTDOWN to {peer_addr}");
+                        }
+                    }
                 }
                 global_cancel.cancel();
                 break;
