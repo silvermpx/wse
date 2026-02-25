@@ -935,4 +935,104 @@ mod tests {
         let buf = BytesMut::from(&[0u8; 4][..]);
         assert!(decode_frame(buf).is_none());
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_two_peers_exchange_hello() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Peer A connects to listener
+        let client_task = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let (mut read, mut write) = stream.into_split();
+
+            // Send HELLO
+            let mut hello = BytesMut::new();
+            encode_hello(&mut hello, "peer-a");
+            let mut frame = BytesMut::new();
+            write_framed(&mut frame, &hello);
+            write.write_all(&frame).await.unwrap();
+
+            // Read HELLO from peer B
+            let mut len_buf = [0u8; 4];
+            read.read_exact(&mut len_buf).await.unwrap();
+            let frame_len = u32::from_be_bytes(len_buf) as usize;
+            let mut frame_buf = BytesMut::zeroed(frame_len);
+            read.read_exact(&mut frame_buf).await.unwrap();
+
+            decode_frame(frame_buf)
+        });
+
+        // Peer B accepts connection
+        let (stream, _) = listener.accept().await.unwrap();
+        let (mut read, mut write) = stream.into_split();
+
+        // Read HELLO from peer A
+        let mut len_buf = [0u8; 4];
+        read.read_exact(&mut len_buf).await.unwrap();
+        let frame_len = u32::from_be_bytes(len_buf) as usize;
+        let mut frame_buf = BytesMut::zeroed(frame_len);
+        read.read_exact(&mut frame_buf).await.unwrap();
+        let hello_a = decode_frame(frame_buf).unwrap();
+
+        assert!(
+            matches!(hello_a, ClusterFrame::Hello { ref instance_id, .. } if instance_id == "peer-a")
+        );
+
+        // Send HELLO back
+        let mut hello = BytesMut::new();
+        encode_hello(&mut hello, "peer-b");
+        let mut frame = BytesMut::new();
+        write_framed(&mut frame, &hello);
+        write.write_all(&frame).await.unwrap();
+
+        // Verify peer A received peer B's HELLO
+        let hello_b = client_task.await.unwrap().unwrap();
+        assert!(
+            matches!(hello_b, ClusterFrame::Hello { ref instance_id, .. } if instance_id == "peer-b")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_msg_roundtrip() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let sender = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let (_, mut write) = stream.into_split();
+
+            // Send a MSG frame
+            let mut msg = BytesMut::new();
+            encode_msg(&mut msg, "chat.general", r#"{"text":"hello"}"#);
+            let mut frame = BytesMut::new();
+            write_framed(&mut frame, &msg);
+            write.write_all(&frame).await.unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let (mut read, _) = stream.into_split();
+
+        // Read MSG frame
+        let mut len_buf = [0u8; 4];
+        read.read_exact(&mut len_buf).await.unwrap();
+        let frame_len = u32::from_be_bytes(len_buf) as usize;
+        let mut frame_buf = BytesMut::zeroed(frame_len);
+        read.read_exact(&mut frame_buf).await.unwrap();
+
+        let msg = decode_frame(frame_buf).unwrap();
+        assert_eq!(
+            msg,
+            ClusterFrame::Msg {
+                topic: "chat.general".into(),
+                payload: r#"{"text":"hello"}"#.into(),
+            }
+        );
+
+        sender.await.unwrap();
+    }
 }
