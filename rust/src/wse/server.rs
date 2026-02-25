@@ -545,7 +545,6 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     let (write_half, read_half) = ws_stream.split();
     let mut read_half = read_half;
     let mut write_half = write_half;
-    let mut raw_write = raw_write;
     let (tx, mut rx) = mpsc::unbounded_channel::<WsFrame>();
     let drain = state.drain_mode.load(Ordering::Relaxed);
 
@@ -687,6 +686,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     // Write task with coalescing + pre-framed broadcast support.
     // `write_half` handles tungstenite Messages (per-connection sends, control frames).
     // `raw_write` handles pre-framed bytes (broadcasts) written directly to TCP.
+    // BufWriter batches multiple PreFramed frames into a single TCP write (one syscall).
+    let mut raw_write = tokio::io::BufWriter::new(raw_write);
     let write_task = tokio::spawn(async move {
         loop {
             let frame = match rx.recv().await {
@@ -718,6 +719,11 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
             while ok && count < 64 {
                 match rx.try_recv() {
                     Ok(WsFrame::Msg(msg)) => {
+                        // Must flush raw_write before tungstenite write
+                        if raw_write.flush().await.is_err() {
+                            ok = false;
+                            break;
+                        }
                         if write_half.feed(msg).await.is_err() {
                             ok = false;
                             break;
@@ -747,11 +753,11 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
             if !ok {
                 break;
             }
-            // Final flush: tungstenite if dirty, raw_write always (ensure TCP send)
-            if tung_dirty && write_half.flush().await.is_err() {
+            // Final flush: raw BufWriter + tungstenite if dirty
+            if raw_write.flush().await.is_err() {
                 break;
             }
-            if raw_write.flush().await.is_err() {
+            if tung_dirty && write_half.flush().await.is_err() {
                 break;
             }
         }
