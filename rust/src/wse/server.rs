@@ -109,8 +109,8 @@ enum ServerCommand {
     Shutdown,
 }
 
-struct SharedState {
-    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
+pub(crate) struct SharedState {
+    pub(crate) connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     max_connections: usize,
     on_connect: RwLock<Option<Py<PyAny>>>,
     on_message: RwLock<Option<Py<PyAny>>>,
@@ -130,15 +130,16 @@ struct SharedState {
     connection_count: AtomicUsize,
     // JWT config: when set, Rust validates JWT in handshake (zero GIL)
     jwt_config: Option<JwtConfig>,
-    topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
+    pub(crate) topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
     conn_topics: DashMap<String, DashSet<String>>,
     redis_cmd_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<RedisCommand>>>,
     redis_metrics: Arc<RedisMetrics>,
     redis_dlq: Arc<std::sync::Mutex<DeadLetterQueue>>,
     // Cluster protocol
     cluster_cmd_tx: std::sync::Mutex<Option<mpsc::Sender<ClusterCommand>>>,
-    cluster_metrics: Arc<ClusterMetrics>,
+    pub(crate) cluster_metrics: Arc<ClusterMetrics>,
     cluster_dlq: Arc<std::sync::Mutex<ClusterDlq>>,
+    pub(crate) cluster_instance_id: std::sync::Mutex<Option<String>>,
 }
 
 unsafe impl Send for SharedState {}
@@ -174,6 +175,7 @@ impl SharedState {
             cluster_cmd_tx: std::sync::Mutex::new(None),
             cluster_metrics: Arc::new(ClusterMetrics::new()),
             cluster_dlq: Arc::new(std::sync::Mutex::new(ClusterDlq::new(1000))),
+            cluster_instance_id: std::sync::Mutex::new(None),
         }
     }
 
@@ -1095,7 +1097,31 @@ impl RustWSEServer {
                                 match res {
                                     Ok((stream, addr)) => {
                                         let _ = stream.set_nodelay(true);
-                                        tokio::spawn(handle_connection(stream, addr, shared.clone()));
+                                        let shared2 = shared.clone();
+                                        tokio::spawn(async move {
+                                            // Protocol detection: peek first byte to distinguish
+                                            // cluster binary frames (first byte 0x00 = length prefix
+                                            // for frames < 16MB) from HTTP/WS (first byte is ASCII
+                                            // letter like 'G' for GET). Timeout handles misbehaving
+                                            // clients that connect but never send data.
+                                            // Note: TLS ClientHello starts with 0x16 -- if direct
+                                            // TLS termination is added, update this check.
+                                            let mut peek = [0u8; 1];
+                                            let is_cluster = match tokio::time::timeout(
+                                                Duration::from_secs(5),
+                                                stream.peek(&mut peek),
+                                            ).await {
+                                                Ok(Ok(1)) => peek[0] == 0x00,
+                                                _ => false,
+                                            };
+                                            if is_cluster {
+                                                super::cluster::handle_cluster_inbound(
+                                                    stream, addr, &shared2,
+                                                ).await;
+                                            } else {
+                                                handle_connection(stream, addr, shared2).await;
+                                            }
+                                        });
                                     }
                                     Err(e) => {
                                         if !running.load(Ordering::SeqCst) { break; }
@@ -1593,6 +1619,7 @@ impl RustWSEServer {
         *self.shared.cluster_cmd_tx.lock().unwrap() = Some(cmd_tx);
 
         let instance_id = uuid::Uuid::now_v7().to_string();
+        *self.shared.cluster_instance_id.lock().unwrap() = Some(instance_id.clone());
         let connections = self.shared.connections.clone();
         let topic_subscribers = self.shared.topic_subscribers.clone();
         let metrics = self.shared.cluster_metrics.clone();

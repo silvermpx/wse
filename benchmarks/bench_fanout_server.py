@@ -1,23 +1,30 @@
 """Fan-out benchmark server.
 
 Starts the Rust WSE server and continuously broadcasts or publishes messages.
-Rust benchmark client (wse-bench --test fanout-broadcast/fanout-pubsub/fanout-multi)
+Rust benchmark client (wse-bench --test fanout-broadcast/fanout-pubsub/fanout-multi/fanout-cluster)
 connects and measures receive throughput.
 
 Modes:
-  broadcast  -- server.broadcast_all() to ALL connections (no Redis)
-  pubsub     -- server.broadcast() via Redis to subscribed connections
-  subscribe  -- subscribe-only mode for multi-instance test (Server B)
+  broadcast        -- server.broadcast_all() to ALL connections (no Redis)
+  pubsub           -- server.broadcast() via Redis to subscribed connections
+  subscribe        -- subscribe-only mode for multi-instance test (Server B, Redis)
+  cluster          -- server.broadcast() via cluster to subscribed connections
+  cluster-subscribe -- subscribe-only mode for multi-instance cluster test (Server B)
 
 Usage:
     # Test 8: Fan-out Broadcast (no Redis)
     python benchmarks/bench_fanout_server.py --mode broadcast
     wse-bench --test fanout-broadcast
 
-    # Test 9: Multi-Instance Fan-out (two servers + Redis)
+    # Test 10: Multi-Instance Fan-out (two servers + Redis)
     python benchmarks/bench_fanout_server.py --mode pubsub --port 5006 --redis-url redis://localhost:6379
     python benchmarks/bench_fanout_server.py --mode subscribe --port 5007 --redis-url redis://localhost:6379
     wse-bench --test fanout-multi --port 5006 --port2 5007
+
+    # Test 11: Multi-Instance Fan-out (two servers + Cluster protocol)
+    python benchmarks/bench_fanout_server.py --mode cluster --port 5006 --peers 127.0.0.1:5007
+    python benchmarks/bench_fanout_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:5006
+    wse-bench --test fanout-cluster --port 5006 --port2 5007
 """
 
 import argparse
@@ -47,8 +54,8 @@ def generate_token(user_id: str = "bench-user") -> str:
 
 
 def drain_loop(server, mode: str, stop_event: threading.Event):
-    """Drain inbound events. For pubsub/subscribe modes, auto-subscribe connections."""
-    subscribe_mode = mode in ("pubsub", "subscribe")
+    """Drain inbound events. For pubsub/subscribe/cluster modes, auto-subscribe connections."""
+    subscribe_mode = mode in ("pubsub", "subscribe", "cluster", "cluster-subscribe")
     while not stop_event.is_set():
         try:
             batch = server.drain_inbound(256, 50)
@@ -80,13 +87,13 @@ def publish_loop(server, mode: str, stop_event: threading.Event):
         try:
             if mode == "broadcast":
                 server.broadcast_all(msg)
-            elif mode == "pubsub":
+            elif mode in ("pubsub", "cluster"):
                 server.broadcast(BENCH_TOPIC, msg)
                 # Yield GIL so drain_loop can process subscribe events
                 if seq % 100 == 0:
                     time.sleep(0)
             else:
-                # subscribe mode: no publishing
+                # subscribe / cluster-subscribe mode: no publishing
                 time.sleep(1)
                 continue
         except Exception:
@@ -116,17 +123,24 @@ def main():
     parser = argparse.ArgumentParser(description="Fan-out benchmark server")
     parser.add_argument(
         "--mode",
-        choices=["broadcast", "pubsub", "subscribe"],
+        choices=["broadcast", "pubsub", "subscribe", "cluster", "cluster-subscribe"],
         required=True,
-        help="broadcast=no Redis, pubsub=Redis publish, subscribe=Redis receive only",
+        help="broadcast=no Redis, pubsub=Redis publish, subscribe=Redis receive only, "
+             "cluster=cluster publish, cluster-subscribe=cluster receive only",
     )
     parser.add_argument("--port", type=int, default=5006)
     parser.add_argument("--max-connections", type=int, default=60000)
     parser.add_argument("--redis-url", default=None, help="Redis URL for pubsub/subscribe modes")
+    parser.add_argument("--peers", nargs="+", default=None,
+                        help="Cluster peer addresses for cluster modes, e.g. 127.0.0.1:5007")
     args = parser.parse_args()
 
     if args.mode in ("pubsub", "subscribe") and not args.redis_url:
         print("ERROR: --redis-url required for pubsub/subscribe mode", file=sys.stderr)
+        sys.exit(1)
+
+    if args.mode in ("cluster", "cluster-subscribe") and not args.peers:
+        print("ERROR: --peers required for cluster/cluster-subscribe mode", file=sys.stderr)
         sys.exit(1)
 
     server = RustWSEServer(
@@ -144,6 +158,10 @@ def main():
     if args.redis_url:
         server.connect_redis(args.redis_url)
         print(f"[fanout-server] Redis connected: {args.redis_url}")
+
+    if args.peers:
+        server.connect_cluster(args.peers)
+        print(f"[fanout-server] Cluster peers: {args.peers}")
 
     token = generate_token()
     print(f"[fanout-server] JWT: {token}")

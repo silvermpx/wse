@@ -26,9 +26,6 @@ JWT_SECRET = b"my-secret-key"
 JWT_ISSUER = "my-app"
 JWT_AUDIENCE = "my-api"
 
-# Cluster listen port = WS port + 10000 (convention for this example)
-CLUSTER_PORT_OFFSET = 10000
-
 
 def make_token(user_id: str = "user-1") -> str:
     return rust_jwt_encode(
@@ -78,7 +75,7 @@ def main():
     parser = argparse.ArgumentParser(description="Multi-instance WSE with cluster protocol")
     parser.add_argument("--port", type=int, default=5007)
     parser.add_argument("--peers", nargs="+", required=True,
-                        help="Peer addresses, e.g. 127.0.0.1:15008")
+                        help="Peer WS addresses, e.g. 127.0.0.1:5008")
     args = parser.parse_args()
 
     server = RustWSEServer(

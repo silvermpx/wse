@@ -67,6 +67,7 @@ pub enum TestName {
     ConnectionLimit,
     FanoutBroadcast,
     FanoutMulti,
+    FanoutCluster,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +92,7 @@ impl Cli {
                     10, 100, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000,
                 ]
             }
-            TestName::FanoutMulti => {
+            TestName::FanoutMulti | TestName::FanoutCluster => {
                 vec![10, 100, 500, 1_000, 2_000, 5_000, 10_000, 20_000]
             }
             _ => DEFAULT_TIERS.to_vec(),

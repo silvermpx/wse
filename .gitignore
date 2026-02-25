@@ -12,6 +12,7 @@ build/
 
 # Rust
 rust/target/
+benchmarks/rust-bench/target/
 # rust/Cargo.lock is committed for reproducible builds
 
 # Virtual environments
@@ -44,3 +45,4 @@ node_modules/
 
 # Internal docs (not for release)
 docs/internal/
+/docs/plans/

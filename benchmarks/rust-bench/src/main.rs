@@ -94,11 +94,14 @@ async fn run_single_test(cli: &Cli, test: TestName) {
         TestName::FanoutMulti => {
             tests::fanout_multi::run(cli).await;
         }
+        TestName::FanoutCluster => {
+            tests::fanout_cluster::run(cli).await;
+        }
     }
 }
 
 async fn run_full_suite(cli: &Cli) {
-    println!("\n  Running full benchmark suite (9 tests)...");
+    println!("\n  Running full benchmark suite (11 tests)...");
 
     tests::connection_storm::run(cli).await;
     pause_between_tests().await;
@@ -125,6 +128,9 @@ async fn run_full_suite(cli: &Cli) {
     pause_between_tests().await;
 
     tests::fanout_multi::run(cli).await;
+    pause_between_tests().await;
+
+    tests::fanout_cluster::run(cli).await;
 }
 
 async fn pause_between_tests() {

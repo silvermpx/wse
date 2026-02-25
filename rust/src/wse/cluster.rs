@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -812,6 +813,110 @@ pub(crate) async fn cluster_manager(
         let _ = handle.await;
     }
     eprintln!("[WSE-Cluster] Manager stopped");
+}
+
+// ---------------------------------------------------------------------------
+// Inbound cluster connection handler (accepted by main server listener)
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn handle_cluster_inbound(
+    stream: TcpStream,
+    addr: SocketAddr,
+    shared: &super::server::SharedState,
+) {
+    // Check if cluster mode is active
+    let instance_id = match shared.cluster_instance_id.lock().unwrap().clone() {
+        Some(id) => id,
+        None => {
+            eprintln!("[WSE-Cluster] Rejected inbound from {addr}: cluster not configured");
+            return;
+        }
+    };
+
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(10))
+        .with_interval(Duration::from_secs(5));
+    let sock_ref = SockRef::from(&stream);
+    let _ = sock_ref.set_tcp_keepalive(&keepalive);
+
+    let (mut reader, mut writer) = stream.into_split();
+
+    // Read peer's HELLO frame
+    let peer_hello_ok = matches!(
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut len_buf = [0u8; 4];
+            reader.read_exact(&mut len_buf).await?;
+            let frame_len = u32::from_be_bytes(len_buf) as usize;
+            if frame_len == 0 || frame_len > MAX_FRAME_SIZE {
+                return Ok::<bool, std::io::Error>(false);
+            }
+            let mut frame_buf = BytesMut::zeroed(frame_len);
+            reader.read_exact(&mut frame_buf).await?;
+            Ok(matches!(
+                decode_frame(frame_buf),
+                Some(ClusterFrame::Hello { .. })
+            ))
+        })
+        .await,
+        Ok(Ok(true))
+    );
+
+    if !peer_hello_ok {
+        eprintln!("[WSE-Cluster] Invalid HELLO from inbound {addr}");
+        return;
+    }
+
+    // Send our HELLO response
+    let mut hello_buf = BytesMut::new();
+    encode_hello(&mut hello_buf, &instance_id);
+    let mut frame = BytesMut::new();
+    write_framed(&mut frame, &hello_buf);
+    if writer.write_all(&frame).await.is_err() {
+        eprintln!("[WSE-Cluster] Failed to send HELLO to inbound {addr}");
+        return;
+    }
+
+    eprintln!("[WSE-Cluster] Accepted inbound peer from {addr}");
+    let metrics = shared.cluster_metrics.clone();
+    metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
+
+    let cancel = CancellationToken::new();
+    let (write_tx, write_rx) = mpsc::channel::<BytesMut>(PER_PEER_CHANNEL_CAP);
+    let last_activity = Arc::new(std::sync::Mutex::new(Instant::now()));
+
+    let writer_handle = tokio::spawn(peer_writer(
+        write_rx,
+        writer,
+        cancel.clone(),
+        metrics.clone(),
+    ));
+
+    let reader_handle = tokio::spawn(peer_reader(
+        reader,
+        write_tx.clone(),
+        shared.connections.clone(),
+        shared.topic_subscribers.clone(),
+        cancel.clone(),
+        metrics.clone(),
+        last_activity.clone(),
+    ));
+
+    let heartbeat_handle = tokio::spawn(heartbeat_task(write_tx, cancel.clone(), last_activity));
+
+    // Wait for any task to finish, then cancel + await all (prevents task leaks)
+    tokio::pin!(reader_handle, writer_handle, heartbeat_handle);
+    tokio::select! {
+        _ = &mut reader_handle => {}
+        _ = &mut writer_handle => {}
+        _ = &mut heartbeat_handle => {}
+    }
+    cancel.cancel();
+    let _ = reader_handle.await;
+    let _ = writer_handle.await;
+    let _ = heartbeat_handle.await;
+
+    metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
+    eprintln!("[WSE-Cluster] Inbound peer {addr} disconnected");
 }
 
 // ---------------------------------------------------------------------------
