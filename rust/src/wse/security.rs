@@ -102,9 +102,11 @@ pub fn rust_aes_gcm_decrypt(py: Python, key: &[u8], data: &[u8]) -> PyResult<Py<
     let (nonce_bytes, ciphertext) = data.split_at(12);
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid key: {e}")))?;
-    let nonce = aes_gcm::aead::generic_array::GenericArray::from_slice(nonce_bytes);
+    let nonce_arr: [u8; 12] = nonce_bytes
+        .try_into()
+        .expect("split_at(12) guarantees 12 bytes");
     let plaintext = cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce_arr.into(), ciphertext)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Decrypt failed: {e}")))?;
     Ok(PyBytes::new(py, &plaintext).unbind())
 }
@@ -194,8 +196,8 @@ mod tests {
 
         // Decrypt
         let (n, c) = blob.split_at(12);
-        let nonce2 = aes_gcm::aead::generic_array::GenericArray::from_slice(n);
-        let dec = cipher.decrypt(nonce2, c).expect("decrypt");
+        let nonce_arr: [u8; 12] = n.try_into().unwrap();
+        let dec = cipher.decrypt(&nonce_arr.into(), c).expect("decrypt");
         assert_eq!(&dec, plaintext);
     }
 
@@ -214,8 +216,8 @@ mod tests {
 
         let cipher2 = Aes256Gcm::new_from_slice(&key2).unwrap();
         let (n, c) = blob.split_at(12);
-        let nonce2 = aes_gcm::aead::generic_array::GenericArray::from_slice(n);
-        assert!(cipher2.decrypt(nonce2, c).is_err());
+        let nonce_arr: [u8; 12] = n.try_into().unwrap();
+        assert!(cipher2.decrypt(&nonce_arr.into(), c).is_err());
     }
 
     #[test]
@@ -229,8 +231,8 @@ mod tests {
         let shared_ba = diffie_hellman(sk_b.to_nonzero_scalar(), pk_a.as_affine());
 
         assert_eq!(
-            shared_ab.raw_secret_bytes().as_slice(),
-            shared_ba.raw_secret_bytes().as_slice()
+            &*shared_ab.raw_secret_bytes(),
+            &*shared_ba.raw_secret_bytes()
         );
     }
 
