@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::{Buf, BufMut, BytesMut};
 use dashmap::{DashMap, DashSet};
@@ -15,6 +15,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::reliability::{CircuitBreaker, ExponentialBackoff};
 use super::server::ConnectionHandle;
+
+/// Current wall-clock time in milliseconds since UNIX epoch. Used for lock-free last_activity tracking.
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -358,7 +366,7 @@ async fn peer_reader(
     topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
     cancel: CancellationToken,
     metrics: Arc<ClusterMetrics>,
-    last_activity: Arc<std::sync::Mutex<Instant>>,
+    last_activity: Arc<AtomicU64>,
 ) {
     let mut len_buf = [0u8; 4];
 
@@ -395,23 +403,17 @@ async fn peer_reader(
         // Decode and dispatch
         match decode_frame(frame_buf) {
             Some(ClusterFrame::Msg { topic, payload }) => {
-                if let Ok(mut t) = last_activity.lock() {
-                    *t = Instant::now();
-                }
+                last_activity.store(epoch_ms(), Ordering::Relaxed);
                 cluster_dispatch(&connections, &topic_subscribers, &topic, &payload, &metrics);
             }
             Some(ClusterFrame::Ping) => {
-                if let Ok(mut t) = last_activity.lock() {
-                    *t = Instant::now();
-                }
+                last_activity.store(epoch_ms(), Ordering::Relaxed);
                 let mut pong = BytesMut::new();
                 encode_pong(&mut pong);
                 let _ = peer_write_tx.send(pong).await;
             }
             Some(ClusterFrame::Pong) => {
-                if let Ok(mut t) = last_activity.lock() {
-                    *t = Instant::now();
-                }
+                last_activity.store(epoch_ms(), Ordering::Relaxed);
             }
             Some(ClusterFrame::Shutdown) => {
                 eprintln!("[WSE-Cluster] Peer sent SHUTDOWN");
@@ -435,7 +437,7 @@ async fn peer_reader(
 async fn heartbeat_task(
     peer_write_tx: mpsc::Sender<BytesMut>,
     cancel: CancellationToken,
-    last_activity: Arc<std::sync::Mutex<Instant>>,
+    last_activity: Arc<AtomicU64>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
     let timeout = Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
@@ -443,9 +445,8 @@ async fn heartbeat_task(
         tokio::select! {
             _ = interval.tick() => {
                 // Check if peer is dead (no activity for HEARTBEAT_TIMEOUT_SECS)
-                if let Ok(t) = last_activity.lock()
-                    && t.elapsed() > timeout
-                {
+                let elapsed_ms = epoch_ms() - last_activity.load(Ordering::Relaxed);
+                if elapsed_ms > timeout.as_millis() as u64 {
                     eprintln!("[WSE-Cluster] Peer heartbeat timeout ({}s no activity)", timeout.as_secs());
                     break;
                 }
@@ -600,7 +601,7 @@ async fn peer_connection_task(
         // Spawn reader, writer, heartbeat with child cancellation token
         let peer_cancel = global_cancel.child_token();
         let (peer_write_tx, peer_write_rx) = mpsc::channel::<BytesMut>(PER_PEER_CHANNEL_CAP);
-        let last_activity = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let last_activity = Arc::new(AtomicU64::new(epoch_ms()));
 
         let writer_handle = tokio::spawn(peer_writer(
             peer_write_rx,
@@ -787,7 +788,12 @@ pub(crate) async fn handle_cluster_inbound(
     shared: &super::server::SharedState,
 ) {
     // Check if cluster mode is active
-    let instance_id = match shared.cluster_instance_id.lock().unwrap().clone() {
+    let instance_id = match shared
+        .cluster_instance_id
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
         Some(id) => id,
         None => {
             eprintln!("[WSE-Cluster] Rejected inbound from {addr}: cluster not configured");
@@ -844,7 +850,7 @@ pub(crate) async fn handle_cluster_inbound(
 
     let cancel = CancellationToken::new();
     let (write_tx, write_rx) = mpsc::channel::<BytesMut>(PER_PEER_CHANNEL_CAP);
-    let last_activity = Arc::new(std::sync::Mutex::new(Instant::now()));
+    let last_activity = Arc::new(AtomicU64::new(epoch_ms()));
 
     let writer_handle = tokio::spawn(peer_writer(
         write_rx,

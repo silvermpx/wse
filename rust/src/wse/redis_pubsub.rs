@@ -183,7 +183,7 @@ async fn publish_pipeline(
 
     metrics.publish_errors.fetch_add(count, Ordering::Relaxed);
     eprintln!("[WSE-Redis] Pipeline publish failed after retries ({count} msgs): {last_err}");
-    let mut guard = dlq.lock().unwrap();
+    let mut guard = dlq.lock().unwrap_or_else(|e| e.into_inner());
     for (channel, payload) in batch {
         guard.push(DlqEntry {
             channel: channel.clone(),
@@ -278,7 +278,7 @@ async fn connect_and_run(
                 pub_metrics
                     .publish_errors
                     .fetch_add(count, Ordering::Relaxed);
-                let mut guard = pub_dlq.lock().unwrap();
+                let mut guard = pub_dlq.lock().unwrap_or_else(|e| e.into_inner());
                 for (channel, payload) in &batch {
                     guard.push(DlqEntry {
                         channel: channel.clone(),
@@ -440,7 +440,7 @@ async fn drain_during_backoff(
                     }
                     Some(RedisCommand::Publish { channel, payload }) => {
                         metrics.publish_errors.fetch_add(1, Ordering::Relaxed);
-                        dlq.lock().unwrap().push(DlqEntry {
+                        dlq.lock().unwrap_or_else(|e| e.into_inner()).push(DlqEntry {
                             channel,
                             payload,
                             error: "Redis disconnected".to_string(),

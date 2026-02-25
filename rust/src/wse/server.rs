@@ -9,7 +9,6 @@
 //   - TCP_NODELAY on accept
 // =============================================================================
 
-use std::collections::HashMap;
 use std::io::{IoSlice, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -102,23 +101,18 @@ async fn flush_raw_batch(writer: &mut TcpStream, batch: &mut Vec<Bytes>) -> std:
     if batch.len() == 1 {
         writer.write_all(&batch[0]).await?;
     } else {
-        let total: usize = batch.iter().map(|b| b.len()).sum();
-        let mut written = 0usize;
-        while written < total {
-            // Build IoSlice refs for remaining data
-            let mut offset = 0usize;
-            let slices: Vec<IoSlice<'_>> = batch
+        // Track position: current buffer index + byte offset within that buffer
+        let mut buf_idx = 0usize;
+        let mut buf_offset = 0usize;
+        while buf_idx < batch.len() {
+            let slices: Vec<IoSlice<'_>> = batch[buf_idx..]
                 .iter()
-                .filter_map(|b| {
-                    let start = offset;
-                    offset += b.len();
-                    if offset <= written {
-                        None // fully written already
-                    } else if start < written {
-                        // partially written
-                        Some(IoSlice::new(&b[(written - start)..]))
+                .enumerate()
+                .map(|(i, b)| {
+                    if i == 0 {
+                        IoSlice::new(&b[buf_offset..])
                     } else {
-                        Some(IoSlice::new(b))
+                        IoSlice::new(b)
                     }
                 })
                 .collect();
@@ -129,7 +123,19 @@ async fn flush_raw_batch(writer: &mut TcpStream, batch: &mut Vec<Bytes>) -> std:
                     "write_vectored returned 0",
                 ));
             }
-            written += n;
+            // Advance position
+            let mut remaining = n;
+            while remaining > 0 && buf_idx < batch.len() {
+                let avail = batch[buf_idx].len() - buf_offset;
+                if remaining >= avail {
+                    remaining -= avail;
+                    buf_idx += 1;
+                    buf_offset = 0;
+                } else {
+                    buf_offset += remaining;
+                    remaining = 0;
+                }
+            }
         }
     }
     batch.clear();
@@ -243,7 +249,7 @@ pub(crate) struct SharedState {
     // Per-connection format preference (lock-free sync access for send_event)
     conn_formats: DashMap<String, bool>,
     // Per-connection rate limiter state (cleaned up on disconnect)
-    conn_rates: std::sync::Mutex<HashMap<String, PerConnRate>>,
+    conn_rates: DashMap<String, PerConnRate>,
     // Atomic connection count (lock-free read from Python without GIL blocking)
     connection_count: AtomicUsize,
     // JWT config: when set, Rust validates JWT in handshake (zero GIL)
@@ -259,9 +265,6 @@ pub(crate) struct SharedState {
     cluster_dlq: Arc<std::sync::Mutex<ClusterDlq>>,
     pub(crate) cluster_instance_id: std::sync::Mutex<Option<String>>,
 }
-
-unsafe impl Send for SharedState {}
-unsafe impl Sync for SharedState {}
 
 impl SharedState {
     fn new(
@@ -282,7 +285,7 @@ impl SharedState {
             inbound_rx: rx,
             inbound_dropped: AtomicU64::new(0),
             conn_formats: DashMap::new(),
-            conn_rates: std::sync::Mutex::new(HashMap::new()),
+            conn_rates: DashMap::new(),
             connection_count: AtomicUsize::new(0),
             jwt_config,
             topic_subscribers: Arc::new(DashMap::new()),
@@ -485,10 +488,12 @@ fn message_category(msg_type: &str) -> &'static str {
 /// Build a JSON error message for auth failures.
 fn build_error_json(code: &str, message: &str) -> String {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    format!(
-        r#"WSE{{"t":"error","p":{{"code":"{}","message":"{}","timestamp":"{}"}},"v":1}}"#,
-        code, message, ts,
-    )
+    let inner = serde_json::json!({
+        "t": "error",
+        "p": { "code": code, "message": message, "timestamp": ts },
+        "v": 1
+    });
+    format!("WSE{inner}")
 }
 
 /// Build server_ready JSON message (sent immediately from Rust after JWT validation).
@@ -1019,20 +1024,19 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     // Cleanup
     state.connections.remove(&*conn_id);
     state.conn_formats.remove(&*conn_id);
-    {
-        state.conn_rates.lock().unwrap().remove(&*conn_id);
-    }
+    state.conn_rates.remove(&*conn_id);
     // Pub/Sub cleanup: remove connection from all subscribed topics
     if let Some((_, topics)) = state.conn_topics.remove(&*conn_id) {
         for topic_ref in topics.iter() {
             let topic = topic_ref.clone();
             if let Some(subscribers) = state.topic_subscribers.get(&topic) {
                 subscribers.remove(&*conn_id);
-                if subscribers.is_empty() {
-                    drop(subscribers);
-                    state.topic_subscribers.remove(&topic);
-                }
             }
+            // Atomic check-and-remove: avoids TOCTOU race where another thread
+            // inserts a subscriber between is_empty() and remove()
+            state
+                .topic_subscribers
+                .remove_if(&topic, |_, subs| subs.is_empty());
         }
     }
     state.connection_count.fetch_sub(1, Ordering::Relaxed);
@@ -1538,8 +1542,9 @@ impl RustWSEServer {
 
         // #8: Per-connection rate limiter (token bucket)
         {
-            let mut rates = self.shared.conn_rates.lock().unwrap();
-            let state = rates
+            let mut state = self
+                .shared
+                .conn_rates
                 .entry(conn_id.to_owned())
                 .or_insert_with(|| PerConnRate {
                     tokens: RATE_CAPACITY,
@@ -1977,11 +1982,10 @@ impl RustWSEServer {
                 for topic in &topics {
                     if let Some(subscribers) = self.shared.topic_subscribers.get(topic) {
                         subscribers.remove(conn_id);
-                        if subscribers.is_empty() {
-                            drop(subscribers);
-                            self.shared.topic_subscribers.remove(topic);
-                        }
                     }
+                    self.shared
+                        .topic_subscribers
+                        .remove_if(topic, |_, subs| subs.is_empty());
                     if let Some(conn_entry) = self.shared.conn_topics.get(conn_id) {
                         conn_entry.remove(topic);
                     }
@@ -1993,11 +1997,10 @@ impl RustWSEServer {
                         let topic = topic_ref.clone();
                         if let Some(subscribers) = self.shared.topic_subscribers.get(&topic) {
                             subscribers.remove(conn_id);
-                            if subscribers.is_empty() {
-                                drop(subscribers);
-                                self.shared.topic_subscribers.remove(&topic);
-                            }
                         }
+                        self.shared
+                            .topic_subscribers
+                            .remove_if(&topic, |_, subs| subs.is_empty());
                     }
                 }
             }
