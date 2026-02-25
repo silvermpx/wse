@@ -10,9 +10,10 @@
 // =============================================================================
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{IoSlice, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -95,21 +96,54 @@ pub(crate) fn pre_frame_binary(data: &[u8]) -> Bytes {
     encode_ws_frame(0x02, data)
 }
 
-/// Flush a batch of pre-framed bytes to TCP in minimal writes.
-/// Single frame: one write_all (zero copy). Multiple: concatenate + one write_all.
+/// Flush a batch of pre-framed bytes to TCP using vectored I/O.
+/// Single frame: direct write_all (zero copy). Multiple: writev via write_vectored (no memcpy).
 async fn flush_raw_batch(writer: &mut TcpStream, batch: &mut Vec<Bytes>) -> std::io::Result<()> {
     if batch.len() == 1 {
         writer.write_all(&batch[0]).await?;
     } else {
         let total: usize = batch.iter().map(|b| b.len()).sum();
-        let mut combined = BytesMut::with_capacity(total);
-        for buf in batch.iter() {
-            combined.extend_from_slice(buf);
+        let mut written = 0usize;
+        while written < total {
+            // Build IoSlice refs for remaining data
+            let mut offset = 0usize;
+            let slices: Vec<IoSlice<'_>> = batch
+                .iter()
+                .filter_map(|b| {
+                    let start = offset;
+                    offset += b.len();
+                    if offset <= written {
+                        None // fully written already
+                    } else if start < written {
+                        // partially written
+                        Some(IoSlice::new(&b[(written - start)..]))
+                    } else {
+                        Some(IoSlice::new(b))
+                    }
+                })
+                .collect();
+            let n = writer.write_vectored(&slices).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "write_vectored returned 0",
+                ));
+            }
+            written += n;
         }
-        writer.write_all(&combined).await?;
     }
     batch.clear();
     Ok(())
+}
+
+/// Cached CPU core count for fan-out chunking. Avoids repeated syscalls on the hot path.
+fn cpu_count() -> usize {
+    static CPU_COUNT: OnceLock<usize> = OnceLock::new();
+    *CPU_COUNT.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+    })
 }
 
 /// Clone a TcpStream by duplicating the file descriptor.
@@ -179,6 +213,7 @@ const RATE_REFILL: f64 = 10_000.0; // tokens per second
 // Parallel fan-out tuning
 // ---------------------------------------------------------------------------
 const PARALLEL_FANOUT_THRESHOLD: usize = 256;
+const MIN_FANOUT_CHUNK: usize = 512;
 
 enum ServerCommand {
     SendText { conn_id: String, data: String },
@@ -1081,10 +1116,8 @@ fn fanout_to_senders(senders: Vec<mpsc::UnboundedSender<WsFrame>>, frame: WsFram
             let _ = tx.send(frame.clone());
         }
     } else {
-        let num_chunks = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4);
-        let chunk_size = n.div_ceil(num_chunks);
+        let num_tasks = (n / MIN_FANOUT_CHUNK).max(1).min(cpu_count());
+        let chunk_size = n.div_ceil(num_tasks);
         let mut iter = senders.into_iter();
         loop {
             let chunk: Vec<mpsc::UnboundedSender<WsFrame>> =
@@ -1135,10 +1168,8 @@ pub(crate) fn fanout_to_senders_with_metrics<M: FanoutMetrics>(
             metrics.add_dropped(f);
         }
     } else {
-        let num_chunks = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4);
-        let chunk_size = n.div_ceil(num_chunks);
+        let num_tasks = (n / MIN_FANOUT_CHUNK).max(1).min(cpu_count());
+        let chunk_size = n.div_ceil(num_tasks);
         let mut iter = senders.into_iter();
         loop {
             let chunk: Vec<mpsc::UnboundedSender<WsFrame>> =
