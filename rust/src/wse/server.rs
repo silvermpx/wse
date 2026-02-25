@@ -97,6 +97,12 @@ struct PerConnRate {
 const RATE_CAPACITY: f64 = 100_000.0;
 const RATE_REFILL: f64 = 10_000.0; // tokens per second
 
+// ---------------------------------------------------------------------------
+// Parallel fan-out tuning
+// ---------------------------------------------------------------------------
+const PARALLEL_FANOUT_THRESHOLD: usize = 256;
+const FANOUT_CHUNK_SIZE: usize = 512;
+
 enum ServerCommand {
     SendText { conn_id: String, data: String },
     SendBytes { conn_id: String, data: Vec<u8> },
@@ -874,6 +880,143 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
 }
 
 // ---------------------------------------------------------------------------
+// Parallel fan-out helpers
+// ---------------------------------------------------------------------------
+
+/// Collect subscriber sender handles for a topic, with dedup.
+/// Holds connections read lock only during collection (not during sends).
+pub(crate) fn collect_topic_senders(
+    conns: &HashMap<String, ConnectionHandle>,
+    topic_subscribers: &DashMap<String, DashSet<String>>,
+    topic: &str,
+) -> Vec<mpsc::UnboundedSender<Message>> {
+    let mut seen = AHashSet::new();
+    let mut senders = Vec::new();
+
+    // Exact topic match
+    if let Some(conn_ids) = topic_subscribers.get(topic) {
+        senders.reserve(conn_ids.len());
+        for conn_id_ref in conn_ids.iter() {
+            let cid = conn_id_ref.key();
+            if seen.insert(cid.clone())
+                && let Some(handle) = conns.get(cid)
+            {
+                senders.push(handle.tx.clone());
+            }
+        }
+    }
+
+    // Glob pattern match
+    for entry in topic_subscribers.iter() {
+        let pattern = entry.key();
+        if (pattern.contains('*') || pattern.contains('?'))
+            && super::redis_pubsub::glob_match(pattern, topic)
+        {
+            for conn_id_ref in entry.value().iter() {
+                let cid = conn_id_ref.key();
+                if seen.insert(cid.clone())
+                    && let Some(handle) = conns.get(cid)
+                {
+                    senders.push(handle.tx.clone());
+                }
+            }
+        }
+    }
+
+    senders
+}
+
+/// Fan-out a pre-built message to collected sender handles.
+/// Parallel when above threshold, sequential otherwise.
+fn fanout_to_senders(senders: Vec<mpsc::UnboundedSender<Message>>, msg: Message) {
+    let n = senders.len();
+    if n == 0 {
+        return;
+    }
+    if n < PARALLEL_FANOUT_THRESHOLD {
+        for tx in &senders {
+            let _ = tx.send(msg.clone());
+        }
+    } else {
+        let mut iter = senders.into_iter();
+        loop {
+            let chunk: Vec<mpsc::UnboundedSender<Message>> =
+                iter.by_ref().take(FANOUT_CHUNK_SIZE).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            let chunk_msg = msg.clone();
+            tokio::spawn(async move {
+                for tx in &chunk {
+                    let _ = tx.send(chunk_msg.clone());
+                }
+            });
+        }
+    }
+}
+
+/// Trait for fan-out metrics tracking. Implemented by ClusterMetrics and RedisMetrics.
+pub(crate) trait FanoutMetrics: Send + Sync + 'static {
+    fn add_delivered(&self, count: u64);
+    fn add_dropped(&self, count: u64);
+}
+
+/// Fan-out with metrics tracking (for cluster/redis dispatch).
+/// Takes Arc<M> where M implements FanoutMetrics, enabling spawned tasks
+/// to update metrics with 'static lifetime.
+pub(crate) fn fanout_to_senders_with_metrics<M: FanoutMetrics>(
+    senders: Vec<mpsc::UnboundedSender<Message>>,
+    msg: Message,
+    metrics: &Arc<M>,
+) {
+    let n = senders.len();
+    if n == 0 {
+        return;
+    }
+    if n < PARALLEL_FANOUT_THRESHOLD {
+        let mut d = 0u64;
+        let mut f = 0u64;
+        for tx in &senders {
+            if tx.send(msg.clone()).is_ok() {
+                d += 1;
+            } else {
+                f += 1;
+            }
+        }
+        metrics.add_delivered(d);
+        if f > 0 {
+            metrics.add_dropped(f);
+        }
+    } else {
+        let mut iter = senders.into_iter();
+        loop {
+            let chunk: Vec<mpsc::UnboundedSender<Message>> =
+                iter.by_ref().take(FANOUT_CHUNK_SIZE).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            let chunk_msg = msg.clone();
+            let m = metrics.clone();
+            tokio::spawn(async move {
+                let mut d = 0u64;
+                let mut f = 0u64;
+                for tx in &chunk {
+                    if tx.send(chunk_msg.clone()).is_ok() {
+                        d += 1;
+                    } else {
+                        f += 1;
+                    }
+                }
+                m.add_delivered(d);
+                if f > 0 {
+                    m.add_dropped(f);
+                }
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Command processor
 // ---------------------------------------------------------------------------
 
@@ -902,48 +1045,28 @@ async fn process_commands(
                 }
             }
             ServerCommand::BroadcastText { data } => {
-                let conns = state.connections.read().await;
-                for h in conns.values() {
-                    let _ = h.tx.send(Message::Text(data.clone().into()));
-                }
+                let msg = Message::Text(data.into());
+                let senders: Vec<mpsc::UnboundedSender<Message>> = {
+                    let conns = state.connections.read().await;
+                    conns.values().map(|h| h.tx.clone()).collect()
+                };
+                fanout_to_senders(senders, msg);
             }
             ServerCommand::BroadcastBytes { data } => {
-                let conns = state.connections.read().await;
-                for h in conns.values() {
-                    let _ = h.tx.send(Message::Binary(data.clone().into()));
-                }
+                let msg = Message::Binary(data.into());
+                let senders: Vec<mpsc::UnboundedSender<Message>> = {
+                    let conns = state.connections.read().await;
+                    conns.values().map(|h| h.tx.clone()).collect()
+                };
+                fanout_to_senders(senders, msg);
             }
             ServerCommand::BroadcastLocal { topic, data } => {
-                // Fan-out to topic subscribers with dedup (AHashSet prevents
-                // duplicate delivery when a connection matches both exact and glob).
-                let conns = state.connections.read().await;
-                let mut seen = AHashSet::new();
-                if let Some(conn_ids) = state.topic_subscribers.get(&topic) {
-                    for conn_id_ref in conn_ids.iter() {
-                        let cid = conn_id_ref.key();
-                        if seen.insert(cid.clone())
-                            && let Some(handle) = conns.get(cid)
-                        {
-                            let _ = handle.tx.send(Message::Text(data.clone().into()));
-                        }
-                    }
-                }
-                // Glob pattern matching for wildcard subscribers
-                for entry in state.topic_subscribers.iter() {
-                    let pattern = entry.key();
-                    if (pattern.contains('*') || pattern.contains('?'))
-                        && super::redis_pubsub::glob_match(pattern, &topic)
-                    {
-                        for conn_id_ref in entry.value().iter() {
-                            let cid = conn_id_ref.key();
-                            if seen.insert(cid.clone())
-                                && let Some(handle) = conns.get(cid)
-                            {
-                                let _ = handle.tx.send(Message::Text(data.clone().into()));
-                            }
-                        }
-                    }
-                }
+                let msg = Message::Text(data.into());
+                let senders = {
+                    let conns = state.connections.read().await;
+                    collect_topic_senders(&conns, &state.topic_subscribers, &topic)
+                };
+                fanout_to_senders(senders, msg);
             }
             ServerCommand::Disconnect { conn_id } => {
                 let conns = state.connections.read().await;

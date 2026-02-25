@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use ahash::AHashSet;
 use dashmap::{DashMap, DashSet};
 use futures_util::StreamExt;
 use tokio::sync::{RwLock, mpsc};
@@ -46,6 +45,15 @@ impl RedisMetrics {
             reconnect_count: AtomicU64::new(0),
             connected: AtomicBool::new(false),
         }
+    }
+}
+
+impl super::server::FanoutMetrics for RedisMetrics {
+    fn add_delivered(&self, count: u64) {
+        self.messages_delivered.fetch_add(count, Ordering::Relaxed);
+    }
+    fn add_dropped(&self, count: u64) {
+        self.messages_dropped.fetch_add(count, Ordering::Relaxed);
     }
 }
 
@@ -129,56 +137,14 @@ async fn dispatch_to_subscribers(
     topic_subscribers: &DashMap<String, DashSet<String>>,
     topic: &str,
     payload: &str,
-    metrics: &RedisMetrics,
+    metrics: &Arc<RedisMetrics>,
 ) {
-    let conns = connections.read().await;
-    let mut delivered: u64 = 0;
-    let mut seen = AHashSet::new();
-
-    if let Some(conn_ids) = topic_subscribers.get(topic) {
-        for conn_id_ref in conn_ids.iter() {
-            let cid = conn_id_ref.key().clone();
-            if seen.insert(cid.clone())
-                && let Some(handle) = conns.get(&cid)
-            {
-                if handle
-                    .tx
-                    .send(Message::Text(payload.to_owned().into()))
-                    .is_ok()
-                {
-                    delivered += 1;
-                } else {
-                    metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-    }
-
-    for entry in topic_subscribers.iter() {
-        let pattern = entry.key();
-        if (pattern.contains('*') || pattern.contains('?')) && glob_match(pattern, topic) {
-            for conn_id_ref in entry.value().iter() {
-                let cid = conn_id_ref.key().clone();
-                if seen.insert(cid.clone())
-                    && let Some(handle) = conns.get(&cid)
-                {
-                    if handle
-                        .tx
-                        .send(Message::Text(payload.to_owned().into()))
-                        .is_ok()
-                    {
-                        delivered += 1;
-                    } else {
-                        metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-    }
-
-    metrics
-        .messages_delivered
-        .fetch_add(delivered, Ordering::Relaxed);
+    let msg = Message::Text(payload.to_owned().into());
+    let senders = {
+        let conns = connections.read().await;
+        super::server::collect_topic_senders(&conns, topic_subscribers, topic)
+    };
+    super::server::fanout_to_senders_with_metrics(senders, msg, metrics);
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +214,7 @@ async fn connect_and_run(
     connections: &RwLock<HashMap<String, ConnectionHandle>>,
     topic_subscribers: &DashMap<String, DashSet<String>>,
     cmd_rx: &mut mpsc::UnboundedReceiver<RedisCommand>,
-    metrics: &RedisMetrics,
+    metrics: &Arc<RedisMetrics>,
     dlq: &std::sync::Mutex<DeadLetterQueue>,
 ) -> Result<(), String> {
     let client = redis::Client::open(url).map_err(|e| format!("Failed to open client: {e}"))?;
@@ -275,7 +241,7 @@ async fn connect_and_run(
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
     // --- Publish task: batches commands from cmd_rx, pipelines to Redis ---
-    let pub_metrics = metrics;
+    let pub_metrics: &RedisMetrics = metrics;
     let pub_dlq = dlq;
     let pub_task = async {
         let mut breaker = CircuitBreaker::new();

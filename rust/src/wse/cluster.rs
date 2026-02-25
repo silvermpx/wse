@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ahash::AHashSet;
 use bytes::{Buf, BufMut, BytesMut};
 use dashmap::{DashMap, DashSet};
 use socket2::{SockRef, TcpKeepalive};
@@ -91,6 +90,15 @@ impl ClusterMetrics {
             reconnect_count: AtomicU64::new(0),
             connected_peers: AtomicU64::new(0),
         }
+    }
+}
+
+impl super::server::FanoutMetrics for ClusterMetrics {
+    fn add_delivered(&self, count: u64) {
+        self.messages_delivered.fetch_add(count, Ordering::Relaxed);
+    }
+    fn add_dropped(&self, count: u64) {
+        self.messages_dropped.fetch_add(count, Ordering::Relaxed);
     }
 }
 
@@ -285,7 +293,7 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
 }
 
 // ---------------------------------------------------------------------------
-// Fan-out dispatch (with AHashSet dedup -- fixes existing BroadcastLocal bug)
+// Fan-out dispatch (delegates to parallel fan-out helpers in server.rs)
 // ---------------------------------------------------------------------------
 
 pub(crate) async fn cluster_dispatch(
@@ -293,55 +301,14 @@ pub(crate) async fn cluster_dispatch(
     topic_subscribers: &DashMap<String, DashSet<String>>,
     topic: &str,
     payload: &str,
-    metrics: &ClusterMetrics,
+    metrics: &Arc<ClusterMetrics>,
 ) {
-    let conns = connections.read().await;
-    let mut seen = AHashSet::new();
-
-    // Exact topic match
-    if let Some(conn_ids) = topic_subscribers.get(topic) {
-        for conn_id_ref in conn_ids.iter() {
-            let cid = conn_id_ref.key().clone();
-            if seen.insert(cid.clone())
-                && let Some(handle) = conns.get(&cid)
-            {
-                if handle
-                    .tx
-                    .send(Message::Text(payload.to_owned().into()))
-                    .is_ok()
-                {
-                    metrics.messages_delivered.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-    }
-
-    // Glob pattern match
-    for entry in topic_subscribers.iter() {
-        let pattern = entry.key();
-        if (pattern.contains('*') || pattern.contains('?'))
-            && super::redis_pubsub::glob_match(pattern, topic)
-        {
-            for conn_id_ref in entry.value().iter() {
-                let cid = conn_id_ref.key().clone();
-                if seen.insert(cid.clone())
-                    && let Some(handle) = conns.get(&cid)
-                {
-                    if handle
-                        .tx
-                        .send(Message::Text(payload.to_owned().into()))
-                        .is_ok()
-                    {
-                        metrics.messages_delivered.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-    }
+    let msg = Message::Text(payload.to_owned().into());
+    let senders = {
+        let conns = connections.read().await;
+        super::server::collect_topic_senders(&conns, topic_subscribers, topic)
+    };
+    super::server::fanout_to_senders_with_metrics(senders, msg, metrics);
 }
 
 // ---------------------------------------------------------------------------
