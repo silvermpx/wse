@@ -2554,4 +2554,120 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Test peer exchange: Node B sends PEER_LIST containing Node C's address to Node A.
+    /// Verifies that PEER_ANNOUNCE and PEER_LIST are correctly exchanged during handshake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_peer_exchange_discovery() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_addr = listener.local_addr().unwrap();
+        let c_addr = "192.168.1.100:9001"; // Node C's address (doesn't need to exist)
+
+        // Node A: connect to B, exchange HELLO, then read PEER_ANNOUNCE + PEER_LIST
+        let node_a = tokio::spawn(async move {
+            let stream = TcpStream::connect(b_addr).await.unwrap();
+            let (mut read, mut write) = stream.into_split();
+
+            // Send HELLO
+            let mut hello = BytesMut::new();
+            encode_hello(&mut hello, "node-a", LOCAL_CAPABILITIES);
+            let mut frame = BytesMut::new();
+            write_framed(&mut frame, &hello);
+            write.write_all(&frame).await.unwrap();
+
+            // Read HELLO from B
+            let mut len_buf = [0u8; 4];
+            read.read_exact(&mut len_buf).await.unwrap();
+            let frame_len = u32::from_be_bytes(len_buf) as usize;
+            let mut frame_buf = BytesMut::zeroed(frame_len);
+            read.read_exact(&mut frame_buf).await.unwrap();
+            let hello_b = decode_frame(frame_buf).unwrap();
+            assert!(
+                matches!(hello_b, ClusterFrame::Hello { ref instance_id, .. } if instance_id == "node-b")
+            );
+
+            // Read PEER_ANNOUNCE from B (B announces its own cluster address)
+            read.read_exact(&mut len_buf).await.unwrap();
+            let frame_len = u32::from_be_bytes(len_buf) as usize;
+            let mut frame_buf = BytesMut::zeroed(frame_len);
+            read.read_exact(&mut frame_buf).await.unwrap();
+            let announce = decode_frame(frame_buf).unwrap();
+
+            // Read PEER_LIST from B
+            read.read_exact(&mut len_buf).await.unwrap();
+            let frame_len = u32::from_be_bytes(len_buf) as usize;
+            let mut frame_buf = BytesMut::zeroed(frame_len);
+            read.read_exact(&mut frame_buf).await.unwrap();
+            let peer_list = decode_frame(frame_buf).unwrap();
+
+            (announce, peer_list)
+        });
+
+        // Node B: accept connection, exchange HELLO, send PEER_ANNOUNCE + PEER_LIST
+        let (stream, _) = listener.accept().await.unwrap();
+        let (mut read, mut write) = stream.into_split();
+
+        // Read HELLO from A
+        let mut len_buf = [0u8; 4];
+        read.read_exact(&mut len_buf).await.unwrap();
+        let frame_len = u32::from_be_bytes(len_buf) as usize;
+        let mut frame_buf = BytesMut::zeroed(frame_len);
+        read.read_exact(&mut frame_buf).await.unwrap();
+        let hello_a = decode_frame(frame_buf).unwrap();
+        assert!(
+            matches!(hello_a, ClusterFrame::Hello { ref instance_id, .. } if instance_id == "node-a")
+        );
+
+        // Send HELLO back
+        let mut hello = BytesMut::new();
+        encode_hello(&mut hello, "node-b", LOCAL_CAPABILITIES);
+        let mut frame = BytesMut::new();
+        write_framed(&mut frame, &hello);
+        write.write_all(&frame).await.unwrap();
+
+        // Send PEER_ANNOUNCE (B's own cluster address)
+        let b_cluster_addr = format!("127.0.0.1:{}", b_addr.port());
+        let mut announce = BytesMut::new();
+        encode_peer_announce(&mut announce, &b_cluster_addr);
+        let mut frame = BytesMut::new();
+        write_framed(&mut frame, &announce);
+        write.write_all(&frame).await.unwrap();
+
+        // Send PEER_LIST with C's address
+        let addrs = vec![c_addr.to_string(), b_cluster_addr.clone()];
+        let mut list = BytesMut::new();
+        encode_peer_list(&mut list, &addrs);
+        let mut frame = BytesMut::new();
+        write_framed(&mut frame, &list);
+        write.write_all(&frame).await.unwrap();
+
+        // Verify what A received
+        let (announce_frame, peer_list_frame) = node_a.await.unwrap();
+
+        // Check PEER_ANNOUNCE
+        assert_eq!(
+            announce_frame,
+            ClusterFrame::PeerAnnounce {
+                addr: b_cluster_addr.clone()
+            }
+        );
+
+        // Check PEER_LIST contains both C's address and B's address
+        match peer_list_frame {
+            ClusterFrame::PeerList { addrs } => {
+                assert!(
+                    addrs.contains(&c_addr.to_string()),
+                    "PEER_LIST should contain Node C's address"
+                );
+                assert!(
+                    addrs.contains(&b_cluster_addr),
+                    "PEER_LIST should contain Node B's address"
+                );
+                assert_eq!(addrs.len(), 2);
+            }
+            other => panic!("Expected PeerList, got {:?}", other),
+        }
+    }
 }
