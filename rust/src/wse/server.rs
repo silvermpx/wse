@@ -1933,6 +1933,7 @@ impl RustWSEServer {
             local_topic_refcount,
             tls_config,
             cluster_port,
+            None, // cluster_addr: set via seeds= parameter (Task 5)
         ));
 
         Ok(())
