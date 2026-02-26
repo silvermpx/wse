@@ -46,11 +46,17 @@ pub(crate) const PROTOCOL_VERSION_MIN: u16 = 1;
 
 // Capability flags (negotiated via bitwise AND of both peers' values)
 pub(crate) const CAP_INTEREST_ROUTING: u32 = 1 << 0; // Phase 2: SUB/UNSUB
-#[allow(dead_code)]
-pub(crate) const CAP_COMPRESSION: u32 = 1 << 1; // Phase 6: reserved for future
+pub(crate) const CAP_COMPRESSION: u32 = 1 << 1; // Phase 6: zstd compression
 
 /// Our capabilities bitmask
-pub(crate) const LOCAL_CAPABILITIES: u32 = CAP_INTEREST_ROUTING;
+pub(crate) const LOCAL_CAPABILITIES: u32 = CAP_INTEREST_ROUTING | CAP_COMPRESSION;
+
+// Per-frame flags (bit 0 of the flags byte in every frame header)
+const FLAG_COMPRESSED: u8 = 0x01;
+
+// Minimum payload size for compression to be worthwhile (bytes).
+// Below this threshold, zstd overhead exceeds savings.
+const COMPRESSION_THRESHOLD: usize = 256;
 
 // ---------------------------------------------------------------------------
 // TLS configuration
@@ -302,6 +308,35 @@ pub(crate) fn encode_msg(buf: &mut BytesMut, topic: &str, payload: &str) -> bool
     true
 }
 
+/// Encode a MSG frame with zstd compression on the payload.
+/// Compresses only if payload >= COMPRESSION_THRESHOLD and compressed size < original.
+/// Falls back to uncompressed encoding if compression doesn't help.
+pub(crate) fn encode_msg_compressed(buf: &mut BytesMut, topic: &str, payload: &str) -> bool {
+    let topic_bytes = topic.as_bytes();
+    if topic_bytes.len() > u16::MAX as usize {
+        return false;
+    }
+    let payload_bytes = payload.as_bytes();
+
+    // Only attempt compression for payloads above threshold
+    if payload_bytes.len() >= COMPRESSION_THRESHOLD
+        && let Ok(compressed) = zstd::bulk::compress(payload_bytes, 1)
+        && compressed.len() < payload_bytes.len()
+    {
+        buf.reserve(8 + topic_bytes.len() + compressed.len());
+        buf.put_u8(MsgType::Msg as u8);
+        buf.put_u8(FLAG_COMPRESSED);
+        buf.put_u16_le(topic_bytes.len() as u16);
+        buf.put_u32_le(compressed.len() as u32);
+        buf.put_slice(topic_bytes);
+        buf.put_slice(&compressed);
+        return true;
+    }
+
+    // Fallback: uncompressed
+    encode_msg(buf, topic, payload)
+}
+
 /// Encode a PING frame (header only, 8 bytes).
 pub(crate) fn encode_ping(buf: &mut BytesMut) {
     buf.reserve(8);
@@ -479,7 +514,7 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
         return None;
     }
     let raw_type = data.get_u8();
-    let _flags = data.get_u8();
+    let flags = data.get_u8();
     let topic_len = data.get_u16_le() as usize;
     let payload_len = data.get_u32_le() as usize;
 
@@ -489,7 +524,14 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                 return None;
             }
             let topic = String::from_utf8(data.split_to(topic_len).to_vec()).ok()?;
-            let payload = String::from_utf8(data.split_to(payload_len).to_vec()).ok()?;
+            let payload = if flags & FLAG_COMPRESSED != 0 {
+                // Decompress zstd payload
+                let compressed = data.split_to(payload_len);
+                let decompressed = zstd::bulk::decompress(&compressed, MAX_FRAME_SIZE).ok()?;
+                String::from_utf8(decompressed).ok()?
+            } else {
+                String::from_utf8(data.split_to(payload_len).to_vec()).ok()?
+            };
             Some(ClusterFrame::Msg { topic, payload })
         }
         Some(MsgType::Ping) => Some(ClusterFrame::Ping),
@@ -1469,7 +1511,7 @@ pub(crate) async fn cluster_manager(
                 match cmd {
                     Some(ClusterCommand::Publish { topic, payload }) => {
                         let mut frame_data = BytesMut::new();
-                        if !encode_msg(&mut frame_data, &topic, &payload) {
+                        if !encode_msg_compressed(&mut frame_data, &topic, &payload) {
                             continue;
                         }
 
@@ -1866,6 +1908,55 @@ mod tests {
             ClusterFrame::Msg {
                 topic: "chat.general".into(),
                 payload: "hello world".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_encode_decode_msg_compressed() {
+        // Small payload: should NOT be compressed (below threshold)
+        let mut buf = BytesMut::new();
+        encode_msg_compressed(&mut buf, "chat", "hello");
+        let frame = decode_frame(buf).unwrap();
+        assert_eq!(
+            frame,
+            ClusterFrame::Msg {
+                topic: "chat".into(),
+                payload: "hello".into(),
+            }
+        );
+
+        // Large payload: should be compressed (must be >= 256 bytes)
+        let big_payload = r#"{"user":"alice","message":"hello world, this is a longer message with repeated patterns for compression","timestamp":1234567890,"tags":["alpha","beta","gamma","delta","epsilon","zeta","eta","theta","iota","kappa"],"metadata":{"source":"api-gateway","version":"1.0.0","region":"us-east-1","cluster":"prod-main","environment":"production","extra":"additional padding data to ensure this payload exceeds the compression threshold of 256 bytes easily"}}"#;
+        assert!(big_payload.len() >= COMPRESSION_THRESHOLD);
+        let mut buf = BytesMut::new();
+        encode_msg_compressed(&mut buf, "events.user", big_payload);
+        // Verify the flags byte indicates compression
+        assert_eq!(buf[0], MsgType::Msg as u8);
+        assert_eq!(buf[1] & FLAG_COMPRESSED, FLAG_COMPRESSED);
+        // Decode should produce the original payload
+        let frame = decode_frame(buf).unwrap();
+        assert_eq!(
+            frame,
+            ClusterFrame::Msg {
+                topic: "events.user".into(),
+                payload: big_payload.into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_decode_uncompressed_msg_with_zero_flags() {
+        // Verify that uncompressed messages (flags=0) still decode correctly
+        let mut buf = BytesMut::new();
+        encode_msg(&mut buf, "topic", "payload");
+        assert_eq!(buf[1], 0); // flags byte should be 0
+        let frame = decode_frame(buf).unwrap();
+        assert_eq!(
+            frame,
+            ClusterFrame::Msg {
+                topic: "topic".into(),
+                payload: "payload".into(),
             }
         );
     }

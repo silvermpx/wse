@@ -38,6 +38,7 @@ mimalloc = "0.1"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = true }
 rustls-pki-types = "1"
+zstd = "0.13"
 
 [dev-dependencies]
 rcgen = "0.13"
