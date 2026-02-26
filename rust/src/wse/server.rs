@@ -1848,7 +1848,8 @@ impl RustWSEServer {
 
     // -- Cluster Protocol -----------------------------------------------------
 
-    #[pyo3(signature = (peers, tls_cert=None, tls_key=None, tls_ca=None, cluster_port=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (peers, tls_cert=None, tls_key=None, tls_ca=None, cluster_port=None, seeds=None, cluster_addr=None))]
     fn connect_cluster(
         &self,
         peers: Vec<String>,
@@ -1856,6 +1857,8 @@ impl RustWSEServer {
         tls_key: Option<String>,
         tls_ca: Option<String>,
         cluster_port: Option<u16>,
+        seeds: Option<Vec<String>>,
+        cluster_addr: Option<String>,
     ) -> PyResult<()> {
         // Mutual exclusion: error if Redis is connected
         if self.shared.redis_cmd_tx.lock().unwrap().is_some() {
@@ -1865,6 +1868,13 @@ impl RustWSEServer {
         }
         if self.shared.cluster_cmd_tx.read().unwrap().is_some() {
             return Err(PyRuntimeError::new_err("Cluster already connected"));
+        }
+
+        // Validate: seeds requires cluster_addr so other nodes can reach us
+        if seeds.is_some() && cluster_addr.is_none() {
+            return Err(PyRuntimeError::new_err(
+                "seeds= requires cluster_addr= so peers can connect back to this node",
+            ));
         }
 
         // Resolve TLS config: explicit params > env vars > None (plaintext)
@@ -1920,8 +1930,16 @@ impl RustWSEServer {
         let dlq = self.shared.cluster_dlq.clone();
         let local_topic_refcount = self.shared.local_topic_refcount.clone();
 
+        // seeds= mode: use seeds as initial peers, enable discovery
+        // peers= mode: use static peer list, no discovery
+        let effective_peers = if let Some(ref s) = seeds {
+            s.clone()
+        } else {
+            peers
+        };
+
         rt_handle.spawn(super::cluster::cluster_manager(
-            peers,
+            effective_peers,
             instance_id,
             cmd_rx,
             interest_tx,
@@ -1933,7 +1951,7 @@ impl RustWSEServer {
             local_topic_refcount,
             tls_config,
             cluster_port,
-            None, // cluster_addr: set via seeds= parameter (Task 5)
+            cluster_addr,
         ));
 
         Ok(())
