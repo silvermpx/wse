@@ -197,12 +197,12 @@ pub(crate) struct SharedState {
     redis_metrics: Arc<RedisMetrics>,
     redis_dlq: Arc<std::sync::Mutex<DeadLetterQueue>>,
     // Cluster protocol
-    cluster_cmd_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<ClusterCommand>>>,
+    cluster_cmd_tx: std::sync::RwLock<Option<mpsc::UnboundedSender<ClusterCommand>>>,
     pub(crate) cluster_metrics: Arc<ClusterMetrics>,
     cluster_dlq: Arc<std::sync::Mutex<ClusterDlq>>,
     pub(crate) cluster_instance_id: std::sync::Mutex<Option<String>>,
     pub(crate) cluster_interest_tx:
-        std::sync::Mutex<Option<mpsc::UnboundedSender<super::cluster::InterestUpdate>>>,
+        std::sync::RwLock<Option<mpsc::UnboundedSender<super::cluster::InterestUpdate>>>,
     pub(crate) local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
 }
 
@@ -233,11 +233,11 @@ impl SharedState {
             redis_cmd_tx: std::sync::Mutex::new(None),
             redis_metrics: Arc::new(RedisMetrics::new()),
             redis_dlq: Arc::new(std::sync::Mutex::new(DeadLetterQueue::new(1000))),
-            cluster_cmd_tx: std::sync::Mutex::new(None),
+            cluster_cmd_tx: std::sync::RwLock::new(None),
             cluster_metrics: Arc::new(ClusterMetrics::new()),
             cluster_dlq: Arc::new(std::sync::Mutex::new(ClusterDlq::new(1000))),
             cluster_instance_id: std::sync::Mutex::new(None),
-            cluster_interest_tx: std::sync::Mutex::new(None),
+            cluster_interest_tx: std::sync::RwLock::new(None),
             local_topic_refcount: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -1001,9 +1001,12 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         }
 
         // Emit UNSUB to cluster for topics whose refcount went 1->0
-        let cluster_tx = state.cluster_cmd_tx.lock().unwrap().clone();
+        let cluster_tx = state.cluster_cmd_tx.read().unwrap().clone();
         if let Some(tx) = cluster_tx {
-            let mut refcounts = state.local_topic_refcount.lock().unwrap();
+            let mut refcounts = state
+                .local_topic_refcount
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             for topic in &disconnected_topics {
                 if let Some(count) = refcounts.get_mut(topic) {
                     *count = count.saturating_sub(1);
@@ -1349,7 +1352,7 @@ impl RustWSEServer {
                                             if is_cluster {
                                                 let interest_tx = shared2
                                                     .cluster_interest_tx
-                                                    .lock()
+                                                    .read()
                                                     .unwrap()
                                                     .clone();
                                                 if let Some(interest_tx) = interest_tx {
@@ -1395,7 +1398,7 @@ impl RustWSEServer {
             return Ok(());
         }
         // Shutdown cluster
-        if let Ok(guard) = self.shared.cluster_cmd_tx.lock()
+        if let Ok(guard) = self.shared.cluster_cmd_tx.read()
             && let Some(ref tx) = *guard
         {
             let _ = tx.send(ClusterCommand::Shutdown);
@@ -1417,7 +1420,7 @@ impl RustWSEServer {
             }
         }
         self.cmd_tx = None;
-        *self.shared.cluster_cmd_tx.lock().unwrap() = None;
+        *self.shared.cluster_cmd_tx.write().unwrap() = None;
         *self.shared.redis_cmd_tx.lock().unwrap() = None;
         Ok(())
     }
@@ -1815,7 +1818,7 @@ impl RustWSEServer {
 
     fn connect_redis(&self, url: String) -> PyResult<()> {
         // Mutual exclusion: error if cluster is connected
-        if self.shared.cluster_cmd_tx.lock().unwrap().is_some() {
+        if self.shared.cluster_cmd_tx.read().unwrap().is_some() {
             return Err(PyRuntimeError::new_err(
                 "Cannot connect Redis: Cluster is already connected. Use one backend at a time.",
             ));
@@ -1852,7 +1855,7 @@ impl RustWSEServer {
                 "Cannot connect cluster: Redis is already connected. Use one backend at a time.",
             ));
         }
-        if self.shared.cluster_cmd_tx.lock().unwrap().is_some() {
+        if self.shared.cluster_cmd_tx.read().unwrap().is_some() {
             return Err(PyRuntimeError::new_err("Cluster already connected"));
         }
 
@@ -1862,11 +1865,11 @@ impl RustWSEServer {
             .ok_or_else(|| PyRuntimeError::new_err("Server not started"))?;
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
-        *self.shared.cluster_cmd_tx.lock().unwrap() = Some(cmd_tx);
+        *self.shared.cluster_cmd_tx.write().unwrap() = Some(cmd_tx);
 
         let (interest_tx, interest_rx) =
             mpsc::unbounded_channel::<super::cluster::InterestUpdate>();
-        *self.shared.cluster_interest_tx.lock().unwrap() = Some(interest_tx.clone());
+        *self.shared.cluster_interest_tx.write().unwrap() = Some(interest_tx.clone());
 
         let instance_id = uuid::Uuid::now_v7().to_string();
         *self.shared.cluster_instance_id.lock().unwrap() = Some(instance_id.clone());
@@ -1910,25 +1913,35 @@ impl RustWSEServer {
     // -- Topic subscriptions --------------------------------------------------
 
     fn subscribe_connection(&self, conn_id: &str, topics: Vec<String>) -> PyResult<()> {
+        // Acquire refcount lock first to keep subscription + refcount atomic
+        let cluster_tx = self.shared.cluster_cmd_tx.read().unwrap().clone();
+        let mut refcounts = if cluster_tx.is_some() {
+            Some(
+                self.shared
+                    .local_topic_refcount
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        } else {
+            None
+        };
+
         for topic in &topics {
             self.shared
                 .topic_subscribers
                 .entry(topic.clone())
                 .or_default()
                 .insert(conn_id.to_owned());
-            self.shared
+            // Only increment refcount if this is genuinely new for this connection
+            let is_new = self
+                .shared
                 .conn_topics
                 .entry(conn_id.to_owned())
                 .or_default()
                 .insert(topic.clone());
-        }
 
-        // Emit SUB to cluster for topics whose refcount went 0->1
-        let cluster_tx = self.shared.cluster_cmd_tx.lock().unwrap().clone();
-        if let Some(tx) = cluster_tx {
-            let mut refcounts = self.shared.local_topic_refcount.lock().unwrap();
-            for topic in &topics {
-                let count = refcounts.entry(topic.clone()).or_insert(0);
+            if is_new && let (Some(tx), Some(rc)) = (&cluster_tx, &mut refcounts) {
+                let count = rc.entry(topic.clone()).or_insert(0);
                 *count += 1;
                 if *count == 1 {
                     let _ = tx.send(ClusterCommand::Sub {
@@ -1943,20 +1956,41 @@ impl RustWSEServer {
 
     #[pyo3(signature = (conn_id, topics = None))]
     fn unsubscribe_connection(&self, conn_id: &str, topics: Option<Vec<String>>) -> PyResult<()> {
+        // Acquire refcount lock first to keep subscription + refcount atomic
+        let cluster_tx = self.shared.cluster_cmd_tx.read().unwrap().clone();
+        let mut refcounts = if cluster_tx.is_some() {
+            Some(
+                self.shared
+                    .local_topic_refcount
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        } else {
+            None
+        };
+
         let removed_topics: Vec<String> = match topics {
             Some(topics) => {
+                let mut actually_removed = Vec::new();
                 for topic in &topics {
-                    if let Some(subscribers) = self.shared.topic_subscribers.get(topic) {
-                        subscribers.remove(conn_id);
-                    }
-                    self.shared
-                        .topic_subscribers
-                        .remove_if(topic, |_, subs| subs.is_empty());
-                    if let Some(conn_entry) = self.shared.conn_topics.get(conn_id) {
-                        conn_entry.remove(topic);
+                    // Only count as removed if conn was actually subscribed
+                    let was_subscribed =
+                        if let Some(conn_entry) = self.shared.conn_topics.get(conn_id) {
+                            conn_entry.remove(topic).is_some()
+                        } else {
+                            false
+                        };
+                    if was_subscribed {
+                        if let Some(subscribers) = self.shared.topic_subscribers.get(topic) {
+                            subscribers.remove(conn_id);
+                        }
+                        self.shared
+                            .topic_subscribers
+                            .remove_if(topic, |_, subs| subs.is_empty());
+                        actually_removed.push(topic.clone());
                     }
                 }
-                topics
+                actually_removed
             }
             None => {
                 let mut removed = Vec::new();
@@ -1977,14 +2011,12 @@ impl RustWSEServer {
         };
 
         // Emit UNSUB to cluster for topics whose refcount went 1->0
-        let cluster_tx = self.shared.cluster_cmd_tx.lock().unwrap().clone();
-        if let Some(tx) = cluster_tx {
-            let mut refcounts = self.shared.local_topic_refcount.lock().unwrap();
+        if let (Some(tx), Some(rc)) = (&cluster_tx, &mut refcounts) {
             for topic in &removed_topics {
-                if let Some(count) = refcounts.get_mut(topic) {
+                if let Some(count) = rc.get_mut(topic) {
                     *count = count.saturating_sub(1);
                     if *count == 0 {
-                        refcounts.remove(topic);
+                        rc.remove(topic);
                         let _ = tx.send(ClusterCommand::Unsub {
                             topic: topic.clone(),
                         });
@@ -2020,8 +2052,8 @@ impl RustWSEServer {
             });
         }
 
-        // Cluster publish (if connected) -- clone sender to avoid holding mutex
-        let cluster_tx = self.shared.cluster_cmd_tx.lock().unwrap().clone();
+        // Cluster publish (if connected) -- clone sender to avoid holding lock
+        let cluster_tx = self.shared.cluster_cmd_tx.read().unwrap().clone();
         if let Some(tx) = cluster_tx {
             tx.send(ClusterCommand::Publish {
                 topic: topic.to_owned(),

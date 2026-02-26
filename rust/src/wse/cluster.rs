@@ -847,7 +847,9 @@ async fn peer_connection_task(
         // Send RESYNC with all current local topics (before spawning writer task)
         {
             let local_topics: Vec<String> = {
-                let refcounts = local_topic_refcount.lock().unwrap();
+                let refcounts = local_topic_refcount
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 refcounts.keys().cloned().collect()
             };
             if !local_topics.is_empty() {
