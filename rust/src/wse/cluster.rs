@@ -131,6 +131,8 @@ pub(crate) enum MsgType {
     Sub = 0x06,
     Unsub = 0x07,
     Resync = 0x08,
+    PeerAnnounce = 0x09,
+    PeerList = 0x0A,
 }
 
 impl MsgType {
@@ -144,6 +146,8 @@ impl MsgType {
             0x06 => Some(Self::Sub),
             0x07 => Some(Self::Unsub),
             0x08 => Some(Self::Resync),
+            0x09 => Some(Self::PeerAnnounce),
+            0x0A => Some(Self::PeerList),
             _ => None,
         }
     }
@@ -377,6 +381,38 @@ pub(crate) fn encode_resync(buf: &mut BytesMut, topics: &[String]) {
     buf.put_slice(payload_bytes);
 }
 
+/// Encode PEER_ANNOUNCE: announces this node's cluster address to a peer.
+/// Format: [u8 type=0x09][u8 flags][u16 LE addr_len][u32 LE 0][addr_bytes]
+#[allow(dead_code)] // used in Task 3 peer exchange
+pub(crate) fn encode_peer_announce(buf: &mut BytesMut, addr: &str) {
+    let addr_bytes = addr.as_bytes();
+    buf.reserve(8 + addr_bytes.len());
+    buf.put_u8(MsgType::PeerAnnounce as u8);
+    buf.put_u8(0); // flags
+    buf.put_u16_le(addr_bytes.len() as u16);
+    buf.put_u32_le(0); // payload_len (unused)
+    buf.put_slice(addr_bytes);
+}
+
+/// Encode PEER_LIST: sends the list of all known peer addresses.
+/// Format: [u8 type=0x0A][u8 flags][u16 LE 0][u32 LE payload_len][payload]
+/// Payload: [u16 LE count][u16 LE addr1_len][addr1_bytes]...
+#[allow(dead_code)] // used in Task 3 peer exchange
+pub(crate) fn encode_peer_list(buf: &mut BytesMut, addrs: &[String]) {
+    let mut payload = BytesMut::new();
+    payload.put_u16_le(addrs.len() as u16);
+    for addr in addrs {
+        payload.put_u16_le(addr.len() as u16);
+        payload.extend_from_slice(addr.as_bytes());
+    }
+    buf.reserve(8 + payload.len());
+    buf.put_u8(MsgType::PeerList as u8);
+    buf.put_u8(0); // flags
+    buf.put_u16_le(0); // topic_len (unused)
+    buf.put_u32_le(payload.len() as u32);
+    buf.extend_from_slice(&payload);
+}
+
 // ---------------------------------------------------------------------------
 // Framing helpers (4-byte BE length prefix)
 // ---------------------------------------------------------------------------
@@ -414,6 +450,12 @@ pub(crate) enum ClusterFrame {
     },
     Resync {
         topics: Vec<String>,
+    },
+    PeerAnnounce {
+        addr: String,
+    },
+    PeerList {
+        addrs: Vec<String>,
     },
     Unknown {
         msg_type: u8,
@@ -490,6 +532,40 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                 raw.split('\n').map(String::from).collect()
             };
             Some(ClusterFrame::Resync { topics })
+        }
+        Some(MsgType::PeerAnnounce) => {
+            if data.remaining() < topic_len {
+                return None;
+            }
+            let addr = String::from_utf8(data.split_to(topic_len).to_vec()).ok()?;
+            Some(ClusterFrame::PeerAnnounce { addr })
+        }
+        Some(MsgType::PeerList) => {
+            if data.remaining() < payload_len {
+                return None;
+            }
+            if payload_len < 2 {
+                return Some(ClusterFrame::PeerList { addrs: Vec::new() });
+            }
+            let payload = data.split_to(payload_len);
+            let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+            let mut addrs = Vec::with_capacity(count);
+            let mut pos = 2usize;
+            for _ in 0..count {
+                if pos + 2 > payload.len() {
+                    break;
+                }
+                let alen = u16::from_le_bytes([payload[pos], payload[pos + 1]]) as usize;
+                pos += 2;
+                if pos + alen > payload.len() {
+                    break;
+                }
+                if let Ok(a) = std::str::from_utf8(&payload[pos..pos + alen]) {
+                    addrs.push(a.to_string());
+                }
+                pos += alen;
+            }
+            Some(ClusterFrame::PeerList { addrs })
         }
         None => {
             // Unknown message type from a newer peer -- safe to skip
@@ -707,6 +783,14 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
                     peer_addr: peer_addr.clone(),
                     topics,
                 });
+            }
+            Some(ClusterFrame::PeerAnnounce { .. }) => {
+                last_activity.store(epoch_ms(), Ordering::Relaxed);
+                // Handled in Task 3: peer exchange implementation
+            }
+            Some(ClusterFrame::PeerList { .. }) => {
+                last_activity.store(epoch_ms(), Ordering::Relaxed);
+                // Handled in Task 3: peer exchange implementation
             }
             None => {
                 eprintln!("[WSE-Cluster] Failed to decode frame, disconnecting");
@@ -1723,6 +1807,36 @@ mod tests {
         encode_resync(&mut buf, &[]);
         let frame = decode_frame(buf).unwrap();
         assert_eq!(frame, ClusterFrame::Resync { topics: Vec::new() });
+    }
+
+    #[test]
+    fn test_encode_decode_peer_announce() {
+        let mut buf = BytesMut::new();
+        encode_peer_announce(&mut buf, "10.0.0.5:9222");
+        let frame = decode_frame(buf).unwrap();
+        assert_eq!(
+            frame,
+            ClusterFrame::PeerAnnounce {
+                addr: "10.0.0.5:9222".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_encode_decode_peer_list() {
+        let addrs = vec!["10.0.0.1:9222".to_string(), "10.0.0.2:9222".to_string()];
+        let mut buf = BytesMut::new();
+        encode_peer_list(&mut buf, &addrs);
+        let frame = decode_frame(buf).unwrap();
+        assert_eq!(frame, ClusterFrame::PeerList { addrs });
+    }
+
+    #[test]
+    fn test_encode_decode_peer_list_empty() {
+        let mut buf = BytesMut::new();
+        encode_peer_list(&mut buf, &[]);
+        let frame = decode_frame(buf).unwrap();
+        assert_eq!(frame, ClusterFrame::PeerList { addrs: Vec::new() });
     }
 
     #[test]
