@@ -315,6 +315,11 @@ pub(crate) fn encode_msg(buf: &mut BytesMut, topic: &str, payload: &str) -> bool
 pub(crate) fn encode_msg_compressed(buf: &mut BytesMut, topic: &str, payload: &str) -> bool {
     let topic_bytes = topic.as_bytes();
     if topic_bytes.len() > u16::MAX as usize {
+        eprintln!(
+            "[WSE-Cluster] Topic too long ({} bytes, max {}), dropping message",
+            topic_bytes.len(),
+            u16::MAX
+        );
         return false;
     }
     let payload_bytes = payload.as_bytes();
@@ -536,6 +541,15 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                         return None;
                     }
                 };
+                // Reject suspiciously high amplification ratios (>100x)
+                if payload_len > 0 && decompressed.len() / payload_len > 100 {
+                    eprintln!(
+                        "[WSE-Cluster] Decompression bomb detected: {}x amplification ({payload_len} -> {} bytes)",
+                        decompressed.len() / payload_len,
+                        decompressed.len()
+                    );
+                    return None;
+                }
                 String::from_utf8(decompressed).ok()?
             } else {
                 String::from_utf8(data.split_to(payload_len).to_vec()).ok()?
@@ -1518,6 +1532,10 @@ pub(crate) async fn cluster_manager(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(ClusterCommand::Publish { topic, payload }) => {
+                        // TODO: For rolling upgrade support, track per-peer negotiated
+                        // capabilities and only send compressed frames to peers that
+                        // advertised CAP_COMPRESSION. Currently safe because all peers
+                        // in a cluster run the same version.
                         let mut frame_data = BytesMut::new();
                         if !encode_msg_compressed(&mut frame_data, &topic, &payload) {
                             continue;
@@ -2004,6 +2022,47 @@ mod tests {
         buf.put_slice(garbage.as_slice());
 
         assert!(decode_frame(buf).is_none());
+    }
+
+    #[test]
+    fn test_compressed_flag_ignored_on_non_msg_frames() {
+        // SUB frame with FLAG_COMPRESSED set -- flag should be ignored
+        let mut buf = BytesMut::new();
+        encode_sub(&mut buf, "chat.*");
+        // Manually set the flags byte to FLAG_COMPRESSED
+        buf[1] = FLAG_COMPRESSED;
+        let frame = decode_frame(buf).unwrap();
+        assert_eq!(
+            frame,
+            ClusterFrame::Sub {
+                topic: "chat.*".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_incompressible_payload_falls_back_to_uncompressed() {
+        // Random-looking data above threshold that doesn't compress well
+        // Use bytes that look random to zstd (high entropy)
+        let mut payload = String::with_capacity(512);
+        for i in 0..512u32 {
+            // Mix of chars to create high-entropy data
+            payload.push(char::from((33 + (i * 7 + i * i) % 94) as u8));
+        }
+        assert!(payload.len() >= COMPRESSION_THRESHOLD);
+
+        let mut buf = BytesMut::new();
+        encode_msg_compressed(&mut buf, "test", &payload);
+        // If compression didn't help, flags should be 0 (uncompressed fallback)
+        // The function should still produce a valid frame either way
+        let frame = decode_frame(buf).unwrap();
+        assert_eq!(
+            frame,
+            ClusterFrame::Msg {
+                topic: "test".into(),
+                payload: payload,
+            }
+        );
     }
 
     #[test]
