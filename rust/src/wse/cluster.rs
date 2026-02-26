@@ -52,6 +52,7 @@ pub(crate) const CAP_COMPRESSION: u32 = 1 << 1; // Phase 6: zstd compression
 pub(crate) const LOCAL_CAPABILITIES: u32 = CAP_INTEREST_ROUTING | CAP_COMPRESSION;
 
 // Per-frame flags (bit 0 of the flags byte in every frame header)
+// bit 0: compressed (zstd), bits 1-7: reserved
 const FLAG_COMPRESSED: u8 = 0x01;
 
 // Minimum payload size for compression to be worthwhile (bytes).
@@ -525,9 +526,16 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             }
             let topic = String::from_utf8(data.split_to(topic_len).to_vec()).ok()?;
             let payload = if flags & FLAG_COMPRESSED != 0 {
-                // Decompress zstd payload
                 let compressed = data.split_to(payload_len);
-                let decompressed = zstd::bulk::decompress(&compressed, MAX_FRAME_SIZE).ok()?;
+                let decompressed = match zstd::bulk::decompress(&compressed, MAX_FRAME_SIZE) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!(
+                            "[WSE-Cluster] Decompression failed ({payload_len} bytes compressed): {e}"
+                        );
+                        return None;
+                    }
+                };
                 String::from_utf8(decompressed).ok()?
             } else {
                 String::from_utf8(data.split_to(payload_len).to_vec()).ok()?
@@ -1959,6 +1967,43 @@ mod tests {
                 payload: "payload".into(),
             }
         );
+    }
+
+    #[test]
+    fn test_decode_rejects_decompression_bomb() {
+        // Compress a payload larger than MAX_FRAME_SIZE (1MB)
+        let big = vec![b'A'; MAX_FRAME_SIZE + 1];
+        let compressed = zstd::bulk::compress(&big, 1).unwrap();
+        // Repeated bytes compress very well, so this fits in a frame
+        assert!(compressed.len() < MAX_FRAME_SIZE);
+
+        let topic = b"bomb";
+        let mut buf = BytesMut::new();
+        buf.put_u8(MsgType::Msg as u8);
+        buf.put_u8(FLAG_COMPRESSED);
+        buf.put_u16_le(topic.len() as u16);
+        buf.put_u32_le(compressed.len() as u32);
+        buf.put_slice(topic);
+        buf.put_slice(&compressed);
+
+        // decode_frame should reject because decompressed size exceeds MAX_FRAME_SIZE
+        assert!(decode_frame(buf).is_none());
+    }
+
+    #[test]
+    fn test_decode_rejects_corrupt_compressed_payload() {
+        // Random bytes with FLAG_COMPRESSED set should fail gracefully
+        let topic = b"test";
+        let garbage = b"this is not valid zstd data at all";
+        let mut buf = BytesMut::new();
+        buf.put_u8(MsgType::Msg as u8);
+        buf.put_u8(FLAG_COMPRESSED);
+        buf.put_u16_le(topic.len() as u16);
+        buf.put_u32_le(garbage.len() as u32);
+        buf.put_slice(topic);
+        buf.put_slice(garbage.as_slice());
+
+        assert!(decode_frame(buf).is_none());
     }
 
     #[test]
