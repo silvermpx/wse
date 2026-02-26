@@ -1848,7 +1848,15 @@ impl RustWSEServer {
 
     // -- Cluster Protocol -----------------------------------------------------
 
-    fn connect_cluster(&self, peers: Vec<String>) -> PyResult<()> {
+    #[pyo3(signature = (peers, tls_cert=None, tls_key=None, tls_ca=None, cluster_port=None))]
+    fn connect_cluster(
+        &self,
+        peers: Vec<String>,
+        tls_cert: Option<String>,
+        tls_key: Option<String>,
+        tls_ca: Option<String>,
+        cluster_port: Option<u16>,
+    ) -> PyResult<()> {
         // Mutual exclusion: error if Redis is connected
         if self.shared.redis_cmd_tx.lock().unwrap().is_some() {
             return Err(PyRuntimeError::new_err(
@@ -1858,6 +1866,39 @@ impl RustWSEServer {
         if self.shared.cluster_cmd_tx.read().unwrap().is_some() {
             return Err(PyRuntimeError::new_err("Cluster already connected"));
         }
+
+        // Resolve TLS config: explicit params > env vars > None (plaintext)
+        let tls_config = match (tls_cert, tls_key, tls_ca) {
+            (Some(cert), Some(key), Some(ca)) => Some(
+                super::cluster::build_cluster_tls(&cert, &key, &ca)
+                    .map_err(|e| PyRuntimeError::new_err(format!("TLS config error: {e}")))?,
+            ),
+            (None, None, None) => {
+                match (
+                    std::env::var("WSE_CLUSTER_TLS_CERT").ok(),
+                    std::env::var("WSE_CLUSTER_TLS_KEY").ok(),
+                    std::env::var("WSE_CLUSTER_TLS_CA").ok(),
+                ) {
+                    (Some(cert), Some(key), Some(ca)) => Some(
+                        super::cluster::build_cluster_tls(&cert, &key, &ca).map_err(|e| {
+                            PyRuntimeError::new_err(format!("TLS config error (from env): {e}"))
+                        })?,
+                    ),
+                    (None, None, None) => None,
+                    _ => {
+                        return Err(PyRuntimeError::new_err(
+                            "Partial TLS env vars: set all of WSE_CLUSTER_TLS_CERT, \
+                             WSE_CLUSTER_TLS_KEY, WSE_CLUSTER_TLS_CA or none",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(PyRuntimeError::new_err(
+                    "Partial TLS config: provide all of tls_cert, tls_key, tls_ca or none",
+                ));
+            }
+        };
 
         let rt_handle = self
             .rt_handle
@@ -1890,6 +1931,8 @@ impl RustWSEServer {
             metrics,
             dlq,
             local_topic_refcount,
+            tls_config,
+            cluster_port,
         ));
 
         Ok(())

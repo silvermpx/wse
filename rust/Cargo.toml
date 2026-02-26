@@ -35,6 +35,12 @@ tokio-util = { version = "0.7", features = ["rt"] }
 socket2 = { version = "0.6", features = ["all"] }
 bytes = "1"
 mimalloc = "0.1"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = true }
+rustls-pki-types = "1"
+
+[dev-dependencies]
+rcgen = "0.13"
 
 [profile.release]
 lto = true

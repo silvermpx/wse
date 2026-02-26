@@ -6,11 +6,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{Buf, BufMut, BytesMut};
 use dashmap::{DashMap, DashSet};
+use rustls::RootCertStore;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::server::WebPkiClientVerifier;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{RwLock, mpsc};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
 
 use super::reliability::{CircuitBreaker, ExponentialBackoff};
@@ -47,6 +51,70 @@ pub(crate) const CAP_COMPRESSION: u32 = 1 << 1; // Phase 6: reserved for future
 
 /// Our capabilities bitmask
 pub(crate) const LOCAL_CAPABILITIES: u32 = CAP_INTEREST_ROUTING;
+
+// ---------------------------------------------------------------------------
+// TLS configuration
+// ---------------------------------------------------------------------------
+
+/// Pre-built TLS configs for both server (accept) and client (connect) roles.
+/// A single node cert+key is used for both roles (like CockroachDB).
+#[derive(Clone)]
+pub(crate) struct ClusterTlsConfig {
+    pub(crate) acceptor: TlsAcceptor,
+    pub(crate) connector: TlsConnector,
+}
+
+/// Build cluster TLS config from PEM file paths.
+/// Requires: node cert, node private key (unencrypted), CA cert.
+pub(crate) fn build_cluster_tls(
+    cert_path: &str,
+    key_path: &str,
+    ca_path: &str,
+) -> Result<ClusterTlsConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|e| format!("Failed to open cert file '{}': {}", cert_path, e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to parse certs from '{}': {}", cert_path, e))?;
+    if certs.is_empty() {
+        return Err(format!("No certificates found in '{}'", cert_path).into());
+    }
+
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .map_err(|e| format!("Failed to load private key '{}': {}", key_path, e))?;
+
+    let ca_certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(ca_path)
+        .map_err(|e| format!("Failed to open CA file '{}': {}", ca_path, e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to parse CA certs from '{}': {}", ca_path, e))?;
+    if ca_certs.is_empty() {
+        return Err(format!("No CA certificates found in '{}'", ca_path).into());
+    }
+
+    let mut root_store = RootCertStore::empty();
+    for cert in &ca_certs {
+        root_store.add(cert.clone())?;
+    }
+
+    // Server config: require client certs (mTLS)
+    let client_verifier = WebPkiClientVerifier::builder(Arc::new(root_store.clone()))
+        .build()
+        .map_err(|e| format!("Failed to build client verifier: {}", e))?;
+    let server_config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(certs.clone(), key.clone_key())
+        .map_err(|e| format!("Failed to build server TLS config: {}", e))?;
+
+    // Client config: present our cert, verify server against CA
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(certs, key)
+        .map_err(|e| format!("Failed to build client TLS config: {}", e))?;
+
+    Ok(ClusterTlsConfig {
+        acceptor: TlsAcceptor::from(Arc::new(server_config)),
+        connector: TlsConnector::from(Arc::new(client_config)),
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Message types
@@ -454,9 +522,9 @@ pub(crate) fn negotiate_capabilities(local: u32, remote: u32) -> u32 {
 // Per-peer writer task (write coalescing: recv + try_recv drain)
 // ---------------------------------------------------------------------------
 
-async fn peer_writer(
+async fn peer_writer<W: AsyncWriteExt + Unpin>(
     mut rx: mpsc::UnboundedReceiver<BytesMut>,
-    mut writer: OwnedWriteHalf,
+    mut writer: W,
     cancel: CancellationToken,
     metrics: Arc<ClusterMetrics>,
 ) {
@@ -534,8 +602,8 @@ async fn peer_dispatch_task(
 /// a dispatch channel (non-blocking) so fan-out never stalls TCP reads.
 /// BufReader (64KB) reduces read syscalls from 2/frame to ~1 per 650 frames.
 #[allow(clippy::too_many_arguments)]
-async fn peer_reader(
-    reader: OwnedReadHalf,
+async fn peer_reader<R: AsyncReadExt + Unpin>(
+    reader: R,
     peer_write_tx: mpsc::UnboundedSender<BytesMut>,
     peer_addr: String,
     interest_tx: mpsc::UnboundedSender<InterestUpdate>,
@@ -687,6 +755,192 @@ async fn heartbeat_task(
 // Single peer connection task (connect + HELLO + spawn reader/writer/heartbeat)
 // ---------------------------------------------------------------------------
 
+/// Run HELLO exchange, RESYNC, then spawn reader/writer/heartbeat and forward data.
+/// Generic over AsyncRead/AsyncWrite to support both plaintext TCP and TLS streams.
+/// Returns when the peer disconnects or cancellation is triggered.
+#[allow(clippy::too_many_arguments)]
+async fn run_peer_session<R, W>(
+    mut reader: R,
+    mut writer: W,
+    peer_addr: &str,
+    instance_id: &str,
+    data_rx: &mut mpsc::UnboundedReceiver<BytesMut>,
+    interest_tx: &mpsc::UnboundedSender<InterestUpdate>,
+    connections: &Arc<RwLock<HashMap<String, ConnectionHandle>>>,
+    topic_subscribers: &Arc<DashMap<String, DashSet<String>>>,
+    metrics: &Arc<ClusterMetrics>,
+    global_cancel: &CancellationToken,
+    local_topic_refcount: &Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    backoff: &mut ExponentialBackoff,
+    breaker: &mut CircuitBreaker,
+) -> bool
+where
+    R: AsyncReadExt + Unpin + Send + 'static,
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
+    // Send HELLO
+    let mut hello_buf = BytesMut::new();
+    encode_hello(&mut hello_buf, instance_id, LOCAL_CAPABILITIES);
+    let mut frame = BytesMut::new();
+    write_framed(&mut frame, &hello_buf);
+    if writer.write_all(&frame).await.is_err() {
+        breaker.record_failure();
+        let delay = backoff.next_delay();
+        eprintln!(
+            "[WSE-Cluster] Failed to send HELLO to {peer_addr}. Retry in {:.1}s",
+            delay.as_secs_f64()
+        );
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            () = global_cancel.cancelled() => return true,
+        }
+        return false;
+    }
+
+    // Read HELLO response
+    let peer_hello = match tokio::time::timeout(Duration::from_secs(5), async {
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf).await?;
+        let frame_len = u32::from_be_bytes(len_buf) as usize;
+        if frame_len == 0 || frame_len > MAX_FRAME_SIZE {
+            return Ok::<Option<ClusterFrame>, std::io::Error>(None);
+        }
+        let mut frame_buf = BytesMut::zeroed(frame_len);
+        reader.read_exact(&mut frame_buf).await?;
+        Ok(decode_frame(frame_buf))
+    })
+    .await
+    {
+        Ok(Ok(frame)) => frame,
+        _ => None,
+    };
+
+    let (_peer_version, _peer_caps) = match peer_hello {
+        Some(ClusterFrame::Hello {
+            protocol_version,
+            capabilities,
+            ..
+        }) => match negotiate_version(PROTOCOL_VERSION, protocol_version) {
+            Some(v) => (v, negotiate_capabilities(LOCAL_CAPABILITIES, capabilities)),
+            None => {
+                eprintln!(
+                    "[WSE-Cluster] Version mismatch with {peer_addr}: local={PROTOCOL_VERSION}, remote={protocol_version}"
+                );
+                breaker.record_failure();
+                let delay = backoff.next_delay();
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    () = global_cancel.cancelled() => return true,
+                }
+                return false;
+            }
+        },
+        _ => {
+            eprintln!("[WSE-Cluster] Invalid HELLO from {peer_addr}");
+            breaker.record_failure();
+            let delay = backoff.next_delay();
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = global_cancel.cancelled() => return true,
+            }
+            return false;
+        }
+    };
+
+    // Connected successfully
+    eprintln!("[WSE-Cluster] Connected to {peer_addr} (v{_peer_version}, caps=0x{_peer_caps:08x})");
+    breaker.record_success();
+    backoff.reset();
+    metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
+
+    // Send RESYNC with all current local topics (before spawning writer task)
+    {
+        let local_topics: Vec<String> = {
+            let refcounts = local_topic_refcount
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            refcounts.keys().cloned().collect()
+        };
+        if !local_topics.is_empty() {
+            let mut resync_buf = BytesMut::new();
+            encode_resync(&mut resync_buf, &local_topics);
+            let mut resync_frame = BytesMut::new();
+            write_framed(&mut resync_frame, &resync_buf);
+            if writer.write_all(&resync_frame).await.is_err() {
+                eprintln!("[WSE-Cluster] Failed to send RESYNC to {peer_addr}");
+                metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
+                return false; // Will reconnect
+            }
+        }
+    }
+
+    // Spawn reader, writer, heartbeat with child cancellation token
+    let peer_cancel = global_cancel.child_token();
+    let (peer_write_tx, peer_write_rx) = mpsc::unbounded_channel::<BytesMut>();
+    let last_activity = Arc::new(AtomicU64::new(epoch_ms()));
+
+    let writer_handle = tokio::spawn(peer_writer(
+        peer_write_rx,
+        writer,
+        peer_cancel.clone(),
+        metrics.clone(),
+    ));
+
+    let reader_handle = tokio::spawn(peer_reader(
+        reader,
+        peer_write_tx.clone(),
+        peer_addr.to_owned(),
+        interest_tx.clone(),
+        connections.clone(),
+        topic_subscribers.clone(),
+        peer_cancel.clone(),
+        metrics.clone(),
+        last_activity.clone(),
+    ));
+
+    let heartbeat_handle = tokio::spawn(heartbeat_task(
+        peer_write_tx.clone(),
+        peer_cancel.clone(),
+        last_activity,
+    ));
+
+    // Forward data from cluster manager to this peer's writer
+    loop {
+        let data = tokio::select! {
+            data = data_rx.recv() => data,
+            () = peer_cancel.cancelled() => break,
+            () = global_cancel.cancelled() => {
+                peer_cancel.cancel();
+                break;
+            }
+        };
+
+        match data {
+            Some(frame_data) => {
+                let _ = peer_write_tx.send(frame_data);
+            }
+            None => {
+                // Manager channel closed (shutdown)
+                peer_cancel.cancel();
+                break;
+            }
+        }
+    }
+
+    // Cleanup
+    peer_cancel.cancel();
+    let _ = writer_handle.await;
+    let _ = reader_handle.await;
+    let _ = heartbeat_handle.await;
+    metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
+    let _ = interest_tx.send(InterestUpdate::PeerDisconnected {
+        peer_addr: peer_addr.to_owned(),
+    });
+    eprintln!("[WSE-Cluster] Disconnected from {peer_addr}");
+
+    global_cancel.is_cancelled()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn peer_connection_task(
     peer_addr: String,
@@ -698,6 +952,7 @@ async fn peer_connection_task(
     metrics: Arc<ClusterMetrics>,
     global_cancel: CancellationToken,
     local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    tls_config: Option<ClusterTlsConfig>,
 ) {
     let mut backoff = ExponentialBackoff::new();
     let mut breaker = CircuitBreaker::new();
@@ -766,170 +1021,92 @@ async fn peer_connection_task(
         let _ = sock_ref.set_recv_buffer_size(262_144);
         let _ = sock_ref.set_send_buffer_size(262_144);
 
-        // Split into owned halves for separate tasks
-        let (reader, mut writer) = stream.into_split();
-
-        // Send HELLO
-        let mut hello_buf = BytesMut::new();
-        encode_hello(&mut hello_buf, &instance_id, LOCAL_CAPABILITIES);
-        let mut frame = BytesMut::new();
-        write_framed(&mut frame, &hello_buf);
-        if writer.write_all(&frame).await.is_err() {
-            breaker.record_failure();
-            let delay = backoff.next_delay();
-            eprintln!(
-                "[WSE-Cluster] Failed to send HELLO to {peer_addr}. Retry in {:.1}s",
-                delay.as_secs_f64()
-            );
-            tokio::select! {
-                () = tokio::time::sleep(delay) => continue,
-                () = global_cancel.cancelled() => break,
-            }
-        }
-
-        // Read HELLO response (full read under single timeout)
-        let mut reader_temp = reader;
-        let peer_hello = match tokio::time::timeout(Duration::from_secs(5), async {
-            let mut len_buf = [0u8; 4];
-            reader_temp.read_exact(&mut len_buf).await?;
-            let frame_len = u32::from_be_bytes(len_buf) as usize;
-            if frame_len == 0 || frame_len > MAX_FRAME_SIZE {
-                return Ok::<Option<ClusterFrame>, std::io::Error>(None);
-            }
-            let mut frame_buf = BytesMut::zeroed(frame_len);
-            reader_temp.read_exact(&mut frame_buf).await?;
-            Ok(decode_frame(frame_buf))
-        })
-        .await
-        {
-            Ok(Ok(frame)) => frame,
-            _ => None,
-        };
-
-        let (_peer_version, _peer_caps) = match peer_hello {
-            Some(ClusterFrame::Hello {
-                protocol_version,
-                capabilities,
-                ..
-            }) => match negotiate_version(PROTOCOL_VERSION, protocol_version) {
-                Some(v) => (v, negotiate_capabilities(LOCAL_CAPABILITIES, capabilities)),
-                None => {
-                    eprintln!(
-                        "[WSE-Cluster] Version mismatch with {peer_addr}: local={PROTOCOL_VERSION}, remote={protocol_version}"
-                    );
+        // TLS handshake or plaintext split, then run session
+        let should_stop = if let Some(ref tls) = tls_config {
+            // Extract hostname/IP from peer_addr for SNI
+            let host = peer_addr.split(':').next().unwrap_or(&peer_addr);
+            let server_name = match host.parse::<std::net::IpAddr>() {
+                Ok(ip) => ServerName::IpAddress(ip.into()),
+                Err(_) => ServerName::try_from(host.to_owned()).unwrap_or_else(|_| {
+                    ServerName::IpAddress(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED).into(),
+                    )
+                }),
+            };
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                tls.connector.connect(server_name, stream),
+            )
+            .await
+            {
+                Ok(Ok(tls_stream)) => {
+                    let (reader, writer) = tokio::io::split(tls_stream);
+                    run_peer_session(
+                        reader,
+                        writer,
+                        &peer_addr,
+                        &instance_id,
+                        &mut data_rx,
+                        &interest_tx,
+                        &connections,
+                        &topic_subscribers,
+                        &metrics,
+                        &global_cancel,
+                        &local_topic_refcount,
+                        &mut backoff,
+                        &mut breaker,
+                    )
+                    .await
+                }
+                Ok(Err(e)) => {
                     breaker.record_failure();
+                    metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
                     let delay = backoff.next_delay();
+                    eprintln!(
+                        "[WSE-Cluster] TLS handshake failed {peer_addr}: {e}. Retry in {:.1}s",
+                        delay.as_secs_f64()
+                    );
                     tokio::select! {
                         () = tokio::time::sleep(delay) => continue,
                         () = global_cancel.cancelled() => break,
                     }
                 }
-            },
-            _ => {
-                eprintln!("[WSE-Cluster] Invalid HELLO from {peer_addr}");
-                breaker.record_failure();
-                let delay = backoff.next_delay();
-                tokio::select! {
-                    () = tokio::time::sleep(delay) => continue,
-                    () = global_cancel.cancelled() => break,
+                Err(_) => {
+                    breaker.record_failure();
+                    metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
+                    let delay = backoff.next_delay();
+                    eprintln!(
+                        "[WSE-Cluster] TLS handshake timeout {peer_addr}. Retry in {:.1}s",
+                        delay.as_secs_f64()
+                    );
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => continue,
+                        () = global_cancel.cancelled() => break,
+                    }
                 }
             }
+        } else {
+            // Plaintext: split into owned halves
+            let (reader, writer) = stream.into_split();
+            run_peer_session(
+                reader,
+                writer,
+                &peer_addr,
+                &instance_id,
+                &mut data_rx,
+                &interest_tx,
+                &connections,
+                &topic_subscribers,
+                &metrics,
+                &global_cancel,
+                &local_topic_refcount,
+                &mut backoff,
+                &mut breaker,
+            )
+            .await
         };
 
-        // Connected successfully
-        eprintln!(
-            "[WSE-Cluster] Connected to {peer_addr} (v{_peer_version}, caps=0x{_peer_caps:08x})"
-        );
-        breaker.record_success();
-        backoff.reset();
-        metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
-
-        // Send RESYNC with all current local topics (before spawning writer task)
-        {
-            let local_topics: Vec<String> = {
-                let refcounts = local_topic_refcount
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                refcounts.keys().cloned().collect()
-            };
-            if !local_topics.is_empty() {
-                let mut resync_buf = BytesMut::new();
-                encode_resync(&mut resync_buf, &local_topics);
-                let mut resync_frame = BytesMut::new();
-                write_framed(&mut resync_frame, &resync_buf);
-                if writer.write_all(&resync_frame).await.is_err() {
-                    eprintln!("[WSE-Cluster] Failed to send RESYNC to {peer_addr}");
-                    metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
-                    continue; // Will reconnect
-                }
-            }
-        }
-
-        // Spawn reader, writer, heartbeat with child cancellation token
-        let peer_cancel = global_cancel.child_token();
-        let (peer_write_tx, peer_write_rx) = mpsc::unbounded_channel::<BytesMut>();
-        let last_activity = Arc::new(AtomicU64::new(epoch_ms()));
-
-        let writer_handle = tokio::spawn(peer_writer(
-            peer_write_rx,
-            writer,
-            peer_cancel.clone(),
-            metrics.clone(),
-        ));
-
-        let reader_handle = tokio::spawn(peer_reader(
-            reader_temp,
-            peer_write_tx.clone(),
-            peer_addr.clone(),
-            interest_tx.clone(),
-            connections.clone(),
-            topic_subscribers.clone(),
-            peer_cancel.clone(),
-            metrics.clone(),
-            last_activity.clone(),
-        ));
-
-        let heartbeat_handle = tokio::spawn(heartbeat_task(
-            peer_write_tx.clone(),
-            peer_cancel.clone(),
-            last_activity,
-        ));
-
-        // Forward data from cluster manager to this peer's writer
-        loop {
-            let data = tokio::select! {
-                data = data_rx.recv() => data,
-                () = peer_cancel.cancelled() => break,
-                () = global_cancel.cancelled() => {
-                    peer_cancel.cancel();
-                    break;
-                }
-            };
-
-            match data {
-                Some(frame_data) => {
-                    let _ = peer_write_tx.send(frame_data);
-                }
-                None => {
-                    // Manager channel closed (shutdown)
-                    peer_cancel.cancel();
-                    break;
-                }
-            }
-        }
-
-        // Cleanup
-        peer_cancel.cancel();
-        let _ = writer_handle.await;
-        let _ = reader_handle.await;
-        let _ = heartbeat_handle.await;
-        metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
-        let _ = interest_tx.send(InterestUpdate::PeerDisconnected {
-            peer_addr: peer_addr.clone(),
-        });
-        eprintln!("[WSE-Cluster] Disconnected from {peer_addr}");
-
-        if global_cancel.is_cancelled() {
+        if should_stop {
             break;
         }
 
@@ -963,6 +1140,8 @@ pub(crate) async fn cluster_manager(
     metrics: Arc<ClusterMetrics>,
     _dlq: Arc<std::sync::Mutex<ClusterDlq>>,
     local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    tls_config: Option<ClusterTlsConfig>,
+    cluster_port: Option<u16>,
 ) {
     let global_cancel = CancellationToken::new();
 
@@ -987,8 +1166,83 @@ pub(crate) async fn cluster_manager(
             metrics.clone(),
             global_cancel.clone(),
             local_topic_refcount.clone(),
+            tls_config.clone(),
         ));
         peer_handles.push(handle);
+    }
+
+    // Start cluster listener for inbound peer connections (separate port)
+    if let Some(port) = cluster_port {
+        let bind_addr = format!("0.0.0.0:{}", port);
+        match tokio::net::TcpListener::bind(&bind_addr).await {
+            Ok(cluster_listener) => {
+                eprintln!("[WSE-Cluster] Cluster listener on {bind_addr}");
+                let tls_cfg = tls_config.clone();
+                let inst_id = instance_id.clone();
+                let int_tx = interest_tx.clone();
+                let conns = connections.clone();
+                let subs = topic_subscribers.clone();
+                let met = metrics.clone();
+                let cancel = global_cancel.clone();
+                let lrc = local_topic_refcount.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            res = cluster_listener.accept() => {
+                                match res {
+                                    Ok((stream, addr)) => {
+                                        let _ = stream.set_nodelay(true);
+                                        let sock = SockRef::from(&stream);
+                                        let _ = sock.set_send_buffer_size(262_144);
+                                        let _ = sock.set_recv_buffer_size(262_144);
+                                        let tls = tls_cfg.clone();
+                                        let int_tx2 = int_tx.clone();
+                                        let conns2 = conns.clone();
+                                        let subs2 = subs.clone();
+                                        let met2 = met.clone();
+                                        let inst2 = inst_id.clone();
+                                        let lrc2 = lrc.clone();
+                                        tokio::spawn(async move {
+                                            if let Some(ref tls) = tls {
+                                                match tokio::time::timeout(
+                                                    Duration::from_secs(5),
+                                                    tls.acceptor.accept(stream),
+                                                ).await {
+                                                    Ok(Ok(tls_stream)) => {
+                                                        handle_cluster_inbound_generic(
+                                                            tls_stream, addr, &inst2,
+                                                            int_tx2, conns2, subs2, met2, lrc2,
+                                                        ).await;
+                                                    }
+                                                    Ok(Err(e)) => {
+                                                        eprintln!("[WSE-Cluster] TLS accept failed from {addr}: {e}");
+                                                    }
+                                                    Err(_) => {
+                                                        eprintln!("[WSE-Cluster] TLS accept timeout from {addr}");
+                                                    }
+                                                }
+                                            } else {
+                                                handle_cluster_inbound_generic(
+                                                    stream, addr, &inst2,
+                                                    int_tx2, conns2, subs2, met2, lrc2,
+                                                ).await;
+                                            }
+                                        });
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[WSE-Cluster] Cluster accept error: {e}");
+                                    }
+                                }
+                            }
+                            () = cancel.cancelled() => break,
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                eprintln!("[WSE-Cluster] Failed to bind cluster listener on {bind_addr}: {e}");
+            }
+        }
     }
 
     eprintln!(
@@ -1091,38 +1345,24 @@ pub(crate) async fn cluster_manager(
 }
 
 // ---------------------------------------------------------------------------
-// Inbound cluster connection handler (accepted by main server listener)
+// Inbound cluster connection handler (generic over transport)
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn handle_cluster_inbound(
-    stream: TcpStream,
+/// Handle inbound cluster peer connection. Generic over stream type (TLS or plaintext).
+#[allow(clippy::too_many_arguments)]
+async fn handle_cluster_inbound_generic<S>(
+    stream: S,
     addr: SocketAddr,
-    shared: &super::server::SharedState,
+    instance_id: &str,
     interest_tx: mpsc::UnboundedSender<InterestUpdate>,
-) {
-    // Check if cluster mode is active
-    let instance_id = match shared
-        .cluster_instance_id
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-    {
-        Some(id) => id,
-        None => {
-            eprintln!("[WSE-Cluster] Rejected inbound from {addr}: cluster not configured");
-            return;
-        }
-    };
-
-    let keepalive = TcpKeepalive::new()
-        .with_time(Duration::from_secs(10))
-        .with_interval(Duration::from_secs(5));
-    let sock_ref = SockRef::from(&stream);
-    let _ = sock_ref.set_tcp_keepalive(&keepalive);
-    let _ = sock_ref.set_recv_buffer_size(262_144);
-    let _ = sock_ref.set_send_buffer_size(262_144);
-
-    let (mut reader, mut writer) = stream.into_split();
+    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
+    topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
+    metrics: Arc<ClusterMetrics>,
+    local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
 
     // Read peer's HELLO frame
     let peer_hello = match tokio::time::timeout(Duration::from_secs(5), async {
@@ -1164,7 +1404,7 @@ pub(crate) async fn handle_cluster_inbound(
 
     // Send our HELLO response
     let mut hello_buf = BytesMut::new();
-    encode_hello(&mut hello_buf, &instance_id, LOCAL_CAPABILITIES);
+    encode_hello(&mut hello_buf, instance_id, LOCAL_CAPABILITIES);
     let mut frame = BytesMut::new();
     write_framed(&mut frame, &hello_buf);
     if writer.write_all(&frame).await.is_err() {
@@ -1175,7 +1415,9 @@ pub(crate) async fn handle_cluster_inbound(
     // Send RESYNC with all current local topics (before spawning writer task)
     {
         let local_topics: Vec<String> = {
-            let refcounts = shared.local_topic_refcount.lock().unwrap();
+            let refcounts = local_topic_refcount
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             refcounts.keys().cloned().collect()
         };
         if !local_topics.is_empty() {
@@ -1194,7 +1436,6 @@ pub(crate) async fn handle_cluster_inbound(
         "[WSE-Cluster] Accepted inbound peer from {addr} (v{_peer_version}, caps=0x{_peer_caps:08x})"
     );
     let peer_addr_str = addr.to_string();
-    let metrics = shared.cluster_metrics.clone();
     metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
 
     let cancel = CancellationToken::new();
@@ -1213,8 +1454,8 @@ pub(crate) async fn handle_cluster_inbound(
         write_tx.clone(),
         peer_addr_str.clone(),
         interest_tx.clone(),
-        shared.connections.clone(),
-        shared.topic_subscribers.clone(),
+        connections,
+        topic_subscribers,
         cancel.clone(),
         metrics.clone(),
         last_activity.clone(),
@@ -1239,6 +1480,48 @@ pub(crate) async fn handle_cluster_inbound(
     });
     metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
     eprintln!("[WSE-Cluster] Inbound peer {addr} disconnected");
+}
+
+/// Legacy inbound handler: used when cluster connections arrive on the main port (no separate cluster listener).
+/// Kept for backwards compatibility when cluster_port is not configured.
+pub(crate) async fn handle_cluster_inbound(
+    stream: TcpStream,
+    addr: SocketAddr,
+    shared: &super::server::SharedState,
+    interest_tx: mpsc::UnboundedSender<InterestUpdate>,
+) {
+    let instance_id = match shared
+        .cluster_instance_id
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        Some(id) => id,
+        None => {
+            eprintln!("[WSE-Cluster] Rejected inbound from {addr}: cluster not configured");
+            return;
+        }
+    };
+
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(10))
+        .with_interval(Duration::from_secs(5));
+    let sock_ref = SockRef::from(&stream);
+    let _ = sock_ref.set_tcp_keepalive(&keepalive);
+    let _ = sock_ref.set_recv_buffer_size(262_144);
+    let _ = sock_ref.set_send_buffer_size(262_144);
+
+    handle_cluster_inbound_generic(
+        stream,
+        addr,
+        &instance_id,
+        interest_tx,
+        shared.connections.clone(),
+        shared.topic_subscribers.clone(),
+        shared.cluster_metrics.clone(),
+        shared.local_topic_refcount.clone(),
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1688,5 +1971,227 @@ mod tests {
         );
 
         sender.await.unwrap();
+    }
+
+    #[test]
+    fn test_build_cluster_tls_missing_cert_file() {
+        let result = build_cluster_tls(
+            "/nonexistent/cert.pem",
+            "/nonexistent/key.pem",
+            "/nonexistent/ca.pem",
+        );
+        assert!(result.is_err());
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("cert file"),
+            "Error should mention cert file, got: {err}"
+        );
+    }
+
+    /// Generate a self-signed CA and a node cert signed by it.
+    /// Returns (ca_cert_pem, node_cert_pem, node_key_pem).
+    fn generate_test_certs() -> (String, String, String) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, SanType};
+        use std::net::IpAddr;
+
+        // Generate CA
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "WSE Test CA");
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        // Generate node cert signed by CA with IP SAN for 127.0.0.1
+        let mut node_params = CertificateParams::default();
+        node_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "test-node");
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        node_params.subject_alt_names = vec![SanType::IpAddress(ip)];
+        let node_key = KeyPair::generate().unwrap();
+        let node_cert = node_params.signed_by(&node_key, &ca_cert, &ca_key).unwrap();
+
+        (ca_cert.pem(), node_cert.pem(), node_key.serialize_pem())
+    }
+
+    #[test]
+    fn test_build_cluster_tls_valid_certs() {
+        let (ca_pem, cert_pem, key_pem) = generate_test_certs();
+
+        let dir = std::env::temp_dir().join("wse_tls_test_valid");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ca.pem"), &ca_pem).unwrap();
+        std::fs::write(dir.join("cert.pem"), &cert_pem).unwrap();
+        std::fs::write(dir.join("key.pem"), &key_pem).unwrap();
+
+        let result = build_cluster_tls(
+            dir.join("cert.pem").to_str().unwrap(),
+            dir.join("key.pem").to_str().unwrap(),
+            dir.join("ca.pem").to_str().unwrap(),
+        );
+        assert!(
+            result.is_ok(),
+            "build_cluster_tls failed: {:?}",
+            result.err()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_tls_cluster_hello_roundtrip() {
+        let (ca_pem, cert_pem, key_pem) = generate_test_certs();
+
+        let dir = std::env::temp_dir().join("wse_tls_roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ca.pem"), &ca_pem).unwrap();
+        std::fs::write(dir.join("cert.pem"), &cert_pem).unwrap();
+        std::fs::write(dir.join("key.pem"), &key_pem).unwrap();
+
+        let tls = build_cluster_tls(
+            dir.join("cert.pem").to_str().unwrap(),
+            dir.join("key.pem").to_str().unwrap(),
+            dir.join("ca.pem").to_str().unwrap(),
+        )
+        .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let tls_server = tls.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls_stream = tls_server.acceptor.accept(stream).await.unwrap();
+
+            // Read HELLO from client
+            let mut len_buf = [0u8; 4];
+            tokio::io::AsyncReadExt::read_exact(&mut tls_stream, &mut len_buf)
+                .await
+                .unwrap();
+            let frame_len = u32::from_be_bytes(len_buf) as usize;
+            let mut frame_buf = BytesMut::zeroed(frame_len);
+            tokio::io::AsyncReadExt::read_exact(&mut tls_stream, &mut frame_buf)
+                .await
+                .unwrap();
+            let frame = decode_frame(frame_buf);
+            assert!(
+                matches!(frame, Some(ClusterFrame::Hello { .. })),
+                "Expected Hello frame from client"
+            );
+
+            // Send HELLO back
+            let mut hello_buf = BytesMut::new();
+            encode_hello(&mut hello_buf, "server-id", LOCAL_CAPABILITIES);
+            let mut framed = BytesMut::new();
+            write_framed(&mut framed, &hello_buf);
+            tokio::io::AsyncWriteExt::write_all(&mut tls_stream, &framed)
+                .await
+                .unwrap();
+        });
+
+        let tls_client = tls;
+        let client = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let server_name = ServerName::from(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+            let mut tls_stream = tls_client
+                .connector
+                .connect(server_name, stream)
+                .await
+                .unwrap();
+
+            // Send HELLO
+            let mut hello_buf = BytesMut::new();
+            encode_hello(&mut hello_buf, "client-id", LOCAL_CAPABILITIES);
+            let mut framed = BytesMut::new();
+            write_framed(&mut framed, &hello_buf);
+            tokio::io::AsyncWriteExt::write_all(&mut tls_stream, &framed)
+                .await
+                .unwrap();
+
+            // Read HELLO response
+            let mut len_buf = [0u8; 4];
+            tokio::io::AsyncReadExt::read_exact(&mut tls_stream, &mut len_buf)
+                .await
+                .unwrap();
+            let frame_len = u32::from_be_bytes(len_buf) as usize;
+            let mut frame_buf = BytesMut::zeroed(frame_len);
+            tokio::io::AsyncReadExt::read_exact(&mut tls_stream, &mut frame_buf)
+                .await
+                .unwrap();
+            let frame = decode_frame(frame_buf);
+            assert!(
+                matches!(frame, Some(ClusterFrame::Hello { .. })),
+                "Expected Hello frame from server"
+            );
+        });
+
+        server.await.unwrap();
+        client.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_tls_rejects_wrong_ca() {
+        // Generate two separate CAs, each with their own node cert
+        let (ca_pem_a, cert_pem_a, key_pem_a) = generate_test_certs();
+        let (ca_pem_b, _cert_pem_b, _key_pem_b) = generate_test_certs();
+
+        let dir = std::env::temp_dir().join("wse_tls_wrong_ca");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Server uses CA A certs
+        std::fs::write(dir.join("ca_a.pem"), &ca_pem_a).unwrap();
+        std::fs::write(dir.join("cert_a.pem"), &cert_pem_a).unwrap();
+        std::fs::write(dir.join("key_a.pem"), &key_pem_a).unwrap();
+
+        // Client trusts CA B (different CA)
+        std::fs::write(dir.join("ca_b.pem"), &ca_pem_b).unwrap();
+
+        let server_tls = build_cluster_tls(
+            dir.join("cert_a.pem").to_str().unwrap(),
+            dir.join("key_a.pem").to_str().unwrap(),
+            dir.join("ca_a.pem").to_str().unwrap(),
+        )
+        .unwrap();
+
+        // Client uses cert from CA A but trusts CA B -- server should reject
+        let client_tls = build_cluster_tls(
+            dir.join("cert_a.pem").to_str().unwrap(),
+            dir.join("key_a.pem").to_str().unwrap(),
+            dir.join("ca_b.pem").to_str().unwrap(),
+        )
+        .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // TLS handshake should fail (client doesn't trust our CA)
+            let result = server_tls.acceptor.accept(stream).await;
+            // Server may or may not fail depending on who detects mismatch first
+            result.is_err()
+        });
+
+        let client = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let server_name = ServerName::from(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+            let result = client_tls.connector.connect(server_name, stream).await;
+            // Client should fail -- server cert not signed by CA B
+            result.is_err()
+        });
+
+        let server_failed = server.await.unwrap();
+        let client_failed = client.await.unwrap();
+        // At least one side should detect the CA mismatch
+        assert!(
+            server_failed || client_failed,
+            "Expected TLS handshake failure with wrong CA"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
