@@ -158,12 +158,6 @@ struct PerConnRate {
 const RATE_CAPACITY: f64 = 100_000.0;
 const RATE_REFILL: f64 = 10_000.0; // tokens per second
 
-// ---------------------------------------------------------------------------
-// Parallel fan-out tuning
-// ---------------------------------------------------------------------------
-const PARALLEL_FANOUT_THRESHOLD: usize = 256;
-const FANOUT_CHUNK_SIZE: usize = 512;
-
 enum ServerCommand {
     SendText { conn_id: String, data: String },
     SendBytes { conn_id: String, data: Vec<u8> },
@@ -192,7 +186,7 @@ pub(crate) struct SharedState {
     // Per-connection format preference (lock-free sync access for send_event)
     conn_formats: DashMap<String, bool>,
     // Per-connection rate limiter state (cleaned up on disconnect)
-    conn_rates: std::sync::Mutex<HashMap<String, PerConnRate>>,
+    conn_rates: DashMap<String, PerConnRate>,
     // Atomic connection count (lock-free read from Python without GIL blocking)
     connection_count: AtomicUsize,
     // JWT config: when set, Rust validates JWT in handshake (zero GIL)
@@ -203,14 +197,14 @@ pub(crate) struct SharedState {
     redis_metrics: Arc<RedisMetrics>,
     redis_dlq: Arc<std::sync::Mutex<DeadLetterQueue>>,
     // Cluster protocol
-    cluster_cmd_tx: std::sync::Mutex<Option<mpsc::Sender<ClusterCommand>>>,
+    cluster_cmd_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<ClusterCommand>>>,
     pub(crate) cluster_metrics: Arc<ClusterMetrics>,
     cluster_dlq: Arc<std::sync::Mutex<ClusterDlq>>,
     pub(crate) cluster_instance_id: std::sync::Mutex<Option<String>>,
+    pub(crate) cluster_interest_tx:
+        std::sync::Mutex<Option<mpsc::UnboundedSender<super::cluster::InterestUpdate>>>,
+    pub(crate) local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
 }
-
-unsafe impl Send for SharedState {}
-unsafe impl Sync for SharedState {}
 
 impl SharedState {
     fn new(
@@ -231,7 +225,7 @@ impl SharedState {
             inbound_rx: rx,
             inbound_dropped: AtomicU64::new(0),
             conn_formats: DashMap::new(),
-            conn_rates: std::sync::Mutex::new(HashMap::new()),
+            conn_rates: DashMap::new(),
             connection_count: AtomicUsize::new(0),
             jwt_config,
             topic_subscribers: Arc::new(DashMap::new()),
@@ -243,6 +237,8 @@ impl SharedState {
             cluster_metrics: Arc::new(ClusterMetrics::new()),
             cluster_dlq: Arc::new(std::sync::Mutex::new(ClusterDlq::new(1000))),
             cluster_instance_id: std::sync::Mutex::new(None),
+            cluster_interest_tx: std::sync::Mutex::new(None),
+            local_topic_refcount: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -434,10 +430,16 @@ fn message_category(msg_type: &str) -> &'static str {
 /// Build a JSON error message for auth failures.
 fn build_error_json(code: &str, message: &str) -> String {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    format!(
-        r#"WSE{{"t":"error","p":{{"code":"{}","message":"{}","timestamp":"{}"}},"v":1}}"#,
-        code, message, ts,
-    )
+    let payload = serde_json::json!({
+        "t": "error",
+        "p": {
+            "code": code,
+            "message": message,
+            "timestamp": ts,
+        },
+        "v": 1
+    });
+    format!("WSE{}", payload)
 }
 
 /// Build server_ready JSON message (sent immediately from Rust after JWT validation).
@@ -478,7 +480,7 @@ fn build_server_ready(conn_id: &str, user_id: &str) -> String {
 
 async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<SharedState>) {
     // Clone the TCP stream FD for pre-framed raw writes (bypasses tungstenite).
-    let (stream, raw_write) = match clone_tcp_stream(stream) {
+    let (stream, mut raw_write) = match clone_tcp_stream(stream) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("[WSE] Failed to clone TCP stream for {addr}: {e}");
@@ -640,18 +642,19 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
             let _ = write_half.close().await;
             return;
         }
+        // Send server_ready BEFORE inserting into connections map.
+        // While we hold the write lock, no broadcast can acquire a read lock,
+        // so server_ready is guaranteed to be first in the channel.
+        if let Some(ref user_id) = rust_auth_user_id {
+            let server_ready = build_server_ready(&conn_id, user_id);
+            let _ = tx.send(WsFrame::Msg(Message::Text(server_ready.into())));
+        }
         conns.insert((*conn_id).clone(), ConnectionHandle { tx: tx.clone() });
-        state.connection_count.fetch_add(1, Ordering::Relaxed);
+        state.connection_count.store(conns.len(), Ordering::Relaxed);
     }
     // Store format preference for lock-free access from send_event()
     if use_msgpack {
         state.conn_formats.insert((*conn_id).clone(), true);
-    }
-
-    // If Rust validated JWT, send server_ready IMMEDIATELY (zero GIL)
-    if let Some(ref user_id) = rust_auth_user_id {
-        let server_ready = build_server_ready(&conn_id, user_id);
-        let _ = tx.send(WsFrame::Msg(Message::Text(server_ready.into())));
     }
 
     // Fire on_connect (drain mode: push to queue; callback mode: background task)
@@ -683,81 +686,94 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         }
     }
 
-    // Write task with coalescing + pre-framed broadcast support.
-    // `write_half` handles tungstenite Messages (per-connection sends, control frames).
-    // `raw_write` handles pre-framed bytes (broadcasts) written directly to TCP.
-    // BufWriter batches multiple PreFramed frames into a single TCP write (one syscall).
-    let mut raw_write = tokio::io::BufWriter::new(raw_write);
+    // Write task: recv_many batch drain + manual concatenation.
+    //
+    // Instead of BufWriter (copies each frame into 8KB internal buffer), we:
+    //   1. Drain up to 256 frames at once with recv_many (bulk atomic drain)
+    //   2. Separate PreFramed (raw broadcast bytes) from Msg (tungstenite control/per-conn)
+    //   3. Write all PreFramed via write_vectored (one writev syscall, zero memcpy)
+    //   4. Feed all Msg to tungstenite, single flush
     let write_task = tokio::spawn(async move {
-        loop {
-            let frame = match rx.recv().await {
-                Some(f) => f,
-                None => break,
-            };
+        let mut batch: Vec<WsFrame> = Vec::with_capacity(256);
 
-            let mut tung_dirty = false;
+        loop {
+            // Drain up to 256 pending frames in one bulk operation
+            let n = rx.recv_many(&mut batch, 256).await;
+            if n == 0 {
+                break; // channel closed
+            }
+
+            // Separate: PreFramed -> slices for writev, Msg -> tungstenite
+            let mut raw_slices: Vec<Bytes> = Vec::new();
+            let mut has_tung = false;
+            for frame in &batch {
+                match frame {
+                    WsFrame::PreFramed(bytes) => raw_slices.push(bytes.clone()),
+                    WsFrame::Msg(_) => has_tung = true,
+                }
+            }
+
             let mut ok = true;
 
-            // Process first frame
-            match frame {
-                WsFrame::Msg(msg) => {
-                    if write_half.feed(msg).await.is_err() {
-                        break;
+            // Write all PreFramed via write_vectored (one writev syscall, zero memcpy).
+            // Single call + fallback: writev once, if partial write then write_all remainder.
+            if !raw_slices.is_empty() {
+                let io_slices: Vec<std::io::IoSlice<'_>> = raw_slices
+                    .iter()
+                    .map(|b| std::io::IoSlice::new(b))
+                    .collect();
+                let total: usize = raw_slices.iter().map(|b| b.len()).sum();
+
+                let written = match raw_write.write_vectored(&io_slices).await {
+                    Ok(0) => {
+                        ok = false;
+                        0
                     }
-                    tung_dirty = true;
-                }
-                WsFrame::PreFramed(bytes) => {
-                    // tungstenite buffer is clean at start of batch
-                    if raw_write.write_all(&bytes).await.is_err() {
-                        break;
+                    Ok(n) => n,
+                    Err(_) => {
+                        ok = false;
+                        0
+                    }
+                };
+
+                // Partial write: concatenate remaining bytes and write_all
+                if ok && written < total {
+                    let mut remaining = BytesMut::with_capacity(total - written);
+                    let mut skip = written;
+                    for slice in &raw_slices {
+                        if skip >= slice.len() {
+                            skip -= slice.len();
+                        } else {
+                            remaining.extend_from_slice(&slice[skip..]);
+                            skip = 0;
+                        }
+                    }
+                    if raw_write.write_all(&remaining).await.is_err() {
+                        ok = false;
                     }
                 }
             }
 
-            // Coalescing: drain pending frames
-            let mut count = 1u32;
-            while ok && count < 64 {
-                match rx.try_recv() {
-                    Ok(WsFrame::Msg(msg)) => {
-                        // Must flush raw_write before tungstenite write
-                        if raw_write.flush().await.is_err() {
-                            ok = false;
-                            break;
-                        }
-                        if write_half.feed(msg).await.is_err() {
-                            ok = false;
-                            break;
-                        }
-                        tung_dirty = true;
-                        count += 1;
+            // Feed all tungstenite Msgs, single flush
+            if ok && has_tung {
+                for frame in batch.drain(..) {
+                    if let WsFrame::Msg(msg) = frame
+                        && write_half.feed(msg).await.is_err()
+                    {
+                        ok = false;
+                        break;
                     }
-                    Ok(WsFrame::PreFramed(bytes)) => {
-                        // Must flush tungstenite before raw write
-                        if tung_dirty {
-                            if write_half.flush().await.is_err() {
-                                ok = false;
-                                break;
-                            }
-                            tung_dirty = false;
-                        }
-                        if raw_write.write_all(&bytes).await.is_err() {
-                            ok = false;
-                            break;
-                        }
-                        count += 1;
-                    }
-                    Err(_) => break,
+                }
+                if ok && write_half.flush().await.is_err() {
+                    ok = false;
                 }
             }
+
+            // Always clear: covers PreFramed-only batches (drain didn't run)
+            // and partial drain (ok=false broke out early).
+            batch.clear();
 
             if !ok {
-                break;
-            }
-            // Final flush: raw BufWriter + tungstenite if dirty
-            if raw_write.flush().await.is_err() {
-                break;
-            }
-            if tung_dirty && write_half.flush().await.is_err() {
                 break;
             }
         }
@@ -966,25 +982,41 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     {
         let mut conns = state.connections.write().await;
         conns.remove(&*conn_id);
+        state.connection_count.store(conns.len(), Ordering::Relaxed);
     }
     state.conn_formats.remove(&*conn_id);
-    {
-        state.conn_rates.lock().unwrap().remove(&*conn_id);
-    }
+    state.conn_rates.remove(&*conn_id);
     // Pub/Sub cleanup: remove connection from all subscribed topics
     if let Some((_, topics)) = state.conn_topics.remove(&*conn_id) {
+        let mut disconnected_topics = Vec::new();
         for topic_ref in topics.iter() {
             let topic = topic_ref.clone();
             if let Some(subscribers) = state.topic_subscribers.get(&topic) {
                 subscribers.remove(&*conn_id);
-                if subscribers.is_empty() {
-                    drop(subscribers);
-                    state.topic_subscribers.remove(&topic);
+            }
+            state
+                .topic_subscribers
+                .remove_if(&topic, |_, subs| subs.is_empty());
+            disconnected_topics.push(topic);
+        }
+
+        // Emit UNSUB to cluster for topics whose refcount went 1->0
+        let cluster_tx = state.cluster_cmd_tx.lock().unwrap().clone();
+        if let Some(tx) = cluster_tx {
+            let mut refcounts = state.local_topic_refcount.lock().unwrap();
+            for topic in &disconnected_topics {
+                if let Some(count) = refcounts.get_mut(topic) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        refcounts.remove(topic);
+                        let _ = tx.send(ClusterCommand::Unsub {
+                            topic: topic.clone(),
+                        });
+                    }
                 }
             }
         }
     }
-    state.connection_count.fetch_sub(1, Ordering::Relaxed);
     if drain {
         state.push_inbound(InboundEvent::Disconnect {
             conn_id: (*conn_id).clone(),
@@ -1010,7 +1042,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
 // ---------------------------------------------------------------------------
 
 /// Collect subscriber sender handles for a topic, with dedup.
-/// Holds connections read lock only during collection (not during sends).
+/// Caller must hold a read guard on the connections map.
 pub(crate) fn collect_topic_senders(
     conns: &HashMap<String, ConnectionHandle>,
     topic_subscribers: &DashMap<String, DashSet<String>>,
@@ -1053,31 +1085,11 @@ pub(crate) fn collect_topic_senders(
 }
 
 /// Fan-out a pre-built message to collected sender handles.
-/// Parallel when above threshold, sequential otherwise.
+/// Sequential fan-out: enqueue pre-built message to all collected sender handles.
+/// Non-blocking channel sends -- each connection's writer task handles actual I/O.
 fn fanout_to_senders(senders: Vec<mpsc::UnboundedSender<WsFrame>>, frame: WsFrame) {
-    let n = senders.len();
-    if n == 0 {
-        return;
-    }
-    if n < PARALLEL_FANOUT_THRESHOLD {
-        for tx in &senders {
-            let _ = tx.send(frame.clone());
-        }
-    } else {
-        let mut iter = senders.into_iter();
-        loop {
-            let chunk: Vec<mpsc::UnboundedSender<WsFrame>> =
-                iter.by_ref().take(FANOUT_CHUNK_SIZE).collect();
-            if chunk.is_empty() {
-                break;
-            }
-            let chunk_frame = frame.clone();
-            tokio::spawn(async move {
-                for tx in &chunk {
-                    let _ = tx.send(chunk_frame.clone());
-                }
-            });
-        }
+    for tx in &senders {
+        let _ = tx.send(frame.clone());
     }
 }
 
@@ -1095,50 +1107,18 @@ pub(crate) fn fanout_to_senders_with_metrics<M: FanoutMetrics>(
     frame: WsFrame,
     metrics: &Arc<M>,
 ) {
-    let n = senders.len();
-    if n == 0 {
-        return;
+    let mut d = 0u64;
+    let mut f = 0u64;
+    for tx in &senders {
+        if tx.send(frame.clone()).is_ok() {
+            d += 1;
+        } else {
+            f += 1;
+        }
     }
-    if n < PARALLEL_FANOUT_THRESHOLD {
-        let mut d = 0u64;
-        let mut f = 0u64;
-        for tx in &senders {
-            if tx.send(frame.clone()).is_ok() {
-                d += 1;
-            } else {
-                f += 1;
-            }
-        }
-        metrics.add_delivered(d);
-        if f > 0 {
-            metrics.add_dropped(f);
-        }
-    } else {
-        let mut iter = senders.into_iter();
-        loop {
-            let chunk: Vec<mpsc::UnboundedSender<WsFrame>> =
-                iter.by_ref().take(FANOUT_CHUNK_SIZE).collect();
-            if chunk.is_empty() {
-                break;
-            }
-            let chunk_frame = frame.clone();
-            let m = metrics.clone();
-            tokio::spawn(async move {
-                let mut d = 0u64;
-                let mut f = 0u64;
-                for tx in &chunk {
-                    if tx.send(chunk_frame.clone()).is_ok() {
-                        d += 1;
-                    } else {
-                        f += 1;
-                    }
-                }
-                m.add_delivered(d);
-                if f > 0 {
-                    m.add_dropped(f);
-                }
-            });
-        }
+    metrics.add_delivered(d);
+    if f > 0 {
+        metrics.add_dropped(f);
     }
 }
 
@@ -1153,60 +1133,60 @@ async fn process_commands(
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             ServerCommand::SendText { conn_id, data } => {
-                let conns = state.connections.read().await;
-                if let Some(h) = conns.get(&conn_id) {
+                let guard = state.connections.read().await;
+                if let Some(h) = guard.get(&conn_id) {
                     let _ = h.tx.send(WsFrame::Msg(Message::Text(data.into())));
                 }
             }
             ServerCommand::SendBytes { conn_id, data } => {
-                let conns = state.connections.read().await;
-                if let Some(h) = conns.get(&conn_id) {
+                let guard = state.connections.read().await;
+                if let Some(h) = guard.get(&conn_id) {
                     let _ = h.tx.send(WsFrame::Msg(Message::Binary(data.into())));
                 }
             }
             ServerCommand::SendPrebuilt { conn_id, message } => {
-                let conns = state.connections.read().await;
-                if let Some(h) = conns.get(&conn_id) {
+                let guard = state.connections.read().await;
+                if let Some(h) = guard.get(&conn_id) {
                     let _ = h.tx.send(WsFrame::Msg(message));
                 }
             }
             ServerCommand::BroadcastText { data } => {
                 let frame = WsFrame::PreFramed(pre_frame_text(&data));
                 let senders: Vec<mpsc::UnboundedSender<WsFrame>> = {
-                    let conns = state.connections.read().await;
-                    conns.values().map(|h| h.tx.clone()).collect()
+                    let guard = state.connections.read().await;
+                    guard.values().map(|h| h.tx.clone()).collect()
                 };
                 fanout_to_senders(senders, frame);
             }
             ServerCommand::BroadcastBytes { data } => {
                 let frame = WsFrame::PreFramed(pre_frame_binary(&data));
                 let senders: Vec<mpsc::UnboundedSender<WsFrame>> = {
-                    let conns = state.connections.read().await;
-                    conns.values().map(|h| h.tx.clone()).collect()
+                    let guard = state.connections.read().await;
+                    guard.values().map(|h| h.tx.clone()).collect()
                 };
                 fanout_to_senders(senders, frame);
             }
             ServerCommand::BroadcastLocal { topic, data } => {
                 let frame = WsFrame::PreFramed(pre_frame_text(&data));
                 let senders = {
-                    let conns = state.connections.read().await;
-                    collect_topic_senders(&conns, &state.topic_subscribers, &topic)
+                    let guard = state.connections.read().await;
+                    collect_topic_senders(&guard, &state.topic_subscribers, &topic)
                 };
                 fanout_to_senders(senders, frame);
             }
             ServerCommand::Disconnect { conn_id } => {
-                let conns = state.connections.read().await;
-                if let Some(h) = conns.get(&conn_id) {
+                let guard = state.connections.read().await;
+                if let Some(h) = guard.get(&conn_id) {
                     let _ = h.tx.send(WsFrame::Msg(Message::Close(None)));
                 }
             }
             ServerCommand::GetConnections { reply } => {
-                let conns = state.connections.read().await;
-                let _ = reply.send(conns.keys().cloned().collect());
+                let guard = state.connections.read().await;
+                let _ = reply.send(guard.keys().cloned().collect());
             }
             ServerCommand::Shutdown => {
-                let conns = state.connections.read().await;
-                for h in conns.values() {
+                let guard = state.connections.read().await;
+                for h in guard.values() {
                     let _ = h.tx.send(WsFrame::Msg(Message::Close(None)));
                 }
                 break;
@@ -1346,6 +1326,9 @@ impl RustWSEServer {
                                 match res {
                                     Ok((stream, addr)) => {
                                         let _ = stream.set_nodelay(true);
+                                        // Larger send buffer for broadcast throughput (default 16KB -> 256KB)
+                                        let sock = socket2::SockRef::from(&stream);
+                                        let _ = sock.set_send_buffer_size(262_144);
                                         let shared2 = shared.clone();
                                         tokio::spawn(async move {
                                             // Protocol detection: peek first byte to distinguish
@@ -1364,9 +1347,21 @@ impl RustWSEServer {
                                                 _ => false,
                                             };
                                             if is_cluster {
-                                                super::cluster::handle_cluster_inbound(
-                                                    stream, addr, &shared2,
-                                                ).await;
+                                                let interest_tx = shared2
+                                                    .cluster_interest_tx
+                                                    .lock()
+                                                    .unwrap()
+                                                    .clone();
+                                                if let Some(interest_tx) = interest_tx {
+                                                    super::cluster::handle_cluster_inbound(
+                                                        stream, addr, &shared2, interest_tx,
+                                                    )
+                                                    .await;
+                                                } else {
+                                                    eprintln!(
+                                                        "[WSE-Cluster] No interest channel for inbound {addr}"
+                                                    );
+                                                }
                                             } else {
                                                 handle_connection(stream, addr, shared2).await;
                                             }
@@ -1403,7 +1398,7 @@ impl RustWSEServer {
         if let Ok(guard) = self.shared.cluster_cmd_tx.lock()
             && let Some(ref tx) = *guard
         {
-            let _ = tx.try_send(ClusterCommand::Shutdown);
+            let _ = tx.send(ClusterCommand::Shutdown);
         }
         // Shutdown Redis
         if let Ok(guard) = self.shared.redis_cmd_tx.lock()
@@ -1488,13 +1483,15 @@ impl RustWSEServer {
 
         // #8: Per-connection rate limiter (token bucket)
         {
-            let mut rates = self.shared.conn_rates.lock().unwrap();
-            let state = rates
+            let mut entry = self
+                .shared
+                .conn_rates
                 .entry(conn_id.to_owned())
                 .or_insert_with(|| PerConnRate {
                     tokens: RATE_CAPACITY,
                     last_refill: std::time::Instant::now(),
                 });
+            let state = entry.value_mut();
             let elapsed = state.last_refill.elapsed().as_secs_f64();
             state.tokens = (state.tokens + elapsed * RATE_REFILL).min(RATE_CAPACITY);
             state.last_refill = std::time::Instant::now();
@@ -1864,8 +1861,12 @@ impl RustWSEServer {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Server not started"))?;
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<ClusterCommand>(131072);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
         *self.shared.cluster_cmd_tx.lock().unwrap() = Some(cmd_tx);
+
+        let (interest_tx, interest_rx) =
+            mpsc::unbounded_channel::<super::cluster::InterestUpdate>();
+        *self.shared.cluster_interest_tx.lock().unwrap() = Some(interest_tx.clone());
 
         let instance_id = uuid::Uuid::now_v7().to_string();
         *self.shared.cluster_instance_id.lock().unwrap() = Some(instance_id.clone());
@@ -1873,15 +1874,19 @@ impl RustWSEServer {
         let topic_subscribers = self.shared.topic_subscribers.clone();
         let metrics = self.shared.cluster_metrics.clone();
         let dlq = self.shared.cluster_dlq.clone();
+        let local_topic_refcount = self.shared.local_topic_refcount.clone();
 
         rt_handle.spawn(super::cluster::cluster_manager(
             peers,
             instance_id,
             cmd_rx,
+            interest_tx,
+            interest_rx,
             connections,
             topic_subscribers,
             metrics,
             dlq,
+            local_topic_refcount,
         ));
 
         Ok(())
@@ -1917,41 +1922,77 @@ impl RustWSEServer {
                 .or_default()
                 .insert(topic.clone());
         }
+
+        // Emit SUB to cluster for topics whose refcount went 0->1
+        let cluster_tx = self.shared.cluster_cmd_tx.lock().unwrap().clone();
+        if let Some(tx) = cluster_tx {
+            let mut refcounts = self.shared.local_topic_refcount.lock().unwrap();
+            for topic in &topics {
+                let count = refcounts.entry(topic.clone()).or_insert(0);
+                *count += 1;
+                if *count == 1 {
+                    let _ = tx.send(ClusterCommand::Sub {
+                        topic: topic.clone(),
+                    });
+                }
+            }
+        }
+
         Ok(())
     }
 
     #[pyo3(signature = (conn_id, topics = None))]
     fn unsubscribe_connection(&self, conn_id: &str, topics: Option<Vec<String>>) -> PyResult<()> {
-        match topics {
+        let removed_topics: Vec<String> = match topics {
             Some(topics) => {
                 for topic in &topics {
                     if let Some(subscribers) = self.shared.topic_subscribers.get(topic) {
                         subscribers.remove(conn_id);
-                        if subscribers.is_empty() {
-                            drop(subscribers);
-                            self.shared.topic_subscribers.remove(topic);
-                        }
                     }
+                    self.shared
+                        .topic_subscribers
+                        .remove_if(topic, |_, subs| subs.is_empty());
                     if let Some(conn_entry) = self.shared.conn_topics.get(conn_id) {
                         conn_entry.remove(topic);
                     }
                 }
+                topics
             }
             None => {
+                let mut removed = Vec::new();
                 if let Some((_, topics)) = self.shared.conn_topics.remove(conn_id) {
                     for topic_ref in topics.iter() {
                         let topic = topic_ref.clone();
                         if let Some(subscribers) = self.shared.topic_subscribers.get(&topic) {
                             subscribers.remove(conn_id);
-                            if subscribers.is_empty() {
-                                drop(subscribers);
-                                self.shared.topic_subscribers.remove(&topic);
-                            }
                         }
+                        self.shared
+                            .topic_subscribers
+                            .remove_if(&topic, |_, subs| subs.is_empty());
+                        removed.push(topic);
+                    }
+                }
+                removed
+            }
+        };
+
+        // Emit UNSUB to cluster for topics whose refcount went 1->0
+        let cluster_tx = self.shared.cluster_cmd_tx.lock().unwrap().clone();
+        if let Some(tx) = cluster_tx {
+            let mut refcounts = self.shared.local_topic_refcount.lock().unwrap();
+            for topic in &removed_topics {
+                if let Some(count) = refcounts.get_mut(topic) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        refcounts.remove(topic);
+                        let _ = tx.send(ClusterCommand::Unsub {
+                            topic: topic.clone(),
+                        });
                     }
                 }
             }
         }
+
         Ok(())
     }
 
@@ -1982,11 +2023,11 @@ impl RustWSEServer {
         // Cluster publish (if connected) -- clone sender to avoid holding mutex
         let cluster_tx = self.shared.cluster_cmd_tx.lock().unwrap().clone();
         if let Some(tx) = cluster_tx {
-            tx.try_send(ClusterCommand::Publish {
+            tx.send(ClusterCommand::Publish {
                 topic: topic.to_owned(),
                 payload: data.to_owned(),
             })
-            .map_err(|_| PyRuntimeError::new_err("Cluster command channel full"))?;
+            .map_err(|_| PyRuntimeError::new_err("Cluster command channel closed"))?;
             return Ok(());
         }
 

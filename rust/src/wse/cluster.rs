@@ -77,7 +77,27 @@ impl MsgType {
 
 pub(crate) enum ClusterCommand {
     Publish { topic: String, payload: String },
+    Sub { topic: String },
+    Unsub { topic: String },
     Shutdown,
+}
+
+pub(crate) enum InterestUpdate {
+    Sub {
+        peer_addr: String,
+        topic: String,
+    },
+    Unsub {
+        peer_addr: String,
+        topic: String,
+    },
+    Resync {
+        peer_addr: String,
+        topics: Vec<String>,
+    },
+    PeerDisconnected {
+        peer_addr: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -234,7 +254,6 @@ pub(crate) fn encode_shutdown(buf: &mut BytesMut) {
 
 /// Encode a SUB frame. Returns false if topic exceeds 64KB.
 /// Format: [u8 type=0x06][u8 flags][u16 LE topic_len][u32 LE payload_len=0][topic]
-#[allow(dead_code)] // Used in Phase 2: Interest-Based Routing
 pub(crate) fn encode_sub(buf: &mut BytesMut, topic: &str) -> bool {
     let topic_bytes = topic.as_bytes();
     if topic_bytes.len() > u16::MAX as usize {
@@ -251,7 +270,6 @@ pub(crate) fn encode_sub(buf: &mut BytesMut, topic: &str) -> bool {
 
 /// Encode an UNSUB frame. Returns false if topic exceeds 64KB.
 /// Format: [u8 type=0x07][u8 flags][u16 LE topic_len][u32 LE payload_len=0][topic]
-#[allow(dead_code)] // Used in Phase 2: Interest-Based Routing
 pub(crate) fn encode_unsub(buf: &mut BytesMut, topic: &str) -> bool {
     let topic_bytes = topic.as_bytes();
     if topic_bytes.len() > u16::MAX as usize {
@@ -268,7 +286,6 @@ pub(crate) fn encode_unsub(buf: &mut BytesMut, topic: &str) -> bool {
 
 /// Encode a RESYNC frame. Topics are joined by "\n" in the payload.
 /// Format: [u8 type=0x08][u8 flags][u16 LE topic_len=0][u32 LE payload_len][payload]
-#[allow(dead_code)] // Used in Phase 2: Interest-Based Routing
 pub(crate) fn encode_resync(buf: &mut BytesMut, topics: &[String]) {
     let payload = topics.join("\n");
     let payload_bytes = payload.as_bytes();
@@ -475,9 +492,12 @@ async fn peer_dispatch_task(
 /// Reads frames from a peer TCP connection. Decoded MSG payloads are pushed to
 /// a dispatch channel (non-blocking) so fan-out never stalls TCP reads.
 /// BufReader (64KB) reduces read syscalls from 2/frame to ~1 per 650 frames.
+#[allow(clippy::too_many_arguments)]
 async fn peer_reader(
     reader: OwnedReadHalf,
     peer_write_tx: mpsc::UnboundedSender<BytesMut>,
+    peer_addr: String,
+    interest_tx: mpsc::UnboundedSender<InterestUpdate>,
     connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
     cancel: CancellationToken,
@@ -551,11 +571,26 @@ async fn peer_reader(
             Some(ClusterFrame::Hello { .. }) => {
                 // Unexpected HELLO after handshake, ignore
             }
-            Some(
-                ClusterFrame::Sub { .. } | ClusterFrame::Unsub { .. } | ClusterFrame::Resync { .. },
-            ) => {
-                // Interest-based routing frames -- handled in Phase 2
+            Some(ClusterFrame::Sub { topic }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
+                let _ = interest_tx.send(InterestUpdate::Sub {
+                    peer_addr: peer_addr.clone(),
+                    topic,
+                });
+            }
+            Some(ClusterFrame::Unsub { topic }) => {
+                last_activity.store(epoch_ms(), Ordering::Relaxed);
+                let _ = interest_tx.send(InterestUpdate::Unsub {
+                    peer_addr: peer_addr.clone(),
+                    topic,
+                });
+            }
+            Some(ClusterFrame::Resync { topics }) => {
+                last_activity.store(epoch_ms(), Ordering::Relaxed);
+                let _ = interest_tx.send(InterestUpdate::Resync {
+                    peer_addr: peer_addr.clone(),
+                    topics,
+                });
             }
             None => {
                 eprintln!("[WSE-Cluster] Failed to decode frame, disconnecting");
@@ -604,14 +639,17 @@ async fn heartbeat_task(
 // Single peer connection task (connect + HELLO + spawn reader/writer/heartbeat)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn peer_connection_task(
     peer_addr: String,
     instance_id: String,
     mut data_rx: mpsc::UnboundedReceiver<BytesMut>,
+    interest_tx: mpsc::UnboundedSender<InterestUpdate>,
     connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
     metrics: Arc<ClusterMetrics>,
     global_cancel: CancellationToken,
+    local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
 ) {
     let mut backoff = ExponentialBackoff::new();
     let mut breaker = CircuitBreaker::new();
@@ -739,6 +777,25 @@ async fn peer_connection_task(
         backoff.reset();
         metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
 
+        // Send RESYNC with all current local topics (before spawning writer task)
+        {
+            let local_topics: Vec<String> = {
+                let refcounts = local_topic_refcount.lock().unwrap();
+                refcounts.keys().cloned().collect()
+            };
+            if !local_topics.is_empty() {
+                let mut resync_buf = BytesMut::new();
+                encode_resync(&mut resync_buf, &local_topics);
+                let mut resync_frame = BytesMut::new();
+                write_framed(&mut resync_frame, &resync_buf);
+                if writer.write_all(&resync_frame).await.is_err() {
+                    eprintln!("[WSE-Cluster] Failed to send RESYNC to {peer_addr}");
+                    metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
+                    continue; // Will reconnect
+                }
+            }
+        }
+
         // Spawn reader, writer, heartbeat with child cancellation token
         let peer_cancel = global_cancel.child_token();
         let (peer_write_tx, peer_write_rx) = mpsc::unbounded_channel::<BytesMut>();
@@ -754,6 +811,8 @@ async fn peer_connection_task(
         let reader_handle = tokio::spawn(peer_reader(
             reader_temp,
             peer_write_tx.clone(),
+            peer_addr.clone(),
+            interest_tx.clone(),
             connections.clone(),
             topic_subscribers.clone(),
             peer_cancel.clone(),
@@ -796,6 +855,9 @@ async fn peer_connection_task(
         let _ = reader_handle.await;
         let _ = heartbeat_handle.await;
         metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
+        let _ = interest_tx.send(InterestUpdate::PeerDisconnected {
+            peer_addr: peer_addr.clone(),
+        });
         eprintln!("[WSE-Cluster] Disconnected from {peer_addr}");
 
         if global_cancel.is_cancelled() {
@@ -820,16 +882,23 @@ async fn peer_connection_task(
 // Cluster manager: orchestrates all peer connections
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cluster_manager(
     peers: Vec<String>,
     instance_id: String,
     mut cmd_rx: mpsc::UnboundedReceiver<ClusterCommand>,
+    interest_tx: mpsc::UnboundedSender<InterestUpdate>,
+    mut interest_rx: mpsc::UnboundedReceiver<InterestUpdate>,
     connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
     metrics: Arc<ClusterMetrics>,
     _dlq: Arc<std::sync::Mutex<ClusterDlq>>,
+    local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
 ) {
     let global_cancel = CancellationToken::new();
+
+    // Remote interest table: peer_addr -> set of topics that peer is interested in
+    let mut remote_interest: HashMap<String, ahash::AHashSet<String>> = HashMap::new();
 
     // Per-peer channels: manager sends encoded BytesMut, peer task forwards to writer
     let mut peer_txs: Vec<(String, mpsc::UnboundedSender<BytesMut>)> = Vec::new();
@@ -843,10 +912,12 @@ pub(crate) async fn cluster_manager(
             peer_addr.clone(),
             instance_id.clone(),
             rx,
+            interest_tx.clone(),
             connections.clone(),
             topic_subscribers.clone(),
             metrics.clone(),
             global_cancel.clone(),
+            local_topic_refcount.clone(),
         ));
         peer_handles.push(handle);
     }
@@ -858,39 +929,88 @@ pub(crate) async fn cluster_manager(
 
     // Main loop: fan out commands to all peer channels
     loop {
-        let cmd = tokio::select! {
-            cmd = cmd_rx.recv() => cmd,
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(ClusterCommand::Publish { topic, payload }) => {
+                        let mut frame_data = BytesMut::new();
+                        if !encode_msg(&mut frame_data, &topic, &payload) {
+                            continue;
+                        }
+
+                        for (peer_addr, tx) in &peer_txs {
+                            let interested = match remote_interest.get(peer_addr) {
+                                Some(topics) => {
+                                    topics.contains(&topic)
+                                        || topics.iter().any(|pat| {
+                                            (pat.contains('*') || pat.contains('?'))
+                                                && super::redis_pubsub::glob_match(pat, &topic)
+                                        })
+                                }
+                                None => true, // No RESYNC yet -> safe default: send to all
+                            };
+                            if interested {
+                                if tx.send(frame_data.clone()).is_ok() {
+                                    metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                    Some(ClusterCommand::Sub { topic }) => {
+                        let mut frame_data = BytesMut::new();
+                        if encode_sub(&mut frame_data, &topic) {
+                            for (_peer_addr, tx) in &peer_txs {
+                                let _ = tx.send(frame_data.clone());
+                            }
+                        }
+                    }
+                    Some(ClusterCommand::Unsub { topic }) => {
+                        let mut frame_data = BytesMut::new();
+                        if encode_unsub(&mut frame_data, &topic) {
+                            for (_peer_addr, tx) in &peer_txs {
+                                let _ = tx.send(frame_data.clone());
+                            }
+                        }
+                    }
+                    Some(ClusterCommand::Shutdown) | None => {
+                        eprintln!("[WSE-Cluster] Manager shutting down");
+                        let mut shutdown_data = BytesMut::new();
+                        encode_shutdown(&mut shutdown_data);
+                        for (peer_addr, tx) in &peer_txs {
+                            if tx.send(shutdown_data.clone()).is_err() {
+                                eprintln!("[WSE-Cluster] Could not send SHUTDOWN to {peer_addr}");
+                            }
+                        }
+                        global_cancel.cancel();
+                        break;
+                    }
+                }
+            }
+            update = interest_rx.recv() => {
+                match update {
+                    Some(InterestUpdate::Sub { peer_addr, topic }) => {
+                        remote_interest.entry(peer_addr).or_default().insert(topic);
+                    }
+                    Some(InterestUpdate::Unsub { peer_addr, topic }) => {
+                        if let Some(topics) = remote_interest.get_mut(&peer_addr) {
+                            topics.remove(&topic);
+                        }
+                    }
+                    Some(InterestUpdate::Resync { peer_addr, topics }) => {
+                        let set: ahash::AHashSet<String> = topics.into_iter().collect();
+                        remote_interest.insert(peer_addr, set);
+                    }
+                    Some(InterestUpdate::PeerDisconnected { peer_addr }) => {
+                        remote_interest.remove(&peer_addr);
+                    }
+                    None => {
+                        // Interest channel closed, continue running
+                    }
+                }
+            }
             () = global_cancel.cancelled() => break,
-        };
-
-        match cmd {
-            Some(ClusterCommand::Publish { topic, payload }) => {
-                let mut frame_data = BytesMut::new();
-                if !encode_msg(&mut frame_data, &topic, &payload) {
-                    continue;
-                }
-
-                for (_peer_addr, tx) in &peer_txs {
-                    if tx.send(frame_data.clone()).is_ok() {
-                        metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-            Some(ClusterCommand::Shutdown) | None => {
-                eprintln!("[WSE-Cluster] Manager shutting down");
-                // Send SHUTDOWN frame to all peers with brief timeout
-                let mut shutdown_data = BytesMut::new();
-                encode_shutdown(&mut shutdown_data);
-                for (peer_addr, tx) in &peer_txs {
-                    if tx.send(shutdown_data.clone()).is_err() {
-                        eprintln!("[WSE-Cluster] Could not send SHUTDOWN to {peer_addr}");
-                    }
-                }
-                global_cancel.cancel();
-                break;
-            }
         }
     }
 
@@ -909,6 +1029,7 @@ pub(crate) async fn handle_cluster_inbound(
     stream: TcpStream,
     addr: SocketAddr,
     shared: &super::server::SharedState,
+    interest_tx: mpsc::UnboundedSender<InterestUpdate>,
 ) {
     // Check if cluster mode is active
     let instance_id = match shared
@@ -969,7 +1090,26 @@ pub(crate) async fn handle_cluster_inbound(
         return;
     }
 
+    // Send RESYNC with all current local topics (before spawning writer task)
+    {
+        let local_topics: Vec<String> = {
+            let refcounts = shared.local_topic_refcount.lock().unwrap();
+            refcounts.keys().cloned().collect()
+        };
+        if !local_topics.is_empty() {
+            let mut resync_buf = BytesMut::new();
+            encode_resync(&mut resync_buf, &local_topics);
+            let mut resync_frame = BytesMut::new();
+            write_framed(&mut resync_frame, &resync_buf);
+            if writer.write_all(&resync_frame).await.is_err() {
+                eprintln!("[WSE-Cluster] Failed to send RESYNC to inbound {addr}");
+                return;
+            }
+        }
+    }
+
     eprintln!("[WSE-Cluster] Accepted inbound peer from {addr}");
+    let peer_addr_str = addr.to_string();
     let metrics = shared.cluster_metrics.clone();
     metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
 
@@ -987,6 +1127,8 @@ pub(crate) async fn handle_cluster_inbound(
     let reader_handle = tokio::spawn(peer_reader(
         reader,
         write_tx.clone(),
+        peer_addr_str.clone(),
+        interest_tx.clone(),
         shared.connections.clone(),
         shared.topic_subscribers.clone(),
         cancel.clone(),
@@ -1008,6 +1150,9 @@ pub(crate) async fn handle_cluster_inbound(
     let _ = writer_handle.await;
     let _ = heartbeat_handle.await;
 
+    let _ = interest_tx.send(InterestUpdate::PeerDisconnected {
+        peer_addr: peer_addr_str,
+    });
     metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
     eprintln!("[WSE-Cluster] Inbound peer {addr} disconnected");
 }
