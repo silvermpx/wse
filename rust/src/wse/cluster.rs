@@ -1610,4 +1610,81 @@ mod tests {
             }
         );
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_sub_unsub_resync_roundtrip() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Peer A sends SUB, UNSUB, RESYNC in a single write
+        let sender = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let (_, mut write) = stream.into_split();
+
+            let mut wire = BytesMut::new();
+
+            // SUB for "chat.general"
+            let mut sub = BytesMut::new();
+            encode_sub(&mut sub, "chat.general");
+            write_framed(&mut wire, &sub);
+
+            // UNSUB for "chat.private"
+            let mut unsub = BytesMut::new();
+            encode_unsub(&mut unsub, "chat.private");
+            write_framed(&mut wire, &unsub);
+
+            // RESYNC with 3 topics
+            let topics = vec!["a".into(), "b".into(), "c".into()];
+            let mut resync = BytesMut::new();
+            encode_resync(&mut resync, &topics);
+            write_framed(&mut wire, &resync);
+
+            write.write_all(&wire).await.unwrap();
+        });
+
+        // Peer B reads and verifies each frame
+        let (stream, _) = listener.accept().await.unwrap();
+        let (mut read, _) = stream.into_split();
+        let mut len_buf = [0u8; 4];
+
+        // Read SUB
+        read.read_exact(&mut len_buf).await.unwrap();
+        let frame_len = u32::from_be_bytes(len_buf) as usize;
+        let mut frame_buf = BytesMut::zeroed(frame_len);
+        read.read_exact(&mut frame_buf).await.unwrap();
+        assert_eq!(
+            decode_frame(frame_buf).unwrap(),
+            ClusterFrame::Sub {
+                topic: "chat.general".into()
+            }
+        );
+
+        // Read UNSUB
+        read.read_exact(&mut len_buf).await.unwrap();
+        let frame_len = u32::from_be_bytes(len_buf) as usize;
+        let mut frame_buf = BytesMut::zeroed(frame_len);
+        read.read_exact(&mut frame_buf).await.unwrap();
+        assert_eq!(
+            decode_frame(frame_buf).unwrap(),
+            ClusterFrame::Unsub {
+                topic: "chat.private".into()
+            }
+        );
+
+        // Read RESYNC
+        read.read_exact(&mut len_buf).await.unwrap();
+        let frame_len = u32::from_be_bytes(len_buf) as usize;
+        let mut frame_buf = BytesMut::zeroed(frame_len);
+        read.read_exact(&mut frame_buf).await.unwrap();
+        assert_eq!(
+            decode_frame(frame_buf).unwrap(),
+            ClusterFrame::Resync {
+                topics: vec!["a".into(), "b".into(), "c".into()]
+            }
+        );
+
+        sender.await.unwrap();
+    }
 }
