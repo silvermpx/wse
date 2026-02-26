@@ -38,6 +38,16 @@ pub(crate) const MAX_BATCH_BYTES: usize = 65_536;
 // Memory growth only happens during benchmarks (publisher >> consumer rate).
 // In production, message rates are bounded by real workload.
 
+pub(crate) const PROTOCOL_VERSION_MIN: u16 = 1;
+
+// Capability flags (negotiated via bitwise AND of both peers' values)
+pub(crate) const CAP_INTEREST_ROUTING: u32 = 1 << 0; // Phase 2: SUB/UNSUB
+#[allow(dead_code)]
+pub(crate) const CAP_COMPRESSION: u32 = 1 << 1; // Phase 6: reserved for future
+
+/// Our capabilities bitmask
+pub(crate) const LOCAL_CAPABILITIES: u32 = CAP_INTEREST_ROUTING;
+
 // ---------------------------------------------------------------------------
 // Message types
 // ---------------------------------------------------------------------------
@@ -112,6 +122,7 @@ pub(crate) struct ClusterMetrics {
     pub bytes_received: AtomicU64,
     pub reconnect_count: AtomicU64,
     pub connected_peers: AtomicU64,
+    pub unknown_message_types: AtomicU64,
 }
 
 impl ClusterMetrics {
@@ -124,6 +135,7 @@ impl ClusterMetrics {
             bytes_received: AtomicU64::new(0),
             reconnect_count: AtomicU64::new(0),
             connected_peers: AtomicU64::new(0),
+            unknown_message_types: AtomicU64::new(0),
         }
     }
 }
@@ -226,7 +238,7 @@ pub(crate) fn encode_pong(buf: &mut BytesMut) {
 
 /// Encode a HELLO frame.
 /// Payload: magic(4) + version(2) + id_len(2) + id_bytes(N) + capabilities(4)
-pub(crate) fn encode_hello(buf: &mut BytesMut, instance_id: &str) {
+pub(crate) fn encode_hello(buf: &mut BytesMut, instance_id: &str, capabilities: u32) {
     let id_bytes = instance_id.as_bytes();
     let payload_len = 4 + 2 + 2 + id_bytes.len() + 4;
     buf.reserve(8 + payload_len);
@@ -240,7 +252,7 @@ pub(crate) fn encode_hello(buf: &mut BytesMut, instance_id: &str) {
     buf.put_u16_le(PROTOCOL_VERSION);
     buf.put_u16_le(id_bytes.len() as u16);
     buf.put_slice(id_bytes);
-    buf.put_u32_le(0); // capabilities (reserved)
+    buf.put_u32_le(capabilities);
 }
 
 /// Encode a SHUTDOWN frame (header only, 8 bytes).
@@ -323,6 +335,7 @@ pub(crate) enum ClusterFrame {
     Hello {
         instance_id: String,
         protocol_version: u16,
+        capabilities: u32,
     },
     Shutdown,
     Sub {
@@ -334,21 +347,24 @@ pub(crate) enum ClusterFrame {
     Resync {
         topics: Vec<String>,
     },
+    Unknown {
+        msg_type: u8,
+    },
 }
 
 /// Decode a frame from raw bytes (after outer length prefix is stripped).
-/// Returns None on any parse error.
+/// Returns None on any parse error (except unknown message types, which return Unknown).
 pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
     if data.remaining() < 8 {
         return None;
     }
-    let msg_type = MsgType::from_u8(data.get_u8())?;
+    let raw_type = data.get_u8();
     let _flags = data.get_u8();
     let topic_len = data.get_u16_le() as usize;
     let payload_len = data.get_u32_le() as usize;
 
-    match msg_type {
-        MsgType::Msg => {
+    match MsgType::from_u8(raw_type) {
+        Some(MsgType::Msg) => {
             if data.remaining() < topic_len + payload_len {
                 return None;
             }
@@ -356,9 +372,9 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             let payload = String::from_utf8(data.split_to(payload_len).to_vec()).ok()?;
             Some(ClusterFrame::Msg { topic, payload })
         }
-        MsgType::Ping => Some(ClusterFrame::Ping),
-        MsgType::Pong => Some(ClusterFrame::Pong),
-        MsgType::Hello => {
+        Some(MsgType::Ping) => Some(ClusterFrame::Ping),
+        Some(MsgType::Pong) => Some(ClusterFrame::Pong),
+        Some(MsgType::Hello) => {
             // Minimum HELLO payload: magic(4) + version(2) + id_len(2) + capabilities(4) = 12
             if payload_len < 12 || data.remaining() < payload_len {
                 return None;
@@ -373,28 +389,29 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                 return None;
             }
             let instance_id = String::from_utf8(data.split_to(id_len).to_vec()).ok()?;
-            let _capabilities = data.get_u32_le();
+            let capabilities = data.get_u32_le();
             Some(ClusterFrame::Hello {
                 instance_id,
                 protocol_version: version,
+                capabilities,
             })
         }
-        MsgType::Shutdown => Some(ClusterFrame::Shutdown),
-        MsgType::Sub => {
+        Some(MsgType::Shutdown) => Some(ClusterFrame::Shutdown),
+        Some(MsgType::Sub) => {
             if data.remaining() < topic_len {
                 return None;
             }
             let topic = String::from_utf8(data.split_to(topic_len).to_vec()).ok()?;
             Some(ClusterFrame::Sub { topic })
         }
-        MsgType::Unsub => {
+        Some(MsgType::Unsub) => {
             if data.remaining() < topic_len {
                 return None;
             }
             let topic = String::from_utf8(data.split_to(topic_len).to_vec()).ok()?;
             Some(ClusterFrame::Unsub { topic })
         }
-        MsgType::Resync => {
+        Some(MsgType::Resync) => {
             if data.remaining() < payload_len {
                 return None;
             }
@@ -406,7 +423,31 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             };
             Some(ClusterFrame::Resync { topics })
         }
+        None => {
+            // Unknown message type from a newer peer -- safe to skip
+            // (outer 4-byte framing means we already consumed the right number of bytes)
+            Some(ClusterFrame::Unknown { msg_type: raw_type })
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Version / capability negotiation
+// ---------------------------------------------------------------------------
+
+/// Negotiate protocol version. Returns min(local, remote) if >= PROTOCOL_VERSION_MIN.
+pub(crate) fn negotiate_version(local_ver: u16, remote_ver: u16) -> Option<u16> {
+    let negotiated = local_ver.min(remote_ver);
+    if negotiated >= PROTOCOL_VERSION_MIN {
+        Some(negotiated)
+    } else {
+        None
+    }
+}
+
+/// Negotiate capabilities: bitwise AND (both must support a feature for it to be active).
+pub(crate) fn negotiate_capabilities(local: u32, remote: u32) -> u32 {
+    local & remote
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +612,13 @@ async fn peer_reader(
             Some(ClusterFrame::Hello { .. }) => {
                 // Unexpected HELLO after handshake, ignore
             }
+            Some(ClusterFrame::Unknown { msg_type }) => {
+                last_activity.store(epoch_ms(), Ordering::Relaxed);
+                metrics
+                    .unknown_message_types
+                    .fetch_add(1, Ordering::Relaxed);
+                eprintln!("[WSE-Cluster] Unknown message type 0x{msg_type:02x}, skipping frame");
+            }
             Some(ClusterFrame::Sub { topic }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
                 let _ = interest_tx.send(InterestUpdate::Sub {
@@ -723,7 +771,7 @@ async fn peer_connection_task(
 
         // Send HELLO
         let mut hello_buf = BytesMut::new();
-        encode_hello(&mut hello_buf, &instance_id);
+        encode_hello(&mut hello_buf, &instance_id, LOCAL_CAPABILITIES);
         let mut frame = BytesMut::new();
         write_framed(&mut frame, &hello_buf);
         if writer.write_all(&frame).await.is_err() {
@@ -741,38 +789,57 @@ async fn peer_connection_task(
 
         // Read HELLO response (full read under single timeout)
         let mut reader_temp = reader;
-        let hello_ok = match tokio::time::timeout(Duration::from_secs(5), async {
+        let peer_hello = match tokio::time::timeout(Duration::from_secs(5), async {
             let mut len_buf = [0u8; 4];
             reader_temp.read_exact(&mut len_buf).await?;
             let frame_len = u32::from_be_bytes(len_buf) as usize;
             if frame_len == 0 || frame_len > MAX_FRAME_SIZE {
-                return Ok::<bool, std::io::Error>(false);
+                return Ok::<Option<ClusterFrame>, std::io::Error>(None);
             }
             let mut frame_buf = BytesMut::zeroed(frame_len);
             reader_temp.read_exact(&mut frame_buf).await?;
-            Ok(matches!(
-                decode_frame(frame_buf),
-                Some(ClusterFrame::Hello { .. })
-            ))
+            Ok(decode_frame(frame_buf))
         })
         .await
         {
-            Ok(Ok(result)) => result,
-            _ => false,
+            Ok(Ok(frame)) => frame,
+            _ => None,
         };
 
-        if !hello_ok {
-            eprintln!("[WSE-Cluster] Invalid HELLO from {peer_addr}");
-            breaker.record_failure();
-            let delay = backoff.next_delay();
-            tokio::select! {
-                () = tokio::time::sleep(delay) => continue,
-                () = global_cancel.cancelled() => break,
+        let (_peer_version, _peer_caps) = match peer_hello {
+            Some(ClusterFrame::Hello {
+                protocol_version,
+                capabilities,
+                ..
+            }) => match negotiate_version(PROTOCOL_VERSION, protocol_version) {
+                Some(v) => (v, negotiate_capabilities(LOCAL_CAPABILITIES, capabilities)),
+                None => {
+                    eprintln!(
+                        "[WSE-Cluster] Version mismatch with {peer_addr}: local={PROTOCOL_VERSION}, remote={protocol_version}"
+                    );
+                    breaker.record_failure();
+                    let delay = backoff.next_delay();
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => continue,
+                        () = global_cancel.cancelled() => break,
+                    }
+                }
+            },
+            _ => {
+                eprintln!("[WSE-Cluster] Invalid HELLO from {peer_addr}");
+                breaker.record_failure();
+                let delay = backoff.next_delay();
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => continue,
+                    () = global_cancel.cancelled() => break,
+                }
             }
-        }
+        };
 
         // Connected successfully
-        eprintln!("[WSE-Cluster] Connected to {peer_addr}");
+        eprintln!(
+            "[WSE-Cluster] Connected to {peer_addr} (v{_peer_version}, caps=0x{_peer_caps:08x})"
+        );
         breaker.record_success();
         backoff.reset();
         metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
@@ -1056,33 +1123,46 @@ pub(crate) async fn handle_cluster_inbound(
     let (mut reader, mut writer) = stream.into_split();
 
     // Read peer's HELLO frame
-    let peer_hello_ok = matches!(
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let mut len_buf = [0u8; 4];
-            reader.read_exact(&mut len_buf).await?;
-            let frame_len = u32::from_be_bytes(len_buf) as usize;
-            if frame_len == 0 || frame_len > MAX_FRAME_SIZE {
-                return Ok::<bool, std::io::Error>(false);
-            }
-            let mut frame_buf = BytesMut::zeroed(frame_len);
-            reader.read_exact(&mut frame_buf).await?;
-            Ok(matches!(
-                decode_frame(frame_buf),
-                Some(ClusterFrame::Hello { .. })
-            ))
-        })
-        .await,
-        Ok(Ok(true))
-    );
+    let peer_hello = match tokio::time::timeout(Duration::from_secs(5), async {
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf).await?;
+        let frame_len = u32::from_be_bytes(len_buf) as usize;
+        if frame_len == 0 || frame_len > MAX_FRAME_SIZE {
+            return Ok::<Option<ClusterFrame>, std::io::Error>(None);
+        }
+        let mut frame_buf = BytesMut::zeroed(frame_len);
+        reader.read_exact(&mut frame_buf).await?;
+        Ok(decode_frame(frame_buf))
+    })
+    .await
+    {
+        Ok(Ok(frame)) => frame,
+        _ => None,
+    };
 
-    if !peer_hello_ok {
-        eprintln!("[WSE-Cluster] Invalid HELLO from inbound {addr}");
-        return;
-    }
+    let (_peer_version, _peer_caps) = match peer_hello {
+        Some(ClusterFrame::Hello {
+            protocol_version,
+            capabilities,
+            ..
+        }) => match negotiate_version(PROTOCOL_VERSION, protocol_version) {
+            Some(v) => (v, negotiate_capabilities(LOCAL_CAPABILITIES, capabilities)),
+            None => {
+                eprintln!(
+                    "[WSE-Cluster] Version mismatch with inbound {addr}: local={PROTOCOL_VERSION}, remote={protocol_version}"
+                );
+                return;
+            }
+        },
+        _ => {
+            eprintln!("[WSE-Cluster] Invalid HELLO from inbound {addr}");
+            return;
+        }
+    };
 
     // Send our HELLO response
     let mut hello_buf = BytesMut::new();
-    encode_hello(&mut hello_buf, &instance_id);
+    encode_hello(&mut hello_buf, &instance_id, LOCAL_CAPABILITIES);
     let mut frame = BytesMut::new();
     write_framed(&mut frame, &hello_buf);
     if writer.write_all(&frame).await.is_err() {
@@ -1108,7 +1188,9 @@ pub(crate) async fn handle_cluster_inbound(
         }
     }
 
-    eprintln!("[WSE-Cluster] Accepted inbound peer from {addr}");
+    eprintln!(
+        "[WSE-Cluster] Accepted inbound peer from {addr} (v{_peer_version}, caps=0x{_peer_caps:08x})"
+    );
     let peer_addr_str = addr.to_string();
     let metrics = shared.cluster_metrics.clone();
     metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
@@ -1193,13 +1275,14 @@ mod tests {
     #[test]
     fn test_encode_decode_hello() {
         let mut buf = BytesMut::new();
-        encode_hello(&mut buf, "instance-abc-123");
+        encode_hello(&mut buf, "instance-abc-123", CAP_INTEREST_ROUTING);
         let frame = decode_frame(buf).unwrap();
         assert_eq!(
             frame,
             ClusterFrame::Hello {
                 instance_id: "instance-abc-123".into(),
                 protocol_version: 1,
+                capabilities: CAP_INTEREST_ROUTING,
             }
         );
     }
@@ -1243,7 +1326,10 @@ mod tests {
         buf.put_u8(0);
         buf.put_u16_le(0);
         buf.put_u32_le(0);
-        assert!(decode_frame(buf).is_none());
+        assert_eq!(
+            decode_frame(buf),
+            Some(ClusterFrame::Unknown { msg_type: 0xFF })
+        );
     }
 
     #[test]
@@ -1394,7 +1480,7 @@ mod tests {
 
             // Send HELLO
             let mut hello = BytesMut::new();
-            encode_hello(&mut hello, "peer-a");
+            encode_hello(&mut hello, "peer-a", LOCAL_CAPABILITIES);
             let mut frame = BytesMut::new();
             write_framed(&mut frame, &hello);
             write.write_all(&frame).await.unwrap();
@@ -1427,7 +1513,7 @@ mod tests {
 
         // Send HELLO back
         let mut hello = BytesMut::new();
-        encode_hello(&mut hello, "peer-b");
+        encode_hello(&mut hello, "peer-b", LOCAL_CAPABILITIES);
         let mut frame = BytesMut::new();
         write_framed(&mut frame, &hello);
         write.write_all(&frame).await.unwrap();
@@ -1478,5 +1564,50 @@ mod tests {
         );
 
         sender.await.unwrap();
+    }
+
+    #[test]
+    fn test_negotiate_version_same() {
+        assert_eq!(negotiate_version(1, 1), Some(1));
+    }
+
+    #[test]
+    fn test_negotiate_version_different() {
+        assert_eq!(negotiate_version(2, 1), Some(1));
+        assert_eq!(negotiate_version(1, 2), Some(1));
+    }
+
+    #[test]
+    fn test_negotiate_version_zero_rejected() {
+        assert_eq!(negotiate_version(1, 0), None);
+    }
+
+    #[test]
+    fn test_negotiate_capabilities() {
+        assert_eq!(negotiate_capabilities(0b11, 0b10), 0b10);
+        assert_eq!(negotiate_capabilities(0b01, 0b10), 0b00);
+        assert_eq!(
+            negotiate_capabilities(CAP_INTEREST_ROUTING, CAP_INTEREST_ROUTING | CAP_COMPRESSION),
+            CAP_INTEREST_ROUTING
+        );
+    }
+
+    #[test]
+    fn test_encode_decode_hello_with_capabilities() {
+        let mut buf = BytesMut::new();
+        encode_hello(
+            &mut buf,
+            "test-node",
+            CAP_INTEREST_ROUTING | CAP_COMPRESSION,
+        );
+        let frame = decode_frame(buf).unwrap();
+        assert_eq!(
+            frame,
+            ClusterFrame::Hello {
+                instance_id: "test-node".into(),
+                protocol_version: 1,
+                capabilities: CAP_INTEREST_ROUTING | CAP_COMPRESSION,
+            }
+        );
     }
 }

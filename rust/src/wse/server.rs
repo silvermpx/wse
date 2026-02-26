@@ -2132,6 +2132,10 @@ impl RustWSEServer {
             cm.reconnect_count.load(Ordering::Relaxed),
         )?;
         dict.set_item(
+            "cluster_unknown_message_types",
+            cm.unknown_message_types.load(Ordering::Relaxed),
+        )?;
+        dict.set_item(
             "cluster_dlq_size",
             self.shared
                 .cluster_dlq
