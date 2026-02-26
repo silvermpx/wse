@@ -1,5 +1,10 @@
 use pyo3::prelude::*;
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 mod jwt;
 mod wse;
 

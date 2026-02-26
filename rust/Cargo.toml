@@ -34,6 +34,7 @@ crossbeam-channel = "0.5"
 tokio-util = { version = "0.7", features = ["rt"] }
 socket2 = { version = "0.6", features = ["all"] }
 bytes = "1"
+mimalloc = "0.1"
 
 [profile.release]
 lto = true
