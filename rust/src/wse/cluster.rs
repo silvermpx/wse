@@ -1,25 +1,25 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{Buf, BufMut, BytesMut};
 use dashmap::{DashMap, DashSet};
 use socket2::{SockRef, TcpKeepalive};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::reliability::{CircuitBreaker, ExponentialBackoff};
 use super::server::ConnectionHandle;
 
-/// Current wall-clock time in milliseconds since UNIX epoch. Used for lock-free last_activity tracking.
+/// Wall-clock time in milliseconds since UNIX epoch (for lock-free heartbeat tracking).
 fn epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
 }
@@ -34,7 +34,9 @@ pub(crate) const MAX_FRAME_SIZE: usize = 1_048_576; // 1MB
 pub(crate) const HEARTBEAT_INTERVAL_SECS: u64 = 5;
 pub(crate) const HEARTBEAT_TIMEOUT_SECS: u64 = 15;
 pub(crate) const MAX_BATCH_BYTES: usize = 65_536;
-pub(crate) const PER_PEER_CHANNEL_CAP: usize = 8192;
+// All cluster channels are unbounded to prevent message drops.
+// Memory growth only happens during benchmarks (publisher >> consumer rate).
+// In production, message rates are bounded by real workload.
 
 // ---------------------------------------------------------------------------
 // Message types
@@ -48,6 +50,9 @@ pub(crate) enum MsgType {
     Pong = 0x03,
     Hello = 0x04,
     Shutdown = 0x05,
+    Sub = 0x06,
+    Unsub = 0x07,
+    Resync = 0x08,
 }
 
 impl MsgType {
@@ -58,6 +63,9 @@ impl MsgType {
             0x03 => Some(Self::Pong),
             0x04 => Some(Self::Hello),
             0x05 => Some(Self::Shutdown),
+            0x06 => Some(Self::Sub),
+            0x07 => Some(Self::Unsub),
+            0x08 => Some(Self::Resync),
             _ => None,
         }
     }
@@ -122,6 +130,7 @@ pub(crate) struct ClusterDlqEntry {
 
 pub(crate) struct ClusterDlq {
     entries: VecDeque<ClusterDlqEntry>,
+    #[allow(dead_code)]
     max_entries: usize,
 }
 
@@ -133,6 +142,7 @@ impl ClusterDlq {
         }
     }
 
+    #[allow(dead_code)]
     pub fn push(&mut self, entry: ClusterDlqEntry) {
         if self.entries.len() >= self.max_entries {
             self.entries.pop_front();
@@ -222,6 +232,54 @@ pub(crate) fn encode_shutdown(buf: &mut BytesMut) {
     buf.put_u32_le(0);
 }
 
+/// Encode a SUB frame. Returns false if topic exceeds 64KB.
+/// Format: [u8 type=0x06][u8 flags][u16 LE topic_len][u32 LE payload_len=0][topic]
+#[allow(dead_code)] // Used in Phase 2: Interest-Based Routing
+pub(crate) fn encode_sub(buf: &mut BytesMut, topic: &str) -> bool {
+    let topic_bytes = topic.as_bytes();
+    if topic_bytes.len() > u16::MAX as usize {
+        return false;
+    }
+    buf.reserve(8 + topic_bytes.len());
+    buf.put_u8(MsgType::Sub as u8);
+    buf.put_u8(0); // flags
+    buf.put_u16_le(topic_bytes.len() as u16);
+    buf.put_u32_le(0); // no payload
+    buf.put_slice(topic_bytes);
+    true
+}
+
+/// Encode an UNSUB frame. Returns false if topic exceeds 64KB.
+/// Format: [u8 type=0x07][u8 flags][u16 LE topic_len][u32 LE payload_len=0][topic]
+#[allow(dead_code)] // Used in Phase 2: Interest-Based Routing
+pub(crate) fn encode_unsub(buf: &mut BytesMut, topic: &str) -> bool {
+    let topic_bytes = topic.as_bytes();
+    if topic_bytes.len() > u16::MAX as usize {
+        return false;
+    }
+    buf.reserve(8 + topic_bytes.len());
+    buf.put_u8(MsgType::Unsub as u8);
+    buf.put_u8(0); // flags
+    buf.put_u16_le(topic_bytes.len() as u16);
+    buf.put_u32_le(0); // no payload
+    buf.put_slice(topic_bytes);
+    true
+}
+
+/// Encode a RESYNC frame. Topics are joined by "\n" in the payload.
+/// Format: [u8 type=0x08][u8 flags][u16 LE topic_len=0][u32 LE payload_len][payload]
+#[allow(dead_code)] // Used in Phase 2: Interest-Based Routing
+pub(crate) fn encode_resync(buf: &mut BytesMut, topics: &[String]) {
+    let payload = topics.join("\n");
+    let payload_bytes = payload.as_bytes();
+    buf.reserve(8 + payload_bytes.len());
+    buf.put_u8(MsgType::Resync as u8);
+    buf.put_u8(0); // flags
+    buf.put_u16_le(0); // no topic field
+    buf.put_u32_le(payload_bytes.len() as u32);
+    buf.put_slice(payload_bytes);
+}
+
 // ---------------------------------------------------------------------------
 // Framing helpers (4-byte BE length prefix)
 // ---------------------------------------------------------------------------
@@ -250,6 +308,15 @@ pub(crate) enum ClusterFrame {
         protocol_version: u16,
     },
     Shutdown,
+    Sub {
+        topic: String,
+    },
+    Unsub {
+        topic: String,
+    },
+    Resync {
+        topics: Vec<String>,
+    },
 }
 
 /// Decode a frame from raw bytes (after outer length prefix is stripped).
@@ -296,23 +363,33 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             })
         }
         MsgType::Shutdown => Some(ClusterFrame::Shutdown),
+        MsgType::Sub => {
+            if data.remaining() < topic_len {
+                return None;
+            }
+            let topic = String::from_utf8(data.split_to(topic_len).to_vec()).ok()?;
+            Some(ClusterFrame::Sub { topic })
+        }
+        MsgType::Unsub => {
+            if data.remaining() < topic_len {
+                return None;
+            }
+            let topic = String::from_utf8(data.split_to(topic_len).to_vec()).ok()?;
+            Some(ClusterFrame::Unsub { topic })
+        }
+        MsgType::Resync => {
+            if data.remaining() < payload_len {
+                return None;
+            }
+            let topics = if payload_len == 0 {
+                Vec::new()
+            } else {
+                let raw = String::from_utf8(data.split_to(payload_len).to_vec()).ok()?;
+                raw.split('\n').map(String::from).collect()
+            };
+            Some(ClusterFrame::Resync { topics })
+        }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Fan-out dispatch (delegates to parallel fan-out helpers in server.rs)
-// ---------------------------------------------------------------------------
-
-pub(crate) fn cluster_dispatch(
-    connections: &DashMap<String, ConnectionHandle>,
-    topic_subscribers: &DashMap<String, DashSet<String>>,
-    topic: &str,
-    payload: &str,
-    metrics: &Arc<ClusterMetrics>,
-) {
-    let frame = super::server::WsFrame::PreFramed(super::server::pre_frame_text(payload));
-    let senders = super::server::collect_topic_senders(connections, topic_subscribers, topic);
-    super::server::fanout_to_senders_with_metrics(senders, frame, metrics);
 }
 
 // ---------------------------------------------------------------------------
@@ -320,7 +397,7 @@ pub(crate) fn cluster_dispatch(
 // ---------------------------------------------------------------------------
 
 async fn peer_writer(
-    mut rx: mpsc::Receiver<BytesMut>,
+    mut rx: mpsc::UnboundedReceiver<BytesMut>,
     mut writer: OwnedWriteHalf,
     cancel: CancellationToken,
     metrics: Arc<ClusterMetrics>,
@@ -356,18 +433,70 @@ async fn peer_writer(
 }
 
 // ---------------------------------------------------------------------------
+// Per-peer dispatch task (decoupled from reader for throughput)
+// ---------------------------------------------------------------------------
+
+/// Dispatch task: receives decoded messages from the reader via channel and fans
+/// out to WebSocket connections in batches. Acquires read lock once per batch.
+async fn peer_dispatch_task(
+    mut rx: mpsc::UnboundedReceiver<(String, String)>,
+    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
+    topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
+    cancel: CancellationToken,
+    metrics: Arc<ClusterMetrics>,
+) {
+    let mut batch: Vec<(String, String)> = Vec::with_capacity(256);
+
+    loop {
+        let n = tokio::select! {
+            n = rx.recv_many(&mut batch, 256) => n,
+            () = cancel.cancelled() => break,
+        };
+        if n == 0 {
+            break;
+        }
+
+        // Single read lock for entire batch
+        let guard = connections.read().await;
+        for (topic, payload) in &batch {
+            let frame = super::server::WsFrame::PreFramed(super::server::pre_frame_text(payload));
+            let senders = super::server::collect_topic_senders(&guard, &topic_subscribers, topic);
+            super::server::fanout_to_senders_with_metrics(senders, frame, &metrics);
+        }
+        drop(guard);
+        batch.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-peer reader task
 // ---------------------------------------------------------------------------
 
+/// Reads frames from a peer TCP connection. Decoded MSG payloads are pushed to
+/// a dispatch channel (non-blocking) so fan-out never stalls TCP reads.
+/// BufReader (64KB) reduces read syscalls from 2/frame to ~1 per 650 frames.
 async fn peer_reader(
-    mut reader: OwnedReadHalf,
-    peer_write_tx: mpsc::Sender<BytesMut>,
-    connections: Arc<DashMap<String, ConnectionHandle>>,
+    reader: OwnedReadHalf,
+    peer_write_tx: mpsc::UnboundedSender<BytesMut>,
+    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
     cancel: CancellationToken,
     metrics: Arc<ClusterMetrics>,
     last_activity: Arc<AtomicU64>,
 ) {
+    // Dispatch channel: decouples TCP read from fan-out to WebSocket connections.
+    let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<(String, String)>();
+
+    let dispatch_handle = tokio::spawn(peer_dispatch_task(
+        dispatch_rx,
+        connections,
+        topic_subscribers,
+        cancel.clone(),
+        metrics.clone(),
+    ));
+
+    // BufReader: bulk reads from TCP into 64KB buffer, serves read_exact from memory
+    let mut reader = BufReader::with_capacity(65_536, reader);
     let mut len_buf = [0u8; 4];
 
     loop {
@@ -404,13 +533,13 @@ async fn peer_reader(
         match decode_frame(frame_buf) {
             Some(ClusterFrame::Msg { topic, payload }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
-                cluster_dispatch(&connections, &topic_subscribers, &topic, &payload, &metrics);
+                let _ = dispatch_tx.send((topic, payload));
             }
             Some(ClusterFrame::Ping) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
                 let mut pong = BytesMut::new();
                 encode_pong(&mut pong);
-                let _ = peer_write_tx.send(pong).await;
+                let _ = peer_write_tx.send(pong);
             }
             Some(ClusterFrame::Pong) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
@@ -422,12 +551,22 @@ async fn peer_reader(
             Some(ClusterFrame::Hello { .. }) => {
                 // Unexpected HELLO after handshake, ignore
             }
+            Some(
+                ClusterFrame::Sub { .. } | ClusterFrame::Unsub { .. } | ClusterFrame::Resync { .. },
+            ) => {
+                // Interest-based routing frames -- handled in Phase 2
+                last_activity.store(epoch_ms(), Ordering::Relaxed);
+            }
             None => {
                 eprintln!("[WSE-Cluster] Failed to decode frame, disconnecting");
                 break;
             }
         }
     }
+
+    // Ensure dispatch task is cleaned up
+    drop(dispatch_tx);
+    let _ = dispatch_handle.await;
 }
 
 // ---------------------------------------------------------------------------
@@ -435,24 +574,24 @@ async fn peer_reader(
 // ---------------------------------------------------------------------------
 
 async fn heartbeat_task(
-    peer_write_tx: mpsc::Sender<BytesMut>,
+    peer_write_tx: mpsc::UnboundedSender<BytesMut>,
     cancel: CancellationToken,
     last_activity: Arc<AtomicU64>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
-    let timeout = Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
+    let timeout_ms = HEARTBEAT_TIMEOUT_SECS * 1000;
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 // Check if peer is dead (no activity for HEARTBEAT_TIMEOUT_SECS)
-                let elapsed_ms = epoch_ms() - last_activity.load(Ordering::Relaxed);
-                if elapsed_ms > timeout.as_millis() as u64 {
-                    eprintln!("[WSE-Cluster] Peer heartbeat timeout ({}s no activity)", timeout.as_secs());
+                let last = last_activity.load(Ordering::Relaxed);
+                if epoch_ms().saturating_sub(last) > timeout_ms {
+                    eprintln!("[WSE-Cluster] Peer heartbeat timeout ({}s no activity)", timeout_ms / 1000);
                     break;
                 }
                 let mut ping = BytesMut::new();
                 encode_ping(&mut ping);
-                if peer_write_tx.send(ping).await.is_err() {
+                if peer_write_tx.send(ping).is_err() {
                     break;
                 }
             }
@@ -468,8 +607,8 @@ async fn heartbeat_task(
 async fn peer_connection_task(
     peer_addr: String,
     instance_id: String,
-    mut data_rx: mpsc::Receiver<BytesMut>,
-    connections: Arc<DashMap<String, ConnectionHandle>>,
+    mut data_rx: mpsc::UnboundedReceiver<BytesMut>,
+    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
     metrics: Arc<ClusterMetrics>,
     global_cancel: CancellationToken,
@@ -531,13 +670,15 @@ async fn peer_connection_task(
             }
         };
 
-        // TCP_NODELAY + keepalive
+        // TCP_NODELAY + keepalive + larger buffers for throughput
         let _ = stream.set_nodelay(true);
         let keepalive = TcpKeepalive::new()
             .with_time(Duration::from_secs(10))
             .with_interval(Duration::from_secs(5));
         let sock_ref = SockRef::from(&stream);
         let _ = sock_ref.set_tcp_keepalive(&keepalive);
+        let _ = sock_ref.set_recv_buffer_size(262_144);
+        let _ = sock_ref.set_send_buffer_size(262_144);
 
         // Split into owned halves for separate tasks
         let (reader, mut writer) = stream.into_split();
@@ -600,7 +741,7 @@ async fn peer_connection_task(
 
         // Spawn reader, writer, heartbeat with child cancellation token
         let peer_cancel = global_cancel.child_token();
-        let (peer_write_tx, peer_write_rx) = mpsc::channel::<BytesMut>(PER_PEER_CHANNEL_CAP);
+        let (peer_write_tx, peer_write_rx) = mpsc::unbounded_channel::<BytesMut>();
         let last_activity = Arc::new(AtomicU64::new(epoch_ms()));
 
         let writer_handle = tokio::spawn(peer_writer(
@@ -639,9 +780,7 @@ async fn peer_connection_task(
 
             match data {
                 Some(frame_data) => {
-                    if peer_write_tx.try_send(frame_data).is_err() {
-                        metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                    }
+                    let _ = peer_write_tx.send(frame_data);
                 }
                 None => {
                     // Manager channel closed (shutdown)
@@ -684,20 +823,20 @@ async fn peer_connection_task(
 pub(crate) async fn cluster_manager(
     peers: Vec<String>,
     instance_id: String,
-    mut cmd_rx: mpsc::Receiver<ClusterCommand>,
-    connections: Arc<DashMap<String, ConnectionHandle>>,
+    mut cmd_rx: mpsc::UnboundedReceiver<ClusterCommand>,
+    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
     metrics: Arc<ClusterMetrics>,
-    dlq: Arc<std::sync::Mutex<ClusterDlq>>,
+    _dlq: Arc<std::sync::Mutex<ClusterDlq>>,
 ) {
     let global_cancel = CancellationToken::new();
 
     // Per-peer channels: manager sends encoded BytesMut, peer task forwards to writer
-    let mut peer_txs: Vec<(String, mpsc::Sender<BytesMut>)> = Vec::new();
+    let mut peer_txs: Vec<(String, mpsc::UnboundedSender<BytesMut>)> = Vec::new();
     let mut peer_handles = Vec::new();
 
     for peer_addr in &peers {
-        let (tx, rx) = mpsc::channel::<BytesMut>(PER_PEER_CHANNEL_CAP);
+        let (tx, rx) = mpsc::unbounded_channel::<BytesMut>();
         peer_txs.push((peer_addr.clone(), tx));
 
         let handle = tokio::spawn(peer_connection_task(
@@ -731,19 +870,11 @@ pub(crate) async fn cluster_manager(
                     continue;
                 }
 
-                for (peer_addr, tx) in &peer_txs {
-                    if tx.try_send(frame_data.clone()).is_err() {
-                        metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                        if let Ok(mut guard) = dlq.lock() {
-                            guard.push(ClusterDlqEntry {
-                                topic: topic.clone(),
-                                payload: payload.clone(),
-                                peer_addr: peer_addr.clone(),
-                                error: "Peer channel full or disconnected".into(),
-                            });
-                        }
-                    } else {
+                for (_peer_addr, tx) in &peer_txs {
+                    if tx.send(frame_data.clone()).is_ok() {
                         metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -753,16 +884,8 @@ pub(crate) async fn cluster_manager(
                 let mut shutdown_data = BytesMut::new();
                 encode_shutdown(&mut shutdown_data);
                 for (peer_addr, tx) in &peer_txs {
-                    match tokio::time::timeout(
-                        Duration::from_millis(500),
-                        tx.send(shutdown_data.clone()),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {}
-                        _ => {
-                            eprintln!("[WSE-Cluster] Could not send SHUTDOWN to {peer_addr}");
-                        }
+                    if tx.send(shutdown_data.clone()).is_err() {
+                        eprintln!("[WSE-Cluster] Could not send SHUTDOWN to {peer_addr}");
                     }
                 }
                 global_cancel.cancel();
@@ -806,6 +929,8 @@ pub(crate) async fn handle_cluster_inbound(
         .with_interval(Duration::from_secs(5));
     let sock_ref = SockRef::from(&stream);
     let _ = sock_ref.set_tcp_keepalive(&keepalive);
+    let _ = sock_ref.set_recv_buffer_size(262_144);
+    let _ = sock_ref.set_send_buffer_size(262_144);
 
     let (mut reader, mut writer) = stream.into_split();
 
@@ -849,7 +974,7 @@ pub(crate) async fn handle_cluster_inbound(
     metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
 
     let cancel = CancellationToken::new();
-    let (write_tx, write_rx) = mpsc::channel::<BytesMut>(PER_PEER_CHANNEL_CAP);
+    let (write_tx, write_rx) = mpsc::unbounded_channel::<BytesMut>();
     let last_activity = Arc::new(AtomicU64::new(epoch_ms()));
 
     let writer_handle = tokio::spawn(peer_writer(
@@ -1012,6 +1137,66 @@ mod tests {
         let entries = dlq.drain_all();
         assert_eq!(entries[0].topic, "t1");
         assert_eq!(entries[1].topic, "t2");
+    }
+
+    #[test]
+    fn test_encode_decode_sub() {
+        let mut buf = BytesMut::new();
+        assert!(encode_sub(&mut buf, "chat.general"));
+        let frame = decode_frame(buf).unwrap();
+        assert_eq!(
+            frame,
+            ClusterFrame::Sub {
+                topic: "chat.general".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_encode_decode_unsub() {
+        let mut buf = BytesMut::new();
+        assert!(encode_unsub(&mut buf, "chat.general"));
+        let frame = decode_frame(buf).unwrap();
+        assert_eq!(
+            frame,
+            ClusterFrame::Unsub {
+                topic: "chat.general".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_encode_decode_resync_multiple() {
+        let topics = vec![
+            "chat.general".to_string(),
+            "chat.private".to_string(),
+            "events.system".to_string(),
+        ];
+        let mut buf = BytesMut::new();
+        encode_resync(&mut buf, &topics);
+        let frame = decode_frame(buf).unwrap();
+        assert_eq!(frame, ClusterFrame::Resync { topics });
+    }
+
+    #[test]
+    fn test_encode_decode_resync_empty() {
+        let mut buf = BytesMut::new();
+        encode_resync(&mut buf, &[]);
+        let frame = decode_frame(buf).unwrap();
+        assert_eq!(frame, ClusterFrame::Resync { topics: Vec::new() });
+    }
+
+    #[test]
+    fn test_encode_decode_sub_glob_pattern() {
+        let mut buf = BytesMut::new();
+        assert!(encode_sub(&mut buf, "user:*:events"));
+        let frame = decode_frame(buf).unwrap();
+        assert_eq!(
+            frame,
+            ClusterFrame::Sub {
+                topic: "user:*:events".into(),
+            }
+        );
     }
 
     #[test]

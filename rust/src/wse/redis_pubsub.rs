@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -7,7 +7,7 @@ use super::reliability::{CircuitBreaker, ExponentialBackoff};
 use super::server::ConnectionHandle;
 use dashmap::{DashMap, DashSet};
 use futures_util::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -130,15 +130,18 @@ pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
 // Fan-out dispatch
 // ---------------------------------------------------------------------------
 
-fn dispatch_to_subscribers(
-    connections: &DashMap<String, ConnectionHandle>,
+async fn dispatch_to_subscribers(
+    connections: &RwLock<HashMap<String, ConnectionHandle>>,
     topic_subscribers: &DashMap<String, DashSet<String>>,
     topic: &str,
     payload: &str,
     metrics: &Arc<RedisMetrics>,
 ) {
     let frame = super::server::WsFrame::PreFramed(super::server::pre_frame_text(payload));
-    let senders = super::server::collect_topic_senders(connections, topic_subscribers, topic);
+    let senders = {
+        let conns = connections.read().await;
+        super::server::collect_topic_senders(&conns, topic_subscribers, topic)
+    };
     super::server::fanout_to_senders_with_metrics(senders, frame, metrics);
 }
 
@@ -183,7 +186,7 @@ async fn publish_pipeline(
 
     metrics.publish_errors.fetch_add(count, Ordering::Relaxed);
     eprintln!("[WSE-Redis] Pipeline publish failed after retries ({count} msgs): {last_err}");
-    let mut guard = dlq.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = dlq.lock().unwrap();
     for (channel, payload) in batch {
         guard.push(DlqEntry {
             channel: channel.clone(),
@@ -206,7 +209,7 @@ enum RunOutcome {
 
 async fn connect_and_run(
     url: &str,
-    connections: &DashMap<String, ConnectionHandle>,
+    connections: &RwLock<HashMap<String, ConnectionHandle>>,
     topic_subscribers: &DashMap<String, DashSet<String>>,
     cmd_rx: &mut mpsc::UnboundedReceiver<RedisCommand>,
     metrics: &Arc<RedisMetrics>,
@@ -278,7 +281,7 @@ async fn connect_and_run(
                 pub_metrics
                     .publish_errors
                     .fetch_add(count, Ordering::Relaxed);
-                let mut guard = pub_dlq.lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = pub_dlq.lock().unwrap();
                 for (channel, payload) in &batch {
                     guard.push(DlqEntry {
                         channel: channel.clone(),
@@ -312,7 +315,8 @@ async fn connect_and_run(
                             topic,
                             &payload,
                             sub_metrics,
-                        );
+                        )
+                        .await;
                     }
                 }
                 None => {
@@ -355,7 +359,7 @@ async fn connect_and_run(
 
 pub(crate) async fn listener_task(
     url: String,
-    connections: Arc<DashMap<String, ConnectionHandle>>,
+    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
     mut cmd_rx: mpsc::UnboundedReceiver<RedisCommand>,
     metrics: Arc<RedisMetrics>,
@@ -440,7 +444,7 @@ async fn drain_during_backoff(
                     }
                     Some(RedisCommand::Publish { channel, payload }) => {
                         metrics.publish_errors.fetch_add(1, Ordering::Relaxed);
-                        dlq.lock().unwrap_or_else(|e| e.into_inner()).push(DlqEntry {
+                        dlq.lock().unwrap().push(DlqEntry {
                             channel,
                             payload,
                             error: "Redis disconnected".to_string(),
