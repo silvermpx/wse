@@ -1668,7 +1668,14 @@ pub(crate) async fn cluster_manager(
 
                         // Uncompressed fallback for peers without CAP_COMPRESSION
                         let mut plain_data = BytesMut::new();
-                        encode_msg(&mut plain_data, &topic, &payload);
+                        if !encode_msg(&mut plain_data, &topic, &payload) {
+                            // Topic too long (>64KB) -- drop, don't send empty frame
+                            eprintln!(
+                                "[WSE-Cluster] Dropping publish: topic too long ({} bytes)",
+                                topic.len()
+                            );
+                            continue;
+                        }
                         let plain_bytes = plain_data.freeze();
 
                         for (peer_addr, tx, caps) in &peer_txs {
@@ -2084,7 +2091,12 @@ pub(crate) async fn handle_cluster_inbound(
     let (new_peer_tx, _new_peer_rx) = mpsc::unbounded_channel::<String>();
     let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
     let (peer_reg_tx, _peer_reg_rx) = mpsc::unbounded_channel::<PeerRegistration>();
-    let connected_instances: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+    // Shared across all legacy inbound calls so duplicate detection actually works
+    static LEGACY_CONNECTED: std::sync::OnceLock<Arc<DashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    let connected_instances = LEGACY_CONNECTED
+        .get_or_init(|| Arc::new(DashMap::new()))
+        .clone();
     // Legacy path has no global_cancel -- create a standalone token.
     // Cleanup happens via tokio runtime drop on server stop.
     let legacy_cancel = CancellationToken::new();

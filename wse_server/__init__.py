@@ -19,6 +19,7 @@ from wse_server._wse_accel import (
     rust_match_event,
     rust_transform_event,
 )
+from wse_server.core.filters import EventFilter
 from wse_server.core.types import EventPriority, DeliveryGuarantee
 
 __version__ = "2.0.0"
@@ -41,6 +42,7 @@ __all__ = [
     "rust_sign_message",
     "rust_match_event",
     "rust_transform_event",
+    "EventFilter",
     "EventPriority",
     "DeliveryGuarantee",
     "__version__",

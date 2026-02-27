@@ -785,8 +785,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                 }
             }
 
-            // Feed all tungstenite Msgs, single flush
-            if ok && has_tung {
+            // Feed all tungstenite Msgs, single flush.
+            // Always attempt Msg frames even if PreFramed write failed --
+            // Close frames are critical control frames that must be sent.
+            if has_tung {
                 for frame in batch.drain(..) {
                     if let WsFrame::Msg(msg) = frame
                         && write_half.feed(msg).await.is_err()
@@ -1478,32 +1480,60 @@ impl RustWSEServer {
                                         })
                                         .collect()
                                 };
+                                let mut force_remove = Vec::new();
                                 for (cid, tx) in &snapshot {
-                                    // Check zombie (no activity for 60s)
                                     if let Some(last) =
                                         ping_state.conn_last_activity.get(cid)
-                                        && now.duration_since(*last) > idle_timeout
                                     {
+                                        // Check zombie (no activity for 60s)
+                                        if now.duration_since(*last) > idle_timeout
+                                        {
+                                            let _ = tx.send(WsFrame::Msg(
+                                                Message::Close(None),
+                                            ));
+                                            // Remove activity entry; next tick
+                                            // will force-remove if still present
+                                            ping_state
+                                                .conn_last_activity
+                                                .remove(cid);
+                                            continue;
+                                        }
+                                        // Send server ping
+                                        let ts =
+                                            chrono::Utc::now().to_rfc3339_opts(
+                                                chrono::SecondsFormat::Millis,
+                                                true,
+                                            );
+                                        let ping_msg = format!(
+                                            "WSE{{\"t\":\"ping\",\"p\":{{\"server_time\":\"{ts}\"}}}}"
+                                        );
                                         let _ = tx.send(WsFrame::Msg(
-                                            Message::Close(None),
+                                            Message::Text(ping_msg.into()),
                                         ));
-                                        // Remove so we don't re-close next tick
-                                        ping_state
-                                            .conn_last_activity
-                                            .remove(cid);
-                                        continue;
+                                    } else {
+                                        // No activity entry = Close was sent last
+                                        // tick but connection didn't terminate.
+                                        // Force-remove this zombie.
+                                        force_remove.push(cid.clone());
                                     }
-                                    // Send server ping
-                                    let ts = chrono::Utc::now().to_rfc3339_opts(
-                                        chrono::SecondsFormat::Millis,
-                                        true,
+                                }
+                                // Force-remove zombies that didn't respond to Close
+                                if !force_remove.is_empty() {
+                                    let mut conns =
+                                        ping_state.connections.write().await;
+                                    for cid in &force_remove {
+                                        conns.remove(cid);
+                                        ping_state.conn_formats.remove(cid);
+                                        ping_state.conn_rates.remove(cid);
+                                    }
+                                    ping_state.connection_count.store(
+                                        conns.len(),
+                                        Ordering::Relaxed,
                                     );
-                                    let ping_msg = format!(
-                                        "WSE{{\"t\":\"ping\",\"p\":{{\"server_time\":\"{ts}\"}}}}"
+                                    eprintln!(
+                                        "[WSE] Force-removed {} zombie connections",
+                                        force_remove.len()
                                     );
-                                    let _ = tx.send(WsFrame::Msg(
-                                        Message::Text(ping_msg.into()),
-                                    ));
                                 }
                             }
                         });
