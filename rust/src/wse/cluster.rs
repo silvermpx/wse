@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::{DashMap, DashSet};
 use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
@@ -180,6 +180,19 @@ pub(crate) enum ClusterCommand {
     GossipPeerAnnounce {
         addr: String,
         exclude_peer: String,
+    },
+}
+
+/// Messages from inbound peer handlers to register/deregister their write channels
+/// with the cluster manager, so inbound peers receive Publish/Sub/Unsub frames.
+pub(crate) enum PeerRegistration {
+    Register {
+        peer_addr: String,
+        write_tx: mpsc::UnboundedSender<Bytes>,
+        negotiated_caps: u32,
+    },
+    Deregister {
+        peer_addr: String,
     },
 }
 
@@ -423,9 +436,26 @@ pub(crate) fn encode_unsub(buf: &mut BytesMut, topic: &str) -> bool {
 
 /// Encode a RESYNC frame. Topics are joined by "\n" in the payload.
 /// Format: [u8 type=0x08][u8 flags][u16 LE topic_len=0][u32 LE payload_len][payload]
+/// If the payload exceeds MAX_FRAME_SIZE, topics are truncated to fit.
 pub(crate) fn encode_resync(buf: &mut BytesMut, topics: &[String]) {
     let payload = topics.join("\n");
     let payload_bytes = payload.as_bytes();
+    // Guard: truncate if payload exceeds MAX_FRAME_SIZE to prevent peer disconnect
+    let payload_bytes = if payload_bytes.len() > MAX_FRAME_SIZE {
+        eprintln!(
+            "[WSE-Cluster] RESYNC payload too large ({} bytes, {} topics), truncating to fit MAX_FRAME_SIZE",
+            payload_bytes.len(),
+            topics.len()
+        );
+        // Find the last complete topic that fits within MAX_FRAME_SIZE
+        let truncated = &payload_bytes[..MAX_FRAME_SIZE];
+        match truncated.iter().rposition(|&b| b == b'\n') {
+            Some(pos) => &payload_bytes[..pos],
+            None => truncated,
+        }
+    } else {
+        payload_bytes
+    };
     buf.reserve(8 + payload_bytes.len());
     buf.put_u8(MsgType::Resync as u8);
     buf.put_u8(0); // flags
@@ -438,6 +468,13 @@ pub(crate) fn encode_resync(buf: &mut BytesMut, topics: &[String]) {
 /// Format: [u8 type=0x09][u8 flags][u16 LE addr_len][u32 LE 0][addr_bytes]
 pub(crate) fn encode_peer_announce(buf: &mut BytesMut, addr: &str) {
     let addr_bytes = addr.as_bytes();
+    if addr_bytes.len() > u16::MAX as usize {
+        eprintln!(
+            "[WSE-Cluster] Peer address too long ({} bytes), dropping announce",
+            addr_bytes.len()
+        );
+        return;
+    }
     buf.reserve(8 + addr_bytes.len());
     buf.put_u8(MsgType::PeerAnnounce as u8);
     buf.put_u8(0); // flags
@@ -450,9 +487,15 @@ pub(crate) fn encode_peer_announce(buf: &mut BytesMut, addr: &str) {
 /// Format: [u8 type=0x0A][u8 flags][u16 LE 0][u32 LE payload_len][payload]
 /// Payload: [u16 LE count][u16 LE addr1_len][addr1_bytes]...
 pub(crate) fn encode_peer_list(buf: &mut BytesMut, addrs: &[String]) {
+    // Cap at u16::MAX entries and skip addresses that exceed u16::MAX bytes
+    let safe_addrs: Vec<&String> = addrs
+        .iter()
+        .filter(|a| a.len() <= u16::MAX as usize)
+        .take(u16::MAX as usize)
+        .collect();
     let mut payload = BytesMut::new();
-    payload.put_u16_le(addrs.len() as u16);
-    for addr in addrs {
+    payload.put_u16_le(safe_addrs.len() as u16);
+    for addr in &safe_addrs {
         payload.put_u16_le(addr.len() as u16);
         payload.extend_from_slice(addr.as_bytes());
     }
@@ -532,6 +575,14 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             let topic = String::from_utf8(data.split_to(topic_len).to_vec()).ok()?;
             let payload = if flags & FLAG_COMPRESSED != 0 {
                 let compressed = data.split_to(payload_len);
+                // Pre-decompression check: reject tiny payloads that could decompress into
+                // MAX_FRAME_SIZE (1MB). Cap at 1000:1 max ratio before even attempting decompress.
+                if payload_len > 0 && payload_len < 64 {
+                    eprintln!(
+                        "[WSE-Cluster] Rejecting suspiciously small compressed payload: {payload_len} bytes"
+                    );
+                    return None;
+                }
                 let decompressed = match zstd::bulk::decompress(&compressed, MAX_FRAME_SIZE) {
                     Ok(d) => d,
                     Err(e) => {
@@ -542,7 +593,7 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                     }
                 };
                 // Reject suspiciously high amplification ratios (>100x)
-                if payload_len > 0 && decompressed.len() / payload_len > 100 {
+                if payload_len > 0 && decompressed.len() > payload_len.saturating_mul(100) {
                     eprintln!(
                         "[WSE-Cluster] Decompression bomb detected: {}x amplification ({payload_len} -> {} bytes)",
                         decompressed.len() / payload_len,
@@ -603,7 +654,10 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                 Vec::new()
             } else {
                 let raw = String::from_utf8(data.split_to(payload_len).to_vec()).ok()?;
-                raw.split('\n').map(String::from).collect()
+                raw.split('\n')
+                    .filter(|t| !t.is_empty())
+                    .map(String::from)
+                    .collect()
             };
             Some(ClusterFrame::Resync { topics })
         }
@@ -673,7 +727,7 @@ pub(crate) fn negotiate_capabilities(local: u32, remote: u32) -> u32 {
 // ---------------------------------------------------------------------------
 
 async fn peer_writer<W: AsyncWriteExt + Unpin>(
-    mut rx: mpsc::UnboundedReceiver<BytesMut>,
+    mut rx: mpsc::UnboundedReceiver<Bytes>,
     mut writer: W,
     cancel: CancellationToken,
     metrics: Arc<ClusterMetrics>,
@@ -701,6 +755,11 @@ async fn peer_writer<W: AsyncWriteExt + Unpin>(
 
         let bytes_count = buf.len() as u64;
         if writer.write_all(&buf).await.is_err() {
+            break;
+        }
+        // flush() is required for TLS -- rustls buffers encrypted data internally
+        // and only writes to the TCP socket on flush. For plain TCP this is a no-op.
+        if writer.flush().await.is_err() {
             break;
         }
         metrics.bytes_sent.fetch_add(bytes_count, Ordering::Relaxed);
@@ -754,7 +813,7 @@ async fn peer_dispatch_task(
 #[allow(clippy::too_many_arguments)]
 async fn peer_reader<R: AsyncReadExt + Unpin>(
     reader: R,
-    peer_write_tx: mpsc::UnboundedSender<BytesMut>,
+    peer_write_tx: mpsc::UnboundedSender<Bytes>,
     peer_addr: String,
     interest_tx: mpsc::UnboundedSender<InterestUpdate>,
     connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
@@ -820,7 +879,7 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
                 let mut pong = BytesMut::new();
                 encode_pong(&mut pong);
-                let _ = peer_write_tx.send(pong);
+                let _ = peer_write_tx.send(pong.freeze());
             }
             Some(ClusterFrame::Pong) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
@@ -893,7 +952,7 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
 // ---------------------------------------------------------------------------
 
 async fn heartbeat_task(
-    peer_write_tx: mpsc::UnboundedSender<BytesMut>,
+    peer_write_tx: mpsc::UnboundedSender<Bytes>,
     cancel: CancellationToken,
     last_activity: Arc<AtomicU64>,
 ) {
@@ -906,11 +965,12 @@ async fn heartbeat_task(
                 let last = last_activity.load(Ordering::Relaxed);
                 if epoch_ms().saturating_sub(last) > timeout_ms {
                     eprintln!("[WSE-Cluster] Peer heartbeat timeout ({}s no activity)", timeout_ms / 1000);
+                    cancel.cancel();
                     break;
                 }
                 let mut ping = BytesMut::new();
                 encode_ping(&mut ping);
-                if peer_write_tx.send(ping).is_err() {
+                if peer_write_tx.send(ping.freeze()).is_err() {
                     break;
                 }
             }
@@ -932,7 +992,7 @@ async fn run_peer_session<R, W>(
     mut writer: W,
     peer_addr: &str,
     instance_id: &str,
-    data_rx: &mut mpsc::UnboundedReceiver<BytesMut>,
+    data_rx: &mut mpsc::UnboundedReceiver<Bytes>,
     interest_tx: &mpsc::UnboundedSender<InterestUpdate>,
     connections: &Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     topic_subscribers: &Arc<DashMap<String, DashSet<String>>>,
@@ -1024,15 +1084,23 @@ where
         }
     };
 
-    // Duplicate connection prevention: if already connected to this instance, drop
-    if connected_instances.contains_key(&peer_instance_id) {
-        eprintln!(
-            "[WSE-Cluster] Already connected to instance {}, dropping duplicate from {peer_addr}",
-            peer_instance_id
-        );
-        return false;
+    // Duplicate connection prevention: atomic check-and-insert via entry() API
+    // to avoid TOCTOU race between contains_key and insert
+    {
+        use dashmap::mapref::entry::Entry;
+        match connected_instances.entry(peer_instance_id.clone()) {
+            Entry::Occupied(_) => {
+                eprintln!(
+                    "[WSE-Cluster] Already connected to instance {}, dropping duplicate from {peer_addr}",
+                    peer_instance_id
+                );
+                return false;
+            }
+            Entry::Vacant(e) => {
+                e.insert(peer_addr.to_string());
+            }
+        }
     }
-    connected_instances.insert(peer_instance_id.clone(), peer_addr.to_string());
 
     // Connected successfully
     eprintln!("[WSE-Cluster] Connected to {peer_addr} (v{_peer_version}, caps=0x{_peer_caps:08x})");
@@ -1086,7 +1154,7 @@ where
 
     // Spawn reader, writer, heartbeat with child cancellation token
     let peer_cancel = global_cancel.child_token();
-    let (peer_write_tx, peer_write_rx) = mpsc::unbounded_channel::<BytesMut>();
+    let (peer_write_tx, peer_write_rx) = mpsc::unbounded_channel::<Bytes>();
     let last_activity = Arc::new(AtomicU64::new(epoch_ms()));
 
     let writer_handle = tokio::spawn(peer_writer(
@@ -1158,7 +1226,7 @@ where
 async fn peer_connection_task(
     peer_addr: String,
     instance_id: String,
-    mut data_rx: mpsc::UnboundedReceiver<BytesMut>,
+    mut data_rx: mpsc::UnboundedReceiver<Bytes>,
     interest_tx: mpsc::UnboundedSender<InterestUpdate>,
     connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
@@ -1179,6 +1247,10 @@ async fn peer_connection_task(
         if global_cancel.is_cancelled() {
             break;
         }
+
+        // Drain stale messages buffered during backoff/reconnect to prevent
+        // unbounded memory growth and replaying outdated data to the peer.
+        while data_rx.try_recv().is_ok() {}
 
         // Circuit breaker check
         if !breaker.can_execute() {
@@ -1366,6 +1438,49 @@ async fn peer_connection_task(
 // Cluster manager: orchestrates all peer connections
 // ---------------------------------------------------------------------------
 
+/// Shared context for spawning peer connection tasks (avoids duplicating 15 clone() calls).
+struct PeerSpawnCtx {
+    instance_id: String,
+    interest_tx: mpsc::UnboundedSender<InterestUpdate>,
+    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
+    topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
+    metrics: Arc<ClusterMetrics>,
+    global_cancel: CancellationToken,
+    local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    tls_config: Option<ClusterTlsConfig>,
+    new_peer_tx: mpsc::UnboundedSender<String>,
+    gossip_cmd_tx: mpsc::UnboundedSender<ClusterCommand>,
+    cluster_addr: Option<String>,
+    known_peers: Arc<DashSet<String>>,
+    connected_instances: Arc<DashMap<String, String>>,
+}
+
+impl PeerSpawnCtx {
+    fn spawn(
+        &self,
+        peer_addr: String,
+        data_rx: mpsc::UnboundedReceiver<Bytes>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(peer_connection_task(
+            peer_addr,
+            self.instance_id.clone(),
+            data_rx,
+            self.interest_tx.clone(),
+            self.connections.clone(),
+            self.topic_subscribers.clone(),
+            self.metrics.clone(),
+            self.global_cancel.clone(),
+            self.local_topic_refcount.clone(),
+            self.tls_config.clone(),
+            self.new_peer_tx.clone(),
+            self.gossip_cmd_tx.clone(),
+            self.cluster_addr.clone(),
+            self.known_peers.clone(),
+            self.connected_instances.clone(),
+        ))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn cluster_manager(
     peers: Vec<String>,
@@ -1397,33 +1512,37 @@ pub(crate) async fn cluster_manager(
     // Reusable cmd_tx for peer tasks to send gossip commands back to manager
     let (gossip_cmd_tx, mut gossip_cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
 
+    // Channel for inbound peer handlers to register/deregister their write channels
+    let (peer_reg_tx, mut peer_reg_rx) = mpsc::unbounded_channel::<PeerRegistration>();
+
     // Per-peer channels: manager sends encoded BytesMut, peer task forwards to writer
-    let mut peer_txs: Vec<(String, mpsc::UnboundedSender<BytesMut>)> = Vec::new();
+    // Each entry: (peer_addr, write_channel, negotiated_caps)
+    let mut peer_txs: Vec<(String, mpsc::UnboundedSender<Bytes>, u32)> = Vec::new();
     let mut peer_handles = Vec::new();
+
+    let spawn_ctx = PeerSpawnCtx {
+        instance_id: instance_id.clone(),
+        interest_tx: interest_tx.clone(),
+        connections: connections.clone(),
+        topic_subscribers: topic_subscribers.clone(),
+        metrics: metrics.clone(),
+        global_cancel: global_cancel.clone(),
+        local_topic_refcount: local_topic_refcount.clone(),
+        tls_config: tls_config.clone(),
+        new_peer_tx: new_peer_tx.clone(),
+        gossip_cmd_tx: gossip_cmd_tx.clone(),
+        cluster_addr: cluster_addr.clone(),
+        known_peers: known_peers.clone(),
+        connected_instances: connected_instances.clone(),
+    };
 
     for peer_addr in &peers {
         known_peers.insert(peer_addr.clone());
-        let (tx, rx) = mpsc::unbounded_channel::<BytesMut>();
-        peer_txs.push((peer_addr.clone(), tx));
-
-        let handle = tokio::spawn(peer_connection_task(
-            peer_addr.clone(),
-            instance_id.clone(),
-            rx,
-            interest_tx.clone(),
-            connections.clone(),
-            topic_subscribers.clone(),
-            metrics.clone(),
-            global_cancel.clone(),
-            local_topic_refcount.clone(),
-            tls_config.clone(),
-            new_peer_tx.clone(),
-            gossip_cmd_tx.clone(),
-            cluster_addr.clone(),
-            known_peers.clone(),
-            connected_instances.clone(),
-        ));
-        peer_handles.push(handle);
+        let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+        // Outbound peers: caps are negotiated in run_peer_session; default to full caps
+        // since all peers in current deployment run the same version.
+        peer_txs.push((peer_addr.clone(), tx, LOCAL_CAPABILITIES));
+        peer_handles.push(spawn_ctx.spawn(peer_addr.clone(), rx));
     }
 
     // Start cluster listener for inbound peer connections (separate port)
@@ -1445,6 +1564,9 @@ pub(crate) async fn cluster_manager(
                 let npt = new_peer_tx.clone();
                 let gct = gossip_cmd_tx.clone();
                 let ci = connected_instances.clone();
+                let prt = peer_reg_tx.clone();
+                let ca = cluster_addr.clone();
+                let kp = known_peers.clone();
                 let conn_semaphore =
                     Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_CLUSTER_CONNS));
                 tokio::spawn(async move {
@@ -1475,6 +1597,10 @@ pub(crate) async fn cluster_manager(
                                         let npt2 = npt.clone();
                                         let gct2 = gct.clone();
                                         let ci2 = ci.clone();
+                                        let prt2 = prt.clone();
+                                        let gc2 = cancel.clone();
+                                        let ca2 = ca.clone();
+                                        let kp2 = kp.clone();
                                         tokio::spawn(async move {
                                             let _permit = permit; // held until task completes
                                             if let Some(ref tls) = tls {
@@ -1486,7 +1612,8 @@ pub(crate) async fn cluster_manager(
                                                         handle_cluster_inbound_generic(
                                                             tls_stream, addr, &inst2,
                                                             int_tx2, conns2, subs2, met2, lrc2,
-                                                            npt2, gct2, ci2,
+                                                            npt2, gct2, ci2, prt2, gc2,
+                                                            ca2, kp2,
                                                         ).await;
                                                     }
                                                     Ok(Err(e)) => {
@@ -1500,7 +1627,8 @@ pub(crate) async fn cluster_manager(
                                                 handle_cluster_inbound_generic(
                                                     stream, addr, &inst2,
                                                     int_tx2, conns2, subs2, met2, lrc2,
-                                                    npt2, gct2, ci2,
+                                                    npt2, gct2, ci2, prt2, gc2,
+                                                    ca2, kp2,
                                                 ).await;
                                             }
                                         });
@@ -1532,28 +1660,35 @@ pub(crate) async fn cluster_manager(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(ClusterCommand::Publish { topic, payload }) => {
-                        // TODO: For rolling upgrade support, track per-peer negotiated
-                        // capabilities and only send compressed frames to peers that
-                        // advertised CAP_COMPRESSION. Currently safe because all peers
-                        // in a cluster run the same version.
-                        let mut frame_data = BytesMut::new();
-                        if !encode_msg_compressed(&mut frame_data, &topic, &payload) {
-                            continue;
-                        }
+                        // Pre-encode both compressed and uncompressed frames.
+                        // Send compressed only to peers that negotiated CAP_COMPRESSION.
+                        let mut compressed_data = BytesMut::new();
+                        let has_compressed = encode_msg_compressed(&mut compressed_data, &topic, &payload);
+                        let compressed_bytes = if has_compressed { Some(compressed_data.freeze()) } else { None };
 
-                        for (peer_addr, tx) in &peer_txs {
+                        // Uncompressed fallback for peers without CAP_COMPRESSION
+                        let mut plain_data = BytesMut::new();
+                        encode_msg(&mut plain_data, &topic, &payload);
+                        let plain_bytes = plain_data.freeze();
+
+                        for (peer_addr, tx, caps) in &peer_txs {
                             let interested = match remote_interest.get(peer_addr) {
                                 Some(topics) => {
                                     topics.contains(&topic)
                                         || topics.iter().any(|pat| {
                                             (pat.contains('*') || pat.contains('?'))
-                                                && super::redis_pubsub::glob_match(pat, &topic)
+                                                && super::server::glob_match(pat, &topic)
                                         })
                                 }
                                 None => true, // No RESYNC yet -> safe default: send to all
                             };
                             if interested {
-                                if tx.send(frame_data.clone()).is_ok() {
+                                let frame = if caps & CAP_COMPRESSION != 0 {
+                                    compressed_bytes.as_ref().unwrap_or(&plain_bytes).clone()
+                                } else {
+                                    plain_bytes.clone()
+                                };
+                                if tx.send(frame).is_ok() {
                                     metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
                                 } else {
                                     metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
@@ -1564,28 +1699,35 @@ pub(crate) async fn cluster_manager(
                     Some(ClusterCommand::Sub { topic }) => {
                         let mut frame_data = BytesMut::new();
                         if encode_sub(&mut frame_data, &topic) {
-                            for (_peer_addr, tx) in &peer_txs {
-                                let _ = tx.send(frame_data.clone());
+                            let frame_bytes = frame_data.freeze();
+                            for (_, tx, _) in &peer_txs {
+                                let _ = tx.send(frame_bytes.clone());
                             }
                         }
                     }
                     Some(ClusterCommand::Unsub { topic }) => {
                         let mut frame_data = BytesMut::new();
                         if encode_unsub(&mut frame_data, &topic) {
-                            for (_peer_addr, tx) in &peer_txs {
-                                let _ = tx.send(frame_data.clone());
+                            let frame_bytes = frame_data.freeze();
+                            for (_, tx, _) in &peer_txs {
+                                let _ = tx.send(frame_bytes.clone());
                             }
                         }
                     }
                     Some(ClusterCommand::GossipPeerAnnounce { addr, exclude_peer }) => {
+                        // Validate address before forwarding
+                        if addr.parse::<std::net::SocketAddr>().is_err() {
+                            eprintln!("[WSE-Cluster] Ignoring invalid gossip address from cmd_rx: {addr}");
+                            continue;
+                        }
                         // Forward PEER_ANNOUNCE to all peers except the source
-                        let mut announce_buf = BytesMut::new();
-                        encode_peer_announce(&mut announce_buf, &addr);
+                        // Note: don't call write_framed() here -- peer_writer adds framing
                         let mut frame_data = BytesMut::new();
-                        write_framed(&mut frame_data, &announce_buf);
-                        for (peer_addr, tx) in &peer_txs {
+                        encode_peer_announce(&mut frame_data, &addr);
+                        let frame_bytes = frame_data.freeze();
+                        for (peer_addr, tx, _) in &peer_txs {
                             if *peer_addr != exclude_peer {
-                                let _ = tx.send(frame_data.clone());
+                                let _ = tx.send(frame_bytes.clone());
                             }
                         }
                     }
@@ -1593,8 +1735,9 @@ pub(crate) async fn cluster_manager(
                         eprintln!("[WSE-Cluster] Manager shutting down");
                         let mut shutdown_data = BytesMut::new();
                         encode_shutdown(&mut shutdown_data);
-                        for (peer_addr, tx) in &peer_txs {
-                            if tx.send(shutdown_data.clone()).is_err() {
+                        let shutdown_bytes = shutdown_data.freeze();
+                        for (peer_addr, tx, _) in &peer_txs {
+                            if tx.send(shutdown_bytes.clone()).is_err() {
                                 eprintln!("[WSE-Cluster] Could not send SHUTDOWN to {peer_addr}");
                             }
                         }
@@ -1605,71 +1748,51 @@ pub(crate) async fn cluster_manager(
             }
             // Dynamic peer discovery: spawn connection tasks for newly discovered peers
             Some(new_addr) = new_peer_rx.recv() => {
+                // Validate address parses as a valid SocketAddr to prevent SSRF
+                if new_addr.parse::<std::net::SocketAddr>().is_err() {
+                    eprintln!("[WSE-Cluster] Ignoring invalid peer address from gossip: {new_addr}");
+                    continue;
+                }
                 // Skip if we already know this peer or it's our own address
                 let is_self = cluster_addr.as_deref() == Some(&new_addr);
                 let already_known = !known_peers.insert(new_addr.clone());
-                if !is_self && !already_known && !peer_txs.iter().any(|(a, _)| a == &new_addr) {
-                    let (tx, rx) = mpsc::unbounded_channel::<BytesMut>();
-                    peer_txs.push((new_addr.clone(), tx));
-                    let handle = tokio::spawn(peer_connection_task(
-                        new_addr.clone(),
-                        instance_id.clone(),
-                        rx,
-                        interest_tx.clone(),
-                        connections.clone(),
-                        topic_subscribers.clone(),
-                        metrics.clone(),
-                        global_cancel.clone(),
-                        local_topic_refcount.clone(),
-                        tls_config.clone(),
-                        new_peer_tx.clone(),
-                        gossip_cmd_tx.clone(),
-                        cluster_addr.clone(),
-                        known_peers.clone(),
-                        connected_instances.clone(),
-                    ));
-                    peer_handles.push(handle);
+                if !is_self && !already_known && !peer_txs.iter().any(|(a, _, _)| a == &new_addr) {
+                    let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+                    peer_txs.push((new_addr.clone(), tx, LOCAL_CAPABILITIES));
+                    peer_handles.push(spawn_ctx.spawn(new_addr.clone(), rx));
                     eprintln!("[WSE-Cluster] Discovered new peer: {new_addr}");
                 }
             }
             // Handle gossip commands from peer tasks
             Some(gossip_cmd) = gossip_cmd_rx.recv() => {
                 if let ClusterCommand::GossipPeerAnnounce { addr, exclude_peer } = gossip_cmd {
-                    // Forward PEER_ANNOUNCE to all peers except the source
-                    let mut announce_buf = BytesMut::new();
-                    encode_peer_announce(&mut announce_buf, &addr);
+                    // Validate address before processing
+                    if addr.parse::<std::net::SocketAddr>().is_err() {
+                        eprintln!("[WSE-Cluster] Ignoring invalid gossip address: {addr}");
+                        continue;
+                    }
+                    let is_self = cluster_addr.as_deref() == Some(&addr);
+                    if is_self {
+                        continue;
+                    }
+                    // Always forward PEER_ANNOUNCE to all peers except the source,
+                    // even for peers we already know about. Other peers may not know yet.
+                    // Note: don't call write_framed() here -- peer_writer adds framing
                     let mut frame_data = BytesMut::new();
-                    write_framed(&mut frame_data, &announce_buf);
-                    for (peer_addr, tx) in &peer_txs {
+                    encode_peer_announce(&mut frame_data, &addr);
+                    let frame_bytes = frame_data.freeze();
+                    for (peer_addr, tx, _) in &peer_txs {
                         if *peer_addr != exclude_peer {
-                            let _ = tx.send(frame_data.clone());
+                            let _ = tx.send(frame_bytes.clone());
                         }
                     }
-                    // Also spawn connection to this peer if new
-                    let is_self = cluster_addr.as_deref() == Some(&addr);
-                    if !is_self && known_peers.insert(addr.clone())
-                        && !peer_txs.iter().any(|(a, _)| a == &addr)
+                    // Only spawn connection to this peer if we don't already know it
+                    if known_peers.insert(addr.clone())
+                        && !peer_txs.iter().any(|(a, _, _)| a == &addr)
                     {
-                        let (tx, rx) = mpsc::unbounded_channel::<BytesMut>();
-                        peer_txs.push((addr.clone(), tx));
-                        let handle = tokio::spawn(peer_connection_task(
-                            addr.clone(),
-                            instance_id.clone(),
-                            rx,
-                            interest_tx.clone(),
-                            connections.clone(),
-                            topic_subscribers.clone(),
-                            metrics.clone(),
-                            global_cancel.clone(),
-                            local_topic_refcount.clone(),
-                            tls_config.clone(),
-                            new_peer_tx.clone(),
-                            gossip_cmd_tx.clone(),
-                            cluster_addr.clone(),
-                            known_peers.clone(),
-                            connected_instances.clone(),
-                        ));
-                        peer_handles.push(handle);
+                        let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+                        peer_txs.push((addr.clone(), tx, LOCAL_CAPABILITIES));
+                        peer_handles.push(spawn_ctx.spawn(addr.clone(), rx));
                         eprintln!("[WSE-Cluster] Discovered peer via gossip: {addr}");
                     }
                 }
@@ -1693,6 +1816,22 @@ pub(crate) async fn cluster_manager(
                     }
                     None => {
                         // Interest channel closed, continue running
+                    }
+                }
+            }
+            // Handle inbound peer registrations/deregistrations
+            Some(reg) = peer_reg_rx.recv() => {
+                match reg {
+                    PeerRegistration::Register { peer_addr, write_tx, negotiated_caps } => {
+                        // Add inbound peer's write channel so it receives Publish/Sub/Unsub
+                        if !peer_txs.iter().any(|(a, _, _)| a == &peer_addr) {
+                            peer_txs.push((peer_addr.clone(), write_tx, negotiated_caps));
+                            eprintln!("[WSE-Cluster] Registered inbound peer: {peer_addr} (caps=0x{negotiated_caps:08x})");
+                        }
+                    }
+                    PeerRegistration::Deregister { peer_addr } => {
+                        // Remove disconnected inbound peer
+                        peer_txs.retain(|(a, _, _)| a != &peer_addr);
                     }
                 }
             }
@@ -1725,6 +1864,10 @@ async fn handle_cluster_inbound_generic<S>(
     new_peer_tx: mpsc::UnboundedSender<String>,
     cmd_tx: mpsc::UnboundedSender<ClusterCommand>,
     connected_instances: Arc<DashMap<String, String>>,
+    peer_reg_tx: mpsc::UnboundedSender<PeerRegistration>,
+    global_cancel: CancellationToken,
+    cluster_addr: Option<String>,
+    known_peers: Arc<DashSet<String>>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -1748,7 +1891,7 @@ async fn handle_cluster_inbound_generic<S>(
         _ => None,
     };
 
-    let (peer_instance_id, _peer_version, _peer_caps) = match peer_hello {
+    let (peer_instance_id, _peer_version, peer_caps) = match peer_hello {
         Some(ClusterFrame::Hello {
             instance_id: peer_id,
             protocol_version,
@@ -1772,15 +1915,22 @@ async fn handle_cluster_inbound_generic<S>(
         }
     };
 
-    // Duplicate connection prevention
-    if connected_instances.contains_key(&peer_instance_id) {
-        eprintln!(
-            "[WSE-Cluster] Already connected to instance {}, rejecting inbound from {addr}",
-            peer_instance_id
-        );
-        return;
+    // Duplicate connection prevention: atomic check-and-insert via entry() API
+    {
+        use dashmap::mapref::entry::Entry;
+        match connected_instances.entry(peer_instance_id.clone()) {
+            Entry::Occupied(_) => {
+                eprintln!(
+                    "[WSE-Cluster] Already connected to instance {}, rejecting inbound from {addr}",
+                    peer_instance_id
+                );
+                return;
+            }
+            Entry::Vacant(e) => {
+                e.insert(addr.to_string());
+            }
+        }
     }
-    connected_instances.insert(peer_instance_id.clone(), addr.to_string());
 
     // Send our HELLO response
     let mut hello_buf = BytesMut::new();
@@ -1812,15 +1962,46 @@ async fn handle_cluster_inbound_generic<S>(
         }
     }
 
+    // Send PEER_ANNOUNCE with our cluster address (if in discovery mode)
+    if let Some(ref our_addr) = cluster_addr {
+        let mut announce_buf = BytesMut::new();
+        encode_peer_announce(&mut announce_buf, our_addr);
+        let mut announce_frame = BytesMut::new();
+        write_framed(&mut announce_frame, &announce_buf);
+        let _ = writer.write_all(&announce_frame).await;
+        let _ = writer.flush().await;
+    }
+
+    // Send PEER_LIST with all known peers
+    {
+        let addrs: Vec<String> = known_peers.iter().map(|r| r.key().clone()).collect();
+        if !addrs.is_empty() {
+            let mut list_buf = BytesMut::new();
+            encode_peer_list(&mut list_buf, &addrs);
+            let mut list_frame = BytesMut::new();
+            write_framed(&mut list_frame, &list_buf);
+            let _ = writer.write_all(&list_frame).await;
+            let _ = writer.flush().await;
+        }
+    }
+
     eprintln!(
-        "[WSE-Cluster] Accepted inbound peer from {addr} (v{_peer_version}, caps=0x{_peer_caps:08x})"
+        "[WSE-Cluster] Accepted inbound peer from {addr} (v{_peer_version}, caps=0x{peer_caps:08x})"
     );
     let peer_addr_str = addr.to_string();
     metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
 
-    let cancel = CancellationToken::new();
-    let (write_tx, write_rx) = mpsc::unbounded_channel::<BytesMut>();
+    let cancel = global_cancel.child_token();
+    let (write_tx, write_rx) = mpsc::unbounded_channel::<Bytes>();
     let last_activity = Arc::new(AtomicU64::new(epoch_ms()));
+
+    // Register this inbound peer's write channel with the cluster manager
+    // so it receives Publish/Sub/Unsub frames (bidirectional routing)
+    let _ = peer_reg_tx.send(PeerRegistration::Register {
+        peer_addr: peer_addr_str.clone(),
+        write_tx: write_tx.clone(),
+        negotiated_caps: peer_caps,
+    });
 
     let writer_handle = tokio::spawn(peer_writer(
         write_rx,
@@ -1857,6 +2038,10 @@ async fn handle_cluster_inbound_generic<S>(
     let _ = writer_handle.await;
     let _ = heartbeat_handle.await;
 
+    // Deregister inbound peer from the cluster manager's peer_txs
+    let _ = peer_reg_tx.send(PeerRegistration::Deregister {
+        peer_addr: peer_addr_str.clone(),
+    });
     connected_instances.remove(&peer_instance_id);
     let _ = interest_tx.send(InterestUpdate::PeerDisconnected {
         peer_addr: peer_addr_str,
@@ -1894,11 +2079,18 @@ pub(crate) async fn handle_cluster_inbound(
     let _ = sock_ref.set_recv_buffer_size(262_144);
     let _ = sock_ref.set_send_buffer_size(262_144);
 
-    // Legacy path: no cluster_manager, so create dummy channels for discovery
-    // (messages sent here are just dropped -- discovery only works with cluster_port)
+    // Legacy path: no cluster_manager, so create dummy channels for discovery and registration
+    // (messages sent here are just dropped -- discovery/registration only works with cluster_port)
     let (new_peer_tx, _new_peer_rx) = mpsc::unbounded_channel::<String>();
     let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
+    let (peer_reg_tx, _peer_reg_rx) = mpsc::unbounded_channel::<PeerRegistration>();
     let connected_instances: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+    // Legacy path has no global_cancel -- create a standalone token.
+    // Cleanup happens via tokio runtime drop on server stop.
+    let legacy_cancel = CancellationToken::new();
+
+    // Legacy path has no gossip discovery
+    let legacy_known_peers: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
     handle_cluster_inbound_generic(
         stream,
@@ -1912,6 +2104,10 @@ pub(crate) async fn handle_cluster_inbound(
         new_peer_tx,
         cmd_tx,
         connected_instances,
+        peer_reg_tx,
+        legacy_cancel,
+        None,
+        legacy_known_peers,
     )
     .await;
 }

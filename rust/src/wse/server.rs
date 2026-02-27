@@ -19,7 +19,6 @@ use std::time::Duration;
 
 use super::cluster::{ClusterCommand, ClusterDlq, ClusterMetrics};
 use super::compression::{rmpv_to_serde_json, serde_json_to_rmpv};
-use super::redis_pubsub::{DeadLetterQueue, RedisCommand, RedisMetrics};
 use crate::jwt::{self, JwtConfig, parse_cookie_value};
 use ahash::AHashSet;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -193,9 +192,6 @@ pub(crate) struct SharedState {
     jwt_config: Option<JwtConfig>,
     pub(crate) topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
     conn_topics: DashMap<String, DashSet<String>>,
-    redis_cmd_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<RedisCommand>>>,
-    redis_metrics: Arc<RedisMetrics>,
-    redis_dlq: Arc<std::sync::Mutex<DeadLetterQueue>>,
     // Cluster protocol
     cluster_cmd_tx: std::sync::RwLock<Option<mpsc::UnboundedSender<ClusterCommand>>>,
     pub(crate) cluster_metrics: Arc<ClusterMetrics>,
@@ -204,6 +200,7 @@ pub(crate) struct SharedState {
     pub(crate) cluster_interest_tx:
         std::sync::RwLock<Option<mpsc::UnboundedSender<super::cluster::InterestUpdate>>>,
     pub(crate) local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    pub(crate) recovery: Option<Arc<super::recovery::RecoveryManager>>,
 }
 
 impl SharedState {
@@ -211,6 +208,7 @@ impl SharedState {
         max_connections: usize,
         jwt_config: Option<JwtConfig>,
         max_inbound_queue_size: usize,
+        recovery: Option<Arc<super::recovery::RecoveryManager>>,
     ) -> Self {
         let cap = max_inbound_queue_size.min(131072);
         let (tx, rx) = bounded(cap);
@@ -230,15 +228,13 @@ impl SharedState {
             jwt_config,
             topic_subscribers: Arc::new(DashMap::new()),
             conn_topics: DashMap::new(),
-            redis_cmd_tx: std::sync::Mutex::new(None),
-            redis_metrics: Arc::new(RedisMetrics::new()),
-            redis_dlq: Arc::new(std::sync::Mutex::new(DeadLetterQueue::new(1000))),
             cluster_cmd_tx: std::sync::RwLock::new(None),
             cluster_metrics: Arc::new(ClusterMetrics::new()),
             cluster_dlq: Arc::new(std::sync::Mutex::new(ClusterDlq::new(1000))),
             cluster_instance_id: std::sync::Mutex::new(None),
             cluster_interest_tx: std::sync::RwLock::new(None),
             local_topic_refcount: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            recovery,
         }
     }
 
@@ -427,6 +423,35 @@ fn message_category(msg_type: &str) -> &'static str {
 // JWT helper functions (used by handle_connection)
 // ---------------------------------------------------------------------------
 
+/// Send an auth error + Close frame over the WS channel, drain it, and return.
+/// Used for JWT rejection to avoid duplicating the send+drain pattern.
+async fn reject_ws_auth(
+    tx: &mpsc::UnboundedSender<WsFrame>,
+    mut rx: mpsc::UnboundedReceiver<WsFrame>,
+    mut write_half: futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<TcpStream>,
+        Message,
+    >,
+    code: &str,
+    message: &str,
+) {
+    let err = build_error_json(code, message);
+    let _ = tx.send(WsFrame::Msg(Message::Text(err.into())));
+    let _ = tx.send(WsFrame::Msg(Message::Close(None)));
+    let write_task = tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            if let WsFrame::Msg(msg) = frame
+                && write_half.feed(msg).await.is_err()
+            {
+                break;
+            }
+        }
+        let _ = write_half.flush().await;
+        let _ = write_half.close().await;
+    });
+    let _ = write_task.await;
+}
+
 /// Build a JSON error message for auth failures.
 fn build_error_json(code: &str, message: &str) -> String {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -571,62 +596,25 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                     if let Some(user_id) = claims.get("sub").and_then(|s| s.as_str()) {
                         Some(user_id.to_string())
                     } else {
-                        let err = build_error_json("AUTH_FAILED", "Token missing user ID");
-                        let _ = tx.send(WsFrame::Msg(Message::Text(err.into())));
-                        let _ = tx.send(WsFrame::Msg(Message::Close(None)));
-                        let write_task = tokio::spawn(async move {
-                            while let Some(frame) = rx.recv().await {
-                                if let WsFrame::Msg(msg) = frame
-                                    && write_half.feed(msg).await.is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            let _ = write_half.flush().await;
-                            let _ = write_half.close().await;
-                        });
-                        let _ = write_task.await;
+                        reject_ws_auth(&tx, rx, write_half, "AUTH_FAILED", "Token missing user ID")
+                            .await;
                         return;
                     }
                 }
                 Err(e) => {
-                    let err = build_error_json("AUTH_FAILED", &format!("{e}"));
-                    let _ = tx.send(WsFrame::Msg(Message::Text(err.into())));
-                    let _ = tx.send(WsFrame::Msg(Message::Close(None)));
-                    let write_task = tokio::spawn(async move {
-                        while let Some(frame) = rx.recv().await {
-                            if let WsFrame::Msg(msg) = frame
-                                && write_half.feed(msg).await.is_err()
-                            {
-                                break;
-                            }
-                        }
-                        let _ = write_half.flush().await;
-                        let _ = write_half.close().await;
-                    });
-                    let _ = write_task.await;
+                    reject_ws_auth(&tx, rx, write_half, "AUTH_FAILED", &format!("{e}")).await;
                     return;
                 }
             },
             None => {
-                let err = build_error_json(
+                reject_ws_auth(
+                    &tx,
+                    rx,
+                    write_half,
                     "AUTH_REQUIRED",
                     "No access_token cookie or Authorization header",
-                );
-                let _ = tx.send(WsFrame::Msg(Message::Text(err.into())));
-                let _ = tx.send(WsFrame::Msg(Message::Close(None)));
-                let write_task = tokio::spawn(async move {
-                    while let Some(frame) = rx.recv().await {
-                        if let WsFrame::Msg(msg) = frame
-                            && write_half.feed(msg).await.is_err()
-                        {
-                            break;
-                        }
-                    }
-                    let _ = write_half.flush().await;
-                    let _ = write_half.close().await;
-                });
-                let _ = write_task.await;
+                )
+                .await;
                 return;
             }
         }
@@ -1041,6 +1029,38 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
 }
 
 // ---------------------------------------------------------------------------
+// Glob matching
+// ---------------------------------------------------------------------------
+
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
+    let pb = pattern.as_bytes();
+    let tb = text.as_bytes();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_p, mut star_t) = (usize::MAX, 0usize);
+
+    while ti < tb.len() {
+        if pi < pb.len() && (pb[pi] == b'?' || pb[pi] == tb[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pb.len() && pb[pi] == b'*' {
+            star_p = pi;
+            star_t = ti;
+            pi += 1;
+        } else if star_p != usize::MAX {
+            pi = star_p + 1;
+            star_t += 1;
+            ti = star_t;
+        } else {
+            return false;
+        }
+    }
+    while pi < pb.len() && pb[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pb.len()
+}
+
+// ---------------------------------------------------------------------------
 // Parallel fan-out helpers
 // ---------------------------------------------------------------------------
 
@@ -1070,9 +1090,7 @@ pub(crate) fn collect_topic_senders(
     // Glob pattern match
     for entry in topic_subscribers.iter() {
         let pattern = entry.key();
-        if (pattern.contains('*') || pattern.contains('?'))
-            && super::redis_pubsub::glob_match(pattern, topic)
-        {
+        if (pattern.contains('*') || pattern.contains('?')) && glob_match(pattern, topic) {
             for conn_id_ref in entry.value().iter() {
                 let cid = conn_id_ref.key();
                 if seen.insert(cid.clone())
@@ -1096,13 +1114,13 @@ fn fanout_to_senders(senders: Vec<mpsc::UnboundedSender<WsFrame>>, frame: WsFram
     }
 }
 
-/// Trait for fan-out metrics tracking. Implemented by ClusterMetrics and RedisMetrics.
+/// Trait for fan-out metrics tracking. Implemented by ClusterMetrics.
 pub(crate) trait FanoutMetrics: Send + Sync + 'static {
     fn add_delivered(&self, count: u64);
     fn add_dropped(&self, count: u64);
 }
 
-/// Fan-out with metrics tracking (for cluster/redis dispatch).
+/// Fan-out with metrics tracking (for cluster dispatch).
 /// Takes Arc<M> where M implements FanoutMetrics, enabling spawned tasks
 /// to update metrics with 'static lifetime.
 pub(crate) fn fanout_to_senders_with_metrics<M: FanoutMetrics>(
@@ -1171,6 +1189,12 @@ async fn process_commands(
             }
             ServerCommand::BroadcastLocal { topic, data } => {
                 let frame = WsFrame::PreFramed(pre_frame_text(&data));
+                // Store in recovery buffer (zero-copy: Bytes is Arc-refcounted)
+                if let Some(ref recovery) = state.recovery
+                    && let WsFrame::PreFramed(ref bytes) = frame
+                {
+                    recovery.push(&topic, bytes.clone());
+                }
                 let senders = {
                     let guard = state.connections.read().await;
                     collect_topic_senders(&guard, &state.topic_subscribers, &topic)
@@ -1218,7 +1242,8 @@ pub struct RustWSEServer {
 #[pymethods]
 impl RustWSEServer {
     #[new]
-    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, max_inbound_queue_size = 131072))]
+    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         host: String,
         port: u16,
@@ -1227,6 +1252,11 @@ impl RustWSEServer {
         jwt_issuer: Option<String>,
         jwt_audience: Option<String>,
         max_inbound_queue_size: usize,
+        recovery_enabled: bool,
+        recovery_buffer_size: usize,
+        recovery_ttl: u64,
+        recovery_max_messages: usize,
+        recovery_memory_budget: usize,
     ) -> Self {
         let jwt_config = jwt_secret.map(|secret| {
             eprintln!(
@@ -1240,6 +1270,25 @@ impl RustWSEServer {
                 audience: jwt_audience.unwrap_or_default(),
             }
         });
+        let recovery = if recovery_enabled {
+            // Find the power-of-two exponent for buffer size
+            let bits = if recovery_buffer_size.is_power_of_two() {
+                recovery_buffer_size.trailing_zeros()
+            } else {
+                recovery_buffer_size.next_power_of_two().trailing_zeros()
+            };
+            Some(Arc::new(super::recovery::RecoveryManager::new(
+                super::recovery::RecoveryConfig {
+                    enabled: true,
+                    buffer_size_bits: bits,
+                    history_ttl_secs: recovery_ttl,
+                    max_recovery_messages: recovery_max_messages,
+                    global_memory_budget: recovery_memory_budget,
+                },
+            )))
+        } else {
+            None
+        };
         Self {
             host,
             port,
@@ -1247,6 +1296,7 @@ impl RustWSEServer {
                 max_connections,
                 jwt_config,
                 max_inbound_queue_size,
+                recovery,
             )),
             cmd_tx: None,
             thread_handle: None,
@@ -1323,6 +1373,18 @@ impl RustWSEServer {
                     };
                     running.store(true, Ordering::SeqCst);
                     let cmd_handle = tokio::spawn(process_commands(cmd_rx, shared.clone()));
+                    // Spawn periodic recovery cleanup if recovery is enabled
+                    if let Some(ref recovery) = shared.recovery {
+                        let rm = recovery.clone();
+                        tokio::spawn(async move {
+                            let mut interval =
+                                tokio::time::interval(Duration::from_secs(30));
+                            loop {
+                                interval.tick().await;
+                                rm.cleanup();
+                            }
+                        });
+                    }
                     loop {
                         tokio::select! {
                             res = listener.accept() => {
@@ -1403,12 +1465,6 @@ impl RustWSEServer {
         {
             let _ = tx.send(ClusterCommand::Shutdown);
         }
-        // Shutdown Redis
-        if let Ok(guard) = self.shared.redis_cmd_tx.lock()
-            && let Some(ref tx) = *guard
-        {
-            let _ = tx.send(RedisCommand::Shutdown);
-        }
         if let Some(ref tx) = self.cmd_tx {
             let _ = tx.send(ServerCommand::Shutdown);
         }
@@ -1421,7 +1477,6 @@ impl RustWSEServer {
         }
         self.cmd_tx = None;
         *self.shared.cluster_cmd_tx.write().unwrap() = None;
-        *self.shared.redis_cmd_tx.lock().unwrap() = None;
         Ok(())
     }
 
@@ -1814,38 +1869,6 @@ impl RustWSEServer {
         self.shared.inbound_rx.len()
     }
 
-    // -- Redis Pub/Sub --------------------------------------------------------
-
-    fn connect_redis(&self, url: String) -> PyResult<()> {
-        // Mutual exclusion: error if cluster is connected
-        if self.shared.cluster_cmd_tx.read().unwrap().is_some() {
-            return Err(PyRuntimeError::new_err(
-                "Cannot connect Redis: Cluster is already connected. Use one backend at a time.",
-            ));
-        }
-        let rt_handle = self
-            .rt_handle
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Server not started"))?;
-
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<RedisCommand>();
-        *self.shared.redis_cmd_tx.lock().unwrap() = Some(cmd_tx);
-
-        let connections = self.shared.connections.clone();
-        let topic_subscribers = self.shared.topic_subscribers.clone();
-        let metrics = self.shared.redis_metrics.clone();
-        let dlq = self.shared.redis_dlq.clone();
-        rt_handle.spawn(super::redis_pubsub::listener_task(
-            url,
-            connections,
-            topic_subscribers,
-            cmd_rx,
-            metrics,
-            dlq,
-        ));
-        Ok(())
-    }
-
     // -- Cluster Protocol -----------------------------------------------------
 
     #[allow(clippy::too_many_arguments)]
@@ -1860,12 +1883,6 @@ impl RustWSEServer {
         seeds: Option<Vec<String>>,
         cluster_addr: Option<String>,
     ) -> PyResult<()> {
-        // Mutual exclusion: error if Redis is connected
-        if self.shared.redis_cmd_tx.lock().unwrap().is_some() {
-            return Err(PyRuntimeError::new_err(
-                "Cannot connect cluster: Redis is already connected. Use one backend at a time.",
-            ));
-        }
         if self.shared.cluster_cmd_tx.read().unwrap().is_some() {
             return Err(PyRuntimeError::new_err("Cluster already connected"));
         }
@@ -2016,6 +2033,132 @@ impl RustWSEServer {
         Ok(())
     }
 
+    #[pyo3(signature = (conn_id, topics, recover = false, epoch = None, offset = None))]
+    fn subscribe_with_recovery(
+        &self,
+        py: Python<'_>,
+        conn_id: &str,
+        topics: Vec<String>,
+        recover: bool,
+        epoch: Option<String>,
+        offset: Option<u64>,
+    ) -> PyResult<Py<PyDict>> {
+        // Step 1: Subscribe using existing logic
+        self.subscribe_connection(conn_id, topics.clone())?;
+
+        // Step 2: Get connection tx (clone it, drop the lock)
+        let tx = if recover {
+            let rt = self
+                .rt_handle
+                .as_ref()
+                .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
+            let guard = rt.block_on(self.shared.connections.read());
+            guard.get(conn_id).map(|h| h.tx.clone())
+        } else {
+            None
+        };
+
+        let recovery_mgr = self.shared.recovery.as_ref();
+        let mut all_recovered = recover && !topics.is_empty();
+        let result_dict = PyDict::new(py);
+        let topics_dict = PyDict::new(py);
+
+        for topic in &topics {
+            let topic_dict = PyDict::new(py);
+
+            // Check if recovery is possible and requested
+            let can_recover = recover
+                && epoch.is_some()
+                && offset.is_some()
+                && recovery_mgr.is_some()
+                && tx.is_some();
+
+            if can_recover {
+                let epoch_str = epoch.as_ref().unwrap();
+                let after_offset = offset.unwrap();
+                let mgr = recovery_mgr.unwrap();
+
+                // Parse epoch from hex string
+                let epoch_u32 = u32::from_str_radix(epoch_str, 16).map_err(|e| {
+                    PyRuntimeError::new_err(format!("Invalid epoch hex string: {e}"))
+                })?;
+
+                let result = mgr.recover(topic, epoch_u32, after_offset);
+                match result {
+                    super::recovery::RecoveryResult::Recovered {
+                        publications,
+                        epoch: current_epoch,
+                        offset: current_offset,
+                    } => {
+                        let count = publications.len();
+                        let conn_tx = tx.as_ref().unwrap();
+                        for pub_bytes in publications {
+                            let _ = conn_tx.send(WsFrame::PreFramed(pub_bytes));
+                        }
+                        topic_dict.set_item("epoch", format!("{:08x}", current_epoch))?;
+                        topic_dict.set_item("offset", current_offset)?;
+                        topic_dict.set_item("recoverable", true)?;
+                        topic_dict.set_item("recovered", true)?;
+                        topic_dict.set_item("count", count)?;
+                    }
+                    super::recovery::RecoveryResult::NotRecovered {
+                        epoch: current_epoch,
+                        offset: current_offset,
+                    } => {
+                        all_recovered = false;
+                        topic_dict.set_item("epoch", format!("{:08x}", current_epoch))?;
+                        topic_dict.set_item("offset", current_offset)?;
+                        topic_dict.set_item("recoverable", true)?;
+                        topic_dict.set_item("recovered", false)?;
+                        topic_dict.set_item("count", 0)?;
+                    }
+                    super::recovery::RecoveryResult::NoHistory => {
+                        all_recovered = false;
+                        // Get current position if available
+                        if let Some((ep, off)) = mgr.get_position(topic) {
+                            topic_dict.set_item("epoch", format!("{:08x}", ep))?;
+                            topic_dict.set_item("offset", off)?;
+                            topic_dict.set_item("recoverable", true)?;
+                        } else {
+                            topic_dict.set_item("epoch", py.None())?;
+                            topic_dict.set_item("offset", 0u64)?;
+                            topic_dict.set_item("recoverable", false)?;
+                        }
+                        topic_dict.set_item("recovered", false)?;
+                        topic_dict.set_item("count", 0)?;
+                    }
+                }
+            } else {
+                // No recovery requested or not possible -- just report current position
+                all_recovered = false;
+                if let Some(mgr) = recovery_mgr {
+                    if let Some((ep, off)) = mgr.get_position(topic) {
+                        topic_dict.set_item("epoch", format!("{:08x}", ep))?;
+                        topic_dict.set_item("offset", off)?;
+                        topic_dict.set_item("recoverable", true)?;
+                    } else {
+                        topic_dict.set_item("epoch", py.None())?;
+                        topic_dict.set_item("offset", 0u64)?;
+                        topic_dict.set_item("recoverable", false)?;
+                    }
+                } else {
+                    topic_dict.set_item("epoch", py.None())?;
+                    topic_dict.set_item("offset", 0u64)?;
+                    topic_dict.set_item("recoverable", false)?;
+                }
+                topic_dict.set_item("recovered", false)?;
+                topic_dict.set_item("count", 0)?;
+            }
+
+            topics_dict.set_item(topic.as_str(), topic_dict)?;
+        }
+
+        result_dict.set_item("recovered", all_recovered)?;
+        result_dict.set_item("topics", topics_dict)?;
+
+        Ok(result_dict.into())
+    }
+
     #[pyo3(signature = (conn_id, topics = None))]
     fn unsubscribe_connection(&self, conn_id: &str, topics: Option<Vec<String>>) -> PyResult<()> {
         // Acquire refcount lock first to keep subscription + refcount atomic
@@ -2090,7 +2233,7 @@ impl RustWSEServer {
         Ok(())
     }
 
-    /// Fan-out to topic subscribers locally without Redis round-trip.
+    /// Fan-out to topic subscribers locally.
     fn broadcast_local(&self, topic: &str, data: &str) -> PyResult<()> {
         let tx = self
             .cmd_tx
@@ -2104,7 +2247,7 @@ impl RustWSEServer {
         Ok(())
     }
 
-    /// Fan-out locally + cluster/Redis PUBLISH for multi-instance coordination.
+    /// Fan-out locally + cluster PUBLISH for multi-instance coordination.
     fn broadcast(&self, topic: &str, data: &str) -> PyResult<()> {
         // Local dispatch (always)
         if let Some(ref tx) = self.cmd_tx {
@@ -2114,7 +2257,7 @@ impl RustWSEServer {
             });
         }
 
-        // Cluster publish (if connected) -- clone sender to avoid holding lock
+        // Cluster publish (if connected)
         let cluster_tx = self.shared.cluster_cmd_tx.read().unwrap().clone();
         if let Some(tx) = cluster_tx {
             tx.send(ClusterCommand::Publish {
@@ -2122,17 +2265,6 @@ impl RustWSEServer {
                 payload: data.to_owned(),
             })
             .map_err(|_| PyRuntimeError::new_err("Cluster command channel closed"))?;
-            return Ok(());
-        }
-
-        // Redis publish (fallback, if connected)
-        let guard = self.shared.redis_cmd_tx.lock().unwrap();
-        if let Some(ref tx) = *guard {
-            tx.send(RedisCommand::Publish {
-                channel: format!("wse:{topic}"),
-                payload: data.to_owned(),
-            })
-            .map_err(|_| PyRuntimeError::new_err("Redis command channel closed"))?;
         }
         Ok(())
     }
@@ -2145,12 +2277,7 @@ impl RustWSEServer {
             .unwrap_or(0)
     }
 
-    fn redis_connected(&self) -> bool {
-        self.shared.redis_metrics.connected.load(Ordering::Relaxed)
-    }
-
     fn health_snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let m = &self.shared.redis_metrics;
         let dict = PyDict::new(py);
         dict.set_item(
             "connections",
@@ -2160,39 +2287,6 @@ impl RustWSEServer {
         dict.set_item(
             "inbound_dropped",
             self.shared.inbound_dropped.load(Ordering::Relaxed),
-        )?;
-        dict.set_item("redis_connected", m.connected.load(Ordering::Relaxed))?;
-        dict.set_item(
-            "redis_messages_received",
-            m.messages_received.load(Ordering::Relaxed),
-        )?;
-        dict.set_item(
-            "redis_messages_published",
-            m.messages_published.load(Ordering::Relaxed),
-        )?;
-        dict.set_item(
-            "redis_messages_delivered",
-            m.messages_delivered.load(Ordering::Relaxed),
-        )?;
-        dict.set_item(
-            "redis_messages_dropped",
-            m.messages_dropped.load(Ordering::Relaxed),
-        )?;
-        dict.set_item(
-            "redis_publish_errors",
-            m.publish_errors.load(Ordering::Relaxed),
-        )?;
-        dict.set_item(
-            "redis_reconnect_count",
-            m.reconnect_count.load(Ordering::Relaxed),
-        )?;
-        dict.set_item(
-            "redis_dlq_size",
-            self.shared
-                .redis_dlq
-                .try_lock()
-                .map(|dlq| dlq.len())
-                .unwrap_or(0),
         )?;
         // Cluster metrics
         let cm = &self.shared.cluster_metrics;
@@ -2243,23 +2337,17 @@ impl RustWSEServer {
                 .map(|s| s.elapsed().as_secs_f64())
                 .unwrap_or(0.0),
         )?;
-        Ok(dict.unbind())
-    }
-
-    fn get_dlq_entries(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        let entries = match self.shared.redis_dlq.try_lock() {
-            Ok(mut dlq) => dlq.drain_all(),
-            Err(_) => Vec::new(),
-        };
-        let list = PyList::empty(py);
-        for entry in &entries {
-            let d = PyDict::new(py);
-            d.set_item("channel", &entry.channel)?;
-            d.set_item("payload", &entry.payload)?;
-            d.set_item("error", &entry.error)?;
-            list.append(d)?;
+        // Recovery metrics
+        if let Some(ref recovery) = self.shared.recovery {
+            dict.set_item("recovery_enabled", true)?;
+            dict.set_item("recovery_topic_count", recovery.topic_count())?;
+            dict.set_item("recovery_total_bytes", recovery.total_bytes())?;
+        } else {
+            dict.set_item("recovery_enabled", false)?;
+            dict.set_item("recovery_topic_count", 0)?;
+            dict.set_item("recovery_total_bytes", 0)?;
         }
-        Ok(list.unbind())
+        Ok(dict.unbind())
     }
 
     fn get_cluster_dlq_entries(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
