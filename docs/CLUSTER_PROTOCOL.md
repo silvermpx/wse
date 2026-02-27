@@ -18,7 +18,7 @@ All frames share a common 8-byte header:
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
-| 0 | 1 | type | Message type (0x01 - 0x0A) |
+| 0 | 1 | type | Message type (0x01 - 0x0C) |
 | 1 | 1 | flags | Bit 0: compressed (zstd), bits 1-7: reserved |
 | 2 | 2 | topic_len | Topic field length (little-endian u16) |
 | 4 | 4 | payload_len | Payload field length (little-endian u32) |
@@ -70,6 +70,7 @@ The magic bytes `WSE\x00` prevent accidental connections from non-WSE services. 
 |-----|------|-------------|
 | 0 | CAP_INTEREST_ROUTING | SUB/UNSUB/RESYNC support |
 | 1 | CAP_COMPRESSION | zstd compression support |
+| 2 | CAP_PRESENCE | Presence sync support |
 
 Negotiated capabilities are the bitwise AND of both peers. A feature is only active when both sides advertise support for it.
 
@@ -128,6 +129,48 @@ Sent by a node to announce its own cluster address to peers. Used during dynamic
 ```
 
 Response to a PeerAnnounce or sent periodically during discovery. Contains the full list of known peer addresses, allowing a newly joined node to connect to all existing members of the mesh.
+
+### PresenceUpdate (0x0B) - Presence Delta
+
+```
+[header: type=0x0B, topic_len=N, payload_len=M]
+[N bytes: topic string]
+[1 byte: action (0=join, 1=leave, 2=update)]
+[8 bytes: updated_at timestamp (little-endian u64, milliseconds since epoch)]
+[2 bytes: user_id_len (little-endian u16)]
+[user_id_len bytes: user_id string]
+[remaining bytes: presence data JSON]
+```
+
+Sent on every presence join, leave, or data update. The receiving peer merges the update using last-write-wins conflict resolution based on the `updated_at` timestamp. Only sent to peers that have negotiated `CAP_PRESENCE`.
+
+Action values:
+
+| Action | Meaning |
+|--------|---------|
+| 0 | Join - user became present in topic |
+| 1 | Leave - user left topic |
+| 2 | Update - user's presence data changed |
+
+### PresenceFull (0x0C) - Full Presence Sync
+
+```
+[header: type=0x0C, topic_len=0, payload_len=M]
+[M bytes: JSON state]
+```
+
+Sent when a new peer connects and completes the HELLO handshake. The payload is the full local presence state serialized as JSON:
+
+```json
+{
+  "chat-1": {
+    "alice": {"data": {"status": "online"}, "updated_at": 1708441800000},
+    "bob": {"data": {"status": "away"}, "updated_at": 1708441795000}
+  }
+}
+```
+
+The receiver merges this state into its own presence tables, creating entries for remote users. Only entries with local connections (not re-synced remote entries) are included in the outgoing full sync to prevent infinite amplification.
 
 ## Interest-Based Routing
 

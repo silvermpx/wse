@@ -2,6 +2,8 @@
 
 Version: 1 (Rust transport)
 
+> For the cluster inter-node binary protocol, see [Cluster Protocol](CLUSTER_PROTOCOL.md).
+
 ## Message Format
 
 All WSE messages are JSON objects with the following structure:
@@ -116,7 +118,7 @@ The plaintext inside the encrypted envelope is the full message including catego
 
 ### Binary Mode: JSON (default since v1.1)
 
-All JSON messages are sent as WebSocket binary frames instead of text frames. This eliminates UTF-8 validation overhead in the WebSocket layer, providing 5-15% higher throughput. The payload format is identical — category prefix followed by JSON — but delivered in a binary frame.
+All JSON messages are sent as WebSocket binary frames instead of text frames. This eliminates UTF-8 validation overhead in the WebSocket layer, providing 5-15% higher throughput. The payload format is identical - category prefix followed by JSON - but delivered in a binary frame.
 
 Clients should handle both text and binary frames containing JSON for backward compatibility.
 
@@ -134,7 +136,7 @@ To opt in, connect with `?format=msgpack` query parameter:
 ws://host:port/wse?format=msgpack
 ```
 
-When enabled, all outbound messages from the server use msgpack instead of JSON. The msgpack payload contains the same fields (`t`, `p`, `id`, `ts`, `seq`, `v`) but encoded with MessagePack. No category prefix is used — the `M:` header replaces it.
+When enabled, all outbound messages from the server use msgpack instead of JSON. The msgpack payload contains the same fields (`t`, `p`, `id`, `ts`, `seq`, `v`) but encoded with MessagePack. No category prefix is used - the `M:` header replaces it.
 
 Requires `@msgpack/msgpack` (JS) or `msgpack` (Python) on the client side.
 
@@ -263,16 +265,71 @@ Client responds with:
 - **Auth failure**: Server closes with code 4401
 - **Normal close**: Code 1000
 
+## Presence Events
+
+When presence tracking is enabled, the server broadcasts presence events to all subscribers of a topic.
+
+### Presence Join (server to client)
+
+Sent when the first connection for a user subscribes to a topic with presence data:
+
+```json
+{"t": "presence_join", "p": {"user_id": "alice", "data": {"status": "online", "name": "Alice"}}}
+```
+
+### Presence Leave (server to client)
+
+Sent when the last connection for a user is removed from a topic:
+
+```json
+{"t": "presence_leave", "p": {"user_id": "alice", "data": {"status": "online", "name": "Alice"}}}
+```
+
+### Presence Update (server to client)
+
+Sent when a user's presence data is updated via `update_presence()`:
+
+```json
+{"t": "presence_update", "p": {"user_id": "alice", "data": {"status": "away"}}}
+```
+
+### Presence Query (client to server)
+
+Request the current member list for a topic:
+
+```json
+{"t": "presence_query", "p": {"topic": "chat-1"}}
+```
+
+### Presence Result (server to client)
+
+Response to a `presence_query` with the full member list:
+
+```json
+{"t": "presence_result", "p": {
+  "topic": "chat-1",
+  "members": {
+    "alice": {"data": {"status": "online"}, "connections": 2},
+    "bob": {"data": {"status": "away"}, "connections": 1}
+  }
+}}
+```
+
+---
+
 ## Client-to-Server Messages
 
 ### Subscribe / Unsubscribe
+
+Subscribe with optional presence data. The `presence` field attaches user metadata for presence tracking (requires `presence_enabled=True` on the server):
 
 ```json
 {
   "t": "subscription",
   "p": {
     "action": "subscribe",
-    "topics": ["notifications", "chat_messages"]
+    "topics": ["notifications", "chat_messages"],
+    "presence": {"status": "online", "name": "Alice"}
   }
 }
 ```
@@ -365,7 +422,7 @@ U{"t":"batch","p":{
 
 ## Message Signing
 
-Messages matching a configurable set of types are signed for integrity verification. The set is empty by default — configure via `signed_message_types` in the connection constructor. When `message_signing_enabled` is `True`, all messages are signed.
+Messages matching a configurable set of types are signed for integrity verification. The set is empty by default - configure via `signed_message_types` in the connection constructor. When `message_signing_enabled` is `True`, all messages are signed.
 
 ```json
 U{"t":"my_critical_event","p":{...},"sig":"<hash>:<timestamp>:<nonce>:<hmac>","v":1}
@@ -408,7 +465,7 @@ payment_completed, account_transfer, config_change, ...
 
 ## Topics
 
-Topics are application-defined. WSE does not enforce any topic names — define topics that match your domain. Examples:
+Topics are application-defined. WSE does not enforce any topic names - define topics that match your domain. Examples:
 
 | Topic | Description |
 |-------|-------------|
@@ -417,4 +474,144 @@ Topics are application-defined. WSE does not enforce any topic names — define 
 | `system_events` | System-wide announcements |
 | `user_presence` | Online/offline status updates |
 
-Configure default topics via `auto_subscribe_topics` in your WSE router setup.
+Configure default topics via `auto_subscribe_topics` in your WSE server configuration.
+
+## Protocol Negotiation
+
+After the WebSocket connection is established and the server sends `server_ready`, the client sends a `client_hello` message to negotiate protocol features, version, and capabilities. The server responds with `server_hello` confirming the negotiated settings.
+
+### Client Hello
+
+Sent by the client immediately after receiving `server_ready`:
+
+```json
+{
+  "t": "client_hello",
+  "p": {
+    "client_version": "2.0.0",
+    "protocol_version": 1,
+    "features": {
+      "compression": true,
+      "batch_messages": true,
+      "encryption": true,
+      "msgpack": false
+    },
+    "capabilities": ["compression", "encryption", "batching"],
+    "encryption_public_key": "<base64-encoded 65-byte ECDH P-256 public key>"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `client_version` | `string` | Semantic version of the client library |
+| `protocol_version` | `int` | Highest protocol version the client supports |
+| `features` | `object` | Feature flags the client wants to enable |
+| `capabilities` | `string[]` | List of supported capability names |
+| `encryption_public_key` | `string` | Client ECDH public key for key exchange (only when encryption is enabled) |
+
+### Server Hello
+
+Sent by the server in response to `client_hello`:
+
+```json
+WSE{
+  "t": "server_hello",
+  "v": 1,
+  "p": {
+    "server_version": "1.5.0",
+    "protocol_version": 1,
+    "negotiated_features": {
+      "compression": true,
+      "batch_messages": true,
+      "encryption": true,
+      "msgpack": false
+    },
+    "limits": {
+      "max_message_size": 1048576,
+      "max_subscriptions": 1000,
+      "rate_limit_capacity": 100000,
+      "rate_limit_refill_rate": 10000
+    }
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `server_version` | `string` | WSE server version |
+| `protocol_version` | `int` | Negotiated protocol version (minimum of client and server) |
+| `negotiated_features` | `object` | Final feature set (intersection of client request and server support) |
+| `limits` | `object` | Server-enforced limits for this connection |
+
+Feature negotiation uses the intersection of client-requested and server-supported features. The negotiated protocol version is the minimum of both sides.
+
+## Server-Initiated Ping
+
+The server sends periodic ping messages to detect stale connections and measure round-trip latency.
+
+**Ping interval**: every 25 seconds.
+
+**Zombie detection**: connections that have not sent any data (including PONG responses) within 60 seconds are considered zombies and closed by the server.
+
+### Ping Message
+
+```json
+WSE{"t":"PING","p":{"timestamp":1708441800000},"v":1}
+```
+
+### Expected Pong Response
+
+The client must respond with a PONG containing both the original server timestamp and the client's own timestamp:
+
+```json
+{"t":"PONG","p":{"client_timestamp":1708441800050,"server_timestamp":1708441800000}}
+```
+
+The server uses the round-trip time (server receive time minus `timestamp`) to track connection health metrics. Clients that fail to respond within the zombie detection window are disconnected with close code 1000.
+
+## Rate Limit Feedback
+
+WSE enforces per-connection rate limits using a token bucket algorithm. The server provides feedback before and after limits are exceeded, giving clients the opportunity to back off gracefully.
+
+**Default configuration**:
+
+| Parameter | Value |
+|-----------|-------|
+| Bucket capacity | 100,000 tokens |
+| Refill rate | 10,000 tokens/second |
+
+### Rate Limit Warning
+
+When 80% of the bucket is consumed (20% remaining), the server sends a warning:
+
+```json
+WSE{"t":"rate_limit_warning","v":1,"p":{
+  "remaining": 20000,
+  "capacity": 100000,
+  "refill_rate": 10000,
+  "message": "Approaching rate limit"
+}}
+```
+
+This gives the client a window to reduce its send rate before messages are rejected.
+
+### Rate Limit Exceeded
+
+When the bucket is empty, the server rejects messages with an error:
+
+```json
+WSE{"t":"error","v":1,"p":{
+  "code": "RATE_LIMITED",
+  "message": "Rate limit exceeded",
+  "retry_after_ms": 100
+}}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `code` | `string` | Error code (`RATE_LIMITED`) |
+| `message` | `string` | Human-readable description |
+| `retry_after_ms` | `int` | Suggested backoff before retrying (milliseconds) |
+
+The connection is not closed on rate limit violation. The client should stop sending, wait for `retry_after_ms`, and resume at a lower rate. Persistent violations may trigger the circuit breaker, which closes the connection with code 1011.

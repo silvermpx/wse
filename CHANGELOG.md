@@ -1,5 +1,83 @@
 # Changelog
 
+## v2.0.0 (2026-02-27)
+
+### Breaking Changes
+
+- **Standalone-only architecture**: the FastAPI Router mode has been removed. `RustWSEServer` is now the only deployment mode. All Python-side connection handling, message routing, and session management code has been removed in favor of the Rust implementation.
+- **Removed dependencies**: `fastapi`, `starlette`, and `redis` are no longer required. The `redis` package remains optional for hybrid deployments using `broadcast()`.
+- **Removed modules**: `wse_server.router`, `wse_server.dependencies`, `wse_server.connection`, `wse_server.core.pubsub`, `wse_server.reliability`, `wse_server.metrics`
+
+### Cluster Protocol (NEW)
+
+Custom binary TCP mesh protocol replacing Redis pub/sub for multi-instance coordination:
+
+- **Broadcast mesh**: direct peer-to-peer TCP connections with full mesh topology, custom 8-byte binary frame header, HELLO handshake with magic bytes and version negotiation
+- **Interest-based routing**: SUB/UNSUB/RESYNC frames allow peers to announce topic subscriptions. Messages are only forwarded to peers with matching subscribers, reducing inter-node bandwidth
+- **Wire protocol versioning**: version negotiated in HELLO handshake, minimum version enforcement, unknown message types silently ignored for forward compatibility
+- **mTLS**: mutual TLS via rustls + tokio-rustls with P-256 certificates and WebPkiClientVerifier for peer authentication on untrusted networks
+- **Dynamic peer discovery**: gossip-based discovery via PeerAnnounce/PeerList frames. New nodes only need one seed address to join the cluster
+- **Inter-peer compression**: zstd compression for messages above 256 bytes, capability-negotiated, with decompression bomb protection (10:1 ratio limit)
+- **Reliability**: per-peer circuit breaker (10 failures, 60s reset), exponential backoff reconnect, heartbeat (5s ping, 15s timeout), dead letter queue (1000 entries)
+
+### Presence Tracking (NEW)
+
+Per-topic presence tracking with automatic user-level join/leave events:
+
+- **Per-topic presence**: track which users are active in each topic with custom metadata (status, display name, etc.)
+- **User-level grouping**: multiple connections from the same user (JWT `sub`) are deduplicated into a single presence entry. Join fires on first connection, leave fires on last disconnect
+- **Presence query API**: `presence(topic)` returns full member list, `presence_stats(topic)` returns O(1) member/connection counts
+- **Data updates**: `update_presence(conn_id, data)` broadcasts updated presence data across all topics where the user is present
+- **Cluster presence sync**: PresenceUpdate (0x0B) and PresenceFull (0x0C) frames synchronize presence state across all cluster nodes with CRDT last-write-wins conflict resolution
+- **TTL sweep**: background task every 30s removes entries from dead connections
+- **Configurable limits**: `presence_max_data_size` (default 4096 bytes), `presence_max_members` per topic (default unlimited)
+
+### Message Recovery (NEW)
+
+Per-topic ring buffer system for recovering missed messages on reconnect:
+
+- Power-of-2 ring buffers per topic with configurable size (default 128 slots)
+- Epoch+offset tracking for precise recovery positioning
+- Global memory budget (default 256MB) with TTL and LRU eviction
+- `subscribe_with_recovery()` returns per-topic recovery status and replays missed messages
+
+### Protocol Negotiation (NEW)
+
+- `client_hello`/`server_hello` handshake with feature discovery and version negotiation
+- Server advertises capabilities (compression, recovery, cluster, batching, msgpack), limits (message size, rate limits), and connection metadata
+
+### Server-Initiated Ping + Zombie Detection (NEW)
+
+- Server pings every connected client every 25 seconds
+- Connections with no activity for 60 seconds are force-closed
+- Prevents resource leaks from abandoned connections
+
+### Rate Limit Feedback (NEW)
+
+- Client receives `rate_limit_warning` when approaching the limit (20% remaining)
+- Client receives `error` with code `RATE_LIMITED` when exceeded
+- Token bucket: 100K capacity, 10K/s refill per connection
+
+### Performance
+
+- **Pre-framed WebSocket broadcast**: frame built once per broadcast, raw bytes shared via Arc across all connections
+- **DashMap**: lock-free concurrent hash maps for connections, topics, rates, and activity tracking
+- **Vectored writes (writev)**: batch frame delivery via write_vectored syscall
+- **CPU-aware fan-out**: hybrid task chunking based on available CPU cores
+- **mimalloc**: global allocator for improved multi-threaded allocation
+
+### Bug Fixes
+
+- Fixed TOCTOU race in topic subscriber cleanup
+- Fixed JSON injection in error response builder
+- Fixed mutex poisoning panics in DLQ and config
+- Fixed event type naming in examples ("message" -> "msg")
+- Updated Python client CLIENT_VERSION to 2.0.0
+
+### Integration Tests
+
+25 tests covering connection lifecycle, messaging, broadcast, subscriptions, protocol negotiation, health monitoring, recovery, and server lifecycle.
+
 ## v1.4.0 (2026-02-24)
 
 ### Redis Pub/Sub (NEW)

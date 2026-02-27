@@ -1,558 +1,488 @@
 # WSE Integration Guide
 
-This guide covers integrating WSE into a new or existing project.
-
-## Deployment Modes
-
-WSE supports two deployment modes. Choose based on your performance requirements.
-
-### Router Mode (embedded in FastAPI)
-
-Mount WSE as a FastAPI router on the same port as your app. One process, one port.
-
-```python
-from fastapi import FastAPI
-from wse_server import create_wse_router, WSEConfig
-import redis.asyncio as redis
-
-app = FastAPI()
-
-redis_client = redis.Redis(host="localhost", port=6379, decode_responses=False)
-
-wse = create_wse_router(WSEConfig(
-    redis_client=redis_client,
-))
-
-app.include_router(wse, prefix="/wse")
-```
-
-Publish events from anywhere in your app:
-
-```python
-bus = app.state.pubsub_bus
-
-await bus.publish(
-    topic="notifications",
-    event={"event_type": "order_shipped", "order_id": 42},
-)
-```
-
-### Standalone Mode (dedicated Rust server)
-
-Run `RustWSEServer` on its own port for maximum throughput. The WebSocket server runs entirely in a Rust tokio runtime -- no FastAPI overhead, no GIL on the hot path. This is how WSE achieves 14M msg/s JSON on EPYC.
-
-```python
-from wse_server._wse_accel import RustWSEServer
-
-server = RustWSEServer(
-    "0.0.0.0", 5006,
-    max_connections=10000,
-    jwt_secret=b"your-secret-key",
-    jwt_issuer="your-app",
-    jwt_audience="your-api",
-)
-server.start()
-
-while True:
-    events = server.drain_inbound(256, 50)
-    for event in events:
-        handle(event)
-```
-
-With standalone mode:
-- JWT validation happens in Rust during the WebSocket handshake (0.01ms)
-- `server_ready` is sent from Rust before Python runs
-- Python receives pre-validated events via `drain_inbound()` (batch polling, one GIL acquisition per batch)
-- Ping/pong, rate limiting, compression all run in Rust
+Complete reference for integrating `wse-server` into your application. Covers server setup, authentication, messaging, subscriptions, clustering, and client SDKs.
 
 ---
 
-## Router Mode Integration
-
-### Step 1: Install
+## 1. Installation
 
 ```bash
 pip install wse-server
 ```
 
-The `wse-server` package includes all server modules and the prebuilt Rust engine. Dependencies (FastAPI, redis, orjson, etc.) are installed automatically.
+The package includes the Python server module and the prebuilt Rust engine (`wse-accel`). No separate compilation step required.
 
-### Step 2: Set Up Redis
+---
 
-Redis is required for multi-instance coordination. For single-instance setups you can pass `redis_client=None` (default) and only in-process PubSub is used.
+## 2. Basic Server Setup
 
 ```python
-import redis.asyncio as redis
+from wse_server import RustWSEServer, rust_jwt_encode
+import time
 
-redis_client = redis.Redis(
-    host="localhost",
-    port=6379,
-    decode_responses=False,
+server = RustWSEServer(
+    "0.0.0.0", 5007,
+    max_connections=10_000,
+    jwt_secret=b"your-secret-key",
+    jwt_issuer="my-app",
+    jwt_audience="my-api",
+)
+server.enable_drain_mode()
+server.start()
+```
+
+The WebSocket server runs entirely in a Rust tokio runtime - no GIL on the hot path. Python receives pre-validated events via `drain_inbound()`, acquiring the GIL once per batch.
+
+---
+
+## 3. JWT Authentication
+
+Configure `jwt_secret`, `jwt_issuer`, and `jwt_audience` in the constructor. The server validates JWT tokens during the WebSocket handshake in Rust (zero-GIL, sub-millisecond).
+
+**Required token claims:**
+
+| Claim | Description |
+|-------|-------------|
+| `sub` | User ID (returned as `user_id` in auth_connect event) |
+| `iss` | Issuer (must match `jwt_issuer`) |
+| `aud` | Audience (must match `jwt_audience`) |
+| `exp` | Expiration timestamp (Unix epoch) |
+| `iat` | Issued-at timestamp (Unix epoch) |
+
+**Token delivery:** The client sends the token as an `Authorization: Bearer <token>` header or an `access_token` cookie during the WebSocket handshake.
+
+**Connection events:**
+- With JWT configured: `auth_connect` event fires with the validated `user_id`
+- Without JWT configured: `connect` event fires with the raw cookies string
+
+**Generating tokens:**
+
+```python
+token = rust_jwt_encode(
+    {"sub": "user-1", "iss": "my-app", "aud": "my-api",
+     "exp": int(time.time()) + 3600, "iat": int(time.time())},
+    b"your-secret-key",
 )
 ```
 
-### Step 3: Create and Mount the Router
+`rust_jwt_encode` runs in Rust - use it instead of PyJWT for consistency with the server's validation logic.
+
+---
+
+## 4. Event Handling
+
+### Drain Mode (recommended)
+
+Drain mode gives you full control over the event loop. Call `enable_drain_mode()` before `start()`, then poll with `drain_inbound()`.
 
 ```python
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from wse_server import create_wse_router, WSEConfig
+server.enable_drain_mode()
+server.start()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    yield
+while True:
+    events = server.drain_inbound(256, 50)  # batch_size, timeout_ms
+    for ev in events:
+        event_type = ev[0]
+        conn_id = ev[1]
 
-app = FastAPI(lifespan=lifespan)
-
-wse = create_wse_router(WSEConfig(
-    redis_client=redis_client,          # None for single-instance
-    auth_handler=your_auth_function,    # Optional: async (WebSocket) -> str|None
-    snapshot_provider=your_snapshots,   # Optional: SnapshotProvider implementation
-    default_topics=["public"],          # Topics for all new connections
-    heartbeat_interval=15.0,            # Seconds
-    idle_timeout=90.0,                  # Seconds
-    enable_compression=True,
-    enable_debug=False,                 # Exposes /wse/debug endpoint
-))
-
-app.include_router(wse, prefix="/wse")
+        if event_type == "auth_connect":
+            user_id = ev[2]
+        elif event_type == "msg":
+            data = ev[2]  # parsed dict
+        elif event_type == "raw":
+            text = ev[2]  # unparsed string
+        elif event_type == "bin":
+            data = ev[2]  # bytes
+        elif event_type == "disconnect":
+            pass
+        elif event_type == "connect":
+            cookies = ev[2]  # no-auth mode only
 ```
 
-See `WSEConfig` in `wse_server.router` for all available options.
+**`drain_inbound(batch_size, timeout_ms)`** - blocks up to `timeout_ms` waiting for the first event, then drains up to `batch_size` events without blocking. Returns a list of tuples.
 
-### Step 4: Implement Snapshot Provider (Optional)
+### Event Types
 
-If you want to deliver initial state when clients connect, implement the `SnapshotProvider` protocol:
+| Type | Trigger | ev[2] payload |
+|------|---------|---------------|
+| `"connect"` | New connection (no JWT configured) | cookies string |
+| `"auth_connect"` | JWT-validated connection | user_id string |
+| `"msg"` | Client sent WSE-prefixed JSON | parsed dict |
+| `"raw"` | Client sent non-JSON text | raw string |
+| `"bin"` | Client sent binary frame | bytes |
+| `"disconnect"` | Connection closed | (none) |
+
+### Callback Mode (alternative)
+
+If you prefer a callback-driven model instead of polling:
 
 ```python
-from wse_server import SnapshotProvider
-from typing import Any
+def on_connect(conn_id, user_id):
+    print(f"Connected: {user_id}")
 
-class MySnapshotProvider:
-    async def get_snapshot(self, user_id: str, topics: list[str]) -> dict[str, Any]:
-        """Return current state keyed by topic."""
-        result = {}
-        if "dashboard" in topics:
-            result["dashboard"] = await fetch_dashboard_data(user_id)
-        if "notifications" in topics:
-            result["notifications"] = await fetch_unread(user_id)
-        return result
+def on_message(conn_id, data):
+    print(f"Message: {data}")
+
+def on_disconnect(conn_id):
+    print(f"Disconnected: {conn_id}")
+
+server.set_callbacks(on_connect, on_message, on_disconnect)
+server.start()
 ```
 
-Pass it to the config:
+Drain mode is recommended for production workloads - it batches events efficiently and gives you explicit control over backpressure.
+
+---
+
+## 5. Sending Messages
 
 ```python
-wse = create_wse_router(WSEConfig(
-    snapshot_provider=MySnapshotProvider(),
-))
+# Send raw text to one connection
+server.send(conn_id, 'WSE{"t":"hello","p":{"msg":"hi"},"v":1}')
+
+# Send binary to one connection
+server.send_bytes(conn_id, b"\x00\x01\x02")
+
+# Send event dict (auto-serialized, auto-compressed if > threshold)
+bytes_sent = server.send_event(conn_id, {"t": "update", "p": {"value": 42}})
+
+# Broadcast to ALL connections (pre-framed, single frame build)
+server.broadcast_all('WSE{"t":"notification","p":{},"v":1}')
+
+# Broadcast to topic subscribers (local instance only)
+server.broadcast_local("prices", '{"t":"price","p":{"symbol":"AAPL","price":187.42}}')
+
+# Broadcast to topic subscribers (local + Redis + cluster peers)
+server.broadcast("prices", '{"t":"price","p":{"symbol":"AAPL","price":187.42}}')
 ```
 
-### Step 5: Publish Events
+**Method summary:**
 
-From anywhere in your application -- FastAPI endpoints, background tasks, Celery workers:
+| Method | Scope | Use case |
+|--------|-------|----------|
+| `send(conn_id, text)` | Single connection | Direct text messages |
+| `send_bytes(conn_id, data)` | Single connection | Binary data |
+| `send_event(conn_id, dict)` | Single connection | Structured events (auto-serialized) |
+| `broadcast_all(text)` | All connections | Global announcements |
+| `broadcast_local(topic, text)` | Topic subscribers (local) | Single-instance topic fan-out |
+| `broadcast(topic, text)` | Topic subscribers (all instances) | Multi-instance topic fan-out |
+
+`broadcast_all` and `broadcast_local` never touch the network - they fan out directly to local connections. `broadcast` additionally forwards to cluster peers and Redis subscribers.
+
+---
+
+## 6. Topic Subscriptions
 
 ```python
-# In a FastAPI endpoint
-from fastapi import Request
+# Subscribe connection to topics
+server.subscribe_connection(conn_id, ["prices", "news"])
 
-@app.post("/items")
-async def create_item(request: Request, body: CreateItemRequest):
-    item = save_item(body)
+# Unsubscribe from specific topics
+server.unsubscribe_connection(conn_id, ["news"])
 
-    bus = request.app.state.pubsub_bus
-    await bus.publish(
-        topic=f"user:{item.owner_id}:events",
-        event={
-            "event_type": "item_created",
-            "item_id": str(item.id),
-            "name": item.name,
-            "status": "active",
-        },
-    )
-    return item
+# Unsubscribe from all topics
+server.unsubscribe_connection(conn_id, None)
+
+# Get subscriber count for a topic
+count = server.get_topic_subscriber_count("prices")
 ```
 
-Topic naming conventions:
-- `user:{user_id}:events` -- user-specific events
-- `chat:{channel_id}` -- channel broadcasts
-- `notifications` -- global notifications
-- Pattern matching with glob wildcards: `user:*:events`
+Topic subscriptions are managed per-connection. When a connection disconnects, its subscriptions are automatically cleaned up. In cluster mode, subscription interest is propagated to peers so that `broadcast()` only forwards messages to nodes that have active subscribers.
 
-### Step 6: JWT Authentication
+---
 
-WSE expects a JWT token with a `sub` claim containing the user ID.
+## 7. Presence Tracking
 
-For **Router mode**, pass an `auth_handler`:
+Presence tracking lets you monitor which users are active in a topic, with automatic join/leave events when users subscribe or disconnect.
 
-```python
-from fastapi import WebSocket
-import jwt
+### Enabling Presence
 
-async def auth_handler(websocket: WebSocket) -> str | None:
-    """Validate JWT and return user_id, or None to reject."""
-    token = websocket.cookies.get("access_token")
-    if not token:
-        auth_header = websocket.headers.get("authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]
-
-    if not token:
-        return None
-
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        return payload["sub"]
-    except jwt.InvalidTokenError:
-        return None
-
-wse = create_wse_router(WSEConfig(auth_handler=auth_handler))
-```
-
-For **Standalone mode**, configure Rust JWT directly:
+Pass `presence_enabled=True` in the constructor:
 
 ```python
 server = RustWSEServer(
-    "0.0.0.0", 5006,
-    jwt_secret=b"your-secret-key",
-    jwt_issuer="your-app",      # Optional: validate iss claim
-    jwt_audience="your-api",    # Optional: validate aud claim
+    "0.0.0.0", 5007,
+    presence_enabled=True,
+    presence_max_data_size=4096,   # max bytes per user's presence data
+    presence_max_members=0,        # 0 = unlimited members per topic
 )
 ```
 
-JWT payload format:
+### Subscribing with Presence Data
+
+When subscribing a connection, pass a dict as the third argument to attach presence metadata:
+
+```python
+server.subscribe_connection(conn_id, ["chat-1"], {"status": "online", "name": "Alice"})
+```
+
+This triggers a `presence_join` event broadcast to all subscribers of `chat-1`. If the same user (same JWT `sub` claim) connects from multiple tabs, only the first connection emits a join event.
+
+### Querying Members
+
+```python
+members = server.presence("chat-1")
+# Returns dict: {
+#     "alice": {"data": {"status": "online", "name": "Alice"}, "connections": 2},
+#     "bob":   {"data": {"status": "away"},  "connections": 1},
+# }
+```
+
+For lightweight counts without iterating all members:
+
+```python
+stats = server.presence_stats("chat-1")
+# Returns dict: {"num_users": 2, "num_connections": 3}
+```
+
+### Updating Presence Data
+
+To change a user's presence data across all their subscribed topics:
+
+```python
+server.update_presence(conn_id, {"status": "away"})
+```
+
+This broadcasts a `presence_update` event to every topic where the connection has presence.
+
+### Presence Events
+
+The following events appear in `drain_inbound()`:
+
+| Event Type | Trigger | ev[2] payload |
+|------------|---------|---------------|
+| `"presence_join"` | First connection for a user subscribes to a topic | `{"user_id": "...", "data": {...}}` |
+| `"presence_leave"` | Last connection for a user leaves a topic | `{"user_id": "...", "data": {...}}` |
+
+These events are also broadcast to all WebSocket subscribers of the topic as structured messages:
 
 ```json
-{
-    "sub": "019c53c4-abcd-7def-8901-234567890abc",
-    "exp": 1708441800,
-    "iat": 1708440000
-}
+{"t": "presence_join", "p": {"user_id": "alice", "data": {"status": "online"}}}
+{"t": "presence_leave", "p": {"user_id": "alice", "data": {"status": "online"}}}
+{"t": "presence_update", "p": {"user_id": "alice", "data": {"status": "away"}}}
+```
+
+### Multi-Connection Behavior
+
+Presence is tracked at the user level, not the connection level. If a user opens multiple browser tabs (multiple WebSocket connections with the same JWT `sub`):
+
+- **Join**: only the first connection triggers a `presence_join` event
+- **Leave**: only when all connections disconnect does a `presence_leave` fire
+- **Data**: presence data reflects the most recent `subscribe_connection` or `update_presence` call
+
+### Auto-Cleanup
+
+When a connection disconnects, its presence is automatically removed from all topics. If it was the user's last connection in a topic, a `presence_leave` event is broadcast. A background sweep runs every 30 seconds to clean up any stale entries from connections that were not properly closed.
+
+### Cluster Sync
+
+In cluster mode, presence state is synchronized across all nodes. When a user joins or leaves on one node, the event is propagated to all peers via `PresenceUpdate` frames. On peer connect, a full presence state sync ensures all nodes have a consistent view. Conflict resolution uses last-write-wins based on wall-clock timestamps.
+
+---
+
+## 8. Message Recovery
+
+Message recovery allows clients to catch up on missed messages after a reconnect. Enable it in the constructor:
+
+```python
+server = RustWSEServer(
+    "0.0.0.0", 5007,
+    recovery_enabled=True,
+    recovery_buffer_size=256,    # slots per topic (power-of-2)
+    recovery_ttl=300,            # 5 minutes
+    recovery_max_messages=500,
+    recovery_memory_budget=268435456,  # 256 MB
+)
+```
+
+**Subscribing with recovery on reconnect:**
+
+```python
+result = server.subscribe_with_recovery(
+    conn_id, ["prices"],
+    recover=True,
+    epoch=client_epoch,    # from previous session
+    offset=client_offset,  # from previous session
+)
+# result: {"topics": {"prices": {"epoch": 123, "offset": 456, "recovered": True, "count": 12}}}
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `recovery_buffer_size` | Ring buffer slots per topic. Must be a power of 2. |
+| `recovery_ttl` | Maximum age (seconds) of recoverable messages. |
+| `recovery_max_messages` | Maximum messages returned in a single recovery. |
+| `recovery_memory_budget` | Hard cap on total memory used by all recovery buffers. |
+
+The client stores the `epoch` and `offset` from its last received message. On reconnect, it passes these values to `subscribe_with_recovery`, and the server replays any messages the client missed (up to the buffer limits).
+
+---
+
+## 9. Cluster Setup
+
+Clustering connects multiple WSE instances into a broadcast mesh. Messages sent via `broadcast()` are forwarded to all peers.
+
+**Basic cluster (no TLS):**
+
+```python
+server.connect_cluster(peers=["10.0.0.2:9999", "10.0.0.3:9999"])
+```
+
+**Cluster with mTLS:**
+
+```python
+server.connect_cluster(
+    peers=["10.0.0.2:9999"],
+    tls_ca="/etc/wse/ca.pem",
+    tls_cert="/etc/wse/node.pem",
+    tls_key="/etc/wse/node.key",
+    cluster_port=9999,
+)
+```
+
+**Cluster with gossip discovery (seed nodes):**
+
+```python
+server.connect_cluster(
+    peers=[],
+    seeds=["10.0.0.2:9999"],
+    cluster_addr="10.0.0.1:9999",
+    cluster_port=9999,
+)
+```
+
+With gossip discovery, nodes find each other through seed nodes and maintain membership automatically. New nodes only need to know at least one seed to join the cluster.
+
+**Cluster status:**
+
+```python
+server.cluster_connected()      # bool - True if connected to at least one peer
+server.cluster_peers_count()    # int - number of active peer connections
 ```
 
 ---
 
-## Frontend Integration (React)
+## 10. Health Monitoring
 
-### Step 1: Install
+```python
+health = server.health_snapshot()
+```
+
+Returns a dict with the current server state:
+
+```python
+{
+    "connections": 150,
+    "inbound_queue_depth": 0,
+    "inbound_dropped": 0,
+    "uptime_secs": 3600.5,
+    "recovery_enabled": True,
+    "recovery_topic_count": 5,
+    "recovery_total_bytes": 1048576,
+    "cluster_connected": True,
+    "cluster_peers": 2,
+    "cluster_messages_sent": 50000,
+    "cluster_messages_delivered": 49950,
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `connections` | Active WebSocket connections |
+| `inbound_queue_depth` | Events waiting to be drained |
+| `inbound_dropped` | Events dropped due to full queue (should be 0) |
+| `uptime_secs` | Server uptime in seconds |
+| `recovery_enabled` | Whether message recovery is active |
+| `recovery_topic_count` | Topics with active recovery buffers |
+| `recovery_total_bytes` | Memory used by recovery buffers |
+| `cluster_connected` | Whether cluster mesh is active |
+| `cluster_peers` | Number of connected cluster peers |
+| `cluster_messages_sent` | Total messages forwarded to peers |
+| `cluster_messages_delivered` | Total messages received from peers |
+
+---
+
+## 11. Connection Management
+
+```python
+# Get all connection IDs
+conn_ids = server.get_connections()
+
+# Get count (lock-free, AtomicUsize)
+count = server.get_connection_count()
+
+# Disconnect a specific connection
+server.disconnect(conn_id)
+
+# Check queue stats
+depth = server.inbound_queue_depth()
+dropped = server.inbound_dropped_count()
+```
+
+`get_connection_count()` is lock-free and safe to call at high frequency (e.g., in health check endpoints). `get_connections()` takes a snapshot of all connection IDs and is slightly more expensive.
+
+---
+
+## 12. Client SDKs
+
+### Python Client
+
+```bash
+pip install wse-client
+```
+
+```python
+from wse_client import AsyncWSEClient
+
+async with AsyncWSEClient("ws://localhost:5007/wse", token="...") as client:
+    await client.subscribe(["prices"])
+    async for event in client:
+        print(event)
+```
+
+### TypeScript / React Client
 
 ```bash
 npm install wse-client
 ```
 
-All dependencies (zustand, pako, msgpack) are bundled.
-
-### Step 2: Add the WSE Hook
-
 ```tsx
-import { useWSE } from 'wse-client';
+import { useWSE } from 'wse-client/react';
 
 function App() {
-  const { isConnected, connectionHealth } = useWSE({
-    topics: ['notifications', 'live_data'],
-    endpoints: [`ws://${window.location.host}/wse`],
-  });
+    const { connected, subscribe, onMessage } = useWSE({
+        url: 'ws://localhost:5007/wse',
+        token: '...',
+    });
 
-  return (
-    <div>
-      <p>Status: {connectionHealth}</p>
-      {/* Your app */}
-    </div>
-  );
+    useEffect(() => {
+        subscribe(['prices']);
+        onMessage('price', (data) => console.log(data));
+    }, []);
 }
 ```
 
-### Step 3: Listen for Events
-
-WSE dispatches events as DOM `CustomEvent`s on `window`. The event name matches the `event_type` from the server.
-
-```typescript
-// In a component or handler setup
-useEffect(() => {
-  const handler = (e: CustomEvent) => {
-    console.log('Item created:', e.detail);
-    // e.detail contains the full event payload
-  };
-
-  window.addEventListener('item_created', handler as EventListener);
-  return () => window.removeEventListener('item_created', handler as EventListener);
-}, []);
-```
-
-### Step 4: React Query Integration
-
-WSE works well with React Query. Set `staleTime: Infinity` and let WSE push updates into the cache:
-
-```typescript
-import { useQuery, useQueryClient } from '@tanstack/react-query';
-
-function ItemList() {
-  const queryClient = useQueryClient();
-
-  const { data: items } = useQuery({
-    queryKey: ['items'],
-    queryFn: fetchItems,
-    staleTime: Infinity,  // WSE controls freshness
-  });
-
-  useEffect(() => {
-    const handler = (e: CustomEvent) => {
-      queryClient.setQueryData(['items'], (old: Item[] | undefined) => {
-        if (!old) return [e.detail];
-        return old.map(o => o.id === e.detail.id ? { ...o, ...e.detail } : o);
-      });
-    };
-
-    window.addEventListener('item_updated', handler as EventListener);
-    return () => window.removeEventListener('item_updated', handler as EventListener);
-  }, [queryClient]);
-
-  return <div>{/* render items */}</div>;
-}
-```
+Both clients handle reconnection with exponential backoff, automatic resubscription, and message recovery (when enabled on the server).
 
 ---
 
-## Python Client Integration
+## 13. Production Deployment
 
-The Python client (`wse-client` on PyPI) connects to WSE from backend services, CLI tools, scripts, and integration tests.
+**Server sizing:**
+- Set `max_connections` based on available memory - approximately 1 KB per idle connection
+- Use `drain_inbound(256, 50)` for optimal throughput (batch size 256, timeout 50ms)
+- Monitor `health_snapshot()` for queue depth, dropped events, and cluster status
 
-### Install
+**TLS termination:**
+- Run behind a reverse proxy (nginx, HAProxy) for TLS termination on client-facing connections
+- Use mTLS for cluster peer connections in production
 
-```bash
-pip install wse-client            # Core (websockets only)
-pip install wse-client[crypto]    # + ECDH/AES-GCM encryption
-pip install wse-client[all]       # + crypto + msgpack + orjson
-```
+**Recovery:**
+- Enable recovery for topics where missed messages matter (e.g., chat, order updates)
+- Set `recovery_memory_budget` to cap total memory usage across all recovery buffers
+- Choose `recovery_buffer_size` as a power of 2 based on your expected message rate and reconnect window
 
-### Async Client
-
-```python
-from wse_client import connect
-
-async with connect("ws://localhost:5006/wse", token="your-jwt") as client:
-    await client.subscribe(["notifications", "live_data"])
-    async for event in client:
-        print(event.type, event.payload)
-```
-
-### Sync Client
-
-```python
-from wse_client import SyncWSEClient
-
-client = SyncWSEClient("ws://localhost:5006/wse", token="your-jwt")
-client.connect()
-client.subscribe(["notifications"])
-
-event = client.recv(timeout=5.0)
-print(event.type, event.payload)
-
-client.close()
-```
-
-### Callback Pattern
-
-```python
-from wse_client import AsyncWSEClient
-
-client = AsyncWSEClient("ws://localhost:5006/wse", token="your-jwt")
-
-@client.on("notifications")
-def handle_notification(event):
-    print(f"Notification: {event.payload}")
-
-@client.on("price_update")
-def handle_price(event):
-    print(f"Price: {event.payload['symbol']} = {event.payload['price']}")
-```
-
-### Use Cases
-
-| Use Case | Pattern |
-|----------|---------|
-| **Microservice-to-microservice** | AsyncWSEClient in FastAPI lifespan |
-| **CLI tool** | SyncWSEClient with `recv()` loop |
-| **Integration tests** | AsyncWSEClient with `async with` context manager |
-| **Data pipeline** | AsyncWSEClient async iterator with batch processing |
-| **Monitoring** | Callback pattern with `@client.on()` handlers |
-
-### Python Client Configuration
-
-```python
-from wse_client import AsyncWSEClient
-from wse_client.types import ReconnectConfig, LoadBalancingStrategy
-
-client = AsyncWSEClient(
-    url="ws://localhost:5006/wse",
-    token="your-jwt",
-    reconnect=ReconnectConfig(
-        max_attempts=-1,            # Infinite retries (default)
-        base_delay=1.0,             # 1s initial delay
-        max_delay=30.0,             # 30s max delay
-        factor=1.5,                 # Backoff multiplier
-    ),
-    queue_size=10000,               # Event queue size
-)
-```
-
----
-
-## Configuration Reference
-
-### WSEConfig (Router Mode)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `auth_handler` | `None` | `async (WebSocket) -> str\|None`. Return user_id or None to reject |
-| `snapshot_provider` | `None` | `SnapshotProvider` implementation for initial state |
-| `default_topics` | `[]` | Topics for connections that don't specify any |
-| `allowed_origins` | `[]` | CSWSH protection. Empty = allow all (dev mode) |
-| `redis_client` | `None` | Redis client for multi-instance pub/sub |
-| `max_message_size` | `1048576` | Max inbound message size (1 MB) |
-| `heartbeat_interval` | `15.0` | Server heartbeat in seconds |
-| `idle_timeout` | `90.0` | Close idle connections after N seconds |
-| `enable_compression` | `True` | Per-message zlib compression |
-| `enable_debug` | `False` | Expose /wse/debug and /wse/compression-test endpoints |
-
-### RustWSEServer (Standalone Mode)
-
-| Parameter | Description |
-|-----------|-------------|
-| `host` | Bind address (e.g. `"0.0.0.0"`) |
-| `port` | Listen port (e.g. `5006`) |
-| `max_connections` | Maximum concurrent WebSocket connections |
-| `jwt_secret` | HS256 signing key (bytes). Enables Rust JWT validation |
-| `jwt_issuer` | Optional: validate `iss` claim |
-| `jwt_audience` | Optional: validate `aud` claim |
-
-### Frontend Configuration
-
-```typescript
-const config: UseWSEConfig = {
-  topics: ['notifications'],
-  endpoints: ['wss://api.example.com/wse'],
-
-  reconnection: {
-    maxRetries: Infinity,
-    initialDelay: 1000,
-    maxDelay: 30000,
-    backoffMultiplier: 1.5,
-  },
-
-  security: {
-    encryption: false,     // Enable for E2E encryption
-    signing: false,        // Enable for message signing
-  },
-
-  performance: {
-    compression: true,     // Enable zlib compression
-    batchSize: 10,         // Messages per batch
-    batchTimeout: 100,     // Batch timeout in ms
-  },
-
-  offline: {
-    enabled: true,         // IndexedDB offline queue
-    maxSize: 1000,         // Max offline messages
-  },
-
-  diagnostics: {
-    enabled: true,         // Network quality monitoring
-  },
-};
-```
-
----
-
-## Adapting for Different Use Cases
-
-### Chat / Messaging
-
-```python
-# Server: broadcast a message to a channel
-await bus.publish(
-    topic=f"chat:{channel_id}",
-    event={
-        "event_type": "message_sent",
-        "message_id": str(msg.id),
-        "text": msg.text,
-        "author": msg.author_name,
-        "timestamp": msg.created_at.isoformat(),
-    },
-)
-```
-
-```tsx
-// React: render messages
-window.addEventListener('message_sent', (e: CustomEvent) => {
-  appendMessage(e.detail);
-});
-```
-
-Recommendations:
-- Enable E2E encryption (`security.encryption: true` on the client)
-- Use `message_sent`, `message_received`, `typing_indicator` event types
-- The offline queue stores messages while disconnected and replays on reconnect
-
-### IoT / Sensor Data
-
-```python
-# Server: push sensor readings
-await bus.publish(
-    topic=f"device:{device_id}:telemetry",
-    event={
-        "event_type": "sensor_reading",
-        "temperature": 23.5,
-        "humidity": 67.2,
-        "battery_pct": 84,
-    },
-)
-```
-
-Recommendations:
-- Enable compression -- sensor data is typically repetitive
-- Use LOW priority for telemetry, HIGH for alerts
-- Increase batch size (50-100) for throughput
-- Consider msgpack (`pip install wse-client[all]`) for binary efficiency
-
-### Financial / Real-Time Data
-
-```python
-# Server: push price updates with signing
-await bus.publish(
-    topic="prices",
-    event={
-        "event_type": "price_update",
-        "symbol": "AAPL",
-        "price": 187.42,
-        "volume": 1_234_567,
-    },
-)
-```
-
-Recommendations:
-- Enable message signing for critical operations
-- Use CRITICAL priority for order confirmations
-- Keep compression disabled for latency-sensitive paths
-- Circuit breaker handles upstream outages gracefully
-
-### Collaborative Editing
-
-```python
-# Server: broadcast an edit operation
-await bus.publish(
-    topic=f"doc:{document_id}",
-    event={
-        "event_type": "text_insert",
-        "position": 42,
-        "text": "hello",
-        "author": user.name,
-        "seq": operation_sequence,
-    },
-)
-```
-
-Recommendations:
-- Use sequence numbers for conflict detection and ordering
-- Deduplication prevents duplicate operations on reconnect
-- Use `request_snapshot()` for initial document state
-- Define granular event types: `text_insert`, `text_delete`, `cursor_move`
+**Cluster scaling:**
+- Use cluster mode for horizontal scaling across multiple nodes
+- Gossip discovery reduces configuration overhead - new nodes only need seed addresses
+- Interest-based routing ensures messages are only forwarded to peers with active subscribers
