@@ -25,6 +25,7 @@ pub enum JwtError {
     InvalidSignature,
     InvalidPayload,
     TokenExpired,
+    TokenNotYetValid,
     InvalidIssuer,
     InvalidAudience,
     Base64Error(base64::DecodeError),
@@ -40,6 +41,7 @@ impl std::fmt::Display for JwtError {
             Self::InvalidSignature => write!(f, "Invalid JWT signature"),
             Self::InvalidPayload => write!(f, "Invalid JWT payload"),
             Self::TokenExpired => write!(f, "Token expired"),
+            Self::TokenNotYetValid => write!(f, "Token not yet valid (nbf)"),
             Self::InvalidIssuer => write!(f, "Invalid issuer"),
             Self::InvalidAudience => write!(f, "Invalid audience"),
             Self::Base64Error(e) => write!(f, "Base64 decode error: {e}"),
@@ -139,7 +141,7 @@ fn jwt_decode_inner(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    // exp — required, reject tokens without expiration
+    // exp - required, reject tokens without expiration
     let exp = payload
         .get("exp")
         .and_then(|e| e.as_i64())
@@ -148,7 +150,15 @@ fn jwt_decode_inner(
         return Err(JwtError::TokenExpired);
     }
 
-    // iss — validate if config specifies issuer
+    // nbf - reject tokens not yet valid (RFC 7519 Section 4.1.5)
+    // Allow 5 minutes of clock skew
+    if let Some(nbf) = payload.get("nbf").and_then(|n| n.as_i64())
+        && now < nbf - 300
+    {
+        return Err(JwtError::TokenNotYetValid);
+    }
+
+    // iss - validate if config specifies issuer
     if let Some(expected_iss) = issuer {
         let token_iss = payload.get("iss").and_then(|i| i.as_str());
         if token_iss != Some(expected_iss) {
@@ -156,7 +166,7 @@ fn jwt_decode_inner(
         }
     }
 
-    // aud — validate if config specifies audience
+    // aud - validate if config specifies audience
     if let Some(expected_aud) = audience {
         let token_aud = payload.get("aud").and_then(|a| a.as_str());
         if token_aud != Some(expected_aud) {

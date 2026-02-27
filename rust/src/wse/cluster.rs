@@ -38,9 +38,8 @@ pub(crate) const MAX_FRAME_SIZE: usize = 1_048_576; // 1MB
 pub(crate) const HEARTBEAT_INTERVAL_SECS: u64 = 5;
 pub(crate) const HEARTBEAT_TIMEOUT_SECS: u64 = 15;
 pub(crate) const MAX_BATCH_BYTES: usize = 65_536;
-// All cluster channels are unbounded to prevent message drops.
-// Memory growth only happens during benchmarks (publisher >> consumer rate).
-// In production, message rates are bounded by real workload.
+// Cluster peer channels are bounded (10K messages) to prevent OOM from slow peers.
+// When a peer falls behind, messages are dropped and metrics.messages_dropped incremented.
 
 pub(crate) const PROTOCOL_VERSION_MIN: u16 = 1;
 
@@ -201,7 +200,7 @@ pub(crate) enum ClusterCommand {
 pub(crate) enum PeerRegistration {
     Register {
         peer_addr: String,
-        write_tx: mpsc::UnboundedSender<Bytes>,
+        write_tx: mpsc::Sender<Bytes>,
         negotiated_caps: u32,
     },
     Deregister {
@@ -293,7 +292,6 @@ pub(crate) struct ClusterDlqEntry {
 
 pub(crate) struct ClusterDlq {
     entries: VecDeque<ClusterDlqEntry>,
-    #[allow(dead_code)]
     max_entries: usize,
 }
 
@@ -305,7 +303,6 @@ impl ClusterDlq {
         }
     }
 
-    #[allow(dead_code)]
     pub fn push(&mut self, entry: ClusterDlqEntry) {
         if self.entries.len() >= self.max_entries {
             self.entries.pop_front();
@@ -319,6 +316,14 @@ impl ClusterDlq {
 
     pub fn drain_all(&mut self) -> Vec<ClusterDlqEntry> {
         self.entries.drain(..).collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn snapshot(&self) -> Vec<(String, String, String)> {
+        self.entries
+            .iter()
+            .map(|e| (e.topic.clone(), e.peer_addr.clone(), e.error.clone()))
+            .collect()
     }
 }
 
@@ -339,6 +344,14 @@ pub(crate) fn encode_msg(buf: &mut BytesMut, topic: &str, payload: &str) -> bool
         return false;
     }
     let payload_bytes = payload.as_bytes();
+    if payload_bytes.len() > MAX_FRAME_SIZE {
+        eprintln!(
+            "[WSE-Cluster] Payload too large ({} bytes, max {}), dropping message",
+            payload_bytes.len(),
+            MAX_FRAME_SIZE
+        );
+        return false;
+    }
     buf.reserve(8 + topic_bytes.len() + payload_bytes.len());
     buf.put_u8(MsgType::Msg as u8);
     buf.put_u8(0); // flags
@@ -701,6 +714,13 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             }
             let version = data.get_u16_le();
             let id_len = data.get_u16_le() as usize;
+            if id_len > 256 {
+                eprintln!(
+                    "[WSE-Cluster] Instance ID too long: {} bytes, max 256",
+                    id_len
+                );
+                return None;
+            }
             if data.remaining() < id_len + 4 {
                 return None;
             }
@@ -844,7 +864,7 @@ pub(crate) fn negotiate_capabilities(local: u32, remote: u32) -> u32 {
 // ---------------------------------------------------------------------------
 
 async fn peer_writer<W: AsyncWriteExt + Unpin>(
-    mut rx: mpsc::UnboundedReceiver<Bytes>,
+    mut rx: mpsc::Receiver<Bytes>,
     mut writer: W,
     cancel: CancellationToken,
     metrics: Arc<ClusterMetrics>,
@@ -930,7 +950,7 @@ async fn peer_dispatch_task(
 #[allow(clippy::too_many_arguments)]
 async fn peer_reader<R: AsyncReadExt + Unpin>(
     reader: R,
-    peer_write_tx: mpsc::UnboundedSender<Bytes>,
+    peer_write_tx: mpsc::Sender<Bytes>,
     peer_addr: String,
     interest_tx: mpsc::UnboundedSender<InterestUpdate>,
     connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
@@ -997,7 +1017,7 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
                 let mut pong = BytesMut::new();
                 encode_pong(&mut pong);
-                let _ = peer_write_tx.send(pong.freeze());
+                let _ = peer_write_tx.try_send(pong.freeze());
             }
             Some(ClusterFrame::Pong) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
@@ -1090,7 +1110,7 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
 // ---------------------------------------------------------------------------
 
 async fn heartbeat_task(
-    peer_write_tx: mpsc::UnboundedSender<Bytes>,
+    peer_write_tx: mpsc::Sender<Bytes>,
     cancel: CancellationToken,
     last_activity: Arc<AtomicU64>,
 ) {
@@ -1108,7 +1128,7 @@ async fn heartbeat_task(
                 }
                 let mut ping = BytesMut::new();
                 encode_ping(&mut ping);
-                if peer_write_tx.send(ping.freeze()).is_err() {
+                if peer_write_tx.try_send(ping.freeze()).is_err() {
                     break;
                 }
             }
@@ -1130,7 +1150,7 @@ async fn run_peer_session<R, W>(
     mut writer: W,
     peer_addr: &str,
     instance_id: &str,
-    data_rx: &mut mpsc::UnboundedReceiver<Bytes>,
+    data_rx: &mut mpsc::Receiver<Bytes>,
     interest_tx: &mpsc::UnboundedSender<InterestUpdate>,
     connections: &Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     topic_subscribers: &Arc<DashMap<String, DashSet<String>>>,
@@ -1313,7 +1333,7 @@ where
 
     // Spawn reader, writer, heartbeat with child cancellation token
     let peer_cancel = global_cancel.child_token();
-    let (peer_write_tx, peer_write_rx) = mpsc::unbounded_channel::<Bytes>();
+    let (peer_write_tx, peer_write_rx) = mpsc::channel::<Bytes>(10_000);
     let last_activity = Arc::new(AtomicU64::new(epoch_ms()));
 
     let writer_handle = tokio::spawn(peer_writer(
@@ -1357,7 +1377,7 @@ where
 
         match data {
             Some(frame_data) => {
-                let _ = peer_write_tx.send(frame_data);
+                let _ = peer_write_tx.try_send(frame_data);
             }
             None => {
                 // Manager channel closed (shutdown)
@@ -1386,7 +1406,7 @@ where
 async fn peer_connection_task(
     peer_addr: String,
     instance_id: String,
-    mut data_rx: mpsc::UnboundedReceiver<Bytes>,
+    mut data_rx: mpsc::Receiver<Bytes>,
     interest_tx: mpsc::UnboundedSender<InterestUpdate>,
     connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
@@ -1627,7 +1647,7 @@ impl PeerSpawnCtx {
     fn spawn(
         &self,
         peer_addr: String,
-        data_rx: mpsc::UnboundedReceiver<Bytes>,
+        data_rx: mpsc::Receiver<Bytes>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(peer_connection_task(
             peer_addr,
@@ -1661,7 +1681,7 @@ pub(crate) async fn cluster_manager(
     connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
     metrics: Arc<ClusterMetrics>,
-    _dlq: Arc<std::sync::Mutex<ClusterDlq>>,
+    dlq: Arc<std::sync::Mutex<ClusterDlq>>,
     local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     tls_config: Option<ClusterTlsConfig>,
     cluster_port: Option<u16>,
@@ -1692,7 +1712,7 @@ pub(crate) async fn cluster_manager(
 
     // Per-peer channels: manager sends encoded BytesMut, peer task forwards to writer
     // Each entry: (peer_addr, write_channel, negotiated_caps)
-    let mut peer_txs: Vec<(String, mpsc::UnboundedSender<Bytes>, u32)> = Vec::new();
+    let mut peer_txs: Vec<(String, mpsc::Sender<Bytes>, u32)> = Vec::new();
     let mut peer_handles = Vec::new();
 
     let spawn_ctx = PeerSpawnCtx {
@@ -1715,7 +1735,7 @@ pub(crate) async fn cluster_manager(
 
     for peer_addr in &peers {
         known_peers.insert(peer_addr.clone());
-        let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+        let (tx, rx) = mpsc::channel::<Bytes>(10_000);
         // Outbound peers: caps are negotiated in run_peer_session; default to full caps
         // since all peers in current deployment run the same version.
         peer_txs.push((peer_addr.clone(), tx, LOCAL_CAPABILITIES));
@@ -1876,10 +1896,25 @@ pub(crate) async fn cluster_manager(
                                 } else {
                                     plain_bytes.clone()
                                 };
-                                if tx.send(frame).is_ok() {
-                                    metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
-                                } else {
-                                    metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                                match tx.try_send(frame) {
+                                    Ok(()) => {
+                                        metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                                        eprintln!("[WSE-Cluster] Peer {peer_addr} backpressure, dropping message");
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                                        if let Ok(mut dlq_guard) = dlq.lock() {
+                                            dlq_guard.push(ClusterDlqEntry {
+                                                topic: topic.clone(),
+                                                payload: payload.clone(),
+                                                peer_addr: peer_addr.clone(),
+                                                error: "peer channel closed".to_string(),
+                                            });
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1889,7 +1924,7 @@ pub(crate) async fn cluster_manager(
                         if encode_sub(&mut frame_data, &topic) {
                             let frame_bytes = frame_data.freeze();
                             for (_, tx, _) in &peer_txs {
-                                let _ = tx.send(frame_bytes.clone());
+                                let _ = tx.try_send(frame_bytes.clone());
                             }
                         }
                     }
@@ -1898,7 +1933,7 @@ pub(crate) async fn cluster_manager(
                         if encode_unsub(&mut frame_data, &topic) {
                             let frame_bytes = frame_data.freeze();
                             for (_, tx, _) in &peer_txs {
-                                let _ = tx.send(frame_bytes.clone());
+                                let _ = tx.try_send(frame_bytes.clone());
                             }
                         }
                     }
@@ -1915,7 +1950,7 @@ pub(crate) async fn cluster_manager(
                         let frame_bytes = frame_data.freeze();
                         for (peer_addr, tx, _) in &peer_txs {
                             if *peer_addr != exclude_peer {
-                                let _ = tx.send(frame_bytes.clone());
+                                let _ = tx.try_send(frame_bytes.clone());
                             }
                         }
                     }
@@ -1923,9 +1958,24 @@ pub(crate) async fn cluster_manager(
                         let mut frame_data = BytesMut::new();
                         if encode_presence_update(&mut frame_data, &topic, &user_id, action, &data, updated_at) {
                             let frame_bytes = frame_data.freeze();
-                            for (_, tx, caps) in &peer_txs {
+                            for (peer_addr, tx, caps) in &peer_txs {
                                 if caps & CAP_PRESENCE != 0 {
-                                    let _ = tx.send(frame_bytes.clone());
+                                    match tx.try_send(frame_bytes.clone()) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            eprintln!("[WSE-Cluster] Peer {peer_addr} backpressure, dropping presence update");
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            if let Ok(mut dlq_guard) = dlq.lock() {
+                                                dlq_guard.push(ClusterDlqEntry {
+                                                    topic: topic.clone(),
+                                                    payload: data.clone(),
+                                                    peer_addr: peer_addr.clone(),
+                                                    error: "presence update failed".to_string(),
+                                                });
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1936,7 +1986,7 @@ pub(crate) async fn cluster_manager(
                         encode_shutdown(&mut shutdown_data);
                         let shutdown_bytes = shutdown_data.freeze();
                         for (peer_addr, tx, _) in &peer_txs {
-                            if tx.send(shutdown_bytes.clone()).is_err() {
+                            if tx.try_send(shutdown_bytes.clone()).is_err() {
                                 eprintln!("[WSE-Cluster] Could not send SHUTDOWN to {peer_addr}");
                             }
                         }
@@ -1956,7 +2006,7 @@ pub(crate) async fn cluster_manager(
                 let is_self = cluster_addr.as_deref() == Some(&new_addr);
                 let already_known = !known_peers.insert(new_addr.clone());
                 if !is_self && !already_known && !peer_txs.iter().any(|(a, _, _)| a == &new_addr) {
-                    let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+                    let (tx, rx) = mpsc::channel::<Bytes>(10_000);
                     peer_txs.push((new_addr.clone(), tx, LOCAL_CAPABILITIES));
                     peer_handles.push(spawn_ctx.spawn(new_addr.clone(), rx));
                     eprintln!("[WSE-Cluster] Discovered new peer: {new_addr}");
@@ -1982,14 +2032,14 @@ pub(crate) async fn cluster_manager(
                     let frame_bytes = frame_data.freeze();
                     for (peer_addr, tx, _) in &peer_txs {
                         if *peer_addr != exclude_peer {
-                            let _ = tx.send(frame_bytes.clone());
+                            let _ = tx.try_send(frame_bytes.clone());
                         }
                     }
                     // Only spawn connection to this peer if we don't already know it
                     if known_peers.insert(addr.clone())
                         && !peer_txs.iter().any(|(a, _, _)| a == &addr)
                     {
-                        let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+                        let (tx, rx) = mpsc::channel::<Bytes>(10_000);
                         peer_txs.push((addr.clone(), tx, LOCAL_CAPABILITIES));
                         peer_handles.push(spawn_ctx.spawn(addr.clone(), rx));
                         eprintln!("[WSE-Cluster] Discovered peer via gossip: {addr}");
@@ -2085,6 +2135,16 @@ pub(crate) async fn cluster_manager(
             }
             () = global_cancel.cancelled() => break,
         }
+
+        // Prune dead peer channels (receiver dropped = peer task exited)
+        peer_txs.retain(|(addr, tx, _)| {
+            if tx.is_closed() {
+                eprintln!("[WSE-Cluster] Pruning dead peer channel: {addr}");
+                false
+            } else {
+                true
+            }
+        });
     }
 
     // Wait for all peer tasks to finish
@@ -2260,7 +2320,7 @@ async fn handle_cluster_inbound_generic<S>(
     metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
 
     let cancel = global_cancel.child_token();
-    let (write_tx, write_rx) = mpsc::unbounded_channel::<Bytes>();
+    let (write_tx, write_rx) = mpsc::channel::<Bytes>(10_000);
     let last_activity = Arc::new(AtomicU64::new(epoch_ms()));
 
     // Register this inbound peer's write channel with the cluster manager

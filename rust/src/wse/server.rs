@@ -1791,19 +1791,24 @@ impl RustWSEServer {
                                         let _ = sock.set_send_buffer_size(262_144);
                                         let shared2 = shared.clone();
                                         tokio::spawn(async move {
-                                            // Protocol detection: peek first byte to distinguish
-                                            // cluster binary frames (first byte 0x00 = length prefix
-                                            // for frames < 16MB) from HTTP/WS (first byte is ASCII
-                                            // letter like 'G' for GET). Timeout handles misbehaving
-                                            // clients that connect but never send data.
-                                            // Note: TLS ClientHello starts with 0x16 -- if direct
-                                            // TLS termination is added, update this check.
-                                            let mut peek = [0u8; 1];
+                                            // Protocol detection: peek first 4 bytes to distinguish
+                                            // cluster binary frames (4-byte big-endian length prefix:
+                                            // 0x00 0x00 0x00 XX for frames < 256 bytes) from HTTP/WS
+                                            // (first byte is ASCII letter like 'G' for GET) or TLS
+                                            // (first byte 0x16 for ClientHello).
+                                            let mut peek = [0u8; 4];
                                             let is_cluster = match tokio::time::timeout(
                                                 Duration::from_secs(5),
                                                 stream.peek(&mut peek),
                                             ).await {
-                                                Ok(Ok(1)) => peek[0] == 0x00,
+                                                Ok(Ok(n)) if n >= 4 => {
+                                                    // Cluster frames start with 4-byte big-endian length prefix.
+                                                    // Valid HELLO is 20-200 bytes, so first 3 bytes are 0x00.
+                                                    // HTTP starts with ASCII letter (GET, POST, etc).
+                                                    // TLS ClientHello starts with 0x16.
+                                                    peek[0] == 0x00 && peek[1] == 0x00 && peek[2] == 0x00 && peek[3] > 0
+                                                }
+                                                Ok(Ok(1..=3)) => peek[0] == 0x00, // Fallback for partial peek
                                                 _ => false,
                                             };
                                             if is_cluster {

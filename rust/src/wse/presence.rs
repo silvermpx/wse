@@ -469,6 +469,14 @@ impl PresenceManager {
     /// Merge full presence state from a peer (called on peer connect).
     /// Expected JSON format: {"topic": {"user_id": {"data": {...}, "updated_at": 123}}}
     pub fn merge_full_state(&self, entries_json: &str) {
+        // Cap incoming full state to 10MB to prevent OOM
+        if entries_json.len() > 10_000_000 {
+            eprintln!(
+                "[Presence] Full state too large ({} bytes, max 10MB), rejecting",
+                entries_json.len()
+            );
+            return;
+        }
         let parsed: serde_json::Value = match serde_json::from_str(entries_json) {
             Ok(v) => v,
             Err(_) => return,
