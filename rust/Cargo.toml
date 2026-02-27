@@ -24,7 +24,7 @@ p256 = { version = "0.13", features = ["ecdh", "jwk"] }
 hkdf = "0.12"
 uuid = { version = "1.21.0", features = ["v7"] }
 base64 = "0.22"
-chrono = { version = "0.4.43", features = ["serde"] }
+chrono = { version = "0.4.44", features = ["serde"] }
 regex = "1.12.3"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "sync", "net", "time", "io-util"] }
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
