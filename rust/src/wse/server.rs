@@ -105,15 +105,6 @@ fn clone_tcp_stream(stream: TcpStream) -> std::io::Result<(TcpStream, TcpStream)
     ))
 }
 
-/// Current wall-clock time as milliseconds since UNIX epoch (for presence timestamps).
-#[allow(dead_code)]
-fn epoch_ms_server() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 // ---------------------------------------------------------------------------
 // Drain mode: inbound event queue (replaces per-message callbacks)
 // ---------------------------------------------------------------------------
@@ -146,13 +137,11 @@ enum InboundEvent {
     Disconnect {
         conn_id: String,
     },
-    #[allow(dead_code)]
     PresenceJoin {
         topic: String,
         user_id: String,
         data: serde_json::Value,
     },
-    #[allow(dead_code)]
     PresenceLeave {
         topic: String,
         user_id: String,
@@ -191,42 +180,6 @@ enum ServerCommand {
     Shutdown,
 }
 
-// ---------------------------------------------------------------------------
-// Presence tracking data structures
-// ---------------------------------------------------------------------------
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-struct PresenceEntry {
-    user_id: String,
-    data: serde_json::Value,
-    connections: Vec<ConnMeta>,
-    updated_at: u64,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-struct ConnMeta {
-    conn_id: String,
-    joined_at: u64,
-}
-
-#[allow(dead_code)]
-struct PresenceStats {
-    num_users: AtomicUsize,
-    num_connections: AtomicUsize,
-}
-
-impl PresenceStats {
-    #[allow(dead_code)]
-    fn new() -> Self {
-        Self {
-            num_users: AtomicUsize::new(0),
-            num_connections: AtomicUsize::new(0),
-        }
-    }
-}
-
 pub(crate) struct SharedState {
     pub(crate) connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     max_connections: usize,
@@ -261,24 +214,8 @@ pub(crate) struct SharedState {
     pub(crate) recovery: Option<Arc<super::recovery::RecoveryManager>>,
     // Per-connection last activity tracking for zombie detection
     conn_last_activity: DashMap<String, std::time::Instant>,
-    // Presence tracking
-    #[allow(dead_code)]
-    presence_enabled: bool,
-    #[allow(dead_code)]
-    presence_max_data_size: usize,
-    #[allow(dead_code)]
-    presence_max_members: usize,
-    // topic -> user_id -> PresenceEntry
-    #[allow(dead_code)]
-    topic_presence: Arc<DashMap<String, DashMap<String, PresenceEntry>>>,
-    // topic -> PresenceStats (incremental counters)
-    #[allow(dead_code)]
-    topic_presence_stats: Arc<DashMap<String, PresenceStats>>,
-    // conn_id -> user_id (persisted from JWT handshake for presence lookups)
-    conn_user_id: DashMap<String, String>,
-    // conn_id -> set of topics where this conn has presence
-    #[allow(dead_code)]
-    conn_presence_topics: DashMap<String, DashSet<String>>,
+    // Presence tracking (None when disabled)
+    pub(crate) presence: Option<Arc<super::presence::PresenceManager>>,
 }
 
 impl SharedState {
@@ -317,13 +254,14 @@ impl SharedState {
             local_topic_refcount: Arc::new(std::sync::Mutex::new(HashMap::new())),
             recovery,
             conn_last_activity: DashMap::new(),
-            presence_enabled,
-            presence_max_data_size,
-            presence_max_members,
-            topic_presence: Arc::new(DashMap::new()),
-            topic_presence_stats: Arc::new(DashMap::new()),
-            conn_user_id: DashMap::new(),
-            conn_presence_topics: DashMap::new(),
+            presence: if presence_enabled {
+                Some(Arc::new(super::presence::PresenceManager::new(
+                    presence_max_data_size,
+                    presence_max_members,
+                )))
+            } else {
+                None
+            },
         }
     }
 
@@ -776,10 +714,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     // Fire on_connect (drain mode: push to queue; callback mode: background task)
     if drain {
         if let Some(user_id) = rust_auth_user_id {
-            // Persist user_id for presence lookups
-            state
-                .conn_user_id
-                .insert(conn_id.to_string(), user_id.clone());
+            // Register user_id for presence lookups
+            if let Some(ref pm) = state.presence {
+                pm.register_connection(&conn_id, &user_id);
+            }
             // Rust validated JWT — send AuthConnect (Python skips JWT decode)
             state.push_inbound(InboundEvent::AuthConnect {
                 conn_id: (*conn_id).clone(),
@@ -1134,8 +1072,21 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     state.conn_formats.remove(&*conn_id);
     state.conn_rates.remove(&*conn_id);
     state.conn_last_activity.remove(&*conn_id);
-    state.conn_user_id.remove(&*conn_id);
-    state.conn_presence_topics.remove(&*conn_id);
+    // Presence cleanup: untrack from all topics before disconnect event
+    if let Some(ref pm) = state.presence {
+        let results = pm.remove_connection(&conn_id);
+        if drain {
+            for (topic, result) in results {
+                if let super::presence::UntrackResult::LastLeave { user_id, data } = result {
+                    state.push_inbound(InboundEvent::PresenceLeave {
+                        topic,
+                        user_id,
+                        data,
+                    });
+                }
+            }
+        }
+    }
     // Pub/Sub cleanup: remove connection from all subscribed topics
     if let Some((_, topics)) = state.conn_topics.remove(&*conn_id) {
         let mut disconnected_topics = Vec::new();
@@ -1616,14 +1567,30 @@ impl RustWSEServer {
                                 }
                                 // Force-remove zombies that didn't respond to Close
                                 if !force_remove.is_empty() {
+                                    let drain = ping_state.drain_mode.load(Ordering::Relaxed);
+                                    // Presence cleanup for zombies
+                                    if let Some(ref pm) = ping_state.presence {
+                                        for cid in &force_remove {
+                                            let results = pm.remove_connection(cid);
+                                            if drain {
+                                                for (topic, result) in results {
+                                                    if let super::presence::UntrackResult::LastLeave { user_id, data } = result {
+                                                        ping_state.push_inbound(InboundEvent::PresenceLeave {
+                                                            topic,
+                                                            user_id,
+                                                            data,
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     let mut conns =
                                         ping_state.connections.write().await;
                                     for cid in &force_remove {
                                         conns.remove(cid);
                                         ping_state.conn_formats.remove(cid);
                                         ping_state.conn_rates.remove(cid);
-                                        ping_state.conn_user_id.remove(cid);
-                                        ping_state.conn_presence_topics.remove(cid);
                                     }
                                     ping_state.connection_count.store(
                                         conns.len(),
@@ -2321,7 +2288,13 @@ impl RustWSEServer {
 
     // -- Topic subscriptions --------------------------------------------------
 
-    fn subscribe_connection(&self, conn_id: &str, topics: Vec<String>) -> PyResult<()> {
+    #[pyo3(signature = (conn_id, topics, presence_data = None))]
+    fn subscribe_connection(
+        &self,
+        conn_id: &str,
+        topics: Vec<String>,
+        presence_data: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
         // Acquire refcount lock first to keep subscription + refcount atomic
         let cluster_tx = self.shared.cluster_cmd_tx.read().unwrap().clone();
         let mut refcounts = if cluster_tx.is_some() {
@@ -2360,6 +2333,24 @@ impl RustWSEServer {
             }
         }
 
+        // Presence tracking
+        if let (Some(pm), Some(pd)) = (&self.shared.presence, &presence_data) {
+            let data = pyobj_to_json(pd.as_any());
+            let drain = self.shared.drain_mode.load(Ordering::Relaxed);
+            for topic in &topics {
+                if let super::presence::TrackResult::FirstJoin { user_id, data } =
+                    pm.track(conn_id, topic, &data)
+                    && drain
+                {
+                    self.shared.push_inbound(InboundEvent::PresenceJoin {
+                        topic: topic.clone(),
+                        user_id,
+                        data,
+                    });
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -2373,8 +2364,8 @@ impl RustWSEServer {
         epoch: Option<String>,
         offset: Option<u64>,
     ) -> PyResult<Py<PyDict>> {
-        // Step 1: Subscribe using existing logic
-        self.subscribe_connection(conn_id, topics.clone())?;
+        // Step 1: Subscribe using existing logic (no presence tracking for recovery)
+        self.subscribe_connection(conn_id, topics.clone(), None)?;
 
         // Step 2: Get connection tx (clone it, drop the lock)
         let tx = if recover {
@@ -2544,6 +2535,23 @@ impl RustWSEServer {
                 removed
             }
         };
+
+        // Presence cleanup for removed topics
+        if let Some(ref pm) = self.shared.presence {
+            let results = pm.untrack_topics(conn_id, &removed_topics);
+            let drain = self.shared.drain_mode.load(Ordering::Relaxed);
+            for (topic, result) in results {
+                if let super::presence::UntrackResult::LastLeave { user_id, data } = result
+                    && drain
+                {
+                    self.shared.push_inbound(InboundEvent::PresenceLeave {
+                        topic,
+                        user_id,
+                        data,
+                    });
+                }
+            }
+        }
 
         // Emit UNSUB to cluster for topics whose refcount went 1->0
         if let (Some(tx), Some(rc)) = (&cluster_tx, &mut refcounts) {

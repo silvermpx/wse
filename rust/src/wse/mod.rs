@@ -2,6 +2,7 @@ pub mod cluster;
 
 pub mod compression;
 pub mod filters;
+pub(crate) mod presence;
 pub mod queue;
 pub mod rate_limiter;
 pub(crate) mod recovery;
