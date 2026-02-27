@@ -257,7 +257,6 @@ impl PresenceManager {
 
     /// Query all members in a topic.
     /// Returns: Vec<(user_id, data, connection_count)>
-    #[allow(dead_code)]
     pub fn query(&self, topic: &str) -> Vec<(String, serde_json::Value, usize)> {
         let mut members = Vec::new();
         if let Some(topic_map) = self.topic_presence.get(topic) {
@@ -274,7 +273,6 @@ impl PresenceManager {
     }
 
     /// Get lightweight stats for a topic (O(1)).
-    #[allow(dead_code)]
     pub fn stats(&self, topic: &str) -> (usize, usize) {
         if let Some(stats) = self.topic_presence_stats.get(topic) {
             (
@@ -287,7 +285,6 @@ impl PresenceManager {
     }
 
     /// Update presence data for a connection across all its topics.
-    #[allow(dead_code)]
     pub fn update_data(&self, conn_id: &str, new_data: &serde_json::Value) -> bool {
         // Validate size
         let data_str = serde_json::to_string(new_data).unwrap_or_default();
@@ -318,13 +315,11 @@ impl PresenceManager {
     }
 
     /// Get total presence-tracked topics count.
-    #[allow(dead_code)]
     pub fn total_topics(&self) -> usize {
         self.topic_presence.len()
     }
 
     /// Get total unique user count across all topics.
-    #[allow(dead_code)]
     pub fn total_users(&self) -> usize {
         self.topic_presence
             .iter()

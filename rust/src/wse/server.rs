@@ -2685,6 +2685,14 @@ impl RustWSEServer {
             dict.set_item("recovery_topic_count", 0)?;
             dict.set_item("recovery_total_bytes", 0)?;
         }
+        // Presence metrics
+        if let Some(ref pm) = self.shared.presence {
+            dict.set_item("presence_enabled", true)?;
+            dict.set_item("presence_topics", pm.total_topics())?;
+            dict.set_item("presence_total_users", pm.total_users())?;
+        } else {
+            dict.set_item("presence_enabled", false)?;
+        }
         Ok(dict.unbind())
     }
 
@@ -2703,6 +2711,52 @@ impl RustWSEServer {
             list.append(d)?;
         }
         Ok(list.unbind())
+    }
+
+    /// Get all members currently present in a topic.
+    /// Returns dict: {user_id: {"data": {...}, "connections": N}}
+    fn presence(&self, py: Python<'_>, topic: &str) -> PyResult<Py<PyDict>> {
+        let result = PyDict::new(py);
+
+        if let Some(ref pm) = self.shared.presence {
+            for (user_id, data, conn_count) in pm.query(topic) {
+                let user_dict = PyDict::new(py);
+                user_dict.set_item("data", json_to_pyobj(py, &data))?;
+                user_dict.set_item("connections", conn_count)?;
+                result.set_item(user_id.as_str(), user_dict)?;
+            }
+        }
+
+        Ok(result.into())
+    }
+
+    /// Get lightweight presence counters for a topic (O(1), no iteration).
+    /// Returns dict: {"num_users": N, "num_connections": M}
+    fn presence_stats(&self, py: Python<'_>, topic: &str) -> PyResult<Py<PyDict>> {
+        let result = PyDict::new(py);
+        if let Some(ref pm) = self.shared.presence {
+            let (users, conns) = pm.stats(topic);
+            result.set_item("num_users", users)?;
+            result.set_item("num_connections", conns)?;
+        } else {
+            result.set_item("num_users", 0)?;
+            result.set_item("num_connections", 0)?;
+        }
+        Ok(result.into())
+    }
+
+    /// Update presence data for a connection across all its presence topics.
+    #[pyo3(signature = (conn_id, data))]
+    fn update_presence(&self, conn_id: &str, data: &Bound<'_, PyDict>) -> PyResult<()> {
+        if let Some(ref pm) = self.shared.presence {
+            let new_data = pyobj_to_json(data.as_any());
+            if !pm.update_data(conn_id, &new_data) {
+                return Err(PyRuntimeError::new_err(
+                    "Failed to update presence data (size limit or unknown connection)",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
