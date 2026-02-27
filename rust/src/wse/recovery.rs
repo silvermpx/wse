@@ -1,7 +1,10 @@
 use bytes::Bytes;
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// Global counter to guarantee unique epochs even for rapid buffer re-creation.
+static EPOCH_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
 // RecoveryResult
@@ -92,12 +95,14 @@ impl TopicRecoveryBuffer {
         let mut entries = Vec::with_capacity(capacity as usize);
         entries.resize_with(capacity as usize, || None);
 
-        // Generate a unique epoch from system time + PID (no external rand dependency).
+        // Generate a unique epoch: time + PID + counter (no external rand dependency).
+        // Counter guarantees uniqueness even for rapid buffer re-creation within same process.
         let epoch = (SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u32)
-            ^ (std::process::id());
+            .wrapping_add(std::process::id())
+            .wrapping_add(EPOCH_COUNTER.fetch_add(1, Ordering::Relaxed));
 
         Self {
             entries: entries.into_boxed_slice(),
@@ -148,8 +153,9 @@ impl TopicRecoveryBuffer {
     /// Returns `None` if `after_offset` is older than the tail (gap too large).
     /// Results are capped at `max_messages`.
     fn recover_since(&self, after_offset: u64, max_messages: usize) -> Option<Vec<Bytes>> {
-        // If the requested offset is before our tail, we can't recover -- gap too large.
-        if after_offset < self.tail_offset && self.head_offset > 0 {
+        // If the first message we need (after_offset + 1) is before the tail,
+        // those messages have been evicted -- gap too large.
+        if self.head_offset > 0 && after_offset.saturating_add(1) < self.tail_offset {
             return None;
         }
 
@@ -246,6 +252,19 @@ impl RecoveryManager {
 
         match buf.recover_since(after_offset, self.config.max_recovery_messages) {
             Some(publications) => {
+                // Check if recovery was truncated by the cap -- if so, the client
+                // is missing messages and should re-fetch from the application backend
+                // (matches Centrifugo's behavior for recovery_max_publication_limit).
+                let available = buf
+                    .head_offset
+                    .saturating_sub(after_offset.saturating_add(1))
+                    as usize;
+                if available > self.config.max_recovery_messages {
+                    return RecoveryResult::NotRecovered {
+                        epoch: buf.epoch,
+                        offset: buf.head_offset,
+                    };
+                }
                 let offset = buf.head_offset.saturating_sub(1);
                 RecoveryResult::Recovered {
                     publications,
@@ -363,8 +382,13 @@ mod tests {
         assert_eq!(buf.head_offset, 10);
         assert_eq!(buf.tail_offset, 6);
 
-        // Trying to recover from offset 3 (before tail) should return None.
+        // Trying to recover from offset 3 (well before tail=6) should return None.
         assert!(buf.recover_since(3, 500).is_none());
+
+        // Boundary: after_offset=5, start=6 which IS the tail -- should succeed.
+        let boundary = buf.recover_since(5, 500).unwrap();
+        assert_eq!(boundary.len(), 4); // offsets 6, 7, 8, 9
+        assert_eq!(&boundary[0][..], b"msg6");
 
         // Recover from offset 7 should return msgs 8 and 9.
         let recovered = buf.recover_since(7, 500).unwrap();
@@ -478,16 +502,27 @@ mod tests {
 
         let (epoch, _) = mgr.get_position("topic1").unwrap();
 
+        // 14 messages after offset 5, but cap is 3 -- should return NotRecovered
+        // (matches Centrifugo: truncated recovery = incomplete = must re-fetch)
         match mgr.recover("topic1", epoch, 5) {
-            RecoveryResult::Recovered { publications, .. } => {
-                // Should be capped at max_recovery_messages=3 even though
-                // there are 14 messages after offset 5.
-                assert_eq!(publications.len(), 3);
-                assert_eq!(&publications[0][..], b"msg6");
-                assert_eq!(&publications[1][..], b"msg7");
-                assert_eq!(&publications[2][..], b"msg8");
+            RecoveryResult::NotRecovered {
+                epoch: ep,
+                offset: off,
+            } => {
+                assert_eq!(ep, epoch);
+                assert_eq!(off, 20); // head_offset
             }
-            _ => panic!("expected Recovered"),
+            _ => panic!("expected NotRecovered when cap truncates"),
+        }
+
+        // But if the gap is within the cap (e.g., after_offset=17, 2 messages to recover)
+        match mgr.recover("topic1", epoch, 17) {
+            RecoveryResult::Recovered { publications, .. } => {
+                assert_eq!(publications.len(), 2); // offsets 18, 19
+                assert_eq!(&publications[0][..], b"msg18");
+                assert_eq!(&publications[1][..], b"msg19");
+            }
+            _ => panic!("expected Recovered when within cap"),
         }
     }
 }

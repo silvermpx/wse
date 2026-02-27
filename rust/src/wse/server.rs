@@ -1271,11 +1271,12 @@ impl RustWSEServer {
             }
         });
         let recovery = if recovery_enabled {
-            // Find the power-of-two exponent for buffer size
-            let bits = if recovery_buffer_size.is_power_of_two() {
-                recovery_buffer_size.trailing_zeros()
+            // Find the power-of-two exponent for buffer size (minimum 16 slots)
+            let clamped = recovery_buffer_size.max(16);
+            let bits = if clamped.is_power_of_two() {
+                clamped.trailing_zeros()
             } else {
-                recovery_buffer_size.next_power_of_two().trailing_zeros()
+                clamped.next_power_of_two().trailing_zeros()
             };
             Some(Arc::new(super::recovery::RecoveryManager::new(
                 super::recovery::RecoveryConfig {
