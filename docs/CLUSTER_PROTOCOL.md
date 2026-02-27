@@ -80,7 +80,7 @@ Negotiated capabilities are the bitwise AND of both peers. A feature is only act
 [header: type=0x05, all other fields zero]
 ```
 
-Sent when a node is shutting down cleanly. The receiving peer removes the sender from its peer table without triggering reconnection logic. Each peer is given up to 500ms to acknowledge the shutdown before the connection is forcibly closed.
+Sent when a node is shutting down cleanly. The receiving peer removes the sender from its peer table without triggering reconnection logic. After sending SHUTDOWN to all peers, the node cancels all peer tasks immediately.
 
 ### SUB (0x06) - Topic Subscribe
 
@@ -196,7 +196,7 @@ MSG frames with payloads above 256 bytes may be zstd-compressed when both peers 
 
 Compression is opportunistic: the sender compresses the payload and only uses the compressed form if it is smaller than the original. If compression does not reduce size, the uncompressed payload is sent with FLAG_COMPRESSED cleared.
 
-**Decompression bomb protection**: the receiver rejects any frame where the decompressed-to-compressed size ratio exceeds 10:1. This prevents a malicious or corrupted peer from sending a small compressed payload that expands into an arbitrarily large buffer.
+**Decompression bomb protection**: the receiver rejects any frame where the decompressed-to-compressed size ratio exceeds 100:1, and rejects compressed payloads smaller than 8 bytes (insufficient for a valid zstd frame). Maximum decompressed size is capped at 1 MB (MAX_FRAME_SIZE). This prevents a malicious or corrupted peer from sending a small compressed payload that expands into an arbitrarily large buffer.
 
 ## mTLS
 
@@ -230,10 +230,10 @@ Gossip is lightweight - PeerAnnounce and PeerList are only exchanged during join
 | Heartbeat | PING every 5s, timeout 15s |
 | Circuit breaker | 10-failure threshold, 60s reset |
 | Reconnect | Exponential backoff: 1s initial, 1.5x multiplier, 60s max, with jitter |
-| Graceful shutdown | SHUTDOWN frame, 500ms per-peer drain timeout |
+| Graceful shutdown | SHUTDOWN frame sent to all peers, then immediate cancel |
 | Dead letter queue | 1,000 entries, FIFO eviction |
 | Write batching | 64 KB batch limit per flush |
-| Backpressure | Bounded per-peer channel (8,192 capacity), messages dropped on overflow |
+| Backpressure | Bounded per-peer channel (10,000 capacity), messages dropped on overflow |
 
 ### Circuit Breaker
 

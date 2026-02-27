@@ -391,6 +391,12 @@ Three outcomes:
 | max_recovery_messages  | 500       | Max messages returned per recovery    |
 | global_memory_budget   | 256 MB    | Total memory across all topic buffers |
 
+### Cluster Limitation
+
+Message recovery is **local to each node**. Recovery ring buffers are not replicated across cluster peers. If a client reconnects to a different node than the one it was originally connected to, recovery will return `NoHistory` because that node has no record of the client's previous position.
+
+For cluster deployments, use **sticky sessions** (e.g., HAProxy with `stick-table`, or consistent hashing by user ID) to ensure clients reconnect to the same node. Alternatively, accept that recovery works only for same-node reconnections and handle `NoHistory` by re-subscribing from scratch.
+
 ---
 
 ## Presence Tracking
@@ -679,6 +685,7 @@ For deployments where direct TCP mesh is not feasible, `broadcast(topic, data)` 
 | conn_last_activity| DashMap                     | Per-connection write       |
 | inbound channel   | crossbeam bounded channel   | MPSC, lock-free           |
 | connection channel| tokio mpsc::unbounded       | SPSC per connection       |
+| cluster peer data | tokio mpsc::bounded(10K)    | Per-peer backpressure     |
 | cluster command   | tokio mpsc::unbounded       | MPSC                      |
 | recovery buffers  | DashMap<TopicRecoveryBuffer>| Per-topic write lock      |
 | presence state    | DashMap<DashMap<PresenceEntry>>| Per-topic per-user write |

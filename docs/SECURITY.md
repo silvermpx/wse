@@ -13,7 +13,7 @@ WSE supports three authentication methods, chosen based on client type:
 | **API / CLI** | Authorization header | `Authorization: Bearer <JWT>` |
 
 **Why cookies for browsers (OWASP recommended):**
-- Browsers **cannot** set custom headers (`Authorization`) during the WebSocket upgrade handshake — the `new WebSocket(url)` API has no header parameter
+- Browsers **cannot** set custom headers (`Authorization`) during the WebSocket upgrade handshake - the `new WebSocket(url)` API has no header parameter
 - HTTP-only cookies are immune to XSS (JavaScript cannot read them)
 - `sameSite=Lax` prevents CSRF on cross-origin requests
 - `secure` ensures HTTPS-only transmission
@@ -27,14 +27,14 @@ WSE supports three authentication methods, chosen based on client type:
 
 The Rust server reads authentication credentials in this order:
 
-1. **HTTP-only cookie**: `access_token` from the `Cookie` header (primary — covers browsers)
-2. **Authorization header**: `Authorization: Bearer <JWT>` (fallback — covers backend clients)
+1. **HTTP-only cookie**: `access_token` from the `Cookie` header (primary - covers browsers)
+2. **Authorization header**: `Authorization: Bearer <JWT>` (fallback - covers backend clients)
 
 Both paths use HS256 (HMAC-SHA256) JWT validation.
 
 ### Rust JWT (recommended, v1.2+)
 
-When `jwt_secret` is configured on the `RustWSEServer`, JWT validation happens entirely in Rust during the WebSocket handshake — zero Python involvement, zero GIL acquisition:
+When `jwt_secret` is configured on the `RustWSEServer`, JWT validation happens entirely in Rust during the WebSocket handshake - zero Python involvement, zero GIL acquisition:
 
 ```python
 server = RustWSEServer(
@@ -186,7 +186,7 @@ E:<IV (12 bytes)><AES-GCM ciphertext>
 
 **Enable encryption:**
 ```typescript
-// Frontend -- useWSE hook initializes SecurityManager automatically
+// Frontend - useWSE hook initializes SecurityManager automatically
 const { } = useWSE({
   security: { encryptionEnabled: true },
 });
@@ -197,23 +197,81 @@ ws://host:port/wse?token=<JWT>&encryption=true
 
 The `SecurityManager` singleton handles ECDH key exchange, AES-GCM encryption/decryption, and key rotation. The `MessageProcessor` automatically decrypts incoming `E:`-prefixed binary frames using `securityManager.decryptFromTransport()`.
 
-## Rate Limiting
+## Cluster Security
 
-### Server-Side
+### Mutual TLS (mTLS)
 
-Token bucket rate limiter per connection:
-- **Capacity**: 1,000 tokens
-- **Refill rate**: 100 tokens/second
-- **Burst**: Up to 1,000 messages instantly, then 100/sec sustained
+All cluster peer connections support mutual TLS for authentication and encryption.
 
-When rate limit is exceeded:
-1. Message is dropped
-2. Client receives `rate_limit_warning` message
-3. `retry_after` field indicates when to resume
+Configuration:
+```python
+server.connect_cluster(
+    peers=["10.0.0.2:9999"],
+    tls_ca="/etc/wse/ca.pem",
+    tls_cert="/etc/wse/node.pem",
+    tls_key="/etc/wse/node.key",
+    cluster_port=9999,
+)
+```
+
+Details:
+- TLS library: rustls + tokio-rustls
+- Certificate curves: P-256 (NIST)
+- Client verification: WebPkiClientVerifier (both sides present and verify certificates)
+- Single certificate/key pair for both server and client roles
+- TLS version: 1.3 by default (1.2 fallback)
+- Without TLS config, cluster connections use plaintext TCP (trusted networks only)
+
+Certificate generation example:
+```bash
+openssl ecparam -genkey -name prime256v1 -out ca.key
+openssl req -new -x509 -key ca.key -out ca.pem -days 365 -subj "/CN=WSE CA"
+
+openssl ecparam -genkey -name prime256v1 -out node.key
+openssl req -new -key node.key -out node.csr -subj "/CN=wse-node-1"
+openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out node.pem -days 365
+```
+
+## Connection Security
+
+### Rate Limiting
+
+Per-connection token bucket rate limiter:
+- **Capacity**: 100,000 tokens
+- **Refill rate**: 10,000 tokens/second
+- **Exceeded**: client receives error with code `RATE_LIMITED`
+- **Warning**: sent at 20% remaining capacity
 
 ### Client-Side
 
 The frontend `RateLimiter` prevents excessive sends.
+
+### Zombie Detection
+
+- Server pings every 25 seconds
+- Connections with no activity for 60 seconds are force-closed
+
+### Connection Limits
+
+- `max_connections` caps total concurrent WebSocket connections
+- Inbound queue bounded at 131,072 events
+- Per-connection deduplication: 50,000-entry AHashSet with FIFO eviction
+
+## Wire-Level Security
+
+### Cluster Frame Protection
+
+- Maximum frame size: 1,048,576 bytes (1 MB)
+- zstd decompression bomb protection: ratio > 100:1 rejected, min 8 bytes compressed
+- Protocol version validation in handshake
+- Unknown message types silently ignored (forward compatibility)
+
+### Client Frame Protection
+
+- WebSocket frame size limited to 1 MB
+- JSON parsing with serde_json (no eval, no injection)
+- User ID from JWT escaped via serde_json in server_ready
+- Binary frames parsed as msgpack or raw bytes (no code execution)
 
 ## Circuit Breaker
 
@@ -239,18 +297,6 @@ When circuit breaker opens:
 3. After reset timeout, transitions to `HALF_OPEN`
 4. On success, closes; on failure, reopens
 
-## Message Size Limits
-
-- **Maximum message size**: 1 MB (1,048,576 bytes)
-- Messages exceeding this limit are rejected with `MESSAGE_TOO_LARGE` error
-- Protocol error counter incremented
-
-## Deduplication
-
-- Server: `deque(maxlen=1000)` for seen message IDs
-- Client: `OrderedDict` with FIFO eviction (5,000 entries)
-- Duplicate messages are silently dropped (metric incremented)
-
 ## Replay Attack Prevention
 
 Frontend nonce cache:
@@ -267,6 +313,7 @@ Frontend nonce cache:
 3. **Rotate JWT secrets** periodically
 4. **Enable signing** for critical operations
 5. **Enable encryption** for sensitive data (PII, credentials)
-6. **Monitor circuit breaker** state for connection health
-7. **Set up DLQ monitoring** for failed message delivery
+6. **Enable mTLS** for cluster peer connections in production
+7. **Monitor circuit breaker** state for connection health
 8. **Use HTTP-only cookies** for web clients (prevents XSS token theft)
+9. **Use separate CA** for cluster certificates (isolate trust domains)
