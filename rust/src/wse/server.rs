@@ -168,7 +168,7 @@ struct PerConnRate {
 const RATE_CAPACITY: f64 = 100_000.0;
 const RATE_REFILL: f64 = 10_000.0; // tokens per second
 
-enum ServerCommand {
+pub(crate) enum ServerCommand {
     SendText { conn_id: String, data: String },
     SendBytes { conn_id: String, data: Vec<u8> },
     SendPrebuilt { conn_id: String, message: Message },
@@ -216,6 +216,9 @@ pub(crate) struct SharedState {
     conn_last_activity: DashMap<String, std::time::Instant>,
     // Presence tracking (None when disabled)
     pub(crate) presence: Option<Arc<super::presence::PresenceManager>>,
+    // Sender for presence broadcasts from disconnect cleanup paths
+    // (where self.cmd_tx is not available, only Arc<SharedState>)
+    presence_broadcast_tx: std::sync::RwLock<Option<mpsc::UnboundedSender<ServerCommand>>>,
 }
 
 impl SharedState {
@@ -262,6 +265,7 @@ impl SharedState {
             } else {
                 None
             },
+            presence_broadcast_tx: std::sync::RwLock::new(None),
         }
     }
 
@@ -394,6 +398,20 @@ fn json_to_pyobj(py: Python<'_>, val: &serde_json::Value) -> Py<PyAny> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Format a presence event as a WSE wire message.
+/// Returns e.g. `WSE{"t":"presence_join","p":{"user_id":"alice","data":{"status":"online"}}}`
+pub(crate) fn format_presence_msg(
+    event_type: &str,
+    user_id: &str,
+    data: &serde_json::Value,
+) -> String {
+    let payload = serde_json::json!({
+        "t": event_type,
+        "p": { "user_id": user_id, "data": data }
+    });
+    format!("WSE{payload}")
+}
 
 fn fire_on_connect(callback: &Py<PyAny>, conn_id: &str, cookies: &str) {
     Python::try_attach(|py| {
@@ -902,13 +920,6 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                         .unwrap_or(1) as u32;
                                 let hello = build_server_hello(&conn_id, client_proto, &state);
                                 let _ = tx.send(WsFrame::Msg(Message::Text(hello.into())));
-                                // Also push to drain queue so Python app knows about client
-                                if drain {
-                                    state.push_inbound(InboundEvent::Message {
-                                        conn_id: (*conn_id).clone(),
-                                        value: val,
-                                    });
-                                }
                                 continue;
                             }
                             if t_val == "ping" {
@@ -1075,13 +1086,35 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     // Presence cleanup: untrack from all topics before disconnect event
     if let Some(ref pm) = state.presence {
         let results = pm.remove_connection(&conn_id);
-        if drain {
-            for (topic, result) in results {
-                if let super::presence::UntrackResult::LastLeave { user_id, data } = result {
+        let cluster_tx = state.cluster_cmd_tx.read().unwrap().clone();
+        for (topic, result) in results {
+            if let super::presence::UntrackResult::LastLeave { user_id, data } = result {
+                if drain {
                     state.push_inbound(InboundEvent::PresenceLeave {
+                        topic: topic.clone(),
+                        user_id: user_id.clone(),
+                        data: data.clone(),
+                    });
+                }
+                // Broadcast to topic subscribers via WebSocket
+                let tx = state.presence_broadcast_tx.read().unwrap().clone();
+                if let Some(tx) = tx {
+                    let msg = format_presence_msg("presence_leave", &user_id, &data);
+                    let _ = tx.send(ServerCommand::BroadcastLocal {
+                        topic: topic.clone(),
+                        data: msg,
+                    });
+                }
+                // Cluster sync: notify peers of presence leave
+                if let Some(ref ctx) = cluster_tx {
+                    let data_str = serde_json::to_string(&data).unwrap_or_default();
+                    let now = super::presence::epoch_ms();
+                    let _ = ctx.send(ClusterCommand::PresenceUpdate {
                         topic,
                         user_id,
-                        data,
+                        action: 1, // leave
+                        data: data_str,
+                        updated_at: now,
                     });
                 }
             }
@@ -1460,6 +1493,8 @@ impl RustWSEServer {
         }
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ServerCommand>();
         self.cmd_tx = Some(cmd_tx.clone());
+        // Store a clone for presence broadcasts from disconnect cleanup paths
+        *self.shared.presence_broadcast_tx.write().unwrap() = Some(cmd_tx.clone());
         let host = self.host.clone();
         let port = self.port;
         let running = self.running.clone();
@@ -1501,6 +1536,88 @@ impl RustWSEServer {
                             loop {
                                 interval.tick().await;
                                 rm.cleanup();
+                            }
+                        });
+                    }
+                    // Presence TTL sweep (every 30 seconds)
+                    if let Some(ref pm) = shared.presence {
+                        let sweep_pm = pm.clone();
+                        let sweep_state = shared.clone();
+                        let sweep_running = running.clone();
+                        tokio::spawn(async move {
+                            let mut interval =
+                                tokio::time::interval(Duration::from_secs(30));
+                            loop {
+                                interval.tick().await;
+                                if !sweep_running.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                let removed =
+                                    sweep_pm.sweep_dead_connections(|conn_id| {
+                                        if conn_id.starts_with("__remote__") {
+                                            return true;
+                                        }
+                                        sweep_state
+                                            .conn_last_activity
+                                            .contains_key(conn_id)
+                                    });
+                                if removed.is_empty() {
+                                    continue;
+                                }
+                                let drain = sweep_state
+                                    .drain_mode
+                                    .load(Ordering::Relaxed);
+                                let broadcast_tx = sweep_state
+                                    .presence_broadcast_tx
+                                    .read()
+                                    .unwrap()
+                                    .clone();
+                                let cluster_tx = sweep_state
+                                    .cluster_cmd_tx
+                                    .read()
+                                    .unwrap()
+                                    .clone();
+                                for (topic, user_id, data) in removed {
+                                    if drain {
+                                        sweep_state.push_inbound(
+                                            InboundEvent::PresenceLeave {
+                                                topic: topic.clone(),
+                                                user_id: user_id.clone(),
+                                                data: data.clone(),
+                                            },
+                                        );
+                                    }
+                                    let msg = format_presence_msg(
+                                        "presence_leave",
+                                        &user_id,
+                                        &data,
+                                    );
+                                    if let Some(ref tx) = broadcast_tx {
+                                        let _ = tx.send(
+                                            ServerCommand::BroadcastLocal {
+                                                topic: topic.clone(),
+                                                data: msg,
+                                            },
+                                        );
+                                    }
+                                    if let Some(ref ctx) = cluster_tx {
+                                        let data_str = serde_json::to_string(
+                                            &data,
+                                        )
+                                        .unwrap_or_default();
+                                        let now =
+                                            super::presence::epoch_ms();
+                                        let _ = ctx.send(
+                                            ClusterCommand::PresenceUpdate {
+                                                topic,
+                                                user_id,
+                                                action: 1,
+                                                data: data_str,
+                                                updated_at: now,
+                                            },
+                                        );
+                                    }
+                                }
                             }
                         });
                     }
@@ -1570,19 +1687,77 @@ impl RustWSEServer {
                                     let drain = ping_state.drain_mode.load(Ordering::Relaxed);
                                     // Presence cleanup for zombies
                                     if let Some(ref pm) = ping_state.presence {
+                                        let broadcast_tx = ping_state.presence_broadcast_tx.read().unwrap().clone();
+                                        let cluster_tx = ping_state.cluster_cmd_tx.read().unwrap().clone();
                                         for cid in &force_remove {
                                             let results = pm.remove_connection(cid);
-                                            if drain {
-                                                for (topic, result) in results {
-                                                    if let super::presence::UntrackResult::LastLeave { user_id, data } = result {
+                                            for (topic, result) in results {
+                                                if let super::presence::UntrackResult::LastLeave { user_id, data } = result {
+                                                    if drain {
                                                         ping_state.push_inbound(InboundEvent::PresenceLeave {
+                                                            topic: topic.clone(),
+                                                            user_id: user_id.clone(),
+                                                            data: data.clone(),
+                                                        });
+                                                    }
+                                                    if let Some(ref tx) = broadcast_tx {
+                                                        let msg = format_presence_msg("presence_leave", &user_id, &data);
+                                                        let _ = tx.send(ServerCommand::BroadcastLocal {
+                                                            topic: topic.clone(),
+                                                            data: msg,
+                                                        });
+                                                    }
+                                                    if let Some(ref ctx) = cluster_tx {
+                                                        let data_str = serde_json::to_string(&data).unwrap_or_default();
+                                                        let now = super::presence::epoch_ms();
+                                                        let _ = ctx.send(ClusterCommand::PresenceUpdate {
                                                             topic,
                                                             user_id,
-                                                            data,
+                                                            action: 1,
+                                                            data: data_str,
+                                                            updated_at: now,
                                                         });
                                                     }
                                                 }
                                             }
+                                        }
+                                    }
+                                    // Topic subscription cleanup for zombies (mirrors disconnect path)
+                                    let cluster_tx = ping_state.cluster_cmd_tx.read().unwrap().clone();
+                                    for cid in &force_remove {
+                                        if let Some((_, topics)) = ping_state.conn_topics.remove(cid) {
+                                            let mut disconnected_topics = Vec::new();
+                                            for topic_ref in topics.iter() {
+                                                let topic = topic_ref.clone();
+                                                if let Some(subscribers) = ping_state.topic_subscribers.get(&topic) {
+                                                    subscribers.remove(cid);
+                                                }
+                                                ping_state.topic_subscribers.remove_if(&topic, |_, subs| subs.is_empty());
+                                                disconnected_topics.push(topic);
+                                            }
+                                            if let Some(ref tx) = cluster_tx {
+                                                let mut refcounts = ping_state
+                                                    .local_topic_refcount
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                for topic in &disconnected_topics {
+                                                    if let Some(count) = refcounts.get_mut(topic) {
+                                                        *count = count.saturating_sub(1);
+                                                        if *count == 0 {
+                                                            refcounts.remove(topic);
+                                                            let _ = tx.send(ClusterCommand::Unsub {
+                                                                topic: topic.clone(),
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Emit disconnect event to Python
+                                        if drain {
+                                            ping_state.push_inbound(InboundEvent::Disconnect {
+                                                conn_id: cid.clone(),
+                                            });
                                         }
                                     }
                                     let mut conns =
@@ -1591,6 +1766,7 @@ impl RustWSEServer {
                                         conns.remove(cid);
                                         ping_state.conn_formats.remove(cid);
                                         ping_state.conn_rates.remove(cid);
+                                        ping_state.conn_last_activity.remove(cid);
                                     }
                                     ping_state.connection_count.store(
                                         conns.len(),
@@ -2266,6 +2442,8 @@ impl RustWSEServer {
             tls_config,
             cluster_port,
             cluster_addr,
+            self.shared.presence.clone(),
+            self.cmd_tx.clone(),
         ));
 
         Ok(())
@@ -2337,16 +2515,40 @@ impl RustWSEServer {
         if let (Some(pm), Some(pd)) = (&self.shared.presence, &presence_data) {
             let data = pyobj_to_json(pd.as_any());
             let drain = self.shared.drain_mode.load(Ordering::Relaxed);
+            let cluster_tx = self.shared.cluster_cmd_tx.read().unwrap().clone();
             for topic in &topics {
-                if let super::presence::TrackResult::FirstJoin { user_id, data } =
-                    pm.track(conn_id, topic, &data)
-                    && drain
+                if let super::presence::TrackResult::FirstJoin {
+                    user_id,
+                    data: join_data,
+                } = pm.track(conn_id, topic, &data)
                 {
-                    self.shared.push_inbound(InboundEvent::PresenceJoin {
-                        topic: topic.clone(),
-                        user_id,
-                        data,
-                    });
+                    if drain {
+                        self.shared.push_inbound(InboundEvent::PresenceJoin {
+                            topic: topic.clone(),
+                            user_id: user_id.clone(),
+                            data: join_data.clone(),
+                        });
+                    }
+                    // Broadcast to topic subscribers via WebSocket
+                    if let Some(ref tx) = self.cmd_tx {
+                        let msg = format_presence_msg("presence_join", &user_id, &join_data);
+                        let _ = tx.send(ServerCommand::BroadcastLocal {
+                            topic: topic.clone(),
+                            data: msg,
+                        });
+                    }
+                    // Cluster sync: notify peers of presence join
+                    if let Some(ref ctx) = cluster_tx {
+                        let data_str = serde_json::to_string(&join_data).unwrap_or_default();
+                        let now = super::presence::epoch_ms();
+                        let _ = ctx.send(ClusterCommand::PresenceUpdate {
+                            topic: topic.clone(),
+                            user_id: user_id.clone(),
+                            action: 0, // join
+                            data: data_str,
+                            updated_at: now,
+                        });
+                    }
                 }
             }
         }
@@ -2541,14 +2743,34 @@ impl RustWSEServer {
             let results = pm.untrack_topics(conn_id, &removed_topics);
             let drain = self.shared.drain_mode.load(Ordering::Relaxed);
             for (topic, result) in results {
-                if let super::presence::UntrackResult::LastLeave { user_id, data } = result
-                    && drain
-                {
-                    self.shared.push_inbound(InboundEvent::PresenceLeave {
-                        topic,
-                        user_id,
-                        data,
-                    });
+                if let super::presence::UntrackResult::LastLeave { user_id, data } = result {
+                    if drain {
+                        self.shared.push_inbound(InboundEvent::PresenceLeave {
+                            topic: topic.clone(),
+                            user_id: user_id.clone(),
+                            data: data.clone(),
+                        });
+                    }
+                    // Broadcast to topic subscribers via WebSocket
+                    if let Some(ref tx) = self.cmd_tx {
+                        let msg = format_presence_msg("presence_leave", &user_id, &data);
+                        let _ = tx.send(ServerCommand::BroadcastLocal {
+                            topic: topic.clone(),
+                            data: msg,
+                        });
+                    }
+                    // Cluster sync: notify peers of presence leave
+                    if let Some(ref ctx) = cluster_tx {
+                        let data_str = serde_json::to_string(&data).unwrap_or_default();
+                        let now = super::presence::epoch_ms();
+                        let _ = ctx.send(ClusterCommand::PresenceUpdate {
+                            topic,
+                            user_id,
+                            action: 1, // leave
+                            data: data_str,
+                            updated_at: now,
+                        });
+                    }
                 }
             }
         }
@@ -2750,10 +2972,39 @@ impl RustWSEServer {
     fn update_presence(&self, conn_id: &str, data: &Bound<'_, PyDict>) -> PyResult<()> {
         if let Some(ref pm) = self.shared.presence {
             let new_data = pyobj_to_json(data.as_any());
-            if !pm.update_data(conn_id, &new_data) {
-                return Err(PyRuntimeError::new_err(
-                    "Failed to update presence data (size limit or unknown connection)",
-                ));
+            match pm.update_data(conn_id, &new_data) {
+                None => {
+                    return Err(PyRuntimeError::new_err(
+                        "Failed to update presence data (size limit or unknown connection)",
+                    ));
+                }
+                Some((user_id, topics)) => {
+                    // Broadcast presence_update to all topics where the user has presence
+                    let data_str = serde_json::to_string(&new_data).unwrap_or_default();
+                    let now = super::presence::epoch_ms();
+                    let cluster_tx = self.shared.cluster_cmd_tx.read().unwrap().clone();
+                    if let Some(ref tx) = self.cmd_tx {
+                        let msg = format_presence_msg("presence_update", &user_id, &new_data);
+                        for topic in &topics {
+                            let _ = tx.send(ServerCommand::BroadcastLocal {
+                                topic: topic.clone(),
+                                data: msg.clone(),
+                            });
+                        }
+                    }
+                    // Cluster sync: notify peers of presence update
+                    if let Some(ref ctx) = cluster_tx {
+                        for topic in topics {
+                            let _ = ctx.send(ClusterCommand::PresenceUpdate {
+                                topic,
+                                user_id: user_id.clone(),
+                                action: 2, // update
+                                data: data_str.clone(),
+                                updated_at: now,
+                            });
+                        }
+                    }
+                }
             }
         }
         Ok(())

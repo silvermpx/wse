@@ -47,9 +47,10 @@ pub(crate) const PROTOCOL_VERSION_MIN: u16 = 1;
 // Capability flags (negotiated via bitwise AND of both peers' values)
 pub(crate) const CAP_INTEREST_ROUTING: u32 = 1 << 0; // Phase 2: SUB/UNSUB
 pub(crate) const CAP_COMPRESSION: u32 = 1 << 1; // Phase 6: zstd compression
+pub(crate) const CAP_PRESENCE: u32 = 1 << 2; // Presence sync
 
 /// Our capabilities bitmask
-pub(crate) const LOCAL_CAPABILITIES: u32 = CAP_INTEREST_ROUTING | CAP_COMPRESSION;
+pub(crate) const LOCAL_CAPABILITIES: u32 = CAP_INTEREST_ROUTING | CAP_COMPRESSION | CAP_PRESENCE;
 
 // Per-frame flags (bit 0 of the flags byte in every frame header)
 // bit 0: compressed (zstd), bits 1-7: reserved
@@ -140,6 +141,8 @@ pub(crate) enum MsgType {
     Resync = 0x08,
     PeerAnnounce = 0x09,
     PeerList = 0x0A,
+    PresenceUpdate = 0x0B,
+    PresenceFull = 0x0C,
 }
 
 impl MsgType {
@@ -155,6 +158,8 @@ impl MsgType {
             0x08 => Some(Self::Resync),
             0x09 => Some(Self::PeerAnnounce),
             0x0A => Some(Self::PeerList),
+            0x0B => Some(Self::PresenceUpdate),
+            0x0C => Some(Self::PresenceFull),
             _ => None,
         }
     }
@@ -181,6 +186,14 @@ pub(crate) enum ClusterCommand {
         addr: String,
         exclude_peer: String,
     },
+    /// Sync a single presence join/leave/update to cluster peers.
+    PresenceUpdate {
+        topic: String,
+        user_id: String,
+        action: u8, // 0 = join, 1 = leave, 2 = update
+        data: String,
+        updated_at: u64,
+    },
 }
 
 /// Messages from inbound peer handlers to register/deregister their write channels
@@ -193,6 +206,20 @@ pub(crate) enum PeerRegistration {
     },
     Deregister {
         peer_addr: String,
+    },
+}
+
+/// Presence frames received from a peer, forwarded to cluster_manager for processing.
+pub(crate) enum PresencePeerFrame {
+    Update {
+        topic: String,
+        user_id: String,
+        action: u8,
+        data: String,
+        updated_at: u64,
+    },
+    Full {
+        entries: String,
     },
 }
 
@@ -507,6 +534,50 @@ pub(crate) fn encode_peer_list(buf: &mut BytesMut, addrs: &[String]) {
     buf.extend_from_slice(&payload);
 }
 
+/// Encode a PRESENCE_UPDATE frame.
+/// Payload: [action(1)][updated_at(8)][user_id_len(2)][user_id][data]
+pub(crate) fn encode_presence_update(
+    buf: &mut BytesMut,
+    topic: &str,
+    user_id: &str,
+    action: u8,
+    data: &str,
+    updated_at: u64,
+) -> bool {
+    let topic_bytes = topic.as_bytes();
+    let user_id_bytes = user_id.as_bytes();
+    let data_bytes = data.as_bytes();
+    if topic_bytes.len() > u16::MAX as usize || user_id_bytes.len() > u16::MAX as usize {
+        return false;
+    }
+    let payload_len = 1 + 8 + 2 + user_id_bytes.len() + data_bytes.len();
+    buf.reserve(8 + topic_bytes.len() + payload_len);
+    buf.put_u8(MsgType::PresenceUpdate as u8);
+    buf.put_u8(0); // flags
+    buf.put_u16_le(topic_bytes.len() as u16);
+    buf.put_u32_le(payload_len as u32);
+    buf.put_slice(topic_bytes);
+    buf.put_u8(action);
+    buf.put_u64_le(updated_at);
+    buf.put_u16_le(user_id_bytes.len() as u16);
+    buf.put_slice(user_id_bytes);
+    buf.put_slice(data_bytes);
+    true
+}
+
+/// Encode a PRESENCE_FULL frame (full presence state sync).
+pub(crate) fn encode_presence_full(buf: &mut BytesMut, entries_json: &str) -> bool {
+    let payload_bytes = entries_json.as_bytes();
+    let topic_len: u16 = 0; // No topic for full sync
+    buf.reserve(8 + payload_bytes.len());
+    buf.put_u8(MsgType::PresenceFull as u8);
+    buf.put_u8(0); // flags
+    buf.put_u16_le(topic_len);
+    buf.put_u32_le(payload_bytes.len() as u32);
+    buf.put_slice(payload_bytes);
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Framing helpers (4-byte BE length prefix)
 // ---------------------------------------------------------------------------
@@ -551,6 +622,16 @@ pub(crate) enum ClusterFrame {
     PeerList {
         addrs: Vec<String>,
     },
+    PresenceUpdate {
+        topic: String,
+        user_id: String,
+        action: u8,
+        data: String,
+        updated_at: u64,
+    },
+    PresenceFull {
+        entries: String,
+    },
     Unknown {
         msg_type: u8,
     },
@@ -577,7 +658,7 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                 let compressed = data.split_to(payload_len);
                 // Pre-decompression check: reject tiny payloads that could decompress into
                 // MAX_FRAME_SIZE (1MB). Cap at 1000:1 max ratio before even attempting decompress.
-                if payload_len > 0 && payload_len < 64 {
+                if payload_len > 0 && payload_len < 8 {
                     eprintln!(
                         "[WSE-Cluster] Rejecting suspiciously small compressed payload: {payload_len} bytes"
                     );
@@ -694,6 +775,42 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                 pos += alen;
             }
             Some(ClusterFrame::PeerList { addrs })
+        }
+        Some(MsgType::PresenceUpdate) => {
+            if data.remaining() < topic_len + payload_len {
+                return None;
+            }
+            let topic = String::from_utf8(data.split_to(topic_len).to_vec()).ok()?;
+            if data.remaining() < 1 + 8 + 2 {
+                return None;
+            }
+            let action = data.get_u8();
+            let updated_at = data.get_u64_le();
+            let user_id_len = data.get_u16_le() as usize;
+            if data.remaining() < user_id_len {
+                return None;
+            }
+            let user_id = String::from_utf8(data.split_to(user_id_len).to_vec()).ok()?;
+            let remaining_data = payload_len.saturating_sub(1 + 8 + 2 + user_id_len);
+            let presence_data = if remaining_data > 0 && data.remaining() >= remaining_data {
+                String::from_utf8(data.split_to(remaining_data).to_vec()).ok()?
+            } else {
+                String::new()
+            };
+            Some(ClusterFrame::PresenceUpdate {
+                topic,
+                user_id,
+                action,
+                data: presence_data,
+                updated_at,
+            })
+        }
+        Some(MsgType::PresenceFull) => {
+            if data.remaining() < payload_len {
+                return None;
+            }
+            let entries = String::from_utf8(data.split_to(payload_len).to_vec()).ok()?;
+            Some(ClusterFrame::PresenceFull { entries })
         }
         None => {
             // Unknown message type from a newer peer -- safe to skip
@@ -823,6 +940,7 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
     last_activity: Arc<AtomicU64>,
     new_peer_tx: mpsc::UnboundedSender<String>,
     cmd_tx: mpsc::UnboundedSender<ClusterCommand>,
+    presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
 ) {
     // Dispatch channel: decouples TCP read from fan-out to WebSocket connections.
     let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<(String, String)>();
@@ -935,6 +1053,26 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
                     let _ = new_peer_tx.send(addr);
                 }
             }
+            Some(ClusterFrame::PresenceUpdate {
+                topic,
+                user_id,
+                action,
+                data,
+                updated_at,
+            }) => {
+                last_activity.store(epoch_ms(), Ordering::Relaxed);
+                let _ = presence_tx.send(PresencePeerFrame::Update {
+                    topic,
+                    user_id,
+                    action,
+                    data,
+                    updated_at,
+                });
+            }
+            Some(ClusterFrame::PresenceFull { entries }) => {
+                last_activity.store(epoch_ms(), Ordering::Relaxed);
+                let _ = presence_tx.send(PresencePeerFrame::Full { entries });
+            }
             None => {
                 eprintln!("[WSE-Cluster] Failed to decode frame, disconnecting");
                 break;
@@ -1006,6 +1144,8 @@ async fn run_peer_session<R, W>(
     cluster_addr: &Option<String>,
     known_peers: &Arc<DashSet<String>>,
     connected_instances: &Arc<DashMap<String, String>>,
+    presence_tx: &mpsc::UnboundedSender<PresencePeerFrame>,
+    presence: &Option<Arc<super::presence::PresenceManager>>,
 ) -> bool
 where
     R: AsyncReadExt + Unpin + Send + 'static,
@@ -1048,7 +1188,7 @@ where
         _ => None,
     };
 
-    let (peer_instance_id, _peer_version, _peer_caps) = match peer_hello {
+    let (peer_instance_id, _peer_version, peer_caps) = match peer_hello {
         Some(ClusterFrame::Hello {
             instance_id: peer_id,
             protocol_version,
@@ -1103,7 +1243,7 @@ where
     }
 
     // Connected successfully
-    eprintln!("[WSE-Cluster] Connected to {peer_addr} (v{_peer_version}, caps=0x{_peer_caps:08x})");
+    eprintln!("[WSE-Cluster] Connected to {peer_addr} (v{_peer_version}, caps=0x{peer_caps:08x})");
     breaker.record_success();
     backoff.reset();
     metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
@@ -1123,6 +1263,7 @@ where
             write_framed(&mut resync_frame, &resync_buf);
             if writer.write_all(&resync_frame).await.is_err() || writer.flush().await.is_err() {
                 eprintln!("[WSE-Cluster] Failed to send RESYNC to {peer_addr}");
+                connected_instances.remove(&peer_instance_id);
                 metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
                 return false; // Will reconnect
             }
@@ -1152,6 +1293,24 @@ where
         }
     }
 
+    // Send full presence state to new peer (only if peer supports presence)
+    if peer_caps & CAP_PRESENCE != 0
+        && let Some(pm) = presence
+    {
+        let entries = pm.serialize_full_state();
+        if !entries.is_empty() && entries != "{}" {
+            let mut buf = BytesMut::new();
+            if encode_presence_full(&mut buf, &entries) {
+                let mut frame = BytesMut::new();
+                write_framed(&mut frame, &buf);
+                if let Err(e) = writer.write_all(&frame).await {
+                    eprintln!("[WSE-Cluster] Failed to send PresenceFull: {e}");
+                }
+                let _ = writer.flush().await;
+            }
+        }
+    }
+
     // Spawn reader, writer, heartbeat with child cancellation token
     let peer_cancel = global_cancel.child_token();
     let (peer_write_tx, peer_write_rx) = mpsc::unbounded_channel::<Bytes>();
@@ -1176,6 +1335,7 @@ where
         last_activity.clone(),
         new_peer_tx.clone(),
         cmd_tx.clone(),
+        presence_tx.clone(),
     ));
 
     let heartbeat_handle = tokio::spawn(heartbeat_task(
@@ -1239,6 +1399,8 @@ async fn peer_connection_task(
     cluster_addr: Option<String>,
     known_peers: Arc<DashSet<String>>,
     connected_instances: Arc<DashMap<String, String>>,
+    presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
+    presence: Option<Arc<super::presence::PresenceManager>>,
 ) {
     let mut backoff = ExponentialBackoff::new();
     let mut breaker = CircuitBreaker::new();
@@ -1360,6 +1522,8 @@ async fn peer_connection_task(
                         &cluster_addr,
                         &known_peers,
                         &connected_instances,
+                        &presence_tx,
+                        &presence,
                     )
                     .await
                 }
@@ -1412,6 +1576,8 @@ async fn peer_connection_task(
                 &cluster_addr,
                 &known_peers,
                 &connected_instances,
+                &presence_tx,
+                &presence,
             )
             .await
         };
@@ -1453,6 +1619,8 @@ struct PeerSpawnCtx {
     cluster_addr: Option<String>,
     known_peers: Arc<DashSet<String>>,
     connected_instances: Arc<DashMap<String, String>>,
+    presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
+    presence: Option<Arc<super::presence::PresenceManager>>,
 }
 
 impl PeerSpawnCtx {
@@ -1477,6 +1645,8 @@ impl PeerSpawnCtx {
             self.cluster_addr.clone(),
             self.known_peers.clone(),
             self.connected_instances.clone(),
+            self.presence_tx.clone(),
+            self.presence.clone(),
         ))
     }
 }
@@ -1496,6 +1666,8 @@ pub(crate) async fn cluster_manager(
     tls_config: Option<ClusterTlsConfig>,
     cluster_port: Option<u16>,
     cluster_addr: Option<String>,
+    presence: Option<Arc<super::presence::PresenceManager>>,
+    server_cmd_tx: Option<mpsc::UnboundedSender<super::server::ServerCommand>>,
 ) {
     let global_cancel = CancellationToken::new();
 
@@ -1514,6 +1686,9 @@ pub(crate) async fn cluster_manager(
 
     // Channel for inbound peer handlers to register/deregister their write channels
     let (peer_reg_tx, mut peer_reg_rx) = mpsc::unbounded_channel::<PeerRegistration>();
+
+    // Channel for presence frames received from peers
+    let (presence_peer_tx, mut presence_peer_rx) = mpsc::unbounded_channel::<PresencePeerFrame>();
 
     // Per-peer channels: manager sends encoded BytesMut, peer task forwards to writer
     // Each entry: (peer_addr, write_channel, negotiated_caps)
@@ -1534,6 +1709,8 @@ pub(crate) async fn cluster_manager(
         cluster_addr: cluster_addr.clone(),
         known_peers: known_peers.clone(),
         connected_instances: connected_instances.clone(),
+        presence_tx: presence_peer_tx.clone(),
+        presence: presence.clone(),
     };
 
     for peer_addr in &peers {
@@ -1567,6 +1744,8 @@ pub(crate) async fn cluster_manager(
                 let prt = peer_reg_tx.clone();
                 let ca = cluster_addr.clone();
                 let kp = known_peers.clone();
+                let pptx = presence_peer_tx.clone();
+                let ppres = presence.clone();
                 let conn_semaphore =
                     Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_CLUSTER_CONNS));
                 tokio::spawn(async move {
@@ -1601,6 +1780,8 @@ pub(crate) async fn cluster_manager(
                                         let gc2 = cancel.clone();
                                         let ca2 = ca.clone();
                                         let kp2 = kp.clone();
+                                        let pptx2 = pptx.clone();
+                                        let ppres2 = ppres.clone();
                                         tokio::spawn(async move {
                                             let _permit = permit; // held until task completes
                                             if let Some(ref tls) = tls {
@@ -1613,7 +1794,7 @@ pub(crate) async fn cluster_manager(
                                                             tls_stream, addr, &inst2,
                                                             int_tx2, conns2, subs2, met2, lrc2,
                                                             npt2, gct2, ci2, prt2, gc2,
-                                                            ca2, kp2,
+                                                            ca2, kp2, pptx2, ppres2,
                                                         ).await;
                                                     }
                                                     Ok(Err(e)) => {
@@ -1628,7 +1809,7 @@ pub(crate) async fn cluster_manager(
                                                     stream, addr, &inst2,
                                                     int_tx2, conns2, subs2, met2, lrc2,
                                                     npt2, gct2, ci2, prt2, gc2,
-                                                    ca2, kp2,
+                                                    ca2, kp2, pptx2, ppres2,
                                                 ).await;
                                             }
                                         });
@@ -1738,6 +1919,17 @@ pub(crate) async fn cluster_manager(
                             }
                         }
                     }
+                    Some(ClusterCommand::PresenceUpdate { topic, user_id, action, data, updated_at }) => {
+                        let mut frame_data = BytesMut::new();
+                        if encode_presence_update(&mut frame_data, &topic, &user_id, action, &data, updated_at) {
+                            let frame_bytes = frame_data.freeze();
+                            for (_, tx, caps) in &peer_txs {
+                                if caps & CAP_PRESENCE != 0 {
+                                    let _ = tx.send(frame_bytes.clone());
+                                }
+                            }
+                        }
+                    }
                     Some(ClusterCommand::Shutdown) | None => {
                         eprintln!("[WSE-Cluster] Manager shutting down");
                         let mut shutdown_data = BytesMut::new();
@@ -1842,6 +2034,55 @@ pub(crate) async fn cluster_manager(
                     }
                 }
             }
+            // Handle presence frames received from peers
+            Some(pf) = presence_peer_rx.recv() => {
+                if let Some(ref pm) = presence {
+                    match pf {
+                        PresencePeerFrame::Update { topic, user_id, action, data, updated_at } => {
+                            let data_val: serde_json::Value = serde_json::from_str(&data).unwrap_or(serde_json::Value::Null);
+                            match action {
+                                0 => {
+                                    // Remote join: merge into local presence
+                                    pm.merge_remote_join(&topic, &user_id, &data_val, updated_at);
+                                    if let Some(ref tx) = server_cmd_tx {
+                                        let msg = super::server::format_presence_msg("presence_join", &user_id, &data_val);
+                                        let _ = tx.send(super::server::ServerCommand::BroadcastLocal {
+                                            topic,
+                                            data: msg,
+                                        });
+                                    }
+                                }
+                                1 => {
+                                    // Remote leave
+                                    pm.merge_remote_leave(&topic, &user_id);
+                                    if let Some(ref tx) = server_cmd_tx {
+                                        let msg = super::server::format_presence_msg("presence_leave", &user_id, &data_val);
+                                        let _ = tx.send(super::server::ServerCommand::BroadcastLocal {
+                                            topic,
+                                            data: msg,
+                                        });
+                                    }
+                                }
+                                2 => {
+                                    // Remote data update
+                                    pm.merge_remote_update(&topic, &user_id, &data_val, updated_at);
+                                    if let Some(ref tx) = server_cmd_tx {
+                                        let msg = super::server::format_presence_msg("presence_update", &user_id, &data_val);
+                                        let _ = tx.send(super::server::ServerCommand::BroadcastLocal {
+                                            topic,
+                                            data: msg,
+                                        });
+                                    }
+                                }
+                                _ => {} // Ignore unknown actions
+                            }
+                        }
+                        PresencePeerFrame::Full { entries } => {
+                            pm.merge_full_state(&entries);
+                        }
+                    }
+                }
+            }
             () = global_cancel.cancelled() => break,
         }
     }
@@ -1875,6 +2116,8 @@ async fn handle_cluster_inbound_generic<S>(
     global_cancel: CancellationToken,
     cluster_addr: Option<String>,
     known_peers: Arc<DashSet<String>>,
+    presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
+    presence: Option<Arc<super::presence::PresenceManager>>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -1992,6 +2235,24 @@ async fn handle_cluster_inbound_generic<S>(
         }
     }
 
+    // Send full presence state to new peer (only if peer supports presence)
+    if peer_caps & CAP_PRESENCE != 0
+        && let Some(pm) = presence
+    {
+        let entries = pm.serialize_full_state();
+        if !entries.is_empty() && entries != "{}" {
+            let mut buf = BytesMut::new();
+            if encode_presence_full(&mut buf, &entries) {
+                let mut frame = BytesMut::new();
+                write_framed(&mut frame, &buf);
+                if let Err(e) = writer.write_all(&frame).await {
+                    eprintln!("[WSE-Cluster] Failed to send PresenceFull to inbound {addr}: {e}");
+                }
+                let _ = writer.flush().await;
+            }
+        }
+    }
+
     eprintln!(
         "[WSE-Cluster] Accepted inbound peer from {addr} (v{_peer_version}, caps=0x{peer_caps:08x})"
     );
@@ -2029,6 +2290,7 @@ async fn handle_cluster_inbound_generic<S>(
         last_activity.clone(),
         new_peer_tx,
         cmd_tx,
+        presence_tx,
     ));
 
     let heartbeat_handle = tokio::spawn(heartbeat_task(write_tx, cancel.clone(), last_activity));
@@ -2091,6 +2353,7 @@ pub(crate) async fn handle_cluster_inbound(
     let (new_peer_tx, _new_peer_rx) = mpsc::unbounded_channel::<String>();
     let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
     let (peer_reg_tx, _peer_reg_rx) = mpsc::unbounded_channel::<PeerRegistration>();
+    let (presence_tx, _presence_rx) = mpsc::unbounded_channel::<PresencePeerFrame>();
     // Shared across all legacy inbound calls so duplicate detection actually works
     static LEGACY_CONNECTED: std::sync::OnceLock<Arc<DashMap<String, String>>> =
         std::sync::OnceLock::new();
@@ -2120,6 +2383,8 @@ pub(crate) async fn handle_cluster_inbound(
         legacy_cancel,
         None,
         legacy_known_peers,
+        presence_tx,
+        shared.presence.clone(),
     )
     .await;
 }
@@ -3072,5 +3337,99 @@ mod tests {
             }
             other => panic!("Expected PeerList, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_encode_decode_presence_update() {
+        let mut buf = BytesMut::new();
+        let ok = encode_presence_update(
+            &mut buf,
+            "room:lobby",
+            "alice",
+            0, // join
+            r#"{"status":"online"}"#,
+            1709000000000,
+        );
+        assert!(ok);
+        let frame = decode_frame(buf).unwrap();
+        match frame {
+            ClusterFrame::PresenceUpdate {
+                topic,
+                user_id,
+                action,
+                data,
+                updated_at,
+            } => {
+                assert_eq!(topic, "room:lobby");
+                assert_eq!(user_id, "alice");
+                assert_eq!(action, 0);
+                assert_eq!(data, r#"{"status":"online"}"#);
+                assert_eq!(updated_at, 1709000000000);
+            }
+            other => panic!("Expected PresenceUpdate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_presence_update_leave() {
+        let mut buf = BytesMut::new();
+        let ok = encode_presence_update(&mut buf, "chat:main", "bob", 1, "", 1709000001000);
+        assert!(ok);
+        let frame = decode_frame(buf).unwrap();
+        match frame {
+            ClusterFrame::PresenceUpdate {
+                topic,
+                user_id,
+                action,
+                data,
+                updated_at,
+            } => {
+                assert_eq!(topic, "chat:main");
+                assert_eq!(user_id, "bob");
+                assert_eq!(action, 1);
+                assert_eq!(data, "");
+                assert_eq!(updated_at, 1709000001000);
+            }
+            other => panic!("Expected PresenceUpdate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_presence_full() {
+        let json = r#"{"room:lobby":{"alice":{"data":{"status":"online"},"updated_at":123}}}"#;
+        let mut buf = BytesMut::new();
+        let ok = encode_presence_full(&mut buf, json);
+        assert!(ok);
+        let frame = decode_frame(buf).unwrap();
+        match frame {
+            ClusterFrame::PresenceFull { entries } => {
+                assert_eq!(entries, json);
+            }
+            other => panic!("Expected PresenceFull, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_presence_full_empty() {
+        let mut buf = BytesMut::new();
+        let ok = encode_presence_full(&mut buf, "{}");
+        assert!(ok);
+        let frame = decode_frame(buf).unwrap();
+        match frame {
+            ClusterFrame::PresenceFull { entries } => {
+                assert_eq!(entries, "{}");
+            }
+            other => panic!("Expected PresenceFull, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cap_presence_flag() {
+        // Verify CAP_PRESENCE is included in LOCAL_CAPABILITIES
+        assert_ne!(LOCAL_CAPABILITIES & CAP_PRESENCE, 0);
+        // Verify it's a distinct flag
+        assert_eq!(CAP_PRESENCE, 1 << 2);
+        assert_ne!(CAP_PRESENCE, CAP_INTEREST_ROUTING);
+        assert_ne!(CAP_PRESENCE, CAP_COMPRESSION);
     }
 }

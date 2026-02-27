@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use dashmap::{DashMap, DashSet};
 
 /// Wall-clock time in milliseconds since UNIX epoch.
-fn epoch_ms() -> u64 {
+pub(crate) fn epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -142,7 +142,7 @@ impl PresenceManager {
             return TrackResult::AtCapacity;
         }
 
-        let is_first = {
+        let (is_first, actually_inserted) = {
             let mut entry = topic_map
                 .entry(user_id.clone())
                 .or_insert_with(|| PresenceEntry {
@@ -153,15 +153,18 @@ impl PresenceManager {
                 });
             let was_empty = entry.connections.is_empty();
             // Add this connection if not already tracked
-            if !entry.connections.iter().any(|c| c.conn_id == conn_id) {
+            let inserted = if !entry.connections.iter().any(|c| c.conn_id == conn_id) {
                 entry.connections.push(ConnMeta {
                     conn_id: conn_id.to_owned(),
                     joined_at: now,
                 });
-            }
+                true
+            } else {
+                false
+            };
             entry.data = data.clone();
             entry.updated_at = now;
-            was_empty
+            (was_empty, inserted)
         };
 
         // Track which topics this conn has presence in
@@ -175,7 +178,9 @@ impl PresenceManager {
             .topic_presence_stats
             .entry(topic.to_owned())
             .or_insert_with(PresenceStats::new);
-        stats.num_connections.fetch_add(1, Ordering::Relaxed);
+        if actually_inserted {
+            stats.num_connections.fetch_add(1, Ordering::Relaxed);
+        }
 
         if is_first {
             stats.num_users.fetch_add(1, Ordering::Relaxed);
@@ -285,19 +290,25 @@ impl PresenceManager {
     }
 
     /// Update presence data for a connection across all its topics.
-    pub fn update_data(&self, conn_id: &str, new_data: &serde_json::Value) -> bool {
+    /// Returns None on failure, Some((user_id, topics)) on success.
+    pub fn update_data(
+        &self,
+        conn_id: &str,
+        new_data: &serde_json::Value,
+    ) -> Option<(String, Vec<String>)> {
         // Validate size
         let data_str = serde_json::to_string(new_data).unwrap_or_default();
         if data_str.len() > self.max_data_size {
-            return false;
+            return None;
         }
 
         let user_id = match self.conn_user_id.get(conn_id) {
             Some(uid) => uid.value().clone(),
-            None => return false,
+            None => return None,
         };
 
         let now = epoch_ms();
+        let mut updated_topics = Vec::new();
 
         if let Some(topics) = self.conn_presence_topics.get(conn_id) {
             for topic_ref in topics.iter() {
@@ -307,11 +318,12 @@ impl PresenceManager {
                 {
                     entry.data = new_data.clone();
                     entry.updated_at = now;
+                    updated_topics.push(topic);
                 }
             }
         }
 
-        true
+        Some((user_id, updated_topics))
     }
 
     /// Get total presence-tracked topics count.
@@ -329,7 +341,6 @@ impl PresenceManager {
 
     /// TTL sweep: remove presence entries where all connections are dead.
     /// Returns list of (topic, user_id, data) for entries that were removed.
-    #[allow(dead_code)]
     pub fn sweep_dead_connections<F>(
         &self,
         is_conn_alive: F,
@@ -361,15 +372,159 @@ impl PresenceManager {
                 topic_map.remove(&user_id);
                 if let Some(stats) = self.topic_presence_stats.get(&topic) {
                     stats.num_users.fetch_sub(1, Ordering::Relaxed);
-                    let current = stats.num_connections.load(Ordering::Relaxed);
-                    stats
-                        .num_connections
-                        .store(current.saturating_sub(dead_conn_count), Ordering::Relaxed);
+                    let _ = stats.num_connections.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |current| Some(current.saturating_sub(dead_conn_count)),
+                    );
                 }
                 removed.push((topic.clone(), user_id, data));
             }
         }
 
         removed
+    }
+
+    // -----------------------------------------------------------------------
+    // Cluster presence sync: merge remote presence state
+    // -----------------------------------------------------------------------
+
+    /// Merge a remote join from a peer node. Does NOT emit events (caller handles broadcast).
+    pub fn merge_remote_join(
+        &self,
+        topic: &str,
+        user_id: &str,
+        data: &serde_json::Value,
+        updated_at: u64,
+    ) {
+        let topic_map = self.topic_presence.entry(topic.to_owned()).or_default();
+        let mut entry = topic_map
+            .entry(user_id.to_owned())
+            .or_insert_with(|| PresenceEntry {
+                user_id: user_id.to_owned(),
+                data: data.clone(),
+                connections: Vec::new(),
+                updated_at,
+            });
+        // Last-write-wins: only update if newer
+        if updated_at >= entry.updated_at {
+            entry.data = data.clone();
+            entry.updated_at = updated_at;
+        }
+        // Remote-only entry: add a sentinel connection so it appears in presence queries
+        if entry.connections.is_empty() {
+            entry.connections.push(ConnMeta {
+                conn_id: format!("__remote__{user_id}"),
+                joined_at: updated_at,
+            });
+            // Update stats
+            let stats = self
+                .topic_presence_stats
+                .entry(topic.to_owned())
+                .or_insert_with(PresenceStats::new);
+            stats.num_users.fetch_add(1, Ordering::Relaxed);
+            stats.num_connections.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Merge a remote leave from a peer node.
+    pub fn merge_remote_leave(&self, topic: &str, user_id: &str) {
+        if let Some(topic_map) = self.topic_presence.get(topic) {
+            // Only remove if user has no local connections (only remote sentinels)
+            let should_remove = if let Some(entry) = topic_map.get(user_id) {
+                entry
+                    .connections
+                    .iter()
+                    .all(|c| c.conn_id.starts_with("__remote__"))
+            } else {
+                false
+            };
+            if should_remove {
+                topic_map.remove(user_id);
+                if let Some(stats) = self.topic_presence_stats.get(topic) {
+                    stats.num_users.fetch_sub(1, Ordering::Relaxed);
+                    stats.num_connections.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Merge a remote data update (last-write-wins).
+    pub fn merge_remote_update(
+        &self,
+        topic: &str,
+        user_id: &str,
+        data: &serde_json::Value,
+        updated_at: u64,
+    ) {
+        if let Some(topic_map) = self.topic_presence.get(topic)
+            && let Some(mut entry) = topic_map.get_mut(user_id)
+            && updated_at >= entry.updated_at
+        {
+            entry.data = data.clone();
+            entry.updated_at = updated_at;
+        }
+    }
+
+    /// Merge full presence state from a peer (called on peer connect).
+    /// Expected JSON format: {"topic": {"user_id": {"data": {...}, "updated_at": 123}}}
+    pub fn merge_full_state(&self, entries_json: &str) {
+        let parsed: serde_json::Value = match serde_json::from_str(entries_json) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let topics = match parsed.as_object() {
+            Some(t) => t,
+            None => return,
+        };
+        for (topic, users_val) in topics {
+            let users = match users_val.as_object() {
+                Some(u) => u,
+                None => continue,
+            };
+            for (user_id, entry_val) in users {
+                let data = entry_val
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let updated_at = entry_val
+                    .get("updated_at")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                self.merge_remote_join(topic, user_id, &data, updated_at);
+            }
+        }
+    }
+
+    /// Serialize all local presence state to JSON for full sync with peers.
+    /// Only includes entries with local connections (not re-syncing remote entries).
+    pub fn serialize_full_state(&self) -> String {
+        let mut state = serde_json::Map::new();
+        for topic_entry in self.topic_presence.iter() {
+            let topic = topic_entry.key();
+            let topic_map = topic_entry.value();
+            let mut users = serde_json::Map::new();
+            for user_entry in topic_map.iter() {
+                let entry = user_entry.value();
+                // Only include entries with local connections (don't re-sync remote entries)
+                if entry
+                    .connections
+                    .iter()
+                    .any(|c| !c.conn_id.starts_with("__remote__"))
+                {
+                    users.insert(
+                        entry.user_id.clone(),
+                        serde_json::json!({
+                            "data": entry.data,
+                            "updated_at": entry.updated_at,
+                        }),
+                    );
+                }
+            }
+            if !users.is_empty() {
+                state.insert(topic.clone(), serde_json::Value::Object(users));
+            }
+        }
+        serde_json::to_string(&serde_json::Value::Object(state)).unwrap_or_default()
     }
 }
