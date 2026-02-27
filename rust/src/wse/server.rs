@@ -105,6 +105,15 @@ fn clone_tcp_stream(stream: TcpStream) -> std::io::Result<(TcpStream, TcpStream)
     ))
 }
 
+/// Current wall-clock time as milliseconds since UNIX epoch (for presence timestamps).
+#[allow(dead_code)]
+fn epoch_ms_server() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 // ---------------------------------------------------------------------------
 // Drain mode: inbound event queue (replaces per-message callbacks)
 // ---------------------------------------------------------------------------
@@ -137,6 +146,18 @@ enum InboundEvent {
     Disconnect {
         conn_id: String,
     },
+    #[allow(dead_code)]
+    PresenceJoin {
+        topic: String,
+        user_id: String,
+        data: serde_json::Value,
+    },
+    #[allow(dead_code)]
+    PresenceLeave {
+        topic: String,
+        user_id: String,
+        data: serde_json::Value,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +189,42 @@ enum ServerCommand {
     Disconnect { conn_id: String },
     GetConnections { reply: oneshot::Sender<Vec<String>> },
     Shutdown,
+}
+
+// ---------------------------------------------------------------------------
+// Presence tracking data structures
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct PresenceEntry {
+    user_id: String,
+    data: serde_json::Value,
+    connections: Vec<ConnMeta>,
+    updated_at: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct ConnMeta {
+    conn_id: String,
+    joined_at: u64,
+}
+
+#[allow(dead_code)]
+struct PresenceStats {
+    num_users: AtomicUsize,
+    num_connections: AtomicUsize,
+}
+
+impl PresenceStats {
+    #[allow(dead_code)]
+    fn new() -> Self {
+        Self {
+            num_users: AtomicUsize::new(0),
+            num_connections: AtomicUsize::new(0),
+        }
+    }
 }
 
 pub(crate) struct SharedState {
@@ -204,6 +261,24 @@ pub(crate) struct SharedState {
     pub(crate) recovery: Option<Arc<super::recovery::RecoveryManager>>,
     // Per-connection last activity tracking for zombie detection
     conn_last_activity: DashMap<String, std::time::Instant>,
+    // Presence tracking
+    #[allow(dead_code)]
+    presence_enabled: bool,
+    #[allow(dead_code)]
+    presence_max_data_size: usize,
+    #[allow(dead_code)]
+    presence_max_members: usize,
+    // topic -> user_id -> PresenceEntry
+    #[allow(dead_code)]
+    topic_presence: Arc<DashMap<String, DashMap<String, PresenceEntry>>>,
+    // topic -> PresenceStats (incremental counters)
+    #[allow(dead_code)]
+    topic_presence_stats: Arc<DashMap<String, PresenceStats>>,
+    // conn_id -> user_id (persisted from JWT handshake for presence lookups)
+    conn_user_id: DashMap<String, String>,
+    // conn_id -> set of topics where this conn has presence
+    #[allow(dead_code)]
+    conn_presence_topics: DashMap<String, DashSet<String>>,
 }
 
 impl SharedState {
@@ -212,6 +287,9 @@ impl SharedState {
         jwt_config: Option<JwtConfig>,
         max_inbound_queue_size: usize,
         recovery: Option<Arc<super::recovery::RecoveryManager>>,
+        presence_enabled: bool,
+        presence_max_data_size: usize,
+        presence_max_members: usize,
     ) -> Self {
         let cap = max_inbound_queue_size.min(131072);
         let (tx, rx) = bounded(cap);
@@ -239,6 +317,13 @@ impl SharedState {
             local_topic_refcount: Arc::new(std::sync::Mutex::new(HashMap::new())),
             recovery,
             conn_last_activity: DashMap::new(),
+            presence_enabled,
+            presence_max_data_size,
+            presence_max_members,
+            topic_presence: Arc::new(DashMap::new()),
+            topic_presence_stats: Arc::new(DashMap::new()),
+            conn_user_id: DashMap::new(),
+            conn_presence_topics: DashMap::new(),
         }
     }
 
@@ -691,6 +776,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     // Fire on_connect (drain mode: push to queue; callback mode: background task)
     if drain {
         if let Some(user_id) = rust_auth_user_id {
+            // Persist user_id for presence lookups
+            state
+                .conn_user_id
+                .insert(conn_id.to_string(), user_id.clone());
             // Rust validated JWT — send AuthConnect (Python skips JWT decode)
             state.push_inbound(InboundEvent::AuthConnect {
                 conn_id: (*conn_id).clone(),
@@ -1045,6 +1134,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     state.conn_formats.remove(&*conn_id);
     state.conn_rates.remove(&*conn_id);
     state.conn_last_activity.remove(&*conn_id);
+    state.conn_user_id.remove(&*conn_id);
+    state.conn_presence_topics.remove(&*conn_id);
     // Pub/Sub cleanup: remove connection from all subscribed topics
     if let Some((_, topics)) = state.conn_topics.remove(&*conn_id) {
         let mut disconnected_topics = Vec::new();
@@ -1313,7 +1404,7 @@ pub struct RustWSEServer {
 #[pymethods]
 impl RustWSEServer {
     #[new]
-    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456))]
+    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         host: String,
@@ -1328,6 +1419,9 @@ impl RustWSEServer {
         recovery_ttl: u64,
         recovery_max_messages: usize,
         recovery_memory_budget: usize,
+        presence_enabled: bool,
+        presence_max_data_size: usize,
+        presence_max_members: usize,
     ) -> Self {
         let jwt_config = jwt_secret.map(|secret| {
             eprintln!(
@@ -1368,6 +1462,9 @@ impl RustWSEServer {
                 jwt_config,
                 max_inbound_queue_size,
                 recovery,
+                presence_enabled,
+                presence_max_data_size,
+                presence_max_members,
             )),
             cmd_tx: None,
             thread_handle: None,
@@ -1525,6 +1622,8 @@ impl RustWSEServer {
                                         conns.remove(cid);
                                         ping_state.conn_formats.remove(cid);
                                         ping_state.conn_rates.remove(cid);
+                                        ping_state.conn_user_id.remove(cid);
+                                        ping_state.conn_presence_topics.remove(cid);
                                     }
                                     ping_state.connection_count.store(
                                         conns.len(),
@@ -2045,6 +2144,44 @@ impl RustWSEServer {
                             "disconnect".into_pyobject(py).unwrap().into_any(),
                             conn_id.as_str().into_pyobject(py).unwrap().into_any(),
                             py.None().into_bound(py).into_any(),
+                        ],
+                    )?;
+                    list.append(tuple)?;
+                }
+                InboundEvent::PresenceJoin {
+                    topic,
+                    user_id,
+                    data,
+                } => {
+                    let payload = PyDict::new(py);
+                    payload.set_item("topic", topic.as_str())?;
+                    payload.set_item("user_id", user_id.as_str())?;
+                    payload.set_item("data", json_to_pyobj(py, data))?;
+                    let tuple = PyTuple::new(
+                        py,
+                        &[
+                            PyString::new(py, "presence_join").into_any(),
+                            py.None().into_bound(py).into_any(),
+                            payload.into_any(),
+                        ],
+                    )?;
+                    list.append(tuple)?;
+                }
+                InboundEvent::PresenceLeave {
+                    topic,
+                    user_id,
+                    data,
+                } => {
+                    let payload = PyDict::new(py);
+                    payload.set_item("topic", topic.as_str())?;
+                    payload.set_item("user_id", user_id.as_str())?;
+                    payload.set_item("data", json_to_pyobj(py, data))?;
+                    let tuple = PyTuple::new(
+                        py,
+                        &[
+                            PyString::new(py, "presence_leave").into_any(),
+                            py.None().into_bound(py).into_any(),
+                            payload.into_any(),
                         ],
                     )?;
                     list.append(tuple)?;
