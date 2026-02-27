@@ -152,6 +152,7 @@ struct DeduplicationState {
 struct PerConnRate {
     tokens: f64,
     last_refill: std::time::Instant,
+    last_warning: Option<std::time::Instant>,
 }
 
 const RATE_CAPACITY: f64 = 100_000.0;
@@ -201,6 +202,8 @@ pub(crate) struct SharedState {
         std::sync::RwLock<Option<mpsc::UnboundedSender<super::cluster::InterestUpdate>>>,
     pub(crate) local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     pub(crate) recovery: Option<Arc<super::recovery::RecoveryManager>>,
+    // Per-connection last activity tracking for zombie detection
+    conn_last_activity: DashMap<String, std::time::Instant>,
 }
 
 impl SharedState {
@@ -235,6 +238,7 @@ impl SharedState {
             cluster_interest_tx: std::sync::RwLock::new(None),
             local_topic_refcount: Arc::new(std::sync::Mutex::new(HashMap::new())),
             recovery,
+            conn_last_activity: DashMap::new(),
         }
     }
 
@@ -467,8 +471,41 @@ fn build_error_json(code: &str, message: &str) -> String {
     format!("WSE{}", payload)
 }
 
+/// Build server_hello JSON response to client_hello (protocol negotiation).
+fn build_server_hello(conn_id: &str, client_proto: u32, state: &SharedState) -> String {
+    let proto = client_proto.min(2);
+    let recovery_enabled = state.recovery.is_some();
+    let cluster_enabled = state.cluster_cmd_tx.read().unwrap().is_some();
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let val = serde_json::json!({
+        "t": "server_hello",
+        "p": {
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "protocol_version": proto,
+            "features": {
+                "compression": true,
+                "recovery": recovery_enabled,
+                "cluster": cluster_enabled,
+                "batching": true,
+                "priority_queue": true,
+                "msgpack": true
+            },
+            "limits": {
+                "max_message_size": 1_048_576,
+                "rate_limit_capacity": RATE_CAPACITY as u64,
+                "rate_limit_refill": RATE_REFILL as u64
+            },
+            "ping_interval": 25000,
+            "connection_id": conn_id,
+            "server_time": ts
+        },
+        "v": 1
+    });
+    format!("WSE{val}")
+}
+
 /// Build server_ready JSON message (sent immediately from Rust after JWT validation).
-fn build_server_ready(conn_id: &str, user_id: &str) -> String {
+fn build_server_ready(conn_id: &str, user_id: &str, recovery_enabled: bool) -> String {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let msg_id = Uuid::now_v7().to_string();
     let val = serde_json::json!({
@@ -487,7 +524,8 @@ fn build_server_ready(conn_id: &str, user_id: &str) -> String {
                     "priority_queue": true,
                     "circuit_breaker": true,
                     "rust_transport": true,
-                    "rust_jwt": true
+                    "rust_jwt": true,
+                    "recovery": recovery_enabled
                 },
                 "connection_id": conn_id,
                 "server_time": ts,
@@ -634,7 +672,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         // While we hold the write lock, no broadcast can acquire a read lock,
         // so server_ready is guaranteed to be first in the channel.
         if let Some(ref user_id) = rust_auth_user_id {
-            let server_ready = build_server_ready(&conn_id, user_id);
+            let recovery_enabled = state.recovery.is_some();
+            let server_ready = build_server_ready(&conn_id, user_id, recovery_enabled);
             let _ = tx.send(WsFrame::Msg(Message::Text(server_ready.into())));
         }
         conns.insert((*conn_id).clone(), ConnectionHandle { tx: tx.clone() });
@@ -644,6 +683,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     if use_msgpack {
         state.conn_formats.insert((*conn_id).clone(), true);
     }
+    // Initialize last activity for zombie detection
+    state
+        .conn_last_activity
+        .insert((*conn_id).clone(), std::time::Instant::now());
 
     // Fire on_connect (drain mode: push to queue; callback mode: background task)
     if drain {
@@ -782,6 +825,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     while let Some(Ok(msg)) = read_half.next().await {
         match msg {
             Message::Text(text) => {
+                // Update last activity for zombie detection
+                state
+                    .conn_last_activity
+                    .insert((*conn_id).clone(), std::time::Instant::now());
                 let text_ref: &str = text.as_ref();
 
                 // Strip prefix for JSON parsing
@@ -816,8 +863,25 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                 // Try to parse JSON in Rust
                 match serde_json::from_str::<serde_json::Value>(json_str) {
                     Ok(val) => {
-                        // Fast-path: ping handled entirely in Rust
+                        // Fast-path: protocol messages handled entirely in Rust
                         if let Some(t_val) = val.get("t").and_then(|t| t.as_str()) {
+                            if t_val == "client_hello" {
+                                let p = val.get("p");
+                                let client_proto =
+                                    p.and_then(|p| p.get("protocol_version"))
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(1) as u32;
+                                let hello = build_server_hello(&conn_id, client_proto, &state);
+                                let _ = tx.send(WsFrame::Msg(Message::Text(hello.into())));
+                                // Also push to drain queue so Python app knows about client
+                                if drain {
+                                    state.push_inbound(InboundEvent::Message {
+                                        conn_id: (*conn_id).clone(),
+                                        value: val,
+                                    });
+                                }
+                                continue;
+                            }
                             if t_val == "ping" {
                                 let timestamp = val
                                     .get("p")
@@ -889,6 +953,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                 }
             }
             Message::Binary(data) => {
+                // Update last activity for zombie detection
+                state
+                    .conn_last_activity
+                    .insert((*conn_id).clone(), std::time::Instant::now());
                 // Check if this connection uses msgpack (lock-free DashMap read)
                 let is_msgpack = state
                     .conn_formats
@@ -974,6 +1042,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     }
     state.conn_formats.remove(&*conn_id);
     state.conn_rates.remove(&*conn_id);
+    state.conn_last_activity.remove(&*conn_id);
     // Pub/Sub cleanup: remove connection from all subscribed topics
     if let Some((_, topics)) = state.conn_topics.remove(&*conn_id) {
         let mut disconnected_topics = Vec::new();
@@ -1280,7 +1349,6 @@ impl RustWSEServer {
             };
             Some(Arc::new(super::recovery::RecoveryManager::new(
                 super::recovery::RecoveryConfig {
-                    enabled: true,
                     buffer_size_bits: bits,
                     history_ttl_secs: recovery_ttl,
                     max_recovery_messages: recovery_max_messages,
@@ -1383,6 +1451,60 @@ impl RustWSEServer {
                             loop {
                                 interval.tick().await;
                                 rm.cleanup();
+                            }
+                        });
+                    }
+                    // Server-initiated ping + zombie detection
+                    {
+                        let ping_state = shared.clone();
+                        tokio::spawn(async move {
+                            let mut interval =
+                                tokio::time::interval(Duration::from_secs(25));
+                            let idle_timeout = Duration::from_secs(60);
+                            loop {
+                                interval.tick().await;
+                                let now = std::time::Instant::now();
+                                // Collect senders under read lock, then release
+                                let snapshot: Vec<(
+                                    String,
+                                    mpsc::UnboundedSender<WsFrame>,
+                                )> = {
+                                    let conns =
+                                        ping_state.connections.read().await;
+                                    conns
+                                        .iter()
+                                        .map(|(cid, h)| {
+                                            (cid.clone(), h.tx.clone())
+                                        })
+                                        .collect()
+                                };
+                                for (cid, tx) in &snapshot {
+                                    // Check zombie (no activity for 60s)
+                                    if let Some(last) =
+                                        ping_state.conn_last_activity.get(cid)
+                                        && now.duration_since(*last) > idle_timeout
+                                    {
+                                        let _ = tx.send(WsFrame::Msg(
+                                            Message::Close(None),
+                                        ));
+                                        // Remove so we don't re-close next tick
+                                        ping_state
+                                            .conn_last_activity
+                                            .remove(cid);
+                                        continue;
+                                    }
+                                    // Send server ping
+                                    let ts = chrono::Utc::now().to_rfc3339_opts(
+                                        chrono::SecondsFormat::Millis,
+                                        true,
+                                    );
+                                    let ping_msg = format!(
+                                        "WSE{{\"t\":\"ping\",\"p\":{{\"server_time\":\"{ts}\"}}}}"
+                                    );
+                                    let _ = tx.send(WsFrame::Msg(
+                                        Message::Text(ping_msg.into()),
+                                    ));
+                                }
                             }
                         });
                     }
@@ -1540,7 +1662,7 @@ impl RustWSEServer {
             }
         }
 
-        // #8: Per-connection rate limiter (token bucket)
+        // #8: Per-connection rate limiter (token bucket) with client feedback
         {
             let mut entry = self
                 .shared
@@ -1549,15 +1671,55 @@ impl RustWSEServer {
                 .or_insert_with(|| PerConnRate {
                     tokens: RATE_CAPACITY,
                     last_refill: std::time::Instant::now(),
+                    last_warning: None,
                 });
-            let state = entry.value_mut();
-            let elapsed = state.last_refill.elapsed().as_secs_f64();
-            state.tokens = (state.tokens + elapsed * RATE_REFILL).min(RATE_CAPACITY);
-            state.last_refill = std::time::Instant::now();
-            if state.tokens < 1.0 {
-                return Ok(0); // rate limited
+            let rate = entry.value_mut();
+            let elapsed = rate.last_refill.elapsed().as_secs_f64();
+            rate.tokens = (rate.tokens + elapsed * RATE_REFILL).min(RATE_CAPACITY);
+            rate.last_refill = std::time::Instant::now();
+
+            if rate.tokens < 1.0 {
+                // Send rate_limited error to client (throttled: max once per second)
+                let should_notify = rate
+                    .last_warning
+                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+                if should_notify {
+                    let err = "WSE{\"t\":\"error\",\"p\":{\"code\":\"RATE_LIMITED\",\"message\":\"Rate limit exceeded\",\"retry_after\":1.0},\"v\":1}".to_string();
+                    cmd_tx
+                        .send(ServerCommand::SendText {
+                            conn_id: conn_id.to_owned(),
+                            data: err,
+                        })
+                        .ok();
+                    rate.last_warning = Some(std::time::Instant::now());
+                }
+                return Ok(0);
             }
-            state.tokens -= 1.0;
+
+            // Warning at 20% remaining capacity (throttled: max once per second)
+            let warning_threshold = RATE_CAPACITY * 0.2;
+            if rate.tokens < warning_threshold {
+                let should_warn = rate
+                    .last_warning
+                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+                if should_warn {
+                    let warning = format!(
+                        "WSE{{\"t\":\"rate_limit_warning\",\"p\":{{\"current_rate\":{},\"limit\":{},\"remaining\":{},\"retry_after\":1.0}},\"v\":1}}",
+                        (RATE_CAPACITY - rate.tokens) as u64,
+                        RATE_CAPACITY as u64,
+                        rate.tokens as u64,
+                    );
+                    cmd_tx
+                        .send(ServerCommand::SendText {
+                            conn_id: conn_id.to_owned(),
+                            data: warning,
+                        })
+                        .ok();
+                    rate.last_warning = Some(std::time::Instant::now());
+                }
+            }
+
+            rate.tokens -= 1.0;
         }
 
         // Build serde_json map from PyDict, with t first

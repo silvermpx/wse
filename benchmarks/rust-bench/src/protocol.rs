@@ -336,6 +336,48 @@ pub async fn connect_batch(
     connections
 }
 
+/// Send a health query via battle_cmd and parse the health_response.
+/// Skips non-health messages (battle data, etc) until the response arrives or timeout.
+/// Uses fast string check before JSON parsing to handle high-throughput flood scenarios.
+pub async fn query_health(ws: &mut WsStream, timeout_secs: u64) -> Option<serde_json::Value> {
+    let cmd = serde_json::json!({
+        "t": "battle_cmd",
+        "p": {"action": "health"}
+    });
+    ws.send(Message::Text(cmd.to_string().into())).await.ok()?;
+
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match tokio::time::timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(msg))) => {
+                // Fast string check before expensive JSON parse -- the server floods
+                // 500K+ messages/s, so we can't afford to parse every one.
+                let might_be_health = match &msg {
+                    Message::Text(text) => text.contains("health_response"),
+                    Message::Binary(data) => std::str::from_utf8(data)
+                        .map(|s| s.contains("health_response"))
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                if might_be_health {
+                    if let Some(parsed) = parse_wse_message(&msg) {
+                        if parsed.get("t").and_then(|t| t.as_str()) == Some("health_response")
+                        {
+                            return parsed.get("p").cloned();
+                        }
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// Close all connections gracefully.
 pub async fn close_all(connections: Vec<WsStream>) {
     let mut handles = Vec::with_capacity(connections.len());

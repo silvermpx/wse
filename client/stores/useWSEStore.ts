@@ -19,6 +19,7 @@ import {
   SecurityInfo,
   SubscriptionInfo,
   OfflineQueueStats,
+  TopicRecoveryPosition,
 } from '../types';
 
 interface WSEStore extends WSEState {
@@ -46,6 +47,9 @@ interface WSEStore extends WSEState {
   addPendingSubscription: (topic: string) => void;
   confirmSubscription: (topic: string) => void;
   failSubscription: (topic: string) => void;
+  setServerRecoveryEnabled: (enabled: boolean) => void;
+  updateRecoveryState: (positions: Record<string, TopicRecoveryPosition>) => void;
+  removeRecoveryTopics: (topics: string[]) => void;
 
   // Actions - Queue
   updateQueueStats: (stats: Partial<QueueStats>) => void;
@@ -157,6 +161,8 @@ const initialSubscriptions: SubscriptionInfo = {
   pendingSubscriptions: [],
   failedSubscriptions: [],
   lastUpdate: null,
+  recoveryState: {},
+  serverRecoveryEnabled: false,
 };
 
 const initialState: WSEState = {
@@ -461,6 +467,28 @@ export const useWSEStore = create<WSEStore>()(
         failedSubscriptions: [...new Set([...state.subscriptions.failedSubscriptions, topic])],
       }
     })),
+
+    setServerRecoveryEnabled: (enabled) => set((state) => ({
+      subscriptions: {
+        ...state.subscriptions,
+        serverRecoveryEnabled: enabled,
+      }
+    })),
+
+    updateRecoveryState: (positions) => set((state) => ({
+      subscriptions: {
+        ...state.subscriptions,
+        recoveryState: { ...state.subscriptions.recoveryState, ...positions },
+      }
+    })),
+
+    removeRecoveryTopics: (topics) => set((state) => {
+      const cleaned = { ...state.subscriptions.recoveryState };
+      for (const t of topics) {
+        delete cleaned[t];
+      }
+      return { subscriptions: { ...state.subscriptions, recoveryState: cleaned } };
+    }),
 
     // Queue Actions
     updateQueueStats: (stats) => set((state) => ({

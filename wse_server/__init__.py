@@ -1,20 +1,47 @@
-"""WSE server -- real-time WebSocket engine with Rust acceleration.
+"""WSE Server -- High-performance WebSocket engine powered by Rust."""
 
-Embed into a FastAPI app as a router::
+from wse_server._wse_accel import (
+    RustWSEServer,
+    RustCompressionManager,
+    RustEventSequencer,
+    RustPriorityMessageQueue,
+    rust_jwt_encode,
+    rust_jwt_decode,
+    rust_aes_gcm_encrypt,
+    rust_aes_gcm_decrypt,
+    rust_ecdh_generate_keypair,
+    rust_ecdh_derive_shared_secret,
+    rust_hmac_sha256,
+    rust_sha256,
+    rust_compress,
+    rust_decompress,
+    rust_sign_message,
+    rust_match_event,
+    rust_transform_event,
+)
+from wse_server.core.types import EventPriority, DeliveryGuarantee
 
-    from fastapi import FastAPI
-    from wse_server import create_wse_router, WSEConfig
+__version__ = "2.0.0"
 
-    app = FastAPI()
-    wse = create_wse_router(WSEConfig())
-    app.include_router(wse, prefix="/wse")
-
-See :class:`WSEConfig` for all configuration options (auth, Redis,
-compression, encryption) and :class:`SnapshotProvider` for delivering
-initial state to clients on connect.
-"""
-
-from .router import SnapshotProvider, WSEConfig, create_wse_router
-
-__version__ = "1.4.4"
-__all__ = ["create_wse_router", "WSEConfig", "SnapshotProvider"]
+__all__ = [
+    "RustWSEServer",
+    "RustCompressionManager",
+    "RustEventSequencer",
+    "RustPriorityMessageQueue",
+    "rust_jwt_encode",
+    "rust_jwt_decode",
+    "rust_aes_gcm_encrypt",
+    "rust_aes_gcm_decrypt",
+    "rust_ecdh_generate_keypair",
+    "rust_ecdh_derive_shared_secret",
+    "rust_hmac_sha256",
+    "rust_sha256",
+    "rust_compress",
+    "rust_decompress",
+    "rust_sign_message",
+    "rust_match_event",
+    "rust_transform_event",
+    "EventPriority",
+    "DeliveryGuarantee",
+    "__version__",
+]

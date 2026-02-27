@@ -10,7 +10,6 @@ static EPOCH_COUNTER: AtomicU32 = AtomicU32::new(0);
 // RecoveryResult
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] // Used in later tasks (wire protocol recovery handler).
 pub(crate) enum RecoveryResult {
     /// Successfully recovered messages after the requested offset.
     Recovered {
@@ -28,9 +27,7 @@ pub(crate) enum RecoveryResult {
 // RecoveryConfig
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] // Fields used by cleanup/recover methods wired in later tasks.
 pub(crate) struct RecoveryConfig {
-    pub(crate) enabled: bool,
     /// Power-of-two exponent for ring buffer capacity (default 7 = 128 msgs).
     pub(crate) buffer_size_bits: u32,
     /// How long (seconds) an idle topic buffer lives before cleanup evicts it.
@@ -44,7 +41,6 @@ pub(crate) struct RecoveryConfig {
 impl Default for RecoveryConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             buffer_size_bits: 7,   // 128 slots
             history_ttl_secs: 300, // 5 minutes
             max_recovery_messages: 500,
@@ -57,21 +53,17 @@ impl Default for RecoveryConfig {
 // RecoveryEntry -- single message stored in the ring buffer
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] // Fields used by recover_since, wired in later tasks.
 struct RecoveryEntry {
     /// Pre-framed WebSocket bytes (Arc-shared with broadcast path -- zero-copy).
     data: Bytes,
     /// Monotonic offset within this topic buffer.
     offset: u64,
-    /// Timestamp of when the entry was pushed.
-    timestamp: Instant,
 }
 
 // ---------------------------------------------------------------------------
 // TopicRecoveryBuffer -- per-topic ring buffer
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] // Fields used by recover/cleanup methods wired in later tasks.
 struct TopicRecoveryBuffer {
     entries: Box<[Option<RecoveryEntry>]>,
     /// Bitmask for power-of-two indexing: capacity - 1.
@@ -135,11 +127,7 @@ impl TopicRecoveryBuffer {
         let idx = (offset & self.mask) as usize;
         let data_len = data.len();
 
-        self.entries[idx] = Some(RecoveryEntry {
-            data,
-            offset,
-            timestamp: Instant::now(),
-        });
+        self.entries[idx] = Some(RecoveryEntry { data, offset });
 
         self.head_offset += 1;
         self.total_bytes += data_len;

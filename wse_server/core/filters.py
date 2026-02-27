@@ -42,7 +42,7 @@ Nested Fields:
 import logging
 from typing import Any
 
-from wse_server._accel import rust_match_event
+from wse_server._wse_accel import rust_match_event
 
 log = logging.getLogger("wse.filters")
 

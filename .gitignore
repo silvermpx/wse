@@ -46,3 +46,4 @@ node_modules/
 # Internal docs (not for release)
 docs/internal/
 /docs/plans/
+/tests/

@@ -4,28 +4,26 @@ use crate::report::{self, LatencySummary, TierResult};
 use crate::stats::{self};
 use std::sync::atomic::Ordering;
 
-/// Test 10: Multi-Instance Fan-out (Redis, two servers)
+/// Test 12: Multi-Instance Fan-out with TLS (Cluster protocol, two servers)
 ///
-/// Publish on Server A (port) -> Redis -> Server B (port2) -> N WebSocket clients.
-/// Tests true horizontal scaling: the publishing server has NO local subscribers,
-/// all delivery happens on a different server instance via Redis coordination.
+/// Same as fanout_cluster but with mTLS between cluster peers.
+/// Measures TLS overhead on cross-instance delivery throughput.
 ///
 /// Architecture:
-///   Server A (--port, publisher only) -> Redis PUBLISH wse:bench_topic
-///   Redis -> Server B (--port2, subscribers) -> PSUBSCRIBE wse:* -> fan-out
-///   Benchmark clients connect to Server B only.
+///   Server A (--port, publisher) -> Cluster TLS -> Server B (--port2, subscribers)
+///   Benchmark clients connect to Server B via plain WebSocket.
 ///
 /// Requires:
-///   bench_fanout_server.py --mode pubsub --port 5006  (Server A, publishes)
-///   bench_fanout_server.py --mode subscribe --port 5007  (Server B, receives clients)
-///   Both must --redis-url to the same Redis instance.
+///   bench_fanout_server.py --mode cluster --port 5006 --peers 127.0.0.1:5007 --generate-tls
+///   bench_fanout_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:5006 \
+///       --tls-cert /tmp/wse_tls_test/server.crt --tls-key /tmp/wse_tls_test/server.key --tls-ca /tmp/wse_tls_test/ca.crt
 pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let port2 = cli.port2.unwrap_or(cli.port + 1);
 
     stats::print_header(
-        "TEST 10: Multi-Instance Fan-out (Redis, two servers)",
+        "TEST 12: Multi-Instance Fan-out with TLS (Cluster, two servers)",
         &format!(
-            "Publish on :{} -> Redis -> :{} -> N subscribers for {}s. Cross-instance delivery.",
+            "Publish on :{} -> Cluster TLS -> :{} -> N subscribers for {}s. Cross-instance delivery over mTLS.",
             cli.port, port2, cli.duration
         ),
     );
@@ -49,17 +47,23 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         Err(e) => {
             eprintln!("FAILED: {e}");
             eprintln!(
-                "\n    Start Server B: python benchmarks/bench_fanout_server.py --mode subscribe --port {port2}"
+                "\n    Start servers with TLS (separate cluster ports):\n    \
+                python benchmarks/bench_fanout_server.py --mode cluster --port {} --peers 127.0.0.1:6007 \\\n      \
+                --cluster-port 6006 --cluster-addr 127.0.0.1:6006 --generate-tls\n    \
+                python benchmarks/bench_fanout_server.py --mode cluster-subscribe --port {} --peers 127.0.0.1:6006 \\\n      \
+                --cluster-port 6007 --cluster-addr 127.0.0.1:6007 \\\n      \
+                --tls-cert /tmp/wse_tls_test/server.crt --tls-key /tmp/wse_tls_test/server.key --tls-ca /tmp/wse_tls_test/ca.crt",
+                cli.port, port2
             );
             return Vec::new();
         }
     }
 
-    let tiers = cli.tiers_for(crate::config::TestName::FanoutMulti);
+    let tiers = cli.tiers_for(crate::config::TestName::FanoutClusterTls);
     let mut results = Vec::new();
 
     for &n in &tiers {
-        println!("\n  --- {} subscribers on Server B (:{}) ---", n, port2);
+        println!("\n  --- {} subscribers on Server B (:{}) [TLS cluster] ---", n, port2);
 
         // Connect all clients to Server B
         let connections = protocol::connect_batch(
@@ -79,7 +83,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
         let actual = connections.len();
 
-        // Server A publishes, Server B fans out to our clients via Redis
+        // Server A publishes, Server B fans out to our clients via TLS Cluster
         let result = super::fanout_broadcast::measure_fanout(
             connections,
             std::time::Duration::from_secs(cli.duration),
@@ -98,7 +102,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
         println!("    Duration:       {:.2}s", result.elapsed);
         println!(
-            "    Published:      {}/s (Server A -> Redis -> Server B)",
+            "    Published:      {}/s (Server A -> TLS Cluster -> Server B)",
             stats::fmt_rate(published_per_sec)
         );
         println!(
@@ -116,7 +120,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         }
 
         if !result.latency.is_empty() {
-            println!("    Delivery latency (publish A -> Redis -> B -> WS):");
+            println!("    Delivery latency (publish A -> TLS Cluster -> B -> WS):");
             result.latency.print_summary("      ");
         }
 
@@ -138,6 +142,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
                 "deliveries_per_sec": deliveries_per_sec,
                 "mb_per_sec": mb_per_sec,
                 "seq_gaps": unique_gaps,
+                "tls": true,
             }),
         });
 

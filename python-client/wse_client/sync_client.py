@@ -149,11 +149,12 @@ class SyncWSEClient:
         )
         return future.result(timeout=5.0)
 
-    def subscribe(self, topics: list[str]) -> bool:
-        """Subscribe to topics. Blocks until sent.
+    def subscribe(self, topics: list[str], *, recover: bool = False) -> bool:
+        """Subscribe to topics, optionally recovering missed messages.
 
         Args:
             topics: Topic names to subscribe to.
+            recover: If True, request message recovery using stored positions.
 
         Returns:
             True if sent, False if not connected.
@@ -161,7 +162,7 @@ class SyncWSEClient:
         if not self._loop or not self._client:
             return False
         future = asyncio.run_coroutine_threadsafe(
-            self._client.subscribe(topics), self._loop
+            self._client.subscribe(topics, recover=recover), self._loop
         )
         return future.result(timeout=5.0)
 
@@ -353,6 +354,20 @@ class SyncWSEClient:
         if self._client:
             return self._client.subscribed_topics
         return set()
+
+    @property
+    def recovery_enabled(self) -> bool:
+        """Whether the server supports message recovery."""
+        if self._client:
+            return self._client.recovery_enabled
+        return False
+
+    @property
+    def recovery_state(self) -> dict[str, tuple[str, int]]:
+        """Per-topic recovery positions: ``{topic: (epoch, offset)}``."""
+        if self._client:
+            return self._client.recovery_state
+        return {}
 
     def get_stats(self) -> dict[str, Any]:
         if self._client:

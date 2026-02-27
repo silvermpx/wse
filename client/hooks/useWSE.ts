@@ -777,10 +777,29 @@ export function useWSE(
     if (!initialSyncSentRef.current) {
       initialSyncSentRef.current = true;
 
-      sendMessage('subscription_update', {
+      // Build subscription payload with recovery info if available
+      const payload: Record<string, any> = {
         action: 'subscribe',
         topics,
-      }, { priority: MessagePriority.HIGH });
+      };
+
+      const currentSubs = useWSEStore.getState().subscriptions;
+      if (currentSubs.serverRecoveryEnabled && Object.keys(currentSubs.recoveryState).length > 0) {
+        const recoveryInfo: Record<string, { epoch: string; offset: number }> = {};
+        for (const topic of topics) {
+          const pos = currentSubs.recoveryState[topic];
+          if (pos) {
+            recoveryInfo[topic] = { epoch: pos.epoch, offset: pos.offset };
+          }
+        }
+        if (Object.keys(recoveryInfo).length > 0) {
+          payload.recover = true;
+          payload.recovery = recoveryInfo;
+          logger.info('Requesting recovery for topics:', Object.keys(recoveryInfo));
+        }
+      }
+
+      sendMessage('subscription_update', payload, { priority: MessagePriority.HIGH });
 
       // Request snapshot immediately after subscription
       requestSnapshot(topics, 3, 1000);
@@ -1199,7 +1218,7 @@ export function useWSE(
   // Public API Implementation
   // ---------------------------------------------------------------------------
 
-  const subscribe = useCallback((topics: string[]) => {
+  const subscribe = useCallback((topics: string[], options?: { recover?: boolean }) => {
     if (!topics.length) return;
 
     const currentTopics = store.activeTopics;
@@ -1208,10 +1227,28 @@ export function useWSE(
     store.setActiveTopics(newTopics);
     saveSubscriptions(newTopics);
 
-    sendMessage('subscription_update', {
+    const payload: Record<string, any> = {
       action: 'subscribe',
       topics,
-    }, { priority: MessagePriority.HIGH });
+    };
+
+    // Attach recovery info when requested and server supports it
+    const currentSubs = useWSEStore.getState().subscriptions;
+    if (options?.recover && currentSubs.serverRecoveryEnabled) {
+      const recoveryInfo: Record<string, { epoch: string; offset: number }> = {};
+      for (const topic of topics) {
+        const pos = currentSubs.recoveryState[topic];
+        if (pos) {
+          recoveryInfo[topic] = { epoch: pos.epoch, offset: pos.offset };
+        }
+      }
+      if (Object.keys(recoveryInfo).length > 0) {
+        payload.recover = true;
+        payload.recovery = recoveryInfo;
+      }
+    }
+
+    sendMessage('subscription_update', payload, { priority: MessagePriority.HIGH });
   }, [store, sendMessage]);
 
   const unsubscribe = useCallback((topics: string[]) => {
@@ -1222,6 +1259,9 @@ export function useWSE(
 
     store.setActiveTopics(newTopics);
     saveSubscriptions(newTopics);
+
+    // Clear recovery state for unsubscribed topics
+    store.removeRecoveryTopics(topics);
 
     sendMessage('subscription_update', {
       action: 'unsubscribe',

@@ -3,16 +3,14 @@
 Server broadcasts messages to N subscribers. Measures delivery throughput,
 message loss (sequence gaps), and end-to-end latency.
 
-Three modes tested:
+Two modes tested:
 - **Single-Instance Broadcast** (Test 8) -- `server.broadcast_all()` directly to all connections
 - **Multi-Instance Cluster** (Test 11) -- publish on Server A -> custom TCP protocol -> Server B -> N subscribers
-- **Multi-Instance Redis** (Test 10) -- publish on Server A -> Redis Pub/Sub -> Server B -> N subscribers
 
 ## Hardware
 
 AMD EPYC 7502P (32 cores, 64 threads), 128 GB RAM, Ubuntu 24.04.
-Client and server on the same machine (loopback). Redis 8.6.1 on localhost (io-threads 8)
-for multi-instance Redis tests.
+Client and server on the same machine (loopback).
 
 Server: `bench_fanout_server.py` with `RustWSEServer` -- production maturin binary,
 drain_mode=ON, JWT auth enabled.
@@ -93,57 +91,16 @@ standalone levels due to batching amortization.
 
 ---
 
-## Test 10: Multi-Instance Fan-out (Redis)
-
-Two separate server processes coordinated via Redis Pub/Sub:
-
-```
-Server A (port 5006, pubsub mode) -- publishes continuously
-    |
-    | Redis PUBLISH wse:bench_topic (pipelined, up to 64/batch)
-    v
-Server B (port 5007, subscribe mode) --> N WebSocket clients
-```
-
-| Subscribers | Published/s | Deliveries/s | Bandwidth | p50 | p95 | p99 | Gaps |
-|-------------|-------------|-------------|-----------|-----|-----|-----|------|
-| 10 | 43K | 429K | 39 MB/s | 68.0s | 72.5s | 72.9s | 0 |
-| 100 | 16K | **1.6M** | 152 MB/s | 78.3s | 84.0s | 84.5s | 0 |
-| 500 | 4K | **1.8M** | 165 MB/s | 90.2s | 96.0s | 96.5s | 0 |
-| 1,000 | 2K | 1.6M | 152 MB/s | 102.6s | 108.1s | 108.6s | 0 |
-| 2,000 | 765 | 1.5M | 141 MB/s | 114.7s | 120.3s | 120.8s | 0 |
-| 5,000 | 212 | 1.1M | 98 MB/s | 126.2s | 132.9s | 133.4s | 0 |
-| 10,000 | 81 | 819K | 75 MB/s | 140.1s | 146.4s | 146.8s | 0 |
-| 20,000 | 34 | 688K | 63 MB/s | 153.4s | 161.1s | 161.7s | 0 |
-
-**Peak: 1.8M deliveries/s at 500 subscribers (165 MB/s). Zero message loss at every tier.**
-
----
-
-## Comparison: All Three Modes
+## Comparison: Standalone vs Cluster
 
 | Mode | Peak del/s | at N subs | Bandwidth | Gaps | Horizontal Scaling |
 |------|-----------|----------|-----------|------|-------------------|
 | Standalone | **4.3M** | 100 | 400 MB/s | 0 | No |
 | Cluster | **9.5M** | 20K | 887 MB/s | 0 | Yes (N instances) |
-| Redis | **1.8M** | 500 | 165 MB/s | 0 | Yes (N instances) |
 
-### Cluster vs Redis
-
-| Subscribers | Cluster del/s | Redis del/s | Cluster Advantage |
-|-------------|---------------|-------------|-------------------|
-| 10 | 517K | 429K | +20% |
-| 100 | 1.9M | 1.6M | +19% |
-| 500 | 2.2M | 1.8M | +22% |
-| 1,000 | 2.0M | 1.6M | +25% |
-| 5,000 | 1.8M | 1.1M | +64% |
-| 10,000 | 3.4M | 819K | **+4.2x** |
-| 20,000 | 9.5M | 688K | **+13.8x** |
-
-Cluster protocol outperforms Redis at all subscriber counts, with the advantage growing
-dramatically at scale (13.8x at 20K subscribers). Cluster connects servers directly via TCP,
-eliminating the Redis serialization/deserialization overhead that becomes the bottleneck
-at high fan-out.
+At low subscriber counts (10-100), the TCP hop between servers is the bottleneck. At higher
+counts, fan-out becomes the dominant cost, and cluster throughput approaches -- and exceeds --
+standalone levels due to batching amortization.
 
 ### Memory at Scale
 
@@ -184,22 +141,6 @@ python benchmarks/bench_fanout_server.py \
 
 # Terminal 3: Run benchmark
 ./benchmarks/rust-bench/target/release/wse-bench --test fanout-cluster \
-  --port 5006 --port2 5007 --duration 10
-```
-
-### Test 10: Multi-Instance Fan-out (Redis)
-
-```bash
-# Terminal 1: Server A (publisher)
-python benchmarks/bench_fanout_server.py \
-  --mode pubsub --port 5006 --redis-url redis://localhost:6379
-
-# Terminal 2: Server B (subscribers)
-python benchmarks/bench_fanout_server.py \
-  --mode subscribe --port 5007 --redis-url redis://localhost:6379
-
-# Terminal 3: Run benchmark
-./benchmarks/rust-bench/target/release/wse-bench --test fanout-multi \
   --port 5006 --port2 5007 --duration 10
 ```
 

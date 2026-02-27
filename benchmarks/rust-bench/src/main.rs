@@ -91,17 +91,38 @@ async fn run_single_test(cli: &Cli, test: TestName) {
         TestName::FanoutBroadcast => {
             tests::fanout_broadcast::run(cli).await;
         }
-        TestName::FanoutMulti => {
-            tests::fanout_multi::run(cli).await;
-        }
         TestName::FanoutCluster => {
             tests::fanout_cluster::run(cli).await;
+        }
+        TestName::FanoutClusterTls => {
+            tests::fanout_cluster_tls::run(cli).await;
+        }
+        TestName::BattleStandalone => {
+            tests::battle_standalone::run(cli).await;
+        }
+        TestName::BattleCluster => {
+            tests::battle_cluster::run(cli).await;
+        }
+        TestName::BattleLoad => {
+            tests::battle_load::run(cli).await;
+        }
+        TestName::BattlePhase3Caps => {
+            tests::battle_phase3_caps::run(cli).await;
+        }
+        TestName::BattlePhase4Tls => {
+            tests::battle_phase4_tls::run(cli).await;
+        }
+        TestName::BattlePhase5Discovery => {
+            tests::battle_phase5_discovery::run(cli).await;
+        }
+        TestName::BattlePhase6Compression => {
+            tests::battle_phase6_compression::run(cli).await;
         }
     }
 }
 
 async fn run_full_suite(cli: &Cli) {
-    println!("\n  Running full benchmark suite (11 tests)...");
+    println!("\n  Running full benchmark suite...");
 
     tests::connection_storm::run(cli).await;
     pause_between_tests().await;
@@ -125,9 +146,6 @@ async fn run_full_suite(cli: &Cli) {
     pause_between_tests().await;
 
     tests::fanout_broadcast::run(cli).await;
-    pause_between_tests().await;
-
-    tests::fanout_multi::run(cli).await;
     pause_between_tests().await;
 
     tests::fanout_cluster::run(cli).await;

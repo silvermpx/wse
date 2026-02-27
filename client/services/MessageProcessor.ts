@@ -660,8 +660,13 @@ export class MessageProcessor {
     store.setConnectionState(ConnectionState.CONNECTED);
     store.updateMetrics({ connectedSince: Date.now() });
 
+    // Check if server supports recovery
+    const details = payload.details || payload;
+    const features = details.features || {};
+    store.setServerRecoveryEnabled(!!features.recovery);
+
     // Store server ready details for later processing
-    this.serverReadyDetails = payload.details || payload;
+    this.serverReadyDetails = details;
     this.serverReadyProcessed = true;
 
     // Process when connection manager is available
@@ -757,6 +762,24 @@ export class MessageProcessor {
       payload.failed_topics.forEach((topic: string) => {
         store.failSubscription(topic);
       });
+    }
+
+    // Store recovery positions from server response
+    if (payload.recovery && typeof payload.recovery === 'object') {
+      const positions: Record<string, { epoch: string; offset: number }> = {};
+      for (const [topic, info] of Object.entries(payload.recovery)) {
+        const ri = info as any;
+        if (ri && ri.epoch != null && ri.offset != null) {
+          const parsedOffset = Number(ri.offset);
+          if (!isNaN(parsedOffset)) {
+            positions[topic] = { epoch: String(ri.epoch), offset: parsedOffset };
+          }
+        }
+      }
+      if (Object.keys(positions).length > 0) {
+        store.updateRecoveryState(positions);
+        logger.info('Recovery positions updated:', positions);
+      }
     }
 
     window.dispatchEvent(new CustomEvent('subscriptionUpdate', {

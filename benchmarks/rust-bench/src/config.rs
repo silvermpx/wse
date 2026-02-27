@@ -54,6 +54,10 @@ pub struct Cli {
     /// Second server port (for multi-instance fan-out test)
     #[arg(long)]
     pub port2: Option<u16>,
+
+    /// Third server port (for 3-node discovery test)
+    #[arg(long)]
+    pub port3: Option<u16>,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,8 +70,15 @@ pub enum TestName {
     SustainedHold,
     ConnectionLimit,
     FanoutBroadcast,
-    FanoutMulti,
     FanoutCluster,
+    FanoutClusterTls,
+    BattleStandalone,
+    BattleCluster,
+    BattleLoad,
+    BattlePhase3Caps,
+    BattlePhase4Tls,
+    BattlePhase5Discovery,
+    BattlePhase6Compression,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +103,7 @@ impl Cli {
                     10, 100, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000,
                 ]
             }
-            TestName::FanoutMulti | TestName::FanoutCluster => {
+            TestName::FanoutCluster | TestName::FanoutClusterTls => {
                 vec![10, 100, 500, 1_000, 2_000, 5_000, 10_000, 20_000]
             }
             _ => DEFAULT_TIERS.to_vec(),

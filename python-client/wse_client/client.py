@@ -137,6 +137,10 @@ class AsyncWSEClient:
         # Snapshot dedup
         self._snapshot_requested = False
 
+        # Recovery state: topic -> (epoch, offset)
+        self._recovery_state: dict[str, tuple[str, int]] = {}
+        self._server_recovery_enabled = False
+
         # Reconnect config for later use
         self._reconnect_cfg = reconnect
 
@@ -283,6 +287,16 @@ class AsyncWSEClient:
         return set(self._subscribed_topics)
 
     @property
+    def recovery_enabled(self) -> bool:
+        """Whether the server supports message recovery."""
+        return self._server_recovery_enabled
+
+    @property
+    def recovery_state(self) -> dict[str, tuple[str, int]]:
+        """Per-topic recovery positions: ``{topic: (epoch, offset)}``."""
+        return dict(self._recovery_state)
+
+    @property
     def queue_size(self) -> int:
         """Number of events waiting in the iterator queue."""
         return self._event_queue.qsize()
@@ -403,11 +417,21 @@ class AsyncWSEClient:
             self._stats.bytes_sent += len(encoded)
         return ok
 
-    async def subscribe(self, topics: list[str]) -> bool:
-        """Subscribe to one or more topics.
+    async def subscribe(
+        self,
+        topics: list[str],
+        *,
+        recover: bool = False,
+    ) -> bool:
+        """Subscribe to one or more topics, optionally recovering missed messages.
+
+        When *recover* is True and the server supports recovery, the client
+        sends its last known epoch and offset for each topic so the server
+        can replay missed messages before confirming the subscription.
 
         Args:
             topics: Topic names, e.g. ``["notifications", "live_data"]``.
+            recover: If True, request message recovery using stored positions.
 
         Returns:
             True if the subscription message was sent.
@@ -416,9 +440,22 @@ class AsyncWSEClient:
         if not new_topics:
             return True
 
+        payload: dict[str, Any] = {"action": "subscribe", "topics": new_topics}
+
+        # Attach recovery info when requested and server supports it
+        if recover and self._server_recovery_enabled:
+            recovery_info: dict[str, dict[str, Any]] = {}
+            for topic in new_topics:
+                state = self._recovery_state.get(topic)
+                if state is not None:
+                    recovery_info[topic] = {"epoch": state[0], "offset": state[1]}
+            if recovery_info:
+                payload["recover"] = True
+                payload["recovery"] = recovery_info
+
         msg = self._codec.encode(
             "subscription_update",
-            {"action": "subscribe", "topics": new_topics},
+            payload,
             priority=MessagePriority.HIGH,
         )
         ok = await self._connection.send(msg)
@@ -444,6 +481,8 @@ class AsyncWSEClient:
         ok = await self._connection.send(msg)
         if ok:
             self._subscribed_topics -= set(topics)
+            for t in topics:
+                self._recovery_state.pop(t, None)
             self._stats.messages_sent += 1
         return ok
 
@@ -689,7 +728,40 @@ class AsyncWSEClient:
         self._connection.handle_server_ready(conn_id)
         self._server_ready_event.set()
         self._snapshot_requested = False
-        logger.info("Server ready (connection_id=%s)", conn_id)
+
+        # Check if server supports recovery (from features in details)
+        details = event.payload.get("details", {})
+        features = details.get("features", {})
+        self._server_recovery_enabled = bool(features.get("recovery", False))
+
+        logger.info(
+            "Server ready (connection_id=%s, recovery=%s)",
+            conn_id,
+            self._server_recovery_enabled,
+        )
+
+        # Auto-resubscribe to previously subscribed topics on reconnect
+        if self._subscribed_topics and self._stats.reconnect_count > 0:
+            has_recovery_state = bool(self._recovery_state)
+            self._fire_task(
+                self._resubscribe_after_reconnect(
+                    recover=self._server_recovery_enabled and has_recovery_state,
+                )
+            )
+
+    async def _resubscribe_after_reconnect(self, *, recover: bool) -> None:
+        """Re-subscribe to all previously subscribed topics after reconnection."""
+        topics = list(self._subscribed_topics)
+        # Clear so subscribe() treats them as new
+        self._subscribed_topics.clear()
+        logger.info(
+            "Re-subscribing to %d topics (recover=%s)", len(topics), recover
+        )
+        ok = await self.subscribe(topics, recover=recover)
+        if not ok:
+            # Restore so the next reconnect can try again
+            self._subscribed_topics.update(topics)
+            logger.warning("Re-subscribe failed, topics preserved for next reconnect")
 
     def _handle_server_hello(self, event: WSEEvent) -> None:
         """Handle server_hello with negotiated features and limits."""
@@ -719,6 +791,21 @@ class AsyncWSEClient:
             logger.warning("Subscription failed for: %s", failed_topics)
         if success_topics:
             logger.debug("Subscribed to: %s", success_topics)
+
+        # Store recovery positions from server response
+        recovery = p.get("recovery", {})
+        for topic, info in recovery.items():
+            if isinstance(info, dict):
+                epoch = info.get("epoch")
+                offset = info.get("offset")
+                if epoch is not None and offset is not None:
+                    self._recovery_state[topic] = (str(epoch), int(offset))
+                    logger.debug(
+                        "Recovery position for %s: epoch=%s offset=%d",
+                        topic,
+                        epoch,
+                        offset,
+                    )
 
     def _handle_error(self, event: WSEEvent) -> None:
         """Handle server error with code classification (matches TS error handler)."""

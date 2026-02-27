@@ -1,34 +1,37 @@
 """Fan-out benchmark server.
 
 Starts the Rust WSE server and continuously broadcasts or publishes messages.
-Rust benchmark client (wse-bench --test fanout-broadcast/fanout-pubsub/fanout-multi/fanout-cluster)
+Rust benchmark client (wse-bench --test fanout-broadcast/fanout-cluster)
 connects and measures receive throughput.
 
 Modes:
-  broadcast        -- server.broadcast_all() to ALL connections (no Redis)
-  pubsub           -- server.broadcast() via Redis to subscribed connections
-  subscribe        -- subscribe-only mode for multi-instance test (Server B, Redis)
+  broadcast        -- server.broadcast_all() to ALL connections
   cluster          -- server.broadcast() via cluster to subscribed connections
   cluster-subscribe -- subscribe-only mode for multi-instance cluster test (Server B)
 
 Usage:
-    # Test 8: Fan-out Broadcast (no Redis)
+    # Test 8: Fan-out Broadcast
     python benchmarks/bench_fanout_server.py --mode broadcast
     wse-bench --test fanout-broadcast
-
-    # Test 10: Multi-Instance Fan-out (two servers + Redis)
-    python benchmarks/bench_fanout_server.py --mode pubsub --port 5006 --redis-url redis://localhost:6379
-    python benchmarks/bench_fanout_server.py --mode subscribe --port 5007 --redis-url redis://localhost:6379
-    wse-bench --test fanout-multi --port 5006 --port2 5007
 
     # Test 11: Multi-Instance Fan-out (two servers + Cluster protocol)
     python benchmarks/bench_fanout_server.py --mode cluster --port 5006 --peers 127.0.0.1:5007
     python benchmarks/bench_fanout_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:5006
     wse-bench --test fanout-cluster --port 5006 --port2 5007
+
+    # Test 12: Multi-Instance Fan-out with TLS (separate cluster ports)
+    python benchmarks/bench_fanout_server.py --mode cluster --port 5006 --peers 127.0.0.1:6007 \\
+        --cluster-port 6006 --cluster-addr 127.0.0.1:6006 --generate-tls
+    python benchmarks/bench_fanout_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:6006 \\
+        --cluster-port 6007 --cluster-addr 127.0.0.1:6007 \\
+        --tls-cert /tmp/wse_tls_test/server.crt --tls-key /tmp/wse_tls_test/server.key --tls-ca /tmp/wse_tls_test/ca.crt
+    wse-bench --test fanout-cluster-tls --port 5006 --port2 5007
 """
 
 import argparse
+import os
 import signal
+import subprocess
 import sys
 import time
 import threading
@@ -40,6 +43,41 @@ JWT_ISSUER = "wse-bench"
 JWT_AUDIENCE = "wse-bench"
 
 BENCH_TOPIC = "bench_topic"
+TLS_CERT_DIR = "/tmp/wse_tls_test"
+
+
+def generate_tls_certs():
+    """Generate self-signed test certs in a fixed directory."""
+    os.makedirs(TLS_CERT_DIR, exist_ok=True)
+
+    ca_key = f"{TLS_CERT_DIR}/ca.key"
+    ca_crt = f"{TLS_CERT_DIR}/ca.crt"
+    srv_key = f"{TLS_CERT_DIR}/server.key"
+    srv_csr = f"{TLS_CERT_DIR}/server.csr"
+    srv_crt = f"{TLS_CERT_DIR}/server.crt"
+
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+        "-keyout", ca_key, "-out", ca_crt,
+        "-days", "1", "-nodes", "-subj", "/CN=wse-test-ca",
+    ], check=True, capture_output=True)
+
+    subprocess.run([
+        "openssl", "req", "-newkey", "rsa:2048",
+        "-keyout", srv_key, "-out", srv_csr,
+        "-nodes", "-subj", "/CN=localhost",
+        "-addext", "subjectAltName=IP:127.0.0.1",
+    ], check=True, capture_output=True)
+
+    subprocess.run([
+        "openssl", "x509", "-req", "-in", srv_csr,
+        "-CA", ca_crt, "-CAkey", ca_key,
+        "-CAcreateserial", "-out", srv_crt, "-days", "1",
+        "-copy_extensions", "copyall",
+    ], check=True, capture_output=True)
+
+    print(f"[fanout-server] TLS certs generated in {TLS_CERT_DIR}")
+    return srv_crt, srv_key, ca_crt
 
 
 def generate_token(user_id: str = "bench-user") -> str:
@@ -54,8 +92,8 @@ def generate_token(user_id: str = "bench-user") -> str:
 
 
 def drain_loop(server, mode: str, stop_event: threading.Event):
-    """Drain inbound events. For pubsub/subscribe/cluster modes, auto-subscribe connections."""
-    subscribe_mode = mode in ("pubsub", "subscribe", "cluster", "cluster-subscribe")
+    """Drain inbound events. For cluster modes, auto-subscribe connections."""
+    subscribe_mode = mode in ("cluster", "cluster-subscribe")
     while not stop_event.is_set():
         try:
             batch = server.drain_inbound(256, 50)
@@ -87,13 +125,13 @@ def publish_loop(server, mode: str, stop_event: threading.Event):
         try:
             if mode == "broadcast":
                 server.broadcast_all(msg)
-            elif mode in ("pubsub", "cluster"):
+            elif mode == "cluster":
                 server.broadcast(BENCH_TOPIC, msg)
                 # Yield GIL so drain_loop can process subscribe events
                 if seq % 100 == 0:
                     time.sleep(0)
             else:
-                # subscribe / cluster-subscribe mode: no publishing
+                # cluster-subscribe mode: no publishing
                 time.sleep(1)
                 continue
         except Exception:
@@ -123,25 +161,34 @@ def main():
     parser = argparse.ArgumentParser(description="Fan-out benchmark server")
     parser.add_argument(
         "--mode",
-        choices=["broadcast", "pubsub", "subscribe", "cluster", "cluster-subscribe"],
+        choices=["broadcast", "cluster", "cluster-subscribe"],
         required=True,
-        help="broadcast=no Redis, pubsub=Redis publish, subscribe=Redis receive only, "
-             "cluster=cluster publish, cluster-subscribe=cluster receive only",
+        help="broadcast=all connections, cluster=cluster publish, cluster-subscribe=cluster receive only",
     )
     parser.add_argument("--port", type=int, default=5006)
     parser.add_argument("--max-connections", type=int, default=60000)
-    parser.add_argument("--redis-url", default=None, help="Redis URL for pubsub/subscribe modes")
     parser.add_argument("--peers", nargs="+", default=None,
                         help="Cluster peer addresses for cluster modes, e.g. 127.0.0.1:5007")
+    parser.add_argument("--tls-cert", default=None, help="Path to TLS certificate PEM")
+    parser.add_argument("--tls-key", default=None, help="Path to TLS private key PEM")
+    parser.add_argument("--tls-ca", default=None, help="Path to CA certificate PEM")
+    parser.add_argument("--generate-tls", action="store_true",
+                        help=f"Generate self-signed test certs in {TLS_CERT_DIR}")
+    parser.add_argument("--cluster-port", type=int, default=None,
+                        help="Cluster listen port (separate from WebSocket port)")
+    parser.add_argument("--cluster-addr", default=None,
+                        help="Cluster advertise address host:port")
     args = parser.parse_args()
 
-    if args.mode in ("pubsub", "subscribe") and not args.redis_url:
-        print("ERROR: --redis-url required for pubsub/subscribe mode", file=sys.stderr)
+    if args.mode in ("cluster", "cluster-subscribe") and not args.peers and not args.cluster_port:
+        print("ERROR: --peers or --cluster-port required for cluster/cluster-subscribe mode", file=sys.stderr)
         sys.exit(1)
 
-    if args.mode in ("cluster", "cluster-subscribe") and not args.peers:
-        print("ERROR: --peers required for cluster/cluster-subscribe mode", file=sys.stderr)
-        sys.exit(1)
+    if args.generate_tls:
+        cert, key, ca = generate_tls_certs()
+        args.tls_cert = cert
+        args.tls_key = key
+        args.tls_ca = ca
 
     server = RustWSEServer(
         "0.0.0.0",
@@ -155,13 +202,22 @@ def main():
     server.start()
     print(f"[fanout-server] Rust WSE on :{args.port} (mode={args.mode})")
 
-    if args.redis_url:
-        server.connect_redis(args.redis_url)
-        print(f"[fanout-server] Redis connected: {args.redis_url}")
-
-    if args.peers:
-        server.connect_cluster(args.peers)
-        print(f"[fanout-server] Cluster peers: {args.peers}")
+    if args.peers or args.cluster_port:
+        peers = args.peers or []
+        server.connect_cluster(
+            peers,
+            tls_cert=args.tls_cert,
+            tls_key=args.tls_key,
+            tls_ca=args.tls_ca,
+            cluster_port=args.cluster_port,
+            cluster_addr=args.cluster_addr,
+        )
+        if peers:
+            print(f"[fanout-server] Cluster peers: {peers}")
+        if args.tls_cert:
+            print(f"[fanout-server] TLS enabled (cert={args.tls_cert})")
+        if args.cluster_port:
+            print(f"[fanout-server] Cluster port: {args.cluster_port}, addr: {args.cluster_addr}")
 
     token = generate_token()
     print(f"[fanout-server] JWT: {token}")

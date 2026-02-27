@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "wse-server"
-version = "1.4.4"
+version = "2.0.0"
 description = "Rust-powered WebSocket engine for Python. Up to 14M msg/s JSON, 30M binary (MsgPack/zlib). Zero-GIL JWT. E2E encrypted."
 readme = "README.md"
 license = { text = "MIT" }
@@ -18,13 +18,12 @@ keywords = [
     "engine",
     "real-time",
     "pubsub",
-    "fastapi",
+    "cluster",
     "encrypted",
     "rust",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
-    "Framework :: FastAPI",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
@@ -38,10 +37,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "fastapi>=0.115",
-    "starlette>=0.40",
     "orjson>=3.10",
-    "redis>=5.0",
     "cryptography>=43.0",
     "pyjwt[crypto]>=2.9",
 ]
@@ -85,9 +81,6 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM", "TCH"]
 ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
-"wse_server/examples/*" = ["F401", "F821", "N806"]
-"wse_server/reliability/circuit_breaker.py" = ["SIM102"]
-"wse_server/connection/connection.py" = ["SIM102"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

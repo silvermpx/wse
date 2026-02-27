@@ -2,7 +2,7 @@
 
 ## Overview
 
-WSE follows a layered architecture with clear separation between transport, protocol, and application concerns. The system supports horizontal scaling through Redis Pub/Sub coordination.
+WSE follows a layered architecture with clear separation between transport, protocol, and application concerns. The system supports horizontal scaling through the built-in cluster protocol (direct TCP mesh).
 
 ## Deployment Modes
 
@@ -389,48 +389,38 @@ The Python client speaks the same wire protocol as the TypeScript client. All pr
 
 ## Multi-Instance Scaling
 
-See **[REDIS_PUBSUB.md](REDIS_PUBSUB.md)** for full Rust standalone Redis Pub/Sub documentation (reliability, circuit breaker, DLQ, metrics, PyO3 API).
+WSE supports horizontal scaling via the built-in cluster protocol -- a direct TCP mesh between server instances.
 
 ```
                     Load Balancer
                    /      |      \
               Instance A  B       C
-                 |        |       |
-              Redis Pub/Sub (shared)
-                 |        |       |
-              User 1    User 2  User 3
+                 \        |       /
+              WSE Cluster Protocol (TCP mesh)
 ```
 
 Each instance:
 1. Accepts WebSocket connections from its assigned users
-2. Subscribes to Redis channels for connected users
-3. Receives ALL published events via Redis broadcast
-4. Checks if the target user is connected to THIS instance
-5. Sends to local WebSocket if connected, ignores otherwise
+2. Connects to peer instances via the cluster protocol
+3. When a topic message is published, forwards to peers with matching subscriptions
+4. Peers fan-out to their local subscribers
 
 ### Router Mode (Python PubSubBus)
 
-```
-Domain Event (any instance)
-    -> WSE Publisher -> PubSubBus.publish()
-    -> Redis PUBLISH wse:user:123:events
-    -> ALL instances receive via SUBSCRIBE/PSUBSCRIBE
-    -> Instance with user 123 connected -> sends to WebSocket
-    -> Other instances -> silently ignore
-```
+Router mode uses the Python `PubSubBus` in `core/pubsub.py` for multi-instance coordination via Redis.
 
-### Standalone Mode (Rust redis_pubsub)
+### Standalone Mode (Rust Cluster)
 
 ```
 Domain Event (any instance)
     -> server.broadcast("user:123:events", payload)
-    -> Rust listener_task -> Redis PUBLISH wse:user:123:events
-    -> ALL instances receive via PSUBSCRIBE wse:*
+    -> local fan-out + ClusterCommand::Publish
+    -> Peer instances receive via TCP mesh
     -> dispatch_to_subscribers() -> exact + glob match
     -> ConnectionHandle.tx -> WebSocket
 ```
 
-Standalone mode includes: auto-reconnect with exponential backoff, circuit breaker (10 failures / 60s reset), publish retry (3 attempts), Dead Letter Queue (1000 entries), AtomicU64 metrics.
+Standalone cluster includes: HELLO handshake with capability negotiation, interest-based routing (SUB/UNSUB/RESYNC), inter-peer zstd compression, gossip peer discovery, auto-reconnect with exponential backoff, circuit breaker, PING/PONG keepalive, graceful SHUTDOWN.
 
 ## Metrics
 

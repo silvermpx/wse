@@ -1,8 +1,15 @@
+pub mod battle_cluster;
+pub mod battle_load;
+pub mod battle_phase3_caps;
+pub mod battle_phase4_tls;
+pub mod battle_phase5_discovery;
+pub mod battle_phase6_compression;
+pub mod battle_standalone;
 pub mod connection_limit;
 pub mod connection_storm;
 pub mod fanout_broadcast;
 pub mod fanout_cluster;
-pub mod fanout_multi;
+pub mod fanout_cluster_tls;
 pub mod format_comparison;
 pub mod ping_latency;
 pub mod size_matrix;

@@ -1,15 +1,12 @@
 """Python client for WSE.
 
-Connects to a standalone or router-mode WSE server,
+Connects to a WSE standalone server,
 subscribes to topics, and prints incoming events.
 
     pip install wse-client
 
     # Connect to standalone server
     python examples/client_python.py --url ws://localhost:5007/wse --token <JWT>
-
-    # Connect to router-mode server
-    python examples/client_python.py --url ws://localhost:8000/wse --token <JWT>
 """
 
 import argparse

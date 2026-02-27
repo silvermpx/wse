@@ -285,11 +285,18 @@ export interface SecurityInfo {
 // Subscriptions
 // ---------------------------------------------------------------------------
 
+export interface TopicRecoveryPosition {
+  epoch: string;
+  offset: number;
+}
+
 export interface SubscriptionInfo {
   topics: string[];
   pendingSubscriptions: string[];
   failedSubscriptions: string[];
   lastUpdate: number | null;
+  recoveryState: Record<string, TopicRecoveryPosition>;
+  serverRecoveryEnabled: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -393,7 +400,7 @@ export interface ClientCapabilities {
 // ---------------------------------------------------------------------------
 
 export interface UseWSEReturn {
-  subscribe: (topics: string[]) => void;
+  subscribe: (topics: string[], options?: { recover?: boolean }) => void;
   unsubscribe: (topics: string[]) => void;
   forceReconnect: () => void;
   changeEndpoint: (endpoint: string) => void;
