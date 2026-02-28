@@ -96,9 +96,11 @@ class OfflineQueue:
         )
         return True
 
-    def drain(self) -> list[str]:
+    def drain(self) -> list[tuple[str, int]]:
         """Return all queued messages in priority order and clear the queue.
 
+        Returns a list of ``(encoded, priority)`` tuples so callers can
+        preserve priority when re-enqueuing on partial flush failure.
         Expired messages (older than *max_age*) are dropped silently.
         """
         if not self._queue:
@@ -116,7 +118,7 @@ class OfflineQueue:
             logger.debug("Dropped %d expired messages from offline queue", expired)
 
         self._queue.clear()
-        return [m.encoded for m in valid]
+        return [(m.encoded, m.priority) for m in valid]
 
     def clear(self) -> None:
         """Discard all queued messages."""

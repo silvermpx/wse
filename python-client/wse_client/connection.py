@@ -383,6 +383,10 @@ class ConnectionManager:
             return
         except Exception as exc:
             logger.warning("Receive loop error: %s", exc)
+            self._ws = None
+            if self._heartbeat_task:
+                self._heartbeat_task.cancel()
+                self._heartbeat_task = None
             self._set_state(ConnectionState.ERROR)
             self._schedule_reconnect()
 

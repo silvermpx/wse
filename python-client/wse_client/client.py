@@ -604,7 +604,11 @@ class AsyncWSEClient:
 
     async def change_endpoint(self, new_url: str) -> None:
         """Change the server endpoint and reconnect."""
-        await self._connection.disconnect()
+        self._disconnecting = True
+        try:
+            await self._connection.disconnect()
+        finally:
+            self._disconnecting = False
         self._connection._url = new_url
         self._connection._active_endpoint = new_url
         self._connection._reconnect_attempts = 0
@@ -833,7 +837,7 @@ class AsyncWSEClient:
         if not messages:
             return
         logger.info("Flushing %d offline-queued messages", len(messages))
-        for i, encoded in enumerate(messages):
+        for i, (encoded, priority) in enumerate(messages):
             ok = await self._connection.send(encoded)
             if not ok:
                 remaining = messages[i:]
@@ -841,8 +845,8 @@ class AsyncWSEClient:
                     "Offline queue flush interrupted, re-enqueuing %d messages",
                     len(remaining),
                 )
-                for msg in remaining:
-                    self._offline_queue.enqueue(msg)
+                for msg, pri in remaining:
+                    self._offline_queue.enqueue(msg, priority=pri)
                 break
 
     def _handle_server_hello(self, event: WSEEvent) -> None:

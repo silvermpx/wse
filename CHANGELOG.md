@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.0.4 (2026-02-28)
+
+### Bug Fixes (Python Client)
+
+- Fix `change_endpoint()` injecting sentinel into message iterator on disconnect
+- Fix recv-loop generic exception leaving heartbeat running, causing double reconnect
+- Fix offline queue losing message priority on partial flush re-enqueue
+- Fix `CLIENT_VERSION` constant not matching package version
+
 ## v2.0.3 (2026-02-28)
 
 ### Bug Fixes (Python Client)
