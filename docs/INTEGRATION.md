@@ -126,15 +126,15 @@ For production, put both behind the same reverse proxy (nginx, Caddy) and route 
 
 Configure `jwt_secret`, `jwt_issuer`, and `jwt_audience` in the constructor. The server validates JWT tokens during the WebSocket handshake in Rust (zero-GIL, sub-millisecond).
 
-**Required token claims:**
+**Token claims:**
 
-| Claim | Description |
-|-------|-------------|
-| `sub` | User ID (returned as `user_id` in auth_connect event) |
-| `iss` | Issuer (must match `jwt_issuer`) |
-| `aud` | Audience (must match `jwt_audience`) |
-| `exp` | Expiration timestamp (Unix epoch) |
-| `iat` | Issued-at timestamp (Unix epoch) |
+| Claim | Required | Description |
+|-------|----------|-------------|
+| `sub` | Yes | User ID (returned as `user_id` in auth_connect event) |
+| `exp` | Yes | Expiration timestamp (Unix epoch) |
+| `iat` | Yes | Issued-at timestamp (Unix epoch) |
+| `iss` | If configured | Issuer (validated only when `jwt_issuer` is set) |
+| `aud` | If configured | Audience (validated only when `jwt_audience` is set) |
 
 **Token delivery:** The client sends the token as an `Authorization: Bearer <token>` header or an `access_token` cookie during the WebSocket handshake.
 
@@ -563,18 +563,16 @@ npm install wse-client
 ```
 
 ```tsx
-import { useWSE } from 'wse-client/react';
+import { useWSE } from 'wse-client';
 
 function App() {
-    const { connected, subscribe, onMessage } = useWSE({
-        url: 'ws://localhost:5007/wse',
-        token: '...',
-    });
+    const { connectionHealth, sendMessage } = useWSE(
+        'jwt-token',
+        ['prices'],
+        { endpoints: ['ws://localhost:5007/wse'] },
+    );
 
-    useEffect(() => {
-        subscribe(['prices']);
-        onMessage('price', (data) => console.log(data));
-    }, []);
+    return <div>Status: {connectionHealth}</div>;
 }
 ```
 

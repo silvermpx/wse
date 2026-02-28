@@ -113,7 +113,17 @@ class AsyncWSEClient:
 
         # Services
         self._compression = CompressionHandler()
-        self._codec = MessageCodec(self._compression, security=self._security)
+        msgpack_handler = None
+        try:
+            from .msgpack_handler import MsgPackHandler
+
+            if MsgPackHandler.available():
+                msgpack_handler = MsgPackHandler()
+        except ImportError:
+            pass
+        self._codec = MessageCodec(
+            self._compression, security=self._security, msgpack=msgpack_handler
+        )
         self._rate_limiter = TokenBucketRateLimiter()
         self._circuit_breaker = CircuitBreaker()
         self._sequencer = EventSequencer()
@@ -340,7 +350,7 @@ class AsyncWSEClient:
         ok = await self._connection.send(encoded)
         if ok:
             self._stats.messages_sent += 1
-            self._stats.bytes_sent += len(encoded)
+            self._stats.bytes_sent += len(encoded.encode("utf-8"))
         return ok
 
     async def send_with_retry(
@@ -423,7 +433,7 @@ class AsyncWSEClient:
         ok = await self._connection.send(encoded)
         if ok:
             self._stats.messages_sent += len(messages)
-            self._stats.bytes_sent += len(encoded)
+            self._stats.bytes_sent += len(encoded.encode("utf-8"))
         return ok
 
     async def subscribe(

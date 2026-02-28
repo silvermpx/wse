@@ -675,6 +675,12 @@ fn build_server_ready(conn_id: &str, user_id: &str, recovery_enabled: bool) -> S
 // ---------------------------------------------------------------------------
 
 async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<SharedState>) {
+    // Early rejection before expensive handshake (best-effort, authoritative check below)
+    if state.connection_count.load(Ordering::Relaxed) >= state.max_connections {
+        eprintln!("[WSE] Max connections reached (early check), rejecting {addr}");
+        return;
+    }
+
     // Clone the TCP stream FD for pre-framed raw writes (bypasses tungstenite).
     let (stream, mut raw_write) = match clone_tcp_stream(stream) {
         Ok(pair) => pair,
@@ -777,7 +783,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                     }
                 }
                 Err(e) => {
-                    reject_ws_auth(&tx, rx, write_half, "AUTH_FAILED", &format!("{e}")).await;
+                    eprintln!("[WSE] JWT validation failed for {addr}: {e}");
+                    reject_ws_auth(&tx, rx, write_half, "AUTH_FAILED", "Authentication failed")
+                        .await;
                     return;
                 }
             },

@@ -37,12 +37,12 @@ binding, Node.js `ws` handles 100K+ connections.
 
 | Client | Processes | JSON msg/s | Binary msg/s | Connections/s | Max Connections |
 |--------|-----------|-----------|--------------|---------------|-----------------|
-| **Rust** (tokio) | 1 (64 cores) | **14.7M** | **30.0M** | 15,020 | 500K |
+| **Rust** (tokio) | 1 (64 threads) | **14.7M** | **30.0M** | 15,020 | 500K |
 | **TypeScript** (ws) | 64 | 7.0M | 7.9M | 10,673 | 64K+ |
 | **TypeScript** (ws) | 1 | 116K | 118K | 5,508 | 64K+ |
 | **Python** (asyncio) | 64 | 6.9M | - | - | - |
 
-Rust uses all 64 cores in a single process (tokio work-stealing). TypeScript needs 64
+Rust uses all 64 threads in a single process (tokio work-stealing). TypeScript needs 64
 OS processes to use the same hardware. Python uses 64 subprocesses with synchronous send
 loops. All three hit the same server - differences are pure client overhead.
 
@@ -189,7 +189,7 @@ serialization overhead becomes significant. At Node.js's 116K msg/s, it's irrele
 | **Compressed** | 7.9M | +13% |
 
 At 64-process scale, MsgPack and Compressed gain 13% over JSON - smaller wire size
-reduces per-process overhead when all 64 cores are saturated.
+reduces per-process overhead when all 64 threads are saturated.
 
 ---
 

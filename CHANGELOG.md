@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.0.2 (2026-02-28)
+
+Bug fixes and documentation updates.
+
+## v2.0.1 (2026-02-28)
+
+Minor fixes.
+
 ## v2.0.0 (2026-02-28)
 
 ### Breaking Changes

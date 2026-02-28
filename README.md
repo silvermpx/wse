@@ -463,7 +463,7 @@ client.run_forever()
 
 Key features: 4 reconnect strategies (exponential, linear, fibonacci, adaptive), connection pool with health scoring and 3 load balancing strategies, circuit breaker, token bucket rate limiter, event sequencer with dedup and reorder buffering, network quality monitoring (latency/jitter/packet loss).
 
-See [python-client/README.md](python-client/README.md) for full API reference.
+See [python-client/](python-client/) for full source and examples.
 
 ### TypeScript / React
 
@@ -489,13 +489,13 @@ function App() {
 
 Key features: offline queue with IndexedDB persistence, adaptive quality management, connection pool with health scoring, E2E encryption (Web Crypto API), message batching, 5 priority levels, Zustand store for external state access.
 
-See [client/README.md](client/README.md) for full API reference.
+See [client/](client/) for full source and examples.
 
 ---
 
 ## Performance
 
-Benchmarked on AMD EPYC 7502P (64 cores, 128 GB RAM), Ubuntu 24.04.
+Benchmarked on AMD EPYC 7502P (32 cores / 64 threads, 128 GB RAM), Ubuntu 24.04.
 
 | Mode | Peak Throughput | Connections | Message Loss |
 |------|----------------|-------------|--------------|

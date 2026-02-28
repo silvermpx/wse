@@ -63,6 +63,7 @@ class SyncWSEClient:
         reconnect: ReconnectConfig | None = None,
         extra_headers: dict[str, str] | None = None,
         queue_size: int = 1000,
+        encryption: bool = False,
     ) -> None:
         self._url = url
         self._token = token
@@ -70,6 +71,7 @@ class SyncWSEClient:
         self._reconnect = reconnect
         self._extra_headers = extra_headers
         self._queue_size = queue_size
+        self._encryption = encryption
 
         self._event_queue: queue.Queue[WSEEvent | None] = queue.Queue(
             maxsize=queue_size
@@ -431,6 +433,7 @@ class SyncWSEClient:
             reconnect=self._reconnect,
             extra_headers=self._extra_headers,
             queue_size=self._queue_size,
+            encryption=self._encryption,
         )
 
         self._connect_error: Exception | None = None

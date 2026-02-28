@@ -30,6 +30,10 @@ export class OfflineQueue {
       request.onerror = () => reject(request.error);
       request.onsuccess = () => {
         this.db = request.result;
+        // Sync _size from existing IndexedDB entries
+        const tx = this.db.transaction([this.storeName], 'readonly');
+        const countReq = tx.objectStore(this.storeName).count();
+        countReq.onsuccess = () => { this._size = countReq.result; };
         resolve();
       };
 

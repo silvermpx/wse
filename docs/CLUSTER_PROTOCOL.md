@@ -237,7 +237,7 @@ Gossip is lightweight - PeerAnnounce and PeerList are only exchanged during join
 
 ### Circuit Breaker
 
-Each peer connection has an independent circuit breaker. After 10 consecutive failures (connection refused, handshake timeout, write error), the breaker opens and the node stops attempting to reconnect for 60 seconds. After the reset interval, a single probe connection is attempted. If it succeeds, the breaker closes and normal operation resumes.
+Each peer connection has an independent circuit breaker. After 10 consecutive failures (connection refused, handshake timeout, write error), the breaker opens and the node stops attempting to reconnect for 60 seconds. After the reset interval, up to 3 probe connections are attempted in half-open state. If 3 consecutive probes succeed, the breaker closes and normal operation resumes.
 
 ### Dead Letter Queue
 

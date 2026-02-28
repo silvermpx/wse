@@ -550,43 +550,50 @@ Single entry point for all WSE functionality in React:
 
 ```typescript
 const {
-  isConnected,        // boolean - connection status
-  connectionState,    // ConnectionState enum
-  subscribe,          // (topics: string[]) => void
+  connectionHealth,   // ConnectionState enum
+  subscribe,          // (topics: string[], options?) => void
   unsubscribe,        // (topics: string[]) => void
-  sendMessage,        // (message: any) => void
-  lastMessage,        // last received message
-  metrics,            // connection metrics
-  diagnostics,        // network diagnostics
-} = useWSE(config);
+  sendMessage,        // (type: string, payload: any, options?) => void
+  sendBatch,          // (messages: Array<{type, payload}>) => void
+  stats,              // ConnectionMetrics
+  activeTopics,       // string[]
+  diagnostics,        // NetworkDiagnostics | null
+  forceReconnect,     // () => void
+  requestSnapshot,    // (topics?) => void
+} = useWSE(token, initialTopics, config);
 ```
 
 Configuration:
 
 ```typescript
 interface WSEConfig {
-  endpoints: string[];          // WebSocket URLs
+  endpoints: string[];              // WebSocket URLs
   reconnection?: {
-    maxRetries?: number;        // default: Infinity
-    initialDelay?: number;      // default: 1000ms
-    maxDelay?: number;          // default: 30000ms
-    backoffMultiplier?: number; // default: 1.5
+    mode?: string;                  // default: 'adaptive'
+    baseDelay?: number;             // default: 1000
+    maxDelay?: number;              // default: 30000
+    maxAttempts?: number;           // default: 10
+    factor?: number;                // default: 1.5
+    jitter?: boolean;               // default: true
   };
   security?: {
-    encryption?: boolean;       // default: false
-    signing?: boolean;          // default: false
+    encryptionEnabled?: boolean;    // default: false
+    messageSignature?: boolean;     // default: false
   };
   performance?: {
-    compression?: boolean;      // default: true
-    batchSize?: number;         // default: 10
-    batchTimeout?: number;      // default: 100ms
+    compressionThreshold?: number;  // default: 1024
+    batchSize?: number;             // default: 10
+    batchTimeout?: number;          // default: 500
+    maxQueueSize?: number;          // default: 10000
   };
   offline?: {
-    enabled?: boolean;          // default: true
-    maxSize?: number;           // default: 1000
+    enabled?: boolean;              // default: true
+    maxSize?: number;               // default: 1000
+    persistToStorage?: boolean;     // default: true
   };
   diagnostics?: {
-    enabled?: boolean;          // default: true
+    enabled?: boolean;              // default: false
+    sampleRate?: number;            // default: 0.1
   };
 }
 ```

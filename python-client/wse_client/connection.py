@@ -299,6 +299,9 @@ class ConnectionManager:
         """Send a binary frame."""
         if not self._ws:
             return False
+        if self._rate_limiter and not self._rate_limiter.try_consume():
+            logger.warning("Rate limit exceeded, dropping binary message")
+            return False
         try:
             await self._ws.send(data)
             return True
@@ -334,7 +337,9 @@ class ConnectionManager:
                     pass
             self._set_state(ConnectionState.DISCONNECTED)
         except ConnectionClosedError as exc:
-            self._handle_close_code(exc.code, exc.reason)
+            code = exc.rcvd.code if exc.rcvd is not None else 1006
+            reason = exc.rcvd.reason if exc.rcvd is not None else ""
+            self._handle_close_code(code, reason)
         except asyncio.CancelledError:
             return
         except Exception as exc:
