@@ -109,6 +109,16 @@ The frame encoding handles all three WebSocket payload length formats (7-bit, 16
 
 ---
 
+## Rust Utility Modules
+
+In addition to the transport server, WSE exports Rust-accelerated utility classes and functions for use in Python application code: priority queues, token bucket rate limiter, event sequencer, compression manager, AES-GCM encryption, ECDH key exchange, HMAC/SHA-256, JWT, event transformer, and MongoDB-style event filters.
+
+These are the same modules that previously existed as pure Python in the old router-based server. They now run in Rust for 10-20x speedup while keeping the same Python API.
+
+Full reference with usage examples: [RUST_UTILITIES.md](RUST_UTILITIES.md)
+
+---
+
 ## PyO3 Bridge
 
 ### Two Inbound Modes

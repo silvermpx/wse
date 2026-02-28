@@ -124,6 +124,9 @@ async fn run_single_test(cli: &Cli, test: TestName) {
         TestName::BattleRecovery => {
             tests::battle_recovery::run(cli).await;
         }
+        TestName::BattleEncryption => {
+            tests::battle_encryption::run(cli).await;
+        }
     }
 }
 

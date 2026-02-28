@@ -97,15 +97,23 @@ class AsyncWSEClient:
         reconnect: ReconnectConfig | None = None,
         extra_headers: dict[str, str] | None = None,
         queue_size: int = 1000,
+        encryption: bool = False,
     ) -> None:
         self._url = url
         self._token = token
         self._initial_topics = list(topics) if topics else []
         self._subscribed_topics: set[str] = set()
 
+        # E2E encryption (optional)
+        self._security: SecurityManager | None = None
+        if encryption:
+            from .security import SecurityManager
+
+            self._security = SecurityManager()
+
         # Services
         self._compression = CompressionHandler()
-        self._codec = MessageCodec(self._compression)
+        self._codec = MessageCodec(self._compression, security=self._security)
         self._rate_limiter = TokenBucketRateLimiter()
         self._circuit_breaker = CircuitBreaker()
         self._sequencer = EventSequencer()
@@ -153,6 +161,7 @@ class AsyncWSEClient:
             extra_headers=extra_headers,
             on_message=self._on_raw_message,
             on_state_change=self._on_state_change,
+            security=self._security,
         )
 
         self._connection._on_pong = self._on_transport_pong
@@ -787,6 +796,18 @@ class AsyncWSEClient:
         rate_limit = p.get("rate_limit")
         if rate_limit and isinstance(rate_limit, (int, float)):
             self._server_rate_limit = int(rate_limit)
+
+        # Complete ECDH key exchange if server confirmed encryption
+        if (
+            self._security is not None
+            and p.get("features", {}).get("encryption")
+            and p.get("encryption_public_key")
+        ):
+            import base64
+
+            server_pubkey_bytes = base64.b64decode(p["encryption_public_key"])
+            self._security.derive_shared_secret(server_pubkey_bytes)
+            logger.info("E2E encryption enabled (ECDH P-256 + AES-GCM-256)")
 
         server_version = p.get("server_version", "unknown")
         logger.info(

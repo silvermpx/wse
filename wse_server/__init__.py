@@ -4,6 +4,9 @@ from wse_server._wse_accel import (
     RustCompressionManager,
     RustEventSequencer,
     RustPriorityMessageQueue,
+    RustPriorityQueue,
+    RustSequencer,
+    RustTokenBucket,
     RustWSEServer,
     rust_aes_gcm_decrypt,
     rust_aes_gcm_encrypt,
@@ -16,19 +19,23 @@ from wse_server._wse_accel import (
     rust_jwt_encode,
     rust_match_event,
     rust_sha256,
+    rust_should_compress,
     rust_sign_message,
     rust_transform_event,
 )
 from wse_server.core.filters import EventFilter
 from wse_server.core.types import DeliveryGuarantee, EventPriority
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 __all__ = [
     "RustWSEServer",
     "RustCompressionManager",
     "RustEventSequencer",
     "RustPriorityMessageQueue",
+    "RustPriorityQueue",
+    "RustSequencer",
+    "RustTokenBucket",
     "rust_jwt_encode",
     "rust_jwt_decode",
     "rust_aes_gcm_encrypt",
@@ -39,6 +46,7 @@ __all__ = [
     "rust_sha256",
     "rust_compress",
     "rust_decompress",
+    "rust_should_compress",
     "rust_sign_message",
     "rust_match_event",
     "rust_transform_event",

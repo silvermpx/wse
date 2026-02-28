@@ -200,8 +200,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .ok();
 
     let mut query_members = 0usize;
-    if let Some(parsed) = drain_for_type_with_data(&mut clients[0], "presence_result", 3000).await
-    {
+    if let Some(parsed) = drain_for_type_with_data(&mut clients[0], "presence_result", 3000).await {
         if let Some(members) = parsed
             .get("p")
             .and_then(|p| p.get("members"))
@@ -249,10 +248,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
     let update_count_0 = drain_for_type(&mut clients[0], "presence_update", 3000).await;
     checks.check(
-        &format!(
-            "Client 0 received presence_update (got {})",
-            update_count_0
-        ),
+        &format!("Client 0 received presence_update (got {})", update_count_0),
         update_count_0 >= 1,
     );
 

@@ -1,12 +1,13 @@
-pub mod battle_cluster;
-pub mod battle_load;
 pub mod battle_caps;
-pub mod battle_tls;
-pub mod battle_discovery;
+pub mod battle_cluster;
 pub mod battle_compression;
+pub mod battle_discovery;
+pub mod battle_encryption;
+pub mod battle_load;
 pub mod battle_presence;
 pub mod battle_recovery;
 pub mod battle_standalone;
+pub mod battle_tls;
 pub mod connection_limit;
 pub mod connection_storm;
 pub mod fanout_broadcast;

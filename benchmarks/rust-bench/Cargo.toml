@@ -24,6 +24,9 @@ flate2 = "1"
 rmp-serde = "1"
 rand = "0.8"
 http = "1"
+p256 = { version = "0.13", features = ["ecdh"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
 
 [profile.release]
 opt-level = 3

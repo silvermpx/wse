@@ -106,7 +106,7 @@ export class SecurityManager {
     }
   }
 
-  private async generateKeyPair(): Promise<void> {
+  async generateKeyPair(): Promise<void> {
     try {
       this.sessionKeyPair = await crypto.subtle.generateKey(
         { name: 'ECDH', namedCurve: 'P-256' },
@@ -125,6 +125,37 @@ export class SecurityManager {
     } catch (error) {
       logger.error('Failed to export public key:', error);
       return null;
+    }
+  }
+
+  async getPublicKeyRaw(): Promise<string | null> {
+    if (!this.sessionKeyPair) return null;
+    try {
+      const raw = await crypto.subtle.exportKey('raw', this.sessionKeyPair.publicKey);
+      return this.arrayBufferToBase64(raw);
+    } catch (error) {
+      logger.error('Failed to export raw public key:', error);
+      return null;
+    }
+  }
+
+  async setServerPublicKeyRaw(b64key: string): Promise<void> {
+    try {
+      const keyData = this.base64ToArrayBuffer(b64key);
+      this.serverPublicKey = await crypto.subtle.importKey(
+        'raw', keyData,
+        { name: 'ECDH', namedCurve: 'P-256' },
+        false, []
+      );
+
+      if (this.sessionKeyPair && this.serverPublicKey) {
+        await this.deriveSharedSecret();
+        this.encryptionEnabled = true;
+        logger.info('E2E encryption enabled via raw key exchange (ECDH P-256 + AES-GCM-256)');
+      }
+    } catch (error) {
+      this.serverPublicKey = null;
+      throw new SecurityError('Failed to import raw server public key', 'KEY_EXCHANGE_FAILED', error);
     }
   }
 
@@ -241,8 +272,7 @@ export class SecurityManager {
   async encryptForTransport(data: string): Promise<ArrayBuffer> {
     const encrypted = await this.encryptMessage(data);
     if (!encrypted) {
-      const encoded = new TextEncoder().encode(data);
-      return encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength) as ArrayBuffer;
+      throw new SecurityError('Cannot send: encryption key not ready', 'ENCRYPTION_FAILED');
     }
 
     const prefix = new TextEncoder().encode('E:');
@@ -258,7 +288,8 @@ export class SecurityManager {
     if (view.length >= 2 && view[0] === 69 && view[1] === 58) {
       return this.decryptMessage(data.slice(2));
     }
-    return this.decryptMessage(data);
+    // Not an E:-prefixed encrypted frame
+    return null;
   }
 
   async signMessage(data: any): Promise<string | null> {
@@ -426,6 +457,19 @@ export class SecurityManager {
       keyExchangeEnabled: !!this.sessionKeyPair,
       backendCompatibilityMode: this.backendCompatibilityMode,
     };
+  }
+
+  resetEncryption(): void {
+    this.encryptionKey = null;
+    this.sharedSecret = null;
+    this.serverPublicKey = null;
+    this.sessionKeyPair = null;
+    if (this.usedIVs) {
+      this.usedIVs.clear();
+    }
+    // Keep encryptionEnabled=true so sendClientHello knows to include pubkey
+    // A fresh keypair will be generated in sendClientHello via getPublicKeyRaw -> generateKeyPair
+    logger.debug('Encryption state reset for reconnect');
   }
 
   destroy(): void {

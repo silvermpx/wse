@@ -53,6 +53,7 @@ from .types import ConnectionState, MessagePriority, ReconnectConfig, ReconnectM
 if TYPE_CHECKING:
     from .circuit_breaker import CircuitBreaker
     from .rate_limiter import TokenBucketRateLimiter
+    from .security import SecurityManager
 
 
 class ConnectionManager:
@@ -73,6 +74,7 @@ class ConnectionManager:
         extra_headers: dict[str, str] | None = None,
         on_message: Callable[[str | bytes], Any] | None = None,
         on_state_change: Callable[[ConnectionState], Any] | None = None,
+        security: SecurityManager | None = None,
     ) -> None:
         self._url = url
         self._token = token
@@ -80,6 +82,7 @@ class ConnectionManager:
         self._circuit_breaker = circuit_breaker
         self._rate_limiter = rate_limiter
         self._extra_headers = extra_headers or {}
+        self._security = security
 
         # Callbacks
         self._on_message = on_message
@@ -269,7 +272,7 @@ class ConnectionManager:
     # -- Send -----------------------------------------------------------------
 
     async def send(self, data: str) -> bool:
-        """Send a text frame.  Returns True on success."""
+        """Send a text frame (or encrypted binary if E2E enabled).  Returns True on success."""
         if not self._ws:
             return False
 
@@ -278,7 +281,12 @@ class ConnectionManager:
             return False
 
         try:
-            await self._ws.send(data)
+            # Encrypt outbound if E2E encryption is active
+            if self._security is not None and self._security.is_enabled:
+                encrypted = self._security.encrypt(data)
+                await self._ws.send(b"E:" + encrypted)
+            else:
+                await self._ws.send(data)
             return True
         except ConnectionClosed:
             logger.debug("Send failed: connection closed")
@@ -430,26 +438,40 @@ class ConnectionManager:
 
     async def _send_client_hello(self) -> None:
         """Send the client_hello handshake message with retry."""
+        # Generate ECDH keypair if encryption is requested
+        encryption_pubkey_b64: str | None = None
+        if self._security is not None:
+            import base64
+
+            # Reset any previous key state (handles reconnect cleanly)
+            self._security.reset()
+            pubkey_bytes = self._security.generate_keypair()
+            encryption_pubkey_b64 = base64.b64encode(pubkey_bytes).decode("ascii")
+
         for attempt in range(CLIENT_HELLO_MAX_RETRIES):
+            p: dict[str, Any] = {
+                "client_version": CLIENT_VERSION,
+                "protocol_version": PROTOCOL_VERSION,
+                "features": {
+                    "compression": True,
+                    "encryption": encryption_pubkey_b64 is not None,
+                    "batching": True,
+                    "priority_queue": True,
+                    "circuit_breaker": True,
+                    "offline_queue": True,
+                    "message_signing": False,
+                    "rate_limiting": True,
+                    "health_check": True,
+                    "metrics": True,
+                },
+                "connection_id": self._connection_id,
+            }
+            if encryption_pubkey_b64 is not None:
+                p["encryption_public_key"] = encryption_pubkey_b64
+
             msg = {
                 "t": "client_hello",
-                "p": {
-                    "client_version": CLIENT_VERSION,
-                    "protocol_version": PROTOCOL_VERSION,
-                    "features": {
-                        "compression": True,
-                        "encryption": False,
-                        "batching": True,
-                        "priority_queue": True,
-                        "circuit_breaker": True,
-                        "offline_queue": True,
-                        "message_signing": False,
-                        "rate_limiting": True,
-                        "health_check": True,
-                        "metrics": True,
-                    },
-                    "connection_id": self._connection_id,
-                },
+                "p": p,
                 "id": str(uuid4()),
                 "ts": datetime.now(UTC).isoformat(),
                 "v": PROTOCOL_VERSION,
@@ -672,11 +694,12 @@ class ConnectionManager:
         parts = [self._url]
         sep = "&" if "?" in self._url else "?"
 
+        enc = "true" if self._security is not None else "false"
         params: list[str] = [
             f"client_version={CLIENT_VERSION}",
             f"protocol_version={PROTOCOL_VERSION}",
             "compression=true",
-            "encryption=false",
+            f"encryption={enc}",
         ]
         if topics:
             from urllib.parse import quote

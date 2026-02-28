@@ -217,7 +217,11 @@ class MessageCodec:
             if self._security is None or not self._security.is_enabled:
                 logger.warning("Received encrypted frame but encryption not configured")
                 return None
-            plaintext = self._security.decrypt(data[2:])
+            try:
+                plaintext = self._security.decrypt(data[2:])
+            except Exception:
+                logger.warning("Decryption failed for E: frame (%d bytes), dropping", len(data))
+                return None
             return self._decode_text(plaintext)
 
         # Raw zlib (magic byte 0x78)

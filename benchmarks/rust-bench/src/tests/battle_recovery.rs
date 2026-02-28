@@ -153,7 +153,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .and_then(|p| p.get("count"))
         .and_then(|c| c.as_u64())
         .unwrap_or(0);
-    checks.check(&format!("Seeded recovery buffer ({} messages)", seeded), seeded > 0);
+    checks.check(
+        &format!("Seeded recovery buffer ({} messages)", seeded),
+        seeded > 0,
+    );
 
     if seeded == 0 {
         println!("    ABORT: Could not seed recovery buffer");
@@ -198,10 +201,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
     let has_recovery_info = epoch.is_some() && offset.is_some();
     checks.check(
-        &format!(
-            "Got recovery info (epoch={:?}, offset={:?})",
-            epoch, offset
-        ),
+        &format!("Got recovery info (epoch={:?}, offset={:?})", epoch, offset),
         has_recovery_info,
     );
 
@@ -371,10 +371,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             .and_then(|c| c.as_u64())
             .unwrap_or(0);
 
-        checks.check(
-            &format!("Recovery flag: {}", recovered),
-            recovered,
-        );
+        checks.check(&format!("Recovery flag: {}", recovered), recovered);
         checks.check(
             &format!("Recovered {} missed messages", recovered_count),
             recovered_count > 0,

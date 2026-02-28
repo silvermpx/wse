@@ -217,6 +217,8 @@ pub(crate) struct SharedState {
     pub(crate) recovery: Option<Arc<super::recovery::RecoveryManager>>,
     // Per-connection last activity tracking for zombie detection
     conn_last_activity: DashMap<String, std::time::Instant>,
+    // Per-connection AES-256-GCM cipher for E2E encryption (optional, client-initiated)
+    conn_encryption: DashMap<String, aes_gcm::Aes256Gcm>,
     // Presence tracking (None when disabled)
     pub(crate) presence: Option<Arc<super::presence::PresenceManager>>,
     // Sender for presence broadcasts from disconnect cleanup paths
@@ -261,6 +263,7 @@ impl SharedState {
             cluster_tls_enabled: AtomicBool::new(false),
             recovery,
             conn_last_activity: DashMap::new(),
+            conn_encryption: DashMap::new(),
             presence: if presence_enabled {
                 Some(Arc::new(super::presence::PresenceManager::new(
                     presence_max_data_size,
@@ -520,13 +523,90 @@ fn build_error_json(code: &str, message: &str) -> String {
     format!("WSE{}", payload)
 }
 
+// ---------------------------------------------------------------------------
+// E2E encryption helpers (ECDH P-256 + AES-GCM-256)
+// ---------------------------------------------------------------------------
+
+/// Perform ECDH key exchange: generate server keypair, derive AES-256 key.
+/// Returns (server_public_key_base64, Aes256Gcm cipher).
+fn derive_connection_key(client_pubkey_b64: &str) -> Result<(String, aes_gcm::Aes256Gcm), String> {
+    use aes_gcm::KeyInit;
+    use base64::Engine;
+    use hkdf::Hkdf;
+    use p256::ecdh::diffie_hellman;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::{PublicKey, SecretKey};
+    use sha2::Sha256;
+
+    let client_pubkey_bytes = base64::engine::general_purpose::STANDARD
+        .decode(client_pubkey_b64)
+        .map_err(|e| format!("Invalid base64: {e}"))?;
+
+    let client_pk = PublicKey::from_sec1_bytes(&client_pubkey_bytes)
+        .map_err(|e| format!("Invalid ECDH public key: {e}"))?;
+
+    let server_sk = SecretKey::random(&mut aes_gcm::aead::OsRng);
+    let server_pk = server_sk.public_key();
+
+    let shared = diffie_hellman(server_sk.to_nonzero_scalar(), client_pk.as_affine());
+
+    let hkdf = Hkdf::<Sha256>::new(Some(b"wse-encryption"), shared.raw_secret_bytes());
+    let mut aes_key = [0u8; 32];
+    hkdf.expand(b"aes-gcm-key", &mut aes_key)
+        .map_err(|e| format!("HKDF expand failed: {e}"))?;
+
+    let cipher = aes_gcm::Aes256Gcm::new_from_slice(&aes_key)
+        .map_err(|e| format!("AES key init failed: {e}"))?;
+
+    let server_pk_point = server_pk.to_encoded_point(false);
+    let server_pk_b64 =
+        base64::engine::general_purpose::STANDARD.encode(server_pk_point.as_bytes());
+
+    Ok((server_pk_b64, cipher))
+}
+
+/// Encrypt plaintext with AES-GCM-256: returns 12-byte IV + ciphertext + 16-byte tag.
+fn encrypt_outbound(cipher: &aes_gcm::Aes256Gcm, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    use aes_gcm::AeadCore;
+    use aes_gcm::aead::Aead;
+
+    let nonce = aes_gcm::Aes256Gcm::generate_nonce(&mut aes_gcm::aead::OsRng);
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|e| format!("AES-GCM encrypt failed: {e}"))?;
+    let mut result = Vec::with_capacity(12 + ciphertext.len());
+    result.extend_from_slice(&nonce);
+    result.extend_from_slice(&ciphertext);
+    Ok(result)
+}
+
+/// Decrypt an AES-GCM-256 payload (12-byte IV + ciphertext + 16-byte tag).
+fn decrypt_inbound(cipher: &aes_gcm::Aes256Gcm, data: &[u8]) -> Result<Vec<u8>, String> {
+    use aes_gcm::aead::Aead;
+
+    if data.len() < 28 {
+        return Err("Encrypted payload too short (min 28 bytes)".into());
+    }
+    let (nonce_bytes, ciphertext) = data.split_at(12);
+    let nonce: [u8; 12] = nonce_bytes.try_into().expect("split_at(12)");
+    cipher
+        .decrypt(&nonce.into(), ciphertext)
+        .map_err(|e| format!("AES-GCM decrypt failed: {e}"))
+}
+
 /// Build server_hello JSON response to client_hello (protocol negotiation).
-fn build_server_hello(conn_id: &str, client_proto: u32, state: &SharedState) -> String {
+fn build_server_hello(
+    conn_id: &str,
+    client_proto: u32,
+    state: &SharedState,
+    encryption_pubkey: Option<&str>,
+) -> String {
     let proto = client_proto.min(2);
     let recovery_enabled = state.recovery.is_some();
     let cluster_enabled = state.cluster_cmd_tx.read().unwrap().is_some();
+    let encryption_enabled = encryption_pubkey.is_some();
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let val = serde_json::json!({
+    let mut val = serde_json::json!({
         "t": "server_hello",
         "p": {
             "server_version": env!("CARGO_PKG_VERSION"),
@@ -537,7 +617,8 @@ fn build_server_hello(conn_id: &str, client_proto: u32, state: &SharedState) -> 
                 "cluster": cluster_enabled,
                 "batching": true,
                 "priority_queue": true,
-                "msgpack": true
+                "msgpack": true,
+                "encryption": encryption_enabled
             },
             "limits": {
                 "max_message_size": 1_048_576,
@@ -550,6 +631,9 @@ fn build_server_hello(conn_id: &str, client_proto: u32, state: &SharedState) -> 
         },
         "v": 1
     });
+    if let Some(pubkey) = encryption_pubkey {
+        val["p"]["encryption_public_key"] = serde_json::Value::String(pubkey.to_string());
+    }
     format!("WSE{val}")
 }
 
@@ -931,7 +1015,47 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                     p.and_then(|p| p.get("protocol_version"))
                                         .and_then(|v| v.as_u64())
                                         .unwrap_or(1) as u32;
-                                let hello = build_server_hello(&conn_id, client_proto, &state);
+
+                                // Check if client requests E2E encryption
+                                let wants_encryption = p
+                                    .and_then(|p| p.get("features"))
+                                    .and_then(|f| f.get("encryption"))
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+
+                                let server_pubkey: Option<String> = if wants_encryption {
+                                    p.and_then(|p| p.get("encryption_public_key"))
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|b64| match derive_connection_key(b64) {
+                                            Ok((server_pk_b64, cipher)) => {
+                                                state
+                                                    .conn_encryption
+                                                    .insert((*conn_id).clone(), cipher);
+                                                Some(server_pk_b64)
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "[WSE] ECDH key exchange failed for {}: {}",
+                                                    conn_id, e
+                                                );
+                                                let err_msg = format!(
+                                                    "WSE{{\"t\":\"error\",\"p\":{{\"code\":\"KEY_EXCHANGE_FAILED\",\"message\":\"ECDH key exchange failed: {}\",\"recoverable\":true}}}}",
+                                                    e.replace('\"', "\\\"")
+                                                );
+                                                let _ = tx.send(WsFrame::Msg(Message::Text(err_msg.into())));
+                                                None
+                                            }
+                                        })
+                                } else {
+                                    None
+                                };
+
+                                let hello = build_server_hello(
+                                    &conn_id,
+                                    client_proto,
+                                    &state,
+                                    server_pubkey.as_deref(),
+                                );
                                 let _ = tx.send(WsFrame::Msg(Message::Text(hello.into())));
                                 continue;
                             }
@@ -947,7 +1071,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                     .as_millis()
                                     as i64;
                                 let pong = format!(
-                                    "WSE{{\"t\":\"PONG\",\"p\":{{\"client_timestamp\":{},\"server_timestamp\":{},\"latency\":{}}},\"v\":2}}",
+                                    "WSE{{\"t\":\"PONG\",\"p\":{{\"client_timestamp\":{},\"server_timestamp\":{},\"latency\":{}}},\"v\":1}}",
                                     timestamp,
                                     server_ts,
                                     server_ts.saturating_sub(timestamp).max(0)
@@ -1010,6 +1134,70 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                 state
                     .conn_last_activity
                     .insert((*conn_id).clone(), std::time::Instant::now());
+
+                // E2E encryption: detect E: prefix and decrypt before processing
+                if data.len() >= 2 && data[0] == b'E' && data[1] == b':' {
+                    if let Some(cipher_ref) = state.conn_encryption.get(&*conn_id) {
+                        match decrypt_inbound(&cipher_ref, &data[2..]) {
+                            Ok(plaintext) => {
+                                // Decrypted payload is UTF-8 text (JSON with optional prefix)
+                                if let Ok(text) = std::str::from_utf8(&plaintext) {
+                                    let json_str = if text.starts_with("WSE{") {
+                                        &text[3..]
+                                    } else if text.starts_with("S{") || text.starts_with("U{") {
+                                        &text[1..]
+                                    } else if text.starts_with('{') {
+                                        text
+                                    } else {
+                                        if drain {
+                                            state.push_inbound(InboundEvent::RawText {
+                                                conn_id: (*conn_id).clone(),
+                                                text: text.to_string(),
+                                            });
+                                        }
+                                        continue;
+                                    };
+                                    if let Ok(val) =
+                                        serde_json::from_str::<serde_json::Value>(json_str)
+                                    {
+                                        let val = normalize_json_keys(val);
+                                        if drain {
+                                            state.push_inbound(InboundEvent::Message {
+                                                conn_id: (*conn_id).clone(),
+                                                value: val,
+                                            });
+                                        } else if let Some(ref cb) = cached_on_message {
+                                            let cb_arc = cb.clone();
+                                            let cid = Arc::clone(&conn_id);
+                                            tokio::task::spawn_blocking(move || {
+                                                Python::try_attach(|py| {
+                                                    let py_obj = json_to_pyobj(py, &val);
+                                                    if let Err(e) =
+                                                        cb_arc.call1(py, (&**cid, py_obj))
+                                                    {
+                                                        eprintln!(
+                                                            "[WSE] on_message (decrypted) error: {e}"
+                                                        );
+                                                    }
+                                                });
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[WSE] Decryption failed for {}: {}", conn_id, e);
+                            }
+                        }
+                    } else {
+                        eprintln!(
+                            "[WSE] Received E: frame but no encryption key for {}",
+                            conn_id
+                        );
+                    }
+                    continue;
+                }
+
                 // Check if this connection uses msgpack (lock-free DashMap read)
                 let is_msgpack = state
                     .conn_formats
@@ -1097,6 +1285,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     state.conn_formats.remove(&*conn_id);
     state.conn_rates.remove(&*conn_id);
     state.conn_last_activity.remove(&*conn_id);
+    state.conn_encryption.remove(&*conn_id);
     // If zombie detection already removed this connection and emitted
     // a disconnect event, skip the rest to avoid duplicate events.
     if already_removed {
@@ -1340,34 +1529,139 @@ async fn process_commands(
                 }
             }
             ServerCommand::BroadcastText { data } => {
-                let frame = WsFrame::PreFramed(pre_frame_text(&data));
-                let senders: Vec<mpsc::UnboundedSender<WsFrame>> = {
+                if state.conn_encryption.is_empty() {
+                    // Fast path: no encrypted connections, zero overhead
+                    let frame = WsFrame::PreFramed(pre_frame_text(&data));
+                    let senders: Vec<mpsc::UnboundedSender<WsFrame>> = {
+                        let guard = state.connections.read().await;
+                        guard.values().map(|h| h.tx.clone()).collect()
+                    };
+                    fanout_to_senders(senders, frame);
+                } else {
+                    let preframed = pre_frame_text(&data);
                     let guard = state.connections.read().await;
-                    guard.values().map(|h| h.tx.clone()).collect()
-                };
-                fanout_to_senders(senders, frame);
+                    let mut plain_senders = Vec::new();
+                    let mut enc_senders = Vec::new();
+                    for (cid, h) in guard.iter() {
+                        if let Some(cipher_ref) = state.conn_encryption.get(cid) {
+                            enc_senders.push((h.tx.clone(), cipher_ref.clone()));
+                        } else {
+                            plain_senders.push(h.tx.clone());
+                        }
+                    }
+                    drop(guard);
+                    if !plain_senders.is_empty() {
+                        fanout_to_senders(plain_senders, WsFrame::PreFramed(preframed));
+                    }
+                    for (tx, cipher) in &enc_senders {
+                        if let Ok(enc) = encrypt_outbound(cipher, data.as_bytes()) {
+                            let mut buf = Vec::with_capacity(2 + enc.len());
+                            buf.extend_from_slice(b"E:");
+                            buf.extend_from_slice(&enc);
+                            let _ = tx.send(WsFrame::Msg(Message::Binary(buf.into())));
+                        }
+                    }
+                }
             }
             ServerCommand::BroadcastBytes { data } => {
-                let frame = WsFrame::PreFramed(pre_frame_binary(&data));
-                let senders: Vec<mpsc::UnboundedSender<WsFrame>> = {
+                if state.conn_encryption.is_empty() {
+                    let frame = WsFrame::PreFramed(pre_frame_binary(&data));
+                    let senders: Vec<mpsc::UnboundedSender<WsFrame>> = {
+                        let guard = state.connections.read().await;
+                        guard.values().map(|h| h.tx.clone()).collect()
+                    };
+                    fanout_to_senders(senders, frame);
+                } else {
+                    let preframed = pre_frame_binary(&data);
                     let guard = state.connections.read().await;
-                    guard.values().map(|h| h.tx.clone()).collect()
-                };
-                fanout_to_senders(senders, frame);
+                    let mut plain_senders = Vec::new();
+                    let mut enc_senders = Vec::new();
+                    for (cid, h) in guard.iter() {
+                        if let Some(cipher_ref) = state.conn_encryption.get(cid) {
+                            enc_senders.push((h.tx.clone(), cipher_ref.clone()));
+                        } else {
+                            plain_senders.push(h.tx.clone());
+                        }
+                    }
+                    drop(guard);
+                    if !plain_senders.is_empty() {
+                        fanout_to_senders(plain_senders, WsFrame::PreFramed(preframed));
+                    }
+                    for (tx, cipher) in &enc_senders {
+                        if let Ok(enc) = encrypt_outbound(cipher, &data) {
+                            let mut buf = Vec::with_capacity(2 + enc.len());
+                            buf.extend_from_slice(b"E:");
+                            buf.extend_from_slice(&enc);
+                            let _ = tx.send(WsFrame::Msg(Message::Binary(buf.into())));
+                        }
+                    }
+                }
             }
             ServerCommand::BroadcastLocal { topic, data } => {
-                let frame = WsFrame::PreFramed(pre_frame_text(&data));
+                let preframed = pre_frame_text(&data);
                 // Store in recovery buffer (zero-copy: Bytes is Arc-refcounted)
-                if let Some(ref recovery) = state.recovery
-                    && let WsFrame::PreFramed(ref bytes) = frame
-                {
-                    recovery.push(&topic, bytes.clone());
+                if let Some(ref recovery) = state.recovery {
+                    recovery.push(&topic, preframed.clone());
                 }
-                let senders = {
+                if state.conn_encryption.is_empty() {
+                    // Fast path: no encrypted connections
+                    let senders = {
+                        let guard = state.connections.read().await;
+                        collect_topic_senders(&guard, &state.topic_subscribers, &topic)
+                    };
+                    fanout_to_senders(senders, WsFrame::PreFramed(preframed));
+                } else {
                     let guard = state.connections.read().await;
-                    collect_topic_senders(&guard, &state.topic_subscribers, &topic)
-                };
-                fanout_to_senders(senders, frame);
+                    let mut plain_senders = Vec::new();
+                    let mut enc_senders = Vec::new();
+                    let mut seen = AHashSet::new();
+                    if let Some(subs) = state.topic_subscribers.get(&topic) {
+                        for cid_ref in subs.iter() {
+                            let cid = cid_ref.key().clone();
+                            if seen.insert(cid.clone())
+                                && let Some(h) = guard.get(&cid)
+                            {
+                                if let Some(cipher_ref) = state.conn_encryption.get(&cid) {
+                                    enc_senders.push((h.tx.clone(), cipher_ref.clone()));
+                                } else {
+                                    plain_senders.push(h.tx.clone());
+                                }
+                            }
+                        }
+                    }
+                    // Glob pattern matching
+                    for entry in state.topic_subscribers.iter() {
+                        let pattern = entry.key();
+                        if (pattern.contains('*') || pattern.contains('?'))
+                            && glob_match(pattern, &topic)
+                        {
+                            for cid_ref in entry.value().iter() {
+                                let cid = cid_ref.key().clone();
+                                if seen.insert(cid.clone())
+                                    && let Some(h) = guard.get(&cid)
+                                {
+                                    if let Some(cipher_ref) = state.conn_encryption.get(&cid) {
+                                        enc_senders.push((h.tx.clone(), cipher_ref.clone()));
+                                    } else {
+                                        plain_senders.push(h.tx.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    drop(guard);
+                    if !plain_senders.is_empty() {
+                        fanout_to_senders(plain_senders, WsFrame::PreFramed(preframed));
+                    }
+                    for (tx, cipher) in &enc_senders {
+                        if let Ok(enc) = encrypt_outbound(cipher, data.as_bytes()) {
+                            let mut buf = Vec::with_capacity(2 + enc.len());
+                            buf.extend_from_slice(b"E:");
+                            buf.extend_from_slice(&enc);
+                            let _ = tx.send(WsFrame::Msg(Message::Binary(buf.into())));
+                        }
+                    }
+                }
             }
             ServerCommand::Disconnect { conn_id } => {
                 let guard = state.connections.read().await;
@@ -1753,6 +2047,7 @@ impl RustWSEServer {
                                             ping_state.conn_formats.remove(cid);
                                             ping_state.conn_rates.remove(cid);
                                             ping_state.conn_last_activity.remove(cid);
+                                            ping_state.conn_encryption.remove(cid);
                                         }
                                         ping_state.connection_count.store(
                                             conns.len(),
@@ -2110,6 +2405,9 @@ impl RustWSEServer {
             .map(|v| *v)
             .unwrap_or(false);
 
+        // Check if this connection has E2E encryption
+        let conn_cipher = self.shared.conn_encryption.get(conn_id);
+
         let byte_count;
 
         if use_msgpack {
@@ -2121,6 +2419,19 @@ impl RustWSEServer {
             let mut final_bytes = Vec::with_capacity(buf.len() + 2);
             final_bytes.extend_from_slice(b"M:");
             final_bytes.extend_from_slice(&buf);
+
+            // Encrypt if E2E enabled for this connection
+            let final_bytes = if let Some(ref cipher) = conn_cipher {
+                let encrypted = encrypt_outbound(cipher, &final_bytes)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Encrypt error: {e}")))?;
+                let mut enc_buf = Vec::with_capacity(2 + encrypted.len());
+                enc_buf.extend_from_slice(b"E:");
+                enc_buf.extend_from_slice(&encrypted);
+                enc_buf
+            } else {
+                final_bytes
+            };
+
             byte_count = final_bytes.len();
             cmd_tx
                 .send(ServerCommand::SendPrebuilt {
@@ -2137,7 +2448,21 @@ impl RustWSEServer {
             let payload_str = format!("{}{}", category, json_str);
             let payload_bytes = payload_str.as_bytes();
 
-            if compression_threshold > 0 && payload_bytes.len() > compression_threshold {
+            if let Some(ref cipher) = conn_cipher {
+                // E2E encrypted: encrypt plaintext payload, send as E: prefix binary
+                let encrypted = encrypt_outbound(cipher, payload_bytes)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Encrypt error: {e}")))?;
+                let mut final_bytes = Vec::with_capacity(2 + encrypted.len());
+                final_bytes.extend_from_slice(b"E:");
+                final_bytes.extend_from_slice(&encrypted);
+                byte_count = final_bytes.len();
+                cmd_tx
+                    .send(ServerCommand::SendPrebuilt {
+                        conn_id: conn_id.to_owned(),
+                        message: Message::Binary(final_bytes.into()),
+                    })
+                    .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
+            } else if compression_threshold > 0 && payload_bytes.len() > compression_threshold {
                 // Compressed: C: prefix + zlib (binary frame)
                 let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
                 encoder

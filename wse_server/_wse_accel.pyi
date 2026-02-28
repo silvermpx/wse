@@ -125,8 +125,14 @@ class RustCompressionManager:
     def unpack_event(self, data: bytes, is_msgpack: bool = True) -> Any:
         """Unpack event from msgpack (with JSON fallback)."""
         ...
-    def get_stats(self) -> dict[str, int]:
-        """Return compression statistics."""
+    def get_stats(self) -> dict[str, int | float]:
+        """Return compression statistics.
+
+        Keys: total_compressed, total_decompressed, compression_failures,
+        decompression_failures, total_bytes_saved (int),
+        compression_success_rate, decompression_success_rate,
+        average_bytes_saved (float).
+        """
         ...
     def reset_stats(self) -> None:
         """Reset all compression statistics to zero."""
@@ -257,7 +263,14 @@ class RustPriorityMessageQueue:
         """Current total message count."""
         ...
     def get_stats(self) -> dict[str, Any]:
-        """Queue statistics: size, max_size, batch_size, priority_distribution, dropped_count."""
+        """Queue statistics.
+
+        Keys: size (int), capacity (int), utilization_percent (float),
+        priority_distribution (dict), priority_queue_depths (dict),
+        dropped_by_priority (dict), total_dropped (int),
+        backpressure (bool), oldest_message_age (float | None),
+        processing_rate (float).
+        """
         ...
     def clear(self) -> None: ...
 

@@ -15,6 +15,7 @@ import { RateLimiter } from './RateLimiter';
 import { ConnectionPool } from './ConnectionPool';
 import { CircuitBreaker } from '../utils/circuitBreaker';
 import { WS_PROTOCOL_VERSION, WS_CLIENT_VERSION, FEATURES } from '../constants';
+import { securityManager } from '../utils/security';
 import { AdaptiveQualityManager } from './AdaptiveQualityManager';
 
 /**
@@ -83,6 +84,9 @@ export class ConnectionManager {
   // Store server ready details temporarily
   private serverReadyDetails: any = null;
   private serverReadyProcessed = false;
+
+  // Serialized queue for encrypted sends (preserves message ordering)
+  private encryptedSendQueue: Promise<void> = Promise.resolve();
 
   // Pluggable auth refresh
   private refreshAuthTokenFn: (() => Promise<void>) | null = null;
@@ -643,7 +647,23 @@ export class ConnectionManager {
 
       const jsonData = JSON.stringify(message);
       const data = `${prefix}${jsonData}`;
-      this.ws.send(data);
+
+      // Encrypt outbound if E2E encryption is active
+      if (securityManager.isEncryptionEnabled()) {
+        // Queue encrypted send to preserve message ordering
+        this.encryptedSendQueue = (this.encryptedSendQueue || Promise.resolve()).then(async () => {
+          try {
+            const encrypted = await securityManager.encryptForTransport(data);
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+              this.ws.send(encrypted);
+            }
+          } catch (err) {
+            logger.error('[ConnectionManager] Encryption failed, dropping message:', err);
+          }
+        });
+      } else {
+        this.ws.send(data);
+      }
 
       const store = useWSEStore.getState();
       store.incrementMetric('messagesSent');
@@ -724,30 +744,44 @@ export class ConnectionManager {
     this.serverReadyDetails = null;
   }
 
-  private sendClientHello(): void {
+  private async sendClientHello(): Promise<void> {
     if (this.clientHelloSent || this.isDestroyed) {
       return;
     }
 
+    // Get raw public key if encryption is enabled (generate fresh keypair if needed)
+    const encryptionEnabled = securityManager.isEncryptionEnabled();
+    let encryptionPublicKey: string | null = null;
+    if (encryptionEnabled) {
+      await securityManager.generateKeyPair();
+      encryptionPublicKey = await securityManager.getPublicKeyRaw();
+    }
+
+    const payload: Record<string, any> = {
+      client_version: WS_CLIENT_VERSION,
+      protocol_version: WS_PROTOCOL_VERSION,
+      features: {
+        compression: FEATURES.COMPRESSION,
+        encryption: encryptionEnabled && encryptionPublicKey !== null,
+        batching: FEATURES.BATCHING,
+        priority_queue: FEATURES.PRIORITY_QUEUE,
+        circuit_breaker: FEATURES.CIRCUIT_BREAKER,
+        offline_queue: FEATURES.OFFLINE_QUEUE,
+        message_signing: FEATURES.MESSAGE_SIGNING,
+        rate_limiting: FEATURES.RATE_LIMITING,
+        health_check: FEATURES.HEALTH_CHECK,
+        metrics: FEATURES.METRICS,
+      },
+      connection_id: this.connectionId,
+    };
+
+    if (encryptionPublicKey) {
+      payload.encryption_public_key = encryptionPublicKey;
+    }
+
     const message: WSMessage = {
       t: 'client_hello',
-      p: {
-        client_version: WS_CLIENT_VERSION,
-        protocol_version: WS_PROTOCOL_VERSION,
-        features: {
-          compression: FEATURES.COMPRESSION,
-          encryption: FEATURES.ENCRYPTION,
-          batching: FEATURES.BATCHING,
-          priority_queue: FEATURES.PRIORITY_QUEUE,
-          circuit_breaker: FEATURES.CIRCUIT_BREAKER,
-          offline_queue: FEATURES.OFFLINE_QUEUE,
-          message_signing: FEATURES.MESSAGE_SIGNING,
-          rate_limiting: FEATURES.RATE_LIMITING,
-          health_check: FEATURES.HEALTH_CHECK,
-          metrics: FEATURES.METRICS,
-        },
-        connection_id: this.connectionId,
-      },
+      p: payload,
       id: crypto.randomUUID(),
       ts: new Date().toISOString(),
       v: WS_PROTOCOL_VERSION,
@@ -821,6 +855,12 @@ export class ConnectionManager {
       this.serverReady = false;
       this.clientHelloSent = false;
       this.serverReadyProcessed = false;
+      this.encryptedSendQueue = Promise.resolve();
+
+      // Reset encryption state so a fresh ECDH keypair is generated on reconnect
+      if (securityManager.isEncryptionEnabled()) {
+        securityManager.resetEncryption();
+      }
 
       const store = useWSEStore.getState();
 

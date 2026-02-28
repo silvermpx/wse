@@ -478,7 +478,7 @@ export class MessageProcessor {
     if (type === 'PING' || type === 'ping') {
       if (this.connectionManager?.ws?.readyState === WebSocket.OPEN) {
         try {
-          const serverTimestamp = message.p?.timestamp || Date.now();
+          const serverTimestamp = message.p?.server_time || message.p?.timestamp || Date.now();
           const pongMessage = {
             t: 'PONG',
             p: {
@@ -552,6 +552,17 @@ export class MessageProcessor {
         const store = useWSEStore.getState();
         store.recordLatency(Date.now() - clientTs);
       }
+    });
+
+    // Presence handlers
+    this.messageHandlers.set('presence_join', (msg) => {
+      window.dispatchEvent(new CustomEvent('presenceJoin', { detail: msg.p }));
+    });
+    this.messageHandlers.set('presence_leave', (msg) => {
+      window.dispatchEvent(new CustomEvent('presenceLeave', { detail: msg.p }));
+    });
+    this.messageHandlers.set('presence_update', (msg) => {
+      window.dispatchEvent(new CustomEvent('presenceUpdate', { detail: msg.p }));
     });
 
     // Debug handlers
@@ -720,6 +731,17 @@ export class MessageProcessor {
       if (payload.limits.max_queue_size) {
         queueStore.setCapacity(payload.limits.max_queue_size);
       }
+    }
+
+    // Complete ECDH key exchange if server confirmed encryption
+    if (
+      payload.features?.encryption &&
+      payload.encryption_public_key &&
+      typeof payload.encryption_public_key === 'string'
+    ) {
+      securityManager.setServerPublicKeyRaw(payload.encryption_public_key).catch(error => {
+        logger.error('Failed to complete ECDH key exchange:', error);
+      });
     }
   }
 
@@ -934,7 +956,7 @@ export class MessageProcessor {
     logger.warn('Rate limit warning:', warning);
 
     const store = useWSEStore.getState();
-    store.setLastError(`Rate limit: ${warning.message}`, 429);
+    store.setLastError(`Rate limit: remaining=${warning.remaining}, limit=${warning.limit}`, 429);
 
     if (warning.retry_after) {
       logger.info(`Should retry after ${warning.retry_after} seconds`);

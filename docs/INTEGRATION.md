@@ -33,6 +33,93 @@ server.start()
 
 The WebSocket server runs entirely in a Rust tokio runtime - no GIL on the hot path. Python receives pre-validated events via `drain_inbound()`, acquiring the GIL once per batch.
 
+### Running alongside FastAPI
+
+WSE runs on its own port with its own TCP listener. To run it alongside FastAPI, start WSE in the FastAPI lifespan and run the drain loop in a background thread:
+
+```python
+import threading
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from wse_server import RustWSEServer, rust_jwt_encode
+
+server = RustWSEServer(
+    "0.0.0.0", 5007,
+    max_connections=10_000,
+    jwt_secret=b"replace-with-a-strong-secret-key!",
+    jwt_issuer="my-app",
+    jwt_audience="my-api",
+)
+
+# --- Event processing (runs in a background thread) -----------------------
+
+users: dict[str, str] = {}  # conn_id -> user_id
+
+def drain_loop():
+    while server.is_running():
+        events = server.drain_inbound(256, 50)
+        for ev in events:
+            event_type, conn_id, data = ev
+            if event_type == "auth_connect":
+                users[conn_id] = data
+                server.subscribe_connection(conn_id, ["notifications"])
+            elif event_type == "msg":
+                handle_message(conn_id, data)
+            elif event_type == "disconnect":
+                users.pop(conn_id, None)
+
+def handle_message(conn_id: str, data: dict):
+    msg_type = data.get("t", "")
+    if msg_type == "chat":
+        server.broadcast("chat", f'{{"t":"chat","p":{{"text":"{data["p"]["text"]}"}}}}'  )
+
+# --- FastAPI lifespan ------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    server.enable_drain_mode()
+    server.start()
+    worker = threading.Thread(target=drain_loop, daemon=True)
+    worker.start()
+    yield
+    server.stop()
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/health")
+def health():
+    return server.health_snapshot()
+
+@app.post("/broadcast/{topic}")
+def broadcast(topic: str, message: str):
+    server.broadcast(topic, message)
+
+@app.get("/token/{user_id}")
+def get_token(user_id: str):
+    import time
+    token = rust_jwt_encode(
+        {"sub": user_id, "iss": "my-app", "aud": "my-api",
+         "exp": int(time.time()) + 3600, "iat": int(time.time())},
+        b"replace-with-a-strong-secret-key!",
+    )
+    return {"token": token}
+```
+
+Run with:
+
+```bash
+uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+This gives you two endpoints:
+- **FastAPI** on port 8000 for REST API (health checks, token generation, broadcast triggers)
+- **WSE** on port 5007 for WebSocket connections (handled entirely by Rust)
+
+The drain loop runs in a daemon thread and processes WebSocket events independently from FastAPI request handling. Both share the same `server` instance, so REST endpoints can call `server.broadcast()`, `server.send()`, `server.health_snapshot()`, etc.
+
+For production, put both behind the same reverse proxy (nginx, Caddy) and route `/wse` to port 5007 and everything else to port 8000.
+
 ---
 
 ## 3. JWT Authentication
