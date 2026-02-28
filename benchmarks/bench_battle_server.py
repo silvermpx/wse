@@ -125,6 +125,28 @@ def drain_loop(server, stop_event: threading.Event):
                                 topics = p.get("topics", [])
                                 if topics:
                                     server.subscribe_connection(conn_id, topics)
+                            elif action == "subscribe_presence":
+                                topics = p.get("topics", [])
+                                presence_data = p.get("presence_data", {})
+                                if topics:
+                                    server.subscribe_connection(
+                                        conn_id, topics, presence_data
+                                    )
+                            elif action == "presence_query":
+                                topic = p.get("topic", "")
+                                if topic:
+                                    members = server.presence(topic)
+                                    response = {
+                                        "t": "presence_result",
+                                        "p": {"topic": topic, "members": members},
+                                    }
+                                    server.send_event(conn_id, response, 0)
+                            elif action == "update_presence":
+                                data = p.get("data", {})
+                                try:
+                                    server.update_presence(conn_id, data)
+                                except Exception:
+                                    pass  # Connection may not have presence
                             elif action == "health":
                                 health = server.health_snapshot()
                                 response = {
@@ -246,6 +268,7 @@ def main():
         jwt_secret=JWT_SECRET,
         jwt_issuer=JWT_ISSUER,
         jwt_audience=JWT_AUDIENCE,
+        presence_enabled=True,
     )
     server.enable_drain_mode()
     server.start()

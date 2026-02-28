@@ -151,7 +151,11 @@ impl PresenceManager {
                     connections: Vec::new(),
                     updated_at: now,
                 });
-            let was_empty = entry.connections.is_empty();
+            // Check for first LOCAL connection (ignore remote sentinels from cluster sync)
+            let was_empty = !entry
+                .connections
+                .iter()
+                .any(|c| !c.conn_id.starts_with("__remote__"));
             // Add this connection if not already tracked
             let inserted = if !entry.connections.iter().any(|c| c.conn_id == conn_id) {
                 entry.connections.push(ConnMeta {
@@ -218,28 +222,36 @@ impl PresenceManager {
         };
 
         if let Some(topic_map) = self.topic_presence.get(topic) {
-            let mut is_last = false;
-            let mut data = serde_json::Value::Null;
-
+            // Phase 1: Remove the connection from the entry (get_mut holds shard lock)
+            let mut removed_conn = false;
             if let Some(mut entry) = topic_map.get_mut(&user_id) {
                 let before = entry.connections.len();
                 entry.connections.retain(|c| c.conn_id != conn_id);
                 if entry.connections.len() < before {
-                    // Actually removed a connection
+                    removed_conn = true;
                     if let Some(stats) = self.topic_presence_stats.get(topic) {
                         stats.num_connections.fetch_sub(1, Ordering::Relaxed);
                     }
                 }
-                is_last = entry.connections.is_empty();
-                data = entry.data.clone();
             }
 
-            if is_last {
-                topic_map.remove(&user_id);
+            // Phase 2: Atomically remove entry only if connections is still empty
+            // (prevents TOCTOU race where track() adds a connection between phases)
+            if removed_conn
+                && let Some((_, removed_entry)) =
+                    topic_map.remove_if(&user_id, |_, entry| entry.connections.is_empty())
+            {
                 if let Some(stats) = self.topic_presence_stats.get(topic) {
-                    stats.num_users.fetch_sub(1, Ordering::Relaxed);
+                    let _ = stats.num_users.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |current| Some(current.saturating_sub(1)),
+                    );
                 }
-                return UntrackResult::LastLeave { user_id, data };
+                return UntrackResult::LastLeave {
+                    user_id,
+                    data: removed_entry.data,
+                };
             }
         }
 
@@ -368,14 +380,28 @@ impl PresenceManager {
                 }
             }
 
-            for (user_id, data, dead_conn_count) in dead_users {
-                topic_map.remove(&user_id);
+            for (user_id, data, _dead_conn_count) in dead_users {
+                // Collect dead conn_ids before removing the user entry
+                let actual_conn_count = if let Some((_, entry)) = topic_map.remove(&user_id) {
+                    let count = entry.connections.len();
+                    for conn in &entry.connections {
+                        self.conn_user_id.remove(&conn.conn_id);
+                        self.conn_presence_topics.remove(&conn.conn_id);
+                    }
+                    count
+                } else {
+                    0
+                };
                 if let Some(stats) = self.topic_presence_stats.get(&topic) {
-                    stats.num_users.fetch_sub(1, Ordering::Relaxed);
+                    let _ = stats.num_users.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |current| Some(current.saturating_sub(1)),
+                    );
                     let _ = stats.num_connections.fetch_update(
                         Ordering::Relaxed,
                         Ordering::Relaxed,
-                        |current| Some(current.saturating_sub(dead_conn_count)),
+                        |current| Some(current.saturating_sub(actual_conn_count)),
                     );
                 }
                 removed.push((topic.clone(), user_id, data));
@@ -397,7 +423,30 @@ impl PresenceManager {
         data: &serde_json::Value,
         updated_at: u64,
     ) {
+        // Validate remote data size (same limit as local track)
+        let data_str = data.to_string();
+        if data_str.len() > self.max_data_size {
+            eprintln!(
+                "[WSE-Presence] Rejecting oversized remote presence data ({} bytes, max {})",
+                data_str.len(),
+                self.max_data_size
+            );
+            return;
+        }
         let topic_map = self.topic_presence.entry(topic.to_owned()).or_default();
+
+        // Enforce max_members limit for remote entries too
+        if self.max_members > 0
+            && !topic_map.contains_key(user_id)
+            && topic_map.len() >= self.max_members
+        {
+            eprintln!(
+                "[WSE-Presence] Rejecting remote join for {user_id}: topic at capacity ({})",
+                self.max_members
+            );
+            return;
+        }
+
         let mut entry = topic_map
             .entry(user_id.to_owned())
             .or_insert_with(|| PresenceEntry {
@@ -430,21 +479,42 @@ impl PresenceManager {
     /// Merge a remote leave from a peer node.
     pub fn merge_remote_leave(&self, topic: &str, user_id: &str) {
         if let Some(topic_map) = self.topic_presence.get(topic) {
-            // Only remove if user has no local connections (only remote sentinels)
-            let should_remove = if let Some(entry) = topic_map.get(user_id) {
+            let mut should_remove_user = false;
+            let mut removed_sentinel = false;
+
+            if let Some(mut entry) = topic_map.get_mut(user_id) {
+                // Remove the __remote__ sentinel specifically
+                let before = entry.connections.len();
                 entry
                     .connections
-                    .iter()
-                    .all(|c| c.conn_id.starts_with("__remote__"))
-            } else {
-                false
-            };
-            if should_remove {
-                topic_map.remove(user_id);
-                if let Some(stats) = self.topic_presence_stats.get(topic) {
-                    stats.num_users.fetch_sub(1, Ordering::Relaxed);
-                    stats.num_connections.fetch_sub(1, Ordering::Relaxed);
+                    .retain(|c| !c.conn_id.starts_with("__remote__"));
+                removed_sentinel = entry.connections.len() < before;
+                // If no connections remain, remove the user entirely
+                should_remove_user = entry.connections.is_empty();
+            }
+
+            if should_remove_user {
+                // Use remove_if to prevent TOCTOU: track() could add a local
+                // connection between get_mut release and this remove call.
+                let actually_removed =
+                    topic_map.remove_if(user_id, |_, entry| entry.connections.is_empty());
+                if actually_removed.is_some()
+                    && let Some(stats) = self.topic_presence_stats.get(topic)
+                {
+                    let _ = stats.num_users.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |current| Some(current.saturating_sub(1)),
+                    );
                 }
+            }
+            // Decrement connection count for each removed sentinel
+            if removed_sentinel && let Some(stats) = self.topic_presence_stats.get(topic) {
+                let _ = stats.num_connections.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |current| Some(current.saturating_sub(1)),
+                );
             }
         }
     }
@@ -457,6 +527,16 @@ impl PresenceManager {
         data: &serde_json::Value,
         updated_at: u64,
     ) {
+        // Validate remote data size (same limit as local track)
+        let data_str = data.to_string();
+        if data_str.len() > self.max_data_size {
+            eprintln!(
+                "[WSE-Presence] Rejecting oversized remote presence update ({} bytes, max {})",
+                data_str.len(),
+                self.max_data_size
+            );
+            return;
+        }
         if let Some(topic_map) = self.topic_presence.get(topic)
             && let Some(mut entry) = topic_map.get_mut(user_id)
             && updated_at >= entry.updated_at

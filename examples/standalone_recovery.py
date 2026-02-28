@@ -1,6 +1,6 @@
 """Standalone WSE server with message recovery on reconnect.
 
-Demonstrates Phase 7 recovery: when a client disconnects and reconnects,
+Demonstrates message recovery: when a client disconnects and reconnects,
 it can recover missed messages from the server's per-topic ring buffer
 using epoch+offset tracking.
 
@@ -23,7 +23,7 @@ from wse_server._wse_accel import RustWSEServer, rust_jwt_encode
 
 HOST = "0.0.0.0"
 PORT = 5007
-JWT_SECRET = b"my-secret-key"
+JWT_SECRET = b"change-me-to-a-secure-32-byte-key!"
 JWT_ISSUER = "my-app"
 JWT_AUDIENCE = "my-api"
 
@@ -58,7 +58,7 @@ def event_loop(server: RustWSEServer, stop: threading.Event):
                 )
                 print(f"    subscribe result: {result}")
 
-            elif event_type == "message":
+            elif event_type == "msg":
                 data = event[2]
                 if isinstance(data, dict):
                     msg_type = data.get("t")
@@ -156,7 +156,7 @@ def main():
         jwt_secret=JWT_SECRET,
         jwt_issuer=JWT_ISSUER,
         jwt_audience=JWT_AUDIENCE,
-        # Phase 7: Enable message recovery
+        # Enable message recovery
         recovery_enabled=True,
         recovery_buffer_size=256,  # 256 messages per topic
         recovery_ttl=300,          # 5 minutes

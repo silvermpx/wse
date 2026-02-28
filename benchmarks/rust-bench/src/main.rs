@@ -118,6 +118,9 @@ async fn run_single_test(cli: &Cli, test: TestName) {
         TestName::BattlePhase6Compression => {
             tests::battle_phase6_compression::run(cli).await;
         }
+        TestName::BattlePresence => {
+            tests::battle_presence::run(cli).await;
+        }
     }
 }
 

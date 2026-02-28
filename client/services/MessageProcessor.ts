@@ -79,7 +79,7 @@ export class MessageProcessor {
 
   private debugMessage(type: string, message: any, details?: any): void {
     // Only log in development or if debug mode is enabled
-    if (process.env.NODE_ENV !== 'development' && !(window as any).WSE_DEBUG) {
+    if (process.env.NODE_ENV !== 'development' && !(typeof window !== 'undefined' && (window as any).WSE_DEBUG)) {
       return;
     }
 
@@ -122,6 +122,7 @@ export class MessageProcessor {
 
   // Add this static method to enable/disable debug mode
   static enableDebugMode(enabled: boolean = true): void {
+    if (typeof window === 'undefined') return;
     (window as any).WSE_DEBUG = enabled;
     if (enabled) {
       logger.info('WSE Debug mode enabled. Messages will be logged to console and sessionStorage.');
@@ -545,7 +546,13 @@ export class MessageProcessor {
     this.messageHandlers.set('connection_quality', (msg) => this.handleConnectionQuality(msg));
     this.messageHandlers.set('snapshot_complete', (msg) => this.handleSnapshotComplete(msg));
     this.messageHandlers.set('heartbeat', () => this.handleHeartbeat());
-    this.messageHandlers.set('PONG', () => {}); // PONG is handled in processTextMessage
+    this.messageHandlers.set('PONG', (msg) => {
+      const clientTs = msg.p?.client_timestamp;
+      if (typeof clientTs === 'number') {
+        const store = useWSEStore.getState();
+        store.recordLatency(Date.now() - clientTs);
+      }
+    });
 
     // Debug handlers
     this.messageHandlers.set('debug_response', (msg) => this.handleDebugResponse(msg));
@@ -560,7 +567,11 @@ export class MessageProcessor {
     this.messageHandlers.set('key_rotation_response', (msg) => this.handleKeyRotationResponse(msg));
 
     // Batch handlers
-    this.messageHandlers.set('batch', (msg) => this.handleBatchMessage(msg));
+    this.messageHandlers.set('batch', (msg) => {
+      this.handleBatchMessage(msg).catch(error => {
+        logger.error('Error processing batch message:', error);
+      });
+    });
     this.messageHandlers.set('batch_message_result', (msg) => this.handleBatchMessageResult(msg));
 
     // Metrics handler
@@ -843,7 +854,7 @@ export class MessageProcessor {
       });
     }
 
-    if (errorCode === 'RATE_LIMIT_EXCEEDED' || errorMessage.includes('Rate limit')) {
+    if (errorCode === 'RATE_LIMITED' || errorCode === 'RATE_LIMIT_EXCEEDED' || errorMessage.includes('Rate limit')) {
       logger.warn('Rate limit exceeded');
       window.dispatchEvent(new CustomEvent('rateLimitExceeded', {
         detail: {
@@ -1119,6 +1130,7 @@ export class MessageProcessor {
     this.batchPromise = new Promise((resolve) => {
       const timer = setTimeout(() => {
         if (this.destroyed) {
+          this.batchPromise = null;
           resolve();
           return;
         }

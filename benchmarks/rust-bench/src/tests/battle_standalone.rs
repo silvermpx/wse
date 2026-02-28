@@ -13,10 +13,10 @@ const SUBSCRIBE_SETTLE_MS: u64 = 500;
 
 /// Per-channel delivery counters shared across connections in a group.
 struct ChannelCounts {
-    all: AtomicU64,          // broadcast_all
-    battle_all: AtomicU64,   // topic "battle_all"
-    battle_half: AtomicU64,  // topic "battle_half"
-    battle_glob: AtomicU64,  // topic "battle.glob_test" (via "battle.*" glob)
+    all: AtomicU64,         // broadcast_all
+    battle_all: AtomicU64,  // topic "battle_all"
+    battle_half: AtomicU64, // topic "battle_half"
+    battle_glob: AtomicU64, // topic "battle.glob_test" (via "battle.*" glob)
     total_bytes: AtomicU64,
 }
 
@@ -96,11 +96,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     .await;
 
     checks.check(
-        &format!(
-            "Connected {}/{} clients",
-            connections.len(),
-            BATTLE_CLIENTS
-        ),
+        &format!("Connected {}/{} clients", connections.len(), BATTLE_CLIENTS),
         connections.len() == BATTLE_CLIENTS,
     );
 
@@ -126,10 +122,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         });
         let _ = ws.send(Message::Text(cmd.to_string().into())).await;
     }
-    println!(
-        "    All {} subscribed to 'battle_all'",
-        connections.len()
-    );
+    println!("    All {} subscribed to 'battle_all'", connections.len());
 
     // First half also subscribes to "battle_half" and "battle.*" (glob)
     for ws in connections[..half].iter_mut() {
@@ -231,25 +224,19 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
     // Topic isolation -- battle_half
     checks.check("Group 1 received 'battle_half' topic", g1_bhalf > 0);
-    checks.check(
-        "Group 2 isolated from 'battle_half'",
-        g2_bhalf == 0,
-    );
+    checks.check("Group 2 isolated from 'battle_half'", g2_bhalf == 0);
 
     // Glob pattern matching -- battle.* matches battle.glob_test
     checks.check(
         "Group 1 received 'battle.glob_test' via glob 'battle.*'",
         g1_bglob > 0,
     );
-    checks.check(
-        "Group 2 isolated from 'battle.glob_test'",
-        g2_bglob == 0,
-    );
+    checks.check("Group 2 isolated from 'battle.glob_test'", g2_bglob == 0);
 
     // Throughput
     let total = g1_counts.total_messages() + g2_counts.total_messages();
-    let total_bytes =
-        g1_counts.total_bytes.load(Ordering::Relaxed) + g2_counts.total_bytes.load(Ordering::Relaxed);
+    let total_bytes = g1_counts.total_bytes.load(Ordering::Relaxed)
+        + g2_counts.total_bytes.load(Ordering::Relaxed);
     let del_per_sec = total as f64 / duration.as_secs_f64();
     println!(
         "\n    Total deliveries: {} ({}/s)",

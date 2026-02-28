@@ -144,7 +144,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         );
         checks.check("Server C cluster_connected == true", connected);
         checks.check(
-            &format!("Server C cluster_unknown_message_types == 0 (got {})", unknown),
+            &format!(
+                "Server C cluster_unknown_message_types == 0 (got {})",
+                unknown
+            ),
             unknown == 0,
         );
     } else {

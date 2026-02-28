@@ -63,7 +63,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut results = Vec::new();
 
     for &n in &tiers {
-        println!("\n  --- {} subscribers on Server B (:{}) [TLS cluster] ---", n, port2);
+        println!(
+            "\n  --- {} subscribers on Server B (:{}) [TLS cluster] ---",
+            n, port2
+        );
 
         // Connect all clients to Server B
         let connections = protocol::connect_batch(

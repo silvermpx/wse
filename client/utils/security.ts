@@ -23,51 +23,6 @@ export class SecurityError extends Error {
   }
 }
 
-// Nonce cache for replay attack prevention with size limits
-class NonceCache {
-  private readonly cache = new Map<string, number>();
-  private readonly cleanupInterval: NodeJS.Timeout;
-  private readonly maxSize = 10000;
-
-  constructor(private readonly maxAge: number = 300000) {
-    this.cleanupInterval = setInterval(() => this.cleanup(), 60000);
-  }
-
-  add(nonce: string): void {
-    this.cache.set(nonce, Date.now());
-
-    if (this.cache.size > this.maxSize * 1.2) {
-      this.cleanup();
-    }
-  }
-
-  has(nonce: string): boolean {
-    return this.cache.has(nonce);
-  }
-
-  private cleanup(): void {
-    const now = Date.now();
-
-    for (const [nonce, timestamp] of this.cache.entries()) {
-      if (now - timestamp > this.maxAge) {
-        this.cache.delete(nonce);
-      }
-    }
-
-    if (this.cache.size > this.maxSize) {
-      const sortedEntries = Array.from(this.cache.entries())
-        .sort((a, b) => a[1] - b[1]);
-      const toRemove = sortedEntries.slice(0, this.cache.size - this.maxSize);
-      toRemove.forEach(([nonce]) => this.cache.delete(nonce));
-    }
-  }
-
-  destroy(): void {
-    clearInterval(this.cleanupInterval);
-    this.cache.clear();
-  }
-}
-
 export class SecurityManager {
   private encryptionEnabled = false;
   private messageSigningEnabled = false;
@@ -78,7 +33,6 @@ export class SecurityManager {
   private keyRotationTimer: NodeJS.Timeout | null = null;
   private keyRotationFailures = 0;
 
-  private readonly nonceCache = new NonceCache();
   private sessionKeyPair: CryptoKeyPair | null = null;
   private sharedSecret: CryptoKey | null = null;
   private serverPublicKey: CryptoKey | null = null;
@@ -238,22 +192,14 @@ export class SecurityManager {
       const encoder = new TextEncoder();
       const encoded = encoder.encode(data);
 
-      let iv: Uint8Array;
-      let ivHex: string;
-      let attempts = 0;
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const ivHex = Array.from(iv).map(b => b.toString(16).padStart(2, '0')).join('');
 
-      do {
-        iv = crypto.getRandomValues(new Uint8Array(12));
-        ivHex = Array.from(iv).map(b => b.toString(16).padStart(2, '0')).join('');
-        attempts++;
-        if (attempts > 10) {
-          this.usedIVs.clear();
-        }
-      } while (this.usedIVs.has(ivHex) && attempts < 100);
-
+      // Track used IVs; evict oldest when cache is full
       this.usedIVs.add(ivHex);
       if (this.usedIVs.size > 10000) {
-        this.usedIVs.clear();
+        const first = this.usedIVs.values().next().value;
+        if (first) this.usedIVs.delete(first);
       }
 
       const encrypted = await crypto.subtle.encrypt(
@@ -487,7 +433,6 @@ export class SecurityManager {
       clearInterval(this.keyRotationTimer);
       this.keyRotationTimer = null;
     }
-    this.nonceCache.destroy();
     if (this.usedIVs) {
       this.usedIVs.clear();
     }

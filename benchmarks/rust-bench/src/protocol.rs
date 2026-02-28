@@ -346,8 +346,7 @@ pub async fn query_health(ws: &mut WsStream, timeout_secs: u64) -> Option<serde_
     });
     ws.send(Message::Text(cmd.to_string().into())).await.ok()?;
 
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -366,8 +365,7 @@ pub async fn query_health(ws: &mut WsStream, timeout_secs: u64) -> Option<serde_
                 };
                 if might_be_health {
                     if let Some(parsed) = parse_wse_message(&msg) {
-                        if parsed.get("t").and_then(|t| t.as_str()) == Some("health_response")
-                        {
+                        if parsed.get("t").and_then(|t| t.as_str()) == Some("health_response") {
                             return parsed.get("p").cloned();
                         }
                     }

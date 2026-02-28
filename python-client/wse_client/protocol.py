@@ -188,7 +188,14 @@ class MessageCodec:
 
         # Compressed: C: prefix
         if data[:2] == PREFIX_COMPRESSED:
-            decompressed = self._compression.decompress(data[2:])
+            try:
+                decompressed = self._compression.decompress(data[2:])
+            except Exception:
+                logger.warning("Corrupt compressed frame (%d bytes), dropping", len(data))
+                return None
+            if len(decompressed) > MAX_MESSAGE_SIZE:
+                logger.warning("Decompressed message exceeds max size (%d bytes), dropping", len(decompressed))
+                return None
             text = decompressed.decode("utf-8")
             return self._decode_text(text)
 
@@ -210,7 +217,14 @@ class MessageCodec:
 
         # Raw zlib (magic byte 0x78)
         if len(data) >= 2 and data[0] == ZLIB_MAGIC and data[1] in ZLIB_METHODS:
-            decompressed = self._compression.decompress(data)
+            try:
+                decompressed = self._compression.decompress(data)
+            except Exception:
+                logger.warning("Corrupt zlib frame (%d bytes), dropping", len(data))
+                return None
+            if len(decompressed) > MAX_MESSAGE_SIZE:
+                logger.warning("Decompressed message exceeds max size (%d bytes), dropping", len(decompressed))
+                return None
             text = decompressed.decode("utf-8")
             return self._decode_text(text)
 

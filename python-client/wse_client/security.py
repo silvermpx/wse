@@ -74,7 +74,10 @@ class SecurityManager:
         public_bytes = self._private_key.public_key().public_bytes(
             Encoding.X962, PublicFormat.UncompressedPoint
         )
-        assert len(public_bytes) == 65  # 0x04 + 32 + 32
+        if len(public_bytes) != 65:
+            raise WSEEncryptionError(
+                f"Unexpected ECDH public key length: {len(public_bytes)}, expected 65"
+            )
         return public_bytes
 
     def derive_shared_secret(self, peer_public_bytes: bytes) -> None:

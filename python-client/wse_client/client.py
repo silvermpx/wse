@@ -59,6 +59,7 @@ _INTERNAL_ONLY_EVENTS = frozenset(
         "pong",
         "heartbeat",
         "PING",
+        "ping",
         "sync_request",
         "metrics_request",
         "priority_message",
@@ -114,6 +115,7 @@ class AsyncWSEClient:
         self._event_queue: asyncio.Queue[WSEEvent | None] = asyncio.Queue(
             maxsize=queue_size
         )
+        self._disconnecting = False
 
         # Callback handlers: type -> list of handlers
         self._handlers: dict[str, list[EventHandler | AsyncEventHandler]] = defaultdict(
@@ -129,9 +131,6 @@ class AsyncWSEClient:
         self._server_max_message_size: int | None = None
         self._server_rate_limit: int | None = None
 
-        # Batch buffer
-        self._batch_buffer: list[str] = []
-        self._batch_task: asyncio.Task[None] | None = None
         self._background_tasks: set[asyncio.Task[Any]] = set()
 
         # Snapshot dedup
@@ -159,7 +158,6 @@ class AsyncWSEClient:
         self._connection._on_pong = self._on_transport_pong
         self._connection._on_ping_sent = lambda: self._network_monitor.record_ping()
         self._server_ready_event = asyncio.Event()
-        self._connected = False
 
         # System handler dispatch table (dict lookup = O(1))
         self._system_handlers: dict[str, Callable[[WSEEvent], None]] = {
@@ -181,6 +179,7 @@ class AsyncWSEClient:
             "pong": self._handle_pong_event,
             "heartbeat": self._handle_pong_event,
             "PING": self._handle_ping_event,
+            "ping": self._handle_ping_event,
             # Response handlers (forwarded to user)
             "debug_response": self._handle_forward_event,
             "sequence_stats_response": self._handle_forward_event,
@@ -218,7 +217,6 @@ class AsyncWSEClient:
     async def connect(self) -> None:
         """Connect and wait for server_ready."""
         await self._connection.connect(self._initial_topics)
-        self._connected = True
 
         # Wait for server_ready with timeout
         try:
@@ -232,24 +230,26 @@ class AsyncWSEClient:
 
     async def disconnect(self) -> None:
         """Disconnect gracefully."""
-        self._connected = False
+        self._disconnecting = True
 
         # Cancel background tasks
         for task in self._background_tasks:
             task.cancel()
         self._background_tasks.clear()
 
-        # Cancel batch flush
-        if self._batch_task:
-            self._batch_task.cancel()
-            self._batch_task = None
-
-        # Signal iterator to stop
+        # Signal iterator to stop (drop oldest if queue is full)
         try:
             self._event_queue.put_nowait(None)
         except asyncio.QueueFull:
-            pass
-        await self._connection.disconnect()
+            try:
+                self._event_queue.get_nowait()
+                self._event_queue.put_nowait(None)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                pass
+        try:
+            await self._connection.disconnect()
+        finally:
+            self._disconnecting = False
 
     async def close(self) -> None:
         """Alias for disconnect."""
@@ -554,6 +554,11 @@ class AsyncWSEClient:
             event = await self._event_queue.get()
 
         if event is None:
+            # Re-queue sentinel so other callers also see the close signal
+            try:
+                self._event_queue.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
             raise WSEConnectionError("Connection closed")
         return event
 
@@ -568,7 +573,9 @@ class AsyncWSEClient:
         self._connection._url = new_url
         self._connection._reconnect_attempts = 0
         self._server_ready_event.clear()
-        await self._connection.connect(self._initial_topics)
+        # Merge dynamically subscribed topics with initial topics
+        all_topics = list(set(self._initial_topics) | self._subscribed_topics)
+        await self._connection.connect(all_topics)
 
     # -- Handler registration -------------------------------------------------
 
@@ -757,11 +764,16 @@ class AsyncWSEClient:
         logger.info(
             "Re-subscribing to %d topics (recover=%s)", len(topics), recover
         )
-        ok = await self.subscribe(topics, recover=recover)
-        if not ok:
-            # Restore so the next reconnect can try again
+        try:
+            ok = await self.subscribe(topics, recover=recover)
+            if not ok:
+                # Restore so the next reconnect can try again
+                self._subscribed_topics.update(topics)
+                logger.warning("Re-subscribe failed, topics preserved for next reconnect")
+        except BaseException:
+            # Restore topics on cancellation or any exception
             self._subscribed_topics.update(topics)
-            logger.warning("Re-subscribe failed, topics preserved for next reconnect")
+            raise
 
     def _handle_server_hello(self, event: WSEEvent) -> None:
         """Handle server_hello with negotiated features and limits."""
@@ -817,7 +829,7 @@ class AsyncWSEClient:
 
         if code == "AUTH_FAILED":
             logger.error("Auth failed: %s", message)
-        elif code == "RATE_LIMIT_EXCEEDED" or "Rate limit" in message:
+        elif code in ("RATE_LIMITED", "RATE_LIMIT_EXCEEDED") or "Rate limit" in message:
             retry_after = p.get("retry_after") or p.get("retryAfter", 0)
             logger.warning(
                 "Rate limit exceeded (retry after %ss): %s", retry_after, message
@@ -997,7 +1009,19 @@ class AsyncWSEClient:
             self._stats.reconnect_count += 1
             self._server_ready_event.clear()
             self._snapshot_requested = False
+            self._sequencer.reset()
         elif state == ConnectionState.CONNECTED:
             pass  # record_ping() is called per-heartbeat via on_ping_sent
         elif state == ConnectionState.DISCONNECTED:
             self._server_ready_event.clear()
+            # Signal iterator to stop on terminal disconnect
+            # (skip if disconnect() already enqueued the sentinel)
+            if not getattr(self, "_disconnecting", False):
+                try:
+                    self._event_queue.put_nowait(None)
+                except asyncio.QueueFull:
+                    try:
+                        self._event_queue.get_nowait()
+                        self._event_queue.put_nowait(None)
+                    except (asyncio.QueueEmpty, asyncio.QueueFull):
+                        pass

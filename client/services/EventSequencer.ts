@@ -23,9 +23,11 @@ export class EventSequencer {
     this.seenIds = new Map();
     this.outOfOrderBuffer = new Map();
 
-    this.cleanupInterval = setInterval(() => {
-      this.cleanup();
-    }, 60000);
+    if (typeof window !== 'undefined') {
+      this.cleanupInterval = setInterval(() => {
+        this.cleanup();
+      }, 60000);
+    }
   }
 
   getNextSequence(): number {

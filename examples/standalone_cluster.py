@@ -22,7 +22,7 @@ import time
 
 from wse_server._wse_accel import RustWSEServer, rust_jwt_encode
 
-JWT_SECRET = b"my-secret-key"
+JWT_SECRET = b"change-me-to-a-secure-32-byte-key!"
 JWT_ISSUER = "my-app"
 JWT_AUDIENCE = "my-api"
 

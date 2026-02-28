@@ -14,6 +14,7 @@ export class OfflineQueue {
   private storeName = 'messages';
   private db: IDBDatabase | null = null;
   private config: OfflineQueueConfig;
+  private _size = 0;
 
   constructor(config: OfflineQueueConfig) {
     this.config = config;
@@ -21,6 +22,7 @@ export class OfflineQueue {
 
   async initialize(): Promise<void> {
     if (!this.config.persistToStorage) return;
+    if (typeof indexedDB === 'undefined') return;
 
     return new Promise((resolve, reject) => {
       const request = indexedDB.open(this.dbName, 1);
@@ -44,6 +46,7 @@ export class OfflineQueue {
 
   async enqueue(message: any): Promise<void> {
     if (!this.config.enabled || !this.db) return;
+    if (this._size >= this.config.maxSize) return;
 
     await this.cleanup();
 
@@ -56,7 +59,7 @@ export class OfflineQueue {
         timestamp: Date.now(),
         retries: 0,
       });
-      request.onsuccess = () => resolve();
+      request.onsuccess = () => { this._size++; resolve(); };
       request.onerror = () => reject(request.error);
     });
   }
@@ -93,7 +96,7 @@ export class OfflineQueue {
 
     return new Promise((resolve, reject) => {
       const request = store.clear();
-      request.onsuccess = () => resolve();
+      request.onsuccess = () => { this._size = 0; resolve(); };
       request.onerror = () => reject(request.error);
     });
   }
@@ -113,6 +116,7 @@ export class OfflineQueue {
         const cursor = (event.target as IDBRequest).result;
         if (cursor) {
           cursor.delete();
+          this._size = Math.max(0, this._size - 1);
           cursor.continue();
         } else {
           resolve();
@@ -124,7 +128,8 @@ export class OfflineQueue {
 
   getStats() {
     return {
-      size: 0,
+      size: this._size,
+      capacity: this.config.maxSize,
       enabled: this.config.enabled,
       persistToStorage: this.config.persistToStorage,
     };

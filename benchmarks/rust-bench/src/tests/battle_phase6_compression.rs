@@ -138,10 +138,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .unwrap_or(0);
     let initial_delivered = initial
         .as_ref()
-        .and_then(|h| {
-            h.get("cluster_messages_delivered")
-                .and_then(|v| v.as_u64())
-        })
+        .and_then(|h| h.get("cluster_messages_delivered").and_then(|v| v.as_u64()))
         .unwrap_or(0);
 
     println!(
@@ -170,10 +167,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .unwrap_or(0);
     let final_delivered = final_health
         .as_ref()
-        .and_then(|h| {
-            h.get("cluster_messages_delivered")
-                .and_then(|v| v.as_u64())
-        })
+        .and_then(|h| h.get("cluster_messages_delivered").and_then(|v| v.as_u64()))
         .unwrap_or(0);
 
     let bytes_delta = final_bytes.saturating_sub(initial_bytes);
@@ -196,10 +190,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
     // Check 2: Messages are being delivered to local subscribers
     checks.check(
-        &format!(
-            "Cluster messages delivered > 0 (got {})",
-            delivered_delta
-        ),
+        &format!("Cluster messages delivered > 0 (got {})", delivered_delta),
         delivered_delta > 0,
     );
 
@@ -221,10 +212,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             "    Avg cluster bytes / delivered message: {:.1} (uncompressed ~1024)",
             avg_bytes_per_delivered
         );
-        println!(
-            "    Compression ratio: {:.1}% of original",
-            compression_pct
-        );
+        println!("    Compression ratio: {:.1}% of original", compression_pct);
 
         // With zstd on repetitive data, avg should be well under 1024.
         // Use 800 as threshold (at least 20% compression).

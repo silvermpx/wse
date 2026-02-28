@@ -16,6 +16,7 @@ import {
   getEndpoints,
   getSavedSubscriptions,
   saveSubscriptions,
+  WS_PROTOCOL_VERSION,
 } from '../constants';
 import { useWSEStore } from '../stores/useWSEStore';
 import { useMessageQueueStore } from '../stores/useMessageQueueStore';
@@ -114,11 +115,13 @@ function cleanupProcessedEvents() {
 }
 
 // Run cleanup every 30 seconds - handle HMR by clearing existing interval
-if ((globalThis as any).__wse_cleanup_interval) {
-  clearInterval((globalThis as any).__wse_cleanup_interval);
+if (typeof window !== 'undefined') {
+  if ((globalThis as any).__wse_cleanup_interval) {
+    clearInterval((globalThis as any).__wse_cleanup_interval);
+  }
+  const cleanupInterval = setInterval(cleanupProcessedEvents, 30000);
+  (globalThis as any).__wse_cleanup_interval = cleanupInterval;
 }
-const cleanupInterval = setInterval(cleanupProcessedEvents, 30000);
-(globalThis as any).__wse_cleanup_interval = cleanupInterval;
 
 // Cleanup on module unload -- handle HMR by removing previous listener
 if (typeof window !== 'undefined') {
@@ -126,8 +129,10 @@ if (typeof window !== 'undefined') {
     window.removeEventListener('beforeunload', (globalThis as any).__wse_beforeunload_handler);
   }
   const beforeUnloadHandler = () => {
-    clearInterval(cleanupInterval);
-    delete (globalThis as any).__wse_cleanup_interval;
+    if ((globalThis as any).__wse_cleanup_interval) {
+      clearInterval((globalThis as any).__wse_cleanup_interval);
+      delete (globalThis as any).__wse_cleanup_interval;
+    }
 
     if (globalWSEInstance && !globalWSEInstance.destroyed) {
       logger.info('[useWSE] Window unload - cleaning up global instance');
@@ -468,7 +473,7 @@ export function useWSE(
       p: payload,
       id: crypto.randomUUID(),
       ts: new Date().toISOString(),
-      v: 2,
+      v: WS_PROTOCOL_VERSION,
     };
 
     if (options.priority) message.pri = options.priority;
@@ -995,6 +1000,8 @@ export function useWSE(
 
       store.reset();
       queueStore.clearQueue();
+
+      isGloballyConnecting = false;
 
       logger.info('WSE: Cleanup complete');
     };

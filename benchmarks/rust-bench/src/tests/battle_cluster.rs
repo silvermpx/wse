@@ -121,7 +121,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 1: Connect to Server B
     // =========================================================================
-    println!("\n  Phase 1: Connect {} clients to Server B (:{})  ", BATTLE_CLIENTS, port2);
+    println!(
+        "\n  Phase 1: Connect {} clients to Server B (:{})  ",
+        BATTLE_CLIENTS, port2
+    );
 
     let mut connections = protocol::connect_batch(
         &cli.host,
@@ -134,7 +137,11 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     .await;
 
     checks.check(
-        &format!("Connected {}/{} to Server B", connections.len(), BATTLE_CLIENTS),
+        &format!(
+            "Connected {}/{} to Server B",
+            connections.len(),
+            BATTLE_CLIENTS
+        ),
         connections.len() == BATTLE_CLIENTS,
     );
 
@@ -170,10 +177,16 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         });
         let _ = ws.send(Message::Text(cmd.to_string().into())).await;
     }
-    println!("    First {} also subscribed to 'battle_half' + 'battle.*'", half);
+    println!(
+        "    First {} also subscribed to 'battle_half' + 'battle.*'",
+        half
+    );
 
     // Longer settle time for cluster -- subscriptions need to propagate via RESYNC
-    println!("    Waiting {}ms for cluster subscription propagation...", SUBSCRIBE_SETTLE_MS);
+    println!(
+        "    Waiting {}ms for cluster subscription propagation...",
+        SUBSCRIBE_SETTLE_MS
+    );
     tokio::time::sleep(Duration::from_millis(SUBSCRIBE_SETTLE_MS)).await;
 
     // Warmup
@@ -239,26 +252,21 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
     println!(
         "    Group 2 ({} clients, battle_all only): all={}, battle_all={}, battle_half={}, glob={}",
-        actual - half, g2_all, g2_ball, g2_bhalf, g2_bglob
+        actual - half,
+        g2_all,
+        g2_ball,
+        g2_bhalf,
+        g2_bglob
     );
 
     // broadcast_all goes to Server A's local clients only (not cluster-forwarded)
     // so Server B clients may or may not receive "all" messages
     // Topic messages should be forwarded via cluster
-    checks.check(
-        "Group 1 received 'battle_all' via cluster",
-        g1_ball > 0,
-    );
-    checks.check(
-        "Group 2 received 'battle_all' via cluster",
-        g2_ball > 0,
-    );
+    checks.check("Group 1 received 'battle_all' via cluster", g1_ball > 0);
+    checks.check("Group 2 received 'battle_all' via cluster", g2_ball > 0);
 
     // Topic isolation across cluster
-    checks.check(
-        "Group 1 received 'battle_half' via cluster",
-        g1_bhalf > 0,
-    );
+    checks.check("Group 1 received 'battle_half' via cluster", g1_bhalf > 0);
     checks.check(
         "Group 2 isolated from 'battle_half' (cluster)",
         g2_bhalf == 0,
@@ -276,8 +284,8 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
     // Throughput
     let total = g1_counts.total_messages() + g2_counts.total_messages();
-    let total_bytes =
-        g1_counts.total_bytes.load(Ordering::Relaxed) + g2_counts.total_bytes.load(Ordering::Relaxed);
+    let total_bytes = g1_counts.total_bytes.load(Ordering::Relaxed)
+        + g2_counts.total_bytes.load(Ordering::Relaxed);
     let del_per_sec = total as f64 / duration.as_secs_f64();
     println!(
         "\n    Total deliveries: {} ({}/s)",

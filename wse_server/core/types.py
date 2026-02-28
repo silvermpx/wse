@@ -24,8 +24,11 @@ class EventPriority(Enum):
 
 
 class DeliveryGuarantee(Enum):
-    """Event delivery guarantees"""
+    """Event delivery guarantees.
+
+    WSE provides at-most-once delivery. The recovery system allows
+    clients to catch up on missed messages within a time window,
+    but does not guarantee redelivery.
+    """
 
     AT_MOST_ONCE = "at_most_once"
-    AT_LEAST_ONCE = "at_least_once"
-    EXACTLY_ONCE = "exactly_once"

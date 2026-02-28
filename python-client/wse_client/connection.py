@@ -214,6 +214,7 @@ class ConnectionManager:
 
         self._set_state(ConnectionState.CONNECTED)
         self._connected_at = time.monotonic()
+        self._last_pong = time.monotonic()
         self._server_ready = False
         self._client_hello_sent = False
 
@@ -360,14 +361,16 @@ class ConnectionManager:
 
             # WSE-prefixed PONG message (JSON format from Rust server)
             # Forward to client layer — _handle_pong_event records latency once
-            if '"t":"PONG"' in data or '"t": "PONG"' in data:
+            # Only match top-level "t" field (first ~20 chars), not nested payloads
+            data_start = data[:25]
+            if '"t":"PONG"' in data_start or '"t": "PONG"' in data_start:
                 self._last_pong = time.monotonic()
                 if self._on_message:
                     self._on_message(data)
                 return
 
-            # WSE-prefixed PING message (JSON format)
-            if '"t":"PING"' in data or '"t": "PING"' in data:
+            # WSE-prefixed PING message (JSON format, server sends lowercase)
+            if '"t":"PING"' in data_start or '"t": "PING"' in data_start or '"t":"ping"' in data_start or '"t": "ping"' in data_start:
                 self._fire_task(self._respond_ping_json(data))
                 self._last_pong = time.monotonic()
                 return
@@ -398,7 +401,9 @@ class ConnectionManager:
             # Strip WSE prefix if present
             json_str = data[3:] if data.startswith("WSE") else data
             parsed = _json.loads(json_str)
-            ts = parsed.get("p", {}).get("timestamp", int(time.time() * 1000))
+            p = parsed.get("p", {})
+            # Server sends "server_time" (RFC 3339) or "timestamp" (ms epoch)
+            ts = p.get("timestamp") or p.get("server_time") or int(time.time() * 1000)
         except Exception:
             ts = int(time.time() * 1000)
 
@@ -501,7 +506,7 @@ class ConnectionManager:
 
     def _handle_close_code(self, code: int, reason: str) -> None:
         """React to a WebSocket close code."""
-        logger.debug("WebSocket closed: code=%d reason=%s", code, reason)
+        logger.debug("WebSocket closed: code=%s reason=%s", code, reason)
 
         self._ws = None
         self._server_ready = False
@@ -669,7 +674,9 @@ class ConnectionManager:
             "encryption=false",
         ]
         if topics:
-            params.append(f"topics={','.join(topics)}")
+            from urllib.parse import quote
+            encoded = ",".join(quote(t, safe="") for t in topics)
+            params.append(f"topics={encoded}")
 
         return parts[0] + sep + "&".join(params)
 

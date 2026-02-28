@@ -38,6 +38,7 @@ pub(crate) const MAX_FRAME_SIZE: usize = 1_048_576; // 1MB
 pub(crate) const HEARTBEAT_INTERVAL_SECS: u64 = 5;
 pub(crate) const HEARTBEAT_TIMEOUT_SECS: u64 = 15;
 pub(crate) const MAX_BATCH_BYTES: usize = 65_536;
+pub(crate) const MAX_CLUSTER_PEERS: usize = 256;
 // Cluster peer channels are bounded (10K messages) to prevent OOM from slow peers.
 // When a peer falls behind, messages are dropped and metrics.messages_dropped incremented.
 
@@ -344,15 +345,14 @@ pub(crate) fn encode_msg(buf: &mut BytesMut, topic: &str, payload: &str) -> bool
         return false;
     }
     let payload_bytes = payload.as_bytes();
-    if payload_bytes.len() > MAX_FRAME_SIZE {
+    let total_frame = 8 + topic_bytes.len() + payload_bytes.len();
+    if total_frame > MAX_FRAME_SIZE {
         eprintln!(
-            "[WSE-Cluster] Payload too large ({} bytes, max {}), dropping message",
-            payload_bytes.len(),
-            MAX_FRAME_SIZE
+            "[WSE-Cluster] Frame too large ({total_frame} bytes, max {MAX_FRAME_SIZE}), dropping message",
         );
         return false;
     }
-    buf.reserve(8 + topic_bytes.len() + payload_bytes.len());
+    buf.reserve(total_frame);
     buf.put_u8(MsgType::Msg as u8);
     buf.put_u8(0); // flags
     buf.put_u16_le(topic_bytes.len() as u16);
@@ -581,8 +581,15 @@ pub(crate) fn encode_presence_update(
 /// Encode a PRESENCE_FULL frame (full presence state sync).
 pub(crate) fn encode_presence_full(buf: &mut BytesMut, entries_json: &str) -> bool {
     let payload_bytes = entries_json.as_bytes();
+    let total_frame = 8 + payload_bytes.len();
+    if total_frame > MAX_FRAME_SIZE {
+        eprintln!(
+            "[WSE-Cluster] PresenceFull frame too large ({total_frame} bytes, max {MAX_FRAME_SIZE}), dropping",
+        );
+        return false;
+    }
     let topic_len: u16 = 0; // No topic for full sync
-    buf.reserve(8 + payload_bytes.len());
+    buf.reserve(total_frame);
     buf.put_u8(MsgType::PresenceFull as u8);
     buf.put_u8(0); // flags
     buf.put_u16_le(topic_len);
@@ -669,14 +676,7 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             let topic = String::from_utf8(data.split_to(topic_len).to_vec()).ok()?;
             let payload = if flags & FLAG_COMPRESSED != 0 {
                 let compressed = data.split_to(payload_len);
-                // Pre-decompression check: reject tiny payloads that could decompress into
-                // MAX_FRAME_SIZE (1MB). Cap at 1000:1 max ratio before even attempting decompress.
-                if payload_len > 0 && payload_len < 8 {
-                    eprintln!(
-                        "[WSE-Cluster] Rejecting suspiciously small compressed payload: {payload_len} bytes"
-                    );
-                    return None;
-                }
+                // zstd::bulk::decompress enforces MAX_FRAME_SIZE output cap (decompression bomb protection).
                 let decompressed = match zstd::bulk::decompress(&compressed, MAX_FRAME_SIZE) {
                     Ok(d) => d,
                     Err(e) => {
@@ -686,15 +686,6 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                         return None;
                     }
                 };
-                // Reject suspiciously high amplification ratios (>100x)
-                if payload_len > 0 && decompressed.len() > payload_len.saturating_mul(100) {
-                    eprintln!(
-                        "[WSE-Cluster] Decompression bomb detected: {}x amplification ({payload_len} -> {} bytes)",
-                        decompressed.len() / payload_len,
-                        decompressed.len()
-                    );
-                    return None;
-                }
                 String::from_utf8(decompressed).ok()?
             } else {
                 String::from_utf8(data.split_to(payload_len).to_vec()).ok()?
@@ -1128,8 +1119,13 @@ async fn heartbeat_task(
                 }
                 let mut ping = BytesMut::new();
                 encode_ping(&mut ping);
-                if peer_write_tx.try_send(ping.freeze()).is_err() {
-                    break;
+                match peer_write_tx.try_send(ping.freeze()) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // Peer backpressured -- skip this ping but keep monitoring.
+                        // The timeout check above will still fire if peer goes silent.
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
             () = cancel.cancelled() => break,
@@ -1742,6 +1738,13 @@ pub(crate) async fn cluster_manager(
         peer_handles.push(spawn_ctx.spawn(peer_addr.clone(), rx));
     }
 
+    // Prune completed peer handles periodically to prevent unbounded growth
+    let prune_handles = |handles: &mut Vec<tokio::task::JoinHandle<()>>| {
+        if handles.len().is_multiple_of(64) {
+            handles.retain(|h| !h.is_finished());
+        }
+    };
+
     // Start cluster listener for inbound peer connections (separate port)
     // Limit concurrent inbound connections to prevent resource exhaustion
     const MAX_INBOUND_CLUSTER_CONNS: usize = 128;
@@ -2006,10 +2009,19 @@ pub(crate) async fn cluster_manager(
                 let is_self = cluster_addr.as_deref() == Some(&new_addr);
                 let already_known = !known_peers.insert(new_addr.clone());
                 if !is_self && !already_known && !peer_txs.iter().any(|(a, _, _)| a == &new_addr) {
-                    let (tx, rx) = mpsc::channel::<Bytes>(10_000);
-                    peer_txs.push((new_addr.clone(), tx, LOCAL_CAPABILITIES));
-                    peer_handles.push(spawn_ctx.spawn(new_addr.clone(), rx));
-                    eprintln!("[WSE-Cluster] Discovered new peer: {new_addr}");
+                    // Prune dead peer channels so they don't count toward capacity
+                    peer_txs.retain(|(_, tx, _)| !tx.is_closed());
+                    if peer_txs.len() >= MAX_CLUSTER_PEERS {
+                        eprintln!(
+                            "[WSE-Cluster] Ignoring discovered peer {new_addr}: at capacity ({MAX_CLUSTER_PEERS} peers)"
+                        );
+                    } else {
+                        let (tx, rx) = mpsc::channel::<Bytes>(10_000);
+                        peer_txs.push((new_addr.clone(), tx, LOCAL_CAPABILITIES));
+                        peer_handles.push(spawn_ctx.spawn(new_addr.clone(), rx));
+                        prune_handles(&mut peer_handles);
+                        eprintln!("[WSE-Cluster] Discovered new peer: {new_addr}");
+                    }
                 }
             }
             // Handle gossip commands from peer tasks
@@ -2039,10 +2051,18 @@ pub(crate) async fn cluster_manager(
                     if known_peers.insert(addr.clone())
                         && !peer_txs.iter().any(|(a, _, _)| a == &addr)
                     {
-                        let (tx, rx) = mpsc::channel::<Bytes>(10_000);
-                        peer_txs.push((addr.clone(), tx, LOCAL_CAPABILITIES));
-                        peer_handles.push(spawn_ctx.spawn(addr.clone(), rx));
-                        eprintln!("[WSE-Cluster] Discovered peer via gossip: {addr}");
+                        peer_txs.retain(|(_, tx, _)| !tx.is_closed());
+                        if peer_txs.len() >= MAX_CLUSTER_PEERS {
+                            eprintln!(
+                                "[WSE-Cluster] Ignoring gossip peer {addr}: at capacity ({MAX_CLUSTER_PEERS} peers)"
+                            );
+                        } else {
+                            let (tx, rx) = mpsc::channel::<Bytes>(10_000);
+                            peer_txs.push((addr.clone(), tx, LOCAL_CAPABILITIES));
+                            peer_handles.push(spawn_ctx.spawn(addr.clone(), rx));
+                            prune_handles(&mut peer_handles);
+                            eprintln!("[WSE-Cluster] Discovered peer via gossip: {addr}");
+                        }
                     }
                 }
             }
@@ -2249,6 +2269,7 @@ async fn handle_cluster_inbound_generic<S>(
     write_framed(&mut frame, &hello_buf);
     if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
         eprintln!("[WSE-Cluster] Failed to send HELLO to inbound {addr}");
+        connected_instances.remove(&peer_instance_id);
         return;
     }
 
@@ -2267,6 +2288,7 @@ async fn handle_cluster_inbound_generic<S>(
             write_framed(&mut resync_frame, &resync_buf);
             if writer.write_all(&resync_frame).await.is_err() || writer.flush().await.is_err() {
                 eprintln!("[WSE-Cluster] Failed to send RESYNC to inbound {addr}");
+                connected_instances.remove(&peer_instance_id);
                 return;
             }
         }

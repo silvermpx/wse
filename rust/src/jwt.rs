@@ -166,10 +166,16 @@ fn jwt_decode_inner(
         }
     }
 
-    // aud - validate if config specifies audience
+    // aud - validate if config specifies audience (RFC 7519: string or array)
     if let Some(expected_aud) = audience {
-        let token_aud = payload.get("aud").and_then(|a| a.as_str());
-        if token_aud != Some(expected_aud) {
+        let aud_valid = match payload.get("aud") {
+            Some(serde_json::Value::String(s)) => s == expected_aud,
+            Some(serde_json::Value::Array(arr)) => {
+                arr.iter().any(|a| a.as_str() == Some(expected_aud))
+            }
+            _ => false,
+        };
+        if !aud_valid {
             return Err(JwtError::InvalidAudience);
         }
     }

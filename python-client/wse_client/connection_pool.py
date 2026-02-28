@@ -79,6 +79,12 @@ class ConnectionPool:
 
         self._apply_recovery()
 
+        # Prefer sticky endpoint if set and healthy
+        if self._preferred_endpoint:
+            ep = self._endpoints.get(self._preferred_endpoint)
+            if ep and ep.score > self.MIN_SCORE:
+                return self._preferred_endpoint
+
         if self._strategy == LoadBalancingStrategy.LEAST_CONNECTIONS:
             return self._select_least_connections()
         elif self._strategy == LoadBalancingStrategy.ROUND_ROBIN:
@@ -189,7 +195,14 @@ class ConnectionPool:
         """Gradually recover scores over time."""
         now = time.monotonic()
         for ep in self._endpoints.values():
-            if ep.score < self.MAX_SCORE and ep.last_failure:
-                elapsed_min = (now - ep.last_failure) / 60.0
-                recovery = elapsed_min * self.RECOVERY_RATE
-                ep.score = min(self.MAX_SCORE, ep.score + recovery)
+            if ep.score >= self.MAX_SCORE:
+                continue
+            # Recover from any penalty (failure or latency)
+            ref_time = ep.last_failure or ep.last_success
+            if ref_time is None:
+                continue
+            ref = getattr(ep, "_last_recovery_time", ref_time)
+            elapsed_min = (now - ref) / 60.0
+            recovery = elapsed_min * self.RECOVERY_RATE
+            ep.score = min(self.MAX_SCORE, ep.score + recovery)
+            ep._last_recovery_time = now  # type: ignore[attr-defined]

@@ -4,9 +4,11 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Thread-local regex cache to avoid recompiling patterns.
+/// Global regex cache to avoid recompiling patterns (capped at 1024 entries).
 static REGEX_CACHE: std::sync::LazyLock<Mutex<HashMap<String, Regex>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const REGEX_CACHE_MAX: usize = 1024;
 
 /// Match an event dict against MongoDB-like filter criteria.
 ///
@@ -213,7 +215,7 @@ fn match_operators(
                     None => false,
                 }
             }
-            _ => true,
+            _ => false,
         };
 
         if !result {
@@ -244,6 +246,11 @@ fn regex_matches(pattern: &str, text: &str) -> PyResult<bool> {
         let compiled = Regex::new(&anchored).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Invalid regex '{pattern}': {e}"))
         })?;
+        if cache.len() >= REGEX_CACHE_MAX
+            && let Some(key) = cache.keys().next().cloned()
+        {
+            cache.remove(&key);
+        }
         cache.insert(anchored.clone(), compiled);
         cache.get(&anchored).unwrap()
     };

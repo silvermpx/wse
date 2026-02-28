@@ -308,17 +308,15 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
     println!(
         "    Group 2 ({} clients, battle_all only): all={}, battle_all={}, battle_half={}, glob={}",
-        actual - half, g2_all, g2_ball, g2_bhalf, g2_bglob
+        actual - half,
+        g2_all,
+        g2_ball,
+        g2_bhalf,
+        g2_bglob
     );
 
-    checks.check(
-        "Group 1 received 'battle_all' via TLS cluster",
-        g1_ball > 0,
-    );
-    checks.check(
-        "Group 2 received 'battle_all' via TLS cluster",
-        g2_ball > 0,
-    );
+    checks.check("Group 1 received 'battle_all' via TLS cluster", g1_ball > 0);
+    checks.check("Group 2 received 'battle_all' via TLS cluster", g2_ball > 0);
     checks.check(
         "Group 1 received 'battle_half' via TLS cluster",
         g1_bhalf > 0,
@@ -327,14 +325,8 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         "Group 2 isolated from 'battle_half' (TLS cluster)",
         g2_bhalf == 0,
     );
-    checks.check(
-        "Group 1 received glob via TLS cluster",
-        g1_bglob > 0,
-    );
-    checks.check(
-        "Group 2 isolated from glob (TLS cluster)",
-        g2_bglob == 0,
-    );
+    checks.check("Group 1 received glob via TLS cluster", g1_bglob > 0);
+    checks.check("Group 2 isolated from glob (TLS cluster)", g2_bglob == 0);
 
     // Throughput
     let total = g1_counts.total_messages() + g2_counts.total_messages();

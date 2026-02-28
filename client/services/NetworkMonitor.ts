@@ -18,7 +18,9 @@ export class NetworkMonitor {
     private maxHistorySize = 100,
     private diagnosticsIntervalMs = 30000
   ) {
-    this.startDiagnostics();
+    if (typeof window !== 'undefined') {
+      this.startDiagnostics();
+    }
   }
 
   recordLatency(latency: number): void {

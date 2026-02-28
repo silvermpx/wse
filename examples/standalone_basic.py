@@ -17,7 +17,7 @@ from wse_server._wse_accel import RustWSEServer, rust_jwt_encode
 
 HOST = "0.0.0.0"
 PORT = 5007
-JWT_SECRET = b"my-secret-key"
+JWT_SECRET = b"change-me-to-a-secure-32-byte-key!"
 JWT_ISSUER = "my-app"
 JWT_AUDIENCE = "my-api"
 
@@ -44,9 +44,9 @@ def event_loop(server: RustWSEServer, stop: threading.Event):
 
     Event types:
       - "auth_connect": new connection, payload = user_id
-      - "message":      parsed JSON from client, payload = dict
-      - "raw_text":     unparsed text frame, payload = str
-      - "binary":       binary frame, payload = bytes
+      - "msg":          parsed JSON from client, payload = dict
+      - "raw":          unparsed text frame, payload = str
+      - "bin":          binary frame, payload = bytes
       - "disconnect":   connection closed, no payload
     """
     connections: dict[str, str] = {}  # conn_id -> user_id
@@ -68,7 +68,7 @@ def event_loop(server: RustWSEServer, stop: threading.Event):
                 # send a welcome message
                 server.send(conn_id, '{"t":"welcome","p":{"msg":"hello from WSE"}}')
 
-            elif event_type == "message":
+            elif event_type == "msg":
                 data = event[2]  # parsed dict
                 user = connections.get(conn_id, "?")
                 print(f"[msg] {user}: {data}")

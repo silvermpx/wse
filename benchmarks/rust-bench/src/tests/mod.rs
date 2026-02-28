@@ -4,6 +4,7 @@ pub mod battle_phase3_caps;
 pub mod battle_phase4_tls;
 pub mod battle_phase5_discovery;
 pub mod battle_phase6_compression;
+pub mod battle_presence;
 pub mod battle_standalone;
 pub mod connection_limit;
 pub mod connection_storm;

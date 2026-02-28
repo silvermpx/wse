@@ -140,3 +140,4 @@ class EventSequencer:
         self._expected_sequence = 0
         self._sequence = 0
         self._duplicates_detected = 0
+        self._cleanup_counter = 0

@@ -197,6 +197,7 @@ class Logger {
   // ---------------------------------------------------------------------------
 
   private sendToLoggingService(entry: LogEntry): void {
+    if (typeof window === 'undefined') return;
     try {
       const key = 'wse_error_logs';
       const existing = localStorage.getItem(key);

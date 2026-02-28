@@ -28,7 +28,6 @@ def client():
     c._connection.send = AsyncMock(return_value=True)
     c._connection.disconnect = AsyncMock()
     c._connection.force_reconnect = AsyncMock()
-    c._connected = True
     return c
 
 
@@ -175,7 +174,7 @@ class TestSystemHandlers:
         event = WSEEvent(
             type="error",
             payload={
-                "code": "RATE_LIMIT_EXCEEDED",
+                "code": "RATE_LIMITED",
                 "message": "Too fast",
                 "retry_after": 5,
             },

@@ -6,7 +6,7 @@ Server publishes price ticks every 100ms.
 Three broadcast methods:
   - broadcast_all(data)           -- send to ALL connections (no topics)
   - broadcast_local(topic, data)  -- send to topic subscribers (single instance)
-  - broadcast(topic, data)        -- send to topic subscribers (all instances via Redis)
+  - broadcast(topic, data)        -- send to topic subscribers (all instances via cluster)
 
     pip install wse-server
     python examples/standalone_broadcast.py
@@ -21,7 +21,7 @@ from wse_server._wse_accel import RustWSEServer, rust_jwt_encode
 
 HOST = "0.0.0.0"
 PORT = 5007
-JWT_SECRET = b"my-secret-key"
+JWT_SECRET = b"change-me-to-a-secure-32-byte-key!"
 JWT_ISSUER = "my-app"
 JWT_AUDIENCE = "my-api"
 
@@ -53,7 +53,7 @@ def event_loop(server: RustWSEServer, stop: threading.Event):
                 # subscribe this connection to the prices topic
                 server.subscribe_connection(conn_id, ["prices"])
 
-            elif event_type == "message":
+            elif event_type == "msg":
                 data = event[2]
                 # client can request additional topics at runtime
                 if isinstance(data, dict) and data.get("t") == "subscribe":

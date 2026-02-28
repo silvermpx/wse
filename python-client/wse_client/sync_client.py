@@ -100,6 +100,16 @@ class SyncWSEClient:
 
         if not self._connected_event.wait(timeout=timeout):
             self._running = False
+            # Stop the background thread to prevent orphaned thread on retry
+            if self._loop and self._client:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self._client.disconnect(), self._loop
+                    ).result(timeout=3.0)
+                except Exception:
+                    pass
+            if self._thread and self._thread.is_alive():
+                self._thread.join(timeout=3.0)
             raise WSETimeoutError(f"Connection timed out after {timeout}s")
 
         # Check if connection failed in background thread
@@ -144,10 +154,13 @@ class SyncWSEClient:
         """Send a message (blocks until sent)."""
         if not self._loop or not self._client:
             return False
-        future = asyncio.run_coroutine_threadsafe(
-            self._client.send(type, payload, priority=priority), self._loop
-        )
-        return future.result(timeout=5.0)
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._client.send(type, payload, priority=priority), self._loop
+            )
+            return future.result(timeout=5.0)
+        except Exception:
+            return False
 
     def subscribe(self, topics: list[str], *, recover: bool = False) -> bool:
         """Subscribe to topics, optionally recovering missed messages.
@@ -161,10 +174,13 @@ class SyncWSEClient:
         """
         if not self._loop or not self._client:
             return False
-        future = asyncio.run_coroutine_threadsafe(
-            self._client.subscribe(topics, recover=recover), self._loop
-        )
-        return future.result(timeout=5.0)
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._client.subscribe(topics, recover=recover), self._loop
+            )
+            return future.result(timeout=5.0)
+        except Exception:
+            return False
 
     def unsubscribe(self, topics: list[str]) -> bool:
         """Unsubscribe from topics. Blocks until sent.
@@ -177,10 +193,13 @@ class SyncWSEClient:
         """
         if not self._loop or not self._client:
             return False
-        future = asyncio.run_coroutine_threadsafe(
-            self._client.unsubscribe(topics), self._loop
-        )
-        return future.result(timeout=5.0)
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._client.unsubscribe(topics), self._loop
+            )
+            return future.result(timeout=5.0)
+        except Exception:
+            return False
 
     def send_with_retry(
         self,
@@ -193,22 +212,28 @@ class SyncWSEClient:
         """Send with exponential backoff retry."""
         if not self._loop or not self._client:
             return False
-        future = asyncio.run_coroutine_threadsafe(
-            self._client.send_with_retry(
-                type, payload, priority=priority, max_retries=max_retries
-            ),
-            self._loop,
-        )
-        return future.result(timeout=30.0)
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._client.send_with_retry(
+                    type, payload, priority=priority, max_retries=max_retries
+                ),
+                self._loop,
+            )
+            return future.result(timeout=30.0)
+        except Exception:
+            return False
 
     def send_batch(self, messages: list[tuple[str, dict[str, Any]]]) -> bool:
         """Send multiple messages in a single batch frame."""
         if not self._loop or not self._client:
             return False
-        future = asyncio.run_coroutine_threadsafe(
-            self._client.send_batch(messages), self._loop
-        )
-        return future.result(timeout=10.0)
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._client.send_batch(messages), self._loop
+            )
+            return future.result(timeout=10.0)
+        except Exception:
+            return False
 
     def request_snapshot(self, topics: list[str] | None = None) -> bool:
         """Request a state snapshot. Blocks until sent.
@@ -221,28 +246,37 @@ class SyncWSEClient:
         """
         if not self._loop or not self._client:
             return False
-        future = asyncio.run_coroutine_threadsafe(
-            self._client.request_snapshot(topics), self._loop
-        )
-        return future.result(timeout=5.0)
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._client.request_snapshot(topics), self._loop
+            )
+            return future.result(timeout=5.0)
+        except Exception:
+            return False
 
     def force_reconnect(self) -> None:
         """Force a reconnection."""
         if not self._loop or not self._client:
             return
-        future = asyncio.run_coroutine_threadsafe(
-            self._client.force_reconnect(), self._loop
-        )
-        future.result(timeout=15.0)
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._client.force_reconnect(), self._loop
+            )
+            future.result(timeout=15.0)
+        except Exception:
+            pass
 
     def change_endpoint(self, new_url: str) -> None:
         """Change endpoint and reconnect."""
         if not self._loop or not self._client:
             return
-        future = asyncio.run_coroutine_threadsafe(
-            self._client.change_endpoint(new_url), self._loop
-        )
-        future.result(timeout=15.0)
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._client.change_endpoint(new_url), self._loop
+            )
+            future.result(timeout=15.0)
+        except Exception:
+            pass
 
     # -- Receive --------------------------------------------------------------
 
@@ -307,7 +341,7 @@ class SyncWSEClient:
 
             self._dispatch_to_handlers(event)
 
-    # -- Properties -----------------------------------------------------------
+    # -- Handler management ---------------------------------------------------
 
     def off(self, event_type: str, fn: Callable[[WSEEvent], Any]) -> None:
         """Remove a specific handler."""

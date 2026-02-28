@@ -193,7 +193,9 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             latency: if merged_latency.is_empty() {
                 None
             } else {
-                Some(crate::report::LatencySummary::from_histogram(&merged_latency))
+                Some(crate::report::LatencySummary::from_histogram(
+                    &merged_latency,
+                ))
             },
             extra: serde_json::json!({
                 "deliveries_per_sec": del_per_sec,
@@ -327,9 +329,13 @@ async fn load_receive_loop(
         }
     }
 
-    counters.received.fetch_add(local_received, Ordering::Relaxed);
+    counters
+        .received
+        .fetch_add(local_received, Ordering::Relaxed);
     counters.bytes.fetch_add(local_bytes, Ordering::Relaxed);
-    counters.broadcast_all.fetch_add(local_ba, Ordering::Relaxed);
+    counters
+        .broadcast_all
+        .fetch_add(local_ba, Ordering::Relaxed);
     counters.topic.fetch_add(local_topic, Ordering::Relaxed);
     if local_gaps > 0 {
         counters.gaps.fetch_add(local_gaps, Ordering::Relaxed);

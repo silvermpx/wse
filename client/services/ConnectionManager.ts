@@ -470,32 +470,7 @@ export class ConnectionManager {
     }
   }
 
-  private async reconnectWithNewToken(): Promise<void> {
-    if (this.isDestroyed) return;
 
-    logger.info('[ConnectionManager] Reconnecting after token refresh');
-
-    const store = useWSEStore.getState();
-    const topics = store.activeTopics;
-
-    if (this.ws) {
-      this.ws.close(1000, 'Token refresh');
-      this.ws = null;
-    }
-
-    await new Promise(resolve => setTimeout(resolve, 100));
-
-    this.consecutiveFailures = 0;
-    this.reconnectAttempts = 0;
-
-    try {
-      await this.connect('cookie', topics);
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      logger.error('[ConnectionManager] Failed to reconnect after token refresh:', errorMessage);
-      throw error;
-    }
-  }
 
   // ---------------------------------------------------------------------------
   // Reconnection with Circuit Breaker

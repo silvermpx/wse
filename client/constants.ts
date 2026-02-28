@@ -188,6 +188,8 @@ export const PERFORMANCE_THRESHOLDS = {
  * Override this by providing endpoints in WSEConfig.
  */
 export function getEndpoints(): string[] {
+    if (typeof window === 'undefined') return [];
+
     // Clear any cached endpoints to avoid old/multiple endpoints
     try {
         localStorage.removeItem(ENDPOINTS_STORAGE_KEY);

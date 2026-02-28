@@ -35,7 +35,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -162,6 +162,7 @@ struct DeduplicationState {
 struct PerConnRate {
     tokens: f64,
     last_refill: std::time::Instant,
+    last_rate_limited: Option<std::time::Instant>,
     last_warning: Option<std::time::Instant>,
 }
 
@@ -211,6 +212,8 @@ pub(crate) struct SharedState {
     pub(crate) cluster_interest_tx:
         std::sync::RwLock<Option<mpsc::UnboundedSender<super::cluster::InterestUpdate>>>,
     pub(crate) local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    // True when cluster TLS is configured (reject cluster connections on main port)
+    cluster_tls_enabled: AtomicBool,
     pub(crate) recovery: Option<Arc<super::recovery::RecoveryManager>>,
     // Per-connection last activity tracking for zombie detection
     conn_last_activity: DashMap<String, std::time::Instant>,
@@ -255,6 +258,7 @@ impl SharedState {
             cluster_instance_id: std::sync::Mutex::new(None),
             cluster_interest_tx: std::sync::RwLock::new(None),
             local_topic_refcount: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            cluster_tls_enabled: AtomicBool::new(false),
             recovery,
             conn_last_activity: DashMap::new(),
             presence: if presence_enabled {
@@ -485,10 +489,14 @@ async fn reject_ws_auth(
     let _ = tx.send(WsFrame::Msg(Message::Close(None)));
     let write_task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
-            if let WsFrame::Msg(msg) = frame
-                && write_half.feed(msg).await.is_err()
-            {
-                break;
+            if let WsFrame::Msg(msg) = frame {
+                let is_close = matches!(msg, Message::Close(_));
+                if write_half.feed(msg).await.is_err() {
+                    break;
+                }
+                if is_close {
+                    break;
+                }
             }
         }
         let _ = write_half.flush().await;
@@ -602,7 +610,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         Arc::new(std::sync::OnceLock::new());
     let hd_clone = handshake_data.clone();
 
-    let ws_stream = match tokio_tungstenite::accept_hdr_async(
+    let mut ws_config = WebSocketConfig::default();
+    ws_config.max_message_size = Some(1_048_576); // 1 MB (matches server_hello)
+    ws_config.max_frame_size = Some(1_048_576);
+    let ws_stream = match tokio_tungstenite::accept_hdr_async_with_config(
         stream,
         move |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
             let cookies = req
@@ -627,6 +638,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
             });
             Ok(response)
         },
+        Some(ws_config),
     )
     .await
     {
@@ -750,8 +762,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         }
     } else {
         let cb_guard = state.on_connect.read().await;
-        if let Some(ref cb) = *cb_guard {
-            let cb_clone = Python::try_attach(|py| cb.clone_ref(py)).expect("GIL attach failed");
+        if let Some(ref cb) = *cb_guard
+            && let Some(cb_clone) = Python::try_attach(|py| cb.clone_ref(py))
+        {
             let cid = (*conn_id).clone();
             let ck = cookie_str.clone();
             drop(cb_guard);
@@ -861,9 +874,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     // Cache on_message callback (only needed in callback mode)
     let cached_on_message: Option<Arc<Py<PyAny>>> = if !drain {
         let cb_guard = state.on_message.read().await;
-        cb_guard.as_ref().map(|cb| {
-            Arc::new(Python::try_attach(|py| cb.clone_ref(py)).expect("GIL attach failed"))
-        })
+        cb_guard
+            .as_ref()
+            .and_then(|cb| Python::try_attach(|py| cb.clone_ref(py)).map(Arc::new))
     } else {
         None
     };
@@ -1074,15 +1087,23 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         }
     }
 
-    // Cleanup
-    {
+    // Cleanup - check if zombie detection already removed this connection
+    let already_removed = {
         let mut conns = state.connections.write().await;
-        conns.remove(&*conn_id);
+        let was_present = conns.remove(&*conn_id).is_some();
         state.connection_count.store(conns.len(), Ordering::Relaxed);
-    }
+        !was_present
+    };
     state.conn_formats.remove(&*conn_id);
     state.conn_rates.remove(&*conn_id);
     state.conn_last_activity.remove(&*conn_id);
+    // If zombie detection already removed this connection and emitted
+    // a disconnect event, skip the rest to avoid duplicate events.
+    if already_removed {
+        drop(tx);
+        let _ = write_task.await;
+        return;
+    }
     // Presence cleanup: untrack from all topics before disconnect event
     if let Some(ref pm) = state.presence {
         let results = pm.remove_connection(&conn_id);
@@ -1160,8 +1181,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         });
     } else {
         let cb_guard = state.on_disconnect.read().await;
-        if let Some(ref cb) = *cb_guard {
-            let cb_clone = Python::try_attach(|py| cb.clone_ref(py)).expect("GIL attach failed");
+        if let Some(ref cb) = *cb_guard
+            && let Some(cb_clone) = Python::try_attach(|py| cb.clone_ref(py))
+        {
             let cid = (*conn_id).clone();
             drop(cb_guard);
             // Fire in background — don't block cleanup on GIL
@@ -1722,7 +1744,22 @@ impl RustWSEServer {
                                             }
                                         }
                                     }
-                                    // Topic subscription cleanup for zombies (mirrors disconnect path)
+                                    // Remove connections FIRST (mirrors normal disconnect order)
+                                    {
+                                        let mut conns =
+                                            ping_state.connections.write().await;
+                                        for cid in &force_remove {
+                                            conns.remove(cid);
+                                            ping_state.conn_formats.remove(cid);
+                                            ping_state.conn_rates.remove(cid);
+                                            ping_state.conn_last_activity.remove(cid);
+                                        }
+                                        ping_state.connection_count.store(
+                                            conns.len(),
+                                            Ordering::Relaxed,
+                                        );
+                                    }
+                                    // Topic subscription cleanup for zombies
                                     let cluster_tx = ping_state.cluster_cmd_tx.read().unwrap().clone();
                                     for cid in &force_remove {
                                         if let Some((_, topics)) = ping_state.conn_topics.remove(cid) {
@@ -1753,25 +1790,24 @@ impl RustWSEServer {
                                                 }
                                             }
                                         }
-                                        // Emit disconnect event to Python
+                                        // Emit disconnect event AFTER cleanup (mirrors normal path)
                                         if drain {
                                             ping_state.push_inbound(InboundEvent::Disconnect {
                                                 conn_id: cid.clone(),
                                             });
+                                        } else {
+                                            let cb_guard = ping_state.on_disconnect.read().await;
+                                            if let Some(ref cb) = *cb_guard
+                                                && let Some(cb_clone) = Python::try_attach(|py| cb.clone_ref(py))
+                                            {
+                                                let cid_owned = cid.clone();
+                                                drop(cb_guard);
+                                                tokio::task::spawn_blocking(move || {
+                                                    fire_on_disconnect(&cb_clone, &cid_owned);
+                                                });
+                                            }
                                         }
                                     }
-                                    let mut conns =
-                                        ping_state.connections.write().await;
-                                    for cid in &force_remove {
-                                        conns.remove(cid);
-                                        ping_state.conn_formats.remove(cid);
-                                        ping_state.conn_rates.remove(cid);
-                                        ping_state.conn_last_activity.remove(cid);
-                                    }
-                                    ping_state.connection_count.store(
-                                        conns.len(),
-                                        Ordering::Relaxed,
-                                    );
                                     eprintln!(
                                         "[WSE] Force-removed {} zombie connections",
                                         force_remove.len()
@@ -1808,10 +1844,28 @@ impl RustWSEServer {
                                                     // TLS ClientHello starts with 0x16.
                                                     peek[0] == 0x00 && peek[1] == 0x00 && peek[2] == 0x00 && peek[3] > 0
                                                 }
-                                                Ok(Ok(1..=3)) => peek[0] == 0x00, // Fallback for partial peek
                                                 _ => false,
                                             };
                                             if is_cluster {
+                                                // Reject cluster connections on main port when mTLS is
+                                                // configured or cluster is not yet initialized.
+                                                let cluster_ready = shared2
+                                                    .cluster_interest_tx
+                                                    .read()
+                                                    .unwrap()
+                                                    .is_some();
+                                                if shared2.cluster_tls_enabled.load(Ordering::Relaxed)
+                                                    || !cluster_ready
+                                                {
+                                                    if shared2.cluster_tls_enabled.load(Ordering::Relaxed) {
+                                                        eprintln!(
+                                                            "[WSE] Rejecting cluster connection on main port \
+                                                             (mTLS required, use dedicated cluster_port): {addr}"
+                                                        );
+                                                    }
+                                                    drop(stream);
+                                                    return;
+                                                }
                                                 let interest_tx = shared2
                                                     .cluster_interest_tx
                                                     .read()
@@ -1948,6 +2002,7 @@ impl RustWSEServer {
                 .or_insert_with(|| PerConnRate {
                     tokens: RATE_CAPACITY,
                     last_refill: std::time::Instant::now(),
+                    last_rate_limited: None,
                     last_warning: None,
                 });
             let rate = entry.value_mut();
@@ -1958,7 +2013,7 @@ impl RustWSEServer {
             if rate.tokens < 1.0 {
                 // Send rate_limited error to client (throttled: max once per second)
                 let should_notify = rate
-                    .last_warning
+                    .last_rate_limited
                     .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
                 if should_notify {
                     let err = "WSE{\"t\":\"error\",\"p\":{\"code\":\"RATE_LIMITED\",\"message\":\"Rate limit exceeded\",\"retry_after\":1.0},\"v\":1}".to_string();
@@ -1968,7 +2023,7 @@ impl RustWSEServer {
                             data: err,
                         })
                         .ok();
-                    rate.last_warning = Some(std::time::Instant::now());
+                    rate.last_rate_limited = Some(std::time::Instant::now());
                 }
                 return Ok(0);
             }
@@ -2405,6 +2460,12 @@ impl RustWSEServer {
             }
         };
 
+        // Track whether cluster TLS is enabled so main port can reject
+        // unauthenticated cluster connections
+        self.shared
+            .cluster_tls_enabled
+            .store(tls_config.is_some(), Ordering::Relaxed);
+
         let rt_handle = self
             .rt_handle
             .as_ref()
@@ -2635,17 +2696,17 @@ impl RustWSEServer {
                     } => {
                         all_recovered = false;
                         topic_dict.set_item("epoch", format!("{:08x}", current_epoch))?;
-                        topic_dict.set_item("offset", current_offset)?;
+                        topic_dict.set_item("offset", current_offset.saturating_sub(1))?;
                         topic_dict.set_item("recoverable", true)?;
                         topic_dict.set_item("recovered", false)?;
                         topic_dict.set_item("count", 0)?;
                     }
                     super::recovery::RecoveryResult::NoHistory => {
                         all_recovered = false;
-                        // Get current position if available
+                        // Get current position if available (normalize to inclusive last offset)
                         if let Some((ep, off)) = mgr.get_position(topic) {
                             topic_dict.set_item("epoch", format!("{:08x}", ep))?;
-                            topic_dict.set_item("offset", off)?;
+                            topic_dict.set_item("offset", off.saturating_sub(1))?;
                             topic_dict.set_item("recoverable", true)?;
                         } else {
                             topic_dict.set_item("epoch", py.None())?;
@@ -2658,11 +2719,12 @@ impl RustWSEServer {
                 }
             } else {
                 // No recovery requested or not possible -- just report current position
+                // (normalize to inclusive last offset, consistent with Recovered path)
                 all_recovered = false;
                 if let Some(mgr) = recovery_mgr {
                     if let Some((ep, off)) = mgr.get_position(topic) {
                         topic_dict.set_item("epoch", format!("{:08x}", ep))?;
-                        topic_dict.set_item("offset", off)?;
+                        topic_dict.set_item("offset", off.saturating_sub(1))?;
                         topic_dict.set_item("recoverable", true)?;
                     } else {
                         topic_dict.set_item("epoch", py.None())?;
@@ -2723,6 +2785,10 @@ impl RustWSEServer {
                         actually_removed.push(topic.clone());
                     }
                 }
+                // Clean up empty conn_topics entry to prevent DashSet leak
+                self.shared
+                    .conn_topics
+                    .remove_if(conn_id, |_, topics| topics.is_empty());
                 actually_removed
             }
             None => {
