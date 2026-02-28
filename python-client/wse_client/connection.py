@@ -465,7 +465,9 @@ class ConnectionManager:
             json_str = data[3:] if data.startswith("WSE") else data
             parsed = _json.loads(json_str)
             p = parsed.get("p", {})
-            server_timestamp = p.get("server_time") or p.get("timestamp") or int(time.time() * 1000)
+            server_timestamp = (
+                p.get("server_time") or p.get("timestamp") or int(time.time() * 1000)
+            )
         except Exception:
             server_timestamp = int(time.time() * 1000)
 

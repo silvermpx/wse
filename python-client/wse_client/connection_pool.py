@@ -140,13 +140,18 @@ class ConnectionPool:
             base_increase = 5.0
             latency_bonus = self._calculate_latency_bonus(ep.avg_latency_ms)
             consistency_bonus = min(10.0, ep.consecutive_successes * 2.0)
-            score = min(self.MAX_SCORE, score + base_increase + latency_bonus + consistency_bonus)
+            score = min(
+                self.MAX_SCORE,
+                score + base_increase + latency_bonus + consistency_bonus,
+            )
 
         # Time-based decay
         now = time.monotonic()
         time_since_check = now - ep.last_checked
         if time_since_check > self.HEALTH_CHECK_INTERVAL:
-            decay_factor = 1.0 - (self.SCORE_DECAY_RATE * time_since_check / self.HEALTH_CHECK_INTERVAL)
+            decay_factor = 1.0 - (
+                self.SCORE_DECAY_RATE * time_since_check / self.HEALTH_CHECK_INTERVAL
+            )
             score = max(self.MIN_SCORE, score * decay_factor)
 
         ep.score = round(score)
@@ -218,7 +223,9 @@ class ConnectionPool:
 
     def add_endpoint(self, url: str) -> None:
         if url not in self._endpoints:
-            self._endpoints[url] = EndpointHealth(url=url, last_checked=time.monotonic())
+            self._endpoints[url] = EndpointHealth(
+                url=url, last_checked=time.monotonic()
+            )
 
     def set_active_endpoint(self, url: str) -> None:
         """Mark an endpoint as the preferred active one."""
