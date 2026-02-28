@@ -51,6 +51,7 @@ dev = [
     "pytest-cov>=5.0",
     "httpx>=0.27",
     "uvicorn>=0.30",
+    "websockets>=13.0",
     "ruff>=0.8",
     "mypy>=1.13",
     "maturin>=1.7",

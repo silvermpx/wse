@@ -370,7 +370,12 @@ class ConnectionManager:
                 return
 
             # WSE-prefixed PING message (JSON format, server sends lowercase)
-            if '"t":"PING"' in data_start or '"t": "PING"' in data_start or '"t":"ping"' in data_start or '"t": "ping"' in data_start:
+            if (
+                '"t":"PING"' in data_start
+                or '"t": "PING"' in data_start
+                or '"t":"ping"' in data_start
+                or '"t": "ping"' in data_start
+            ):
                 self._fire_task(self._respond_ping_json(data))
                 self._last_pong = time.monotonic()
                 return
@@ -675,6 +680,7 @@ class ConnectionManager:
         ]
         if topics:
             from urllib.parse import quote
+
             encoded = ",".join(quote(t, safe="") for t in topics)
             params.append(f"topics={encoded}")
 

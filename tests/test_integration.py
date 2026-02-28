@@ -10,13 +10,14 @@ import time
 
 import pytest
 import websockets
+from wse_server._wse_accel import RustWSEServer
 
 from tests.conftest import make_token
-from wse_server._wse_accel import RustWSEServer
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def ws_url(port: int) -> str:
     return f"ws://127.0.0.1:{port}/wse"
@@ -28,7 +29,9 @@ async def connect(port: int, token: str | None = None, timeout: float = 2.0):
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return await websockets.connect(
-        ws_url(port), additional_headers=headers, open_timeout=timeout,
+        ws_url(port),
+        additional_headers=headers,
+        open_timeout=timeout,
     )
 
 
@@ -70,8 +73,8 @@ def drain_all(server, timeout_ms: int = 100) -> list[tuple]:
 # Connection lifecycle
 # ---------------------------------------------------------------------------
 
-class TestConnectionLifecycle:
 
+class TestConnectionLifecycle:
     @pytest.mark.asyncio
     async def test_connect_with_jwt(self, server, server_port):
         """JWT-authenticated connection emits auth_connect with user_id."""
@@ -87,15 +90,15 @@ class TestConnectionLifecycle:
 
     @pytest.mark.asyncio
     async def test_connect_without_jwt_rejected(self, server, server_port):
-        """Connection without JWT to a JWT-required server gets rejected."""
-        with pytest.raises((websockets.exceptions.ConnectionClosed, Exception)):
-            async with await connect(server_port, None) as ws:
-                await asyncio.wait_for(ws.recv(), timeout=2.0)
+        """Connection without JWT to a JWT-required server sends AUTH_REQUIRED error."""
+        async with await connect(server_port, None) as ws:
+            msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            assert "AUTH_REQUIRED" in str(msg)
 
     @pytest.mark.asyncio
     async def test_connect_no_auth_server(self, server_no_auth, server_port):
         """Server without JWT accepts connections, emits 'connect'."""
-        async with await connect(server_port, None) as ws:
+        async with await connect(server_port, None):
             ev = drain_until(server_no_auth, "connect")
             assert ev[0] == "connect"
             assert isinstance(ev[1], str)  # conn_id
@@ -141,8 +144,8 @@ class TestConnectionLifecycle:
 # Message send / receive
 # ---------------------------------------------------------------------------
 
-class TestMessaging:
 
+class TestMessaging:
     @pytest.mark.asyncio
     async def test_send_text(self, server, server_port):
         """server.send() delivers raw text to client."""
@@ -220,15 +223,14 @@ class TestMessaging:
 # Broadcast
 # ---------------------------------------------------------------------------
 
-class TestBroadcast:
 
+class TestBroadcast:
     @pytest.mark.asyncio
     async def test_broadcast_all(self, server, server_port):
         """broadcast_all sends to every connected client."""
         t1 = make_token("u1")
         t2 = make_token("u2")
-        async with await connect(server_port, t1) as ws1, \
-                     await connect(server_port, t2) as ws2:
+        async with await connect(server_port, t1) as ws1, await connect(server_port, t2) as ws2:
             # consume server_ready
             await asyncio.wait_for(ws1.recv(), timeout=2.0)
             await asyncio.wait_for(ws2.recv(), timeout=2.0)
@@ -247,8 +249,7 @@ class TestBroadcast:
         """broadcast_local sends only to topic subscribers."""
         t1 = make_token("sub")
         t2 = make_token("nosub")
-        async with await connect(server_port, t1) as ws1, \
-                     await connect(server_port, t2) as ws2:
+        async with await connect(server_port, t1) as ws1, await connect(server_port, t2) as ws2:
             await asyncio.wait_for(ws1.recv(), timeout=2.0)
             await asyncio.wait_for(ws2.recv(), timeout=2.0)
             ev1 = drain_until(server, "auth_connect")
@@ -274,8 +275,8 @@ class TestBroadcast:
 # Subscriptions
 # ---------------------------------------------------------------------------
 
-class TestSubscriptions:
 
+class TestSubscriptions:
     @pytest.mark.asyncio
     async def test_subscribe_unsubscribe(self, server, server_port):
         """Subscribe adds to topic, unsubscribe removes."""
@@ -331,8 +332,8 @@ class TestSubscriptions:
 # Client hello / Server hello
 # ---------------------------------------------------------------------------
 
-class TestProtocolNegotiation:
 
+class TestProtocolNegotiation:
     @pytest.mark.asyncio
     async def test_client_hello(self, server, server_port):
         """Client sends client_hello, gets server_hello back."""
@@ -342,10 +343,12 @@ class TestProtocolNegotiation:
             await asyncio.wait_for(ws.recv(), timeout=2.0)
             drain_until(server, "auth_connect")
 
-            hello = json.dumps({
-                "t": "client_hello",
-                "p": {"client_version": "2.0.0", "protocol_version": 2},
-            })
+            hello = json.dumps(
+                {
+                    "t": "client_hello",
+                    "p": {"client_version": "2.0.0", "protocol_version": 2},
+                }
+            )
             await ws.send(f"WSE{hello}")
 
             msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
@@ -359,8 +362,8 @@ class TestProtocolNegotiation:
 # Health / diagnostics
 # ---------------------------------------------------------------------------
 
-class TestHealth:
 
+class TestHealth:
     @pytest.mark.asyncio
     async def test_health_snapshot(self, server, server_port):
         """health_snapshot returns valid dict with expected keys."""
@@ -386,8 +389,8 @@ class TestHealth:
 # Recovery
 # ---------------------------------------------------------------------------
 
-class TestRecovery:
 
+class TestRecovery:
     @pytest.mark.asyncio
     async def test_subscribe_with_recovery(self, server_with_recovery, server_port):
         """subscribe_with_recovery returns recovery metadata."""
@@ -398,7 +401,9 @@ class TestRecovery:
             conn_id = server_with_recovery.get_connections()[0]
 
             result = server_with_recovery.subscribe_with_recovery(
-                conn_id, ["prices"], recover=False,
+                conn_id,
+                ["prices"],
+                recover=False,
             )
             assert isinstance(result, dict)
             assert "topics" in result
@@ -414,8 +419,8 @@ class TestRecovery:
 # Server lifecycle
 # ---------------------------------------------------------------------------
 
-class TestServerLifecycle:
 
+class TestServerLifecycle:
     def test_start_stop(self, server_port):
         """Server starts and stops cleanly."""
         srv = RustWSEServer("127.0.0.1", server_port, max_connections=10)
@@ -451,18 +456,20 @@ class TestServerLifecycle:
 # Presence tracking
 # ---------------------------------------------------------------------------
 
-class TestPresence:
 
+class TestPresence:
     @pytest.mark.asyncio
     async def test_presence_join_on_subscribe(self, server_with_presence, server_port):
         """Subscribing with presence_data emits presence_join event."""
         token = make_token("alice")
-        async with await connect(server_port, token) as ws:
+        async with await connect(server_port, token):
             ev = drain_until(server_with_presence, "auth_connect")
             conn_id = ev[1]
 
             server_with_presence.subscribe_connection(
-                conn_id, ["chat-1"], {"status": "online"},
+                conn_id,
+                ["chat-1"],
+                {"status": "online"},
             )
 
             ev = drain_until(server_with_presence, "presence_join", timeout=1.0)
@@ -482,7 +489,9 @@ class TestPresence:
         conn_id = ev[1]
 
         server_with_presence.subscribe_connection(
-            conn_id, ["chat-1"], {"status": "online"},
+            conn_id,
+            ["chat-1"],
+            {"status": "online"},
         )
         drain_until(server_with_presence, "presence_join", timeout=1.0)
 
@@ -506,14 +515,18 @@ class TestPresence:
 
         # First subscribe: join event
         server_with_presence.subscribe_connection(
-            conn_id1, ["chat-1"], {"status": "online"},
+            conn_id1,
+            ["chat-1"],
+            {"status": "online"},
         )
         ev = drain_until(server_with_presence, "presence_join", timeout=1.0)
         assert ev[2]["user_id"] == "carol"
 
         # Second subscribe: NO join event (user already present)
         server_with_presence.subscribe_connection(
-            conn_id2, ["chat-1"], {"status": "online"},
+            conn_id2,
+            ["chat-1"],
+            {"status": "online"},
         )
         # Small drain to check no presence_join
         time.sleep(0.1)
@@ -536,7 +549,7 @@ class TestPresence:
     async def test_no_presence_without_data(self, server_with_presence, server_port):
         """subscribe_connection without presence_data does NOT track presence."""
         token = make_token("ghost")
-        async with await connect(server_port, token) as ws:
+        async with await connect(server_port, token):
             ev = drain_until(server_with_presence, "auth_connect")
             # Subscribe without presence_data
             server_with_presence.subscribe_connection(ev[1], ["room"])
@@ -548,12 +561,14 @@ class TestPresence:
     async def test_presence_leave_on_unsubscribe(self, server_with_presence, server_port):
         """Unsubscribing from topic removes presence for that topic."""
         token = make_token("helen")
-        async with await connect(server_port, token) as ws:
+        async with await connect(server_port, token):
             ev = drain_until(server_with_presence, "auth_connect")
             conn_id = ev[1]
 
             server_with_presence.subscribe_connection(
-                conn_id, ["room"], {"status": "online"},
+                conn_id,
+                ["room"],
+                {"status": "online"},
             )
             drain_until(server_with_presence, "presence_join", timeout=1.0)
 
@@ -567,17 +582,21 @@ class TestPresence:
         token1 = make_token("dave")
         token2 = make_token("eve")
 
-        async with await connect(server_port, token1) as ws1:
+        async with await connect(server_port, token1):
             ev = drain_until(server_with_presence, "auth_connect")
             server_with_presence.subscribe_connection(
-                ev[1], ["room"], {"status": "online"},
+                ev[1],
+                ["room"],
+                {"status": "online"},
             )
             drain_until(server_with_presence, "presence_join", timeout=1.0)
 
-            async with await connect(server_port, token2) as ws2:
+            async with await connect(server_port, token2):
                 ev = drain_until(server_with_presence, "auth_connect")
                 server_with_presence.subscribe_connection(
-                    ev[1], ["room"], {"status": "away"},
+                    ev[1],
+                    ["room"],
+                    {"status": "away"},
                 )
                 drain_until(server_with_presence, "presence_join", timeout=1.0)
 
@@ -593,10 +612,12 @@ class TestPresence:
     async def test_presence_stats(self, server_with_presence, server_port):
         """presence_stats() returns lightweight counters."""
         token = make_token("frank")
-        async with await connect(server_port, token) as ws:
+        async with await connect(server_port, token):
             ev = drain_until(server_with_presence, "auth_connect")
             server_with_presence.subscribe_connection(
-                ev[1], ["room"], {"status": "online"},
+                ev[1],
+                ["room"],
+                {"status": "online"},
             )
             drain_until(server_with_presence, "presence_join", timeout=1.0)
 
@@ -608,12 +629,14 @@ class TestPresence:
     async def test_update_presence(self, server_with_presence, server_port):
         """update_presence changes user data."""
         token = make_token("ivan")
-        async with await connect(server_port, token) as ws:
+        async with await connect(server_port, token):
             ev = drain_until(server_with_presence, "auth_connect")
             conn_id = ev[1]
 
             server_with_presence.subscribe_connection(
-                conn_id, ["room"], {"status": "online"},
+                conn_id,
+                ["room"],
+                {"status": "online"},
             )
             drain_until(server_with_presence, "presence_join", timeout=1.0)
 
@@ -627,10 +650,12 @@ class TestPresence:
     async def test_presence_health_snapshot(self, server_with_presence, server_port):
         """health_snapshot includes presence metrics."""
         token = make_token("jane")
-        async with await connect(server_port, token) as ws:
+        async with await connect(server_port, token):
             ev = drain_until(server_with_presence, "auth_connect")
             server_with_presence.subscribe_connection(
-                ev[1], ["room"], {"status": "online"},
+                ev[1],
+                ["room"],
+                {"status": "online"},
             )
             drain_until(server_with_presence, "presence_join", timeout=1.0)
 
@@ -648,7 +673,9 @@ class TestPresence:
         conn_id = ev[1]
 
         server_with_presence.subscribe_connection(
-            conn_id, ["room"], {"status": "online"},
+            conn_id,
+            ["room"],
+            {"status": "online"},
         )
         drain_until(server_with_presence, "presence_join", timeout=1.0)
 
@@ -681,7 +708,9 @@ class TestPresence:
             await asyncio.wait_for(ws_alice.recv(), timeout=2.0)
             ev = drain_until(server_with_presence, "auth_connect")
             server_with_presence.subscribe_connection(
-                ev[1], ["room"], {"status": "online"},
+                ev[1],
+                ["room"],
+                {"status": "online"},
             )
             drain_until(server_with_presence, "presence_join", timeout=1.0)
 
@@ -697,7 +726,9 @@ class TestPresence:
                 await asyncio.wait_for(ws_bob.recv(), timeout=2.0)
                 ev = drain_until(server_with_presence, "auth_connect")
                 server_with_presence.subscribe_connection(
-                    ev[1], ["room"], {"status": "away"},
+                    ev[1],
+                    ["room"],
+                    {"status": "away"},
                 )
                 drain_until(server_with_presence, "presence_join", timeout=1.0)
 
@@ -734,7 +765,9 @@ class TestPresence:
             ev = drain_until(server_with_presence, "auth_connect")
             alice_conn_id = ev[1]
             server_with_presence.subscribe_connection(
-                alice_conn_id, ["room"], {"status": "online"},
+                alice_conn_id,
+                ["room"],
+                {"status": "online"},
             )
             drain_until(server_with_presence, "presence_join", timeout=1.0)
             # Consume Alice's own join broadcast
@@ -746,7 +779,9 @@ class TestPresence:
                 ev = drain_until(server_with_presence, "auth_connect")
                 bob_conn_id = ev[1]
                 server_with_presence.subscribe_connection(
-                    bob_conn_id, ["room"], {"status": "online"},
+                    bob_conn_id,
+                    ["room"],
+                    {"status": "online"},
                 )
                 drain_until(server_with_presence, "presence_join", timeout=1.0)
                 # Consume Bob's join broadcast on Alice's ws
@@ -768,14 +803,16 @@ class TestPresence:
     async def test_presence_data_size_limit(self, server_with_presence, server_port):
         """Presence data exceeding max size is silently skipped (no join event)."""
         token = make_token("bigdata")
-        async with await connect(server_port, token) as ws:
+        async with await connect(server_port, token):
             ev = drain_until(server_with_presence, "auth_connect")
             conn_id = ev[1]
 
             # Default max is 4096 bytes -- send data that exceeds it
             huge_data = {"payload": "x" * 5000}
             server_with_presence.subscribe_connection(
-                conn_id, ["room"], huge_data,
+                conn_id,
+                ["room"],
+                huge_data,
             )
             # No presence_join event should fire (data too large)
             time.sleep(0.1)

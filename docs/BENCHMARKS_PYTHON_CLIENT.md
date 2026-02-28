@@ -1,8 +1,8 @@
-# WSE Performance Benchmarks — Python Client
+# WSE Performance Benchmarks - Python Client
 
 All results below were collected using Python benchmark scripts (`websockets` library).
 Single-client tests use one async connection. Multi-process tests spawn one OS process per
-connection with a tight synchronous `send()` loop — no asyncio overhead, true OS parallelism.
+connection with a tight synchronous `send()` loop - no asyncio overhead, true OS parallelism.
 
 Server is always the production `RustWSEServer` (maturin-compiled binary, full Python wrapper,
 JWT auth in handshake). No FastAPI or DB overhead.
@@ -165,7 +165,7 @@ Same multi-process methodology, scaled to 64 threads (32 cores).
 | 80 | 2,014K msg/s | 2,036K msg/s | 1,675K | 25,143 | 0.3% |
 | 128 | 2,013K msg/s | 2,041K msg/s | 1,836K | 15,662 | 0.7% |
 
-2M msg/s is the single-server ceiling with Python clients. 64 workers is optimal —
+2M msg/s is the single-server ceiling with Python clients. 64 workers is optimal -
 adding more workers just increases contention without improving throughput.
 
 ### Message Size Impact (64 workers)
@@ -246,7 +246,7 @@ the Python client to its limits.
 
 ### drain_mode=OFF (Rust reads + parses + drops, no Python)
 
-Raw Rust ingest ceiling — no queue, no GIL involvement.
+Raw Rust ingest ceiling - no queue, no GIL involvement.
 
 #### Connection Storm
 
@@ -416,7 +416,7 @@ Peak bandwidth: **14.3 GB/s** at 64KB. Within 6% of drain=OFF.
 | msgpack wire @ 500 | 4.3M msg/s | 4.2M msg/s | 98% |
 
 crossbeam-channel drain mode has zero measurable overhead. The channel is not a
-bottleneck — the Python client is the limiting factor at these throughput levels.
+bottleneck - the Python client is the limiting factor at these throughput levels.
 
 ---
 
