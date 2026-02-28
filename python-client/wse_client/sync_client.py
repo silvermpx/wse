@@ -18,6 +18,7 @@ from .errors import WSEConnectionError, WSETimeoutError
 from .types import (
     ConnectionQuality,
     ConnectionState,
+    LoadBalancingStrategy,
     ReconnectConfig,
     WSEEvent,
 )
@@ -64,6 +65,8 @@ class SyncWSEClient:
         extra_headers: dict[str, str] | None = None,
         queue_size: int = 1000,
         encryption: bool = False,
+        endpoints: list[str] | None = None,
+        load_balancing: LoadBalancingStrategy = LoadBalancingStrategy.WEIGHTED_RANDOM,
     ) -> None:
         self._url = url
         self._token = token
@@ -72,6 +75,8 @@ class SyncWSEClient:
         self._extra_headers = extra_headers
         self._queue_size = queue_size
         self._encryption = encryption
+        self._endpoints = endpoints
+        self._load_balancing = load_balancing
 
         self._event_queue: queue.Queue[WSEEvent | None] = queue.Queue(
             maxsize=queue_size
@@ -93,6 +98,7 @@ class SyncWSEClient:
         if self._running:
             return
 
+        self._connect_error = None
         self._running = True
         self._connected_event.clear()
         self._thread = threading.Thread(
@@ -285,6 +291,8 @@ class SyncWSEClient:
     def recv(self, timeout: float | None = None) -> WSEEvent:
         """Receive the next event. Blocks until available.
 
+        Registered ``on()`` handlers are invoked before the event is returned.
+
         Args:
             timeout: Max seconds to wait. ``None`` blocks indefinitely.
 
@@ -302,6 +310,8 @@ class SyncWSEClient:
 
         if event is None:
             raise WSEConnectionError("Connection closed")
+
+        self._dispatch_to_handlers(event)
         return event
 
     # -- Handler registration -------------------------------------------------
@@ -434,6 +444,8 @@ class SyncWSEClient:
             extra_headers=self._extra_headers,
             queue_size=self._queue_size,
             encryption=self._encryption,
+            endpoints=self._endpoints,
+            load_balancing=self._load_balancing,
         )
 
         self._connect_error: Exception | None = None

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import os
@@ -59,8 +60,13 @@ class SecurityManager:
         self._private_key: EllipticCurvePrivateKey | None = None
         self._aes_key: bytes | None = None
         self._signing_key: bytes | None = None
+        self._signing_enabled_flag = False  # explicit opt-in via enable_signing()
         self._enabled = False
         self._iv_cache: dict[bytes, None] = {}  # ordered dict for FIFO eviction
+
+        # Key rotation
+        self._rotation_task: asyncio.Task[None] | None = None
+        self._rotation_interval: float = 3600.0  # 1 hour default
 
     @property
     def is_enabled(self) -> bool:
@@ -108,6 +114,7 @@ class SecurityManager:
         self._signing_key = os.urandom(32)
         self._enabled = True
         self._iv_cache = {}
+        self.start_key_rotation()
         logger.debug("Encryption enabled (AES-GCM-256)")
 
     # -- AES-GCM-256 encrypt / decrypt ----------------------------------------
@@ -144,22 +151,39 @@ class SecurityManager:
 
     # -- HMAC-SHA256 signing ---------------------------------------------------
 
+    @property
+    def signing_enabled(self) -> bool:
+        return self._signing_enabled_flag and self._signing_key is not None
+
+    def enable_signing(self) -> None:
+        """Explicitly enable HMAC signing for outgoing messages."""
+        self._signing_enabled_flag = True
+
     def sign(self, payload_json: str) -> str:
-        """Sign a JSON payload.  Returns hex-encoded HMAC-SHA256."""
+        """Sign a JSON payload.  Returns base64-encoded HMAC-SHA256.
+
+        Wire-compatible with TS client ``signMessage()``: direct HMAC-SHA256
+        over raw UTF-8 bytes, base64-encoded output.
+        """
         if self._signing_key is None:
             raise WSEEncryptionError("Signing key not available")
 
-        # Match Rust: SHA256(payload) -> hex, then HMAC-SHA256(key, hex_hash)
-        payload_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
-        sig = hmac.new(
-            self._signing_key, payload_hash.encode("utf-8"), hashlib.sha256
-        ).hexdigest()
-        return sig
+        import base64
 
-    def verify(self, payload_json: str, signature_hex: str) -> bool:
-        """Verify an HMAC-SHA256 signature."""
-        expected = self.sign(payload_json)
-        return hmac.compare_digest(expected, signature_hex)
+        sig_bytes = hmac.new(
+            self._signing_key,
+            payload_json.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        return base64.b64encode(sig_bytes).decode("ascii")
+
+    def verify(self, payload_json: str, signature_b64: str) -> bool:
+        """Verify a base64-encoded HMAC-SHA256 signature."""
+        try:
+            expected = self.sign(payload_json)
+            return hmac.compare_digest(expected, signature_b64)
+        except Exception:
+            return False
 
     # -- Helpers --------------------------------------------------------------
 
@@ -181,10 +205,65 @@ class SecurityManager:
         self._iv_cache[iv] = None
         return iv
 
+    # -- Key rotation ---------------------------------------------------------
+
+    def start_key_rotation(self, interval: float = 3600.0) -> None:
+        """Start periodic key rotation (default: 1 hour).
+
+        Matches TS ``scheduleKeyRotation()``. Rotation is skipped when an
+        ECDH shared secret is active because replacing the ECDH-derived key
+        with a random one would break encryption (server still holds the
+        old shared secret).
+        """
+        if self._rotation_task is not None:
+            return
+        self._rotation_interval = interval
+        try:
+            loop = asyncio.get_running_loop()
+            self._rotation_task = loop.create_task(self._rotation_loop())
+        except RuntimeError:
+            # No running event loop; caller must start rotation later
+            pass
+
+    def stop_key_rotation(self) -> None:
+        """Cancel the key rotation timer."""
+        if self._rotation_task is not None:
+            self._rotation_task.cancel()
+            self._rotation_task = None
+
+    async def _rotation_loop(self) -> None:
+        """Periodic key rotation coroutine."""
+        failures = 0
+        while True:
+            try:
+                await asyncio.sleep(self._rotation_interval)
+            except asyncio.CancelledError:
+                return
+
+            # Skip rotation when ECDH session is active (matches TS behavior)
+            if self._aes_key is not None and self._enabled:
+                logger.debug("Skipping key rotation (ECDH session active)")
+                continue
+
+            try:
+                self._signing_key = os.urandom(32)
+                self._iv_cache = {}
+                failures = 0
+                logger.debug("Keys rotated successfully")
+            except Exception as exc:
+                failures += 1
+                logger.error("Key rotation failed: %s", exc)
+                if failures >= 3:
+                    logger.error("Key rotation disabled after 3 consecutive failures")
+                    return
+
+    # -- Reset ----------------------------------------------------------------
+
     def reset(self) -> None:
-        """Clear all keys and disable encryption."""
+        """Clear all keys, disable encryption, and cancel rotation."""
         self._private_key = None
         self._aes_key = None
         self._signing_key = None
         self._enabled = False
         self._iv_cache = {}
+        self.stop_key_rotation()

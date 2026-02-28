@@ -152,6 +152,12 @@ class MessageCodec:
             message["pri"] = priority
         if correlation_id is not None:
             message["cid"] = correlation_id
+
+        # HMAC signing (when enabled)
+        if self._security is not None and self._security.signing_enabled:
+            json_str = _json_dumps(message)
+            message["sig"] = self._security.sign(json_str)
+
         return f"{category}{_json_dumps(message)}"
 
     # -- Text decoding ---------------------------------------------------------

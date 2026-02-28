@@ -42,13 +42,20 @@ from .constants import (
     WS_CLOSE_POLICY_VIOLATION,
     WS_CLOSE_RATE_LIMITED,
 )
+from .connection_pool import ConnectionPool
 from .errors import (
     WSEAuthError,
     WSECircuitBreakerError,
     WSEConnectionError,
     WSETimeoutError,
 )
-from .types import ConnectionState, MessagePriority, ReconnectConfig, ReconnectMode
+from .types import (
+    ConnectionState,
+    LoadBalancingStrategy,
+    MessagePriority,
+    ReconnectConfig,
+    ReconnectMode,
+)
 
 if TYPE_CHECKING:
     from .circuit_breaker import CircuitBreaker
@@ -75,6 +82,8 @@ class ConnectionManager:
         on_message: Callable[[str | bytes], Any] | None = None,
         on_state_change: Callable[[ConnectionState], Any] | None = None,
         security: SecurityManager | None = None,
+        endpoints: list[str] | None = None,
+        load_balancing: LoadBalancingStrategy = LoadBalancingStrategy.WEIGHTED_RANDOM,
     ) -> None:
         self._url = url
         self._token = token
@@ -83,6 +92,15 @@ class ConnectionManager:
         self._rate_limiter = rate_limiter
         self._extra_headers = extra_headers or {}
         self._security = security
+
+        # Connection pool for multi-endpoint failover
+        all_endpoints = endpoints or []
+        if url not in all_endpoints:
+            all_endpoints = [url] + all_endpoints
+        self._pool: ConnectionPool | None = None
+        if len(all_endpoints) > 1:
+            self._pool = ConnectionPool(all_endpoints, strategy=load_balancing)
+        self._active_endpoint: str = url
 
         # Callbacks
         self._on_message = on_message
@@ -154,6 +172,12 @@ class ConnectionManager:
         if self._circuit_breaker and not self._circuit_breaker.can_execute():
             raise WSECircuitBreakerError("Circuit breaker is open")
 
+        # Select endpoint from pool (failover support)
+        if self._pool is not None:
+            selected = self._pool.select_endpoint()
+            self._url = selected
+            self._active_endpoint = selected
+
         self._is_connecting = True
         self._set_state(ConnectionState.CONNECTING)
 
@@ -161,12 +185,17 @@ class ConnectionManager:
             await self._connect_ws(initial_topics)
             if self._circuit_breaker:
                 self._circuit_breaker.record_success()
+            if self._pool is not None:
+                self._pool.record_success(self._active_endpoint)
+                self._pool.add_connection(self._active_endpoint)
             self._consecutive_failures = 0
             self._reconnect_attempts = 0
         except Exception:
             self._consecutive_failures += 1
             if self._circuit_breaker:
                 self._circuit_breaker.record_failure()
+            if self._pool is not None:
+                self._pool.record_failure(self._active_endpoint)
             raise
         finally:
             self._is_connecting = False
@@ -232,6 +261,9 @@ class ConnectionManager:
         self._client_hello_sent = False
         self._connection_id = None
 
+        if self._pool is not None:
+            self._pool.remove_connection(self._active_endpoint)
+
         # Cancel tasks and await completion before closing the socket
         tasks_to_await: list[asyncio.Task[Any]] = []
         if self._heartbeat_task:
@@ -268,6 +300,9 @@ class ConnectionManager:
         """Disconnect and mark permanently destroyed."""
         self._destroyed = True
         await self.disconnect()
+        if self._pool is not None:
+            self._pool.destroy()
+            self._pool = None
 
     # -- Send -----------------------------------------------------------------
 
@@ -296,14 +331,18 @@ class ConnectionManager:
             return False
 
     async def send_bytes(self, data: bytes) -> bool:
-        """Send a binary frame."""
+        """Send a binary frame (encrypted if E2E is active)."""
         if not self._ws:
             return False
         if self._rate_limiter and not self._rate_limiter.try_consume():
             logger.warning("Rate limit exceeded, dropping binary message")
             return False
         try:
-            await self._ws.send(data)
+            if self._security is not None and self._security.is_enabled:
+                encrypted = self._security.encrypt(data.decode("utf-8"))
+                await self._ws.send(b"E:" + encrypted)
+            else:
+                await self._ws.send(data)
             return True
         except Exception:
             return False
@@ -399,12 +438,15 @@ class ConnectionManager:
 
     def _record_pong_latency(self, ts_str: str) -> None:
         """Extract latency from PONG timestamp and forward to callback."""
-        if self._on_pong and ts_str:
+        if ts_str:
             try:
                 ts = float(ts_str)
                 latency = time.time() * 1000 - ts
                 if 0 <= latency < 60000:
-                    self._on_pong(latency)
+                    if self._on_pong:
+                        self._on_pong(latency)
+                    if self._pool is not None:
+                        self._pool.record_success(self._active_endpoint, latency)
             except (ValueError, TypeError):
                 pass
 
@@ -622,6 +664,9 @@ class ConnectionManager:
 
     async def _force_reconnect(self) -> None:
         """Tear down and reconnect immediately."""
+        if self._pool is not None:
+            self._pool.remove_connection(self._active_endpoint)
+
         # Cancel tasks FIRST (before closing socket) to avoid spurious
         # exceptions in _recv_loop triggering unintended reconnect paths.
         tasks_to_await: list[asyncio.Task[None]] = []

@@ -27,6 +27,7 @@ Optional extras::
 from ._version import __version__
 from .client import AsyncWSEClient
 from .connection_pool import ConnectionPool
+from .offline_queue import OfflineQueue
 from .errors import (
     WSEAuthError,
     WSECircuitBreakerError,
@@ -87,6 +88,7 @@ __all__ = [
     "AsyncWSEClient",
     "SyncWSEClient",
     "ConnectionPool",
+    "OfflineQueue",
     "WSEEvent",
     "ConnectionState",
     "ConnectionQuality",

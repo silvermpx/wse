@@ -32,12 +32,14 @@ from .constants import (
 from .errors import WSEConnectionError
 from .event_sequencer import EventSequencer
 from .network_monitor import NetworkMonitor
+from .offline_queue import OfflineQueue
 from .protocol import MessageCodec
 from .rate_limiter import TokenBucketRateLimiter
 from .types import (
     ConnectionQuality,
     ConnectionState,
     ConnectionStats,
+    LoadBalancingStrategy,
     MessagePriority,
     ReconnectConfig,
     WSEEvent,
@@ -98,6 +100,8 @@ class AsyncWSEClient:
         extra_headers: dict[str, str] | None = None,
         queue_size: int = 1000,
         encryption: bool = False,
+        endpoints: list[str] | None = None,
+        load_balancing: LoadBalancingStrategy = LoadBalancingStrategy.WEIGHTED_RANDOM,
     ) -> None:
         self._url = url
         self._token = token
@@ -128,6 +132,7 @@ class AsyncWSEClient:
         self._circuit_breaker = CircuitBreaker()
         self._sequencer = EventSequencer()
         self._network_monitor = NetworkMonitor()
+        self._offline_queue = OfflineQueue(max_size=1000, max_age=300.0)
 
         # Event queue for async iteration
         self._event_queue: asyncio.Queue[WSEEvent | None] = asyncio.Queue(
@@ -172,6 +177,8 @@ class AsyncWSEClient:
             on_message=self._on_raw_message,
             on_state_change=self._on_state_change,
             security=self._security,
+            endpoints=endpoints,
+            load_balancing=load_balancing,
         )
 
         self._connection._on_pong = self._on_transport_pong
@@ -256,6 +263,13 @@ class AsyncWSEClient:
             task.cancel()
         self._background_tasks.clear()
 
+        # Stop key rotation timer
+        if self._security is not None:
+            self._security.stop_key_rotation()
+
+        # Clear offline queue (no point replaying after explicit disconnect)
+        self._offline_queue.clear()
+
         # Signal iterator to stop (drop oldest if queue is full)
         try:
             self._event_queue.put_nowait(None)
@@ -266,7 +280,7 @@ class AsyncWSEClient:
             except (asyncio.QueueEmpty, asyncio.QueueFull):
                 pass
         try:
-            await self._connection.disconnect()
+            await self._connection.destroy()
         finally:
             self._disconnecting = False
 
@@ -351,6 +365,8 @@ class AsyncWSEClient:
         if ok:
             self._stats.messages_sent += 1
             self._stats.bytes_sent += len(encoded.encode("utf-8"))
+        elif self._offline_queue.enabled:
+            self._offline_queue.enqueue(encoded, priority=priority, msg_type=type)
         return ok
 
     async def send_with_retry(
@@ -590,8 +606,15 @@ class AsyncWSEClient:
         """Change the server endpoint and reconnect."""
         await self._connection.disconnect()
         self._connection._url = new_url
+        self._connection._active_endpoint = new_url
         self._connection._reconnect_attempts = 0
         self._server_ready_event.clear()
+
+        # Register with pool if active
+        if self._connection._pool is not None:
+            self._connection._pool.add_endpoint(new_url)
+            self._connection._pool.set_active_endpoint(new_url)
+
         # Merge dynamically subscribed topics with initial topics
         all_topics = list(set(self._initial_topics) | self._subscribed_topics)
         await self._connection.connect(all_topics)
@@ -667,6 +690,12 @@ class AsyncWSEClient:
                 "can_execute": self._circuit_breaker.can_execute(),
             },
             "rate_limiter": self._rate_limiter.get_stats(),
+            "offline_queue": self._offline_queue.get_stats(),
+            "connection_pool": (
+                self._connection._pool.get_stats()
+                if self._connection._pool is not None
+                else None
+            ),
         }
 
     # -- Internal: message handling -------------------------------------------
@@ -775,6 +804,10 @@ class AsyncWSEClient:
                 )
             )
 
+        # Flush offline queue after server is ready
+        if self._offline_queue.size > 0:
+            self._fire_task(self._flush_offline_queue())
+
     async def _resubscribe_after_reconnect(self, *, recover: bool) -> None:
         """Re-subscribe to all previously subscribed topics after reconnection."""
         topics = list(self._subscribed_topics)
@@ -793,6 +826,24 @@ class AsyncWSEClient:
             # Restore topics on cancellation or any exception
             self._subscribed_topics.update(topics)
             raise
+
+    async def _flush_offline_queue(self) -> None:
+        """Replay queued messages after reconnection."""
+        messages = self._offline_queue.drain()
+        if not messages:
+            return
+        logger.info("Flushing %d offline-queued messages", len(messages))
+        for i, encoded in enumerate(messages):
+            ok = await self._connection.send(encoded)
+            if not ok:
+                remaining = messages[i:]
+                logger.warning(
+                    "Offline queue flush interrupted, re-enqueuing %d messages",
+                    len(remaining),
+                )
+                for msg in remaining:
+                    self._offline_queue.enqueue(msg)
+                break
 
     def _handle_server_hello(self, event: WSEEvent) -> None:
         """Handle server_hello with negotiated features and limits."""
@@ -1045,9 +1096,11 @@ class AsyncWSEClient:
             pass  # record_ping() is called per-heartbeat via on_ping_sent
         elif state == ConnectionState.DISCONNECTED:
             self._server_ready_event.clear()
-            # Signal iterator to stop on terminal disconnect
-            # (skip if disconnect() already enqueued the sentinel)
-            if not getattr(self, "_disconnecting", False):
+            # Signal iterator to stop on terminal disconnect.
+            # DISCONNECTED only fires for permanent closes (normal close,
+            # going_away). Transient errors go through RECONNECTING, not here.
+            # Skip if disconnect() already enqueued the sentinel.
+            if not self._disconnecting:
                 try:
                     self._event_queue.put_nowait(None)
                 except asyncio.QueueFull:
