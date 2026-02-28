@@ -141,7 +141,7 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin pytest pytest-asyncio pytest-cov httpx
+          pip install maturin pytest pytest-asyncio pytest-cov httpx websockets
 
       - name: Build Rust extension
         run: |

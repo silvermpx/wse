@@ -8,12 +8,12 @@ Each client has its own detailed results page.
 | Client | Language | Max Connections Tested | Peak Throughput | Details |
 |--------|----------|----------------------|-----------------|---------|
 | **wse-bench** | Rust (tokio) | **500,000** | **30M msg/s** | [Rust Client Results](BENCHMARKS_RUST_CLIENT.md) |
-| **wse-bench** (fan-out) | Rust (tokio) | **500,000** | **2.1M del/s** | [Fan-out Results](BENCHMARKS_FANOUT.md) |
+| **wse-bench** (fan-out) | Rust (tokio) | **500,000** | **5.0M del/s** | [Fan-out Results](BENCHMARKS_FANOUT.md) |
 | **bench_brutal.py** | Python (sync) | 1,000 | 6.9M msg/s | [Python Client Results](BENCHMARKS_PYTHON_CLIENT.md) |
 | **bench_wse_multiprocess.py** | Python (multi-proc) | 128 | 2.1M msg/s | [Python Client Results](BENCHMARKS_PYTHON_CLIENT.md) |
 
 The Rust client removed the Python overhead and revealed the true server ceiling.
-The Python client was always the bottleneck — the server had roughly 2x more headroom
+The Python client was always the bottleneck - the server had roughly 2x more headroom
 than Python could measure.
 
 ---
@@ -33,16 +33,16 @@ full Python wrapper with drain_mode, JWT auth, the whole stack.
 
 | Metric | Value | Source |
 |--------|-------|--------|
-| Peak throughput (JSON) | **14.2M msg/s** (2.5 GB/s) | Rust client, 500 conns |
+| Peak throughput (JSON) | **14.7M msg/s** (2.6 GB/s) | Rust client, 500 conns |
 | Peak throughput (binary) | **30M msg/s** | Rust client, 100 conns |
-| Fan-out broadcast | **2.1M del/s** | 500K subs, 0 gaps |
+| Fan-out broadcast | **5.0M del/s** | 100 subs, 0 gaps |
 | Fan-out cluster (2 nodes) | **9.5M del/s** | Native TCP mesh, 20K subs, 0 gaps |
-| Peak message rate | **19.4M msg/s** | Rust client, 64B payload |
+| Peak message rate | **20.7M msg/s** | Rust client, 64B payload |
 | Throughput at 50K conns | **13.8M msg/s** (2.4 GB/s) | Rust client |
 | Max concurrent connections | **500,000** (0 errors) | Rust client |
 | Connection accept rate | **15,020 conn/s** | Rust client, 2K tier |
 | Ping RTT at low load | **0.38 ms** p50 | Rust client, 100 conns |
-| Peak bandwidth | **19.9 GB/s** | Rust client, 16KB msgs |
+| Peak bandwidth | **20.4 GB/s** | Rust client, 16KB msgs |
 | Sustained hold (100K conns, 30s) | **100% survival** | Rust client |
 | drain_mode overhead | **< 2%** | Python client comparison |
 
@@ -78,27 +78,27 @@ Per-operation speedup from moving hot-path logic from Python to Rust (PyO3/matur
 | Multi-process burst (M2) | **488,000 msg/s** | -- | ~0.5M msg/s |
 | EPYC 7502P (64w, Python) | **2,045,000 msg/s** | 2.60 ms | 5.7x vs M2 |
 | EPYC 7502P (64w, MsgPack) | **2,072,000 msg/s** | -- | ~2M msg/s |
-| **Rust client (JSON)** | **13,500,000 msg/s** | -- | **6.6x vs Python** |
-| **Rust client (compressed)** | **20,500,000 msg/s** | -- | **10x vs Python** |
+| **Rust client (JSON)** | **14,700,000 msg/s** | -- | **7.2x vs Python** |
+| **Rust client (compressed)** | **30,000,000 msg/s** | -- | **14.7x vs Python** |
 
 ### Python Optimization Highlights
 
-1. **orjson** (3-5x faster JSON) — replaced stdlib `json.dumps`/`json.loads`
-2. **Log level downgrade** — hot-path INFO to DEBUG (eliminated disk I/O per message)
-3. **deque(maxlen)** — replaced `list` + `pop(0)` with O(1) eviction
-4. **OrderedDict dedup** — FIFO duplicate tracking without linear scan
-5. **Priority queue reduction** — 10K to 1K capacity (5x memory savings per connection)
+1. **orjson** (3-5x faster JSON) - replaced stdlib `json.dumps`/`json.loads`
+2. **Log level downgrade** - hot-path INFO to DEBUG (eliminated disk I/O per message)
+3. **deque(maxlen)** - replaced `list` + `pop(0)` with O(1) eviction
+4. **OrderedDict dedup** - FIFO duplicate tracking without linear scan
+5. **Priority queue reduction** - 10K to 1K capacity (5x memory savings per connection)
 
 ### Rust Acceleration Highlights
 
-1. **Rust JWT in handshake** — 27x faster connection setup (GIL eliminated from critical path)
-2. **flate2 compression** — 6.7x faster than Python zlib
-3. **AHashSet dedup** — 27x faster duplicate detection
-4. **BinaryHeap priority queue** — 25x faster message ordering
-5. **Zero-copy transforms** — 15x faster event envelope construction
-6. **Atomic rate limiter** — 40x faster token bucket
-7. **Large message path** — 5x faster at 64KB (2.7 GB/s single client)
-8. **Inbound msgpack parsing** — binary frames parsed in Rust via rmpv (zero Python overhead)
+1. **Rust JWT in handshake** - 27x faster connection setup (GIL eliminated from critical path)
+2. **flate2 compression** - 6.7x faster than Python zlib
+3. **AHashSet dedup** - 27x faster duplicate detection
+4. **BinaryHeap priority queue** - 25x faster message ordering
+5. **Zero-copy transforms** - 15x faster event envelope construction
+6. **Atomic rate limiter** - 40x faster token bucket
+7. **Large message path** - 5x faster at 64KB (2.7 GB/s single client)
+8. **Inbound msgpack parsing** - binary frames parsed in Rust via rmpv (zero Python overhead)
 
 ---
 
@@ -135,4 +135,4 @@ cd benchmarks/rust-bench && cargo build --release
 
 ---
 
-*Tested February 2026. WSE v1.3.9, wse-bench v0.1.0.*
+*Tested February 2026. WSE v2.0.0, wse-bench v0.1.0.*

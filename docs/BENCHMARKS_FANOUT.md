@@ -35,21 +35,21 @@ For >64K connections: multi-IP via loopback aliases (127.0.0.1 through 127.0.0.9
 
 Server continuously broadcasts JSON messages. All connections receive every message.
 
-| Subscribers | Published/s | Deliveries/s | Bandwidth | p50 | p95 | p99 | Gaps |
-|-------------|-------------|-------------|-----------|-----|-----|-----|------|
-| 10 | 406K | 4.1M | 377 MB/s | 5.1s | 8.0s | 8.8s | 0 |
-| 100 | 43K | **4.3M** | 400 MB/s | 8.0s | 15.5s | 16.3s | 0 |
-| 500 | 7K | 3.5M | 327 MB/s | 19.7s | 27.6s | 28.3s | 0 |
-| 1,000 | 2K | 2.3M | 214 MB/s | 34.4s | 39.9s | 40.5s | 0 |
-| 2,000 | 1K | 2.2M | 202 MB/s | 46.5s | 52.2s | 52.7s | 0 |
-| 5,000 | 372 | 1.9M | 173 MB/s | 58.9s | 64.8s | 65.2s | 0 |
-| 10,000 | 172 | 1.7M | 161 MB/s | 71.7s | 77.8s | 78.4s | 0 |
-| 20,000 | 85 | 1.7M | 160 MB/s | 86.2s | 92.7s | 93.2s | 0 |
-| 50,000* | 83 | 2.7M | 254 MB/s | 111.0s | 118.7s | 119.6s | 0 |
+| Subscribers | Published/s | Deliveries/s | Bandwidth | Gaps |
+|-------------|-------------|-------------|-----------|------|
+| 10 | 481K | 4.8M | 353 MB/s | 0 |
+| 100 | 50K | **5.0M** | 369 MB/s | 0 |
+| 500 | 8K | 4.2M | 309 MB/s | 0 |
+| 1,000 | 4K | 3.8M | 279 MB/s | 0 |
+| 2,000 | 2K | 3.3M | 239 MB/s | 0 |
+| 5,000 | 473 | 2.4M | 174 MB/s | 0 |
+| 10,000 | 201 | 2.0M | 148 MB/s | 0 |
+| 20,000 | 84 | 1.7M | 123 MB/s | 0 |
+| 50,000* | 83 | 2.7M | 254 MB/s | 0 |
 
 *32,764 of 50,000 connected (ulimit). 100K and 200K tiers skipped (same ulimit limit).
 
-**Peak: 4.3M deliveries/s at 100 subscribers (400 MB/s). Zero message loss at every tier.**
+**Peak: 5.0M deliveries/s at 100 subscribers (369 MB/s). Zero message loss at every tier.**
 
 **Note on latency:** High p50 values (seconds, not milliseconds) are a benchmark artifact.
 The publisher floods at maximum rate -- hundreds of thousands of messages per second --
@@ -95,7 +95,7 @@ standalone levels due to batching amortization.
 
 | Mode | Peak del/s | at N subs | Bandwidth | Gaps | Horizontal Scaling |
 |------|-----------|----------|-----------|------|-------------------|
-| Standalone | **4.3M** | 100 | 400 MB/s | 0 | No |
+| Standalone | **5.0M** | 100 | 369 MB/s | 0 | No |
 | Cluster | **9.5M** | 20K | 887 MB/s | 0 | Yes (N instances) |
 
 At low subscriber counts (10-100), the TCP hop between servers is the bottleneck. At higher
@@ -146,4 +146,4 @@ python benchmarks/bench_fanout_server.py \
 
 ---
 
-*Tested February 26, 2026. WSE v1.4.4, wse-bench v0.1.0.*
+*Tested February 28, 2026. WSE v2.0.0, wse-bench v0.1.0.*

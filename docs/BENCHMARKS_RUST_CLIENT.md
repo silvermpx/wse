@@ -1,7 +1,7 @@
-# WSE Stress Test — Rust Client (wse-bench)
+# WSE Stress Test - Rust Client (wse-bench)
 
 Tested the true server limits by removing the Python client bottleneck.
-Previous Python bench (`bench_brutal.py`) topped out at ~6.9M msg/s with 1,000 connections —
+Previous Python bench (`bench_brutal.py`) topped out at ~6.9M msg/s with 1,000 connections -
 the asyncio event loop and GIL were the ceiling, not the server.
 
 Built a native Rust benchmark client (`wse-bench`) using tokio with one task per connection.
@@ -12,7 +12,7 @@ This is the first time we've been able to push the server past the Python overhe
 AMD EPYC 7502P (32 cores, 64 threads), 128 GB RAM, Ubuntu 24.04.
 Client and server on the same machine (loopback, zero network noise).
 
-Server: `bench_server.py` with `RustWSEServer` — same maturin-compiled binary as production,
+Server: `bench_server.py` with `RustWSEServer` - same maturin-compiled binary as production,
 running through the full Python wrapper with drain_mode=ON and JWT auth enabled.
 
 ## OS Tuning
@@ -31,13 +31,13 @@ For >64K connections: multi-IP via loopback aliases (127.0.0.1, 127.0.0.2).
 Server baseline (idle, 0 connections): **50.5 MB** RSS.
 
 During active 100K connection tests with 64KB payloads, server RSS peaked at ~27 GB.
-Most of this is Python allocator retention — glibc malloc holds freed pages rather than
+Most of this is Python allocator retention - glibc malloc holds freed pages rather than
 returning them to the OS. After connections close, RSS stays elevated even though the
 memory is logically free.
 
 Per-connection static overhead from the Rust core is ~4.4 KB (WebSocket buffers,
 connection registration maps, rate limiter state). At 100K connections that's ~440 MB
-for connection state alone — the rest is Python VM, message processing buffers, and
+for connection state alone - the rest is Python VM, message processing buffers, and
 allocator fragmentation.
 
 ---
@@ -70,7 +70,7 @@ JWT-authenticated handshake.
 ## Test 2: Ping/Pong Latency Under Load
 
 Each connection sends 50 application-level PINGs, server responds with PONGs.
-All connections ping concurrently — this is worst-case latency, not sequential.
+All connections ping concurrently - this is worst-case latency, not sequential.
 
 | Connections | Total Pings | p50 | p95 | p99 | p99.9 | p99.99 |
 |-------------|-------------|-----|-----|-----|-------|--------|
@@ -85,7 +85,7 @@ All connections ping concurrently — this is worst-case latency, not sequential
 | 50,000 | 2,500,000 | 498.7 ms | 718.9 ms | 1,150.0 ms | 1,669.1 ms | 2,111.5 ms |
 
 At 100 connections, p50 is **0.38ms** (sub-millisecond). At 50K concurrent connections all
-pinging simultaneously, p50 is ~500ms — expected given 50,000 round-trips competing for
+pinging simultaneously, p50 is ~500ms - expected given 50,000 round-trips competing for
 the same server. The server never drops a connection or fails to respond.
 
 ---
@@ -108,7 +108,7 @@ All connections send ~175-byte JSON trading messages as fast as possible for 10 
 
 Peak throughput: **14.7M msg/s** at 500-1000 connections (2.6 GB/s).
 The server stays above 11M msg/s even at 50K concurrent connections.
-Zero errors at every tier — not a single dropped connection.
+Zero errors at every tier - not a single dropped connection.
 
 ### Python vs Rust Client Comparison
 
@@ -155,7 +155,7 @@ Peak message rate: **20.7M msg/s** at 64B payload with 100 connections.
 
 Peak bandwidth: **20.4 GB/s** at 16KB payload with 100 connections.
 
-At small payloads (64-256B), the bottleneck is per-message overhead — syscalls, frame
+At small payloads (64-256B), the bottleneck is per-message overhead - syscalls, frame
 headers, tokio task scheduling. At large payloads (16-64KB), it's raw memory bandwidth.
 The sweet spot for total throughput is 16KB: high enough to amortize overhead, small
 enough to avoid memory pressure.
@@ -186,7 +186,7 @@ Peak: **30.0M msg/s** (compressed) and **29.6M msg/s** (MsgPack) at 100 connecti
 ## Test 6: Sustained Hold
 
 Hold N connections for 30 seconds with periodic PING/PONG (every 5 seconds).
-Tests long-term stability — can the server maintain connections without degradation?
+Tests long-term stability - can the server maintain connections without degradation?
 
 | Connections | Survival | Total PINGs | p50 | p95 | p99 |
 |-------------|----------|-------------|-----|-----|-----|
@@ -248,14 +248,14 @@ Memory at 500K: server + client consumed ~123 GB of the 128 GB available, with
 
 ## Key Takeaways
 
-1. **14.7M msg/s peak** (JSON), **30M msg/s** (binary formats) — the true server ceiling is 2-4x what the Python client showed
+1. **14.7M msg/s peak** (JSON), **30M msg/s** (binary formats) - the true server ceiling is 2-4x what the Python client showed
 2. **20.4 GB/s peak bandwidth** at 16KB payloads
-3. **500K concurrent connections** with zero failures — limited only by available RAM (128 GB)
+3. **500K concurrent connections** with zero failures - limited only by available RAM (128 GB)
 4. **100% connection survival** for 30 seconds at every tier including 100K
-5. **Binary > JSON** for inbound throughput — MsgPack and compressed both achieve ~30M msg/s (2x JSON)
+5. **Binary > JSON** for inbound throughput - MsgPack and compressed both achieve ~30M msg/s (2x JSON)
 6. **Sub-millisecond latency** at low connection counts (p50 = 0.38ms at 100 connections)
-7. **The bottleneck was always the client** — Python's asyncio/GIL limited us, not the Rust server core
-8. **Production-identical server** — these results are from the actual maturin-compiled binary
+7. **The bottleneck was always the client** - Python's asyncio/GIL limited us, not the Rust server core
+8. **Production-identical server** - these results are from the actual maturin-compiled binary
    running through the full Python wrapper with drain_mode, JWT auth, the whole stack
 
 ---

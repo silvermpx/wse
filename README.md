@@ -499,8 +499,8 @@ Benchmarked on AMD EPYC 7502P (64 cores, 128 GB RAM), Ubuntu 24.04.
 
 | Mode | Peak Throughput | Connections | Message Loss |
 |------|----------------|-------------|--------------|
-| Standalone (fan-out) | 4.3M deliveries/s | 500K | 0% |
-| Standalone (inbound JSON) | 14.4M msg/s | 500K | 0% |
+| Standalone (fan-out) | 5.0M deliveries/s | 500K | 0% |
+| Standalone (inbound JSON) | 14.7M msg/s | 500K | 0% |
 | Standalone (inbound msgpack) | 30M msg/s | 500K | 0% |
 | Cluster (2 nodes) | 9.5M deliveries/s | 20K per node | 0% |
 

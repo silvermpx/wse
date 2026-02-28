@@ -761,15 +761,15 @@ class AsyncWSEClient:
         topics = list(self._subscribed_topics)
         # Clear so subscribe() treats them as new
         self._subscribed_topics.clear()
-        logger.info(
-            "Re-subscribing to %d topics (recover=%s)", len(topics), recover
-        )
+        logger.info("Re-subscribing to %d topics (recover=%s)", len(topics), recover)
         try:
             ok = await self.subscribe(topics, recover=recover)
             if not ok:
                 # Restore so the next reconnect can try again
                 self._subscribed_topics.update(topics)
-                logger.warning("Re-subscribe failed, topics preserved for next reconnect")
+                logger.warning(
+                    "Re-subscribe failed, topics preserved for next reconnect"
+                )
         except BaseException:
             # Restore topics on cancellation or any exception
             self._subscribed_topics.update(topics)

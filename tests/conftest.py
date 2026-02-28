@@ -1,10 +1,8 @@
 """Shared fixtures for WSE integration tests."""
 
 import time
-import threading
-import pytest
-import asyncio
 
+import pytest
 from wse_server._wse_accel import RustWSEServer, rust_jwt_encode
 
 # Use high ports to avoid conflicts
@@ -21,13 +19,20 @@ def _next_port():
     _next_port.counter += 1
     return BASE_PORT + _next_port.counter
 
+
 _next_port.counter = 0
 
 
 def make_token(user_id: str = "test-user", exp_offset: int = 3600) -> str:
     now = int(time.time())
     return rust_jwt_encode(
-        {"sub": user_id, "iss": JWT_ISSUER, "aud": JWT_AUDIENCE, "exp": now + exp_offset, "iat": now},
+        {
+            "sub": user_id,
+            "iss": JWT_ISSUER,
+            "aud": JWT_AUDIENCE,
+            "exp": now + exp_offset,
+            "iat": now,
+        },
         JWT_SECRET,
     )
 
@@ -36,6 +41,7 @@ def make_token(user_id: str = "test-user", exp_offset: int = 3600) -> str:
 def _clear_pending_events():
     """Clear the drain_until pending buffer between tests."""
     from tests.test_integration import _pending_events
+
     _pending_events.clear()
     yield
     _pending_events.clear()

@@ -1,6 +1,6 @@
-# WSE Stress Test — TypeScript Client (wse-ts-bench)
+# WSE Stress Test - TypeScript Client (wse-ts-bench)
 
-Measured real-world performance from a **Node.js consumer** perspective — the actual use case
+Measured real-world performance from a **Node.js consumer** perspective - the actual use case
 for the `wse-client` npm package. The Rust bench proved the server can do 14M msg/s JSON and
 30M binary; this measures what a TypeScript application actually gets.
 
@@ -13,7 +13,7 @@ multi-core usage via tokio work-stealing.
 AMD EPYC 7502P (32 cores, 64 threads), 128 GB RAM, Ubuntu 24.04.
 Client and server on the same machine (loopback, zero network noise).
 
-Server: `bench_server.py` with `RustWSEServer` — same maturin-compiled binary as production,
+Server: `bench_server.py` with `RustWSEServer` - same maturin-compiled binary as production,
 running through the full Python wrapper with drain_mode=ON and JWT auth enabled.
 
 - **Node.js**: 22.22.0
@@ -37,14 +37,14 @@ binding, Node.js `ws` handles 100K+ connections.
 
 | Client | Processes | JSON msg/s | Binary msg/s | Connections/s | Max Connections |
 |--------|-----------|-----------|--------------|---------------|-----------------|
-| **Rust** (tokio) | 1 (64 cores) | **14.2M** | **30.0M** | 15,020 | 500K |
+| **Rust** (tokio) | 1 (64 cores) | **14.7M** | **30.0M** | 15,020 | 500K |
 | **TypeScript** (ws) | 64 | 7.0M | 7.9M | 10,673 | 64K+ |
 | **TypeScript** (ws) | 1 | 116K | 118K | 5,508 | 64K+ |
-| **Python** (asyncio) | 64 | 6.9M | — | — | — |
+| **Python** (asyncio) | 64 | 6.9M | - | - | - |
 
 Rust uses all 64 cores in a single process (tokio work-stealing). TypeScript needs 64
 OS processes to use the same hardware. Python uses 64 subprocesses with synchronous send
-loops. All three hit the same server — differences are pure client overhead.
+loops. All three hit the same server - differences are pure client overhead.
 
 ---
 
@@ -64,7 +64,7 @@ HTTP upgrade + JWT validation + `server_ready` round-trip time.
 | 50,000 | 4,453/s | 5,140 ms | 10,830 ms | 11,120 ms | 11,150 ms | 0 |
 
 Peak accept rate: **5,508 conn/s** at 10K tier. Zero errors across all tiers. Rate
-decreases above 10K due to event loop saturation during batch handshakes — each
+decreases above 10K due to event loop saturation during batch handshakes - each
 connection goes through the full JWT + `server_ready` + `client_hello` handshake
 sequentially on one thread.
 
@@ -84,7 +84,7 @@ Promise allocation + V8 GC pauses during batch opens.
 ## Test 2: Ping/Pong Latency Under Load
 
 Each connection sends 50 application-level PINGs, server responds with PONGs.
-All connections ping concurrently — worst-case latency, not sequential.
+All connections ping concurrently - worst-case latency, not sequential.
 
 | Connections | Total Pings | p50 | p95 | p99 | Max |
 |-------------|-------------|-----|-----|-----|-----|
@@ -94,7 +94,7 @@ All connections ping concurrently — worst-case latency, not sequential.
 | 5,000 | 250,000 | 199.9 ms | 535.3 ms | 621.4 ms | 746.6 ms |
 | 10,000 | 500,000 | 408.3 ms | 1,160 ms | 1,360 ms | 1,610 ms |
 
-At 100 connections: p50 = 6.1ms (Rust: 0.38ms, 16x faster). The gap is the event loop —
+At 100 connections: p50 = 6.1ms (Rust: 0.38ms, 16x faster). The gap is the event loop -
 all connections share a single thread, so each PING/PONG round-trip waits behind all
 other I/O callbacks. Latency scales linearly with connection count.
 
@@ -113,10 +113,10 @@ All connections send ~175-byte JSON trading messages as fast as possible for 10 
 | 10,000 | 20K | 3.5 | 2 |
 
 Peak throughput: **116K msg/s** at 100 connections (20.3 MB/s). The event loop is the
-ceiling — `ws` frame encoding + libuv scheduling caps a single thread. More connections
+ceiling - `ws` frame encoding + libuv scheduling caps a single thread. More connections
 means more context switching, reducing per-connection throughput.
 
-Rust at 100 connections: 13.8M msg/s (119x faster). This is the tokio-vs-event-loop gap.
+Rust at 100 connections: 14.5M msg/s (125x faster). This is the tokio-vs-event-loop gap.
 
 ### 64-Process Throughput
 
@@ -126,7 +126,7 @@ Rust at 100 connections: 13.8M msg/s (119x faster). This is the tokio-vs-event-l
 | **Aggregate** | **6,950K msg/s** |
 | Linear scaling | 97% |
 
-64 processes achieve 7.0M msg/s — 97% of theoretical max (64 x 108K = 6.9M).
+64 processes achieve 7.0M msg/s - 97% of theoretical max (64 x 108K = 6.9M).
 OS scheduling across 64 logical cores provides excellent parallelism.
 
 ---
@@ -174,7 +174,7 @@ Wire sizes: JSON = 175 bytes, MsgPack = 145 bytes (`M:` prefix), Compressed = 15
 | 5,000 | 35K | 35K | +0.8% | 35K | +0.3% |
 | 10,000 | 17K | 18K | +1.3% | 18K | +0.4% |
 
-At single-process scale, all three formats perform within 1-2% — the bottleneck is
+At single-process scale, all three formats perform within 1-2% - the bottleneck is
 `ws` frame encoding + event loop scheduling, not serialization.
 
 Rust sees a **2x** gap between JSON (14M) and binary (30M) because at 14M msg/s,
@@ -184,11 +184,11 @@ serialization overhead becomes significant. At Node.js's 116K msg/s, it's irrele
 
 | Format | Aggregate msg/s | vs JSON |
 |--------|----------------|---------|
-| **JSON** | 7.0M | — |
+| **JSON** | 7.0M | - |
 | **MsgPack** | 7.9M | +13% |
 | **Compressed** | 7.9M | +13% |
 
-At 64-process scale, MsgPack and Compressed gain 13% over JSON — smaller wire size
+At 64-process scale, MsgPack and Compressed gain 13% over JSON - smaller wire size
 reduces per-process overhead when all 64 cores are saturated.
 
 ---
@@ -196,7 +196,7 @@ reduces per-process overhead when all 64 cores are saturated.
 ## Test 6: Sustained Hold
 
 Hold N connections for 30 seconds with periodic PING/PONG (every 5 seconds).
-Tests long-term stability — can the server + Node.js client maintain connections
+Tests long-term stability - can the server + Node.js client maintain connections
 without degradation?
 
 | Connections | Survival | Disconnects | Total PINGs | p50 | p95 | p99 |
@@ -206,7 +206,7 @@ without degradation?
 | 10,000 | **100%** | 0 | 50,000 | 9.2 ms | 28.1 ms | 35.2 ms |
 
 **100% survival** across all tiers. Zero disconnects over 30 seconds. PING latency
-remains stable — no drift, no memory leaks, no GC pressure in the test window.
+remains stable - no drift, no memory leaks, no GC pressure in the test window.
 
 Matches the Rust client result (100% at all tiers including 100K). Connection stability
 is a server-side property, not client-dependent.
@@ -229,20 +229,20 @@ Binary search for the maximum number of stable connections. Exponential probe th
 
 **Max stable connections: 64K+** (limited by OS ulimit=65536, not server or client).
 All probes succeeded up to the OS limit. With `ulimit -n 500000` and multi-IP binding,
-Node.js `ws` can handle well beyond 64K — the server proved 500K with the Rust client.
+Node.js `ws` can handle well beyond 64K - the server proved 500K with the Rust client.
 
 ---
 
 ## Key Takeaways
 
-1. **116K msg/s** single-process peak (JSON) — typical for a well-tuned Node.js WebSocket client
-2. **7.0M msg/s** at 64 processes — 97% linear scaling across all cores
-3. **Rust is 119x faster per-thread** (14.2M vs 116K single-process) — tokio async vs V8 event loop
-4. **64K+ stable connections** per process — limited by ulimit, not the `ws` library
-5. **100% connection survival** for 30 seconds at every tier — rock-solid stability
+1. **116K msg/s** single-process peak (JSON) - typical for a well-tuned Node.js WebSocket client
+2. **7.0M msg/s** at 64 processes - 97% linear scaling across all cores
+3. **Rust is 127x faster per-thread** (14.7M vs 116K single-process) - tokio async vs V8 event loop
+4. **64K+ stable connections** per process - limited by ulimit, not the `ws` library
+5. **100% connection survival** for 30 seconds at every tier - rock-solid stability
 6. **Format differences are negligible** at single-process scale (<2%), meaningful at 64-process (+13% for binary)
-7. **Latency scales linearly** with connections — single event loop means all connections share one thread
-8. **Production-identical server** — same maturin-compiled binary, full JWT auth, drain_mode
+7. **Latency scales linearly** with connections - single event loop means all connections share one thread
+8. **Production-identical server** - same maturin-compiled binary, full JWT auth, drain_mode
 
 ---
 
@@ -259,10 +259,10 @@ npm install
 
 # Run the full suite (all 7 tests, single process)
 npx tsx src/main.ts \
-  --host 127.0.0.1 --port 5006 \
-  --secret "bench-secret-key-for-testing-only" \
-  --tiers 100,500,1000,5000,10000,30000,50000 \
-  --duration 10
+ --host 127.0.0.1 --port 5006 \
+ --secret "bench-secret-key-for-testing-only" \
+ --tiers 100,500,1000,5000,10000,30000,50000 \
+ --duration 10
 
 # Single test
 npx tsx src/main.ts --test throughput --tiers 100,1000 --duration 3
