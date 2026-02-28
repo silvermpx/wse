@@ -1,5 +1,5 @@
 use crate::config::Cli;
-use crate::protocol::{self, parse_wse_message};
+use crate::protocol::{self, parse_wse_message, WsStream};
 use crate::report::TierResult;
 use crate::stats;
 use futures_util::{SinkExt, StreamExt};
@@ -32,13 +32,74 @@ impl CheckResult {
     }
 }
 
+/// Drain messages until we find a specific type or deadline expires.
+/// Returns the parsed message if found.
+async fn drain_for_type(
+    ws: &mut WsStream,
+    target_type: &str,
+    deadline_ms: u64,
+) -> Option<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_ms);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let Some(parsed) = parse_wse_message(&msg) {
+                    if parsed.get("t").and_then(|t| t.as_str()) == Some(target_type) {
+                        return Some(parsed);
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    None
+}
+
+/// Count messages of a given type within a deadline. Returns (count, last_seq).
+async fn count_messages_with_seq(
+    ws: &mut WsStream,
+    target_type: &str,
+    deadline_ms: u64,
+) -> (u64, Option<u64>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_ms);
+    let mut count = 0u64;
+    let mut last_seq: Option<u64> = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let Some(parsed) = parse_wse_message(&msg) {
+                    if parsed.get("t").and_then(|t| t.as_str()) == Some(target_type) {
+                        count += 1;
+                        if let Some(seq) = parsed
+                            .get("p")
+                            .and_then(|p| p.get("seq"))
+                            .and_then(|s| s.as_u64())
+                        {
+                            last_seq = Some(seq);
+                        }
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    (count, last_seq)
+}
+
 /// Battle Test: Message Recovery
 ///
-/// Tests subscribe_with_recovery: connect, subscribe, disconnect, wait for
-/// messages to accumulate in the ring buffer, reconnect with recover=true
-/// and epoch+offset, verify missed messages are replayed.
+/// Tests subscribe_with_recovery, epoch+offset tracking, missed message replay.
+/// Uses publish_messages command to populate recovery buffer on demand.
 ///
-/// Requires: python benchmarks/bench_battle_server.py --recovery
+/// Requires: python benchmarks/bench_battle_server.py --recovery --no-publish
 pub async fn run(cli: &Cli) -> Vec<TierResult> {
     stats::print_header(
         "BATTLE TEST: Message Recovery",
@@ -48,9 +109,9 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut checks = CheckResult::new();
 
     // =========================================================================
-    // Phase 1: Connect and subscribe with recovery (initial)
+    // Step 1: Connect and seed the recovery buffer
     // =========================================================================
-    println!("\n  Phase 1: Connect and subscribe with recovery");
+    println!("\n  Step 1: Connect and seed recovery buffer");
 
     let token = crate::jwt::generate_bench_token(cli.secret.as_bytes(), "recovery-user");
     let mut ws = match protocol::connect_and_handshake(
@@ -70,7 +131,41 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     };
     checks.check("Connected to server", true);
 
-    // Subscribe with recovery (initial, no recover)
+    // Ask server to publish 50 messages to seed recovery buffer
+    // (buffer_size=256, so keep total under 256 to avoid eviction)
+    let seed_msg = serde_json::json!({
+        "t": "battle_cmd",
+        "p": {
+            "action": "publish_messages",
+            "topic": RECOVERY_TOPIC,
+            "count": 50
+        }
+    });
+    ws.send(Message::Text(seed_msg.to_string().into()))
+        .await
+        .ok();
+
+    // Wait for publish_ack
+    let ack = drain_for_type(&mut ws, "publish_ack", 5000).await;
+    let seeded = ack
+        .as_ref()
+        .and_then(|a| a.get("p"))
+        .and_then(|p| p.get("count"))
+        .and_then(|c| c.as_u64())
+        .unwrap_or(0);
+    checks.check(&format!("Seeded recovery buffer ({} messages)", seeded), seeded > 0);
+
+    if seeded == 0 {
+        println!("    ABORT: Could not seed recovery buffer");
+        let _ = ws.close(None).await;
+        return Vec::new();
+    }
+
+    // =========================================================================
+    // Step 2: Subscribe with recovery (initial, get epoch/offset)
+    // =========================================================================
+    println!("\n  Step 2: Subscribe with recovery (initial)");
+
     let subscribe_msg = serde_json::json!({
         "t": "battle_cmd",
         "p": {
@@ -83,32 +178,23 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .await
         .ok();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Read subscription response to get epoch/offset
-    let mut epoch: Option<String> = None;
-    let mut offset: Option<u64> = None;
-
-    while let Ok(Some(Ok(msg))) =
-        tokio::time::timeout(Duration::from_millis(500), ws.next()).await
-    {
-        if let Some(parsed) = parse_wse_message(&msg) {
-            let msg_type = parsed.get("t").and_then(|t| t.as_str());
-            if msg_type == Some("subscription_update") {
-                if let Some(recovery) = parsed
-                    .get("p")
-                    .and_then(|p| p.get("recovery"))
-                    .and_then(|r| r.get(RECOVERY_TOPIC))
-                {
-                    epoch = recovery
-                        .get("epoch")
-                        .and_then(|e| e.as_str())
-                        .map(String::from);
-                    offset = recovery.get("offset").and_then(|o| o.as_u64());
-                }
-            }
-        }
-    }
+    let sub_update = drain_for_type(&mut ws, "subscription_update", 5000).await;
+    let (epoch, offset) = if let Some(ref parsed) = sub_update {
+        let recovery = parsed
+            .get("p")
+            .and_then(|p| p.get("recovery"))
+            .and_then(|r| r.get(RECOVERY_TOPIC));
+        let ep = recovery
+            .and_then(|r| r.get("epoch"))
+            .and_then(|e| e.as_str())
+            .map(String::from);
+        let off = recovery
+            .and_then(|r| r.get("offset"))
+            .and_then(|o| o.as_u64());
+        (ep, off)
+    } else {
+        (None, None)
+    };
 
     let has_recovery_info = epoch.is_some() && offset.is_some();
     checks.check(
@@ -126,56 +212,108 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     }
 
     // =========================================================================
-    // Phase 2: Receive some messages to advance offset
+    // Step 3: Publish more messages while subscribed (we receive them)
     // =========================================================================
-    println!("\n  Phase 2: Receive messages for 3 seconds");
+    println!("\n  Step 3: Publish 20 more messages (we receive these)");
 
-    let mut received_before = 0u64;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    let mut last_offset = offset;
-
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
+    let more_msg = serde_json::json!({
+        "t": "battle_cmd",
+        "p": {
+            "action": "publish_messages",
+            "topic": RECOVERY_TOPIC,
+            "count": 20
         }
-        match tokio::time::timeout(remaining, ws.next()).await {
-            Ok(Some(Ok(msg))) => {
-                if let Some(parsed) = parse_wse_message(&msg) {
-                    if parsed.get("t").and_then(|t| t.as_str()) == Some("battle") {
-                        received_before += 1;
-                        // Track sequence for offset
-                        if let Some(seq) = parsed
-                            .get("p")
-                            .and_then(|p| p.get("seq"))
-                            .and_then(|s| s.as_u64())
-                        {
-                            last_offset = Some(seq);
-                        }
-                    }
-                }
-            }
-            _ => break,
-        }
-    }
+    });
+    ws.send(Message::Text(more_msg.to_string().into()))
+        .await
+        .ok();
 
+    // Receive the battle messages + publish_ack
+    let (received_before, _last_seq) = count_messages_with_seq(&mut ws, "battle", 3000).await;
     checks.check(
         &format!("Received {} messages before disconnect", received_before),
         received_before > 0,
     );
 
-    // =========================================================================
-    // Phase 3: Disconnect (messages accumulate in server buffer)
-    // =========================================================================
-    println!("\n  Phase 3: Disconnect and wait 3 seconds (messages accumulate)");
+    // Re-query current recovery position after receiving messages
+    let pos_msg = serde_json::json!({
+        "t": "battle_cmd",
+        "p": {
+            "action": "subscribe_recovery",
+            "topics": [RECOVERY_TOPIC],
+            "recover": false
+        }
+    });
+    ws.send(Message::Text(pos_msg.to_string().into()))
+        .await
+        .ok();
+    let pos_update = drain_for_type(&mut ws, "subscription_update", 3000).await;
+    let last_offset = pos_update
+        .as_ref()
+        .and_then(|p| p.get("p"))
+        .and_then(|p| p.get("recovery"))
+        .and_then(|r| r.get(RECOVERY_TOPIC))
+        .and_then(|r| r.get("offset"))
+        .and_then(|o| o.as_u64())
+        .unwrap_or(offset.unwrap_or(0));
+    println!("    Last known offset before disconnect: {}", last_offset);
 
+    // =========================================================================
+    // Step 4: Disconnect and publish messages we'll miss
+    // =========================================================================
+    println!("\n  Step 4: Disconnect");
     let _ = ws.close(None).await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Connect a second helper connection to trigger publish while first is disconnected
+    println!("    Publishing 100 messages while disconnected...");
+    let mut helper = match protocol::connect_and_handshake(
+        &cli.host,
+        cli.port,
+        &token,
+        "compression=false&protocol_version=1",
+        10,
+    )
+    .await
+    {
+        Ok(ws) => ws,
+        Err(e) => {
+            println!("    [FAIL] Failed to connect helper: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let missed_msg = serde_json::json!({
+        "t": "battle_cmd",
+        "p": {
+            "action": "publish_messages",
+            "topic": RECOVERY_TOPIC,
+            "count": 100
+        }
+    });
+    helper
+        .send(Message::Text(missed_msg.to_string().into()))
+        .await
+        .ok();
+
+    // Wait for ack
+    let missed_ack = drain_for_type(&mut helper, "publish_ack", 5000).await;
+    let missed_count = missed_ack
+        .as_ref()
+        .and_then(|a| a.get("p"))
+        .and_then(|p| p.get("count"))
+        .and_then(|c| c.as_u64())
+        .unwrap_or(0);
+    checks.check(
+        &format!("Published {} messages while disconnected", missed_count),
+        missed_count > 0,
+    );
+    let _ = helper.close(None).await;
 
     // =========================================================================
-    // Phase 4: Reconnect with recovery
+    // Step 5: Reconnect with recovery
     // =========================================================================
-    println!("\n  Phase 4: Reconnect and subscribe with recover=true");
+    println!("\n  Step 5: Reconnect and subscribe with recover=true");
 
     let mut ws2 = match protocol::connect_and_handshake(
         &cli.host,
@@ -194,7 +332,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     };
     checks.check("Reconnected to server", true);
 
-    // Subscribe with recovery (recover=true, with epoch+offset)
+    // Subscribe with recovery (recover=true, with epoch + last_offset from step 3)
     let recover_msg = serde_json::json!({
         "t": "battle_cmd",
         "p": {
@@ -204,7 +342,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             "recovery": {
                 RECOVERY_TOPIC: {
                     "epoch": epoch.as_deref().unwrap_or(""),
-                    "offset": last_offset.unwrap_or(0)
+                    "offset": last_offset
                 }
             }
         }
@@ -213,77 +351,43 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .await
         .ok();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
     // =========================================================================
-    // Phase 5: Verify recovery response
+    // Step 6: Verify recovery response
     // =========================================================================
-    println!("\n  Phase 5: Verify recovery response and replayed messages");
+    println!("\n  Step 6: Verify recovery response");
 
-    let mut recovered = false;
-    let mut recovered_count = 0u64;
-    let mut new_messages = 0u64;
+    let recovery_response = drain_for_type(&mut ws2, "subscription_update", 5000).await;
 
-    let read_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let remaining = read_deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match tokio::time::timeout(remaining, ws2.next()).await {
-            Ok(Some(Ok(msg))) => {
-                if let Some(parsed) = parse_wse_message(&msg) {
-                    let msg_type = parsed.get("t").and_then(|t| t.as_str());
-                    match msg_type {
-                        Some("subscription_update") => {
-                            if let Some(p) = parsed.get("p") {
-                                recovered = p
-                                    .get("recovered")
-                                    .and_then(|r| r.as_bool())
-                                    .unwrap_or(false);
-                                if let Some(recovery_info) = p
-                                    .get("recovery")
-                                    .and_then(|r| r.get(RECOVERY_TOPIC))
-                                {
-                                    recovered_count = recovery_info
-                                        .get("count")
-                                        .and_then(|c| c.as_u64())
-                                        .unwrap_or(0);
-                                }
-                            }
-                        }
-                        Some("battle") => {
-                            new_messages += 1;
-                            // Stop after receiving some new messages
-                            if new_messages >= 10 {
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => break,
-        }
+    if let Some(ref parsed) = recovery_response {
+        let p = parsed.get("p");
+        let recovered = p
+            .and_then(|p| p.get("recovered"))
+            .and_then(|r| r.as_bool())
+            .unwrap_or(false);
+        let recovered_count = p
+            .and_then(|p| p.get("recovery"))
+            .and_then(|r| r.get(RECOVERY_TOPIC))
+            .and_then(|r| r.get("count"))
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0);
+
+        checks.check(
+            &format!("Recovery flag: {}", recovered),
+            recovered,
+        );
+        checks.check(
+            &format!("Recovered {} missed messages", recovered_count),
+            recovered_count > 0,
+        );
+    } else {
+        checks.check("Got recovery subscription_update", false);
+        checks.check("Recovery count > 0", false);
     }
 
-    checks.check(
-        &format!("Recovery flag in response: {}", recovered),
-        recovered,
-    );
-    checks.check(
-        &format!("Recovered {} missed messages", recovered_count),
-        recovered_count > 0,
-    );
-    checks.check(
-        &format!("Receiving new messages after recovery (got {})", new_messages),
-        new_messages > 0,
-    );
-
     // =========================================================================
-    // Phase 6: Verify health shows recovery stats
+    // Step 7: Verify health shows recovery stats
     // =========================================================================
-    println!("\n  Phase 6: Verify recovery health stats");
+    println!("\n  Step 7: Verify recovery health stats");
 
     if let Some(health) = protocol::query_health(&mut ws2, 3).await {
         let recovery_topics = health
@@ -307,15 +411,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     }
 
     // =========================================================================
-    // Phase 7: Clean up
+    // Clean up
     // =========================================================================
-    println!("\n  Phase 7: Clean up");
+    println!("\n  Clean up");
     let _ = ws2.close(None).await;
     println!("    Client disconnected");
 
-    // =========================================================================
-    // Summary
-    // =========================================================================
     let total = checks.passed + checks.failed;
     println!("\n  Result: {}/{} checks passed", checks.passed, total);
     if checks.failed > 0 {

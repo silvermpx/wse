@@ -187,6 +187,20 @@ def drain_loop(server, stop_event: threading.Event):
                                         },
                                     })
                                     server.send(conn_id, f"WSE{response}")
+                            elif action == "publish_messages":
+                                # Publish N messages to a topic (for recovery buffer testing)
+                                topic = p.get("topic", "battle_all")
+                                count = min(p.get("count", 100), 10000)
+                                import json as _json
+                                for i in range(count):
+                                    ts_us = int(time.time() * 1_000_000)
+                                    msg = f'{{"t":"battle","p":{{"ch":"{topic}","seq":{i},"ts_us":{ts_us}}}}}'
+                                    server.broadcast(topic, msg)
+                                ack = _json.dumps({
+                                    "t": "publish_ack",
+                                    "p": {"topic": topic, "count": count}
+                                })
+                                server.send(conn_id, f"WSE{ack}")
                             elif action == "health":
                                 health = server.health_snapshot()
                                 response = {
@@ -272,6 +286,8 @@ def main():
                         help="Cluster peer addresses, e.g. 127.0.0.1:5007")
     parser.add_argument("--message-size", type=int, default=100,
                         help="Approximate message size in bytes (default: 100)")
+    parser.add_argument("--no-publish", action="store_true",
+                        help="Disable publish loop (for feature-only tests like presence/recovery)")
     parser.add_argument("--recovery", action="store_true",
                         help="Enable message recovery (ring buffer per topic)")
 
@@ -312,9 +328,9 @@ def main():
     if args.recovery:
         server_kwargs.update(
             recovery_enabled=True,
-            recovery_buffer_size=256,
+            recovery_buffer_size=4096,
             recovery_ttl=300,
-            recovery_max_messages=500,
+            recovery_max_messages=2000,
         )
     server = RustWSEServer(
         "0.0.0.0",
@@ -363,10 +379,14 @@ def main():
     drain_thread = threading.Thread(target=drain_loop, args=(server, stop), daemon=True)
     drain_thread.start()
 
-    pub_thread = threading.Thread(
-        target=publish_loop, args=(server, args.mode, args.message_size, stop), daemon=True
-    )
-    pub_thread.start()
+    if not args.no_publish:
+        pub_thread = threading.Thread(
+            target=publish_loop, args=(server, args.mode, args.message_size, stop), daemon=True
+        )
+        pub_thread.start()
+    else:
+        print("[battle-server] Publish loop disabled (--no-publish)")
+
 
     try:
         while not stop.is_set():
@@ -374,7 +394,11 @@ def main():
     except KeyboardInterrupt:
         stop.set()
 
-    server.stop()
+    time.sleep(0.5)  # let daemon threads release borrows
+    try:
+        server.stop()
+    except RuntimeError:
+        pass  # threads may still hold borrow
     print("[battle-server] Stopped.")
 
 

@@ -33,6 +33,56 @@ impl CheckResult {
     }
 }
 
+/// Read messages from a WsStream until deadline, looking for messages with
+/// a specific "t" type. Returns the count found. Handles the battle server
+/// flooding broadcast messages by using a hard deadline instead of per-message timeout.
+async fn drain_for_type(ws: &mut WsStream, msg_type: &str, deadline_ms: u64) -> u32 {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_ms);
+    let mut count = 0u32;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let Some(parsed) = parse_wse_message(&msg) {
+                    if parsed.get("t").and_then(|t| t.as_str()) == Some(msg_type) {
+                        count += 1;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    count
+}
+
+/// Drain messages looking for a specific type and return the parsed JSON payload.
+async fn drain_for_type_with_data(
+    ws: &mut WsStream,
+    msg_type: &str,
+    deadline_ms: u64,
+) -> Option<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_ms);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match tokio::time::timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let Some(parsed) = parse_wse_message(&msg) {
+                    if parsed.get("t").and_then(|t| t.as_str()) == Some(msg_type) {
+                        return Some(parsed);
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// Battle Test: Presence Tracking
 ///
 /// Tests presence join/leave events, presence query, data updates, and
@@ -114,17 +164,11 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     println!("\n  Phase 3: Verify presence_join events");
 
+    // Use hard deadline (3s) - battle server may be flooding, so per-message
+    // timeout won't work. Drain all messages within deadline looking for joins.
     let mut join_counts = [0u32; 3];
     for (i, client) in clients.iter_mut().enumerate().take(3) {
-        while let Ok(Some(Ok(msg))) =
-            tokio::time::timeout(Duration::from_millis(200), client.next()).await
-        {
-            if let Some(parsed) = parse_wse_message(&msg) {
-                if parsed.get("t").and_then(|t| t.as_str()) == Some("presence_join") {
-                    join_counts[i] += 1;
-                }
-            }
-        }
+        join_counts[i] = drain_for_type(client, "presence_join", 3000).await;
     }
 
     // Client 0 subscribed first, should see joins from client 1 and 2 (+ possibly self)
@@ -154,22 +198,16 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .send(Message::Text(query_msg.to_string().into()))
         .await
         .ok();
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let mut query_members = 0usize;
-    while let Ok(Some(Ok(msg))) =
-        tokio::time::timeout(Duration::from_millis(200), clients[0].next()).await
+    if let Some(parsed) = drain_for_type_with_data(&mut clients[0], "presence_result", 3000).await
     {
-        if let Some(parsed) = parse_wse_message(&msg) {
-            if parsed.get("t").and_then(|t| t.as_str()) == Some("presence_result") {
-                if let Some(members) = parsed
-                    .get("p")
-                    .and_then(|p| p.get("members"))
-                    .and_then(|m| m.as_object())
-                {
-                    query_members = members.len();
-                }
-            }
+        if let Some(members) = parsed
+            .get("p")
+            .and_then(|p| p.get("members"))
+            .and_then(|m| m.as_object())
+        {
+            query_members = members.len();
         }
     }
     checks.check(
@@ -185,16 +223,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let _ = clients[2].close(None).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let mut leave_count_0 = 0u32;
-    while let Ok(Some(Ok(msg))) =
-        tokio::time::timeout(Duration::from_millis(200), clients[0].next()).await
-    {
-        if let Some(parsed) = parse_wse_message(&msg) {
-            if parsed.get("t").and_then(|t| t.as_str()) == Some("presence_leave") {
-                leave_count_0 += 1;
-            }
-        }
-    }
+    let leave_count_0 = drain_for_type(&mut clients[0], "presence_leave", 3000).await;
     checks.check(
         &format!("Client 0 received presence_leave (got {})", leave_count_0),
         leave_count_0 >= 1,
@@ -218,18 +247,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .ok();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let mut update_count_0 = 0u32;
-    while let Ok(Some(Ok(msg))) =
-        tokio::time::timeout(Duration::from_millis(200), clients[0].next()).await
-    {
-        if let Some(parsed) = parse_wse_message(&msg) {
-            if parsed.get("t").and_then(|t| t.as_str()) == Some("presence_update") {
-                update_count_0 += 1;
-            }
-        }
-    }
+    let update_count_0 = drain_for_type(&mut clients[0], "presence_update", 3000).await;
     checks.check(
-        &format!("Client 0 received presence_update (got {})", update_count_0),
+        &format!(
+            "Client 0 received presence_update (got {})",
+            update_count_0
+        ),
         update_count_0 >= 1,
     );
 

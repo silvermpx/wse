@@ -168,67 +168,45 @@ Two paths depending on server configuration:
 2. Python extracts and validates JWT from cookies
 3. Python sends `server_ready` after validation
 
-The Rust JWT path eliminates GIL acquisition from the connection critical path, reducing median connection latency from ~23ms to 0.47ms.
+The Rust JWT path eliminates GIL acquisition from the connection critical path, reducing median connection latency from ~23ms to 0.53ms.
 
 ### 3. Server Ready
 
 Sent after authentication succeeds (from Rust when JWT is configured, from Python otherwise):
 
 ```json
-WSE{"v":1,"t":"server_ready","p":{
+WSE{"v":1,"t":"server_ready","id":"019c53c4-abcd-7def","ts":"2026-02-28T12:00:00.000Z","seq":1,"p":{
   "message": "Connection established (Rust transport)",
   "details": {
     "version": 1,
     "features": {
       "compression": true,
-      "encryption": true,
+      "encryption": false,
       "batching": true,
       "priority_queue": true,
       "circuit_breaker": true,
       "rust_transport": true,
-      "rust_jwt": true
+      "rust_jwt": true,
+      "recovery": true
     },
     "connection_id": "rs_f186cd9d_019c53c4",
-    "server_time": "2026-02-20T15:30:00.000Z",
-    "user_id": "019c53c4-abcd-7def-8901-234567890abc",
-    "encryption_public_key": "<base64-encoded 65-byte ECDH P-256 public key>"
+    "server_time": "2026-02-28T12:00:00.000Z",
+    "user_id": "019c53c4-abcd-7def-8901-234567890abc"
   }
 }}
 ```
 
-When `encryption` is `true`, the `encryption_public_key` field contains the server's ECDH P-256 public key (65 bytes, uncompressed SEC1, base64-encoded). The client uses this to derive the shared AES-256 key.
-
 When `rust_jwt` is `true`, JWT validation was performed by the Rust server during the handshake (before this message was sent). The `user_id` field is the validated subject from the JWT.
 
-### 4. Auto-Subscribe
+Encryption key exchange happens separately via `encryption_request`/`encryption_response` messages, not in `server_ready`.
 
-Server automatically subscribes the connection to default topics and sends subscription confirmation:
+### 4. Subscriptions
 
-```json
-U{"t":"subscription_update","p":{
-  "action": "subscribe",
-  "success": true,
-  "topics": ["notifications", "chat_messages", ...],
-  "success_topics": [...],
-  "active_subscriptions": [...]
-}}
-```
+The Python application subscribes connections to topics via `subscribe_connection(conn_id, topics)`. Subscription management is server-side only - there is no auto-subscribe mechanism.
 
-### 5. Snapshots
+### 5. Updates
 
-After subscription, server sends full state snapshots:
-
-```json
-S{"t":"user_snapshot","p":{
-  "users": [...],
-  "count": 2,
-  "timestamp": "2026-02-20T15:30:00.123Z"
-}}
-```
-
-### 6. Incremental Updates
-
-Real-time updates follow snapshots:
+Real-time updates are sent via topic broadcast:
 
 ```json
 U{"t":"user_update","p":{
@@ -238,29 +216,23 @@ U{"t":"user_update","p":{
 }}
 ```
 
-### 7. Heartbeat
+### 6. Heartbeat
 
-Server sends heartbeat every 15 seconds:
-
-```json
-WSE{"t":"heartbeat","p":{"timestamp":1708441800000,"sequence":42},"v":1}
-```
-
-Server also sends JSON PING for latency measurement:
+Server sends a ping every 25 seconds:
 
 ```json
-WSE{"t":"PING","p":{"timestamp":1708441800000},"v":1}
+WSE{"t":"ping","p":{"server_time":"2026-02-28T12:00:00.000Z"}}
 ```
 
-Client responds with:
+Client responds with a PONG echoing the server timestamp plus its own:
 
 ```json
 {"t":"PONG","p":{"client_timestamp":1708441800000,"server_timestamp":1708441800050}}
 ```
 
-### 8. Disconnect
+### 7. Disconnect
 
-- **Idle timeout**: Server closes after 90s of inactivity (code 1000)
+- **Idle timeout**: Server closes after 60s of inactivity (code 1000)
 - **Circuit breaker**: Server closes after too many errors (code 1011)
 - **Auth failure**: Server closes with code 4401
 - **Normal close**: Code 1000
@@ -293,27 +265,7 @@ Sent when a user's presence data is updated via `update_presence()`:
 {"t": "presence_update", "p": {"user_id": "alice", "data": {"status": "away"}}}
 ```
 
-### Presence Query (client to server)
-
-Request the current member list for a topic:
-
-```json
-{"t": "presence_query", "p": {"topic": "chat-1"}}
-```
-
-### Presence Result (server to client)
-
-Response to a `presence_query` with the full member list:
-
-```json
-{"t": "presence_result", "p": {
-  "topic": "chat-1",
-  "members": {
-    "alice": {"data": {"status": "online"}, "connections": 2},
-    "bob": {"data": {"status": "away"}, "connections": 1}
-  }
-}}
-```
+Presence is queried through the Python API (`server.presence(topic)`, `server.presence_stats(topic)`), not through WebSocket messages.
 
 ---
 
@@ -445,7 +397,7 @@ payment_completed, account_transfer, config_change, ...
 | Code | Meaning |
 |------|---------|
 | `AUTH_FAILED` | JWT authentication failed |
-| `RATE_LIMIT_EXCEEDED` | Client sending too fast |
+| `RATE_LIMITED` | Client sending too fast |
 | `MESSAGE_TOO_LARGE` | Message exceeds 1 MB limit |
 | `INVALID_SUBSCRIPTION` | No topics specified |
 | `INVALID_ACTION` | Unknown subscription action |
@@ -474,7 +426,7 @@ Topics are application-defined. WSE does not enforce any topic names - define to
 | `system_events` | System-wide announcements |
 | `user_presence` | Online/offline status updates |
 
-Configure default topics via `auto_subscribe_topics` in your WSE server configuration.
+Subscribe connections to topics in your `drain_inbound()` event handler using `subscribe_connection(conn_id, topics)`.
 
 ## Protocol Negotiation
 
@@ -519,20 +471,24 @@ WSE{
   "t": "server_hello",
   "v": 1,
   "p": {
-    "server_version": "1.5.0",
+    "server_version": "2.0.0",
     "protocol_version": 1,
-    "negotiated_features": {
+    "features": {
       "compression": true,
-      "batch_messages": true,
-      "encryption": true,
-      "msgpack": false
+      "recovery": true,
+      "cluster": false,
+      "batching": true,
+      "priority_queue": true,
+      "msgpack": true
     },
     "limits": {
       "max_message_size": 1048576,
-      "max_subscriptions": 1000,
       "rate_limit_capacity": 100000,
-      "rate_limit_refill_rate": 10000
-    }
+      "rate_limit_refill": 10000
+    },
+    "ping_interval": 25000,
+    "connection_id": "conn-abc-123",
+    "server_time": "2026-02-28T12:00:00.000Z"
   }
 }
 ```
@@ -541,10 +497,13 @@ WSE{
 |-------|------|-------------|
 | `server_version` | `string` | WSE server version |
 | `protocol_version` | `int` | Negotiated protocol version (minimum of client and server) |
-| `negotiated_features` | `object` | Final feature set (intersection of client request and server support) |
+| `features` | `object` | Server feature flags (compression, recovery, cluster, batching, priority_queue, msgpack) |
 | `limits` | `object` | Server-enforced limits for this connection |
+| `ping_interval` | `int` | Server ping interval in milliseconds |
+| `connection_id` | `string` | Unique connection identifier |
+| `server_time` | `string` | Server wall clock (ISO 8601) |
 
-Feature negotiation uses the intersection of client-requested and server-supported features. The negotiated protocol version is the minimum of both sides.
+The negotiated protocol version is the minimum of both sides.
 
 ## Server-Initiated Ping
 
@@ -557,7 +516,7 @@ The server sends periodic ping messages to detect stale connections and measure 
 ### Ping Message
 
 ```json
-WSE{"t":"PING","p":{"timestamp":1708441800000},"v":1}
+WSE{"t":"ping","p":{"server_time":"2026-02-28T12:00:00.000Z"}}
 ```
 
 ### Expected Pong Response
@@ -568,7 +527,7 @@ The client must respond with a PONG containing both the original server timestam
 {"t":"PONG","p":{"client_timestamp":1708441800050,"server_timestamp":1708441800000}}
 ```
 
-The server uses the round-trip time (server receive time minus `timestamp`) to track connection health metrics. Clients that fail to respond within the zombie detection window are disconnected with close code 1000.
+The server uses the round-trip time to track connection health metrics. Clients that fail to respond within the zombie detection window are disconnected with close code 1000.
 
 ## Rate Limit Feedback
 
@@ -587,10 +546,10 @@ When 80% of the bucket is consumed (20% remaining), the server sends a warning:
 
 ```json
 WSE{"t":"rate_limit_warning","v":1,"p":{
+  "current_rate": 80000,
+  "limit": 100000,
   "remaining": 20000,
-  "capacity": 100000,
-  "refill_rate": 10000,
-  "message": "Approaching rate limit"
+  "retry_after": 1.0
 }}
 ```
 
@@ -604,7 +563,7 @@ When the bucket is empty, the server rejects messages with an error:
 WSE{"t":"error","v":1,"p":{
   "code": "RATE_LIMITED",
   "message": "Rate limit exceeded",
-  "retry_after_ms": 100
+  "retry_after": 1.0
 }}
 ```
 
@@ -612,6 +571,6 @@ WSE{"t":"error","v":1,"p":{
 |-------|------|-------------|
 | `code` | `string` | Error code (`RATE_LIMITED`) |
 | `message` | `string` | Human-readable description |
-| `retry_after_ms` | `int` | Suggested backoff before retrying (milliseconds) |
+| `retry_after` | `float` | Suggested backoff before retrying (seconds) |
 
-The connection is not closed on rate limit violation. The client should stop sending, wait for `retry_after_ms`, and resume at a lower rate. Persistent violations may trigger the circuit breaker, which closes the connection with code 1011.
+The connection is not closed on rate limit violation. The client should stop sending, wait for `retry_after` seconds, and resume at a lower rate. Persistent violations may trigger the circuit breaker, which closes the connection with code 1011.

@@ -4,7 +4,7 @@ Async usage::
 
     from wse_client import connect
 
-    async with connect("ws://localhost:5006/wse", token="your-jwt") as client:
+    async with connect("ws://localhost:5007/wse", token="your-jwt") as client:
         await client.subscribe(["notifications"])
         async for event in client:
             print(event.type, event.payload)
@@ -13,7 +13,7 @@ Sync usage::
 
     from wse_client import SyncWSEClient
 
-    client = SyncWSEClient("ws://localhost:5006/wse", token="your-jwt")
+    client = SyncWSEClient("ws://localhost:5007/wse", token="your-jwt")
     client.connect()
     event = client.recv(timeout=5.0)
     client.close()
@@ -45,6 +45,7 @@ from .types import (
     LoadBalancingStrategy,
     MessagePriority,
     ReconnectConfig,
+    ReconnectMode,
     WSEEvent,
 )
 
@@ -60,7 +61,7 @@ def connect(
     ``reconnect``, ``extra_headers``, ``queue_size``.
 
     Args:
-        url: WebSocket server URL, e.g. ``"ws://localhost:5006/wse"``.
+        url: WebSocket server URL, e.g. ``"ws://localhost:5007/wse"``.
         **kwargs: Passed to :class:`AsyncWSEClient`.
 
     Returns:
@@ -72,7 +73,7 @@ def connect(
 
     Example::
 
-        async with connect("ws://localhost:5006/wse", token="jwt") as client:
+        async with connect("ws://localhost:5007/wse", token="jwt") as client:
             await client.subscribe(["notifications"])
             async for event in client:
                 print(event.type, event.payload)
@@ -92,6 +93,7 @@ __all__ = [
     "ConnectionStats",
     "MessagePriority",
     "ReconnectConfig",
+    "ReconnectMode",
     "LoadBalancingStrategy",
     "WSEError",
     "WSEConnectionError",

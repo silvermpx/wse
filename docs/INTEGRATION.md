@@ -23,7 +23,7 @@ import time
 server = RustWSEServer(
     "0.0.0.0", 5007,
     max_connections=10_000,
-    jwt_secret=b"your-secret-key",
+    jwt_secret=b"replace-with-a-strong-secret-key!",
     jwt_issuer="my-app",
     jwt_audience="my-api",
 )
@@ -61,7 +61,7 @@ Configure `jwt_secret`, `jwt_issuer`, and `jwt_audience` in the constructor. The
 token = rust_jwt_encode(
     {"sub": "user-1", "iss": "my-app", "aud": "my-api",
      "exp": int(time.time()) + 3600, "iat": int(time.time())},
-    b"your-secret-key",
+    b"replace-with-a-strong-secret-key!",
 )
 ```
 
@@ -87,6 +87,7 @@ while True:
 
         if event_type == "auth_connect":
             user_id = ev[2]
+            server.subscribe_connection(conn_id, ["updates"])
         elif event_type == "msg":
             data = ev[2]  # parsed dict
         elif event_type == "raw":
@@ -97,9 +98,13 @@ while True:
             pass
         elif event_type == "connect":
             cookies = ev[2]  # no-auth mode only
+        elif event_type == "presence_join":
+            info = ev[2]    # {"topic": ..., "user_id": ..., "data": ...}
+        elif event_type == "presence_leave":
+            info = ev[2]    # {"topic": ..., "user_id": ..., "data": ...}
 ```
 
-**`drain_inbound(batch_size, timeout_ms)`** - blocks up to `timeout_ms` waiting for the first event, then drains up to `batch_size` events without blocking. Returns a list of tuples.
+**`drain_inbound(batch_size, timeout_ms)`** - blocks up to `timeout_ms` waiting for the first event, then drains up to `batch_size` events without blocking. Returns a list of tuples. The GIL is released during the channel wait and acquired once for the entire batch.
 
 ### Event Types
 
@@ -110,7 +115,9 @@ while True:
 | `"msg"` | Client sent WSE-prefixed JSON | parsed dict |
 | `"raw"` | Client sent non-JSON text | raw string |
 | `"bin"` | Client sent binary frame | bytes |
-| `"disconnect"` | Connection closed | (none) |
+| `"disconnect"` | Connection closed | None |
+| `"presence_join"` | User's first connection joined a topic | dict: topic, user_id, data |
+| `"presence_leave"` | User's last connection left a topic | dict: topic, user_id, data |
 
 ### Callback Mode (alternative)
 
@@ -130,7 +137,7 @@ server.set_callbacks(on_connect, on_message, on_disconnect)
 server.start()
 ```
 
-Drain mode is recommended for production workloads - it batches events efficiently and gives you explicit control over backpressure.
+Drain mode is recommended for production workloads - it batches events efficiently and gives you explicit control over backpressure. Callbacks use `spawn_blocking` per invocation, which acquires the GIL more frequently.
 
 ---
 
@@ -152,7 +159,7 @@ server.broadcast_all('WSE{"t":"notification","p":{},"v":1}')
 # Broadcast to topic subscribers (local instance only)
 server.broadcast_local("prices", '{"t":"price","p":{"symbol":"AAPL","price":187.42}}')
 
-# Broadcast to topic subscribers (local + Redis + cluster peers)
+# Broadcast to topic subscribers (local + cluster peers)
 server.broadcast("prices", '{"t":"price","p":{"symbol":"AAPL","price":187.42}}')
 ```
 
@@ -163,11 +170,12 @@ server.broadcast("prices", '{"t":"price","p":{"symbol":"AAPL","price":187.42}}')
 | `send(conn_id, text)` | Single connection | Direct text messages |
 | `send_bytes(conn_id, data)` | Single connection | Binary data |
 | `send_event(conn_id, dict)` | Single connection | Structured events (auto-serialized) |
-| `broadcast_all(text)` | All connections | Global announcements |
+| `broadcast_all(text)` | All connections | Global announcements (text) |
+| `broadcast_all_bytes(data)` | All connections | Global announcements (binary) |
 | `broadcast_local(topic, text)` | Topic subscribers (local) | Single-instance topic fan-out |
 | `broadcast(topic, text)` | Topic subscribers (all instances) | Multi-instance topic fan-out |
 
-`broadcast_all` and `broadcast_local` never touch the network - they fan out directly to local connections. `broadcast` additionally forwards to cluster peers and Redis subscribers.
+`broadcast_all` and `broadcast_local` never touch the network - they fan out directly to local connections. `broadcast` additionally forwards to cluster peers via the native TCP mesh protocol.
 
 ---
 
@@ -251,8 +259,8 @@ The following events appear in `drain_inbound()`:
 
 | Event Type | Trigger | ev[2] payload |
 |------------|---------|---------------|
-| `"presence_join"` | First connection for a user subscribes to a topic | `{"user_id": "...", "data": {...}}` |
-| `"presence_leave"` | Last connection for a user leaves a topic | `{"user_id": "...", "data": {...}}` |
+| `"presence_join"` | First connection for a user subscribes to a topic | `{"topic": "...", "user_id": "...", "data": {...}}` |
+| `"presence_leave"` | Last connection for a user leaves a topic | `{"topic": "...", "user_id": "...", "data": {...}}` |
 
 These events are also broadcast to all WebSocket subscribers of the topic as structured messages:
 
@@ -380,9 +388,18 @@ Returns a dict with the current server state:
     "recovery_topic_count": 5,
     "recovery_total_bytes": 1048576,
     "cluster_connected": True,
-    "cluster_peers": 2,
+    "cluster_peer_count": 2,
     "cluster_messages_sent": 50000,
     "cluster_messages_delivered": 49950,
+    "cluster_messages_dropped": 0,
+    "cluster_bytes_sent": 1048576,
+    "cluster_bytes_received": 1024000,
+    "cluster_reconnect_count": 0,
+    "cluster_unknown_message_types": 0,
+    "cluster_dlq_size": 0,
+    "presence_enabled": True,
+    "presence_topics": 3,
+    "presence_total_users": 25,
 }
 ```
 
@@ -396,9 +413,18 @@ Returns a dict with the current server state:
 | `recovery_topic_count` | Topics with active recovery buffers |
 | `recovery_total_bytes` | Memory used by recovery buffers |
 | `cluster_connected` | Whether cluster mesh is active |
-| `cluster_peers` | Number of connected cluster peers |
+| `cluster_peer_count` | Number of connected cluster peers |
 | `cluster_messages_sent` | Total messages forwarded to peers |
 | `cluster_messages_delivered` | Total messages received from peers |
+| `cluster_messages_dropped` | Messages that failed to send to peers |
+| `cluster_bytes_sent` | Total bytes sent to peers |
+| `cluster_bytes_received` | Total bytes received from peers |
+| `cluster_reconnect_count` | Number of peer reconnections |
+| `cluster_unknown_message_types` | Unrecognized frame types received |
+| `cluster_dlq_size` | Dead letter queue entries |
+| `presence_enabled` | Whether presence tracking is active |
+| `presence_topics` | Topics with active presence tracking |
+| `presence_total_users` | Total tracked users across all topics |
 
 ---
 
@@ -417,6 +443,9 @@ server.disconnect(conn_id)
 # Check queue stats
 depth = server.inbound_queue_depth()
 dropped = server.inbound_dropped_count()
+
+# Retrieve failed cluster messages from dead letter queue
+dlq = server.get_cluster_dlq_entries()
 ```
 
 `get_connection_count()` is lock-free and safe to call at high frequency (e.g., in health check endpoints). `get_connections()` takes a snapshot of all connection IDs and is slightly more expensive.
@@ -468,21 +497,46 @@ Both clients handle reconnection with exponential backoff, automatic resubscript
 
 ## 13. Production Deployment
 
-**Server sizing:**
-- Set `max_connections` based on available memory - approximately 1 KB per idle connection
-- Use `drain_inbound(256, 50)` for optimal throughput (batch size 256, timeout 50ms)
-- Monitor `health_snapshot()` for queue depth, dropped events, and cluster status
+### Server Sizing
 
-**TLS termination:**
-- Run behind a reverse proxy (nginx, HAProxy) for TLS termination on client-facing connections
-- Use mTLS for cluster peer connections in production
+- Set `max_connections` based on available memory. Approximately 1 KB per idle connection, more under active message flow.
+- Use `drain_inbound(256, 50)` for optimal throughput. Batch size 256 amortizes GIL acquisition. Timeout 50ms balances latency and CPU usage.
+- Monitor `health_snapshot()` for queue depth and dropped events. A non-zero `inbound_dropped` indicates the drain loop is too slow.
 
-**Recovery:**
-- Enable recovery for topics where missed messages matter (e.g., chat, order updates)
-- Set `recovery_memory_budget` to cap total memory usage across all recovery buffers
-- Choose `recovery_buffer_size` as a power of 2 based on your expected message rate and reconnect window
+### TLS Termination
 
-**Cluster scaling:**
-- Use cluster mode for horizontal scaling across multiple nodes
-- Gossip discovery reduces configuration overhead - new nodes only need seed addresses
-- Interest-based routing ensures messages are only forwarded to peers with active subscribers
+- Run behind a reverse proxy (nginx, HAProxy, Caddy) for TLS on client-facing connections. WSE serves WebSocket over plain TCP.
+- Use mTLS for cluster peer connections in production. Configure `tls_ca`, `tls_cert`, `tls_key` in `connect_cluster()`.
+- Always use `wss://` in production. The `access_token` cookie has `Secure` flag, which requires HTTPS.
+
+### Recovery Configuration
+
+- Enable recovery for topics where missed messages matter (chat, order updates, notifications).
+- Set `recovery_memory_budget` to cap total memory across all topic buffers. Default 256 MB is suitable for most workloads.
+- Choose `recovery_buffer_size` as a power of 2 based on message rate and expected reconnect window. For example: 1000 msg/s with 30s reconnect window needs at least 32768 slots.
+- Recovery is local to each node. For cluster deployments, use sticky sessions (HAProxy `stick-table`, consistent hashing) to route clients back to the same node.
+
+### Cluster Scaling
+
+- Start with cluster mode when a single instance cannot handle the connection count or you need geographic distribution.
+- Gossip discovery reduces configuration overhead. New nodes only need one seed address to join.
+- Interest-based routing reduces inter-node bandwidth. Only topics with active subscribers on both nodes generate cross-node traffic.
+- Monitor cluster health via `cluster_peers_count()` and the `cluster_messages_sent`/`cluster_messages_delivered` counters in `health_snapshot()`.
+
+### Presence in Production
+
+- Presence data size is bounded by `presence_max_data_size` (default 4 KB per user). Keep presence payloads small - status, display name, avatar URL.
+- Use `presence_stats()` instead of `presence()` for health checks and dashboards. It returns O(1) counts without iterating members.
+- In cluster mode, presence sync adds one PresenceUpdate frame per join/leave/update event. A full presence sync (PresenceFull frame) is sent when a new peer connects.
+
+### Monitoring
+
+Key metrics to watch:
+
+| Metric | Source | Alert Threshold |
+|--------|--------|-----------------|
+| `inbound_dropped` | `health_snapshot()` | > 0 |
+| `inbound_queue_depth` | `health_snapshot()` | > 50% of `max_inbound_queue_size` |
+| `cluster_peer_count` | `health_snapshot()` | < expected peer count |
+| `recovery_total_bytes` | `health_snapshot()` | > 80% of `recovery_memory_budget` |
+| Connection count | `get_connection_count()` | > 90% of `max_connections` |

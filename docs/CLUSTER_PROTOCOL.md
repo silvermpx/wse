@@ -91,7 +91,7 @@ Sent when a node is shutting down cleanly. The receiving peer removes the sender
 
 Sent when the first local client on a node subscribes to a topic. The receiving peer records this interest so it can route matching MSG frames to the sender.
 
-Topic patterns support glob-style matching (e.g., `chat.*`, `prices.*.usd`).
+Topics are matched by exact string comparison.
 
 ### UNSUB (0x07) - Topic Unsubscribe
 
@@ -196,7 +196,7 @@ MSG frames with payloads above 256 bytes may be zstd-compressed when both peers 
 
 Compression is opportunistic: the sender compresses the payload and only uses the compressed form if it is smaller than the original. If compression does not reduce size, the uncompressed payload is sent with FLAG_COMPRESSED cleared.
 
-**Decompression bomb protection**: the receiver rejects any frame where the decompressed-to-compressed size ratio exceeds 100:1, and rejects compressed payloads smaller than 8 bytes (insufficient for a valid zstd frame). Maximum decompressed size is capped at 1 MB (MAX_FRAME_SIZE). This prevents a malicious or corrupted peer from sending a small compressed payload that expands into an arbitrarily large buffer.
+**Decompression bomb protection**: decompressed output is capped at 1 MB (MAX_FRAME_SIZE) via `zstd::bulk::decompress`. This prevents a malicious or corrupted peer from sending a small compressed payload that expands into an arbitrarily large buffer.
 
 ## mTLS
 
@@ -209,7 +209,7 @@ Optional mutual TLS provides authentication and encryption for inter-node traffi
 | Client verification | WebPkiClientVerifier (mutual) |
 | Certificate model | Single cert/key pair for both server and client roles |
 
-**Configuration**: pass `ca_cert`, `node_cert`, and `node_key` file paths to `connect_cluster()`. All three must be PEM-encoded. The node certificate is used for both accepting inbound connections (server role) and initiating outbound connections (client role).
+**Configuration**: pass `tls_ca`, `tls_cert`, and `tls_key` file paths to `connect_cluster()`. All three must be PEM-encoded. The node certificate is used for both accepting inbound connections (server role) and initiating outbound connections (client role).
 
 When TLS is configured, all peer connections are upgraded to TLS immediately after TCP connect, before the HELLO handshake. Plaintext connections are not accepted when TLS is enabled.
 

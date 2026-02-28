@@ -22,17 +22,19 @@ RustWSEServer (PyO3)
     |     +-- Recovery cleanup task
     |
     +-- SharedState
-          +-- connections: DashMap<String, ConnectionHandle>
-          +-- topic_subscribers: DashMap<String, DashSet<String>>
+          +-- connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>
+          +-- topic_subscribers: Arc<DashMap<String, DashSet<String>>>
           +-- conn_topics: DashMap<String, DashSet<String>>
+          +-- conn_formats: DashMap<String, bool>
           +-- conn_rates: DashMap<String, PerConnRate>
           +-- conn_last_activity: DashMap<String, Instant>
+          +-- connection_count: AtomicUsize
           +-- inbound_tx/rx: crossbeam bounded channel
-          +-- recovery: Option<RecoveryManager>
-          +-- presence: Option<PresenceManager>
-          +-- cluster_cmd_tx: Option<Sender<ClusterCommand>>
+          +-- recovery: Option<Arc<RecoveryManager>>
+          +-- presence: Option<Arc<PresenceManager>>
+          +-- cluster_cmd_tx: RwLock<Option<Sender<ClusterCommand>>>
           +-- cluster_metrics: Arc<ClusterMetrics>
-          +-- dedup: Mutex<DeduplicationState>
+          +-- cluster_dlq: Arc<Mutex<ClusterDlq>>
 ```
 
 ---
@@ -140,6 +142,8 @@ Python callbacks are invoked via `spawn_blocking` to run off tokio worker thread
 | `"raw"`        | Unparsed text string                    |
 | `"bin"`        | Raw bytes                               |
 | `"disconnect"` | None                                    |
+| `"presence_join"` | dict: user_id, topic, data           |
+| `"presence_leave"` | dict: user_id, topic, data          |
 
 ### GIL Management
 
@@ -153,7 +157,7 @@ Python callbacks are invoked via `spawn_blocking` to run off tokio worker thread
 ```
 Python                          Rust Behavior
 ------                          -------------
-server.send(conn_id, data)   -> Serialize to JSON/msgpack, send via connection channel
+server.send(conn_id, data)   -> Send raw text frame via connection channel
 server.broadcast_all(data)   -> Pre-frame once, fan-out to all connections
 server.broadcast_local(t, d) -> Topic lookup, fan-out to matching subscribers
 server.broadcast(t, d)       -> Local fan-out + ClusterCommand::Publish to peers
@@ -182,7 +186,7 @@ server.send(conn_id, event_dict)
   -> Rate limit check (token bucket)
   -> Serialize: JSON with serde_json, or msgpack via rmpv
   -> Compress if above threshold (zlib)
-  -> Build WSE envelope: {"e": type, "d": payload, "id": uuid, "t": timestamp, "v": 1}
+  -> Build WSE envelope: {"t": type, "p": payload, "id": uuid, "seq": N, "ts": timestamp, "v": 1}
   -> Send through connection's mpsc channel
   -> Write task: tungstenite feed() + flush()
 ```
@@ -234,20 +238,22 @@ Binary frame format - 8-byte header followed by topic and payload:
   1 byte   1 byte  2 bytes     4 bytes       var     var
 ```
 
-Ten message types:
+Twelve message types:
 
-| Type (u8) | Name         | Purpose                                  |
-|-----------|--------------|------------------------------------------|
-| 0x01      | MSG          | Topic message payload                    |
-| 0x02      | PING         | Heartbeat request                        |
-| 0x03      | PONG         | Heartbeat response                       |
-| 0x04      | HELLO        | Handshake with capabilities              |
-| 0x05      | SHUTDOWN     | Graceful disconnect notification         |
-| 0x06      | SUB          | Subscribe to topic (interest routing)    |
-| 0x07      | UNSUB        | Unsubscribe from topic                   |
-| 0x08      | RESYNC       | Full topic set synchronization           |
-| 0x09      | PeerAnnounce | Gossip: announce a new peer address      |
-| 0x0A      | PeerList     | Gossip: share known peer list            |
+| Type (u8) | Name           | Purpose                                  |
+|-----------|----------------|------------------------------------------|
+| 0x01      | MSG            | Topic message payload                    |
+| 0x02      | PING           | Heartbeat request                        |
+| 0x03      | PONG           | Heartbeat response                       |
+| 0x04      | HELLO          | Handshake with capabilities              |
+| 0x05      | SHUTDOWN       | Graceful disconnect notification         |
+| 0x06      | SUB            | Subscribe to topic (interest routing)    |
+| 0x07      | UNSUB          | Unsubscribe from topic                   |
+| 0x08      | RESYNC         | Full topic set synchronization           |
+| 0x09      | PeerAnnounce   | Gossip: announce a new peer address      |
+| 0x0A      | PeerList       | Gossip: share known peer list            |
+| 0x0B      | PresenceUpdate | Presence join/leave/update for one user  |
+| 0x0C      | PresenceFull   | Full presence state sync on peer connect |
 
 ### Handshake
 
@@ -267,6 +273,7 @@ Capability negotiation uses bitwise AND of both peers' capability fields. Curren
 |-----|-----------------------|----------------------------|
 | 0   | CAP_INTEREST_ROUTING  | SUB/UNSUB/RESYNC support   |
 | 1   | CAP_COMPRESSION       | zstd inter-peer compression|
+| 2   | CAP_PRESENCE          | Presence sync frames       |
 
 ### Interest-Based Routing
 
@@ -299,7 +306,7 @@ Cluster connections support mutual TLS using rustls + tokio-rustls:
 - **P-256 certificates** with WebPKI validation.
 - A single node certificate and key is used for both server (accept) and client (connect) roles.
 - **WebPkiClientVerifier** requires all connecting peers to present a valid certificate signed by the shared CA.
-- Configuration: `cert_path`, `key_path`, `ca_path` (PEM format).
+- Configuration: `tls_cert`, `tls_key`, `tls_ca` (PEM format).
 
 ### Reliability
 
@@ -458,7 +465,7 @@ The single largest optimization. For a broadcast to N connections, the WebSocket
 
 ### DashMap
 
-All shared state maps (`connections`, `topic_subscribers`, `conn_topics`, `conn_rates`, `conn_last_activity`) use `DashMap` - a sharded concurrent hash map. This eliminates reader-writer lock contention on the global connections map during fan-out and subscription management.
+Most shared state maps (`topic_subscribers`, `conn_topics`, `conn_formats`, `conn_rates`, `conn_last_activity`) use `DashMap` - a sharded concurrent hash map. The `connections` map uses `Arc<RwLock<HashMap>>` since connection registration and removal are relatively infrequent compared to reads during fan-out.
 
 ### Vectored Writes (writev)
 
@@ -666,10 +673,6 @@ When `broadcast(topic, data)` is called:
 4. MSG frame sent only to peers with matching topic subscriptions.
 5. Receiving peers dispatch to their local subscribers via `collect_topic_senders()`.
 
-### Multi-Instance (Redis, Optional)
-
-For deployments where direct TCP mesh is not feasible, `broadcast(topic, data)` can coordinate through Redis pub/sub. The server publishes to a Redis channel; all instances subscribed to that channel receive and fan out locally. Redis is used only as a coordination layer - all WebSocket I/O remains in Rust.
-
 ---
 
 ## Concurrency Model Summary
@@ -678,9 +681,10 @@ For deployments where direct TCP mesh is not feasible, `broadcast(topic, data)` 
 +-------------------+----------------------------+---------------------------+
 | Component         | Concurrency Primitive      | Access Pattern            |
 +-------------------+----------------------------+---------------------------+
-| connections       | DashMap (sharded)           | Concurrent read/write     |
-| topic_subscribers | DashMap<String, DashSet>    | Concurrent read/write     |
+| connections       | Arc<RwLock<HashMap>>        | Read-heavy, write on connect/disconnect |
+| topic_subscribers | Arc<DashMap<String, DashSet>>| Concurrent read/write     |
 | conn_topics       | DashMap<String, DashSet>    | Concurrent read/write     |
+| conn_formats      | DashMap<String, bool>       | Per-connection read/write  |
 | conn_rates        | DashMap                     | Per-connection write       |
 | conn_last_activity| DashMap                     | Per-connection write       |
 | inbound channel   | crossbeam bounded channel   | MPSC, lock-free           |

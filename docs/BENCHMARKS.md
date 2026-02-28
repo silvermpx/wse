@@ -36,7 +36,7 @@ full Python wrapper with drain_mode, JWT auth, the whole stack.
 | Peak throughput (JSON) | **14.2M msg/s** (2.5 GB/s) | Rust client, 500 conns |
 | Peak throughput (binary) | **30M msg/s** | Rust client, 100 conns |
 | Fan-out broadcast | **2.1M del/s** | 500K subs, 0 gaps |
-| Fan-out multi-instance | **1.04M del/s** | Redis 8.6, pipelined, 0 gaps |
+| Fan-out cluster (2 nodes) | **9.5M del/s** | Native TCP mesh, 20K subs, 0 gaps |
 | Peak message rate | **19.4M msg/s** | Rust client, 64B payload |
 | Throughput at 50K conns | **13.8M msg/s** (2.4 GB/s) | Rust client |
 | Max concurrent connections | **500,000** (0 errors) | Rust client |
@@ -101,8 +101,8 @@ Hashrocket WebSocket Shootout (i7-4790K), Lemire ws benchmark (Xeon Gold).
 | E2E encryption | AES-GCM-256 + ECDH | No | No | No | No |
 | Message signing | HMAC-SHA256 | HMAC-SHA256 | No | No | No |
 | Message ordering | Sequence + gap detect | Sequence numbers | No | No | No |
-| Dead letter queue | Redis-backed | No | No | No | No |
-| Multi-instance | Redis Pub/Sub | Redis/Nats/Tarantool | Manual | Redis adapter | Manual |
+| Dead letter queue | In-memory ring buffer | No | No | No | No |
+| Multi-instance | Native TCP cluster | Redis/Nats/Tarantool | Manual | Redis adapter | Manual |
 | Health monitoring | Quality scoring | No | No | No | No |
 | React integration | useWSE hook + Zustand | JS client | No | React adapter | No |
 

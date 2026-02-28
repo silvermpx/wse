@@ -414,7 +414,7 @@ export interface UseWSEReturn {
   downloadDiagnostics: () => void;
   clearOfflineQueue: () => Promise<void>;
   getQueueSize: () => number;
-  requestSnapshot: () => void;
+  requestSnapshot: (topics?: string[]) => void;
   debugHandlers: () => void;
 }
 

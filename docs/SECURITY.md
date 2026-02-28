@@ -32,16 +32,16 @@ The Rust server reads authentication credentials in this order:
 
 Both paths use HS256 (HMAC-SHA256) JWT validation.
 
-### Rust JWT (recommended, v1.2+)
+### JWT Validation
 
-When `jwt_secret` is configured on the `RustWSEServer`, JWT validation happens entirely in Rust during the WebSocket handshake - zero Python involvement, zero GIL acquisition:
+JWT validation runs entirely in Rust during the WebSocket handshake. Zero Python involvement, zero GIL acquisition.
 
 ```python
 server = RustWSEServer(
     host="0.0.0.0",
     port=5006,
     max_connections=10000,
-    jwt_secret=b"your-secret-key",
+    jwt_secret=b"replace-with-a-strong-secret-key!",
     jwt_issuer="your-app",      # optional: validate iss claim
     jwt_audience="your-api",    # optional: validate aud claim
 )
@@ -49,31 +49,30 @@ server = RustWSEServer(
 
 The Rust server extracts the `access_token` cookie from the HTTP upgrade headers and validates:
 1. HS256 signature (constant-time comparison)
-2. `exp` claim (reject expired tokens)
+2. `exp` claim (reject expired tokens, boundary check per RFC 7519)
 3. `iss` claim (if `jwt_issuer` configured)
 4. `aud` claim (if `jwt_audience` configured)
 
-On success, the server sends `server_ready` directly from Rust and pushes an `AuthConnect` event to the drain queue with the validated `user_id`. Python receives the pre-validated user ID and skips JWT decode entirely.
+On success, the server sends `server_ready` directly from Rust and pushes an `AuthConnect` event to the drain queue with the validated `user_id`.
 
-**Performance:** 0.01ms per JWT decode in Rust vs ~0.85ms in Python (85x faster). Connection latency drops from ~23ms to 0.53ms median.
+**Performance:** 0.01ms per JWT decode. Connection latency: 0.53ms median.
 
-### Python JWT (fallback)
-
-When `jwt_secret` is not configured, the server falls back to Python-based JWT validation via the `auth_handler` callback. The server checks:
-
-1. **HTTP-only cookie**: `access_token` cookie (primary)
-2. **Authorization header**: `Authorization: Bearer <JWT>` (fallback)
-
-Token requirements:
+**Token requirements:**
 ```json
 {
-  "sub": "<user-uuid>",
+  "sub": "<user-id>",
   "exp": 1708441800,
-  "iat": 1708440000
+  "iat": 1708440000,
+  "iss": "your-app",
+  "aud": "your-api"
 }
 ```
 
-On authentication failure (both paths):
+The `sub` claim is returned as `user_id` in the `auth_connect` drain event. `iss` and `aud` are validated only if configured in the constructor.
+
+When `jwt_secret` is `None`, authentication is disabled and all connections receive a `connect` event instead of `auth_connect`.
+
+On authentication failure:
 - Server sends `error` message with code `AUTH_FAILED`
 - Connection closed with code `4401`
 
@@ -172,12 +171,13 @@ WSE supports optional E2E encryption using Web Crypto API:
 E:<IV (12 bytes)><AES-GCM ciphertext>
 ```
 
-**Backend encryption:**
-- Uses Fernet (symmetric) from the security layer
-- Channel-specific tokens with 1-hour expiry
-- Key rotation support via environment variables
+**Server-side encryption (Rust):**
+- ECDH P-256 key pair generated per connection via `p256` crate
+- Session key derivation via HKDF-SHA256 (salt: `wse-encryption`, info: `aes-gcm-key`)
+- AES-GCM-256 encrypt/decrypt via `aes-gcm` crate
+- Per-connection key lifecycle: generate on handshake, derive on client key exchange, clear on disconnect
 
-**Frontend encryption (`security.ts`):**
+**Client-side encryption (`security.ts`):**
 - AES-GCM-256 with unique IVs per message (IV reuse prevention)
 - Nonce cache for replay attack prevention (5-minute window, 10K max)
 - Automatic key rotation (configurable interval, default: 1 hour)
@@ -185,17 +185,24 @@ E:<IV (12 bytes)><AES-GCM ciphertext>
 - Cleanup on destroy (keys, timers, caches cleared from memory)
 
 **Enable encryption:**
+
 ```typescript
-// Frontend - useWSE hook initializes SecurityManager automatically
+// TypeScript/React client
 const { } = useWSE({
   security: { encryptionEnabled: true },
 });
-
-// Backend (connect URL)
-ws://host:port/wse?token=<JWT>&encryption=true
 ```
 
-The `SecurityManager` singleton handles ECDH key exchange, AES-GCM encryption/decryption, and key rotation. The `MessageProcessor` automatically decrypts incoming `E:`-prefixed binary frames using `securityManager.decryptFromTransport()`.
+```python
+# Python client
+from wse_client import AsyncWSEClient
+
+# Encryption is negotiated during the handshake when crypto extras are installed
+async with AsyncWSEClient("ws://localhost:5006/wse", token="<jwt>") as client:
+    await client.subscribe(["secure-topic"])
+```
+
+The key exchange happens automatically during the `client_hello`/`server_hello` handshake. The `SecurityManager` handles ECDH key exchange, AES-GCM encryption/decryption, and key rotation. Incoming `E:`-prefixed binary frames are decrypted transparently by the message processor.
 
 ## Cluster Security
 
@@ -262,7 +269,7 @@ The frontend `RateLimiter` prevents excessive sends.
 ### Cluster Frame Protection
 
 - Maximum frame size: 1,048,576 bytes (1 MB)
-- zstd decompression bomb protection: ratio > 100:1 rejected, min 8 bytes compressed
+- zstd decompression output capped at 1 MB (MAX_FRAME_SIZE)
 - Protocol version validation in handshake
 - Unknown message types silently ignored (forward compatibility)
 
@@ -275,16 +282,20 @@ The frontend `RateLimiter` prevents excessive sends.
 
 ## Circuit Breaker
 
-Per-connection circuit breaker (Google SRE Chapter 22 pattern):
+**Cluster circuit breaker** (per-peer):
 
 | Parameter | Value |
 |-----------|-------|
 | Failure threshold | 10 |
-| Success threshold | 3 |
-| Reset timeout | 30 seconds |
-| Half-open max calls | 5 |
-| Window size | 50 |
-| Failure rate threshold | 30% |
+| Reset timeout | 60 seconds |
+| Half-open probe calls | 3 |
+
+**Client-side circuit breaker** (TypeScript/Python SDKs):
+
+| Parameter | Value |
+|-----------|-------|
+| Failure threshold | 5 |
+| Reset timeout | 60 seconds |
 
 States:
 - **CLOSED**: Normal operation

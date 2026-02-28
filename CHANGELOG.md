@@ -5,7 +5,7 @@
 ### Breaking Changes
 
 - **Standalone-only architecture**: the FastAPI Router mode has been removed. `RustWSEServer` is now the only deployment mode. All Python-side connection handling, message routing, and session management code has been removed in favor of the Rust implementation.
-- **Removed dependencies**: `fastapi`, `starlette`, and `redis` are no longer required. The `redis` package remains optional for hybrid deployments using `broadcast()`.
+- **Removed dependencies**: `fastapi`, `starlette`, and `redis` are no longer required.
 - **Removed modules**: `wse_server.router`, `wse_server.dependencies`, `wse_server.connection`, `wse_server.core.pubsub`, `wse_server.reliability`, `wse_server.metrics`
 
 ### Cluster Protocol (NEW)
@@ -17,7 +17,7 @@ Custom binary TCP mesh protocol replacing Redis pub/sub for multi-instance coord
 - **Wire protocol versioning**: version negotiated in HELLO handshake, minimum version enforcement, unknown message types silently ignored for forward compatibility
 - **mTLS**: mutual TLS via rustls + tokio-rustls with P-256 certificates and WebPkiClientVerifier for peer authentication on untrusted networks
 - **Dynamic peer discovery**: gossip-based discovery via PeerAnnounce/PeerList frames. New nodes only need one seed address to join the cluster
-- **Inter-peer compression**: zstd compression for messages above 256 bytes, capability-negotiated, with decompression bomb protection (10:1 ratio limit)
+- **Inter-peer compression**: zstd compression for messages above 256 bytes, capability-negotiated, decompression output capped at 1 MB
 - **Reliability**: per-peer circuit breaker (10 failures, 60s reset), exponential backoff reconnect, heartbeat (5s ping, 15s timeout), dead letter queue (1000 entries)
 
 ### Presence Tracking (NEW)
@@ -61,7 +61,7 @@ Per-topic ring buffer system for recovering missed messages on reconnect:
 ### Performance
 
 - **Pre-framed WebSocket broadcast**: frame built once per broadcast, raw bytes shared via Arc across all connections
-- **DashMap**: lock-free concurrent hash maps for connections, topics, rates, and activity tracking
+- **DashMap**: lock-free concurrent hash maps for topics, formats, rates, and activity tracking
 - **Vectored writes (writev)**: batch frame delivery via write_vectored syscall
 - **CPU-aware fan-out**: hybrid task chunking based on available CPU cores
 - **mimalloc**: global allocator for improved multi-threaded allocation
@@ -84,43 +84,43 @@ Per-topic ring buffer system for recovering missed messages on reconnect:
 
 Built-in Redis Pub/Sub module for multi-instance horizontal scaling:
 
-- **`publish(topic, data)`** — cross-instance message delivery via Redis with pipelined PUBLISH (up to 64 commands per round-trip, ~45K msg/s with Redis 8.6)
-- **`publish_local(topic, data)`** — single-instance topic fan-out without Redis (~2.1M del/s)
-- **`subscribe_connection(conn_id, topics)`** — topic subscriptions with exact match and glob patterns (`*`, `?`)
-- **PSUBSCRIBE wse:\*** — automatic Redis subscription, `wse:` prefix stripped for local topic routing
-- **Deduplication** — connections matching both exact and wildcard patterns receive messages once
+- **`publish(topic, data)`** - cross-instance message delivery via Redis with pipelined PUBLISH (up to 64 commands per round-trip, ~45K msg/s with Redis 8.6)
+- **`publish_local(topic, data)`** - single-instance topic fan-out without Redis (~2.1M del/s)
+- **`subscribe_connection(conn_id, topics)`** - topic subscriptions with exact match and glob patterns (`*`, `?`)
+- **PSUBSCRIBE wse:\*** - automatic Redis subscription, `wse:` prefix stripped for local topic routing
+- **Deduplication** - connections matching both exact and wildcard patterns receive messages once
 
 ### Reliability
 
 - **Auto-reconnection** with exponential backoff (1s initial, 1.5x multiplier, 60s max, +/-20% jitter)
-- **Circuit breaker** — two breakers (connection + publish), 10-failure threshold, 60s reset, HALF_OPEN probe with 3 test calls
-- **Dead Letter Queue** — in-memory ring buffer (1000 entries), populated on publish failure or circuit breaker open, drained via `get_dlq_entries()`
-- **Pipelined publish with retry** — batches up to 64 PUBLISH commands, retries 3x (100ms, 200ms delays), then DLQ
+- **Circuit breaker** - two breakers (connection + publish), 10-failure threshold, 60s reset, HALF_OPEN probe with 3 test calls
+- **Dead Letter Queue** - in-memory ring buffer (1000 entries), populated on publish failure or circuit breaker open, drained via `get_dlq_entries()`
+- **Pipelined publish with retry** - batches up to 64 PUBLISH commands, retries 3x (100ms, 200ms delays), then DLQ
 
 ### Health Monitoring
 
-- **`health_snapshot()`** — full server health dict: connections, queue depth, Redis status, all metrics, uptime
-- **`redis_connected()`** — Redis connection status (bool)
-- **Metrics** — AtomicU64 counters: messages received/published/delivered/dropped, publish errors, reconnect count
+- **`health_snapshot()`** - full server health dict: connections, queue depth, Redis status, all metrics, uptime
+- **`redis_connected()`** - Redis connection status (bool)
+- **Metrics** - AtomicU64 counters: messages received/published/delivered/dropped, publish errors, reconnect count
 
 ### Server Improvements
 
-- **Idle connection timeout** — configurable per-connection timeout (default 300s), reset on any message or ping
-- **Server uptime tracking** — `started_at` tracked, exposed in `health_snapshot()`
+- **Idle connection timeout** - configurable per-connection timeout (default 300s), reset on any message or ping
+- **Server uptime tracking** - `started_at` tracked, exposed in `health_snapshot()`
 
 ### Fan-out Benchmarks
 
 - **Single-instance broadcast**: 2.1M deliveries/s, 500K connections, zero message loss
 - **Multi-instance (Redis 8.6)**: 1.04M deliveries/s peak at 500 subscribers, zero gaps
-- **Fan-out benchmark suite** — `bench_fanout_server.py` (broadcast/pubsub/subscribe modes) + `wse-bench --test fanout-broadcast/fanout-multi`
+- **Fan-out benchmark suite** - `bench_fanout_server.py` (broadcast/pubsub/subscribe modes) + `wse-bench --test fanout-broadcast/fanout-multi`
 
 ## v1.3.9 (2026-02-24)
 
 ### Benchmarks
 
-- **TypeScript benchmark client** (`benchmarks/ts-bench/`) — 7-test suite matching the Rust bench, measuring Node.js consumer performance: 116K msg/s single-process, 7.0M msg/s at 64 processes (97% linear scaling), 64K+ stable connections, 100% hold survival
-- **Rust benchmark client** (`benchmarks/rust-bench/`) — confirmed 14.2M msg/s JSON, 30M msg/s binary, 500K connections with zero failures on EPYC 7502P
-- **Full cross-client benchmark documentation** — Rust, Python, and TypeScript results with per-tier breakdowns, latency percentiles, payload size matrices, and format comparisons
+- **TypeScript benchmark client** (`benchmarks/ts-bench/`) - 7-test suite matching the Rust bench, measuring Node.js consumer performance: 116K msg/s single-process, 7.0M msg/s at 64 processes (97% linear scaling), 64K+ stable connections, 100% hold survival
+- **Rust benchmark client** (`benchmarks/rust-bench/`) - confirmed 14.2M msg/s JSON, 30M msg/s binary, 500K connections with zero failures on EPYC 7502P
+- **Full cross-client benchmark documentation** - Rust, Python, and TypeScript results with per-tier breakdowns, latency percentiles, payload size matrices, and format comparisons
 
 ### Bug Fixes (TypeScript Benchmark)
 
@@ -131,16 +131,16 @@ Built-in Redis Pub/Sub module for multi-instance horizontal scaling:
 
 ### Bug Fixes (Rust Server)
 
-- Fixed `push_inbound` only counting `Full` errors — now counts all send failures including channel disconnect during shutdown (was silently dropping events without incrementing `inbound_dropped`)
-- Fixed inconsistent queue size cap between standalone (uncapped) and embedded (65536) — both now cap at 131072
+- Fixed `push_inbound` only counting `Full` errors - now counts all send failures including channel disconnect during shutdown (was silently dropping events without incrementing `inbound_dropped`)
+- Fixed inconsistent queue size cap between standalone (uncapped) and embedded (65536) - both now cap at 131072
 
 ## v1.3.7 (2026-02-24)
 
 ### Performance Fix (Rust Server)
 
-- **Replaced `Mutex<VecDeque>` with `crossbeam-channel` in drain mode** — eliminates lock contention when N Tokio tasks push to the inbound queue simultaneously. `try_send()` is lock-free (atomic CAS), replacing `Mutex::lock()` which blocked Tokio worker threads under high concurrency.
-- **Bounded inbound queue** — added `max_inbound_queue_size` (default 65536) to prevent OOM under sustained load. When full, new events are dropped (back-pressure) instead of unbounded growth.
-- **Drain mode throughput now matches non-drain mode** — benchmarked at 6.9M msg/s at 1000 connections (was 178K msg/s with Mutex, 38x improvement). Zero overhead from the channel.
+- **Replaced `Mutex<VecDeque>` with `crossbeam-channel` in drain mode** - eliminates lock contention when N Tokio tasks push to the inbound queue simultaneously. `try_send()` is lock-free (atomic CAS), replacing `Mutex::lock()` which blocked Tokio worker threads under high concurrency.
+- **Bounded inbound queue** - added `max_inbound_queue_size` (default 65536) to prevent OOM under sustained load. When full, new events are dropped (back-pressure) instead of unbounded growth.
+- **Drain mode throughput now matches non-drain mode** - benchmarked at 6.9M msg/s at 1000 connections (was 178K msg/s with Mutex, 38x improvement). Zero overhead from the channel.
 
 ### Dependencies
 
@@ -184,7 +184,7 @@ Built-in Redis Pub/Sub module for multi-instance horizontal scaling:
 
 ### Bug Fixes (TypeScript Client)
 
-- Fixed binary frame prefix stripping in `handleIncomingMessage`: server sends uncompressed JSON as binary with `WSE{`/`S{`/`U{` prefix — now stripped before parse (was bypassing age filter and dedup)
+- Fixed binary frame prefix stripping in `handleIncomingMessage`: server sends uncompressed JSON as binary with `WSE{`/`S{`/`U{` prefix - now stripped before parse (was bypassing age filter and dedup)
 - Fixed binary frame prefix stripping in `processBinaryMessage`: category prefix (`WSE{`/`S{`/`U{`) stripped before JSON.parse in step 4 (was falling through to "unknown format" error)
 - Fixed key rotation breaking ECDH encryption: `rotateKeys()` now skips when shared secret exists
 - Fixed `beforeunload` listener accumulating on HMR: handler tracked on `globalThis`, removed before re-add
@@ -210,7 +210,7 @@ Built-in Redis Pub/Sub module for multi-instance horizontal scaling:
 - Fixed JWT expiration boundary: `now >= exp` per RFC 7519 (was `now > exp`, accepting tokens at exact expiration second)
 - Fixed `conn_rates` memory leak: per-connection rate limiter state now cleaned up on disconnect (was growing unbounded)
 - Fixed JSON injection in `build_server_ready`: user_id from JWT `sub` claim now properly escaped via `serde_json` (was raw format string interpolation)
-- Replaced `get_connection_count()` channel round-trip with `AtomicUsize` — zero GIL, zero blocking, nanosecond reads from Python async handlers
+- Replaced `get_connection_count()` channel round-trip with `AtomicUsize` - zero GIL, zero blocking, nanosecond reads from Python async handlers
 
 ### Documentation
 
@@ -237,14 +237,14 @@ Built-in Redis Pub/Sub module for multi-instance horizontal scaling:
 
 Full-featured async Python client (`wse-client`) with feature parity to the TypeScript client:
 
-- **AsyncWSEClient** — async context manager, async iterator, callback pattern
-- **SyncWSEClient** — thread-safe synchronous wrapper with `run_forever()`
-- **Wire protocol** — full binary frame support (zlib, msgpack, AES-GCM encrypted)
-- **Security** — ECDH P-256 key exchange, AES-GCM-256 encryption, HMAC-SHA256 signing
-- **Resilience** — circuit breaker, token bucket rate limiter, reconnect with 4 strategies
-- **Connection pool** — multi-endpoint with health scoring, 3 load balancing strategies
-- **Network monitor** — latency/jitter/packet-loss quality analysis
-- **Event sequencer** — deduplication + out-of-order buffering
+- **AsyncWSEClient** - async context manager, async iterator, callback pattern
+- **SyncWSEClient** - thread-safe synchronous wrapper with `run_forever()`
+- **Wire protocol** - full binary frame support (zlib, msgpack, AES-GCM encrypted)
+- **Security** - ECDH P-256 key exchange, AES-GCM-256 encryption, HMAC-SHA256 signing
+- **Resilience** - circuit breaker, token bucket rate limiter, reconnect with 4 strategies
+- **Connection pool** - multi-endpoint with health scoring, 3 load balancing strategies
+- **Network monitor** - latency/jitter/packet-loss quality analysis
+- **Event sequencer** - deduplication + out-of-order buffering
 
 ### Bug Fixes
 
@@ -264,14 +264,14 @@ Full-featured async Python client (`wse-client`) with feature parity to the Type
 - Documented both deployment modes: Router (embedded FastAPI) and Standalone (dedicated Rust server)
 - Clarified that all benchmarks use standalone mode
 - Updated benchmark methodology section with standalone server instructions
-- Cleaned up PROTOCOL.md — replaced domain-specific examples with generic ones
+- Cleaned up PROTOCOL.md - replaced domain-specific examples with generic ones
 
 ## v1.2.1 (2026-02-22)
 
 ### Benchmark Suite
 
-- Added multi-process benchmark (`benchmarks/bench_wse_multiprocess.py`) — stress-tests with N parallel workers, 9 test categories including sustained load and msgpack
-- Added standalone benchmark server (`benchmarks/bench_server.py`) — minimal Rust WSE with JWT auth, no database needed
+- Added multi-process benchmark (`benchmarks/bench_wse_multiprocess.py`) - stress-tests with N parallel workers, 9 test categories including sustained load and msgpack
+- Added standalone benchmark server (`benchmarks/bench_server.py`) - minimal Rust WSE with JWT auth, no database needed
 - Fixed code formatting (ruff)
 - Fixed README protocol version (v1, not v2)
 
@@ -281,11 +281,11 @@ Full-featured async Python client (`wse-client`) with feature parity to the Type
 
 Pure Rust HS256 JWT encode/decode module, eliminating Python JWT libraries from the connection critical path:
 
-- **`rust_jwt_encode(claims, secret)`** — HS256 JWT creation with base64url encoding
-- **`rust_jwt_decode(token, secret, issuer, audience)`** — JWT validation with signature verification, expiry check, issuer/audience claims
-- **Zero-GIL handshake authentication** — when `jwt_secret` is configured, the Rust server validates JWT cookies during the WebSocket handshake and sends `server_ready` directly from Rust, before any Python code runs
-- **`InboundEvent::AuthConnect`** — new drain queue event type for Rust-authenticated connections. Python receives `user_id` directly and skips JWT decode entirely
-- **Cookie extraction in Rust** — `access_token` parsed from HTTP cookie header using zero-copy string operations during handshake
+- **`rust_jwt_encode(claims, secret)`** - HS256 JWT creation with base64url encoding
+- **`rust_jwt_decode(token, secret, issuer, audience)`** - JWT validation with signature verification, expiry check, issuer/audience claims
+- **Zero-GIL handshake authentication** - when `jwt_secret` is configured, the Rust server validates JWT cookies during the WebSocket handshake and sends `server_ready` directly from Rust, before any Python code runs
+- **`InboundEvent::AuthConnect`** - new drain queue event type for Rust-authenticated connections. Python receives `user_id` directly and skips JWT decode entirely
+- **Cookie extraction in Rust** - `access_token` parsed from HTTP cookie header using zero-copy string operations during handshake
 
 **Connection flow with Rust JWT:**
 ```
@@ -303,7 +303,7 @@ Full end-to-end encryption with ECDH key exchange, matching the frontend `securi
 - **Rust-accelerated AES-GCM-256** encrypt/decrypt via `aes-gcm` crate (`rust_aes_gcm_encrypt`, `rust_aes_gcm_decrypt`)
 - **ECDH P-256 key exchange** via `p256` crate (`rust_ecdh_generate_keypair`, `rust_ecdh_derive_shared_secret`)
 - **HKDF-SHA256** key derivation with salt=`wse-encryption`, info=`aes-gcm-key` (matching frontend)
-- **Per-connection session keys** — each connection gets its own ECDH keypair and derived AES-256 key
+- **Per-connection session keys** - each connection gets its own ECDH keypair and derived AES-256 key
 - Wire format: `E:` prefix + 12-byte IV + AES-GCM ciphertext + 16-byte auth tag
 
 **Key exchange flow:**
@@ -315,20 +315,20 @@ Full end-to-end encryption with ECDH key exchange, matching the frontend `securi
 
 New Python classes:
 
-- `AesGcmProvider` — built-in `EncryptionProvider` implementation with per-connection keys
-- `SecurityManager.generate_keypair(conn_id)` — ECDH keypair generation
-- `SecurityManager.derive_session_key(conn_id, peer_pk)` — session key derivation
-- `SecurityManager.remove_connection(conn_id)` — cleanup on disconnect
+- `AesGcmProvider` - built-in `EncryptionProvider` implementation with per-connection keys
+- `SecurityManager.generate_keypair(conn_id)` - ECDH keypair generation
+- `SecurityManager.derive_session_key(conn_id, peer_pk)` - session key derivation
+- `SecurityManager.remove_connection(conn_id)` - cleanup on disconnect
 
 ### Connection Latency Optimization
 
 Backend handshake latency reduced by 27x (median 23ms -> 0.53ms):
 
-- **Rust JWT validation** — JWT decoded entirely in Rust during WebSocket handshake, zero GIL acquisition on the connection critical path
-- **OnceLock handshake** — replaced 2x `Arc<Mutex>` with a single `OnceLock<HandshakeResult>` in the WebSocket accept callback. Eliminates 4 lock operations per connection.
-- **DashMap for conn_formats** — replaced `std::sync::Mutex<HashMap>` with lock-free `DashMap` for msgpack format tracking. One fewer lock acquisition during connection registration.
-- **spawn_blocking for on_connect** — Python `on_connect` callback now runs in a background thread via `tokio::task::spawn_blocking` instead of blocking the async connection setup.
-- **SIMD via target-cpu=native** — `.cargo/config.toml` enables native CPU features (AVX2/NEON) for faster zlib compression, HTTP header parsing, and HashMap operations.
+- **Rust JWT validation** - JWT decoded entirely in Rust during WebSocket handshake, zero GIL acquisition on the connection critical path
+- **OnceLock handshake** - replaced 2x `Arc<Mutex>` with a single `OnceLock<HandshakeResult>` in the WebSocket accept callback. Eliminates 4 lock operations per connection.
+- **DashMap for conn_formats** - replaced `std::sync::Mutex<HashMap>` with lock-free `DashMap` for msgpack format tracking. One fewer lock acquisition during connection registration.
+- **spawn_blocking for on_connect** - Python `on_connect` callback now runs in a background thread via `tokio::task::spawn_blocking` instead of blocking the async connection setup.
+- **SIMD via target-cpu=native** - `.cargo/config.toml` enables native CPU features (AVX2/NEON) for faster zlib compression, HTTP header parsing, and HashMap operations.
 
 ### Large Message Throughput
 
@@ -352,15 +352,15 @@ Binary frames from msgpack-connected clients are now parsed entirely in Rust:
 
 Configurable set of message types that are always signed for integrity, regardless of the global `message_signing_enabled` flag:
 
-- `DEFAULT_SIGNED_MESSAGE_TYPES` — empty `frozenset` by default (configure for your domain)
-- `WSEConnection(signed_message_types=frozenset({...}))` — pass your critical types
+- `DEFAULT_SIGNED_MESSAGE_TYPES` - empty `frozenset` by default (configure for your domain)
+- `WSEConnection(signed_message_types=frozenset({...}))` - pass your critical types
 - Logic: sign if `message_signing_enabled` OR `message_type in signed_message_types`
 - Signature format: `hash:timestamp:nonce:hmac` (or JWT via TokenProvider)
 
 ### Test Suite
 
-- **Rust tests**: 15 inline tests — JWT encode/decode (10 tests), AES-GCM roundtrip, wrong-key rejection, ECDH symmetry, HKDF derivation, HMAC determinism
-- **Python tests**: 100 security tests (was 48) — added JWT encode/decode, Rust crypto, ECDH, AesGcmProvider, SecurityManager ECDH, and full E2E encryption tests
+- **Rust tests**: 15 inline tests - JWT encode/decode (10 tests), AES-GCM roundtrip, wrong-key rejection, ECDH symmetry, HKDF derivation, HMAC determinism
+- **Python tests**: 100 security tests (was 48) - added JWT encode/decode, Rust crypto, ECDH, AesGcmProvider, SecurityManager ECDH, and full E2E encryption tests
 - **Full suite**: 376+ tests passing
 
 ### Dependencies
@@ -382,7 +382,7 @@ All outbound JSON messages now use WebSocket binary frames instead of text frame
 
 ### MessagePack Transport (opt-in)
 
-Per-connection msgpack support via `?format=msgpack` query parameter on the WebSocket URL. When enabled, outbound messages are serialized with MessagePack (`M:` prefix) instead of JSON — roughly 2x faster serialization and ~30% smaller on the wire.
+Per-connection msgpack support via `?format=msgpack` query parameter on the WebSocket URL. When enabled, outbound messages are serialized with MessagePack (`M:` prefix) instead of JSON - roughly 2x faster serialization and ~30% smaller on the wire.
 
 The server extracts the format preference during the WebSocket handshake and applies it automatically to all `send_event()` calls for that connection. No changes needed on the Python publisher side.
 
