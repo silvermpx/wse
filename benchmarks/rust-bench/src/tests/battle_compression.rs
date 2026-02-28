@@ -30,7 +30,7 @@ impl CheckResult {
     }
 }
 
-/// Battle Test: Phase 6 -- Inter-Peer zstd Compression
+/// Battle Test: Inter-Peer zstd Compression
 ///
 /// Verifies zstd compression on cluster wire by comparing compressed bytes
 /// received vs message count. With ~1KB messages, compressed bytes/message
@@ -53,7 +53,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let port2 = cli.port2.unwrap_or(cli.port + 1);
 
     stats::print_header(
-        "BATTLE TEST: Phase 6 -- Inter-Peer Compression",
+        "BATTLE TEST: Inter-Peer Compression",
         &format!(
             "Verify zstd compression on large cluster messages (:{} -> :{}).",
             cli.port, port2

@@ -32,7 +32,7 @@ impl CheckResult {
     }
 }
 
-/// Battle Test: Phase 3 -- Capability Negotiation Verification
+/// Battle Test: Capability Negotiation Verification
 ///
 /// Verifies the HELLO handshake correctly negotiates capabilities
 /// (CAP_INTEREST_ROUTING | CAP_COMPRESSION). Queries health_snapshot on
@@ -49,7 +49,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let port2 = cli.port2.unwrap_or(cli.port + 1);
 
     stats::print_header(
-        "BATTLE TEST: Phase 3 -- Capability Negotiation",
+        "BATTLE TEST: Capability Negotiation",
         &format!(
             "Verify HELLO handshake, capability bits, cluster health on :{} and :{}.",
             cli.port, port2

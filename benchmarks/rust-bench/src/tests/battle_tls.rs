@@ -63,7 +63,7 @@ impl CheckResult {
     }
 }
 
-/// Battle Test: Phase 4 -- TLS Cluster Verification
+/// Battle Test: TLS Cluster Verification
 ///
 /// Same as battle_cluster (topic routing, isolation, glob patterns) but
 /// with mTLS between cluster peers. Proves the cluster protocol works
@@ -82,7 +82,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let port2 = cli.port2.unwrap_or(cli.port + 1);
 
     stats::print_header(
-        "BATTLE TEST: Phase 4 -- TLS Cluster Verification",
+        "BATTLE TEST: TLS Cluster Verification",
         &format!(
             "Verify topic routing, isolation, glob patterns over mTLS cluster (:{} -> :{}).",
             cli.port, port2

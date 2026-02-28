@@ -75,11 +75,12 @@ pub enum TestName {
     BattleStandalone,
     BattleCluster,
     BattleLoad,
-    BattlePhase3Caps,
-    BattlePhase4Tls,
-    BattlePhase5Discovery,
-    BattlePhase6Compression,
+    BattleCaps,
+    BattleTls,
+    BattleDiscovery,
+    BattleCompression,
     BattlePresence,
+    BattleRecovery,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]

@@ -106,20 +106,23 @@ async fn run_single_test(cli: &Cli, test: TestName) {
         TestName::BattleLoad => {
             tests::battle_load::run(cli).await;
         }
-        TestName::BattlePhase3Caps => {
-            tests::battle_phase3_caps::run(cli).await;
+        TestName::BattleCaps => {
+            tests::battle_caps::run(cli).await;
         }
-        TestName::BattlePhase4Tls => {
-            tests::battle_phase4_tls::run(cli).await;
+        TestName::BattleTls => {
+            tests::battle_tls::run(cli).await;
         }
-        TestName::BattlePhase5Discovery => {
-            tests::battle_phase5_discovery::run(cli).await;
+        TestName::BattleDiscovery => {
+            tests::battle_discovery::run(cli).await;
         }
-        TestName::BattlePhase6Compression => {
-            tests::battle_phase6_compression::run(cli).await;
+        TestName::BattleCompression => {
+            tests::battle_compression::run(cli).await;
         }
         TestName::BattlePresence => {
             tests::battle_presence::run(cli).await;
+        }
+        TestName::BattleRecovery => {
+            tests::battle_recovery::run(cli).await;
         }
     }
 }

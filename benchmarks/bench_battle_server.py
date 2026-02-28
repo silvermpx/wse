@@ -147,6 +147,46 @@ def drain_loop(server, stop_event: threading.Event):
                                     server.update_presence(conn_id, data)
                                 except Exception:
                                     pass  # Connection may not have presence
+                            elif action == "subscribe_recovery":
+                                topics = p.get("topics", [])
+                                recover = p.get("recover", False)
+                                recovery_info = p.get("recovery", {})
+                                if topics:
+                                    ep = None
+                                    off = None
+                                    if recover and recovery_info:
+                                        first_info = next(iter(recovery_info.values()), {})
+                                        ep = first_info.get("epoch")
+                                        off = first_info.get("offset")
+                                    result = server.subscribe_with_recovery(
+                                        conn_id, topics,
+                                        recover=recover,
+                                        epoch=ep,
+                                        offset=int(off) if off is not None else None,
+                                    )
+                                    import json
+                                    topics_info = result.get("topics", {})
+                                    response = json.dumps({
+                                        "t": "subscription_update",
+                                        "p": {
+                                            "action": "subscribe",
+                                            "success": True,
+                                            "success_topics": topics,
+                                            "recoverable": True,
+                                            "recovered": result.get("recovered", False),
+                                            "recovery": {
+                                                t: {
+                                                    "epoch": info.get("epoch"),
+                                                    "offset": info.get("offset"),
+                                                    "recovered": info.get("recovered", False),
+                                                    "count": info.get("count", 0),
+                                                }
+                                                for t, info in topics_info.items()
+                                                if isinstance(info, dict)
+                                            },
+                                        },
+                                    })
+                                    server.send(conn_id, f"WSE{response}")
                             elif action == "health":
                                 health = server.health_snapshot()
                                 response = {
@@ -232,6 +272,8 @@ def main():
                         help="Cluster peer addresses, e.g. 127.0.0.1:5007")
     parser.add_argument("--message-size", type=int, default=100,
                         help="Approximate message size in bytes (default: 100)")
+    parser.add_argument("--recovery", action="store_true",
+                        help="Enable message recovery (ring buffer per topic)")
 
     # TLS options
     parser.add_argument("--tls-cert", default=None, help="Path to TLS certificate PEM")
@@ -261,14 +303,24 @@ def main():
         args.tls_key = key
         args.tls_ca = ca
 
-    server = RustWSEServer(
-        "0.0.0.0",
-        args.port,
-        args.max_connections,
+    server_kwargs = dict(
         jwt_secret=JWT_SECRET,
         jwt_issuer=JWT_ISSUER,
         jwt_audience=JWT_AUDIENCE,
         presence_enabled=True,
+    )
+    if args.recovery:
+        server_kwargs.update(
+            recovery_enabled=True,
+            recovery_buffer_size=256,
+            recovery_ttl=300,
+            recovery_max_messages=500,
+        )
+    server = RustWSEServer(
+        "0.0.0.0",
+        args.port,
+        args.max_connections,
+        **server_kwargs,
     )
     server.enable_drain_mode()
     server.start()

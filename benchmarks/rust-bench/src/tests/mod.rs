@@ -1,10 +1,11 @@
 pub mod battle_cluster;
 pub mod battle_load;
-pub mod battle_phase3_caps;
-pub mod battle_phase4_tls;
-pub mod battle_phase5_discovery;
-pub mod battle_phase6_compression;
+pub mod battle_caps;
+pub mod battle_tls;
+pub mod battle_discovery;
+pub mod battle_compression;
 pub mod battle_presence;
+pub mod battle_recovery;
 pub mod battle_standalone;
 pub mod connection_limit;
 pub mod connection_storm;

@@ -32,7 +32,7 @@ impl CheckResult {
     }
 }
 
-/// Battle Test: Phase 5 -- Gossip Peer Discovery
+/// Battle Test: Gossip Peer Discovery
 ///
 /// Tests 3-node gossip-based peer discovery:
 ///   Node A listens only (no --peers), has cluster_addr for gossip
@@ -64,7 +64,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let port3 = cli.port3.unwrap_or(cli.port + 2);
 
     stats::print_header(
-        "BATTLE TEST: Phase 5 -- Gossip Peer Discovery",
+        "BATTLE TEST: Gossip Peer Discovery",
         &format!(
             "3-node gossip: A(:{}) <- B(:{}) direct, C(:{}) discovers via seeds.",
             cli.port, port2, port3
