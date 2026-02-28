@@ -1693,6 +1693,8 @@ pub(crate) async fn cluster_manager(
     // Dynamic peer tracking
     let known_peers: Arc<DashSet<String>> = Arc::new(DashSet::new());
     let connected_instances: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+    // Static peers have their own reconnect loop; never remove them from known_peers
+    let static_peers: std::collections::HashSet<String> = peers.iter().cloned().collect();
 
     // Channel for peer_reader to notify about newly discovered peers
     let (new_peer_tx, mut new_peer_rx) = mpsc::unbounded_channel::<String>();
@@ -1946,14 +1948,15 @@ pub(crate) async fn cluster_manager(
                             eprintln!("[WSE-Cluster] Ignoring invalid gossip address from cmd_rx: {addr}");
                             continue;
                         }
-                        // Forward PEER_ANNOUNCE to all peers except the source
-                        // Note: don't call write_framed() here -- peer_writer adds framing
-                        let mut frame_data = BytesMut::new();
-                        encode_peer_announce(&mut frame_data, &addr);
-                        let frame_bytes = frame_data.freeze();
-                        for (peer_addr, tx, _) in &peer_txs {
-                            if *peer_addr != exclude_peer {
-                                let _ = tx.try_send(frame_bytes.clone());
+                        // Forward only for newly discovered peers to prevent amplification
+                        if !known_peers.contains(&addr) {
+                            let mut frame_data = BytesMut::new();
+                            encode_peer_announce(&mut frame_data, &addr);
+                            let frame_bytes = frame_data.freeze();
+                            for (peer_addr, tx, _) in &peer_txs {
+                                if *peer_addr != exclude_peer {
+                                    let _ = tx.try_send(frame_bytes.clone());
+                                }
                             }
                         }
                     }
@@ -2036,15 +2039,17 @@ pub(crate) async fn cluster_manager(
                     if is_self {
                         continue;
                     }
-                    // Always forward PEER_ANNOUNCE to all peers except the source,
-                    // even for peers we already know about. Other peers may not know yet.
-                    // Note: don't call write_framed() here -- peer_writer adds framing
-                    let mut frame_data = BytesMut::new();
-                    encode_peer_announce(&mut frame_data, &addr);
-                    let frame_bytes = frame_data.freeze();
-                    for (peer_addr, tx, _) in &peer_txs {
-                        if *peer_addr != exclude_peer {
-                            let _ = tx.try_send(frame_bytes.clone());
+                    // Forward PEER_ANNOUNCE only for newly discovered peers
+                    // to prevent gossip amplification in dense clusters
+                    let is_new = !known_peers.contains(&addr);
+                    if is_new {
+                        let mut frame_data = BytesMut::new();
+                        encode_peer_announce(&mut frame_data, &addr);
+                        let frame_bytes = frame_data.freeze();
+                        for (peer_addr, tx, _) in &peer_txs {
+                            if *peer_addr != exclude_peer {
+                                let _ = tx.try_send(frame_bytes.clone());
+                            }
                         }
                     }
                     // Only spawn connection to this peer if we don't already know it
@@ -2082,6 +2087,10 @@ pub(crate) async fn cluster_manager(
                     }
                     Some(InterestUpdate::PeerDisconnected { peer_addr }) => {
                         remote_interest.remove(&peer_addr);
+                        // Allow gossip-discovered peers to be re-discovered
+                        if !static_peers.contains(&peer_addr) {
+                            known_peers.remove(&peer_addr);
+                        }
                     }
                     None => {
                         // Interest channel closed, continue running
@@ -2101,6 +2110,10 @@ pub(crate) async fn cluster_manager(
                     PeerRegistration::Deregister { peer_addr } => {
                         // Remove disconnected inbound peer
                         peer_txs.retain(|(a, _, _)| a != &peer_addr);
+                        // Allow gossip-discovered peers to be re-discovered
+                        if !static_peers.contains(&peer_addr) {
+                            known_peers.remove(&peer_addr);
+                        }
                     }
                 }
             }

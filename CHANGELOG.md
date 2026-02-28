@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.0.7 (2026-02-28)
+
+### Bug Fixes (Cluster Protocol)
+
+- Fix gossip amplification: only forward `PeerAnnounce` for newly discovered peers, preventing O(N*K) redundant frames
+- Fix `known_peers` growing unbounded: remove gossip-discovered peers on disconnect so dead peers don't accumulate
+- Guard static (configured) peers from `known_peers` removal to prevent duplicate reconnect tasks
+
 ## v2.0.6 (2026-02-28)
 
 ### Bug Fixes (Rust Server)
