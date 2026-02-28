@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.0.3 (2026-02-28)
+
+### Bug Fixes (Python Client)
+
+- Fix HMAC signing auto-activation when encryption enabled
+- Fix `send_bytes()` bypassing E2E encryption
+- Fix key rotation not restarting after reconnect
+- Fix offline queue message loss on partial flush failure
+- Fix `SyncWSEClient` stale error state on retry
+- Fix connection pool active count growing on force-reconnect
+
 ## v2.0.2 (2026-02-28)
 
 Bug fixes and documentation updates.
