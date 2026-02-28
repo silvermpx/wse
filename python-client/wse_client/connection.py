@@ -462,18 +462,19 @@ class ConnectionManager:
     async def _respond_ping_json(self, data: str) -> None:
         """Respond to a JSON-format PING from server."""
         try:
-            # Strip WSE prefix if present
             json_str = data[3:] if data.startswith("WSE") else data
             parsed = _json.loads(json_str)
             p = parsed.get("p", {})
-            # Server sends "server_time" (RFC 3339) or "timestamp" (ms epoch)
-            ts = p.get("timestamp") or p.get("server_time") or int(time.time() * 1000)
+            server_timestamp = p.get("server_time") or p.get("timestamp") or int(time.time() * 1000)
         except Exception:
-            ts = int(time.time() * 1000)
+            server_timestamp = int(time.time() * 1000)
 
         pong_msg = {
             "t": "PONG",
-            "p": {"timestamp": ts},
+            "p": {
+                "server_timestamp": server_timestamp,
+                "client_timestamp": int(time.time() * 1000),
+            },
             "v": PROTOCOL_VERSION,
         }
         payload = f"WSE{_json.dumps(pong_msg, separators=(',', ':'))}"
@@ -714,7 +715,7 @@ class ConnectionManager:
         if cfg.mode == ReconnectMode.LINEAR:
             delay = cfg.base_delay + attempt * 1.0
         elif cfg.mode == ReconnectMode.FIBONACCI:
-            delay = cfg.base_delay * _fib(min(attempt + 1, 10))
+            delay = cfg.base_delay * _fib(min(attempt, 10))
         else:
             # Exponential / Adaptive
             delay = cfg.base_delay * (cfg.factor**attempt)

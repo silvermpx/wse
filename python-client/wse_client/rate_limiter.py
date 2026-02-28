@@ -38,12 +38,11 @@ class TokenBucketRateLimiter:
         now = time.monotonic()
         elapsed = now - self._last_refill
         if elapsed >= self._refill_interval:
-            intervals = elapsed / self._refill_interval
-            self._tokens = min(
-                self._capacity,
-                self._tokens + intervals * self._refill_rate,
-            )
-            self._last_refill = now
+            intervals = int(elapsed / self._refill_interval)
+            tokens_to_add = intervals * self._refill_rate
+            self._tokens = min(self._capacity, self._tokens + tokens_to_add)
+            # Snap back to preserve fractional interval remainder
+            self._last_refill = now - (elapsed % self._refill_interval)
 
     def can_send(self) -> bool:
         self._refill()

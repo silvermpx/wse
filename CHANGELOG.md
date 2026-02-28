@@ -1,6 +1,14 @@
 # Changelog
 
-## v2.0.4 (2026-02-28)
+## v2.0.5 (2026-02-28)
+
+### Client Protocol Sync
+
+- Align PONG response format with TS client (`server_timestamp` + `client_timestamp` keys)
+- Align rate limiter to discrete refill with interval snapback (matches TS)
+- Align ConnectionPool health scoring: scaled failure penalty, latency bonus, consistency bonus, time decay
+- Align fibonacci reconnect delay sequence with TS client
+- Fix TS `SEQUENCE_WINDOW_SIZE` constant (1000 -> 10000, matching actual runtime default)
 
 ### Bug Fixes (Python Client)
 

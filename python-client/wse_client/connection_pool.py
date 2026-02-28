@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .types import LoadBalancingStrategy
@@ -24,12 +24,15 @@ class EndpointHealth:
     score: float = 100.0
     active_connections: int = 0
     total_connections: int = 0
-    failures: int = 0
-    successes: int = 0
-    last_latency_ms: float = 0.0
+    consecutive_failures: int = 0
+    consecutive_successes: int = 0
+    total_requests: int = 0
+    failed_requests: int = 0
     avg_latency_ms: float = 0.0
+    latency_history: list[float] = field(default_factory=list)
     last_failure: float | None = None
     last_success: float | None = None
+    last_checked: float = 0.0
 
 
 class ConnectionPool:
@@ -42,13 +45,11 @@ class ConnectionPool:
     """
 
     # Scoring constants (match TS client)
-    BASE_SCORE = 100.0
-    FAILURE_PENALTY = 20.0
-    SUCCESS_BONUS = 5.0
-    LATENCY_PENALTY_FACTOR = 0.1  # per ms over 100
-    RECOVERY_RATE = 2.0  # points per minute
-    MIN_SCORE = 0.0
+    MIN_SCORE = 10.0
     MAX_SCORE = 100.0
+    HEALTH_CHECK_INTERVAL = 30.0  # seconds
+    SCORE_DECAY_RATE = 0.1
+    LATENCY_HISTORY_SIZE = 100
 
     def __init__(
         self,
@@ -63,7 +64,8 @@ class ConnectionPool:
         """
         self._strategy = strategy
         self._endpoints: dict[str, EndpointHealth] = {
-            url: EndpointHealth(url=url) for url in endpoints
+            url: EndpointHealth(url=url, last_checked=time.monotonic())
+            for url in endpoints
         }
         self._rr_index = 0
         self._preferred_endpoint: str | None = None
@@ -76,8 +78,6 @@ class ConnectionPool:
         """Pick the best endpoint using the configured strategy."""
         if not self._endpoints:
             raise ValueError("No endpoints configured")
-
-        self._apply_recovery()
 
         # Prefer sticky endpoint if set and healthy
         if self._preferred_endpoint:
@@ -96,29 +96,74 @@ class ConnectionPool:
         ep = self._endpoints.get(url)
         if not ep:
             return
-        ep.successes += 1
         ep.last_success = time.monotonic()
-        ep.last_latency_ms = latency_ms
-        # EMA for average latency
-        if ep.avg_latency_ms == 0.0:
-            ep.avg_latency_ms = latency_ms
-        else:
-            ep.avg_latency_ms = ep.avg_latency_ms * 0.8 + latency_ms * 0.2
+        ep.consecutive_successes += 1
+        ep.consecutive_failures = 0
+        ep.total_requests += 1
 
-        ep.score = min(self.MAX_SCORE, ep.score + self.SUCCESS_BONUS)
+        if latency_ms >= 0:
+            ep.latency_history.append(latency_ms)
+            if len(ep.latency_history) > self.LATENCY_HISTORY_SIZE:
+                ep.latency_history.pop(0)
+            ep.avg_latency_ms = (
+                sum(ep.latency_history) / len(ep.latency_history)
+                if ep.latency_history
+                else 0.0
+            )
 
-        # Latency penalty for slow responses
-        if latency_ms > 100:
-            penalty = (latency_ms - 100) * self.LATENCY_PENALTY_FACTOR
-            ep.score = max(self.MIN_SCORE, ep.score - penalty)
+        self._update_health_score(url)
 
     def record_failure(self, url: str) -> None:
         ep = self._endpoints.get(url)
         if not ep:
             return
-        ep.failures += 1
         ep.last_failure = time.monotonic()
-        ep.score = max(self.MIN_SCORE, ep.score - self.FAILURE_PENALTY)
+        ep.consecutive_failures += 1
+        ep.consecutive_successes = 0
+        ep.total_requests += 1
+        ep.failed_requests += 1
+
+        self._update_health_score(url, is_failure=True)
+
+    def _update_health_score(self, url: str, *, is_failure: bool = False) -> None:
+        """Compute health score matching TS ConnectionPool.updateHealthScore."""
+        ep = self._endpoints.get(url)
+        if not ep:
+            return
+
+        score = ep.score
+
+        if is_failure:
+            penalty = min(30.0, ep.consecutive_failures * 10.0)
+            score = max(self.MIN_SCORE, score - penalty)
+        else:
+            base_increase = 5.0
+            latency_bonus = self._calculate_latency_bonus(ep.avg_latency_ms)
+            consistency_bonus = min(10.0, ep.consecutive_successes * 2.0)
+            score = min(self.MAX_SCORE, score + base_increase + latency_bonus + consistency_bonus)
+
+        # Time-based decay
+        now = time.monotonic()
+        time_since_check = now - ep.last_checked
+        if time_since_check > self.HEALTH_CHECK_INTERVAL:
+            decay_factor = 1.0 - (self.SCORE_DECAY_RATE * time_since_check / self.HEALTH_CHECK_INTERVAL)
+            score = max(self.MIN_SCORE, score * decay_factor)
+
+        ep.score = round(score)
+        ep.last_checked = now
+
+    @staticmethod
+    def _calculate_latency_bonus(avg_latency: float) -> float:
+        """Latency bonus matching TS calculateLatencyBonus."""
+        if avg_latency == 0:
+            return 0.0
+        if avg_latency < 50:
+            return 5.0
+        if avg_latency < 100:
+            return 3.0
+        if avg_latency < 200:
+            return 1.0
+        return 0.0
 
     def add_connection(self, url: str) -> None:
         ep = self._endpoints.get(url)
@@ -135,11 +180,13 @@ class ConnectionPool:
         return [
             {
                 "url": ep.url,
-                "score": round(ep.score, 1),
+                "score": ep.score,
                 "active": ep.active_connections,
-                "failures": ep.failures,
-                "successes": ep.successes,
+                "failures": ep.failed_requests,
+                "successes": ep.total_requests - ep.failed_requests,
                 "avg_latency_ms": round(ep.avg_latency_ms, 1),
+                "consecutive_failures": ep.consecutive_failures,
+                "consecutive_successes": ep.consecutive_successes,
             }
             for ep in self._endpoints.values()
         ]
@@ -171,7 +218,7 @@ class ConnectionPool:
 
     def add_endpoint(self, url: str) -> None:
         if url not in self._endpoints:
-            self._endpoints[url] = EndpointHealth(url=url)
+            self._endpoints[url] = EndpointHealth(url=url, last_checked=time.monotonic())
 
     def set_active_endpoint(self, url: str) -> None:
         """Mark an endpoint as the preferred active one."""
@@ -179,30 +226,20 @@ class ConnectionPool:
 
     def reset(self) -> None:
         """Reset all endpoint scores to default."""
+        now = time.monotonic()
         for ep in self._endpoints.values():
-            ep.score = self.BASE_SCORE
-            ep.failures = 0
-            ep.successes = 0
+            ep.score = self.MAX_SCORE
+            ep.consecutive_failures = 0
+            ep.consecutive_successes = 0
+            ep.total_requests = 0
+            ep.failed_requests = 0
             ep.active_connections = 0
+            ep.latency_history.clear()
+            ep.avg_latency_ms = 0.0
             ep.last_failure = None
             ep.last_success = None
+            ep.last_checked = now
 
     def destroy(self) -> None:
         """Clear all endpoints."""
         self._endpoints.clear()
-
-    def _apply_recovery(self) -> None:
-        """Gradually recover scores over time."""
-        now = time.monotonic()
-        for ep in self._endpoints.values():
-            if ep.score >= self.MAX_SCORE:
-                continue
-            # Recover from any penalty (failure or latency)
-            ref_time = ep.last_failure or ep.last_success
-            if ref_time is None:
-                continue
-            ref = getattr(ep, "_last_recovery_time", ref_time)
-            elapsed_min = (now - ref) / 60.0
-            recovery = elapsed_min * self.RECOVERY_RATE
-            ep.score = min(self.MAX_SCORE, ep.score + recovery)
-            ep._last_recovery_time = now  # type: ignore[attr-defined]

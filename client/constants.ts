@@ -65,7 +65,7 @@ export const RATE_LIMIT_REFILL_INTERVAL = 1.0; // seconds
 // Sequencing Constants
 // ---------------------------------------------------------------------------
 
-export const SEQUENCE_WINDOW_SIZE = 1000;
+export const SEQUENCE_WINDOW_SIZE = 10000;
 export const MAX_OUT_OF_ORDER = 100;
 export const DUPLICATE_WINDOW_SIZE = 1000;
 
