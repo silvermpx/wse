@@ -101,7 +101,7 @@ class ConnectionPool:
         ep.consecutive_failures = 0
         ep.total_requests += 1
 
-        if latency_ms >= 0:
+        if latency_ms > 0:
             ep.latency_history.append(latency_ms)
             if len(ep.latency_history) > self.LATENCY_HISTORY_SIZE:
                 ep.latency_history.pop(0)

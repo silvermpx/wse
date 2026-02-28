@@ -44,7 +44,7 @@ class OfflineQueue:
     Args:
         max_size: Maximum number of buffered messages. Default 1000.
         max_age: Maximum age in seconds before a message is discarded.
-            Default 300 (5 minutes).
+            Default 3600 (1 hour).
         enabled: Whether the queue is active. Default True.
     """
 
@@ -52,7 +52,7 @@ class OfflineQueue:
         self,
         *,
         max_size: int = 1000,
-        max_age: float = 300.0,
+        max_age: float = 3600.0,
         enabled: bool = True,
     ) -> None:
         self._max_size = max_size

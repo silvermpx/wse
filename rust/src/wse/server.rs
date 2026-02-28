@@ -170,14 +170,35 @@ const RATE_CAPACITY: f64 = 100_000.0;
 const RATE_REFILL: f64 = 10_000.0; // tokens per second
 
 pub(crate) enum ServerCommand {
-    SendText { conn_id: String, data: String },
-    SendBytes { conn_id: String, data: Vec<u8> },
-    SendPrebuilt { conn_id: String, message: Message },
-    BroadcastText { data: String },
-    BroadcastBytes { data: Vec<u8> },
-    BroadcastLocal { topic: String, data: String },
-    Disconnect { conn_id: String },
-    GetConnections { reply: oneshot::Sender<Vec<String>> },
+    SendText {
+        conn_id: String,
+        data: String,
+    },
+    SendBytes {
+        conn_id: String,
+        data: Vec<u8>,
+    },
+    SendPrebuilt {
+        conn_id: String,
+        message: Message,
+    },
+    BroadcastText {
+        data: String,
+    },
+    BroadcastBytes {
+        data: Vec<u8>,
+    },
+    BroadcastLocal {
+        topic: String,
+        data: String,
+        skip_recovery: bool,
+    },
+    Disconnect {
+        conn_id: String,
+    },
+    GetConnections {
+        reply: oneshot::Sender<Vec<String>>,
+    },
     Shutdown,
 }
 
@@ -1321,6 +1342,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                     let _ = tx.send(ServerCommand::BroadcastLocal {
                         topic: topic.clone(),
                         data: msg,
+                        skip_recovery: true,
                     });
                 }
                 // Cluster sync: notify peers of presence leave
@@ -1605,10 +1627,14 @@ async fn process_commands(
                     }
                 }
             }
-            ServerCommand::BroadcastLocal { topic, data } => {
+            ServerCommand::BroadcastLocal {
+                topic,
+                data,
+                skip_recovery,
+            } => {
                 let preframed = pre_frame_text(&data);
-                // Store in recovery buffer (zero-copy: Bytes is Arc-refcounted)
-                if let Some(ref recovery) = state.recovery {
+                // Store in recovery buffer (skip for presence events)
+                if !skip_recovery && let Some(ref recovery) = state.recovery {
                     recovery.push(&topic, preframed.clone());
                 }
                 if state.conn_encryption.is_empty() {
@@ -1921,6 +1947,7 @@ impl RustWSEServer {
                                             ServerCommand::BroadcastLocal {
                                                 topic: topic.clone(),
                                                 data: msg,
+                                                skip_recovery: true,
                                             },
                                         );
                                     }
@@ -2029,6 +2056,7 @@ impl RustWSEServer {
                                                         let _ = tx.send(ServerCommand::BroadcastLocal {
                                                             topic: topic.clone(),
                                                             data: msg,
+                                                            skip_recovery: true,
                                                         });
                                                     }
                                                     if let Some(ref ctx) = cluster_tx {
@@ -2934,6 +2962,7 @@ impl RustWSEServer {
                         let _ = tx.send(ServerCommand::BroadcastLocal {
                             topic: topic.clone(),
                             data: msg,
+                            skip_recovery: true,
                         });
                     }
                     // Cluster sync: notify peers of presence join
@@ -3161,6 +3190,7 @@ impl RustWSEServer {
                         let _ = tx.send(ServerCommand::BroadcastLocal {
                             topic: topic.clone(),
                             data: msg,
+                            skip_recovery: true,
                         });
                     }
                     // Cluster sync: notify peers of presence leave
@@ -3206,6 +3236,7 @@ impl RustWSEServer {
         tx.send(ServerCommand::BroadcastLocal {
             topic: topic.to_owned(),
             data: data.to_owned(),
+            skip_recovery: false,
         })
         .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         Ok(())
@@ -3218,6 +3249,7 @@ impl RustWSEServer {
             let _ = tx.send(ServerCommand::BroadcastLocal {
                 topic: topic.to_owned(),
                 data: data.to_owned(),
+                skip_recovery: false,
             });
         }
 
@@ -3393,6 +3425,7 @@ impl RustWSEServer {
                             let _ = tx.send(ServerCommand::BroadcastLocal {
                                 topic: topic.clone(),
                                 data: msg.clone(),
+                                skip_recovery: true,
                             });
                         }
                     }

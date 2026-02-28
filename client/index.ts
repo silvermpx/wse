@@ -64,4 +64,4 @@ export * from './constants';
 // Version Info
 // ---------------------------------------------------------------------------
 
-export const WSE_VERSION = '2.0.2';
+export const WSE_VERSION = '2.0.6';

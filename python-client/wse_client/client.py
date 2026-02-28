@@ -132,7 +132,7 @@ class AsyncWSEClient:
         self._circuit_breaker = CircuitBreaker()
         self._sequencer = EventSequencer()
         self._network_monitor = NetworkMonitor()
-        self._offline_queue = OfflineQueue(max_size=1000, max_age=300.0)
+        self._offline_queue = OfflineQueue(max_size=1000, max_age=3600.0)
 
         # Event queue for async iteration
         self._event_queue: asyncio.Queue[WSEEvent | None] = asyncio.Queue(

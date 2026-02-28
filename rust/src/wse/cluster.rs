@@ -2119,6 +2119,7 @@ pub(crate) async fn cluster_manager(
                                         let _ = tx.send(super::server::ServerCommand::BroadcastLocal {
                                             topic,
                                             data: msg,
+                                            skip_recovery: true,
                                         });
                                     }
                                 }
@@ -2130,6 +2131,7 @@ pub(crate) async fn cluster_manager(
                                         let _ = tx.send(super::server::ServerCommand::BroadcastLocal {
                                             topic,
                                             data: msg,
+                                            skip_recovery: true,
                                         });
                                     }
                                 }
@@ -2141,6 +2143,7 @@ pub(crate) async fn cluster_manager(
                                         let _ = tx.send(super::server::ServerCommand::BroadcastLocal {
                                             topic,
                                             data: msg,
+                                            skip_recovery: true,
                                         });
                                     }
                                 }

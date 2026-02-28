@@ -142,7 +142,7 @@ impl PresenceManager {
             return TrackResult::AtCapacity;
         }
 
-        let (is_first, actually_inserted) = {
+        let (is_first, actually_inserted, has_remote_sentinel) = {
             let mut entry = topic_map
                 .entry(user_id.clone())
                 .or_insert_with(|| PresenceEntry {
@@ -151,7 +151,12 @@ impl PresenceManager {
                     connections: Vec::new(),
                     updated_at: now,
                 });
-            // Check for first LOCAL connection (ignore remote sentinels from cluster sync)
+            // Check for remote sentinel (from cluster sync) while holding the shard lock
+            let has_remote = entry
+                .connections
+                .iter()
+                .any(|c| c.conn_id.starts_with("__remote__"));
+            // Check for first LOCAL connection (ignore remote sentinels)
             let was_empty = !entry
                 .connections
                 .iter()
@@ -168,7 +173,7 @@ impl PresenceManager {
             };
             entry.data = data.clone();
             entry.updated_at = now;
-            (was_empty, inserted)
+            (was_empty, inserted, has_remote)
         };
 
         // Track which topics this conn has presence in
@@ -187,7 +192,11 @@ impl PresenceManager {
         }
 
         if is_first {
-            stats.num_users.fetch_add(1, Ordering::Relaxed);
+            // Only increment num_users if no remote sentinel exists
+            // (merge_remote_join already counted this user)
+            if !has_remote_sentinel {
+                stats.num_users.fetch_add(1, Ordering::Relaxed);
+            }
             TrackResult::FirstJoin {
                 user_id,
                 data: data.clone(),
@@ -381,8 +390,12 @@ impl PresenceManager {
             }
 
             for (user_id, data, _dead_conn_count) in dead_users {
-                // Collect dead conn_ids before removing the user entry
-                let actual_conn_count = if let Some((_, entry)) = topic_map.remove(&user_id) {
+                // Use remove_if to guard against concurrent track() adding a new conn
+                let actual_conn_count = if let Some((_, entry)) =
+                    topic_map.remove_if(&user_id, |_, e| {
+                        // Only remove if all connections are still dead
+                        e.connections.iter().all(|c| !is_conn_alive(&c.conn_id))
+                    }) {
                     let count = entry.connections.len();
                     for conn in &entry.connections {
                         self.conn_user_id.remove(&conn.conn_id);
@@ -390,21 +403,42 @@ impl PresenceManager {
                     }
                     count
                 } else {
+                    // Entry was either already removed or a live conn was added - skip
+                    // But still clean up any dead local connections from the entry
+                    if let Some(mut entry) = topic_map.get_mut(&user_id) {
+                        let before = entry.connections.len();
+                        entry.connections.retain(|c| {
+                            c.conn_id.starts_with("__remote__") || is_conn_alive(&c.conn_id)
+                        });
+                        let removed_count = before - entry.connections.len();
+                        if removed_count > 0
+                            && let Some(stats) = self.topic_presence_stats.get(&topic)
+                        {
+                            let _ = stats.num_connections.fetch_update(
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                                |current| Some(current.saturating_sub(removed_count)),
+                            );
+                        }
+                    }
                     0
                 };
-                if let Some(stats) = self.topic_presence_stats.get(&topic) {
-                    let _ = stats.num_users.fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |current| Some(current.saturating_sub(1)),
-                    );
-                    let _ = stats.num_connections.fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |current| Some(current.saturating_sub(actual_conn_count)),
-                    );
+                // Only decrement stats and emit leave if the entry was actually removed
+                if actual_conn_count > 0 {
+                    if let Some(stats) = self.topic_presence_stats.get(&topic) {
+                        let _ = stats.num_users.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |current| Some(current.saturating_sub(1)),
+                        );
+                        let _ = stats.num_connections.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |current| Some(current.saturating_sub(actual_conn_count)),
+                        );
+                    }
+                    removed.push((topic.clone(), user_id, data));
                 }
-                removed.push((topic.clone(), user_id, data));
             }
         }
 

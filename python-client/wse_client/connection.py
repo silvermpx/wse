@@ -339,7 +339,12 @@ class ConnectionManager:
             return False
         try:
             if self._security is not None and self._security.is_enabled:
-                encrypted = self._security.encrypt(data.decode("utf-8"))
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    logger.warning("send_bytes: non-UTF-8 data cannot be E2E encrypted")
+                    return False
+                encrypted = self._security.encrypt(text)
                 await self._ws.send(b"E:" + encrypted)
             else:
                 await self._ws.send(data)

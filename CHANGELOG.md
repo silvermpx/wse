@@ -1,5 +1,25 @@
 # Changelog
 
+## v2.0.6 (2026-02-28)
+
+### Bug Fixes (Rust Server)
+
+- Fix presence events polluting recovery ring buffer (added `skip_recovery` flag to BroadcastLocal)
+- Fix presence user double-count when remote sentinel already exists (atomic check inside entry guard)
+- Fix `sweep_dead_connections` race condition: `remove()` replaced with `remove_if()` to prevent removing entries with live connections added concurrently
+- Fix `sweep_dead_connections` leaving dead local connections when remote sentinels keep entry alive
+- Fix recovery `get()` silently dropping messages in release builds on slot mismatch
+
+### Bug Fixes (Python Client)
+
+- Fix offline queue `max_age` default (300s -> 3600s, matching TS client)
+- Fix `record_success(0.0)` recording spurious zero-latency entries in connection pool
+- Fix `send_bytes()` crashing on non-UTF-8 binary data when E2E encryption is enabled
+
+### Bug Fixes (TS Client)
+
+- Fix `SEQUENCE_WINDOW_SIZE` constant (1000 -> 10000, matching runtime default)
+
 ## v2.0.5 (2026-02-28)
 
 ### Client Protocol Sync

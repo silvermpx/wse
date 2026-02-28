@@ -164,9 +164,10 @@ impl TopicRecoveryBuffer {
             {
                 result.push(entry.data.clone());
             } else {
-                // Unreachable: the tail guard ensures every slot in [start, head_offset)
-                // was written after tail advanced past any previous occupant.
+                // Slot mismatch should be unreachable, but if it occurs in release,
+                // signal failure so the client re-subscribes rather than missing messages.
                 debug_assert!(false, "slot {} mismatch: expected offset {}", idx, offset);
+                return None;
             }
         }
 
