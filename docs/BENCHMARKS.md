@@ -66,48 +66,6 @@ Per-operation speedup from moving hot-path logic from Python to Rust (PyO3/matur
 
 ---
 
-## Comparison with Alternatives
-
-All alternatives primarily benchmark fan-out (server broadcasts to clients) or idle
-connection count, not inbound throughput (clients sending to server). WSE benchmarks
-measure inbound throughput — the harder and more realistic workload.
-
-### Throughput
-
-| Metric | WSE | Centrifugo | uWebSockets | Socket.IO | ws (Node.js) |
-|--------|-----|------------|-------------|-----------|--------------|
-| **Inbound sustained** | **20.5M msg/s** (Rust client) | Not published | Not published | Not published | 19K echo RT/s |
-| **Inbound sustained** | **2.0M msg/s** (Python 64w) | -- | -- | -- | -- |
-| **Single client** | **113K msg/s** | -- | -- | ~10K | ~19K echo |
-| **Fan-out (broadcast)** | **2.1M del/s** (1 proc) | 500K msg/s (20 pods) | 120K msg/s (4 cores) | 30K msg/s | 13K (i7) |
-| **Connection count** | **500K tested** | 1M (K8s cluster) | 120K (4 cores) | 30K (4 cores) | 100K+ |
-| **Connection latency** | **0.53 ms** (single) | Not published | Not published | ~50 ms | ~10 ms |
-| **Ping RTT** | **0.09 ms** (single) | Not published | Not published | ~1 ms | ~0.1 ms |
-
-Sources: Centrifugo 1M blog, ezioda004 uWS vs Socket.IO benchmark (AWS c5a.xlarge),
-Hashrocket WebSocket Shootout (i7-4790K), Lemire ws benchmark (Xeon Gold).
-
-### Features
-
-| Feature | WSE | Centrifugo | uWebSockets | Socket.IO | ws |
-|---------|-----|------------|-------------|-----------|-----|
-| Language | Python + Rust | Go | C++ | Node.js | Node.js |
-| JWT auth in handshake | Rust (0.01ms) | Go | No | No | No |
-| Wire formats | JSON + MsgPack | JSON + Protobuf | JSON | JSON | JSON |
-| Compression | zlib (Rust) | -- | per-msg deflate | per-msg deflate | per-msg deflate |
-| Priority queue | 5-level (Rust) | No | No | No | No |
-| Circuit breaker | Client + Server | No | No | No | No |
-| Offline queue | IndexedDB | No | No | No | No |
-| E2E encryption | AES-GCM-256 + ECDH | No | No | No | No |
-| Message signing | HMAC-SHA256 | HMAC-SHA256 | No | No | No |
-| Message ordering | Sequence + gap detect | Sequence numbers | No | No | No |
-| Dead letter queue | In-memory ring buffer | No | No | No | No |
-| Multi-instance | Native TCP cluster | Redis/Nats/Tarantool | Manual | Redis adapter | Manual |
-| Health monitoring | Quality scoring | No | No | No | No |
-| React integration | useWSE hook + Zustand | JS client | No | React adapter | No |
-
----
-
 ## Performance Optimization History
 
 | Phase | Throughput | Connection Latency | Improvement |
