@@ -96,17 +96,17 @@ All connections send ~175-byte JSON trading messages as fast as possible for 10 
 
 | Connections | Msg/s | GB/s | Per-conn msg/s | Errors |
 |-------------|-------|------|----------------|--------|
-| 100 | 13.8M | 2.4 | 138,208 | 0 |
-| 500 | 14.2M | 2.5 | 28,339 | 0 |
-| 1,000 | 14.1M | 2.5 | 14,145 | 0 |
-| 2,000 | 11.3M | 2.0 | 5,658 | 0 |
-| 5,000 | 11.4M | 2.0 | 2,276 | 0 |
-| 10,000 | 11.1M | 1.9 | 1,112 | 0 |
-| 20,000 | 12.1M | 2.1 | 607 | 0 |
-| 30,000 | 12.2M | 2.1 | 406 | 0 |
+| 100 | 14.5M | 2.5 | 144,663 | 0 |
+| 500 | 14.7M | 2.6 | 29,461 | 0 |
+| 1,000 | 14.7M | 2.6 | 14,717 | 0 |
+| 2,000 | 13.6M | 2.4 | 6,796 | 0 |
+| 5,000 | 11.4M | 2.0 | 2,277 | 0 |
+| 10,000 | 11.0M | 1.9 | 1,100 | 0 |
+| 20,000 | 11.8M | 2.1 | 592 | 0 |
+| 30,000 | 12.1M | 2.1 | 403 | 0 |
 | 50,000 | 13.8M | 2.4 | 276 | 0 |
 
-Peak throughput: **14.2M msg/s** at 500 connections (2.5 GB/s).
+Peak throughput: **14.7M msg/s** at 500-1000 connections (2.6 GB/s).
 The server stays above 11M msg/s even at 50K concurrent connections.
 Zero errors at every tier — not a single dropped connection.
 
@@ -114,9 +114,9 @@ Zero errors at every tier — not a single dropped connection.
 
 | Metric | Python Client | Rust Client | Improvement |
 |--------|--------------|-------------|-------------|
-| Peak msg/s | 6.9M (1K conns) | 14.2M (500 conns) | **2.1x** |
+| Peak msg/s | 6.9M (1K conns) | 14.7M (500 conns) | **2.1x** |
 | Max connections tested | ~1,000 | **500,000** | **500x** |
-| Throughput at 100 conns | 2.3M | 13.8M | **6.0x** |
+| Throughput at 100 conns | 2.3M | 14.5M | **6.3x** |
 | Connection errors | 0 | 0 | same |
 
 The Python client was the bottleneck all along. The server had 2x more headroom
@@ -133,27 +133,27 @@ Full throughput matrix across 6 payload sizes and 11 connection tiers.
 
 | Size \ Conns | 100 | 500 | 1K | 2K | 5K | 10K | 20K | 30K | 50K | 75K | 100K |
 |-------------|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|------|
-| **64 B** | 18.6M | 19.0M | 18.8M | 19.4M | 19.1M | 19.1M | 15.7M | 15.4M | 15.3M | 14.7M | 15.0M |
-| **256 B** | 12.5M | 12.3M | 12.3M | 11.7M | 8.3M | 11.0M | 10.8M | 10.5M | 10.6M | 10.6M | 8.9M |
-| **1 KB** | 10.2M | 10.3M | 10.2M | 8.3M | 8.5M | 8.2M | 7.9M | 7.3M | 6.7M | 6.5M | 6.6M |
-| **4 KB** | 4.6M | 4.9M | 4.9M | 4.2M | 4.0M | 3.9M | 3.6M | 3.1M | 3.3M | 2.0M | 2.3M |
-| **16 KB** | 1.2M | 1.2M | 1.2M | 1.1M | 1.0M | 1.0M | 1.0M | 800K | 971K | 919K | 824K |
-| **64 KB** | 284K | 279K | 284K | 250K | 261K | 254K | 220K | 256K | 242K | 261K | 267K |
+| **64 B** | 20.7M | 20.6M | 20.1M | 19.7M | 19.3M | 19.0M | 17.2M | 16.1M | 15.3M | 14.7M | 15.0M |
+| **256 B** | 13.8M | 14.0M | 13.9M | 13.7M | 13.0M | 13.0M | 11.1M | 11.0M | 10.6M | 10.6M | 8.9M |
+| **1 KB** | 11.0M | 11.0M | 11.0M | 9.2M | 9.5M | 8.7M | 8.0M | 7.4M | 6.7M | 6.5M | 6.6M |
+| **4 KB** | 4.9M | 4.9M | 4.9M | 4.3M | 4.2M | 3.4M | 3.7M | 3.6M | 3.3M | 2.0M | 2.3M |
+| **16 KB** | 1.2M | 1.2M | 1.2M | 1.1M | 944K | 923K | 790K | 1.1M | 971K | 919K | 824K |
+| **64 KB** | 290K | 288K | 287K | 263K | 239K | 237K | 266K | 275K | 242K | 261K | 267K |
 
-Peak message rate: **19.4M msg/s** at 64B payload with 2K connections.
+Peak message rate: **20.7M msg/s** at 64B payload with 100 connections.
 
 ### Bandwidth (GB/s)
 
 | Size \ Conns | 100 | 500 | 1K | 2K | 5K | 10K | 20K | 30K | 50K | 75K | 100K |
 |-------------|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|------|
-| **64 B** | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 0.8 | 0.8 | 0.8 | 0.8 | 0.8 |
-| **256 B** | 3.0 | 3.0 | 3.0 | 2.8 | 2.0 | 2.6 | 2.6 | 2.5 | 2.6 | 2.6 | 2.1 |
-| **1 KB** | 10.1 | 10.2 | 10.1 | 8.2 | 8.4 | 8.1 | 7.8 | 7.2 | 6.7 | 6.4 | 6.5 |
-| **4 KB** | 18.5 | 19.5 | 19.4 | 16.9 | 15.8 | 15.4 | 14.5 | 12.3 | 13.2 | 8.2 | 9.3 |
-| **16 KB** | 19.6 | 19.6 | 19.9 | 17.6 | 16.7 | 16.2 | 16.6 | 12.8 | 15.5 | 14.7 | 13.2 |
-| **64 KB** | 18.2 | 17.9 | 18.2 | 16.0 | 16.7 | 16.2 | 14.1 | 16.4 | 15.5 | 16.7 | 17.1 |
+| **64 B** | 1.1 | 1.1 | 1.1 | 1.1 | 1.0 | 1.0 | 0.9 | 0.9 | 0.8 | 0.8 | 0.8 |
+| **256 B** | 3.4 | 3.4 | 3.4 | 3.4 | 3.2 | 3.2 | 2.7 | 2.7 | 2.6 | 2.6 | 2.1 |
+| **1 KB** | 11.1 | 11.2 | 11.2 | 9.3 | 9.6 | 8.8 | 8.1 | 7.5 | 6.7 | 6.4 | 6.5 |
+| **4 KB** | 19.8 | 20.0 | 20.0 | 17.6 | 17.1 | 13.9 | 15.2 | 14.7 | 13.2 | 8.2 | 9.3 |
+| **16 KB** | 20.4 | 19.9 | 20.0 | 17.3 | 15.5 | 15.1 | 12.9 | 17.6 | 15.5 | 14.7 | 13.2 |
+| **64 KB** | 19.0 | 18.9 | 18.8 | 17.2 | 15.6 | 15.5 | 17.4 | 18.0 | 15.5 | 16.7 | 17.1 |
 
-Peak bandwidth: **19.9 GB/s** at 16KB payload with 1K connections.
+Peak bandwidth: **20.4 GB/s** at 16KB payload with 100 connections.
 
 At small payloads (64-256B), the bottleneck is per-message overhead — syscalls, frame
 headers, tokio task scheduling. At large payloads (16-64KB), it's raw memory bandwidth.
@@ -248,8 +248,8 @@ Memory at 500K: server + client consumed ~123 GB of the 128 GB available, with
 
 ## Key Takeaways
 
-1. **14.2M msg/s peak** (JSON), **30M msg/s** (binary formats) — the true server ceiling is 2-4x what the Python client showed
-2. **19.9 GB/s peak bandwidth** at 16KB payloads
+1. **14.7M msg/s peak** (JSON), **30M msg/s** (binary formats) — the true server ceiling is 2-4x what the Python client showed
+2. **20.4 GB/s peak bandwidth** at 16KB payloads
 3. **500K concurrent connections** with zero failures — limited only by available RAM (128 GB)
 4. **100% connection survival** for 30 seconds at every tier including 100K
 5. **Binary > JSON** for inbound throughput — MsgPack and compressed both achieve ~30M msg/s (2x JSON)
@@ -288,4 +288,4 @@ ulimit -n 500000
 
 ---
 
-*Tested February 24, 2026. WSE v1.3.9, wse-bench v0.1.0.*
+*Tested February 28, 2026. WSE v2.0.0, wse-bench v0.1.0.*
