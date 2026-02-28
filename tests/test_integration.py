@@ -10,9 +10,9 @@ import time
 
 import pytest
 import websockets
-from wse_server._wse_accel import RustWSEServer
 
 from tests.conftest import make_token
+from wse_server._wse_accel import RustWSEServer
 
 # ---------------------------------------------------------------------------
 # Helpers

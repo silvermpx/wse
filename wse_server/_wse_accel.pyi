@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 # =============================================================================
 # Compression
@@ -68,9 +69,7 @@ def rust_ecdh_generate_keypair() -> tuple[bytes, bytes]:
     """Generate an ECDH P-256 keypair. Returns (private_key, public_key_sec1)."""
     ...
 
-def rust_ecdh_derive_shared_secret(
-    private_key: bytes, peer_public_key: bytes
-) -> bytes:
+def rust_ecdh_derive_shared_secret(private_key: bytes, peer_public_key: bytes) -> bytes:
     """Derive a 32-byte AES key via ECDH + HKDF-SHA256."""
     ...
 
@@ -78,9 +77,7 @@ def rust_ecdh_derive_shared_secret(
 # JWT
 # =============================================================================
 
-def rust_jwt_encode(
-    claims: dict[str, Any], secret: bytes, algorithm: str = "HS256"
-) -> str:
+def rust_jwt_encode(claims: dict[str, Any], secret: bytes, algorithm: str = "HS256") -> str:
     """Encode claims into a JWT (HS256)."""
     ...
 
@@ -101,9 +98,7 @@ def rust_jwt_decode(
 class RustCompressionManager:
     """Zlib compression manager with optional msgpack support."""
 
-    def __init__(
-        self, threshold: int = 1024, compression_level: int = 6
-    ) -> None: ...
+    def __init__(self, threshold: int = 1024, compression_level: int = 6) -> None: ...
     def should_compress(self, data: bytes) -> bool:
         """Return True if data exceeds the compression threshold."""
         ...
@@ -193,9 +188,7 @@ class RustSequencer:
 class RustEventSequencer:
     """Event sequencer with dedup and out-of-order buffering."""
 
-    def __init__(
-        self, window_size: int = 10000, max_out_of_order: int = 100
-    ) -> None: ...
+    def __init__(self, window_size: int = 10000, max_out_of_order: int = 100) -> None: ...
     def next_seq(self) -> int:
         """Increment and return the next sequence number."""
         ...
@@ -205,9 +198,7 @@ class RustEventSequencer:
     def is_duplicate(self, event_id: str) -> bool:
         """Check if event ID has been seen."""
         ...
-    def process_sequenced_event(
-        self, topic: str, sequence: int, event: Any
-    ) -> list[Any] | None:
+    def process_sequenced_event(self, topic: str, sequence: int, event: Any) -> list[Any] | None:
         """Process a sequenced event. Returns deliverable events or None if buffered."""
         ...
     def cleanup(self) -> None:
@@ -414,9 +405,7 @@ class RustWSEServer:
     ) -> dict[str, Any]:
         """Subscribe with message recovery. Returns per-topic recovery status."""
         ...
-    def unsubscribe_connection(
-        self, conn_id: str, topics: list[str] | None = None
-    ) -> None:
+    def unsubscribe_connection(self, conn_id: str, topics: list[str] | None = None) -> None:
         """Unsubscribe from topics. If topics is None, unsubscribe from all."""
         ...
     def get_topic_subscriber_count(self, topic: str) -> int:

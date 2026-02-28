@@ -220,7 +220,9 @@ class MessageCodec:
             try:
                 plaintext = self._security.decrypt(data[2:])
             except Exception:
-                logger.warning("Decryption failed for E: frame (%d bytes), dropping", len(data))
+                logger.warning(
+                    "Decryption failed for E: frame (%d bytes), dropping", len(data)
+                )
                 return None
             return self._decode_text(plaintext)
 

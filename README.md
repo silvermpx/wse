@@ -5,7 +5,7 @@
 [![npm](https://img.shields.io/npm/v/wse-client)](https://www.npmjs.com/package/wse-client)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-High-performance WebSocket server built in Rust with native clustering, message recovery, presence tracking, and real-time fan-out. Exposed to Python via PyO3 with zero GIL overhead on the data path.
+High-performance WebSocket server built in Rust with native clustering, E2E encryption, message recovery, presence tracking, and real-time fan-out. Exposed to Python via PyO3 with zero GIL overhead on the data path. Ships with Rust-accelerated utilities for application code: priority queues, rate limiters, event sequencing, compression, cryptography, and JWT.
 
 ## Features
 
@@ -529,6 +529,7 @@ Working examples in the [`examples/`](examples/) directory:
 - [Integration Guide](docs/INTEGRATION.md) - complete setup and API reference
 - [Wire Protocol](docs/PROTOCOL.md) - message format specification
 - [Cluster Protocol](docs/CLUSTER_PROTOCOL.md) - TCP mesh, frame format, gossip, interest routing
+- [Rust Utilities](docs/RUST_UTILITIES.md) - priority queues, rate limiters, sequencing, compression, crypto, JWT
 - [Security](docs/SECURITY.md) - JWT, encryption, mTLS, rate limiting, circuit breaker
 - [Deployment](docs/DEPLOYMENT.md) - production setup, Docker, Kubernetes, cluster configuration
 - [Migration Guide](docs/MIGRATION.md) - upgrading from v1.x to v2.0
