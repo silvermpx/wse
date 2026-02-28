@@ -3,6 +3,7 @@
 import time
 
 import pytest
+
 from wse_server._wse_accel import RustWSEServer, rust_jwt_encode
 
 # Use high ports to avoid conflicts
