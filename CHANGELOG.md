@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.1.1 (2026-03-01)
+
+### Message Format Consistency
+
+- Fixed Python client `_parsed_to_event` to read `c` field from JSON (was only reading from legacy wire prefix)
+- Updated all documentation examples to use `c` field format: PROTOCOL.md, INTEGRATION.md, SECURITY.md, README.md
+- Updated examples/ to use `c` field in `send()` calls and removed old `WSE{...}` wire prefix
+- Updated integration tests and benchmarks to use `c` field format
+- Updated wire protocol descriptions in all READMEs
+
 ## v2.1.0 (2026-03-01)
 
 ### Prometheus Metrics
