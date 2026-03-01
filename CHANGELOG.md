@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.0.8 (2026-03-01)
+
+### Configurable JWT Cookie Name
+
+- Added `jwt_cookie_name` parameter to `RustWSEServer` constructor (default: `"access_token"`)
+- Server now reads JWT from the configured cookie name instead of hardcoded `access_token`
+- Allows integration with apps using custom cookie names for auth tokens
+
+### Documentation
+
+- Added TS/React client file structure and provider setup guide (Section 8)
+- Added publishing patterns documentation (Section 14): Pattern A (publisher-based, hexagonal) and Pattern B (event sourcing, EventBus + transformer)
+- Updated JWT auth docs to reflect configurable cookie name across PROTOCOL.md, SECURITY.md, INTEGRATION.md, DEPLOYMENT.md
+
 ## v2.0.7 (2026-02-28)
 
 ### Bug Fixes (Cluster Protocol)

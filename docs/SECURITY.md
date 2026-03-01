@@ -8,7 +8,7 @@ WSE supports three authentication methods, chosen based on client type:
 
 | Client Type | Method | How |
 |-------------|--------|-----|
-| **Browser (TS/React)** | HTTP-only Cookie | `access_token` cookie with `httpOnly + secure + sameSite=Lax` |
+| **Browser (TS/React)** | HTTP-only Cookie | Cookie with `httpOnly + secure + sameSite=Lax` (default name: `access_token`, configurable via `jwt_cookie_name`) |
 | **Backend (Python)** | Cookie + Authorization header | Sends both; server reads whichever is available |
 | **API / CLI** | Authorization header | `Authorization: Bearer <JWT>` |
 
@@ -27,7 +27,7 @@ WSE supports three authentication methods, chosen based on client type:
 
 The Rust server reads authentication credentials in this order:
 
-1. **HTTP-only cookie**: `access_token` from the `Cookie` header (primary - covers browsers)
+1. **HTTP-only cookie**: from the `Cookie` header (default name: `access_token`, configurable via `jwt_cookie_name` constructor parameter)
 2. **Authorization header**: `Authorization: Bearer <JWT>` (fallback - covers backend clients)
 
 Both paths use HS256 (HMAC-SHA256) JWT validation.
@@ -44,10 +44,11 @@ server = RustWSEServer(
     jwt_secret=b"replace-with-a-strong-secret-key!",
     jwt_issuer="your-app",      # optional: validate iss claim
     jwt_audience="your-api",    # optional: validate aud claim
+    jwt_cookie_name="access_token",  # optional: cookie name for JWT (default: "access_token")
 )
 ```
 
-The Rust server extracts the `access_token` cookie from the HTTP upgrade headers and validates:
+The Rust server extracts the JWT cookie (configured via `jwt_cookie_name`, default `access_token`) from the HTTP upgrade headers and validates:
 1. HS256 signature (constant-time comparison)
 2. `exp` claim (reject expired tokens, boundary check per RFC 7519)
 3. `iss` claim (if `jwt_issuer` configured)
@@ -80,7 +81,7 @@ On authentication failure:
 
 **Browser (TS/React client):**
 ```typescript
-// Cookie is set by your login endpoint:
+// Cookie is set by your login endpoint (name must match jwt_cookie_name):
 // Set-Cookie: access_token=<JWT>; HttpOnly; Secure; SameSite=Lax; Max-Age=900
 // The browser attaches it automatically on WebSocket upgrade
 const ws = new WebSocket('wss://host:port/wse');

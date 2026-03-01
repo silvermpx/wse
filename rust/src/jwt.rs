@@ -70,6 +70,7 @@ pub struct JwtConfig {
     pub secret: Vec<u8>,
     pub issuer: String,
     pub audience: String,
+    pub cookie_name: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +415,7 @@ mod tests {
             secret: test_secret(),
             issuer: "sqv".to_string(),
             audience: "sqv-api".to_string(),
+            cookie_name: "access_token".to_string(),
         }
     }
 
@@ -612,6 +614,7 @@ mod tests {
             secret: secret.clone(),
             issuer: String::new(),
             audience: String::new(),
+            cookie_name: "access_token".to_string(),
         };
         let claims = serde_json::json!({
             "sub": "user-123",

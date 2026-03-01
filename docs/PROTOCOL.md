@@ -150,14 +150,14 @@ Client → Rust Server (port 5006): WebSocket UPGRADE /wse
 Server → Client: 101 Switching Protocols
 ```
 
-Authentication is via HTTP-only `access_token` cookie (same as REST API). No query parameter needed.
+Authentication is via HTTP-only cookie (default name: `access_token`, configurable via `jwt_cookie_name`). No query parameter needed.
 
 ### 2. Authentication
 
 Two paths depending on server configuration:
 
 **Rust JWT (when `jwt_secret` is configured):**
-1. Rust extracts `access_token` from cookie header during handshake
+1. Rust extracts JWT from cookie header during handshake (cookie name configured via `jwt_cookie_name`, default `access_token`)
 2. Rust validates JWT signature, expiry, issuer, audience
 3. On success: Rust sends `server_ready` immediately (zero GIL)
 4. Rust pushes `AuthConnect{conn_id, user_id}` to drain queue

@@ -21,6 +21,7 @@ server = RustWSEServer(
     jwt_secret=b"replace-with-a-strong-secret-key!",
     jwt_issuer="my-app",
     jwt_audience="my-api",
+    jwt_cookie_name="access_token",  # optional, default: "access_token"
 )
 server.enable_drain_mode()
 server.start()
@@ -83,6 +84,7 @@ server = RustWSEServer(
     jwt_secret=b"replace-with-a-strong-secret-key!",
     jwt_issuer="my-app",
     jwt_audience="my-api",
+    jwt_cookie_name="access_token",  # optional, default: "access_token"
     recovery_enabled=True,
     presence_enabled=True,
 )

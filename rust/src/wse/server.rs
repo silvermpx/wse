@@ -782,7 +782,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     // On success: send server_ready immediately, push AuthConnect to drain queue.
     // On failure: send error + close — connection never registered.
     let rust_auth_user_id: Option<String> = if let Some(ref jwt_cfg) = state.jwt_config {
-        let token = parse_cookie_value(&cookie_str, "access_token").or_else(|| {
+        let token = parse_cookie_value(&cookie_str, &jwt_cfg.cookie_name).or_else(|| {
             auth_header.as_deref().and_then(|h| {
                 // RFC 7235: auth-scheme is case-insensitive
                 if h.len() > 7 && h[..7].eq_ignore_ascii_case("bearer ") {
@@ -816,7 +816,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                     rx,
                     write_half,
                     "AUTH_REQUIRED",
-                    "No access_token cookie or Authorization header",
+                    "No JWT cookie or Authorization header",
                 )
                 .await;
                 return;
@@ -1738,7 +1738,7 @@ pub struct RustWSEServer {
 #[pymethods]
 impl RustWSEServer {
     #[new]
-    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0))]
+    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         host: String,
@@ -1747,6 +1747,7 @@ impl RustWSEServer {
         jwt_secret: Option<Vec<u8>>,
         jwt_issuer: Option<String>,
         jwt_audience: Option<String>,
+        jwt_cookie_name: Option<String>,
         max_inbound_queue_size: usize,
         recovery_enabled: bool,
         recovery_buffer_size: usize,
@@ -1767,6 +1768,7 @@ impl RustWSEServer {
                 secret,
                 issuer: jwt_issuer.unwrap_or_default(),
                 audience: jwt_audience.unwrap_or_default(),
+                cookie_name: jwt_cookie_name.unwrap_or_else(|| "access_token".to_string()),
             }
         });
         let recovery = if recovery_enabled {

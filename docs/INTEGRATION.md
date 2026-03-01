@@ -26,6 +26,7 @@ server = RustWSEServer(
     jwt_secret=b"replace-with-a-strong-secret-key!",
     jwt_issuer="my-app",
     jwt_audience="my-api",
+    jwt_cookie_name="access_token",  # optional, default: "access_token"
 )
 server.enable_drain_mode()
 server.start()
@@ -50,6 +51,7 @@ server = RustWSEServer(
     jwt_secret=b"replace-with-a-strong-secret-key!",
     jwt_issuer="my-app",
     jwt_audience="my-api",
+    jwt_cookie_name="access_token",  # optional, default: "access_token"
 )
 
 # --- Event processing (runs in a background thread) -----------------------
@@ -124,7 +126,7 @@ For production, put both behind the same reverse proxy (nginx, Caddy) and route 
 
 ## 3. JWT Authentication
 
-Configure `jwt_secret`, `jwt_issuer`, and `jwt_audience` in the constructor. The server validates JWT tokens during the WebSocket handshake in Rust (zero-GIL, sub-millisecond).
+Configure `jwt_secret`, `jwt_issuer`, `jwt_audience`, and optionally `jwt_cookie_name` in the constructor. The server validates JWT tokens during the WebSocket handshake in Rust (zero-GIL, sub-millisecond).
 
 **Token claims:**
 
@@ -136,7 +138,7 @@ Configure `jwt_secret`, `jwt_issuer`, and `jwt_audience` in the constructor. The
 | `iss` | If configured | Issuer (validated only when `jwt_issuer` is set) |
 | `aud` | If configured | Audience (validated only when `jwt_audience` is set) |
 
-**Token delivery:** The client sends the token as an `Authorization: Bearer <token>` header or an `access_token` cookie during the WebSocket handshake.
+**Token delivery:** The client sends the token as an `Authorization: Bearer <token>` header or a cookie during the WebSocket handshake. The cookie name defaults to `access_token` and can be changed via the `jwt_cookie_name` constructor parameter.
 
 **Connection events:**
 - With JWT configured: `auth_connect` event fires with the validated `user_id`
@@ -562,19 +564,96 @@ async with AsyncWSEClient("ws://localhost:5007/wse", token="...") as client:
 npm install wse-client
 ```
 
-```tsx
-import { useWSE } from 'wse-client';
+**Recommended file structure:**
 
-function App() {
-    const { connectionHealth, sendMessage } = useWSE(
-        'jwt-token',
-        ['prices'],
-        { endpoints: ['ws://localhost:5007/wse'] },
-    );
+```
+src/wse/
+├── index.ts              # re-export: export * from 'wse-client'
+├── config.ts             # App-specific: endpoints, auth refresh, topics
+└── handlers/
+    ├── index.ts           # registerAllHandlers()
+    ├── BrokerHandlers.ts  # Domain-specific event handlers
+    └── ...
+```
 
-    return <div>Status: {connectionHealth}</div>;
+Everything else (services, stores, hooks, protocols, utils, types, constants) comes from the package. Use a barrel re-export so existing `@/wse` imports keep working:
+
+```typescript
+// src/wse/index.ts
+export * from 'wse-client';
+```
+
+**App-level config** (endpoints, auth, topics):
+
+```typescript
+// src/wse/config.ts
+export const APP_DEFAULT_TOPICS = [
+  'broker_events', 'account_events', 'market_data',
+] as const;
+
+export function getAppEndpoints(): string[] {
+  const url = import.meta.env?.VITE_WSE_URL;  // Vite
+  if (url) {
+    const normalized = url.replace(/\/$/, '');
+    return [normalized.endsWith('/wse') ? normalized : `${normalized}/wse`];
+  }
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  return [`${protocol}://${window.location.host}/wse`];
+}
+
+export async function refreshAuthToken(): Promise<void> {
+  const res = await fetch('/api/auth/refresh', {
+    method: 'POST', credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!res.ok) throw new Error(`Token refresh failed: ${res.status}`);
 }
 ```
+
+**Provider setup:**
+
+```tsx
+import { useWSE } from 'wse-client';
+import type { UseWSEConfig } from 'wse-client';
+import { APP_DEFAULT_TOPICS, getAppEndpoints, refreshAuthToken } from '@/wse/config';
+
+export function WSEProvider({ children }: { children: ReactNode }) {
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+
+  const wseConfig: UseWSEConfig = {
+    endpoints: getAppEndpoints(),
+    refreshAuthToken,
+  };
+
+  const wse = useWSE(
+    isAuthenticated ? 'cookie' : undefined,  // 'cookie' = HttpOnly cookie auth
+    [...APP_DEFAULT_TOPICS],
+    wseConfig,
+  );
+
+  return <WSEContext.Provider value={wse}>{children}</WSEContext.Provider>;
+}
+```
+
+**Key points:**
+- `useWSE(token?, initialTopics?, config?)` — 3 arguments
+- `refreshAuthToken` goes inside `UseWSEConfig`, not as a separate argument
+- Pass `'cookie'` as token for HttpOnly cookie auth (browser sends cookies on WS upgrade)
+- Pass `undefined` when not authenticated (prevents connection)
+
+**Event handlers** — register by the `"t"` value the backend publisher sets:
+
+```typescript
+// handlers/index.ts
+export function registerAllHandlers(messageProcessor: {
+  registerHandler: (type: string, handler: (msg: any) => void) => void;
+}): void {
+  messageProcessor.registerHandler('broker_health_update', BrokerHandlers.handleHealthUpdate);
+  messageProcessor.registerHandler('quote_update', MarketDataHandlers.handleQuoteUpdate);
+}
+```
+
+Frontend never maps domain event names. It receives ready `"t"` + `"p"` from the backend publisher. See Section 14 for the publishing architecture.
 
 Both clients handle reconnection with exponential backoff, automatic resubscription, and message recovery (when enabled on the server).
 
@@ -625,3 +704,176 @@ Key metrics to watch:
 | `cluster_peer_count` | `health_snapshot()` | < expected peer count |
 | `recovery_total_bytes` | `health_snapshot()` | > 80% of `recovery_memory_budget` |
 | Connection count | `get_connection_count()` | > 90% of `max_connections` |
+
+---
+
+## 14. Publishing Patterns
+
+How to publish real-time events from backend to frontend via WSE. Two patterns depending on your architecture.
+
+| Architecture | Pattern | Transformer | Mapping Table |
+|-------------|---------|-------------|---------------|
+| **Hexagonal / Publisher-based** | A | No | No — publisher method IS the mapping |
+| **Event Sourcing / EventBus** | B | Yes (`rust_transform_event`) | Yes (`INTERNAL_TO_WS_EVENT_TYPE_MAP`) |
+
+### Pattern A: Publisher-Based (Hexagonal Architecture)
+
+Each publisher method explicitly sets `"t"` and `"p"`. No mapping table, no transformer. Best when publishers control what events are emitted.
+
+```
+Domain Layer                    →  Defines PORT (interface)
+                                   WSEPublisherPort.publish_validation_result(user_id, result)
+                                   Domain does NOT know about WebSocket, JSON, "t"/"p", topics.
+
+Presentation Layer (adapter)    →  Publisher IMPLEMENTS port:
+                                   → builds {"t": "status_update", "p": {...}, "id": uuid, "ts": iso, "v": 1}
+                                   → calls server.broadcast_local(topic, json)
+
+Rust WSE Server                 →  broadcast_local(topic, json) — fan-out. Transport only.
+
+Frontend                        →  registerHandler("status_update", Handlers.handleStatusUpdate)
+                                   Receives ready "t" + "p". No mapping.
+```
+
+**Publisher method = mapping:**
+
+```python
+class GatewayPublisher:
+    def _build_event(self, event_type: str, payload: dict) -> dict:
+        return {
+            "t": event_type,
+            "id": str(uuid7()),
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "p": payload,
+            "v": 1,
+        }
+
+    async def publish_broker_health(self, user_id, connections, market_data):
+        event = self._build_event("broker_health_update", {
+            "connections": connections,
+            "market_data_stream": market_data,
+        })
+        self._publish_to_rust(f"user:{user_id}:broker_health", event)
+```
+
+**Domain port / adapter split:**
+
+```python
+# domain/my_domain/ports/outbound/wse_publisher.py (PORT)
+class WSEPublisherPort(ABC):
+    @abstractmethod
+    async def publish_result(self, user_id: str, result: Result) -> None: ...
+
+# presentation/wse/publishers/my_publisher.py (ADAPTER)
+class MyPublisher(WSEPublisherPort):
+    async def publish_result(self, user_id: str, result: Result) -> None:
+        event = self._build_event("result_update", {"score": result.score})
+        self._publish_to_rust(f"user:{user_id}:events", event)
+```
+
+Domain says WHAT to publish. Publisher decides HOW (format, topic, transport).
+
+**Infrastructure publishers** (no domain port needed):
+
+For events originating in infrastructure (market data streams, broker health), the publisher can be standalone — no port required. Used when the event source is infrastructure rather than domain business logic.
+
+**Adding a new event (3 files):**
+
+1. Domain port — add abstract method
+2. Publisher — implement method, set `"t"`
+3. Frontend handler — `registerHandler('my_event', handler)`
+
+No mapping tables, no transformer, no config updates.
+
+### Pattern B: Event Sourcing (EventBus + Transformer)
+
+Domain aggregates emit events (`UserProfileUpdated`, `BrokerAccountLinked`). These arrive as a single stream via EventBus. Publisher doesn't have dedicated methods per event — it receives whatever the aggregates emit.
+
+```
+EventBus (RedPanda / Kafka)     →  Aggregates emit: UserProfileUpdated, CounterpartyCreated, ...
+
+Domain Publisher                →  1. Reads "event_type" from raw event
+                                   2. Looks up WS type via INTERNAL_TO_WS_EVENT_TYPE_MAP
+                                   3. rust_transform_event() builds wire format
+                                   4. server.broadcast(topic, json)
+
+Rust WSE Server                 →  broadcast(topic, json) — fan-out. Transport only.
+
+Frontend                        →  registerHandler("user_profile_update", handler)
+                                   Receives ready "t" + "p". No mapping.
+```
+
+**Mapping table** (inlined in publisher, not a separate file):
+
+```python
+INTERNAL_TO_WS_EVENT_TYPE_MAP: dict[str, str] = {
+    'UserProfileUpdated': 'user_profile_update',
+    'CounterpartyCreated': 'counterparty_update',
+    'CustomsDeclarationSubmitted': 'customs_declaration_update',
+    # ...
+}
+```
+
+Events not in the table are silently filtered (not forwarded to frontend).
+
+**Publisher:**
+
+```python
+from wse_server._wse_accel import rust_transform_event
+
+class WSEDomainPublisher:
+    async def _handle_event(self, event: dict):
+        ws_type = INTERNAL_TO_WS_EVENT_TYPE_MAP.get(event.get("event_type"))
+        if not ws_type:
+            return  # filtered
+        ws_message = rust_transform_event(event, next(self._seq), INTERNAL_TO_WS_EVENT_TYPE_MAP)
+        if ws_message:
+            self._server.broadcast(topic, json.dumps(ws_message, default=str))
+```
+
+**Adding a new event (2 steps):**
+
+1. Mapping table — add one line: `'MyDomainEvent': 'my_event_update'`
+2. Frontend handler — `registerHandler('my_event_update', handler)`
+
+### Wire Format (Both Patterns)
+
+```json
+{
+  "t": "broker_health_update",
+  "id": "0194a5b2-...",
+  "ts": "2026-03-01T12:00:00.000000Z",
+  "p": { "connections": [], "market_data_stream": {} },
+  "v": 1
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `t` | string | Event type (snake_case, set by publisher or transformer) |
+| `id` | string | UUID7 message ID |
+| `ts` | string | ISO 8601 timestamp |
+| `p` | object | Payload (domain data, ready to consume) |
+| `v` | int | Protocol version |
+
+Optional: `_msg_cat` (`"S"` for snapshots), `seq` (if sequencing enabled).
+
+### Topic Naming
+
+```
+user:{user_id}:{domain}_events    # Per-user domain events
+system:{category}                  # Global system events
+```
+
+### Pattern A vs Pattern B
+
+| | Pattern A (Publisher-Based) | Pattern B (Event Sourcing) |
+|---|---|---|
+| Event source | Publisher methods (explicit) | EventBus stream (aggregates) |
+| Who sets `"t"` | Publisher method directly | Mapping table lookup |
+| Transformer | Not needed | `rust_transform_event()` |
+| Mapping table | Anti-pattern | Required |
+| Adding event | Add publisher method + handler | Add mapping line + handler |
+| Best for | Services, gateways, infrastructure | Event sourcing, CQRS, DDD |
+
+**Common to both:** Frontend never maps domain event names. Server is transport-only.
