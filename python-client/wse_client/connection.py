@@ -485,7 +485,7 @@ class ConnectionManager:
             },
             "v": PROTOCOL_VERSION,
         }
-        await self.send(_json.dumps(pong_msg, separators=(',', ':')))
+        await self.send(_json.dumps(pong_msg, separators=(",", ":")))
 
     def handle_server_ready(self, connection_id: str | None = None) -> None:
         """Called by the client layer when ``server_ready`` is decoded."""
@@ -537,7 +537,7 @@ class ConnectionManager:
                 "v": PROTOCOL_VERSION,
                 "pri": MessagePriority.CRITICAL,
             }
-            ok = await self.send(_json.dumps(msg, separators=(',', ':')))
+            ok = await self.send(_json.dumps(msg, separators=(",", ":")))
             if ok:
                 self._client_hello_sent = True
                 return
@@ -582,7 +582,7 @@ class ConnectionManager:
                 "p": {"timestamp": int(time.time() * 1000)},
                 "v": PROTOCOL_VERSION,
             }
-            ok = await self.send(_json.dumps(ping_msg, separators=(',', ':')))
+            ok = await self.send(_json.dumps(ping_msg, separators=(",", ":")))
             if ok and self._on_ping_sent:
                 self._on_ping_sent()
             elif not ok:
