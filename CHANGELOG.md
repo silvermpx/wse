@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.1.0 (2026-03-01)
+
+### Prometheus Metrics
+
+- Added `prometheus_metrics()` method returning Prometheus text exposition format
+- 25 metrics: gauges (connections, topics, uptime, queue depth, cluster peers) + counters (messages in/out, bytes in/out, connections accepted/rejected, auth failures, rate limited, inbound dropped) + cluster counters + optional recovery/presence
+- 8 new atomic counters in Rust: `messages_received_total`, `messages_sent_total`, `connections_accepted_total`, `connections_rejected_total`, `bytes_received_total`, `bytes_sent_total`, `auth_failures_total`, `rate_limited_total`
+- No external crate dependency, manual text formatting
+- Updated DEPLOYMENT.md monitoring section with Prometheus setup and alert conditions
+- Added INTEGRATION.md Section 15 with full metric reference and scrape config
+
 ## v2.0.8 (2026-03-01)
 
 ### Configurable JWT Cookie Name
