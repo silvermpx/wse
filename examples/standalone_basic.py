@@ -66,7 +66,7 @@ def event_loop(server: RustWSEServer, stop: threading.Event):
                 connections[conn_id] = user_id
                 print(f"[+] {user_id} connected ({conn_id})")
                 # send a welcome message
-                server.send(conn_id, '{"t":"welcome","p":{"msg":"hello from WSE"}}')
+                server.send(conn_id, '{"c":"U","t":"welcome","p":{"msg":"hello from WSE"},"v":1}')
 
             elif event_type == "msg":
                 data = event[2]  # parsed dict

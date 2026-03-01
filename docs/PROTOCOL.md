@@ -115,11 +115,11 @@ Encryption spec:
 7. Both sides run HKDF to get the AES-256 key
 8. All subsequent `E:`-prefixed messages use this key
 
-The plaintext inside the encrypted envelope is the full message including category prefix (e.g. `U{...}`).
+The plaintext inside the encrypted envelope is the full JSON message (e.g. `{"c":"U","t":"...","p":{...},"v":1}`).
 
 ### Binary Mode: JSON (default since v1.1)
 
-All JSON messages are sent as WebSocket binary frames instead of text frames. This eliminates UTF-8 validation overhead in the WebSocket layer, providing 5-15% higher throughput. The payload format is identical - category prefix followed by JSON - but delivered in a binary frame.
+All JSON messages are sent as WebSocket binary frames instead of text frames. This eliminates UTF-8 validation overhead in the WebSocket layer, providing 5-15% higher throughput. The payload format is identical JSON with `c` field, but delivered in a binary frame.
 
 Clients should handle both text and binary frames containing JSON for backward compatibility.
 
@@ -137,7 +137,7 @@ To opt in, connect with `?format=msgpack` query parameter:
 ws://host:port/wse?format=msgpack
 ```
 
-When enabled, all outbound messages from the server use msgpack instead of JSON. The msgpack payload contains the same fields (`t`, `p`, `id`, `ts`, `seq`, `v`) but encoded with MessagePack. No category prefix is used - the `M:` header replaces it.
+When enabled, all outbound messages from the server use msgpack instead of JSON. The msgpack payload contains the same fields (`c`, `t`, `p`, `id`, `ts`, `seq`, `v`) but encoded with MessagePack.
 
 Requires `@msgpack/msgpack` (JS) or `msgpack` (Python) on the client side.
 
@@ -176,7 +176,7 @@ The Rust JWT path eliminates GIL acquisition from the connection critical path, 
 Sent after authentication succeeds (from Rust when JWT is configured, from Python otherwise):
 
 ```json
-WSE{"v":1,"t":"server_ready","id":"019c53c4-abcd-7def","ts":"2026-02-28T12:00:00.000Z","seq":1,"p":{
+{"c":"WSE","t":"server_ready","p":{
   "message": "Connection established (Rust transport)",
   "details": {
     "version": 1,
@@ -194,7 +194,7 @@ WSE{"v":1,"t":"server_ready","id":"019c53c4-abcd-7def","ts":"2026-02-28T12:00:00
     "server_time": "2026-02-28T12:00:00.000Z",
     "user_id": "019c53c4-abcd-7def-8901-234567890abc"
   }
-}}
+},"v":1}
 ```
 
 When `rust_jwt` is `true`, JWT validation was performed by the Rust server during the handshake (before this message was sent). The `user_id` field is the validated subject from the JWT.
@@ -210,11 +210,11 @@ The Python application subscribes connections to topics via `subscribe_connectio
 Real-time updates are sent via topic broadcast:
 
 ```json
-U{"t":"user_update","p":{
+{"c":"U","t":"user_update","p":{
   "user_id": "...",
   "status": "online",
   "last_seen": "2026-02-20T15:30:00.123Z"
-}}
+},"v":1}
 ```
 
 ### 6. Heartbeat
@@ -222,13 +222,13 @@ U{"t":"user_update","p":{
 Server sends a ping every 25 seconds:
 
 ```json
-WSE{"t":"ping","p":{"server_time":"2026-02-28T12:00:00.000Z"}}
+{"c":"WSE","t":"ping","p":{"server_time":"2026-02-28T12:00:00.000Z"}}
 ```
 
 Client responds with a PONG echoing the server timestamp plus its own:
 
 ```json
-{"t":"PONG","p":{"client_timestamp":1708441800000,"server_timestamp":1708441800050}}
+{"c":"WSE","t":"PONG","p":{"client_timestamp":1708441800050,"server_timestamp":1708441800000}}
 ```
 
 ### 7. Disconnect
@@ -247,7 +247,7 @@ When presence tracking is enabled, the server broadcasts presence events to all 
 Sent when the first connection for a user subscribes to a topic with presence data:
 
 ```json
-{"t": "presence_join", "p": {"user_id": "alice", "data": {"status": "online", "name": "Alice"}}}
+{"c":"WSE","t":"presence_join","p":{"user_id":"alice","data":{"status":"online","name":"Alice"}},"v":1}
 ```
 
 ### Presence Leave (server to client)
@@ -255,7 +255,7 @@ Sent when the first connection for a user subscribes to a topic with presence da
 Sent when the last connection for a user is removed from a topic:
 
 ```json
-{"t": "presence_leave", "p": {"user_id": "alice", "data": {"status": "online", "name": "Alice"}}}
+{"c":"WSE","t":"presence_leave","p":{"user_id":"alice","data":{"status":"online","name":"Alice"}},"v":1}
 ```
 
 ### Presence Update (server to client)
@@ -263,7 +263,7 @@ Sent when the last connection for a user is removed from a topic:
 Sent when a user's presence data is updated via `update_presence()`:
 
 ```json
-{"t": "presence_update", "p": {"user_id": "alice", "data": {"status": "away"}}}
+{"c":"WSE","t":"presence_update","p":{"user_id":"alice","data":{"status":"away"}},"v":1}
 ```
 
 Presence is queried through the Python API (`server.presence(topic)`, `server.presence_stats(topic)`), not through WebSocket messages.
@@ -277,14 +277,11 @@ Presence is queried through the Python API (`server.presence(topic)`, `server.pr
 Subscribe with optional presence data. The `presence` field attaches user metadata for presence tracking (requires `presence_enabled=True` on the server):
 
 ```json
-{
-  "t": "subscription",
-  "p": {
-    "action": "subscribe",
-    "topics": ["notifications", "chat_messages"],
-    "presence": {"status": "online", "name": "Alice"}
-  }
-}
+{"c":"WSE","t":"subscription","p":{
+  "action": "subscribe",
+  "topics": ["notifications", "chat_messages"],
+  "presence": {"status": "online", "name": "Alice"}
+},"v":1}
 ```
 
 ### Sync Request
@@ -292,13 +289,10 @@ Subscribe with optional presence data. The `presence` field attaches user metada
 Request initial data snapshots:
 
 ```json
-{
-  "t": "sync_request",
-  "p": {
-    "topics": ["notifications", "chat_messages"],
-    "include_snapshots": true
-  }
-}
+{"c":"S","t":"sync_request","p":{
+  "topics": ["notifications", "chat_messages"],
+  "include_snapshots": true
+},"v":1}
 ```
 
 ### Client Hello
@@ -306,20 +300,17 @@ Request initial data snapshots:
 Protocol negotiation. When encryption is enabled, includes the client's ECDH public key:
 
 ```json
-{
-  "t": "client_hello",
-  "p": {
-    "client_version": "2.0.0",
-    "protocol_version": 2,
-    "features": {
-      "compression": true,
-      "batch_messages": true,
-      "encryption": true
-    },
-    "capabilities": ["compression", "encryption", "batching"],
-    "encryption_public_key": "<base64-encoded 65-byte ECDH P-256 public key>"
-  }
-}
+{"c":"WSE","t":"client_hello","p":{
+  "client_version": "2.1.0",
+  "protocol_version": 1,
+  "features": {
+    "compression": true,
+    "batch_messages": true,
+    "encryption": true
+  },
+  "capabilities": ["compression", "encryption", "batching"],
+  "encryption_public_key": "<base64-encoded 65-byte ECDH P-256 public key>"
+},"v":1}
 ```
 
 Once the server receives `client_hello` with `encryption_public_key`, it derives the shared AES-256 key. All subsequent messages from both sides may be sent as `E:`-prefixed encrypted binary frames.
@@ -329,34 +320,25 @@ Once the server receives `client_hello` with `encryption_public_key`, it derives
 Dynamic configuration:
 
 ```json
-{
-  "t": "config_update",
-  "p": {
-    "compression_enabled": true,
-    "compression_threshold": 2048,
-    "batching_enabled": true,
-    "batch_size": 20,
-    "batch_timeout": 0.2
-  }
-}
+{"c":"WSE","t":"config_update","p":{
+  "compression_enabled": true,
+  "compression_threshold": 2048,
+  "batching_enabled": true,
+  "batch_size": 20,
+  "batch_timeout": 0.2
+},"v":1}
 ```
 
 ### Health Check
 
 ```json
-{
-  "t": "health_check",
-  "p": {}
-}
+{"c":"WSE","t":"health_check","p":{},"v":1}
 ```
 
 ### Metrics Request
 
 ```json
-{
-  "t": "metrics_request",
-  "p": {}
-}
+{"c":"WSE","t":"metrics_request","p":{},"v":1}
 ```
 
 ## Batching
@@ -364,13 +346,13 @@ Dynamic configuration:
 When the client supports batching (`batch_messages: true` in features), the server may send multiple messages in a single frame:
 
 ```json
-U{"t":"batch","p":{
+{"c":"WSE","t":"batch","p":{
   "messages": [
-    {"t":"notification","p":{...}},
-    {"t":"chat_message","p":{...}}
+    {"t":"notification","p":{"title":"New message"}},
+    {"t":"chat_message","p":{"text":"Hello"}}
   ],
   "count": 2
-}}
+},"v":1}
 ```
 
 ## Message Signing
@@ -378,7 +360,7 @@ U{"t":"batch","p":{
 Messages matching a configurable set of types are signed for integrity verification. The set is empty by default - configure via `signed_message_types` in the connection constructor. When `message_signing_enabled` is `True`, all messages are signed.
 
 ```json
-U{"t":"my_critical_event","p":{...},"sig":"<hash>:<timestamp>:<nonce>:<hmac>","v":1}
+{"c":"U","t":"my_critical_event","p":{"action":"transfer","amount":500},"sig":"<hash>:<timestamp>:<nonce>:<hmac>","v":1}
 ```
 
 The `sig` field contains an HMAC-SHA256 signature (or JWT when a TokenProvider is configured):
@@ -438,21 +420,18 @@ After the WebSocket connection is established and the server sends `server_ready
 Sent by the client immediately after receiving `server_ready`:
 
 ```json
-{
-  "t": "client_hello",
-  "p": {
-    "client_version": "2.0.0",
-    "protocol_version": 1,
-    "features": {
-      "compression": true,
-      "batch_messages": true,
-      "encryption": true,
-      "msgpack": false
-    },
-    "capabilities": ["compression", "encryption", "batching"],
-    "encryption_public_key": "<base64-encoded 65-byte ECDH P-256 public key>"
-  }
-}
+{"c":"WSE","t":"client_hello","p":{
+  "client_version": "2.1.0",
+  "protocol_version": 1,
+  "features": {
+    "compression": true,
+    "batch_messages": true,
+    "encryption": true,
+    "msgpack": false
+  },
+  "capabilities": ["compression", "encryption", "batching"],
+  "encryption_public_key": "<base64-encoded 65-byte ECDH P-256 public key>"
+},"v":1}
 ```
 
 | Field | Type | Description |
@@ -468,30 +447,26 @@ Sent by the client immediately after receiving `server_ready`:
 Sent by the server in response to `client_hello`:
 
 ```json
-WSE{
-  "t": "server_hello",
-  "v": 1,
-  "p": {
-    "server_version": "2.0.0",
-    "protocol_version": 1,
-    "features": {
-      "compression": true,
-      "recovery": true,
-      "cluster": false,
-      "batching": true,
-      "priority_queue": true,
-      "msgpack": true
-    },
-    "limits": {
-      "max_message_size": 1048576,
-      "rate_limit_capacity": 100000,
-      "rate_limit_refill": 10000
-    },
-    "ping_interval": 25000,
-    "connection_id": "conn-abc-123",
-    "server_time": "2026-02-28T12:00:00.000Z"
-  }
-}
+{"c":"WSE","t":"server_hello","p":{
+  "server_version": "2.1.0",
+  "protocol_version": 1,
+  "features": {
+    "compression": true,
+    "recovery": true,
+    "cluster": false,
+    "batching": true,
+    "priority_queue": true,
+    "msgpack": true
+  },
+  "limits": {
+    "max_message_size": 1048576,
+    "rate_limit_capacity": 100000,
+    "rate_limit_refill": 10000
+  },
+  "ping_interval": 25000,
+  "connection_id": "conn-abc-123",
+  "server_time": "2026-02-28T12:00:00.000Z"
+},"v":1}
 ```
 
 | Field | Type | Description |
@@ -517,7 +492,7 @@ The server sends periodic ping messages to detect stale connections and measure 
 ### Ping Message
 
 ```json
-WSE{"t":"ping","p":{"server_time":"2026-02-28T12:00:00.000Z"}}
+{"c":"WSE","t":"ping","p":{"server_time":"2026-02-28T12:00:00.000Z"}}
 ```
 
 ### Expected Pong Response
@@ -525,7 +500,7 @@ WSE{"t":"ping","p":{"server_time":"2026-02-28T12:00:00.000Z"}}
 The client must respond with a PONG containing both the original server timestamp and the client's own timestamp:
 
 ```json
-{"t":"PONG","p":{"client_timestamp":1708441800050,"server_timestamp":1708441800000}}
+{"c":"WSE","t":"PONG","p":{"client_timestamp":1708441800050,"server_timestamp":1708441800000}}
 ```
 
 The server uses the round-trip time to track connection health metrics. Clients that fail to respond within the zombie detection window are disconnected with close code 1000.
@@ -546,12 +521,12 @@ WSE enforces per-connection rate limits using a token bucket algorithm. The serv
 When 80% of the bucket is consumed (20% remaining), the server sends a warning:
 
 ```json
-WSE{"t":"rate_limit_warning","v":1,"p":{
+{"c":"WSE","t":"rate_limit_warning","p":{
   "current_rate": 80000,
   "limit": 100000,
   "remaining": 20000,
   "retry_after": 1.0
-}}
+},"v":1}
 ```
 
 This gives the client a window to reduce its send rate before messages are rejected.
@@ -561,11 +536,11 @@ This gives the client a window to reduce its send rate before messages are rejec
 When the bucket is empty, the server rejects messages with an error:
 
 ```json
-WSE{"t":"error","v":1,"p":{
+{"c":"WSE","t":"error","p":{
   "code": "RATE_LIMITED",
   "message": "Rate limit exceeded",
   "retry_after": 1.0
-}}
+},"v":1}
 ```
 
 | Field | Type | Description |

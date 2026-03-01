@@ -420,7 +420,7 @@ class ConnectionManager:
                 self._last_pong = time.monotonic()
                 return
 
-            # WSE-prefixed PONG message (JSON format from Rust server)
+            # PONG message (JSON with c field from Rust server)
             # Forward to client layer — _handle_pong_event records latency once
             # Only match top-level "t" field (first ~20 chars), not nested payloads
             data_start = data[:25]
@@ -430,7 +430,7 @@ class ConnectionManager:
                     self._on_message(data)
                 return
 
-            # WSE-prefixed PING message (JSON format, server sends lowercase)
+            # PING message (JSON with c field, server sends lowercase)
             if (
                 '"t":"PING"' in data_start
                 or '"t": "PING"' in data_start

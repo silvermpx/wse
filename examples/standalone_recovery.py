@@ -91,6 +91,7 @@ def event_loop(server: RustWSEServer, stop: threading.Event):
 
                             # Send subscription confirmation with recovery info
                             response = json.dumps({
+                                "c": "WSE",
                                 "t": "subscription_update",
                                 "p": {
                                     "action": "subscribe",
@@ -110,8 +111,9 @@ def event_loop(server: RustWSEServer, stop: threading.Event):
                                         if isinstance(info, dict)
                                     },
                                 },
+                                "v": 1,
                             })
-                            server.send(conn_id, f"WSE{response}")
+                            server.send(conn_id, response)
                             print(f"    [{conn_id}] subscribe {topics} recover={recover} -> {result}")
 
             elif event_type == "disconnect":

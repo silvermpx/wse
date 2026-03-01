@@ -296,7 +296,7 @@ import { WSE_VERSION, WS_CLIENT_VERSION, WS_PROTOCOL_VERSION } from 'wse-client'
 
 Speaks WSE wire protocol v1, identical to the Python client:
 
-- **Text frames:** Category prefix (`WSE{`, `S{`, `U{`) + JSON envelope
+- **Text frames:** JSON with `c` field for category (`WSE`, `S`, `U`)
 - **Binary frames:** Codec prefix (`C:` zlib, `M:` msgpack, `E:` AES-GCM) + payload
 - **Heartbeat:** JSON PING/PONG with latency tracking
 - **Protocol negotiation:** `client_hello`/`server_hello` handshake with feature discovery

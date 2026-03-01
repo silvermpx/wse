@@ -269,7 +269,7 @@ from wse_client.errors import (
 
 The client speaks WSE wire protocol v1:
 
-- **Text frames:** Category prefix (`WSE{`, `S{`, `U{`) + JSON envelope
+- **Text frames:** JSON with `c` field for category (`WSE`, `S`, `U`)
 - **Binary frames:** Codec prefix (`C:` zlib, `M:` msgpack, `E:` AES-GCM) + payload
 - **Heartbeat:** JSON PING/PONG with latency tracking
 

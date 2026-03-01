@@ -5,11 +5,11 @@
 # Handles all message encoding/decoding per docs/PROTOCOL.md:
 #
 # Incoming (server -> client):
-#   Text:   "WSE{...}" / "S{..." / "U{..." -> strip prefix, JSON parse
+#   Text:   JSON with "c" field for category, or legacy prefix (WSE{, S{, U{)
 #   Binary: C: (zlib), M: (msgpack), E: (encrypted), raw zlib (0x78), plain JSON
 #
 # Outgoing (client -> server):
-#   JSON with optional category prefix
+#   JSON with "c" field for category
 # =============================================================================
 
 from __future__ import annotations
@@ -290,6 +290,9 @@ class MessageCodec:
                     events.append(evt)
             return events if events else None
 
+        # Category: prefer wire prefix, fall back to "c" field in JSON
+        cat = category.value if category else parsed.get("c")
+
         return WSEEvent(
             type=t,
             payload=p if isinstance(p, dict) else {"data": p},
@@ -297,7 +300,7 @@ class MessageCodec:
             sequence=parsed.get("seq"),
             timestamp=parsed.get("ts"),
             version=parsed.get("v", PROTOCOL_VERSION),
-            category=category.value if category else None,
+            category=cat,
             priority=parsed.get("pri"),
             correlation_id=parsed.get("cid"),
             signature=parsed.get("sig"),
