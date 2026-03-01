@@ -477,6 +477,7 @@ class ConnectionManager:
             server_timestamp = int(time.time() * 1000)
 
         pong_msg = {
+            "c": "WSE",
             "t": "PONG",
             "p": {
                 "server_timestamp": server_timestamp,
@@ -484,8 +485,7 @@ class ConnectionManager:
             },
             "v": PROTOCOL_VERSION,
         }
-        payload = f"WSE{_json.dumps(pong_msg, separators=(',', ':'))}"
-        await self.send(payload)
+        await self.send(_json.dumps(pong_msg, separators=(',', ':')))
 
     def handle_server_ready(self, connection_id: str | None = None) -> None:
         """Called by the client layer when ``server_ready`` is decoded."""
@@ -529,6 +529,7 @@ class ConnectionManager:
                 p["encryption_public_key"] = encryption_pubkey_b64
 
             msg = {
+                "c": "WSE",
                 "t": "client_hello",
                 "p": p,
                 "id": str(uuid4()),
@@ -536,8 +537,7 @@ class ConnectionManager:
                 "v": PROTOCOL_VERSION,
                 "pri": MessagePriority.CRITICAL,
             }
-            payload = f"WSE{_json.dumps(msg, separators=(',', ':'))}"
-            ok = await self.send(payload)
+            ok = await self.send(_json.dumps(msg, separators=(',', ':')))
             if ok:
                 self._client_hello_sent = True
                 return
@@ -577,12 +577,12 @@ class ConnectionManager:
 
             # Send PING (lowercase -- Rust server fast-path checks "ping")
             ping_msg = {
+                "c": "WSE",
                 "t": "ping",
                 "p": {"timestamp": int(time.time() * 1000)},
                 "v": PROTOCOL_VERSION,
             }
-            payload = f"WSE{_json.dumps(ping_msg, separators=(',', ':'))}"
-            ok = await self.send(payload)
+            ok = await self.send(_json.dumps(ping_msg, separators=(',', ':')))
             if ok and self._on_ping_sent:
                 self._on_ping_sent()
             elif not ok:

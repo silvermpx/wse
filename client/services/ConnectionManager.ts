@@ -638,15 +638,15 @@ export class ConnectionManager {
 
     try {
       const msgType = message.t || '';
-      let prefix = 'U';
+      let category: 'U' | 'S' | 'WSE' = 'U';
       if (msgType === 'client_hello' || msgType === 'subscription_update') {
-        prefix = 'WSE';
+        category = 'WSE';
       } else if (msgType === 'sync_request' || msgType.startsWith('request_')) {
-        prefix = 'S';
+        category = 'S';
       }
 
-      const jsonData = JSON.stringify(message);
-      const data = `${prefix}${jsonData}`;
+      const envelope = { c: category, ...message };
+      const data = JSON.stringify(envelope);
 
       // Encrypt outbound if E2E encryption is active
       if (securityManager.isEncryptionEnabled()) {
@@ -935,7 +935,7 @@ export class ConnectionManager {
             p: { timestamp: Date.now() },
             v: WS_PROTOCOL_VERSION
           };
-          this.ws.send(`WSE${JSON.stringify(pingMessage)}`);
+          this.ws.send(JSON.stringify({ c: 'WSE', ...pingMessage }));
           const store = useWSEStore.getState();
           store.incrementMetric('messagesSent');
         } catch (error) {

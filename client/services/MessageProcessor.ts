@@ -272,8 +272,8 @@ export class MessageProcessor {
             },
             v: WS_PROTOCOL_VERSION
           };
-          this.connectionManager.ws.send(`WSE${JSON.stringify(pongMessage)}`);
-          logger.debug(`Responded to WSE:PING with JSON PONG`);
+          this.connectionManager.ws.send(JSON.stringify({ c: 'WSE', ...pongMessage }));
+          logger.debug(`Responded to PING with JSON PONG`);
         } catch (error) {
           logger.error('Failed to send PONG:', error);
         }
@@ -311,7 +311,7 @@ export class MessageProcessor {
     try {
       const parsed = JSON.parse(jsonData);
       if (msgCategory) {
-        parsed._msg_cat = msgCategory;
+        parsed.c = msgCategory;
       }
       return parsed;
     } catch (error) {
@@ -487,7 +487,7 @@ export class MessageProcessor {
             },
             v: WS_PROTOCOL_VERSION
           };
-          this.connectionManager.ws.send(`WSE${JSON.stringify(pongMessage)}`);
+          this.connectionManager.ws.send(JSON.stringify({ c: 'WSE', ...pongMessage }));
           logger.debug(`Responded to JSON PING with PONG`);
         } catch (error) {
           logger.error('Failed to send PONG:', error);

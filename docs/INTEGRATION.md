@@ -856,7 +856,7 @@ class WSEDomainPublisher:
 | `p` | object | Payload (domain data, ready to consume) |
 | `v` | int | Protocol version |
 
-Optional: `_msg_cat` (`"S"` for snapshots), `seq` (if sequencing enabled).
+Optional: `c` (`"S"` for snapshots), `seq` (if sequencing enabled).
 
 ### Topic Naming
 

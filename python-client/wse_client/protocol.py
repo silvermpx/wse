@@ -125,12 +125,12 @@ class MessageCodec:
         correlation_id: str | None = None,
         category: str | None = None,
     ) -> str:
-        """Encode an outgoing message as JSON with category prefix.
+        """Encode an outgoing message as JSON with category field.
 
         Category is auto-detected from message type if not specified:
-        - WSE prefix for system messages (client_hello, subscription_update, etc.)
-        - S prefix for sync/snapshot messages (sync_request, etc.)
-        - U prefix for all other user messages
+        - WSE for system messages (client_hello, subscription_update, etc.)
+        - S for sync/snapshot messages (sync_request, etc.)
+        - U for all other user messages
         """
         if category is None:
             if type in _SYSTEM_TYPES:
@@ -141,6 +141,7 @@ class MessageCodec:
                 category = PREFIX_UPDATE
         self._sequence += 1
         message: dict[str, Any] = {
+            "c": category,
             "t": type,
             "p": payload,
             "id": str(uuid4()),
@@ -158,7 +159,7 @@ class MessageCodec:
             json_str = _json_dumps(message)
             message["sig"] = self._security.sign(json_str)
 
-        return f"{category}{_json_dumps(message)}"
+        return _json_dumps(message)
 
     # -- Text decoding ---------------------------------------------------------
 

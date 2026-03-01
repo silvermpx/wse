@@ -427,18 +427,18 @@ fn json_to_pyobj(py: Python<'_>, val: &serde_json::Value) -> Py<PyAny> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Format a presence event as a WSE wire message.
-/// Returns e.g. `WSE{"t":"presence_join","p":{"user_id":"alice","data":{"status":"online"}}}`
+/// Format a presence event as a JSON message with category.
 pub(crate) fn format_presence_msg(
     event_type: &str,
     user_id: &str,
     data: &serde_json::Value,
 ) -> String {
     let payload = serde_json::json!({
+        "c": "WSE",
         "t": event_type,
         "p": { "user_id": user_id, "data": data }
     });
-    format!("WSE{payload}")
+    payload.to_string()
 }
 
 fn fire_on_connect(callback: &Py<PyAny>, conn_id: &str, cookies: &str) {
@@ -492,6 +492,33 @@ fn message_category(msg_type: &str) -> &'static str {
     }
 }
 
+/// Inject `"c"` field at the start of a JSON object from Python publishers.
+/// Scans for `"t":"xxx"` to determine category, inserts `"c":"X"` right after `{`.
+/// No wire prefix, no full JSON parse.
+fn inject_category(data: &str) -> String {
+    if data.contains("\"c\":") {
+        return data.to_string();
+    }
+    if let Some(start) = data.find("\"t\":\"") {
+        let val_start = start + 5;
+        if let Some(val_end) = data[val_start..].find('"') {
+            let event_type = &data[val_start..val_start + val_end];
+            let cat = message_category(event_type);
+            // Insert "c":"X", right after opening {
+            if let Some(brace) = data.find('{') {
+                let mut result = String::with_capacity(data.len() + cat.len() + 8);
+                result.push_str(&data[..=brace]);
+                result.push_str("\"c\":\"");
+                result.push_str(cat);
+                result.push_str("\",");
+                result.push_str(&data[brace + 1..]);
+                return result;
+            }
+        }
+    }
+    data.to_string()
+}
+
 // ---------------------------------------------------------------------------
 // JWT helper functions (used by handle_connection)
 // ---------------------------------------------------------------------------
@@ -533,6 +560,7 @@ async fn reject_ws_auth(
 fn build_error_json(code: &str, message: &str) -> String {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let payload = serde_json::json!({
+        "c": "WSE",
         "t": "error",
         "p": {
             "code": code,
@@ -541,7 +569,7 @@ fn build_error_json(code: &str, message: &str) -> String {
         },
         "v": 1
     });
-    format!("WSE{}", payload)
+    payload.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +656,7 @@ fn build_server_hello(
     let encryption_enabled = encryption_pubkey.is_some();
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut val = serde_json::json!({
+        "c": "WSE",
         "t": "server_hello",
         "p": {
             "server_version": env!("CARGO_PKG_VERSION"),
@@ -655,7 +684,7 @@ fn build_server_hello(
     if let Some(pubkey) = encryption_pubkey {
         val["p"]["encryption_public_key"] = serde_json::Value::String(pubkey.to_string());
     }
-    format!("WSE{val}")
+    val.to_string()
 }
 
 /// Build server_ready JSON message (sent immediately from Rust after JWT validation).
@@ -663,6 +692,7 @@ fn build_server_ready(conn_id: &str, user_id: &str, recovery_enabled: bool) -> S
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let msg_id = Uuid::now_v7().to_string();
     let val = serde_json::json!({
+        "c": "WSE",
         "t": "server_ready",
         "id": msg_id,
         "ts": ts,
@@ -688,7 +718,7 @@ fn build_server_ready(conn_id: &str, user_id: &str, recovery_enabled: bool) -> S
         },
         "v": 1
     });
-    format!("WSE{val}")
+    val.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,7 +1098,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                                     conn_id, e
                                                 );
                                                 let err_msg = format!(
-                                                    "WSE{{\"t\":\"error\",\"p\":{{\"code\":\"KEY_EXCHANGE_FAILED\",\"message\":\"ECDH key exchange failed: {}\",\"recoverable\":true}}}}",
+                                                    "{{\"c\":\"WSE\",\"t\":\"error\",\"p\":{{\"code\":\"KEY_EXCHANGE_FAILED\",\"message\":\"ECDH key exchange failed: {}\",\"recoverable\":true}}}}",
                                                     e.replace('\"', "\\\"")
                                                 );
                                                 let _ = tx.send(WsFrame::Msg(Message::Text(err_msg.into())));
@@ -1100,7 +1130,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                     .as_millis()
                                     as i64;
                                 let pong = format!(
-                                    "WSE{{\"t\":\"PONG\",\"p\":{{\"client_timestamp\":{},\"server_timestamp\":{},\"latency\":{}}},\"v\":1}}",
+                                    "{{\"c\":\"WSE\",\"t\":\"PONG\",\"p\":{{\"client_timestamp\":{},\"server_timestamp\":{},\"latency\":{}}},\"v\":1}}",
                                     timestamp,
                                     server_ts,
                                     server_ts.saturating_sub(timestamp).max(0)
@@ -2023,7 +2053,7 @@ impl RustWSEServer {
                                                 true,
                                             );
                                         let ping_msg = format!(
-                                            "WSE{{\"t\":\"ping\",\"p\":{{\"server_time\":\"{ts}\"}}}}"
+                                            "{{\"c\":\"WSE\",\"t\":\"ping\",\"p\":{{\"server_time\":\"{ts}\"}}}}"
                                         );
                                         let _ = tx.send(WsFrame::Msg(
                                             Message::Text(ping_msg.into()),
@@ -2349,7 +2379,7 @@ impl RustWSEServer {
                     .last_rate_limited
                     .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
                 if should_notify {
-                    let err = "WSE{\"t\":\"error\",\"p\":{\"code\":\"RATE_LIMITED\",\"message\":\"Rate limit exceeded\",\"retry_after\":1.0},\"v\":1}".to_string();
+                    let err = "{\"c\":\"WSE\",\"t\":\"error\",\"p\":{\"code\":\"RATE_LIMITED\",\"message\":\"Rate limit exceeded\",\"retry_after\":1.0},\"v\":1}".to_string();
                     cmd_tx
                         .send(ServerCommand::SendText {
                             conn_id: conn_id.to_owned(),
@@ -2369,7 +2399,7 @@ impl RustWSEServer {
                     .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
                 if should_warn {
                     let warning = format!(
-                        "WSE{{\"t\":\"rate_limit_warning\",\"p\":{{\"current_rate\":{},\"limit\":{},\"remaining\":{},\"retry_after\":1.0}},\"v\":1}}",
+                        "{{\"c\":\"WSE\",\"t\":\"rate_limit_warning\",\"p\":{{\"current_rate\":{},\"limit\":{},\"remaining\":{},\"retry_after\":1.0}},\"v\":1}}",
                         (RATE_CAPACITY - rate.tokens) as u64,
                         RATE_CAPACITY as u64,
                         rate.tokens as u64,
@@ -2387,25 +2417,33 @@ impl RustWSEServer {
             rate.tokens -= 1.0;
         }
 
-        // Build serde_json map from PyDict, with t first
+        // Build serde_json map from PyDict: c first, t second, v last
         let mut map = serde_json::Map::new();
         let mut msg_type = String::new();
 
-        // Extract 't' first
+        // Extract 't' value (need it to determine category)
         if let Ok(Some(t_val)) = event.get_item("t")
             && let Ok(s) = t_val.extract::<String>()
         {
-            msg_type = s.clone();
-            map.insert("t".to_string(), serde_json::Value::String(s));
+            msg_type = s;
         }
 
-        // All other keys (skip t, v, _msg_cat)
+        // c first (category)
+        let cat = message_category(&msg_type);
+        map.insert("c".to_string(), serde_json::Value::String(cat.to_string()));
+
+        // t second
+        if !msg_type.is_empty() {
+            map.insert("t".to_string(), serde_json::Value::String(msg_type.clone()));
+        }
+
+        // All other keys (skip t, v, c)
         for (k, v) in event.iter() {
             let key = match k.extract::<String>() {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            if key == "t" || key == "v" || key == "_msg_cat" {
+            if key == "t" || key == "v" || key == "c" {
                 continue;
             }
             map.insert(key, pyobj_to_json(&v));
@@ -2478,13 +2516,11 @@ impl RustWSEServer {
                 })
                 .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         } else {
-            // JSON path: serialize + category prefix
+            // JSON path: serialize (no wire prefix, c is inside JSON)
             let json_str = serde_json::to_string(&serde_json::Value::Object(map))
                 .map_err(|e| PyRuntimeError::new_err(format!("JSON error: {e}")))?;
 
-            let category = message_category(&msg_type);
-            let payload_str = format!("{}{}", category, json_str);
-            let payload_bytes = payload_str.as_bytes();
+            let payload_bytes = json_str.as_bytes();
 
             if let Some(ref cipher) = conn_cipher {
                 // E2E encrypted: encrypt plaintext payload, send as E: prefix binary
@@ -2521,11 +2557,11 @@ impl RustWSEServer {
                     .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
             } else {
                 // Uncompressed JSON: binary frame (skips UTF-8 validation overhead)
-                byte_count = payload_str.len();
+                byte_count = json_str.len();
                 cmd_tx
                     .send(ServerCommand::SendPrebuilt {
                         conn_id: conn_id.to_owned(),
-                        message: Message::Binary(payload_str.into_bytes().into()),
+                        message: Message::Binary(json_str.into_bytes().into()),
                     })
                     .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
             }
@@ -2539,10 +2575,9 @@ impl RustWSEServer {
             .cmd_tx
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
-        tx.send(ServerCommand::BroadcastText {
-            data: data.to_owned(),
-        })
-        .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
+        let data = inject_category(data);
+        tx.send(ServerCommand::BroadcastText { data })
+            .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         Ok(())
     }
 
@@ -3235,9 +3270,10 @@ impl RustWSEServer {
             .cmd_tx
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
+        let data = inject_category(data);
         tx.send(ServerCommand::BroadcastLocal {
             topic: topic.to_owned(),
-            data: data.to_owned(),
+            data,
             skip_recovery: false,
         })
         .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
@@ -3246,11 +3282,13 @@ impl RustWSEServer {
 
     /// Fan-out locally + cluster PUBLISH for multi-instance coordination.
     fn broadcast(&self, topic: &str, data: &str) -> PyResult<()> {
+        let data = inject_category(data);
+
         // Local dispatch (always)
         if let Some(ref tx) = self.cmd_tx {
             let _ = tx.send(ServerCommand::BroadcastLocal {
                 topic: topic.to_owned(),
-                data: data.to_owned(),
+                data: data.clone(),
                 skip_recovery: false,
             });
         }
@@ -3260,7 +3298,7 @@ impl RustWSEServer {
         if let Some(tx) = cluster_tx {
             tx.send(ClusterCommand::Publish {
                 topic: topic.to_owned(),
-                payload: data.to_owned(),
+                payload: data,
             })
             .map_err(|_| PyRuntimeError::new_err("Cluster command channel closed"))?;
         }

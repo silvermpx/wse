@@ -138,9 +138,8 @@ class TestEncoding:
     def test_basic_encode(self):
         codec = _make_codec()
         encoded = codec.encode("test_event", {"key": "value"})
-        # User messages get U prefix (auto-detected)
-        assert encoded.startswith("U{")
-        parsed = json.loads(encoded[1:])
+        parsed = json.loads(encoded)
+        assert parsed["c"] == "U"
         assert parsed["t"] == "test_event"
         assert parsed["p"] == {"key": "value"}
         assert "id" in parsed
@@ -148,33 +147,35 @@ class TestEncoding:
         assert "ts" in parsed
         assert parsed["v"] == 1
 
-    def test_system_message_gets_wse_prefix(self):
+    def test_system_message_gets_wse_category(self):
         codec = _make_codec()
         encoded = codec.encode("client_hello", {"version": "1.0"})
-        assert encoded.startswith("WSE{")
+        parsed = json.loads(encoded)
+        assert parsed["c"] == "WSE"
 
-    def test_sync_message_gets_s_prefix(self):
+    def test_sync_message_gets_s_category(self):
         codec = _make_codec()
         encoded = codec.encode("sync_request", {"topics": ["prices"]})
-        assert encoded.startswith("S{")
+        parsed = json.loads(encoded)
+        assert parsed["c"] == "S"
 
     def test_encode_with_category(self):
         codec = _make_codec()
         encoded = codec.encode("price_update", {"price": 100}, category="U")
-        assert encoded.startswith("U{")
-        parsed = json.loads(encoded[1:])
+        parsed = json.loads(encoded)
+        assert parsed["c"] == "U"
         assert parsed["t"] == "price_update"
 
     def test_sequence_increments(self):
         codec = _make_codec()
-        e1 = json.loads(codec.encode("a", {})[1:])  # Strip U prefix
-        e2 = json.loads(codec.encode("b", {})[1:])
+        e1 = json.loads(codec.encode("a", {}))
+        e2 = json.loads(codec.encode("b", {}))
         assert e2["seq"] == e1["seq"] + 1
 
     def test_priority_and_correlation(self):
         codec = _make_codec()
         encoded = codec.encode("cmd", {"x": 1}, priority=10, correlation_id="req-1")
-        parsed = json.loads(encoded[1:])  # Strip U prefix
+        parsed = json.loads(encoded)
         assert parsed["pri"] == 10
         assert parsed["cid"] == "req-1"
 

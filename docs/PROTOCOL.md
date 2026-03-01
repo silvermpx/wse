@@ -10,6 +10,7 @@ All WSE messages are JSON objects with the following structure:
 
 ```json
 {
+  "c": "U",
   "t": "event_type",
   "id": "019c53c4-abcd-7def-8901-234567890abc",
   "ts": "2026-02-20T15:30:00.000Z",
@@ -21,16 +22,21 @@ All WSE messages are JSON objects with the following structure:
 }
 ```
 
+### Field Order
+
+Fields are ordered for readability in DevTools: `c` first, `t` second, `v` last.
+
 ### Required Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `v` | `int` | Protocol version (currently `1`) |
-| `id` | `string` | Unique message ID (UUID v7) |
+| `c` | `string` | Message category (`"U"`, `"S"`, or `"WSE"`) |
 | `t` | `string` | Event type (e.g., `user_update`, `chat_message`) |
+| `id` | `string` | Unique message ID (UUID v7) |
 | `ts` | `string` | ISO 8601 timestamp with timezone |
 | `seq` | `int` | Monotonically increasing sequence number |
 | `p` | `object` | Event payload (type-specific data) |
+| `v` | `int` | Protocol version (currently `1`) |
 
 ### Optional Fields
 
@@ -43,34 +49,29 @@ All WSE messages are JSON objects with the following structure:
 
 ## Message Categories
 
-Messages are prefixed with a category identifier before the JSON payload:
+The `c` field identifies the message category:
 
-| Prefix | Category | Description | Examples |
-|--------|----------|-------------|----------|
-| `WSE` | System | Protocol-level messages | `server_ready`, `PING`, `PONG`, `error` |
-| `S` | Snapshot | Full state snapshots | `user_snapshot`, `channel_snapshot` |
-| `U` | Update | Incremental updates | `user_update`, `chat_message` |
+| Value | Category | Description | Examples |
+|-------|----------|-------------|----------|
+| `"WSE"` | System | Protocol-level messages | `server_ready`, `ping`, `PONG`, `error` |
+| `"S"` | Snapshot | Full state snapshots | `user_snapshot`, `channel_snapshot` |
+| `"U"` | Update | Incremental updates | `user_update`, `chat_message` |
 
 ### Wire Format
 
-```
-WSE{"t":"server_ready","p":{...},"v":1}
-S{"t":"user_snapshot","p":{...},"v":1}
-U{"t":"user_update","p":{...},"v":1}
+```json
+{"c":"WSE","t":"server_ready","p":{...},"v":1}
+{"c":"S","t":"user_snapshot","p":{...},"v":1}
+{"c":"U","t":"user_update","p":{...},"v":1}
 ```
 
-The client must strip the prefix before JSON parsing:
-
-```typescript
-if (data.startsWith('WSE{')) json = data.slice(3);
-else if (data.startsWith('S{') || data.startsWith('U{')) json = data.slice(1);
-```
+No wire prefix. Category is inside the JSON object as the `c` field.
 
 ## Transport Modes
 
 ### Text Mode (default)
 
-Standard WebSocket text frames with category prefix + JSON.
+Standard WebSocket text frames with JSON.
 
 ### Binary Mode: Compression
 
@@ -80,7 +81,7 @@ When a message exceeds the compression threshold (default: 1024 bytes), the serv
 C:<zlib-compressed-data>
 ```
 
-The client detects the `C:` prefix, strips it, decompresses with zlib, and parses the resulting JSON string (which still includes the category prefix).
+The client detects the `C:` prefix, strips it, decompresses with zlib, and parses the resulting JSON string.
 
 ### Binary Mode: Encryption
 

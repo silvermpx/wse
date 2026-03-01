@@ -8,11 +8,22 @@
 - Server now reads JWT from the configured cookie name instead of hardcoded `access_token`
 - Allows integration with apps using custom cookie names for auth tokens
 
+### Message Category Field
+
+- Replaced wire prefix (`WSE{`, `S{`, `U{`) with `"c"` field inside JSON: `{"c":"U","t":"bar_update",...}`
+- `c` is always first field, `t` second, `v` last for DevTools readability
+- All messages now have `c` field (was missing on non-snapshot events)
+- Renamed `_msg_cat` to `c` across server, transformer, and clients
+- Rust server auto-injects `c` for `broadcast_local`/`broadcast`/`broadcast_all` messages
+- TS and Python clients send `c` inside JSON instead of prefix
+- Backwards-compatible: clients still parse incoming wire prefix for older servers
+
 ### Documentation
 
 - Added TS/React client file structure and provider setup guide (Section 8)
 - Added publishing patterns documentation (Section 14): Pattern A (publisher-based, hexagonal) and Pattern B (event sourcing, EventBus + transformer)
 - Updated JWT auth docs to reflect configurable cookie name across PROTOCOL.md, SECURITY.md, INTEGRATION.md, DEPLOYMENT.md
+- Updated PROTOCOL.md: wire format now uses `c` field instead of prefix
 
 ## v2.0.7 (2026-02-28)
 

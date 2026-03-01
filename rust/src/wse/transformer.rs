@@ -344,25 +344,14 @@ pub fn rust_transform_event<'py>(
     let payload = extract_payload(py, event)?;
     let payload_converted = convert_value(py, payload.as_any())?;
 
-    // 7. Build wire envelope: t first, v last
+    // 7. Build wire envelope: c first, t second, v last
     let envelope = PyDict::new(py);
-    envelope.set_item("t", PyString::new(py, &ws_event_type))?;
-    envelope.set_item("id", PyString::new(py, &event_id))?;
-    envelope.set_item("ts", PyString::new(py, &timestamp))?;
-    envelope.set_item("seq", sequence)?;
-    envelope.set_item("p", payload_converted)?;
-    envelope.set_item("v", 1)?;
 
-    // 8. Preserve original event type
-    if raw_event_type != ws_event_type {
-        envelope.set_item("original_event_type", PyString::new(py, &raw_event_type))?;
-    }
-
-    // 9. Message category
-    if let Some(msg_cat) = dict_get(event, "_msg_cat")? {
-        envelope.set_item("_msg_cat", msg_cat)?;
+    // c first (category)
+    if let Some(msg_cat) = dict_get(event, "c")? {
+        envelope.set_item("c", msg_cat)?;
     } else if ws_event_type.contains("_snapshot") || ws_event_type.contains("snapshot_") {
-        envelope.set_item("_msg_cat", "S")?;
+        envelope.set_item("c", "S")?;
     } else {
         const WSE_TYPES: &[&str] = &[
             "server_ready",
@@ -373,8 +362,23 @@ pub fn rust_transform_event<'py>(
             "pong",
         ];
         if WSE_TYPES.contains(&ws_event_type.as_str()) {
-            envelope.set_item("_msg_cat", "WSE")?;
+            envelope.set_item("c", "WSE")?;
+        } else {
+            envelope.set_item("c", "U")?;
         }
+    }
+
+    // t second
+    envelope.set_item("t", PyString::new(py, &ws_event_type))?;
+    envelope.set_item("id", PyString::new(py, &event_id))?;
+    envelope.set_item("ts", PyString::new(py, &timestamp))?;
+    envelope.set_item("seq", sequence)?;
+    envelope.set_item("p", payload_converted)?;
+    envelope.set_item("v", 1)?;
+
+    // Preserve original event type
+    if raw_event_type != ws_event_type {
+        envelope.set_item("original_event_type", PyString::new(py, &raw_event_type))?;
     }
 
     // 10. Latency

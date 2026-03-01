@@ -180,7 +180,7 @@ export interface WSMessage {
   latency_ms?: number;
   wse_processing_ms?: number;
   trace_id?: string;
-  _msg_cat?: 'WSE' | 'S' | 'U';
+  c?: 'WSE' | 'S' | 'U';
 }
 
 export interface QueuedMessage {
