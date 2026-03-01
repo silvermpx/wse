@@ -75,7 +75,7 @@ class TestSend:
     async def test_send_with_priority(self, client):
         await client.send("cmd", {}, priority=MessagePriority.CRITICAL)
         sent_data = client._connection.send.call_args[0][0]
-        parsed = json.loads(sent_data[1:])  # Strip U prefix
+        parsed = json.loads(sent_data)
         assert parsed["pri"] == MessagePriority.CRITICAL
 
     @pytest.mark.asyncio

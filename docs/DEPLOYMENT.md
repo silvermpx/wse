@@ -308,35 +308,62 @@ Memory usage depends on message sizes, presence data, and recovery buffer config
 
 ## Monitoring
 
-### Health Endpoint
+### Prometheus Metrics
 
-Expose `health_snapshot()` via an HTTP endpoint in your application:
+WSE exposes metrics in Prometheus text exposition format via `prometheus_metrics()`. Wire it to an HTTP endpoint:
 
 ```python
-from flask import Flask, jsonify
+from starlette.responses import PlainTextResponse
 
-app = Flask(__name__)
+@app.get("/metrics")
+async def metrics():
+    return PlainTextResponse(
+        server.prometheus_metrics(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
+```
 
-@app.route("/health")
-def health():
-    return jsonify(server.health_snapshot())
+Prometheus scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: wse
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["localhost:8000"]
+    metrics_path: /metrics
+```
+
+See [INTEGRATION.md Section 15](INTEGRATION.md#15-prometheus-metrics) for the full list of exposed metrics.
+
+### Health Endpoint
+
+For simple health checks (load balancer probes, dashboards), use `health_snapshot()`:
+
+```python
+@app.get("/health")
+async def health():
+    return server.health_snapshot()
 ```
 
 ### Key Metrics
 
-| Metric | Source | Description |
-|--------|--------|-------------|
-| `connections` | `health_snapshot()` | Active WebSocket connections |
-| `inbound_queue_depth` | `health_snapshot()` | Pending events in drain queue |
-| `inbound_dropped` | `health_snapshot()` | Events dropped (queue full) |
-| `cluster_peer_count` | `health_snapshot()` | Connected cluster peers |
-| `recovery_total_bytes` | `health_snapshot()` | Memory used by recovery buffers |
+| Metric | Type | Alert Condition |
+|--------|------|-----------------|
+| `wse_connections` | gauge | Approaching `max_connections` |
+| `wse_inbound_queue_depth` | gauge | Sustained growth (drain loop too slow) |
+| `wse_inbound_dropped_total` | counter | Any increase (events lost) |
+| `wse_auth_failures_total` | counter | Spike (brute force or misconfigured clients) |
+| `wse_rate_limited_total` | counter | Sustained growth (publisher too fast) |
+| `wse_cluster_peers` | gauge | Below expected count (peer down) |
+| `wse_recovery_bytes` | gauge | Above 80% of `recovery_memory_budget` |
 
 ### Alerts
 
-- `inbound_dropped > 0` - drain loop is too slow, increase batch size or add processing capacity.
-- `cluster_peer_count < expected` - peer disconnected, check network and mTLS certificates.
-- `recovery_total_bytes > 80% budget` - consider increasing `recovery_memory_budget` or reducing `recovery_ttl`.
+- `wse_inbound_dropped_total` increasing - drain loop is too slow, increase batch size or add processing capacity.
+- `wse_cluster_peers < expected` - peer disconnected, check network and mTLS certificates.
+- `wse_recovery_bytes > 80% budget` - consider increasing `recovery_memory_budget` or reducing `recovery_ttl`.
+- `wse_auth_failures_total` spike - possible brute force attempt or client misconfiguration.
 
 ---
 
