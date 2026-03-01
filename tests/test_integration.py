@@ -156,7 +156,7 @@ class TestMessaging:
             drain_until(server, "auth_connect")
             conn_id = server.get_connections()[0]
 
-            server.send(conn_id, 'WSE{"t":"hello","p":{"x":1},"v":1}')
+            server.send(conn_id, '{"c":"U","t":"hello","p":{"x":1},"v":1}')
             msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
             assert "hello" in str(msg)
 
@@ -184,7 +184,7 @@ class TestMessaging:
             await asyncio.wait_for(ws.recv(), timeout=2.0)
             drain_until(server, "auth_connect")
 
-            await ws.send('WSE{"t":"chat","p":{"text":"hello"}}')
+            await ws.send('{"c":"WSE","t":"chat","p":{"text":"hello"}}')
             ev = drain_until(server, "msg")
             assert ev[0] == "msg"
             assert isinstance(ev[2], dict)
@@ -213,7 +213,7 @@ class TestMessaging:
             drain_until(server, "auth_connect")
 
             ts = int(time.time() * 1000)
-            await ws.send(f'WSE{{"t":"ping","p":{{"timestamp":{ts}}}}}')
+            await ws.send(f'{{"c":"WSE","t":"ping","p":{{"timestamp":{ts}}}}}')
             msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
             assert "PONG" in str(msg)
             assert str(ts) in str(msg)
@@ -237,7 +237,7 @@ class TestBroadcast:
             drain_until(server, "auth_connect")
             drain_until(server, "auth_connect")
 
-            server.broadcast_all('WSE{"t":"global","p":{},"v":1}')
+            server.broadcast_all('{"t":"global","p":{},"v":1}')
 
             m1 = await asyncio.wait_for(ws1.recv(), timeout=2.0)
             m2 = await asyncio.wait_for(ws2.recv(), timeout=2.0)
@@ -260,7 +260,7 @@ class TestBroadcast:
 
             server.subscribe_connection(sub_conn_id, ["prices"])
 
-            server.broadcast_local("prices", 'WSE{"t":"price","p":{"symbol":"AAPL"},"v":1}')
+            server.broadcast_local("prices", '{"t":"price","p":{"symbol":"AAPL"},"v":1}')
 
             # Subscriber gets it
             m1 = await asyncio.wait_for(ws1.recv(), timeout=2.0)
@@ -349,7 +349,7 @@ class TestProtocolNegotiation:
                     "p": {"client_version": "2.0.0", "protocol_version": 2},
                 }
             )
-            await ws.send(f"WSE{hello}")
+            await ws.send(json.dumps({"c": "WSE", **json.loads(hello)}))
 
             msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
             text = str(msg)
@@ -448,8 +448,8 @@ class TestServerLifecycle:
 
     def test_broadcast_no_connections(self, server):
         """Broadcasting with zero connections doesn't crash."""
-        server.broadcast_all("WSE{}")
-        server.broadcast_local("topic", "WSE{}")
+        server.broadcast_all("{}")
+        server.broadcast_local("topic", "{}")
 
 
 # ---------------------------------------------------------------------------

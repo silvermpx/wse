@@ -167,6 +167,7 @@ def drain_loop(server, stop_event: threading.Event):
                                     import json
                                     topics_info = result.get("topics", {})
                                     response = json.dumps({
+                                        "c": "WSE",
                                         "t": "subscription_update",
                                         "p": {
                                             "action": "subscribe",
@@ -185,8 +186,9 @@ def drain_loop(server, stop_event: threading.Event):
                                                 if isinstance(info, dict)
                                             },
                                         },
+                                        "v": 1,
                                     })
-                                    server.send(conn_id, f"WSE{response}")
+                                    server.send(conn_id, response)
                             elif action == "publish_messages":
                                 # Publish N messages to a topic (for recovery buffer testing)
                                 topic = p.get("topic", "battle_all")
@@ -197,10 +199,12 @@ def drain_loop(server, stop_event: threading.Event):
                                     msg = f'{{"t":"battle","p":{{"ch":"{topic}","seq":{i},"ts_us":{ts_us}}}}}'
                                     server.broadcast(topic, msg)
                                 ack = _json.dumps({
+                                    "c": "WSE",
                                     "t": "publish_ack",
-                                    "p": {"topic": topic, "count": count}
+                                    "p": {"topic": topic, "count": count},
+                                    "v": 1,
                                 })
-                                server.send(conn_id, f"WSE{ack}")
+                                server.send(conn_id, ack)
                             elif action == "health":
                                 health = server.health_snapshot()
                                 response = {

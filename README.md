@@ -403,9 +403,9 @@ Full security documentation: [docs/SECURITY.md](docs/SECURITY.md)
 
 ## Wire Protocol
 
-WSE uses a custom wire protocol with category-prefixed messages:
+WSE uses a custom wire protocol with categorized JSON messages:
 
-**Text frames:** `WSE{...}` (system), `S{...}` (snapshot), `U{...}` (update) + JSON envelope
+**Text frames:** JSON with `c` field for category: `"WSE"` (system), `"S"` (snapshot), `"U"` (update)
 
 **Binary frames:** `C:` (zlib compressed), `M:` (MessagePack), `E:` (AES-GCM encrypted), raw zlib (0x78 magic byte)
 

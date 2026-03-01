@@ -233,22 +233,22 @@ Drain mode is recommended for production workloads - it batches events efficient
 ## 5. Sending Messages
 
 ```python
-# Send raw text to one connection
-server.send(conn_id, 'WSE{"t":"hello","p":{"msg":"hi"},"v":1}')
+# Send raw text to one connection (must include "c" field manually)
+server.send(conn_id, '{"c":"U","t":"hello","p":{"msg":"hi"},"v":1}')
 
 # Send binary to one connection
 server.send_bytes(conn_id, b"\x00\x01\x02")
 
-# Send event dict (auto-serialized, auto-compressed if > threshold)
+# Send event dict (auto-serialized, "c" field auto-injected)
 bytes_sent = server.send_event(conn_id, {"t": "update", "p": {"value": 42}})
 
-# Broadcast to ALL connections (pre-framed, single frame build)
-server.broadcast_all('WSE{"t":"notification","p":{},"v":1}')
+# Broadcast to ALL connections ("c" field auto-injected)
+server.broadcast_all('{"t":"notification","p":{},"v":1}')
 
-# Broadcast to topic subscribers (local instance only)
+# Broadcast to topic subscribers, local instance only ("c" auto-injected)
 server.broadcast_local("prices", '{"t":"price","p":{"symbol":"AAPL","price":187.42}}')
 
-# Broadcast to topic subscribers (local + cluster peers)
+# Broadcast to topic subscribers, local + cluster peers ("c" auto-injected)
 server.broadcast("prices", '{"t":"price","p":{"symbol":"AAPL","price":187.42}}')
 ```
 
@@ -354,9 +354,9 @@ The following events appear in `drain_inbound()`:
 These events are also broadcast to all WebSocket subscribers of the topic as structured messages:
 
 ```json
-{"t": "presence_join", "p": {"user_id": "alice", "data": {"status": "online"}}}
-{"t": "presence_leave", "p": {"user_id": "alice", "data": {"status": "online"}}}
-{"t": "presence_update", "p": {"user_id": "alice", "data": {"status": "away"}}}
+{"c":"WSE","t":"presence_join","p":{"user_id":"alice","data":{"status":"online"}},"v":1}
+{"c":"WSE","t":"presence_leave","p":{"user_id":"alice","data":{"status":"online"}},"v":1}
+{"c":"WSE","t":"presence_update","p":{"user_id":"alice","data":{"status":"away"}},"v":1}
 ```
 
 ### Multi-Connection Behavior
@@ -727,7 +727,7 @@ Domain Layer                    →  Defines PORT (interface)
 
 Presentation Layer (adapter)    →  Publisher IMPLEMENTS port:
                                    → builds {"t": "status_update", "p": {...}, "id": uuid, "ts": iso, "v": 1}
-                                   → calls server.broadcast_local(topic, json)
+                                   → calls server.broadcast_local(topic, json)  // "c" auto-injected
 
 Rust WSE Server                 →  broadcast_local(topic, json) — fan-out. Transport only.
 
@@ -840,6 +840,7 @@ class WSEDomainPublisher:
 
 ```json
 {
+  "c": "U",
   "t": "broker_health_update",
   "id": "0194a5b2-...",
   "ts": "2026-03-01T12:00:00.000000Z",
@@ -850,13 +851,12 @@ class WSEDomainPublisher:
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `c` | string | Category: `"U"` (update), `"S"` (snapshot), `"WSE"` (system). Auto-injected by broadcast methods. |
 | `t` | string | Event type (snake_case, set by publisher or transformer) |
 | `id` | string | UUID7 message ID |
 | `ts` | string | ISO 8601 timestamp |
 | `p` | object | Payload (domain data, ready to consume) |
 | `v` | int | Protocol version |
-
-Optional: `c` (`"S"` for snapshots), `seq` (if sequencing enabled).
 
 ### Topic Naming
 
