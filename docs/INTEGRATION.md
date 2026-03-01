@@ -877,3 +877,79 @@ system:{category}                  # Global system events
 | Best for | Services, gateways, infrastructure | Event sourcing, CQRS, DDD |
 
 **Common to both:** Frontend never maps domain event names. Server is transport-only.
+
+---
+
+## 15. Prometheus Metrics
+
+WSE exposes production metrics in Prometheus text exposition format via the `prometheus_metrics()` method.
+
+### Setup
+
+```python
+from starlette.responses import PlainTextResponse
+
+@app.get("/metrics")
+async def metrics():
+    return PlainTextResponse(
+        server.prometheus_metrics(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
+```
+
+### Available Metrics
+
+**Gauges** (current values):
+
+| Metric | Description |
+|---|---|
+| `wse_connections` | Active WebSocket connections |
+| `wse_inbound_queue_depth` | Pending events in drain queue |
+| `wse_uptime_seconds` | Server uptime |
+| `wse_topics` | Active topic count |
+| `wse_cluster_peers` | Connected cluster peers |
+
+**Counters** (cumulative):
+
+| Metric | Description |
+|---|---|
+| `wse_messages_received_total` | Messages received from clients |
+| `wse_messages_sent_total` | Messages sent to clients (via `send_event`) |
+| `wse_bytes_received_total` | Bytes received from clients |
+| `wse_bytes_sent_total` | Bytes sent to clients |
+| `wse_connections_accepted_total` | Total connections accepted |
+| `wse_connections_rejected_total` | Connections rejected (max limit or auth failure) |
+| `wse_auth_failures_total` | JWT authentication failures |
+| `wse_rate_limited_total` | Messages dropped by rate limiter |
+| `wse_inbound_dropped_total` | Drain queue events dropped (queue full) |
+
+**Cluster counters** (when clustering is enabled):
+
+| Metric | Description |
+|---|---|
+| `wse_cluster_messages_sent_total` | Messages forwarded to peers |
+| `wse_cluster_messages_delivered_total` | Messages received from peers |
+| `wse_cluster_messages_dropped_total` | Cluster messages dropped |
+| `wse_cluster_bytes_sent_total` | Bytes sent to peers |
+| `wse_cluster_bytes_received_total` | Bytes received from peers |
+| `wse_cluster_reconnects_total` | Peer reconnections |
+
+**Recovery/Presence** (when enabled):
+
+| Metric | Description |
+|---|---|
+| `wse_recovery_topics` | Topics with recovery buffers |
+| `wse_recovery_bytes` | Bytes in recovery buffers |
+| `wse_presence_topics` | Topics with presence tracking |
+| `wse_presence_users` | Total tracked users |
+
+### Prometheus Config
+
+```yaml
+scrape_configs:
+  - job_name: wse
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["localhost:8000"]
+    metrics_path: /metrics
+```

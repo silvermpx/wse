@@ -245,6 +245,15 @@ pub(crate) struct SharedState {
     // Sender for presence broadcasts from disconnect cleanup paths
     // (where self.cmd_tx is not available, only Arc<SharedState>)
     presence_broadcast_tx: std::sync::RwLock<Option<mpsc::UnboundedSender<ServerCommand>>>,
+    // Prometheus counters
+    messages_received_total: AtomicU64,
+    messages_sent_total: AtomicU64,
+    connections_accepted_total: AtomicU64,
+    connections_rejected_total: AtomicU64,
+    bytes_received_total: AtomicU64,
+    bytes_sent_total: AtomicU64,
+    auth_failures_total: AtomicU64,
+    rate_limited_total: AtomicU64,
 }
 
 impl SharedState {
@@ -294,6 +303,14 @@ impl SharedState {
                 None
             },
             presence_broadcast_tx: std::sync::RwLock::new(None),
+            messages_received_total: AtomicU64::new(0),
+            messages_sent_total: AtomicU64::new(0),
+            connections_accepted_total: AtomicU64::new(0),
+            connections_rejected_total: AtomicU64::new(0),
+            bytes_received_total: AtomicU64::new(0),
+            bytes_sent_total: AtomicU64::new(0),
+            auth_failures_total: AtomicU64::new(0),
+            rate_limited_total: AtomicU64::new(0),
         }
     }
 
@@ -728,6 +745,9 @@ fn build_server_ready(conn_id: &str, user_id: &str, recovery_enabled: bool) -> S
 async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<SharedState>) {
     // Early rejection before expensive handshake (best-effort, authoritative check below)
     if state.connection_count.load(Ordering::Relaxed) >= state.max_connections {
+        state
+            .connections_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
         eprintln!("[WSE] Max connections reached (early check), rejecting {addr}");
         return;
     }
@@ -828,6 +848,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                     if let Some(user_id) = claims.get("sub").and_then(|s| s.as_str()) {
                         Some(user_id.to_string())
                     } else {
+                        state.auth_failures_total.fetch_add(1, Ordering::Relaxed);
+                        state
+                            .connections_rejected_total
+                            .fetch_add(1, Ordering::Relaxed);
                         reject_ws_auth(&tx, rx, write_half, "AUTH_FAILED", "Token missing user ID")
                             .await;
                         return;
@@ -835,12 +859,20 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                 }
                 Err(e) => {
                     eprintln!("[WSE] JWT validation failed for {addr}: {e}");
+                    state.auth_failures_total.fetch_add(1, Ordering::Relaxed);
+                    state
+                        .connections_rejected_total
+                        .fetch_add(1, Ordering::Relaxed);
                     reject_ws_auth(&tx, rx, write_half, "AUTH_FAILED", "Authentication failed")
                         .await;
                     return;
                 }
             },
             None => {
+                state.auth_failures_total.fetch_add(1, Ordering::Relaxed);
+                state
+                    .connections_rejected_total
+                    .fetch_add(1, Ordering::Relaxed);
                 reject_ws_auth(
                     &tx,
                     rx,
@@ -860,6 +892,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     {
         let mut conns = state.connections.write().await;
         if conns.len() >= state.max_connections {
+            state
+                .connections_rejected_total
+                .fetch_add(1, Ordering::Relaxed);
             eprintln!("[WSE] Max connections reached, rejecting {addr}");
             let _ = write_half.close().await;
             return;
@@ -874,6 +909,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         }
         conns.insert((*conn_id).clone(), ConnectionHandle { tx: tx.clone() });
         state.connection_count.store(conns.len(), Ordering::Relaxed);
+        state
+            .connections_accepted_total
+            .fetch_add(1, Ordering::Relaxed);
     }
     // Store format preference for lock-free access from send_event()
     if use_msgpack {
@@ -1028,6 +1066,12 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     while let Some(Ok(msg)) = read_half.next().await {
         match msg {
             Message::Text(text) => {
+                state
+                    .messages_received_total
+                    .fetch_add(1, Ordering::Relaxed);
+                state
+                    .bytes_received_total
+                    .fetch_add(text.len() as u64, Ordering::Relaxed);
                 // Update last activity for zombie detection
                 state
                     .conn_last_activity
@@ -1189,6 +1233,12 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                 }
             }
             Message::Binary(data) => {
+                state
+                    .messages_received_total
+                    .fetch_add(1, Ordering::Relaxed);
+                state
+                    .bytes_received_total
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
                 // Update last activity for zombie detection
                 state
                     .conn_last_activity
@@ -2374,6 +2424,9 @@ impl RustWSEServer {
             rate.last_refill = std::time::Instant::now();
 
             if rate.tokens < 1.0 {
+                self.shared
+                    .rate_limited_total
+                    .fetch_add(1, Ordering::Relaxed);
                 // Send rate_limited error to client (throttled: max once per second)
                 let should_notify = rate
                     .last_rate_limited
@@ -2567,6 +2620,12 @@ impl RustWSEServer {
             }
         }
 
+        self.shared
+            .messages_sent_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .bytes_sent_total
+            .fetch_add(byte_count as u64, Ordering::Relaxed);
         Ok(byte_count)
     }
 
@@ -3392,6 +3451,186 @@ impl RustWSEServer {
             dict.set_item("presence_enabled", false)?;
         }
         Ok(dict.unbind())
+    }
+
+    fn prometheus_metrics(&self) -> String {
+        let mut out = String::with_capacity(4096);
+
+        // Gauges
+        out.push_str("# HELP wse_connections Current active WebSocket connections\n");
+        out.push_str("# TYPE wse_connections gauge\n");
+        out.push_str(&format!(
+            "wse_connections {}\n",
+            self.shared.connection_count.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP wse_inbound_queue_depth Drain queue backlog\n");
+        out.push_str("# TYPE wse_inbound_queue_depth gauge\n");
+        out.push_str(&format!(
+            "wse_inbound_queue_depth {}\n",
+            self.shared.inbound_rx.len()
+        ));
+
+        out.push_str("# HELP wse_uptime_seconds Server uptime in seconds\n");
+        out.push_str("# TYPE wse_uptime_seconds gauge\n");
+        out.push_str(&format!(
+            "wse_uptime_seconds {:.1}\n",
+            self.started_at
+                .map(|s| s.elapsed().as_secs_f64())
+                .unwrap_or(0.0)
+        ));
+
+        out.push_str("# HELP wse_topics Number of active topics\n");
+        out.push_str("# TYPE wse_topics gauge\n");
+        out.push_str(&format!(
+            "wse_topics {}\n",
+            self.shared.topic_subscribers.len()
+        ));
+
+        // Counters
+        out.push_str("# HELP wse_messages_received_total Total messages received from clients\n");
+        out.push_str("# TYPE wse_messages_received_total counter\n");
+        out.push_str(&format!(
+            "wse_messages_received_total {}\n",
+            self.shared.messages_received_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP wse_messages_sent_total Total messages sent to clients\n");
+        out.push_str("# TYPE wse_messages_sent_total counter\n");
+        out.push_str(&format!(
+            "wse_messages_sent_total {}\n",
+            self.shared.messages_sent_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP wse_connections_accepted_total Total connections accepted\n");
+        out.push_str("# TYPE wse_connections_accepted_total counter\n");
+        out.push_str(&format!(
+            "wse_connections_accepted_total {}\n",
+            self.shared
+                .connections_accepted_total
+                .load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP wse_connections_rejected_total Total connections rejected\n");
+        out.push_str("# TYPE wse_connections_rejected_total counter\n");
+        out.push_str(&format!(
+            "wse_connections_rejected_total {}\n",
+            self.shared
+                .connections_rejected_total
+                .load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP wse_bytes_received_total Total bytes received from clients\n");
+        out.push_str("# TYPE wse_bytes_received_total counter\n");
+        out.push_str(&format!(
+            "wse_bytes_received_total {}\n",
+            self.shared.bytes_received_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP wse_bytes_sent_total Total bytes sent to clients\n");
+        out.push_str("# TYPE wse_bytes_sent_total counter\n");
+        out.push_str(&format!(
+            "wse_bytes_sent_total {}\n",
+            self.shared.bytes_sent_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP wse_auth_failures_total Total authentication failures\n");
+        out.push_str("# TYPE wse_auth_failures_total counter\n");
+        out.push_str(&format!(
+            "wse_auth_failures_total {}\n",
+            self.shared.auth_failures_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP wse_rate_limited_total Total messages dropped by rate limiter\n");
+        out.push_str("# TYPE wse_rate_limited_total counter\n");
+        out.push_str(&format!(
+            "wse_rate_limited_total {}\n",
+            self.shared.rate_limited_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP wse_inbound_dropped_total Drain queue events dropped\n");
+        out.push_str("# TYPE wse_inbound_dropped_total counter\n");
+        out.push_str(&format!(
+            "wse_inbound_dropped_total {}\n",
+            self.shared.inbound_dropped.load(Ordering::Relaxed)
+        ));
+
+        // Cluster metrics
+        let cm = &self.shared.cluster_metrics;
+        out.push_str("# HELP wse_cluster_peers Connected cluster peers\n");
+        out.push_str("# TYPE wse_cluster_peers gauge\n");
+        out.push_str(&format!(
+            "wse_cluster_peers {}\n",
+            cm.connected_peers.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP wse_cluster_messages_sent_total Messages sent to cluster peers\n");
+        out.push_str("# TYPE wse_cluster_messages_sent_total counter\n");
+        out.push_str(&format!(
+            "wse_cluster_messages_sent_total {}\n",
+            cm.messages_sent.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP wse_cluster_messages_delivered_total Messages delivered from cluster peers\n",
+        );
+        out.push_str("# TYPE wse_cluster_messages_delivered_total counter\n");
+        out.push_str(&format!(
+            "wse_cluster_messages_delivered_total {}\n",
+            cm.messages_delivered.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP wse_cluster_messages_dropped_total Messages dropped in cluster\n");
+        out.push_str("# TYPE wse_cluster_messages_dropped_total counter\n");
+        out.push_str(&format!(
+            "wse_cluster_messages_dropped_total {}\n",
+            cm.messages_dropped.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP wse_cluster_bytes_sent_total Bytes sent to cluster peers\n");
+        out.push_str("# TYPE wse_cluster_bytes_sent_total counter\n");
+        out.push_str(&format!(
+            "wse_cluster_bytes_sent_total {}\n",
+            cm.bytes_sent.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP wse_cluster_bytes_received_total Bytes received from cluster peers\n");
+        out.push_str("# TYPE wse_cluster_bytes_received_total counter\n");
+        out.push_str(&format!(
+            "wse_cluster_bytes_received_total {}\n",
+            cm.bytes_received.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP wse_cluster_reconnects_total Cluster peer reconnections\n");
+        out.push_str("# TYPE wse_cluster_reconnects_total counter\n");
+        out.push_str(&format!(
+            "wse_cluster_reconnects_total {}\n",
+            cm.reconnect_count.load(Ordering::Relaxed)
+        ));
+
+        // Recovery metrics (conditional)
+        if let Some(ref recovery) = self.shared.recovery {
+            out.push_str("# HELP wse_recovery_topics Topics with recovery buffers\n");
+            out.push_str("# TYPE wse_recovery_topics gauge\n");
+            out.push_str(&format!("wse_recovery_topics {}\n", recovery.topic_count()));
+
+            out.push_str("# HELP wse_recovery_bytes Total bytes in recovery buffers\n");
+            out.push_str("# TYPE wse_recovery_bytes gauge\n");
+            out.push_str(&format!("wse_recovery_bytes {}\n", recovery.total_bytes()));
+        }
+
+        // Presence metrics (conditional)
+        if let Some(ref pm) = self.shared.presence {
+            out.push_str("# HELP wse_presence_topics Topics with presence tracking\n");
+            out.push_str("# TYPE wse_presence_topics gauge\n");
+            out.push_str(&format!("wse_presence_topics {}\n", pm.total_topics()));
+
+            out.push_str("# HELP wse_presence_users Total users across all topics\n");
+            out.push_str("# TYPE wse_presence_users gauge\n");
+            out.push_str(&format!("wse_presence_users {}\n", pm.total_users()));
+        }
+
+        out
     }
 
     fn get_cluster_dlq_entries(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
