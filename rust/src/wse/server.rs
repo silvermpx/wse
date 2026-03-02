@@ -166,9 +166,6 @@ struct PerConnRate {
     last_warning: Option<std::time::Instant>,
 }
 
-const RATE_CAPACITY: f64 = 100_000.0;
-const RATE_REFILL: f64 = 10_000.0; // tokens per second
-
 pub(crate) enum ServerCommand {
     SendText {
         conn_id: String,
@@ -245,6 +242,12 @@ pub(crate) struct SharedState {
     // Sender for presence broadcasts from disconnect cleanup paths
     // (where self.cmd_tx is not available, only Arc<SharedState>)
     presence_broadcast_tx: std::sync::RwLock<Option<mpsc::UnboundedSender<ServerCommand>>>,
+    // Configurable limits
+    rate_capacity: f64,
+    rate_refill: f64,
+    max_message_size: usize,
+    ping_interval_secs: u64,
+    idle_timeout_secs: u64,
     // Prometheus counters
     messages_received_total: AtomicU64,
     messages_sent_total: AtomicU64,
@@ -257,6 +260,7 @@ pub(crate) struct SharedState {
 }
 
 impl SharedState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         max_connections: usize,
         jwt_config: Option<JwtConfig>,
@@ -265,9 +269,13 @@ impl SharedState {
         presence_enabled: bool,
         presence_max_data_size: usize,
         presence_max_members: usize,
+        rate_capacity: f64,
+        rate_refill: f64,
+        max_message_size: usize,
+        ping_interval_secs: u64,
+        idle_timeout_secs: u64,
     ) -> Self {
-        let cap = max_inbound_queue_size.min(131072);
-        let (tx, rx) = bounded(cap);
+        let (tx, rx) = bounded(max_inbound_queue_size);
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             max_connections,
@@ -303,6 +311,11 @@ impl SharedState {
                 None
             },
             presence_broadcast_tx: std::sync::RwLock::new(None),
+            rate_capacity,
+            rate_refill,
+            max_message_size,
+            ping_interval_secs,
+            idle_timeout_secs,
             messages_received_total: AtomicU64::new(0),
             messages_sent_total: AtomicU64::new(0),
             connections_accepted_total: AtomicU64::new(0),
@@ -688,11 +701,11 @@ fn build_server_hello(
                 "encryption": encryption_enabled
             },
             "limits": {
-                "max_message_size": 1_048_576,
-                "rate_limit_capacity": RATE_CAPACITY as u64,
-                "rate_limit_refill": RATE_REFILL as u64
+                "max_message_size": state.max_message_size,
+                "rate_limit_capacity": state.rate_capacity as u64,
+                "rate_limit_refill": state.rate_refill as u64
             },
-            "ping_interval": 25000,
+            "ping_interval": state.ping_interval_secs * 1000,
             "connection_id": conn_id,
             "server_time": ts
         },
@@ -772,8 +785,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     let hd_clone = handshake_data.clone();
 
     let mut ws_config = WebSocketConfig::default();
-    ws_config.max_message_size = Some(1_048_576); // 1 MB (matches server_hello)
-    ws_config.max_frame_size = Some(1_048_576);
+    ws_config.max_message_size = Some(state.max_message_size);
+    ws_config.max_frame_size = Some(state.max_message_size);
     let ws_stream = match tokio_tungstenite::accept_hdr_async_with_config(
         stream,
         move |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
@@ -1818,7 +1831,7 @@ pub struct RustWSEServer {
 #[pymethods]
 impl RustWSEServer {
     #[new]
-    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0))]
+    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         host: String,
@@ -1837,7 +1850,16 @@ impl RustWSEServer {
         presence_enabled: bool,
         presence_max_data_size: usize,
         presence_max_members: usize,
+        rate_limit_capacity: f64,
+        rate_limit_refill: f64,
+        max_message_size: usize,
+        ping_interval: u64,
+        idle_timeout: u64,
     ) -> Self {
+        assert!(
+            ping_interval < idle_timeout,
+            "ping_interval ({ping_interval}s) must be less than idle_timeout ({idle_timeout}s)"
+        );
         let jwt_config = jwt_secret.map(|secret| {
             eprintln!(
                 "[WSE] JWT auth enabled (issuer={}, audience={})",
@@ -1881,6 +1903,11 @@ impl RustWSEServer {
                 presence_enabled,
                 presence_max_data_size,
                 presence_max_members,
+                rate_limit_capacity,
+                rate_limit_refill,
+                max_message_size,
+                ping_interval,
+                idle_timeout,
             )),
             cmd_tx: None,
             thread_handle: None,
@@ -2059,8 +2086,8 @@ impl RustWSEServer {
                         let ping_state = shared.clone();
                         tokio::spawn(async move {
                             let mut interval =
-                                tokio::time::interval(Duration::from_secs(25));
-                            let idle_timeout = Duration::from_secs(60);
+                                tokio::time::interval(Duration::from_secs(ping_state.ping_interval_secs));
+                            let idle_timeout = Duration::from_secs(ping_state.idle_timeout_secs);
                             loop {
                                 interval.tick().await;
                                 let now = std::time::Instant::now();
@@ -2413,14 +2440,15 @@ impl RustWSEServer {
                 .conn_rates
                 .entry(conn_id.to_owned())
                 .or_insert_with(|| PerConnRate {
-                    tokens: RATE_CAPACITY,
+                    tokens: self.shared.rate_capacity,
                     last_refill: std::time::Instant::now(),
                     last_rate_limited: None,
                     last_warning: None,
                 });
             let rate = entry.value_mut();
             let elapsed = rate.last_refill.elapsed().as_secs_f64();
-            rate.tokens = (rate.tokens + elapsed * RATE_REFILL).min(RATE_CAPACITY);
+            rate.tokens =
+                (rate.tokens + elapsed * self.shared.rate_refill).min(self.shared.rate_capacity);
             rate.last_refill = std::time::Instant::now();
 
             if rate.tokens < 1.0 {
@@ -2445,7 +2473,7 @@ impl RustWSEServer {
             }
 
             // Warning at 20% remaining capacity (throttled: max once per second)
-            let warning_threshold = RATE_CAPACITY * 0.2;
+            let warning_threshold = self.shared.rate_capacity * 0.2;
             if rate.tokens < warning_threshold {
                 let should_warn = rate
                     .last_warning
@@ -2453,8 +2481,8 @@ impl RustWSEServer {
                 if should_warn {
                     let warning = format!(
                         "{{\"c\":\"WSE\",\"t\":\"rate_limit_warning\",\"p\":{{\"current_rate\":{},\"limit\":{},\"remaining\":{},\"retry_after\":1.0}},\"v\":1}}",
-                        (RATE_CAPACITY - rate.tokens) as u64,
-                        RATE_CAPACITY as u64,
+                        (self.shared.rate_capacity - rate.tokens) as u64,
+                        self.shared.rate_capacity as u64,
                         rate.tokens as u64,
                     );
                     cmd_tx
