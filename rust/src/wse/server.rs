@@ -1016,6 +1016,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     let pending_write = pending.clone();
     let write_task = tokio::spawn(async move {
         let mut batch: Vec<WsFrame> = Vec::with_capacity(256);
+        let mut raw_slices: Vec<Bytes> = Vec::with_capacity(256);
 
         loop {
             // Drain up to 256 pending frames in one bulk operation
@@ -1023,12 +1024,11 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
             if n == 0 {
                 break; // channel closed
             }
-            // Decrement pending bytes (byte-based backpressure)
+            // Calculate drained bytes for backpressure accounting (decremented after write)
             let drained_bytes: usize = batch.iter().map(ws_frame_size).sum();
-            pending_write.fetch_sub(drained_bytes, Ordering::Relaxed);
 
             // Separate: PreFramed -> slices for writev, Msg -> tungstenite
-            let mut raw_slices: Vec<Bytes> = Vec::new();
+            raw_slices.clear();
             let mut has_tung = false;
             for frame in &batch {
                 match frame {
@@ -1094,6 +1094,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                     ok = false;
                 }
             }
+
+            // Decrement pending bytes AFTER write completes -- keeps counter
+            // accurate while data is in flight (matches NATS/Centrifugo semantics).
+            pending_write.fetch_sub(drained_bytes, Ordering::Relaxed);
 
             // Always clear: covers PreFramed-only batches (drain didn't run)
             // and partial drain (ok=false broke out early).
@@ -1819,14 +1823,19 @@ async fn process_commands(
                             slow_drops.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        if let Ok(enc) = encrypt_outbound(cipher, data.as_bytes()) {
-                            let mut buf = Vec::with_capacity(2 + enc.len());
-                            buf.extend_from_slice(b"E:");
-                            buf.extend_from_slice(&enc);
-                            let enc_bytes = buf.len() + 4;
-                            pending.fetch_add(enc_bytes, Ordering::Relaxed);
-                            if tx.send(WsFrame::Msg(Message::Binary(buf.into()))).is_err() {
-                                pending.fetch_sub(enc_bytes, Ordering::Relaxed);
+                        match encrypt_outbound(cipher, data.as_bytes()) {
+                            Ok(enc) => {
+                                let mut buf = Vec::with_capacity(2 + enc.len());
+                                buf.extend_from_slice(b"E:");
+                                buf.extend_from_slice(&enc);
+                                let enc_bytes = buf.len() + 4;
+                                pending.fetch_add(enc_bytes, Ordering::Relaxed);
+                                if tx.send(WsFrame::Msg(Message::Binary(buf.into()))).is_err() {
+                                    pending.fetch_sub(enc_bytes, Ordering::Relaxed);
+                                }
+                            }
+                            Err(_) => {
+                                slow_drops.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -1866,14 +1875,19 @@ async fn process_commands(
                             slow_drops.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        if let Ok(enc) = encrypt_outbound(cipher, &data) {
-                            let mut buf = Vec::with_capacity(2 + enc.len());
-                            buf.extend_from_slice(b"E:");
-                            buf.extend_from_slice(&enc);
-                            let enc_bytes = buf.len() + 4;
-                            pending.fetch_add(enc_bytes, Ordering::Relaxed);
-                            if tx.send(WsFrame::Msg(Message::Binary(buf.into()))).is_err() {
-                                pending.fetch_sub(enc_bytes, Ordering::Relaxed);
+                        match encrypt_outbound(cipher, &data) {
+                            Ok(enc) => {
+                                let mut buf = Vec::with_capacity(2 + enc.len());
+                                buf.extend_from_slice(b"E:");
+                                buf.extend_from_slice(&enc);
+                                let enc_bytes = buf.len() + 4;
+                                pending.fetch_add(enc_bytes, Ordering::Relaxed);
+                                if tx.send(WsFrame::Msg(Message::Binary(buf.into()))).is_err() {
+                                    pending.fetch_sub(enc_bytes, Ordering::Relaxed);
+                                }
+                            }
+                            Err(_) => {
+                                slow_drops.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -1964,14 +1978,19 @@ async fn process_commands(
                             slow_drops.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        if let Ok(enc) = encrypt_outbound(cipher, data.as_bytes()) {
-                            let mut buf = Vec::with_capacity(2 + enc.len());
-                            buf.extend_from_slice(b"E:");
-                            buf.extend_from_slice(&enc);
-                            let enc_bytes = buf.len() + 4;
-                            pending.fetch_add(enc_bytes, Ordering::Relaxed);
-                            if tx.send(WsFrame::Msg(Message::Binary(buf.into()))).is_err() {
-                                pending.fetch_sub(enc_bytes, Ordering::Relaxed);
+                        match encrypt_outbound(cipher, data.as_bytes()) {
+                            Ok(enc) => {
+                                let mut buf = Vec::with_capacity(2 + enc.len());
+                                buf.extend_from_slice(b"E:");
+                                buf.extend_from_slice(&enc);
+                                let enc_bytes = buf.len() + 4;
+                                pending.fetch_add(enc_bytes, Ordering::Relaxed);
+                                if tx.send(WsFrame::Msg(Message::Binary(buf.into()))).is_err() {
+                                    pending.fetch_sub(enc_bytes, Ordering::Relaxed);
+                                }
+                            }
+                            Err(_) => {
+                                slow_drops.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -2307,6 +2326,10 @@ impl RustWSEServer {
                                         })
                                         .collect()
                                 };
+                                // Trim stale entries from suspected_slow (disconnected connections)
+                                if !suspected_slow.is_empty() {
+                                    suspected_slow.retain(|id| snapshot.iter().any(|(cid, _, _)| cid == id));
+                                }
                                 let mut force_remove = Vec::new();
                                 for (cid, tx, pending) in &snapshot {
                                     // Slow consumer detection via pending counter
