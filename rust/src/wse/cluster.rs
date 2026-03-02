@@ -907,6 +907,8 @@ async fn peer_dispatch_task(
     topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
     cancel: CancellationToken,
     metrics: Arc<ClusterMetrics>,
+    max_outbound: usize,
+    slow_drops: Arc<AtomicU64>,
 ) {
     let mut batch: Vec<(String, String)> = Vec::with_capacity(256);
 
@@ -924,7 +926,13 @@ async fn peer_dispatch_task(
         for (topic, payload) in &batch {
             let frame = super::server::WsFrame::PreFramed(super::server::pre_frame_text(payload));
             let senders = super::server::collect_topic_senders(&guard, &topic_subscribers, topic);
-            super::server::fanout_to_senders_with_metrics(senders, frame, &metrics);
+            super::server::fanout_to_senders_with_metrics(
+                &senders,
+                frame,
+                &metrics,
+                max_outbound,
+                &slow_drops,
+            );
         }
         drop(guard);
         batch.clear();
@@ -952,6 +960,8 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
     new_peer_tx: mpsc::UnboundedSender<String>,
     cmd_tx: mpsc::UnboundedSender<ClusterCommand>,
     presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
+    max_outbound: usize,
+    slow_drops: Arc<AtomicU64>,
 ) {
     // Dispatch channel: decouples TCP read from fan-out to WebSocket connections.
     let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<(String, String)>();
@@ -962,6 +972,8 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
         topic_subscribers,
         cancel.clone(),
         metrics.clone(),
+        max_outbound,
+        slow_drops,
     ));
 
     // BufReader: bulk reads from TCP into 64KB buffer, serves read_exact from memory
@@ -1162,6 +1174,8 @@ async fn run_peer_session<R, W>(
     connected_instances: &Arc<DashMap<String, String>>,
     presence_tx: &mpsc::UnboundedSender<PresencePeerFrame>,
     presence: &Option<Arc<super::presence::PresenceManager>>,
+    max_outbound: usize,
+    slow_drops: &Arc<AtomicU64>,
 ) -> bool
 where
     R: AsyncReadExt + Unpin + Send + 'static,
@@ -1352,6 +1366,8 @@ where
         new_peer_tx.clone(),
         cmd_tx.clone(),
         presence_tx.clone(),
+        max_outbound,
+        slow_drops.clone(),
     ));
 
     let heartbeat_handle = tokio::spawn(heartbeat_task(
@@ -1417,6 +1433,8 @@ async fn peer_connection_task(
     connected_instances: Arc<DashMap<String, String>>,
     presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
     presence: Option<Arc<super::presence::PresenceManager>>,
+    max_outbound: usize,
+    slow_drops: Arc<AtomicU64>,
 ) {
     let mut backoff = ExponentialBackoff::new();
     let mut breaker = CircuitBreaker::new();
@@ -1540,6 +1558,8 @@ async fn peer_connection_task(
                         &connected_instances,
                         &presence_tx,
                         &presence,
+                        max_outbound,
+                        &slow_drops,
                     )
                     .await
                 }
@@ -1594,6 +1614,8 @@ async fn peer_connection_task(
                 &connected_instances,
                 &presence_tx,
                 &presence,
+                max_outbound,
+                &slow_drops,
             )
             .await
         };
@@ -1637,6 +1659,8 @@ struct PeerSpawnCtx {
     connected_instances: Arc<DashMap<String, String>>,
     presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
     presence: Option<Arc<super::presence::PresenceManager>>,
+    max_outbound: usize,
+    slow_drops: Arc<AtomicU64>,
 }
 
 impl PeerSpawnCtx {
@@ -1663,6 +1687,8 @@ impl PeerSpawnCtx {
             self.connected_instances.clone(),
             self.presence_tx.clone(),
             self.presence.clone(),
+            self.max_outbound,
+            self.slow_drops.clone(),
         ))
     }
 }
@@ -1684,6 +1710,8 @@ pub(crate) async fn cluster_manager(
     cluster_addr: Option<String>,
     presence: Option<Arc<super::presence::PresenceManager>>,
     server_cmd_tx: Option<mpsc::UnboundedSender<super::server::ServerCommand>>,
+    max_outbound: usize,
+    slow_drops: Arc<AtomicU64>,
 ) {
     let global_cancel = CancellationToken::new();
 
@@ -1729,6 +1757,8 @@ pub(crate) async fn cluster_manager(
         connected_instances: connected_instances.clone(),
         presence_tx: presence_peer_tx.clone(),
         presence: presence.clone(),
+        max_outbound,
+        slow_drops: slow_drops.clone(),
     };
 
     for peer_addr in &peers {
@@ -1771,6 +1801,8 @@ pub(crate) async fn cluster_manager(
                 let kp = known_peers.clone();
                 let pptx = presence_peer_tx.clone();
                 let ppres = presence.clone();
+                let mo = max_outbound;
+                let sd = slow_drops.clone();
                 let conn_semaphore =
                     Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_CLUSTER_CONNS));
                 tokio::spawn(async move {
@@ -1807,6 +1839,8 @@ pub(crate) async fn cluster_manager(
                                         let kp2 = kp.clone();
                                         let pptx2 = pptx.clone();
                                         let ppres2 = ppres.clone();
+                                        let mo2 = mo;
+                                        let sd2 = sd.clone();
                                         tokio::spawn(async move {
                                             let _permit = permit; // held until task completes
                                             if let Some(ref tls) = tls {
@@ -1820,6 +1854,7 @@ pub(crate) async fn cluster_manager(
                                                             int_tx2, conns2, subs2, met2, lrc2,
                                                             npt2, gct2, ci2, prt2, gc2,
                                                             ca2, kp2, pptx2, ppres2,
+                                                            mo2, sd2,
                                                         ).await;
                                                     }
                                                     Ok(Err(e)) => {
@@ -1835,6 +1870,7 @@ pub(crate) async fn cluster_manager(
                                                     int_tx2, conns2, subs2, met2, lrc2,
                                                     npt2, gct2, ci2, prt2, gc2,
                                                     ca2, kp2, pptx2, ppres2,
+                                                    mo2, sd2,
                                                 ).await;
                                             }
                                         });
@@ -2214,6 +2250,8 @@ async fn handle_cluster_inbound_generic<S>(
     known_peers: Arc<DashSet<String>>,
     presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
     presence: Option<Arc<super::presence::PresenceManager>>,
+    max_outbound: usize,
+    slow_drops: Arc<AtomicU64>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -2389,6 +2427,8 @@ async fn handle_cluster_inbound_generic<S>(
         new_peer_tx,
         cmd_tx,
         presence_tx,
+        max_outbound,
+        slow_drops,
     ));
 
     let heartbeat_handle = tokio::spawn(heartbeat_task(write_tx, cancel.clone(), last_activity));
@@ -2483,6 +2523,8 @@ pub(crate) async fn handle_cluster_inbound(
         legacy_known_peers,
         presence_tx,
         shared.presence.clone(),
+        shared.max_outbound_queue_size,
+        Arc::clone(&shared.slow_consumer_drops),
     )
     .await;
 }

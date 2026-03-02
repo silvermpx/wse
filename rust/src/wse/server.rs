@@ -54,6 +54,7 @@ pub(crate) enum WsFrame {
 
 pub(crate) struct ConnectionHandle {
     pub(crate) tx: mpsc::UnboundedSender<WsFrame>,
+    pub(crate) pending: Arc<AtomicUsize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +249,9 @@ pub(crate) struct SharedState {
     max_message_size: usize,
     ping_interval_secs: u64,
     idle_timeout_secs: u64,
+    pub(crate) max_outbound_queue_size: usize,
     // Prometheus counters
+    pub(crate) slow_consumer_drops: Arc<AtomicU64>,
     messages_received_total: AtomicU64,
     messages_sent_total: AtomicU64,
     connections_accepted_total: AtomicU64,
@@ -274,6 +277,7 @@ impl SharedState {
         max_message_size: usize,
         ping_interval_secs: u64,
         idle_timeout_secs: u64,
+        max_outbound_queue_size: usize,
     ) -> Self {
         let (tx, rx) = bounded(max_inbound_queue_size);
         Self {
@@ -316,6 +320,8 @@ impl SharedState {
             max_message_size,
             ping_interval_secs,
             idle_timeout_secs,
+            max_outbound_queue_size,
+            slow_consumer_drops: Arc::new(AtomicU64::new(0)),
             messages_received_total: AtomicU64::new(0),
             messages_sent_total: AtomicU64::new(0),
             connections_accepted_total: AtomicU64::new(0),
@@ -838,6 +844,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     let mut read_half = read_half;
     let mut write_half = write_half;
     let (tx, mut rx) = mpsc::unbounded_channel::<WsFrame>();
+    let pending = Arc::new(AtomicUsize::new(0));
     let drain = state.drain_mode.load(Ordering::Relaxed);
 
     // ── JWT validation in Rust (zero GIL) ──────────────────────────────────
@@ -918,9 +925,20 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         if let Some(ref user_id) = rust_auth_user_id {
             let recovery_enabled = state.recovery.is_some();
             let server_ready = build_server_ready(&conn_id, user_id, recovery_enabled);
-            let _ = tx.send(WsFrame::Msg(Message::Text(server_ready.into())));
+            if tx
+                .send(WsFrame::Msg(Message::Text(server_ready.into())))
+                .is_ok()
+            {
+                pending.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        conns.insert((*conn_id).clone(), ConnectionHandle { tx: tx.clone() });
+        conns.insert(
+            (*conn_id).clone(),
+            ConnectionHandle {
+                tx: tx.clone(),
+                pending: pending.clone(),
+            },
+        );
         state.connection_count.store(conns.len(), Ordering::Relaxed);
         state
             .connections_accepted_total
@@ -976,6 +994,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     //   2. Separate PreFramed (raw broadcast bytes) from Msg (tungstenite control/per-conn)
     //   3. Write all PreFramed via write_vectored (one writev syscall, zero memcpy)
     //   4. Feed all Msg to tungstenite, single flush
+    let pending_write = pending.clone();
     let write_task = tokio::spawn(async move {
         let mut batch: Vec<WsFrame> = Vec::with_capacity(256);
 
@@ -985,6 +1004,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
             if n == 0 {
                 break; // channel closed
             }
+            // Decrement pending counter (messages consumed from channel)
+            pending_write.fetch_sub(n, Ordering::Relaxed);
 
             // Separate: PreFramed -> slices for writev, Msg -> tungstenite
             let mut raw_slices: Vec<Bytes> = Vec::new();
@@ -1158,7 +1179,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                                     "{{\"c\":\"WSE\",\"t\":\"error\",\"p\":{{\"code\":\"KEY_EXCHANGE_FAILED\",\"message\":\"ECDH key exchange failed: {}\",\"recoverable\":true}}}}",
                                                     e.replace('\"', "\\\"")
                                                 );
-                                                let _ = tx.send(WsFrame::Msg(Message::Text(err_msg.into())));
+                                                if tx.send(WsFrame::Msg(Message::Text(err_msg.into()))).is_ok() {
+                                                    pending.fetch_add(1, Ordering::Relaxed);
+                                                }
                                                 None
                                             }
                                         })
@@ -1172,7 +1195,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                     &state,
                                     server_pubkey.as_deref(),
                                 );
-                                let _ = tx.send(WsFrame::Msg(Message::Text(hello.into())));
+                                if tx.send(WsFrame::Msg(Message::Text(hello.into()))).is_ok() {
+                                    pending.fetch_add(1, Ordering::Relaxed);
+                                }
                                 continue;
                             }
                             if t_val == "ping" {
@@ -1192,7 +1217,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                     server_ts,
                                     server_ts.saturating_sub(timestamp).max(0)
                                 );
-                                let _ = tx.send(WsFrame::Msg(Message::Text(pong.into())));
+                                if tx.send(WsFrame::Msg(Message::Text(pong.into()))).is_ok() {
+                                    pending.fetch_add(1, Ordering::Relaxed);
+                                }
                                 continue;
                             }
                             if t_val == "pong" || t_val == "PONG" {
@@ -1390,7 +1417,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                 }
             }
             Message::Ping(payload) => {
-                let _ = tx.send(WsFrame::Msg(Message::Pong(payload)));
+                if tx.send(WsFrame::Msg(Message::Pong(payload))).is_ok() {
+                    pending.fetch_add(1, Ordering::Relaxed);
+                }
             }
             Message::Close(_) => break,
             Message::Pong(_) | Message::Frame(_) => {}
@@ -1550,7 +1579,7 @@ pub(crate) fn collect_topic_senders(
     conns: &HashMap<String, ConnectionHandle>,
     topic_subscribers: &DashMap<String, DashSet<String>>,
     topic: &str,
-) -> Vec<mpsc::UnboundedSender<WsFrame>> {
+) -> Vec<(mpsc::UnboundedSender<WsFrame>, Arc<AtomicUsize>)> {
     let mut seen = AHashSet::new();
     let mut senders = Vec::new();
 
@@ -1562,7 +1591,7 @@ pub(crate) fn collect_topic_senders(
             if seen.insert(cid.clone())
                 && let Some(handle) = conns.get(cid)
             {
-                senders.push(handle.tx.clone());
+                senders.push((handle.tx.clone(), handle.pending.clone()));
             }
         }
     }
@@ -1576,7 +1605,7 @@ pub(crate) fn collect_topic_senders(
                 if seen.insert(cid.clone())
                     && let Some(handle) = conns.get(cid)
                 {
-                    senders.push(handle.tx.clone());
+                    senders.push((handle.tx.clone(), handle.pending.clone()));
                 }
             }
         }
@@ -1588,9 +1617,21 @@ pub(crate) fn collect_topic_senders(
 /// Fan-out a pre-built message to collected sender handles.
 /// Sequential fan-out: enqueue pre-built message to all collected sender handles.
 /// Non-blocking channel sends -- each connection's writer task handles actual I/O.
-fn fanout_to_senders(senders: Vec<mpsc::UnboundedSender<WsFrame>>, frame: WsFrame) {
-    for tx in &senders {
-        let _ = tx.send(frame.clone());
+/// Checks per-connection pending counter; drops message for slow consumers.
+fn fanout_to_senders(
+    senders: &[(mpsc::UnboundedSender<WsFrame>, Arc<AtomicUsize>)],
+    frame: WsFrame,
+    max_pending: usize,
+    slow_drops: &AtomicU64,
+) {
+    for (tx, pending) in senders {
+        if max_pending > 0 && pending.load(Ordering::Relaxed) >= max_pending {
+            slow_drops.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        if tx.send(frame.clone()).is_ok() {
+            pending.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1604,14 +1645,22 @@ pub(crate) trait FanoutMetrics: Send + Sync + 'static {
 /// Takes Arc<M> where M implements FanoutMetrics, enabling spawned tasks
 /// to update metrics with 'static lifetime.
 pub(crate) fn fanout_to_senders_with_metrics<M: FanoutMetrics>(
-    senders: Vec<mpsc::UnboundedSender<WsFrame>>,
+    senders: &[(mpsc::UnboundedSender<WsFrame>, Arc<AtomicUsize>)],
     frame: WsFrame,
     metrics: &Arc<M>,
+    max_pending: usize,
+    slow_drops: &AtomicU64,
 ) {
     let mut d = 0u64;
     let mut f = 0u64;
-    for tx in &senders {
+    for (tx, pending) in senders {
+        if max_pending > 0 && pending.load(Ordering::Relaxed) >= max_pending {
+            slow_drops.fetch_add(1, Ordering::Relaxed);
+            f += 1;
+            continue;
+        }
         if tx.send(frame.clone()).is_ok() {
+            pending.fetch_add(1, Ordering::Relaxed);
             d += 1;
         } else {
             f += 1;
@@ -1636,30 +1685,54 @@ async fn process_commands(
             ServerCommand::SendText { conn_id, data } => {
                 let guard = state.connections.read().await;
                 if let Some(h) = guard.get(&conn_id) {
-                    let _ = h.tx.send(WsFrame::Msg(Message::Text(data.into())));
+                    let max_pending = state.max_outbound_queue_size;
+                    if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
+                        state.slow_consumer_drops.fetch_add(1, Ordering::Relaxed);
+                    } else if h.tx.send(WsFrame::Msg(Message::Text(data.into()))).is_ok() {
+                        h.pending.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             ServerCommand::SendBytes { conn_id, data } => {
                 let guard = state.connections.read().await;
                 if let Some(h) = guard.get(&conn_id) {
-                    let _ = h.tx.send(WsFrame::Msg(Message::Binary(data.into())));
+                    let max_pending = state.max_outbound_queue_size;
+                    if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
+                        state.slow_consumer_drops.fetch_add(1, Ordering::Relaxed);
+                    } else if h
+                        .tx
+                        .send(WsFrame::Msg(Message::Binary(data.into())))
+                        .is_ok()
+                    {
+                        h.pending.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             ServerCommand::SendPrebuilt { conn_id, message } => {
                 let guard = state.connections.read().await;
                 if let Some(h) = guard.get(&conn_id) {
-                    let _ = h.tx.send(WsFrame::Msg(message));
+                    let max_pending = state.max_outbound_queue_size;
+                    if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
+                        state.slow_consumer_drops.fetch_add(1, Ordering::Relaxed);
+                    } else if h.tx.send(WsFrame::Msg(message)).is_ok() {
+                        h.pending.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             ServerCommand::BroadcastText { data } => {
+                let max_pending = state.max_outbound_queue_size;
+                let slow_drops = &state.slow_consumer_drops;
                 if state.conn_encryption.is_empty() {
                     // Fast path: no encrypted connections, zero overhead
                     let frame = WsFrame::PreFramed(pre_frame_text(&data));
-                    let senders: Vec<mpsc::UnboundedSender<WsFrame>> = {
+                    let senders: Vec<(mpsc::UnboundedSender<WsFrame>, Arc<AtomicUsize>)> = {
                         let guard = state.connections.read().await;
-                        guard.values().map(|h| h.tx.clone()).collect()
+                        guard
+                            .values()
+                            .map(|h| (h.tx.clone(), h.pending.clone()))
+                            .collect()
                     };
-                    fanout_to_senders(senders, frame);
+                    fanout_to_senders(&senders, frame, max_pending, slow_drops);
                 } else {
                     let preframed = pre_frame_text(&data);
                     let guard = state.connections.read().await;
@@ -1667,33 +1740,49 @@ async fn process_commands(
                     let mut enc_senders = Vec::new();
                     for (cid, h) in guard.iter() {
                         if let Some(cipher_ref) = state.conn_encryption.get(cid) {
-                            enc_senders.push((h.tx.clone(), cipher_ref.clone()));
+                            enc_senders.push((h.tx.clone(), h.pending.clone(), cipher_ref.clone()));
                         } else {
-                            plain_senders.push(h.tx.clone());
+                            plain_senders.push((h.tx.clone(), h.pending.clone()));
                         }
                     }
                     drop(guard);
                     if !plain_senders.is_empty() {
-                        fanout_to_senders(plain_senders, WsFrame::PreFramed(preframed));
+                        fanout_to_senders(
+                            &plain_senders,
+                            WsFrame::PreFramed(preframed),
+                            max_pending,
+                            slow_drops,
+                        );
                     }
-                    for (tx, cipher) in &enc_senders {
+                    for (tx, pending, cipher) in &enc_senders {
+                        if max_pending > 0 && pending.load(Ordering::Relaxed) >= max_pending {
+                            slow_drops.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                         if let Ok(enc) = encrypt_outbound(cipher, data.as_bytes()) {
                             let mut buf = Vec::with_capacity(2 + enc.len());
                             buf.extend_from_slice(b"E:");
                             buf.extend_from_slice(&enc);
-                            let _ = tx.send(WsFrame::Msg(Message::Binary(buf.into())));
+                            if tx.send(WsFrame::Msg(Message::Binary(buf.into()))).is_ok() {
+                                pending.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
             }
             ServerCommand::BroadcastBytes { data } => {
+                let max_pending = state.max_outbound_queue_size;
+                let slow_drops = &state.slow_consumer_drops;
                 if state.conn_encryption.is_empty() {
                     let frame = WsFrame::PreFramed(pre_frame_binary(&data));
-                    let senders: Vec<mpsc::UnboundedSender<WsFrame>> = {
+                    let senders: Vec<(mpsc::UnboundedSender<WsFrame>, Arc<AtomicUsize>)> = {
                         let guard = state.connections.read().await;
-                        guard.values().map(|h| h.tx.clone()).collect()
+                        guard
+                            .values()
+                            .map(|h| (h.tx.clone(), h.pending.clone()))
+                            .collect()
                     };
-                    fanout_to_senders(senders, frame);
+                    fanout_to_senders(&senders, frame, max_pending, slow_drops);
                 } else {
                     let preframed = pre_frame_binary(&data);
                     let guard = state.connections.read().await;
@@ -1701,21 +1790,32 @@ async fn process_commands(
                     let mut enc_senders = Vec::new();
                     for (cid, h) in guard.iter() {
                         if let Some(cipher_ref) = state.conn_encryption.get(cid) {
-                            enc_senders.push((h.tx.clone(), cipher_ref.clone()));
+                            enc_senders.push((h.tx.clone(), h.pending.clone(), cipher_ref.clone()));
                         } else {
-                            plain_senders.push(h.tx.clone());
+                            plain_senders.push((h.tx.clone(), h.pending.clone()));
                         }
                     }
                     drop(guard);
                     if !plain_senders.is_empty() {
-                        fanout_to_senders(plain_senders, WsFrame::PreFramed(preframed));
+                        fanout_to_senders(
+                            &plain_senders,
+                            WsFrame::PreFramed(preframed),
+                            max_pending,
+                            slow_drops,
+                        );
                     }
-                    for (tx, cipher) in &enc_senders {
+                    for (tx, pending, cipher) in &enc_senders {
+                        if max_pending > 0 && pending.load(Ordering::Relaxed) >= max_pending {
+                            slow_drops.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                         if let Ok(enc) = encrypt_outbound(cipher, &data) {
                             let mut buf = Vec::with_capacity(2 + enc.len());
                             buf.extend_from_slice(b"E:");
                             buf.extend_from_slice(&enc);
-                            let _ = tx.send(WsFrame::Msg(Message::Binary(buf.into())));
+                            if tx.send(WsFrame::Msg(Message::Binary(buf.into()))).is_ok() {
+                                pending.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -1726,6 +1826,8 @@ async fn process_commands(
                 skip_recovery,
             } => {
                 let preframed = pre_frame_text(&data);
+                let max_pending = state.max_outbound_queue_size;
+                let slow_drops = &state.slow_consumer_drops;
                 // Store in recovery buffer (skip for presence events)
                 if !skip_recovery && let Some(ref recovery) = state.recovery {
                     recovery.push(&topic, preframed.clone());
@@ -1736,7 +1838,12 @@ async fn process_commands(
                         let guard = state.connections.read().await;
                         collect_topic_senders(&guard, &state.topic_subscribers, &topic)
                     };
-                    fanout_to_senders(senders, WsFrame::PreFramed(preframed));
+                    fanout_to_senders(
+                        &senders,
+                        WsFrame::PreFramed(preframed),
+                        max_pending,
+                        slow_drops,
+                    );
                 } else {
                     let guard = state.connections.read().await;
                     let mut plain_senders = Vec::new();
@@ -1749,9 +1856,13 @@ async fn process_commands(
                                 && let Some(h) = guard.get(&cid)
                             {
                                 if let Some(cipher_ref) = state.conn_encryption.get(&cid) {
-                                    enc_senders.push((h.tx.clone(), cipher_ref.clone()));
+                                    enc_senders.push((
+                                        h.tx.clone(),
+                                        h.pending.clone(),
+                                        cipher_ref.clone(),
+                                    ));
                                 } else {
-                                    plain_senders.push(h.tx.clone());
+                                    plain_senders.push((h.tx.clone(), h.pending.clone()));
                                 }
                             }
                         }
@@ -1768,9 +1879,13 @@ async fn process_commands(
                                     && let Some(h) = guard.get(&cid)
                                 {
                                     if let Some(cipher_ref) = state.conn_encryption.get(&cid) {
-                                        enc_senders.push((h.tx.clone(), cipher_ref.clone()));
+                                        enc_senders.push((
+                                            h.tx.clone(),
+                                            h.pending.clone(),
+                                            cipher_ref.clone(),
+                                        ));
                                     } else {
-                                        plain_senders.push(h.tx.clone());
+                                        plain_senders.push((h.tx.clone(), h.pending.clone()));
                                     }
                                 }
                             }
@@ -1778,22 +1893,36 @@ async fn process_commands(
                     }
                     drop(guard);
                     if !plain_senders.is_empty() {
-                        fanout_to_senders(plain_senders, WsFrame::PreFramed(preframed));
+                        fanout_to_senders(
+                            &plain_senders,
+                            WsFrame::PreFramed(preframed),
+                            max_pending,
+                            slow_drops,
+                        );
                     }
-                    for (tx, cipher) in &enc_senders {
+                    for (tx, pending, cipher) in &enc_senders {
+                        if max_pending > 0 && pending.load(Ordering::Relaxed) >= max_pending {
+                            slow_drops.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                         if let Ok(enc) = encrypt_outbound(cipher, data.as_bytes()) {
                             let mut buf = Vec::with_capacity(2 + enc.len());
                             buf.extend_from_slice(b"E:");
                             buf.extend_from_slice(&enc);
-                            let _ = tx.send(WsFrame::Msg(Message::Binary(buf.into())));
+                            if tx.send(WsFrame::Msg(Message::Binary(buf.into()))).is_ok() {
+                                pending.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
             }
             ServerCommand::Disconnect { conn_id } => {
+                // Control message: send unconditionally, increment pending
                 let guard = state.connections.read().await;
-                if let Some(h) = guard.get(&conn_id) {
-                    let _ = h.tx.send(WsFrame::Msg(Message::Close(None)));
+                if let Some(h) = guard.get(&conn_id)
+                    && h.tx.send(WsFrame::Msg(Message::Close(None))).is_ok()
+                {
+                    h.pending.fetch_add(1, Ordering::Relaxed);
                 }
             }
             ServerCommand::GetConnections { reply } => {
@@ -1803,7 +1932,9 @@ async fn process_commands(
             ServerCommand::Shutdown => {
                 let guard = state.connections.read().await;
                 for h in guard.values() {
-                    let _ = h.tx.send(WsFrame::Msg(Message::Close(None)));
+                    if h.tx.send(WsFrame::Msg(Message::Close(None))).is_ok() {
+                        h.pending.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 break;
             }
@@ -1831,7 +1962,7 @@ pub struct RustWSEServer {
 #[pymethods]
 impl RustWSEServer {
     #[new]
-    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60))]
+    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_size = 8192))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         host: String,
@@ -1855,6 +1986,7 @@ impl RustWSEServer {
         max_message_size: usize,
         ping_interval: u64,
         idle_timeout: u64,
+        max_outbound_queue_size: usize,
     ) -> Self {
         assert!(
             ping_interval < idle_timeout,
@@ -1908,6 +2040,7 @@ impl RustWSEServer {
                 max_message_size,
                 ping_interval,
                 idle_timeout,
+                max_outbound_queue_size,
             )),
             cmd_tx: None,
             thread_handle: None,
@@ -2081,41 +2214,74 @@ impl RustWSEServer {
                             }
                         });
                     }
-                    // Server-initiated ping + zombie detection
+                    // Server-initiated ping + zombie detection + slow consumer detection
                     {
                         let ping_state = shared.clone();
                         tokio::spawn(async move {
                             let mut interval =
                                 tokio::time::interval(Duration::from_secs(ping_state.ping_interval_secs));
                             let idle_timeout = Duration::from_secs(ping_state.idle_timeout_secs);
+                            let max_pending = ping_state.max_outbound_queue_size;
+                            // Two-phase slow consumer detection: connections suspected
+                            // of being slow (queue full on first check). If still full
+                            // on the next tick, they get disconnected.
+                            let mut suspected_slow: AHashSet<String> = AHashSet::new();
                             loop {
                                 interval.tick().await;
                                 let now = std::time::Instant::now();
-                                // Collect senders under read lock, then release
+                                // Collect senders + pending counters under read lock
                                 let snapshot: Vec<(
                                     String,
                                     mpsc::UnboundedSender<WsFrame>,
+                                    Arc<AtomicUsize>,
                                 )> = {
                                     let conns =
                                         ping_state.connections.read().await;
                                     conns
                                         .iter()
                                         .map(|(cid, h)| {
-                                            (cid.clone(), h.tx.clone())
+                                            (cid.clone(), h.tx.clone(), h.pending.clone())
                                         })
                                         .collect()
                                 };
                                 let mut force_remove = Vec::new();
-                                for (cid, tx) in &snapshot {
+                                for (cid, tx, pending) in &snapshot {
+                                    // Slow consumer detection via pending counter
+                                    if max_pending > 0
+                                        && pending.load(Ordering::Relaxed) >= max_pending
+                                    {
+                                        if suspected_slow.contains(cid) {
+                                            // Second tick still full: disconnect
+                                            if tx.send(WsFrame::Msg(
+                                                Message::Close(None),
+                                            )).is_ok() {
+                                                pending.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            ping_state
+                                                .conn_last_activity
+                                                .remove(cid);
+                                            suspected_slow.remove(cid);
+                                            continue;
+                                        } else {
+                                            // First tick: suspect
+                                            suspected_slow.insert(cid.clone());
+                                        }
+                                    } else {
+                                        // Queue not full: clear suspicion
+                                        suspected_slow.remove(cid);
+                                    }
+
                                     if let Some(last) =
                                         ping_state.conn_last_activity.get(cid)
                                     {
-                                        // Check zombie (no activity for 60s)
+                                        // Check zombie (no activity for idle_timeout)
                                         if now.duration_since(*last) > idle_timeout
                                         {
-                                            let _ = tx.send(WsFrame::Msg(
+                                            if tx.send(WsFrame::Msg(
                                                 Message::Close(None),
-                                            ));
+                                            )).is_ok() {
+                                                pending.fetch_add(1, Ordering::Relaxed);
+                                            }
                                             // Remove activity entry; next tick
                                             // will force-remove if still present
                                             ping_state
@@ -2132,9 +2298,11 @@ impl RustWSEServer {
                                         let ping_msg = format!(
                                             "{{\"c\":\"WSE\",\"t\":\"ping\",\"p\":{{\"server_time\":\"{ts}\"}}}}"
                                         );
-                                        let _ = tx.send(WsFrame::Msg(
+                                        if tx.send(WsFrame::Msg(
                                             Message::Text(ping_msg.into()),
-                                        ));
+                                        )).is_ok() {
+                                            pending.fetch_add(1, Ordering::Relaxed);
+                                        }
                                     } else {
                                         // No activity entry = Close was sent last
                                         // tick but connection didn't terminate.
@@ -2995,6 +3163,8 @@ impl RustWSEServer {
             cluster_addr,
             self.shared.presence.clone(),
             self.cmd_tx.clone(),
+            self.shared.max_outbound_queue_size,
+            Arc::clone(&self.shared.slow_consumer_drops),
         ));
 
         Ok(())
@@ -3121,16 +3291,19 @@ impl RustWSEServer {
         // Step 1: Subscribe using existing logic (no presence tracking for recovery)
         self.subscribe_connection(conn_id, topics.clone(), None)?;
 
-        // Step 2: Get connection tx (clone it, drop the lock)
-        let tx = if recover {
+        // Step 2: Get connection tx + pending counter (clone them, drop the lock)
+        let (tx, tx_pending) = if recover {
             let rt = self
                 .rt_handle
                 .as_ref()
                 .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
             let guard = rt.block_on(self.shared.connections.read());
-            guard.get(conn_id).map(|h| h.tx.clone())
+            match guard.get(conn_id) {
+                Some(h) => (Some(h.tx.clone()), Some(h.pending.clone())),
+                None => (None, None),
+            }
         } else {
-            None
+            (None, None)
         };
 
         let recovery_mgr = self.shared.recovery.as_ref();
@@ -3167,8 +3340,11 @@ impl RustWSEServer {
                     } => {
                         let count = publications.len();
                         let conn_tx = tx.as_ref().unwrap();
+                        let conn_pending = tx_pending.as_ref().unwrap();
                         for pub_bytes in publications {
-                            let _ = conn_tx.send(WsFrame::PreFramed(pub_bytes));
+                            if conn_tx.send(WsFrame::PreFramed(pub_bytes)).is_ok() {
+                                conn_pending.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         topic_dict.set_item("epoch", format!("{:08x}", current_epoch))?;
                         topic_dict.set_item("offset", current_offset)?;
@@ -3581,6 +3757,15 @@ impl RustWSEServer {
         out.push_str(&format!(
             "wse_inbound_dropped_total {}\n",
             self.shared.inbound_dropped.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP wse_slow_consumer_drops_total Messages dropped due to slow consumers\n",
+        );
+        out.push_str("# TYPE wse_slow_consumer_drops_total counter\n");
+        out.push_str(&format!(
+            "wse_slow_consumer_drops_total {}\n",
+            self.shared.slow_consumer_drops.load(Ordering::Relaxed)
         ));
 
         // Cluster metrics
