@@ -266,8 +266,11 @@ pub(crate) async fn receive_loop(
         match tokio::time::timeout(remaining, ws.next()).await {
             Ok(Some(Ok(msg))) => {
                 if let Some(parsed) = parse_wse_message(&msg) {
-                    // Timestamp gating: only count messages published after measurement
-                    // started. Stale messages from spawn/warmup are discarded entirely.
+                    local_bytes += msg.len() as u64;
+                    local_received += 1;
+
+                    // Latency: only measure for messages published after measurement started
+                    // (stale messages from pipeline backlog would show multi-second latency)
                     let ts_us = parsed
                         .get("p")
                         .and_then(|p| p.get("ts_us"))
@@ -275,33 +278,14 @@ pub(crate) async fn receive_loop(
                         .or_else(|| parsed.get("ts_us").and_then(|v| v.as_u64()));
 
                     if let Some(ts) = ts_us {
-                        if ts < measurement_start_us {
-                            // Stale message from before measurement window -- skip
-                            // but still track sequence for gap detection
-                            if let Some(seq) = parsed
-                                .get("p")
-                                .and_then(|p| p.get("seq"))
-                                .and_then(|v| v.as_i64())
-                                .or_else(|| parsed.get("seq").and_then(|v| v.as_i64()))
-                            {
-                                last_seq = seq;
-                            }
-                            continue;
+                        if ts >= measurement_start_us {
+                            let now_us = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_micros() as u64;
+                            let lat_us = now_us.saturating_sub(ts);
+                            local_hist.record_us(lat_us.max(1));
                         }
-                    }
-
-                    // Count only messages within the measurement window
-                    local_bytes += msg.len() as u64;
-                    local_received += 1;
-
-                    // Latency: ts_us embedded by server
-                    if let Some(ts) = ts_us {
-                        let now_us = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_micros() as u64;
-                        let lat_us = now_us.saturating_sub(ts);
-                        local_hist.record_us(lat_us.max(1));
                     }
 
                     // Sequence gap detection
