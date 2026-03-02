@@ -35,6 +35,7 @@ import subprocess
 import sys
 import time
 import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from wse_server._wse_accel import RustWSEServer, rust_jwt_encode
 
@@ -89,6 +90,29 @@ def generate_token(user_id: str = "bench-user") -> str:
         "iat": int(time.time()),
     }
     return rust_jwt_encode(claims, JWT_SECRET)
+
+
+def start_metrics_server(server, port: int):
+    """Start a tiny HTTP server that exposes Prometheus metrics."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = server.prometheus_metrics().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass  # silence request logs
+
+    httpd = HTTPServer(("0.0.0.0", port), Handler)
+    httpd.daemon_threads = True
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    print(f"[fanout-server] Metrics on :{port}/metrics")
+    return httpd
 
 
 def drain_loop(server, mode: str, stop_event: threading.Event):
@@ -218,6 +242,9 @@ def main():
             print(f"[fanout-server] TLS enabled (cert={args.tls_cert})")
         if args.cluster_port:
             print(f"[fanout-server] Cluster port: {args.cluster_port}, addr: {args.cluster_addr}")
+
+    metrics_port = args.port + 1000
+    start_metrics_server(server, metrics_port)
 
     token = generate_token()
     print(f"[fanout-server] JWT: {token}")

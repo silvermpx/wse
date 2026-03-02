@@ -376,6 +376,41 @@ pub async fn query_health(ws: &mut WsStream, timeout_secs: u64) -> Option<serde_
     }
 }
 
+/// Query slow_consumer_drops_total from the server's Prometheus metrics HTTP endpoint.
+/// Returns the counter value, or None if the endpoint is unreachable or metric not found.
+pub async fn query_slow_consumer_drops(host: &str, metrics_port: u16) -> Option<u64> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let addr = format!("{host}:{metrics_port}");
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .ok()?
+    .ok()?;
+
+    let request = format!("GET /metrics HTTP/1.0\r\nHost: {addr}\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.ok()?;
+
+    let mut body = Vec::with_capacity(4096);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stream.read_to_end(&mut body),
+    )
+    .await
+    .ok()?
+    .ok()?;
+
+    let text = String::from_utf8_lossy(&body);
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("wse_slow_consumer_drops_total ") {
+            return rest.trim().parse::<u64>().ok();
+        }
+    }
+    None
+}
+
 /// Close all connections gracefully.
 pub async fn close_all(connections: Vec<WsStream>) {
     let mut handles = Vec::with_capacity(connections.len());

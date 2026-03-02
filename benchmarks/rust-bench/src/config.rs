@@ -58,6 +58,17 @@ pub struct Cli {
     /// Third server port (for 3-node discovery test)
     #[arg(long)]
     pub port3: Option<u16>,
+
+    /// Metrics HTTP port (for querying Prometheus metrics from bench server)
+    #[arg(long)]
+    pub metrics_port: Option<u16>,
+}
+
+impl Cli {
+    /// Metrics port for a given server port. Defaults to port + 1000.
+    pub fn metrics_port_for(&self, server_port: u16) -> u16 {
+        self.metrics_port.unwrap_or(server_port + 1000)
+    }
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
