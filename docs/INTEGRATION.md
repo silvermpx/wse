@@ -616,6 +616,7 @@ export async function refreshAuthToken(): Promise<void> {
 import { useWSE } from 'wse-client';
 import type { UseWSEConfig } from 'wse-client';
 import { APP_DEFAULT_TOPICS, getAppEndpoints, refreshAuthToken } from '@/wse/config';
+import { registerAllHandlers } from '@/wse/handlers';
 
 export function WSEProvider({ children }: { children: ReactNode }) {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
@@ -623,6 +624,7 @@ export function WSEProvider({ children }: { children: ReactNode }) {
   const wseConfig: UseWSEConfig = {
     endpoints: getAppEndpoints(),
     refreshAuthToken,
+    registerHandlers: registerAllHandlers,
   };
 
   const wse = useWSE(

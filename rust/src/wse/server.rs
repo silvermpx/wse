@@ -52,8 +52,25 @@ pub(crate) enum WsFrame {
     PreFramed(Bytes),
 }
 
+/// Byte size of a WsFrame for backpressure accounting.
+/// Counts payload + estimated framing overhead (~4 bytes for most messages).
+#[inline]
+fn ws_frame_size(frame: &WsFrame) -> usize {
+    match frame {
+        WsFrame::PreFramed(bytes) => bytes.len(),
+        WsFrame::Msg(msg) => match msg {
+            Message::Text(s) => s.len() + 4,
+            Message::Binary(b) => b.len() + 4,
+            Message::Ping(p) | Message::Pong(p) => p.len() + 4,
+            Message::Close(_) => 8,
+            Message::Frame(_) => 16,
+        },
+    }
+}
+
 pub(crate) struct ConnectionHandle {
     pub(crate) tx: mpsc::UnboundedSender<WsFrame>,
+    /// Pending outbound bytes (not messages) for backpressure accounting.
     pub(crate) pending: Arc<AtomicUsize>,
 }
 
@@ -249,7 +266,7 @@ pub(crate) struct SharedState {
     max_message_size: usize,
     ping_interval_secs: u64,
     idle_timeout_secs: u64,
-    pub(crate) max_outbound_queue_size: usize,
+    pub(crate) max_outbound_queue_bytes: usize,
     // Prometheus counters
     pub(crate) slow_consumer_drops: Arc<AtomicU64>,
     messages_received_total: AtomicU64,
@@ -277,7 +294,7 @@ impl SharedState {
         max_message_size: usize,
         ping_interval_secs: u64,
         idle_timeout_secs: u64,
-        max_outbound_queue_size: usize,
+        max_outbound_queue_bytes: usize,
     ) -> Self {
         let (tx, rx) = bounded(max_inbound_queue_size);
         Self {
@@ -320,7 +337,7 @@ impl SharedState {
             max_message_size,
             ping_interval_secs,
             idle_timeout_secs,
-            max_outbound_queue_size,
+            max_outbound_queue_bytes,
             slow_consumer_drops: Arc::new(AtomicU64::new(0)),
             messages_received_total: AtomicU64::new(0),
             messages_sent_total: AtomicU64::new(0),
@@ -925,12 +942,13 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         if let Some(ref user_id) = rust_auth_user_id {
             let recovery_enabled = state.recovery.is_some();
             let server_ready = build_server_ready(&conn_id, user_id, recovery_enabled);
-            pending.fetch_add(1, Ordering::Relaxed);
+            let sr_bytes = server_ready.len() + 4;
+            pending.fetch_add(sr_bytes, Ordering::Relaxed);
             if tx
                 .send(WsFrame::Msg(Message::Text(server_ready.into())))
                 .is_err()
             {
-                pending.fetch_sub(1, Ordering::Relaxed);
+                pending.fetch_sub(sr_bytes, Ordering::Relaxed);
             }
         }
         conns.insert(
@@ -1005,8 +1023,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
             if n == 0 {
                 break; // channel closed
             }
-            // Decrement pending counter (messages consumed from channel)
-            pending_write.fetch_sub(n, Ordering::Relaxed);
+            // Decrement pending bytes (byte-based backpressure)
+            let drained_bytes: usize = batch.iter().map(ws_frame_size).sum();
+            pending_write.fetch_sub(drained_bytes, Ordering::Relaxed);
 
             // Separate: PreFramed -> slices for writev, Msg -> tungstenite
             let mut raw_slices: Vec<Bytes> = Vec::new();
@@ -1180,9 +1199,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                                     "{{\"c\":\"WSE\",\"t\":\"error\",\"p\":{{\"code\":\"KEY_EXCHANGE_FAILED\",\"message\":\"ECDH key exchange failed: {}\",\"recoverable\":true}}}}",
                                                     e.replace('\"', "\\\"")
                                                 );
-                                                pending.fetch_add(1, Ordering::Relaxed);
+                                                let em_bytes = err_msg.len() + 4;
+                                                pending.fetch_add(em_bytes, Ordering::Relaxed);
                                                 if tx.send(WsFrame::Msg(Message::Text(err_msg.into()))).is_err() {
-                                                    pending.fetch_sub(1, Ordering::Relaxed);
+                                                    pending.fetch_sub(em_bytes, Ordering::Relaxed);
                                                 }
                                                 None
                                             }
@@ -1197,9 +1217,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                     &state,
                                     server_pubkey.as_deref(),
                                 );
-                                pending.fetch_add(1, Ordering::Relaxed);
+                                let h_bytes = hello.len() + 4;
+                                pending.fetch_add(h_bytes, Ordering::Relaxed);
                                 if tx.send(WsFrame::Msg(Message::Text(hello.into()))).is_err() {
-                                    pending.fetch_sub(1, Ordering::Relaxed);
+                                    pending.fetch_sub(h_bytes, Ordering::Relaxed);
                                 }
                                 continue;
                             }
@@ -1220,9 +1241,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                     server_ts,
                                     server_ts.saturating_sub(timestamp).max(0)
                                 );
-                                pending.fetch_add(1, Ordering::Relaxed);
+                                let po_bytes = pong.len() + 4;
+                                pending.fetch_add(po_bytes, Ordering::Relaxed);
                                 if tx.send(WsFrame::Msg(Message::Text(pong.into()))).is_err() {
-                                    pending.fetch_sub(1, Ordering::Relaxed);
+                                    pending.fetch_sub(po_bytes, Ordering::Relaxed);
                                 }
                                 continue;
                             }
@@ -1421,9 +1443,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                 }
             }
             Message::Ping(payload) => {
-                pending.fetch_add(1, Ordering::Relaxed);
+                let pong_bytes = payload.len() + 4;
+                pending.fetch_add(pong_bytes, Ordering::Relaxed);
                 if tx.send(WsFrame::Msg(Message::Pong(payload))).is_err() {
-                    pending.fetch_sub(1, Ordering::Relaxed);
+                    pending.fetch_sub(pong_bytes, Ordering::Relaxed);
                 }
             }
             Message::Close(_) => break,
@@ -1629,14 +1652,15 @@ fn fanout_all_connections(
     max_pending: usize,
     slow_drops: &AtomicU64,
 ) {
+    let frame_bytes = ws_frame_size(&frame);
     for h in conns.values() {
         if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
             slow_drops.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        h.pending.fetch_add(1, Ordering::Relaxed);
+        h.pending.fetch_add(frame_bytes, Ordering::Relaxed);
         if h.tx.send(frame.clone()).is_err() {
-            h.pending.fetch_sub(1, Ordering::Relaxed);
+            h.pending.fetch_sub(frame_bytes, Ordering::Relaxed);
         }
     }
 }
@@ -1651,17 +1675,15 @@ fn fanout_to_senders(
     max_pending: usize,
     slow_drops: &AtomicU64,
 ) {
+    let frame_bytes = ws_frame_size(&frame);
     for (tx, pending) in senders {
         if max_pending > 0 && pending.load(Ordering::Relaxed) >= max_pending {
             slow_drops.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        // Increment BEFORE send to prevent TOCTOU underflow:
-        // if the write task drains between send and increment, fetch_sub
-        // would underflow the counter.
-        pending.fetch_add(1, Ordering::Relaxed);
+        pending.fetch_add(frame_bytes, Ordering::Relaxed);
         if tx.send(frame.clone()).is_err() {
-            pending.fetch_sub(1, Ordering::Relaxed);
+            pending.fetch_sub(frame_bytes, Ordering::Relaxed);
         }
     }
 }
@@ -1682,6 +1704,7 @@ pub(crate) fn fanout_to_senders_with_metrics<M: FanoutMetrics>(
     max_pending: usize,
     slow_drops: &AtomicU64,
 ) {
+    let frame_bytes = ws_frame_size(&frame);
     let mut d = 0u64;
     let mut f = 0u64;
     for (tx, pending) in senders {
@@ -1690,11 +1713,11 @@ pub(crate) fn fanout_to_senders_with_metrics<M: FanoutMetrics>(
             f += 1;
             continue;
         }
-        pending.fetch_add(1, Ordering::Relaxed);
+        pending.fetch_add(frame_bytes, Ordering::Relaxed);
         if tx.send(frame.clone()).is_ok() {
             d += 1;
         } else {
-            pending.fetch_sub(1, Ordering::Relaxed);
+            pending.fetch_sub(frame_bytes, Ordering::Relaxed);
             f += 1;
         }
     }
@@ -1717,13 +1740,14 @@ async fn process_commands(
             ServerCommand::SendText { conn_id, data } => {
                 let guard = state.connections.read().await;
                 if let Some(h) = guard.get(&conn_id) {
-                    let max_pending = state.max_outbound_queue_size;
+                    let max_pending = state.max_outbound_queue_bytes;
                     if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
                         state.slow_consumer_drops.fetch_add(1, Ordering::Relaxed);
                     } else {
-                        h.pending.fetch_add(1, Ordering::Relaxed);
+                        let msg_bytes = data.len() + 4;
+                        h.pending.fetch_add(msg_bytes, Ordering::Relaxed);
                         if h.tx.send(WsFrame::Msg(Message::Text(data.into()))).is_err() {
-                            h.pending.fetch_sub(1, Ordering::Relaxed);
+                            h.pending.fetch_sub(msg_bytes, Ordering::Relaxed);
                         }
                     }
                 }
@@ -1731,16 +1755,17 @@ async fn process_commands(
             ServerCommand::SendBytes { conn_id, data } => {
                 let guard = state.connections.read().await;
                 if let Some(h) = guard.get(&conn_id) {
-                    let max_pending = state.max_outbound_queue_size;
+                    let max_pending = state.max_outbound_queue_bytes;
                     if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
                         state.slow_consumer_drops.fetch_add(1, Ordering::Relaxed);
                     } else {
-                        h.pending.fetch_add(1, Ordering::Relaxed);
+                        let msg_bytes = data.len() + 4;
+                        h.pending.fetch_add(msg_bytes, Ordering::Relaxed);
                         if h.tx
                             .send(WsFrame::Msg(Message::Binary(data.into())))
                             .is_err()
                         {
-                            h.pending.fetch_sub(1, Ordering::Relaxed);
+                            h.pending.fetch_sub(msg_bytes, Ordering::Relaxed);
                         }
                     }
                 }
@@ -1748,19 +1773,20 @@ async fn process_commands(
             ServerCommand::SendPrebuilt { conn_id, message } => {
                 let guard = state.connections.read().await;
                 if let Some(h) = guard.get(&conn_id) {
-                    let max_pending = state.max_outbound_queue_size;
+                    let max_pending = state.max_outbound_queue_bytes;
                     if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
                         state.slow_consumer_drops.fetch_add(1, Ordering::Relaxed);
                     } else {
-                        h.pending.fetch_add(1, Ordering::Relaxed);
+                        let msg_bytes = ws_frame_size(&WsFrame::Msg(message.clone()));
+                        h.pending.fetch_add(msg_bytes, Ordering::Relaxed);
                         if h.tx.send(WsFrame::Msg(message)).is_err() {
-                            h.pending.fetch_sub(1, Ordering::Relaxed);
+                            h.pending.fetch_sub(msg_bytes, Ordering::Relaxed);
                         }
                     }
                 }
             }
             ServerCommand::BroadcastText { data } => {
-                let max_pending = state.max_outbound_queue_size;
+                let max_pending = state.max_outbound_queue_bytes;
                 let slow_drops = &state.slow_consumer_drops;
                 if state.conn_encryption.is_empty() {
                     // Fast path: fan-out while holding read lock (no Vec alloc, no Arc clones)
@@ -1797,16 +1823,17 @@ async fn process_commands(
                             let mut buf = Vec::with_capacity(2 + enc.len());
                             buf.extend_from_slice(b"E:");
                             buf.extend_from_slice(&enc);
-                            pending.fetch_add(1, Ordering::Relaxed);
+                            let enc_bytes = buf.len() + 4;
+                            pending.fetch_add(enc_bytes, Ordering::Relaxed);
                             if tx.send(WsFrame::Msg(Message::Binary(buf.into()))).is_err() {
-                                pending.fetch_sub(1, Ordering::Relaxed);
+                                pending.fetch_sub(enc_bytes, Ordering::Relaxed);
                             }
                         }
                     }
                 }
             }
             ServerCommand::BroadcastBytes { data } => {
-                let max_pending = state.max_outbound_queue_size;
+                let max_pending = state.max_outbound_queue_bytes;
                 let slow_drops = &state.slow_consumer_drops;
                 if state.conn_encryption.is_empty() {
                     // Fast path: fan-out while holding read lock (no Vec alloc, no Arc clones)
@@ -1843,9 +1870,10 @@ async fn process_commands(
                             let mut buf = Vec::with_capacity(2 + enc.len());
                             buf.extend_from_slice(b"E:");
                             buf.extend_from_slice(&enc);
-                            pending.fetch_add(1, Ordering::Relaxed);
+                            let enc_bytes = buf.len() + 4;
+                            pending.fetch_add(enc_bytes, Ordering::Relaxed);
                             if tx.send(WsFrame::Msg(Message::Binary(buf.into()))).is_err() {
-                                pending.fetch_sub(1, Ordering::Relaxed);
+                                pending.fetch_sub(enc_bytes, Ordering::Relaxed);
                             }
                         }
                     }
@@ -1857,7 +1885,7 @@ async fn process_commands(
                 skip_recovery,
             } => {
                 let preframed = pre_frame_text(&data);
-                let max_pending = state.max_outbound_queue_size;
+                let max_pending = state.max_outbound_queue_bytes;
                 let slow_drops = &state.slow_consumer_drops;
                 // Store in recovery buffer (skip for presence events)
                 if !skip_recovery && let Some(ref recovery) = state.recovery {
@@ -1940,21 +1968,22 @@ async fn process_commands(
                             let mut buf = Vec::with_capacity(2 + enc.len());
                             buf.extend_from_slice(b"E:");
                             buf.extend_from_slice(&enc);
-                            pending.fetch_add(1, Ordering::Relaxed);
+                            let enc_bytes = buf.len() + 4;
+                            pending.fetch_add(enc_bytes, Ordering::Relaxed);
                             if tx.send(WsFrame::Msg(Message::Binary(buf.into()))).is_err() {
-                                pending.fetch_sub(1, Ordering::Relaxed);
+                                pending.fetch_sub(enc_bytes, Ordering::Relaxed);
                             }
                         }
                     }
                 }
             }
             ServerCommand::Disconnect { conn_id } => {
-                // Control message: send unconditionally, increment pending
+                // Control message: send unconditionally
                 let guard = state.connections.read().await;
                 if let Some(h) = guard.get(&conn_id) {
-                    h.pending.fetch_add(1, Ordering::Relaxed);
+                    h.pending.fetch_add(8, Ordering::Relaxed);
                     if h.tx.send(WsFrame::Msg(Message::Close(None))).is_err() {
-                        h.pending.fetch_sub(1, Ordering::Relaxed);
+                        h.pending.fetch_sub(8, Ordering::Relaxed);
                     }
                 }
             }
@@ -1965,9 +1994,9 @@ async fn process_commands(
             ServerCommand::Shutdown => {
                 let guard = state.connections.read().await;
                 for h in guard.values() {
-                    h.pending.fetch_add(1, Ordering::Relaxed);
+                    h.pending.fetch_add(8, Ordering::Relaxed);
                     if h.tx.send(WsFrame::Msg(Message::Close(None))).is_err() {
-                        h.pending.fetch_sub(1, Ordering::Relaxed);
+                        h.pending.fetch_sub(8, Ordering::Relaxed);
                     }
                 }
                 break;
@@ -1996,7 +2025,7 @@ pub struct RustWSEServer {
 #[pymethods]
 impl RustWSEServer {
     #[new]
-    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_size = 8192))]
+    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_bytes = 16_777_216))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         host: String,
@@ -2020,7 +2049,7 @@ impl RustWSEServer {
         max_message_size: usize,
         ping_interval: u64,
         idle_timeout: u64,
-        max_outbound_queue_size: usize,
+        max_outbound_queue_bytes: usize,
     ) -> Self {
         assert!(
             ping_interval < idle_timeout,
@@ -2074,7 +2103,7 @@ impl RustWSEServer {
                 max_message_size,
                 ping_interval,
                 idle_timeout,
-                max_outbound_queue_size,
+                max_outbound_queue_bytes,
             )),
             cmd_tx: None,
             thread_handle: None,
@@ -2255,7 +2284,7 @@ impl RustWSEServer {
                             let mut interval =
                                 tokio::time::interval(Duration::from_secs(ping_state.ping_interval_secs));
                             let idle_timeout = Duration::from_secs(ping_state.idle_timeout_secs);
-                            let max_pending = ping_state.max_outbound_queue_size;
+                            let max_pending = ping_state.max_outbound_queue_bytes;
                             // Two-phase slow consumer detection: connections suspected
                             // of being slow (queue full on first check). If still full
                             // on the next tick, they get disconnected.
@@ -2286,11 +2315,11 @@ impl RustWSEServer {
                                     {
                                         if suspected_slow.contains(cid) {
                                             // Second tick still full: disconnect
-                                            pending.fetch_add(1, Ordering::Relaxed);
+                                            pending.fetch_add(8, Ordering::Relaxed);
                                             if tx.send(WsFrame::Msg(
                                                 Message::Close(None),
                                             )).is_err() {
-                                                pending.fetch_sub(1, Ordering::Relaxed);
+                                                pending.fetch_sub(8, Ordering::Relaxed);
                                             }
                                             ping_state
                                                 .conn_last_activity
@@ -2313,11 +2342,11 @@ impl RustWSEServer {
                                         // Check zombie (no activity for idle_timeout)
                                         if now.duration_since(*last) > idle_timeout
                                         {
-                                            pending.fetch_add(1, Ordering::Relaxed);
+                                            pending.fetch_add(8, Ordering::Relaxed);
                                             if tx.send(WsFrame::Msg(
                                                 Message::Close(None),
                                             )).is_err() {
-                                                pending.fetch_sub(1, Ordering::Relaxed);
+                                                pending.fetch_sub(8, Ordering::Relaxed);
                                             }
                                             // Remove activity entry; next tick
                                             // will force-remove if still present
@@ -2335,11 +2364,12 @@ impl RustWSEServer {
                                         let ping_msg = format!(
                                             "{{\"c\":\"WSE\",\"t\":\"ping\",\"p\":{{\"server_time\":\"{ts}\"}}}}"
                                         );
-                                        pending.fetch_add(1, Ordering::Relaxed);
+                                        let pm_bytes = ping_msg.len() + 4;
+                                        pending.fetch_add(pm_bytes, Ordering::Relaxed);
                                         if tx.send(WsFrame::Msg(
                                             Message::Text(ping_msg.into()),
                                         )).is_err() {
-                                            pending.fetch_sub(1, Ordering::Relaxed);
+                                            pending.fetch_sub(pm_bytes, Ordering::Relaxed);
                                         }
                                     } else {
                                         // No activity entry = Close was sent last
@@ -3201,7 +3231,7 @@ impl RustWSEServer {
             cluster_addr,
             self.shared.presence.clone(),
             self.cmd_tx.clone(),
-            self.shared.max_outbound_queue_size,
+            self.shared.max_outbound_queue_bytes,
             Arc::clone(&self.shared.slow_consumer_drops),
         ));
 
@@ -3380,9 +3410,10 @@ impl RustWSEServer {
                         let conn_tx = tx.as_ref().unwrap();
                         let conn_pending = tx_pending.as_ref().unwrap();
                         for pub_bytes in publications {
-                            conn_pending.fetch_add(1, Ordering::Relaxed);
+                            let pb_size = pub_bytes.len();
+                            conn_pending.fetch_add(pb_size, Ordering::Relaxed);
                             if conn_tx.send(WsFrame::PreFramed(pub_bytes)).is_err() {
-                                conn_pending.fetch_sub(1, Ordering::Relaxed);
+                                conn_pending.fetch_sub(pb_size, Ordering::Relaxed);
                             }
                         }
                         topic_dict.set_item("epoch", format!("{:08x}", current_epoch))?;
