@@ -2523,7 +2523,7 @@ pub(crate) async fn handle_cluster_inbound(
         legacy_known_peers,
         presence_tx,
         shared.presence.clone(),
-        shared.max_outbound_queue_size,
+        shared.max_outbound_queue_bytes,
         Arc::clone(&shared.slow_consumer_drops),
     )
     .await;

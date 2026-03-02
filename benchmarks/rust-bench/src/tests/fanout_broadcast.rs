@@ -59,6 +59,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         if actual < n {
             println!("    WARNING: {}/{} connected", actual, n);
         }
+        // Capture drops counter before measurement for per-tier delta
+        let drops_before =
+            protocol::query_slow_consumer_drops(&cli.host, cli.metrics_port_for(cli.port)).await;
+
         let result = measure_fanout(connections, Duration::from_secs(cli.duration)).await;
 
         let deliveries_per_sec = result.total_received as f64 / result.elapsed;
@@ -96,12 +100,13 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             result.latency.print_summary("      ");
         }
 
-        let drops = protocol::query_slow_consumer_drops(
-            &cli.host,
-            cli.metrics_port_for(cli.port),
-        )
-        .await;
-        match drops {
+        let drops_after =
+            protocol::query_slow_consumer_drops(&cli.host, cli.metrics_port_for(cli.port)).await;
+        let tier_drops = match (drops_before, drops_after) {
+            (Some(b), Some(a)) => Some(a.saturating_sub(b)),
+            _ => drops_after,
+        };
+        match tier_drops {
             Some(0) => println!("    Server drops:   0 (ok)"),
             Some(d) => println!("    Server drops:   {} (slow consumer drops)", d),
             None => {} // metrics endpoint not available, skip silently
@@ -161,7 +166,8 @@ pub(crate) async fn measure_fanout(connections: Vec<WsStream>, duration: Duratio
         drain_handles.push(tokio::spawn(async move {
             let mut ws = ws;
             loop {
-                let remaining = warmup_deadline.saturating_duration_since(tokio::time::Instant::now());
+                let remaining =
+                    warmup_deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
                     break;
                 }
@@ -197,7 +203,13 @@ pub(crate) async fn measure_fanout(connections: Vec<WsStream>, duration: Duratio
         let lat = latency.clone();
 
         handles.push(tokio::spawn(receive_loop(
-            ws, deadline, recv, bytes, gaps, lat, measurement_start_us,
+            ws,
+            deadline,
+            recv,
+            bytes,
+            gaps,
+            lat,
+            measurement_start_us,
         )));
     }
 
@@ -253,28 +265,43 @@ pub(crate) async fn receive_loop(
 
         match tokio::time::timeout(remaining, ws.next()).await {
             Ok(Some(Ok(msg))) => {
-                local_bytes += msg.len() as u64;
-                local_received += 1;
-
                 if let Some(parsed) = parse_wse_message(&msg) {
-                    // Latency: ts_us embedded by server.
-                    // Only record latency for messages published after measurement started
-                    // (timestamp gating). Stale messages from warmup count for throughput
-                    // but not latency.
-                    if let Some(ts_us) = parsed
+                    // Timestamp gating: only count messages published after measurement
+                    // started. Stale messages from spawn/warmup are discarded entirely.
+                    let ts_us = parsed
                         .get("p")
                         .and_then(|p| p.get("ts_us"))
                         .and_then(|v| v.as_u64())
-                        .or_else(|| parsed.get("ts_us").and_then(|v| v.as_u64()))
-                    {
-                        if ts_us >= measurement_start_us {
-                            let now_us = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_micros() as u64;
-                            let lat_us = now_us.saturating_sub(ts_us);
-                            local_hist.record_us(lat_us.max(1));
+                        .or_else(|| parsed.get("ts_us").and_then(|v| v.as_u64()));
+
+                    if let Some(ts) = ts_us {
+                        if ts < measurement_start_us {
+                            // Stale message from before measurement window -- skip
+                            // but still track sequence for gap detection
+                            if let Some(seq) = parsed
+                                .get("p")
+                                .and_then(|p| p.get("seq"))
+                                .and_then(|v| v.as_i64())
+                                .or_else(|| parsed.get("seq").and_then(|v| v.as_i64()))
+                            {
+                                last_seq = seq;
+                            }
+                            continue;
                         }
+                    }
+
+                    // Count only messages within the measurement window
+                    local_bytes += msg.len() as u64;
+                    local_received += 1;
+
+                    // Latency: ts_us embedded by server
+                    if let Some(ts) = ts_us {
+                        let now_us = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_micros() as u64;
+                        let lat_us = now_us.saturating_sub(ts);
+                        local_hist.record_us(lat_us.max(1));
                     }
 
                     // Sequence gap detection

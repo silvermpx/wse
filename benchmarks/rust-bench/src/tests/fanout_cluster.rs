@@ -77,6 +77,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
         let actual = connections.len();
 
+        // Capture drops counters before measurement for per-tier delta
+        let drops_a_before =
+            protocol::query_slow_consumer_drops(&cli.host, cli.metrics_port_for(cli.port)).await;
+        let drops_b_before =
+            protocol::query_slow_consumer_drops(&cli.host, cli.metrics_port_for(port2)).await;
+
         // Server A publishes, Server B fans out to our clients via Cluster
         let result = super::fanout_broadcast::measure_fanout(
             connections,
@@ -118,18 +124,20 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             result.latency.print_summary("      ");
         }
 
-        // Query drops from both servers (publisher A + subscriber B)
-        let drops_a = protocol::query_slow_consumer_drops(
-            &cli.host,
-            cli.metrics_port_for(cli.port),
-        )
-        .await;
-        let drops_b = protocol::query_slow_consumer_drops(
-            &cli.host,
-            cli.metrics_port_for(port2),
-        )
-        .await;
-        if let (Some(a), Some(b)) = (drops_a, drops_b) {
+        // Query drops from both servers, compute per-tier delta
+        let drops_a_after =
+            protocol::query_slow_consumer_drops(&cli.host, cli.metrics_port_for(cli.port)).await;
+        let drops_b_after =
+            protocol::query_slow_consumer_drops(&cli.host, cli.metrics_port_for(port2)).await;
+        let da = match (drops_a_before, drops_a_after) {
+            (Some(b), Some(a)) => Some(a.saturating_sub(b)),
+            _ => drops_a_after,
+        };
+        let db = match (drops_b_before, drops_b_after) {
+            (Some(b), Some(a)) => Some(a.saturating_sub(b)),
+            _ => drops_b_after,
+        };
+        if let (Some(a), Some(b)) = (da, db) {
             if a + b == 0 {
                 println!("    Server drops:   0 (ok)");
             } else {
