@@ -141,11 +141,38 @@ pub(crate) async fn measure_fanout(connections: Vec<WsStream>, duration: Duratio
     let total_gaps = Arc::new(AtomicU64::new(0));
     let latency = Arc::new(Mutex::new(LatencyHistogram::new()));
 
-    // Warmup: 2s for server to stabilize + drain buffered messages.
-    // Warmup happens BEFORE spawning tasks so all tasks start at the same time.
-    // Connections are already established (connect_batch done), server is publishing.
-    let warmup = Duration::from_secs(2);
-    tokio::time::sleep(warmup).await;
+    // Active drain warmup: read and discard all buffered messages for 2s.
+    // This ensures measurement starts with a clean pipeline (no stale messages
+    // that would show multi-second latency from inter-tier publishing).
+    let warmup_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut drain_handles = Vec::with_capacity(actual);
+    for ws in connections {
+        drain_handles.push(tokio::spawn(async move {
+            let mut ws = ws;
+            loop {
+                let remaining = warmup_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, ws.next()).await {
+                    Ok(Some(Ok(_))) => {} // discard
+                    _ => break,
+                }
+            }
+            ws
+        }));
+    }
+    let connections: Vec<WsStream> = futures_util::future::join_all(drain_handles)
+        .await
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Timestamp gating: only measure latency for messages published after this point.
+    let measurement_start_us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
 
     // All tasks share the same deadline so measurement window is identical.
     let deadline = tokio::time::Instant::now() + duration;
@@ -159,7 +186,7 @@ pub(crate) async fn measure_fanout(connections: Vec<WsStream>, duration: Duratio
         let lat = latency.clone();
 
         handles.push(tokio::spawn(receive_loop(
-            ws, deadline, recv, bytes, gaps, lat,
+            ws, deadline, recv, bytes, gaps, lat, measurement_start_us,
         )));
     }
 
@@ -199,6 +226,7 @@ pub(crate) async fn receive_loop(
     total_bytes: Arc<AtomicU64>,
     total_gaps: Arc<AtomicU64>,
     latency: Arc<Mutex<LatencyHistogram>>,
+    measurement_start_us: u64,
 ) -> WsStream {
     let mut local_received = 0u64;
     let mut local_bytes = 0u64;
@@ -218,19 +246,24 @@ pub(crate) async fn receive_loop(
                 local_received += 1;
 
                 if let Some(parsed) = parse_wse_message(&msg) {
-                    // Latency: ts_us embedded by server
+                    // Latency: ts_us embedded by server.
+                    // Only record latency for messages published after measurement started
+                    // (timestamp gating). Stale messages from warmup count for throughput
+                    // but not latency.
                     if let Some(ts_us) = parsed
                         .get("p")
                         .and_then(|p| p.get("ts_us"))
                         .and_then(|v| v.as_u64())
                         .or_else(|| parsed.get("ts_us").and_then(|v| v.as_u64()))
                     {
-                        let now_us = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_micros() as u64;
-                        let lat_us = now_us.saturating_sub(ts_us);
-                        local_hist.record_us(lat_us.max(1));
+                        if ts_us >= measurement_start_us {
+                            let now_us = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_micros() as u64;
+                            let lat_us = now_us.saturating_sub(ts_us);
+                            local_hist.record_us(lat_us.max(1));
+                        }
                     }
 
                     // Sequence gap detection
