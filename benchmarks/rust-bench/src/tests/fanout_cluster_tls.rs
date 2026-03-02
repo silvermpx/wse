@@ -127,6 +127,24 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             result.latency.print_summary("      ");
         }
 
+        let drops_a = protocol::query_slow_consumer_drops(
+            &cli.host,
+            cli.metrics_port_for(cli.port),
+        )
+        .await;
+        let drops_b = protocol::query_slow_consumer_drops(
+            &cli.host,
+            cli.metrics_port_for(port2),
+        )
+        .await;
+        if let (Some(a), Some(b)) = (drops_a, drops_b) {
+            if a + b == 0 {
+                println!("    Server drops:   0 (ok)");
+            } else {
+                println!("    Server drops:   A={}, B={}", a, b);
+            }
+        }
+
         results.push(TierResult {
             tier: n,
             connected: actual,

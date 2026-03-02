@@ -96,6 +96,17 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             result.latency.print_summary("      ");
         }
 
+        let drops = protocol::query_slow_consumer_drops(
+            &cli.host,
+            cli.metrics_port_for(cli.port),
+        )
+        .await;
+        match drops {
+            Some(0) => println!("    Server drops:   0 (ok)"),
+            Some(d) => println!("    Server drops:   {} (slow consumer drops)", d),
+            None => {} // metrics endpoint not available, skip silently
+        }
+
         results.push(TierResult {
             tier: n,
             connected: actual,
