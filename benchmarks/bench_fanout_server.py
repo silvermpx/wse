@@ -144,7 +144,7 @@ def publish_loop(server, mode: str, stop_event: threading.Event):
 
     while not stop_event.is_set():
         ts_us = int(time.time() * 1_000_000)
-        msg = f'{{"t":"fanout_tick","p":{{"seq":{seq},"ts_us":{ts_us},"s":"ES","px":5234.75,"q":2}}}}'
+        msg = f'{{"c":"U","t":"fanout_tick","p":{{"seq":{seq},"ts_us":{ts_us},"s":"ES","px":5234.75,"q":2}}}}'
 
         try:
             if mode == "broadcast":
