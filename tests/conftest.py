@@ -10,7 +10,7 @@ from wse_server._wse_accel import RustWSEServer, rust_jwt_encode
 BASE_PORT = 15_007
 
 # Shared JWT config
-JWT_SECRET = b"test-secret-key-for-integration"
+JWT_SECRET = b"test-secret-key-for-integration!"
 JWT_ISSUER = "wse-test"
 JWT_AUDIENCE = "wse-test-api"
 
