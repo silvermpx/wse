@@ -26,7 +26,9 @@ server = RustWSEServer(
     jwt_secret=b"replace-with-a-strong-secret-key!",
     jwt_issuer="my-app",
     jwt_audience="my-api",
-    jwt_cookie_name="access_token",  # optional, default: "access_token"
+    jwt_cookie_name="access_token",    # optional, default: "access_token"
+    jwt_previous_secret=None,          # optional: old secret for zero-downtime rotation
+    jwt_key_id=None,                   # optional: expected kid header claim
 )
 server.enable_drain_mode()
 server.start()
@@ -51,7 +53,9 @@ server = RustWSEServer(
     jwt_secret=b"replace-with-a-strong-secret-key!",
     jwt_issuer="my-app",
     jwt_audience="my-api",
-    jwt_cookie_name="access_token",  # optional, default: "access_token"
+    jwt_cookie_name="access_token",    # optional, default: "access_token"
+    jwt_previous_secret=None,          # optional: old secret for zero-downtime rotation
+    jwt_key_id=None,                   # optional: expected kid header claim
 )
 
 # --- Event processing (runs in a background thread) -----------------------
@@ -126,7 +130,7 @@ For production, put both behind the same reverse proxy (nginx, Caddy) and route 
 
 ## 3. JWT Authentication
 
-Configure `jwt_secret`, `jwt_issuer`, `jwt_audience`, and optionally `jwt_cookie_name` in the constructor. The server validates JWT tokens during the WebSocket handshake in Rust (zero-GIL, sub-millisecond).
+Configure `jwt_secret`, `jwt_issuer`, `jwt_audience`, and optionally `jwt_cookie_name` and `jwt_algorithm` in the constructor. The server validates JWT tokens during the WebSocket handshake in Rust (zero-GIL, sub-millisecond). Supported algorithms: HS256 (default), RS256, ES256.
 
 **Token claims:**
 
@@ -134,7 +138,7 @@ Configure `jwt_secret`, `jwt_issuer`, `jwt_audience`, and optionally `jwt_cookie
 |-------|----------|-------------|
 | `sub` | Yes | User ID (returned as `user_id` in auth_connect event) |
 | `exp` | Yes | Expiration timestamp (Unix epoch) |
-| `iat` | Yes | Issued-at timestamp (Unix epoch) |
+| `iat` | No (recommended) | Issued-at timestamp (Unix epoch) |
 | `iss` | If configured | Issuer (validated only when `jwt_issuer` is set) |
 | `aud` | If configured | Audience (validated only when `jwt_audience` is set) |
 
@@ -147,10 +151,27 @@ Configure `jwt_secret`, `jwt_issuer`, `jwt_audience`, and optionally `jwt_cookie
 **Generating tokens:**
 
 ```python
+# HS256 (default)
 token = rust_jwt_encode(
     {"sub": "user-1", "iss": "my-app", "aud": "my-api",
      "exp": int(time.time()) + 3600, "iat": int(time.time())},
     b"replace-with-a-strong-secret-key!",
+)
+
+# RS256
+token = rust_jwt_encode(
+    {"sub": "user-1", "iss": "my-app", "aud": "my-api",
+     "exp": int(time.time()) + 3600, "iat": int(time.time())},
+    open("private_key.pem", "rb").read(),
+    algorithm="RS256",
+)
+
+# ES256
+token = rust_jwt_encode(
+    {"sub": "user-1", "iss": "my-app", "aud": "my-api",
+     "exp": int(time.time()) + 3600, "iat": int(time.time())},
+    open("ec_private.pem", "rb").read(),
+    algorithm="ES256",
 )
 ```
 

@@ -1,5 +1,43 @@
 # Changelog
 
+## v2.2.1 (2026-03-06)
+
+### RS256 + ES256 JWT Algorithm Support
+
+Asymmetric JWT algorithms for external auth service integration. Default remains HS256 for backward compatibility:
+
+- **RS256 (RSA PKCS#1 v1.5 + SHA-256)** -- sign with RSA private key, verify with public key. PEM format
+- **ES256 (ECDSA P-256 + SHA-256)** -- sign with EC private key, verify with public key. PEM format
+- **`jwt_algorithm`** constructor parameter -- `"HS256"` (default), `"RS256"`, or `"ES256"`
+- **`jwt_private_key`** constructor parameter -- PEM private key bytes for RS256/ES256 token encoding
+- **Algorithm confusion prevention** -- token `alg` header must match configured algorithm (enforced by jsonwebtoken crate)
+- **Key rotation works for all algorithms** -- `jwt_previous_secret` accepts previous public key (RS256/ES256) or previous shared secret (HS256)
+- **Powered by jsonwebtoken v10** -- replaced hand-rolled HMAC crypto with battle-tested jsonwebtoken crate (rust_crypto backend)
+
+### JWT Hardening (RFC 7518, RFC 8725)
+
+Production-grade JWT module with key rotation, key ID validation, and RFC compliance:
+
+- **Minimum key length enforcement** -- HS256 secret must be >= 32 bytes per RFC 7518. Validated at server startup (not first request). Short keys now raise `PyValueError` immediately
+- **Clock skew tolerance** -- `exp` and `nbf` claims allow 30 seconds of clock drift (RFC 8725 recommendation). Previously `exp` had zero tolerance, `nbf` had 300s
+- **Token size limit** -- tokens > 8KB rejected before any parsing (DoS prevention)
+- **Key rotation** -- `jwt_previous_secret` parameter enables zero-downtime secret rotation. Tokens signed with the old key are accepted during the transition window. Old key is tried only on signature failure (expired/malformed tokens are never retried)
+- **Key ID (kid) validation** -- `jwt_key_id` parameter. Encode embeds `kid` in JWT header; decode rejects tokens with mismatched `kid`. Prevents key confusion in multi-key deployments
+- **Key rotation + kid interaction** -- when both are configured, old-key tokens with different `kid` values are accepted during rotation (kid not enforced on fallback path)
+
+### Bug Fixes
+
+- Fixed `glob_topic_count` race between subscribe and concurrent unsubscribe (shard lock now held across atomic increment, preventing stuck counter that forces O(N) scan on every broadcast)
+- Fixed Bearer token extraction panic on non-ASCII `Authorization` header (now uses `get()` slice instead of direct index)
+- Fixed `jwt_previous_secret` length not validated at startup (now rejects < 32 bytes like primary secret)
+
+### Documentation
+
+- Added RS256/ES256 algorithm examples to SECURITY.md, INTEGRATION.md, DEPLOYMENT.md
+- Added `jwt_algorithm` and `jwt_private_key` to README params table and feature list
+- Added `jwt_previous_secret` and `jwt_key_id` parameters to README, SECURITY.md, INTEGRATION.md, DEPLOYMENT.md
+- Updated `.pyi` type stubs with all missing constructor parameters and ValueError docs
+
 ## v2.2.0 (2026-03-06)
 
 ### OOM Protection (Slow Consumer Backpressure)

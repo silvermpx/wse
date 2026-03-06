@@ -77,8 +77,21 @@ def rust_ecdh_derive_shared_secret(private_key: bytes, peer_public_key: bytes) -
 # JWT
 # =============================================================================
 
-def rust_jwt_encode(claims: dict[str, Any], secret: bytes, algorithm: str = "HS256") -> str:
-    """Encode claims into a JWT (HS256)."""
+def rust_jwt_encode(
+    claims: dict[str, Any],
+    secret: bytes,
+    algorithm: str = "HS256",
+    key_id: str | None = None,
+) -> str:
+    """Encode claims into a JWT token string.
+
+    Supported algorithms: HS256 (default), RS256, ES256.
+    For HS256: secret is the shared key (>= 32 bytes).
+    For RS256/ES256: secret is the PEM-encoded private key.
+
+    Raises ValueError if algorithm is not HS256, RS256, or ES256.
+    Raises RuntimeError on signing failure (invalid key, bad PEM, etc.).
+    """
     ...
 
 def rust_jwt_decode(
@@ -87,8 +100,18 @@ def rust_jwt_decode(
     algorithm: str = "HS256",
     issuer: str | None = None,
     audience: str | None = None,
+    previous_secret: bytes | None = None,
+    key_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Decode and validate a JWT. Returns None on failure."""
+    """Decode and validate a JWT. Returns None on failure.
+
+    Supported algorithms: HS256 (default), RS256, ES256.
+    For HS256: secret is the shared key (>= 32 bytes).
+    For RS256/ES256: secret is the PEM-encoded public key.
+
+    Raises ValueError if algorithm is not HS256, RS256, or ES256.
+    Returns None on all other failures (expired, wrong key, invalid signature, etc.)
+    """
     ...
 
 # =============================================================================
@@ -285,6 +308,11 @@ class RustWSEServer:
         jwt_secret: bytes | None = None,
         jwt_issuer: str | None = None,
         jwt_audience: str | None = None,
+        jwt_cookie_name: str | None = None,
+        jwt_previous_secret: bytes | None = None,
+        jwt_key_id: str | None = None,
+        jwt_algorithm: str | None = None,
+        jwt_private_key: bytes | None = None,
         max_inbound_queue_size: int = 131072,
         recovery_enabled: bool = False,
         recovery_buffer_size: int = 128,
@@ -294,6 +322,12 @@ class RustWSEServer:
         presence_enabled: bool = False,
         presence_max_data_size: int = 4096,
         presence_max_members: int = 0,
+        rate_limit_capacity: float = 100_000.0,
+        rate_limit_refill: float = 10_000.0,
+        max_message_size: int = 1_048_576,
+        ping_interval: int = 25,
+        idle_timeout: int = 60,
+        max_outbound_queue_bytes: int = 16_777_216,
     ) -> None: ...
 
     # -- Lifecycle ------------------------------------------------------------

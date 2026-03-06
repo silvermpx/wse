@@ -30,29 +30,71 @@ The Rust server reads authentication credentials in this order:
 1. **HTTP-only cookie**: from the `Cookie` header (default name: `access_token`, configurable via `jwt_cookie_name` constructor parameter)
 2. **Authorization header**: `Authorization: Bearer <JWT>` (fallback - covers backend clients)
 
-Both paths use HS256 (HMAC-SHA256) JWT validation.
+Both paths use the configured JWT algorithm (HS256 by default, RS256 and ES256 also supported).
 
 ### JWT Validation
 
 JWT validation runs entirely in Rust during the WebSocket handshake. Zero Python involvement, zero GIL acquisition.
 
 ```python
+# HS256 (default -- symmetric, shared secret)
 server = RustWSEServer(
     host="0.0.0.0",
     port=5006,
     max_connections=10000,
     jwt_secret=b"replace-with-a-strong-secret-key!",
-    jwt_issuer="your-app",      # optional: validate iss claim
-    jwt_audience="your-api",    # optional: validate aud claim
-    jwt_cookie_name="access_token",  # optional: cookie name for JWT (default: "access_token")
+    jwt_issuer="your-app",           # optional: validate iss claim
+    jwt_audience="your-api",         # optional: validate aud claim
+    jwt_cookie_name="access_token",  # optional: cookie name (default: "access_token")
+    jwt_previous_secret=None,        # optional: previous secret for key rotation
+    jwt_key_id=None,                 # optional: expected kid header claim
+)
+
+# RS256 (asymmetric -- external auth service signs with RSA private key)
+server = RustWSEServer(
+    host="0.0.0.0",
+    port=5006,
+    jwt_secret=open("public_key.pem", "rb").read(),      # RSA public key (PEM)
+    jwt_algorithm="RS256",
+    # jwt_private_key=open("private_key.pem", "rb").read(), # only if server needs to encode tokens
+    jwt_issuer="auth-service",
+    jwt_audience="my-api",
+)
+
+# ES256 (asymmetric -- external auth service signs with EC P-256 private key)
+server = RustWSEServer(
+    host="0.0.0.0",
+    port=5006,
+    jwt_secret=open("ec_public.pem", "rb").read(),       # EC P-256 public key (PEM)
+    jwt_algorithm="ES256",
+    # jwt_private_key=open("ec_private.pem", "rb").read(),  # only if server needs to encode tokens
+    jwt_issuer="auth-service",
+    jwt_audience="my-api",
 )
 ```
 
-The Rust server extracts the JWT cookie (configured via `jwt_cookie_name`, default `access_token`) from the HTTP upgrade headers and validates:
-1. HS256 signature (constant-time comparison)
-2. `exp` claim (reject expired tokens, boundary check per RFC 7519)
-3. `iss` claim (if `jwt_issuer` configured)
-4. `aud` claim (if `jwt_audience` configured)
+The Rust server extracts the JWT from cookies (configured via `jwt_cookie_name`) or the `Authorization: Bearer <token>` header and validates:
+
+1. Token size limit (8KB max, prevents DoS)
+2. Algorithm enforcement (configured algorithm only, not derived from token header -- prevents algorithm confusion attacks)
+3. `kid` claim (if `jwt_key_id` configured, checked before signature)
+4. Signature verification via jsonwebtoken crate (HS256: HMAC-SHA256, RS256: RSA PKCS#1v1.5, ES256: ECDSA P-256)
+5. `exp` claim (required, 30s clock skew tolerance per RFC 8725)
+6. `nbf` claim (if present, 30s clock skew tolerance per RFC 7519)
+7. `iss` claim (if `jwt_issuer` configured)
+8. `aud` claim (if `jwt_audience` configured, supports string or array per RFC 7519)
+
+**Supported algorithms:**
+
+| Algorithm | Type | `jwt_secret` | `jwt_private_key` |
+|-----------|------|-------------|-------------------|
+| HS256 (default) | Symmetric | Shared secret (>= 32 bytes) | Not needed |
+| RS256 | Asymmetric | RSA public key (PEM) | RSA private key (PEM, for encoding) |
+| ES256 | Asymmetric | EC P-256 public key (PEM) | EC P-256 private key (PEM, for encoding) |
+
+**Key requirements:** HS256 secret must be >= 32 bytes (RFC 7518). RS256/ES256 keys must be valid PEM. Tokens without `exp` are rejected.
+
+**Key rotation:** Set `jwt_previous_secret` to the old key when rotating. For HS256: old shared secret. For RS256/ES256: old public key PEM. Tokens signed with either key are accepted during the transition window. Remove `jwt_previous_secret` after all old tokens have expired.
 
 On success, the server sends `server_ready` directly from Rust and pushes an `AuthConnect` event to the drain queue with the validated `user_id`.
 
@@ -74,8 +116,8 @@ The `sub` claim is returned as `user_id` in the `auth_connect` drain event. `iss
 When `jwt_secret` is `None`, authentication is disabled and all connections receive a `connect` event instead of `auth_connect`.
 
 On authentication failure:
-- Server sends `error` message with code `AUTH_FAILED`
-- Connection closed with code `4401`
+- Server sends `error` message with code `AUTH_FAILED` or `AUTH_REQUIRED`
+- Connection closed with close code `4401`
 
 ### Client Authentication Examples
 
@@ -110,14 +152,24 @@ Always use `wss://` (WebSocket Secure) in production. WSE does not enforce TLS a
 
 ### Origin Validation
 
-WSE validates the `Origin` header to prevent Cross-Site WebSocket Hijacking (CSWSH). Configure allowed origins via the `ALLOWED_ORIGINS` environment variable:
+WSE does not perform origin validation at the application layer. To prevent Cross-Site WebSocket Hijacking (CSWSH), configure origin checks in your reverse proxy:
 
-```bash
-# Comma-separated list of allowed origins
-ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
+```nginx
+# nginx: reject WebSocket upgrades from unknown origins
+map $http_origin $origin_allowed {
+    default 0;
+    "https://app.example.com" 1;
+    "https://admin.example.com" 1;
+}
+server {
+    location /wse {
+        if ($origin_allowed = 0) { return 403; }
+        # ... proxy_pass etc.
+    }
+}
 ```
 
-When `ALLOWED_ORIGINS` is set, connections from unlisted origins are rejected with close code `4403`. When not set (development mode), all origins are allowed.
+JWT authentication provides the primary access control. Origin validation at the proxy layer adds defense-in-depth against CSWSH.
 
 ## Message Security
 
@@ -322,11 +374,12 @@ Frontend nonce cache:
 ## Best Practices
 
 1. **Always use TLS** (`wss://`) in production
-2. **Configure ALLOWED_ORIGINS** to prevent CSWSH
-3. **Rotate JWT secrets** periodically
-4. **Enable signing** for critical operations
-5. **Enable encryption** for sensitive data (PII, credentials)
-6. **Enable mTLS** for cluster peer connections in production
-7. **Monitor circuit breaker** state for connection health
-8. **Use HTTP-only cookies** for web clients (prevents XSS token theft)
-9. **Use separate CA** for cluster certificates (isolate trust domains)
+2. **Configure origin validation** in your reverse proxy to prevent CSWSH
+3. **Use asymmetric algorithms (RS256/ES256)** when tokens are issued by an external auth service
+4. **Rotate JWT keys** periodically using `jwt_previous_secret`
+5. **Enable signing** for critical operations
+6. **Enable encryption** for sensitive data (PII, credentials)
+7. **Enable mTLS** for cluster peer connections in production
+8. **Monitor circuit breaker** state for connection health
+9. **Use HTTP-only cookies** for web clients (prevents XSS token theft)
+10. **Use separate CA** for cluster certificates (isolate trust domains)

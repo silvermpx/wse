@@ -21,7 +21,11 @@ server = RustWSEServer(
     jwt_secret=b"replace-with-a-strong-secret-key!",
     jwt_issuer="my-app",
     jwt_audience="my-api",
-    jwt_cookie_name="access_token",  # optional, default: "access_token"
+    jwt_cookie_name="access_token",    # optional, default: "access_token"
+    jwt_previous_secret=None,          # optional: old secret for zero-downtime rotation
+    jwt_key_id=None,                   # optional: expected kid header claim
+    # jwt_algorithm="RS256",           # optional: use RS256 or ES256 instead of HS256
+    # jwt_private_key=open("key.pem", "rb").read(),  # optional: private key for token encoding
 )
 server.enable_drain_mode()
 server.start()
@@ -84,7 +88,11 @@ server = RustWSEServer(
     jwt_secret=b"replace-with-a-strong-secret-key!",
     jwt_issuer="my-app",
     jwt_audience="my-api",
-    jwt_cookie_name="access_token",  # optional, default: "access_token"
+    jwt_cookie_name="access_token",    # optional, default: "access_token"
+    jwt_previous_secret=None,          # optional: old secret for zero-downtime rotation
+    jwt_key_id=None,                   # optional: expected kid header claim
+    # jwt_algorithm="RS256",           # optional: RS256 or ES256
+    # jwt_private_key=open("key.pem", "rb").read(),
     recovery_enabled=True,
     presence_enabled=True,
 )
@@ -369,12 +377,6 @@ async def health():
 
 ---
 
-## Environment Variables
+## Configuration
 
-WSE reads the following environment variables:
-
-| Variable | Description |
-|----------|-------------|
-| `ALLOWED_ORIGINS` | Comma-separated list of allowed WebSocket origins. Empty = allow all (development only). |
-
-All other configuration is passed programmatically through the `RustWSEServer` constructor and `connect_cluster()` method.
+All configuration is passed programmatically through the `RustWSEServer` constructor and `connect_cluster()` method. Origin validation should be configured in your reverse proxy (see [SECURITY.md](SECURITY.md#origin-validation)).

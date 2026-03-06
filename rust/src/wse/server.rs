@@ -647,6 +647,9 @@ fn inject_category(data: &str) -> String {
 
 /// Send an auth error + Close frame over the WS channel, drain it, and return.
 /// Used for JWT rejection to avoid duplicating the send+drain pattern.
+/// Reject a WebSocket connection with an auth error JSON body and close code 4401.
+/// `code` and `message` are included in the JSON error body only; the WS close
+/// frame always uses generic code 4401 to avoid leaking auth failure details.
 async fn reject_ws_auth(
     tx: &mpsc::UnboundedSender<WsFrame>,
     mut rx: mpsc::UnboundedReceiver<WsFrame>,
@@ -659,7 +662,10 @@ async fn reject_ws_auth(
 ) {
     let err = build_error_json(code, message);
     let _ = tx.send(WsFrame::Msg(Message::Text(err.into())));
-    let _ = tx.send(WsFrame::Msg(Message::Close(None)));
+    let _ = tx.send(WsFrame::Msg(Message::Close(Some(CloseFrame {
+        code: CloseCode::Library(4401),
+        reason: "Authentication failed".into(),
+    }))));
     let write_task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if let WsFrame::Msg(msg) = frame {
@@ -944,8 +950,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         let token = parse_cookie_value(&cookie_str, &jwt_cfg.cookie_name).or_else(|| {
             auth_header.as_deref().and_then(|h| {
                 // RFC 7235: auth-scheme is case-insensitive
-                if h.len() > 7 && h[..7].eq_ignore_ascii_case("bearer ") {
-                    Some(&h[7..])
+                if h.get(..7)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("bearer "))
+                {
+                    h.get(7..)
                 } else {
                     None
                 }
@@ -954,7 +962,11 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         match token {
             Some(tok) => match jwt::jwt_decode(tok, jwt_cfg) {
                 Ok(claims) => {
-                    if let Some(user_id) = claims.get("sub").and_then(|s| s.as_str()) {
+                    if let Some(user_id) = claims
+                        .get("sub")
+                        .and_then(|s| s.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
                         Some(user_id.to_string())
                     } else {
                         state.auth_failures_total.fetch_add(1, Ordering::Relaxed);
@@ -2222,7 +2234,7 @@ pub struct RustWSEServer {
 #[pymethods]
 impl RustWSEServer {
     #[new]
-    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_bytes = 16_777_216))]
+    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, jwt_previous_secret = None, jwt_key_id = None, jwt_algorithm = None, jwt_private_key = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_bytes = 16_777_216))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         host: String,
@@ -2232,6 +2244,10 @@ impl RustWSEServer {
         jwt_issuer: Option<String>,
         jwt_audience: Option<String>,
         jwt_cookie_name: Option<String>,
+        jwt_previous_secret: Option<Vec<u8>>,
+        jwt_key_id: Option<String>,
+        jwt_algorithm: Option<String>,
+        jwt_private_key: Option<Vec<u8>>,
         max_inbound_queue_size: usize,
         recovery_enabled: bool,
         recovery_buffer_size: usize,
@@ -2253,18 +2269,94 @@ impl RustWSEServer {
                 "ping_interval ({ping_interval}s) must be less than idle_timeout ({idle_timeout}s)"
             )));
         }
-        let jwt_config = jwt_secret.map(|secret| {
-            eprintln!(
-                "[WSE] JWT auth enabled (issuer={}, audience={})",
-                jwt_issuer.as_deref().unwrap_or("none"),
-                jwt_audience.as_deref().unwrap_or("none"),
-            );
-            JwtConfig {
-                secret,
-                issuer: jwt_issuer.unwrap_or_default(),
-                audience: jwt_audience.unwrap_or_default(),
-                cookie_name: jwt_cookie_name.unwrap_or_else(|| "access_token".to_string()),
+        let jwt_alg = match jwt_algorithm.as_deref() {
+            None | Some("HS256") => jwt::JwtAlgorithm::HS256,
+            Some("RS256") => jwt::JwtAlgorithm::RS256,
+            Some("ES256") => jwt::JwtAlgorithm::ES256,
+            Some(other) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unsupported jwt_algorithm: {other}. Supported: HS256, RS256, ES256"
+                )));
             }
+        };
+        // Algorithm-specific key validation at startup
+        if jwt_secret.is_some() {
+            match jwt_alg {
+                jwt::JwtAlgorithm::HS256 => {
+                    if let Some(ref s) = jwt_secret
+                        && s.len() < 32
+                    {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "jwt_secret must be at least 32 bytes (RFC 7518 HS256 minimum)",
+                        ));
+                    }
+                    if let Some(ref s) = jwt_previous_secret
+                        && s.len() < 32
+                    {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "jwt_previous_secret must be at least 32 bytes",
+                        ));
+                    }
+                }
+                jwt::JwtAlgorithm::RS256 => {
+                    if let Some(ref s) = jwt_secret {
+                        jsonwebtoken::DecodingKey::from_rsa_pem(s).map_err(|e| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "Invalid RS256 public key PEM: {e}"
+                            ))
+                        })?;
+                    }
+                    if let Some(ref s) = jwt_previous_secret {
+                        jsonwebtoken::DecodingKey::from_rsa_pem(s).map_err(|e| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "Invalid RS256 jwt_previous_secret PEM: {e}"
+                            ))
+                        })?;
+                    }
+                    if let Some(ref s) = jwt_private_key {
+                        jsonwebtoken::EncodingKey::from_rsa_pem(s).map_err(|e| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "Invalid RS256 jwt_private_key PEM: {e}"
+                            ))
+                        })?;
+                    }
+                }
+                jwt::JwtAlgorithm::ES256 => {
+                    if let Some(ref s) = jwt_secret {
+                        jsonwebtoken::DecodingKey::from_ec_pem(s).map_err(|e| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "Invalid ES256 public key PEM: {e}"
+                            ))
+                        })?;
+                    }
+                    if let Some(ref s) = jwt_previous_secret {
+                        jsonwebtoken::DecodingKey::from_ec_pem(s).map_err(|e| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "Invalid ES256 jwt_previous_secret PEM: {e}"
+                            ))
+                        })?;
+                    }
+                    if let Some(ref s) = jwt_private_key {
+                        jsonwebtoken::EncodingKey::from_ec_pem(s).map_err(|e| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "Invalid ES256 jwt_private_key PEM: {e}"
+                            ))
+                        })?;
+                    }
+                }
+            }
+        }
+        // Private key validated above but not stored in JwtConfig -- rust_jwt_encode
+        // takes the key directly as an argument. Avoids keeping key material in memory.
+        drop(jwt_private_key);
+        let jwt_config = jwt_secret.map(|secret| JwtConfig {
+            algorithm: jwt_alg,
+            secret,
+            previous_secret: jwt_previous_secret,
+            key_id: jwt_key_id,
+            issuer: jwt_issuer.unwrap_or_default(),
+            audience: jwt_audience.unwrap_or_default(),
+            cookie_name: jwt_cookie_name.unwrap_or_else(|| "access_token".to_string()),
         });
         let recovery = if recovery_enabled {
             // Find the power-of-two exponent for buffer size (minimum 16 slots)
@@ -3507,10 +3599,12 @@ impl RustWSEServer {
                     .or_default();
                 let is_new_entry = outer.insert(conn_id.to_owned(), h.clone()).is_none();
                 let is_first = is_new_entry && outer.len() == 1;
-                drop(outer); // release shard lock before fetch_add
+                // fetch_add while holding shard lock to prevent race with concurrent
+                // unsubscribe (which also needs the shard lock for remove_if)
                 if is_first && (topic.contains('*') || topic.contains('?')) {
                     self.shared.glob_topic_count.fetch_add(1, Ordering::Relaxed);
                 }
+                drop(outer);
             } else {
                 // Connection already disconnected -- skip topic tracking and cluster sub
                 // to avoid phantom subscriptions in conn_topics and cluster interest

@@ -14,7 +14,7 @@ High-performance WebSocket server built in Rust with native clustering, E2E encr
 | Feature | Details |
 |---------|---------|
 | **Rust core** | tokio async runtime, tungstenite WebSocket transport, dedicated thread pool, zero GIL on the data path |
-| **JWT authentication** | Rust-native HS256 validation during handshake (0.01ms), cookie + Authorization header extraction |
+| **JWT authentication** | HS256, RS256, ES256 algorithms via jsonwebtoken crate. Validated during handshake (0.01ms), cookie + Authorization header extraction, key rotation, kid validation |
 | **Protocol negotiation** | `client_hello`/`server_hello` handshake with feature discovery, capability advertisement, version agreement |
 | **Topic subscriptions** | Per-connection topic subscriptions with automatic cleanup on disconnect |
 | **Pre-framed broadcast** | WebSocket frame built once, shared via Arc across all connections, single allocation per broadcast |
@@ -99,7 +99,7 @@ High-performance WebSocket server built in Rust with native clustering, E2E encr
 
 | Feature | Details |
 |---------|---------|
-| **Origin validation** | `ALLOWED_ORIGINS` env var, rejects unlisted origins with close code 4403 |
+| **Origin validation** | Configure in reverse proxy (nginx/Caddy) to prevent CSWSH |
 | **Cookie auth** | `access_token` HTTP-only cookie with `Secure + SameSite=Lax` (OWASP recommended for browsers) |
 | **Frame protection** | 1 MB max frame size, serde_json parsing (no eval), escaped user IDs in server_ready |
 | **Cluster frame protection** | zstd decompression output capped at 1 MB (MAX_FRAME_SIZE), protocol version validation |
@@ -163,9 +163,14 @@ token = rust_jwt_encode(
 | `host` | required | Bind address |
 | `port` | required | Bind port |
 | `max_connections` | 1000 | Maximum concurrent WebSocket connections |
-| `jwt_secret` | None | HS256 secret for JWT validation (bytes, min 32 bytes). `None` disables authentication |
+| `jwt_secret` | None | JWT key for validation. HS256: shared secret (bytes, min 32). RS256/ES256: PEM public key. `None` disables auth |
 | `jwt_issuer` | None | Expected `iss` claim. Skipped if `None` |
 | `jwt_audience` | None | Expected `aud` claim. Skipped if `None` |
+| `jwt_cookie_name` | "access_token" | Cookie name for JWT token extraction |
+| `jwt_previous_secret` | None | Previous key for zero-downtime rotation. HS256: previous secret. RS256/ES256: previous public key PEM |
+| `jwt_key_id` | None | Expected `kid` header claim. Rejects tokens with mismatched key ID |
+| `jwt_algorithm` | None | JWT algorithm: `"HS256"` (default), `"RS256"`, or `"ES256"` |
+| `jwt_private_key` | None | PEM private key for RS256/ES256 token encoding. Not needed for HS256 |
 | `max_inbound_queue_size` | 131072 | Drain mode bounded queue capacity |
 | `recovery_enabled` | False | Enable per-topic message recovery buffers |
 | `recovery_buffer_size` | 128 | Ring buffer slots per topic (rounded to power-of-2) |
@@ -176,7 +181,6 @@ token = rust_jwt_encode(
 | `presence_max_data_size` | 4096 | Max bytes for a user's presence metadata |
 | `presence_max_members` | 0 | Max tracked members per topic (0 = unlimited) |
 | `max_outbound_queue_bytes` | 16777216 | Per-connection outbound buffer limit (bytes, default 16 MB). Messages dropped when exceeded |
-| `jwt_cookie_name` | "access_token" | Cookie name for JWT token extraction |
 | `rate_limit_capacity` | 100000.0 | Token bucket capacity per connection |
 | `rate_limit_refill` | 10000.0 | Token bucket refill rate per second |
 | `max_message_size` | 1048576 | Maximum WebSocket frame size in bytes (default 1 MB) |
@@ -382,7 +386,7 @@ Token delivery:
 - **Backend clients**: `Authorization: Bearer <token>` header and/or `access_token` cookie
 - **API clients**: `Authorization: Bearer <token>` header
 
-Required claims: `sub` (user ID), `exp` (expiration), `iat` (issued at). Optional: `iss`, `aud` (validated if configured).
+Required claims: `sub` (user ID), `exp` (expiration). Recommended: `iat` (issued at). Optional: `iss`, `aud` (validated if configured).
 
 ### End-to-End Encryption
 
