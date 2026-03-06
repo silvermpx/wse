@@ -181,19 +181,6 @@ fn decompress_and_parse(data: &[u8]) -> Option<serde_json::Value> {
     parse_text_frame(&decompressed)
 }
 
-/// Build a WSE application-level PING message.
-#[allow(dead_code)]
-pub fn build_ping() -> String {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    serde_json::json!({
-        "t": "ping",
-        "p": { "client_timestamp": now_ms }
-    })
-    .to_string()
-}
 
 /// Check if a parsed message is a PONG (server sends uppercase "PONG").
 pub fn is_pong(msg: &serde_json::Value) -> bool {
@@ -253,7 +240,7 @@ pub fn build_payload(size: usize) -> String {
 }
 
 /// Max ports per source IP (with some headroom for the server's own port).
-const PORTS_PER_IP: usize = 60_000;
+const PORTS_PER_IP: usize = 30_000; // 30K per IP to support 100K+ connections across 4 IPs
 
 /// Connect N websockets in batches, returning established connections.
 /// For N > PORTS_PER_IP, automatically uses multiple loopback source IPs

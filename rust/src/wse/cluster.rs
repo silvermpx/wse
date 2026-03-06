@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::reliability::{CircuitBreaker, ExponentialBackoff};
 use super::server::ConnectionHandle;
+use super::server::FanoutMetrics;
 
 /// Wall-clock time in milliseconds since UNIX epoch (for lock-free heartbeat tracking).
 fn epoch_ms() -> u64 {
@@ -38,6 +39,10 @@ pub(crate) const MAX_FRAME_SIZE: usize = 1_048_576; // 1MB
 pub(crate) const HEARTBEAT_INTERVAL_SECS: u64 = 5;
 pub(crate) const HEARTBEAT_TIMEOUT_SECS: u64 = 15;
 pub(crate) const MAX_BATCH_BYTES: usize = 65_536;
+
+/// Monotonic generation counter for peer sessions. Prevents stale RESYNC
+/// continuation frames from a prior connection corrupting the new session.
+static PEER_SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub(crate) const MAX_CLUSTER_PEERS: usize = 256;
 // Cluster peer channels are bounded (10K messages) to prevent OOM from slow peers.
 // When a peer falls behind, messages are dropped and metrics.messages_dropped incremented.
@@ -207,6 +212,10 @@ pub(crate) enum PeerRegistration {
     Deregister {
         peer_addr: String,
     },
+    UpdateCaps {
+        peer_addr: String,
+        negotiated_caps: u32,
+    },
 }
 
 /// Presence frames received from a peer, forwarded to cluster_manager for processing.
@@ -235,9 +244,13 @@ pub(crate) enum InterestUpdate {
     Resync {
         peer_addr: String,
         topics: Vec<String>,
+        is_continuation: bool,
+        /// Session generation -- filters stale continuations from prior connections.
+        generation: u64,
     },
     PeerDisconnected {
         peer_addr: String,
+        generation: u64,
     },
 }
 
@@ -317,14 +330,6 @@ impl ClusterDlq {
 
     pub fn drain_all(&mut self) -> Vec<ClusterDlqEntry> {
         self.entries.drain(..).collect()
-    }
-
-    #[allow(dead_code)]
-    pub fn snapshot(&self) -> Vec<(String, String, String)> {
-        self.entries
-            .iter()
-            .map(|e| (e.topic.clone(), e.peer_addr.clone(), e.error.clone()))
-            .collect()
     }
 }
 
@@ -474,34 +479,54 @@ pub(crate) fn encode_unsub(buf: &mut BytesMut, topic: &str) -> bool {
     true
 }
 
-/// Encode a RESYNC frame. Topics are joined by "\n" in the payload.
+/// Encode RESYNC frame(s). Topics are joined by "\n" in the payload.
 /// Format: [u8 type=0x08][u8 flags][u16 LE topic_len=0][u32 LE payload_len][payload]
-/// If the payload exceeds MAX_FRAME_SIZE, topics are truncated to fit.
-pub(crate) fn encode_resync(buf: &mut BytesMut, topics: &[String]) {
+/// flags=0x00 for first/only frame (replace semantics), 0x01 for continuation (extend).
+/// Returns multiple frames if the payload exceeds MAX_FRAME_SIZE.
+pub(crate) fn encode_resync(topics: &[String]) -> Vec<BytesMut> {
     let payload = topics.join("\n");
     let payload_bytes = payload.as_bytes();
-    // Guard: truncate if payload exceeds MAX_FRAME_SIZE to prevent peer disconnect
-    let payload_bytes = if payload_bytes.len() > MAX_FRAME_SIZE {
-        eprintln!(
-            "[WSE-Cluster] RESYNC payload too large ({} bytes, {} topics), truncating to fit MAX_FRAME_SIZE",
-            payload_bytes.len(),
-            topics.len()
-        );
-        // Find the last complete topic that fits within MAX_FRAME_SIZE
-        let truncated = &payload_bytes[..MAX_FRAME_SIZE];
-        match truncated.iter().rposition(|&b| b == b'\n') {
-            Some(pos) => &payload_bytes[..pos],
-            None => truncated,
-        }
-    } else {
-        payload_bytes
-    };
-    buf.reserve(8 + payload_bytes.len());
-    buf.put_u8(MsgType::Resync as u8);
-    buf.put_u8(0); // flags
-    buf.put_u16_le(0); // no topic field
-    buf.put_u32_le(payload_bytes.len() as u32);
-    buf.put_slice(payload_bytes);
+
+    fn encode_single(chunk: &[u8], flags: u8) -> BytesMut {
+        let mut buf = BytesMut::with_capacity(8 + chunk.len());
+        buf.put_u8(MsgType::Resync as u8);
+        buf.put_u8(flags);
+        buf.put_u16_le(0);
+        buf.put_u32_le(chunk.len() as u32);
+        buf.put_slice(chunk);
+        buf
+    }
+
+    if payload_bytes.is_empty() || payload_bytes.len() <= MAX_FRAME_SIZE {
+        return vec![encode_single(payload_bytes, 0x00)];
+    }
+    // Multi-frame: split at newline boundaries to stay under MAX_FRAME_SIZE
+    // First frame: flags=0x00 (replace), continuation frames: flags=0x01 (extend)
+    let mut frames = Vec::new();
+    let mut start = 0;
+    while start < payload_bytes.len() {
+        let remaining = payload_bytes.len() - start;
+        let chunk_end = if remaining <= MAX_FRAME_SIZE {
+            payload_bytes.len()
+        } else {
+            let window_end = start + MAX_FRAME_SIZE;
+            match payload_bytes[start..window_end]
+                .iter()
+                .rposition(|&b| b == b'\n')
+            {
+                Some(pos) => start + pos,
+                None => window_end,
+            }
+        };
+        let flags = if frames.is_empty() { 0x00 } else { 0x01 };
+        frames.push(encode_single(&payload_bytes[start..chunk_end], flags));
+        start = if chunk_end < payload_bytes.len() && payload_bytes[chunk_end] == b'\n' {
+            chunk_end + 1
+        } else {
+            chunk_end
+        };
+    }
+    frames
 }
 
 /// Encode PEER_ANNOUNCE: announces this node's cluster address to a peer.
@@ -617,7 +642,7 @@ fn write_framed(buf: &mut BytesMut, inner: &[u8]) {
 pub(crate) enum ClusterFrame {
     Msg {
         topic: String,
-        payload: String,
+        payload: Bytes,
     },
     Ping,
     Pong,
@@ -635,6 +660,7 @@ pub(crate) enum ClusterFrame {
     },
     Resync {
         topics: Vec<String>,
+        is_continuation: bool,
     },
     PeerAnnounce {
         addr: String,
@@ -686,9 +712,9 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                         return None;
                     }
                 };
-                String::from_utf8(decompressed).ok()?
+                Bytes::from(decompressed)
             } else {
-                String::from_utf8(data.split_to(payload_len).to_vec()).ok()?
+                data.split_to(payload_len).freeze() // zero-copy: BytesMut -> Bytes
             };
             Some(ClusterFrame::Msg { topic, payload })
         }
@@ -745,13 +771,18 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             let topics = if payload_len == 0 {
                 Vec::new()
             } else {
-                let raw = String::from_utf8(data.split_to(payload_len).to_vec()).ok()?;
-                raw.split('\n')
-                    .filter(|t| !t.is_empty())
-                    .map(String::from)
+                let raw_bytes = data.split_to(payload_len);
+                let slice: &[u8] = &raw_bytes;
+                slice
+                    .split(|&b| b == b'\n')
+                    .filter(|chunk| !chunk.is_empty())
+                    .filter_map(|chunk| String::from_utf8(chunk.to_vec()).ok())
                     .collect()
             };
-            Some(ClusterFrame::Resync { topics })
+            Some(ClusterFrame::Resync {
+                topics,
+                is_continuation: flags & 0x01 != 0,
+            })
         }
         Some(MsgType::PeerAnnounce) => {
             if data.remaining() < topic_len {
@@ -896,50 +927,6 @@ async fn peer_writer<W: AsyncWriteExt + Unpin>(
 }
 
 // ---------------------------------------------------------------------------
-// Per-peer dispatch task (decoupled from reader for throughput)
-// ---------------------------------------------------------------------------
-
-/// Dispatch task: receives decoded messages from the reader via channel and fans
-/// out to WebSocket connections in batches. Acquires read lock once per batch.
-async fn peer_dispatch_task(
-    mut rx: mpsc::UnboundedReceiver<(String, String)>,
-    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
-    topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
-    cancel: CancellationToken,
-    metrics: Arc<ClusterMetrics>,
-    max_outbound: usize,
-    slow_drops: Arc<AtomicU64>,
-) {
-    let mut batch: Vec<(String, String)> = Vec::with_capacity(256);
-
-    loop {
-        let n = tokio::select! {
-            n = rx.recv_many(&mut batch, 256) => n,
-            () = cancel.cancelled() => break,
-        };
-        if n == 0 {
-            break;
-        }
-
-        // Single read lock for entire batch
-        let guard = connections.read().await;
-        for (topic, payload) in &batch {
-            let frame = super::server::WsFrame::PreFramed(super::server::pre_frame_text(payload));
-            let senders = super::server::collect_topic_senders(&guard, &topic_subscribers, topic);
-            super::server::fanout_to_senders_with_metrics(
-                &senders,
-                frame,
-                &metrics,
-                max_outbound,
-                &slow_drops,
-            );
-        }
-        drop(guard);
-        batch.clear();
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Per-peer reader task
 // ---------------------------------------------------------------------------
 
@@ -952,30 +939,15 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
     peer_write_tx: mpsc::Sender<Bytes>,
     peer_addr: String,
     interest_tx: mpsc::UnboundedSender<InterestUpdate>,
-    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
-    topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
+    dispatch_tx: mpsc::UnboundedSender<(String, Bytes)>,
     cancel: CancellationToken,
     metrics: Arc<ClusterMetrics>,
     last_activity: Arc<AtomicU64>,
     new_peer_tx: mpsc::UnboundedSender<String>,
     cmd_tx: mpsc::UnboundedSender<ClusterCommand>,
     presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
-    max_outbound: usize,
-    slow_drops: Arc<AtomicU64>,
+    generation: u64,
 ) {
-    // Dispatch channel: decouples TCP read from fan-out to WebSocket connections.
-    let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<(String, String)>();
-
-    let dispatch_handle = tokio::spawn(peer_dispatch_task(
-        dispatch_rx,
-        connections,
-        topic_subscribers,
-        cancel.clone(),
-        metrics.clone(),
-        max_outbound,
-        slow_drops,
-    ));
-
     // BufReader: bulk reads from TCP into 64KB buffer, serves read_exact from memory
     let mut reader = BufReader::with_capacity(65_536, reader);
     let mut len_buf = [0u8; 4];
@@ -1053,11 +1025,16 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
                     topic,
                 });
             }
-            Some(ClusterFrame::Resync { topics }) => {
+            Some(ClusterFrame::Resync {
+                topics,
+                is_continuation,
+            }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
                 let _ = interest_tx.send(InterestUpdate::Resync {
                     peer_addr: peer_addr.clone(),
                     topics,
+                    is_continuation,
+                    generation,
                 });
             }
             Some(ClusterFrame::PeerAnnounce { addr }) => {
@@ -1102,10 +1079,65 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
             }
         }
     }
+}
 
-    // Ensure dispatch task is cleaned up
-    drop(dispatch_tx);
-    let _ = dispatch_handle.await;
+// ---------------------------------------------------------------------------
+// Per-peer dispatch task: receives decoded (topic, payload) from reader,
+// pre-frames as WebSocket and fans out via NATS-style direct buffer.
+// Decouples TCP reads from RwLock acquisition on the connections map.
+// ---------------------------------------------------------------------------
+
+async fn peer_dispatch_task(
+    mut dispatch_rx: mpsc::UnboundedReceiver<(String, Bytes)>,
+    topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
+    glob_topic_count: Arc<AtomicUsize>,
+    metrics: Arc<ClusterMetrics>,
+    cancel: CancellationToken,
+    max_outbound: usize,
+    slow_drops: Arc<AtomicU64>,
+) {
+    let mut batch: Vec<(String, Bytes)> = Vec::with_capacity(64);
+
+    loop {
+        // Wait for first message (blocking)
+        let msg = tokio::select! {
+            m = dispatch_rx.recv() => m,
+            () = cancel.cancelled() => break,
+        };
+        let Some(first) = msg else { break };
+        batch.push(first);
+
+        // Drain any additional queued messages (non-blocking)
+        while batch.len() < 256 {
+            match dispatch_rx.try_recv() {
+                Ok(m) => batch.push(m),
+                Err(_) => break,
+            }
+        }
+
+        // No RwLock needed -- handles are stored directly in topic_subscribers
+        let mut total_delivered = 0u64;
+        let mut total_dropped = 0u64;
+
+        for (topic, payload) in batch.drain(..) {
+            let preframed = super::server::encode_ws_frame(0x01, &payload);
+            let (d, f) = super::server::fanout_topic_direct(
+                &topic_subscribers,
+                &topic,
+                &preframed,
+                max_outbound,
+                &slow_drops,
+                glob_topic_count.load(Ordering::Relaxed),
+            );
+            total_delivered += d;
+            total_dropped += f;
+        }
+
+        metrics.add_delivered(total_delivered);
+        if total_dropped > 0 {
+            metrics.add_dropped(total_dropped);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,8 +1166,10 @@ async fn heartbeat_task(
                 match peer_write_tx.try_send(ping.freeze()) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        // Peer backpressured -- skip this ping but keep monitoring.
-                        // The timeout check above will still fire if peer goes silent.
+                        // Write channel full -- ping couldn't be queued.
+                        // Do NOT treat as liveness evidence: a TCP-dead peer with a full
+                        // send buffer also triggers Full, and updating last_activity here
+                        // would prevent the timeout from ever firing.
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
@@ -1160,8 +1194,9 @@ async fn run_peer_session<R, W>(
     instance_id: &str,
     data_rx: &mut mpsc::Receiver<Bytes>,
     interest_tx: &mpsc::UnboundedSender<InterestUpdate>,
-    connections: &Arc<RwLock<HashMap<String, ConnectionHandle>>>,
-    topic_subscribers: &Arc<DashMap<String, DashSet<String>>>,
+    _connections: &Arc<RwLock<HashMap<String, ConnectionHandle>>>,
+    topic_subscribers: &Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
+    glob_topic_count: &Arc<AtomicUsize>,
     metrics: &Arc<ClusterMetrics>,
     global_cancel: &CancellationToken,
     local_topic_refcount: &Arc<std::sync::Mutex<HashMap<String, usize>>>,
@@ -1176,7 +1211,7 @@ async fn run_peer_session<R, W>(
     presence: &Option<Arc<super::presence::PresenceManager>>,
     max_outbound: usize,
     slow_drops: &Arc<AtomicU64>,
-) -> bool
+) -> (bool, u32)
 where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
@@ -1195,9 +1230,9 @@ where
         );
         tokio::select! {
             () = tokio::time::sleep(delay) => {}
-            () = global_cancel.cancelled() => return true,
+            () = global_cancel.cancelled() => return (true, 0),
         }
-        return false;
+        return (false, 0);
     }
 
     // Read HELLO response
@@ -1237,9 +1272,9 @@ where
                 let delay = backoff.next_delay();
                 tokio::select! {
                     () = tokio::time::sleep(delay) => {}
-                    () = global_cancel.cancelled() => return true,
+                    () = global_cancel.cancelled() => return (true, 0),
                 }
-                return false;
+                return (false, 0);
             }
         },
         _ => {
@@ -1248,9 +1283,9 @@ where
             let delay = backoff.next_delay();
             tokio::select! {
                 () = tokio::time::sleep(delay) => {}
-                () = global_cancel.cancelled() => return true,
+                () = global_cancel.cancelled() => return (true, 0),
             }
-            return false;
+            return (false, 0);
         }
     };
 
@@ -1264,7 +1299,7 @@ where
                     "[WSE-Cluster] Already connected to instance {}, dropping duplicate from {peer_addr}",
                     peer_instance_id
                 );
-                return false;
+                return (false, peer_caps);
             }
             Entry::Vacant(e) => {
                 e.insert(peer_addr.to_string());
@@ -1287,15 +1322,16 @@ where
             refcounts.keys().cloned().collect()
         };
         if !local_topics.is_empty() {
-            let mut resync_buf = BytesMut::new();
-            encode_resync(&mut resync_buf, &local_topics);
-            let mut resync_frame = BytesMut::new();
-            write_framed(&mut resync_frame, &resync_buf);
-            if writer.write_all(&resync_frame).await.is_err() || writer.flush().await.is_err() {
+            let resync_frames = encode_resync(&local_topics);
+            let mut wire_buf = BytesMut::new();
+            for frame in &resync_frames {
+                write_framed(&mut wire_buf, frame);
+            }
+            if writer.write_all(&wire_buf).await.is_err() || writer.flush().await.is_err() {
                 eprintln!("[WSE-Cluster] Failed to send RESYNC to {peer_addr}");
                 connected_instances.remove(&peer_instance_id);
                 metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
-                return false; // Will reconnect
+                return (false, peer_caps); // Will reconnect
             }
         }
     }
@@ -1353,21 +1389,32 @@ where
         metrics.clone(),
     ));
 
+    let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<(String, Bytes)>();
+
+    let dispatch_handle = tokio::spawn(peer_dispatch_task(
+        dispatch_rx,
+        topic_subscribers.clone(),
+        glob_topic_count.clone(),
+        metrics.clone(),
+        peer_cancel.clone(),
+        max_outbound,
+        slow_drops.clone(),
+    ));
+
+    let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
     let reader_handle = tokio::spawn(peer_reader(
         reader,
         peer_write_tx.clone(),
         peer_addr.to_owned(),
         interest_tx.clone(),
-        connections.clone(),
-        topic_subscribers.clone(),
+        dispatch_tx,
         peer_cancel.clone(),
         metrics.clone(),
         last_activity.clone(),
         new_peer_tx.clone(),
         cmd_tx.clone(),
         presence_tx.clone(),
-        max_outbound,
-        slow_drops.clone(),
+        session_gen,
     ));
 
     let heartbeat_handle = tokio::spawn(heartbeat_task(
@@ -1403,15 +1450,17 @@ where
     peer_cancel.cancel();
     let _ = writer_handle.await;
     let _ = reader_handle.await;
+    let _ = dispatch_handle.await;
     let _ = heartbeat_handle.await;
     metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
     connected_instances.remove(&peer_instance_id);
     let _ = interest_tx.send(InterestUpdate::PeerDisconnected {
         peer_addr: peer_addr.to_owned(),
+        generation: session_gen,
     });
     eprintln!("[WSE-Cluster] Disconnected from {peer_addr}");
 
-    global_cancel.is_cancelled()
+    (global_cancel.is_cancelled(), peer_caps)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1421,7 +1470,8 @@ async fn peer_connection_task(
     mut data_rx: mpsc::Receiver<Bytes>,
     interest_tx: mpsc::UnboundedSender<InterestUpdate>,
     connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
-    topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
+    topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
+    glob_topic_count: Arc<AtomicUsize>,
     metrics: Arc<ClusterMetrics>,
     global_cancel: CancellationToken,
     local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
@@ -1433,6 +1483,7 @@ async fn peer_connection_task(
     connected_instances: Arc<DashMap<String, String>>,
     presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
     presence: Option<Arc<super::presence::PresenceManager>>,
+    peer_reg_tx: mpsc::UnboundedSender<PeerRegistration>,
     max_outbound: usize,
     slow_drops: Arc<AtomicU64>,
 ) {
@@ -1508,7 +1559,7 @@ async fn peer_connection_task(
         let _ = sock_ref.set_send_buffer_size(262_144);
 
         // TLS handshake or plaintext split, then run session
-        let should_stop = if let Some(ref tls) = tls_config {
+        let result = if let Some(ref tls) = tls_config {
             // Extract hostname/IP from peer_addr for SNI
             let host = peer_addr.split(':').next().unwrap_or(&peer_addr);
             let server_name = match host.parse::<std::net::IpAddr>() {
@@ -1546,6 +1597,7 @@ async fn peer_connection_task(
                         &interest_tx,
                         &connections,
                         &topic_subscribers,
+                        &glob_topic_count,
                         &metrics,
                         &global_cancel,
                         &local_topic_refcount,
@@ -1602,6 +1654,7 @@ async fn peer_connection_task(
                 &interest_tx,
                 &connections,
                 &topic_subscribers,
+                &glob_topic_count,
                 &metrics,
                 &global_cancel,
                 &local_topic_refcount,
@@ -1619,6 +1672,16 @@ async fn peer_connection_task(
             )
             .await
         };
+
+        let (should_stop, negotiated_caps) = result;
+
+        // Update outbound peer caps after handshake negotiation
+        if negotiated_caps != 0 {
+            let _ = peer_reg_tx.send(PeerRegistration::UpdateCaps {
+                peer_addr: peer_addr.clone(),
+                negotiated_caps,
+            });
+        }
 
         if should_stop {
             break;
@@ -1647,7 +1710,8 @@ struct PeerSpawnCtx {
     instance_id: String,
     interest_tx: mpsc::UnboundedSender<InterestUpdate>,
     connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
-    topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
+    topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
+    glob_topic_count: Arc<AtomicUsize>,
     metrics: Arc<ClusterMetrics>,
     global_cancel: CancellationToken,
     local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
@@ -1659,6 +1723,7 @@ struct PeerSpawnCtx {
     connected_instances: Arc<DashMap<String, String>>,
     presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
     presence: Option<Arc<super::presence::PresenceManager>>,
+    peer_reg_tx: mpsc::UnboundedSender<PeerRegistration>,
     max_outbound: usize,
     slow_drops: Arc<AtomicU64>,
 }
@@ -1676,6 +1741,7 @@ impl PeerSpawnCtx {
             self.interest_tx.clone(),
             self.connections.clone(),
             self.topic_subscribers.clone(),
+            self.glob_topic_count.clone(),
             self.metrics.clone(),
             self.global_cancel.clone(),
             self.local_topic_refcount.clone(),
@@ -1687,6 +1753,7 @@ impl PeerSpawnCtx {
             self.connected_instances.clone(),
             self.presence_tx.clone(),
             self.presence.clone(),
+            self.peer_reg_tx.clone(),
             self.max_outbound,
             self.slow_drops.clone(),
         ))
@@ -1701,7 +1768,8 @@ pub(crate) async fn cluster_manager(
     interest_tx: mpsc::UnboundedSender<InterestUpdate>,
     mut interest_rx: mpsc::UnboundedReceiver<InterestUpdate>,
     connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
-    topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
+    topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
+    glob_topic_count: Arc<AtomicUsize>,
     metrics: Arc<ClusterMetrics>,
     dlq: Arc<std::sync::Mutex<ClusterDlq>>,
     local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
@@ -1717,6 +1785,8 @@ pub(crate) async fn cluster_manager(
 
     // Remote interest table: peer_addr -> set of topics that peer is interested in
     let mut remote_interest: HashMap<String, ahash::AHashSet<String>> = HashMap::new();
+    // Track the latest session generation per peer to filter stale RESYNC continuations
+    let mut peer_generation: HashMap<String, u64> = HashMap::new();
 
     // Dynamic peer tracking
     let known_peers: Arc<DashSet<String>> = Arc::new(DashSet::new());
@@ -1746,6 +1816,7 @@ pub(crate) async fn cluster_manager(
         interest_tx: interest_tx.clone(),
         connections: connections.clone(),
         topic_subscribers: topic_subscribers.clone(),
+        glob_topic_count: glob_topic_count.clone(),
         metrics: metrics.clone(),
         global_cancel: global_cancel.clone(),
         local_topic_refcount: local_topic_refcount.clone(),
@@ -1757,6 +1828,7 @@ pub(crate) async fn cluster_manager(
         connected_instances: connected_instances.clone(),
         presence_tx: presence_peer_tx.clone(),
         presence: presence.clone(),
+        peer_reg_tx: peer_reg_tx.clone(),
         max_outbound,
         slow_drops: slow_drops.clone(),
     };
@@ -1770,10 +1842,13 @@ pub(crate) async fn cluster_manager(
         peer_handles.push(spawn_ctx.spawn(peer_addr.clone(), rx));
     }
 
-    // Prune completed peer handles periodically to prevent unbounded growth
-    let prune_handles = |handles: &mut Vec<tokio::task::JoinHandle<()>>| {
-        if handles.len().is_multiple_of(64) {
+    // Prune completed peer handles every 16 additions to prevent unbounded growth
+    let mut handles_since_prune = 0u32;
+    let mut prune_handles = |handles: &mut Vec<tokio::task::JoinHandle<()>>| {
+        handles_since_prune += 1;
+        if handles_since_prune >= 16 {
             handles.retain(|h| !h.is_finished());
+            handles_since_prune = 0;
         }
     };
 
@@ -1790,6 +1865,7 @@ pub(crate) async fn cluster_manager(
                 let int_tx = interest_tx.clone();
                 let conns = connections.clone();
                 let subs = topic_subscribers.clone();
+                let gtc = glob_topic_count.clone();
                 let met = metrics.clone();
                 let cancel = global_cancel.clone();
                 let lrc = local_topic_refcount.clone();
@@ -1827,6 +1903,7 @@ pub(crate) async fn cluster_manager(
                                         let int_tx2 = int_tx.clone();
                                         let conns2 = conns.clone();
                                         let subs2 = subs.clone();
+                                        let gtc2 = gtc.clone();
                                         let met2 = met.clone();
                                         let inst2 = inst_id.clone();
                                         let lrc2 = lrc.clone();
@@ -1851,7 +1928,7 @@ pub(crate) async fn cluster_manager(
                                                     Ok(Ok(tls_stream)) => {
                                                         handle_cluster_inbound_generic(
                                                             tls_stream, addr, &inst2,
-                                                            int_tx2, conns2, subs2, met2, lrc2,
+                                                            int_tx2, conns2, subs2, gtc2, met2, lrc2,
                                                             npt2, gct2, ci2, prt2, gc2,
                                                             ca2, kp2, pptx2, ppres2,
                                                             mo2, sd2,
@@ -1867,7 +1944,7 @@ pub(crate) async fn cluster_manager(
                                             } else {
                                                 handle_cluster_inbound_generic(
                                                     stream, addr, &inst2,
-                                                    int_tx2, conns2, subs2, met2, lrc2,
+                                                    int_tx2, conns2, subs2, gtc2, met2, lrc2,
                                                     npt2, gct2, ci2, prt2, gc2,
                                                     ca2, kp2, pptx2, ppres2,
                                                     mo2, sd2,
@@ -1964,8 +2041,10 @@ pub(crate) async fn cluster_manager(
                         let mut frame_data = BytesMut::new();
                         if encode_sub(&mut frame_data, &topic) {
                             let frame_bytes = frame_data.freeze();
-                            for (_, tx, _) in &peer_txs {
-                                let _ = tx.try_send(frame_bytes.clone());
+                            for (_, tx, caps) in &peer_txs {
+                                if caps & CAP_INTEREST_ROUTING != 0 {
+                                    let _ = tx.try_send(frame_bytes.clone());
+                                }
                             }
                         }
                     }
@@ -1973,29 +2052,15 @@ pub(crate) async fn cluster_manager(
                         let mut frame_data = BytesMut::new();
                         if encode_unsub(&mut frame_data, &topic) {
                             let frame_bytes = frame_data.freeze();
-                            for (_, tx, _) in &peer_txs {
-                                let _ = tx.try_send(frame_bytes.clone());
-                            }
-                        }
-                    }
-                    Some(ClusterCommand::GossipPeerAnnounce { addr, exclude_peer }) => {
-                        // Validate address before forwarding
-                        if addr.parse::<std::net::SocketAddr>().is_err() {
-                            eprintln!("[WSE-Cluster] Ignoring invalid gossip address from cmd_rx: {addr}");
-                            continue;
-                        }
-                        // Forward only for newly discovered peers to prevent amplification
-                        if !known_peers.contains(&addr) {
-                            let mut frame_data = BytesMut::new();
-                            encode_peer_announce(&mut frame_data, &addr);
-                            let frame_bytes = frame_data.freeze();
-                            for (peer_addr, tx, _) in &peer_txs {
-                                if *peer_addr != exclude_peer {
+                            for (_, tx, caps) in &peer_txs {
+                                if caps & CAP_INTEREST_ROUTING != 0 {
                                     let _ = tx.try_send(frame_bytes.clone());
                                 }
                             }
                         }
                     }
+                    // GossipPeerAnnounce is handled exclusively via gossip_cmd_rx below
+                    Some(ClusterCommand::GossipPeerAnnounce { .. }) => {}
                     Some(ClusterCommand::PresenceUpdate { topic, user_id, action, data, updated_at }) => {
                         let mut frame_data = BytesMut::new();
                         if encode_presence_update(&mut frame_data, &topic, &user_id, action, &data, updated_at) {
@@ -2117,15 +2182,29 @@ pub(crate) async fn cluster_manager(
                             topics.remove(&topic);
                         }
                     }
-                    Some(InterestUpdate::Resync { peer_addr, topics }) => {
-                        let set: ahash::AHashSet<String> = topics.into_iter().collect();
-                        remote_interest.insert(peer_addr, set);
+                    Some(InterestUpdate::Resync { peer_addr, topics, is_continuation, generation }) => {
+                        if is_continuation {
+                            // Continuation frame: only apply if generation matches current session.
+                            // Stale continuations from a prior connection are silently dropped.
+                            if peer_generation.get(&peer_addr) == Some(&generation) {
+                                remote_interest.entry(peer_addr).or_default().extend(topics);
+                            }
+                        } else {
+                            // First/only frame: replace entire set and record generation
+                            peer_generation.insert(peer_addr.clone(), generation);
+                            let set: ahash::AHashSet<String> = topics.into_iter().collect();
+                            remote_interest.insert(peer_addr, set);
+                        }
                     }
-                    Some(InterestUpdate::PeerDisconnected { peer_addr }) => {
-                        remote_interest.remove(&peer_addr);
-                        // Allow gossip-discovered peers to be re-discovered
-                        if !static_peers.contains(&peer_addr) {
-                            known_peers.remove(&peer_addr);
+                    Some(InterestUpdate::PeerDisconnected { peer_addr, generation }) => {
+                        // Only process disconnect if generation matches current session.
+                        // Prevents a stale disconnect from clearing a newer session's interest.
+                        if peer_generation.get(&peer_addr).is_none_or(|g| *g == generation) {
+                            remote_interest.remove(&peer_addr);
+                            peer_generation.remove(&peer_addr);
+                            if !static_peers.contains(&peer_addr) {
+                                known_peers.remove(&peer_addr);
+                            }
                         }
                     }
                     None => {
@@ -2149,6 +2228,12 @@ pub(crate) async fn cluster_manager(
                         // Allow gossip-discovered peers to be re-discovered
                         if !static_peers.contains(&peer_addr) {
                             known_peers.remove(&peer_addr);
+                        }
+                    }
+                    PeerRegistration::UpdateCaps { peer_addr, negotiated_caps } => {
+                        // Update outbound peer caps after handshake negotiation
+                        if let Some((_, _, caps)) = peer_txs.iter_mut().find(|(a, _, _)| a == &peer_addr) {
+                            *caps = negotiated_caps;
                         }
                     }
                 }
@@ -2237,8 +2322,9 @@ async fn handle_cluster_inbound_generic<S>(
     addr: SocketAddr,
     instance_id: &str,
     interest_tx: mpsc::UnboundedSender<InterestUpdate>,
-    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
-    topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
+    _connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
+    topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
+    glob_topic_count: Arc<AtomicUsize>,
     metrics: Arc<ClusterMetrics>,
     local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     new_peer_tx: mpsc::UnboundedSender<String>,
@@ -2336,11 +2422,12 @@ async fn handle_cluster_inbound_generic<S>(
             refcounts.keys().cloned().collect()
         };
         if !local_topics.is_empty() {
-            let mut resync_buf = BytesMut::new();
-            encode_resync(&mut resync_buf, &local_topics);
-            let mut resync_frame = BytesMut::new();
-            write_framed(&mut resync_frame, &resync_buf);
-            if writer.write_all(&resync_frame).await.is_err() || writer.flush().await.is_err() {
+            let resync_frames = encode_resync(&local_topics);
+            let mut wire_buf = BytesMut::new();
+            for frame in &resync_frames {
+                write_framed(&mut wire_buf, frame);
+            }
+            if writer.write_all(&wire_buf).await.is_err() || writer.flush().await.is_err() {
                 eprintln!("[WSE-Cluster] Failed to send RESYNC to inbound {addr}");
                 connected_instances.remove(&peer_instance_id);
                 return;
@@ -2414,35 +2501,53 @@ async fn handle_cluster_inbound_generic<S>(
         metrics.clone(),
     ));
 
+    let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<(String, Bytes)>();
+
+    let dispatch_handle = tokio::spawn(peer_dispatch_task(
+        dispatch_rx,
+        topic_subscribers,
+        glob_topic_count,
+        metrics.clone(),
+        cancel.clone(),
+        max_outbound,
+        slow_drops,
+    ));
+
+    let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
     let reader_handle = tokio::spawn(peer_reader(
         reader,
         write_tx.clone(),
         peer_addr_str.clone(),
         interest_tx.clone(),
-        connections,
-        topic_subscribers,
+        dispatch_tx,
         cancel.clone(),
         metrics.clone(),
         last_activity.clone(),
         new_peer_tx,
         cmd_tx,
         presence_tx,
-        max_outbound,
-        slow_drops,
+        session_gen,
     ));
 
     let heartbeat_handle = tokio::spawn(heartbeat_task(write_tx, cancel.clone(), last_activity));
 
     // Wait for any task to finish, then cancel + await all (prevents task leaks)
-    tokio::pin!(reader_handle, writer_handle, heartbeat_handle);
+    tokio::pin!(
+        reader_handle,
+        writer_handle,
+        heartbeat_handle,
+        dispatch_handle
+    );
     tokio::select! {
         _ = &mut reader_handle => {}
         _ = &mut writer_handle => {}
         _ = &mut heartbeat_handle => {}
+        _ = &mut dispatch_handle => {}
     }
     cancel.cancel();
     let _ = reader_handle.await;
     let _ = writer_handle.await;
+    let _ = dispatch_handle.await;
     let _ = heartbeat_handle.await;
 
     // Deregister inbound peer from the cluster manager's peer_txs
@@ -2452,6 +2557,7 @@ async fn handle_cluster_inbound_generic<S>(
     connected_instances.remove(&peer_instance_id);
     let _ = interest_tx.send(InterestUpdate::PeerDisconnected {
         peer_addr: peer_addr_str,
+        generation: session_gen,
     });
     metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
     eprintln!("[WSE-Cluster] Inbound peer {addr} disconnected");
@@ -2512,6 +2618,7 @@ pub(crate) async fn handle_cluster_inbound(
         interest_tx,
         shared.connections.clone(),
         shared.topic_subscribers.clone(),
+        shared.glob_topic_count.clone(),
         shared.cluster_metrics.clone(),
         shared.local_topic_refcount.clone(),
         new_peer_tx,
@@ -2546,7 +2653,7 @@ mod tests {
             frame,
             ClusterFrame::Msg {
                 topic: "chat.general".into(),
-                payload: "hello world".into(),
+                payload: Bytes::from("hello world"),
             }
         );
     }
@@ -2561,7 +2668,7 @@ mod tests {
             frame,
             ClusterFrame::Msg {
                 topic: "chat".into(),
-                payload: "hello".into(),
+                payload: Bytes::from("hello"),
             }
         );
 
@@ -2579,7 +2686,7 @@ mod tests {
             frame,
             ClusterFrame::Msg {
                 topic: "events.user".into(),
-                payload: big_payload.into(),
+                payload: Bytes::from(big_payload),
             }
         );
     }
@@ -2595,7 +2702,7 @@ mod tests {
             frame,
             ClusterFrame::Msg {
                 topic: "topic".into(),
-                payload: "payload".into(),
+                payload: Bytes::from("payload"),
             }
         );
     }
@@ -2673,7 +2780,7 @@ mod tests {
             frame,
             ClusterFrame::Msg {
                 topic: "test".into(),
-                payload: payload,
+                payload: Bytes::from(payload),
             }
         );
     }
@@ -2820,18 +2927,30 @@ mod tests {
             "chat.private".to_string(),
             "events.system".to_string(),
         ];
-        let mut buf = BytesMut::new();
-        encode_resync(&mut buf, &topics);
-        let frame = decode_frame(buf).unwrap();
-        assert_eq!(frame, ClusterFrame::Resync { topics });
+        let frames = encode_resync(&topics);
+        assert_eq!(frames.len(), 1);
+        let frame = decode_frame(frames.into_iter().next().unwrap()).unwrap();
+        assert_eq!(
+            frame,
+            ClusterFrame::Resync {
+                topics,
+                is_continuation: false
+            }
+        );
     }
 
     #[test]
     fn test_encode_decode_resync_empty() {
-        let mut buf = BytesMut::new();
-        encode_resync(&mut buf, &[]);
-        let frame = decode_frame(buf).unwrap();
-        assert_eq!(frame, ClusterFrame::Resync { topics: Vec::new() });
+        let frames = encode_resync(&[]);
+        assert_eq!(frames.len(), 1);
+        let frame = decode_frame(frames.into_iter().next().unwrap()).unwrap();
+        assert_eq!(
+            frame,
+            ClusterFrame::Resync {
+                topics: Vec::new(),
+                is_continuation: false
+            }
+        );
     }
 
     #[test]
@@ -2886,7 +3005,7 @@ mod tests {
             frame,
             ClusterFrame::Msg {
                 topic: "".into(),
-                payload: "".into(),
+                payload: Bytes::from(""),
             }
         );
     }
@@ -2902,7 +3021,7 @@ mod tests {
             frame,
             ClusterFrame::Msg {
                 topic: topic.into(),
-                payload,
+                payload: Bytes::from(payload),
             }
         );
     }
@@ -3006,7 +3125,7 @@ mod tests {
             msg,
             ClusterFrame::Msg {
                 topic: "chat.general".into(),
-                payload: r#"{"text":"hello"}"#.into(),
+                payload: Bytes::from(r#"{"text":"hello"}"#),
             }
         );
 
@@ -3084,9 +3203,9 @@ mod tests {
 
             // RESYNC with 3 topics
             let topics = vec!["a".into(), "b".into(), "c".into()];
-            let mut resync = BytesMut::new();
-            encode_resync(&mut resync, &topics);
-            write_framed(&mut wire, &resync);
+            for frame in &encode_resync(&topics) {
+                write_framed(&mut wire, frame);
+            }
 
             write.write_all(&wire).await.unwrap();
         });
@@ -3128,7 +3247,8 @@ mod tests {
         assert_eq!(
             decode_frame(frame_buf).unwrap(),
             ClusterFrame::Resync {
-                topics: vec!["a".into(), "b".into(), "c".into()]
+                topics: vec!["a".into(), "b".into(), "c".into()],
+                is_continuation: false,
             }
         );
 

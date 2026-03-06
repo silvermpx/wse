@@ -1,5 +1,43 @@
 # Changelog
 
+## v2.2.0 (2026-03-06)
+
+### OOM Protection (Slow Consumer Backpressure)
+
+Per-connection byte-based backpressure that prevents slow or dead clients from causing server OOM:
+
+- **Per-connection pending byte counter** tracks outbound buffer size (AtomicUsize, lock-free)
+- **`max_outbound_queue_bytes`** parameter (default 16MB) -- messages are dropped when a connection's pending bytes exceed this limit
+- **`wse_slow_consumer_drops_total`** Prometheus counter tracks total dropped messages across all connections
+- **Dead connection guard** in fan-out skips connections whose write task has exited but cleanup hasn't run
+- Cluster peer channels enforce the same backpressure limits
+- Recovery system (ring buffer) allows clients to reclaim dropped messages on reconnect
+
+### Performance
+
+Rewritten outbound message path for broadcast fan-out. Up to 69% higher throughput on single-node, 3x horizontal scaling on cluster:
+
+- **Direct buffer writes** -- broadcast fan-out writes directly into a per-connection byte buffer (`Mutex<BytesMut>` + `Notify`) instead of sending through per-connection mpsc channels. Per-subscriber fan-out cost reduced from ~80-130ns (mpsc::send) to ~15-20ns (mutex lock + memcpy). Write task wakeup only fires when buffer transitions from empty to non-empty, eliminating ~99% of unnecessary notifications during rapid publishing
+- **Connection handle storage in subscriptions** -- topic subscription map stores connection handles directly instead of connection ID strings. Fan-out iterates handles without a HashMap lookup per subscriber (~30ns saved each). Single-node peak: 4.7M del/s (was 2.9M)
+- **Cluster fan-out via direct buffer** -- cluster peer dispatch writes into subscriber buffers directly, bypassing the RwLock that previously guarded the connections map on every batch. Cluster peak: 6.6M del/s at 500 subscribers across 2 nodes (140% of single-node)
+- Write task pre-allocates batch vectors (eliminates per-batch allocation)
+- Backpressure accounting uses atomic operations with no locks on the fan-out path
+
+### Bug Fixes
+
+- Fixed `inject_category` matching nested JSON keys: rewrote with depth-aware scanner that only matches top-level `t` field
+- Fixed encryption failures incorrectly counted as `slow_consumer_drops` (now separate error path)
+- Fixed `RESYNC` multi-frame receiver overwriting topic set on each frame (first frame replaces, continuations extend)
+- Fixed `prune_handles` never triggering (counter-based trigger every 16 additions, was `.is_multiple_of(64)`)
+- Fixed dead `GossipPeerAnnounce` duplicate handler (unreachable code path)
+- Fixed constructor `assert!` panic surfacing as `BaseException` (now returns `PyValueError`)
+- Fixed `glob_topic_count` double-increment on re-subscribe to same topic
+- Fixed cluster `Sub`/`Unsub` frames sent to peers without `CAP_INTEREST_ROUTING`
+- Fixed `recover_since` overflow on `u64::MAX` offset (now returns empty via `checked_add`)
+- Switched callback fields from `tokio::sync::RwLock` to `std::sync::RwLock` (write-once, read-many pattern)
+- Graceful shutdown now sends WebSocket Close frame with code 1001 per RFC 6455
+- Multi-frame `RESYNC` encoding splits at newline boundaries instead of silent truncation
+
 ## v2.1.1 (2026-03-01)
 
 ### Message Format Consistency

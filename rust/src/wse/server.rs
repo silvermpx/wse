@@ -35,7 +35,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketConfig};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -68,10 +69,15 @@ fn ws_frame_size(frame: &WsFrame) -> usize {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ConnectionHandle {
     pub(crate) tx: mpsc::UnboundedSender<WsFrame>,
     /// Pending outbound bytes (not messages) for backpressure accounting.
     pub(crate) pending: Arc<AtomicUsize>,
+    /// NATS-style direct byte buffer for broadcast_all (bypasses mpsc channel).
+    pub(crate) broadcast_buf: Arc<parking_lot::Mutex<BytesMut>>,
+    /// Wakes write task when broadcast data is appended to broadcast_buf.
+    pub(crate) broadcast_notify: Arc<tokio::sync::Notify>,
 }
 
 // ---------------------------------------------------------------------------
@@ -80,7 +86,7 @@ pub(crate) struct ConnectionHandle {
 
 /// Encode a complete WebSocket frame: header + payload.
 /// Server-to-client frames are NOT masked, so all connections receive identical bytes.
-fn encode_ws_frame(opcode: u8, payload: &[u8]) -> Bytes {
+pub(crate) fn encode_ws_frame(opcode: u8, payload: &[u8]) -> Bytes {
     let len = payload.len();
     let header_len = if len < 126 {
         2
@@ -220,9 +226,9 @@ pub(crate) enum ServerCommand {
 pub(crate) struct SharedState {
     pub(crate) connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     max_connections: usize,
-    on_connect: RwLock<Option<Py<PyAny>>>,
-    on_message: RwLock<Option<Py<PyAny>>>,
-    on_disconnect: RwLock<Option<Py<PyAny>>>,
+    on_connect: std::sync::RwLock<Option<Py<PyAny>>>,
+    on_message: std::sync::RwLock<Option<Py<PyAny>>>,
+    on_disconnect: std::sync::RwLock<Option<Py<PyAny>>>,
     // Drain mode: when active, inbound events go to channel instead of callbacks
     drain_mode: AtomicBool,
     // Lock-free bounded channel: Tokio tasks send (non-blocking), Python drains
@@ -238,8 +244,10 @@ pub(crate) struct SharedState {
     connection_count: AtomicUsize,
     // JWT config: when set, Rust validates JWT in handshake (zero GIL)
     jwt_config: Option<JwtConfig>,
-    pub(crate) topic_subscribers: Arc<DashMap<String, DashSet<String>>>,
+    pub(crate) topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
     conn_topics: DashMap<String, DashSet<String>>,
+    // Count of glob-pattern topics (contains * or ?) -- avoids O(T) scan in fanout_topic_direct
+    pub(crate) glob_topic_count: Arc<AtomicUsize>,
     // Cluster protocol
     cluster_cmd_tx: std::sync::RwLock<Option<mpsc::UnboundedSender<ClusterCommand>>>,
     pub(crate) cluster_metrics: Arc<ClusterMetrics>,
@@ -300,9 +308,9 @@ impl SharedState {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             max_connections,
-            on_connect: RwLock::new(None),
-            on_message: RwLock::new(None),
-            on_disconnect: RwLock::new(None),
+            on_connect: std::sync::RwLock::new(None),
+            on_message: std::sync::RwLock::new(None),
+            on_disconnect: std::sync::RwLock::new(None),
             drain_mode: AtomicBool::new(false),
             inbound_tx: tx,
             inbound_rx: rx,
@@ -313,6 +321,7 @@ impl SharedState {
             jwt_config,
             topic_subscribers: Arc::new(DashMap::new()),
             conn_topics: DashMap::new(),
+            glob_topic_count: Arc::new(AtomicUsize::new(0)),
             cluster_cmd_tx: std::sync::RwLock::new(None),
             cluster_metrics: Arc::new(ClusterMetrics::new()),
             cluster_dlq: Arc::new(std::sync::Mutex::new(ClusterDlq::new(1000))),
@@ -546,29 +555,89 @@ fn message_category(msg_type: &str) -> &'static str {
 }
 
 /// Inject `"c"` field at the start of a JSON object from Python publishers.
-/// Scans for `"t":"xxx"` to determine category, inserts `"c":"X"` right after `{`.
-/// No wire prefix, no full JSON parse.
+/// Depth-aware scan: only matches `"t"` and `"c"` keys at the top-level object (depth 1),
+/// ignoring occurrences inside nested objects or string values.
 fn inject_category(data: &str) -> String {
-    if data.contains("\"c\":") {
-        return data.to_string();
-    }
-    if let Some(start) = data.find("\"t\":\"") {
-        let val_start = start + 5;
-        if let Some(val_end) = data[val_start..].find('"') {
-            let event_type = &data[val_start..val_start + val_end];
-            let cat = message_category(event_type);
-            // Insert "c":"X", right after opening {
-            if let Some(brace) = data.find('{') {
-                let mut result = String::with_capacity(data.len() + cat.len() + 8);
-                result.push_str(&data[..=brace]);
-                result.push_str("\"c\":\"");
-                result.push_str(cat);
-                result.push_str("\",");
-                result.push_str(&data[brace + 1..]);
-                return result;
+    let bytes = data.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut t_val_range: Option<(usize, usize)> = None;
+    let mut first_brace: Option<usize> = None;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'{' => {
+                depth += 1;
+                if first_brace.is_none() {
+                    first_brace = Some(i);
+                }
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                i += 1;
+            }
+            // Top-level "c": key -- category already present
+            b'"' if depth == 1 && bytes[i..].starts_with(b"\"c\":") => {
+                return data.to_string();
+            }
+            // Top-level "t":"value" -- extract event type
+            b'"' if depth == 1 && t_val_range.is_none() && bytes[i..].starts_with(b"\"t\":\"") => {
+                let val_start = i + 5;
+                let mut j = val_start;
+                loop {
+                    if j >= bytes.len() {
+                        break;
+                    }
+                    if bytes[j] == b'\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if bytes[j] == b'"' {
+                        t_val_range = Some((val_start, j));
+                        i = j + 1;
+                        break;
+                    }
+                    j += 1;
+                }
+                if t_val_range.is_none() {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                in_string = true;
+                i += 1;
+            }
+            _ => {
+                i += 1;
             }
         }
     }
+
+    if let (Some((vs, ve)), Some(brace)) = (t_val_range, first_brace) {
+        let event_type = &data[vs..ve];
+        let cat = message_category(event_type);
+        let mut result = String::with_capacity(data.len() + cat.len() + 8);
+        result.push_str(&data[..=brace]);
+        result.push_str("\"c\":\"");
+        result.push_str(cat);
+        result.push_str("\",");
+        result.push_str(&data[brace + 1..]);
+        return result;
+    }
+
     data.to_string()
 }
 
@@ -862,6 +931,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     let mut write_half = write_half;
     let (tx, mut rx) = mpsc::unbounded_channel::<WsFrame>();
     let pending = Arc::new(AtomicUsize::new(0));
+    let broadcast_buf = Arc::new(parking_lot::Mutex::new(BytesMut::with_capacity(512)));
+    let broadcast_notify = Arc::new(tokio::sync::Notify::new());
     let drain = state.drain_mode.load(Ordering::Relaxed);
 
     // ── JWT validation in Rust (zero GIL) ──────────────────────────────────
@@ -956,6 +1027,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
             ConnectionHandle {
                 tx: tx.clone(),
                 pending: pending.clone(),
+                broadcast_buf: broadcast_buf.clone(),
+                broadcast_notify: broadcast_notify.clone(),
             },
         );
         state.connection_count.store(conns.len(), Ordering::Relaxed);
@@ -992,7 +1065,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
             });
         }
     } else {
-        let cb_guard = state.on_connect.read().await;
+        let cb_guard = state.on_connect.read().unwrap();
         if let Some(ref cb) = *cb_guard
             && let Some(cb_clone) = Python::try_attach(|py| cb.clone_ref(py))
         {
@@ -1006,105 +1079,130 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         }
     }
 
-    // Write task: recv_many batch drain + manual concatenation.
+    // Write task: dual-path (NATS-style broadcast buffer + mpsc control channel).
     //
-    // Instead of BufWriter (copies each frame into 8KB internal buffer), we:
-    //   1. Drain up to 256 frames at once with recv_many (bulk atomic drain)
-    //   2. Separate PreFramed (raw broadcast bytes) from Msg (tungstenite control/per-conn)
-    //   3. Write all PreFramed via write_vectored (one writev syscall, zero memcpy)
-    //   4. Feed all Msg to tungstenite, single flush
+    // Phase 1 (top of loop): drain broadcast_buf (direct bytes from broadcast_all)
+    // Phase 2 (select!): wait for control mpsc OR broadcast notify
+    //
+    // Control messages (server_ready, pong, close, send_event, topic) go through mpsc.
+    // Broadcast data goes through direct buffer (bypasses mpsc entirely).
     let pending_write = pending.clone();
+    let broadcast_buf_write = broadcast_buf;
+    let broadcast_notify_write = broadcast_notify;
     let write_task = tokio::spawn(async move {
         let mut batch: Vec<WsFrame> = Vec::with_capacity(256);
         let mut raw_slices: Vec<Bytes> = Vec::with_capacity(256);
+        // Skip Phase 1 on first iteration so server_ready (in mpsc) is sent before
+        // any broadcast data (in broadcast_buf). After the first iteration, Phase 1
+        // always runs to avoid the Notify lost-permit race.
+        let mut first_iteration = true;
 
         loop {
-            // Drain up to 256 pending frames in one bulk operation
-            let n = rx.recv_many(&mut batch, 256).await;
-            if n == 0 {
-                break; // channel closed
-            }
-            // Calculate drained bytes for backpressure accounting (decremented after write)
-            let drained_bytes: usize = batch.iter().map(ws_frame_size).sum();
-
-            // Separate: PreFramed -> slices for writev, Msg -> tungstenite
-            raw_slices.clear();
-            let mut has_tung = false;
-            for frame in &batch {
-                match frame {
-                    WsFrame::PreFramed(bytes) => raw_slices.push(bytes.clone()),
-                    WsFrame::Msg(_) => has_tung = true,
+            // Phase 1: Drain broadcast buffer (skip on first iteration for server_ready ordering).
+            // This avoids the Notify lost-permit race: if select! cancelled notified()
+            // on a previous iteration, the data is still in the buffer.
+            let broadcast_data = if first_iteration {
+                first_iteration = false;
+                None
+            } else {
+                let mut buf = broadcast_buf_write.lock();
+                if !buf.is_empty() {
+                    Some(buf.split().freeze()) // zero-copy handoff
+                } else {
+                    None
                 }
+            };
+            if let Some(data) = broadcast_data {
+                let len = data.len();
+                if raw_write.write_all(&data).await.is_err() {
+                    pending_write.fetch_sub(len, Ordering::Relaxed);
+                    break;
+                }
+                pending_write.fetch_sub(len, Ordering::Relaxed);
+                continue; // check buffer again before blocking
             }
 
-            let mut ok = true;
+            // Phase 2: Buffer empty, wait for either source.
+            tokio::select! {
+                biased;
 
-            // Write all PreFramed via write_vectored (one writev syscall, zero memcpy).
-            // Single call + fallback: writev once, if partial write then write_all remainder.
-            if !raw_slices.is_empty() {
-                let io_slices: Vec<std::io::IoSlice<'_>> = raw_slices
-                    .iter()
-                    .map(|b| std::io::IoSlice::new(b))
-                    .collect();
-                let total: usize = raw_slices.iter().map(|b| b.len()).sum();
-
-                let written = match raw_write.write_vectored(&io_slices).await {
-                    Ok(0) => {
-                        ok = false;
-                        0
+                // Control/topic messages (server_ready, close, pong, send_event, topic)
+                n = rx.recv_many(&mut batch, 256) => {
+                    if n == 0 {
+                        break; // channel closed
                     }
-                    Ok(n) => n,
-                    Err(_) => {
-                        ok = false;
-                        0
-                    }
-                };
+                    let drained_bytes: usize = batch.iter().map(ws_frame_size).sum();
 
-                // Partial write: concatenate remaining bytes and write_all
-                if ok && written < total {
-                    let mut remaining = BytesMut::with_capacity(total - written);
-                    let mut skip = written;
-                    for slice in &raw_slices {
-                        if skip >= slice.len() {
-                            skip -= slice.len();
-                        } else {
-                            remaining.extend_from_slice(&slice[skip..]);
-                            skip = 0;
+                    // Separate: PreFramed -> slices for writev, Msg -> tungstenite
+                    raw_slices.clear();
+                    let mut has_tung = false;
+                    for frame in &batch {
+                        match frame {
+                            WsFrame::PreFramed(bytes) => raw_slices.push(bytes.clone()),
+                            WsFrame::Msg(_) => has_tung = true,
                         }
                     }
-                    if raw_write.write_all(&remaining).await.is_err() {
-                        ok = false;
-                    }
-                }
-            }
 
-            // Feed all tungstenite Msgs, single flush.
-            // Always attempt Msg frames even if PreFramed write failed --
-            // Close frames are critical control frames that must be sent.
-            if has_tung {
-                for frame in batch.drain(..) {
-                    if let WsFrame::Msg(msg) = frame
-                        && write_half.feed(msg).await.is_err()
-                    {
-                        ok = false;
+                    let mut ok = true;
+
+                    // Write PreFramed via write_vectored (writev syscall)
+                    if !raw_slices.is_empty() {
+                        let io_slices: Vec<std::io::IoSlice<'_>> = raw_slices
+                            .iter()
+                            .map(|b| std::io::IoSlice::new(b))
+                            .collect();
+                        let total: usize = raw_slices.iter().map(|b| b.len()).sum();
+
+                        let written = match raw_write.write_vectored(&io_slices).await {
+                            Ok(0) => { ok = false; 0 }
+                            Ok(n) => n,
+                            Err(_) => { ok = false; 0 }
+                        };
+
+                        if ok && written < total {
+                            let mut remaining = BytesMut::with_capacity(total - written);
+                            let mut skip = written;
+                            for slice in &raw_slices {
+                                if skip >= slice.len() {
+                                    skip -= slice.len();
+                                } else {
+                                    remaining.extend_from_slice(&slice[skip..]);
+                                    skip = 0;
+                                }
+                            }
+                            if raw_write.write_all(&remaining).await.is_err() {
+                                ok = false;
+                            }
+                        }
+                    }
+
+                    // Feed tungstenite Msgs, single flush
+                    if has_tung && ok {
+                        for frame in batch.drain(..) {
+                            if let WsFrame::Msg(msg) = frame
+                                && write_half.feed(msg).await.is_err()
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok && write_half.flush().await.is_err() {
+                            ok = false;
+                        }
+                    }
+
+                    pending_write.fetch_sub(drained_bytes, Ordering::Relaxed);
+                    batch.clear();
+
+                    if !ok {
                         break;
                     }
                 }
-                if ok && write_half.flush().await.is_err() {
-                    ok = false;
+
+                // Broadcast buffer wakeup -- loop back to Phase 1 to drain
+                _ = broadcast_notify_write.notified() => {
+                    continue;
                 }
-            }
-
-            // Decrement pending bytes AFTER write completes -- keeps counter
-            // accurate while data is in flight (matches NATS/Centrifugo semantics).
-            pending_write.fetch_sub(drained_bytes, Ordering::Relaxed);
-
-            // Always clear: covers PreFramed-only batches (drain didn't run)
-            // and partial drain (ok=false broke out early).
-            batch.clear();
-
-            if !ok {
-                break;
             }
         }
         let _ = write_half.close().await;
@@ -1112,7 +1210,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
 
     // Cache on_message callback (only needed in callback mode)
     let cached_on_message: Option<Arc<Py<PyAny>>> = if !drain {
-        let cb_guard = state.on_message.read().await;
+        let cb_guard = state.on_message.read().unwrap();
         cb_guard
             .as_ref()
             .and_then(|cb| Python::try_attach(|py| cb.clone_ref(py)).map(Arc::new))
@@ -1522,9 +1620,14 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
             if let Some(subscribers) = state.topic_subscribers.get(&topic) {
                 subscribers.remove(&*conn_id);
             }
-            state
+            if state
                 .topic_subscribers
-                .remove_if(&topic, |_, subs| subs.is_empty());
+                .remove_if(&topic, |_, subs| subs.is_empty())
+                .is_some()
+                && (topic.contains('*') || topic.contains('?'))
+            {
+                state.glob_topic_count.fetch_sub(1, Ordering::Relaxed);
+            }
             disconnected_topics.push(topic);
         }
 
@@ -1553,7 +1656,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
             conn_id: (*conn_id).clone(),
         });
     } else {
-        let cb_guard = state.on_disconnect.read().await;
+        let cb_guard = state.on_disconnect.read().unwrap();
         if let Some(ref cb) = *cb_guard
             && let Some(cb_clone) = Python::try_attach(|py| cb.clone_ref(py))
         {
@@ -1605,130 +1708,158 @@ pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
 // Parallel fan-out helpers
 // ---------------------------------------------------------------------------
 
-/// Collect subscriber sender handles for a topic, with dedup.
-/// Caller must hold a read guard on the connections map.
-pub(crate) fn collect_topic_senders(
+/// NATS-style direct buffer fan-out for broadcast_all (BroadcastText/BroadcastBytes).
+/// Appends pre-framed bytes to each connection's broadcast_buf under parking_lot::Mutex,
+/// bypassing the mpsc channel entirely. Per-connection cost: ~15-20ns vs ~80-130ns for mpsc.
+/// Only calls notify_one() when buffer transitions from empty to non-empty (skip when
+/// write task is already awake draining data).
+#[inline]
+fn fanout_broadcast_direct(
     conns: &HashMap<String, ConnectionHandle>,
-    topic_subscribers: &DashMap<String, DashSet<String>>,
-    topic: &str,
-) -> Vec<(mpsc::UnboundedSender<WsFrame>, Arc<AtomicUsize>)> {
-    let mut seen = AHashSet::new();
-    let mut senders = Vec::new();
-
-    // Exact topic match
-    if let Some(conn_ids) = topic_subscribers.get(topic) {
-        senders.reserve(conn_ids.len());
-        for conn_id_ref in conn_ids.iter() {
-            let cid = conn_id_ref.key();
-            if seen.insert(cid.clone())
-                && let Some(handle) = conns.get(cid)
-            {
-                senders.push((handle.tx.clone(), handle.pending.clone()));
-            }
+    data: &Bytes,
+    max_pending: usize,
+    slow_drops: &AtomicU64,
+) {
+    let data_len = data.len();
+    for h in conns.values() {
+        // Skip dead connections (write task exited but cleanup hasn't run yet)
+        if h.tx.is_closed() {
+            continue;
+        }
+        if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
+            slow_drops.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        h.pending.fetch_add(data_len, Ordering::Relaxed);
+        let was_empty = {
+            let mut buf = h.broadcast_buf.lock();
+            let empty = buf.is_empty();
+            buf.extend_from_slice(data);
+            empty
+        };
+        if was_empty {
+            h.broadcast_notify.notify_one();
         }
     }
+}
 
-    // Glob pattern match
-    for entry in topic_subscribers.iter() {
-        let pattern = entry.key();
-        if (pattern.contains('*') || pattern.contains('?')) && glob_match(pattern, topic) {
-            for conn_id_ref in entry.value().iter() {
-                let cid = conn_id_ref.key();
-                if seen.insert(cid.clone())
-                    && let Some(handle) = conns.get(cid)
-                {
-                    senders.push((handle.tx.clone(), handle.pending.clone()));
+/// NATS-style direct buffer fan-out for topic-filtered connections (BroadcastLocal + cluster).
+/// Iterates ConnectionHandle values stored directly in topic_subscribers DashMap,
+/// eliminating the per-connection HashMap lookup that was the main bottleneck.
+/// Returns (delivered, dropped) counts for metrics tracking.
+#[inline]
+pub(crate) fn fanout_topic_direct(
+    topic_subscribers: &DashMap<String, DashMap<String, ConnectionHandle>>,
+    topic: &str,
+    data: &Bytes,
+    max_pending: usize,
+    slow_drops: &AtomicU64,
+    glob_count: usize,
+) -> (u64, u64) {
+    let data_len = data.len();
+    let mut delivered = 0u64;
+    let mut dropped = 0u64;
+
+    // Check if any glob patterns exist (rare -- most deployments use exact topics)
+    let has_globs = glob_count > 0;
+
+    if !has_globs {
+        // Fast path: exact match only, iterate handles directly (no HashMap lookup)
+        if let Some(subs) = topic_subscribers.get(topic) {
+            for entry in subs.iter() {
+                let h = entry.value();
+                if h.tx.is_closed() {
+                    continue;
+                }
+                if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
+                    slow_drops.fetch_add(1, Ordering::Relaxed);
+                    dropped += 1;
+                    continue;
+                }
+                h.pending.fetch_add(data_len, Ordering::Relaxed);
+                let was_empty = {
+                    let mut buf = h.broadcast_buf.lock();
+                    let empty = buf.is_empty();
+                    buf.extend_from_slice(data);
+                    empty
+                };
+                if was_empty {
+                    h.broadcast_notify.notify_one();
+                }
+                delivered += 1;
+            }
+        }
+    } else {
+        // Slow path: glob patterns exist, need AHashSet for dedup
+        let mut seen = AHashSet::new();
+
+        // Exact topic match
+        if let Some(subs) = topic_subscribers.get(topic) {
+            for entry in subs.iter() {
+                if seen.insert(entry.key().clone()) {
+                    let h = entry.value();
+                    if h.tx.is_closed() {
+                        continue;
+                    }
+                    if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
+                        slow_drops.fetch_add(1, Ordering::Relaxed);
+                        dropped += 1;
+                        continue;
+                    }
+                    h.pending.fetch_add(data_len, Ordering::Relaxed);
+                    let was_empty = {
+                        let mut buf = h.broadcast_buf.lock();
+                        let empty = buf.is_empty();
+                        buf.extend_from_slice(data);
+                        empty
+                    };
+                    if was_empty {
+                        h.broadcast_notify.notify_one();
+                    }
+                    delivered += 1;
+                }
+            }
+        }
+
+        // Glob pattern match
+        for topic_entry in topic_subscribers.iter() {
+            let pattern = topic_entry.key();
+            if (pattern.contains('*') || pattern.contains('?')) && glob_match(pattern, topic) {
+                for entry in topic_entry.value().iter() {
+                    if seen.insert(entry.key().clone()) {
+                        let h = entry.value();
+                        if h.tx.is_closed() {
+                            continue;
+                        }
+                        if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
+                            slow_drops.fetch_add(1, Ordering::Relaxed);
+                            dropped += 1;
+                            continue;
+                        }
+                        h.pending.fetch_add(data_len, Ordering::Relaxed);
+                        let was_empty = {
+                            let mut buf = h.broadcast_buf.lock();
+                            let empty = buf.is_empty();
+                            buf.extend_from_slice(data);
+                            empty
+                        };
+                        if was_empty {
+                            h.broadcast_notify.notify_one();
+                        }
+                        delivered += 1;
+                    }
                 }
             }
         }
     }
 
-    senders
-}
-
-/// Fan-out directly from connections map -- avoids Vec allocation + N Arc clones.
-/// Use this for BroadcastText/BroadcastBytes fast path (no encryption).
-/// Caller must hold the read lock on connections.
-#[inline]
-fn fanout_all_connections(
-    conns: &HashMap<String, ConnectionHandle>,
-    frame: WsFrame,
-    max_pending: usize,
-    slow_drops: &AtomicU64,
-) {
-    let frame_bytes = ws_frame_size(&frame);
-    for h in conns.values() {
-        if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
-            slow_drops.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        h.pending.fetch_add(frame_bytes, Ordering::Relaxed);
-        if h.tx.send(frame.clone()).is_err() {
-            h.pending.fetch_sub(frame_bytes, Ordering::Relaxed);
-        }
-    }
-}
-
-/// Fan-out a pre-built message to collected sender handles.
-/// Sequential fan-out: enqueue pre-built message to all collected sender handles.
-/// Non-blocking channel sends -- each connection's writer task handles actual I/O.
-/// Checks per-connection pending counter; drops message for slow consumers.
-fn fanout_to_senders(
-    senders: &[(mpsc::UnboundedSender<WsFrame>, Arc<AtomicUsize>)],
-    frame: WsFrame,
-    max_pending: usize,
-    slow_drops: &AtomicU64,
-) {
-    let frame_bytes = ws_frame_size(&frame);
-    for (tx, pending) in senders {
-        if max_pending > 0 && pending.load(Ordering::Relaxed) >= max_pending {
-            slow_drops.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        pending.fetch_add(frame_bytes, Ordering::Relaxed);
-        if tx.send(frame.clone()).is_err() {
-            pending.fetch_sub(frame_bytes, Ordering::Relaxed);
-        }
-    }
+    (delivered, dropped)
 }
 
 /// Trait for fan-out metrics tracking. Implemented by ClusterMetrics.
 pub(crate) trait FanoutMetrics: Send + Sync + 'static {
     fn add_delivered(&self, count: u64);
     fn add_dropped(&self, count: u64);
-}
-
-/// Fan-out with metrics tracking (for cluster dispatch).
-/// Takes Arc<M> where M implements FanoutMetrics, enabling spawned tasks
-/// to update metrics with 'static lifetime.
-pub(crate) fn fanout_to_senders_with_metrics<M: FanoutMetrics>(
-    senders: &[(mpsc::UnboundedSender<WsFrame>, Arc<AtomicUsize>)],
-    frame: WsFrame,
-    metrics: &Arc<M>,
-    max_pending: usize,
-    slow_drops: &AtomicU64,
-) {
-    let frame_bytes = ws_frame_size(&frame);
-    let mut d = 0u64;
-    let mut f = 0u64;
-    for (tx, pending) in senders {
-        if max_pending > 0 && pending.load(Ordering::Relaxed) >= max_pending {
-            slow_drops.fetch_add(1, Ordering::Relaxed);
-            f += 1;
-            continue;
-        }
-        pending.fetch_add(frame_bytes, Ordering::Relaxed);
-        if tx.send(frame.clone()).is_ok() {
-            d += 1;
-        } else {
-            pending.fetch_sub(frame_bytes, Ordering::Relaxed);
-            f += 1;
-        }
-    }
-    metrics.add_delivered(d);
-    if f > 0 {
-        metrics.add_dropped(f);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1793,31 +1924,37 @@ async fn process_commands(
                 let max_pending = state.max_outbound_queue_bytes;
                 let slow_drops = &state.slow_consumer_drops;
                 if state.conn_encryption.is_empty() {
-                    // Fast path: fan-out while holding read lock (no Vec alloc, no Arc clones)
-                    let frame = WsFrame::PreFramed(pre_frame_text(&data));
+                    // NATS-style: direct buffer append (bypasses mpsc channel)
+                    let preframed = pre_frame_text(&data);
                     let guard = state.connections.read().await;
-                    fanout_all_connections(&guard, frame, max_pending, slow_drops);
+                    fanout_broadcast_direct(&guard, &preframed, max_pending, slow_drops);
                 } else {
                     let preframed = pre_frame_text(&data);
                     let guard = state.connections.read().await;
-                    let mut plain_senders = Vec::new();
                     let mut enc_senders = Vec::new();
                     for (cid, h) in guard.iter() {
                         if let Some(cipher_ref) = state.conn_encryption.get(cid) {
                             enc_senders.push((h.tx.clone(), h.pending.clone(), cipher_ref.clone()));
                         } else {
-                            plain_senders.push((h.tx.clone(), h.pending.clone()));
+                            // Plain connection: direct buffer append
+                            let data_len = preframed.len();
+                            if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
+                                slow_drops.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            h.pending.fetch_add(data_len, Ordering::Relaxed);
+                            let was_empty = {
+                                let mut buf = h.broadcast_buf.lock();
+                                let empty = buf.is_empty();
+                                buf.extend_from_slice(&preframed);
+                                empty
+                            };
+                            if was_empty {
+                                h.broadcast_notify.notify_one();
+                            }
                         }
                     }
                     drop(guard);
-                    if !plain_senders.is_empty() {
-                        fanout_to_senders(
-                            &plain_senders,
-                            WsFrame::PreFramed(preframed),
-                            max_pending,
-                            slow_drops,
-                        );
-                    }
                     for (tx, pending, cipher) in &enc_senders {
                         if max_pending > 0 && pending.load(Ordering::Relaxed) >= max_pending {
                             slow_drops.fetch_add(1, Ordering::Relaxed);
@@ -1834,8 +1971,8 @@ async fn process_commands(
                                     pending.fetch_sub(enc_bytes, Ordering::Relaxed);
                                 }
                             }
-                            Err(_) => {
-                                slow_drops.fetch_add(1, Ordering::Relaxed);
+                            Err(e) => {
+                                eprintln!("[WSE] encrypt_outbound failed: {e}");
                             }
                         }
                     }
@@ -1845,31 +1982,37 @@ async fn process_commands(
                 let max_pending = state.max_outbound_queue_bytes;
                 let slow_drops = &state.slow_consumer_drops;
                 if state.conn_encryption.is_empty() {
-                    // Fast path: fan-out while holding read lock (no Vec alloc, no Arc clones)
-                    let frame = WsFrame::PreFramed(pre_frame_binary(&data));
+                    // NATS-style: direct buffer append (bypasses mpsc channel)
+                    let preframed = pre_frame_binary(&data);
                     let guard = state.connections.read().await;
-                    fanout_all_connections(&guard, frame, max_pending, slow_drops);
+                    fanout_broadcast_direct(&guard, &preframed, max_pending, slow_drops);
                 } else {
                     let preframed = pre_frame_binary(&data);
                     let guard = state.connections.read().await;
-                    let mut plain_senders = Vec::new();
                     let mut enc_senders = Vec::new();
                     for (cid, h) in guard.iter() {
                         if let Some(cipher_ref) = state.conn_encryption.get(cid) {
                             enc_senders.push((h.tx.clone(), h.pending.clone(), cipher_ref.clone()));
                         } else {
-                            plain_senders.push((h.tx.clone(), h.pending.clone()));
+                            // Plain connection: direct buffer append
+                            let data_len = preframed.len();
+                            if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
+                                slow_drops.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            h.pending.fetch_add(data_len, Ordering::Relaxed);
+                            let was_empty = {
+                                let mut buf = h.broadcast_buf.lock();
+                                let empty = buf.is_empty();
+                                buf.extend_from_slice(&preframed);
+                                empty
+                            };
+                            if was_empty {
+                                h.broadcast_notify.notify_one();
+                            }
                         }
                     }
                     drop(guard);
-                    if !plain_senders.is_empty() {
-                        fanout_to_senders(
-                            &plain_senders,
-                            WsFrame::PreFramed(preframed),
-                            max_pending,
-                            slow_drops,
-                        );
-                    }
                     for (tx, pending, cipher) in &enc_senders {
                         if max_pending > 0 && pending.load(Ordering::Relaxed) >= max_pending {
                             slow_drops.fetch_add(1, Ordering::Relaxed);
@@ -1886,8 +2029,8 @@ async fn process_commands(
                                     pending.fetch_sub(enc_bytes, Ordering::Relaxed);
                                 }
                             }
-                            Err(_) => {
-                                slow_drops.fetch_add(1, Ordering::Relaxed);
+                            Err(e) => {
+                                eprintln!("[WSE] encrypt_outbound failed: {e}");
                             }
                         }
                     }
@@ -1906,28 +2049,25 @@ async fn process_commands(
                     recovery.push(&topic, preframed.clone());
                 }
                 if state.conn_encryption.is_empty() {
-                    // Fast path: no encrypted connections
-                    let senders = {
-                        let guard = state.connections.read().await;
-                        collect_topic_senders(&guard, &state.topic_subscribers, &topic)
-                    };
-                    fanout_to_senders(
-                        &senders,
-                        WsFrame::PreFramed(preframed),
+                    // Fast path: NATS-style direct buffer (bypasses mpsc channel)
+                    fanout_topic_direct(
+                        &state.topic_subscribers,
+                        &topic,
+                        &preframed,
                         max_pending,
                         slow_drops,
+                        state.glob_topic_count.load(Ordering::Relaxed),
                     );
                 } else {
-                    let guard = state.connections.read().await;
-                    let mut plain_senders = Vec::new();
+                    // Mixed: direct buffer for plain, mpsc for encrypted
+                    // No connections RwLock needed -- handles are in topic_subscribers
                     let mut enc_senders = Vec::new();
                     let mut seen = AHashSet::new();
                     if let Some(subs) = state.topic_subscribers.get(&topic) {
-                        for cid_ref in subs.iter() {
-                            let cid = cid_ref.key().clone();
-                            if seen.insert(cid.clone())
-                                && let Some(h) = guard.get(&cid)
-                            {
+                        for entry in subs.iter() {
+                            let cid = entry.key().clone();
+                            if seen.insert(cid.clone()) {
+                                let h = entry.value();
                                 if let Some(cipher_ref) = state.conn_encryption.get(&cid) {
                                     enc_senders.push((
                                         h.tx.clone(),
@@ -1935,22 +2075,41 @@ async fn process_commands(
                                         cipher_ref.clone(),
                                     ));
                                 } else {
-                                    plain_senders.push((h.tx.clone(), h.pending.clone()));
+                                    // Plain connection: direct buffer append
+                                    if h.tx.is_closed() {
+                                        continue;
+                                    }
+                                    let data_len = preframed.len();
+                                    if max_pending > 0
+                                        && h.pending.load(Ordering::Relaxed) >= max_pending
+                                    {
+                                        slow_drops.fetch_add(1, Ordering::Relaxed);
+                                        continue;
+                                    }
+                                    h.pending.fetch_add(data_len, Ordering::Relaxed);
+                                    let was_empty = {
+                                        let mut buf = h.broadcast_buf.lock();
+                                        let empty = buf.is_empty();
+                                        buf.extend_from_slice(&preframed);
+                                        empty
+                                    };
+                                    if was_empty {
+                                        h.broadcast_notify.notify_one();
+                                    }
                                 }
                             }
                         }
                     }
                     // Glob pattern matching
-                    for entry in state.topic_subscribers.iter() {
-                        let pattern = entry.key();
+                    for topic_entry in state.topic_subscribers.iter() {
+                        let pattern = topic_entry.key();
                         if (pattern.contains('*') || pattern.contains('?'))
                             && glob_match(pattern, &topic)
                         {
-                            for cid_ref in entry.value().iter() {
-                                let cid = cid_ref.key().clone();
-                                if seen.insert(cid.clone())
-                                    && let Some(h) = guard.get(&cid)
-                                {
+                            for entry in topic_entry.value().iter() {
+                                let cid = entry.key().clone();
+                                if seen.insert(cid.clone()) {
+                                    let h = entry.value();
                                     if let Some(cipher_ref) = state.conn_encryption.get(&cid) {
                                         enc_senders.push((
                                             h.tx.clone(),
@@ -1958,20 +2117,31 @@ async fn process_commands(
                                             cipher_ref.clone(),
                                         ));
                                     } else {
-                                        plain_senders.push((h.tx.clone(), h.pending.clone()));
+                                        // Plain connection: direct buffer append
+                                        if h.tx.is_closed() {
+                                            continue;
+                                        }
+                                        let data_len = preframed.len();
+                                        if max_pending > 0
+                                            && h.pending.load(Ordering::Relaxed) >= max_pending
+                                        {
+                                            slow_drops.fetch_add(1, Ordering::Relaxed);
+                                            continue;
+                                        }
+                                        h.pending.fetch_add(data_len, Ordering::Relaxed);
+                                        let was_empty = {
+                                            let mut buf = h.broadcast_buf.lock();
+                                            let empty = buf.is_empty();
+                                            buf.extend_from_slice(&preframed);
+                                            empty
+                                        };
+                                        if was_empty {
+                                            h.broadcast_notify.notify_one();
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    drop(guard);
-                    if !plain_senders.is_empty() {
-                        fanout_to_senders(
-                            &plain_senders,
-                            WsFrame::PreFramed(preframed),
-                            max_pending,
-                            slow_drops,
-                        );
                     }
                     for (tx, pending, cipher) in &enc_senders {
                         if max_pending > 0 && pending.load(Ordering::Relaxed) >= max_pending {
@@ -1989,8 +2159,8 @@ async fn process_commands(
                                     pending.fetch_sub(enc_bytes, Ordering::Relaxed);
                                 }
                             }
-                            Err(_) => {
-                                slow_drops.fetch_add(1, Ordering::Relaxed);
+                            Err(e) => {
+                                eprintln!("[WSE] encrypt_outbound failed: {e}");
                             }
                         }
                     }
@@ -2011,13 +2181,20 @@ async fn process_commands(
                 let _ = reply.send(guard.keys().cloned().collect());
             }
             ServerCommand::Shutdown => {
+                let close_frame = Message::Close(Some(CloseFrame {
+                    code: CloseCode::Away,
+                    reason: "server shutting down".into(),
+                }));
                 let guard = state.connections.read().await;
                 for h in guard.values() {
                     h.pending.fetch_add(8, Ordering::Relaxed);
-                    if h.tx.send(WsFrame::Msg(Message::Close(None))).is_err() {
+                    if h.tx.send(WsFrame::Msg(close_frame.clone())).is_err() {
                         h.pending.fetch_sub(8, Ordering::Relaxed);
                     }
                 }
+                drop(guard);
+                // Drain period: allow in-flight messages to flush before exiting
+                tokio::time::sleep(Duration::from_secs(2)).await;
                 break;
             }
         }
@@ -2069,11 +2246,12 @@ impl RustWSEServer {
         ping_interval: u64,
         idle_timeout: u64,
         max_outbound_queue_bytes: usize,
-    ) -> Self {
-        assert!(
-            ping_interval < idle_timeout,
-            "ping_interval ({ping_interval}s) must be less than idle_timeout ({idle_timeout}s)"
-        );
+    ) -> PyResult<Self> {
+        if ping_interval >= idle_timeout {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "ping_interval ({ping_interval}s) must be less than idle_timeout ({idle_timeout}s)"
+            )));
+        }
         let jwt_config = jwt_secret.map(|secret| {
             eprintln!(
                 "[WSE] JWT auth enabled (issuer={}, audience={})",
@@ -2106,7 +2284,7 @@ impl RustWSEServer {
         } else {
             None
         };
-        Self {
+        Ok(Self {
             host,
             port,
             shared: Arc::new(SharedState::new(
@@ -2134,7 +2312,7 @@ impl RustWSEServer {
             })),
             rt_handle: None,
             started_at: None,
-        }
+        })
     }
 
     fn set_callbacks(
@@ -2151,13 +2329,9 @@ impl RustWSEServer {
             return Err(PyRuntimeError::new_err("All callbacks must be callable"));
         }
         let shared = self.shared.clone();
-        let rt =
-            Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("Runtime error: {e}")))?;
-        rt.block_on(async {
-            *shared.on_connect.write().await = Some(on_connect);
-            *shared.on_message.write().await = Some(on_message);
-            *shared.on_disconnect.write().await = Some(on_disconnect);
-        });
+        *shared.on_connect.write().unwrap() = Some(on_connect);
+        *shared.on_message.write().unwrap() = Some(on_message);
+        *shared.on_disconnect.write().unwrap() = Some(on_disconnect);
         Ok(())
     }
 
@@ -2328,7 +2502,8 @@ impl RustWSEServer {
                                 };
                                 // Trim stale entries from suspected_slow (disconnected connections)
                                 if !suspected_slow.is_empty() {
-                                    suspected_slow.retain(|id| snapshot.iter().any(|(cid, _, _)| cid == id));
+                                    let snapshot_ids: ahash::AHashSet<&str> = snapshot.iter().map(|(cid, _, _)| cid.as_str()).collect();
+                                    suspected_slow.retain(|id| snapshot_ids.contains(id.as_str()));
                                 }
                                 let mut force_remove = Vec::new();
                                 for (cid, tx, pending) in &snapshot {
@@ -2442,12 +2617,17 @@ impl RustWSEServer {
                                             }
                                         }
                                     }
-                                    // Remove connections FIRST (mirrors normal disconnect order)
+                                    // Remove connections FIRST (mirrors normal disconnect order).
+                                    // Track which cids were actually present -- handle_connection
+                                    // may have already cleaned up if the connection closed naturally.
+                                    let mut was_present: ahash::AHashSet<String> = ahash::AHashSet::new();
                                     {
                                         let mut conns =
                                             ping_state.connections.write().await;
                                         for cid in &force_remove {
-                                            conns.remove(cid);
+                                            if conns.remove(cid).is_some() {
+                                                was_present.insert(cid.clone());
+                                            }
                                             ping_state.conn_formats.remove(cid);
                                             ping_state.conn_rates.remove(cid);
                                             ping_state.conn_last_activity.remove(cid);
@@ -2458,9 +2638,12 @@ impl RustWSEServer {
                                             Ordering::Relaxed,
                                         );
                                     }
-                                    // Topic subscription cleanup for zombies
+                                    // Topic subscription cleanup for zombies (only if we actually removed them)
                                     let cluster_tx = ping_state.cluster_cmd_tx.read().unwrap().clone();
                                     for cid in &force_remove {
+                                        if !was_present.contains(cid) {
+                                            continue; // handle_connection already cleaned up
+                                        }
                                         if let Some((_, topics)) = ping_state.conn_topics.remove(cid) {
                                             let mut disconnected_topics = Vec::new();
                                             for topic_ref in topics.iter() {
@@ -2468,7 +2651,11 @@ impl RustWSEServer {
                                                 if let Some(subscribers) = ping_state.topic_subscribers.get(&topic) {
                                                     subscribers.remove(cid);
                                                 }
-                                                ping_state.topic_subscribers.remove_if(&topic, |_, subs| subs.is_empty());
+                                                if ping_state.topic_subscribers.remove_if(&topic, |_, subs| subs.is_empty()).is_some()
+                                                    && (topic.contains('*') || topic.contains('?'))
+                                                {
+                                                    ping_state.glob_topic_count.fetch_sub(1, Ordering::Relaxed);
+                                                }
                                                 disconnected_topics.push(topic);
                                             }
                                             if let Some(ref tx) = cluster_tx {
@@ -2495,7 +2682,7 @@ impl RustWSEServer {
                                                 conn_id: cid.clone(),
                                             });
                                         } else {
-                                            let cb_guard = ping_state.on_disconnect.read().await;
+                                            let cb_guard = ping_state.on_disconnect.read().unwrap();
                                             if let Some(ref cb) = *cb_guard
                                                 && let Some(cb_clone) = Python::try_attach(|py| cb.clone_ref(py))
                                             {
@@ -3246,6 +3433,7 @@ impl RustWSEServer {
             interest_rx,
             connections,
             topic_subscribers,
+            self.shared.glob_topic_count.clone(),
             metrics,
             dlq,
             local_topic_refcount,
@@ -3298,12 +3486,35 @@ impl RustWSEServer {
             None
         };
 
+        // Get ConnectionHandle for direct fan-out (skip HashMap lookup in hot path).
+        // Uses block_on(connections.read()) for guaranteed acquisition -- matches the
+        // pattern in subscribe_with_recovery. Safe from Python GIL context since the
+        // write lock holder runs on a different tokio thread.
+        let handle = self.rt_handle.as_ref().and_then(|rt| {
+            let guard = rt.block_on(self.shared.connections.read());
+            guard.get(conn_id).cloned()
+        });
+
         for topic in &topics {
-            self.shared
-                .topic_subscribers
-                .entry(topic.clone())
-                .or_default()
-                .insert(conn_id.to_owned());
+            if let Some(ref h) = handle {
+                // Use single entry() call to detect fresh topic creation atomically
+                // (avoids TOCTOU race between contains_key and entry)
+                let outer = self
+                    .shared
+                    .topic_subscribers
+                    .entry(topic.clone())
+                    .or_default();
+                let is_new_entry = outer.insert(conn_id.to_owned(), h.clone()).is_none();
+                let is_first = is_new_entry && outer.len() == 1;
+                drop(outer); // release shard lock before fetch_add
+                if is_first && (topic.contains('*') || topic.contains('?')) {
+                    self.shared.glob_topic_count.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                // Connection already disconnected -- skip topic tracking and cluster sub
+                // to avoid phantom subscriptions in conn_topics and cluster interest
+                continue;
+            }
             // Only increment refcount if this is genuinely new for this connection
             let is_new = self
                 .shared
@@ -3534,9 +3745,15 @@ impl RustWSEServer {
                         if let Some(subscribers) = self.shared.topic_subscribers.get(topic) {
                             subscribers.remove(conn_id);
                         }
-                        self.shared
+                        if self
+                            .shared
                             .topic_subscribers
-                            .remove_if(topic, |_, subs| subs.is_empty());
+                            .remove_if(topic, |_, subs| subs.is_empty())
+                            .is_some()
+                            && (topic.contains('*') || topic.contains('?'))
+                        {
+                            self.shared.glob_topic_count.fetch_sub(1, Ordering::Relaxed);
+                        }
                         actually_removed.push(topic.clone());
                     }
                 }
@@ -3554,9 +3771,15 @@ impl RustWSEServer {
                         if let Some(subscribers) = self.shared.topic_subscribers.get(&topic) {
                             subscribers.remove(conn_id);
                         }
-                        self.shared
+                        if self
+                            .shared
                             .topic_subscribers
-                            .remove_if(&topic, |_, subs| subs.is_empty());
+                            .remove_if(&topic, |_, subs| subs.is_empty())
+                            .is_some()
+                            && (topic.contains('*') || topic.contains('?'))
+                        {
+                            self.shared.glob_topic_count.fetch_sub(1, Ordering::Relaxed);
+                        }
                         removed.push(topic);
                     }
                 }

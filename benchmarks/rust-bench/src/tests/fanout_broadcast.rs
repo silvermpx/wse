@@ -69,12 +69,6 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         let mb_per_sec = result.total_bytes as f64 / result.elapsed / 1_000_000.0;
         let published_per_sec = deliveries_per_sec / actual as f64;
         let raw_gaps = result.total_gaps.load(Ordering::Relaxed);
-        // Gaps are counted per-subscriber; normalize to unique message gaps
-        let unique_gaps = if actual > 0 {
-            raw_gaps / actual as u64
-        } else {
-            raw_gaps
-        };
 
         println!("    Duration:       {:.2}s", result.elapsed);
         println!(
@@ -91,8 +85,8 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             "    Bandwidth:      {}",
             stats::fmt_bytes_per_sec(result.total_bytes as f64 / result.elapsed)
         );
-        if unique_gaps > 0 {
-            println!("    Seq gaps:       ~{} unique messages lost", unique_gaps);
+        if raw_gaps > 0 {
+            println!("    Seq gaps:       ~{} unique messages lost", raw_gaps);
         }
 
         if !result.latency.is_empty() {
@@ -129,11 +123,13 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
                 "published_per_sec": published_per_sec,
                 "deliveries_per_sec": deliveries_per_sec,
                 "mb_per_sec": mb_per_sec,
-                "seq_gaps": unique_gaps,
+                "seq_gaps": raw_gaps,
             }),
         });
 
         protocol::close_all(result.connections).await;
+        // Cooldown: let server finish tearing down connections before next tier
+        tokio::time::sleep(Duration::from_secs(2)).await;
         println!();
     }
 
@@ -219,7 +215,8 @@ pub(crate) async fn measure_fanout(connections: Vec<WsStream>, duration: Duratio
         .filter_map(|r| r.ok())
         .collect();
 
-    let elapsed = start.elapsed().as_secs_f64();
+    // Use deadline-based elapsed, not join_all wall time (task teardown inflates it)
+    let elapsed = duration.as_secs_f64().min(start.elapsed().as_secs_f64());
 
     let merged_latency = match Arc::try_unwrap(latency) {
         Ok(mutex) => mutex.into_inner(),

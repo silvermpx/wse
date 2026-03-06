@@ -109,17 +109,8 @@ fn jwt_decode_inner(
     }
     let (header_b64, payload_b64, sig_b64) = (parts[0], parts[1], parts[2]);
 
-    // 2. Verify signature (HMAC-SHA256)
-    let signing_input = format!("{}.{}", header_b64, payload_b64);
-    let signature = URL_SAFE_NO_PAD.decode(sig_b64)?;
-
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(signing_input.as_bytes());
-    // Constant-time comparison via hmac crate's verify_slice
-    mac.verify_slice(&signature)
-        .map_err(|_| JwtError::InvalidSignature)?;
-
-    // 3. Decode and validate header
+    // 2. Decode and validate header BEFORE signature verification
+    //    (prevents information leak about valid signatures for unsupported algorithms)
     let header_bytes = URL_SAFE_NO_PAD.decode(header_b64)?;
     let header: serde_json::Value = serde_json::from_slice(&header_bytes)?;
 
@@ -130,6 +121,16 @@ fn jwt_decode_inner(
     if alg != "HS256" {
         return Err(JwtError::UnsupportedAlgorithm);
     }
+
+    // 3. Verify signature (HMAC-SHA256)
+    let signing_input = format!("{}.{}", header_b64, payload_b64);
+    let signature = URL_SAFE_NO_PAD.decode(sig_b64)?;
+
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(signing_input.as_bytes());
+    // Constant-time comparison via hmac crate's verify_slice
+    mac.verify_slice(&signature)
+        .map_err(|_| JwtError::InvalidSignature)?;
 
     // 4. Decode payload
     let payload_bytes = URL_SAFE_NO_PAD.decode(payload_b64)?;

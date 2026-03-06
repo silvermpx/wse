@@ -190,7 +190,7 @@ def main():
         help="broadcast=all connections, cluster=cluster publish, cluster-subscribe=cluster receive only",
     )
     parser.add_argument("--port", type=int, default=5006)
-    parser.add_argument("--max-connections", type=int, default=60000)
+    parser.add_argument("--max-connections", type=int, default=150000)
     parser.add_argument("--peers", nargs="+", default=None,
                         help="Cluster peer addresses for cluster modes, e.g. 127.0.0.1:5007")
     parser.add_argument("--tls-cert", default=None, help="Path to TLS certificate PEM")

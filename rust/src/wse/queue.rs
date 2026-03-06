@@ -226,13 +226,8 @@ impl RustPriorityMessageQueue {
                     *self.dropped_count.entry(priority).or_insert(0) += 1;
                     return false;
                 }
-                // HIGH/CRITICAL but no room: still cannot enqueue
-                // (queue is full of HIGH/CRITICAL only)
-                // The Python code does not explicitly handle this final case
-                // with a return false, but implicitly the message IS enqueued
-                // because `dropped` stays false but we continue past the if-block.
-                // However, size >= max_size and nothing was dropped, so we must
-                // drop the incoming message to maintain the invariant.
+                // HIGH/CRITICAL but no room: queue is full of HIGH/CRITICAL only.
+                // Drop the incoming message to maintain the size invariant.
                 *self.dropped_count.entry(priority).or_insert(0) += 1;
                 return false;
             }
