@@ -1,35 +1,58 @@
 use crate::config::Cli;
-use crate::protocol::{self};
+use crate::protocol;
 use crate::report::{self, LatencySummary, TierResult};
-use crate::stats::{self};
+use crate::stats;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 /// Test 11: Multi-Instance Fan-out (Cluster protocol, two servers)
 ///
-/// Publish on Server A (port) -> Cluster TCP -> Server B (port2) -> N WebSocket clients.
-/// Tests horizontal scaling via direct TCP mesh (no Redis, no broker).
+/// Subscribers split 50/50 across Server A and Server B.
+/// Server A publishes -> local fan-out to N/2 subs + cluster replication to B -> fan-out to N/2 subs.
+/// Tests true horizontal scaling: total deliveries = published * N.
 ///
 /// Architecture:
-///   Server A (--port, publisher only) -> cluster broadcast to peers
-///   Server B (--port2, subscribers) -> receives cluster MSG -> fan-out to WS clients
-///   Benchmark clients connect to Server B only.
+///   Server A (--port, publisher + N/2 subscribers) -> broadcasts locally + cluster to B
+///   Server B (--port2, N/2 subscribers) -> receives cluster MSG -> fan-out to its clients
+///   Benchmark clients connect to BOTH servers (split 50/50).
 ///
 /// Requires:
-///   bench_fanout_server.py --mode cluster --port 5006 --peers 127.0.0.1:5007
-///   bench_fanout_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:5006
+///   bench_fanout_server.py --mode cluster --port 5006 --peers 127.0.0.1:7007 --cluster-port 7006 --cluster-addr 127.0.0.1:7006
+///   bench_fanout_server.py --mode cluster --port 5007 --peers 127.0.0.1:7006 --cluster-port 7007 --cluster-addr 127.0.0.1:7007
 pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let port2 = cli.port2.unwrap_or(cli.port + 1);
 
     stats::print_header(
-        "TEST 11: Multi-Instance Fan-out (Cluster, two servers)",
+        "TEST 11: Multi-Instance Fan-out (Cluster, two servers, split 50/50)",
         &format!(
-            "Publish on :{} -> Cluster TCP -> :{} -> N subscribers for {}s. Cross-instance delivery.",
+            "Publish on :{} -> local N/2 + Cluster -> :{} N/2 subs for {}s. Horizontal scaling.",
             cli.port, port2, cli.duration
         ),
     );
 
-    // Verify connectivity to Server B (subscribers connect here)
+    // Verify connectivity to both servers
     let token = crate::jwt::generate_bench_token(cli.secret.as_bytes(), "bench-user");
+
+    print!("    Checking Server A (:{})... ", cli.port);
+    match protocol::connect_and_handshake(
+        &cli.host,
+        cli.port,
+        &token,
+        "compression=false&protocol_version=1",
+        10,
+    )
+    .await
+    {
+        Ok(ws) => {
+            protocol::close_all(vec![ws]).await;
+            println!("OK");
+        }
+        Err(e) => {
+            eprintln!("FAILED: {e}");
+            return Vec::new();
+        }
+    }
+
     print!("    Checking Server B (:{})... ", port2);
     match protocol::connect_and_handshake(
         &cli.host,
@@ -47,7 +70,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         Err(e) => {
             eprintln!("FAILED: {e}");
             eprintln!(
-                "\n    Start Server B: python benchmarks/bench_fanout_server.py --mode cluster-subscribe --port {port2} --peers 127.0.0.1:{}", cli.port
+                "\n    Start Server B: python benchmarks/bench_fanout_server.py --mode cluster --port {port2} --peers 127.0.0.1:{}", cli.port
             );
             return Vec::new();
         }
@@ -57,33 +80,58 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut results = Vec::new();
 
     for &n in &tiers {
-        println!("\n  --- {} subscribers on Server B (:{}) ---", n, port2);
+        let half = n / 2;
+        let half_b = n - half; // handles odd numbers
+        println!(
+            "\n  --- {} subscribers ({} on A:{}, {} on B:{}) ---",
+            n, half, cli.port, half_b, port2
+        );
 
-        // Connect all clients to Server B
-        let connections = protocol::connect_batch(
-            &cli.host,
-            port2,
-            &token,
-            n,
-            cli.batch_size,
-            "compression=false&protocol_version=1",
-        )
-        .await;
+        // Connect half to Server A, half to Server B (in parallel)
+        let (conns_a, conns_b) = tokio::join!(
+            protocol::connect_batch(
+                &cli.host,
+                cli.port,
+                &token,
+                half,
+                cli.batch_size,
+                "compression=false&protocol_version=1",
+            ),
+            protocol::connect_batch(
+                &cli.host,
+                port2,
+                &token,
+                half_b,
+                cli.batch_size,
+                "compression=false&protocol_version=1",
+            )
+        );
 
-        if connections.is_empty() {
-            println!("    FAILED: no connections to Server B");
+        let actual_a = conns_a.len();
+        let actual_b = conns_b.len();
+        let actual = actual_a + actual_b;
+
+        if actual == 0 {
+            println!("    FAILED: no connections");
             continue;
         }
 
-        let actual = connections.len();
+        println!(
+            "    Split: A={}/{}, B={}/{}",
+            actual_a, half, actual_b, half_b
+        );
 
-        // Capture drops counters before measurement for per-tier delta
+        // Merge all connections for unified measurement
+        let mut connections = conns_a;
+        connections.extend(conns_b);
+
+        // Capture drops counters before measurement
         let drops_a_before =
             protocol::query_slow_consumer_drops(&cli.host, cli.metrics_port_for(cli.port)).await;
         let drops_b_before =
             protocol::query_slow_consumer_drops(&cli.host, cli.metrics_port_for(port2)).await;
 
-        // Server A publishes, Server B fans out to our clients via Cluster
+        // Measure: Server A publishes, both servers fan out to their local clients
         let result = super::fanout_broadcast::measure_fanout(
             connections,
             std::time::Duration::from_secs(cli.duration),
@@ -94,19 +142,14 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         let mb_per_sec = result.total_bytes as f64 / result.elapsed / 1_000_000.0;
         let published_per_sec = deliveries_per_sec / actual as f64;
         let raw_gaps = result.total_gaps.load(Ordering::Relaxed);
-        let unique_gaps = if actual > 0 {
-            raw_gaps / actual as u64
-        } else {
-            raw_gaps
-        };
 
         println!("    Duration:       {:.2}s", result.elapsed);
         println!(
-            "    Published:      {}/s (Server A -> Cluster -> Server B)",
+            "    Published:      {}/s (Server A -> local + Cluster -> Server B)",
             stats::fmt_rate(published_per_sec)
         );
         println!(
-            "    Deliveries:     {}/s (fan-out: {} x {} subs)",
+            "    Deliveries:     {}/s (fan-out: {} x {} subs across 2 nodes)",
             stats::fmt_rate(deliveries_per_sec),
             stats::fmt_rate(published_per_sec),
             actual
@@ -115,16 +158,16 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             "    Bandwidth:      {}",
             stats::fmt_bytes_per_sec(result.total_bytes as f64 / result.elapsed)
         );
-        if unique_gaps > 0 {
-            println!("    Seq gaps:       ~{} unique messages lost", unique_gaps);
+        if raw_gaps > 0 {
+            println!("    Seq gaps:       ~{} unique messages lost", raw_gaps);
         }
 
         if !result.latency.is_empty() {
-            println!("    Delivery latency (publish A -> Cluster -> B -> WS):");
+            println!("    Delivery latency:");
             result.latency.print_summary("      ");
         }
 
-        // Query drops from both servers, compute per-tier delta
+        // Query drops from both servers
         let drops_a_after =
             protocol::query_slow_consumer_drops(&cli.host, cli.metrics_port_for(cli.port)).await;
         let drops_b_after =
@@ -162,11 +205,14 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
                 "published_per_sec": published_per_sec,
                 "deliveries_per_sec": deliveries_per_sec,
                 "mb_per_sec": mb_per_sec,
-                "seq_gaps": unique_gaps,
+                "seq_gaps": raw_gaps,
+                "split_a": actual_a,
+                "split_b": actual_b,
             }),
         });
 
         protocol::close_all(result.connections).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
         println!();
     }
 

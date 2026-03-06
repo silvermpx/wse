@@ -114,6 +114,74 @@ Production recommendation: cap at ~200K connections per process on 128 GB machin
 
 ---
 
+## v2.2.0 Results (March 2026)
+
+Slow consumer protection (per-connection byte-based backpressure), fan-out hot path
+optimizations, dependency updates (tokio 1.50). CPU pinning for isolation:
+server on cores 0-15,32-47 (32 cores), benchmark client on remaining cores.
+
+### Test 10: Single-Node Topic Fan-out (32 cores, pinned)
+
+Topic-based fan-out via `broadcast_local()`. Server pinned to 32 cores.
+
+| Subscribers | Published/s | Deliveries/s | Bandwidth | Gaps | Drops |
+|-------------|-------------|-------------|-----------|------|-------|
+| 10 | 254K | 2.5M | 257 MB/s | 0 | 0 |
+| 100 | 47K | **4.7M** | 477 MB/s | 0 | 0 |
+| 500 | 5K | 2.4M | 246 MB/s | 0 | 0 |
+| 1,000 | 2K | 2.0M | 200 MB/s | 0 | 0 |
+| 2,000 | 1K | 2.2M | 220 MB/s | 0 | 0 |
+| 5,000 | 441 | 2.2M | 222 MB/s | 0 | 0 |
+| 10,000 | 155 | 1.6M | 156 MB/s | 0 | 0 |
+| 20,000 | 57 | 1.1M | 115 MB/s | 0 | 0 |
+| 50,000 | 18 | 940K | 95 MB/s | 0 | 0 |
+| 100,000 | 10 | 1.1M | 107 MB/s | 0 | 0 |
+
+**Peak: 4.7M deliveries/s at 100 subscribers. Zero gaps, zero drops at all tiers including 100K.**
+
+### Test 11: Cluster Fan-out 50/50 Split (32+32 cores, pinned)
+
+Subscribers split evenly across two servers. Server A publishes and fans out to its
+local N/2 subscribers, then replicates via cluster TCP to Server B which fans out to
+its N/2 subscribers. True horizontal scaling test.
+
+```
+Server A (cores 0-15,32-47)          Server B (cores 16-31,48-63)
+  - publisher                          - N/2 subscribers
+  - N/2 subscribers
+  |                                    ^
+  +--- cluster TCP (direct) ---------->+
+```
+
+| Subscribers | Split A/B | Published/s | Deliveries/s | Bandwidth | Gaps | Drops |
+|-------------|-----------|-------------|-------------|-----------|------|-------|
+| 10 | 5/5 | 154K | 1.5M | 156 MB/s | 0 | 0 |
+| 100 | 50/50 | 43K | 4.3M | 432 MB/s | 0 | 0 |
+| 500 | 250/250 | 13K | **6.6M** | 662 MB/s | 0 | 0 |
+| 1,000 | 500/500 | 6K | 6.4M | 642 MB/s | 0 | 0 |
+| 2,000 | 1000/1000 | 3K | 5.6M | 559 MB/s | 0 | 0 |
+| 5,000 | 2500/2500 | 815 | 4.1M | 412 MB/s | 0 | 0 |
+
+**Peak: 6.6M deliveries/s at 500 subscribers (140% of single-node). Zero gaps, zero drops.**
+
+### v2.2.0 Comparison: Single-Node vs Cluster
+
+| Subs | Single-Node | Cluster 50/50 | Scaling |
+|------|------------|--------------|---------|
+| 10 | 2.5M | 1.5M | 0.6x |
+| 100 | 4.7M | 4.3M | 0.9x |
+| 500 | 2.4M | **6.6M** | **2.8x** |
+| 1,000 | 2.0M | 6.4M | **3.2x** |
+| 2,000 | 2.2M | 5.6M | **2.5x** |
+| 5,000 | 2.2M | 4.1M | **1.9x** |
+
+At 500-1000 subscribers, the cluster delivers 3x the throughput of a single node,
+confirming true horizontal scaling. At low counts (10), the inter-node TCP hop
+overhead dominates. At very high counts (5K+), per-connection write cost dominates
+and the scaling advantage narrows.
+
+---
+
 ## Reproducing
 
 ### Test 8: Single-Instance Broadcast
@@ -146,4 +214,4 @@ python benchmarks/bench_fanout_server.py \
 
 ---
 
-*Tested February 28, 2026. WSE v2.0.0, wse-bench v0.1.0.*
+*Original results: February 28, 2026 (WSE v2.0.0). v2.2.0 results: March 6, 2026.*

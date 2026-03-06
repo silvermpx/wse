@@ -109,7 +109,6 @@ impl RustSequencer {
 /// Mirrors the Python `SequencedEvent` dataclass.
 #[allow(dead_code)]
 struct BufferedEvent {
-    event_id: String,
     sequence: u64,
     timestamp: Instant,
     payload: Py<PyAny>,
@@ -279,14 +278,7 @@ impl RustEventSequencer {
                 Ok(result.into_any())
             } else {
                 // Buffer the event for later delivery.
-                let event_id: String = event
-                    .get_item("id")
-                    .ok()
-                    .and_then(|v: Bound<'_, PyAny>| v.extract::<String>().ok())
-                    .unwrap_or_default();
-
                 let buffered = BufferedEvent {
-                    event_id,
                     sequence,
                     timestamp: Instant::now(),
                     payload: event.clone().unbind(),

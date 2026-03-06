@@ -3,6 +3,7 @@ use crate::protocol::{self};
 use crate::report::{self, LatencySummary, TierResult};
 use crate::stats::{self};
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 /// Test 12: Multi-Instance Fan-out with TLS (Cluster protocol, two servers)
 ///
@@ -103,11 +104,6 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         let mb_per_sec = result.total_bytes as f64 / result.elapsed / 1_000_000.0;
         let published_per_sec = deliveries_per_sec / actual as f64;
         let raw_gaps = result.total_gaps.load(Ordering::Relaxed);
-        let unique_gaps = if actual > 0 {
-            raw_gaps / actual as u64
-        } else {
-            raw_gaps
-        };
 
         println!("    Duration:       {:.2}s", result.elapsed);
         println!(
@@ -124,8 +120,8 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             "    Bandwidth:      {}",
             stats::fmt_bytes_per_sec(result.total_bytes as f64 / result.elapsed)
         );
-        if unique_gaps > 0 {
-            println!("    Seq gaps:       ~{} unique messages lost", unique_gaps);
+        if raw_gaps > 0 {
+            println!("    Seq gaps:       ~{} unique messages lost", raw_gaps);
         }
 
         if !result.latency.is_empty() {
@@ -171,12 +167,14 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
                 "published_per_sec": published_per_sec,
                 "deliveries_per_sec": deliveries_per_sec,
                 "mb_per_sec": mb_per_sec,
-                "seq_gaps": unique_gaps,
+                "seq_gaps": raw_gaps,
                 "tls": true,
             }),
         });
 
         protocol::close_all(result.connections).await;
+        // Cooldown: let server finish tearing down connections before next tier
+        tokio::time::sleep(Duration::from_secs(2)).await;
         println!();
     }
 

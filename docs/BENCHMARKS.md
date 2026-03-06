@@ -35,8 +35,8 @@ full Python wrapper with drain_mode, JWT auth, the whole stack.
 |--------|-------|--------|
 | Peak throughput (JSON) | **14.7M msg/s** (2.6 GB/s) | Rust client, 500 conns |
 | Peak throughput (binary) | **30M msg/s** | Rust client, 100 conns |
-| Fan-out broadcast | **5.0M del/s** | 100 subs, 0 gaps |
-| Fan-out cluster (2 nodes) | **9.5M del/s** | Native TCP mesh, 20K subs, 0 gaps |
+| Fan-out broadcast (v2.2) | **4.7M del/s** | 32 cores pinned, 100 subs, 0 gaps, 0 drops |
+| Fan-out cluster 50/50 (v2.2) | **6.6M del/s** | 2 nodes, 500 subs, 0 gaps, 0 drops |
 | Peak message rate | **20.7M msg/s** | Rust client, 64B payload |
 | Throughput at 50K conns | **13.8M msg/s** (2.4 GB/s) | Rust client |
 | Max concurrent connections | **500,000** (0 errors) | Rust client |

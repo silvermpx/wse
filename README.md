@@ -175,6 +175,13 @@ token = rust_jwt_encode(
 | `presence_enabled` | False | Enable per-topic presence tracking |
 | `presence_max_data_size` | 4096 | Max bytes for a user's presence metadata |
 | `presence_max_members` | 0 | Max tracked members per topic (0 = unlimited) |
+| `max_outbound_queue_bytes` | 16777216 | Per-connection outbound buffer limit (bytes, default 16 MB). Messages dropped when exceeded |
+| `jwt_cookie_name` | "access_token" | Cookie name for JWT token extraction |
+| `rate_limit_capacity` | 100000.0 | Token bucket capacity per connection |
+| `rate_limit_refill` | 10000.0 | Token bucket refill rate per second |
+| `max_message_size` | 1048576 | Maximum WebSocket frame size in bytes (default 1 MB) |
+| `ping_interval` | 25 | Server-initiated ping interval in seconds |
+| `idle_timeout` | 60 | Force-close connections idle for this many seconds |
 
 ---
 
@@ -499,10 +506,10 @@ Benchmarked on AMD EPYC 7502P (32 cores / 64 threads, 128 GB RAM), Ubuntu 24.04.
 
 | Mode | Peak Throughput | Connections | Message Loss |
 |------|----------------|-------------|--------------|
-| Standalone (fan-out) | 5.0M deliveries/s | 500K | 0% |
+| Standalone (fan-out) | 4.7M deliveries/s | 100K | 0% |
 | Standalone (inbound JSON) | 14.7M msg/s | 500K | 0% |
 | Standalone (inbound msgpack) | 30M msg/s | 500K | 0% |
-| Cluster (2 nodes) | 9.5M deliveries/s | 20K per node | 0% |
+| Cluster (2 nodes, 50/50) | 6.6M deliveries/s | 500 per node | 0% |
 
 Sub-millisecond latency. Median 0.38ms with JWT authentication. Connection handshake: 0.53ms median (Rust JWT path).
 

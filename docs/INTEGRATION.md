@@ -703,6 +703,7 @@ Key metrics to watch:
 |--------|--------|-----------------|
 | `inbound_dropped` | `health_snapshot()` | > 0 |
 | `inbound_queue_depth` | `health_snapshot()` | > 50% of `max_inbound_queue_size` |
+| `slow_consumer_drops` | `prometheus_metrics()` | > 0 (clients can't keep up) |
 | `cluster_peer_count` | `health_snapshot()` | < expected peer count |
 | `recovery_total_bytes` | `health_snapshot()` | > 80% of `recovery_memory_budget` |
 | Connection count | `get_connection_count()` | > 90% of `max_connections` |
@@ -924,6 +925,7 @@ async def metrics():
 | `wse_auth_failures_total` | JWT authentication failures |
 | `wse_rate_limited_total` | Messages dropped by rate limiter |
 | `wse_inbound_dropped_total` | Drain queue events dropped (queue full) |
+| `wse_slow_consumer_drops_total` | Messages dropped due to slow consumer backpressure |
 
 **Cluster counters** (when clustering is enabled):
 

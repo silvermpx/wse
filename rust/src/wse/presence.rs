@@ -171,8 +171,10 @@ impl PresenceManager {
             } else {
                 false
             };
-            entry.data = data.clone();
-            entry.updated_at = now;
+            if now >= entry.updated_at {
+                entry.data = data.clone();
+                entry.updated_at = now;
+            }
             (was_empty, inserted, has_remote)
         };
 

@@ -302,7 +302,7 @@ With gossip discovery, each pod uses the first pod (`wse-0`) as a seed. The goss
 | 100,000 | 4 GB | 8 | 512 MB |
 | 500,000 | 16 GB | 16+ | 1 GB+ |
 
-Memory usage depends on message sizes, presence data, and recovery buffer configuration. The numbers above assume typical workloads with 1 KB average message size.
+Memory usage depends on message sizes, presence data, and recovery buffer configuration. The numbers above assume typical workloads with 1 KB average message size. Per-connection outbound buffers are capped at `max_outbound_queue_bytes` (default 16 MB); slow consumers that exceed this limit have messages dropped (recoverable via reconnect).
 
 ---
 
@@ -355,6 +355,7 @@ async def health():
 | `wse_inbound_dropped_total` | counter | Any increase (events lost) |
 | `wse_auth_failures_total` | counter | Spike (brute force or misconfigured clients) |
 | `wse_rate_limited_total` | counter | Sustained growth (publisher too fast) |
+| `wse_slow_consumer_drops_total` | counter | Any increase (slow clients, tune `max_outbound_queue_bytes`) |
 | `wse_cluster_peers` | gauge | Below expected count (peer down) |
 | `wse_recovery_bytes` | gauge | Above 80% of `recovery_memory_budget` |
 
@@ -364,6 +365,7 @@ async def health():
 - `wse_cluster_peers < expected` - peer disconnected, check network and mTLS certificates.
 - `wse_recovery_bytes > 80% budget` - consider increasing `recovery_memory_budget` or reducing `recovery_ttl`.
 - `wse_auth_failures_total` spike - possible brute force attempt or client misconfiguration.
+- `wse_slow_consumer_drops_total` increasing - clients can't consume fast enough. Increase `max_outbound_queue_bytes` or investigate slow subscribers.
 
 ---
 

@@ -143,11 +143,14 @@ impl TopicRecoveryBuffer {
     fn recover_since(&self, after_offset: u64, max_messages: usize) -> Option<Vec<Bytes>> {
         // If the first message we need (after_offset + 1) is before the tail,
         // those messages have been evicted -- gap too large.
-        if self.head_offset > 0 && after_offset.saturating_add(1) < self.tail_offset {
+        let start = match after_offset.checked_add(1) {
+            Some(s) => s,
+            None => return Some(Vec::new()), // u64::MAX means fully up-to-date
+        };
+
+        if self.head_offset > 0 && start < self.tail_offset {
             return None;
         }
-
-        let start = after_offset.saturating_add(1);
         if start >= self.head_offset {
             // Nothing to recover -- client is up to date.
             return Some(Vec::new());
