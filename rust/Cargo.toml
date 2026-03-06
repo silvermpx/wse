@@ -41,7 +41,7 @@ zstd = "0.13"
 parking_lot = "0.12"
 
 [dev-dependencies]
-rcgen = "0.13"
+rcgen = "0.14"
 
 [profile.release]
 lto = true
