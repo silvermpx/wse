@@ -881,6 +881,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     ws_config.max_frame_size = Some(state.max_message_size);
     let ws_stream = match tokio_tungstenite::accept_hdr_async_with_config(
         stream,
+        #[allow(clippy::result_large_err)]
         move |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
             let cookies = req
                 .headers()
