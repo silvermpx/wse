@@ -2371,8 +2371,7 @@ async fn process_commands(
                             break;
                         }
                         if tokio::time::Instant::now() >= deadline {
-                            let remaining =
-                                drain_state.connection_count.load(Ordering::Relaxed);
+                            let remaining = drain_state.connection_count.load(Ordering::Relaxed);
                             tracing::warn!(
                                 "[WSE] Drain timeout: {remaining} connections remaining"
                             );
