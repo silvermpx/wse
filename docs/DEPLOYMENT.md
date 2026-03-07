@@ -300,6 +300,71 @@ With gossip discovery, each pod uses the first pod (`wse-0`) as a seed. The goss
 
 ---
 
+## Graceful Drain
+
+The `drain()` method enables zero-downtime deployments by sending a WebSocket Close frame to all connected clients and rejecting new connections.
+
+### Basic Usage
+
+```python
+server.drain(close_code=4300, close_reason="shutting down", timeout=10)
+```
+
+Clients receive close code 4300, which signals a server-initiated drain. Well-behaved clients reconnect to another instance. After `timeout` seconds, any remaining connections are force-closed.
+
+### Kubernetes preStop Hook
+
+Use `drain()` in a Kubernetes preStop hook to give clients time to reconnect before the pod is terminated:
+
+```python
+import signal
+
+def handle_sigterm(signum, frame):
+    server.drain(close_code=4300, close_reason="pod shutting down", timeout=10)
+    server.stop()
+
+signal.signal(signal.SIGTERM, handle_sigterm)
+```
+
+Configure the pod spec with sufficient `terminationGracePeriodSeconds` to cover the drain timeout:
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 30
+  containers:
+    - name: wse
+      lifecycle:
+        preStop:
+          exec:
+            command: ["kill", "-SIGTERM", "1"]
+```
+
+### Rolling Restarts
+
+For rolling deployments, the sequence per pod is:
+
+1. Kubernetes sends SIGTERM
+2. preStop hook calls `drain(timeout=10)` -- clients receive close code 4300 and reconnect to other pods
+3. Drain wait runs as a separate task; health checks and cluster protocol continue to work during the window
+4. After timeout, `server.stop()` cleans up remaining resources
+5. Kubernetes replaces the pod
+
+In cluster mode, the draining node notifies peers via `ClusterCommand::Drain`. Peers update their routing tables so new messages are not forwarded to the draining node.
+
+### Client Handling
+
+Configure clients to detect close code 4300 and reconnect immediately:
+
+```python
+# Python client -- automatic reconnect handles this by default
+async with connect("ws://host/wse", token="...") as client:
+    # On close code 4300, the client reconnects to the next endpoint in the pool
+    async for event in client:
+        process(event)
+```
+
+---
+
 ## Resource Sizing
 
 | Connections | RAM (approx) | CPU Cores | Recovery Budget |

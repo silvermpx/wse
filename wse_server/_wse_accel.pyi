@@ -338,6 +338,19 @@ class RustWSEServer:
     def stop(self) -> None:
         """Stop the server and close all connections."""
         ...
+    def drain(
+        self,
+        close_code: int = 4300,
+        close_reason: str = "",
+        timeout: int = 30,
+    ) -> None:
+        """Enter graceful drain mode (lame duck).
+
+        Stops accepting new connections, sends Close frame with custom code
+        to all clients, notifies cluster peers, and waits for clients to
+        disconnect or timeout. Call stop() after drain() to fully shut down.
+        """
+        ...
     def is_running(self) -> bool:
         """Return True if the server is running."""
         ...
@@ -419,6 +432,22 @@ class RustWSEServer:
         """Force-disconnect a connection."""
         ...
 
+    # -- Topic Authorization ---------------------------------------------------
+
+    def set_topic_acl(
+        self,
+        conn_id: str,
+        allow: list[str] | None = None,
+        deny: list[str] | None = None,
+    ) -> None:
+        """Set topic ACL for a connection programmatically.
+
+        allow: glob patterns (empty = allow all).
+        deny: glob patterns (deny takes precedence over allow).
+        JWT `wse_topics` claim sets ACL automatically during auth.
+        """
+        ...
+
     # -- Subscriptions --------------------------------------------------------
 
     def subscribe_connection(
@@ -426,8 +455,14 @@ class RustWSEServer:
         conn_id: str,
         topics: list[str],
         presence_data: dict[str, Any] | None = None,
+        queue_group: str | None = None,
     ) -> None:
-        """Subscribe a connection to topics. Optionally set initial presence data."""
+        """Subscribe a connection to topics. Optionally set initial presence data.
+
+        If queue_group is set, the connection joins a queue group instead of
+        receiving fan-out. Messages are round-robin distributed to one member
+        per group.
+        """
         ...
     def subscribe_with_recovery(
         self,
@@ -444,6 +479,9 @@ class RustWSEServer:
         ...
     def get_topic_subscriber_count(self, topic: str) -> int:
         """Number of connections subscribed to a topic."""
+        ...
+    def get_queue_group_info(self, topic: str) -> dict[str, int]:
+        """Get queue group info for a topic. Returns {group_name: member_count}."""
         ...
 
     # -- Presence -------------------------------------------------------------
@@ -483,6 +521,12 @@ class RustWSEServer:
 
     def health_snapshot(self) -> dict[str, Any]:
         """Full server health metrics: connections, queue, cluster, recovery, presence, uptime."""
+        ...
+    def cluster_info(self) -> list[dict[str, Any]]:
+        """List connected cluster peers with address, instance_id, capabilities, connected_at."""
+        ...
+    def reload_cluster_tls(self, cert_path: str, key_path: str, ca_path: str) -> None:
+        """Hot-reload cluster TLS certificates. New connections use updated certs."""
         ...
     def get_cluster_dlq_entries(self) -> list[dict[str, Any]]:
         """Drain and return dead-letter-queue entries from failed cluster sends."""

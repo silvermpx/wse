@@ -179,11 +179,133 @@ impl TopicRecoveryBuffer {
 }
 
 // ---------------------------------------------------------------------------
+// ForeignRecoveryBuffer -- stores messages from other cluster nodes
+// ---------------------------------------------------------------------------
+//
+// When a cluster peer publishes a message, it attaches its local (epoch, offset).
+// This buffer stores those messages keyed by the origin node's epoch so that a
+// client reconnecting to *this* node can recover using the original epoch/offset
+// even though the messages originated elsewhere.
+
+struct ForeignRecoveryBuffer {
+    entries: Box<[Option<RecoveryEntry>]>,
+    mask: u64,
+    head_offset: u64,
+    tail_offset: u64,
+    /// The originating node's epoch (not ours).
+    epoch: u32,
+    total_bytes: usize,
+    last_write: Instant,
+    initialized: bool,
+}
+
+impl ForeignRecoveryBuffer {
+    fn new(capacity_bits: u32, epoch: u32) -> Self {
+        let capacity = 1u64 << capacity_bits;
+        let mut entries = Vec::with_capacity(capacity as usize);
+        entries.resize_with(capacity as usize, || None);
+        Self {
+            entries: entries.into_boxed_slice(),
+            mask: capacity - 1,
+            head_offset: 0,
+            tail_offset: 0,
+            epoch,
+            total_bytes: 0,
+            last_write: Instant::now(),
+            initialized: false,
+        }
+    }
+
+    /// Insert at the origin node's offset. Handles gaps and out-of-order arrival.
+    fn push_at(&mut self, data: Bytes, origin_offset: u64) {
+        let capacity = self.mask + 1;
+
+        // First message sets the baseline (handles origin_offset = 0 correctly).
+        if !self.initialized {
+            self.tail_offset = origin_offset;
+            self.head_offset = origin_offset;
+            self.initialized = true;
+        }
+
+        // Skip if already stored (duplicate or behind tail).
+        if origin_offset < self.tail_offset {
+            return;
+        }
+
+        // Advance head if this is a new high-water mark.
+        if origin_offset >= self.head_offset {
+            // Cap eviction to one full buffer rotation to prevent DoS via extreme offset.
+            let new_tail = origin_offset.saturating_sub(capacity - 1);
+            while self.tail_offset < new_tail {
+                let evict_idx = (self.tail_offset & self.mask) as usize;
+                if let Some(old) = self.entries[evict_idx].take() {
+                    self.total_bytes -= old.data.len();
+                }
+                self.tail_offset += 1;
+            }
+            self.head_offset = origin_offset.saturating_add(1);
+        }
+
+        let idx = (origin_offset & self.mask) as usize;
+        let data_len = data.len();
+
+        // Evict any existing entry at this slot (shouldn't happen, but defensive).
+        if let Some(old) = self.entries[idx].take() {
+            self.total_bytes -= old.data.len();
+        }
+
+        self.entries[idx] = Some(RecoveryEntry {
+            data,
+            offset: origin_offset,
+        });
+        self.total_bytes += data_len;
+        self.last_write = Instant::now();
+    }
+
+    /// Recover messages after `after_offset`, same logic as TopicRecoveryBuffer.
+    fn recover_since(&self, after_offset: u64, max_messages: usize) -> Option<Vec<Bytes>> {
+        let start = match after_offset.checked_add(1) {
+            Some(s) => s,
+            None => return Some(Vec::new()),
+        };
+
+        if self.head_offset > self.tail_offset && start < self.tail_offset {
+            return None;
+        }
+        if start >= self.head_offset {
+            return Some(Vec::new());
+        }
+
+        let count = ((self.head_offset - start) as usize).min(max_messages);
+        let mut result = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let offset = start + i as u64;
+            let idx = (offset & self.mask) as usize;
+            if let Some(entry) = &self.entries[idx] {
+                if entry.offset == offset {
+                    result.push(entry.data.clone());
+                } else {
+                    // Gap in foreign buffer (missed cluster message) -- can't recover.
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+
+        Some(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RecoveryManager -- thread-safe manager for all topic buffers
 // ---------------------------------------------------------------------------
 
 pub(crate) struct RecoveryManager {
     buffers: DashMap<String, TopicRecoveryBuffer>,
+    /// Foreign buffers: keyed by "topic:epoch" to support multiple origin epochs.
+    foreign_buffers: DashMap<String, ForeignRecoveryBuffer>,
     config: RecoveryConfig,
     total_bytes: AtomicUsize,
 }
@@ -192,6 +314,7 @@ impl RecoveryManager {
     pub(crate) fn new(config: RecoveryConfig) -> Self {
         Self {
             buffers: DashMap::new(),
+            foreign_buffers: DashMap::new(),
             config,
             total_bytes: AtomicUsize::new(0),
         }
@@ -218,24 +341,115 @@ impl RecoveryManager {
             self.total_bytes
                 .fetch_add(new_bytes - old_bytes, Ordering::Relaxed);
         } else if old_bytes > new_bytes {
+            let _ = self
+                .total_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    Some(cur.saturating_sub(old_bytes - new_bytes))
+                });
+        }
+    }
+
+    /// Store a message received from a cluster peer in a foreign recovery buffer.
+    ///
+    /// The epoch and offset belong to the originating node. This lets clients
+    /// recover using the original epoch/offset from any node in the cluster.
+    pub(crate) fn push_foreign(
+        &self,
+        topic: &str,
+        data: Bytes,
+        origin_epoch: u32,
+        origin_offset: u64,
+    ) {
+        // Key: "topic\0epoch" -- null byte separator is safe (never in topic names).
+        let key = format!("{topic}\0{origin_epoch}");
+
+        let mut entry = self.foreign_buffers.entry(key).or_insert_with(|| {
+            ForeignRecoveryBuffer::new(self.config.buffer_size_bits, origin_epoch)
+        });
+
+        let buf = entry.value_mut();
+        let old_bytes = buf.total_bytes;
+        buf.push_at(data, origin_offset);
+        let new_bytes = buf.total_bytes;
+
+        if new_bytes > old_bytes {
             self.total_bytes
-                .fetch_sub(old_bytes - new_bytes, Ordering::Relaxed);
+                .fetch_add(new_bytes - old_bytes, Ordering::Relaxed);
+        } else if old_bytes > new_bytes {
+            let _ = self
+                .total_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    Some(cur.saturating_sub(old_bytes - new_bytes))
+                });
         }
     }
 
     /// Attempt to recover messages for a topic after a given offset.
     ///
-    /// Validates that the epoch matches the current buffer epoch. If the epoch
-    /// doesn't match (server restarted), returns `NotRecovered` with the current
-    /// position so the client can re-subscribe.
+    /// First checks the local buffer. If the epoch matches, recovers from local.
+    /// If the epoch doesn't match local, checks foreign buffers (cluster-replicated).
+    /// This allows clients to recover from any node, even after reconnecting to a
+    /// different node than the one that originally published the messages.
     pub(crate) fn recover(&self, topic: &str, epoch: u32, after_offset: u64) -> RecoveryResult {
-        let buf = match self.buffers.get(topic) {
-            Some(b) => b,
-            None => return RecoveryResult::NoHistory,
-        };
+        // Try local buffer first.
+        if let Some(buf) = self.buffers.get(topic)
+            && buf.epoch == epoch
+        {
+            return self.recover_from_local(&buf, after_offset);
+        }
 
-        // Epoch mismatch means the server restarted -- client must re-subscribe.
-        if buf.epoch != epoch {
+        // Epoch doesn't match local -- check foreign buffers.
+        let foreign_key = format!("{topic}\0{epoch}");
+        if let Some(fbuf) = self.foreign_buffers.get(&foreign_key)
+            && fbuf.epoch == epoch
+        {
+            // Early backlog check before recover_since to avoid wasted allocation
+            let available =
+                fbuf.head_offset
+                    .saturating_sub(after_offset.saturating_add(1)) as usize;
+            if available > self.config.max_recovery_messages {
+                return RecoveryResult::NotRecovered {
+                    epoch: fbuf.epoch,
+                    offset: fbuf.head_offset,
+                };
+            }
+            match fbuf.recover_since(after_offset, self.config.max_recovery_messages) {
+                Some(publications) => {
+                    let offset = fbuf.head_offset.saturating_sub(1);
+                    return RecoveryResult::Recovered {
+                        publications,
+                        epoch: fbuf.epoch,
+                        offset,
+                    };
+                }
+                None => {
+                    return RecoveryResult::NotRecovered {
+                        epoch: fbuf.epoch,
+                        offset: fbuf.head_offset,
+                    };
+                }
+            }
+        }
+
+        // No matching buffer found at all.
+        if let Some(buf) = self.buffers.get(topic) {
+            // Local buffer exists but with different epoch -- tell client to re-subscribe.
+            RecoveryResult::NotRecovered {
+                epoch: buf.epoch,
+                offset: buf.head_offset,
+            }
+        } else {
+            RecoveryResult::NoHistory
+        }
+    }
+
+    /// Internal: recover from a local TopicRecoveryBuffer (epoch already verified).
+    fn recover_from_local(&self, buf: &TopicRecoveryBuffer, after_offset: u64) -> RecoveryResult {
+        // Check backlog size BEFORE doing recovery work to avoid wasted computation
+        let available = buf
+            .head_offset
+            .saturating_sub(after_offset.saturating_add(1)) as usize;
+        if available > self.config.max_recovery_messages {
             return RecoveryResult::NotRecovered {
                 epoch: buf.epoch,
                 offset: buf.head_offset,
@@ -244,19 +458,6 @@ impl RecoveryManager {
 
         match buf.recover_since(after_offset, self.config.max_recovery_messages) {
             Some(publications) => {
-                // Check if recovery was truncated by the cap -- if so, the client
-                // is missing messages and should re-fetch from the application backend
-                // (matches Centrifugo's behavior for recovery_max_publication_limit).
-                let available = buf
-                    .head_offset
-                    .saturating_sub(after_offset.saturating_add(1))
-                    as usize;
-                if available > self.config.max_recovery_messages {
-                    return RecoveryResult::NotRecovered {
-                        epoch: buf.epoch,
-                        offset: buf.head_offset,
-                    };
-                }
                 let offset = buf.head_offset.saturating_sub(1);
                 RecoveryResult::Recovered {
                     publications,
@@ -283,11 +484,12 @@ impl RecoveryManager {
     /// First pass: remove any buffer whose `last_write` is older than the TTL.
     /// Second pass (if still over budget): collect remaining buffers sorted by
     /// `last_write` (oldest first) and remove them until under budget.
+    /// Both local and foreign buffers are cleaned up.
     pub(crate) fn cleanup(&self) {
         let ttl_cutoff =
             Instant::now() - std::time::Duration::from_secs(self.config.history_ttl_secs);
 
-        // First pass: remove TTL-expired buffers.
+        // First pass: remove TTL-expired local buffers.
         let mut to_remove = Vec::new();
         for entry in self.buffers.iter() {
             if entry.value().last_write < ttl_cutoff {
@@ -296,29 +498,74 @@ impl RecoveryManager {
         }
         for key in &to_remove {
             if let Some((_, removed)) = self.buffers.remove(key) {
-                self.total_bytes
-                    .fetch_sub(removed.total_bytes, Ordering::Relaxed);
+                let _ =
+                    self.total_bytes
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                            Some(cur.saturating_sub(removed.total_bytes))
+                        });
             }
         }
 
-        // Second pass: if still over budget, evict LRU until under budget.
+        // First pass: remove TTL-expired foreign buffers.
+        let mut foreign_to_remove = Vec::new();
+        for entry in self.foreign_buffers.iter() {
+            if entry.value().last_write < ttl_cutoff {
+                foreign_to_remove.push(entry.key().clone());
+            }
+        }
+        for key in &foreign_to_remove {
+            if let Some((_, removed)) = self.foreign_buffers.remove(key) {
+                let _ =
+                    self.total_bytes
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                            Some(cur.saturating_sub(removed.total_bytes))
+                        });
+            }
+        }
+
+        // Second pass: if still over budget, evict LRU across both local and foreign.
         if self.total_bytes.load(Ordering::Relaxed) > self.config.global_memory_budget {
-            let mut candidates: Vec<(String, Instant, usize)> = self
-                .buffers
-                .iter()
-                .map(|e| (e.key().clone(), e.value().last_write, e.value().total_bytes))
-                .collect();
+            // Collect candidates from both maps. Tag with 'L' (local) or 'F' (foreign).
+            let mut candidates: Vec<(String, Instant, usize, bool)> = Vec::new();
+
+            for e in self.buffers.iter() {
+                candidates.push((
+                    e.key().clone(),
+                    e.value().last_write,
+                    e.value().total_bytes,
+                    true, // is_local
+                ));
+            }
+            for e in self.foreign_buffers.iter() {
+                candidates.push((
+                    e.key().clone(),
+                    e.value().last_write,
+                    e.value().total_bytes,
+                    false, // is_foreign
+                ));
+            }
 
             // Sort by last_write ascending (oldest first).
-            candidates.sort_by_key(|(_, lw, _)| *lw);
+            candidates.sort_by_key(|(_, lw, _, _)| *lw);
 
-            for (topic, _, _) in candidates {
+            for (key, _, _, is_local) in candidates {
                 if self.total_bytes.load(Ordering::Relaxed) <= self.config.global_memory_budget {
                     break;
                 }
-                if let Some((_, removed)) = self.buffers.remove(&topic) {
-                    self.total_bytes
-                        .fetch_sub(removed.total_bytes, Ordering::Relaxed);
+                if is_local {
+                    if let Some((_, removed)) = self.buffers.remove(&key) {
+                        let _ = self.total_bytes.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |cur| Some(cur.saturating_sub(removed.total_bytes)),
+                        );
+                    }
+                } else if let Some((_, removed)) = self.foreign_buffers.remove(&key) {
+                    let _ = self.total_bytes.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |cur| Some(cur.saturating_sub(removed.total_bytes)),
+                    );
                 }
             }
         }
@@ -515,6 +762,179 @@ mod tests {
                 assert_eq!(&publications[1][..], b"msg19");
             }
             _ => panic!("expected Recovered when within cap"),
+        }
+    }
+
+    // --- ForeignRecoveryBuffer tests ---
+
+    #[test]
+    fn test_foreign_push_recover() {
+        let config = RecoveryConfig::default();
+        let mgr = RecoveryManager::new(config);
+
+        let foreign_epoch: u32 = 42;
+
+        // Simulate receiving 5 messages from a cluster peer.
+        for i in 0u64..5 {
+            mgr.push_foreign("topic1", make_data(&format!("fmsg{i}")), foreign_epoch, i);
+        }
+
+        // Recover using the foreign epoch -- should succeed.
+        match mgr.recover("topic1", foreign_epoch, 2) {
+            RecoveryResult::Recovered {
+                publications,
+                epoch,
+                offset,
+            } => {
+                assert_eq!(epoch, foreign_epoch);
+                assert_eq!(offset, 4); // head_offset - 1 = 5 - 1
+                assert_eq!(publications.len(), 2);
+                assert_eq!(&publications[0][..], b"fmsg3");
+                assert_eq!(&publications[1][..], b"fmsg4");
+            }
+            other => panic!(
+                "expected Recovered, got {:?}",
+                match other {
+                    RecoveryResult::NotRecovered { .. } => "NotRecovered",
+                    RecoveryResult::NoHistory => "NoHistory",
+                    _ => "unknown",
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn test_foreign_epoch_mismatch() {
+        let config = RecoveryConfig::default();
+        let mgr = RecoveryManager::new(config);
+
+        let foreign_epoch: u32 = 42;
+        mgr.push_foreign("topic1", make_data("data"), foreign_epoch, 0);
+
+        // Try to recover with wrong epoch -- no matching buffer.
+        let wrong_epoch = 99;
+        match mgr.recover("topic1", wrong_epoch, 0) {
+            RecoveryResult::NoHistory => {}
+            _ => panic!("expected NoHistory for unmatched foreign epoch"),
+        }
+    }
+
+    #[test]
+    fn test_foreign_buffer_eviction() {
+        let config = RecoveryConfig {
+            global_memory_budget: 20,
+            history_ttl_secs: 3600,
+            ..RecoveryConfig::default()
+        };
+        let mgr = RecoveryManager::new(config);
+
+        // Push local data (7 bytes).
+        mgr.push("t_local", make_data("aaaaaaa"));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // Push foreign data (7 bytes).
+        mgr.push_foreign("t_foreign", make_data("bbbbbbb"), 42, 0);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // Push more foreign data (7 bytes) -- total now 21, over budget of 20.
+        mgr.push_foreign("t_foreign2", make_data("ccccccc"), 43, 0);
+
+        assert!(mgr.total_bytes() > 20);
+
+        mgr.cleanup();
+
+        // After cleanup, should be at or under budget.
+        assert!(mgr.total_bytes() <= 20);
+    }
+
+    #[test]
+    fn test_foreign_ttl_cleanup() {
+        let config = RecoveryConfig {
+            history_ttl_secs: 0, // immediate expiry
+            ..RecoveryConfig::default()
+        };
+        let mgr = RecoveryManager::new(config);
+
+        mgr.push_foreign("topic1", make_data("data"), 42, 0);
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        mgr.cleanup();
+        assert_eq!(mgr.total_bytes(), 0);
+        assert_eq!(mgr.foreign_buffers.len(), 0);
+    }
+
+    #[test]
+    fn test_foreign_and_local_coexist() {
+        let config = RecoveryConfig::default();
+        let mgr = RecoveryManager::new(config);
+
+        // Local messages on topic1.
+        mgr.push("topic1", make_data("local0"));
+        mgr.push("topic1", make_data("local1"));
+        let (local_epoch, _) = mgr.get_position("topic1").unwrap();
+
+        // Foreign messages on same topic, different epoch.
+        let foreign_epoch: u32 = 77;
+        mgr.push_foreign("topic1", make_data("foreign0"), foreign_epoch, 0);
+        mgr.push_foreign("topic1", make_data("foreign1"), foreign_epoch, 1);
+
+        // Recover using local epoch.
+        match mgr.recover("topic1", local_epoch, 0) {
+            RecoveryResult::Recovered { publications, .. } => {
+                assert_eq!(publications.len(), 1);
+                assert_eq!(&publications[0][..], b"local1");
+            }
+            _ => panic!("expected Recovered from local buffer"),
+        }
+
+        // Recover using foreign epoch.
+        match mgr.recover("topic1", foreign_epoch, 0) {
+            RecoveryResult::Recovered { publications, .. } => {
+                assert_eq!(publications.len(), 1);
+                assert_eq!(&publications[0][..], b"foreign1");
+            }
+            _ => panic!("expected Recovered from foreign buffer"),
+        }
+    }
+
+    #[test]
+    fn test_foreign_buffer_overflow() {
+        let config = RecoveryConfig {
+            buffer_size_bits: 2, // 4 slots
+            ..RecoveryConfig::default()
+        };
+        let mgr = RecoveryManager::new(config);
+
+        let epoch: u32 = 50;
+        // Push 10 messages -- only last 4 should survive (offsets 6-9).
+        for i in 0u64..10 {
+            mgr.push_foreign("topic1", make_data(&format!("fm{i}")), epoch, i);
+        }
+
+        // Recovery from offset 4 (start=5, before tail=6) should fail.
+        match mgr.recover("topic1", epoch, 4) {
+            RecoveryResult::NotRecovered { .. } => {}
+            _ => panic!("expected NotRecovered for gap too large"),
+        }
+
+        // Recovery from offset 5 (start=6 = tail) should succeed with 4 messages.
+        match mgr.recover("topic1", epoch, 5) {
+            RecoveryResult::Recovered { publications, .. } => {
+                assert_eq!(publications.len(), 4);
+                assert_eq!(&publications[0][..], b"fm6");
+            }
+            _ => panic!("expected Recovered at boundary"),
+        }
+
+        // Recovery from offset 7 should get messages 8, 9.
+        match mgr.recover("topic1", epoch, 7) {
+            RecoveryResult::Recovered { publications, .. } => {
+                assert_eq!(publications.len(), 2);
+                assert_eq!(&publications[0][..], b"fm8");
+                assert_eq!(&publications[1][..], b"fm9");
+            }
+            _ => panic!("expected Recovered"),
         }
     }
 }

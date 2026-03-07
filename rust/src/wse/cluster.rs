@@ -53,13 +53,19 @@ pub(crate) const PROTOCOL_VERSION_MIN: u16 = 1;
 pub(crate) const CAP_INTEREST_ROUTING: u32 = 1 << 0; // Phase 2: SUB/UNSUB
 pub(crate) const CAP_COMPRESSION: u32 = 1 << 1; // Phase 6: zstd compression
 pub(crate) const CAP_PRESENCE: u32 = 1 << 2; // Presence sync
+pub(crate) const CAP_RECOVERY: u32 = 1 << 3; // Cross-node recovery
 
 /// Our capabilities bitmask
-pub(crate) const LOCAL_CAPABILITIES: u32 = CAP_INTEREST_ROUTING | CAP_COMPRESSION | CAP_PRESENCE;
+pub(crate) const LOCAL_CAPABILITIES: u32 =
+    CAP_INTEREST_ROUTING | CAP_COMPRESSION | CAP_PRESENCE | CAP_RECOVERY;
 
 // Per-frame flags (bit 0 of the flags byte in every frame header)
-// bit 0: compressed (zstd), bits 1-7: reserved
+// bit 0: compressed (zstd), bit 1: has recovery trailer, bits 2-7: reserved
 const FLAG_COMPRESSED: u8 = 0x01;
+const FLAG_HAS_RECOVERY: u8 = 0x02;
+
+/// Dispatch tuple: (topic, payload, optional origin recovery position).
+type DispatchItem = (String, Bytes, Option<(u32, u64)>);
 
 // Minimum payload size for compression to be worthwhile (bytes).
 // Below this threshold, zstd overhead exceeds savings.
@@ -148,6 +154,7 @@ pub(crate) enum MsgType {
     PeerList = 0x0A,
     PresenceUpdate = 0x0B,
     PresenceFull = 0x0C,
+    Drain = 0x0D,
 }
 
 impl MsgType {
@@ -165,6 +172,7 @@ impl MsgType {
             0x0A => Some(Self::PeerList),
             0x0B => Some(Self::PresenceUpdate),
             0x0C => Some(Self::PresenceFull),
+            0x0D => Some(Self::Drain),
             _ => None,
         }
     }
@@ -186,6 +194,8 @@ pub(crate) enum ClusterCommand {
         topic: String,
     },
     Shutdown,
+    /// Notify cluster peers that this node is entering drain mode.
+    Drain,
     /// Gossip a peer address to all connected peers (except the source).
     GossipPeerAnnounce {
         addr: String,
@@ -267,6 +277,15 @@ pub(crate) struct ClusterMetrics {
     pub reconnect_count: AtomicU64,
     pub connected_peers: AtomicU64,
     pub unknown_message_types: AtomicU64,
+    pub peer_info: DashMap<String, PeerInfo>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PeerInfo {
+    pub address: String,
+    pub instance_id: String,
+    pub capabilities: u32,
+    pub connected_at: u64,
 }
 
 impl ClusterMetrics {
@@ -280,6 +299,7 @@ impl ClusterMetrics {
             reconnect_count: AtomicU64::new(0),
             connected_peers: AtomicU64::new(0),
             unknown_message_types: AtomicU64::new(0),
+            peer_info: DashMap::new(),
         }
     }
 }
@@ -342,7 +362,7 @@ impl ClusterDlq {
 pub(crate) fn encode_msg(buf: &mut BytesMut, topic: &str, payload: &str) -> bool {
     let topic_bytes = topic.as_bytes();
     if topic_bytes.len() > u16::MAX as usize {
-        eprintln!(
+        tracing::warn!(
             "[WSE-Cluster] Topic too long ({} bytes, max {}), dropping message",
             topic_bytes.len(),
             u16::MAX
@@ -352,7 +372,7 @@ pub(crate) fn encode_msg(buf: &mut BytesMut, topic: &str, payload: &str) -> bool
     let payload_bytes = payload.as_bytes();
     let total_frame = 8 + topic_bytes.len() + payload_bytes.len();
     if total_frame > MAX_FRAME_SIZE {
-        eprintln!(
+        tracing::warn!(
             "[WSE-Cluster] Frame too large ({total_frame} bytes, max {MAX_FRAME_SIZE}), dropping message",
         );
         return false;
@@ -373,7 +393,7 @@ pub(crate) fn encode_msg(buf: &mut BytesMut, topic: &str, payload: &str) -> bool
 pub(crate) fn encode_msg_compressed(buf: &mut BytesMut, topic: &str, payload: &str) -> bool {
     let topic_bytes = topic.as_bytes();
     if topic_bytes.len() > u16::MAX as usize {
-        eprintln!(
+        tracing::warn!(
             "[WSE-Cluster] Topic too long ({} bytes, max {}), dropping message",
             topic_bytes.len(),
             u16::MAX
@@ -399,6 +419,61 @@ pub(crate) fn encode_msg_compressed(buf: &mut BytesMut, topic: &str, payload: &s
 
     // Fallback: uncompressed
     encode_msg(buf, topic, payload)
+}
+
+/// Encode a MSG frame with recovery trailer (origin epoch + offset).
+/// Optionally compresses the payload with zstd. The 12-byte recovery trailer
+/// is appended AFTER the payload (not included in payload_len).
+pub(crate) fn encode_msg_with_recovery(
+    buf: &mut BytesMut,
+    topic: &str,
+    payload: &str,
+    origin_epoch: u32,
+    origin_offset: u64,
+    compress: bool,
+) -> bool {
+    let topic_bytes = topic.as_bytes();
+    if topic_bytes.len() > u16::MAX as usize {
+        return false;
+    }
+    let payload_bytes = payload.as_bytes();
+
+    if compress
+        && payload_bytes.len() >= COMPRESSION_THRESHOLD
+        && let Ok(compressed) = zstd::bulk::compress(payload_bytes, 1)
+        && compressed.len() < payload_bytes.len()
+    {
+        let total = 8 + topic_bytes.len() + compressed.len() + 12; // +12 for recovery trailer
+        if total > MAX_FRAME_SIZE {
+            return false;
+        }
+        buf.reserve(total);
+        buf.put_u8(MsgType::Msg as u8);
+        buf.put_u8(FLAG_COMPRESSED | FLAG_HAS_RECOVERY);
+        buf.put_u16_le(topic_bytes.len() as u16);
+        buf.put_u32_le(compressed.len() as u32);
+        buf.put_slice(topic_bytes);
+        buf.put_slice(&compressed);
+        buf.put_u32_le(origin_epoch);
+        buf.put_u64_le(origin_offset);
+        return true;
+    }
+
+    // Uncompressed with recovery trailer
+    let total = 8 + topic_bytes.len() + payload_bytes.len() + 12;
+    if total > MAX_FRAME_SIZE {
+        return false;
+    }
+    buf.reserve(total);
+    buf.put_u8(MsgType::Msg as u8);
+    buf.put_u8(FLAG_HAS_RECOVERY);
+    buf.put_u16_le(topic_bytes.len() as u16);
+    buf.put_u32_le(payload_bytes.len() as u32);
+    buf.put_slice(topic_bytes);
+    buf.put_slice(payload_bytes);
+    buf.put_u32_le(origin_epoch);
+    buf.put_u64_le(origin_offset);
+    true
 }
 
 /// Encode a PING frame (header only, 8 bytes).
@@ -442,6 +517,16 @@ pub(crate) fn encode_hello(buf: &mut BytesMut, instance_id: &str, capabilities: 
 pub(crate) fn encode_shutdown(buf: &mut BytesMut) {
     buf.reserve(8);
     buf.put_u8(MsgType::Shutdown as u8);
+    buf.put_u8(0);
+    buf.put_u16_le(0);
+    buf.put_u32_le(0);
+}
+
+/// Encode a DRAIN frame. Header-only, 8 bytes (like Shutdown).
+/// Tells peers this node is entering lame-duck mode.
+pub(crate) fn encode_drain(buf: &mut BytesMut) {
+    buf.reserve(8);
+    buf.put_u8(MsgType::Drain as u8);
     buf.put_u8(0);
     buf.put_u16_le(0);
     buf.put_u32_le(0);
@@ -506,10 +591,12 @@ pub(crate) fn encode_resync(topics: &[String]) -> Vec<BytesMut> {
     let mut start = 0;
     while start < payload_bytes.len() {
         let remaining = payload_bytes.len() - start;
-        let chunk_end = if remaining <= MAX_FRAME_SIZE {
+        // Reserve 8 bytes for the wire header to stay under MAX_FRAME_SIZE on the wire
+        let chunk_limit = MAX_FRAME_SIZE - 8;
+        let chunk_end = if remaining <= chunk_limit {
             payload_bytes.len()
         } else {
-            let window_end = start + MAX_FRAME_SIZE;
+            let window_end = start + chunk_limit;
             match payload_bytes[start..window_end]
                 .iter()
                 .rposition(|&b| b == b'\n')
@@ -534,7 +621,7 @@ pub(crate) fn encode_resync(topics: &[String]) -> Vec<BytesMut> {
 pub(crate) fn encode_peer_announce(buf: &mut BytesMut, addr: &str) {
     let addr_bytes = addr.as_bytes();
     if addr_bytes.len() > u16::MAX as usize {
-        eprintln!(
+        tracing::warn!(
             "[WSE-Cluster] Peer address too long ({} bytes), dropping announce",
             addr_bytes.len()
         );
@@ -608,7 +695,7 @@ pub(crate) fn encode_presence_full(buf: &mut BytesMut, entries_json: &str) -> bo
     let payload_bytes = entries_json.as_bytes();
     let total_frame = 8 + payload_bytes.len();
     if total_frame > MAX_FRAME_SIZE {
-        eprintln!(
+        tracing::warn!(
             "[WSE-Cluster] PresenceFull frame too large ({total_frame} bytes, max {MAX_FRAME_SIZE}), dropping",
         );
         return false;
@@ -643,6 +730,8 @@ pub(crate) enum ClusterFrame {
     Msg {
         topic: String,
         payload: Bytes,
+        /// Origin node's recovery position (epoch, offset) for cross-node recovery.
+        recovery: Option<(u32, u64)>,
     },
     Ping,
     Pong,
@@ -678,6 +767,8 @@ pub(crate) enum ClusterFrame {
     PresenceFull {
         entries: String,
     },
+    /// Graceful drain: this node is shutting down, migrate connections.
+    Drain,
     Unknown {
         msg_type: u8,
     },
@@ -706,7 +797,7 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                 let decompressed = match zstd::bulk::decompress(&compressed, MAX_FRAME_SIZE) {
                     Ok(d) => d,
                     Err(e) => {
-                        eprintln!(
+                        tracing::warn!(
                             "[WSE-Cluster] Decompression failed ({payload_len} bytes compressed): {e}"
                         );
                         return None;
@@ -716,7 +807,22 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             } else {
                 data.split_to(payload_len).freeze() // zero-copy: BytesMut -> Bytes
             };
-            Some(ClusterFrame::Msg { topic, payload })
+            // Parse optional recovery trailer (12 bytes: u32 epoch + u64 offset)
+            let recovery = if flags & FLAG_HAS_RECOVERY != 0 {
+                if data.remaining() < 12 {
+                    return None; // malformed: flag set but recovery trailer missing
+                }
+                let epoch = data.get_u32_le();
+                let offset = data.get_u64_le();
+                Some((epoch, offset))
+            } else {
+                None
+            };
+            Some(ClusterFrame::Msg {
+                topic,
+                payload,
+                recovery,
+            })
         }
         Some(MsgType::Ping) => Some(ClusterFrame::Ping),
         Some(MsgType::Pong) => Some(ClusterFrame::Pong),
@@ -732,7 +838,7 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             let version = data.get_u16_le();
             let id_len = data.get_u16_le() as usize;
             if id_len > 256 {
-                eprintln!(
+                tracing::warn!(
                     "[WSE-Cluster] Instance ID too long: {} bytes, max 256",
                     id_len
                 );
@@ -750,6 +856,7 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             })
         }
         Some(MsgType::Shutdown) => Some(ClusterFrame::Shutdown),
+        Some(MsgType::Drain) => Some(ClusterFrame::Drain),
         Some(MsgType::Sub) => {
             if data.remaining() < topic_len {
                 return None;
@@ -939,7 +1046,7 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
     peer_write_tx: mpsc::Sender<Bytes>,
     peer_addr: String,
     interest_tx: mpsc::UnboundedSender<InterestUpdate>,
-    dispatch_tx: mpsc::UnboundedSender<(String, Bytes)>,
+    dispatch_tx: mpsc::UnboundedSender<DispatchItem>,
     cancel: CancellationToken,
     metrics: Arc<ClusterMetrics>,
     last_activity: Arc<AtomicU64>,
@@ -964,7 +1071,7 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
 
         let frame_len = u32::from_be_bytes(len_buf) as usize;
         if frame_len == 0 || frame_len > MAX_FRAME_SIZE {
-            eprintln!("[WSE-Cluster] Invalid frame size: {frame_len}, disconnecting");
+            tracing::warn!("[WSE-Cluster] Invalid frame size: {frame_len}, disconnecting");
             break;
         }
 
@@ -984,9 +1091,13 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
 
         // Decode and dispatch
         match decode_frame(frame_buf) {
-            Some(ClusterFrame::Msg { topic, payload }) => {
+            Some(ClusterFrame::Msg {
+                topic,
+                payload,
+                recovery,
+            }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
-                let _ = dispatch_tx.send((topic, payload));
+                let _ = dispatch_tx.send((topic, payload, recovery));
             }
             Some(ClusterFrame::Ping) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
@@ -998,8 +1109,12 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
             }
             Some(ClusterFrame::Shutdown) => {
-                eprintln!("[WSE-Cluster] Peer sent SHUTDOWN");
+                tracing::info!("[WSE-Cluster] Peer sent SHUTDOWN");
                 break;
+            }
+            Some(ClusterFrame::Drain) => {
+                tracing::info!("[WSE-Cluster] Peer entering drain mode (lame duck)");
+                // Peer is draining; log but keep connection open for final messages
             }
             Some(ClusterFrame::Hello { .. }) => {
                 // Unexpected HELLO after handshake, ignore
@@ -1009,7 +1124,9 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
                 metrics
                     .unknown_message_types
                     .fetch_add(1, Ordering::Relaxed);
-                eprintln!("[WSE-Cluster] Unknown message type 0x{msg_type:02x}, skipping frame");
+                tracing::warn!(
+                    "[WSE-Cluster] Unknown message type 0x{msg_type:02x}, skipping frame"
+                );
             }
             Some(ClusterFrame::Sub { topic }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
@@ -1074,7 +1191,7 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
                 let _ = presence_tx.send(PresencePeerFrame::Full { entries });
             }
             None => {
-                eprintln!("[WSE-Cluster] Failed to decode frame, disconnecting");
+                tracing::error!("[WSE-Cluster] Failed to decode frame, disconnecting");
                 break;
             }
         }
@@ -1087,16 +1204,20 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
 // Decouples TCP reads from RwLock acquisition on the connections map.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn peer_dispatch_task(
-    mut dispatch_rx: mpsc::UnboundedReceiver<(String, Bytes)>,
+    mut dispatch_rx: mpsc::UnboundedReceiver<DispatchItem>,
     topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
     glob_topic_count: Arc<AtomicUsize>,
     metrics: Arc<ClusterMetrics>,
     cancel: CancellationToken,
     max_outbound: usize,
     slow_drops: Arc<AtomicU64>,
+    recovery: Option<Arc<super::recovery::RecoveryManager>>,
+    topic_message_counts: Arc<DashMap<String, AtomicU64>>,
+    queue_groups: Arc<DashMap<String, DashMap<String, super::server::QueueGroup>>>,
 ) {
-    let mut batch: Vec<(String, Bytes)> = Vec::with_capacity(64);
+    let mut batch: Vec<DispatchItem> = Vec::with_capacity(64);
 
     loop {
         // Wait for first message (blocking)
@@ -1119,8 +1240,14 @@ async fn peer_dispatch_task(
         let mut total_delivered = 0u64;
         let mut total_dropped = 0u64;
 
-        for (topic, payload) in batch.drain(..) {
+        for (topic, payload, rec) in batch.drain(..) {
             let preframed = super::server::encode_ws_frame(0x01, &payload);
+
+            // Store in foreign recovery buffer before fan-out (cross-node recovery)
+            if let (Some(rm), Some((epoch, offset))) = (&recovery, rec) {
+                rm.push_foreign(&topic, preframed.clone(), epoch, offset);
+            }
+
             let (d, f) = super::server::fanout_topic_direct(
                 &topic_subscribers,
                 &topic,
@@ -1131,6 +1258,53 @@ async fn peer_dispatch_task(
             );
             total_delivered += d;
             total_dropped += f;
+
+            // Track per-topic message count for Prometheus top-N metrics
+            topic_message_counts
+                .entry(topic.clone())
+                .or_insert_with(|| AtomicU64::new(0))
+                .fetch_add(1, Ordering::Relaxed);
+
+            // Cross-cluster queue group dispatch: round-robin to one member per group
+            if let Some(topic_groups) = queue_groups.get(&topic) {
+                for mut group_entry in topic_groups.iter_mut() {
+                    let group = group_entry.value_mut();
+                    let len = group.members.len();
+                    if len == 0 {
+                        continue;
+                    }
+                    let base = group.next.fetch_add(1, Ordering::Relaxed);
+                    let data_len = preframed.len();
+                    let mut delivered = false;
+                    for attempt in 0..len {
+                        let idx = (base + attempt) % len;
+                        let (_, ref h) = group.members[idx];
+                        if h.tx.is_closed() {
+                            continue;
+                        }
+                        if max_outbound > 0 && h.pending.load(Ordering::Relaxed) >= max_outbound {
+                            slow_drops.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        h.pending.fetch_add(data_len, Ordering::Relaxed);
+                        let was_empty = {
+                            let mut buf = h.broadcast_buf.lock();
+                            let empty = buf.is_empty();
+                            buf.extend_from_slice(&preframed);
+                            empty
+                        };
+                        if was_empty {
+                            h.broadcast_notify.notify_one();
+                        }
+                        delivered = true;
+                        total_delivered += 1;
+                        break;
+                    }
+                    if !delivered {
+                        total_dropped += 1;
+                    }
+                }
+            }
         }
 
         metrics.add_delivered(total_delivered);
@@ -1157,7 +1331,7 @@ async fn heartbeat_task(
                 // Check if peer is dead (no activity for HEARTBEAT_TIMEOUT_SECS)
                 let last = last_activity.load(Ordering::Relaxed);
                 if epoch_ms().saturating_sub(last) > timeout_ms {
-                    eprintln!("[WSE-Cluster] Peer heartbeat timeout ({}s no activity)", timeout_ms / 1000);
+                    tracing::warn!("[WSE-Cluster] Peer heartbeat timeout ({}s no activity)", timeout_ms / 1000);
                     cancel.cancel();
                     break;
                 }
@@ -1211,6 +1385,9 @@ async fn run_peer_session<R, W>(
     presence: &Option<Arc<super::presence::PresenceManager>>,
     max_outbound: usize,
     slow_drops: &Arc<AtomicU64>,
+    recovery: &Option<Arc<super::recovery::RecoveryManager>>,
+    topic_message_counts: &Arc<DashMap<String, AtomicU64>>,
+    queue_groups: &Arc<DashMap<String, DashMap<String, super::server::QueueGroup>>>,
 ) -> (bool, u32)
 where
     R: AsyncReadExt + Unpin + Send + 'static,
@@ -1223,15 +1400,7 @@ where
     write_framed(&mut frame, &hello_buf);
     if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
         breaker.record_failure();
-        let delay = backoff.next_delay();
-        eprintln!(
-            "[WSE-Cluster] Failed to send HELLO to {peer_addr}. Retry in {:.1}s",
-            delay.as_secs_f64()
-        );
-        tokio::select! {
-            () = tokio::time::sleep(delay) => {}
-            () = global_cancel.cancelled() => return (true, 0),
-        }
+        tracing::warn!("[WSE-Cluster] Failed to send HELLO to {peer_addr}");
         return (false, 0);
     }
 
@@ -1265,26 +1434,16 @@ where
                 negotiate_capabilities(LOCAL_CAPABILITIES, capabilities),
             ),
             None => {
-                eprintln!(
+                tracing::warn!(
                     "[WSE-Cluster] Version mismatch with {peer_addr}: local={PROTOCOL_VERSION}, remote={protocol_version}"
                 );
                 breaker.record_failure();
-                let delay = backoff.next_delay();
-                tokio::select! {
-                    () = tokio::time::sleep(delay) => {}
-                    () = global_cancel.cancelled() => return (true, 0),
-                }
                 return (false, 0);
             }
         },
         _ => {
-            eprintln!("[WSE-Cluster] Invalid HELLO from {peer_addr}");
+            tracing::warn!("[WSE-Cluster] Invalid HELLO from {peer_addr}");
             breaker.record_failure();
-            let delay = backoff.next_delay();
-            tokio::select! {
-                () = tokio::time::sleep(delay) => {}
-                () = global_cancel.cancelled() => return (true, 0),
-            }
             return (false, 0);
         }
     };
@@ -1295,10 +1454,12 @@ where
         use dashmap::mapref::entry::Entry;
         match connected_instances.entry(peer_instance_id.clone()) {
             Entry::Occupied(_) => {
-                eprintln!(
+                tracing::info!(
                     "[WSE-Cluster] Already connected to instance {}, dropping duplicate from {peer_addr}",
                     peer_instance_id
                 );
+                // Record failure so peer_connection_task backs off instead of spinning
+                breaker.record_failure();
                 return (false, peer_caps);
             }
             Entry::Vacant(e) => {
@@ -1308,10 +1469,21 @@ where
     }
 
     // Connected successfully
-    eprintln!("[WSE-Cluster] Connected to {peer_addr} (v{_peer_version}, caps=0x{peer_caps:08x})");
+    tracing::info!(
+        "[WSE-Cluster] Connected to {peer_addr} (v{_peer_version}, caps=0x{peer_caps:08x})"
+    );
     breaker.record_success();
     backoff.reset();
     metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
+    metrics.peer_info.insert(
+        peer_addr.to_owned(),
+        PeerInfo {
+            address: peer_addr.to_owned(),
+            instance_id: peer_instance_id.clone(),
+            capabilities: peer_caps,
+            connected_at: epoch_ms(),
+        },
+    );
 
     // Send RESYNC with all current local topics (before spawning writer task)
     {
@@ -1328,9 +1500,10 @@ where
                 write_framed(&mut wire_buf, frame);
             }
             if writer.write_all(&wire_buf).await.is_err() || writer.flush().await.is_err() {
-                eprintln!("[WSE-Cluster] Failed to send RESYNC to {peer_addr}");
+                tracing::warn!("[WSE-Cluster] Failed to send RESYNC to {peer_addr}");
                 connected_instances.remove(&peer_instance_id);
                 metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
+                metrics.peer_info.remove(peer_addr);
                 return (false, peer_caps); // Will reconnect
             }
         }
@@ -1370,7 +1543,7 @@ where
                 let mut frame = BytesMut::new();
                 write_framed(&mut frame, &buf);
                 if let Err(e) = writer.write_all(&frame).await {
-                    eprintln!("[WSE-Cluster] Failed to send PresenceFull: {e}");
+                    tracing::warn!("[WSE-Cluster] Failed to send PresenceFull: {e}");
                 }
                 let _ = writer.flush().await;
             }
@@ -1389,7 +1562,7 @@ where
         metrics.clone(),
     ));
 
-    let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<(String, Bytes)>();
+    let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<DispatchItem>();
 
     let dispatch_handle = tokio::spawn(peer_dispatch_task(
         dispatch_rx,
@@ -1399,6 +1572,9 @@ where
         peer_cancel.clone(),
         max_outbound,
         slow_drops.clone(),
+        recovery.clone(),
+        topic_message_counts.clone(),
+        queue_groups.clone(),
     ));
 
     let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -1436,7 +1612,9 @@ where
 
         match data {
             Some(frame_data) => {
-                let _ = peer_write_tx.try_send(frame_data);
+                if peer_write_tx.try_send(frame_data).is_err() {
+                    metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                }
             }
             None => {
                 // Manager channel closed (shutdown)
@@ -1453,12 +1631,13 @@ where
     let _ = dispatch_handle.await;
     let _ = heartbeat_handle.await;
     metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
+    metrics.peer_info.remove(peer_addr);
     connected_instances.remove(&peer_instance_id);
     let _ = interest_tx.send(InterestUpdate::PeerDisconnected {
         peer_addr: peer_addr.to_owned(),
         generation: session_gen,
     });
-    eprintln!("[WSE-Cluster] Disconnected from {peer_addr}");
+    tracing::info!("[WSE-Cluster] Disconnected from {peer_addr}");
 
     (global_cancel.is_cancelled(), peer_caps)
 }
@@ -1475,7 +1654,7 @@ async fn peer_connection_task(
     metrics: Arc<ClusterMetrics>,
     global_cancel: CancellationToken,
     local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    tls_config: Option<ClusterTlsConfig>,
+    tls_config: Option<Arc<arc_swap::ArcSwap<ClusterTlsConfig>>>,
     new_peer_tx: mpsc::UnboundedSender<String>,
     cmd_tx: mpsc::UnboundedSender<ClusterCommand>,
     cluster_addr: Option<String>,
@@ -1486,6 +1665,9 @@ async fn peer_connection_task(
     peer_reg_tx: mpsc::UnboundedSender<PeerRegistration>,
     max_outbound: usize,
     slow_drops: Arc<AtomicU64>,
+    recovery: Option<Arc<super::recovery::RecoveryManager>>,
+    topic_message_counts: Arc<DashMap<String, AtomicU64>>,
+    queue_groups: Arc<DashMap<String, DashMap<String, super::server::QueueGroup>>>,
 ) {
     let mut backoff = ExponentialBackoff::new();
     let mut breaker = CircuitBreaker::new();
@@ -1502,7 +1684,7 @@ async fn peer_connection_task(
         // Circuit breaker check
         if !breaker.can_execute() {
             let delay = breaker.reset_timeout;
-            eprintln!(
+            tracing::warn!(
                 "[WSE-Cluster] Circuit open for {peer_addr}, waiting {:.0}s",
                 delay.as_secs_f64()
             );
@@ -1524,7 +1706,7 @@ async fn peer_connection_task(
                 breaker.record_failure();
                 metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
                 let delay = backoff.next_delay();
-                eprintln!(
+                tracing::warn!(
                     "[WSE-Cluster] Connect failed {peer_addr}: {e}. Retry in {:.1}s",
                     delay.as_secs_f64()
                 );
@@ -1537,7 +1719,7 @@ async fn peer_connection_task(
                 breaker.record_failure();
                 metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
                 let delay = backoff.next_delay();
-                eprintln!(
+                tracing::warn!(
                     "[WSE-Cluster] Connect timeout {peer_addr}. Retry in {:.1}s",
                     delay.as_secs_f64()
                 );
@@ -1558,8 +1740,11 @@ async fn peer_connection_task(
         let _ = sock_ref.set_recv_buffer_size(262_144);
         let _ = sock_ref.set_send_buffer_size(262_144);
 
-        // TLS handshake or plaintext split, then run session
-        let result = if let Some(ref tls) = tls_config {
+        // TLS handshake or plaintext split, then run session.
+        // Load current TLS config snapshot -- safe even if a reload swaps the
+        // config mid-flight because TlsAcceptor/TlsConnector internally use Arc.
+        let tls_snap = tls_config.as_ref().map(|holder| holder.load());
+        let result = if let Some(ref tls) = tls_snap {
             // Extract hostname/IP from peer_addr for SNI
             let host = peer_addr.split(':').next().unwrap_or(&peer_addr);
             let server_name = match host.parse::<std::net::IpAddr>() {
@@ -1569,7 +1754,7 @@ async fn peer_connection_task(
                     Err(e) => {
                         breaker.record_failure();
                         let delay = backoff.next_delay();
-                        eprintln!(
+                        tracing::error!(
                             "[WSE-Cluster] Invalid peer address for TLS SNI '{host}': {e}. Retry in {:.1}s",
                             delay.as_secs_f64()
                         );
@@ -1612,6 +1797,9 @@ async fn peer_connection_task(
                         &presence,
                         max_outbound,
                         &slow_drops,
+                        &recovery,
+                        &topic_message_counts,
+                        &queue_groups,
                     )
                     .await
                 }
@@ -1619,7 +1807,7 @@ async fn peer_connection_task(
                     breaker.record_failure();
                     metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
                     let delay = backoff.next_delay();
-                    eprintln!(
+                    tracing::warn!(
                         "[WSE-Cluster] TLS handshake failed {peer_addr}: {e}. Retry in {:.1}s",
                         delay.as_secs_f64()
                     );
@@ -1632,7 +1820,7 @@ async fn peer_connection_task(
                     breaker.record_failure();
                     metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
                     let delay = backoff.next_delay();
-                    eprintln!(
+                    tracing::warn!(
                         "[WSE-Cluster] TLS handshake timeout {peer_addr}. Retry in {:.1}s",
                         delay.as_secs_f64()
                     );
@@ -1669,6 +1857,9 @@ async fn peer_connection_task(
                 &presence,
                 max_outbound,
                 &slow_drops,
+                &recovery,
+                &topic_message_counts,
+                &queue_groups,
             )
             .await
         };
@@ -1690,7 +1881,7 @@ async fn peer_connection_task(
         // Reconnect
         metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
         let delay = backoff.next_delay();
-        eprintln!(
+        tracing::info!(
             "[WSE-Cluster] Reconnecting to {peer_addr} in {:.1}s",
             delay.as_secs_f64()
         );
@@ -1715,7 +1906,7 @@ struct PeerSpawnCtx {
     metrics: Arc<ClusterMetrics>,
     global_cancel: CancellationToken,
     local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    tls_config: Option<ClusterTlsConfig>,
+    tls_config: Option<Arc<arc_swap::ArcSwap<ClusterTlsConfig>>>,
     new_peer_tx: mpsc::UnboundedSender<String>,
     gossip_cmd_tx: mpsc::UnboundedSender<ClusterCommand>,
     cluster_addr: Option<String>,
@@ -1726,6 +1917,9 @@ struct PeerSpawnCtx {
     peer_reg_tx: mpsc::UnboundedSender<PeerRegistration>,
     max_outbound: usize,
     slow_drops: Arc<AtomicU64>,
+    recovery: Option<Arc<super::recovery::RecoveryManager>>,
+    topic_message_counts: Arc<DashMap<String, AtomicU64>>,
+    queue_groups: Arc<DashMap<String, DashMap<String, super::server::QueueGroup>>>,
 }
 
 impl PeerSpawnCtx {
@@ -1756,6 +1950,9 @@ impl PeerSpawnCtx {
             self.peer_reg_tx.clone(),
             self.max_outbound,
             self.slow_drops.clone(),
+            self.recovery.clone(),
+            self.topic_message_counts.clone(),
+            self.queue_groups.clone(),
         ))
     }
 }
@@ -1773,13 +1970,16 @@ pub(crate) async fn cluster_manager(
     metrics: Arc<ClusterMetrics>,
     dlq: Arc<std::sync::Mutex<ClusterDlq>>,
     local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    tls_config: Option<ClusterTlsConfig>,
+    tls_config: Option<Arc<arc_swap::ArcSwap<ClusterTlsConfig>>>,
     cluster_port: Option<u16>,
     cluster_addr: Option<String>,
     presence: Option<Arc<super::presence::PresenceManager>>,
     server_cmd_tx: Option<mpsc::UnboundedSender<super::server::ServerCommand>>,
     max_outbound: usize,
     slow_drops: Arc<AtomicU64>,
+    recovery: Option<Arc<super::recovery::RecoveryManager>>,
+    topic_message_counts: Arc<DashMap<String, AtomicU64>>,
+    queue_groups: Arc<DashMap<String, DashMap<String, super::server::QueueGroup>>>,
 ) {
     let global_cancel = CancellationToken::new();
 
@@ -1831,6 +2031,9 @@ pub(crate) async fn cluster_manager(
         peer_reg_tx: peer_reg_tx.clone(),
         max_outbound,
         slow_drops: slow_drops.clone(),
+        recovery: recovery.clone(),
+        topic_message_counts: topic_message_counts.clone(),
+        queue_groups: queue_groups.clone(),
     };
 
     for peer_addr in &peers {
@@ -1859,7 +2062,7 @@ pub(crate) async fn cluster_manager(
         let bind_addr = format!("0.0.0.0:{}", port);
         match tokio::net::TcpListener::bind(&bind_addr).await {
             Ok(cluster_listener) => {
-                eprintln!("[WSE-Cluster] Cluster listener on {bind_addr}");
+                tracing::info!("[WSE-Cluster] Cluster listener on {bind_addr}");
                 let tls_cfg = tls_config.clone();
                 let inst_id = instance_id.clone();
                 let int_tx = interest_tx.clone();
@@ -1879,6 +2082,9 @@ pub(crate) async fn cluster_manager(
                 let ppres = presence.clone();
                 let mo = max_outbound;
                 let sd = slow_drops.clone();
+                let rec = recovery.clone();
+                let tmc = topic_message_counts.clone();
+                let qg = queue_groups.clone();
                 let conn_semaphore =
                     Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_CLUSTER_CONNS));
                 tokio::spawn(async move {
@@ -1890,7 +2096,7 @@ pub(crate) async fn cluster_manager(
                                         let permit = match conn_semaphore.clone().try_acquire_owned() {
                                             Ok(permit) => permit,
                                             Err(_) => {
-                                                eprintln!("[WSE-Cluster] Max inbound connections reached, rejecting {addr}");
+                                                tracing::warn!("[WSE-Cluster] Max inbound connections reached, rejecting {addr}");
                                                 drop(stream);
                                                 continue;
                                             }
@@ -1918,12 +2124,17 @@ pub(crate) async fn cluster_manager(
                                         let ppres2 = ppres.clone();
                                         let mo2 = mo;
                                         let sd2 = sd.clone();
+                                        let rec2 = rec.clone();
+                                        let tmc2 = tmc.clone();
+                                        let qg2 = qg.clone();
                                         tokio::spawn(async move {
                                             let _permit = permit; // held until task completes
-                                            if let Some(ref tls) = tls {
+                                            // Load current TLS config snapshot for this handshake
+                                            let tls_snap = tls.as_ref().map(|holder| holder.load());
+                                            if let Some(ref tls_cfg) = tls_snap {
                                                 match tokio::time::timeout(
                                                     Duration::from_secs(5),
-                                                    tls.acceptor.accept(stream),
+                                                    tls_cfg.acceptor.accept(stream),
                                                 ).await {
                                                     Ok(Ok(tls_stream)) => {
                                                         handle_cluster_inbound_generic(
@@ -1931,14 +2142,15 @@ pub(crate) async fn cluster_manager(
                                                             int_tx2, conns2, subs2, gtc2, met2, lrc2,
                                                             npt2, gct2, ci2, prt2, gc2,
                                                             ca2, kp2, pptx2, ppres2,
-                                                            mo2, sd2,
+                                                            mo2, sd2, rec2,
+                                                            tmc2, qg2,
                                                         ).await;
                                                     }
                                                     Ok(Err(e)) => {
-                                                        eprintln!("[WSE-Cluster] TLS accept failed from {addr}: {e}");
+                                                        tracing::warn!("[WSE-Cluster] TLS accept failed from {addr}: {e}");
                                                     }
                                                     Err(_) => {
-                                                        eprintln!("[WSE-Cluster] TLS accept timeout from {addr}");
+                                                        tracing::warn!("[WSE-Cluster] TLS accept timeout from {addr}");
                                                     }
                                                 }
                                             } else {
@@ -1947,13 +2159,14 @@ pub(crate) async fn cluster_manager(
                                                     int_tx2, conns2, subs2, gtc2, met2, lrc2,
                                                     npt2, gct2, ci2, prt2, gc2,
                                                     ca2, kp2, pptx2, ppres2,
-                                                    mo2, sd2,
+                                                    mo2, sd2, rec2,
+                                                    tmc2, qg2,
                                                 ).await;
                                             }
                                         });
                                     }
                                     Err(e) => {
-                                        eprintln!("[WSE-Cluster] Cluster accept error: {e}");
+                                        tracing::error!("[WSE-Cluster] Cluster accept error: {e}");
                                     }
                                 }
                             }
@@ -1963,12 +2176,14 @@ pub(crate) async fn cluster_manager(
                 });
             }
             Err(e) => {
-                eprintln!("[WSE-Cluster] Failed to bind cluster listener on {bind_addr}: {e}");
+                tracing::error!(
+                    "[WSE-Cluster] Failed to bind cluster listener on {bind_addr}: {e}"
+                );
             }
         }
     }
 
-    eprintln!(
+    tracing::info!(
         "[WSE-Cluster] Manager started, {} peers configured",
         peers.len()
     );
@@ -1979,17 +2194,38 @@ pub(crate) async fn cluster_manager(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(ClusterCommand::Publish { topic, payload }) => {
-                        // Pre-encode both compressed and uncompressed frames.
-                        // Send compressed only to peers that negotiated CAP_COMPRESSION.
+                        // Get origin recovery position for cross-node recovery
+                        let rec_pos = recovery.as_ref().and_then(|rm| rm.get_position(&topic));
+
+                        // Pre-encode frames: with/without recovery, with/without compression
+                        let recovery_compressed = if let Some((epoch, offset)) = rec_pos {
+                            let mut buf = BytesMut::new();
+                            if encode_msg_with_recovery(&mut buf, &topic, &payload, epoch, offset, true) {
+                                Some(buf.freeze())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let recovery_plain = if let Some((epoch, offset)) = rec_pos {
+                            let mut buf = BytesMut::new();
+                            if encode_msg_with_recovery(&mut buf, &topic, &payload, epoch, offset, false) {
+                                Some(buf.freeze())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
                         let mut compressed_data = BytesMut::new();
                         let has_compressed = encode_msg_compressed(&mut compressed_data, &topic, &payload);
                         let compressed_bytes = if has_compressed { Some(compressed_data.freeze()) } else { None };
 
-                        // Uncompressed fallback for peers without CAP_COMPRESSION
                         let mut plain_data = BytesMut::new();
                         if !encode_msg(&mut plain_data, &topic, &payload) {
-                            // Topic too long (>64KB) -- drop, don't send empty frame
-                            eprintln!(
+                            tracing::warn!(
                                 "[WSE-Cluster] Dropping publish: topic too long ({} bytes)",
                                 topic.len()
                             );
@@ -2009,7 +2245,13 @@ pub(crate) async fn cluster_manager(
                                 None => true, // No RESYNC yet -> safe default: send to all
                             };
                             if interested {
-                                let frame = if caps & CAP_COMPRESSION != 0 {
+                                let frame = if caps & CAP_RECOVERY != 0 {
+                                    if caps & CAP_COMPRESSION != 0 {
+                                        recovery_compressed.as_ref().unwrap_or(&plain_bytes).clone()
+                                    } else {
+                                        recovery_plain.as_ref().unwrap_or(&plain_bytes).clone()
+                                    }
+                                } else if caps & CAP_COMPRESSION != 0 {
                                     compressed_bytes.as_ref().unwrap_or(&plain_bytes).clone()
                                 } else {
                                     plain_bytes.clone()
@@ -2020,7 +2262,7 @@ pub(crate) async fn cluster_manager(
                                     }
                                     Err(mpsc::error::TrySendError::Full(_)) => {
                                         metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                                        eprintln!("[WSE-Cluster] Peer {peer_addr} backpressure, dropping message");
+                                        tracing::warn!("[WSE-Cluster] Peer {peer_addr} backpressure, dropping message");
                                     }
                                     Err(mpsc::error::TrySendError::Closed(_)) => {
                                         metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
@@ -2070,7 +2312,7 @@ pub(crate) async fn cluster_manager(
                                     match tx.try_send(frame_bytes.clone()) {
                                         Ok(()) => {}
                                         Err(mpsc::error::TrySendError::Full(_)) => {
-                                            eprintln!("[WSE-Cluster] Peer {peer_addr} backpressure, dropping presence update");
+                                            tracing::warn!("[WSE-Cluster] Peer {peer_addr} backpressure, dropping presence update");
                                         }
                                         Err(mpsc::error::TrySendError::Closed(_)) => {
                                             if let Ok(mut dlq_guard) = dlq.lock() {
@@ -2087,14 +2329,25 @@ pub(crate) async fn cluster_manager(
                             }
                         }
                     }
+                    Some(ClusterCommand::Drain) => {
+                        tracing::info!("[WSE-Cluster] Sending DRAIN to all peers");
+                        let mut drain_data = BytesMut::new();
+                        encode_drain(&mut drain_data);
+                        let drain_bytes = drain_data.freeze();
+                        for (peer_addr, tx, _) in &peer_txs {
+                            if tx.try_send(drain_bytes.clone()).is_err() {
+                                tracing::warn!("[WSE-Cluster] Could not send DRAIN to {peer_addr}");
+                            }
+                        }
+                    }
                     Some(ClusterCommand::Shutdown) | None => {
-                        eprintln!("[WSE-Cluster] Manager shutting down");
+                        tracing::info!("[WSE-Cluster] Manager shutting down");
                         let mut shutdown_data = BytesMut::new();
                         encode_shutdown(&mut shutdown_data);
                         let shutdown_bytes = shutdown_data.freeze();
                         for (peer_addr, tx, _) in &peer_txs {
                             if tx.try_send(shutdown_bytes.clone()).is_err() {
-                                eprintln!("[WSE-Cluster] Could not send SHUTDOWN to {peer_addr}");
+                                tracing::warn!("[WSE-Cluster] Could not send SHUTDOWN to {peer_addr}");
                             }
                         }
                         global_cancel.cancel();
@@ -2106,25 +2359,27 @@ pub(crate) async fn cluster_manager(
             Some(new_addr) = new_peer_rx.recv() => {
                 // Validate address parses as a valid SocketAddr to prevent SSRF
                 if new_addr.parse::<std::net::SocketAddr>().is_err() {
-                    eprintln!("[WSE-Cluster] Ignoring invalid peer address from gossip: {new_addr}");
+                    tracing::debug!("[WSE-Cluster] Ignoring invalid peer address from gossip: {new_addr}");
                     continue;
                 }
                 // Skip if we already know this peer or it's our own address
                 let is_self = cluster_addr.as_deref() == Some(&new_addr);
                 let already_known = !known_peers.insert(new_addr.clone());
-                if !is_self && !already_known && !peer_txs.iter().any(|(a, _, _)| a == &new_addr) {
-                    // Prune dead peer channels so they don't count toward capacity
+                if !is_self && !already_known {
+                    // Prune dead peer channels FIRST so closed entries don't block re-connection
                     peer_txs.retain(|(_, tx, _)| !tx.is_closed());
-                    if peer_txs.len() >= MAX_CLUSTER_PEERS {
-                        eprintln!(
-                            "[WSE-Cluster] Ignoring discovered peer {new_addr}: at capacity ({MAX_CLUSTER_PEERS} peers)"
-                        );
-                    } else {
-                        let (tx, rx) = mpsc::channel::<Bytes>(10_000);
-                        peer_txs.push((new_addr.clone(), tx, LOCAL_CAPABILITIES));
-                        peer_handles.push(spawn_ctx.spawn(new_addr.clone(), rx));
-                        prune_handles(&mut peer_handles);
-                        eprintln!("[WSE-Cluster] Discovered new peer: {new_addr}");
+                    if !peer_txs.iter().any(|(a, _, _)| a == &new_addr) {
+                        if peer_txs.len() >= MAX_CLUSTER_PEERS {
+                            tracing::warn!(
+                                "[WSE-Cluster] Ignoring discovered peer {new_addr}: at capacity ({MAX_CLUSTER_PEERS} peers)"
+                            );
+                        } else {
+                            let (tx, rx) = mpsc::channel::<Bytes>(10_000);
+                            peer_txs.push((new_addr.clone(), tx, LOCAL_CAPABILITIES));
+                            peer_handles.push(spawn_ctx.spawn(new_addr.clone(), rx));
+                            prune_handles(&mut peer_handles);
+                            tracing::info!("[WSE-Cluster] Discovered new peer: {new_addr}");
+                        }
                     }
                 }
             }
@@ -2133,7 +2388,7 @@ pub(crate) async fn cluster_manager(
                 if let ClusterCommand::GossipPeerAnnounce { addr, exclude_peer } = gossip_cmd {
                     // Validate address before processing
                     if addr.parse::<std::net::SocketAddr>().is_err() {
-                        eprintln!("[WSE-Cluster] Ignoring invalid gossip address: {addr}");
+                        tracing::debug!("[WSE-Cluster] Ignoring invalid gossip address: {addr}");
                         continue;
                     }
                     let is_self = cluster_addr.as_deref() == Some(&addr);
@@ -2159,7 +2414,7 @@ pub(crate) async fn cluster_manager(
                     {
                         peer_txs.retain(|(_, tx, _)| !tx.is_closed());
                         if peer_txs.len() >= MAX_CLUSTER_PEERS {
-                            eprintln!(
+                            tracing::warn!(
                                 "[WSE-Cluster] Ignoring gossip peer {addr}: at capacity ({MAX_CLUSTER_PEERS} peers)"
                             );
                         } else {
@@ -2167,7 +2422,7 @@ pub(crate) async fn cluster_manager(
                             peer_txs.push((addr.clone(), tx, LOCAL_CAPABILITIES));
                             peer_handles.push(spawn_ctx.spawn(addr.clone(), rx));
                             prune_handles(&mut peer_handles);
-                            eprintln!("[WSE-Cluster] Discovered peer via gossip: {addr}");
+                            tracing::info!("[WSE-Cluster] Discovered peer via gossip: {addr}");
                         }
                     }
                 }
@@ -2219,7 +2474,7 @@ pub(crate) async fn cluster_manager(
                         // Add inbound peer's write channel so it receives Publish/Sub/Unsub
                         if !peer_txs.iter().any(|(a, _, _)| a == &peer_addr) {
                             peer_txs.push((peer_addr.clone(), write_tx, negotiated_caps));
-                            eprintln!("[WSE-Cluster] Registered inbound peer: {peer_addr} (caps=0x{negotiated_caps:08x})");
+                            tracing::info!("[WSE-Cluster] Registered inbound peer: {peer_addr} (caps=0x{negotiated_caps:08x})");
                         }
                     }
                     PeerRegistration::Deregister { peer_addr } => {
@@ -2296,7 +2551,7 @@ pub(crate) async fn cluster_manager(
         // Prune dead peer channels (receiver dropped = peer task exited)
         peer_txs.retain(|(addr, tx, _)| {
             if tx.is_closed() {
-                eprintln!("[WSE-Cluster] Pruning dead peer channel: {addr}");
+                tracing::debug!("[WSE-Cluster] Pruning dead peer channel: {addr}");
                 false
             } else {
                 true
@@ -2308,7 +2563,7 @@ pub(crate) async fn cluster_manager(
     for handle in peer_handles {
         let _ = handle.await;
     }
-    eprintln!("[WSE-Cluster] Manager stopped");
+    tracing::info!("[WSE-Cluster] Manager stopped");
 }
 
 // ---------------------------------------------------------------------------
@@ -2338,6 +2593,9 @@ async fn handle_cluster_inbound_generic<S>(
     presence: Option<Arc<super::presence::PresenceManager>>,
     max_outbound: usize,
     slow_drops: Arc<AtomicU64>,
+    recovery: Option<Arc<super::recovery::RecoveryManager>>,
+    topic_message_counts: Arc<DashMap<String, AtomicU64>>,
+    queue_groups: Arc<DashMap<String, DashMap<String, super::server::QueueGroup>>>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -2373,14 +2631,14 @@ async fn handle_cluster_inbound_generic<S>(
                 negotiate_capabilities(LOCAL_CAPABILITIES, capabilities),
             ),
             None => {
-                eprintln!(
+                tracing::warn!(
                     "[WSE-Cluster] Version mismatch with inbound {addr}: local={PROTOCOL_VERSION}, remote={protocol_version}"
                 );
                 return;
             }
         },
         _ => {
-            eprintln!("[WSE-Cluster] Invalid HELLO from inbound {addr}");
+            tracing::warn!("[WSE-Cluster] Invalid HELLO from inbound {addr}");
             return;
         }
     };
@@ -2390,7 +2648,7 @@ async fn handle_cluster_inbound_generic<S>(
         use dashmap::mapref::entry::Entry;
         match connected_instances.entry(peer_instance_id.clone()) {
             Entry::Occupied(_) => {
-                eprintln!(
+                tracing::info!(
                     "[WSE-Cluster] Already connected to instance {}, rejecting inbound from {addr}",
                     peer_instance_id
                 );
@@ -2408,7 +2666,7 @@ async fn handle_cluster_inbound_generic<S>(
     let mut frame = BytesMut::new();
     write_framed(&mut frame, &hello_buf);
     if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
-        eprintln!("[WSE-Cluster] Failed to send HELLO to inbound {addr}");
+        tracing::error!("[WSE-Cluster] Failed to send HELLO to inbound {addr}");
         connected_instances.remove(&peer_instance_id);
         return;
     }
@@ -2428,7 +2686,7 @@ async fn handle_cluster_inbound_generic<S>(
                 write_framed(&mut wire_buf, frame);
             }
             if writer.write_all(&wire_buf).await.is_err() || writer.flush().await.is_err() {
-                eprintln!("[WSE-Cluster] Failed to send RESYNC to inbound {addr}");
+                tracing::warn!("[WSE-Cluster] Failed to send RESYNC to inbound {addr}");
                 connected_instances.remove(&peer_instance_id);
                 return;
             }
@@ -2469,18 +2727,29 @@ async fn handle_cluster_inbound_generic<S>(
                 let mut frame = BytesMut::new();
                 write_framed(&mut frame, &buf);
                 if let Err(e) = writer.write_all(&frame).await {
-                    eprintln!("[WSE-Cluster] Failed to send PresenceFull to inbound {addr}: {e}");
+                    tracing::warn!(
+                        "[WSE-Cluster] Failed to send PresenceFull to inbound {addr}: {e}"
+                    );
                 }
                 let _ = writer.flush().await;
             }
         }
     }
 
-    eprintln!(
+    tracing::info!(
         "[WSE-Cluster] Accepted inbound peer from {addr} (v{_peer_version}, caps=0x{peer_caps:08x})"
     );
     let peer_addr_str = addr.to_string();
     metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
+    metrics.peer_info.insert(
+        peer_addr_str.clone(),
+        PeerInfo {
+            address: peer_addr_str.clone(),
+            instance_id: peer_instance_id.clone(),
+            capabilities: peer_caps,
+            connected_at: epoch_ms(),
+        },
+    );
 
     let cancel = global_cancel.child_token();
     let (write_tx, write_rx) = mpsc::channel::<Bytes>(10_000);
@@ -2501,7 +2770,7 @@ async fn handle_cluster_inbound_generic<S>(
         metrics.clone(),
     ));
 
-    let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<(String, Bytes)>();
+    let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<DispatchItem>();
 
     let dispatch_handle = tokio::spawn(peer_dispatch_task(
         dispatch_rx,
@@ -2511,6 +2780,9 @@ async fn handle_cluster_inbound_generic<S>(
         cancel.clone(),
         max_outbound,
         slow_drops,
+        recovery,
+        topic_message_counts,
+        queue_groups,
     ));
 
     let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -2555,12 +2827,13 @@ async fn handle_cluster_inbound_generic<S>(
         peer_addr: peer_addr_str.clone(),
     });
     connected_instances.remove(&peer_instance_id);
+    metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
+    metrics.peer_info.remove(&peer_addr_str);
     let _ = interest_tx.send(InterestUpdate::PeerDisconnected {
         peer_addr: peer_addr_str,
         generation: session_gen,
     });
-    metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
-    eprintln!("[WSE-Cluster] Inbound peer {addr} disconnected");
+    tracing::info!("[WSE-Cluster] Inbound peer {addr} disconnected");
 }
 
 /// Legacy inbound handler: used when cluster connections arrive on the main port (no separate cluster listener).
@@ -2579,7 +2852,7 @@ pub(crate) async fn handle_cluster_inbound(
     {
         Some(id) => id,
         None => {
-            eprintln!("[WSE-Cluster] Rejected inbound from {addr}: cluster not configured");
+            tracing::warn!("[WSE-Cluster] Rejected inbound from {addr}: cluster not configured");
             return;
         }
     };
@@ -2598,7 +2871,10 @@ pub(crate) async fn handle_cluster_inbound(
     let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
     let (peer_reg_tx, _peer_reg_rx) = mpsc::unbounded_channel::<PeerRegistration>();
     let (presence_tx, _presence_rx) = mpsc::unbounded_channel::<PresencePeerFrame>();
-    // Shared across all legacy inbound calls so duplicate detection actually works
+    // Shared across all legacy inbound calls so duplicate detection actually works.
+    // Note: this static persists across server restarts within the same process, but entries
+    // are always cleaned up in handle_cluster_inbound_generic on disconnect.
+    // Legacy path is mutually exclusive with connect_cluster (which uses its own DashMap).
     static LEGACY_CONNECTED: std::sync::OnceLock<Arc<DashMap<String, String>>> =
         std::sync::OnceLock::new();
     let connected_instances = LEGACY_CONNECTED
@@ -2632,6 +2908,9 @@ pub(crate) async fn handle_cluster_inbound(
         shared.presence.clone(),
         shared.max_outbound_queue_bytes,
         Arc::clone(&shared.slow_consumer_drops),
+        shared.recovery.clone(),
+        shared.topic_message_counts.clone(),
+        shared.queue_groups.clone(),
     )
     .await;
 }
@@ -2654,6 +2933,7 @@ mod tests {
             ClusterFrame::Msg {
                 topic: "chat.general".into(),
                 payload: Bytes::from("hello world"),
+                recovery: None,
             }
         );
     }
@@ -2669,6 +2949,7 @@ mod tests {
             ClusterFrame::Msg {
                 topic: "chat".into(),
                 payload: Bytes::from("hello"),
+                recovery: None,
             }
         );
 
@@ -2687,6 +2968,7 @@ mod tests {
             ClusterFrame::Msg {
                 topic: "events.user".into(),
                 payload: Bytes::from(big_payload),
+                recovery: None,
             }
         );
     }
@@ -2703,6 +2985,7 @@ mod tests {
             ClusterFrame::Msg {
                 topic: "topic".into(),
                 payload: Bytes::from("payload"),
+                recovery: None,
             }
         );
     }
@@ -2781,6 +3064,7 @@ mod tests {
             ClusterFrame::Msg {
                 topic: "test".into(),
                 payload: Bytes::from(payload),
+                recovery: None,
             }
         );
     }
@@ -3006,6 +3290,7 @@ mod tests {
             ClusterFrame::Msg {
                 topic: "".into(),
                 payload: Bytes::from(""),
+                recovery: None,
             }
         );
     }
@@ -3022,6 +3307,7 @@ mod tests {
             ClusterFrame::Msg {
                 topic: topic.into(),
                 payload: Bytes::from(payload),
+                recovery: None,
             }
         );
     }
@@ -3126,6 +3412,7 @@ mod tests {
             ClusterFrame::Msg {
                 topic: "chat.general".into(),
                 payload: Bytes::from(r#"{"text":"hello"}"#),
+                recovery: None,
             }
         );
 
@@ -3691,5 +3978,277 @@ mod tests {
         assert_eq!(CAP_PRESENCE, 1 << 2);
         assert_ne!(CAP_PRESENCE, CAP_INTEREST_ROUTING);
         assert_ne!(CAP_PRESENCE, CAP_COMPRESSION);
+    }
+
+    #[test]
+    fn test_cap_recovery_flag() {
+        assert_ne!(LOCAL_CAPABILITIES & CAP_RECOVERY, 0);
+        assert_eq!(CAP_RECOVERY, 1 << 3);
+        assert_ne!(CAP_RECOVERY, CAP_INTEREST_ROUTING);
+        assert_ne!(CAP_RECOVERY, CAP_COMPRESSION);
+        assert_ne!(CAP_RECOVERY, CAP_PRESENCE);
+    }
+
+    #[test]
+    fn test_encode_decode_msg_with_recovery() {
+        let mut buf = BytesMut::new();
+        let epoch: u32 = 12345;
+        let offset: u64 = 67890;
+        encode_msg_with_recovery(
+            &mut buf,
+            "events.topic",
+            r#"{"data":"test"}"#,
+            epoch,
+            offset,
+            false,
+        );
+        let frame = decode_frame(buf).unwrap();
+        match frame {
+            ClusterFrame::Msg {
+                topic,
+                payload,
+                recovery,
+            } => {
+                assert_eq!(topic, "events.topic");
+                assert_eq!(&payload[..], br#"{"data":"test"}"#);
+                assert_eq!(recovery, Some((epoch, offset)));
+            }
+            _ => panic!("expected Msg frame"),
+        }
+    }
+
+    #[test]
+    fn test_msg_recovery_backward_compat() {
+        // Old-style MSG (no recovery flag) should decode with recovery: None
+        let mut buf = BytesMut::new();
+        encode_msg(&mut buf, "topic1", "payload");
+        let frame = decode_frame(buf).unwrap();
+        match frame {
+            ClusterFrame::Msg { recovery, .. } => {
+                assert_eq!(recovery, None);
+            }
+            _ => panic!("expected Msg frame"),
+        }
+    }
+
+    #[test]
+    fn test_msg_recovery_flag_with_compression() {
+        let mut buf = BytesMut::new();
+        let epoch: u32 = 999;
+        let offset: u64 = 42;
+        // Large enough payload to actually compress
+        let payload = "x".repeat(200);
+        let compressed = encode_msg_with_recovery(
+            &mut buf,
+            "big.topic",
+            &payload,
+            epoch,
+            offset,
+            true, // try compress
+        );
+
+        let frame = decode_frame(buf).unwrap();
+        match frame {
+            ClusterFrame::Msg {
+                topic,
+                payload: decoded_payload,
+                recovery,
+            } => {
+                assert_eq!(topic, "big.topic");
+                assert_eq!(recovery, Some((epoch, offset)));
+                if compressed {
+                    // If it actually compressed, payload should match after decode
+                    assert_eq!(decoded_payload.len(), payload.len());
+                }
+                assert_eq!(std::str::from_utf8(&decoded_payload).unwrap(), payload);
+            }
+            _ => panic!("expected Msg frame"),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_drain() {
+        let mut buf = BytesMut::new();
+        encode_drain(&mut buf);
+        let frame = decode_frame(buf).unwrap();
+        assert_eq!(frame, ClusterFrame::Drain);
+    }
+
+    #[test]
+    fn test_cluster_info_peer_info() {
+        let metrics = ClusterMetrics::new();
+
+        // Insert a peer
+        metrics.peer_info.insert(
+            "192.168.1.1:7006".to_string(),
+            PeerInfo {
+                address: "192.168.1.1:7006".to_string(),
+                instance_id: "node-abc-123".to_string(),
+                capabilities: 0x0F,
+                connected_at: 1700000000000,
+            },
+        );
+
+        assert_eq!(metrics.peer_info.len(), 1);
+        let entry = metrics.peer_info.get("192.168.1.1:7006").unwrap();
+        assert_eq!(entry.address, "192.168.1.1:7006");
+        assert_eq!(entry.instance_id, "node-abc-123");
+        assert_eq!(entry.capabilities, 0x0F);
+        assert_eq!(entry.connected_at, 1700000000000);
+        drop(entry);
+
+        // Insert a second peer
+        metrics.peer_info.insert(
+            "192.168.1.2:7007".to_string(),
+            PeerInfo {
+                address: "192.168.1.2:7007".to_string(),
+                instance_id: "node-def-456".to_string(),
+                capabilities: 0x1F,
+                connected_at: 1700000001000,
+            },
+        );
+        assert_eq!(metrics.peer_info.len(), 2);
+
+        // Remove the first peer
+        metrics.peer_info.remove("192.168.1.1:7006");
+        assert_eq!(metrics.peer_info.len(), 1);
+        assert!(metrics.peer_info.get("192.168.1.1:7006").is_none());
+        assert!(metrics.peer_info.get("192.168.1.2:7007").is_some());
+
+        // Remove the second peer
+        metrics.peer_info.remove("192.168.1.2:7007");
+        assert_eq!(metrics.peer_info.len(), 0);
+    }
+
+    #[test]
+    fn test_reload_cluster_tls() {
+        // Generate two independent CA/cert pairs to verify the swap
+        let (ca_pem1, cert_pem1, key_pem1) = generate_test_certs();
+        let (ca_pem2, cert_pem2, key_pem2) = generate_test_certs();
+
+        let dir = std::env::temp_dir().join(format!("wse_tls_reload_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write first set of certs
+        std::fs::write(dir.join("ca1.pem"), &ca_pem1).unwrap();
+        std::fs::write(dir.join("cert1.pem"), &cert_pem1).unwrap();
+        std::fs::write(dir.join("key1.pem"), &key_pem1).unwrap();
+
+        // Write second set of certs
+        std::fs::write(dir.join("ca2.pem"), &ca_pem2).unwrap();
+        std::fs::write(dir.join("cert2.pem"), &cert_pem2).unwrap();
+        std::fs::write(dir.join("key2.pem"), &key_pem2).unwrap();
+
+        // Build initial config and wrap in ArcSwap
+        let config1 = build_cluster_tls(
+            dir.join("cert1.pem").to_str().unwrap(),
+            dir.join("key1.pem").to_str().unwrap(),
+            dir.join("ca1.pem").to_str().unwrap(),
+        )
+        .expect("first build_cluster_tls failed");
+
+        let holder = Arc::new(arc_swap::ArcSwap::from_pointee(config1));
+
+        // Take a snapshot before reload
+        let snap_before = holder.load();
+
+        // Build new config and swap
+        let config2 = build_cluster_tls(
+            dir.join("cert2.pem").to_str().unwrap(),
+            dir.join("key2.pem").to_str().unwrap(),
+            dir.join("ca2.pem").to_str().unwrap(),
+        )
+        .expect("second build_cluster_tls failed");
+
+        holder.store(Arc::new(config2));
+
+        // Take a snapshot after reload
+        let snap_after = holder.load();
+
+        // The two snapshots must point to different allocations (different configs)
+        assert!(
+            !Arc::ptr_eq(&snap_before, &snap_after),
+            "ArcSwap should point to a new config after reload"
+        );
+
+        // The old snapshot is still valid (not dropped) -- proves in-flight
+        // handshakes using the old config won't be affected by the swap
+        drop(snap_before);
+        drop(snap_after);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cluster_queue_group_dispatch() {
+        use crate::wse::server::QueueGroup;
+        use bytes::BytesMut;
+        use parking_lot::Mutex;
+
+        // Create queue groups with 3 members
+        let queue_groups: Arc<DashMap<String, DashMap<String, QueueGroup>>> =
+            Arc::new(DashMap::new());
+
+        let mut members = Vec::new();
+        let mut _rxs = Vec::new();
+        for i in 0..3 {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let h = crate::wse::server::ConnectionHandle {
+                tx,
+                pending: Arc::new(AtomicUsize::new(0)),
+                broadcast_buf: Arc::new(Mutex::new(BytesMut::new())),
+                broadcast_notify: Arc::new(tokio::sync::Notify::new()),
+            };
+            members.push((format!("conn{i}"), h));
+            _rxs.push(rx);
+        }
+
+        let group = QueueGroup {
+            members,
+            next: AtomicUsize::new(0),
+        };
+        let inner: DashMap<String, QueueGroup> = DashMap::new();
+        inner.insert("workers".to_string(), group);
+        queue_groups.insert("tasks".to_string(), inner);
+
+        let preframed = crate::wse::server::encode_ws_frame(0x01, b"test-payload");
+
+        // Dispatch 6 messages using the same logic as peer_dispatch_task
+        for _ in 0..6 {
+            if let Some(topic_groups) = queue_groups.get("tasks") {
+                for mut group_entry in topic_groups.iter_mut() {
+                    let group = group_entry.value_mut();
+                    let len = group.members.len();
+                    let base = group.next.fetch_add(1, Ordering::Relaxed);
+                    let data_len = preframed.len();
+                    for attempt in 0..len {
+                        let idx = (base + attempt) % len;
+                        let (_, ref h) = group.members[idx];
+                        if h.tx.is_closed() {
+                            continue;
+                        }
+                        h.pending.fetch_add(data_len, Ordering::Relaxed);
+                        {
+                            let mut buf = h.broadcast_buf.lock();
+                            buf.extend_from_slice(&preframed);
+                        }
+                        h.broadcast_notify.notify_one();
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Each member should have received 2 messages (6 / 3 round-robin)
+        let tg = queue_groups.get("tasks").unwrap();
+        let g = tg.get("workers").unwrap();
+        for (id, h) in &g.members {
+            assert_eq!(
+                h.pending.load(Ordering::Relaxed),
+                preframed.len() * 2,
+                "{id} should have 2 messages"
+            );
+        }
     }
 }

@@ -181,7 +181,6 @@ fn decompress_and_parse(data: &[u8]) -> Option<serde_json::Value> {
     parse_text_frame(&decompressed)
 }
 
-
 /// Check if a parsed message is a PONG (server sends uppercase "PONG").
 pub fn is_pong(msg: &serde_json::Value) -> bool {
     msg.get("t")

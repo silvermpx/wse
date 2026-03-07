@@ -252,3 +252,35 @@ The writer task for each peer connection uses a drain loop: it blocks on the fir
 WSE clusters use a full-mesh topology. Every node maintains a direct TCP connection to every other node. This provides the lowest possible latency (single hop) and simplest routing (no forwarding, no leader election).
 
 Full mesh scales well for the target deployment size of 2 to 20 nodes. For larger clusters, interest-based routing significantly reduces per-node bandwidth by filtering messages at the source.
+
+## Topology API
+
+The `cluster_info()` method exposes the current cluster topology from the perspective of the local node:
+
+```python
+peers = server.cluster_info()
+# [
+#     {"address": "10.0.0.2:9999", "instance_id": "a1b2c3...", "connected": True},
+#     {"address": "10.0.0.3:9999", "instance_id": "d4e5f6...", "connected": True},
+# ]
+```
+
+Each entry contains:
+
+| Field | Description |
+|-------|-------------|
+| `address` | Peer's cluster address (host:port) |
+| `instance_id` | Unique identifier assigned at peer startup (UUID) |
+| `connected` | Whether the TCP connection to this peer is currently active |
+
+Use `cluster_info()` for monitoring dashboards, verifying that gossip discovery has converged, and debugging connectivity issues between nodes.
+
+## Drain Notification
+
+When a node initiates graceful drain via `drain()`, it sends a `ClusterCommand::Drain` notification to all connected peers before closing client connections. This allows peers to:
+
+1. Remove the draining node from their routing tables
+2. Stop forwarding new messages to the draining node
+3. Redirect interest-routed traffic to remaining nodes
+
+The drain notification is a best-effort signal. If the draining node loses connectivity before the notification is delivered, peers detect the failure through the standard heartbeat timeout (15s) and remove the node automatically.

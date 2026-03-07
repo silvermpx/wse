@@ -48,6 +48,7 @@ import subprocess
 import sys
 import time
 import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from wse_server._wse_accel import RustWSEServer, rust_jwt_encode
 
@@ -105,6 +106,29 @@ def generate_tls_certs():
 
     print(f"[battle-server] TLS certs generated in {TLS_CERT_DIR}")
     return srv_crt, srv_key, ca_crt
+
+
+def start_metrics_server(server, port: int):
+    """Start a tiny HTTP server that exposes Prometheus metrics."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = server.prometheus_metrics().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass  # silence request logs
+
+    httpd = HTTPServer(("0.0.0.0", port), Handler)
+    httpd.daemon_threads = True
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    print(f"[battle-server] Metrics on :{port}/metrics")
+    return httpd
 
 
 def drain_loop(server, stop_event: threading.Event):
@@ -210,6 +234,64 @@ def drain_loop(server, stop_event: threading.Event):
                                 response = {
                                     "t": "health_response",
                                     "p": health,
+                                }
+                                server.send_event(conn_id, response, 0)
+                            elif action == "subscribe_queue_group":
+                                topics = p.get("topics", [])
+                                group = p.get("queue_group", "default")
+                                if topics:
+                                    server.subscribe_connection(conn_id, topics, queue_group=group)
+                                response = {
+                                    "t": "queue_group_subscribed",
+                                    "p": {"topics": topics, "group": group},
+                                }
+                                server.send_event(conn_id, response, 0)
+                            elif action == "queue_group_info":
+                                topic = p.get("topic", "")
+                                info = server.get_queue_group_info(topic) if topic else {}
+                                response = {
+                                    "t": "queue_group_info_result",
+                                    "p": {"topic": topic, "groups": info},
+                                }
+                                server.send_event(conn_id, response, 0)
+                            elif action == "set_topic_acl":
+                                allow = p.get("allow")
+                                deny = p.get("deny")
+                                server.set_topic_acl(conn_id, allow=allow, deny=deny)
+                                response = {
+                                    "t": "acl_set",
+                                    "p": {"allow": allow, "deny": deny},
+                                }
+                                server.send_event(conn_id, response, 0)
+                            elif action == "start_drain":
+                                delay = p.get("delay", 0.5)
+                                def do_drain(d=delay):
+                                    time.sleep(d)
+                                    try:
+                                        server.drain(close_code=4300, close_reason="battle-drain-test", timeout=10)
+                                    except Exception:
+                                        pass
+                                threading.Thread(target=do_drain, daemon=True).start()
+                                response = {
+                                    "t": "drain_started",
+                                    "p": {"delay": delay},
+                                }
+                                server.send_event(conn_id, response, 0)
+                            elif action == "cluster_info":
+                                try:
+                                    info = server.cluster_info()
+                                except Exception:
+                                    info = []
+                                response = {
+                                    "t": "cluster_info_result",
+                                    "p": {"peers": info},
+                                }
+                                server.send_event(conn_id, response, 0)
+                            elif action == "prometheus":
+                                metrics = server.prometheus_metrics()
+                                response = {
+                                    "t": "prometheus_result",
+                                    "p": {"metrics": metrics},
                                 }
                                 server.send_event(conn_id, response, 0)
             else:
@@ -365,6 +447,9 @@ def main():
             print(f"[battle-server] TLS enabled (cert={args.tls_cert})")
         if args.cluster_port:
             print(f"[battle-server] Cluster port: {args.cluster_port}, addr: {args.cluster_addr}")
+
+    metrics_port = args.port + 1000
+    start_metrics_server(server, metrics_port)
 
     token = generate_token()
     print(f"[battle-server] JWT: {token}")

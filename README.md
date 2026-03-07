@@ -29,6 +29,9 @@ High-performance WebSocket server built in Rust with native clustering, E2E encr
 | **Compression** | zlib for client-facing messages above threshold (default 1024 bytes) |
 | **MessagePack** | Opt-in binary transport via `?format=msgpack`, roughly 2x faster serialization, 30% smaller |
 | **Message signing** | Selective HMAC-SHA256 signing for critical operations, nonce-based replay prevention |
+| **Queue groups** | Round-robin dispatch within named groups for load-balanced worker pools |
+| **Topic ACL** | Per-connection allow/deny glob patterns for topic access control |
+| **Graceful drain** | `drain()` sends Close frame to all clients, rejects new connections, notifies cluster peers |
 
 ### End-to-End Encryption
 
@@ -55,6 +58,7 @@ High-performance WebSocket server built in Rust with native clustering, E2E encr
 | **Circuit breaker** | 10 failures to open, 60s reset, 3 half-open probe calls |
 | **Dead letter queue** | 1000-entry ring buffer for failed cluster sends |
 | **Presence sync** | PresenceUpdate/PresenceFull frames, CRDT last-write-wins conflict resolution |
+| **Topology API** | `cluster_info()` returns connected peer list with address, instance_id, status |
 
 ### Presence Tracking
 
@@ -254,12 +258,33 @@ server.broadcast(topic, text)                    # Fan-out to topic subscribers 
 ```python
 server.subscribe_connection(conn_id, ["prices", "news"])              # Subscribe to topics
 server.subscribe_connection(conn_id, ["chat"], {"status": "online"})  # Subscribe with presence data
+server.subscribe_connection(conn_id, ["tasks"], queue_group="workers") # Subscribe with queue group (round-robin)
 server.unsubscribe_connection(conn_id, ["news"])                      # Unsubscribe from specific topics
 server.unsubscribe_connection(conn_id, None)                          # Unsubscribe from all topics
 server.get_topic_subscriber_count("prices")                           # Subscriber count for a topic
 ```
 
 Subscriptions are cleaned up automatically on disconnect. In cluster mode, interest changes are propagated to peers via SUB/UNSUB frames.
+
+**Queue groups**: connections in the same `queue_group` receive messages round-robin instead of fanout. Normal subscribers (no queue group) still receive all messages. Useful for distributing work across a pool of consumers.
+
+### Topic ACL
+
+Per-connection topic access control with glob pattern matching.
+
+```python
+# Allow only "user:*" topics, deny everything else
+server.set_topic_acl(conn_id, allow=["user:*"])
+
+# Allow "data:*" but deny "data:internal:*"
+server.set_topic_acl(conn_id, allow=["data:*"], deny=["data:internal:*"])
+
+# Must be called before subscribe_connection
+server.subscribe_connection(conn_id, ["data:prices"])   # allowed
+server.subscribe_connection(conn_id, ["data:internal:audit"])  # denied
+```
+
+Deny patterns take precedence over allow patterns. Supports `*` (any characters) and `?` (single character) wildcards. Applied at subscribe time.
 
 ### Presence Tracking
 
@@ -321,6 +346,7 @@ server.connect_cluster(
 
 server.cluster_connected()       # True if connected to at least one peer
 server.cluster_peers_count()     # Number of active peer connections
+server.cluster_info()            # List of connected peers (address, instance_id, connected)
 ```
 
 Nodes form a full TCP mesh automatically. The cluster protocol uses a custom binary frame format with an 8-byte header, 12 message types, and capability negotiation during handshake. Features:
@@ -368,10 +394,13 @@ health = server.health_snapshot()
 server.get_connection_count()        # Lock-free AtomicUsize read
 server.get_connections()             # List all connection IDs (snapshot)
 server.disconnect(conn_id)           # Force-disconnect a connection
+server.drain(close_code=4300, close_reason="shutting down", timeout=10)  # Graceful drain
 server.inbound_queue_depth()         # Events waiting to be drained
 server.inbound_dropped_count()       # Events dropped due to full queue
 server.get_cluster_dlq_entries()     # Retrieve failed cluster messages from dead letter queue
 ```
+
+`drain()` sends a WebSocket Close frame to all connected clients and rejects new connections. The drain wait runs as a separate task, so the command processor stays responsive. Use for zero-downtime deployments and rolling restarts.
 
 ---
 

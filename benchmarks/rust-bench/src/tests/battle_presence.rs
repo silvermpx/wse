@@ -34,8 +34,7 @@ impl CheckResult {
 }
 
 /// Read messages from a WsStream until deadline, looking for messages with
-/// a specific "t" type. Returns the count found. Handles the battle server
-/// flooding broadcast messages by using a hard deadline instead of per-message timeout.
+/// a specific "t" type. Returns the count found.
 async fn drain_for_type(ws: &mut WsStream, msg_type: &str, deadline_ms: u64) -> u32 {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_ms);
     let mut count = 0u32;
@@ -89,7 +88,9 @@ async fn drain_for_type_with_data(
 /// clean disconnect handling. Connects 5 clients with different user IDs,
 /// subscribes 3 with presence data, verifies join/leave/update events.
 ///
-/// Requires: python benchmarks/bench_battle_server.py (with presence_enabled)
+/// Requires: python benchmarks/bench_battle_server.py --mode standalone --no-publish
+/// (--no-publish avoids broadcast flood that would cause presence events to be
+/// dropped by outbound backpressure)
 pub async fn run(cli: &Cli) -> Vec<TierResult> {
     stats::print_header(
         "BATTLE TEST: Presence Tracking",
@@ -201,13 +202,26 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
     let mut query_members = 0usize;
     if let Some(parsed) = drain_for_type_with_data(&mut clients[0], "presence_result", 3000).await {
+        println!(
+            "    presence_result payload: {}",
+            serde_json::to_string(&parsed).unwrap_or_default()
+        );
         if let Some(members) = parsed
             .get("p")
             .and_then(|p| p.get("members"))
             .and_then(|m| m.as_object())
         {
             query_members = members.len();
+        } else if let Some(members) = parsed
+            .get("p")
+            .and_then(|p| p.get("members"))
+            .and_then(|m| m.as_array())
+        {
+            query_members = members.len();
+            println!("    NOTE: members is array, not object");
         }
+    } else {
+        println!("    WARNING: No presence_result response received");
     }
     checks.check(
         &format!("Presence query shows 3 members (got {})", query_members),

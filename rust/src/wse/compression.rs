@@ -15,6 +15,11 @@ use std::io::Write;
 /// * `level` - Compression level 1 (fastest) through 9 (smallest).
 #[pyfunction]
 pub fn rust_compress(py: Python, data: &[u8], level: i32) -> PyResult<Py<PyBytes>> {
+    if !(1..=9).contains(&level) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "compression level must be between 1 and 9",
+        ));
+    }
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level as u32));
     encoder.write_all(data).map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("compression write error: {e}"))

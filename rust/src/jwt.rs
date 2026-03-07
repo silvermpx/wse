@@ -503,6 +503,82 @@ fn json_value_to_py(py: Python<'_>, val: &serde_json::Value) -> Py<PyAny> {
 }
 
 // ---------------------------------------------------------------------------
+// TopicAcl -- per-connection topic authorization from JWT claims
+// ---------------------------------------------------------------------------
+
+/// Topic-level access control list extracted from JWT `wse_topics` claim.
+///
+/// Format in JWT: `{"wse_topics": {"allow": ["chat.*"], "deny": ["admin.*"]}}`
+///
+/// Rules:
+/// - Deny takes precedence over allow
+/// - Empty allow list = allow all (backward compatible)
+/// - Patterns use glob matching (*, ?)
+#[derive(Debug, Clone)]
+pub struct TopicAcl {
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+}
+
+impl TopicAcl {
+    /// Check if a topic is allowed by this ACL.
+    ///
+    /// Deny rules take precedence. Empty allow = allow all.
+    pub fn is_allowed(&self, topic: &str) -> bool {
+        // Check deny first (deny takes precedence)
+        for pattern in &self.deny {
+            if crate::wse::server::glob_match(pattern, topic) {
+                return false;
+            }
+        }
+
+        // Empty allow = allow all
+        if self.allow.is_empty() {
+            return true;
+        }
+
+        // Check allow patterns
+        for pattern in &self.allow {
+            if crate::wse::server::glob_match(pattern, topic) {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+/// Extract optional topic ACL from JWT claims.
+///
+/// Returns `None` if no `wse_topics` claim is present (backward compatible).
+pub fn extract_topic_acl(claims: &serde_json::Value) -> Option<TopicAcl> {
+    let topics = claims.get("wse_topics")?;
+    let obj = topics.as_object()?;
+
+    let allow = obj
+        .get("allow")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let deny = obj
+        .get("deny")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(TopicAcl { allow, deny })
+}
+
+// ---------------------------------------------------------------------------
 // Rust-level unit tests
 // ---------------------------------------------------------------------------
 
@@ -1221,5 +1297,93 @@ mod tests {
         };
         let result = jwt_decode(&token, &config);
         assert!(result.is_err());
+    }
+
+    // --- TopicAcl tests ---
+
+    #[test]
+    fn test_topic_acl_allow_only() {
+        let acl = TopicAcl {
+            allow: vec!["chat.*".to_string(), "events".to_string()],
+            deny: vec![],
+        };
+        assert!(acl.is_allowed("chat.general"));
+        assert!(acl.is_allowed("chat.private"));
+        assert!(acl.is_allowed("events"));
+        assert!(!acl.is_allowed("admin.settings"));
+        assert!(!acl.is_allowed("other.topic"));
+    }
+
+    #[test]
+    fn test_topic_acl_deny_precedence() {
+        let acl = TopicAcl {
+            allow: vec!["chat.*".to_string()],
+            deny: vec!["chat.secret".to_string()],
+        };
+        assert!(acl.is_allowed("chat.general"));
+        assert!(!acl.is_allowed("chat.secret"));
+    }
+
+    #[test]
+    fn test_topic_acl_empty_allow() {
+        // Empty allow = allow all (only deny filters)
+        let acl = TopicAcl {
+            allow: vec![],
+            deny: vec!["admin.*".to_string()],
+        };
+        assert!(acl.is_allowed("chat.general"));
+        assert!(acl.is_allowed("events"));
+        assert!(!acl.is_allowed("admin.settings"));
+    }
+
+    #[test]
+    fn test_topic_acl_glob_matching() {
+        let acl = TopicAcl {
+            allow: vec!["user.*.messages".to_string(), "broadcast".to_string()],
+            deny: vec![],
+        };
+        assert!(acl.is_allowed("user.123.messages"));
+        assert!(acl.is_allowed("user.abc.messages"));
+        assert!(acl.is_allowed("broadcast"));
+        assert!(!acl.is_allowed("user.123.settings"));
+    }
+
+    #[test]
+    fn test_extract_topic_acl_present() {
+        let claims = serde_json::json!({
+            "sub": "user1",
+            "wse_topics": {
+                "allow": ["chat.*", "events"],
+                "deny": ["admin.*"]
+            }
+        });
+        let acl = extract_topic_acl(&claims).unwrap();
+        assert_eq!(acl.allow, vec!["chat.*", "events"]);
+        assert_eq!(acl.deny, vec!["admin.*"]);
+    }
+
+    #[test]
+    fn test_extract_topic_acl_missing() {
+        let claims = serde_json::json!({"sub": "user1"});
+        assert!(extract_topic_acl(&claims).is_none());
+    }
+
+    #[test]
+    fn test_extract_topic_acl_partial() {
+        // Only allow, no deny
+        let claims = serde_json::json!({
+            "sub": "user1",
+            "wse_topics": {"allow": ["chat.*"]}
+        });
+        let acl = extract_topic_acl(&claims).unwrap();
+        assert_eq!(acl.allow, vec!["chat.*"]);
+        assert!(acl.deny.is_empty());
+    }
+
+    #[test]
+    fn test_no_acl_backward_compat() {
+        // No wse_topics claim = no ACL = extract returns None
+        let claims = serde_json::json!({"sub": "user1", "iss": "myapp"});
+        assert!(extract_topic_acl(&claims).is_none());
     }
 }

@@ -398,9 +398,14 @@ impl PresenceManager {
                         // Only remove if all connections are still dead
                         e.connections.iter().all(|c| !is_conn_alive(&c.conn_id))
                     }) {
-                    let count = entry.connections.len();
+                    // Only count connections whose tracking entry still exists.
+                    // untrack_conn_from_topic may have already removed some and
+                    // decremented num_connections for them -- avoid double-decrement.
+                    let mut count = 0usize;
                     for conn in &entry.connections {
-                        self.conn_user_id.remove(&conn.conn_id);
+                        if self.conn_user_id.remove(&conn.conn_id).is_some() {
+                            count += 1;
+                        }
                         self.conn_presence_topics.remove(&conn.conn_id);
                     }
                     count
@@ -462,7 +467,7 @@ impl PresenceManager {
         // Validate remote data size (same limit as local track)
         let data_str = data.to_string();
         if data_str.len() > self.max_data_size {
-            eprintln!(
+            tracing::warn!(
                 "[WSE-Presence] Rejecting oversized remote presence data ({} bytes, max {})",
                 data_str.len(),
                 self.max_data_size
@@ -476,7 +481,7 @@ impl PresenceManager {
             && !topic_map.contains_key(user_id)
             && topic_map.len() >= self.max_members
         {
-            eprintln!(
+            tracing::warn!(
                 "[WSE-Presence] Rejecting remote join for {user_id}: topic at capacity ({})",
                 self.max_members
             );
@@ -566,7 +571,7 @@ impl PresenceManager {
         // Validate remote data size (same limit as local track)
         let data_str = data.to_string();
         if data_str.len() > self.max_data_size {
-            eprintln!(
+            tracing::warn!(
                 "[WSE-Presence] Rejecting oversized remote presence update ({} bytes, max {})",
                 data_str.len(),
                 self.max_data_size
@@ -587,7 +592,7 @@ impl PresenceManager {
     pub fn merge_full_state(&self, entries_json: &str) {
         // Cap incoming full state to 10MB to prevent OOM
         if entries_json.len() > 10_000_000 {
-            eprintln!(
+            tracing::error!(
                 "[Presence] Full state too large ({} bytes, max 10MB), rejecting",
                 entries_json.len()
             );

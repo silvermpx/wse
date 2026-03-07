@@ -307,6 +307,55 @@ count = server.get_topic_subscriber_count("prices")
 
 Topic subscriptions are managed per-connection. When a connection disconnects, its subscriptions are automatically cleaned up. In cluster mode, subscription interest is propagated to peers so that `broadcast()` only forwards messages to nodes that have active subscribers.
 
+### Queue Groups
+
+Connections in the same queue group receive messages round-robin instead of fanout. Normal subscribers (no queue group) continue to receive all messages.
+
+```python
+# Three worker connections in the "processors" queue group
+server.subscribe_connection(worker_1, ["tasks"], queue_group="processors")
+server.subscribe_connection(worker_2, ["tasks"], queue_group="processors")
+server.subscribe_connection(worker_3, ["tasks"], queue_group="processors")
+
+# A monitoring connection (no queue group) still gets all messages
+server.subscribe_connection(monitor_conn, ["tasks"])
+
+# When a message is broadcast to "tasks":
+# - One of worker_1/worker_2/worker_3 receives it (round-robin)
+# - monitor_conn receives it (standard fanout)
+server.broadcast("tasks", '{"t":"task","p":{"id":"abc"}}')
+```
+
+Use queue groups when you need to distribute work across a pool of consumers. Each topic tracks its own set of queue groups independently, so the same connection can be in different groups for different topics.
+
+### Topic ACL
+
+Per-connection topic access control with glob pattern matching. Call `set_topic_acl` before `subscribe_connection` to enforce the rules.
+
+```python
+# Tenant isolation: connection can only access its own namespace
+server.set_topic_acl(conn_id, allow=["tenant:acme:*"])
+
+# Role-based access: allow data topics but block internal channels
+server.set_topic_acl(conn_id, allow=["data:*", "notifications:*"], deny=["data:internal:*"])
+
+# Must be called before subscribe
+server.subscribe_connection(conn_id, ["data:prices"])          # allowed
+server.subscribe_connection(conn_id, ["data:internal:audit"])  # denied (deny takes precedence)
+server.subscribe_connection(conn_id, ["admin:settings"])       # denied (not in allow list)
+```
+
+**Rules:**
+
+| Rule | Behavior |
+|------|----------|
+| No ACL set | All topics allowed (default) |
+| Allow only | Only matching topics permitted |
+| Deny only | Only matching topics blocked |
+| Allow + Deny | Must match allow AND not match deny |
+
+Patterns support `*` (any characters) and `?` (single character) wildcards. Deny always takes precedence over allow.
+
 ---
 
 ## 7. Presence Tracking
@@ -478,6 +527,18 @@ server.cluster_connected()      # bool - True if connected to at least one peer
 server.cluster_peers_count()    # int - number of active peer connections
 ```
 
+**Cluster topology:**
+
+```python
+peers = server.cluster_info()
+# [
+#     {"address": "10.0.0.2:9999", "instance_id": "a1b2c3...", "connected": True},
+#     {"address": "10.0.0.3:9999", "instance_id": "d4e5f6...", "connected": True},
+# ]
+```
+
+`cluster_info()` returns a list of connected peer entries. Each entry includes the peer's cluster address, its unique instance ID (assigned at startup), and connection status. Useful for monitoring dashboards and verifying that dynamic peer discovery is working correctly.
+
 ---
 
 ## 10. Health Monitoring
@@ -559,6 +620,26 @@ dlq = server.get_cluster_dlq_entries()
 ```
 
 `get_connection_count()` is lock-free and safe to call at high frequency (e.g., in health check endpoints). `get_connections()` takes a snapshot of all connection IDs and is slightly more expensive.
+
+### Graceful Drain
+
+Shut down the server without dropping in-flight messages. The `drain()` method sends a WebSocket Close frame to all connected clients and stops accepting new connections.
+
+```python
+server.drain(close_code=4300, close_reason="", timeout=30)
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `close_code` | 4300 | WebSocket close code sent to clients |
+| `close_reason` | `""` | Close reason string |
+| `timeout` | 30 | Seconds to wait for clients to disconnect before force-closing |
+
+The drain wait runs as a separate tokio task. The command processor stays responsive during the timeout window, so health checks and cluster protocol messages continue to work.
+
+Clients can detect a server-initiated drain by checking for close code 4300 and reconnecting to another instance. In cluster mode, the draining node notifies peers via `ClusterCommand::Drain` so they can update routing tables.
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for Kubernetes preStop hook and rolling restart patterns.
 
 ---
 
@@ -958,6 +1039,14 @@ async def metrics():
 | `wse_cluster_bytes_sent_total` | Bytes sent to peers |
 | `wse_cluster_bytes_received_total` | Bytes received from peers |
 | `wse_cluster_reconnects_total` | Peer reconnections |
+
+**Per-topic counters:**
+
+| Metric | Description |
+|---|---|
+| `wse_topic_messages_total{topic="..."}` | Messages broadcast to a topic (top 50 topics by volume) |
+
+The per-topic counter tracks the 50 highest-volume topics. When the internal map exceeds 10K entries, stale topics are evicted automatically to prevent unbounded memory growth.
 
 **Recovery/Presence** (when enabled):
 

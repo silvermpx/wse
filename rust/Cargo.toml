@@ -1,6 +1,6 @@
 [package]
 name = "wse-accel"
-version = "2.2.1"
+version = "2.3.0"
 edition = "2024"
 
 [lib]
@@ -40,6 +40,9 @@ rustls = { version = "0.23", default-features = true }
 rustls-pki-types = "1"
 zstd = "0.13"
 parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+arc-swap = "1"
 
 [dev-dependencies]
 rcgen = "0.13"

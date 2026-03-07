@@ -318,6 +318,33 @@ The frontend `RateLimiter` prevents excessive sends.
 - Inbound queue bounded at 131,072 events
 - Per-connection deduplication: 50,000-entry AHashSet with FIFO eviction
 
+## Topic ACL
+
+Per-connection topic access control using allow/deny glob patterns. Enforces which topics a connection can subscribe to, providing multi-tenant isolation and role-based access at the subscription layer.
+
+```python
+# Set ACL before subscribing
+server.set_topic_acl(conn_id, allow=["tenant:acme:*"], deny=["tenant:acme:internal:*"])
+server.subscribe_connection(conn_id, ["tenant:acme:prices"])   # allowed
+server.subscribe_connection(conn_id, ["tenant:acme:internal:logs"])  # denied
+server.subscribe_connection(conn_id, ["tenant:other:prices"])  # denied (not in allow list)
+```
+
+**Evaluation order:**
+
+1. If deny list is set and the topic matches any deny pattern, subscription is rejected
+2. If allow list is set and the topic does not match any allow pattern, subscription is rejected
+3. Otherwise, subscription is permitted
+
+Deny always takes precedence over allow. Patterns support `*` (match any characters) and `?` (match single character).
+
+**Security considerations:**
+
+- ACLs are enforced at subscribe time only. Call `set_topic_acl` before `subscribe_connection`.
+- ACLs are per-connection, not per-user. Different connections from the same user can have different ACLs.
+- Without ACLs, all topics are accessible (backward compatible).
+- Combine with JWT `sub` claim for user-level authorization: read the user's role from the JWT payload in your drain loop, then set appropriate ACLs.
+
 ## Wire-Level Security
 
 ### Cluster Frame Protection

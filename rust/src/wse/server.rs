@@ -81,6 +81,17 @@ pub(crate) struct ConnectionHandle {
 }
 
 // ---------------------------------------------------------------------------
+// QueueGroup -- round-robin distribution within a topic
+// ---------------------------------------------------------------------------
+
+/// A queue group distributes messages round-robin to one member instead of
+/// fan-out to all. Members are connections subscribed with the same queue_group name.
+pub(crate) struct QueueGroup {
+    pub(crate) members: Vec<(String, ConnectionHandle)>,
+    pub(crate) next: AtomicUsize,
+}
+
+// ---------------------------------------------------------------------------
 // Pre-framed WebSocket encoding (server-to-client, no masking per RFC 6455)
 // ---------------------------------------------------------------------------
 
@@ -221,6 +232,12 @@ pub(crate) enum ServerCommand {
         reply: oneshot::Sender<Vec<String>>,
     },
     Shutdown,
+    /// Graceful drain: stop accepting, close all clients with custom code, wait.
+    Drain {
+        close_code: u16,
+        close_reason: String,
+        timeout_secs: u64,
+    },
 }
 
 pub(crate) struct SharedState {
@@ -244,8 +261,12 @@ pub(crate) struct SharedState {
     connection_count: AtomicUsize,
     // JWT config: when set, Rust validates JWT in handshake (zero GIL)
     jwt_config: Option<JwtConfig>,
+    // Graceful drain: when true, reject new connections
+    draining: AtomicBool,
     pub(crate) topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
     conn_topics: DashMap<String, DashSet<String>>,
+    // Per-connection topic ACL from JWT wse_topics claim (None entry = allow all)
+    conn_topic_acl: DashMap<String, crate::jwt::TopicAcl>,
     // Count of glob-pattern topics (contains * or ?) -- avoids O(T) scan in fanout_topic_direct
     pub(crate) glob_topic_count: Arc<AtomicUsize>,
     // Cluster protocol
@@ -258,6 +279,9 @@ pub(crate) struct SharedState {
     pub(crate) local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     // True when cluster TLS is configured (reject cluster connections on main port)
     cluster_tls_enabled: AtomicBool,
+    // ArcSwap holder for hot-reloading cluster TLS certificates at runtime
+    pub(crate) cluster_tls_holder:
+        std::sync::RwLock<Option<Arc<arc_swap::ArcSwap<super::cluster::ClusterTlsConfig>>>>,
     pub(crate) recovery: Option<Arc<super::recovery::RecoveryManager>>,
     // Per-connection last activity tracking for zombie detection
     conn_last_activity: DashMap<String, std::time::Instant>,
@@ -265,6 +289,10 @@ pub(crate) struct SharedState {
     conn_encryption: DashMap<String, aes_gcm::Aes256Gcm>,
     // Presence tracking (None when disabled)
     pub(crate) presence: Option<Arc<super::presence::PresenceManager>>,
+    // Queue groups: topic -> group_name -> QueueGroup (round-robin distribution)
+    pub(crate) queue_groups: Arc<DashMap<String, DashMap<String, QueueGroup>>>,
+    // Reverse index: conn_id -> set of (topic, group_name) for cleanup on disconnect
+    conn_queue_groups: DashMap<String, Vec<(String, String)>>,
     // Sender for presence broadcasts from disconnect cleanup paths
     // (where self.cmd_tx is not available, only Arc<SharedState>)
     presence_broadcast_tx: std::sync::RwLock<Option<mpsc::UnboundedSender<ServerCommand>>>,
@@ -285,6 +313,8 @@ pub(crate) struct SharedState {
     bytes_sent_total: AtomicU64,
     auth_failures_total: AtomicU64,
     rate_limited_total: AtomicU64,
+    // Per-topic message delivery counts (for top-N Prometheus metrics)
+    pub(crate) topic_message_counts: Arc<DashMap<String, AtomicU64>>,
 }
 
 impl SharedState {
@@ -319,8 +349,10 @@ impl SharedState {
             conn_rates: DashMap::new(),
             connection_count: AtomicUsize::new(0),
             jwt_config,
+            draining: AtomicBool::new(false),
             topic_subscribers: Arc::new(DashMap::new()),
             conn_topics: DashMap::new(),
+            conn_topic_acl: DashMap::new(),
             glob_topic_count: Arc::new(AtomicUsize::new(0)),
             cluster_cmd_tx: std::sync::RwLock::new(None),
             cluster_metrics: Arc::new(ClusterMetrics::new()),
@@ -329,6 +361,7 @@ impl SharedState {
             cluster_interest_tx: std::sync::RwLock::new(None),
             local_topic_refcount: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cluster_tls_enabled: AtomicBool::new(false),
+            cluster_tls_holder: std::sync::RwLock::new(None),
             recovery,
             conn_last_activity: DashMap::new(),
             conn_encryption: DashMap::new(),
@@ -340,6 +373,8 @@ impl SharedState {
             } else {
                 None
             },
+            queue_groups: Arc::new(DashMap::new()),
+            conn_queue_groups: DashMap::new(),
             presence_broadcast_tx: std::sync::RwLock::new(None),
             rate_capacity,
             rate_refill,
@@ -356,6 +391,7 @@ impl SharedState {
             bytes_sent_total: AtomicU64::new(0),
             auth_failures_total: AtomicU64::new(0),
             rate_limited_total: AtomicU64::new(0),
+            topic_message_counts: Arc::new(DashMap::new()),
         }
     }
 
@@ -506,7 +542,7 @@ pub(crate) fn format_presence_msg(
 fn fire_on_connect(callback: &Py<PyAny>, conn_id: &str, cookies: &str) {
     Python::try_attach(|py| {
         if let Err(e) = callback.call1(py, (conn_id, cookies)) {
-            eprintln!("[WSE] on_connect error: {e}");
+            tracing::warn!("[WSE] on_connect error: {e}");
         }
     });
 }
@@ -514,7 +550,7 @@ fn fire_on_connect(callback: &Py<PyAny>, conn_id: &str, cookies: &str) {
 fn fire_on_disconnect(callback: &Py<PyAny>, conn_id: &str) {
     Python::try_attach(|py| {
         if let Err(e) = callback.call1(py, (conn_id,)) {
-            eprintln!("[WSE] on_disconnect error: {e}");
+            tracing::warn!("[WSE] on_disconnect error: {e}");
         }
     });
 }
@@ -568,7 +604,12 @@ fn inject_category(data: &str) -> String {
     while i < bytes.len() {
         if in_string {
             if bytes[i] == b'\\' {
-                i += 2;
+                i += 1; // skip the backslash
+                if i < bytes.len() && bytes[i] == b'u' {
+                    i += 5; // skip uXXXX (4 hex digits + the 'u')
+                } else {
+                    i += 1; // skip single escaped char
+                }
                 continue;
             }
             if bytes[i] == b'"' {
@@ -602,7 +643,12 @@ fn inject_category(data: &str) -> String {
                         break;
                     }
                     if bytes[j] == b'\\' {
-                        j += 2;
+                        j += 1; // skip backslash
+                        if j < bytes.len() && bytes[j] == b'u' {
+                            j += 5; // skip uXXXX
+                        } else {
+                            j += 1; // skip single escaped char
+                        }
                         continue;
                     }
                     if bytes[j] == b'"' {
@@ -615,6 +661,18 @@ fn inject_category(data: &str) -> String {
                 if t_val_range.is_none() {
                     i += 1;
                 }
+            }
+            // Top-level "t": with non-string value (number, null, bool) -- use "U" (unknown) category.
+            // Synthesize a range pointing to "U" so inject_category still adds the "c" field.
+            b'"' if depth == 1
+                && t_val_range.is_none()
+                && bytes[i..].starts_with(b"\"t\":")
+                && !bytes[i..].starts_with(b"\"t\":\"") =>
+            {
+                // Non-string t value -- set a synthetic range that will map to "U" category
+                // Use 0..0 as a sentinel: message_category("") returns "U"
+                t_val_range = Some((0, 0));
+                i += 4; // skip past "t":
             }
             b'"' => {
                 in_string = true;
@@ -854,12 +912,20 @@ fn build_server_ready(conn_id: &str, user_id: &str, recovery_enabled: bool) -> S
 // ---------------------------------------------------------------------------
 
 async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<SharedState>) {
+    // Reject new connections during graceful drain
+    if state.draining.load(Ordering::Relaxed) {
+        state
+            .connections_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
     // Early rejection before expensive handshake (best-effort, authoritative check below)
     if state.connection_count.load(Ordering::Relaxed) >= state.max_connections {
         state
             .connections_rejected_total
             .fetch_add(1, Ordering::Relaxed);
-        eprintln!("[WSE] Max connections reached (early check), rejecting {addr}");
+        tracing::warn!("[WSE] Max connections reached (early check), rejecting {addr}");
         return;
     }
 
@@ -867,7 +933,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     let (stream, mut raw_write) = match clone_tcp_stream(stream) {
         Ok(pair) => pair,
         Err(e) => {
-            eprintln!("[WSE] Failed to clone TCP stream for {addr}: {e}");
+            tracing::error!("[WSE] Failed to clone TCP stream for {addr}: {e}");
             return;
         }
     };
@@ -917,7 +983,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     {
         Ok(ws) => ws,
         Err(e) => {
-            eprintln!("[WSE] WS handshake failed for {addr}: {e}");
+            tracing::warn!("[WSE] WS handshake failed for {addr}: {e}");
             return;
         }
     };
@@ -967,6 +1033,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                         .and_then(|s| s.as_str())
                         .filter(|s| !s.is_empty())
                     {
+                        // Extract optional topic ACL from wse_topics claim
+                        if let Some(acl) = jwt::extract_topic_acl(&claims) {
+                            state.conn_topic_acl.insert(conn_id.to_string(), acl);
+                        }
                         Some(user_id.to_string())
                     } else {
                         state.auth_failures_total.fetch_add(1, Ordering::Relaxed);
@@ -979,7 +1049,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                     }
                 }
                 Err(e) => {
-                    eprintln!("[WSE] JWT validation failed for {addr}: {e}");
+                    tracing::warn!("[WSE] JWT validation failed for {addr}: {e}");
                     state.auth_failures_total.fetch_add(1, Ordering::Relaxed);
                     state
                         .connections_rejected_total
@@ -1016,7 +1086,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
             state
                 .connections_rejected_total
                 .fetch_add(1, Ordering::Relaxed);
-            eprintln!("[WSE] Max connections reached, rejecting {addr}");
+            tracing::warn!("[WSE] Max connections reached, rejecting {addr}");
+            // Clean up ACL entry inserted before registration check
+            state.conn_topic_acl.remove(&*conn_id);
             let _ = write_half.close().await;
             return;
         }
@@ -1158,8 +1230,24 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
 
                     let mut ok = true;
 
+                    // Flush tungstenite Msgs FIRST to ensure its internal buffer
+                    // is drained before raw_write uses the same fd
+                    if has_tung && ok {
+                        for frame in batch.drain(..) {
+                            if let WsFrame::Msg(msg) = frame
+                                && write_half.feed(msg).await.is_err()
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok && write_half.flush().await.is_err() {
+                            ok = false;
+                        }
+                    }
+
                     // Write PreFramed via write_vectored (writev syscall)
-                    if !raw_slices.is_empty() {
+                    if !raw_slices.is_empty() && ok {
                         let io_slices: Vec<std::io::IoSlice<'_>> = raw_slices
                             .iter()
                             .map(|b| std::io::IoSlice::new(b))
@@ -1186,21 +1274,6 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                             if raw_write.write_all(&remaining).await.is_err() {
                                 ok = false;
                             }
-                        }
-                    }
-
-                    // Feed tungstenite Msgs, single flush
-                    if has_tung && ok {
-                        for frame in batch.drain(..) {
-                            if let WsFrame::Msg(msg) = frame
-                                && write_half.feed(msg).await.is_err()
-                            {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        if ok && write_half.flush().await.is_err() {
-                            ok = false;
                         }
                     }
 
@@ -1268,7 +1341,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                         tokio::task::spawn_blocking(move || {
                             Python::try_attach(|py| {
                                 if let Err(e) = cb_arc.call1(py, (&**cid, &*t)) {
-                                    eprintln!("[WSE] on_message error: {e}");
+                                    tracing::warn!("[WSE] on_message error: {e}");
                                 }
                             });
                         });
@@ -1306,7 +1379,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                                 Some(server_pk_b64)
                                             }
                                             Err(e) => {
-                                                eprintln!(
+                                                tracing::error!(
                                                     "[WSE] ECDH key exchange failed for {}: {}",
                                                     conn_id, e
                                                 );
@@ -1385,7 +1458,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                 Python::try_attach(|py| {
                                     let py_obj = json_to_pyobj(py, &val);
                                     if let Err(e) = cb_arc.call1(py, (&**cid, py_obj)) {
-                                        eprintln!("[WSE] on_message error: {e}");
+                                        tracing::warn!("[WSE] on_message error: {e}");
                                     }
                                 });
                             });
@@ -1405,7 +1478,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                             tokio::task::spawn_blocking(move || {
                                 Python::try_attach(|py| {
                                     if let Err(e) = cb_arc.call1(py, (&**cid, &*t)) {
-                                        eprintln!("[WSE] on_message error: {e}");
+                                        tracing::warn!("[WSE] on_message error: {e}");
                                     }
                                 });
                             });
@@ -1465,7 +1538,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                                     if let Err(e) =
                                                         cb_arc.call1(py, (&**cid, py_obj))
                                                     {
-                                                        eprintln!(
+                                                        tracing::warn!(
                                                             "[WSE] on_message (decrypted) error: {e}"
                                                         );
                                                     }
@@ -1476,11 +1549,11 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                 }
                             }
                             Err(e) => {
-                                eprintln!("[WSE] Decryption failed for {}: {}", conn_id, e);
+                                tracing::error!("[WSE] Decryption failed for {}: {}", conn_id, e);
                             }
                         }
                     } else {
-                        eprintln!(
+                        tracing::error!(
                             "[WSE] Received E: frame but no encryption key for {}",
                             conn_id
                         );
@@ -1534,13 +1607,13 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                     let json_val = normalize_json_keys(json_val);
                                     let py_obj = json_to_pyobj(py, &json_val);
                                     if let Err(e) = cb_arc.call1(py, (&**cid, py_obj)) {
-                                        eprintln!("[WSE] on_message (msgpack) error: {e}");
+                                        tracing::warn!("[WSE] on_message (msgpack) error: {e}");
                                     }
                                 }
                                 Err(_) => {
                                     let py_bytes = PyBytes::new(py, &d);
                                     if let Err(e) = cb_arc.call1(py, (&**cid, py_bytes)) {
-                                        eprintln!("[WSE] on_message (binary) error: {e}");
+                                        tracing::warn!("[WSE] on_message (binary) error: {e}");
                                     }
                                 }
                             });
@@ -1550,7 +1623,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                             Python::try_attach(|py| {
                                 let py_bytes = PyBytes::new(py, &d);
                                 if let Err(e) = cb_arc.call1(py, (&**cid, py_bytes)) {
-                                    eprintln!("[WSE] on_message (binary) error: {e}");
+                                    tracing::warn!("[WSE] on_message (binary) error: {e}");
                                 }
                             });
                         });
@@ -1580,6 +1653,23 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     state.conn_rates.remove(&*conn_id);
     state.conn_last_activity.remove(&*conn_id);
     state.conn_encryption.remove(&*conn_id);
+    state.conn_topic_acl.remove(&*conn_id);
+    // Queue group cleanup: remove this connection from all queue groups
+    if let Some((_, memberships)) = state.conn_queue_groups.remove(&*conn_id) {
+        for (topic, group_name) in memberships {
+            if let Some(topic_groups) = state.queue_groups.get(&topic) {
+                if let Some(mut group) = topic_groups.get_mut(&group_name) {
+                    group.members.retain(|(id, _)| id != &*conn_id);
+                }
+                // Clean up empty group
+                topic_groups.remove_if(&group_name, |_, g| g.members.is_empty());
+            }
+            // Clean up empty topic entry
+            state
+                .queue_groups
+                .remove_if(&topic, |_, groups| groups.is_empty());
+        }
+    }
     // If zombie detection already removed this connection and emitted
     // a disconnect event, skip the rest to avoid duplicate events.
     if already_removed {
@@ -1985,7 +2075,7 @@ async fn process_commands(
                                 }
                             }
                             Err(e) => {
-                                eprintln!("[WSE] encrypt_outbound failed: {e}");
+                                tracing::error!("[WSE] encrypt_outbound failed: {e}");
                             }
                         }
                     }
@@ -2043,7 +2133,7 @@ async fn process_commands(
                                 }
                             }
                             Err(e) => {
-                                eprintln!("[WSE] encrypt_outbound failed: {e}");
+                                tracing::error!("[WSE] encrypt_outbound failed: {e}");
                             }
                         }
                     }
@@ -2061,6 +2151,12 @@ async fn process_commands(
                 if !skip_recovery && let Some(ref recovery) = state.recovery {
                     recovery.push(&topic, preframed.clone());
                 }
+                // Track per-topic message count for Prometheus top-N metrics
+                state
+                    .topic_message_counts
+                    .entry(topic.clone())
+                    .or_insert_with(|| AtomicU64::new(0))
+                    .fetch_add(1, Ordering::Relaxed);
                 if state.conn_encryption.is_empty() {
                     // Fast path: NATS-style direct buffer (bypasses mpsc channel)
                     fanout_topic_direct(
@@ -2173,8 +2269,48 @@ async fn process_commands(
                                 }
                             }
                             Err(e) => {
-                                eprintln!("[WSE] encrypt_outbound failed: {e}");
+                                tracing::error!("[WSE] encrypt_outbound failed: {e}");
                             }
+                        }
+                    }
+                }
+                // Queue group dispatch: round-robin to one member per group.
+                // Retry on dead/backpressured members to avoid silent message loss.
+                if let Some(topic_groups) = state.queue_groups.get(&topic) {
+                    for mut group_entry in topic_groups.iter_mut() {
+                        let group = group_entry.value_mut();
+                        let len = group.members.len();
+                        if len == 0 {
+                            continue;
+                        }
+                        let base = group.next.fetch_add(1, Ordering::Relaxed);
+                        let data_len = preframed.len();
+                        let mut delivered = false;
+                        for attempt in 0..len {
+                            let idx = (base + attempt) % len;
+                            let (_, ref h) = group.members[idx];
+                            if h.tx.is_closed() {
+                                continue;
+                            }
+                            if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
+                                slow_drops.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            h.pending.fetch_add(data_len, Ordering::Relaxed);
+                            let was_empty = {
+                                let mut buf = h.broadcast_buf.lock();
+                                let empty = buf.is_empty();
+                                buf.extend_from_slice(&preframed);
+                                empty
+                            };
+                            if was_empty {
+                                h.broadcast_notify.notify_one();
+                            }
+                            delivered = true;
+                            break;
+                        }
+                        if !delivered {
+                            slow_drops.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -2192,6 +2328,59 @@ async fn process_commands(
             ServerCommand::GetConnections { reply } => {
                 let guard = state.connections.read().await;
                 let _ = reply.send(guard.keys().cloned().collect());
+            }
+            ServerCommand::Drain {
+                close_code,
+                close_reason,
+                timeout_secs,
+            } => {
+                // Set draining flag to reject new connections
+                state.draining.store(true, Ordering::Relaxed);
+                tracing::info!("[WSE] Entering drain mode (lame duck)");
+
+                // Notify cluster peers
+                if let Some(tx) = state.cluster_cmd_tx.read().unwrap().as_ref() {
+                    let _ = tx.send(ClusterCommand::Drain);
+                }
+
+                // Send close frame with custom code to all clients
+                let close_frame = Message::Close(Some(CloseFrame {
+                    code: CloseCode::from(close_code),
+                    reason: close_reason.into(),
+                }));
+                let guard = state.connections.read().await;
+                let n = guard.len();
+                for h in guard.values() {
+                    h.pending.fetch_add(8, Ordering::Relaxed);
+                    if h.tx.send(WsFrame::Msg(close_frame.clone())).is_err() {
+                        h.pending.fetch_sub(8, Ordering::Relaxed);
+                    }
+                }
+                drop(guard);
+                tracing::info!(
+                    "[WSE] Drain: sent close to {n} connections, waiting up to {timeout_secs}s"
+                );
+
+                // Spawn drain wait as separate task so command processor stays responsive
+                let drain_state = state.clone();
+                tokio::spawn(async move {
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+                    loop {
+                        if drain_state.connection_count.load(Ordering::Relaxed) == 0 {
+                            tracing::info!("[WSE] Drain complete: all connections closed");
+                            break;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            let remaining =
+                                drain_state.connection_count.load(Ordering::Relaxed);
+                            tracing::warn!(
+                                "[WSE] Drain timeout: {remaining} connections remaining"
+                            );
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                });
             }
             ServerCommand::Shutdown => {
                 let close_frame = Message::Close(Some(CloseFrame {
@@ -2432,6 +2621,13 @@ impl RustWSEServer {
         if self.running.load(Ordering::SeqCst) {
             return Err(PyRuntimeError::new_err("Server is already running"));
         }
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("wse_accel=info")),
+            )
+            .with_target(false)
+            .try_init();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ServerCommand>();
         self.cmd_tx = Some(cmd_tx.clone());
         // Store a clone for presence broadcasts from disconnect cleanup paths
@@ -2449,7 +2645,7 @@ impl RustWSEServer {
                 let rt = match Runtime::new() {
                     Ok(rt) => rt,
                     Err(e) => {
-                        eprintln!("[WSE] Failed to create runtime: {e}");
+                        tracing::error!("[WSE] Failed to create runtime: {e}");
                         return;
                     }
                 };
@@ -2458,11 +2654,11 @@ impl RustWSEServer {
                     let bind_addr = format!("{host}:{port}");
                     let listener = match TcpListener::bind(&bind_addr).await {
                         Ok(l) => {
-                            eprintln!("[WSE] Listening on {bind_addr}");
+                            tracing::info!("[WSE] Listening on {bind_addr}");
                             l
                         }
                         Err(e) => {
-                            eprintln!("[WSE] Failed to bind {bind_addr}: {e}");
+                            tracing::error!("[WSE] Failed to bind {bind_addr}: {e}");
                             return;
                         }
                     };
@@ -2725,6 +2921,19 @@ impl RustWSEServer {
                                             ping_state.conn_rates.remove(cid);
                                             ping_state.conn_last_activity.remove(cid);
                                             ping_state.conn_encryption.remove(cid);
+                                            ping_state.conn_topic_acl.remove(cid);
+                                            // Queue group cleanup for zombies
+                                            if let Some((_, memberships)) = ping_state.conn_queue_groups.remove(cid) {
+                                                for (topic, group_name) in memberships {
+                                                    if let Some(tg) = ping_state.queue_groups.get(&topic) {
+                                                        if let Some(mut g) = tg.get_mut(&group_name) {
+                                                            g.members.retain(|(id, _)| id != cid);
+                                                        }
+                                                        tg.remove_if(&group_name, |_, g| g.members.is_empty());
+                                                    }
+                                                    ping_state.queue_groups.remove_if(&topic, |_, groups| groups.is_empty());
+                                                }
+                                            }
                                         }
                                         ping_state.connection_count.store(
                                             conns.len(),
@@ -2787,7 +2996,7 @@ impl RustWSEServer {
                                             }
                                         }
                                     }
-                                    eprintln!(
+                                    tracing::warn!(
                                         "[WSE] Force-removed {} zombie connections",
                                         force_remove.len()
                                     );
@@ -2837,7 +3046,7 @@ impl RustWSEServer {
                                                     || !cluster_ready
                                                 {
                                                     if shared2.cluster_tls_enabled.load(Ordering::Relaxed) {
-                                                        eprintln!(
+                                                        tracing::warn!(
                                                             "[WSE] Rejecting cluster connection on main port \
                                                              (mTLS required, use dedicated cluster_port): {addr}"
                                                         );
@@ -2856,7 +3065,7 @@ impl RustWSEServer {
                                                     )
                                                     .await;
                                                 } else {
-                                                    eprintln!(
+                                                    tracing::warn!(
                                                         "[WSE-Cluster] No interest channel for inbound {addr}"
                                                     );
                                                 }
@@ -2867,7 +3076,7 @@ impl RustWSEServer {
                                     }
                                     Err(e) => {
                                         if !running.load(Ordering::SeqCst) { break; }
-                                        eprintln!("[WSE] Accept error: {e}");
+                                        tracing::error!("[WSE] Accept error: {e}");
                                     }
                                 }
                             }
@@ -2878,13 +3087,36 @@ impl RustWSEServer {
                     }
                     let _ = cmd_handle.await;
                     running.store(false, Ordering::SeqCst);
-                    eprintln!("[WSE] Shut down");
+                    tracing::info!("[WSE] Shut down");
                 });
             })
             .map_err(|e| PyRuntimeError::new_err(format!("Spawn error: {e}")))?;
         self.thread_handle = Some(handle);
         self.rt_handle = rt_handle_rx.recv().ok();
         self.started_at = Some(std::time::Instant::now());
+        Ok(())
+    }
+
+    /// Enter graceful drain mode (lame duck).
+    ///
+    /// 1. Stops accepting new connections
+    /// 2. Notifies cluster peers via DRAIN frame
+    /// 3. Sends Close frame with custom code to all clients
+    /// 4. Waits up to `timeout` seconds for clients to disconnect
+    ///
+    /// Call `stop()` after `drain()` to fully shut down.
+    #[pyo3(signature = (close_code = 4300, close_reason = "", timeout = 30))]
+    fn drain(&self, close_code: u16, close_reason: &str, timeout: u64) -> PyResult<()> {
+        let tx = self
+            .cmd_tx
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
+        tx.send(ServerCommand::Drain {
+            close_code,
+            close_reason: close_reason.to_owned(),
+            timeout_secs: timeout,
+        })
+        .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         Ok(())
     }
 
@@ -3490,6 +3722,11 @@ impl RustWSEServer {
             .cluster_tls_enabled
             .store(tls_config.is_some(), Ordering::Relaxed);
 
+        // Wrap TLS config in ArcSwap for hot-reload support. The holder is
+        // stored in SharedState so reload_cluster_tls() can swap it later.
+        let tls_holder = tls_config.map(|cfg| Arc::new(arc_swap::ArcSwap::from_pointee(cfg)));
+        *self.shared.cluster_tls_holder.write().unwrap() = tls_holder.clone();
+
         let rt_handle = self
             .rt_handle
             .as_ref()
@@ -3530,13 +3767,16 @@ impl RustWSEServer {
             metrics,
             dlq,
             local_topic_refcount,
-            tls_config,
+            tls_holder,
             cluster_port,
             cluster_addr,
             self.shared.presence.clone(),
             self.cmd_tx.clone(),
             self.shared.max_outbound_queue_bytes,
             Arc::clone(&self.shared.slow_consumer_drops),
+            self.shared.recovery.clone(),
+            self.shared.topic_message_counts.clone(),
+            self.shared.queue_groups.clone(),
         ));
 
         Ok(())
@@ -3557,17 +3797,89 @@ impl RustWSEServer {
             .load(Ordering::Relaxed)
     }
 
+    /// Hot-reload cluster TLS certificates without restarting the server.
+    /// New connections will use the updated certs; in-flight handshakes
+    /// complete with the previous config (TlsAcceptor/TlsConnector use Arc internally).
+    #[pyo3(signature = (cert_path, key_path, ca_path))]
+    fn reload_cluster_tls(
+        &self,
+        cert_path: String,
+        key_path: String,
+        ca_path: String,
+    ) -> PyResult<()> {
+        let guard = self.shared.cluster_tls_holder.read().unwrap();
+        let holder = guard.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Cluster TLS not configured")
+        })?;
+        let new_config = super::cluster::build_cluster_tls(&cert_path, &key_path, &ca_path)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("TLS reload failed: {e}"))
+            })?;
+        holder.store(std::sync::Arc::new(new_config));
+        tracing::info!("[WSE] Cluster TLS certificates reloaded");
+        Ok(())
+    }
+
+    fn cluster_info(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let list = PyList::empty(py);
+        for entry in self.shared.cluster_metrics.peer_info.iter() {
+            let d = PyDict::new(py);
+            d.set_item("address", &entry.value().address)?;
+            d.set_item("instance_id", &entry.value().instance_id)?;
+            d.set_item("capabilities", entry.value().capabilities)?;
+            d.set_item("connected_at", entry.value().connected_at)?;
+            list.append(d)?;
+        }
+        Ok(list.unbind())
+    }
+
+    // -- Topic authorization --------------------------------------------------
+
+    /// Set topic ACL for a connection programmatically (for non-JWT auth).
+    ///
+    /// - allow: list of glob patterns (empty = allow all)
+    /// - deny: list of glob patterns (deny takes precedence over allow)
+    #[pyo3(signature = (conn_id, allow = None, deny = None))]
+    fn set_topic_acl(&self, conn_id: &str, allow: Option<Vec<String>>, deny: Option<Vec<String>>) {
+        let acl = crate::jwt::TopicAcl {
+            allow: allow.unwrap_or_default(),
+            deny: deny.unwrap_or_default(),
+        };
+        self.shared.conn_topic_acl.insert(conn_id.to_owned(), acl);
+    }
+
     // -- Topic subscriptions --------------------------------------------------
 
-    #[pyo3(signature = (conn_id, topics, presence_data = None))]
+    #[pyo3(signature = (conn_id, topics, presence_data = None, queue_group = None))]
     fn subscribe_connection(
         &self,
         conn_id: &str,
         topics: Vec<String>,
         presence_data: Option<&Bound<'_, PyDict>>,
+        queue_group: Option<String>,
     ) -> PyResult<()> {
-        // Acquire refcount lock first to keep subscription + refcount atomic
+        // Filter topics through ACL if one exists for this connection.
+        // No ACL = allow all (backward compatible).
+        let topics = if let Some(acl) = self.shared.conn_topic_acl.get(conn_id) {
+            topics
+                .into_iter()
+                .filter(|t| acl.is_allowed(t))
+                .collect::<Vec<_>>()
+        } else {
+            topics
+        };
+
         let cluster_tx = self.shared.cluster_cmd_tx.read().unwrap().clone();
+
+        // Get ConnectionHandle FIRST (may block_on tokio), before acquiring any mutexes.
+        // This prevents deadlock: tokio tasks acquire connections.write() then local_topic_refcount,
+        // so we must follow the same order.
+        let handle = self.rt_handle.as_ref().and_then(|rt| {
+            let guard = rt.block_on(self.shared.connections.read());
+            guard.get(conn_id).cloned()
+        });
+
+        // Acquire refcount lock AFTER block_on completes
         let mut refcounts = if cluster_tx.is_some() {
             Some(
                 self.shared
@@ -3579,35 +3891,63 @@ impl RustWSEServer {
             None
         };
 
-        // Get ConnectionHandle for direct fan-out (skip HashMap lookup in hot path).
-        // Uses block_on(connections.read()) for guaranteed acquisition -- matches the
-        // pattern in subscribe_with_recovery. Safe from Python GIL context since the
-        // write lock holder runs on a different tokio thread.
-        let handle = self.rt_handle.as_ref().and_then(|rt| {
-            let guard = rt.block_on(self.shared.connections.read());
-            guard.get(conn_id).cloned()
-        });
-
         for topic in &topics {
             if let Some(ref h) = handle {
-                // Use single entry() call to detect fresh topic creation atomically
-                // (avoids TOCTOU race between contains_key and entry)
-                let outer = self
-                    .shared
-                    .topic_subscribers
-                    .entry(topic.clone())
-                    .or_default();
-                let is_new_entry = outer.insert(conn_id.to_owned(), h.clone()).is_none();
-                let is_first = is_new_entry && outer.len() == 1;
-                // fetch_add while holding shard lock to prevent race with concurrent
-                // unsubscribe (which also needs the shard lock for remove_if)
-                if is_first && (topic.contains('*') || topic.contains('?')) {
-                    self.shared.glob_topic_count.fetch_add(1, Ordering::Relaxed);
+                if let Some(ref qg_name) = queue_group {
+                    // Queue group mode: add to queue_groups, NOT to topic_subscribers.
+                    // Messages to this topic will round-robin to one member per group.
+                    let topic_groups = self.shared.queue_groups.entry(topic.clone()).or_default();
+                    let mut group =
+                        topic_groups
+                            .entry(qg_name.clone())
+                            .or_insert_with(|| QueueGroup {
+                                members: Vec::new(),
+                                next: AtomicUsize::new(0),
+                            });
+                    // Avoid duplicate membership
+                    if !group.members.iter().any(|(id, _)| id == conn_id) {
+                        group.members.push((conn_id.to_owned(), h.clone()));
+                    }
+                    drop(group);
+                    drop(topic_groups);
+                    // Track for disconnect cleanup (avoid duplicates from repeated subscribe calls)
+                    {
+                        let mut memberships = self
+                            .shared
+                            .conn_queue_groups
+                            .entry(conn_id.to_owned())
+                            .or_default();
+                        let pair = (topic.clone(), qg_name.clone());
+                        if !memberships.contains(&pair) {
+                            memberships.push(pair);
+                        }
+                    }
+                } else {
+                    // Normal fan-out mode: add to topic_subscribers
+                    // Use single entry() call to detect fresh topic creation atomically
+                    // (avoids TOCTOU race between contains_key and entry)
+                    let outer = self
+                        .shared
+                        .topic_subscribers
+                        .entry(topic.clone())
+                        .or_default();
+                    let is_new_entry = outer.insert(conn_id.to_owned(), h.clone()).is_none();
+                    let is_first = is_new_entry && outer.len() == 1;
+                    // fetch_add while holding shard lock to prevent race with concurrent
+                    // unsubscribe (which also needs the shard lock for remove_if)
+                    if is_first && (topic.contains('*') || topic.contains('?')) {
+                        self.shared.glob_topic_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    drop(outer);
                 }
-                drop(outer);
             } else {
                 // Connection already disconnected -- skip topic tracking and cluster sub
                 // to avoid phantom subscriptions in conn_topics and cluster interest
+                continue;
+            }
+            // Queue-group members have their own cleanup via conn_queue_groups.
+            // Skip conn_topics + cluster refcount tracking to avoid spurious UNSUB.
+            if queue_group.is_some() {
                 continue;
             }
             // Only increment refcount if this is genuinely new for this connection
@@ -3686,7 +4026,7 @@ impl RustWSEServer {
         offset: Option<u64>,
     ) -> PyResult<Py<PyDict>> {
         // Step 1: Subscribe using existing logic (no presence tracking for recovery)
-        self.subscribe_connection(conn_id, topics.clone(), None)?;
+        self.subscribe_connection(conn_id, topics.clone(), None, None)?;
 
         // Step 2: Get connection tx + pending counter (clone them, drop the lock)
         let (tx, tx_pending) = if recover {
@@ -3825,6 +4165,12 @@ impl RustWSEServer {
             None
         };
 
+        let unsubscribe_all = topics.is_none();
+        // Save requested topics for queue group cleanup (conn_queue_groups tracks separately from conn_topics)
+        let requested_unsub: Vec<String> = match &topics {
+            Some(t) => t.clone(),
+            None => Vec::new(),
+        };
         let removed_topics: Vec<String> = match topics {
             Some(topics) => {
                 let mut actually_removed = Vec::new();
@@ -3881,6 +4227,33 @@ impl RustWSEServer {
                 removed
             }
         };
+
+        // Queue group cleanup: when unsubscribing specific topics, only remove those;
+        // when unsubscribing all (topics=None), remove all queue group memberships.
+        if let Some(mut memberships) = self.shared.conn_queue_groups.get_mut(conn_id) {
+            memberships.retain(|(topic, group_name)| {
+                if !unsubscribe_all
+                    && !removed_topics.contains(topic)
+                    && !requested_unsub.contains(topic)
+                {
+                    return true; // keep: topic was not in unsubscribe request
+                }
+                if let Some(tg) = self.shared.queue_groups.get(topic) {
+                    if let Some(mut g) = tg.get_mut(group_name) {
+                        g.members.retain(|(id, _)| id != conn_id);
+                    }
+                    tg.remove_if(group_name, |_, g| g.members.is_empty());
+                }
+                self.shared
+                    .queue_groups
+                    .remove_if(topic, |_, groups| groups.is_empty());
+                false // remove from memberships
+            });
+        }
+        // Clean up empty conn_queue_groups entry
+        self.shared
+            .conn_queue_groups
+            .remove_if(conn_id, |_, v| v.is_empty());
 
         // Presence cleanup for removed topics
         if let Some(ref pm) = self.shared.presence {
@@ -3985,6 +4358,17 @@ impl RustWSEServer {
             .get(topic)
             .map(|s| s.len())
             .unwrap_or(0)
+    }
+
+    /// Get queue group info for a topic. Returns dict of group_name -> member_count.
+    fn get_queue_group_info(&self, py: Python<'_>, topic: &str) -> PyResult<Py<PyDict>> {
+        let dict = PyDict::new(py);
+        if let Some(topic_groups) = self.shared.queue_groups.get(topic) {
+            for entry in topic_groups.iter() {
+                dict.set_item(entry.key().as_str(), entry.value().members.len())?;
+            }
+        }
+        Ok(dict.into())
     }
 
     fn health_snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
@@ -4243,6 +4627,46 @@ impl RustWSEServer {
             out.push_str(&format!("wse_recovery_bytes {}\n", recovery.total_bytes()));
         }
 
+        // Per-topic message counts (top 50 by volume)
+        // Evict stale entries when map grows too large (prevents unbounded growth
+        // for servers using user-scoped or UUID-keyed topics)
+        {
+            let map = &self.shared.topic_message_counts;
+            if map.len() > 10_000 {
+                let active_topics: std::collections::HashSet<String> = self
+                    .shared
+                    .topic_subscribers
+                    .iter()
+                    .map(|e| e.key().clone())
+                    .collect();
+                map.retain(|k, _| active_topics.contains(k));
+            }
+            if !map.is_empty() {
+                let mut entries: Vec<(String, u64)> = map
+                    .iter()
+                    .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+                    .collect();
+                entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                entries.truncate(50);
+
+                out.push_str(
+                    "# HELP wse_topic_messages_total Messages delivered per topic (top 50)\n",
+                );
+                out.push_str("# TYPE wse_topic_messages_total counter\n");
+                for (topic, count) in &entries {
+                    // Escape label value per Prometheus exposition format
+                    let safe_topic = topic
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\"")
+                        .replace('\n', "\\n");
+                    out.push_str(&format!(
+                        "wse_topic_messages_total{{topic=\"{}\"}} {}\n",
+                        safe_topic, count
+                    ));
+                }
+            }
+        }
+
         // Presence metrics (conditional)
         if let Some(ref pm) = self.shared.presence {
             out.push_str("# HELP wse_presence_topics Topics with presence tracking\n");
@@ -4407,5 +4831,217 @@ mod tests {
         assert_eq!(frame[0], 0x82); // binary opcode
         assert_eq!(frame[1], 3);
         assert_eq!(&frame[2..], &[1, 2, 3]);
+    }
+
+    // -- Queue group tests ----------------------------------------------------
+
+    fn make_handle() -> (ConnectionHandle, mpsc::UnboundedReceiver<WsFrame>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let h = ConnectionHandle {
+            tx,
+            pending: Arc::new(AtomicUsize::new(0)),
+            broadcast_buf: Arc::new(parking_lot::Mutex::new(BytesMut::new())),
+            broadcast_notify: Arc::new(tokio::sync::Notify::new()),
+        };
+        (h, rx)
+    }
+
+    #[test]
+    fn test_queue_group_round_robin() {
+        // 3 members in one group, 9 messages -> each gets 3
+        let queue_groups: DashMap<String, DashMap<String, QueueGroup>> = DashMap::new();
+        let topic = "work".to_string();
+
+        let (h1, _rx1) = make_handle();
+        let (h2, _rx2) = make_handle();
+        let (h3, _rx3) = make_handle();
+
+        let group = QueueGroup {
+            members: vec![
+                ("c1".to_string(), h1),
+                ("c2".to_string(), h2),
+                ("c3".to_string(), h3),
+            ],
+            next: AtomicUsize::new(0),
+        };
+        let inner: DashMap<String, QueueGroup> = DashMap::new();
+        inner.insert("workers".to_string(), group);
+        queue_groups.insert(topic.clone(), inner);
+
+        let data = pre_frame_text("hello");
+        // Send 9 messages through round-robin
+        for _ in 0..9 {
+            if let Some(tg) = queue_groups.get(&topic) {
+                for mut entry in tg.iter_mut() {
+                    let g = entry.value_mut();
+                    let idx = g.next.fetch_add(1, Ordering::Relaxed) % g.members.len();
+                    let (_, ref h) = g.members[idx];
+                    h.pending.fetch_add(data.len(), Ordering::Relaxed);
+                    let mut buf = h.broadcast_buf.lock();
+                    buf.extend_from_slice(&data);
+                }
+            }
+        }
+
+        // Check each member got 3 messages worth of data
+        let tg = queue_groups.get(&topic).unwrap();
+        let g = tg.get("workers").unwrap();
+        for (_, h) in &g.members {
+            assert_eq!(
+                h.pending.load(Ordering::Relaxed),
+                data.len() * 3,
+                "Each member should receive 3 messages"
+            );
+        }
+    }
+
+    #[test]
+    fn test_queue_group_and_fanout_coexist() {
+        // Fan-out subscribers and queue group members can exist for the same topic
+        let topic_subscribers: DashMap<String, DashMap<String, ConnectionHandle>> = DashMap::new();
+        let queue_groups: DashMap<String, DashMap<String, QueueGroup>> = DashMap::new();
+        let topic = "events".to_string();
+
+        // Fan-out subscriber
+        let (h_fanout, _rx_fanout) = make_handle();
+        let inner_subs: DashMap<String, ConnectionHandle> = DashMap::new();
+        inner_subs.insert("fanout1".to_string(), h_fanout);
+        topic_subscribers.insert(topic.clone(), inner_subs);
+
+        // Queue group member
+        let (h_qg, _rx_qg) = make_handle();
+        let group = QueueGroup {
+            members: vec![("qg1".to_string(), h_qg)],
+            next: AtomicUsize::new(0),
+        };
+        let inner_groups: DashMap<String, QueueGroup> = DashMap::new();
+        inner_groups.insert("workers".to_string(), group);
+        queue_groups.insert(topic.clone(), inner_groups);
+
+        // Both should exist independently
+        assert_eq!(topic_subscribers.get(&topic).unwrap().len(), 1);
+        assert_eq!(queue_groups.get(&topic).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_queue_group_member_disconnect() {
+        let queue_groups: DashMap<String, DashMap<String, QueueGroup>> = DashMap::new();
+        let conn_queue_groups: DashMap<String, Vec<(String, String)>> = DashMap::new();
+
+        let (h1, _rx1) = make_handle();
+        let (h2, _rx2) = make_handle();
+
+        let group = QueueGroup {
+            members: vec![("c1".to_string(), h1), ("c2".to_string(), h2)],
+            next: AtomicUsize::new(0),
+        };
+        let inner: DashMap<String, QueueGroup> = DashMap::new();
+        inner.insert("workers".to_string(), group);
+        queue_groups.insert("work".to_string(), inner);
+
+        conn_queue_groups.insert(
+            "c1".to_string(),
+            vec![("work".to_string(), "workers".to_string())],
+        );
+
+        // Simulate disconnect cleanup for c1
+        if let Some((_, memberships)) = conn_queue_groups.remove("c1") {
+            for (topic, group_name) in memberships {
+                if let Some(tg) = queue_groups.get(&topic) {
+                    if let Some(mut g) = tg.get_mut(&group_name) {
+                        g.members.retain(|(id, _)| id != "c1");
+                    }
+                    tg.remove_if(&group_name, |_, g| g.members.is_empty());
+                }
+                queue_groups.remove_if(&topic, |_, groups| groups.is_empty());
+            }
+        }
+
+        // c2 should still be a member
+        let tg = queue_groups.get("work").unwrap();
+        let g = tg.get("workers").unwrap();
+        assert_eq!(g.members.len(), 1);
+        assert_eq!(g.members[0].0, "c2");
+    }
+
+    #[test]
+    fn test_queue_group_empty_cleanup() {
+        let queue_groups: DashMap<String, DashMap<String, QueueGroup>> = DashMap::new();
+        let (h1, _rx1) = make_handle();
+
+        let group = QueueGroup {
+            members: vec![("c1".to_string(), h1)],
+            next: AtomicUsize::new(0),
+        };
+        let inner: DashMap<String, QueueGroup> = DashMap::new();
+        inner.insert("workers".to_string(), group);
+        queue_groups.insert("work".to_string(), inner);
+
+        // Remove the only member
+        {
+            let tg = queue_groups.get("work").unwrap();
+            let mut g = tg.get_mut("workers").unwrap();
+            g.members.retain(|(id, _)| id != "c1");
+        }
+        // Clean up empty groups
+        if let Some(tg) = queue_groups.get("work") {
+            tg.remove_if("workers", |_, g| g.members.is_empty());
+        }
+        queue_groups.remove_if("work", |_, groups| groups.is_empty());
+
+        // Everything should be cleaned up
+        assert!(queue_groups.is_empty());
+    }
+
+    #[test]
+    fn test_topic_metrics_counting() {
+        let counts: DashMap<String, AtomicU64> = DashMap::new();
+
+        // First insert
+        counts.insert("chat.general".to_string(), AtomicU64::new(1));
+
+        // Subsequent increments
+        if let Some(counter) = counts.get("chat.general") {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(counter) = counts.get("chat.general") {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Different topic
+        counts.insert("events.system".to_string(), AtomicU64::new(1));
+
+        assert_eq!(
+            counts.get("chat.general").unwrap().load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(
+            counts.get("events.system").unwrap().load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn test_topic_metrics_top_n_limit() {
+        let counts: DashMap<String, AtomicU64> = DashMap::new();
+
+        // Insert 60 topics
+        for i in 0..60 {
+            counts.insert(format!("topic.{i}"), AtomicU64::new(i as u64));
+        }
+
+        // Simulate top-50 extraction
+        let mut entries: Vec<(String, u64)> = counts
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        entries.truncate(50);
+
+        assert_eq!(entries.len(), 50);
+        // Highest should be 59
+        assert_eq!(entries[0].1, 59);
+        // 50th should be 10 (topics 0-9 excluded)
+        assert_eq!(entries[49].1, 10);
     }
 }

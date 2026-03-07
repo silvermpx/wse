@@ -127,6 +127,21 @@ async fn run_single_test(cli: &Cli, test: TestName) {
         TestName::BattleEncryption => {
             tests::battle_encryption::run(cli).await;
         }
+        TestName::BattleQueueGroups => {
+            tests::battle_queue_groups::run(cli).await;
+        }
+        TestName::BattleTopicAcl => {
+            tests::battle_topic_acl::run(cli).await;
+        }
+        TestName::BattleDrain => {
+            tests::battle_drain::run(cli).await;
+        }
+        TestName::BattleMetrics => {
+            tests::battle_metrics::run(cli).await;
+        }
+        TestName::BattleTopology => {
+            tests::battle_topology::run(cli).await;
+        }
     }
 }
 

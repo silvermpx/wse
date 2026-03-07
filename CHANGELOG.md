@@ -1,5 +1,63 @@
 # Changelog
 
+## v2.3.0 (2026-03-07)
+
+### Queue Groups (Round-Robin Dispatch)
+
+Load-balanced message delivery across worker pools. Connections in the same queue group receive messages round-robin instead of fanout:
+
+- **`queue_group` parameter** on `subscribe_connection(conn_id, topics, presence_data=None, queue_group=None)` -- assigns the connection to a named group for round-robin dispatch
+- **Normal subscribers unaffected** -- connections without a queue group continue to receive all messages (standard fanout)
+- **Per-topic grouping** -- each topic tracks its own set of queue groups independently
+- Use case: distributing tasks across a pool of worker connections without duplicate processing
+
+### Topic ACL (Allow/Deny Glob Patterns)
+
+Per-connection topic access control with glob pattern matching:
+
+- **`set_topic_acl(conn_id, allow=None, deny=None)`** -- restricts which topics a connection can subscribe to
+- **Allow list** -- when set, only topics matching at least one pattern are permitted. Supports `*` (any characters) and `?` (single character) wildcards
+- **Deny list** -- topics matching any deny pattern are blocked, regardless of allow list
+- **Deny takes precedence** -- a topic matching both allow and deny is denied
+- **Applied at subscribe time** -- call `set_topic_acl` before `subscribe_connection` for the rules to take effect
+- Use case: multi-tenant isolation, role-based topic access
+
+### Graceful Drain
+
+Zero-downtime shutdown for rolling deployments:
+
+- **`drain(close_code=4300, close_reason="shutting down", timeout=10)`** -- sends a WebSocket Close frame to all connected clients and waits for them to disconnect
+- **Custom close code** -- clients can detect server-initiated drain via the 4300 close code and reconnect to another instance
+- **Non-blocking** -- the drain wait runs as a separate task; the command processor stays responsive during the timeout window
+- **Rejects new connections** -- once drain starts, incoming connections are rejected with a close frame
+- **Cluster notification** -- peers are notified via `ClusterCommand::Drain` so they can update routing tables
+- Use case: Kubernetes preStop hooks, rolling restarts, blue-green deployments
+
+### Per-Topic Prometheus Metrics
+
+- **`wse_topic_messages_total{topic="..."}`** counter -- per-topic message volume, top 50 topics by count
+- **Automatic eviction** -- stale entries are evicted when the internal map exceeds 10K topics, preventing unbounded growth
+- **New recovery/presence gauges** -- `wse_recovery_topics`, `wse_recovery_bytes`, `wse_presence_topics`, `wse_presence_users`
+
+### Cluster Topology API
+
+- **`cluster_info()`** -- returns a list of connected peer entries, each with address, instance_id, and connected status
+- Use case: monitoring dashboards, verifying dynamic peer discovery, operational tooling
+
+### Bug Fixes
+
+- Fixed `drain()` blocking the command processor for up to 30s (drain wait now spawns as a separate tokio task)
+- Fixed `topic_message_counts` DashMap growing without bound (evicts stale entries when map exceeds 10K threshold)
+- Fixed queue group drops not counted in `slow_consumer_drops` metric
+
+### Battle Tests
+
+- `battle-queue-groups` -- round-robin dispatch verification (8 checks)
+- `battle-topic-acl` -- allow/deny glob pattern enforcement (9 checks)
+- `battle-drain` -- graceful shutdown with Close code 4300 (6 checks)
+- `battle-metrics` -- per-topic Prometheus counter verification (8 checks)
+- `battle-topology` -- `cluster_info()` peer list verification (7 checks)
+
 ## v2.2.1 (2026-03-06)
 
 ### RS256 + ES256 JWT Algorithm Support
