@@ -26,7 +26,7 @@ Per-connection topic access control with glob pattern matching:
 
 Zero-downtime shutdown for rolling deployments:
 
-- **`drain(close_code=4300, close_reason="shutting down", timeout=10)`** -- sends a WebSocket Close frame to all connected clients and waits for them to disconnect
+- **`drain(close_code=4300, close_reason="", timeout=30)`** -- sends a WebSocket Close frame to all connected clients and waits for them to disconnect
 - **Custom close code** -- clients can detect server-initiated drain via the 4300 close code and reconnect to another instance
 - **Non-blocking** -- the drain wait runs as a separate task; the command processor stays responsive during the timeout window
 - **Rejects new connections** -- once drain starts, incoming connections are rejected with a close frame
