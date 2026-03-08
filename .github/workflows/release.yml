@@ -50,7 +50,7 @@ jobs:
 
       - name: Setup QEMU (for cross-compilation)
         if: matrix.os == 'linux' && matrix.target == 'aarch64-unknown-linux-gnu'
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3.7.0
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a  # v4.0.0
 
       - name: Build wheels
         uses: PyO3/maturin-action@b1bd829e37fef14c63f19162034228a2f3dc1021  # v1.50.0
