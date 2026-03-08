@@ -2421,6 +2421,11 @@ pub struct RustWSEServer {
 
 #[pymethods]
 impl RustWSEServer {
+    /// Create a new WSE server instance.
+    ///
+    /// The server runs all transport in Rust (TCP, TLS, WS framing, JWT auth,
+    /// compression, encryption, ping/pong). Python handles application logic
+    /// via drain mode or callbacks.
     #[new]
     #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, jwt_previous_secret = None, jwt_key_id = None, jwt_algorithm = None, jwt_private_key = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_bytes = 16_777_216))]
     #[allow(clippy::too_many_arguments)]
@@ -2596,6 +2601,13 @@ impl RustWSEServer {
         })
     }
 
+    /// Register Python callbacks for connection events.
+    ///
+    /// - on_connect(conn_id, cookies) -- called when a client connects
+    /// - on_message(conn_id, data) -- called when a message is received
+    /// - on_disconnect(conn_id) -- called when a client disconnects
+    ///
+    /// Alternative to drain mode. Cannot be used together with enable_drain_mode().
     fn set_callbacks(
         &self,
         py: Python<'_>,
@@ -2616,6 +2628,10 @@ impl RustWSEServer {
         Ok(())
     }
 
+    /// Start the WebSocket server on a background thread.
+    ///
+    /// Spawns a dedicated tokio runtime, binds to host:port, and begins
+    /// accepting connections. Raises RuntimeError if already running.
     fn start(&mut self) -> PyResult<()> {
         if self.running.load(Ordering::SeqCst) {
             return Err(PyRuntimeError::new_err("Server is already running"));
@@ -3119,6 +3135,10 @@ impl RustWSEServer {
         Ok(())
     }
 
+    /// Stop the server and close all connections.
+    ///
+    /// Shuts down the cluster mesh, sends a Shutdown command, and joins
+    /// the server thread. Safe to call if not running (returns Ok).
     fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
         if !self.running.load(Ordering::SeqCst) {
             return Ok(());
@@ -3146,6 +3166,7 @@ impl RustWSEServer {
 
     // -- send methods -------------------------------------------------------
 
+    /// Send a raw text frame to a single connection.
     fn send(&self, conn_id: &str, data: &str) -> PyResult<()> {
         let tx = self
             .cmd_tx
@@ -3159,6 +3180,7 @@ impl RustWSEServer {
         Ok(())
     }
 
+    /// Send a raw binary frame to a single connection.
     fn send_bytes(&self, conn_id: &str, data: &[u8]) -> PyResult<()> {
         let tx = self
             .cmd_tx
@@ -3427,6 +3449,7 @@ impl RustWSEServer {
         Ok(byte_count)
     }
 
+    /// Send a text frame to all connected clients (no topic filtering).
     fn broadcast_all(&self, data: &str) -> PyResult<()> {
         let tx = self
             .cmd_tx
@@ -3438,6 +3461,7 @@ impl RustWSEServer {
         Ok(())
     }
 
+    /// Send a binary frame to all connected clients.
     fn broadcast_all_bytes(&self, data: &[u8]) -> PyResult<()> {
         let tx = self
             .cmd_tx
@@ -3452,10 +3476,12 @@ impl RustWSEServer {
 
     // -- query / management -------------------------------------------------
 
+    /// Number of active connections (lock-free AtomicUsize read).
     fn get_connection_count(&self) -> usize {
         self.shared.connection_count.load(Ordering::Relaxed)
     }
 
+    /// List all active connection IDs.
     fn get_connections(&self) -> PyResult<Vec<String>> {
         let tx = self
             .cmd_tx
@@ -3469,6 +3495,7 @@ impl RustWSEServer {
             .map_err(|_| PyRuntimeError::new_err("Reply dropped"))
     }
 
+    /// Force-disconnect a connection by sending a Close frame.
     fn disconnect(&self, conn_id: &str) -> PyResult<()> {
         let tx = self
             .cmd_tx
@@ -3481,6 +3508,7 @@ impl RustWSEServer {
         Ok(())
     }
 
+    /// Return True if the server is running.
     fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
@@ -3497,9 +3525,12 @@ impl RustWSEServer {
     /// Drain up to max_count inbound events. Blocks up to timeout_ms waiting
     /// for at least one event. Returns list of (event_type, conn_id, data) tuples.
     ///
-    /// event_type: "connect" | "auth_connect" | "msg" | "raw" | "bin" | "disconnect"
+    /// event_type: "connect" | "auth_connect" | "msg" | "raw" | "bin" |
+    ///             "disconnect" | "presence_join" | "presence_leave"
+    ///
     /// data: str (for "connect"=cookies, "auth_connect"=user_id, "raw"),
-    ///       dict (for "msg"), bytes (for "bin"), None (for "disconnect")
+    ///       dict (for "msg", "presence_join", "presence_leave"),
+    ///       bytes (for "bin"), None (for "disconnect")
     ///
     /// GIL is released while waiting on channel, acquired once for batch conversion.
     #[pyo3(signature = (max_count = 256, timeout_ms = 50))]
@@ -3649,16 +3680,26 @@ impl RustWSEServer {
         Ok(list.unbind())
     }
 
+    /// Number of inbound events dropped due to queue overflow.
     fn inbound_dropped_count(&self) -> u64 {
         self.shared.inbound_dropped.load(Ordering::Relaxed)
     }
 
+    /// Current number of events waiting in the inbound queue.
     fn inbound_queue_depth(&self) -> usize {
         self.shared.inbound_rx.len()
     }
 
     // -- Cluster Protocol -----------------------------------------------------
 
+    /// Connect to cluster peers via TCP mesh protocol.
+    ///
+    /// Two modes: static peers (pass peer addresses directly) or seed-based
+    /// discovery (pass seeds + cluster_addr for gossip). TLS is optional;
+    /// falls back to WSE_CLUSTER_TLS_CERT/KEY/CA env vars if not provided.
+    ///
+    /// Raises RuntimeError if cluster is already connected or if seeds
+    /// is used without cluster_addr.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (peers, tls_cert=None, tls_key=None, tls_ca=None, cluster_port=None, seeds=None, cluster_addr=None))]
     fn connect_cluster(
@@ -3781,6 +3822,7 @@ impl RustWSEServer {
         Ok(())
     }
 
+    /// Return True if at least one cluster peer is connected.
     fn cluster_connected(&self) -> bool {
         self.shared
             .cluster_metrics
@@ -3789,6 +3831,7 @@ impl RustWSEServer {
             > 0
     }
 
+    /// Number of connected cluster peers.
     fn cluster_peers_count(&self) -> u64 {
         self.shared
             .cluster_metrics
@@ -3819,6 +3862,8 @@ impl RustWSEServer {
         Ok(())
     }
 
+    /// List connected cluster peers with address, instance_id, capabilities,
+    /// and connected_at timestamp. Returns a list of dicts.
     fn cluster_info(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
         let list = PyList::empty(py);
         for entry in self.shared.cluster_metrics.peer_info.iter() {
@@ -3849,6 +3894,11 @@ impl RustWSEServer {
 
     // -- Topic subscriptions --------------------------------------------------
 
+    /// Subscribe a connection to topics.
+    ///
+    /// Optionally set initial presence data (requires presence_enabled=True).
+    /// If queue_group is set, the connection joins a named group for
+    /// round-robin dispatch instead of standard fan-out.
     #[pyo3(signature = (conn_id, topics, presence_data = None, queue_group = None))]
     fn subscribe_connection(
         &self,
@@ -4014,6 +4064,13 @@ impl RustWSEServer {
         Ok(())
     }
 
+    /// Subscribe with message recovery support.
+    ///
+    /// Returns a dict with per-topic recovery status:
+    /// {recovered: bool, topics: {topic: {epoch, offset, recoverable, recovered, count}}}
+    ///
+    /// When recover=True, replays missed messages from the recovery buffer.
+    /// Pass epoch (hex string) and offset from a previous session to resume.
     #[pyo3(signature = (conn_id, topics, recover = false, epoch = None, offset = None))]
     fn subscribe_with_recovery(
         &self,
@@ -4149,6 +4206,8 @@ impl RustWSEServer {
         Ok(result_dict.into())
     }
 
+    /// Unsubscribe a connection from topics.
+    /// If topics is None, unsubscribe from all topics.
     #[pyo3(signature = (conn_id, topics = None))]
     fn unsubscribe_connection(&self, conn_id: &str, topics: Option<Vec<String>>) -> PyResult<()> {
         // Acquire refcount lock first to keep subscription + refcount atomic
@@ -4351,6 +4410,7 @@ impl RustWSEServer {
         Ok(())
     }
 
+    /// Number of fan-out subscribers on a topic (excludes queue group members).
     fn get_topic_subscriber_count(&self, topic: &str) -> usize {
         self.shared
             .topic_subscribers
@@ -4370,6 +4430,13 @@ impl RustWSEServer {
         Ok(dict.into())
     }
 
+    /// Full server health snapshot as a dict.
+    ///
+    /// Keys: connections, inbound_queue_depth, inbound_dropped,
+    /// cluster_connected, cluster_peer_count, cluster_messages_sent/delivered/dropped,
+    /// cluster_bytes_sent/received, cluster_reconnect_count, cluster_dlq_size,
+    /// uptime_secs, recovery_enabled/topic_count/total_bytes,
+    /// presence_enabled/topics/total_users.
     fn health_snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let dict = PyDict::new(py);
         dict.set_item(
@@ -4451,6 +4518,11 @@ impl RustWSEServer {
         Ok(dict.unbind())
     }
 
+    /// Return Prometheus exposition format metrics string.
+    ///
+    /// Includes gauges (connections, queue depth, uptime, drops),
+    /// per-topic counters (top 50 by volume), cluster metrics,
+    /// and optional recovery/presence gauges.
     fn prometheus_metrics(&self) -> String {
         let mut out = String::with_capacity(4096);
 
@@ -4680,6 +4752,10 @@ impl RustWSEServer {
         out
     }
 
+    /// Drain and return dead-letter-queue entries from failed cluster sends.
+    ///
+    /// Each entry is a dict with keys: topic, payload, peer_addr, error.
+    /// Entries are consumed (not peeked) -- calling twice returns different results.
     fn get_cluster_dlq_entries(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
         let entries = match self.shared.cluster_dlq.try_lock() {
             Ok(mut dlq) => dlq.drain_all(),

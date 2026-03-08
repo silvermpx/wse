@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.3.1 (2026-03-08)
+
+### Documentation
+
+- Added Python docstrings to all 32 PyO3 methods (visible in IDE autocomplete and `help()`)
+- Added `prometheus_metrics()` to `.pyi` type stub (was missing from IDE hints)
+- Fixed `drain_inbound()` docstring: added missing `presence_join` and `presence_leave` event types
+
+### Version Sync
+
+- Bumped Python client and TS client versions to match server release
+
 ## v2.3.0 (2026-03-07)
 
 ### Queue Groups (Round-Robin Dispatch)
@@ -426,7 +438,7 @@ Built-in Redis Pub/Sub module for multi-instance horizontal scaling:
 - Fixed `ConnectionClosedOK` handler: `__aexit__` now awaited directly instead of fire-and-forget (was cancelled by `disconnect()`)
 - Fixed `_on_raw_message` text frame byte counting: `len(str)` → `len(str.encode("utf-8"))` for accurate stats
 
-### Bug Fixes (TypeScript Client)
+### Bug Fixes (TS Client)
 
 - Fixed binary frame prefix stripping in `handleIncomingMessage`: server sends uncompressed JSON as binary with `WSE{`/`S{`/`U{` prefix - now stripped before parse (was bypassing age filter and dedup)
 - Fixed binary frame prefix stripping in `processBinaryMessage`: category prefix (`WSE{`/`S{`/`U{`) stripped before JSON.parse in step 4 (was falling through to "unknown format" error)

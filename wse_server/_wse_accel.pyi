@@ -522,6 +522,17 @@ class RustWSEServer:
     def health_snapshot(self) -> dict[str, Any]:
         """Full server health metrics: connections, queue, cluster, recovery, presence, uptime."""
         ...
+    def prometheus_metrics(self) -> str:
+        """Return Prometheus exposition format metrics string.
+
+        Gauges: wse_connections, wse_inbound_queue_depth, wse_uptime_seconds,
+        wse_slow_consumer_drops, wse_inbound_dropped.
+        Per-topic: wse_topic_messages_total{topic="..."} (top 50 by count).
+        Cluster: wse_cluster_peers, wse_cluster_dlq_size.
+        Recovery: wse_recovery_topics, wse_recovery_bytes.
+        Presence: wse_presence_topics, wse_presence_users.
+        """
+        ...
     def cluster_info(self) -> list[dict[str, Any]]:
         """List connected cluster peers with address, instance_id, capabilities, connected_at."""
         ...
