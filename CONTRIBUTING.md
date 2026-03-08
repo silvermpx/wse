@@ -8,7 +8,7 @@ Thank you for your interest in contributing to WSE. This guide covers the develo
 
 - Python 3.12+
 - Rust 1.75+ (stable)
-- Node.js 18+ (for TypeScript client)
+- Node.js 18+ (for TS client)
 - maturin (`pip install maturin`)
 
 ### Building from Source
@@ -40,7 +40,7 @@ pytest tests/
 # Python client tests
 cd python-client && pytest tests/
 
-# TypeScript client
+# TS client
 npm test
 ```
 

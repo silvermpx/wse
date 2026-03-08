@@ -47,7 +47,7 @@ GCM_TAG_LEN = 16  # 128 bits
 class SecurityManager:
     """ECDH P-256 + AES-GCM-256 + HMAC-SHA256.
 
-    Wire-compatible with the Rust server and TypeScript client.
+    Wire-compatible with the Rust server and TS client.
     Requires ``cryptography`` package (``pip install wse-client[crypto]``).
     """
 

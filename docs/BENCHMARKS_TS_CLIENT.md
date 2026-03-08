@@ -1,4 +1,4 @@
-# WSE Stress Test - TypeScript Client (wse-ts-bench)
+# WSE Stress Test - TS Client (wse-ts-bench)
 
 Measured real-world performance from a **Node.js consumer** perspective - the actual use case
 for the `wse-client` npm package. The Rust bench proved the server can do 14M msg/s JSON and

@@ -491,7 +491,7 @@ Built-in Redis Pub/Sub module for multi-instance horizontal scaling:
 
 ### Python Client (NEW)
 
-Full-featured async Python client (`wse-client`) with feature parity to the TypeScript client:
+Full-featured async Python client (`wse-client`) with feature parity to the TS client:
 
 - **AsyncWSEClient** - async context manager, async iterator, callback pattern
 - **SyncWSEClient** - thread-safe synchronous wrapper with `run_forever()`

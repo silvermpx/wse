@@ -9,7 +9,7 @@
     "declarationMap": true,
     "sourceMap": true,
     "outDir": "dist",
-    "rootDir": "client",
+    "rootDir": "ts-client",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
@@ -19,6 +19,6 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false
   },
-  "include": ["client/**/*.ts", "client/**/*.tsx"],
+  "include": ["ts-client/**/*.ts", "ts-client/**/*.tsx"],
   "exclude": ["node_modules", "dist", "**/*.test.ts"]
 }

@@ -546,7 +546,7 @@ Benchmarked on AMD EPYC 7502P (32 cores / 64 threads, 128 GB RAM), Ubuntu 24.04.
 
 Sub-millisecond latency. Median 0.38ms with JWT authentication. Connection handshake: 0.53ms median (Rust JWT path).
 
-Detailed results: [Benchmarks](docs/BENCHMARKS.md) | [Fan-out](docs/BENCHMARKS_FANOUT.md) | [Rust Client](docs/BENCHMARKS_RUST_CLIENT.md) | [Python Client](docs/BENCHMARKS_PYTHON_CLIENT.md) | [TypeScript Client](docs/BENCHMARKS_TS_CLIENT.md)
+Detailed results: [Benchmarks](docs/BENCHMARKS.md) | [Fan-out](docs/BENCHMARKS_FANOUT.md) | [Rust Client](docs/BENCHMARKS_RUST_CLIENT.md) | [Python Client](docs/BENCHMARKS_PYTHON_CLIENT.md) | [TS Client](docs/BENCHMARKS_TS_CLIENT.md)
 
 ---
 

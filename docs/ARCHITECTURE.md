@@ -662,7 +662,7 @@ WebSocket.recv()
 
 ### Wire Compatibility
 
-The Python client and TypeScript client speak the same wire protocol. All prefix formats, binary frame detection, encryption handshake, and message envelope structure are identical. Both clients can connect to the same server simultaneously.
+The Python client and TS client speak the same wire protocol. All prefix formats, binary frame detection, encryption handshake, and message envelope structure are identical. Both clients can connect to the same server simultaneously.
 
 ---
 

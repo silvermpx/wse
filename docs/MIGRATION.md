@@ -147,6 +147,6 @@ Clients receive `rate_limit_warning` at 20% remaining capacity and `RATE_LIMITED
 
 5. **Remove unused dependencies.** Uninstall `fastapi`, `starlette`, `redis`, `uvicorn` if only used by WSE.
 
-6. **Update client SDKs.** Both Python and TypeScript clients are wire-compatible with v2.0. Update to the latest version for recovery and presence support.
+6. **Update client SDKs.** Both Python and TS clients are wire-compatible with v2.0. Update to the latest version for recovery and presence support.
 
 7. **Test.** Run your application and verify event handling, subscriptions, and message delivery work as expected.

@@ -6,7 +6,7 @@ Python client for [WSE (WebSocket Engine)](https://github.com/niceguy135/wse) - 
 [![Python](https://img.shields.io/pypi/pyversions/wse-client)](https://pypi.org/project/wse-client/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](../LICENSE)
 
-Feature parity with the TypeScript client. Pure Python, no Rust dependency.
+Feature parity with the TS client. Pure Python, no Rust dependency.
 
 ## Installation
 
@@ -206,7 +206,7 @@ ECDH P-256 key exchange with AES-GCM-256 encryption. Requires the `cryptography`
 pip install wse-client[crypto]
 ```
 
-Key exchange happens automatically during the WebSocket handshake. All messages are encrypted with per-connection session keys derived via HKDF-SHA256. Wire format is the `E:` prefix + 12-byte IV + ciphertext + 16-byte auth tag, compatible with the TypeScript client and Rust server.
+Key exchange happens automatically during the WebSocket handshake. All messages are encrypted with per-connection session keys derived via HKDF-SHA256. Wire format is the `E:` prefix + 12-byte IV + ciphertext + 16-byte auth tag, compatible with the TS client and Rust server.
 
 ### Circuit Breaker
 
