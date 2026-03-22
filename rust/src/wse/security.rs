@@ -141,10 +141,10 @@ pub fn rust_ecdh_generate_keypair(py: Python) -> PyResult<(Py<PyBytes>, Py<PyByt
 /// private_key: 32-byte raw scalar.
 /// peer_public_key: 65-byte uncompressed SEC1 point (04 || X || Y).
 ///
-/// HKDF parameters (matching frontend security.ts):
-///   salt  = "wse-encryption"
-///   info  = "aes-gcm-key"
-///   hash  = SHA-256
+/// HKDF parameters (RFC 5869, matching server.rs / security.py / security.ts):
+///   salt   = None (zero-salt default, 32 zero bytes for SHA-256)
+///   info   = "wse-encryption/aes-gcm-key"
+///   hash   = SHA-256
 ///   output = 32 bytes (AES-256 key)
 #[pyfunction]
 pub fn rust_ecdh_derive_shared_secret(
@@ -162,12 +162,14 @@ pub fn rust_ecdh_derive_shared_secret(
     // ECDH key agreement
     let shared = diffie_hellman(secret.to_nonzero_scalar(), peer_pk.as_affine());
 
-    // HKDF-SHA256: salt="wse-encryption", info="aes-gcm-key"
-    let hkdf = Hkdf::<Sha256>::new(Some(b"wse-encryption"), shared.raw_secret_bytes());
+    // HKDF-SHA256 (RFC 5869): IKM = ECDH shared secret, salt = None (zero-salt),
+    // info = context label for domain separation. All 4 components must match.
+    let hkdf = Hkdf::<Sha256>::new(None, shared.raw_secret_bytes());
     let mut aes_key = [0u8; 32];
-    hkdf.expand(b"aes-gcm-key", &mut aes_key).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("HKDF expand failed: {e}"))
-    })?;
+    hkdf.expand(b"wse-encryption/aes-gcm-key", &mut aes_key)
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("HKDF expand failed: {e}"))
+        })?;
 
     Ok(PyBytes::new(py, &aes_key).unbind())
 }
@@ -242,9 +244,11 @@ mod tests {
         let pk = sk.public_key();
         // Self-exchange just to test HKDF
         let shared = diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine());
-        let hkdf = Hkdf::<Sha256>::new(Some(b"wse-encryption"), shared.raw_secret_bytes());
+        // Must match production: salt=None, info="wse-encryption/aes-gcm-key"
+        let hkdf = Hkdf::<Sha256>::new(None, shared.raw_secret_bytes());
         let mut key = [0u8; 32];
-        hkdf.expand(b"aes-gcm-key", &mut key).unwrap();
+        hkdf.expand(b"wse-encryption/aes-gcm-key", &mut key)
+            .unwrap();
         assert_eq!(key.len(), 32);
         // Key should not be all zeros
         assert!(key.iter().any(|&b| b != 0));

@@ -4,9 +4,11 @@
 
 ### Security
 
-- Fixed HKDF key derivation: salt/IKM arguments were swapped (RFC 5869 compliance)
+- Fixed HKDF key derivation across all 4 components (server, security.rs, Python client, TS client): salt/IKM corrected per RFC 5869, context label moved to info parameter
 - Added 10-second timeout on WebSocket handshake to prevent slow loris attacks
 - Plaintext cluster connections on main port now log a security warning
+- Fixed zlib decompression bomb: bounded output to 10 MB max (prevents OOM from crafted payloads)
+- Fixed regex cache eviction: FIFO via IndexMap instead of random HashMap key (prevents cache poisoning)
 - Removed unused `InvalidHeader` JWT error variant (dead code cleanup)
 
 ### Bug Fixes
@@ -19,13 +21,34 @@
 - **Python client**: fixed `_server_ready_event` not cleared on reconnect (stale set from prior session)
 - **TS client**: fixed module-level `circuitBreakerCheckInterval` shared across all `useWSE` hook instances (moved to per-instance ref)
 - **TS client**: fixed `batchInterval` and `diagnosticsInterval` leak on unmount-remount cycle
+- **Python client**: fixed `_server_ready_event.set()` crash if called before `connect()` (None guard)
+- **TS client**: fixed age filter silently dropping `server_ready` events on clock skew
+- **TS client**: fixed direct `ws.send()` in MessageProcessor bypassing rate limiter and isDestroyed guard
+- **Python client**: fixed signing key rotation skipped entirely during ECDH sessions
+- **TS client**: fixed `heartbeatInterval` leak on terminal close codes (4429/4401/4403)
+- **TS client**: fixed `waitForHandlers` interval not cancellable by `destroy()`
+- **TS client**: fixed age filter not exempting handshake events after initial 5s window on reconnect
+- **TS client**: removed duplicate event dedup in `handleIncomingMessage` that broke EventSequencer gap tracking
+- Fixed `max_subscriptions_per_connection` bypass via queue group subscriptions (now counts both regular and queue group memberships)
+- Fixed HKDF unit test in security.rs using stale parameters that didn't match production code
 
 ### Improvements
 
 - Added `max_subscriptions_per_connection` config parameter (default: 0 = unlimited) to prevent topic explosion DoS
+- Added `sendControl()` method in TS client for PING/PONG that bypasses rate limiter (RFC 6455 compliance)
 - **TS client**: event throttle is now configurable via `eventThrottleMs` config option (default: 0 = disabled, was hardcoded 500ms)
+- **Python client**: added `set_error_handler()` and `background_error` property to `SyncWSEClient` for surfacing background loop errors
 - Removed all `#[allow(dead_code)]` suppressions (fixed underlying issues instead)
+- Replaced all `#[allow(clippy::too_many_arguments)]` with `#[expect]` + reason on PyO3 boundary functions
 - Documented `refreshAuthToken` behavior: only active in cookie-auth mode
+
+### Refactoring
+
+- `ClusterContext` struct replaces 15+ arguments in 6 cluster peer functions (net -170 lines)
+- `SharedStateConfig` struct replaces 14 arguments in `SharedState::new()`
+- `ServerParams`, `JwtParams`, `RecoveryParams`, `PresenceParams` structs group `RustWSEServer::new()` args
+- `connect_cluster_inner()` extracts body from PyO3 shim with grouped TLS tuple
+- Regex cache switched from `HashMap` (random eviction) to `IndexMap` (FIFO eviction)
 
 ## v2.3.1 (2026-03-08)
 

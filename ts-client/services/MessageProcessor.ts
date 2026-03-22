@@ -30,6 +30,7 @@ export class MessageProcessor {
   // Use promise-based queue for race condition prevention
   private batchPromise: Promise<void> | null = null;
   private destroyed = false;
+  private waitForHandlersInterval: NodeJS.Timeout | null = null;
 
   // Add server ready state management
   private serverReadyProcessed = false;
@@ -262,7 +263,7 @@ export class MessageProcessor {
       const parts = data.split(':');
       const serverTimestamp = parts.length > 1 ? parseInt(parts[parts.length - 1], 10) : Date.now();
 
-      if (this.connectionManager?.ws?.readyState === WebSocket.OPEN) {
+      if (this.connectionManager) {
         try {
           const pongMessage = {
             t: 'PONG',
@@ -272,7 +273,7 @@ export class MessageProcessor {
             },
             v: WS_PROTOCOL_VERSION
           };
-          this.connectionManager.ws.send(JSON.stringify({ c: 'WSE', ...pongMessage }));
+          this.connectionManager.sendControl(JSON.stringify({ c: 'WSE', ...pongMessage }));
           logger.debug(`Responded to PING with JSON PONG`);
         } catch (error) {
           logger.error('Failed to send PONG:', error);
@@ -476,7 +477,7 @@ export class MessageProcessor {
 
     // Handle JSON PING from backend - respond with JSON PONG
     if (type === 'PING' || type === 'ping') {
-      if (this.connectionManager?.ws?.readyState === WebSocket.OPEN) {
+      if (this.connectionManager) {
         try {
           const serverTimestamp = message.p?.server_time || message.p?.timestamp || Date.now();
           const pongMessage = {
@@ -487,7 +488,7 @@ export class MessageProcessor {
             },
             v: WS_PROTOCOL_VERSION
           };
-          this.connectionManager.ws.send(JSON.stringify({ c: 'WSE', ...pongMessage }));
+          this.connectionManager.sendControl(JSON.stringify({ c: 'WSE', ...pongMessage }));
           logger.debug(`Responded to JSON PING with PONG`);
         } catch (error) {
           logger.error('Failed to send PONG:', error);
@@ -1284,11 +1285,18 @@ export class MessageProcessor {
       if (checkHandlers()) return;
 
       const startTime = Date.now();
-      const interval = setInterval(() => {
-        if (checkHandlers()) {
-          clearInterval(interval);
+      this.waitForHandlersInterval = setInterval(() => {
+        if (this.destroyed || checkHandlers()) {
+          if (this.waitForHandlersInterval) {
+            clearInterval(this.waitForHandlersInterval);
+            this.waitForHandlersInterval = null;
+          }
+          if (this.destroyed) resolve(false);
         } else if (Date.now() - startTime > timeout) {
-          clearInterval(interval);
+          if (this.waitForHandlersInterval) {
+            clearInterval(this.waitForHandlersInterval);
+            this.waitForHandlersInterval = null;
+          }
           resolve(requiredHandlers.every(h => this.isHandlerRegistered(h)));
         }
       }, 100);
@@ -1301,6 +1309,11 @@ export class MessageProcessor {
     if (this.batchTimer) {
       clearTimeout(this.batchTimer);
       this.batchTimer = null;
+    }
+
+    if (this.waitForHandlersInterval) {
+      clearInterval(this.waitForHandlersInterval);
+      this.waitForHandlersInterval = null;
     }
 
     this.batchPromise = null;

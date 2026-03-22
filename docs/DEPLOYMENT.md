@@ -377,6 +377,8 @@ async with connect("ws://host/wse", token="...") as client:
 
 Memory usage depends on message sizes, presence data, and recovery buffer configuration. The numbers above assume typical workloads with 1 KB average message size. Per-connection outbound buffers are capped at `max_outbound_queue_bytes` (default 16 MB); slow consumers that exceed this limit have messages dropped (recoverable via reconnect).
 
+Set `max_subscriptions_per_connection` to limit how many topics each connection can subscribe to (default 0 = unlimited). This prevents a single client from creating millions of unique topics and exhausting server memory. Both regular subscriptions and queue group memberships count against the same budget.
+
 ---
 
 ## Monitoring

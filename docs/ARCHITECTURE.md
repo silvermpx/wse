@@ -23,7 +23,7 @@ RustWSEServer (PyO3)
     |
     +-- SharedState
           +-- connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>
-          +-- topic_subscribers: Arc<DashMap<String, DashSet<String>>>
+          +-- topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>
           +-- conn_topics: DashMap<String, DashSet<String>>
           +-- conn_formats: DashMap<String, bool>
           +-- conn_rates: DashMap<String, PerConnRate>
@@ -56,7 +56,7 @@ Key runtime properties:
 ```
 TCP accept
   -> TLS handshake (if configured)
-  -> WebSocket upgrade (tungstenite)
+  -> WebSocket upgrade with 10s timeout (tungstenite, prevents slow loris)
   -> OnceLock handshake: extract cookies, format preference, Authorization header
   -> JWT validation in Rust (if jwt_secret configured, zero GIL)
   -> Spawn read task + write task
@@ -503,6 +503,23 @@ When a connection exceeds its rate limit:
 2. A warning is emitted at 20% remaining capacity (throttled via `last_warning` timestamp to avoid log spam).
 3. The offending message is dropped.
 
+### Backpressure (Slow Consumer Protection)
+
+Per-connection byte-based backpressure via `max_outbound_queue_bytes` (default 16 MB):
+
+- Each connection tracks pending outbound bytes in an `AtomicUsize` counter
+- Before fan-out, the counter is checked: if `pending >= max_outbound_queue_bytes`, the message is dropped for that connection (others still receive it)
+- The counter uses `saturating_sub` on flush to prevent underflow wraparound
+- Two-phase slow consumer detection: first tick marks as suspected, second tick sends WebSocket Close, third tick force-removes as zombie
+
+### Subscription Limits
+
+`max_subscriptions_per_connection` (default 0 = unlimited) caps the total number of topics per connection. Both regular subscriptions (`conn_topics`) and queue group memberships (`conn_queue_groups`) count against the same budget. Prevents topic explosion DoS.
+
+### Decompression Limits
+
+Zlib decompression is bounded to 10 MB output. Zstd cluster frame decompression is bounded to 1 MB (`MAX_FRAME_SIZE`). Both reject payloads that decompress beyond the limit, preventing decompression bomb attacks.
+
 ### Serialization
 
 - **JSON**: `serde_json` for serialization, with a custom `pyobj_to_json` converter that handles Python `datetime`, `UUID`, `Decimal`, `Enum`, `bytes` (hex), nested dicts/lists.
@@ -699,8 +716,9 @@ When `broadcast(topic, data)` is called:
 | Component         | Concurrency Primitive      | Access Pattern            |
 +-------------------+----------------------------+---------------------------+
 | connections       | Arc<RwLock<HashMap>>        | Read-heavy, write on connect/disconnect |
-| topic_subscribers | Arc<DashMap<String, DashSet>>| Concurrent read/write     |
+| topic_subscribers | Arc<DashMap<String, DashMap<String, ConnectionHandle>>>| Direct handle access, no HashMap lookup |
 | conn_topics       | DashMap<String, DashSet>    | Concurrent read/write     |
+| queue_groups      | Arc<DashMap<String, DashMap<String, QueueGroup>>>| Per-topic per-group       |
 | conn_formats      | DashMap<String, bool>       | Per-connection read/write  |
 | conn_rates        | DashMap                     | Per-connection write       |
 | conn_last_activity| DashMap                     | Per-connection write       |

@@ -1,8 +1,12 @@
 use flate2::Compression;
-use flate2::write::{ZlibDecoder, ZlibEncoder};
+use flate2::write::ZlibEncoder;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyNone, PyString, PyTuple};
 use std::io::Write;
+
+/// Maximum decompressed output size (10 MB). Prevents decompression bombs
+/// where a small compressed payload expands to gigabytes of RAM.
+const MAX_DECOMPRESS_SIZE: usize = 10 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Standalone functions (backward compatibility)
@@ -30,17 +34,36 @@ pub fn rust_compress(py: Python, data: &[u8], level: i32) -> PyResult<Py<PyBytes
     Ok(PyBytes::new(py, &compressed).unbind())
 }
 
-/// Decompress zlib-compressed data.
+/// Decompress zlib-compressed data (bounded to MAX_DECOMPRESS_SIZE).
 #[pyfunction]
 pub fn rust_decompress(py: Python, data: &[u8]) -> PyResult<Py<PyBytes>> {
-    let mut decoder = ZlibDecoder::new(Vec::new());
-    decoder.write_all(data).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("decompression write error: {e}"))
-    })?;
-    let decompressed = decoder.finish().map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("decompression finish error: {e}"))
-    })?;
-    Ok(PyBytes::new(py, &decompressed).unbind())
+    bounded_decompress(data)
+        .map(|decompressed| PyBytes::new(py, &decompressed).unbind())
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+}
+
+/// Decompress with bounded output to prevent decompression bombs.
+fn bounded_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
+    use flate2::read::ZlibDecoder as ZlibReader;
+    use std::io::Read;
+    let mut decoder = ZlibReader::new(data);
+    let mut output = Vec::with_capacity(data.len().min(65_536));
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = decoder
+            .read(&mut buf)
+            .map_err(|e| format!("decompression error: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        output.extend_from_slice(&buf[..n]);
+        if output.len() > MAX_DECOMPRESS_SIZE {
+            return Err(format!(
+                "decompressed output exceeds {MAX_DECOMPRESS_SIZE} bytes limit"
+            ));
+        }
+    }
+    Ok(output)
 }
 
 /// Return true if the data length exceeds the given threshold.
@@ -376,27 +399,18 @@ impl RustCompressionManager {
         Ok(PyBytes::new(py, &compressed).unbind())
     }
 
-    /// Decompress zlib-compressed data with stats tracking.
+    /// Decompress zlib-compressed data with stats tracking (bounded).
     fn decompress(&mut self, py: Python, data: &[u8]) -> PyResult<Py<PyBytes>> {
-        let mut decoder = ZlibDecoder::new(Vec::new());
-        if let Err(e) = decoder.write_all(data) {
-            self.decompression_failures += 1;
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "decompression write error: {e}"
-            )));
-        }
-        let decompressed = match decoder.finish() {
-            Ok(d) => d,
+        match bounded_decompress(data) {
+            Ok(decompressed) => {
+                self.total_decompressed += 1;
+                Ok(PyBytes::new(py, &decompressed).unbind())
+            }
             Err(e) => {
                 self.decompression_failures += 1;
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "decompression finish error: {e}"
-                )));
+                Err(pyo3::exceptions::PyRuntimeError::new_err(e))
             }
-        };
-
-        self.total_decompressed += 1;
-        Ok(PyBytes::new(py, &decompressed).unbind())
+        }
     }
 
     /// Pack a Python dict using msgpack with custom serialization for UUID/datetime/Enum.

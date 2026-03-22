@@ -366,9 +366,15 @@ Deny always takes precedence over allow. Patterns support `*` (match any charact
 - Protocol version validation in handshake
 - Unknown message types silently ignored (forward compatibility)
 
+### Decompression Bomb Protection
+
+- **Zlib**: output bounded to 10 MB. Decompression is streamed in 8 KB chunks with size check after each read. Rejects payloads that decompress beyond the limit before allocating full output.
+- **Zstd (cluster)**: output bounded to 1 MB (MAX_FRAME_SIZE). Uses `zstd::bulk::decompress` with explicit capacity limit.
+- **Regex cache**: FIFO eviction via IndexMap (insertion-ordered). Capped at 1024 entries. Prevents cache poisoning where an attacker sends unique patterns to evict useful compiled regexes.
+
 ### Client Frame Protection
 
-- WebSocket frame size limited to 1 MB
+- WebSocket frame size limited to 1 MB (`max_message_size`)
 - JSON parsing with serde_json (no eval, no injection)
 - User ID from JWT escaped via serde_json in server_ready
 - Binary frames parsed as msgpack or raw bytes (no code execution)

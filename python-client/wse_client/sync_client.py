@@ -90,6 +90,8 @@ class SyncWSEClient:
         self._running = False
         self._connected_event = threading.Event()
         self._connect_error: Exception | None = None
+        self._background_error: Exception | None = None
+        self._on_error: Callable[[Exception], Any] | None = None
 
     # -- Lifecycle ------------------------------------------------------------
 
@@ -125,6 +127,20 @@ class SyncWSEClient:
         if err is not None:
             self._running = False
             raise WSEConnectionError(f"Connection failed: {err}") from err
+
+    def set_error_handler(self, handler: Callable[[Exception], Any]) -> None:
+        """Set a callback for background loop errors that occur after connect().
+
+        Without this, errors in the background event loop (e.g. unexpected
+        disconnect without reconnect) are only logged. The handler is called
+        from the background thread.
+        """
+        self._on_error = handler
+
+    @property
+    def background_error(self) -> Exception | None:
+        """Last error from the background event loop (None if healthy)."""
+        return self._background_error
 
     def close(self) -> None:
         """Disconnect and stop the background thread."""
@@ -468,7 +484,13 @@ class SyncWSEClient:
 
         except Exception as exc:
             self._connect_error = exc
+            self._background_error = exc
             logger.error("Client error: %s", exc)
+            if self._on_error is not None:
+                try:
+                    self._on_error(exc)
+                except Exception:
+                    pass
         finally:
             await self._client.disconnect()
             self._connected_event.set()  # Unblock connect() if still waiting

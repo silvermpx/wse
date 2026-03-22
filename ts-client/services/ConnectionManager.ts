@@ -691,8 +691,24 @@ export class ConnectionManager {
       return false;
     }
 
+    return this._sendDirect(data);
+  }
+
+  /**
+   * Send a protocol-level control message (PONG) bypassing the rate limiter.
+   * RFC 6455 requires PONG responses "as soon as is practical" -- they must
+   * not be dropped due to application-level rate limiting.
+   */
+  sendControl(data: string | ArrayBuffer): boolean {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.isDestroyed) {
+      return false;
+    }
+    return this._sendDirect(data);
+  }
+
+  private _sendDirect(data: string | ArrayBuffer): boolean {
     try {
-      this.ws.send(data);
+      this.ws!.send(data);
 
       const store = useWSEStore.getState();
       store.incrementMetric('messagesSent');
@@ -706,7 +722,7 @@ export class ConnectionManager {
       return true;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      logger.error('[ConnectionManager] Failed to send raw message:', errorMessage);
+      logger.error('[ConnectionManager] Failed to send message:', errorMessage);
       return false;
     }
   }
@@ -854,6 +870,13 @@ export class ConnectionManager {
 
       logger.info(`[ConnectionManager] WebSocket closed on ${endpoint}: code=${event.code}, reason=${event.reason}`);
 
+      // Always stop heartbeat on close to prevent leaked intervals.
+      // startHeartbeat() re-arms on reconnect success.
+      if (this.heartbeatInterval) {
+        clearInterval(this.heartbeatInterval);
+        this.heartbeatInterval = null;
+      }
+
       this.ws = null;
       this.serverReady = false;
       this.clientHelloSent = false;
@@ -932,19 +955,12 @@ export class ConnectionManager {
       }
 
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        try {
-          const pingMessage = {
-            t: 'ping',
-            p: { timestamp: Date.now() },
-            v: WS_PROTOCOL_VERSION
-          };
-          this.ws.send(JSON.stringify({ c: 'WSE', ...pingMessage }));
-          const store = useWSEStore.getState();
-          store.incrementMetric('messagesSent');
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          logger.error('[ConnectionManager] Failed to send PING:', errorMessage);
-        }
+        const pingMessage = {
+          t: 'ping',
+          p: { timestamp: Date.now() },
+          v: WS_PROTOCOL_VERSION
+        };
+        this.sendControl(JSON.stringify({ c: 'WSE', ...pingMessage }));
       }
     }, 15000);
   }

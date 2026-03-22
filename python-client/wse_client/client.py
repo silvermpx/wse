@@ -234,6 +234,8 @@ class AsyncWSEClient:
         return self
 
     async def __anext__(self) -> WSEEvent:
+        if self._event_queue is None:
+            raise StopAsyncIteration
         event = await self._event_queue.get()
         if event is None:
             raise StopAsyncIteration
@@ -280,14 +282,15 @@ class AsyncWSEClient:
         self._offline_queue.clear()
 
         # Signal iterator to stop (drop oldest if queue is full)
-        try:
-            self._event_queue.put_nowait(None)
-        except asyncio.QueueFull:
+        if self._event_queue is not None:
             try:
-                self._event_queue.get_nowait()
                 self._event_queue.put_nowait(None)
-            except (asyncio.QueueEmpty, asyncio.QueueFull):
-                pass
+            except asyncio.QueueFull:
+                try:
+                    self._event_queue.get_nowait()
+                    self._event_queue.put_nowait(None)
+                except (asyncio.QueueEmpty, asyncio.QueueFull):
+                    pass
         try:
             await self._connection.destroy()
         finally:
@@ -592,6 +595,8 @@ class AsyncWSEClient:
             WSEConnectionError: If the connection is closed.
             asyncio.TimeoutError: If *timeout* expires.
         """
+        if self._event_queue is None:
+            raise WSEConnectionError("Not connected")
         if timeout is not None:
             event = await asyncio.wait_for(self._event_queue.get(), timeout=timeout)
         else:
@@ -608,7 +613,8 @@ class AsyncWSEClient:
 
     async def force_reconnect(self) -> None:
         """Force a reconnection (e.g. after detecting degraded quality)."""
-        self._server_ready_event.clear()
+        if self._server_ready_event is not None:
+            self._server_ready_event.clear()
         await self._connection.force_reconnect()
 
     async def change_endpoint(self, new_url: str) -> None:
@@ -621,7 +627,8 @@ class AsyncWSEClient:
         self._connection._url = new_url
         self._connection._active_endpoint = new_url
         self._connection._reconnect_attempts = 0
-        self._server_ready_event.clear()
+        if self._server_ready_event is not None:
+            self._server_ready_event.clear()
 
         # Register with pool if active
         if self._connection._pool is not None:
@@ -760,6 +767,8 @@ class AsyncWSEClient:
         self._invoke_handlers(event)
 
         # Enqueue for async iterator
+        if self._event_queue is None:
+            return
         try:
             self._event_queue.put_nowait(event)
         except asyncio.QueueFull:
@@ -794,7 +803,8 @@ class AsyncWSEClient:
             "details", {}
         ).get("connection_id")
         self._connection.handle_server_ready(conn_id)
-        self._server_ready_event.set()
+        if self._server_ready_event is not None:
+            self._server_ready_event.set()
         self._snapshot_requested = False
 
         # Check if server supports recovery (from features in details)
@@ -1102,18 +1112,20 @@ class AsyncWSEClient:
     def _on_state_change(self, state: ConnectionState) -> None:
         if state == ConnectionState.RECONNECTING:
             self._stats.reconnect_count += 1
-            self._server_ready_event.clear()
+            if self._server_ready_event is not None:
+                self._server_ready_event.clear()
             self._snapshot_requested = False
             self._sequencer.reset()
         elif state == ConnectionState.CONNECTED:
             pass  # record_ping() is called per-heartbeat via on_ping_sent
         elif state == ConnectionState.DISCONNECTED:
-            self._server_ready_event.clear()
+            if self._server_ready_event is not None:
+                self._server_ready_event.clear()
             # Signal iterator to stop on terminal disconnect.
             # DISCONNECTED only fires for permanent closes (normal close,
             # going_away). Transient errors go through RECONNECTING, not here.
             # Skip if disconnect() already enqueued the sentinel.
-            if not self._disconnecting:
+            if not self._disconnecting and self._event_queue is not None:
                 try:
                     self._event_queue.put_nowait(None)
                 except asyncio.QueueFull:

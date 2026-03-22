@@ -197,12 +197,14 @@ export class SecurityManager {
         'raw', sharedSecretBits, 'HKDF', false, ['deriveKey']
       );
 
+      // RFC 5869: salt = empty (zero-salt default), info = context label
+      // Must match server.rs, security.rs, and Python client exactly
       this.encryptionKey = await crypto.subtle.deriveKey(
         {
           name: 'HKDF',
           hash: 'SHA-256',
-          salt: new TextEncoder().encode('wse-encryption'),
-          info: new TextEncoder().encode('aes-gcm-key')
+          salt: new Uint8Array(0),
+          info: new TextEncoder().encode('wse-encryption/aes-gcm-key')
         },
         this.sharedSecret,
         { name: 'AES-GCM', length: 256 },

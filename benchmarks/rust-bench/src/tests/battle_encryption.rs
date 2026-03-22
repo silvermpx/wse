@@ -13,8 +13,8 @@ use std::time::Duration;
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-const HKDF_SALT: &[u8] = b"wse-encryption";
-const HKDF_INFO: &[u8] = b"aes-gcm-key";
+// RFC 5869: zero-salt + context info. Must match all WSE components.
+const HKDF_INFO: &[u8] = b"wse-encryption/aes-gcm-key";
 
 struct CheckResult {
     passed: u32,
@@ -87,7 +87,7 @@ async fn connect_raw(
 
 /// Derive AES-256-GCM cipher from ECDH shared secret.
 fn derive_cipher(shared_secret: &[u8]) -> Aes256Gcm {
-    let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret);
+    let hk = Hkdf::<Sha256>::new(None, shared_secret);
     let mut aes_key = [0u8; 32];
     hk.expand(HKDF_INFO, &mut aes_key)
         .expect("HKDF expand failed");

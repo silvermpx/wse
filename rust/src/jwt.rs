@@ -326,10 +326,42 @@ pub fn parse_cookie_value<'a>(cookies: &'a str, name: &str) -> Option<&'a str> {
 // PyO3 wrappers (for Python consumers — HTTP routes, etc.)
 // ---------------------------------------------------------------------------
 
+/// Decode a JWT, returning claims as serde_json::Value or error.
+fn jwt_decode_with_rotation(
+    token: &str,
+    secret: &[u8],
+    algorithm: &str,
+    issuer: Option<&str>,
+    audience: Option<&str>,
+    previous_secret: Option<&[u8]>,
+    key_id: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let alg = JwtAlgorithm::from_str(algorithm).map_err(|_| {
+        format!("Unsupported algorithm: {algorithm}. Supported: HS256, RS256, ES256")
+    })?;
+
+    let result = match jwt_decode_inner(token, secret, alg, issuer, audience, key_id) {
+        Err(JwtError::InvalidSignature | JwtError::InvalidKeyId) if previous_secret.is_some() => {
+            if let Ok(hdr) = jsonwebtoken::decode_header(token)
+                && hdr.alg != alg.to_jw()
+            {
+                return Err("algorithm mismatch".to_string());
+            }
+            jwt_decode_inner(token, previous_secret.unwrap(), alg, issuer, audience, None)
+        }
+        other => other,
+    };
+
+    result.map_err(|e| e.to_string())
+}
+
 /// Decode a JWT token. Returns a dict of claims on success, None on failure.
 #[pyfunction]
 #[pyo3(signature = (token, secret, algorithm="HS256", issuer=None, audience=None, previous_secret=None, key_id=None))]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "PyO3 boundary: py + 7 Python kwargs"
+)]
 pub fn rust_jwt_decode<'py>(
     py: Python<'py>,
     token: &str,
@@ -340,25 +372,15 @@ pub fn rust_jwt_decode<'py>(
     previous_secret: Option<&[u8]>,
     key_id: Option<&str>,
 ) -> PyResult<Option<Py<PyDict>>> {
-    let alg = JwtAlgorithm::from_str(algorithm).map_err(|_| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "Unsupported algorithm: {algorithm}. Supported: HS256, RS256, ES256"
-        ))
-    })?;
-
-    let result = match jwt_decode_inner(token, secret, alg, issuer, audience, key_id) {
-        Err(JwtError::InvalidSignature | JwtError::InvalidKeyId) if previous_secret.is_some() => {
-            if let Ok(hdr) = jsonwebtoken::decode_header(token)
-                && hdr.alg != alg.to_jw()
-            {
-                return Ok(None);
-            }
-            jwt_decode_inner(token, previous_secret.unwrap(), alg, issuer, audience, None)
-        }
-        other => other,
-    };
-
-    match result {
+    match jwt_decode_with_rotation(
+        token,
+        secret,
+        algorithm,
+        issuer,
+        audience,
+        previous_secret,
+        key_id,
+    ) {
         Ok(payload) => {
             let dict = PyDict::new(py);
             if let serde_json::Value::Object(map) = payload {

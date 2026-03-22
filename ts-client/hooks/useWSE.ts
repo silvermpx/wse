@@ -632,14 +632,18 @@ export function useWSE(
         const connectionTime = Date.now() - (window.__wseConnectionStartTime || Date.now());
         const isNewConnection = connectionTime < 5000;
 
+        // Critical handshake events are never age-filtered
+        const isHandshakeEvent = eventType === 'server_ready' || eventType === 'server_hello'
+          || eventType === 'error' || eventType === 'subscription_update';
+
         if (isNewConnection) {
-          if (eventType && eventType.includes('snapshot')) {
-            logger.debug(`Accepting ${eventType} snapshot during new connection`);
+          if (isHandshakeEvent || (eventType && eventType.includes('snapshot'))) {
+            logger.debug(`Accepting ${eventType} during new connection`);
           } else if (age > 1000) {
             logger.debug(`Rejecting old ${eventType} event during new connection (${Math.round(age / 1000)}s old)`);
             return;
           }
-        } else {
+        } else if (!isHandshakeEvent) {
           const maxAge = eventType && (
             eventType.includes('snapshot') ||
             eventType.includes('health_update') ||
@@ -652,16 +656,12 @@ export function useWSE(
         }
       }
 
-      // Check event ID for deduplication
+      // Track event IDs for diagnostics (actual dedup is in MessageProcessor's
+      // EventSequencer -- filtering here would cause the sequencer to miss events)
       if (parsed && parsed.id) {
         if (processedEvents.size >= MAX_CACHED_EVENTS) {
           const oldestKey = processedEvents.keys().next().value;
           if (oldestKey) processedEvents.delete(oldestKey);
-        }
-
-        if (processedEvents.has(parsed.id)) {
-          logger.debug(`Skipping globally duplicate event: ${parsed.id}`);
-          return;
         }
         processedEvents.set(parsed.id, Date.now());
       }
@@ -942,6 +942,8 @@ export function useWSE(
       networkMonitorRef.current = globalWSEInstance.networkMonitor;
       offlineQueueRef.current = globalWSEInstance.offlineQueue;
       initializedRef.current = true;
+      // Restart circuit breaker check (cleared on previous unmount)
+      startCircuitBreakerCheck();
       return;
     }
 

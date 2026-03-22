@@ -1,12 +1,12 @@
+use indexmap::IndexMap;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use regex::Regex;
-use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Global regex cache to avoid recompiling patterns (capped at 1024 entries).
-static REGEX_CACHE: std::sync::LazyLock<Mutex<HashMap<String, Regex>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Global regex cache (insertion-ordered for FIFO eviction, capped at 1024).
+static REGEX_CACHE: std::sync::LazyLock<Mutex<IndexMap<String, Regex>>> =
+    std::sync::LazyLock::new(|| Mutex::new(IndexMap::new()));
 
 const REGEX_CACHE_MAX: usize = 1024;
 
@@ -246,10 +246,8 @@ fn regex_matches(pattern: &str, text: &str) -> PyResult<bool> {
         let compiled = Regex::new(&anchored).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Invalid regex '{pattern}': {e}"))
         })?;
-        if cache.len() >= REGEX_CACHE_MAX
-            && let Some(key) = cache.keys().next().cloned()
-        {
-            cache.remove(&key);
+        if cache.len() >= REGEX_CACHE_MAX {
+            cache.shift_remove_index(0); // evict oldest (FIFO)
         }
         cache.insert(anchored.clone(), compiled);
         cache.get(&anchored).unwrap()

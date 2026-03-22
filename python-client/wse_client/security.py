@@ -37,8 +37,8 @@ except ImportError:
 from .errors import WSEEncryptionError
 
 # Wire constants
-HKDF_SALT = b"wse-encryption"
-HKDF_INFO = b"aes-gcm-key"
+HKDF_SALT = None  # RFC 5869: zero-salt default for ECDH output
+HKDF_INFO = b"wse-encryption/aes-gcm-key"
 AES_KEY_LEN = 32  # 256 bits
 GCM_IV_LEN = 12  # 96 bits
 GCM_TAG_LEN = 16  # 128 bits
@@ -240,16 +240,13 @@ class SecurityManager:
             except asyncio.CancelledError:
                 return
 
-            # Skip rotation when ECDH session is active (matches TS behavior)
-            if self._aes_key is not None and self._enabled:
-                logger.debug("Skipping key rotation (ECDH session active)")
-                continue
-
             try:
+                # Signing key rotates regardless of ECDH session state --
+                # it is independent of the AES key derived from ECDH
                 self._signing_key = os.urandom(32)
                 self._iv_cache = {}
                 failures = 0
-                logger.debug("Keys rotated successfully")
+                logger.debug("Signing key rotated successfully")
             except Exception as exc:
                 failures += 1
                 logger.error("Key rotation failed: %s", exc)

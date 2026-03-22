@@ -792,8 +792,8 @@ fn derive_connection_key(client_pubkey_b64: &str) -> Result<(String, aes_gcm::Ae
 
     let shared = diffie_hellman(server_sk.to_nonzero_scalar(), client_pk.as_affine());
 
-    // RFC 5869: IKM = DH shared secret, salt = None (zero-salt default),
-    // info = context string for domain separation in expand()
+    // HKDF-SHA256 (RFC 5869): IKM = ECDH shared secret, salt = None (zero-salt),
+    // info = context label for domain separation. All 4 components must match.
     let hkdf = Hkdf::<Sha256>::new(None, shared.raw_secret_bytes());
     let mut aes_key = [0u8; 32];
     hkdf.expand(b"wse-encryption/aes-gcm-key", &mut aes_key)
@@ -2443,6 +2443,321 @@ pub struct RustWSEServer {
     started_at: Option<std::time::Instant>,
 }
 
+// Parameter groups for RustWSEServer::new() -- keeps the PyO3 #[new] shim clean
+struct ServerParams {
+    max_connections: usize,
+    max_inbound_queue_size: usize,
+    max_message_size: usize,
+    ping_interval: u64,
+    idle_timeout: u64,
+    max_outbound_queue_bytes: usize,
+    max_subscriptions_per_connection: usize,
+    rate_limit_capacity: f64,
+    rate_limit_refill: f64,
+}
+
+struct JwtParams {
+    jwt_secret: Option<Vec<u8>>,
+    jwt_issuer: Option<String>,
+    jwt_audience: Option<String>,
+    jwt_cookie_name: Option<String>,
+    jwt_previous_secret: Option<Vec<u8>>,
+    jwt_key_id: Option<String>,
+    jwt_algorithm: Option<String>,
+    jwt_private_key: Option<Vec<u8>>,
+}
+
+struct RecoveryParams {
+    recovery_enabled: bool,
+    recovery_buffer_size: usize,
+    recovery_ttl: u64,
+    recovery_max_messages: usize,
+    recovery_memory_budget: usize,
+}
+
+struct PresenceParams {
+    presence_enabled: bool,
+    presence_max_data_size: usize,
+    presence_max_members: usize,
+}
+
+impl RustWSEServer {
+    fn build(
+        host: String,
+        port: u16,
+        srv: ServerParams,
+        jwt: JwtParams,
+        rec: RecoveryParams,
+        pres: PresenceParams,
+    ) -> PyResult<Self> {
+        if srv.ping_interval >= srv.idle_timeout {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "ping_interval ({}s) must be less than idle_timeout ({}s)",
+                srv.ping_interval, srv.idle_timeout
+            )));
+        }
+        let jwt_alg = match jwt.jwt_algorithm.as_deref() {
+            None | Some("HS256") => jwt::JwtAlgorithm::HS256,
+            Some("RS256") => jwt::JwtAlgorithm::RS256,
+            Some("ES256") => jwt::JwtAlgorithm::ES256,
+            Some(other) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unsupported jwt_algorithm: {other}. Supported: HS256, RS256, ES256"
+                )));
+            }
+        };
+        // Algorithm-specific key validation at startup
+        if jwt.jwt_secret.is_some() {
+            match jwt_alg {
+                jwt::JwtAlgorithm::HS256 => {
+                    if let Some(ref s) = jwt.jwt_secret
+                        && s.len() < 32
+                    {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "jwt_secret must be at least 32 bytes (RFC 7518 HS256 minimum)",
+                        ));
+                    }
+                    if let Some(ref s) = jwt.jwt_previous_secret
+                        && s.len() < 32
+                    {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "jwt_previous_secret must be at least 32 bytes",
+                        ));
+                    }
+                }
+                jwt::JwtAlgorithm::RS256 => {
+                    if let Some(ref s) = jwt.jwt_secret {
+                        jsonwebtoken::DecodingKey::from_rsa_pem(s).map_err(|e| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "Invalid RS256 public key PEM: {e}"
+                            ))
+                        })?;
+                    }
+                    if let Some(ref s) = jwt.jwt_previous_secret {
+                        jsonwebtoken::DecodingKey::from_rsa_pem(s).map_err(|e| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "Invalid RS256 jwt_previous_secret PEM: {e}"
+                            ))
+                        })?;
+                    }
+                    if let Some(ref s) = jwt.jwt_private_key {
+                        jsonwebtoken::EncodingKey::from_rsa_pem(s).map_err(|e| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "Invalid RS256 jwt_private_key PEM: {e}"
+                            ))
+                        })?;
+                    }
+                }
+                jwt::JwtAlgorithm::ES256 => {
+                    if let Some(ref s) = jwt.jwt_secret {
+                        jsonwebtoken::DecodingKey::from_ec_pem(s).map_err(|e| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "Invalid ES256 public key PEM: {e}"
+                            ))
+                        })?;
+                    }
+                    if let Some(ref s) = jwt.jwt_previous_secret {
+                        jsonwebtoken::DecodingKey::from_ec_pem(s).map_err(|e| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "Invalid ES256 jwt_previous_secret PEM: {e}"
+                            ))
+                        })?;
+                    }
+                    if let Some(ref s) = jwt.jwt_private_key {
+                        jsonwebtoken::EncodingKey::from_ec_pem(s).map_err(|e| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "Invalid ES256 jwt_private_key PEM: {e}"
+                            ))
+                        })?;
+                    }
+                }
+            }
+        }
+        drop(jwt.jwt_private_key);
+        let jwt_config = jwt.jwt_secret.map(|secret| JwtConfig {
+            algorithm: jwt_alg,
+            secret: Zeroizing::new(secret),
+            previous_secret: jwt.jwt_previous_secret.map(Zeroizing::new),
+            key_id: jwt.jwt_key_id,
+            issuer: jwt.jwt_issuer.unwrap_or_default(),
+            audience: jwt.jwt_audience.unwrap_or_default(),
+            cookie_name: jwt
+                .jwt_cookie_name
+                .unwrap_or_else(|| "access_token".to_string()),
+        });
+        let recovery = if rec.recovery_enabled {
+            let clamped = rec.recovery_buffer_size.max(16);
+            let bits = if clamped.is_power_of_two() {
+                clamped.trailing_zeros()
+            } else {
+                clamped.next_power_of_two().trailing_zeros()
+            };
+            Some(Arc::new(super::recovery::RecoveryManager::new(
+                super::recovery::RecoveryConfig {
+                    buffer_size_bits: bits,
+                    history_ttl_secs: rec.recovery_ttl,
+                    max_recovery_messages: rec.recovery_max_messages,
+                    global_memory_budget: rec.recovery_memory_budget,
+                },
+            )))
+        } else {
+            None
+        };
+        Ok(Self {
+            host,
+            port,
+            shared: Arc::new(SharedState::new(SharedStateConfig {
+                max_connections: srv.max_connections,
+                jwt_config,
+                max_inbound_queue_size: srv.max_inbound_queue_size,
+                recovery,
+                presence_enabled: pres.presence_enabled,
+                presence_max_data_size: pres.presence_max_data_size,
+                presence_max_members: pres.presence_max_members,
+                rate_capacity: srv.rate_limit_capacity,
+                rate_refill: srv.rate_limit_refill,
+                max_message_size: srv.max_message_size,
+                ping_interval_secs: srv.ping_interval,
+                idle_timeout_secs: srv.idle_timeout,
+                max_outbound_queue_bytes: srv.max_outbound_queue_bytes,
+                max_subscriptions_per_connection: srv.max_subscriptions_per_connection,
+            })),
+            cmd_tx: None,
+            thread_handle: None,
+            running: Arc::new(AtomicBool::new(false)),
+            dedup: Arc::new(std::sync::Mutex::new(DeduplicationState {
+                seen: AHashSet::with_capacity(50_000),
+                queue: std::collections::VecDeque::with_capacity(50_000),
+                max_entries: 50_000,
+            })),
+            rt_handle: None,
+            started_at: None,
+        })
+    }
+
+    fn connect_cluster_inner(
+        &self,
+        peers: Vec<String>,
+        tls: (Option<String>, Option<String>, Option<String>),
+        cluster_port: Option<u16>,
+        seeds: Option<Vec<String>>,
+        cluster_addr: Option<String>,
+    ) -> PyResult<()> {
+        let (tls_cert, tls_key, tls_ca) = tls;
+
+        if self.shared.cluster_cmd_tx.read().unwrap().is_some() {
+            return Err(PyRuntimeError::new_err("Cluster already connected"));
+        }
+
+        if seeds.is_some() && cluster_addr.is_none() {
+            return Err(PyRuntimeError::new_err(
+                "seeds= requires cluster_addr= so peers can connect back to this node",
+            ));
+        }
+
+        let tls_config = match (tls_cert, tls_key, tls_ca) {
+            (Some(cert), Some(key), Some(ca)) => Some(
+                super::cluster::build_cluster_tls(&cert, &key, &ca)
+                    .map_err(|e| PyRuntimeError::new_err(format!("TLS config error: {e}")))?,
+            ),
+            (None, None, None) => {
+                match (
+                    std::env::var("WSE_CLUSTER_TLS_CERT").ok(),
+                    std::env::var("WSE_CLUSTER_TLS_KEY").ok(),
+                    std::env::var("WSE_CLUSTER_TLS_CA").ok(),
+                ) {
+                    (Some(cert), Some(key), Some(ca)) => Some(
+                        super::cluster::build_cluster_tls(&cert, &key, &ca).map_err(|e| {
+                            PyRuntimeError::new_err(format!("TLS config error (from env): {e}"))
+                        })?,
+                    ),
+                    (None, None, None) => None,
+                    _ => {
+                        return Err(PyRuntimeError::new_err(
+                            "Partial TLS env vars: set all of WSE_CLUSTER_TLS_CERT, \
+                             WSE_CLUSTER_TLS_KEY, WSE_CLUSTER_TLS_CA or none",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(PyRuntimeError::new_err(
+                    "Partial TLS config: provide all of tls_cert, tls_key, tls_ca or none",
+                ));
+            }
+        };
+
+        self.shared
+            .cluster_tls_enabled
+            .store(tls_config.is_some(), Ordering::Relaxed);
+
+        let tls_holder = tls_config.map(|cfg| Arc::new(arc_swap::ArcSwap::from_pointee(cfg)));
+        *self.shared.cluster_tls_holder.write().unwrap() = tls_holder.clone();
+
+        let rt_handle = self
+            .rt_handle
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Server not started"))?;
+
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
+        *self.shared.cluster_cmd_tx.write().unwrap() = Some(cmd_tx);
+
+        let (interest_tx, interest_rx) =
+            mpsc::unbounded_channel::<super::cluster::InterestUpdate>();
+        *self.shared.cluster_interest_tx.write().unwrap() = Some(interest_tx.clone());
+
+        let instance_id = uuid::Uuid::now_v7().to_string();
+        *self.shared.cluster_instance_id.lock().unwrap() = Some(instance_id.clone());
+        let dlq = self.shared.cluster_dlq.clone();
+
+        let effective_peers = if let Some(ref s) = seeds {
+            s.clone()
+        } else {
+            peers
+        };
+
+        let (placeholder_new_peer_tx, _) = mpsc::unbounded_channel::<String>();
+        let (placeholder_cmd_tx, _) = mpsc::unbounded_channel::<super::cluster::ClusterCommand>();
+        let (placeholder_presence_tx, _) =
+            mpsc::unbounded_channel::<super::cluster::PresencePeerFrame>();
+
+        let ctx = super::cluster::ClusterContext {
+            interest_tx,
+            topic_subscribers: self.shared.topic_subscribers.clone(),
+            glob_topic_count: self.shared.glob_topic_count.clone(),
+            metrics: self.shared.cluster_metrics.clone(),
+            new_peer_tx: placeholder_new_peer_tx,
+            cmd_tx: placeholder_cmd_tx,
+            presence_tx: placeholder_presence_tx,
+            connected_instances: Arc::new(dashmap::DashMap::new()),
+            known_peers: Arc::new(dashmap::DashSet::new()),
+            local_topic_refcount: self.shared.local_topic_refcount.clone(),
+            cluster_addr,
+            max_outbound: self.shared.max_outbound_queue_bytes,
+            slow_drops: Arc::clone(&self.shared.slow_consumer_drops),
+            recovery: self.shared.recovery.clone(),
+            topic_message_counts: self.shared.topic_message_counts.clone(),
+            queue_groups: self.shared.queue_groups.clone(),
+        };
+
+        rt_handle.spawn(super::cluster::cluster_manager(
+            effective_peers,
+            instance_id,
+            (cmd_rx, interest_rx),
+            ctx,
+            dlq,
+            tls_holder,
+            (
+                cluster_port,
+                self.shared.presence.clone(),
+                self.cmd_tx.clone(),
+            ),
+        ));
+
+        Ok(())
+    }
+}
+
 #[pymethods]
 impl RustWSEServer {
     /// Create a new WSE server instance.
@@ -2452,7 +2767,10 @@ impl RustWSEServer {
     /// via drain mode or callbacks.
     #[new]
     #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, jwt_previous_secret = None, jwt_key_id = None, jwt_algorithm = None, jwt_private_key = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_bytes = 16_777_216, max_subscriptions_per_connection = 0))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "PyO3 __init__: 27 Python kwargs with defaults"
+    )]
     fn new(
         host: String,
         port: u16,
@@ -2482,149 +2800,43 @@ impl RustWSEServer {
         max_outbound_queue_bytes: usize,
         max_subscriptions_per_connection: usize,
     ) -> PyResult<Self> {
-        if ping_interval >= idle_timeout {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "ping_interval ({ping_interval}s) must be less than idle_timeout ({idle_timeout}s)"
-            )));
-        }
-        let jwt_alg = match jwt_algorithm.as_deref() {
-            None | Some("HS256") => jwt::JwtAlgorithm::HS256,
-            Some("RS256") => jwt::JwtAlgorithm::RS256,
-            Some("ES256") => jwt::JwtAlgorithm::ES256,
-            Some(other) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Unsupported jwt_algorithm: {other}. Supported: HS256, RS256, ES256"
-                )));
-            }
-        };
-        // Algorithm-specific key validation at startup
-        if jwt_secret.is_some() {
-            match jwt_alg {
-                jwt::JwtAlgorithm::HS256 => {
-                    if let Some(ref s) = jwt_secret
-                        && s.len() < 32
-                    {
-                        return Err(pyo3::exceptions::PyValueError::new_err(
-                            "jwt_secret must be at least 32 bytes (RFC 7518 HS256 minimum)",
-                        ));
-                    }
-                    if let Some(ref s) = jwt_previous_secret
-                        && s.len() < 32
-                    {
-                        return Err(pyo3::exceptions::PyValueError::new_err(
-                            "jwt_previous_secret must be at least 32 bytes",
-                        ));
-                    }
-                }
-                jwt::JwtAlgorithm::RS256 => {
-                    if let Some(ref s) = jwt_secret {
-                        jsonwebtoken::DecodingKey::from_rsa_pem(s).map_err(|e| {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "Invalid RS256 public key PEM: {e}"
-                            ))
-                        })?;
-                    }
-                    if let Some(ref s) = jwt_previous_secret {
-                        jsonwebtoken::DecodingKey::from_rsa_pem(s).map_err(|e| {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "Invalid RS256 jwt_previous_secret PEM: {e}"
-                            ))
-                        })?;
-                    }
-                    if let Some(ref s) = jwt_private_key {
-                        jsonwebtoken::EncodingKey::from_rsa_pem(s).map_err(|e| {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "Invalid RS256 jwt_private_key PEM: {e}"
-                            ))
-                        })?;
-                    }
-                }
-                jwt::JwtAlgorithm::ES256 => {
-                    if let Some(ref s) = jwt_secret {
-                        jsonwebtoken::DecodingKey::from_ec_pem(s).map_err(|e| {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "Invalid ES256 public key PEM: {e}"
-                            ))
-                        })?;
-                    }
-                    if let Some(ref s) = jwt_previous_secret {
-                        jsonwebtoken::DecodingKey::from_ec_pem(s).map_err(|e| {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "Invalid ES256 jwt_previous_secret PEM: {e}"
-                            ))
-                        })?;
-                    }
-                    if let Some(ref s) = jwt_private_key {
-                        jsonwebtoken::EncodingKey::from_ec_pem(s).map_err(|e| {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "Invalid ES256 jwt_private_key PEM: {e}"
-                            ))
-                        })?;
-                    }
-                }
-            }
-        }
-        // Private key validated above but not stored in JwtConfig -- rust_jwt_encode
-        // takes the key directly as an argument. Avoids keeping key material in memory.
-        drop(jwt_private_key);
-        let jwt_config = jwt_secret.map(|secret| JwtConfig {
-            algorithm: jwt_alg,
-            secret: Zeroizing::new(secret),
-            previous_secret: jwt_previous_secret.map(Zeroizing::new),
-            key_id: jwt_key_id,
-            issuer: jwt_issuer.unwrap_or_default(),
-            audience: jwt_audience.unwrap_or_default(),
-            cookie_name: jwt_cookie_name.unwrap_or_else(|| "access_token".to_string()),
-        });
-        let recovery = if recovery_enabled {
-            // Find the power-of-two exponent for buffer size (minimum 16 slots)
-            let clamped = recovery_buffer_size.max(16);
-            let bits = if clamped.is_power_of_two() {
-                clamped.trailing_zeros()
-            } else {
-                clamped.next_power_of_two().trailing_zeros()
-            };
-            Some(Arc::new(super::recovery::RecoveryManager::new(
-                super::recovery::RecoveryConfig {
-                    buffer_size_bits: bits,
-                    history_ttl_secs: recovery_ttl,
-                    max_recovery_messages: recovery_max_messages,
-                    global_memory_budget: recovery_memory_budget,
-                },
-            )))
-        } else {
-            None
-        };
-        Ok(Self {
+        Self::build(
             host,
             port,
-            shared: Arc::new(SharedState::new(SharedStateConfig {
+            ServerParams {
                 max_connections,
-                jwt_config,
                 max_inbound_queue_size,
-                recovery,
+                max_message_size,
+                ping_interval,
+                idle_timeout,
+                max_outbound_queue_bytes,
+                max_subscriptions_per_connection,
+                rate_limit_capacity,
+                rate_limit_refill,
+            },
+            JwtParams {
+                jwt_secret,
+                jwt_issuer,
+                jwt_audience,
+                jwt_cookie_name,
+                jwt_previous_secret,
+                jwt_key_id,
+                jwt_algorithm,
+                jwt_private_key,
+            },
+            RecoveryParams {
+                recovery_enabled,
+                recovery_buffer_size,
+                recovery_ttl,
+                recovery_max_messages,
+                recovery_memory_budget,
+            },
+            PresenceParams {
                 presence_enabled,
                 presence_max_data_size,
                 presence_max_members,
-                rate_capacity: rate_limit_capacity,
-                rate_refill: rate_limit_refill,
-                max_message_size,
-                ping_interval_secs: ping_interval,
-                idle_timeout_secs: idle_timeout,
-                max_outbound_queue_bytes,
-                max_subscriptions_per_connection,
-            })),
-            cmd_tx: None,
-            thread_handle: None,
-            running: Arc::new(AtomicBool::new(false)),
-            dedup: Arc::new(std::sync::Mutex::new(DeduplicationState {
-                seen: AHashSet::with_capacity(50_000),
-                queue: std::collections::VecDeque::with_capacity(50_000),
-                max_entries: 50_000,
-            })),
-            rt_handle: None,
-            started_at: None,
-        })
+            },
+        )
     }
 
     /// Register Python callbacks for connection events.
@@ -3734,9 +3946,11 @@ impl RustWSEServer {
     ///
     /// Raises RuntimeError if cluster is already connected or if seeds
     /// is used without cluster_addr.
-    // PyO3 method: Python API requires flat keyword arguments
-    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (peers, tls_cert=None, tls_key=None, tls_ca=None, cluster_port=None, seeds=None, cluster_addr=None))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "PyO3 boundary: &self + 7 Python kwargs"
+    )]
     fn connect_cluster(
         &self,
         peers: Vec<String>,
@@ -3747,126 +3961,13 @@ impl RustWSEServer {
         seeds: Option<Vec<String>>,
         cluster_addr: Option<String>,
     ) -> PyResult<()> {
-        if self.shared.cluster_cmd_tx.read().unwrap().is_some() {
-            return Err(PyRuntimeError::new_err("Cluster already connected"));
-        }
-
-        // Validate: seeds requires cluster_addr so other nodes can reach us
-        if seeds.is_some() && cluster_addr.is_none() {
-            return Err(PyRuntimeError::new_err(
-                "seeds= requires cluster_addr= so peers can connect back to this node",
-            ));
-        }
-
-        // Resolve TLS config: explicit params > env vars > None (plaintext)
-        let tls_config = match (tls_cert, tls_key, tls_ca) {
-            (Some(cert), Some(key), Some(ca)) => Some(
-                super::cluster::build_cluster_tls(&cert, &key, &ca)
-                    .map_err(|e| PyRuntimeError::new_err(format!("TLS config error: {e}")))?,
-            ),
-            (None, None, None) => {
-                match (
-                    std::env::var("WSE_CLUSTER_TLS_CERT").ok(),
-                    std::env::var("WSE_CLUSTER_TLS_KEY").ok(),
-                    std::env::var("WSE_CLUSTER_TLS_CA").ok(),
-                ) {
-                    (Some(cert), Some(key), Some(ca)) => Some(
-                        super::cluster::build_cluster_tls(&cert, &key, &ca).map_err(|e| {
-                            PyRuntimeError::new_err(format!("TLS config error (from env): {e}"))
-                        })?,
-                    ),
-                    (None, None, None) => None,
-                    _ => {
-                        return Err(PyRuntimeError::new_err(
-                            "Partial TLS env vars: set all of WSE_CLUSTER_TLS_CERT, \
-                             WSE_CLUSTER_TLS_KEY, WSE_CLUSTER_TLS_CA or none",
-                        ));
-                    }
-                }
-            }
-            _ => {
-                return Err(PyRuntimeError::new_err(
-                    "Partial TLS config: provide all of tls_cert, tls_key, tls_ca or none",
-                ));
-            }
-        };
-
-        // Track whether cluster TLS is enabled so main port can reject
-        // unauthenticated cluster connections
-        self.shared
-            .cluster_tls_enabled
-            .store(tls_config.is_some(), Ordering::Relaxed);
-
-        // Wrap TLS config in ArcSwap for hot-reload support. The holder is
-        // stored in SharedState so reload_cluster_tls() can swap it later.
-        let tls_holder = tls_config.map(|cfg| Arc::new(arc_swap::ArcSwap::from_pointee(cfg)));
-        *self.shared.cluster_tls_holder.write().unwrap() = tls_holder.clone();
-
-        let rt_handle = self
-            .rt_handle
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Server not started"))?;
-
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
-        *self.shared.cluster_cmd_tx.write().unwrap() = Some(cmd_tx);
-
-        let (interest_tx, interest_rx) =
-            mpsc::unbounded_channel::<super::cluster::InterestUpdate>();
-        *self.shared.cluster_interest_tx.write().unwrap() = Some(interest_tx.clone());
-
-        let instance_id = uuid::Uuid::now_v7().to_string();
-        *self.shared.cluster_instance_id.lock().unwrap() = Some(instance_id.clone());
-        let dlq = self.shared.cluster_dlq.clone();
-
-        // seeds= mode: use seeds as initial peers, enable discovery
-        // peers= mode: use static peer list, no discovery
-        let effective_peers = if let Some(ref s) = seeds {
-            s.clone()
-        } else {
-            peers
-        };
-
-        // Placeholder senders for manager-internal channels. cluster_manager
-        // creates the real channels and overrides these fields via struct update.
-        let (placeholder_new_peer_tx, _) = mpsc::unbounded_channel::<String>();
-        let (placeholder_cmd_tx, _) = mpsc::unbounded_channel::<super::cluster::ClusterCommand>();
-        let (placeholder_presence_tx, _) =
-            mpsc::unbounded_channel::<super::cluster::PresencePeerFrame>();
-
-        let ctx = super::cluster::ClusterContext {
-            interest_tx,
-            topic_subscribers: self.shared.topic_subscribers.clone(),
-            glob_topic_count: self.shared.glob_topic_count.clone(),
-            metrics: self.shared.cluster_metrics.clone(),
-            new_peer_tx: placeholder_new_peer_tx,
-            cmd_tx: placeholder_cmd_tx,
-            presence_tx: placeholder_presence_tx,
-            connected_instances: Arc::new(dashmap::DashMap::new()),
-            known_peers: Arc::new(dashmap::DashSet::new()),
-            local_topic_refcount: self.shared.local_topic_refcount.clone(),
+        self.connect_cluster_inner(
+            peers,
+            (tls_cert, tls_key, tls_ca),
+            cluster_port,
+            seeds,
             cluster_addr,
-            max_outbound: self.shared.max_outbound_queue_bytes,
-            slow_drops: Arc::clone(&self.shared.slow_consumer_drops),
-            recovery: self.shared.recovery.clone(),
-            topic_message_counts: self.shared.topic_message_counts.clone(),
-            queue_groups: self.shared.queue_groups.clone(),
-        };
-
-        rt_handle.spawn(super::cluster::cluster_manager(
-            effective_peers,
-            instance_id,
-            (cmd_rx, interest_rx),
-            ctx,
-            dlq,
-            tls_holder,
-            (
-                cluster_port,
-                self.shared.presence.clone(),
-                self.cmd_tx.clone(),
-            ),
-        ));
-
-        Ok(())
+        )
     }
 
     /// Return True if at least one cluster peer is connected.
@@ -3965,15 +4066,24 @@ impl RustWSEServer {
             topics
         };
 
-        // Enforce per-connection subscription limit (0 = unlimited)
+        // Enforce per-connection subscription limit (0 = unlimited).
+        // Count both regular subscriptions (conn_topics) and queue group
+        // memberships (conn_queue_groups) against the same budget.
         let max_subs = self.shared.max_subscriptions_per_connection;
         if max_subs > 0 {
-            let current = self
+            let topic_count = self
                 .shared
                 .conn_topics
                 .get(conn_id)
                 .map(|s| s.len())
                 .unwrap_or(0);
+            let qg_count = self
+                .shared
+                .conn_queue_groups
+                .get(conn_id)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            let current = topic_count + qg_count;
             let allowed = max_subs.saturating_sub(current);
             if allowed == 0 {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
