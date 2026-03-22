@@ -241,6 +241,24 @@ pub(crate) enum ServerCommand {
     },
 }
 
+/// Configuration for SharedState construction.
+pub(crate) struct SharedStateConfig {
+    pub max_connections: usize,
+    pub jwt_config: Option<JwtConfig>,
+    pub max_inbound_queue_size: usize,
+    pub recovery: Option<Arc<super::recovery::RecoveryManager>>,
+    pub presence_enabled: bool,
+    pub presence_max_data_size: usize,
+    pub presence_max_members: usize,
+    pub rate_capacity: f64,
+    pub rate_refill: f64,
+    pub max_message_size: usize,
+    pub ping_interval_secs: u64,
+    pub idle_timeout_secs: u64,
+    pub max_outbound_queue_bytes: usize,
+    pub max_subscriptions_per_connection: usize,
+}
+
 pub(crate) struct SharedState {
     pub(crate) connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     max_connections: usize,
@@ -321,27 +339,11 @@ pub(crate) struct SharedState {
 }
 
 impl SharedState {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        max_connections: usize,
-        jwt_config: Option<JwtConfig>,
-        max_inbound_queue_size: usize,
-        recovery: Option<Arc<super::recovery::RecoveryManager>>,
-        presence_enabled: bool,
-        presence_max_data_size: usize,
-        presence_max_members: usize,
-        rate_capacity: f64,
-        rate_refill: f64,
-        max_message_size: usize,
-        ping_interval_secs: u64,
-        idle_timeout_secs: u64,
-        max_outbound_queue_bytes: usize,
-        max_subscriptions_per_connection: usize,
-    ) -> Self {
-        let (tx, rx) = bounded(max_inbound_queue_size);
+    fn new(cfg: SharedStateConfig) -> Self {
+        let (tx, rx) = bounded(cfg.max_inbound_queue_size);
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
-            max_connections,
+            max_connections: cfg.max_connections,
             on_connect: std::sync::RwLock::new(None),
             on_message: std::sync::RwLock::new(None),
             on_disconnect: std::sync::RwLock::new(None),
@@ -352,7 +354,7 @@ impl SharedState {
             conn_formats: DashMap::new(),
             conn_rates: DashMap::new(),
             connection_count: AtomicUsize::new(0),
-            jwt_config,
+            jwt_config: cfg.jwt_config,
             draining: AtomicBool::new(false),
             topic_subscribers: Arc::new(DashMap::new()),
             conn_topics: DashMap::new(),
@@ -366,13 +368,13 @@ impl SharedState {
             local_topic_refcount: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cluster_tls_enabled: AtomicBool::new(false),
             cluster_tls_holder: std::sync::RwLock::new(None),
-            recovery,
+            recovery: cfg.recovery,
             conn_last_activity: DashMap::new(),
             conn_encryption: DashMap::new(),
-            presence: if presence_enabled {
+            presence: if cfg.presence_enabled {
                 Some(Arc::new(super::presence::PresenceManager::new(
-                    presence_max_data_size,
-                    presence_max_members,
+                    cfg.presence_max_data_size,
+                    cfg.presence_max_members,
                 )))
             } else {
                 None
@@ -380,13 +382,13 @@ impl SharedState {
             queue_groups: Arc::new(DashMap::new()),
             conn_queue_groups: DashMap::new(),
             presence_broadcast_tx: std::sync::RwLock::new(None),
-            rate_capacity,
-            rate_refill,
-            max_message_size,
-            ping_interval_secs,
-            idle_timeout_secs,
-            max_outbound_queue_bytes,
-            max_subscriptions_per_connection,
+            rate_capacity: cfg.rate_capacity,
+            rate_refill: cfg.rate_refill,
+            max_message_size: cfg.max_message_size,
+            ping_interval_secs: cfg.ping_interval_secs,
+            idle_timeout_secs: cfg.idle_timeout_secs,
+            max_outbound_queue_bytes: cfg.max_outbound_queue_bytes,
+            max_subscriptions_per_connection: cfg.max_subscriptions_per_connection,
             slow_consumer_drops: Arc::new(AtomicU64::new(0)),
             messages_received_total: AtomicU64::new(0),
             messages_sent_total: AtomicU64::new(0),
@@ -2596,7 +2598,7 @@ impl RustWSEServer {
         Ok(Self {
             host,
             port,
-            shared: Arc::new(SharedState::new(
+            shared: Arc::new(SharedState::new(SharedStateConfig {
                 max_connections,
                 jwt_config,
                 max_inbound_queue_size,
@@ -2604,14 +2606,14 @@ impl RustWSEServer {
                 presence_enabled,
                 presence_max_data_size,
                 presence_max_members,
-                rate_limit_capacity,
-                rate_limit_refill,
+                rate_capacity: rate_limit_capacity,
+                rate_refill: rate_limit_refill,
                 max_message_size,
-                ping_interval,
-                idle_timeout,
+                ping_interval_secs: ping_interval,
+                idle_timeout_secs: idle_timeout,
                 max_outbound_queue_bytes,
                 max_subscriptions_per_connection,
-            )),
+            })),
             cmd_tx: None,
             thread_handle: None,
             running: Arc::new(AtomicBool::new(false)),
@@ -3732,6 +3734,7 @@ impl RustWSEServer {
     ///
     /// Raises RuntimeError if cluster is already connected or if seeds
     /// is used without cluster_addr.
+    // PyO3 method: Python API requires flat keyword arguments
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (peers, tls_cert=None, tls_key=None, tls_ca=None, cluster_port=None, seeds=None, cluster_addr=None))]
     fn connect_cluster(
