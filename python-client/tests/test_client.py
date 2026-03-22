@@ -17,7 +17,12 @@ from wse_client.types import (
 @pytest.fixture
 def client():
     """Create a client with mocked connection manager."""
+    import asyncio
+
     c = AsyncWSEClient("ws://localhost:5006/wse", token="test-jwt")
+    # Initialize lazy asyncio primitives (normally done in connect())
+    c._event_queue = asyncio.Queue(maxsize=c._queue_size)
+    c._server_ready_event = asyncio.Event()
     # Mock the connection manager to avoid real WebSocket
     c._connection = MagicMock()
     c._connection.is_connected = True
