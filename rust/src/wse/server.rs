@@ -3813,11 +3813,7 @@ impl RustWSEServer {
 
         let instance_id = uuid::Uuid::now_v7().to_string();
         *self.shared.cluster_instance_id.lock().unwrap() = Some(instance_id.clone());
-        let connections = self.shared.connections.clone();
-        let topic_subscribers = self.shared.topic_subscribers.clone();
-        let metrics = self.shared.cluster_metrics.clone();
         let dlq = self.shared.cluster_dlq.clone();
-        let local_topic_refcount = self.shared.local_topic_refcount.clone();
 
         // seeds= mode: use seeds as initial peers, enable discovery
         // peers= mode: use static peer list, no discovery
@@ -3827,28 +3823,44 @@ impl RustWSEServer {
             peers
         };
 
+        // Placeholder senders for manager-internal channels. cluster_manager
+        // creates the real channels and overrides these fields via struct update.
+        let (placeholder_new_peer_tx, _) = mpsc::unbounded_channel::<String>();
+        let (placeholder_cmd_tx, _) = mpsc::unbounded_channel::<super::cluster::ClusterCommand>();
+        let (placeholder_presence_tx, _) =
+            mpsc::unbounded_channel::<super::cluster::PresencePeerFrame>();
+
+        let ctx = super::cluster::ClusterContext {
+            interest_tx,
+            topic_subscribers: self.shared.topic_subscribers.clone(),
+            glob_topic_count: self.shared.glob_topic_count.clone(),
+            metrics: self.shared.cluster_metrics.clone(),
+            new_peer_tx: placeholder_new_peer_tx,
+            cmd_tx: placeholder_cmd_tx,
+            presence_tx: placeholder_presence_tx,
+            connected_instances: Arc::new(dashmap::DashMap::new()),
+            known_peers: Arc::new(dashmap::DashSet::new()),
+            local_topic_refcount: self.shared.local_topic_refcount.clone(),
+            cluster_addr,
+            max_outbound: self.shared.max_outbound_queue_bytes,
+            slow_drops: Arc::clone(&self.shared.slow_consumer_drops),
+            recovery: self.shared.recovery.clone(),
+            topic_message_counts: self.shared.topic_message_counts.clone(),
+            queue_groups: self.shared.queue_groups.clone(),
+        };
+
         rt_handle.spawn(super::cluster::cluster_manager(
             effective_peers,
             instance_id,
-            cmd_rx,
-            interest_tx,
-            interest_rx,
-            connections,
-            topic_subscribers,
-            self.shared.glob_topic_count.clone(),
-            metrics,
+            (cmd_rx, interest_rx),
+            ctx,
             dlq,
-            local_topic_refcount,
             tls_holder,
-            cluster_port,
-            cluster_addr,
-            self.shared.presence.clone(),
-            self.cmd_tx.clone(),
-            self.shared.max_outbound_queue_bytes,
-            Arc::clone(&self.shared.slow_consumer_drops),
-            self.shared.recovery.clone(),
-            self.shared.topic_message_counts.clone(),
-            self.shared.queue_groups.clone(),
+            (
+                cluster_port,
+                self.shared.presence.clone(),
+                self.cmd_tx.clone(),
+            ),
         ));
 
         Ok(())

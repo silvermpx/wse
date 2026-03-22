@@ -13,7 +13,7 @@ use rustls::server::WebPkiClientVerifier;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
 
@@ -70,6 +70,33 @@ type DispatchItem = (String, Bytes, Option<(u32, u64)>);
 // Minimum payload size for compression to be worthwhile (bytes).
 // Below this threshold, zstd overhead exceeds savings.
 const COMPRESSION_THRESHOLD: usize = 256;
+
+// ---------------------------------------------------------------------------
+// ClusterContext: shared state passed to all cluster peer tasks
+// ---------------------------------------------------------------------------
+
+/// Bundles the shared references passed to peer_reader, peer_dispatch_task,
+/// run_peer_session, peer_connection_task, and handle_cluster_inbound_generic.
+/// Eliminates 15+ repeated arguments from function signatures.
+#[derive(Clone)]
+pub(crate) struct ClusterContext {
+    pub interest_tx: mpsc::UnboundedSender<InterestUpdate>,
+    pub topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
+    pub glob_topic_count: Arc<AtomicUsize>,
+    pub metrics: Arc<ClusterMetrics>,
+    pub new_peer_tx: mpsc::UnboundedSender<String>,
+    pub cmd_tx: mpsc::UnboundedSender<ClusterCommand>,
+    pub presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
+    pub connected_instances: Arc<DashMap<String, String>>,
+    pub known_peers: Arc<DashSet<String>>,
+    pub local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    pub cluster_addr: Option<String>,
+    pub max_outbound: usize,
+    pub slow_drops: Arc<AtomicU64>,
+    pub recovery: Option<Arc<super::recovery::RecoveryManager>>,
+    pub topic_message_counts: Arc<DashMap<String, AtomicU64>>,
+    pub queue_groups: Arc<DashMap<String, DashMap<String, super::server::QueueGroup>>>,
+}
 
 // ---------------------------------------------------------------------------
 // TLS configuration
@@ -1040,21 +1067,16 @@ async fn peer_writer<W: AsyncWriteExt + Unpin>(
 /// Reads frames from a peer TCP connection. Decoded MSG payloads are pushed to
 /// a dispatch channel (non-blocking) so fan-out never stalls TCP reads.
 /// BufReader (64KB) reduces read syscalls from 2/frame to ~1 per 650 frames.
-#[allow(clippy::too_many_arguments)]
 async fn peer_reader<R: AsyncReadExt + Unpin>(
     reader: R,
     peer_write_tx: mpsc::Sender<Bytes>,
     peer_addr: String,
-    interest_tx: mpsc::UnboundedSender<InterestUpdate>,
+    ctx: ClusterContext,
     dispatch_tx: mpsc::UnboundedSender<DispatchItem>,
     cancel: CancellationToken,
-    metrics: Arc<ClusterMetrics>,
-    last_activity: Arc<AtomicU64>,
-    new_peer_tx: mpsc::UnboundedSender<String>,
-    cmd_tx: mpsc::UnboundedSender<ClusterCommand>,
-    presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
-    generation: u64,
+    session: (Arc<AtomicU64>, u64),
 ) {
+    let (last_activity, generation) = session;
     // BufReader: bulk reads from TCP into 64KB buffer, serves read_exact from memory
     let mut reader = BufReader::with_capacity(65_536, reader);
     let mut len_buf = [0u8; 4];
@@ -1085,7 +1107,7 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
             break;
         }
 
-        metrics
+        ctx.metrics
             .bytes_received
             .fetch_add((4 + frame_len) as u64, Ordering::Relaxed);
 
@@ -1121,7 +1143,7 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
             }
             Some(ClusterFrame::Unknown { msg_type }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
-                metrics
+                ctx.metrics
                     .unknown_message_types
                     .fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
@@ -1130,14 +1152,14 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
             }
             Some(ClusterFrame::Sub { topic }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
-                let _ = interest_tx.send(InterestUpdate::Sub {
+                let _ = ctx.interest_tx.send(InterestUpdate::Sub {
                     peer_addr: peer_addr.clone(),
                     topic,
                 });
             }
             Some(ClusterFrame::Unsub { topic }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
-                let _ = interest_tx.send(InterestUpdate::Unsub {
+                let _ = ctx.interest_tx.send(InterestUpdate::Unsub {
                     peer_addr: peer_addr.clone(),
                     topic,
                 });
@@ -1147,7 +1169,7 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
                 is_continuation,
             }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
-                let _ = interest_tx.send(InterestUpdate::Resync {
+                let _ = ctx.interest_tx.send(InterestUpdate::Resync {
                     peer_addr: peer_addr.clone(),
                     topics,
                     is_continuation,
@@ -1157,9 +1179,9 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
             Some(ClusterFrame::PeerAnnounce { addr }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
                 // Notify cluster_manager to connect to new peer
-                let _ = new_peer_tx.send(addr.clone());
+                let _ = ctx.new_peer_tx.send(addr.clone());
                 // Gossip to all other peers (excluding sender)
-                let _ = cmd_tx.send(ClusterCommand::GossipPeerAnnounce {
+                let _ = ctx.cmd_tx.send(ClusterCommand::GossipPeerAnnounce {
                     addr,
                     exclude_peer: peer_addr.clone(),
                 });
@@ -1167,7 +1189,7 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
             Some(ClusterFrame::PeerList { addrs }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
                 for addr in addrs {
-                    let _ = new_peer_tx.send(addr);
+                    let _ = ctx.new_peer_tx.send(addr);
                 }
             }
             Some(ClusterFrame::PresenceUpdate {
@@ -1178,7 +1200,7 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
                 updated_at,
             }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
-                let _ = presence_tx.send(PresencePeerFrame::Update {
+                let _ = ctx.presence_tx.send(PresencePeerFrame::Update {
                     topic,
                     user_id,
                     action,
@@ -1188,7 +1210,7 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
             }
             Some(ClusterFrame::PresenceFull { entries }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
-                let _ = presence_tx.send(PresencePeerFrame::Full { entries });
+                let _ = ctx.presence_tx.send(PresencePeerFrame::Full { entries });
             }
             None => {
                 tracing::error!("[WSE-Cluster] Failed to decode frame, disconnecting");
@@ -1204,18 +1226,10 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
 // Decouples TCP reads from RwLock acquisition on the connections map.
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 async fn peer_dispatch_task(
     mut dispatch_rx: mpsc::UnboundedReceiver<DispatchItem>,
-    topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
-    glob_topic_count: Arc<AtomicUsize>,
-    metrics: Arc<ClusterMetrics>,
+    ctx: ClusterContext,
     cancel: CancellationToken,
-    max_outbound: usize,
-    slow_drops: Arc<AtomicU64>,
-    recovery: Option<Arc<super::recovery::RecoveryManager>>,
-    topic_message_counts: Arc<DashMap<String, AtomicU64>>,
-    queue_groups: Arc<DashMap<String, DashMap<String, super::server::QueueGroup>>>,
 ) {
     let mut batch: Vec<DispatchItem> = Vec::with_capacity(64);
 
@@ -1244,29 +1258,29 @@ async fn peer_dispatch_task(
             let preframed = super::server::encode_ws_frame(0x01, &payload);
 
             // Store in foreign recovery buffer before fan-out (cross-node recovery)
-            if let (Some(rm), Some((epoch, offset))) = (&recovery, rec) {
+            if let (Some(rm), Some((epoch, offset))) = (&ctx.recovery, rec) {
                 rm.push_foreign(&topic, preframed.clone(), epoch, offset);
             }
 
             let (d, f) = super::server::fanout_topic_direct(
-                &topic_subscribers,
+                &ctx.topic_subscribers,
                 &topic,
                 &preframed,
-                max_outbound,
-                &slow_drops,
-                glob_topic_count.load(Ordering::Relaxed),
+                ctx.max_outbound,
+                &ctx.slow_drops,
+                ctx.glob_topic_count.load(Ordering::Relaxed),
             );
             total_delivered += d;
             total_dropped += f;
 
             // Track per-topic message count for Prometheus top-N metrics
-            topic_message_counts
+            ctx.topic_message_counts
                 .entry(topic.clone())
                 .or_insert_with(|| AtomicU64::new(0))
                 .fetch_add(1, Ordering::Relaxed);
 
             // Cross-cluster queue group dispatch: round-robin to one member per group
-            if let Some(topic_groups) = queue_groups.get(&topic) {
+            if let Some(topic_groups) = ctx.queue_groups.get(&topic) {
                 for mut group_entry in topic_groups.iter_mut() {
                     let group = group_entry.value_mut();
                     let len = group.members.len();
@@ -1282,8 +1296,10 @@ async fn peer_dispatch_task(
                         if h.tx.is_closed() {
                             continue;
                         }
-                        if max_outbound > 0 && h.pending.load(Ordering::Relaxed) >= max_outbound {
-                            slow_drops.fetch_add(1, Ordering::Relaxed);
+                        if ctx.max_outbound > 0
+                            && h.pending.load(Ordering::Relaxed) >= ctx.max_outbound
+                        {
+                            ctx.slow_drops.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
                         h.pending.fetch_add(data_len, Ordering::Relaxed);
@@ -1307,9 +1323,9 @@ async fn peer_dispatch_task(
             }
         }
 
-        metrics.add_delivered(total_delivered);
+        ctx.metrics.add_delivered(total_delivered);
         if total_dropped > 0 {
-            metrics.add_dropped(total_dropped);
+            ctx.metrics.add_dropped(total_dropped);
         }
     }
 }
@@ -1360,39 +1376,25 @@ async fn heartbeat_task(
 /// Run HELLO exchange, RESYNC, then spawn reader/writer/heartbeat and forward data.
 /// Generic over AsyncRead/AsyncWrite to support both plaintext TCP and TLS streams.
 /// Returns when the peer disconnects or cancellation is triggered.
-#[allow(clippy::too_many_arguments)]
 async fn run_peer_session<R, W>(
     mut reader: R,
     mut writer: W,
-    peer_addr: &str,
-    instance_id: &str,
+    ids: (&str, &str),
     data_rx: &mut mpsc::Receiver<Bytes>,
-    interest_tx: &mpsc::UnboundedSender<InterestUpdate>,
-    _connections: &Arc<RwLock<HashMap<String, ConnectionHandle>>>,
-    topic_subscribers: &Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
-    glob_topic_count: &Arc<AtomicUsize>,
-    metrics: &Arc<ClusterMetrics>,
-    global_cancel: &CancellationToken,
-    local_topic_refcount: &Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    backoff: &mut ExponentialBackoff,
-    breaker: &mut CircuitBreaker,
-    new_peer_tx: &mpsc::UnboundedSender<String>,
-    cmd_tx: &mpsc::UnboundedSender<ClusterCommand>,
-    cluster_addr: &Option<String>,
-    known_peers: &Arc<DashSet<String>>,
-    connected_instances: &Arc<DashMap<String, String>>,
-    presence_tx: &mpsc::UnboundedSender<PresencePeerFrame>,
-    presence: &Option<Arc<super::presence::PresenceManager>>,
-    max_outbound: usize,
-    slow_drops: &Arc<AtomicU64>,
-    recovery: &Option<Arc<super::recovery::RecoveryManager>>,
-    topic_message_counts: &Arc<DashMap<String, AtomicU64>>,
-    queue_groups: &Arc<DashMap<String, DashMap<String, super::server::QueueGroup>>>,
+    ctx: &ClusterContext,
+    reliability: (&mut ExponentialBackoff, &mut CircuitBreaker),
+    session: (
+        &Option<Arc<super::presence::PresenceManager>>,
+        &CancellationToken,
+    ),
 ) -> (bool, u32)
 where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
+    let (peer_addr, instance_id) = ids;
+    let (backoff, breaker) = reliability;
+    let (presence, global_cancel) = session;
     // Send HELLO
     let mut hello_buf = BytesMut::new();
     encode_hello(&mut hello_buf, instance_id, LOCAL_CAPABILITIES);
@@ -1452,7 +1454,7 @@ where
     // to avoid TOCTOU race between contains_key and insert
     {
         use dashmap::mapref::entry::Entry;
-        match connected_instances.entry(peer_instance_id.clone()) {
+        match ctx.connected_instances.entry(peer_instance_id.clone()) {
             Entry::Occupied(_) => {
                 tracing::info!(
                     "[WSE-Cluster] Already connected to instance {}, dropping duplicate from {peer_addr}",
@@ -1474,8 +1476,8 @@ where
     );
     breaker.record_success();
     backoff.reset();
-    metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
-    metrics.peer_info.insert(
+    ctx.metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
+    ctx.metrics.peer_info.insert(
         peer_addr.to_owned(),
         PeerInfo {
             address: peer_addr.to_owned(),
@@ -1488,7 +1490,8 @@ where
     // Send RESYNC with all current local topics (before spawning writer task)
     {
         let local_topics: Vec<String> = {
-            let refcounts = local_topic_refcount
+            let refcounts = ctx
+                .local_topic_refcount
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             refcounts.keys().cloned().collect()
@@ -1501,16 +1504,16 @@ where
             }
             if writer.write_all(&wire_buf).await.is_err() || writer.flush().await.is_err() {
                 tracing::warn!("[WSE-Cluster] Failed to send RESYNC to {peer_addr}");
-                connected_instances.remove(&peer_instance_id);
-                metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
-                metrics.peer_info.remove(peer_addr);
+                ctx.connected_instances.remove(&peer_instance_id);
+                ctx.metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
+                ctx.metrics.peer_info.remove(peer_addr);
                 return (false, peer_caps); // Will reconnect
             }
         }
     }
 
     // Send PEER_ANNOUNCE with our cluster address (if in discovery mode)
-    if let Some(our_addr) = cluster_addr {
+    if let Some(ref our_addr) = ctx.cluster_addr {
         let mut announce_buf = BytesMut::new();
         encode_peer_announce(&mut announce_buf, our_addr);
         let mut announce_frame = BytesMut::new();
@@ -1521,7 +1524,7 @@ where
 
     // Send PEER_LIST with all known peers
     {
-        let addrs: Vec<String> = known_peers.iter().map(|r| r.key().clone()).collect();
+        let addrs: Vec<String> = ctx.known_peers.iter().map(|r| r.key().clone()).collect();
         if !addrs.is_empty() {
             let mut list_buf = BytesMut::new();
             encode_peer_list(&mut list_buf, &addrs);
@@ -1559,22 +1562,15 @@ where
         peer_write_rx,
         writer,
         peer_cancel.clone(),
-        metrics.clone(),
+        ctx.metrics.clone(),
     ));
 
     let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<DispatchItem>();
 
     let dispatch_handle = tokio::spawn(peer_dispatch_task(
         dispatch_rx,
-        topic_subscribers.clone(),
-        glob_topic_count.clone(),
-        metrics.clone(),
+        ctx.clone(),
         peer_cancel.clone(),
-        max_outbound,
-        slow_drops.clone(),
-        recovery.clone(),
-        topic_message_counts.clone(),
-        queue_groups.clone(),
     ));
 
     let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
@@ -1582,15 +1578,10 @@ where
         reader,
         peer_write_tx.clone(),
         peer_addr.to_owned(),
-        interest_tx.clone(),
+        ctx.clone(),
         dispatch_tx,
         peer_cancel.clone(),
-        metrics.clone(),
-        last_activity.clone(),
-        new_peer_tx.clone(),
-        cmd_tx.clone(),
-        presence_tx.clone(),
-        session_gen,
+        (last_activity.clone(), session_gen),
     ));
 
     let heartbeat_handle = tokio::spawn(heartbeat_task(
@@ -1613,7 +1604,7 @@ where
         match data {
             Some(frame_data) => {
                 if peer_write_tx.try_send(frame_data).is_err() {
-                    metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                    ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
             None => {
@@ -1630,10 +1621,10 @@ where
     let _ = reader_handle.await;
     let _ = dispatch_handle.await;
     let _ = heartbeat_handle.await;
-    metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
-    metrics.peer_info.remove(peer_addr);
-    connected_instances.remove(&peer_instance_id);
-    let _ = interest_tx.send(InterestUpdate::PeerDisconnected {
+    ctx.metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
+    ctx.metrics.peer_info.remove(peer_addr);
+    ctx.connected_instances.remove(&peer_instance_id);
+    let _ = ctx.interest_tx.send(InterestUpdate::PeerDisconnected {
         peer_addr: peer_addr.to_owned(),
         generation: session_gen,
     });
@@ -1642,33 +1633,19 @@ where
     (global_cancel.is_cancelled(), peer_caps)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn peer_connection_task(
     peer_addr: String,
     instance_id: String,
     mut data_rx: mpsc::Receiver<Bytes>,
-    interest_tx: mpsc::UnboundedSender<InterestUpdate>,
-    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
-    topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
-    glob_topic_count: Arc<AtomicUsize>,
-    metrics: Arc<ClusterMetrics>,
-    global_cancel: CancellationToken,
-    local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    ctx: ClusterContext,
     tls_config: Option<Arc<arc_swap::ArcSwap<ClusterTlsConfig>>>,
-    new_peer_tx: mpsc::UnboundedSender<String>,
-    cmd_tx: mpsc::UnboundedSender<ClusterCommand>,
-    cluster_addr: Option<String>,
-    known_peers: Arc<DashSet<String>>,
-    connected_instances: Arc<DashMap<String, String>>,
-    presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
-    presence: Option<Arc<super::presence::PresenceManager>>,
     peer_reg_tx: mpsc::UnboundedSender<PeerRegistration>,
-    max_outbound: usize,
-    slow_drops: Arc<AtomicU64>,
-    recovery: Option<Arc<super::recovery::RecoveryManager>>,
-    topic_message_counts: Arc<DashMap<String, AtomicU64>>,
-    queue_groups: Arc<DashMap<String, DashMap<String, super::server::QueueGroup>>>,
+    session: (
+        Option<Arc<super::presence::PresenceManager>>,
+        CancellationToken,
+    ),
 ) {
+    let (presence, global_cancel) = session;
     let mut backoff = ExponentialBackoff::new();
     let mut breaker = CircuitBreaker::new();
 
@@ -1704,7 +1681,7 @@ async fn peer_connection_task(
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
                 breaker.record_failure();
-                metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
+                ctx.metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
                 let delay = backoff.next_delay();
                 tracing::warn!(
                     "[WSE-Cluster] Connect failed {peer_addr}: {e}. Retry in {:.1}s",
@@ -1717,7 +1694,7 @@ async fn peer_connection_task(
             }
             Err(_) => {
                 breaker.record_failure();
-                metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
+                ctx.metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
                 let delay = backoff.next_delay();
                 tracing::warn!(
                     "[WSE-Cluster] Connect timeout {peer_addr}. Retry in {:.1}s",
@@ -1776,36 +1753,17 @@ async fn peer_connection_task(
                     run_peer_session(
                         reader,
                         writer,
-                        &peer_addr,
-                        &instance_id,
+                        (&peer_addr, &instance_id),
                         &mut data_rx,
-                        &interest_tx,
-                        &connections,
-                        &topic_subscribers,
-                        &glob_topic_count,
-                        &metrics,
-                        &global_cancel,
-                        &local_topic_refcount,
-                        &mut backoff,
-                        &mut breaker,
-                        &new_peer_tx,
-                        &cmd_tx,
-                        &cluster_addr,
-                        &known_peers,
-                        &connected_instances,
-                        &presence_tx,
-                        &presence,
-                        max_outbound,
-                        &slow_drops,
-                        &recovery,
-                        &topic_message_counts,
-                        &queue_groups,
+                        &ctx,
+                        (&mut backoff, &mut breaker),
+                        (&presence, &global_cancel),
                     )
                     .await
                 }
                 Ok(Err(e)) => {
                     breaker.record_failure();
-                    metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
+                    ctx.metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
                     let delay = backoff.next_delay();
                     tracing::warn!(
                         "[WSE-Cluster] TLS handshake failed {peer_addr}: {e}. Retry in {:.1}s",
@@ -1818,7 +1776,7 @@ async fn peer_connection_task(
                 }
                 Err(_) => {
                     breaker.record_failure();
-                    metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
+                    ctx.metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
                     let delay = backoff.next_delay();
                     tracing::warn!(
                         "[WSE-Cluster] TLS handshake timeout {peer_addr}. Retry in {:.1}s",
@@ -1836,30 +1794,11 @@ async fn peer_connection_task(
             run_peer_session(
                 reader,
                 writer,
-                &peer_addr,
-                &instance_id,
+                (&peer_addr, &instance_id),
                 &mut data_rx,
-                &interest_tx,
-                &connections,
-                &topic_subscribers,
-                &glob_topic_count,
-                &metrics,
-                &global_cancel,
-                &local_topic_refcount,
-                &mut backoff,
-                &mut breaker,
-                &new_peer_tx,
-                &cmd_tx,
-                &cluster_addr,
-                &known_peers,
-                &connected_instances,
-                &presence_tx,
-                &presence,
-                max_outbound,
-                &slow_drops,
-                &recovery,
-                &topic_message_counts,
-                &queue_groups,
+                &ctx,
+                (&mut backoff, &mut breaker),
+                (&presence, &global_cancel),
             )
             .await
         };
@@ -1879,7 +1818,7 @@ async fn peer_connection_task(
         }
 
         // Reconnect
-        metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
+        ctx.metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
         let delay = backoff.next_delay();
         tracing::info!(
             "[WSE-Cluster] Reconnecting to {peer_addr} in {:.1}s",
@@ -1896,30 +1835,14 @@ async fn peer_connection_task(
 // Cluster manager: orchestrates all peer connections
 // ---------------------------------------------------------------------------
 
-/// Shared context for spawning peer connection tasks (avoids duplicating 15 clone() calls).
+/// Shared context for spawning peer connection tasks.
 struct PeerSpawnCtx {
     instance_id: String,
-    interest_tx: mpsc::UnboundedSender<InterestUpdate>,
-    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
-    topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
-    glob_topic_count: Arc<AtomicUsize>,
-    metrics: Arc<ClusterMetrics>,
+    ctx: ClusterContext,
     global_cancel: CancellationToken,
-    local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     tls_config: Option<Arc<arc_swap::ArcSwap<ClusterTlsConfig>>>,
-    new_peer_tx: mpsc::UnboundedSender<String>,
-    gossip_cmd_tx: mpsc::UnboundedSender<ClusterCommand>,
-    cluster_addr: Option<String>,
-    known_peers: Arc<DashSet<String>>,
-    connected_instances: Arc<DashMap<String, String>>,
-    presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
-    presence: Option<Arc<super::presence::PresenceManager>>,
     peer_reg_tx: mpsc::UnboundedSender<PeerRegistration>,
-    max_outbound: usize,
-    slow_drops: Arc<AtomicU64>,
-    recovery: Option<Arc<super::recovery::RecoveryManager>>,
-    topic_message_counts: Arc<DashMap<String, AtomicU64>>,
-    queue_groups: Arc<DashMap<String, DashMap<String, super::server::QueueGroup>>>,
+    presence: Option<Arc<super::presence::PresenceManager>>,
 }
 
 impl PeerSpawnCtx {
@@ -1932,55 +1855,32 @@ impl PeerSpawnCtx {
             peer_addr,
             self.instance_id.clone(),
             data_rx,
-            self.interest_tx.clone(),
-            self.connections.clone(),
-            self.topic_subscribers.clone(),
-            self.glob_topic_count.clone(),
-            self.metrics.clone(),
-            self.global_cancel.clone(),
-            self.local_topic_refcount.clone(),
+            self.ctx.clone(),
             self.tls_config.clone(),
-            self.new_peer_tx.clone(),
-            self.gossip_cmd_tx.clone(),
-            self.cluster_addr.clone(),
-            self.known_peers.clone(),
-            self.connected_instances.clone(),
-            self.presence_tx.clone(),
-            self.presence.clone(),
             self.peer_reg_tx.clone(),
-            self.max_outbound,
-            self.slow_drops.clone(),
-            self.recovery.clone(),
-            self.topic_message_counts.clone(),
-            self.queue_groups.clone(),
+            (self.presence.clone(), self.global_cancel.clone()),
         ))
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cluster_manager(
     peers: Vec<String>,
     instance_id: String,
-    mut cmd_rx: mpsc::UnboundedReceiver<ClusterCommand>,
-    interest_tx: mpsc::UnboundedSender<InterestUpdate>,
-    mut interest_rx: mpsc::UnboundedReceiver<InterestUpdate>,
-    connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
-    topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
-    glob_topic_count: Arc<AtomicUsize>,
-    metrics: Arc<ClusterMetrics>,
+    channels: (
+        mpsc::UnboundedReceiver<ClusterCommand>,
+        mpsc::UnboundedReceiver<InterestUpdate>,
+    ),
+    ctx: ClusterContext,
     dlq: Arc<std::sync::Mutex<ClusterDlq>>,
-    local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     tls_config: Option<Arc<arc_swap::ArcSwap<ClusterTlsConfig>>>,
-    cluster_port: Option<u16>,
-    cluster_addr: Option<String>,
-    presence: Option<Arc<super::presence::PresenceManager>>,
-    server_cmd_tx: Option<mpsc::UnboundedSender<super::server::ServerCommand>>,
-    max_outbound: usize,
-    slow_drops: Arc<AtomicU64>,
-    recovery: Option<Arc<super::recovery::RecoveryManager>>,
-    topic_message_counts: Arc<DashMap<String, AtomicU64>>,
-    queue_groups: Arc<DashMap<String, DashMap<String, super::server::QueueGroup>>>,
+    cluster_opts: (
+        Option<u16>,
+        Option<Arc<super::presence::PresenceManager>>,
+        Option<mpsc::UnboundedSender<super::server::ServerCommand>>,
+    ),
 ) {
+    let (mut cmd_rx, mut interest_rx) = channels;
+    let (cluster_port, presence, server_cmd_tx) = cluster_opts;
     let global_cancel = CancellationToken::new();
 
     // Remote interest table: peer_addr -> set of topics that peer is interested in
@@ -1988,23 +1888,25 @@ pub(crate) async fn cluster_manager(
     // Track the latest session generation per peer to filter stale RESYNC continuations
     let mut peer_generation: HashMap<String, u64> = HashMap::new();
 
-    // Dynamic peer tracking
-    let known_peers: Arc<DashSet<String>> = Arc::new(DashSet::new());
-    let connected_instances: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
     // Static peers have their own reconnect loop; never remove them from known_peers
     let static_peers: std::collections::HashSet<String> = peers.iter().cloned().collect();
 
-    // Channel for peer_reader to notify about newly discovered peers
+    // Manager-internal channels: peer tasks send back to the manager via these.
+    // The senders are placed into the ClusterContext that gets cloned to each task.
     let (new_peer_tx, mut new_peer_rx) = mpsc::unbounded_channel::<String>();
-
-    // Reusable cmd_tx for peer tasks to send gossip commands back to manager
     let (gossip_cmd_tx, mut gossip_cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
-
-    // Channel for inbound peer handlers to register/deregister their write channels
     let (peer_reg_tx, mut peer_reg_rx) = mpsc::unbounded_channel::<PeerRegistration>();
-
-    // Channel for presence frames received from peers
     let (presence_peer_tx, mut presence_peer_rx) = mpsc::unbounded_channel::<PresencePeerFrame>();
+
+    // Build the full ClusterContext by overriding the manager-internal channel senders
+    let ctx = ClusterContext {
+        new_peer_tx,
+        cmd_tx: gossip_cmd_tx,
+        presence_tx: presence_peer_tx,
+        connected_instances: Arc::new(DashMap::new()),
+        known_peers: Arc::new(DashSet::new()),
+        ..ctx
+    };
 
     // Per-peer channels: manager sends encoded BytesMut, peer task forwards to writer
     // Each entry: (peer_addr, write_channel, negotiated_caps)
@@ -2013,31 +1915,15 @@ pub(crate) async fn cluster_manager(
 
     let spawn_ctx = PeerSpawnCtx {
         instance_id: instance_id.clone(),
-        interest_tx: interest_tx.clone(),
-        connections: connections.clone(),
-        topic_subscribers: topic_subscribers.clone(),
-        glob_topic_count: glob_topic_count.clone(),
-        metrics: metrics.clone(),
+        ctx: ctx.clone(),
         global_cancel: global_cancel.clone(),
-        local_topic_refcount: local_topic_refcount.clone(),
         tls_config: tls_config.clone(),
-        new_peer_tx: new_peer_tx.clone(),
-        gossip_cmd_tx: gossip_cmd_tx.clone(),
-        cluster_addr: cluster_addr.clone(),
-        known_peers: known_peers.clone(),
-        connected_instances: connected_instances.clone(),
-        presence_tx: presence_peer_tx.clone(),
-        presence: presence.clone(),
         peer_reg_tx: peer_reg_tx.clone(),
-        max_outbound,
-        slow_drops: slow_drops.clone(),
-        recovery: recovery.clone(),
-        topic_message_counts: topic_message_counts.clone(),
-        queue_groups: queue_groups.clone(),
+        presence: presence.clone(),
     };
 
     for peer_addr in &peers {
-        known_peers.insert(peer_addr.clone());
+        ctx.known_peers.insert(peer_addr.clone());
         let (tx, rx) = mpsc::channel::<Bytes>(10_000);
         // Outbound peers: caps are negotiated in run_peer_session; default to full caps
         // since all peers in current deployment run the same version.
@@ -2065,26 +1951,10 @@ pub(crate) async fn cluster_manager(
                 tracing::info!("[WSE-Cluster] Cluster listener on {bind_addr}");
                 let tls_cfg = tls_config.clone();
                 let inst_id = instance_id.clone();
-                let int_tx = interest_tx.clone();
-                let conns = connections.clone();
-                let subs = topic_subscribers.clone();
-                let gtc = glob_topic_count.clone();
-                let met = metrics.clone();
                 let cancel = global_cancel.clone();
-                let lrc = local_topic_refcount.clone();
-                let npt = new_peer_tx.clone();
-                let gct = gossip_cmd_tx.clone();
-                let ci = connected_instances.clone();
                 let prt = peer_reg_tx.clone();
-                let ca = cluster_addr.clone();
-                let kp = known_peers.clone();
-                let pptx = presence_peer_tx.clone();
+                let inbound_ctx = ctx.clone();
                 let ppres = presence.clone();
-                let mo = max_outbound;
-                let sd = slow_drops.clone();
-                let rec = recovery.clone();
-                let tmc = topic_message_counts.clone();
-                let qg = queue_groups.clone();
                 let conn_semaphore =
                     Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_CLUSTER_CONNS));
                 tokio::spawn(async move {
@@ -2106,27 +1976,11 @@ pub(crate) async fn cluster_manager(
                                         let _ = sock.set_send_buffer_size(262_144);
                                         let _ = sock.set_recv_buffer_size(262_144);
                                         let tls = tls_cfg.clone();
-                                        let int_tx2 = int_tx.clone();
-                                        let conns2 = conns.clone();
-                                        let subs2 = subs.clone();
-                                        let gtc2 = gtc.clone();
-                                        let met2 = met.clone();
                                         let inst2 = inst_id.clone();
-                                        let lrc2 = lrc.clone();
-                                        let npt2 = npt.clone();
-                                        let gct2 = gct.clone();
-                                        let ci2 = ci.clone();
                                         let prt2 = prt.clone();
                                         let gc2 = cancel.clone();
-                                        let ca2 = ca.clone();
-                                        let kp2 = kp.clone();
-                                        let pptx2 = pptx.clone();
+                                        let ctx2 = inbound_ctx.clone();
                                         let ppres2 = ppres.clone();
-                                        let mo2 = mo;
-                                        let sd2 = sd.clone();
-                                        let rec2 = rec.clone();
-                                        let tmc2 = tmc.clone();
-                                        let qg2 = qg.clone();
                                         tokio::spawn(async move {
                                             let _permit = permit; // held until task completes
                                             // Load current TLS config snapshot for this handshake
@@ -2139,11 +1993,7 @@ pub(crate) async fn cluster_manager(
                                                     Ok(Ok(tls_stream)) => {
                                                         handle_cluster_inbound_generic(
                                                             tls_stream, addr, &inst2,
-                                                            int_tx2, conns2, subs2, gtc2, met2, lrc2,
-                                                            npt2, gct2, ci2, prt2, gc2,
-                                                            ca2, kp2, pptx2, ppres2,
-                                                            mo2, sd2, rec2,
-                                                            tmc2, qg2,
+                                                            ctx2, prt2, gc2, ppres2,
                                                         ).await;
                                                     }
                                                     Ok(Err(e)) => {
@@ -2156,11 +2006,7 @@ pub(crate) async fn cluster_manager(
                                             } else {
                                                 handle_cluster_inbound_generic(
                                                     stream, addr, &inst2,
-                                                    int_tx2, conns2, subs2, gtc2, met2, lrc2,
-                                                    npt2, gct2, ci2, prt2, gc2,
-                                                    ca2, kp2, pptx2, ppres2,
-                                                    mo2, sd2, rec2,
-                                                    tmc2, qg2,
+                                                    ctx2, prt2, gc2, ppres2,
                                                 ).await;
                                             }
                                         });
@@ -2195,7 +2041,7 @@ pub(crate) async fn cluster_manager(
                 match cmd {
                     Some(ClusterCommand::Publish { topic, payload }) => {
                         // Get origin recovery position for cross-node recovery
-                        let rec_pos = recovery.as_ref().and_then(|rm| rm.get_position(&topic));
+                        let rec_pos = ctx.recovery.as_ref().and_then(|rm| rm.get_position(&topic));
 
                         // Pre-encode frames: with/without recovery, with/without compression
                         let recovery_compressed = if let Some((epoch, offset)) = rec_pos {
@@ -2258,14 +2104,14 @@ pub(crate) async fn cluster_manager(
                                 };
                                 match tx.try_send(frame) {
                                     Ok(()) => {
-                                        metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
+                                        ctx.metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
                                     }
                                     Err(mpsc::error::TrySendError::Full(_)) => {
-                                        metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                                        ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
                                         tracing::warn!("[WSE-Cluster] Peer {peer_addr} backpressure, dropping message");
                                     }
                                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                                        ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
                                         if let Ok(mut dlq_guard) = dlq.lock() {
                                             dlq_guard.push(ClusterDlqEntry {
                                                 topic: topic.clone(),
@@ -2363,8 +2209,8 @@ pub(crate) async fn cluster_manager(
                     continue;
                 }
                 // Skip if we already know this peer or it's our own address
-                let is_self = cluster_addr.as_deref() == Some(&new_addr);
-                let already_known = !known_peers.insert(new_addr.clone());
+                let is_self = ctx.cluster_addr.as_deref() == Some(&new_addr);
+                let already_known = !ctx.known_peers.insert(new_addr.clone());
                 if !is_self && !already_known {
                     // Prune dead peer channels FIRST so closed entries don't block re-connection
                     peer_txs.retain(|(_, tx, _)| !tx.is_closed());
@@ -2391,13 +2237,13 @@ pub(crate) async fn cluster_manager(
                         tracing::debug!("[WSE-Cluster] Ignoring invalid gossip address: {addr}");
                         continue;
                     }
-                    let is_self = cluster_addr.as_deref() == Some(&addr);
+                    let is_self = ctx.cluster_addr.as_deref() == Some(&addr);
                     if is_self {
                         continue;
                     }
                     // Forward PEER_ANNOUNCE only for newly discovered peers
                     // to prevent gossip amplification in dense clusters
-                    let is_new = !known_peers.contains(&addr);
+                    let is_new = !ctx.known_peers.contains(&addr);
                     if is_new {
                         let mut frame_data = BytesMut::new();
                         encode_peer_announce(&mut frame_data, &addr);
@@ -2409,7 +2255,7 @@ pub(crate) async fn cluster_manager(
                         }
                     }
                     // Only spawn connection to this peer if we don't already know it
-                    if known_peers.insert(addr.clone())
+                    if ctx.known_peers.insert(addr.clone())
                         && !peer_txs.iter().any(|(a, _, _)| a == &addr)
                     {
                         peer_txs.retain(|(_, tx, _)| !tx.is_closed());
@@ -2458,7 +2304,7 @@ pub(crate) async fn cluster_manager(
                             remote_interest.remove(&peer_addr);
                             peer_generation.remove(&peer_addr);
                             if !static_peers.contains(&peer_addr) {
-                                known_peers.remove(&peer_addr);
+                                ctx.known_peers.remove(&peer_addr);
                             }
                         }
                     }
@@ -2482,7 +2328,7 @@ pub(crate) async fn cluster_manager(
                         peer_txs.retain(|(a, _, _)| a != &peer_addr);
                         // Allow gossip-discovered peers to be re-discovered
                         if !static_peers.contains(&peer_addr) {
-                            known_peers.remove(&peer_addr);
+                            ctx.known_peers.remove(&peer_addr);
                         }
                     }
                     PeerRegistration::UpdateCaps { peer_addr, negotiated_caps } => {
@@ -2571,31 +2417,14 @@ pub(crate) async fn cluster_manager(
 // ---------------------------------------------------------------------------
 
 /// Handle inbound cluster peer connection. Generic over stream type (TLS or plaintext).
-#[allow(clippy::too_many_arguments)]
 async fn handle_cluster_inbound_generic<S>(
     stream: S,
     addr: SocketAddr,
     instance_id: &str,
-    interest_tx: mpsc::UnboundedSender<InterestUpdate>,
-    _connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
-    topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
-    glob_topic_count: Arc<AtomicUsize>,
-    metrics: Arc<ClusterMetrics>,
-    local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    new_peer_tx: mpsc::UnboundedSender<String>,
-    cmd_tx: mpsc::UnboundedSender<ClusterCommand>,
-    connected_instances: Arc<DashMap<String, String>>,
+    ctx: ClusterContext,
     peer_reg_tx: mpsc::UnboundedSender<PeerRegistration>,
     global_cancel: CancellationToken,
-    cluster_addr: Option<String>,
-    known_peers: Arc<DashSet<String>>,
-    presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
     presence: Option<Arc<super::presence::PresenceManager>>,
-    max_outbound: usize,
-    slow_drops: Arc<AtomicU64>,
-    recovery: Option<Arc<super::recovery::RecoveryManager>>,
-    topic_message_counts: Arc<DashMap<String, AtomicU64>>,
-    queue_groups: Arc<DashMap<String, DashMap<String, super::server::QueueGroup>>>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -2646,7 +2475,7 @@ async fn handle_cluster_inbound_generic<S>(
     // Duplicate connection prevention: atomic check-and-insert via entry() API
     {
         use dashmap::mapref::entry::Entry;
-        match connected_instances.entry(peer_instance_id.clone()) {
+        match ctx.connected_instances.entry(peer_instance_id.clone()) {
             Entry::Occupied(_) => {
                 tracing::info!(
                     "[WSE-Cluster] Already connected to instance {}, rejecting inbound from {addr}",
@@ -2667,14 +2496,15 @@ async fn handle_cluster_inbound_generic<S>(
     write_framed(&mut frame, &hello_buf);
     if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
         tracing::error!("[WSE-Cluster] Failed to send HELLO to inbound {addr}");
-        connected_instances.remove(&peer_instance_id);
+        ctx.connected_instances.remove(&peer_instance_id);
         return;
     }
 
     // Send RESYNC with all current local topics (before spawning writer task)
     {
         let local_topics: Vec<String> = {
-            let refcounts = local_topic_refcount
+            let refcounts = ctx
+                .local_topic_refcount
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             refcounts.keys().cloned().collect()
@@ -2687,14 +2517,14 @@ async fn handle_cluster_inbound_generic<S>(
             }
             if writer.write_all(&wire_buf).await.is_err() || writer.flush().await.is_err() {
                 tracing::warn!("[WSE-Cluster] Failed to send RESYNC to inbound {addr}");
-                connected_instances.remove(&peer_instance_id);
+                ctx.connected_instances.remove(&peer_instance_id);
                 return;
             }
         }
     }
 
     // Send PEER_ANNOUNCE with our cluster address (if in discovery mode)
-    if let Some(ref our_addr) = cluster_addr {
+    if let Some(ref our_addr) = ctx.cluster_addr {
         let mut announce_buf = BytesMut::new();
         encode_peer_announce(&mut announce_buf, our_addr);
         let mut announce_frame = BytesMut::new();
@@ -2705,7 +2535,7 @@ async fn handle_cluster_inbound_generic<S>(
 
     // Send PEER_LIST with all known peers
     {
-        let addrs: Vec<String> = known_peers.iter().map(|r| r.key().clone()).collect();
+        let addrs: Vec<String> = ctx.known_peers.iter().map(|r| r.key().clone()).collect();
         if !addrs.is_empty() {
             let mut list_buf = BytesMut::new();
             encode_peer_list(&mut list_buf, &addrs);
@@ -2740,8 +2570,8 @@ async fn handle_cluster_inbound_generic<S>(
         "[WSE-Cluster] Accepted inbound peer from {addr} (v{_peer_version}, caps=0x{peer_caps:08x})"
     );
     let peer_addr_str = addr.to_string();
-    metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
-    metrics.peer_info.insert(
+    ctx.metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
+    ctx.metrics.peer_info.insert(
         peer_addr_str.clone(),
         PeerInfo {
             address: peer_addr_str.clone(),
@@ -2767,38 +2597,23 @@ async fn handle_cluster_inbound_generic<S>(
         write_rx,
         writer,
         cancel.clone(),
-        metrics.clone(),
+        ctx.metrics.clone(),
     ));
 
     let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<DispatchItem>();
 
-    let dispatch_handle = tokio::spawn(peer_dispatch_task(
-        dispatch_rx,
-        topic_subscribers,
-        glob_topic_count,
-        metrics.clone(),
-        cancel.clone(),
-        max_outbound,
-        slow_drops,
-        recovery,
-        topic_message_counts,
-        queue_groups,
-    ));
+    let dispatch_handle =
+        tokio::spawn(peer_dispatch_task(dispatch_rx, ctx.clone(), cancel.clone()));
 
     let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
     let reader_handle = tokio::spawn(peer_reader(
         reader,
         write_tx.clone(),
         peer_addr_str.clone(),
-        interest_tx.clone(),
+        ctx.clone(),
         dispatch_tx,
         cancel.clone(),
-        metrics.clone(),
-        last_activity.clone(),
-        new_peer_tx,
-        cmd_tx,
-        presence_tx,
-        session_gen,
+        (last_activity.clone(), session_gen),
     ));
 
     let heartbeat_handle = tokio::spawn(heartbeat_task(write_tx, cancel.clone(), last_activity));
@@ -2826,10 +2641,10 @@ async fn handle_cluster_inbound_generic<S>(
     let _ = peer_reg_tx.send(PeerRegistration::Deregister {
         peer_addr: peer_addr_str.clone(),
     });
-    connected_instances.remove(&peer_instance_id);
-    metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
-    metrics.peer_info.remove(&peer_addr_str);
-    let _ = interest_tx.send(InterestUpdate::PeerDisconnected {
+    ctx.connected_instances.remove(&peer_instance_id);
+    ctx.metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
+    ctx.metrics.peer_info.remove(&peer_addr_str);
+    let _ = ctx.interest_tx.send(InterestUpdate::PeerDisconnected {
         peer_addr: peer_addr_str,
         generation: session_gen,
     });
@@ -2887,30 +2702,33 @@ pub(crate) async fn handle_cluster_inbound(
     // Legacy path has no gossip discovery
     let legacy_known_peers: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
+    let ctx = ClusterContext {
+        interest_tx,
+        topic_subscribers: shared.topic_subscribers.clone(),
+        glob_topic_count: shared.glob_topic_count.clone(),
+        metrics: shared.cluster_metrics.clone(),
+        new_peer_tx,
+        cmd_tx,
+        presence_tx,
+        connected_instances,
+        known_peers: legacy_known_peers,
+        local_topic_refcount: shared.local_topic_refcount.clone(),
+        cluster_addr: None,
+        max_outbound: shared.max_outbound_queue_bytes,
+        slow_drops: Arc::clone(&shared.slow_consumer_drops),
+        recovery: shared.recovery.clone(),
+        topic_message_counts: shared.topic_message_counts.clone(),
+        queue_groups: shared.queue_groups.clone(),
+    };
+
     handle_cluster_inbound_generic(
         stream,
         addr,
         &instance_id,
-        interest_tx,
-        shared.connections.clone(),
-        shared.topic_subscribers.clone(),
-        shared.glob_topic_count.clone(),
-        shared.cluster_metrics.clone(),
-        shared.local_topic_refcount.clone(),
-        new_peer_tx,
-        cmd_tx,
-        connected_instances,
+        ctx,
         peer_reg_tx,
         legacy_cancel,
-        None,
-        legacy_known_peers,
-        presence_tx,
         shared.presence.clone(),
-        shared.max_outbound_queue_bytes,
-        Arc::clone(&shared.slow_consumer_drops),
-        shared.recovery.clone(),
-        shared.topic_message_counts.clone(),
-        shared.queue_groups.clone(),
     )
     .await;
 }
