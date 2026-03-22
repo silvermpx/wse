@@ -168,7 +168,10 @@ jobs:
         run: cargo install cargo-audit --locked
 
       - name: Rust dependency audit
-        run: cargo audit --file rust/Cargo.lock
+        run: cargo audit --file rust/Cargo.lock --ignore RUSTSEC-2023-0071
+        # RUSTSEC-2023-0071: rsa crate Marvin Attack (timing side-channel in RSA decryption).
+        # Not exploitable: WSE uses jsonwebtoken for JWT signature verification only,
+        # never RSA decryption. No fix available upstream.
 
       - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f  # v6.3.0
         with:
