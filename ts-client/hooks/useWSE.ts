@@ -83,8 +83,7 @@ let isGloballyConnecting = false;
 let lastConnectionAttemptTime = 0;
 const MIN_CONNECTION_INTERVAL = 500;
 
-// Circuit breaker check interval
-let circuitBreakerCheckInterval: NodeJS.Timeout | null = null;
+// Circuit breaker check interval (moved to per-instance ref inside hook)
 
 // Event deduplication at the module level
 const processedEvents = new Map<string, number>();
@@ -247,6 +246,13 @@ export interface UseWSEConfig extends Partial<WSEConfig> {
     registerHandler: (type: string, handler: (msg: any) => void) => void;
     getRegisteredHandlers?: () => string[];
   }) => void;
+
+  /**
+   * Throttle interval in ms for non-system events (default: 0 = disabled).
+   * When set, events of the same type arriving faster than this interval
+   * are silently dropped before reaching handlers.
+   */
+  eventThrottleMs?: number;
 }
 
 export function useWSE(
@@ -288,9 +294,12 @@ export function useWSE(
   // Track current token to detect changes
   const currentTokenRef = useRef<string | undefined>(undefined);
 
+  // Per-instance circuit breaker interval (not module-level)
+  const circuitBreakerIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
   // Add timestamp tracking for rate limiting
   const lastEventTimestampRef = useRef<Map<string, number>>(new Map());
-  const EVENT_THROTTLE_MS = 500;
+  const EVENT_THROTTLE_MS = config?.eventThrottleMs ?? 0;
 
   // Critical handlers from config (defaults to empty)
   const criticalHandlers = config?.criticalHandlers || [];
@@ -327,12 +336,12 @@ export function useWSE(
 
   const startCircuitBreakerCheck = useCallback(() => {
     // Clear any existing interval so updated validToken closure is used
-    if (circuitBreakerCheckInterval) {
-      clearInterval(circuitBreakerCheckInterval);
-      circuitBreakerCheckInterval = null;
+    if (circuitBreakerIntervalRef.current) {
+      clearInterval(circuitBreakerIntervalRef.current);
+      circuitBreakerIntervalRef.current = null;
     }
 
-    circuitBreakerCheckInterval = setInterval(() => {
+    circuitBreakerIntervalRef.current = setInterval(() => {
       store.checkCircuitBreakerTimeout();
 
       if (store.canReconnect() && store.connectionState === ConnectionState.ERROR) {
@@ -348,9 +357,9 @@ export function useWSE(
   }, [store, validToken]);
 
   const stopCircuitBreakerCheck = useCallback(() => {
-    if (circuitBreakerCheckInterval) {
-      clearInterval(circuitBreakerCheckInterval);
-      circuitBreakerCheckInterval = null;
+    if (circuitBreakerIntervalRef.current) {
+      clearInterval(circuitBreakerIntervalRef.current);
+      circuitBreakerIntervalRef.current = null;
     }
   }, []);
 
@@ -1201,6 +1210,12 @@ export function useWSE(
 
     return () => {
       logger.info('useWSE effect cleanup triggered');
+
+      // Always clean up per-instance intervals to prevent leaks
+      if (circuitBreakerIntervalRef.current) {
+        clearInterval(circuitBreakerIntervalRef.current);
+        circuitBreakerIntervalRef.current = null;
+      }
 
       if (globalWSEInstance && globalWSEInstance.token === validToken) {
         if (currentTokenRef.current !== validToken) {

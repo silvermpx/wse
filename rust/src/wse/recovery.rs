@@ -339,11 +339,11 @@ impl RecoveryManager {
         // so cleanup() cannot remove this buffer between the read and update.
         if new_bytes > old_bytes {
             self.total_bytes
-                .fetch_add(new_bytes - old_bytes, Ordering::Relaxed);
+                .fetch_add(new_bytes - old_bytes, Ordering::AcqRel);
         } else if old_bytes > new_bytes {
             let _ = self
                 .total_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                     Some(cur.saturating_sub(old_bytes - new_bytes))
                 });
         }
@@ -374,11 +374,11 @@ impl RecoveryManager {
 
         if new_bytes > old_bytes {
             self.total_bytes
-                .fetch_add(new_bytes - old_bytes, Ordering::Relaxed);
+                .fetch_add(new_bytes - old_bytes, Ordering::AcqRel);
         } else if old_bytes > new_bytes {
             let _ = self
                 .total_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                     Some(cur.saturating_sub(old_bytes - new_bytes))
                 });
         }

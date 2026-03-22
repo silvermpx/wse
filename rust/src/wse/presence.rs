@@ -21,8 +21,7 @@ pub(crate) struct PresenceEntry {
 #[derive(Clone, Debug)]
 pub(crate) struct ConnMeta {
     pub conn_id: String,
-    #[allow(dead_code)]
-    pub joined_at: u64,
+    pub _joined_at: u64,
 }
 
 pub(crate) struct PresenceStats {
@@ -165,7 +164,7 @@ impl PresenceManager {
             let inserted = if !entry.connections.iter().any(|c| c.conn_id == conn_id) {
                 entry.connections.push(ConnMeta {
                     conn_id: conn_id.to_owned(),
-                    joined_at: now,
+                    _joined_at: now,
                 });
                 true
             } else {
@@ -505,7 +504,7 @@ impl PresenceManager {
         if entry.connections.is_empty() {
             entry.connections.push(ConnMeta {
                 conn_id: format!("__remote__{user_id}"),
-                joined_at: updated_at,
+                _joined_at: updated_at,
             });
             // Update stats
             let stats = self

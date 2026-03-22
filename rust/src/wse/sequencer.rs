@@ -107,9 +107,8 @@ impl RustSequencer {
 
 /// A buffered event waiting for its turn to be delivered in-order.
 /// Mirrors the Python `SequencedEvent` dataclass.
-#[allow(dead_code)]
 struct BufferedEvent {
-    sequence: u64,
+    _sequence: u64,
     timestamp: Instant,
     payload: Py<PyAny>,
 }
@@ -279,7 +278,7 @@ impl RustEventSequencer {
             } else {
                 // Buffer the event for later delivery.
                 let buffered = BufferedEvent {
-                    sequence,
+                    _sequence: sequence,
                     timestamp: Instant::now(),
                     payload: event.clone().unbind(),
                 };

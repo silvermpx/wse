@@ -1,5 +1,32 @@
 # Changelog
 
+## v2.3.2 (2026-03-22)
+
+### Security
+
+- Fixed HKDF key derivation: salt/IKM arguments were swapped (RFC 5869 compliance)
+- Added 10-second timeout on WebSocket handshake to prevent slow loris attacks
+- Plaintext cluster connections on main port now log a security warning
+- Removed unused `InvalidHeader` JWT error variant (dead code cleanup)
+
+### Bug Fixes
+
+- Fixed `pending` byte counter underflow: replaced `fetch_sub` with `saturating_sub` to prevent counter wraparound disabling backpressure
+- Fixed `PEER_SESSION_GENERATION` atomic ordering: `Relaxed` -> `AcqRel` to guarantee strict monotonicity across threads on ARM
+- Fixed recovery buffer `total_bytes` accounting: strengthened atomic ordering from `Relaxed` to `AcqRel` to prevent budget drift under high concurrency
+- Fixed rcgen 0.14 API compatibility in cluster TLS tests
+- **Python client**: fixed `asyncio.Queue`/`asyncio.Event` created in `__init__` before event loop exists (RuntimeError on Python 3.12+)
+- **Python client**: fixed `_server_ready_event` not cleared on reconnect (stale set from prior session)
+- **TS client**: fixed module-level `circuitBreakerCheckInterval` shared across all `useWSE` hook instances (moved to per-instance ref)
+- **TS client**: fixed `batchInterval` and `diagnosticsInterval` leak on unmount-remount cycle
+
+### Improvements
+
+- Added `max_subscriptions_per_connection` config parameter (default: 0 = unlimited) to prevent topic explosion DoS
+- **TS client**: event throttle is now configurable via `eventThrottleMs` config option (default: 0 = disabled, was hardcoded 500ms)
+- Removed all `#[allow(dead_code)]` suppressions (fixed underlying issues instead)
+- Documented `refreshAuthToken` behavior: only active in cookie-auth mode
+
 ## v2.3.1 (2026-03-08)
 
 ### Documentation

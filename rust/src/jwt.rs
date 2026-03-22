@@ -6,6 +6,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
 // Algorithm
@@ -42,10 +43,8 @@ impl JwtAlgorithm {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-#[allow(dead_code)]
-pub enum JwtError {
+pub(crate) enum JwtError {
     MalformedToken,
-    InvalidHeader,
     UnsupportedAlgorithm,
     InvalidSignature,
     InvalidPayload,
@@ -63,7 +62,6 @@ impl std::fmt::Display for JwtError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MalformedToken => write!(f, "Malformed JWT token"),
-            Self::InvalidHeader => write!(f, "Invalid JWT header"),
             Self::UnsupportedAlgorithm => {
                 write!(f, "Unsupported algorithm (supported: HS256, RS256, ES256)")
             }
@@ -123,10 +121,11 @@ pub struct JwtConfig {
     pub algorithm: JwtAlgorithm,
     /// For HS256: shared secret (>= 32 bytes).
     /// For RS256/ES256: public key in PEM format (for verification).
-    pub secret: Vec<u8>,
+    /// Wrapped in Zeroizing to clear key material from memory on drop.
+    pub secret: Zeroizing<Vec<u8>>,
     /// For HS256: previous shared secret for key rotation.
     /// For RS256/ES256: previous public key in PEM format.
-    pub previous_secret: Option<Vec<u8>>,
+    pub previous_secret: Option<Zeroizing<Vec<u8>>>,
     // private_key validated at startup but not stored -- PyO3 rust_jwt_encode
     // takes the key directly as an argument. Keeping key material out of
     // long-lived SharedState reduces exposure in crash dumps.
@@ -593,7 +592,7 @@ mod tests {
     fn hs256_config() -> JwtConfig {
         JwtConfig {
             algorithm: JwtAlgorithm::HS256,
-            secret: test_secret(),
+            secret: Zeroizing::new(test_secret()),
             previous_secret: None,
             key_id: None,
             issuer: "sqv".to_string(),
@@ -666,7 +665,7 @@ mod tests {
         let token = jwt_encode(&claims, &config.secret, JwtAlgorithm::HS256, None).unwrap();
 
         let bad_config = JwtConfig {
-            secret: b"wrong-secret-key-at-least-32bytes!".to_vec(),
+            secret: Zeroizing::new(b"wrong-secret-key-at-least-32bytes!".to_vec()),
             ..hs256_config()
         };
         let result = jwt_decode(&token, &bad_config);
@@ -797,7 +796,7 @@ mod tests {
         let secret = test_secret();
         let config = JwtConfig {
             algorithm: JwtAlgorithm::HS256,
-            secret: secret.clone(),
+            secret: Zeroizing::new(secret.clone()),
             previous_secret: None,
             key_id: None,
             issuer: String::new(),
@@ -903,8 +902,8 @@ mod tests {
 
         let config = JwtConfig {
             algorithm: JwtAlgorithm::HS256,
-            secret: new_secret,
-            previous_secret: Some(old_secret),
+            secret: Zeroizing::new(new_secret),
+            previous_secret: Some(Zeroizing::new(old_secret)),
             key_id: None,
             issuer: "sqv".to_string(),
             audience: "sqv-api".to_string(),
@@ -928,8 +927,8 @@ mod tests {
 
         let config = JwtConfig {
             algorithm: JwtAlgorithm::HS256,
-            secret: b"current-secret-key-32-bytes-ok!!".to_vec(),
-            previous_secret: Some(b"previous-secret-key-32bytes-ok!!".to_vec()),
+            secret: Zeroizing::new(b"current-secret-key-32-bytes-ok!!".to_vec()),
+            previous_secret: Some(Zeroizing::new(b"previous-secret-key-32bytes-ok!!".to_vec())),
             key_id: None,
             issuer: "sqv".to_string(),
             audience: "sqv-api".to_string(),
@@ -958,7 +957,7 @@ mod tests {
         // Decode with matching kid
         let config = JwtConfig {
             algorithm: JwtAlgorithm::HS256,
-            secret,
+            secret: Zeroizing::new(secret),
             previous_secret: None,
             key_id: Some("key-2024-03".to_string()),
             issuer: String::new(),
@@ -981,7 +980,7 @@ mod tests {
 
         let config = JwtConfig {
             algorithm: JwtAlgorithm::HS256,
-            secret,
+            secret: Zeroizing::new(secret),
             previous_secret: None,
             key_id: Some("key-new".to_string()),
             issuer: String::new(),
@@ -1004,7 +1003,7 @@ mod tests {
 
         let config = JwtConfig {
             algorithm: JwtAlgorithm::HS256,
-            secret,
+            secret: Zeroizing::new(secret),
             previous_secret: None,
             key_id: Some("expected-kid".to_string()),
             issuer: String::new(),
@@ -1026,7 +1025,7 @@ mod tests {
         let token = jwt_encode(&claims, &secret, JwtAlgorithm::HS256, Some("some-kid")).unwrap();
         let config = JwtConfig {
             algorithm: JwtAlgorithm::HS256,
-            secret,
+            secret: Zeroizing::new(secret),
             previous_secret: None,
             key_id: None,
             issuer: String::new(),
@@ -1056,7 +1055,7 @@ mod tests {
 
         let config = JwtConfig {
             algorithm: JwtAlgorithm::RS256,
-            secret: RSA_PUBLIC_KEY.to_vec(),
+            secret: Zeroizing::new(RSA_PUBLIC_KEY.to_vec()),
             previous_secret: None,
             key_id: None,
             issuer: "test".to_string(),
@@ -1080,7 +1079,7 @@ mod tests {
         // Verify with key 2 (different keypair)
         let config = JwtConfig {
             algorithm: JwtAlgorithm::RS256,
-            secret: RSA2_PUBLIC_KEY.to_vec(),
+            secret: Zeroizing::new(RSA2_PUBLIC_KEY.to_vec()),
             previous_secret: None,
             key_id: None,
             issuer: String::new(),
@@ -1104,8 +1103,8 @@ mod tests {
         // Config: new key is primary, old key is previous
         let config = JwtConfig {
             algorithm: JwtAlgorithm::RS256,
-            secret: RSA2_PUBLIC_KEY.to_vec(),
-            previous_secret: Some(RSA_PUBLIC_KEY.to_vec()),
+            secret: Zeroizing::new(RSA2_PUBLIC_KEY.to_vec()),
+            previous_secret: Some(Zeroizing::new(RSA_PUBLIC_KEY.to_vec())),
             key_id: None,
             issuer: String::new(),
             audience: String::new(),
@@ -1136,7 +1135,7 @@ mod tests {
 
         let config = JwtConfig {
             algorithm: JwtAlgorithm::RS256,
-            secret: RSA_PUBLIC_KEY.to_vec(),
+            secret: Zeroizing::new(RSA_PUBLIC_KEY.to_vec()),
             previous_secret: None,
             key_id: Some("rsa-key-1".to_string()),
             issuer: String::new(),
@@ -1165,7 +1164,7 @@ mod tests {
 
         let config = JwtConfig {
             algorithm: JwtAlgorithm::ES256,
-            secret: EC_PUBLIC_KEY.to_vec(),
+            secret: Zeroizing::new(EC_PUBLIC_KEY.to_vec()),
             previous_secret: None,
             key_id: None,
             issuer: "test".to_string(),
@@ -1187,7 +1186,7 @@ mod tests {
 
         let config = JwtConfig {
             algorithm: JwtAlgorithm::ES256,
-            secret: EC2_PUBLIC_KEY.to_vec(),
+            secret: Zeroizing::new(EC2_PUBLIC_KEY.to_vec()),
             previous_secret: None,
             key_id: None,
             issuer: String::new(),
@@ -1209,8 +1208,8 @@ mod tests {
 
         let config = JwtConfig {
             algorithm: JwtAlgorithm::ES256,
-            secret: EC2_PUBLIC_KEY.to_vec(),
-            previous_secret: Some(EC_PUBLIC_KEY.to_vec()),
+            secret: Zeroizing::new(EC2_PUBLIC_KEY.to_vec()),
+            previous_secret: Some(Zeroizing::new(EC_PUBLIC_KEY.to_vec())),
             key_id: None,
             issuer: String::new(),
             audience: String::new(),
@@ -1241,7 +1240,7 @@ mod tests {
 
         let config = JwtConfig {
             algorithm: JwtAlgorithm::ES256,
-            secret: EC_PUBLIC_KEY.to_vec(),
+            secret: Zeroizing::new(EC_PUBLIC_KEY.to_vec()),
             previous_secret: None,
             key_id: Some("ec-key-1".to_string()),
             issuer: String::new(),
@@ -1266,7 +1265,7 @@ mod tests {
         // Try to decode with RS256 config
         let config = JwtConfig {
             algorithm: JwtAlgorithm::RS256,
-            secret: RSA_PUBLIC_KEY.to_vec(),
+            secret: Zeroizing::new(RSA_PUBLIC_KEY.to_vec()),
             previous_secret: None,
             key_id: None,
             issuer: String::new(),
@@ -1288,7 +1287,7 @@ mod tests {
 
         let config = JwtConfig {
             algorithm: JwtAlgorithm::ES256,
-            secret: EC_PUBLIC_KEY.to_vec(),
+            secret: Zeroizing::new(EC_PUBLIC_KEY.to_vec()),
             previous_secret: None,
             key_id: None,
             issuer: String::new(),

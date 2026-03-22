@@ -312,9 +312,15 @@ The frontend `RateLimiter` prevents excessive sends.
 - Server pings every 25 seconds
 - Connections with no activity for 60 seconds are force-closed
 
+### Handshake Protection
+
+- 10-second timeout on WebSocket upgrade handshake prevents slow loris attacks
+- Connections that stall during HTTP upgrade are terminated before consuming server resources
+
 ### Connection Limits
 
 - `max_connections` caps total concurrent WebSocket connections
+- `max_subscriptions_per_connection` caps topics per connection (0 = unlimited). Prevents topic explosion DoS where a single client creates millions of unique topics
 - Inbound queue bounded at 131,072 events
 - Per-connection deduplication: 50,000-entry AHashSet with FIFO eviction
 
@@ -346,6 +352,12 @@ Deny always takes precedence over allow. Patterns support `*` (match any charact
 - Combine with JWT `sub` claim for user-level authorization: read the user's role from the JWT payload in your drain loop, then set appropriate ACLs.
 
 ## Wire-Level Security
+
+### Cluster Authentication
+
+- **With TLS**: mutual TLS (mTLS) provides both encryption and authentication. Cluster connections are only accepted on the dedicated `cluster_port`
+- **Without TLS**: cluster connections on the main WebSocket port log a security warning. For production, always enable cluster TLS or use a dedicated cluster port on a private network
+- Plaintext cluster connections are accepted only when cluster is initialized and TLS is not configured
 
 ### Cluster Frame Protection
 

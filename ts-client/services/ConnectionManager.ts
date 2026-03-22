@@ -400,6 +400,9 @@ export class ConnectionManager {
   // ---------------------------------------------------------------------------
 
   private setupTokenRefresh(): void {
+    // Token refresh is only needed for cookie-based auth where the server
+    // manages session cookies. For JWT bearer tokens, the application should
+    // handle token refresh externally and reconnect with the new token.
     if (this.isDestroyed || !this.usesCookieAuth || !this.refreshAuthTokenFn) return;
 
     if (this.tokenRefreshTimer) {

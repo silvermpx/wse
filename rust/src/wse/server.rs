@@ -38,6 +38,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketConfig};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -303,6 +304,8 @@ pub(crate) struct SharedState {
     ping_interval_secs: u64,
     idle_timeout_secs: u64,
     pub(crate) max_outbound_queue_bytes: usize,
+    // Per-connection subscription limit (0 = unlimited)
+    max_subscriptions_per_connection: usize,
     // Prometheus counters
     pub(crate) slow_consumer_drops: Arc<AtomicU64>,
     messages_received_total: AtomicU64,
@@ -333,6 +336,7 @@ impl SharedState {
         ping_interval_secs: u64,
         idle_timeout_secs: u64,
         max_outbound_queue_bytes: usize,
+        max_subscriptions_per_connection: usize,
     ) -> Self {
         let (tx, rx) = bounded(max_inbound_queue_size);
         Self {
@@ -382,6 +386,7 @@ impl SharedState {
             ping_interval_secs,
             idle_timeout_secs,
             max_outbound_queue_bytes,
+            max_subscriptions_per_connection,
             slow_consumer_drops: Arc::new(AtomicU64::new(0)),
             messages_received_total: AtomicU64::new(0),
             messages_sent_total: AtomicU64::new(0),
@@ -785,9 +790,11 @@ fn derive_connection_key(client_pubkey_b64: &str) -> Result<(String, aes_gcm::Ae
 
     let shared = diffie_hellman(server_sk.to_nonzero_scalar(), client_pk.as_affine());
 
-    let hkdf = Hkdf::<Sha256>::new(Some(b"wse-encryption"), shared.raw_secret_bytes());
+    // RFC 5869: IKM = DH shared secret, salt = None (zero-salt default),
+    // info = context string for domain separation in expand()
+    let hkdf = Hkdf::<Sha256>::new(None, shared.raw_secret_bytes());
     let mut aes_key = [0u8; 32];
-    hkdf.expand(b"aes-gcm-key", &mut aes_key)
+    hkdf.expand(b"wse-encryption/aes-gcm-key", &mut aes_key)
         .map_err(|e| format!("HKDF expand failed: {e}"))?;
 
     let cipher = aes_gcm::Aes256Gcm::new_from_slice(&aes_key)
@@ -951,39 +958,47 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_message_size = Some(state.max_message_size);
     ws_config.max_frame_size = Some(state.max_message_size);
-    let ws_stream = match tokio_tungstenite::accept_hdr_async_with_config(
-        stream,
-        #[allow(clippy::result_large_err)]
-        move |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
-            let cookies = req
-                .headers()
-                .get("cookie")
-                .and_then(|cv| cv.to_str().ok())
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let wants_msgpack = req
-                .uri()
-                .query()
-                .is_some_and(|q| q.contains("format=msgpack"));
-            let authorization = req
-                .headers()
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-            let _ = hd_clone.set(HandshakeResult {
-                cookies,
-                wants_msgpack,
-                authorization,
-            });
-            Ok(response)
-        },
-        Some(ws_config),
+    // 10-second timeout prevents slow loris attacks on the handshake
+    let ws_stream = match tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio_tungstenite::accept_hdr_async_with_config(
+            stream,
+            #[allow(clippy::result_large_err)]
+            move |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
+                let cookies = req
+                    .headers()
+                    .get("cookie")
+                    .and_then(|cv| cv.to_str().ok())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let wants_msgpack = req
+                    .uri()
+                    .query()
+                    .is_some_and(|q| q.contains("format=msgpack"));
+                let authorization = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let _ = hd_clone.set(HandshakeResult {
+                    cookies,
+                    wants_msgpack,
+                    authorization,
+                });
+                Ok(response)
+            },
+            Some(ws_config),
+        ),
     )
     .await
     {
-        Ok(ws) => ws,
-        Err(e) => {
+        Ok(Ok(ws)) => ws,
+        Ok(Err(e)) => {
             tracing::warn!("[WSE] WS handshake failed for {addr}: {e}");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!("[WSE] WS handshake timeout for {addr}");
             return;
         }
     };
@@ -1200,10 +1215,15 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
             if let Some(data) = broadcast_data {
                 let len = data.len();
                 if raw_write.write_all(&data).await.is_err() {
-                    pending_write.fetch_sub(len, Ordering::Relaxed);
+                    let _ =
+                        pending_write.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                            Some(cur.saturating_sub(len))
+                        });
                     break;
                 }
-                pending_write.fetch_sub(len, Ordering::Relaxed);
+                let _ = pending_write.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    Some(cur.saturating_sub(len))
+                });
                 continue; // check buffer again before blocking
             }
 
@@ -1277,7 +1297,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                         }
                     }
 
-                    pending_write.fetch_sub(drained_bytes, Ordering::Relaxed);
+                    let _ = pending_write.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                        Some(cur.saturating_sub(drained_bytes))
+                    });
                     batch.clear();
 
                     if !ok {
@@ -2427,7 +2449,7 @@ impl RustWSEServer {
     /// compression, encryption, ping/pong). Python handles application logic
     /// via drain mode or callbacks.
     #[new]
-    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, jwt_previous_secret = None, jwt_key_id = None, jwt_algorithm = None, jwt_private_key = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_bytes = 16_777_216))]
+    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, jwt_previous_secret = None, jwt_key_id = None, jwt_algorithm = None, jwt_private_key = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_bytes = 16_777_216, max_subscriptions_per_connection = 0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         host: String,
@@ -2456,6 +2478,7 @@ impl RustWSEServer {
         ping_interval: u64,
         idle_timeout: u64,
         max_outbound_queue_bytes: usize,
+        max_subscriptions_per_connection: usize,
     ) -> PyResult<Self> {
         if ping_interval >= idle_timeout {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -2544,8 +2567,8 @@ impl RustWSEServer {
         drop(jwt_private_key);
         let jwt_config = jwt_secret.map(|secret| JwtConfig {
             algorithm: jwt_alg,
-            secret,
-            previous_secret: jwt_previous_secret,
+            secret: Zeroizing::new(secret),
+            previous_secret: jwt_previous_secret.map(Zeroizing::new),
             key_id: jwt_key_id,
             issuer: jwt_issuer.unwrap_or_default(),
             audience: jwt_audience.unwrap_or_default(),
@@ -2587,6 +2610,7 @@ impl RustWSEServer {
                 ping_interval,
                 idle_timeout,
                 max_outbound_queue_bytes,
+                max_subscriptions_per_connection,
             )),
             cmd_tx: None,
             thread_handle: None,
@@ -3050,17 +3074,18 @@ impl RustWSEServer {
                                                 _ => false,
                                             };
                                             if is_cluster {
-                                                // Reject cluster connections on main port when mTLS is
-                                                // configured or cluster is not yet initialized.
+                                                // Reject cluster connections on main port:
+                                                // - always when mTLS is configured (use dedicated cluster_port)
+                                                // - always when TLS is NOT configured (unauthenticated injection risk)
+                                                // - when cluster is not yet initialized
                                                 let cluster_ready = shared2
                                                     .cluster_interest_tx
                                                     .read()
                                                     .unwrap()
                                                     .is_some();
-                                                if shared2.cluster_tls_enabled.load(Ordering::Relaxed)
-                                                    || !cluster_ready
-                                                {
-                                                    if shared2.cluster_tls_enabled.load(Ordering::Relaxed) {
+                                                let tls_enabled = shared2.cluster_tls_enabled.load(Ordering::Relaxed);
+                                                if tls_enabled || !cluster_ready {
+                                                    if tls_enabled {
                                                         tracing::warn!(
                                                             "[WSE] Rejecting cluster connection on main port \
                                                              (mTLS required, use dedicated cluster_port): {addr}"
@@ -3069,6 +3094,13 @@ impl RustWSEServer {
                                                     drop(stream);
                                                     return;
                                                 }
+                                                // Non-TLS cluster on main port: reject unless cluster_port
+                                                // is explicitly not set (backward compat for single-port
+                                                // deployments). Log a warning for security awareness.
+                                                tracing::warn!(
+                                                    "[WSE] Accepting plaintext cluster connection on main port \
+                                                     from {addr} -- configure cluster TLS for production use"
+                                                );
                                                 let interest_tx = shared2
                                                     .cluster_interest_tx
                                                     .read()
@@ -3909,7 +3941,7 @@ impl RustWSEServer {
     ) -> PyResult<()> {
         // Filter topics through ACL if one exists for this connection.
         // No ACL = allow all (backward compatible).
-        let topics = if let Some(acl) = self.shared.conn_topic_acl.get(conn_id) {
+        let mut topics = if let Some(acl) = self.shared.conn_topic_acl.get(conn_id) {
             topics
                 .into_iter()
                 .filter(|t| acl.is_allowed(t))
@@ -3917,6 +3949,27 @@ impl RustWSEServer {
         } else {
             topics
         };
+
+        // Enforce per-connection subscription limit (0 = unlimited)
+        let max_subs = self.shared.max_subscriptions_per_connection;
+        if max_subs > 0 {
+            let current = self
+                .shared
+                .conn_topics
+                .get(conn_id)
+                .map(|s| s.len())
+                .unwrap_or(0);
+            let allowed = max_subs.saturating_sub(current);
+            if allowed == 0 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Connection {conn_id} reached max subscriptions ({max_subs})"
+                )));
+            }
+            // Truncate topics to fit within remaining budget
+            if topics.len() > allowed {
+                topics.truncate(allowed);
+            }
+        }
 
         let cluster_tx = self.shared.cluster_cmd_tx.read().unwrap().clone();
 

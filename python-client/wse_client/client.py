@@ -134,10 +134,10 @@ class AsyncWSEClient:
         self._network_monitor = NetworkMonitor()
         self._offline_queue = OfflineQueue(max_size=1000, max_age=3600.0)
 
-        # Event queue for async iteration
-        self._event_queue: asyncio.Queue[WSEEvent | None] = asyncio.Queue(
-            maxsize=queue_size
-        )
+        # Event queue for async iteration (created lazily in connect() to avoid
+        # RuntimeError when instantiated outside a running event loop)
+        self._event_queue: asyncio.Queue[WSEEvent | None] | None = None
+        self._queue_size = queue_size
         self._disconnecting = False
 
         # Callback handlers: type -> list of handlers
@@ -183,7 +183,8 @@ class AsyncWSEClient:
 
         self._connection._on_pong = self._on_transport_pong
         self._connection._on_ping_sent = lambda: self._network_monitor.record_ping()
-        self._server_ready_event = asyncio.Event()
+        # Created lazily in connect() to avoid RuntimeError outside event loop
+        self._server_ready_event: asyncio.Event | None = None
 
         # System handler dispatch table (dict lookup = O(1))
         self._system_handlers: dict[str, Callable[[WSEEvent], None]] = {
@@ -242,6 +243,14 @@ class AsyncWSEClient:
 
     async def connect(self) -> None:
         """Connect and wait for server_ready."""
+        # Lazily create asyncio primitives (requires running event loop)
+        if self._event_queue is None:
+            self._event_queue = asyncio.Queue(maxsize=self._queue_size)
+        if self._server_ready_event is None:
+            self._server_ready_event = asyncio.Event()
+        # Clear in case of reconnect (prevents stale set from prior session)
+        self._server_ready_event.clear()
+
         await self._connection.connect(self._initial_topics)
 
         # Wait for server_ready with timeout
@@ -332,7 +341,7 @@ class AsyncWSEClient:
     @property
     def queue_size(self) -> int:
         """Number of events waiting in the iterator queue."""
-        return self._event_queue.qsize()
+        return self._event_queue.qsize() if self._event_queue else 0
 
     # -- Send / Subscribe / Unsubscribe ---------------------------------------
 
@@ -681,7 +690,7 @@ class AsyncWSEClient:
             "bytes_sent": self._stats.bytes_sent,
             "reconnect_count": self._stats.reconnect_count,
             "sequencer": self._sequencer.get_stats(),
-            "queue_size": self._event_queue.qsize(),
+            "queue_size": self._event_queue.qsize() if self._event_queue else 0,
             "network": {
                 "quality": diag.quality.value,
                 "latency_ms": diag.round_trip_time,
@@ -949,7 +958,7 @@ class AsyncWSEClient:
                     "latency_ms": diag.round_trip_time,
                     "jitter_ms": diag.jitter,
                 },
-                "queue_size": self._event_queue.qsize(),
+                "queue_size": self._event_queue.qsize() if self._event_queue else 0,
             },
             priority=MessagePriority.CRITICAL,
         )
@@ -1033,8 +1042,8 @@ class AsyncWSEClient:
                     "bytes_sent": self._stats.bytes_sent,
                 },
                 "queue_stats": {
-                    "size": self._event_queue.qsize(),
-                    "max_size": self._event_queue.maxsize,
+                    "size": self._event_queue.qsize() if self._event_queue else 0,
+                    "max_size": self._event_queue.maxsize if self._event_queue else 0,
                 },
                 "diagnostics": {
                     "quality": diag.quality.value,

@@ -1577,7 +1577,7 @@ where
         queue_groups.clone(),
     ));
 
-    let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
     let reader_handle = tokio::spawn(peer_reader(
         reader,
         peer_write_tx.clone(),
@@ -2785,7 +2785,7 @@ async fn handle_cluster_inbound_generic<S>(
         queue_groups,
     ));
 
-    let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
     let reader_handle = tokio::spawn(peer_reader(
         reader,
         write_tx.clone(),
@@ -3580,7 +3580,8 @@ mod tests {
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
         node_params.subject_alt_names = vec![SanType::IpAddress(ip)];
         let node_key = KeyPair::generate().unwrap();
-        let node_cert = node_params.signed_by(&node_key, &ca_cert, &ca_key).unwrap();
+        let ca_issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+        let node_cert = node_params.signed_by(&node_key, &ca_issuer).unwrap();
 
         (ca_cert.pem(), node_cert.pem(), node_key.serialize_pem())
     }
