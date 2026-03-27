@@ -53,7 +53,7 @@ jobs:
         uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a  # v4.0.0
 
       - name: Build wheels
-        uses: PyO3/maturin-action@c0c6d69dce7c061509f7b0f5ea52050b45080fbc  # v1.50.1
+        uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad  # v1.50.1
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
@@ -76,7 +76,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - uses: PyO3/maturin-action@c0c6d69dce7c061509f7b0f5ea52050b45080fbc  # v1.50.1
+      - uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad  # v1.50.1
         with:
           command: sdist
           args: --out dist
