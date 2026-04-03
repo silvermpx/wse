@@ -22,7 +22,7 @@ dashmap = "6"
 aes-gcm = "0.10"
 p256 = { version = "0.13", features = ["ecdh", "jwk"] }
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
-hkdf = "0.12"
+hkdf = "0.13"
 uuid = { version = "1.22.0", features = ["v7"] }
 base64 = "0.22"
 chrono = { version = "0.4.44", features = ["serde"] }
