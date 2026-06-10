@@ -1025,6 +1025,18 @@ pub(crate) fn negotiate_capabilities(local: u32, remote: u32) -> u32 {
     local & remote
 }
 
+/// Deterministic duplicate-connection tiebreaker. When two nodes discover each
+/// other they BOTH dial, yielding two TCP links per pair; each node would then
+/// decide locally which to keep and, in ~half of races, keep opposite links so
+/// both get torn down and both reconnect (flapping). The surviving link is the
+/// one whose DIALER has the lexicographically-lower instance_id: the lower-id
+/// node keeps its outbound and the higher-id node rejects its own outbound and
+/// accepts the inbound. Equal ids (a self-connection) survive on neither side,
+/// so a node never connects to itself even if its own address is in its peer list.
+pub(crate) fn cluster_link_survives(dialer_id: &str, receiver_id: &str) -> bool {
+    dialer_id < receiver_id
+}
+
 // ---------------------------------------------------------------------------
 // Per-peer writer task (write coalescing: recv + try_recv drain)
 // ---------------------------------------------------------------------------
@@ -1472,6 +1484,20 @@ where
             return (false, 0);
         }
     };
+
+    // Tiebreaker: we are the DIALER here. If our instance_id is not lower than the
+    // peer's, the peer is the designated dialer -- drop our outbound (it will dial
+    // us and we accept that inbound), so exactly one link survives per pair. Equal
+    // ids = a self-connection, also dropped. Do NOT touch connected_instances: the
+    // peer's inbound link may already hold its instance_id and removing it would
+    // clobber a valid link. Return success so peer_connection_task does not treat
+    // this as a failure and tight-loop; a later reconnect just yields again.
+    if !cluster_link_survives(instance_id, &peer_instance_id) {
+        tracing::debug!(
+            "[WSE-Cluster] Yielding outbound to {peer_addr}: instance {peer_instance_id} is the designated dialer"
+        );
+        return (true, peer_caps);
+    }
 
     // Duplicate connection prevention: atomic check-and-insert via entry() API
     // to avoid TOCTOU race between contains_key and insert
@@ -2503,6 +2529,17 @@ async fn handle_cluster_inbound_generic<S>(
             return;
         }
     };
+
+    // Tiebreaker: the peer is the DIALER here, we are the receiver. If the peer's
+    // instance_id is not lower than ours, WE are the designated dialer -- reject
+    // this inbound (we keep our own outbound to the peer instead), so exactly one
+    // link survives per pair. Equal ids = a self-connection, also rejected.
+    if !cluster_link_survives(&peer_instance_id, instance_id) {
+        tracing::debug!(
+            "[WSE-Cluster] Rejecting inbound from {addr}: we (instance {instance_id}) are the designated dialer for {peer_instance_id}"
+        );
+        return;
+    }
 
     // Duplicate connection prevention: atomic check-and-insert via entry() API
     {
@@ -4126,5 +4163,27 @@ mod tests {
                 .is_err(),
             "send past the bound must fail (shed), proving the queue is bounded"
         );
+    }
+
+    // The duplicate-connection tiebreaker: for any pair exactly ONE direction
+    // survives (the lower-id dialer), and a self-connection survives on neither.
+    #[test]
+    fn cluster_link_survives_keeps_exactly_one_direction() {
+        assert!(cluster_link_survives("a", "b")); // a dials b -> survives
+        assert!(!cluster_link_survives("b", "a")); // b dials a -> yields
+        assert!(cluster_link_survives("node-01", "node-02"));
+        assert!(!cluster_link_survives("node-02", "node-01"));
+
+        // Self-connection (equal ids): neither side survives.
+        assert!(!cluster_link_survives("x", "x"));
+
+        // Mutual exclusion for any distinct pair -> never two links, never zero.
+        for (a, b) in [("alpha", "beta"), ("z", "a"), ("n1", "n2")] {
+            assert_ne!(
+                cluster_link_survives(a, b),
+                cluster_link_survives(b, a),
+                "exactly one of A->B / B->A must survive for {a},{b}"
+            );
+        }
     }
 }
