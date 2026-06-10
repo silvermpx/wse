@@ -713,7 +713,18 @@ pub(crate) fn encode_presence_update(
         return false;
     }
     let payload_len = 1 + 8 + 2 + user_id_bytes.len() + data_bytes.len();
-    buf.reserve(8 + topic_bytes.len() + payload_len);
+    let total_frame = 8 + topic_bytes.len() + payload_len;
+    // Guard the total frame like every other encoder. presence_max_data_size is
+    // operator-configurable; without this a large presence update would emit a
+    // frame the receiving peer_reader rejects (> MAX_FRAME_SIZE), disconnecting
+    // the peer and flapping the link on ordinary presence traffic.
+    if total_frame > MAX_FRAME_SIZE {
+        tracing::warn!(
+            "[WSE-Cluster] PresenceUpdate frame too large ({total_frame} bytes, max {MAX_FRAME_SIZE}), dropping",
+        );
+        return false;
+    }
+    buf.reserve(total_frame);
     buf.put_u8(MsgType::PresenceUpdate as u8);
     buf.put_u8(0); // flags
     buf.put_u16_le(topic_bytes.len() as u16);
@@ -943,7 +954,11 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                 return Some(ClusterFrame::PeerList { addrs: Vec::new() });
             }
             let payload = data.split_to(payload_len);
-            let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+            // Cap both the pre-allocation and the loop at MAX_CLUSTER_PEERS so a
+            // declared count (u16, up to 65535) cannot force a large transient
+            // allocation, and a 1 MB frame of tiny entries cannot expand into a
+            // huge addr Vec. A real peer list never exceeds the peer cap.
+            let count = (u16::from_le_bytes([payload[0], payload[1]]) as usize).min(MAX_CLUSTER_PEERS);
             let mut addrs = Vec::with_capacity(count);
             let mut pos = 2usize;
             for _ in 0..count {
