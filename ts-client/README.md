@@ -236,7 +236,7 @@ const queueSize = useMessageQueueStore.getState().size;
 | **Batching** | Automatic message batching to reduce WebSocket frame overhead |
 | **Rate limiting** | Client-side token bucket (1000 tokens, 100/sec refill) |
 | **Circuit breaker** | Connection storm prevention (5 failures -> 60s cooldown -> half-open probe) |
-| **Event sequencing** | Duplicate detection and out-of-order message buffering |
+| **Idempotent delivery** | Per-topic `(epoch, offset)` dedup + gap-triggered recovery; positions survive reconnects |
 | **Connection pool** | Multi-endpoint with adaptive health scoring and load balancing |
 | **Network monitor** | Real-time latency, jitter, packet loss measurement, quality scoring |
 | **Priority queues** | 5 priority levels from CRITICAL to BACKGROUND |
@@ -298,6 +298,7 @@ Speaks WSE wire protocol v1, identical to the Python client:
 
 - **Text frames:** JSON with `c` field for category (`WSE`, `S`, `U`)
 - **Binary frames:** Codec prefix (`C:` zlib, `M:` msgpack, `E:` AES-GCM) + payload
+- **Recovery stamp:** topic publications carry `tp` (topic), `e` (epoch, 8-hex), `o` (offset) for idempotent dedup + gap recovery
 - **Heartbeat:** JSON PING/PONG with latency tracking
 - **Protocol negotiation:** `client_hello`/`server_hello` handshake with feature discovery
 

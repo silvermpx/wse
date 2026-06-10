@@ -155,6 +155,9 @@ class WSEEvent:
     priority: int | None = None      # Message priority (see MessagePriority)
     correlation_id: str | None = None  # Request correlation ID
     signature: str | None = None     # Message signature (if signed)
+    topic: str | None = None         # Recovery stamp: topic ("tp" field)
+    epoch: str | None = None         # Recovery stamp: buffer epoch, 8-hex ("e")
+    offset: int | None = None        # Recovery stamp: per-topic offset ("o")
 ```
 
 ## Features
@@ -218,9 +221,16 @@ States: CLOSED (normal) -> OPEN (blocking) -> HALF_OPEN (probing) -> CLOSED (rec
 
 Client-side token bucket rate limiter (1000 tokens, 100/sec refill). Prevents message flooding and coordinates with the server's rate limit feedback (`rate_limit_warning` at 20% capacity).
 
-### Event Sequencing
+### Idempotent delivery & recovery
 
-Automatic duplicate detection via sliding window (10,000-entry dedup cache). Out-of-order event buffering with configurable gap tolerance (up to 100 sequence gap). Missed sequences trigger automatic gap recovery.
+Stamped topic messages carry a per-message `(topic, epoch, offset)` (`tp`/`e`/`o`).
+Dedup and ordering are driven by the per-topic `(epoch, offset)`, which is
+authoritative and survives reconnects: a duplicate (offset already seen on the
+same epoch) is dropped, an in-order message is delivered, and an offset gap
+triggers automatic recovery from the last in-order position. An epoch change
+(server restart) re-baselines the topic. Unstamped messages fall back to a
+sliding-window id dedup (10,000-entry cache). The server's global `seq` is a
+diagnostic only — it is not used for ordering.
 
 ### Network Quality Monitoring
 
