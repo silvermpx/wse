@@ -262,11 +262,6 @@ export class MessageProcessor {
         return;
       }
 
-      // Record sequence if present (diagnostic only -- not used for ordering)
-      if (message.seq !== undefined) {
-        this.sequencer.recordSequence(message.seq);
-      }
-
       // Route message
       await this.routeMessage(message);
 

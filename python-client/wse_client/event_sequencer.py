@@ -10,42 +10,37 @@ from __future__ import annotations
 
 import time
 
-from .constants import DUPLICATE_MAX_AGE, MAX_OUT_OF_ORDER, SEQUENCE_WINDOW_SIZE
-from .types import WSEEvent
+from .constants import DUPLICATE_MAX_AGE, SEQUENCE_WINDOW_SIZE
 
 
 class EventSequencer:
-    """Duplicate detection and out-of-order event reordering.
+    """Idempotent delivery: id dedup + per-topic (epoch, offset) dedup/gap detection.
 
-    Tracks seen message IDs in a sliding window and buffers events
-    that arrive ahead of their expected sequence number.
+    Tracks seen message IDs in a sliding window (for unstamped messages) and the
+    last-seen (epoch, offset) per topic (the authoritative dedup/ordering for
+    stamped messages). Also owns the client's outbound send sequence counter.
 
     Args:
         window_size: Dedup window size (default 10 000).
-        max_out_of_order: Max sequence gap before resetting (default 100).
         max_age: Seconds before expiring old entries (default 300).
     """
 
     def __init__(
         self,
         window_size: int = SEQUENCE_WINDOW_SIZE,
-        max_out_of_order: int = MAX_OUT_OF_ORDER,
         max_age: float = DUPLICATE_MAX_AGE,
     ) -> None:
         self._window_size = window_size
-        self._max_out_of_order = max_out_of_order
         self._max_age = max_age
 
         self._seen_ids: dict[str, float] = {}
-        self._expected_sequence = 0
-        self._out_of_order_buffer: dict[int, tuple[WSEEvent, float]] = {}
         self._sequence = 0
         self._cleanup_counter = 0
         self._duplicates_detected = 0
-        # Per-topic last-seen recovery position: topic -> (epoch, offset).
-        # This is the AUTHORITATIVE dedup/ordering for stamped messages and must
-        # survive reconnects within an epoch (do not clear on reconnect), unlike
-        # the seq-based reorder buffer which the server's global seq makes unsound.
+        # Per-topic last-seen recovery position: topic -> (epoch, offset). The
+        # AUTHORITATIVE dedup/ordering for stamped messages; survives reconnects
+        # within an epoch (not cleared on reconnect). Replaces the old seq-based
+        # reorder buffer, which the server's global seq made unsound.
         self._topic_positions: dict[str, tuple[str, int]] = {}
 
     def get_next_sequence(self) -> int:
@@ -112,43 +107,6 @@ class EventSequencer:
         """Set a topic's position (e.g. from a subscription_update reply)."""
         self._topic_positions[topic] = (epoch, offset)
 
-    def record_sequence(self, seq: int) -> None:
-        if seq >= self._expected_sequence:
-            self._expected_sequence = seq + 1
-
-    def process_sequenced_event(
-        self, seq: int, event: WSEEvent
-    ) -> list[WSEEvent] | None:
-        """Process event with sequence number. Returns ordered events or None."""
-        # If sequence matches expected, deliver it plus any buffered followers
-        if seq == self._expected_sequence:
-            result = [event]
-            self._expected_sequence = seq + 1
-
-            # Drain consecutive buffered events
-            while self._expected_sequence in self._out_of_order_buffer:
-                buffered, _ts = self._out_of_order_buffer.pop(self._expected_sequence)
-                result.append(buffered)
-                self._expected_sequence += 1
-
-            return result
-
-        # Future sequence: buffer if gap is within limit
-        gap = seq - self._expected_sequence
-        if 0 < gap <= self._max_out_of_order:
-            self._out_of_order_buffer[seq] = (event, time.monotonic())
-            self._cleanup_stale_buffer()
-            return None
-
-        # Gap too large: reset and deliver
-        if gap > self._max_out_of_order:
-            self._out_of_order_buffer.clear()
-            self._expected_sequence = seq + 1
-            return [event]
-
-        # Old sequence (already delivered): skip
-        return None
-
     def _cleanup_old_entries(self) -> None:
         now = time.monotonic()
         cutoff = now - self._max_age
@@ -156,22 +114,11 @@ class EventSequencer:
         for k in expired:
             del self._seen_ids[k]
 
-    def _cleanup_stale_buffer(self) -> None:
-        """Remove out-of-order buffered events older than max_age."""
-        now = time.monotonic()
-        cutoff = now - self._max_age
-        expired = [
-            seq for seq, (_, ts) in self._out_of_order_buffer.items() if ts < cutoff
-        ]
-        for seq in expired:
-            del self._out_of_order_buffer[seq]
-
     def get_stats(self) -> dict:
         return {
             "current_sequence": self._sequence,
-            "expected_sequence": self._expected_sequence,
             "duplicate_window_size": len(self._seen_ids),
-            "out_of_order_buffer_size": len(self._out_of_order_buffer),
+            "topic_positions": len(self._topic_positions),
             "duplicates_detected": self._duplicates_detected,
         }
 
@@ -180,8 +127,6 @@ class EventSequencer:
         positions too. NOT to be called on a transient reconnect, which must keep
         positions so (epoch, offset) dedup spans the reconnect."""
         self._seen_ids.clear()
-        self._out_of_order_buffer.clear()
-        self._expected_sequence = 0
         self._sequence = 0
         self._duplicates_detected = 0
         self._cleanup_counter = 0
