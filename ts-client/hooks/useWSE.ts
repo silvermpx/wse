@@ -573,9 +573,8 @@ export function useWSE(
 
   const handleIncomingMessage = useCallback((data: string | ArrayBuffer) => {
     const processor = messageProcessorRef.current;
-    const monitor = networkMonitorRef.current;
 
-    if (!processor || !monitor) return;
+    if (!processor) return;
 
     try {
       let parsed: any;
@@ -697,14 +696,6 @@ export function useWSE(
 
     } catch (e) {
       logger.debug('Could not pre-parse message for deduplication:', e);
-    }
-
-    // Record metrics
-    monitor.recordPacketReceived();
-    if (data instanceof ArrayBuffer) {
-      monitor.recordBytes(data.byteLength);
-    } else {
-      monitor.recordBytes(data.length);
     }
 
     // Process the message
@@ -1124,6 +1115,11 @@ export function useWSE(
         connectionManagerRef.current = connectionManager;
         networkMonitorRef.current = networkMonitor;
         offlineQueueRef.current = offlineQueue;
+
+        // Feed the monitor real round-trip latency from the single PONG-parsing
+        // site so its jitter/quality reflect the live connection (read via the
+        // ref so it survives monitor re-creation).
+        messageProcessor.setLatencyListener((l) => networkMonitorRef.current?.recordLatency(l));
 
         initializedRef.current = true;
 

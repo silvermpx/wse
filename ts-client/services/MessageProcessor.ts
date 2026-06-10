@@ -27,6 +27,12 @@ export class MessageProcessor {
   private connectionManager: any = null;
   private isReady = false;
 
+  // Optional sink for measured round-trip latency (ms), set by the host. The
+  // PONG handlers are the single place RTT is computed, so anything that wants
+  // latency (e.g. the NetworkMonitor's jitter/quality window) subscribes here
+  // rather than re-parsing pongs.
+  private onLatency: ((latencyMs: number) => void) | null = null;
+
   // Use promise-based queue for race condition prevention
   private batchPromise: Promise<void> | null = null;
   private destroyed = false;
@@ -54,6 +60,10 @@ export class MessageProcessor {
     this.messageHandlers = new Map();
 
     this.registerDefaultHandlers();
+  }
+
+  setLatencyListener(fn: ((latencyMs: number) => void) | null): void {
+    this.onLatency = fn;
   }
 
   setConnectionManager(manager: any): void {
@@ -305,6 +315,7 @@ export class MessageProcessor {
 
       const store = useWSEStore.getState();
       store.recordLatency(latency);
+      this.onLatency?.(latency);
 
       logger.debug(`WSE:PONG latency: ${latency}ms`);
       return null;
@@ -566,8 +577,10 @@ export class MessageProcessor {
     this.messageHandlers.set('PONG', (msg) => {
       const clientTs = msg.p?.client_timestamp;
       if (typeof clientTs === 'number') {
+        const latency = Date.now() - clientTs;
         const store = useWSEStore.getState();
-        store.recordLatency(Date.now() - clientTs);
+        store.recordLatency(latency);
+        this.onLatency?.(latency);
       }
     });
 

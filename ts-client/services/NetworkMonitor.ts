@@ -8,9 +8,6 @@ import { logger } from '../utils/logger';
 
 export class NetworkMonitor {
   private latencyHistory: number[] = [];
-  private packetsSent = 0;
-  private packetsReceived = 0;
-  private bytesHistory: Array<{ timestamp: number; bytes: number }> = [];
   private lastDiagnostics: NetworkDiagnostics | null = null;
   private diagnosticsInterval: NodeJS.Timeout | null = null;
 
@@ -24,46 +21,48 @@ export class NetworkMonitor {
   }
 
   recordLatency(latency: number): void {
+    // Fed from MessageProcessor's PONG handler (the single source of latency
+    // truth). We deliberately do NOT also push to the store here: MessageProcessor
+    // already records every RTT to the store, so writing it again would
+    // double-count and skew the store's EMA / percentiles. The monitor keeps its
+    // own window purely to derive jitter and quality.
     this.latencyHistory.push(latency);
-
     if (this.latencyHistory.length > this.maxHistorySize) {
       this.latencyHistory.shift();
     }
-
-    const store = useWSEStore.getState();
-    store.recordLatency(latency);
-  }
-
-  recordPacketSent(): void {
-    this.packetsSent++;
-  }
-
-  recordPacketReceived(): void {
-    this.packetsReceived++;
-  }
-
-  recordBytes(bytes: number): void {
-    this.bytesHistory.push({
-      timestamp: Date.now(),
-      bytes
-    });
-
-    const cutoff = Date.now() - 60000;
-    this.bytesHistory = this.bytesHistory.filter(b => b.timestamp > cutoff);
   }
 
   analyze(): NetworkDiagnostics {
+    // With no RTT samples yet we report UNKNOWN rather than fabricating a verdict
+    // -- an empty window must not read as "EXCELLENT".
+    if (this.latencyHistory.length === 0) {
+      const diagnostics: NetworkDiagnostics = {
+        quality: ConnectionQuality.UNKNOWN,
+        stability: 100,
+        jitter: 0,
+        packetLoss: 0,
+        roundTripTime: 0,
+        suggestions: [],
+        lastAnalysis: Date.now(),
+      };
+      this.lastDiagnostics = diagnostics;
+      return diagnostics;
+    }
+
     const avgLatency = this.calculateAverage(this.latencyHistory);
     const jitter = this.calculateJitter();
-    const packetLoss = this.calculatePacketLoss();
-    const quality = this.determineQuality(avgLatency, jitter, packetLoss);
-    const suggestions = this.generateSuggestions(quality, avgLatency, jitter, packetLoss);
+    const quality = this.determineQuality(avgLatency, jitter);
+    const suggestions = this.generateSuggestions(quality, avgLatency, jitter);
 
     const diagnostics: NetworkDiagnostics = {
       quality,
-      stability: 100 - (jitter / 100) * 50,
+      stability: Math.max(0, 100 - (jitter / 100) * 50),
       jitter,
-      packetLoss,
+      // App-layer packet loss isn't a meaningful client metric over a pub/sub
+      // WebSocket (the client receives far more than it sends, and TCP doesn't
+      // surface frame loss), so we don't fabricate it. 0 == "not measured"; it
+      // never skews the quality verdict, which is driven by real latency+jitter.
+      packetLoss: 0,
       roundTripTime: avgLatency,
       suggestions,
       lastAnalysis: Date.now(),
@@ -89,21 +88,15 @@ export class NetworkMonitor {
     return sumDiff / (this.latencyHistory.length - 1);
   }
 
-  private calculatePacketLoss(): number {
-    if (this.packetsSent === 0) return 0;
-    return ((this.packetsSent - this.packetsReceived) / this.packetsSent) * 100;
-  }
-
   private determineQuality(
     avgLatency: number,
-    jitter: number,
-    packetLoss: number
+    jitter: number
   ): ConnectionQuality {
-    if (avgLatency > 300 || jitter > 100 || packetLoss > 5) {
+    if (avgLatency > 300 || jitter > 100) {
       return ConnectionQuality.POOR;
-    } else if (avgLatency > 150 || jitter > 50 || packetLoss > 2) {
+    } else if (avgLatency > 150 || jitter > 50) {
       return ConnectionQuality.FAIR;
-    } else if (avgLatency > 75 || jitter > 25 || packetLoss > 0.5) {
+    } else if (avgLatency > 75 || jitter > 25) {
       return ConnectionQuality.GOOD;
     }
     return ConnectionQuality.EXCELLENT;
@@ -112,8 +105,7 @@ export class NetworkMonitor {
   private generateSuggestions(
     quality: ConnectionQuality,
     avgLatency: number,
-    jitter: number,
-    packetLoss: number
+    jitter: number
   ): string[] {
     const suggestions: string[] = [];
 
@@ -123,9 +115,6 @@ export class NetworkMonitor {
       }
       if (jitter > 75) {
         suggestions.push('High network jitter detected. This may cause unstable connections.');
-      }
-      if (packetLoss > 3) {
-        suggestions.push('Significant packet loss detected. Check for network congestion or interference.');
       }
       suggestions.push('Try closing unnecessary applications that use network bandwidth.');
       suggestions.push('Consider using a wired connection instead of Wi-Fi for better stability.');
@@ -169,9 +158,6 @@ export class NetworkMonitor {
 
   reset(): void {
     this.latencyHistory = [];
-    this.packetsSent = 0;
-    this.packetsReceived = 0;
-    this.bytesHistory = [];
     this.lastDiagnostics = null;
   }
 

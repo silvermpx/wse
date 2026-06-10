@@ -443,9 +443,6 @@ export interface IMessageProcessor {
 }
 
 export interface INetworkMonitor {
-  recordPacketSent(): void;
-  recordPacketReceived(): void;
-  recordBytes(bytes: number): void;
   recordLatency(latency: number): void;
   analyze(): NetworkDiagnostics;
   destroy(): void;
