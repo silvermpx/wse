@@ -857,8 +857,11 @@ fn decrypt_inbound(cipher: &aes_gcm::Aes256Gcm, data: &[u8]) -> Result<Vec<u8>, 
     if data.len() < 28 {
         return Err("Encrypted payload too short (min 28 bytes)".into());
     }
-    let (nonce_bytes, ciphertext) = data.split_at(12);
-    let nonce: [u8; 12] = nonce_bytes.try_into().expect("split_at(12)");
+    // Non-panicking split of the 12-byte IV from attacker-controlled bytes
+    // (unreachable Err given the >= 28 check, but no expect on the hot path).
+    let Some((&nonce, ciphertext)) = data.split_first_chunk::<12>() else {
+        return Err("Encrypted payload too short (min 28 bytes)".into());
+    };
     cipher
         .decrypt(&nonce.into(), ciphertext)
         .map_err(|e| format!("AES-GCM decrypt failed: {e}"))
@@ -991,7 +994,10 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
         Duration::from_secs(10),
         tokio_tungstenite::accept_hdr_async_with_config(
             stream,
-            #[allow(clippy::result_large_err)]
+            #[expect(
+                clippy::result_large_err,
+                reason = "the tungstenite accept_hdr callback signature fixes Err = ErrorResponse; we cannot box it"
+            )]
             move |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
                 let cookies = req
                     .headers()
