@@ -52,6 +52,11 @@ pub(crate) const MAX_CLUSTER_PEERS: usize = 256;
 // unbounded backlog. Shedding keeps the single reader loop responsive to control and
 // heartbeat frames, and shed messages remain recoverable via the recovery buffer.
 pub(crate) const PEER_DISPATCH_QUEUE_CAP: usize = 10_000;
+/// Max distinct topics tracked in one peer's remote-interest set. Bounds memory
+/// so a buggy or compromised (but authenticated) peer streaming distinct SUB
+/// frames cannot grow the set without limit. Generous -- a peer aggregates the
+/// interest of all its local connections.
+pub(crate) const MAX_REMOTE_INTEREST_PER_PEER: usize = 1_000_000;
 
 pub(crate) const PROTOCOL_VERSION_MIN: u16 = 1;
 
@@ -2341,7 +2346,12 @@ pub(crate) async fn cluster_manager(
             update = interest_rx.recv() => {
                 match update {
                     Some(InterestUpdate::Sub { peer_addr, topic }) => {
-                        remote_interest.entry(peer_addr).or_default().insert(topic);
+                        let set = remote_interest.entry(peer_addr).or_default();
+                        // Bound the per-peer interest set (a re-sub of an existing
+                        // topic always succeeds; a new topic past the cap is dropped).
+                        if set.len() < MAX_REMOTE_INTEREST_PER_PEER || set.contains(&topic) {
+                            set.insert(topic);
+                        }
                     }
                     Some(InterestUpdate::Unsub { peer_addr, topic }) => {
                         if let Some(topics) = remote_interest.get_mut(&peer_addr) {

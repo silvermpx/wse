@@ -4104,6 +4104,23 @@ impl RustWSEServer {
             topics
         };
 
+        // Reject topics containing ASCII control characters. The cluster RESYNC
+        // wire format newline-delimits topics, so a '\n' in a topic name would be
+        // decoded by a peer as two separate interest entries -- corrupting that
+        // peer's routing table (a topic-injection vector). Drop them at this
+        // single chokepoint where topics enter local interest / RESYNC. Non-ASCII
+        // UTF-8 topics are unaffected (only ASCII control bytes are rejected).
+        topics.retain(|t| {
+            if t.bytes().any(|b| b.is_ascii_control()) {
+                tracing::warn!(
+                    "[WSE] Rejecting subscribe to topic with control characters (conn {conn_id})"
+                );
+                false
+            } else {
+                true
+            }
+        });
+
         // Enforce per-connection subscription limit (0 = unlimited).
         // Count both regular subscriptions (conn_topics) and queue group
         // memberships (conn_queue_groups) against the same budget.
