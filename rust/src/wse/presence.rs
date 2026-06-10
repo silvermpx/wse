@@ -730,36 +730,71 @@ impl PresenceManager {
         }
     }
 
-    /// Serialize all local presence state to JSON for full sync with peers.
-    /// Only includes entries with local connections (not re-syncing remote entries).
-    pub fn serialize_full_state(&self) -> String {
-        let mut state = serde_json::Map::new();
+    /// Serialize local presence state into one or more JSON chunks, each whose
+    /// serialized length stays within `max_payload_bytes`. Only entries with a
+    /// local connection are included (remote sentinels are not re-synced).
+    ///
+    /// The receiver merges each chunk additively (per-user via merge_remote_join),
+    /// so several partial chunks reconstruct the same set as a single frame would
+    /// -- no continuation flag or reassembly buffer is needed. This replaces a
+    /// single-frame serialization that was SILENTLY DROPPED when a busy node's
+    /// full state exceeded the max cluster frame size, leaving a joining peer
+    /// with no initial presence at all (only future deltas).
+    pub fn serialize_full_state_chunked(&self, max_payload_bytes: usize) -> Vec<String> {
+        let mut chunks: Vec<String> = Vec::new();
+        let mut current = serde_json::Map::new();
+        let mut est: usize = 2; // running estimate of current's serialized len ("{}")
+
         for topic_entry in self.topic_presence.iter() {
             let topic = topic_entry.key();
             let topic_map = topic_entry.value();
-            let mut users = serde_json::Map::new();
             for user_entry in topic_map.iter() {
                 let entry = user_entry.value();
-                // Only include entries with local connections (don't re-sync remote entries)
-                if entry
+                // Only local entries (don't re-sync remote sentinels).
+                if !entry
                     .connections
                     .iter()
-                    .any(|c| !c.conn_id.starts_with("__remote__"))
+                    .any(|c| !c.conn_id.starts_with(REMOTE_PREFIX))
                 {
-                    users.insert(
-                        entry.user_id.clone(),
-                        serde_json::json!({
-                            "data": entry.data,
-                            "updated_at": entry.updated_at,
-                        }),
-                    );
+                    continue;
                 }
-            }
-            if !users.is_empty() {
-                state.insert(topic.clone(), serde_json::Value::Object(users));
+                let value = serde_json::json!({
+                    "data": entry.data,
+                    "updated_at": entry.updated_at,
+                });
+                // Conservative per-user contribution: topic key + user key + value
+                // + JSON punctuation/quotes/nested braces.
+                let add_est = topic.len() + entry.user_id.len() + value.to_string().len() + 24;
+
+                // Flush the current chunk before it would exceed the budget (but
+                // never flush an empty chunk -- a single oversized user still goes
+                // out alone and is handled by encode_presence_full's own guard).
+                if est + add_est > max_payload_bytes && !current.is_empty() {
+                    if let Ok(s) = serde_json::to_string(&serde_json::Value::Object(
+                        std::mem::take(&mut current),
+                    )) {
+                        chunks.push(s);
+                    }
+                    est = 2;
+                }
+
+                if let Some(obj) = current
+                    .entry(topic.clone())
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                    .as_object_mut()
+                {
+                    obj.insert(entry.user_id.clone(), value);
+                }
+                est += add_est;
             }
         }
-        serde_json::to_string(&serde_json::Value::Object(state)).unwrap_or_default()
+
+        if !current.is_empty()
+            && let Ok(s) = serde_json::to_string(&serde_json::Value::Object(current))
+        {
+            chunks.push(s);
+        }
+        chunks
     }
 }
 
@@ -842,5 +877,41 @@ mod tests {
         let stats = mgr.topic_presence_stats.get("room").expect("stats exist");
         assert_eq!(stats.num_users.load(Ordering::Relaxed), 1);
         assert_eq!(stats.num_connections.load(Ordering::Relaxed), 1);
+    }
+
+    // R1 #6: full-state sync is chunked, so a node with more presence than fits
+    // in one frame still sends ALL of it (the old single frame was dropped).
+    #[test]
+    fn full_state_chunked_covers_all_users_and_splits() {
+        let mgr = PresenceManager::new(4096, 0);
+        let d = data();
+        for i in 0..6 {
+            let conn = format!("conn{i}");
+            let uid = format!("user{i}");
+            mgr.register_connection(&conn, &uid);
+            mgr.track(&conn, "room", &d);
+        }
+
+        // Huge limit -> a single chunk with all six users.
+        let one = mgr.serialize_full_state_chunked(1_000_000);
+        assert_eq!(one.len(), 1, "everything fits in one chunk");
+        let parsed: serde_json::Value = serde_json::from_str(&one[0]).expect("valid JSON");
+        assert_eq!(parsed["room"].as_object().expect("room obj").len(), 6);
+
+        // Tiny limit -> multiple chunks whose union still covers all six users,
+        // each chunk independently valid JSON the receiver can merge additively.
+        let many = mgr.serialize_full_state_chunked(60);
+        assert!(many.len() > 1, "a small budget splits into multiple chunks");
+        let mut seen = std::collections::HashSet::new();
+        for chunk in &many {
+            let v: serde_json::Value =
+                serde_json::from_str(chunk).expect("each chunk is valid JSON");
+            for users in v.as_object().expect("obj").values() {
+                for uid in users.as_object().expect("users obj").keys() {
+                    seen.insert(uid.clone());
+                }
+            }
+        }
+        assert_eq!(seen.len(), 6, "every user appears in some chunk");
     }
 }

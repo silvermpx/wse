@@ -1559,8 +1559,9 @@ where
     if peer_caps & CAP_PRESENCE != 0
         && let Some(pm) = presence
     {
-        let entries = pm.serialize_full_state();
-        if !entries.is_empty() && entries != "{}" {
+        // Chunked so a node with >1 frame of presence still sends its full state
+        // (a single oversized frame was previously dropped, leaving the peer blind).
+        for entries in pm.serialize_full_state_chunked(MAX_FRAME_SIZE - 1024) {
             let mut buf = BytesMut::new();
             if encode_presence_full(&mut buf, &entries) {
                 let mut frame = BytesMut::new();
@@ -2578,8 +2579,9 @@ async fn handle_cluster_inbound_generic<S>(
     if peer_caps & CAP_PRESENCE != 0
         && let Some(pm) = presence
     {
-        let entries = pm.serialize_full_state();
-        if !entries.is_empty() && entries != "{}" {
+        // Chunked so a node with >1 frame of presence still sends its full state
+        // (a single oversized frame was previously dropped, leaving the peer blind).
+        for entries in pm.serialize_full_state_chunked(MAX_FRAME_SIZE - 1024) {
             let mut buf = BytesMut::new();
             if encode_presence_full(&mut buf, &entries) {
                 let mut frame = BytesMut::new();
