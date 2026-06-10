@@ -3555,11 +3555,16 @@ impl RustWSEServer {
         if let Ok(Some(id_val)) = event.get_item("id")
             && let Ok(id_str) = id_val.extract::<String>()
         {
+            // Dedup is per (connection, id): the SAME event id delivered to a
+            // DIFFERENT connection is a legitimate distinct send and must not be
+            // dropped (the set was previously keyed by id alone, so send_event to
+            // conn B silently returned 0 if conn A had already received that id).
+            let key = format!("{conn_id}\0{id_str}");
             let mut dedup = self.dedup.lock().unwrap();
-            if !dedup.seen.insert(id_str.clone()) {
-                return Ok(0); // duplicate, skip serialize+send
+            if !dedup.seen.insert(key.clone()) {
+                return Ok(0); // duplicate to THIS connection, skip serialize+send
             }
-            dedup.queue.push_back(id_str);
+            dedup.queue.push_back(key);
             while dedup.queue.len() > dedup.max_entries {
                 if let Some(old) = dedup.queue.pop_front() {
                     dedup.seen.remove(&old);
