@@ -58,9 +58,15 @@ export class SecurityManager {
       this.keyRotationInterval = config.keyRotationInterval || 3600000;
       this.backendCompatibilityMode = config.backendCompatibilityMode || false;
 
+      // The transport AES key is NOT generated here -- it is derived from the
+      // ECDH exchange (deriveSharedSecret) after server_hello. Generating a
+      // standalone random key here and using it before the exchange encrypted
+      // client_hello with a key the server does not have, so the server dropped
+      // the frame and the handshake deadlocked. Only the ECDH keypair is
+      // generated (below); transport encryption activates once the shared
+      // secret exists (isTransportEncryptionReady()).
       if (this.encryptionEnabled) {
-        await this.generateEncryptionKey();
-        logger.info('Encryption enabled for WebSocket messages with AES-GCM');
+        logger.info('Encryption requested; AES key derived via ECDH after server_hello');
       }
 
       if (this.messageSigningEnabled) {
@@ -433,6 +439,17 @@ export class SecurityManager {
 
   isEncryptionEnabled(): boolean {
     return this.encryptionEnabled;
+  }
+
+  /**
+   * True only once the ECDH shared secret has been derived (after server_hello),
+   * i.e. when outbound transport encryption is actually safe. The send path
+   * gates on THIS, not isEncryptionEnabled(), so client_hello (sent before the
+   * key exchange) goes plaintext instead of being encrypted with a key the
+   * server does not yet have -- which would deadlock the handshake.
+   */
+  isTransportEncryptionReady(): boolean {
+    return this.encryptionEnabled && this.sharedSecret !== null;
   }
 
   isMessageSigningEnabled(): boolean {

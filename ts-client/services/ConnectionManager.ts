@@ -651,8 +651,10 @@ export class ConnectionManager {
       const envelope = { c: category, ...message };
       const data = JSON.stringify(envelope);
 
-      // Encrypt outbound if E2E encryption is active
-      if (securityManager.isEncryptionEnabled()) {
+      // Encrypt outbound only once the ECDH shared secret exists. Before that
+      // (e.g. client_hello), send plaintext -- encrypting with a not-yet-shared
+      // key would deadlock the handshake.
+      if (securityManager.isTransportEncryptionReady()) {
         // Queue encrypted send to preserve message ordering
         this.encryptedSendQueue = (this.encryptedSendQueue || Promise.resolve()).then(async () => {
           try {
