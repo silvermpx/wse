@@ -308,6 +308,12 @@ pub(crate) enum InterestUpdate {
         peer_addr: String,
         generation: u64,
     },
+    /// Peer entered drain mode (lame duck): stop routing new messages to it, but
+    /// keep the connection open for in-flight delivery (no presence purge, no
+    /// reconnect implications -- unlike PeerDisconnected).
+    Drain {
+        peer_addr: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,7 +1195,12 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
             }
             Some(ClusterFrame::Drain) => {
                 tracing::info!("[WSE-Cluster] Peer entering drain mode (lame duck)");
-                // Peer is draining; log but keep connection open for final messages
+                // Stop routing NEW messages to the draining peer (clear its remote
+                // interest) but keep the connection open for in-flight delivery.
+                last_activity.store(epoch_ms(), Ordering::Relaxed);
+                let _ = ctx.interest_tx.send(InterestUpdate::Drain {
+                    peer_addr: peer_addr.clone(),
+                });
             }
             Some(ClusterFrame::Hello { .. }) => {
                 // Unexpected HELLO after handshake, ignore
@@ -2415,6 +2426,13 @@ pub(crate) async fn cluster_manager(
                                 ctx.known_peers.remove(&peer_addr);
                             }
                         }
+                    }
+                    Some(InterestUpdate::Drain { peer_addr }) => {
+                        // Lame duck: stop routing new messages to the draining peer
+                        // (clear its interest) but leave generation / known_peers /
+                        // presence intact -- the connection stays up for in-flight
+                        // delivery and the peer may resume via a later RESYNC.
+                        remote_interest.remove(&peer_addr);
                     }
                     None => {
                         // Interest channel closed, continue running
