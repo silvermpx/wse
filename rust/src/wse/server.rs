@@ -131,6 +131,29 @@ pub(crate) fn pre_frame_binary(data: &[u8]) -> Bytes {
     encode_ws_frame(0x02, data)
 }
 
+/// Weave this message's recovery coordinates -- topic (`tp`), epoch (`e`, as an
+/// 8-hex string) and offset (`o`) -- in as the first members of the JSON object,
+/// right after the opening brace (the same position inject_category writes `c`).
+/// Topic broadcasts are JSON objects produced by inject_category, so they always
+/// start with `{`; anything else is returned unchanged. These fields let the
+/// client dedup idempotently across reconnects within an epoch, detect gaps
+/// (offset jumps), and request recovery from its last-seen (epoch, offset).
+pub(crate) fn stamp_recovery_fields(json: &str, topic: &str, epoch: u32, offset: u64) -> String {
+    let trimmed = json.trim_start();
+    match trimmed.strip_prefix('{') {
+        Some(rest) => {
+            let sep = if rest.trim_start().starts_with('}') {
+                ""
+            } else {
+                ","
+            };
+            let topic_json = serde_json::to_string(topic).unwrap_or_else(|_| "\"\"".to_string());
+            format!("{{\"tp\":{topic_json},\"e\":\"{epoch:08x}\",\"o\":{offset}{sep}{rest}")
+        }
+        None => json.to_owned(),
+    }
+}
+
 /// Clone a TcpStream by duplicating the file descriptor.
 /// Returns (original, clone) -- both refer to the same socket.
 fn clone_tcp_stream(stream: TcpStream) -> std::io::Result<(TcpStream, TcpStream)> {
@@ -2171,13 +2194,25 @@ async fn process_commands(
                 data,
                 skip_recovery,
             } => {
-                let preframed = pre_frame_text(&data);
+                // Stamp the JSON with this message's (topic, epoch, offset) and store
+                // the UNFRAMED stamped payload, so the live copy and any replayed copy
+                // are byte-identical and clients can dedup / detect gaps / recover from
+                // their last-seen position. The offset is reserved atomically inside
+                // push_stamped. Presence events (skip_recovery) are neither stamped nor
+                // stored. The encrypted fan-out below encrypts this same `stamped` JSON
+                // and the recovery-replay path frames/encrypts it per connection, so
+                // there is exactly one wire form per (topic, offset).
+                let stamped: Bytes = if !skip_recovery && let Some(ref recovery) = state.recovery {
+                    recovery.push_stamped(&topic, |epoch, offset| {
+                        Bytes::from(stamp_recovery_fields(&data, &topic, epoch, offset))
+                    })
+                } else {
+                    Bytes::from(data)
+                };
+                let stamped_str = std::str::from_utf8(&stamped).unwrap_or("");
+                let preframed = pre_frame_text(stamped_str);
                 let max_pending = state.max_outbound_queue_bytes;
                 let slow_drops = &state.slow_consumer_drops;
-                // Store in recovery buffer (skip for presence events)
-                if !skip_recovery && let Some(ref recovery) = state.recovery {
-                    recovery.push(&topic, preframed.clone());
-                }
                 // Track per-topic message count for Prometheus top-N metrics
                 state
                     .topic_message_counts
@@ -2284,7 +2319,7 @@ async fn process_commands(
                             slow_drops.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        match encrypt_outbound(cipher, data.as_bytes()) {
+                        match encrypt_outbound(cipher, &stamped) {
                             Ok(enc) => {
                                 let mut buf = Vec::with_capacity(2 + enc.len());
                                 buf.extend_from_slice(b"E:");
@@ -4300,6 +4335,10 @@ impl RustWSEServer {
         };
 
         let recovery_mgr = self.shared.recovery.as_ref();
+        let max_pending = self.shared.max_outbound_queue_bytes;
+        // Per-connection cipher so replayed messages are framed/encrypted exactly
+        // like live ones (an owned clone -- no DashMap ref held across the loop).
+        let conn_cipher = self.shared.conn_encryption.get(conn_id).map(|c| c.clone());
         let mut all_recovered = recover && !topics.is_empty();
         let result_dict = PyDict::new(py);
         let topics_dict = PyDict::new(py);
@@ -4348,11 +4387,42 @@ impl RustWSEServer {
                         let count = publications.len();
                         let conn_tx = tx.as_ref().unwrap();
                         let conn_pending = tx_pending.as_ref().unwrap();
-                        for pub_bytes in publications {
-                            let pb_size = pub_bytes.len();
-                            conn_pending.fetch_add(pb_size, Ordering::Relaxed);
-                            if conn_tx.send(WsFrame::PreFramed(pub_bytes)).is_err() {
-                                conn_pending.fetch_sub(pb_size, Ordering::Relaxed);
+                        // The recovery buffer stores the UNFRAMED stamped JSON, so frame
+                        // it -- or encrypt + frame for an E2E connection -- per connection
+                        // at send time, exactly like the live fan-out. This stops a
+                        // plaintext frame being replayed to an encrypted client (a
+                        // confidentiality leak + an undecodable frame on the client).
+                        // Replay is also gated on the connection's back-pressure budget so
+                        // a slow reconnecting client is not flooded in one shot; on
+                        // overflow we stop and the client re-detects the gap from the next
+                        // live (e, o) and recovers again.
+                        for payload in publications {
+                            if max_pending > 0
+                                && conn_pending.load(Ordering::Relaxed) >= max_pending
+                            {
+                                break;
+                            }
+                            let (frame, sz) = if let Some(ref c) = conn_cipher {
+                                match encrypt_outbound(c, &payload) {
+                                    Ok(enc) => {
+                                        let mut buf = Vec::with_capacity(2 + enc.len());
+                                        buf.extend_from_slice(b"E:");
+                                        buf.extend_from_slice(&enc);
+                                        let sz = buf.len() + 4;
+                                        (WsFrame::Msg(Message::Binary(buf.into())), sz)
+                                    }
+                                    Err(_) => continue,
+                                }
+                            } else {
+                                let framed =
+                                    pre_frame_text(std::str::from_utf8(&payload).unwrap_or(""));
+                                let sz = framed.len();
+                                (WsFrame::PreFramed(framed), sz)
+                            };
+                            conn_pending.fetch_add(sz, Ordering::Relaxed);
+                            if conn_tx.send(frame).is_err() {
+                                conn_pending.fetch_sub(sz, Ordering::Relaxed);
+                                break;
                             }
                         }
                         topic_dict.set_item("epoch", format!("{:08x}", current_epoch))?;
@@ -5071,6 +5141,37 @@ impl RustWSEServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stamp_recovery_fields_injects_tp_e_o_and_preserves_payload() {
+        let stamped =
+            stamp_recovery_fields(r#"{"c":"U","t":"x","p":{"k":1},"v":1}"#, "room", 0xab, 7);
+        let v: serde_json::Value = serde_json::from_str(&stamped).expect("valid JSON");
+        assert_eq!(v["tp"], "room");
+        assert_eq!(v["e"], "000000ab"); // 8-hex, matches the recover() epoch format
+        assert_eq!(v["o"], 7);
+        // Original envelope fields are preserved.
+        assert_eq!(v["c"], "U");
+        assert_eq!(v["t"], "x");
+        assert_eq!(v["p"]["k"], 1);
+        assert_eq!(v["v"], 1);
+    }
+
+    #[test]
+    fn stamp_recovery_fields_handles_empty_object_escape_and_non_object() {
+        // Empty object -> no dangling comma.
+        let s = stamp_recovery_fields("{}", "t", 1, 2);
+        let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+        assert_eq!(v["tp"], "t");
+        assert_eq!(v["o"], 2);
+        // A topic containing a quote is JSON-escaped (no corruption).
+        let s2 = stamp_recovery_fields(r#"{"a":1}"#, "ro\"om", 0, 0);
+        let v2: serde_json::Value = serde_json::from_str(&s2).expect("valid JSON");
+        assert_eq!(v2["tp"], "ro\"om");
+        assert_eq!(v2["a"], 1);
+        // Non-object input is returned unchanged (defensive).
+        assert_eq!(stamp_recovery_fields("[1,2]", "t", 1, 2), "[1,2]");
+    }
 
     #[test]
     fn test_encode_ws_frame_small() {

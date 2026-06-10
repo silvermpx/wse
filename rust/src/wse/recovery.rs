@@ -320,18 +320,31 @@ impl RecoveryManager {
         }
     }
 
-    /// Push a message into the topic's recovery buffer.
+    /// Reserve this message's `(epoch, offset)`, build the stored bytes from them
+    /// via `build`, push, and return the stored bytes.
     ///
-    /// Creates the buffer lazily via the DashMap entry API if it doesn't exist.
-    pub(crate) fn push(&self, topic: &str, data: Bytes) {
+    /// The epoch/offset read and the push happen under the SAME DashMap shard
+    /// write lock, so the offset handed to `build` is exactly the offset the
+    /// message is stored at -- race-free even with concurrent pushers. This lets
+    /// the caller weave the recovery coordinates INTO the payload before it is
+    /// framed/encrypted, so the live copy and any replayed copy are byte-identical
+    /// and the client can dedup / detect gaps from the message itself.
+    pub(crate) fn push_stamped<F>(&self, topic: &str, build: F) -> Bytes
+    where
+        F: FnOnce(u32, u64) -> Bytes,
+    {
         let mut entry = self
             .buffers
             .entry(topic.to_owned())
             .or_insert_with(|| TopicRecoveryBuffer::new(self.config.buffer_size_bits));
 
         let buf = entry.value_mut();
+        let epoch = buf.epoch;
+        let offset = buf.head_offset; // the offset buf.push() is about to assign
+        let data = build(epoch, offset);
+
         let old_bytes = buf.total_bytes;
-        buf.push(data);
+        buf.push(data.clone());
         let new_bytes = buf.total_bytes;
 
         // Update global byte counter with the delta (accounts for evictions).
@@ -347,6 +360,14 @@ impl RecoveryManager {
                     Some(cur.saturating_sub(old_bytes - new_bytes))
                 });
         }
+        data
+    }
+
+    /// Push a pre-built message (recovery coordinates already woven in, or none).
+    /// Test-only convenience over push_stamped; production stamps via push_stamped.
+    #[cfg(test)]
+    pub(crate) fn push(&self, topic: &str, data: Bytes) {
+        self.push_stamped(topic, move |_epoch, _offset| data);
     }
 
     /// Store a message received from a cluster peer in a foreign recovery buffer.
@@ -724,6 +745,38 @@ mod tests {
 
         let (_epoch, offset) = mgr.get_position("topic1").unwrap();
         assert_eq!(offset, 3); // head_offset after 3 pushes
+    }
+
+    #[test]
+    fn push_stamped_offset_matches_storage_and_recover() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        let mut reserved = Vec::new();
+        for _ in 0..3 {
+            let stored = mgr.push_stamped("topic1", |epoch, offset| {
+                reserved.push((epoch, offset));
+                make_data(&format!("o={offset}"))
+            });
+            // The returned bytes are exactly what was built for the reserved offset.
+            let (_, off) = *reserved.last().unwrap();
+            assert_eq!(&stored[..], format!("o={off}").as_bytes());
+        }
+        // Offsets are assigned 0,1,2 and the epoch is stable across pushes -- i.e.
+        // the offset handed to the builder is exactly the storage offset.
+        assert_eq!(
+            reserved.iter().map(|(_, o)| *o).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(reserved.iter().all(|(e, _)| *e == reserved[0].0));
+
+        // recover() returns the stamped bytes at the offsets they were stored at.
+        let (epoch, _) = mgr.get_position("topic1").unwrap();
+        match mgr.recover("topic1", epoch, 0) {
+            RecoveryResult::Recovered { publications, .. } => {
+                assert_eq!(&publications[0][..], b"o=1");
+                assert_eq!(&publications[1][..], b"o=2");
+            }
+            _ => panic!("expected Recovered"),
+        }
     }
 
     #[test]

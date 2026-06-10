@@ -1277,9 +1277,12 @@ async fn peer_dispatch_task(
         for (topic, payload, rec) in batch.drain(..) {
             let preframed = super::server::encode_ws_frame(0x01, &payload);
 
-            // Store in foreign recovery buffer before fan-out (cross-node recovery)
+            // Store the UNFRAMED payload in the foreign recovery buffer (cross-node
+            // recovery), matching the local buffer's stored form so subscribe_with_
+            // recovery frames/encrypts replayed bytes per connection. Live fan-out
+            // below still uses the shared pre-framed bytes.
             if let (Some(rm), Some((epoch, offset))) = (&ctx.recovery, rec) {
-                rm.push_foreign(&topic, preframed.clone(), epoch, offset);
+                rm.push_foreign(&topic, payload.clone(), epoch, offset);
             }
 
             let (d, f) = super::server::fanout_topic_direct(
