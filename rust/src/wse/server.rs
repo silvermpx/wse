@@ -949,7 +949,36 @@ fn build_server_ready(conn_id: &str, user_id: &str, recovery_enabled: bool) -> S
 // Connection handler
 // ---------------------------------------------------------------------------
 
-async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<SharedState>) {
+/// Max connections allowed to sit in the pre-handshake / handshake phase at once.
+/// `max_connections` only counts REGISTERED connections (a connection registers
+/// after the WS upgrade + JWT complete), so without this a slowloris that opens
+/// sockets but never completes the upgrade -- each held up to the 10s handshake
+/// timeout -- exhausts tasks and file descriptors well before any limit fires.
+const MAX_PENDING_HANDSHAKES: usize = 512;
+
+/// RAII counter for in-flight (pre-registration) handshakes: increments on
+/// construction, decrements when the handshake task ends (success or failure).
+struct HandshakeGuard(Arc<AtomicUsize>);
+
+impl HandshakeGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for HandshakeGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+async fn handle_connection(
+    stream: TcpStream,
+    addr: SocketAddr,
+    state: Arc<SharedState>,
+    hs_guard: HandshakeGuard,
+) {
     // Reject new connections during graceful drain
     if state.draining.load(Ordering::Relaxed) {
         state
@@ -1170,6 +1199,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
             .connections_accepted_total
             .fetch_add(1, Ordering::Relaxed);
     }
+    // Handshake + registration complete -- release the pre-handshake slot. (On any
+    // earlier return, e.g. a failed/timed-out handshake, hs_guard drops here too.)
+    drop(hs_guard);
     // Store format preference for lock-free access from send_event()
     if use_msgpack {
         state.conn_formats.insert((*conn_id).clone(), true);
@@ -3308,11 +3340,24 @@ impl RustWSEServer {
                             }
                         });
                     }
+                    // Bounds the number of connections in the pre-handshake phase
+                    // (slowloris): max_connections only counts registered ones.
+                    let handshakes_in_flight = Arc::new(AtomicUsize::new(0));
                     loop {
                         tokio::select! {
                             res = listener.accept() => {
                                 match res {
                                     Ok((stream, addr)) => {
+                                        if handshakes_in_flight.load(Ordering::Relaxed)
+                                            >= MAX_PENDING_HANDSHAKES
+                                        {
+                                            tracing::warn!(
+                                                "[WSE] Pre-handshake cap reached ({MAX_PENDING_HANDSHAKES}), dropping {addr}"
+                                            );
+                                            continue; // drop the stream
+                                        }
+                                        let hs_guard =
+                                            HandshakeGuard::new(handshakes_in_flight.clone());
                                         let _ = stream.set_nodelay(true);
                                         // Larger send buffer for broadcast throughput (default 16KB -> 256KB)
                                         let sock = socket2::SockRef::from(&stream);
@@ -3382,7 +3427,7 @@ impl RustWSEServer {
                                                     );
                                                 }
                                             } else {
-                                                handle_connection(stream, addr, shared2).await;
+                                                handle_connection(stream, addr, shared2, hs_guard).await;
                                             }
                                         });
                                     }
@@ -5201,6 +5246,23 @@ mod tests {
         assert_eq!(v2["a"], 1);
         // Non-object input is returned unchanged (defensive).
         assert_eq!(stamp_recovery_fields("[1,2]", "t", 1, 2), "[1,2]");
+    }
+
+    // The slowloris cap relies on HandshakeGuard counting in-flight handshakes
+    // exactly: +1 on construction, -1 on drop (handshake complete / failed).
+    #[test]
+    fn handshake_guard_counts_in_flight() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        {
+            let _g1 = HandshakeGuard::new(counter.clone());
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+            {
+                let _g2 = HandshakeGuard::new(counter.clone());
+                assert_eq!(counter.load(Ordering::Relaxed), 2);
+            }
+            assert_eq!(counter.load(Ordering::Relaxed), 1, "inner slot released");
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 0, "all slots released");
     }
 
     #[test]
