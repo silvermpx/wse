@@ -8,6 +8,143 @@ use std::io::Write;
 /// where a small compressed payload expands to gigabytes of RAM.
 const MAX_DECOMPRESS_SIZE: usize = 10 * 1024 * 1024;
 
+/// Maximum msgpack nesting depth accepted on inbound decode.
+///
+/// `rmpv::decode::read_value` is a recursive-descent decoder with NO depth
+/// limit, so a hostile deeply-nested payload (e.g. ~1M repeated `0x91` fixarray
+/// markers packed into a 1 MB frame) overflows the thread stack and aborts the
+/// whole process. Such frames are rejected BEFORE decoding. 64 is far beyond
+/// any legitimate event shape and is the same order of magnitude as
+/// serde_json's built-in recursion budget, which already protects the JSON path.
+pub(crate) const MAX_MSGPACK_DEPTH: usize = 64;
+
+/// Read an `n`-byte big-endian unsigned length/count at `*pos`, advancing `pos`.
+fn read_be_uint(data: &[u8], pos: &mut usize, n: usize) -> Result<usize, ()> {
+    let mut v: usize = 0;
+    for _ in 0..n {
+        let b = *data.get(*pos).ok_or(())?;
+        *pos += 1;
+        v = (v << 8) | b as usize;
+    }
+    Ok(v)
+}
+
+/// Open a container level, rejecting if it would exceed `max_depth`.
+fn open_container(remaining: &mut Vec<u64>, children: u64, max_depth: usize) -> Result<(), ()> {
+    if remaining.len() >= max_depth {
+        return Err(());
+    }
+    remaining.push(children);
+    Ok(())
+}
+
+/// Structurally validate that `data` begins with a single msgpack value whose
+/// nesting depth does not exceed `max_depth`, WITHOUT building the value tree
+/// (iterative, no recursion, no decoded allocation, O(len)). Returns `Err` on a
+/// depth violation, a truncated/invalid frame, or the reserved `0xc1` marker.
+///
+/// Run before `rmpv::decode::read_value`, whose recursive decoder would
+/// otherwise overflow the stack on a hostile deeply-nested frame.
+pub(crate) fn check_msgpack_depth(data: &[u8], max_depth: usize) -> Result<(), ()> {
+    // Each stack entry is the count of child VALUES still to be read at that
+    // open container level; current depth == stack length.
+    let mut remaining: Vec<u64> = Vec::new();
+    let mut pos: usize = 0;
+
+    loop {
+        // Close every container whose children are all consumed.
+        while matches!(remaining.last(), Some(&0)) {
+            remaining.pop();
+        }
+        // One complete top-level value has been read and all containers closed.
+        if remaining.is_empty() && pos > 0 {
+            return Ok(());
+        }
+        // Count the value we are about to read against its parent container.
+        if let Some(top) = remaining.last_mut() {
+            *top -= 1;
+        }
+
+        let marker = *data.get(pos).ok_or(())?;
+        pos += 1;
+
+        match marker {
+            // fixint (pos/neg), nil, bool: no payload, no children.
+            0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => {}
+            0xc1 => return Err(()), // reserved -- never a valid value
+            0x80..=0x8f => open_container(&mut remaining, (marker & 0x0f) as u64 * 2, max_depth)?, // fixmap
+            0x90..=0x9f => open_container(&mut remaining, (marker & 0x0f) as u64, max_depth)?, // fixarray
+            0xa0..=0xbf => pos = pos.checked_add((marker & 0x1f) as usize).ok_or(())?, // fixstr
+            0xc4 | 0xd9 => {
+                let l = read_be_uint(data, &mut pos, 1)?; // bin8 / str8
+                pos = pos.checked_add(l).ok_or(())?;
+            }
+            0xc5 | 0xda => {
+                let l = read_be_uint(data, &mut pos, 2)?; // bin16 / str16
+                pos = pos.checked_add(l).ok_or(())?;
+            }
+            0xc6 | 0xdb => {
+                let l = read_be_uint(data, &mut pos, 4)?; // bin32 / str32
+                pos = pos.checked_add(l).ok_or(())?;
+            }
+            0xc7 => {
+                let l = read_be_uint(data, &mut pos, 1)?; // ext8 (+1 type byte)
+                pos = pos.checked_add(l + 1).ok_or(())?;
+            }
+            0xc8 => {
+                let l = read_be_uint(data, &mut pos, 2)?; // ext16
+                pos = pos.checked_add(l + 1).ok_or(())?;
+            }
+            0xc9 => {
+                let l = read_be_uint(data, &mut pos, 4)?; // ext32
+                pos = pos.checked_add(l + 1).ok_or(())?;
+            }
+            0xca => pos = pos.checked_add(4).ok_or(())?, // float32
+            0xcb => pos = pos.checked_add(8).ok_or(())?, // float64
+            0xcc | 0xd0 => pos = pos.checked_add(1).ok_or(())?, // uint8 / int8
+            0xcd | 0xd1 => pos = pos.checked_add(2).ok_or(())?, // uint16 / int16
+            0xce | 0xd2 => pos = pos.checked_add(4).ok_or(())?, // uint32 / int32
+            0xcf | 0xd3 => pos = pos.checked_add(8).ok_or(())?, // uint64 / int64
+            0xd4 => pos = pos.checked_add(1 + 1).ok_or(())?, // fixext1
+            0xd5 => pos = pos.checked_add(1 + 2).ok_or(())?, // fixext2
+            0xd6 => pos = pos.checked_add(1 + 4).ok_or(())?, // fixext4
+            0xd7 => pos = pos.checked_add(1 + 8).ok_or(())?, // fixext8
+            0xd8 => pos = pos.checked_add(1 + 16).ok_or(())?, // fixext16
+            0xdc => {
+                let n = read_be_uint(data, &mut pos, 2)? as u64; // array16
+                open_container(&mut remaining, n, max_depth)?;
+            }
+            0xdd => {
+                let n = read_be_uint(data, &mut pos, 4)? as u64; // array32
+                open_container(&mut remaining, n, max_depth)?;
+            }
+            0xde => {
+                let n = read_be_uint(data, &mut pos, 2)? as u64; // map16
+                open_container(&mut remaining, n * 2, max_depth)?;
+            }
+            0xdf => {
+                let n = read_be_uint(data, &mut pos, 4)? as u64; // map32
+                open_container(&mut remaining, n * 2, max_depth)?;
+            }
+        }
+
+        // A scalar payload skip (str/bin/ext/fixstr/fixint-width) advances `pos`
+        // past bytes it never indexed; reject here if that ran off the end so a
+        // truncated value is an Err rather than a false "valid" pass.
+        if pos > data.len() {
+            return Err(());
+        }
+    }
+}
+
+/// Depth-guarded msgpack decode: reject frames deeper than `MAX_MSGPACK_DEPTH`
+/// (which would overflow rmpv's recursive decoder) before decoding. `Err(())`
+/// means "not safely decodable" -- callers fall back to raw bytes / JSON.
+pub(crate) fn decode_msgpack_guarded(data: &[u8]) -> Result<rmpv::Value, ()> {
+    check_msgpack_depth(data, MAX_MSGPACK_DEPTH)?;
+    rmpv::decode::read_value(&mut &data[..]).map_err(|_| ())
+}
+
 // ---------------------------------------------------------------------------
 // Standalone functions (backward compatibility)
 // ---------------------------------------------------------------------------
@@ -429,8 +566,10 @@ impl RustCompressionManager {
 
     /// Unpack msgpack bytes to a Python dict.
     fn unpack_msgpack<'py>(&self, py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
-        let val = rmpv::decode::read_value(&mut &data[..]).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("msgpack unpacking failed: {e}"))
+        let val = decode_msgpack_guarded(data).map_err(|()| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "msgpack unpacking failed (invalid or exceeds max nesting depth)",
+            )
         })?;
         rmpv_to_py(py, &val)
     }
@@ -473,8 +612,8 @@ impl RustCompressionManager {
         is_msgpack: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         if is_msgpack {
-            // Try msgpack first
-            if let Ok(val) = rmpv::decode::read_value(&mut &data[..])
+            // Try msgpack first (depth-guarded against stack-overflow frames)
+            if let Ok(val) = decode_msgpack_guarded(data)
                 && let Ok(py_obj) = rmpv_to_py(py, &val)
             {
                 return Ok(py_obj);
@@ -637,5 +776,75 @@ fn try_json_decode<'py>(
             Ok(Some(py_obj))
         }
         Err(_) => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Encode a chain of `n` nested single-element fixarrays terminated by a nil:
+    // 0x91 0x91 ... 0x91 0xc0  -> nesting depth n. This is the stack-overflow bomb.
+    fn nested_arrays(n: usize) -> Vec<u8> {
+        let mut v = vec![0x91u8; n];
+        v.push(0xc0); // innermost element: nil
+        v
+    }
+
+    #[test]
+    fn depth_scan_accepts_shallow_values() {
+        // scalars
+        assert!(check_msgpack_depth(&[0x00], MAX_MSGPACK_DEPTH).is_ok()); // positive fixint
+        assert!(check_msgpack_depth(&[0xc0], MAX_MSGPACK_DEPTH).is_ok()); // nil
+        assert!(check_msgpack_depth(&[0xc3], MAX_MSGPACK_DEPTH).is_ok()); // true
+        // fixstr "hi"
+        assert!(check_msgpack_depth(&[0xa2, b'h', b'i'], MAX_MSGPACK_DEPTH).is_ok());
+        // empty array / empty map
+        assert!(check_msgpack_depth(&[0x90], MAX_MSGPACK_DEPTH).is_ok());
+        assert!(check_msgpack_depth(&[0x80], MAX_MSGPACK_DEPTH).is_ok());
+        // {"k": [1, 2]} == fixmap1 { fixstr "k": fixarray2 [1,2] }
+        let buf = [0x81, 0xa1, b'k', 0x92, 0x01, 0x02];
+        assert!(check_msgpack_depth(&buf, MAX_MSGPACK_DEPTH).is_ok());
+    }
+
+    #[test]
+    fn depth_scan_accepts_exactly_max_depth_and_rejects_deeper() {
+        // Exactly MAX_MSGPACK_DEPTH nested arrays must pass.
+        assert!(check_msgpack_depth(&nested_arrays(MAX_MSGPACK_DEPTH), MAX_MSGPACK_DEPTH).is_ok());
+        // One deeper must be rejected.
+        assert!(
+            check_msgpack_depth(&nested_arrays(MAX_MSGPACK_DEPTH + 1), MAX_MSGPACK_DEPTH).is_err()
+        );
+    }
+
+    #[test]
+    fn depth_scan_rejects_pathological_bomb_quickly() {
+        // ~100k nested arrays (would blow rmpv's recursive decoder stack). The
+        // scan must reject without recursing and without reading the whole input.
+        let bomb = vec![0x91u8; 100_000];
+        assert!(check_msgpack_depth(&bomb, MAX_MSGPACK_DEPTH).is_err());
+    }
+
+    #[test]
+    fn depth_scan_rejects_truncated_and_reserved() {
+        // Truncated: fixarray claims 1 child but no bytes follow.
+        assert!(check_msgpack_depth(&[0x91], MAX_MSGPACK_DEPTH).is_err());
+        // Truncated str: fixstr len 5 but no payload.
+        assert!(check_msgpack_depth(&[0xa5], MAX_MSGPACK_DEPTH).is_err());
+        // Reserved marker 0xc1 is never a valid value.
+        assert!(check_msgpack_depth(&[0xc1], MAX_MSGPACK_DEPTH).is_err());
+        // Empty input.
+        assert!(check_msgpack_depth(&[], MAX_MSGPACK_DEPTH).is_err());
+    }
+
+    #[test]
+    fn guarded_decode_matches_rmpv_for_valid_and_rejects_bomb() {
+        // Valid shallow value decodes identically to raw rmpv.
+        let buf = [0x92, 0x01, 0x02]; // [1, 2]
+        let guarded = decode_msgpack_guarded(&buf).expect("valid msgpack");
+        let raw = rmpv::decode::read_value(&mut &buf[..]).unwrap();
+        assert_eq!(guarded, raw);
+        // Bomb is rejected before rmpv ever recurses.
+        assert!(decode_msgpack_guarded(&nested_arrays(MAX_MSGPACK_DEPTH + 5)).is_err());
     }
 }

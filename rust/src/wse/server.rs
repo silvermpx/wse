@@ -18,7 +18,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::cluster::{ClusterCommand, ClusterDlq, ClusterMetrics};
-use super::compression::{rmpv_to_serde_json, serde_json_to_rmpv};
+use super::compression::{decode_msgpack_guarded, rmpv_to_serde_json, serde_json_to_rmpv};
 use crate::jwt::{self, JwtConfig, parse_cookie_value};
 use ahash::AHashSet;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -1595,7 +1595,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                 if drain {
                     if is_msgpack {
                         // Parse msgpack in Rust → push pre-parsed dict (same as JSON text path)
-                        match rmpv::decode::read_value(&mut &data[..]) {
+                        match decode_msgpack_guarded(&data[..]) {
                             Ok(rmpv_val) => {
                                 let json_val = rmpv_to_serde_json(&rmpv_val);
                                 let json_val = normalize_json_keys(json_val);
@@ -1625,7 +1625,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                     if is_msgpack {
                         // Parse msgpack and pass as dict to callback (same as JSON text)
                         tokio::task::spawn_blocking(move || {
-                            Python::try_attach(|py| match rmpv::decode::read_value(&mut &d[..]) {
+                            Python::try_attach(|py| match decode_msgpack_guarded(&d[..]) {
                                 Ok(rmpv_val) => {
                                     let json_val = rmpv_to_serde_json(&rmpv_val);
                                     let json_val = normalize_json_keys(json_val);
