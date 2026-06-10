@@ -1658,18 +1658,22 @@ async fn handle_connection(
                                         } else if let Some(ref cb) = cached_on_message {
                                             let cb_arc = cb.clone();
                                             let cid = Arc::clone(&conn_id);
-                                            spawn_bounded_callback(&callback_sem, &state, move || {
-                                                Python::try_attach(|py| {
-                                                    let py_obj = json_to_pyobj(py, &val);
-                                                    if let Err(e) =
-                                                        cb_arc.call1(py, (&**cid, py_obj))
-                                                    {
-                                                        tracing::warn!(
-                                                            "[WSE] on_message (decrypted) error: {e}"
-                                                        );
-                                                    }
-                                                });
-                                            });
+                                            spawn_bounded_callback(
+                                                &callback_sem,
+                                                &state,
+                                                move || {
+                                                    Python::try_attach(|py| {
+                                                        let py_obj = json_to_pyobj(py, &val);
+                                                        if let Err(e) =
+                                                            cb_arc.call1(py, (&**cid, py_obj))
+                                                        {
+                                                            tracing::warn!(
+                                                                "[WSE] on_message (decrypted) error: {e}"
+                                                            );
+                                                        }
+                                                    });
+                                                },
+                                            );
                                         }
                                     }
                                 }
