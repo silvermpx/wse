@@ -681,15 +681,26 @@ class ConnectionManager:
 
         # Cancel tasks FIRST (before closing socket) to avoid spurious
         # exceptions in _recv_loop triggering unintended reconnect paths.
+        #
+        # CRITICAL: never cancel-and-await the CURRENT task. _force_reconnect is
+        # called from inside _heartbeat_loop on idle timeout; cancelling
+        # self._heartbeat_task there cancels THIS coroutine, and the awaited
+        # gather then raises CancelledError into _force_reconnect before
+        # _schedule_reconnect() runs -- the socket is never closed and the
+        # reconnect is never scheduled, leaving a permanent zombie. Skip the
+        # current task (it returns on its own right after this call) and only
+        # cancel+await the others.
+        current = asyncio.current_task()
         tasks_to_await: list[asyncio.Task[None]] = []
-        if self._heartbeat_task:
+        if self._heartbeat_task is not None and self._heartbeat_task is not current:
             self._heartbeat_task.cancel()
             tasks_to_await.append(self._heartbeat_task)
-            self._heartbeat_task = None
-        if self._recv_task:
+        if self._recv_task is not None and self._recv_task is not current:
             self._recv_task.cancel()
             tasks_to_await.append(self._recv_task)
-            self._recv_task = None
+        # Drop references regardless; the current task exits after this returns.
+        self._heartbeat_task = None
+        self._recv_task = None
         if tasks_to_await:
             await asyncio.gather(*tasks_to_await, return_exceptions=True)
 
