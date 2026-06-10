@@ -37,6 +37,11 @@ pub(crate) const PROTOCOL_VERSION: u16 = 1;
 pub(crate) const MAX_FRAME_SIZE: usize = 1_048_576; // 1MB
 pub(crate) const HEARTBEAT_INTERVAL_SECS: u64 = 5;
 pub(crate) const HEARTBEAT_TIMEOUT_SECS: u64 = 15;
+/// How often each peer link re-sends its full local interest (RESYNC). SUB/UNSUB
+/// deltas are best-effort (try_send drops under back-pressure), so a dropped one
+/// would otherwise leave the peer's view of our interest permanently wrong; the
+/// periodic full set heals it.
+pub(crate) const CLUSTER_RESYNC_INTERVAL_SECS: u64 = 60;
 pub(crate) const MAX_BATCH_BYTES: usize = 65_536;
 
 /// Monotonic generation counter for peer sessions. Prevents stale RESYNC
@@ -1393,11 +1398,30 @@ async fn heartbeat_task(
     peer_write_tx: mpsc::Sender<Bytes>,
     cancel: CancellationToken,
     last_activity: Arc<AtomicU64>,
+    local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+    let mut resync_interval =
+        tokio::time::interval(Duration::from_secs(CLUSTER_RESYNC_INTERVAL_SECS));
+    resync_interval.reset(); // don't RESYNC immediately (the handshake already did)
     let timeout_ms = HEARTBEAT_TIMEOUT_SECS * 1000;
     loop {
         tokio::select! {
+            _ = resync_interval.tick() => {
+                // Self-heal interest divergence from a dropped SUB/UNSUB: re-send
+                // the full local interest set. Inner frames go through the channel
+                // unframed (peer_writer adds the length prefix), like every other
+                // peer send.
+                let local_topics: Vec<String> = match local_topic_refcount.lock() {
+                    Ok(g) => g.keys().cloned().collect(),
+                    Err(e) => e.into_inner().keys().cloned().collect(),
+                };
+                for frame_buf in encode_resync(&local_topics) {
+                    if peer_write_tx.try_send(frame_buf.freeze()).is_err() {
+                        break; // channel full/closed; the next tick retries
+                    }
+                }
+            }
             _ = interval.tick() => {
                 // Check if peer is dead (no activity for HEARTBEAT_TIMEOUT_SECS)
                 let last = last_activity.load(Ordering::Relaxed);
@@ -1658,6 +1682,7 @@ where
         peer_write_tx.clone(),
         peer_cancel.clone(),
         last_activity,
+        ctx.local_topic_refcount.clone(),
     ));
 
     // Forward data from cluster manager to this peer's writer
@@ -2711,7 +2736,12 @@ async fn handle_cluster_inbound_generic<S>(
         (last_activity.clone(), session_gen),
     ));
 
-    let heartbeat_handle = tokio::spawn(heartbeat_task(write_tx, cancel.clone(), last_activity));
+    let heartbeat_handle = tokio::spawn(heartbeat_task(
+        write_tx,
+        cancel.clone(),
+        last_activity,
+        ctx.local_topic_refcount.clone(),
+    ));
 
     // Wait for any task to finish, then cancel + await all (prevents task leaks)
     tokio::pin!(
