@@ -45,7 +45,13 @@ pub(crate) const MAX_BATCH_BYTES: usize = 65_536;
 static PEER_SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub(crate) const MAX_CLUSTER_PEERS: usize = 256;
 // Cluster peer channels are bounded (10K messages) to prevent OOM from slow peers.
-// When a peer falls behind, messages are dropped and metrics.messages_dropped incremented.
+// This applies to BOTH directions: the per-peer writer channel (peer_write_tx) AND
+// the inbound MSG dispatch channel (dispatch_tx). When a peer publishes faster than
+// local fan-out can drain, the bounded dispatch queue fills and excess messages are
+// shed (try_send) with metrics.messages_dropped incremented, rather than growing an
+// unbounded backlog. Shedding keeps the single reader loop responsive to control and
+// heartbeat frames, and shed messages remain recoverable via the recovery buffer.
+pub(crate) const PEER_DISPATCH_QUEUE_CAP: usize = 10_000;
 
 pub(crate) const PROTOCOL_VERSION_MIN: u16 = 1;
 
@@ -1072,7 +1078,7 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
     peer_write_tx: mpsc::Sender<Bytes>,
     peer_addr: String,
     ctx: ClusterContext,
-    dispatch_tx: mpsc::UnboundedSender<DispatchItem>,
+    dispatch_tx: mpsc::Sender<DispatchItem>,
     cancel: CancellationToken,
     session: (Arc<AtomicU64>, u64),
 ) {
@@ -1119,7 +1125,13 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
                 recovery,
             }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
-                let _ = dispatch_tx.send((topic, payload, recovery));
+                // Bounded dispatch: shed (don't block the reader) when local fan-out
+                // falls behind, so a fast peer cannot grow an unbounded backlog -> OOM.
+                // Shed MSGs stay recoverable via the recovery buffer; the reader remains
+                // responsive to control/heartbeat frames on the same loop.
+                if dispatch_tx.try_send((topic, payload, recovery)).is_err() {
+                    ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                }
             }
             Some(ClusterFrame::Ping) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
@@ -1227,7 +1239,7 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
 // ---------------------------------------------------------------------------
 
 async fn peer_dispatch_task(
-    mut dispatch_rx: mpsc::UnboundedReceiver<DispatchItem>,
+    mut dispatch_rx: mpsc::Receiver<DispatchItem>,
     ctx: ClusterContext,
     cancel: CancellationToken,
 ) {
@@ -1565,7 +1577,7 @@ where
         ctx.metrics.clone(),
     ));
 
-    let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<DispatchItem>();
+    let (dispatch_tx, dispatch_rx) = mpsc::channel::<DispatchItem>(PEER_DISPATCH_QUEUE_CAP);
 
     let dispatch_handle = tokio::spawn(peer_dispatch_task(
         dispatch_rx,
@@ -2600,7 +2612,7 @@ async fn handle_cluster_inbound_generic<S>(
         ctx.metrics.clone(),
     ));
 
-    let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<DispatchItem>();
+    let (dispatch_tx, dispatch_rx) = mpsc::channel::<DispatchItem>(PEER_DISPATCH_QUEUE_CAP);
 
     let dispatch_handle =
         tokio::spawn(peer_dispatch_task(dispatch_rx, ctx.clone(), cancel.clone()));
@@ -4069,5 +4081,29 @@ mod tests {
                 "{id} should have 2 messages"
             );
         }
+    }
+
+    // Regression: the inbound MSG dispatch channel is BOUNDED at
+    // PEER_DISPATCH_QUEUE_CAP and sheds via try_send when full, so a fast peer
+    // cannot grow an unbounded backlog -> OOM. peer_reader relies on exactly this
+    // "try_send returns Err when full" behavior to shed (bumping messages_dropped)
+    // instead of blocking the reader or growing memory without bound.
+    #[tokio::test]
+    async fn dispatch_channel_is_bounded_and_sheds_when_full() {
+        let (tx, _rx) = mpsc::channel::<DispatchItem>(PEER_DISPATCH_QUEUE_CAP);
+        // Fill to capacity with no consumer draining.
+        for _ in 0..PEER_DISPATCH_QUEUE_CAP {
+            assert!(
+                tx.try_send(("t".to_string(), Bytes::from_static(b"p"), None))
+                    .is_ok(),
+                "sends up to the cap must succeed"
+            );
+        }
+        // The next send must shed (Err), never block or grow the queue.
+        assert!(
+            tx.try_send(("t".to_string(), Bytes::from_static(b"p"), None))
+                .is_err(),
+            "send past the bound must fail (shed), proving the queue is bounded"
+        );
     }
 }
