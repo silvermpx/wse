@@ -8,6 +8,7 @@ use p256::{PublicKey, SecretKey, ecdh::diffie_hellman, elliptic_curve::sec1::ToE
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -124,16 +125,20 @@ pub fn rust_ecdh_generate_keypair(py: Python) -> PyResult<(Py<PyBytes>, Py<PyByt
     let secret = SecretKey::random(&mut OsRng);
     let public = secret.public_key();
 
-    // Private key: 32-byte scalar
-    let sk_bytes = secret.to_bytes();
+    // Private key: 32-byte scalar. `secret` itself zeroizes on drop; we also wipe
+    // our serialized copy after handing the bytes to Python so it does not linger
+    // in freed stack/heap (crash dumps, core files).
+    let mut sk_bytes = secret.to_bytes();
 
     // Public key: uncompressed SEC1 point (65 bytes)
     let pk_point = public.to_encoded_point(false);
 
-    Ok((
+    let result = (
         PyBytes::new(py, &sk_bytes).unbind(),
         PyBytes::new(py, pk_point.as_bytes()).unbind(),
-    ))
+    );
+    sk_bytes[..].zeroize();
+    Ok(result)
 }
 
 /// Derive a 32-byte AES key from ECDH shared secret + HKDF-SHA256.
@@ -171,7 +176,10 @@ pub fn rust_ecdh_derive_shared_secret(
             pyo3::exceptions::PyRuntimeError::new_err(format!("HKDF expand failed: {e}"))
         })?;
 
-    Ok(PyBytes::new(py, &aes_key).unbind())
+    // Hand the key to Python, then wipe our copy from the stack.
+    let result = PyBytes::new(py, &aes_key).unbind();
+    aes_key.zeroize();
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -232,10 +240,7 @@ mod tests {
         let shared_ab = diffie_hellman(sk_a.to_nonzero_scalar(), pk_b.as_affine());
         let shared_ba = diffie_hellman(sk_b.to_nonzero_scalar(), pk_a.as_affine());
 
-        assert_eq!(
-            &*shared_ab.raw_secret_bytes(),
-            &*shared_ba.raw_secret_bytes()
-        );
+        assert_eq!(shared_ab.raw_secret_bytes(), shared_ba.raw_secret_bytes());
     }
 
     #[test]

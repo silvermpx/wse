@@ -38,6 +38,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketConfig};
 use uuid::Uuid;
+use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
@@ -801,6 +802,8 @@ fn derive_connection_key(client_pubkey_b64: &str) -> Result<(String, aes_gcm::Ae
 
     let cipher = aes_gcm::Aes256Gcm::new_from_slice(&aes_key)
         .map_err(|e| format!("AES key init failed: {e}"))?;
+    // The cipher now owns the key material; wipe our stack copy.
+    aes_key.zeroize();
 
     let server_pk_point = server_pk.to_encoded_point(false);
     let server_pk_b64 =
