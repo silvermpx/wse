@@ -100,7 +100,8 @@ class WSEEvent:
         type: Event type string, e.g. ``"notifications"``, ``"price_update"``.
         payload: Event data as a dict.
         id: Unique message UUID for deduplication.
-        sequence: Monotonic sequence number for ordering.
+        sequence: Server global sequence number (diagnostic only; ordering
+            and dedup are per-topic via epoch/offset).
         timestamp: ISO-8601 timestamp from the server.
         version: Wire protocol version (default 1).
         category: ``"WSE"`` (system), ``"S"`` (snapshot), ``"U"`` (update).

@@ -3,7 +3,7 @@
 # =============================================================================
 #
 # WebSocket lifecycle management: connect, auth, heartbeat, reconnect.
-# Port of client/services/ConnectionManager.ts.
+# Port of ts-client/services/ConnectionManager.ts.
 # =============================================================================
 
 from __future__ import annotations

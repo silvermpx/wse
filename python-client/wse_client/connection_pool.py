@@ -3,7 +3,7 @@
 # =============================================================================
 #
 # Multi-endpoint management with health scoring and load balancing.
-# Port of client/services/ConnectionPool.ts.
+# Port of ts-client/services/ConnectionPool.ts.
 # =============================================================================
 
 from __future__ import annotations

@@ -2,8 +2,8 @@
 # WSE Python Client -- Event Sequencer
 # =============================================================================
 #
-# Duplicate detection and out-of-order event buffering.
-# Port of client/services/EventSequencer.ts.
+# Idempotent delivery: id dedup + per-topic (epoch, offset) dedup/gap detection.
+# Port of ts-client/services/EventSequencer.ts.
 # =============================================================================
 
 from __future__ import annotations

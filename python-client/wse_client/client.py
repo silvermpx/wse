@@ -3,7 +3,7 @@
 # =============================================================================
 #
 # Primary public API.  Async context manager, async iterator, callbacks.
-# Port of client/hooks/useWSE.ts + client/services/MessageProcessor.ts.
+# Port of ts-client/hooks/useWSE.ts + client/services/MessageProcessor.ts.
 # =============================================================================
 
 from __future__ import annotations

@@ -3,7 +3,7 @@
 # =============================================================================
 #
 # Buffers outgoing messages when the connection is down and flushes them
-# (in priority order) on reconnect.  Port of client/services/OfflineQueue.ts.
+# (in priority order) on reconnect.  Port of ts-client/services/OfflineQueue.ts.
 #
 # In-memory implementation - Python processes don't need persistence across
 # restarts the way browser tabs need IndexedDB.

@@ -3,7 +3,7 @@
 # =============================================================================
 #
 # Latency / jitter / packet loss analysis -> connection quality.
-# Port of client/services/NetworkMonitor.ts.
+# Port of ts-client/services/NetworkMonitor.ts.
 # =============================================================================
 
 from __future__ import annotations
