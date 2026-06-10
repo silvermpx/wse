@@ -1424,7 +1424,14 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Share
                                     .and_then(|v| v.as_bool())
                                     .unwrap_or(false);
 
-                                let server_pubkey: Option<String> = if wants_encryption {
+                                // Once-only key exchange: never re-derive the cipher
+                                // if this connection already has one. A repeated
+                                // client_hello would otherwise overwrite the AES key
+                                // mid-session (making in-flight encrypted messages
+                                // undecryptable) and is a cheap ECDH-keygen DoS amplifier.
+                                let server_pubkey: Option<String> = if wants_encryption
+                                    && !state.conn_encryption.contains_key(&*conn_id)
+                                {
                                     p.and_then(|p| p.get("encryption_public_key"))
                                         .and_then(|v| v.as_str())
                                         .and_then(|b64| match derive_connection_key(b64) {
