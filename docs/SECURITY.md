@@ -227,7 +227,7 @@ E:<IV (12 bytes)><AES-GCM ciphertext>
 
 **Server-side encryption (Rust):**
 - ECDH P-256 key pair generated per connection via `p256` crate
-- Session key derivation via HKDF-SHA256 (salt: `wse-encryption`, info: `aes-gcm-key`)
+- Session key derivation via HKDF-SHA256 (no salt, info: `wse-encryption/aes-gcm-key`)
 - AES-GCM-256 encrypt/decrypt via `aes-gcm` crate
 - Per-connection key lifecycle: generate on handshake, derive on client key exchange, clear on disconnect
 

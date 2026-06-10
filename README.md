@@ -39,7 +39,7 @@ High-performance WebSocket server built in Rust with native clustering, E2E encr
 |---------|---------|
 | **Key exchange** | ECDH P-256 (per-connection keypair, automatic during handshake) |
 | **Encryption** | AES-GCM-256 with unique 12-byte IV per message |
-| **Key derivation** | HKDF-SHA256 (salt: `wse-encryption`, info: `aes-gcm-key`) |
+| **Key derivation** | HKDF-SHA256 (no salt, info: `wse-encryption/aes-gcm-key`) |
 | **Wire format** | `E:` prefix + 12-byte IV + AES-GCM ciphertext + 16-byte auth tag |
 | **Key rotation** | Configurable rotation interval (default 1 hour), automatic renegotiation |
 | **Replay prevention** | Nonce cache (10K entries, 5-minute TTL) on the client side |
@@ -318,7 +318,7 @@ result = server.subscribe_with_recovery(
     epoch=client_epoch,       # From previous session
     offset=client_offset,     # From previous session
 )
-# {"topics": {"prices": {"epoch": 123, "offset": 456, "recovered": True, "count": 12}}}
+# {"topics": {"prices": {"epoch": "0000007b", "offset": 456, "recovered": True, "count": 12}}}
 ```
 
 The server maintains per-topic ring buffers (power-of-2 capacity, bitmask indexing). Clients store the `epoch` and `offset` from their last received message. On reconnect, the server replays missed messages from the ring buffer. If the gap is too large or the epoch has changed, the client receives a `NotRecovered` status and should re-subscribe from scratch.
@@ -530,7 +530,7 @@ function App() {
 
 Key features: offline queue with IndexedDB persistence, adaptive quality management, connection pool with health scoring, E2E encryption (Web Crypto API), message batching, 5 priority levels, Zustand store for external state access.
 
-See [client/](client/) for full source and examples.
+See [ts-client/](ts-client/) for full source and examples.
 
 ---
 

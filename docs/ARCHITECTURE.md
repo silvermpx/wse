@@ -531,7 +531,7 @@ Zlib decompression is bounded to 10 MB output. Zstd cluster frame decompression 
 ## Frontend Architecture (TypeScript/React)
 
 ```
-client/
+ts-client/
 +-- index.ts                       Public API exports
 +-- types.ts                       TypeScript interfaces and types
 +-- constants.ts                   Protocol constants, event maps

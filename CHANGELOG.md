@@ -1,5 +1,37 @@
 # Changelog
 
+## v2.4.0 (2026-06-10)
+
+### Added
+
+- **Per-message recovery stamp (`tp` / `e` / `o`).** Topic publications now carry their topic, buffer epoch (8-hex), and per-topic offset, so clients dedupe idempotently, detect gaps, and resume from their last-seen position. Both clients consume it; see PROTOCOL.md.
+
+### Security
+
+- **CRITICAL:** recovery replay no longer sends stored plaintext to E2E-encrypted connections -- replayed messages are framed/encrypted per connection like live fan-out.
+- **CRITICAL:** fail-closed topic ACL on the recovery path -- `subscribe_with_recovery` filters topics through the connection ACL before replaying history or probing positions (was cross-tenant leakable).
+- msgpack inbound: reject frames deeper than 64 nesting levels before decoding (rmpv recursion could stack-overflow the process).
+- Zeroize derived AES keys and the serialized ECDH scalar.
+
+### Reliability
+
+- **CRITICAL:** bounded the inbound cluster MSG dispatch queue (was unbounded -> remote-triggerable OOM); excess sheds with a metric.
+- Deterministic duplicate-connection tiebreaker (`cluster_link_survives`): exactly one link per pair, no flapping; self-connections rejected.
+- Presence: per-origin sentinels + last-write-wins leave + ghost cleanup on peer disconnect + chunked full-state sync.
+- Sequencer: per-topic ordering cursor is retired on idle TTL, not on an empty reorder buffer (was causing false gaps/resets).
+- Recovery replay is now back-pressure gated.
+
+### Clients
+
+- Python + TS: idempotent (epoch, offset) dedup + gap-triggered recovery; per-topic positions survive reconnects.
+- Python: fixed idle-timeout reconnect cancelling itself into a zombie; circuit-breaker-open now wakes the async iterator; server_hello limits read from `p["limits"]`; dropped the unsound global-seq reordering.
+- TS: fixed E2E encryption deadlocking the handshake (encrypt only after ECDH); reconnect lockout after 10 successful reconnects; cookie-auth reconnect after an auth failure.
+
+### Documentation
+
+- Corrected HKDF parameters (no salt; info `wse-encryption/aes-gcm-key`) in README / PROTOCOL / SECURITY / RUST_UTILITIES.
+- Recovery epoch documented as an 8-hex string (not an int); stale `client/` paths -> `ts-client/`.
+
 ## v2.3.2 (2026-03-22)
 
 ### Security

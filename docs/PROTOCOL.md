@@ -46,6 +46,34 @@ Fields are ordered for readability in DevTools: `c` first, `t` second, `v` last.
 | `pri` | `int` | Priority (1=BACKGROUND, 3=LOW, 5=NORMAL, 8=HIGH, 10=CRITICAL) |
 | `cid` | `string` | Correlation ID for request/response pairing |
 | `wse_processing_ms` | `int` | Server-side processing time in milliseconds |
+| `tp` | `string` | Recovery stamp: topic this message was published to (see below) |
+| `e` | `string` | Recovery stamp: topic buffer epoch, 8 hex chars (e.g. `"0000abcd"`) |
+| `o` | `int` | Recovery stamp: per-topic monotonic offset (u64) |
+
+### Recovery stamp (`tp` / `e` / `o`)
+
+When recovery is enabled, every **topic publication** carries three extra
+top-level fields so clients can dedupe idempotently, detect gaps, and resume
+from their last-seen position:
+
+```json
+{"tp":"chat_messages","e":"0000abcd","o":42,"c":"U","t":"chat_message","p":{…},"v":1}
+```
+
+- `tp` — the topic. A single connection receives many topics, so the topic is
+  needed to attribute each `(epoch, offset)` to the right per-topic sequence.
+- `e` — the topic buffer's epoch as an 8-hex string. It changes when the server
+  restarts (the buffer is recreated), invalidating old offsets.
+- `o` — the message's offset within that topic's buffer, monotonically
+  increasing. The same `(tp, e, o)` is stamped on the live message and on any
+  recovery replay of it, giving each message a stable identity across both.
+
+Client dedup / gap logic (per topic): a different `e` than last seen → epoch
+changed, accept and re-baseline; `o <= last` on the same epoch → duplicate,
+drop; `o == last + 1` → in order; `o > last + 1` → gap, recover from the last
+in-order position. Control/system messages (`server_ready`, `ping`, …) are **not**
+stamped. The cluster inter-node MSG frame carries the same `(epoch, offset)` in a
+binary trailer (see [Cluster Protocol](CLUSTER_PROTOCOL.md)).
 
 ## Message Categories
 
@@ -99,8 +127,8 @@ Encryption spec:
 | IV | 12 bytes (96 bits), random per message |
 | Auth tag | 16 bytes (128 bits), appended to ciphertext |
 | Key exchange | ECDH P-256 with HKDF-SHA256 |
-| HKDF salt | `wse-encryption` (UTF-8 bytes) |
-| HKDF info | `aes-gcm-key` (UTF-8 bytes) |
+| HKDF salt | none (no salt; HKDF-Extract uses a zero salt) |
+| HKDF info | `wse-encryption/aes-gcm-key` (UTF-8 bytes) |
 | HKDF hash | SHA-256 |
 | Derived key | 32 bytes (256 bits) |
 

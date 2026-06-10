@@ -471,7 +471,7 @@ result = server.subscribe_with_recovery(
     epoch=client_epoch,    # from previous session
     offset=client_offset,  # from previous session
 )
-# result: {"topics": {"prices": {"epoch": 123, "offset": 456, "recovered": True, "count": 12}}}
+# result: {"topics": {"prices": {"epoch": "0000007b", "offset": 456, "recovered": True, "count": 12}}}
 ```
 
 | Parameter | Description |

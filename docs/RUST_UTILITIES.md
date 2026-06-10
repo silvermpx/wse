@@ -259,7 +259,7 @@ ciphertext = rust_aes_gcm_encrypt(key_a, b"encrypted with shared secret")
 plaintext = rust_aes_gcm_decrypt(key_b, ciphertext)
 ```
 
-HKDF parameters: salt=`wse-encryption`, info=`aes-gcm-key`, hash=SHA-256.
+HKDF parameters: no salt, info=`wse-encryption/aes-gcm-key`, hash=SHA-256.
 
 ### HMAC and Hashing
 
