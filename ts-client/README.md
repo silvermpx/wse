@@ -105,6 +105,8 @@ useWSE('jwt-token', ['notifications'], {
   },
   criticalHandlers: ['my_event'],              // Block until these handlers are registered
 
+  eventThrottleMs: 0,                          // Throttle same-type non-system events (ms); 0 = disabled
+
   // TanStack Query integration (optional)
   queryClient: queryClient,                    // Adapts stale times based on connection quality
 
@@ -238,7 +240,7 @@ const queueSize = useMessageQueueStore.getState().size;
 | **Circuit breaker** | Connection storm prevention (5 failures -> 60s cooldown -> half-open probe) |
 | **Idempotent delivery** | Per-topic `(epoch, offset)` dedup + gap-triggered recovery; positions survive reconnects |
 | **Connection pool** | Multi-endpoint with adaptive health scoring and load balancing |
-| **Network monitor** | Real-time latency, jitter, packet loss measurement, quality scoring |
+| **Network monitor** | Real-time latency and jitter from PONG round-trips, quality scoring (UNKNOWN until samples arrive) |
 | **Priority queues** | 5 priority levels from CRITICAL to BACKGROUND |
 | **Adaptive quality** | Dynamic adjustment of compression and batching based on network conditions |
 | **Token refresh** | Automatic token refresh via `refreshAuthToken` callback on auth failure |

@@ -247,7 +247,7 @@ server.set_callbacks(on_connect, on_message, on_disconnect)
 server.start()
 ```
 
-Drain mode is recommended for production workloads - it batches events efficiently and gives you explicit control over backpressure. Callbacks use `spawn_blocking` per invocation, which acquires the GIL more frequently.
+Drain mode is recommended for production workloads - it batches events efficiently and gives you explicit control over backpressure. Callbacks use `spawn_blocking` per invocation, which acquires the GIL more frequently; in-flight callbacks are bounded at 256 per connection, and excess inbound messages are shed (counted in `wse_rate_limited_total`) rather than spawning unbounded blocking tasks.
 
 ---
 
@@ -482,6 +482,8 @@ result = server.subscribe_with_recovery(
 | `recovery_memory_budget` | Hard cap on total memory used by all recovery buffers. |
 
 The client stores the `epoch` and `offset` from its last received message. On reconnect, it passes these values to `subscribe_with_recovery`, and the server replays any messages the client missed (up to the buffer limits).
+
+When recovery is enabled, every topic broadcast is stamped with `tp` (topic), `e` (epoch, 8-hex) and `o` (offset) fields injected into the JSON payload, so the client SDKs track their per-topic position from the messages themselves. They drop duplicates idempotently by `(epoch, offset)` and, on a detected offset gap, automatically re-request recovery from their last in-order position — no application code required.
 
 ---
 
@@ -1025,7 +1027,7 @@ async def metrics():
 | `wse_connections_accepted_total` | Total connections accepted |
 | `wse_connections_rejected_total` | Connections rejected (max limit or auth failure) |
 | `wse_auth_failures_total` | JWT authentication failures |
-| `wse_rate_limited_total` | Messages dropped by rate limiter |
+| `wse_rate_limited_total` | Messages dropped by rate limiter (in callback mode also counts shed callback dispatches) |
 | `wse_inbound_dropped_total` | Drain queue events dropped (queue full) |
 | `wse_slow_consumer_drops_total` | Messages dropped due to slow consumer backpressure |
 

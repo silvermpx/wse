@@ -230,9 +230,10 @@ E:<IV (12 bytes)><AES-GCM ciphertext>
 - Session key derivation via HKDF-SHA256 (no salt, info: `wse-encryption/aes-gcm-key`)
 - AES-GCM-256 encrypt/decrypt via `aes-gcm` crate
 - Per-connection key lifecycle: generate on handshake, derive on client key exchange, clear on disconnect
+- Recovery replay: buffered messages are stored **unframed**; each is framed — or encrypted then framed — per connection at replay time, so a plaintext frame is never replayed to an E2E-encrypted connection
 
 **Client-side encryption (`security.ts`):**
-- AES-GCM-256 with unique IVs per message (IV reuse prevention)
+- AES-GCM-256 with a fresh random IV per message; the recent-IV set is checked **before** each encryption (redraw on collision, and refuse to encrypt rather than reuse an IV)
 - Nonce cache for replay attack prevention (5-minute window, 10K max)
 - Automatic key rotation (configurable interval, default: 1 hour)
 - Constant-time string comparison for security checks
@@ -316,6 +317,7 @@ The frontend `RateLimiter` prevents excessive sends.
 
 - 10-second timeout on WebSocket upgrade handshake prevents slow loris attacks
 - Connections that stall during HTTP upgrade are terminated before consuming server resources
+- At most 512 connections may sit in the pre-handshake state at once (`MAX_PENDING_HANDSHAKES`); further accepts are dropped before the upgrade, so a flood of half-open sockets can't exhaust tasks/file descriptors before the connection limit applies
 
 ### Connection Limits
 
@@ -346,7 +348,7 @@ Deny always takes precedence over allow. Patterns support `*` (match any charact
 
 **Security considerations:**
 
-- ACLs are enforced at subscribe time only. Call `set_topic_acl` before `subscribe_connection`.
+- ACLs are enforced at subscribe time **and on recovery replay**: `subscribe_with_recovery` filters replayed topics through the same ACL, fail-closed — an unauthorized topic is never replayed and its position is never probed (no existence/count leak). Call `set_topic_acl` before `subscribe_connection`.
 - ACLs are per-connection, not per-user. Different connections from the same user can have different ACLs.
 - Without ACLs, all topics are accessible (backward compatible).
 - Combine with JWT `sub` claim for user-level authorization: read the user's role from the JWT payload in your drain loop, then set appropriate ACLs.
@@ -378,6 +380,8 @@ Deny always takes precedence over allow. Patterns support `*` (match any charact
 - JSON parsing with serde_json (no eval, no injection)
 - User ID from JWT escaped via serde_json in server_ready
 - Binary frames parsed as msgpack or raw bytes (no code execution)
+- Inbound msgpack frames nested deeper than 64 levels (`MAX_MSGPACK_DEPTH`) are rejected before decoding, so a crafted deeply-nested payload can't stack-overflow the decoder
+- Callback mode bounds in-flight `on_message` callbacks at 256 per connection; excess inbound work is shed (counted in `rate_limited_total`) rather than spawning unbounded blocking tasks
 
 ## Circuit Breaker
 

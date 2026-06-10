@@ -1,5 +1,31 @@
 # Migration Guide
 
+## Migrating from v2.x to v2.4
+
+v2.4.0 has **no breaking API changes**. The wire and constructor surface are
+backward compatible; the changes below are opt-in or transparent.
+
+- **Per-message recovery stamp.** When `recovery_enabled=True`, every topic
+  broadcast now carries injected `tp`/`e`/`o` (topic, epoch, offset) fields. This
+  is wire-compatible — older clients simply ignore the extra fields. The bundled
+  Python and TypeScript clients use them automatically for idempotent dedup and
+  gap recovery.
+- **Client SDK behavior change (no API change).** Both clients no longer buffer or
+  reorder out-of-order messages by the global `seq` (which was never a per-topic
+  order). They now dedup idempotently by per-topic `(epoch, offset)` and trigger
+  automatic gap recovery — messages are never held back waiting for a sequence.
+  If you depended on the old reorder-buffer behavior, note that ordering is now
+  per-topic via the recovery stamp.
+- **Server hardening (no API change).** A pre-handshake connection cap (512)
+  guards against slowloris; callback-mode `on_message` dispatch is bounded (256
+  concurrent per connection, excess shed); recovery replay is fail-closed against
+  the connection's topic ACL. No configuration is required.
+- **TS client:** `WSE_VERSION` is now `'2.4.0'`; the NetworkMonitor reports real
+  latency/jitter (no longer a constant reading) and no longer exposes an app-layer
+  `packetLoss` field.
+
+---
+
 ## Migrating from v1.x to v2.0
 
 WSE v2.0 removes the FastAPI Router mode and Redis pub/sub in favor of a standalone Rust server with a native cluster protocol. This guide covers the breaking changes and migration steps.

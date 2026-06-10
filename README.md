@@ -81,6 +81,7 @@ High-performance WebSocket server built in Rust with native clustering, E2E encr
 | **Memory management** | Global budget (default 256 MB), TTL eviction, LRU eviction when over budget |
 | **Zero-copy storage** | Recovery entries share `Bytes` (Arc) with the broadcast path |
 | **Recovery on reconnect** | `subscribe_with_recovery()` replays missed messages automatically |
+| **Per-message stamp** | When recovery is enabled, every topic broadcast carries `tp`/`e`/`o` (topic, epoch, offset) so clients dedup idempotently and detect gaps from the messages themselves |
 
 ### Client SDKs (Python + TypeScript/React)
 
@@ -91,8 +92,8 @@ High-performance WebSocket server built in Rust with native clustering, E2E encr
 | **Circuit breaker** | CLOSED/OPEN/HALF_OPEN state machine, prevents connection storms |
 | **Rate limiting** | Client-side token bucket, coordinates with server feedback |
 | **E2E encryption** | Wire-compatible AES-GCM-256 + ECDH P-256 (both clients speak the same protocol) |
-| **Event sequencing** | Duplicate detection (sliding window) + out-of-order buffering |
-| **Network monitor** | Real-time latency, jitter, packet loss measurement, quality scoring |
+| **Event sequencing** | Duplicate detection (sliding window) + per-topic `(epoch, offset)` idempotent dedup with automatic gap recovery |
+| **Network monitor** | Real-time latency, jitter, and connection-quality scoring (Python client also estimates packet loss) |
 | **Priority queues** | 5 levels from CRITICAL to BACKGROUND |
 | **Offline queue** | IndexedDB persistence (TypeScript), replayed on reconnect |
 | **Compression** | Automatic zlib for messages above threshold |
@@ -105,8 +106,11 @@ High-performance WebSocket server built in Rust with native clustering, E2E encr
 |---------|---------|
 | **Origin validation** | Configure in reverse proxy (nginx/Caddy) to prevent CSWSH |
 | **Cookie auth** | `access_token` HTTP-only cookie with `Secure + SameSite=Lax` (OWASP recommended for browsers) |
-| **Frame protection** | 1 MB max frame size, serde_json parsing (no eval), escaped user IDs in server_ready |
+| **Frame protection** | 1 MB max frame size, serde_json parsing (no eval), escaped user IDs in server_ready; inbound msgpack rejected beyond 64 nesting levels |
 | **Cluster frame protection** | zstd decompression output capped at 1 MB (MAX_FRAME_SIZE), protocol version validation |
+| **Slowloris protection** | At most 512 concurrent pre-handshake connections; sockets that never complete the WS upgrade are bounded and dropped |
+| **Bounded callback dispatch** | Callback mode caps in-flight `on_message` callbacks at 256 per connection; excess inbound work is shed and counted as rate-limited |
+| **Fail-closed recovery ACL** | Recovery replay applies the connection's topic ACL — unauthorized topics are never replayed or position-probed |
 
 ---
 
@@ -321,7 +325,7 @@ result = server.subscribe_with_recovery(
 # {"topics": {"prices": {"epoch": "0000007b", "offset": 456, "recovered": True, "count": 12}}}
 ```
 
-The server maintains per-topic ring buffers (power-of-2 capacity, bitmask indexing). Clients store the `epoch` and `offset` from their last received message. On reconnect, the server replays missed messages from the ring buffer. If the gap is too large or the epoch has changed, the client receives a `NotRecovered` status and should re-subscribe from scratch.
+The server maintains per-topic ring buffers (power-of-2 capacity, bitmask indexing). When recovery is enabled, every topic broadcast is stamped with `tp`/`e`/`o` (topic, epoch, offset) fields, so clients track their per-topic position from the messages themselves, drop duplicates idempotently by `(epoch, offset)`, and automatically request recovery when they detect an offset gap. On reconnect, the server replays missed messages from the ring buffer. If the gap is too large or the epoch has changed, the client receives a `NotRecovered` status and should re-subscribe from scratch.
 
 Memory is managed with a global budget (default 256 MB), TTL eviction for idle buffers, and LRU eviction when over budget.
 
@@ -502,7 +506,7 @@ def handle(event):
 client.run_forever()
 ```
 
-Key features: 4 reconnect strategies (exponential, linear, fibonacci, adaptive), connection pool with health scoring and 3 load balancing strategies, circuit breaker, token bucket rate limiter, event sequencer with dedup and reorder buffering, network quality monitoring (latency/jitter/packet loss).
+Key features: 4 reconnect strategies (exponential, linear, fibonacci, adaptive), connection pool with health scoring and 3 load balancing strategies, circuit breaker, token bucket rate limiter, event sequencer with id dedup plus per-topic `(epoch, offset)` idempotent dedup and gap recovery, network quality monitoring (latency/jitter/packet loss).
 
 See [python-client/](python-client/) for full source and examples.
 
@@ -573,7 +577,7 @@ Working examples in the [`examples/`](examples/) directory:
 - [Rust Utilities](docs/RUST_UTILITIES.md) - priority queues, rate limiters, sequencing, compression, crypto, JWT
 - [Security](docs/SECURITY.md) - JWT, encryption, mTLS, rate limiting, circuit breaker
 - [Deployment](docs/DEPLOYMENT.md) - production setup, Docker, Kubernetes, cluster configuration
-- [Migration Guide](docs/MIGRATION.md) - upgrading from v1.x to v2.0
+- [Migration Guide](docs/MIGRATION.md) - upgrading from v1.x to v2.x
 - [Contributing](CONTRIBUTING.md) - development setup and coding standards
 - [Changelog](CHANGELOG.md) - version history
 

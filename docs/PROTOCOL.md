@@ -24,7 +24,7 @@ All WSE messages are JSON objects with the following structure:
 
 ### Field Order
 
-Fields are ordered for readability in DevTools: `c` first, `t` second, `v` last.
+Fields are ordered for readability in DevTools: `c` first, `t` second, `v` last. On recovery-stamped topic publications the `tp`/`e`/`o` fields precede `c`.
 
 ### Required Fields
 
@@ -34,7 +34,7 @@ Fields are ordered for readability in DevTools: `c` first, `t` second, `v` last.
 | `t` | `string` | Event type (e.g., `user_update`, `chat_message`) |
 | `id` | `string` | Unique message ID (UUID v7) |
 | `ts` | `string` | ISO 8601 timestamp with timezone |
-| `seq` | `int` | Monotonically increasing sequence number |
+| `seq` | `int` | Process-global monotonic counter (diagnostic only; NOT a per-topic order — use `tp`/`e`/`o` for ordering and dedup) |
 | `p` | `object` | Event payload (type-specific data) |
 | `v` | `int` | Protocol version (currently `1`) |
 
@@ -165,7 +165,9 @@ To opt in, connect with `?format=msgpack` query parameter:
 ws://host:port/wse?format=msgpack
 ```
 
-When enabled, all outbound messages from the server use msgpack instead of JSON. The msgpack payload contains the same fields (`c`, `t`, `p`, `id`, `ts`, `seq`, `v`) but encoded with MessagePack.
+When enabled, per-connection `send()` serializes that connection's messages with MessagePack instead of JSON (same fields: `c`, `t`, `p`, `id`, `ts`, `seq`, `v`). Topic broadcasts are delivered to every subscriber as pre-framed JSON binary frames regardless of per-connection format (the broadcast frame is built once and shared).
+
+Inbound msgpack frames nested deeper than 64 levels are rejected before decoding, so a crafted deeply-nested payload can't stack-overflow the decoder.
 
 Requires `@msgpack/msgpack` (JS) or `msgpack` (Python) on the client side.
 
@@ -311,6 +313,38 @@ Subscribe with optional presence data. The `presence` field attaches user metada
   "presence": {"status": "online", "name": "Alice"}
 },"v":1}
 ```
+
+### Recovery Request / Reply
+
+To resume an already-subscribed topic after a gap or reconnect, the client sends
+a `subscription_update` carrying `recover: true` and its last-seen position per
+topic:
+
+```json
+{"c":"WSE","t":"subscription_update","p":{
+  "action": "subscribe",
+  "topics": ["chat_messages"],
+  "recover": true,
+  "recovery": {"chat_messages": {"epoch": "0000abcd", "offset": 456}}
+},"v":1}
+```
+
+The server replies with a `subscription_update` that lists the resolved topics
+and, per topic, the server's current `(epoch, offset)` plus whether history was
+actually replayed:
+
+```json
+{"c":"WSE","t":"subscription_update","p":{
+  "success_topics": ["chat_messages"],
+  "failed_topics": [],
+  "recovery": {"chat_messages": {"epoch": "0000abce", "offset": 512, "recovered": true, "count": 12}}
+},"v":1}
+```
+
+When `recovered` is `false` (history was evicted, or the epoch changed on a
+server restart), the missed range cannot be replayed; the client re-baselines its
+dedup position **forward** to the returned `(epoch, offset)` so the next live
+message isn't mistaken for a gap. `recovered` defaults to `true` if omitted.
 
 ### Sync Request
 

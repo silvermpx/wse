@@ -138,7 +138,7 @@ while True:
 
 **Callback mode**:
 
-Python callbacks are invoked via `spawn_blocking` to run off tokio worker threads. The GIL is acquired per callback invocation. Simpler to use but higher overhead under load.
+Python callbacks are invoked via `spawn_blocking` to run off tokio worker threads. The GIL is acquired per callback invocation. Simpler to use but higher overhead under load. In-flight callbacks are bounded to 256 per connection (`MAX_INFLIGHT_CALLBACKS`); when saturated, inbound messages are shed and counted in `rate_limited_total`, so an inbound flood can't exhaust the tokio blocking pool.
 
 ### Event Types
 
@@ -248,7 +248,7 @@ Binary frame format - 8-byte header followed by topic and payload:
   1 byte   1 byte  2 bytes     4 bytes       var     var
 ```
 
-Twelve message types:
+Thirteen message types:
 
 | Type (u8) | Name           | Purpose                                  |
 |-----------|----------------|------------------------------------------|
@@ -264,6 +264,7 @@ Twelve message types:
 | 0x0A      | PeerList       | Gossip: share known peer list            |
 | 0x0B      | PresenceUpdate | Presence join/leave/update for one user  |
 | 0x0C      | PresenceFull   | Full presence state sync on peer connect |
+| 0x0D      | Drain          | Lame-duck: peer draining, stop routing new messages |
 
 ### Handshake
 
@@ -397,22 +398,24 @@ Three outcomes:
 - **TTL eviction**: buffers with no writes for 300 seconds (default) are removed.
 - **LRU eviction**: if still over budget after TTL cleanup, oldest-written buffers are evicted first.
 - A background cleanup task runs periodically to enforce these limits.
-- Recovery entries store `Bytes` (Arc-shared with the broadcast path) - zero-copy between broadcast and recovery storage.
+- Recovery entries store the **unframed** stamped payload (`Bytes`). The WebSocket wire frame is a separate buffer built per fan-out, and replay frames — or encrypts then frames — the stored payload per connection, so the same buffer can be delivered to plaintext and E2E-encrypted connections alike.
 
 ### Configuration
 
-| Parameter              | Default   | Description                           |
-|------------------------|-----------|---------------------------------------|
-| buffer_size_bits       | 7         | Ring capacity = 2^7 = 128 messages    |
-| history_ttl_secs       | 300       | Idle buffer eviction (seconds)        |
-| max_recovery_messages  | 500       | Max messages returned per recovery    |
-| global_memory_budget   | 256 MB    | Total memory across all topic buffers |
+These are the `RustWSEServer` constructor parameters (internally, `recovery_buffer_size` is clamped to a minimum of 16 and rounded up to a power of two):
 
-### Cluster Limitation
+| Parameter               | Default       | Description                                  |
+|-------------------------|---------------|----------------------------------------------|
+| recovery_buffer_size    | 128           | Ring capacity in messages (min 16, → 2^n)    |
+| recovery_ttl            | 300           | Idle buffer eviction (seconds)               |
+| recovery_max_messages   | 500           | Max messages returned per recovery           |
+| recovery_memory_budget  | 256 MB        | Total memory across all topic buffers        |
 
-Message recovery is **local to each node**. Recovery ring buffers are not replicated across cluster peers. If a client reconnects to a different node than the one it was originally connected to, recovery will return `NoHistory` because that node has no record of the client's previous position.
+### Cluster Recovery
 
-For cluster deployments, use **sticky sessions** (e.g., HAProxy with `stick-table`, or consistent hashing by user ID) to ensure clients reconnect to the same node. Alternatively, accept that recovery works only for same-node reconnections and handle `NoHistory` by re-subscribing from scratch.
+Recovery works across nodes for any topic the new node has interest in. Inter-node MSG frames carry a 12-byte recovery trailer with the origin `(epoch, offset)` (see [Cluster Protocol](CLUSTER_PROTOCOL.md#msg-0x01---application-message)); the receiving node stores those payloads in **foreign recovery buffers** keyed by `(topic, origin_epoch)`. So a client that reconnects to a *different* node can still recover with its original `(epoch, offset)` — provided that node had local subscribers for the topic (and therefore received its MSG frames under interest routing).
+
+If the new node never had interest in the topic, it has no buffer for it and recovery returns `NoHistory`; the client re-subscribes from scratch. **Sticky sessions** (e.g., HAProxy `stick-table`, or consistent hashing by user ID) are therefore an optimization that *guarantees* recovery, no longer a requirement for it to work at all.
 
 ---
 
@@ -459,9 +462,9 @@ A background task runs every 30 seconds calling `sweep_dead_connections()`. This
 In cluster mode, presence state is synchronized between nodes using two frame types:
 
 - **PresenceUpdate (0x0B)**: sent on every join, leave, or data update. Contains the topic, user ID, action byte (0=join, 1=leave, 2=update), timestamp, and presence data JSON. Peers apply the update using CRDT-style last-write-wins conflict resolution based on the `updated_at` timestamp.
-- **PresenceFull (0x0C)**: sent when a new peer connects. Contains the full presence state as JSON, keyed by topic and user ID. The receiver merges this state, creating entries for remote users with sentinel connection IDs (`__remote__<user_id>`).
+- **PresenceFull (0x0C)**: sent (possibly split across several chunked frames) when a new peer connects. Contains the full presence state as JSON, keyed by topic and user ID. The receiver merges this state, creating **per-origin** sentinel connection IDs (`__remote__<origin>\x1F<user_id>`, one per origin+user).
 
-Remote-only entries (users connected to other nodes) are included in `presence()` query results but are distinguished internally. When a remote leave is received, only entries with no local connections are removed, preventing a remote leave from clearing a user who is also connected locally.
+Remote-only entries (users connected to other nodes) are included in `presence()` query results but are distinguished internally. A remote leave removes only the leaving peer's sentinel (gated by an `updated_at` last-write-wins check), and a peer disconnect purges only that origin's sentinels — so one peer's leave or death can't clear a user still present via another peer or locally.
 
 The `CAP_PRESENCE` capability flag (bit 2) in the HELLO handshake controls whether presence sync is active between two peers. Both nodes must advertise this capability for presence frames to be exchanged.
 
@@ -547,7 +550,7 @@ ts-client/
 |   +-- NetworkMonitor.ts          Online/offline detection
 |   +-- RateLimiter.ts             Client-side rate limiting
 |   +-- OfflineQueue.ts            IndexedDB persistence for offline messages
-|   +-- EventSequencer.ts          Sequence gap detection
+|   +-- EventSequencer.ts          Per-topic (epoch, offset) dedup + gap detection
 |   +-- AdaptiveQualityManager.ts  Dynamic quality adjustment
 +-- protocols/
 |   +-- compression.ts             zlib decompression (pako)
@@ -622,7 +625,7 @@ WebSocket.onmessage
   -> Binary: check C:/E:/M: prefix -> decompress/decrypt/unpack
   -> Text: strip WSE/S/U prefix -> JSON.parse
   -> Deduplication check (message ID)
-  -> Sequence check (gap detection)
+  -> Recovery-stamp check: per-topic (epoch, offset) dedup + gap detection
   -> Handler registry lookup by event type
   -> Domain handler (custom handlers per event type)
   -> window.dispatchEvent(new CustomEvent(eventType, { detail: payload }))
@@ -645,7 +648,7 @@ python-client/wse_client/
 +-- security.py            ECDH P-256, AES-GCM-256, HMAC-SHA256
 +-- circuit_breaker.py     CLOSED/OPEN/HALF_OPEN state machine
 +-- rate_limiter.py        Token bucket
-+-- event_sequencer.py     Dedup + out-of-order buffering
++-- event_sequencer.py     Id dedup + per-topic (epoch, offset) gap detection
 +-- connection_pool.py     Multi-endpoint, health scoring, 3 LB strategies
 +-- network_monitor.py     Latency/jitter/quality analysis
 +-- types.py               Enums, dataclasses (WSEEvent, ConnectionState)
@@ -671,7 +674,7 @@ WebSocket.recv()
   -> Binary: check C:/E:/M: prefix -> decompress/decrypt/unpack
   -> Text: strip WSE/S/U prefix -> json.loads
   -> Deduplication check (event ID, 10K window)
-  -> Sequence check (gap detection, reorder buffer)
+  -> Recovery-stamp check: per-topic (epoch, offset) dedup + gap detection
   -> System handler dispatch (server_ready, error, PONG, etc.)
   -> User handler callbacks (@client.on("type"))
   -> Async iterator queue (async for event in client)

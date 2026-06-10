@@ -379,6 +379,8 @@ Memory usage depends on message sizes, presence data, and recovery buffer config
 
 Set `max_subscriptions_per_connection` to limit how many topics each connection can subscribe to (default 0 = unlimited). This prevents a single client from creating millions of unique topics and exhausting server memory. Both regular subscriptions and queue group memberships count against the same budget.
 
+Separately from `max_connections` (which counts only registered connections — those past the WebSocket upgrade and JWT), the server caps concurrent **pre-handshake** connections at 512 (slowloris protection, not configurable). TCP connects beyond this are dropped before the upgrade, so a flood of half-open sockets can't exhaust tasks/file descriptors ahead of the connection limit.
+
 ---
 
 ## Monitoring

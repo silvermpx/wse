@@ -12,14 +12,16 @@ WSE uses a custom binary protocol for communication between cluster nodes. All i
 
 If the HELLO handshake fails - wrong magic bytes, unsupported version, or malformed payload - the connection is closed immediately and the initiator retries with exponential backoff.
 
+**Duplicate-link tiebreaker.** When two nodes dial each other at the same time, both links complete and a deterministic rule keeps exactly one: the surviving link is the one whose **dialer** has the lexicographically lower `instance_id`. The node with the higher id drops its own outbound dial and keeps the inbound link; the other side does the reverse. This avoids flapping and guarantees a single link per pair without coordination.
+
 ## Frame Format
 
 All frames share a common 8-byte header:
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
-| 0 | 1 | type | Message type (0x01 - 0x0C) |
-| 1 | 1 | flags | Bit 0: compressed (zstd), bits 1-7: reserved |
+| 0 | 1 | type | Message type (0x01 - 0x0D) |
+| 1 | 1 | flags | Bit 0: compressed (zstd); bit 1: has recovery trailer; bits 2-7: reserved |
 | 2 | 2 | topic_len | Topic field length (little-endian u16) |
 | 4 | 4 | payload_len | Payload field length (little-endian u32) |
 | 8 | N | topic | Topic string (UTF-8, N = topic_len) |
@@ -42,6 +44,8 @@ Carries a topic-addressed message from one node to subscribers on another.
 If FLAG_COMPRESSED (0x01) is set in the flags byte, the payload is zstd-compressed. The receiver decompresses before dispatching to local subscribers.
 
 The payload contains pre-framed WebSocket data. This means the sending node has already formatted the message for WebSocket delivery, so the receiving node can forward it directly to connected clients without re-serialization.
+
+If FLAG_HAS_RECOVERY (0x02) is set, a 12-byte **recovery trailer** is appended *after* the payload (and is **not** counted in `payload_len`): a little-endian `u32` origin epoch followed by a little-endian `u64` origin offset. The receiving node stores the payload in a foreign recovery buffer keyed by `(topic, origin_epoch)`, so a client that reconnects to a different node can still recover with its original `(epoch, offset)` — provided that node had interest in (and therefore received) the topic's messages.
 
 ### PING (0x02) / PONG (0x03) - Heartbeat
 
@@ -111,6 +115,8 @@ Sent when the last local client on a node unsubscribes from a topic. The receivi
 
 Sent after a peer reconnects to re-establish the full interest table. The receiver replaces any stale interest state for the sender with the topics in this message. This prevents interest drift caused by missed SUB/UNSUB messages during disconnection.
 
+RESYNC is also re-sent periodically on every peer link — every 60 seconds (`CLUSTER_RESYNC_INTERVAL_SECS`) — as a drift safety-net, so a lost SUB/UNSUB on a live link is self-healing and not only corrected on reconnect.
+
 ### PeerAnnounce (0x09) - Address Gossip
 
 ```
@@ -170,7 +176,18 @@ Sent when a new peer connects and completes the HELLO handshake. The payload is 
 }
 ```
 
-The receiver merges this state into its own presence tables, creating entries for remote users. Only entries with local connections (not re-synced remote entries) are included in the outgoing full sync to prevent infinite amplification.
+The receiver merges this state into its own presence tables, creating **per-origin** sentinel entries (`__remote__<origin>\x1F<user_id>`, one per origin+user) for remote users, so one peer's leave or disconnect can't erase a user still present via another peer. A large state may be split across multiple PresenceFull frames (chunked under the frame-size budget) and merged additively. Only entries with local connections (not re-synced remote entries) are included in the outgoing full sync to prevent infinite amplification.
+
+### DRAIN (0x0D) - Lame Duck
+
+```
+[header: type=0x0D, all other fields zero]
+```
+
+Sent when a node begins graceful drain. On receipt, a peer clears the draining
+node's interest entries so it stops routing **new** messages there, but keeps the
+TCP connection open so in-flight delivery can finish (lame-duck). See
+[Drain Notification](#drain-notification).
 
 ## Interest-Based Routing
 
@@ -233,7 +250,7 @@ Gossip is lightweight - PeerAnnounce and PeerList are only exchanged during join
 | Graceful shutdown | SHUTDOWN frame sent to all peers, then immediate cancel |
 | Dead letter queue | 1,000 entries, FIFO eviction |
 | Write batching | 64 KB batch limit per flush |
-| Backpressure | Bounded per-peer channel (10,000 capacity), messages dropped on overflow |
+| Backpressure | Bounded per-peer outbound channel (10,000 capacity), messages dropped on overflow. The inbound MSG dispatch queue per peer is likewise bounded (10,000); overflow is shed (counted in `messages_dropped`) so the reader stays responsive to heartbeats, and shed messages remain recoverable via recovery buffers |
 
 ### Circuit Breaker
 
@@ -277,10 +294,10 @@ Use `cluster_info()` for monitoring dashboards, verifying that gossip discovery 
 
 ## Drain Notification
 
-When a node initiates graceful drain via `drain()`, it sends a `ClusterCommand::Drain` notification to all connected peers before closing client connections. This allows peers to:
+When a node initiates graceful drain via `drain()`, the internal `ClusterCommand::Drain` is sent on the wire as a **DRAIN frame (0x0D)** to all connected peers before closing client connections. On receipt, each peer:
 
-1. Remove the draining node from their routing tables
-2. Stop forwarding new messages to the draining node
-3. Redirect interest-routed traffic to remaining nodes
+1. Clears the draining node's interest entries so it stops routing **new** messages to it
+2. Keeps the TCP connection open so any in-flight delivery can finish (lame-duck)
+3. Redirects interest-routed traffic to remaining nodes
 
-The drain notification is a best-effort signal. If the draining node loses connectivity before the notification is delivered, peers detect the failure through the standard heartbeat timeout (15s) and remove the node automatically.
+The drain notification is a best-effort signal. If the draining node loses connectivity before the DRAIN frame is delivered, peers detect the failure through the standard heartbeat timeout (15s) and remove the node automatically.

@@ -12,10 +12,12 @@
 - **CRITICAL:** fail-closed topic ACL on the recovery path -- `subscribe_with_recovery` filters topics through the connection ACL before replaying history or probing positions (was cross-tenant leakable).
 - msgpack inbound: reject frames deeper than 64 nesting levels before decoding (rmpv recursion could stack-overflow the process).
 - Zeroize derived AES keys and the serialized ECDH scalar.
+- TS client: the AES-GCM IV-reuse guard now checks the recent-IV set *before* encrypting (was write-only -- it recorded IVs but never consulted them, so it could not have prevented reuse). On collision it redraws, and refuses to encrypt rather than reuse an IV.
 
 ### Reliability
 
 - **CRITICAL:** bounded the inbound cluster MSG dispatch queue (was unbounded -> remote-triggerable OOM); excess sheds with a metric.
+- Bounded callback-mode inbound `on_message` dispatch (256 concurrent blocking tasks); excess inbound work sheds with the rate-limit metric instead of spawning unbounded `spawn_blocking` tasks. An inbound flood can no longer exhaust the tokio blocking pool or contend the GIL and starve other connections.
 - Deterministic duplicate-connection tiebreaker (`cluster_link_survives`): exactly one link per pair, no flapping; self-connections rejected.
 - Presence: per-origin sentinels + last-write-wins leave + ghost cleanup on peer disconnect + chunked full-state sync.
 - Sequencer: per-topic ordering cursor is retired on idle TTL, not on an empty reorder buffer (was causing false gaps/resets).
@@ -26,6 +28,7 @@
 - Python + TS: idempotent (epoch, offset) dedup + gap-triggered recovery; per-topic positions survive reconnects.
 - Python: fixed idle-timeout reconnect cancelling itself into a zombie; circuit-breaker-open now wakes the async iterator; server_hello limits read from `p["limits"]`; dropped the unsound global-seq reordering.
 - TS: fixed E2E encryption deadlocking the handshake (encrypt only after ECDH); reconnect lockout after 10 successful reconnects; cookie-auth reconnect after an auth failure.
+- TS: NetworkMonitor now reports real network quality -- latency/jitter/quality are fed from live PONG round-trip times (was unfed, so it always reported a constant "excellent"); reports UNKNOWN when no samples exist and drops the app-layer packet-loss metric (not meaningful over a pub/sub WebSocket). Removed the dead per-connection metrics map from ConnectionPool.
 
 ### Documentation
 

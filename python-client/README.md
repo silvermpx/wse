@@ -83,6 +83,9 @@ client.run_forever()
 | `reconnect` | ReconnectConfig | default config | Reconnection strategy |
 | `extra_headers` | dict[str, str] | None | Additional HTTP headers for the handshake |
 | `queue_size` | int | 1000 | Max events buffered for the async iterator |
+| `encryption` | bool | False | Enable E2E encryption (ECDH P-256 + AES-GCM-256; requires the `[crypto]` extra) |
+| `endpoints` | list[str] | None | Additional endpoints for the built-in connection pool / failover |
+| `load_balancing` | LoadBalancingStrategy | WEIGHTED_RANDOM | Endpoint selection strategy when `endpoints` is set |
 
 The `connect(url, **kwargs)` factory returns an `AsyncWSEClient` configured as an async context manager.
 
@@ -209,7 +212,7 @@ ECDH P-256 key exchange with AES-GCM-256 encryption. Requires the `cryptography`
 pip install wse-client[crypto]
 ```
 
-Key exchange happens automatically during the WebSocket handshake. All messages are encrypted with per-connection session keys derived via HKDF-SHA256. Wire format is the `E:` prefix + 12-byte IV + ciphertext + 16-byte auth tag, compatible with the TS client and Rust server.
+Enable it with `AsyncWSEClient(url, encryption=True)` (it is off by default). Key exchange then happens automatically during the WebSocket handshake. All messages are encrypted with per-connection session keys derived via HKDF-SHA256. Wire format is the `E:` prefix + 12-byte IV + ciphertext + 16-byte auth tag, compatible with the TS client and Rust server.
 
 ### Circuit Breaker
 
@@ -238,10 +241,10 @@ Real-time network quality assessment based on PING/PONG round-trip measurements:
 
 ```python
 stats = client.get_stats()
-print(stats["network"]["quality"])       # EXCELLENT / GOOD / FAIR / POOR
+print(stats["network"]["quality"])       # EXCELLENT / GOOD / FAIR / POOR (UNKNOWN until enough samples)
 print(stats["network"]["latency_ms"])    # Average round-trip time
 print(stats["network"]["jitter_ms"])     # Latency variance
-print(stats["network"]["packet_loss"])   # Estimated packet loss ratio
+print(stats["network"]["packet_loss"])   # Estimated packet loss (%)
 ```
 
 ### Connection Pool
