@@ -15,7 +15,8 @@ export class SecurityError extends Error {
     message: string,
     public readonly code: 'ENCRYPTION_FAILED' | 'DECRYPTION_FAILED' |
            'SIGNING_FAILED' | 'VERIFICATION_FAILED' | 'KEY_GENERATION_FAILED' |
-           'KEY_EXCHANGE_FAILED' | 'REPLAY_ATTACK' | 'NEGOTIATION_FAILED',
+           'KEY_EXCHANGE_FAILED' | 'REPLAY_ATTACK' | 'NEGOTIATION_FAILED' |
+           'IV_REUSE',
     public readonly details?: any
   ) {
     super(message);
@@ -231,10 +232,23 @@ export class SecurityManager {
       const encoder = new TextEncoder();
       const encoded = encoder.encode(data);
 
-      const iv = crypto.getRandomValues(new Uint8Array(12));
-      const ivHex = Array.from(iv).map(b => b.toString(16).padStart(2, '0')).join('');
+      // Draw a 96-bit IV and guard against reuse under the same key. IV reuse
+      // is catastrophic for AES-GCM (it leaks the GHASH auth key), so we CHECK
+      // the recent-IV set before using one rather than only recording it. With
+      // a CSPRNG the redraw effectively never fires (birthday bound ~2^48), but
+      // consulting the set is what makes the guard real instead of write-only.
+      let iv = crypto.getRandomValues(new Uint8Array(12));
+      let ivHex = Array.from(iv).map(b => b.toString(16).padStart(2, '0')).join('');
+      for (let attempt = 0; this.usedIVs.has(ivHex) && attempt < 8; attempt++) {
+        iv = crypto.getRandomValues(new Uint8Array(12));
+        ivHex = Array.from(iv).map(b => b.toString(16).padStart(2, '0')).join('');
+      }
+      if (this.usedIVs.has(ivHex)) {
+        // Could not obtain a fresh IV — refuse to encrypt rather than reuse one.
+        throw new SecurityError('Unable to generate a unique IV', 'IV_REUSE');
+      }
 
-      // Track used IVs; evict oldest when cache is full
+      // Record it; evict oldest when the window is full.
       this.usedIVs.add(ivHex);
       if (this.usedIVs.size > 10000) {
         const first = this.usedIVs.values().next().value;
