@@ -18,16 +18,6 @@ interface EndpointHealth {
   lastChecked: number;
 }
 
-interface ConnectionMetrics {
-  endpoint: string;
-  connectedAt: number;
-  messagesReceived: number;
-  messagesSent: number;
-  bytesReceived: number;
-  bytesSent: number;
-  lastActivity: number;
-}
-
 export interface ConnectionPoolConfig {
   maxPerEndpoint?: number;
   healthCheckInterval?: number;
@@ -43,7 +33,6 @@ export interface ConnectionPoolConfig {
 export class ConnectionPool {
   private endpoints: Map<string, EndpointHealth> = new Map();
   private connections: Map<string, WebSocket[]> = new Map();
-  private connectionMetrics: Map<string, ConnectionMetrics> = new Map();
   private healthScores: Map<string, number> = new Map();
   private activeEndpoint: string | null = null;
   private preferredEndpoint: string | null = null;
@@ -304,7 +293,6 @@ export class ConnectionPool {
       });
     });
     this.connections.clear();
-    this.connectionMetrics.clear();
     this.activeEndpoint = null;
   }
 
