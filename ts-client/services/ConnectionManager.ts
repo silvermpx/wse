@@ -303,6 +303,12 @@ export class ConnectionManager {
 
       this.reconnectAttempts = 0;
       this.consecutiveFailures = 0;
+      // Reset the store reconnect counter on success. It gates canReconnect(),
+      // so it must count CONSECUTIVE FAILURES, not lifetime reconnects -- it used
+      // to be incremented on every successful reconnect and never reset, locking
+      // out a long-lived flaky-network session after maxReconnectAttempts (10)
+      // successful reconnects.
+      store.updateMetrics({ reconnectCount: 0 });
 
       this.startHeartbeat();
 
@@ -313,6 +319,7 @@ export class ConnectionManager {
       logger.error('[ConnectionManager] Connection failed:', errorMessage);
 
       this.consecutiveFailures++;
+      store.incrementMetric('reconnectCount'); // consecutive failures (gates canReconnect)
       this.connectionPool.recordFailure(endpoint);
       this.connectionCircuitBreaker.recordFailure();
 
@@ -322,7 +329,13 @@ export class ConnectionManager {
       }
 
       if (errorMessage.includes('Authentication failed')) {
-        this.token = null;
+        // For cookie auth the credential is the HTTP-only cookie (token is just
+        // the 'cookie' sentinel). Nulling it would make every later reconnect
+        // throw 'No token available' even after the cookie is refreshed
+        // server-side, so keep the sentinel; only clear a real bearer token.
+        if (!this.usesCookieAuth) {
+          this.token = null;
+        }
         store.setLastError('Authentication failed', 401);
         store.incrementMetric('authFailures');
 
@@ -522,7 +535,8 @@ export class ConnectionManager {
       }
 
       await this.connectToEndpoint(endpoint, store.activeTopics);
-      store.incrementMetric('reconnectCount');
+      // (reconnectCount is reset on connect success and incremented on failure,
+      // so it tracks consecutive failures -- do not increment it here.)
 
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -907,7 +921,12 @@ export class ConnectionManager {
         store.setLastError('Authentication failed', event.code);
         store.incrementMetric('authFailures');
 
-        this.token = null;
+        // Keep the 'cookie' sentinel for cookie auth (only clear a real bearer
+        // token) so the post-refresh reconnect below does not throw
+        // 'No token available'.
+        if (!this.usesCookieAuth) {
+          this.token = null;
+        }
 
         window.dispatchEvent(new CustomEvent('wseAuthFailed', {
           detail: {
