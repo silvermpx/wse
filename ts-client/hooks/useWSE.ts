@@ -622,8 +622,11 @@ export function useWSE(
         }
       }
 
-      // Age filtering
-      if (parsed && parsed.ts) {
+      // Age filtering -- skipped for recovery-stamped messages (tp/e/o). A
+      // replayed message intentionally keeps its original (old) ts, so age-
+      // filtering it would silently break recovery; dedup and ordering for
+      // stamped messages is handled downstream by (epoch, offset).
+      if (parsed && parsed.ts && !(parsed.tp && parsed.e)) {
         const eventTime = new Date(parsed.ts).getTime();
         const now = Date.now();
         const age = now - eventTime;
@@ -847,6 +850,37 @@ export function useWSE(
       window.removeEventListener('subscriptionUpdate', handleSubscriptionUpdate as EventListener);
     };
   }, []);
+
+  // Recover the missed range when MessageProcessor reports a per-topic offset
+  // gap (offset jumped ahead). Re-request the topic with recover=true from the
+  // last in-order position; the server replays last+1..head, which arrives in
+  // order and advances the position past the gap.
+  useEffect(() => {
+    const handleRecoveryGap = (event: CustomEvent) => {
+      const topic = event.detail?.topic;
+      if (!topic) return;
+      const subs = useWSEStore.getState().subscriptions;
+      if (!subs.serverRecoveryEnabled) return;
+      const pos = subs.recoveryState[topic];
+      if (!pos) return;
+      sendMessage(
+        'subscription_update',
+        {
+          action: 'subscribe',
+          topics: [topic],
+          recover: true,
+          recovery: { [topic]: { epoch: pos.epoch, offset: pos.offset } },
+        },
+        { priority: MessagePriority.HIGH },
+      );
+      logger.info(`Recovery requested after gap on topic: ${topic}`);
+    };
+
+    window.addEventListener('wseRecoveryGap', handleRecoveryGap as EventListener);
+    return () => {
+      window.removeEventListener('wseRecoveryGap', handleRecoveryGap as EventListener);
+    };
+  }, [sendMessage]);
 
   // Handle snapshot request events
   useEffect(() => {

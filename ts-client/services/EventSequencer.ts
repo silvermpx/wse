@@ -9,6 +9,10 @@ export class EventSequencer {
   private seenIds: Map<string, number>;
   private expectedSequence = 0;
   private outOfOrderBuffer: Map<number, any>;
+  // Per-topic last-seen recovery position. AUTHORITATIVE dedup/ordering for
+  // stamped messages; survives reconnects within an epoch (the server's global
+  // `seq` is not a per-topic order, so seq-based reordering is unsound).
+  private topicPositions = new Map<string, { epoch: string; offset: number }>();
   private readonly windowSize: number;
   private readonly maxOutOfOrder: number;
   private cleanupInterval: NodeJS.Timeout | null = null;
@@ -82,6 +86,40 @@ export class EventSequencer {
     if (removed > 0) {
       logger.debug(`Cleaned up ${removed} old event IDs`);
     }
+  }
+
+  /**
+   * Idempotent dedup + gap detection by per-topic (epoch, offset). Mirrors the
+   * Python client's check_topic_stamp.
+   *   'duplicate' -- already delivered (offset <= last on same epoch); drop.
+   *   'gap'       -- offset jumped ahead; deliver but recover the missed range
+   *                  (this does NOT advance the position, so recovery from
+   *                  `last` replays last+1..head in order without re-dedup).
+   *   'deliver'   -- next in order, or first message on a new/changed epoch.
+   */
+  checkTopicStamp(topic: string, epoch: string, offset: number): 'duplicate' | 'gap' | 'deliver' {
+    const prev = this.topicPositions.get(topic);
+    if (!prev || prev.epoch !== epoch) {
+      this.topicPositions.set(topic, { epoch, offset });
+      return 'deliver';
+    }
+    const last = prev.offset;
+    if (offset <= last) {
+      return 'duplicate';
+    }
+    if (offset === last + 1) {
+      this.topicPositions.set(topic, { epoch, offset });
+      return 'deliver';
+    }
+    return 'gap';
+  }
+
+  getTopicPosition(topic: string): { epoch: string; offset: number } | undefined {
+    return this.topicPositions.get(topic);
+  }
+
+  setTopicPosition(topic: string, epoch: string, offset: number): void {
+    this.topicPositions.set(topic, { epoch, offset });
   }
 
   recordSequence(sequence: number): void {
@@ -179,6 +217,7 @@ export class EventSequencer {
 
     this.seenIds.clear();
     this.outOfOrderBuffer.clear();
+    this.topicPositions.clear();
     this.sequence = 0;
     this.expectedSequence = 0;
     this.cleanupCounter = 0;
@@ -187,10 +226,13 @@ export class EventSequencer {
   }
 
   reset(): void {
+    // Full reset for a NEW session (not a transient reconnect, which must keep
+    // topic positions so (epoch, offset) dedup spans the reconnect).
     this.sequence = 0;
     this.expectedSequence = 0;
     this.seenIds.clear();
     this.outOfOrderBuffer.clear();
+    this.topicPositions.clear();
     this.cleanupCounter = 0;
 
     logger.debug('EventSequencer reset');

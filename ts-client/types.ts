@@ -181,6 +181,11 @@ export interface WSMessage {
   wse_processing_ms?: number;
   trace_id?: string;
   c?: 'WSE' | 'S' | 'U';
+  // Recovery stamp on topic publications: topic / epoch (8-hex) / offset.
+  // Drives idempotent dedup, gap detection, and recovery from last-seen.
+  tp?: string;
+  e?: string;
+  o?: number;
 }
 
 export interface QueuedMessage {

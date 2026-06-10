@@ -235,13 +235,34 @@ export class MessageProcessor {
       // Log performance metrics for observability
       this.logPerformanceMetrics(message);
 
-      // Check for duplicate
-      if (message.id && this.sequencer.isDuplicate(message.id)) {
+      // Idempotency: stamped topic messages (tp/e/o) are deduped and gap-detected
+      // by per-topic (epoch, offset) -- authoritative and reconnect-safe. The
+      // global `seq` is NOT a per-topic order, so it must not drive dedup here.
+      // Unstamped messages fall back to id-based dedup.
+      if (message.tp && message.e && message.o !== undefined) {
+        const verdict = this.sequencer.checkTopicStamp(message.tp, message.e, message.o);
+        if (verdict === 'duplicate') {
+          logger.debug(`Duplicate (offset) ignored: ${message.tp}#${message.o}`);
+          return;
+        }
+        if (verdict === 'gap') {
+          // Drop this out-of-order copy and recover the whole missed range from
+          // the last in-order position; the recovery replay re-delivers it in
+          // order. useWSE listens for wseRecoveryGap and re-subscribes with
+          // recover=true from the stored position.
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('wseRecoveryGap', { detail: { topic: message.tp } }));
+          }
+          return;
+        }
+        // In order (or new/changed epoch): persist the advanced position.
+        store.updateRecoveryState({ [message.tp]: { epoch: message.e, offset: message.o } });
+      } else if (message.id && this.sequencer.isDuplicate(message.id)) {
         logger.debug(`Duplicate message ignored: ${message.id}`);
         return;
       }
 
-      // Record sequence if present
+      // Record sequence if present (diagnostic only -- not used for ordering)
       if (message.seq !== undefined) {
         this.sequencer.recordSequence(message.seq);
       }
