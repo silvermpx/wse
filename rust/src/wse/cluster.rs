@@ -264,6 +264,8 @@ pub(crate) enum PeerRegistration {
 /// Presence frames received from a peer, forwarded to cluster_manager for processing.
 pub(crate) enum PresencePeerFrame {
     Update {
+        /// Reporting peer's address -- keys the per-origin presence sentinel.
+        origin: String,
         topic: String,
         user_id: String,
         action: u8,
@@ -271,6 +273,8 @@ pub(crate) enum PresencePeerFrame {
         updated_at: u64,
     },
     Full {
+        /// Reporting peer's address -- keys the per-origin presence sentinels.
+        origin: String,
         entries: String,
     },
 }
@@ -1213,6 +1217,7 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
             }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
                 let _ = ctx.presence_tx.send(PresencePeerFrame::Update {
+                    origin: peer_addr.clone(),
                     topic,
                     user_id,
                     action,
@@ -1222,7 +1227,10 @@ async fn peer_reader<R: AsyncReadExt + Unpin>(
             }
             Some(ClusterFrame::PresenceFull { entries }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
-                let _ = ctx.presence_tx.send(PresencePeerFrame::Full { entries });
+                let _ = ctx.presence_tx.send(PresencePeerFrame::Full {
+                    origin: peer_addr.clone(),
+                    entries,
+                });
             }
             None => {
                 tracing::error!("[WSE-Cluster] Failed to decode frame, disconnecting");
@@ -2312,7 +2320,15 @@ pub(crate) async fn cluster_manager(
                     Some(InterestUpdate::PeerDisconnected { peer_addr, generation }) => {
                         // Only process disconnect if generation matches current session.
                         // Prevents a stale disconnect from clearing a newer session's interest.
-                        if peer_generation.get(&peer_addr).is_none_or(|g| *g == generation) {
+                        let stale = peer_generation
+                            .get(&peer_addr)
+                            .is_some_and(|g| *g != generation);
+                        if !stale {
+                            // Purge this peer's presence sentinels so a crashed peer
+                            // (no per-user leave) leaves no ghost members behind.
+                            if let Some(ref pm) = presence {
+                                pm.purge_origin(&peer_addr);
+                            }
                             remote_interest.remove(&peer_addr);
                             peer_generation.remove(&peer_addr);
                             if !static_peers.contains(&peer_addr) {
@@ -2355,12 +2371,12 @@ pub(crate) async fn cluster_manager(
             Some(pf) = presence_peer_rx.recv() => {
                 if let Some(ref pm) = presence {
                     match pf {
-                        PresencePeerFrame::Update { topic, user_id, action, data, updated_at } => {
+                        PresencePeerFrame::Update { origin, topic, user_id, action, data, updated_at } => {
                             let data_val: serde_json::Value = serde_json::from_str(&data).unwrap_or(serde_json::Value::Null);
                             match action {
                                 0 => {
                                     // Remote join: merge into local presence
-                                    pm.merge_remote_join(&topic, &user_id, &data_val, updated_at);
+                                    pm.merge_remote_join(&topic, &user_id, &data_val, updated_at, &origin);
                                     if let Some(ref tx) = server_cmd_tx {
                                         let msg = super::server::format_presence_msg("presence_join", &user_id, &data_val);
                                         let _ = tx.send(super::server::ServerCommand::BroadcastLocal {
@@ -2372,7 +2388,7 @@ pub(crate) async fn cluster_manager(
                                 }
                                 1 => {
                                     // Remote leave
-                                    pm.merge_remote_leave(&topic, &user_id);
+                                    pm.merge_remote_leave(&topic, &user_id, updated_at, &origin);
                                     if let Some(ref tx) = server_cmd_tx {
                                         let msg = super::server::format_presence_msg("presence_leave", &user_id, &data_val);
                                         let _ = tx.send(super::server::ServerCommand::BroadcastLocal {
@@ -2397,8 +2413,8 @@ pub(crate) async fn cluster_manager(
                                 _ => {} // Ignore unknown actions
                             }
                         }
-                        PresencePeerFrame::Full { entries } => {
-                            pm.merge_full_state(&entries);
+                        PresencePeerFrame::Full { origin, entries } => {
+                            pm.merge_full_state(&entries, &origin);
                         }
                     }
                 }
