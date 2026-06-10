@@ -19,7 +19,6 @@ use tokio_util::sync::CancellationToken;
 
 use super::reliability::{CircuitBreaker, ExponentialBackoff};
 use super::server::ConnectionHandle;
-use super::server::FanoutMetrics;
 
 /// Wall-clock time in milliseconds since UNIX epoch (for lock-free heartbeat tracking).
 fn epoch_ms() -> u64 {
@@ -346,7 +345,7 @@ impl ClusterMetrics {
     }
 }
 
-impl super::server::FanoutMetrics for ClusterMetrics {
+impl ClusterMetrics {
     fn add_delivered(&self, count: u64) {
         self.messages_delivered.fetch_add(count, Ordering::Relaxed);
     }
@@ -963,7 +962,8 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             // declared count (u16, up to 65535) cannot force a large transient
             // allocation, and a 1 MB frame of tiny entries cannot expand into a
             // huge addr Vec. A real peer list never exceeds the peer cap.
-            let count = (u16::from_le_bytes([payload[0], payload[1]]) as usize).min(MAX_CLUSTER_PEERS);
+            let count =
+                (u16::from_le_bytes([payload[0], payload[1]]) as usize).min(MAX_CLUSTER_PEERS);
             let mut addrs = Vec::with_capacity(count);
             let mut pos = 2usize;
             for _ in 0..count {

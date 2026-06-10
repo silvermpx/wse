@@ -2054,12 +2054,6 @@ pub(crate) fn fanout_topic_direct(
     (delivered, dropped)
 }
 
-/// Trait for fan-out metrics tracking. Implemented by ClusterMetrics.
-pub(crate) trait FanoutMetrics: Send + Sync + 'static {
-    fn add_delivered(&self, count: u64);
-    fn add_dropped(&self, count: u64);
-}
-
 // ---------------------------------------------------------------------------
 // Command processor
 // ---------------------------------------------------------------------------

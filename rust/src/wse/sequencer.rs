@@ -108,7 +108,7 @@ impl RustSequencer {
 /// A buffered event waiting for its turn to be delivered in-order.
 /// Mirrors the Python `SequencedEvent` dataclass.
 struct BufferedEvent {
-    _sequence: u64,
+    // The sequence is the BTreeMap key, so it is not duplicated in the value.
     timestamp: Instant,
     payload: Py<PyAny>,
 }
@@ -294,7 +294,6 @@ impl RustEventSequencer {
             } else {
                 // Buffer the event for later delivery.
                 let buffered = BufferedEvent {
-                    _sequence: sequence,
                     timestamp: Instant::now(),
                     payload: event.clone().unbind(),
                 };
