@@ -153,15 +153,19 @@ class AsyncWSEClient:
         self._server_features: dict[str, Any] = {}
         self._server_max_message_size: int | None = None
         self._server_rate_limit: int | None = None
+        self._server_ping_interval_ms: int | None = None
 
         self._background_tasks: set[asyncio.Task[Any]] = set()
 
         # Snapshot dedup
         self._snapshot_requested = False
 
-        # Recovery state: topic -> (epoch, offset)
+        # Recovery state: topic -> (epoch, offset) -- last position confirmed
+        # delivered in order. Advanced per-message; persists across reconnects.
         self._recovery_state: dict[str, tuple[str, int]] = {}
         self._server_recovery_enabled = False
+        # Topics with a recovery request in flight (one at a time, anti-loop).
+        self._recovery_in_flight: set[str] = set()
 
         # Reconnect config for later use
         self._reconnect_cfg = reconnect
@@ -737,21 +741,67 @@ class AsyncWSEClient:
             self._process_event(event)
 
     def _process_event(self, event: WSEEvent) -> None:
-        """Dedup, sequence, handle system events, then dispatch."""
-        # Dedup
-        if event.id and self._sequencer.is_duplicate(event.id):
-            return
+        """Dedup + gap-detect, handle system events, then dispatch.
 
-        # Sequence
-        if event.sequence is not None:
-            ordered = self._sequencer.process_sequenced_event(event.sequence, event)
-            if ordered is None:
-                return  # Buffered, not yet deliverable
-            for evt in ordered:
-                self._dispatch_event(evt)
+        Stamped topic messages (tp/e/o) are deduped and ordered by per-topic
+        (epoch, offset) -- authoritative and reconnect-safe. The server's `seq`
+        is a process-global counter, NOT a per-topic order, so it must not drive
+        reordering: doing so buffered control messages such as server_ready
+        (which carries seq=1 while the client expected 0) and stalled the
+        handshake. Unstamped messages fall back to id-based dedup.
+        """
+        if event.topic and event.epoch and event.offset is not None:
+            verdict = self._sequencer.check_topic_stamp(
+                event.topic, event.epoch, event.offset
+            )
+            if verdict == "duplicate":
+                return
+            if verdict == "gap":
+                # Recover the whole missed range from the last in-order position
+                # (still in _recovery_state); drop this out-of-order copy -- the
+                # recovery replay re-delivers it in order.
+                self._on_recovery_gap(event.topic)
+                return
+            # In order (or new/changed epoch): advance and deliver.
+            self._recovery_state[event.topic] = (event.epoch, event.offset)
+        elif event.id and self._sequencer.is_duplicate(event.id):
             return
 
         self._dispatch_event(event)
+
+    def _on_recovery_gap(self, topic: str) -> None:
+        """A per-topic offset gap was detected -- request recovery from the last
+        in-order position, guarded against re-entrant loops (one in-flight
+        recovery per topic)."""
+        if topic in self._recovery_in_flight:
+            return
+        self._recovery_in_flight.add(topic)
+        self._fire_task(self._recover_topic(topic))
+
+    async def _recover_topic(self, topic: str) -> None:
+        """Send a recovery request for an already-subscribed topic (gap fill).
+
+        subscribe() can't be reused here because it filters already-subscribed
+        topics; this sends the recovery subscription_update directly from the
+        stored (epoch, offset)."""
+        try:
+            state = self._recovery_state.get(topic)
+            if not self._server_recovery_enabled or state is None:
+                return
+            payload = {
+                "action": "subscribe",
+                "topics": [topic],
+                "recover": True,
+                "recovery": {topic: {"epoch": state[0], "offset": state[1]}},
+            }
+            msg = self._codec.encode(
+                "subscription_update", payload, priority=MessagePriority.HIGH
+            )
+            await self._connection.send(msg)
+        except Exception as exc:
+            logger.debug("recovery request for '%s' failed: %s", topic, exc)
+        finally:
+            self._recovery_in_flight.discard(topic)
 
     def _dispatch_event(self, event: WSEEvent) -> None:
         """Handle system events, invoke callbacks, enqueue for iterator."""
@@ -873,13 +923,24 @@ class AsyncWSEClient:
         p = event.payload
         self._server_features = p.get("features", {})
 
-        max_msg_size = p.get("max_message_size")
-        if max_msg_size and isinstance(max_msg_size, int):
+        # Server-enforced limits are nested under "limits" (max_message_size,
+        # rate_limit_capacity, rate_limit_refill). They were read at the payload
+        # top level before, so neither value was ever populated.
+        limits = p.get("limits", {})
+        if not isinstance(limits, dict):
+            limits = {}
+
+        max_msg_size = limits.get("max_message_size")
+        if isinstance(max_msg_size, int):
             self._server_max_message_size = max_msg_size
 
-        rate_limit = p.get("rate_limit")
-        if rate_limit and isinstance(rate_limit, (int, float)):
-            self._server_rate_limit = int(rate_limit)
+        rate_cap = limits.get("rate_limit_capacity")
+        if isinstance(rate_cap, (int, float)):
+            self._server_rate_limit = int(rate_cap)
+
+        ping_interval = p.get("ping_interval")
+        if isinstance(ping_interval, (int, float)) and ping_interval > 0:
+            self._server_ping_interval_ms = int(ping_interval)
 
         # Complete ECDH key exchange if server confirmed encryption
         if (
@@ -912,17 +973,28 @@ class AsyncWSEClient:
         # Store recovery positions from server response
         recovery = p.get("recovery", {})
         for topic, info in recovery.items():
-            if isinstance(info, dict):
-                epoch = info.get("epoch")
-                offset = info.get("offset")
-                if epoch is not None and offset is not None:
-                    self._recovery_state[topic] = (str(epoch), int(offset))
-                    logger.debug(
-                        "Recovery position for %s: epoch=%s offset=%d",
-                        topic,
-                        epoch,
-                        offset,
-                    )
+            if not isinstance(info, dict):
+                continue
+            epoch = info.get("epoch")
+            offset = info.get("offset")
+            if epoch is None or offset is None:
+                continue
+            self._recovery_state[topic] = (str(epoch), int(offset))
+            # When the server could NOT recover (history evicted, or epoch
+            # changed on a server restart), resync the dedup position FORWARD to
+            # the server's current position. Otherwise the next live message
+            # looks like a gap and triggers recovery again -- forever. The
+            # unrecoverable gap is accepted. `recovered` defaults True so the
+            # behavior is unchanged when the server omits the flag.
+            if not info.get("recovered", True):
+                self._sequencer.set_topic_position(topic, str(epoch), int(offset))
+            logger.debug(
+                "Recovery position for %s: epoch=%s offset=%d recovered=%s",
+                topic,
+                epoch,
+                offset,
+                info.get("recovered", True),
+            )
 
     def _handle_error(self, event: WSEEvent) -> None:
         """Handle server error with code classification (matches TS error handler)."""
@@ -1115,15 +1187,19 @@ class AsyncWSEClient:
             if self._server_ready_event is not None:
                 self._server_ready_event.clear()
             self._snapshot_requested = False
-            self._sequencer.reset()
+            # Do NOT reset the sequencer on reconnect: per-topic (epoch, offset)
+            # positions and the dedup window must survive so replayed/duplicate
+            # messages are recognised. A full reset only happens on a new session.
         elif state == ConnectionState.CONNECTED:
             pass  # record_ping() is called per-heartbeat via on_ping_sent
-        elif state == ConnectionState.DISCONNECTED:
+        elif state in (ConnectionState.DISCONNECTED, ConnectionState.ERROR):
             if self._server_ready_event is not None:
                 self._server_ready_event.clear()
-            # Signal iterator to stop on terminal disconnect.
-            # DISCONNECTED only fires for permanent closes (normal close,
-            # going_away). Transient errors go through RECONNECTING, not here.
+            # Wake the async iterator on ANY terminal state. ERROR (circuit
+            # breaker open / auth failure / rate limited -- all non-retrying)
+            # previously pushed no sentinel, so `async for` consumers blocked
+            # forever once the breaker tripped. DISCONNECTED is the normal/going-
+            # away close. Transient errors go through RECONNECTING, not here.
             # Skip if disconnect() already enqueued the sentinel.
             if not self._disconnecting and self._event_queue is not None:
                 try:

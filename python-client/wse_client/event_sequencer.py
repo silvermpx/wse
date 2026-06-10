@@ -42,6 +42,11 @@ class EventSequencer:
         self._sequence = 0
         self._cleanup_counter = 0
         self._duplicates_detected = 0
+        # Per-topic last-seen recovery position: topic -> (epoch, offset).
+        # This is the AUTHORITATIVE dedup/ordering for stamped messages and must
+        # survive reconnects within an epoch (do not clear on reconnect), unlike
+        # the seq-based reorder buffer which the server's global seq makes unsound.
+        self._topic_positions: dict[str, tuple[str, int]] = {}
 
     def get_next_sequence(self) -> int:
         self._sequence += 1
@@ -70,6 +75,42 @@ class EventSequencer:
             del self._seen_ids[oldest_key]
 
         return False
+
+    def check_topic_stamp(self, topic: str, epoch: str, offset: int) -> str:
+        """Idempotent dedup + gap detection by per-topic ``(epoch, offset)``.
+
+        Returns one of:
+            ``"duplicate"`` -- already delivered (offset <= last seen on the same
+                epoch); the caller should drop it. This is what makes replay /
+                reconnect overlap safe independently of the id window.
+            ``"gap"`` -- the offset jumped ahead of the expected next; the caller
+                should still deliver it but trigger recovery to fill the hole.
+            ``"deliver"`` -- the next in order, or the first message on a new or
+                changed epoch (server restart -- old offsets are meaningless).
+        """
+        prev = self._topic_positions.get(topic)
+        if prev is None or prev[0] != epoch:
+            # New topic, or epoch change (server restart): accept and (re)baseline.
+            self._topic_positions[topic] = (epoch, offset)
+            return "deliver"
+        last = prev[1]
+        if offset <= last:
+            return "duplicate"
+        if offset == last + 1:
+            self._topic_positions[topic] = (epoch, offset)
+            return "deliver"
+        # Gap: do NOT advance. The caller recovers from `last`, which replays the
+        # whole missed range (last+1 .. head) in order; advancing here would make
+        # those replayed messages look like duplicates and they'd be dropped.
+        return "gap"
+
+    def topic_position(self, topic: str) -> tuple[str, int] | None:
+        """Last-seen ``(epoch, offset)`` for a topic, for recovery requests."""
+        return self._topic_positions.get(topic)
+
+    def set_topic_position(self, topic: str, epoch: str, offset: int) -> None:
+        """Set a topic's position (e.g. from a subscription_update reply)."""
+        self._topic_positions[topic] = (epoch, offset)
 
     def record_sequence(self, seq: int) -> None:
         if seq >= self._expected_sequence:
@@ -135,9 +176,13 @@ class EventSequencer:
         }
 
     def reset(self) -> None:
+        """Full reset for a NEW session (e.g. token change) -- clears per-topic
+        positions too. NOT to be called on a transient reconnect, which must keep
+        positions so (epoch, offset) dedup spans the reconnect."""
         self._seen_ids.clear()
         self._out_of_order_buffer.clear()
         self._expected_sequence = 0
         self._sequence = 0
         self._duplicates_detected = 0
         self._cleanup_counter = 0
+        self._topic_positions.clear()

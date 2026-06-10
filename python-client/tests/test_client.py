@@ -153,19 +153,26 @@ class TestSystemHandlers:
         client._connection.handle_server_ready.assert_called_once_with("srv-123")
 
     def test_server_hello_stores_features(self, client):
+        # Limits are nested under "limits" with capacity/refill (the real server
+        # wire shape, server.rs build_server_hello), and ping_interval is top-level.
         event = WSEEvent(
             type="server_hello",
             payload={
                 "server_version": "2.0",
                 "features": {"compression": True, "encryption": True},
-                "max_message_size": 2_000_000,
-                "rate_limit": 500,
+                "limits": {
+                    "max_message_size": 2_000_000,
+                    "rate_limit_capacity": 500,
+                    "rate_limit_refill": 100,
+                },
+                "ping_interval": 25_000,
             },
         )
         client._handle_server_hello(event)
         assert client._server_features == {"compression": True, "encryption": True}
         assert client._server_max_message_size == 2_000_000
         assert client._server_rate_limit == 500
+        assert client._server_ping_interval_ms == 25_000
 
     def test_error_handler_logs_auth(self, client):
         event = WSEEvent(

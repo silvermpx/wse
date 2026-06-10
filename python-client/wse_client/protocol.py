@@ -293,6 +293,14 @@ class MessageCodec:
         # Category: prefer wire prefix, fall back to "c" field in JSON
         cat = category.value if category else parsed.get("c")
 
+        # Recovery stamp (present on stamped topic publications): topic / epoch /
+        # offset, accepted under the short wire keys with long-name fallbacks.
+        topic = parsed.get("tp") or parsed.get("topic")
+        epoch = parsed.get("e") or parsed.get("epoch")
+        offset = parsed.get("o")
+        if offset is None:
+            offset = parsed.get("offset")
+
         return WSEEvent(
             type=t,
             payload=p if isinstance(p, dict) else {"data": p},
@@ -304,4 +312,7 @@ class MessageCodec:
             priority=parsed.get("pri"),
             correlation_id=parsed.get("cid"),
             signature=parsed.get("sig"),
+            topic=topic if isinstance(topic, str) else None,
+            epoch=str(epoch) if epoch is not None else None,
+            offset=int(offset) if isinstance(offset, int) else None,
         )

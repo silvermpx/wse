@@ -95,3 +95,50 @@ class TestSequenceOrdering:
         assert stats["current_sequence"] == 0
         assert stats["expected_sequence"] == 0
         assert stats["duplicate_window_size"] == 0
+
+
+class TestTopicStamp:
+    """Per-topic (epoch, offset) idempotent dedup + gap detection."""
+
+    def test_new_topic_delivers_and_baselines(self):
+        seq = EventSequencer()
+        assert seq.check_topic_stamp("room", "0000000a", 5) == "deliver"
+        assert seq.topic_position("room") == ("0000000a", 5)
+
+    def test_in_order_advances(self):
+        seq = EventSequencer()
+        seq.check_topic_stamp("room", "0000000a", 5)
+        assert seq.check_topic_stamp("room", "0000000a", 6) == "deliver"
+        assert seq.topic_position("room") == ("0000000a", 6)
+
+    def test_duplicate_dropped(self):
+        seq = EventSequencer()
+        seq.check_topic_stamp("room", "0000000a", 5)
+        seq.check_topic_stamp("room", "0000000a", 6)
+        # Re-seeing an already-delivered offset (e.g. replay overlap) is a dup.
+        assert seq.check_topic_stamp("room", "0000000a", 6) == "duplicate"
+        assert seq.check_topic_stamp("room", "0000000a", 3) == "duplicate"
+        assert seq.topic_position("room") == ("0000000a", 6)
+
+    def test_gap_does_not_advance(self):
+        seq = EventSequencer()
+        seq.check_topic_stamp("room", "0000000a", 5)
+        # Jump from 5 to 9 -> gap; position must stay at 5 so recovery from 5
+        # replays 6..9 in order without them being deduped.
+        assert seq.check_topic_stamp("room", "0000000a", 9) == "gap"
+        assert seq.topic_position("room") == ("0000000a", 5)
+        # The replayed in-order messages then advance contiguously.
+        assert seq.check_topic_stamp("room", "0000000a", 6) == "deliver"
+
+    def test_epoch_change_rebaselines(self):
+        seq = EventSequencer()
+        seq.check_topic_stamp("room", "0000000a", 100)
+        # New epoch (server restart): accept and reset, regardless of offset.
+        assert seq.check_topic_stamp("room", "0000000b", 0) == "deliver"
+        assert seq.topic_position("room") == ("0000000b", 0)
+
+    def test_positions_survive_full_reset_only(self):
+        seq = EventSequencer()
+        seq.check_topic_stamp("room", "0000000a", 5)
+        seq.reset()
+        assert seq.topic_position("room") is None

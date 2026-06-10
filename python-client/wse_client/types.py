@@ -107,6 +107,12 @@ class WSEEvent:
         priority: Numeric priority (see :class:`MessagePriority`).
         correlation_id: Links a request to its response.
         signature: HMAC-SHA256 hex signature when message signing is on.
+        topic: Recovery stamp -- the topic this message was published to (``tp``).
+        epoch: Recovery stamp -- the topic buffer epoch as an 8-hex string (``e``).
+        offset: Recovery stamp -- the per-topic monotonic offset (``o``). Together
+            with ``epoch`` this drives idempotent dedup, gap detection, and
+            recovery from the last-seen position. Present only on stamped topic
+            publications (absent on control/system messages).
     """
 
     type: str
@@ -119,6 +125,9 @@ class WSEEvent:
     priority: int | None = None
     correlation_id: str | None = None
     signature: str | None = None
+    topic: str | None = None
+    epoch: str | None = None
+    offset: int | None = None
 
 
 @dataclass
