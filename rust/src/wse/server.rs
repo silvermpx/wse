@@ -4265,6 +4265,25 @@ impl RustWSEServer {
         // Step 1: Subscribe using existing logic (no presence tracking for recovery)
         self.subscribe_connection(conn_id, topics.clone(), None, None)?;
 
+        // Fail-closed authorization for the recovery path: subscribe_connection
+        // above filters the LIVE subscription through the connection's topic ACL,
+        // but the recovery loop below must apply the SAME filter -- otherwise a
+        // connection scoped to user:SELF:* could pass user:OTHER:private and have
+        // the recovery buffer replay another tenant's history (and get_position
+        // leak that topic's existence + message counts). When no ACL is
+        // configured the connection is unrestricted (the fail-open default is a
+        // separate finding); here we only mirror whatever subscribe_connection did.
+        let allowed: std::collections::HashSet<String> =
+            if let Some(acl) = self.shared.conn_topic_acl.get(conn_id) {
+                topics
+                    .iter()
+                    .filter(|t| acl.is_allowed(t.as_str()))
+                    .cloned()
+                    .collect()
+            } else {
+                topics.iter().cloned().collect()
+            };
+
         // Step 2: Get connection tx + pending counter (clone them, drop the lock)
         let (tx, tx_pending) = if recover {
             let rt = self
@@ -4287,6 +4306,20 @@ impl RustWSEServer {
 
         for topic in &topics {
             let topic_dict = PyDict::new(py);
+
+            // Fail-closed: a topic this connection is not authorized for is never
+            // recovered and its position is never probed (no history replay, no
+            // existence/count leak). It was already dropped from the live sub.
+            if !allowed.contains(topic) {
+                all_recovered = false;
+                topic_dict.set_item("epoch", py.None())?;
+                topic_dict.set_item("offset", 0u64)?;
+                topic_dict.set_item("recoverable", false)?;
+                topic_dict.set_item("recovered", false)?;
+                topic_dict.set_item("count", 0)?;
+                topics_dict.set_item(topic.as_str(), topic_dict)?;
+                continue;
+            }
 
             // Check if recovery is possible and requested
             let can_recover = recover
