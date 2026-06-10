@@ -4895,7 +4895,7 @@ impl RustWSEServer {
                     .iter()
                     .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
                     .collect();
-                entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                entries.sort_unstable_by_key(|e| std::cmp::Reverse(e.1));
                 entries.truncate(50);
 
                 out.push_str(
@@ -5288,7 +5288,7 @@ mod tests {
             .iter()
             .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
             .collect();
-        entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_unstable_by_key(|e| std::cmp::Reverse(e.1));
         entries.truncate(50);
 
         assert_eq!(entries.len(), 50);
