@@ -135,6 +135,10 @@ pub struct RustEventSequencer {
     expected_sequences: HashMap<String, u64>,
     /// Per-topic: buffered future events keyed by sequence number.
     buffered_events: HashMap<String, BTreeMap<u64, BufferedEvent>>,
+    /// Per-topic: last time any event was processed. Drives idle-TTL eviction of
+    /// the ordering cursor so cleanup does NOT drop a live in-order topic's
+    /// cursor merely because its reorder buffer is momentarily empty.
+    last_activity: HashMap<String, Instant>,
 
     // Stats
     duplicate_count: u64,
@@ -160,6 +164,7 @@ impl RustEventSequencer {
             max_out_of_order,
             expected_sequences: HashMap::new(),
             buffered_events: HashMap::new(),
+            last_activity: HashMap::new(),
             duplicate_count: 0,
             out_of_order_count: 0,
             dropped_count: 0,
@@ -228,6 +233,17 @@ impl RustEventSequencer {
         event: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let topic_owned = topic.to_owned();
+
+        // Record activity so cleanup's idle-TTL eviction keeps this topic's
+        // ordering cursor alive while it is live (allocates the key only the
+        // first time the topic is seen).
+        match self.last_activity.get_mut(topic) {
+            Some(ts) => *ts = Instant::now(),
+            None => {
+                self.last_activity
+                    .insert(topic_owned.clone(), Instant::now());
+            }
+        }
 
         // Initialize topic tracking on first event.
         if !self.expected_sequences.contains_key(&topic_owned) {
@@ -307,10 +323,12 @@ impl RustEventSequencer {
             Some(t) => {
                 self.expected_sequences.remove(t);
                 self.buffered_events.remove(t);
+                self.last_activity.remove(t);
             }
             None => {
                 self.expected_sequences.clear();
                 self.buffered_events.clear();
+                self.last_activity.clear();
             }
         }
     }
@@ -428,13 +446,17 @@ impl RustEventSequencer {
     fn cleanup(&mut self) {
         let now = Instant::now();
 
-        // Clean buffered events older than 5 minutes.
-        let mut empty_topics: Vec<String> = Vec::new();
+        // Topic ordering state (cursor + reorder buffer) is retired only after a
+        // topic has been idle this long -- never merely because its reorder
+        // buffer drained (the healthy in-order case).
+        const TTL_SECS: f64 = 300.0;
 
-        for (topic, events) in &mut self.buffered_events {
+        // Drop buffered (out-of-order) events older than the TTL; reclaims memory
+        // for gaps that never filled, without touching the cursor.
+        for events in self.buffered_events.values_mut() {
             let to_remove: Vec<u64> = events
                 .iter()
-                .filter(|(_, e)| now.duration_since(e.timestamp).as_secs_f64() > 300.0)
+                .filter(|(_, e)| now.duration_since(e.timestamp).as_secs_f64() > TTL_SECS)
                 .map(|(&seq, _)| seq)
                 .collect();
 
@@ -442,15 +464,28 @@ impl RustEventSequencer {
                 events.remove(&seq);
                 self.dropped_count += 1;
             }
-
-            if events.is_empty() {
-                empty_topics.push(topic.clone());
-            }
         }
 
-        for topic in empty_topics {
-            self.buffered_events.remove(&topic);
+        // Evict per-topic ordering state ONLY for topics idle past the TTL.
+        // The old trigger ("reorder buffer is empty") dropped a live in-order
+        // topic's expected-sequence cursor, resetting gap detection: the next
+        // event was then treated as a brand-new topic start, so a real gap went
+        // unnoticed and a stale/duplicate sequence could roll the cursor
+        // backwards into a reset storm.
+        let idle_topics: Vec<String> = self
+            .expected_sequences
+            .keys()
+            .filter(|t| {
+                self.last_activity
+                    .get(*t)
+                    .is_none_or(|ts| now.duration_since(*ts).as_secs_f64() > TTL_SECS)
+            })
+            .cloned()
+            .collect();
+        for topic in idle_topics {
             self.expected_sequences.remove(&topic);
+            self.buffered_events.remove(&topic);
+            self.last_activity.remove(&topic);
         }
 
         // Trim seen_ids if significantly over window_size.
@@ -465,5 +500,58 @@ impl RustEventSequencer {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    // Regression (R2 #3): cleanup() must NOT drop the expected-sequence cursor
+    // of a live in-order topic just because its reorder buffer happens to be
+    // empty. Dropping it reset gap detection -- the next event was treated as a
+    // fresh topic start, so a real gap went unnoticed (and a stale/duplicate
+    // sequence could roll the cursor backwards).
+    #[test]
+    fn cleanup_keeps_cursor_for_active_in_order_topic() {
+        let mut seq = RustEventSequencer::new(100, 100);
+        // Healthy in-order topic: cursor advanced, reorder buffer EMPTY,
+        // activity just now.
+        seq.expected_sequences.insert("room".to_string(), 42);
+        seq.buffered_events
+            .insert("room".to_string(), BTreeMap::new());
+        seq.last_activity.insert("room".to_string(), Instant::now());
+
+        seq.cleanup();
+
+        assert_eq!(
+            seq.expected_sequences.get("room"),
+            Some(&42),
+            "an active in-order topic's ordering cursor must survive cleanup"
+        );
+    }
+
+    // The cursor IS reclaimed once a topic has been idle past the TTL, so the
+    // maps stay bounded across many ephemeral topics.
+    #[test]
+    fn cleanup_evicts_idle_topic_cursor() {
+        let mut seq = RustEventSequencer::new(100, 100);
+        seq.expected_sequences.insert("stale".to_string(), 7);
+        seq.buffered_events
+            .insert("stale".to_string(), BTreeMap::new());
+        let old = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .expect("instant 600s in the past is representable");
+        seq.last_activity.insert("stale".to_string(), old);
+
+        seq.cleanup();
+
+        assert!(
+            !seq.expected_sequences.contains_key("stale"),
+            "a topic idle past the TTL must have its cursor evicted"
+        );
+        assert!(!seq.last_activity.contains_key("stale"));
+        assert!(!seq.buffered_events.contains_key("stale"));
     }
 }
