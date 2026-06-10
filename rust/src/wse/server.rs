@@ -956,6 +956,32 @@ fn build_server_ready(conn_id: &str, user_id: &str, recovery_enabled: bool) -> S
 /// timeout -- exhausts tasks and file descriptors well before any limit fires.
 const MAX_PENDING_HANDSHAKES: usize = 512;
 
+/// Max concurrent on_message callbacks (blocking tasks) per connection in
+/// callback mode. Bounds inbound flooding from exhausting the blocking pool.
+const MAX_INFLIGHT_CALLBACKS: usize = 256;
+
+/// Spawn an on_message callback as a bounded blocking task. If `MAX_INFLIGHT_
+/// CALLBACKS` are already running for this connection the inbound work is SHED
+/// (counted as rate-limited) rather than spawning an unbounded task -- a client
+/// flooding inbound messages otherwise exhausts the blocking pool and contends
+/// the GIL. The permit is released when the blocking task finishes.
+fn spawn_bounded_callback<F>(sem: &Arc<tokio::sync::Semaphore>, state: &Arc<SharedState>, work: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    match sem.clone().try_acquire_owned() {
+        Ok(permit) => {
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                work();
+            });
+        }
+        Err(_) => {
+            state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// RAII counter for in-flight (pre-registration) handshakes: increments on
 /// construction, decrements when the handshake task ends (success or failure).
 struct HandshakeGuard(Arc<AtomicUsize>);
@@ -1391,6 +1417,11 @@ async fn handle_connection(
     } else {
         None
     };
+    // Bounds concurrent on_message callbacks in CALLBACK mode. Each inbound
+    // message spawns a blocking task; without a cap a flood exhausts the blocking
+    // thread pool and contends the GIL. When saturated the inbound is shed
+    // (counted as rate-limited). Drain mode uses the bounded inbound_tx instead.
+    let callback_sem = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_CALLBACKS));
 
     // Read loop
     while let Some(Ok(msg)) = read_half.next().await {
@@ -1426,7 +1457,7 @@ async fn handle_connection(
                         let cb_arc = cb.clone();
                         let cid = Arc::clone(&conn_id);
                         let t = text.to_string();
-                        tokio::task::spawn_blocking(move || {
+                        spawn_bounded_callback(&callback_sem, &state, move || {
                             Python::try_attach(|py| {
                                 if let Err(e) = cb_arc.call1(py, (&**cid, &*t)) {
                                     tracing::warn!("[WSE] on_message error: {e}");
@@ -1549,7 +1580,7 @@ async fn handle_connection(
                             // Callback mode: convert to PyDict + call Python
                             let cb_arc = cb.clone();
                             let cid = Arc::clone(&conn_id);
-                            tokio::task::spawn_blocking(move || {
+                            spawn_bounded_callback(&callback_sem, &state, move || {
                                 Python::try_attach(|py| {
                                     let py_obj = json_to_pyobj(py, &val);
                                     if let Err(e) = cb_arc.call1(py, (&**cid, py_obj)) {
@@ -1570,7 +1601,7 @@ async fn handle_connection(
                             let cb_arc = cb.clone();
                             let cid = Arc::clone(&conn_id);
                             let t = text.to_string();
-                            tokio::task::spawn_blocking(move || {
+                            spawn_bounded_callback(&callback_sem, &state, move || {
                                 Python::try_attach(|py| {
                                     if let Err(e) = cb_arc.call1(py, (&**cid, &*t)) {
                                         tracing::warn!("[WSE] on_message error: {e}");
@@ -1627,7 +1658,7 @@ async fn handle_connection(
                                         } else if let Some(ref cb) = cached_on_message {
                                             let cb_arc = cb.clone();
                                             let cid = Arc::clone(&conn_id);
-                                            tokio::task::spawn_blocking(move || {
+                                            spawn_bounded_callback(&callback_sem, &state, move || {
                                                 Python::try_attach(|py| {
                                                     let py_obj = json_to_pyobj(py, &val);
                                                     if let Err(e) =
@@ -1695,7 +1726,7 @@ async fn handle_connection(
                     let d = data.to_vec();
                     if is_msgpack {
                         // Parse msgpack and pass as dict to callback (same as JSON text)
-                        tokio::task::spawn_blocking(move || {
+                        spawn_bounded_callback(&callback_sem, &state, move || {
                             Python::try_attach(|py| match decode_msgpack_guarded(&d[..]) {
                                 Ok(rmpv_val) => {
                                     let json_val = rmpv_to_serde_json(&rmpv_val);
@@ -1714,7 +1745,7 @@ async fn handle_connection(
                             });
                         });
                     } else {
-                        tokio::task::spawn_blocking(move || {
+                        spawn_bounded_callback(&callback_sem, &state, move || {
                             Python::try_attach(|py| {
                                 let py_bytes = PyBytes::new(py, &d);
                                 if let Err(e) = cb_arc.call1(py, (&**cid, py_bytes)) {
