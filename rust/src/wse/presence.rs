@@ -346,10 +346,7 @@ impl PresenceManager {
             return None;
         }
 
-        let user_id = match self.conn_user_id.get(conn_id) {
-            Some(uid) => uid.value().clone(),
-            None => return None,
-        };
+        let user_id = self.conn_user_id.get(conn_id)?.value().clone();
 
         let now = epoch_ms();
         let mut updated_topics = Vec::new();
