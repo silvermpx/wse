@@ -626,10 +626,12 @@ class ConnectionManager:
             logger.error("Auth/policy failure (code %d): %s", code, reason)
             return
 
-        # Rate limited -> no retry
+        # Rate limited -> transient by definition: back off and retry (the
+        # delay grows with each attempt); parking in ERROR forever turned a
+        # momentary throttle into a dead client.
         if code == WS_CLOSE_RATE_LIMITED:
-            self._set_state(ConnectionState.ERROR)
-            logger.error("Rate limited by server")
+            logger.error("Rate limited by server - backing off")
+            self._schedule_reconnect()
             return
 
         # Anything else -> reconnect
@@ -667,9 +669,17 @@ class ConnectionManager:
         self._reconnect_attempts += 1
         try:
             await self.connect()
-        except (WSEAuthError, WSECircuitBreakerError):
-            # Don't retry on auth failures or circuit breaker
+        except WSEAuthError:
+            # No refresh machinery in this client (the token is caller-supplied)
+            # -- a rejected token cannot self-heal, so ERROR is terminal here.
             self._set_state(ConnectionState.ERROR)
+        except WSECircuitBreakerError:
+            # An OPEN breaker is a pause, not a death sentence: it half-opens
+            # after its reset timeout, but only if another attempt arrives.
+            # Dying here made the first open breaker permanent (the TS client
+            # had the same bug, fixed in 2.4.1).
+            logger.debug("Circuit breaker open - retrying on the backoff schedule")
+            self._schedule_reconnect()
         except Exception as exc:
             logger.debug("Reconnect attempt failed: %s", exc)
             self._schedule_reconnect()

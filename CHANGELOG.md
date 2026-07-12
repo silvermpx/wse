@@ -22,6 +22,15 @@
   as truly infinite. Reconnection after any-length server downtime is now
   automatic.
 
+### Fixed (Python client)
+
+- Same class, two of the paths: an OPEN circuit breaker raised
+  `WSECircuitBreakerError` inside the reconnect task and parked the client in
+  `ERROR` (the breaker's half-open probe window was unreachable), and a
+  rate-limit close never retried. Both now stay on the backoff schedule.
+  (`-1 = infinite` was already handled correctly here; auth failures remain
+  terminal by design -- this client has no token-refresh callback.)
+
 
 ## v2.4.0 (2026-06-10)
 
