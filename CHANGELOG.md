@@ -1,5 +1,28 @@
 # Changelog
 
+## v2.4.1 (2026-07-12)
+
+### Fixed (TS client)
+
+- **CRITICAL: reconnect could die permanently after a server restart.** Three
+  dead-end paths in `ConnectionManager` left the client parked in `ERROR`
+  until a full page reload:
+  - `maxAttempts: -1` (the documented "infinite" contract, and the shipped
+    default) was silently clamped to 10 attempts. With exponential backoff
+    that budget exhausts in ~105s -- shorter than a typical server
+    restart/redeploy -- after which the client never tried again.
+  - An OPEN connection circuit breaker aborted `reconnect()` without
+    scheduling a retry, so the breaker's own half-open window (60s) was
+    unreachable: the first open breaker was permanent.
+  - An auth close (4401/4403) whose token refresh ALSO failed (the usual case
+    when one origin serves both the WS and the auth API and is restarting)
+    logged the error and stopped; likewise a 4429 rate-limit close parked in
+    `ERROR` with no retry.
+  All four paths now stay on the capped-backoff retry loop; `-1` is honored
+  as truly infinite. Reconnection after any-length server downtime is now
+  automatic.
+
+
 ## v2.4.0 (2026-06-10)
 
 ### Added

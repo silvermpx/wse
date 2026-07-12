@@ -38,7 +38,6 @@ export interface ConnectionManagerConfig {
   } | null;
 }
 
-const DEFAULT_MAX_RECONNECT_ATTEMPTS = 10;
 const MAX_TOKEN_REFRESH_ATTEMPTS = 3;
 
 // Cached TextEncoder for efficient byte size calculation
@@ -501,12 +500,24 @@ export class ConnectionManager {
 
     const store = useWSEStore.getState();
 
+    // -1 means INFINITE retries (the documented contract of
+    // RECONNECT_MAX_ATTEMPTS). It used to clamp to a 10-attempt default,
+    // which with exponential backoff exhausts in ~105s -- any server restart
+    // longer than that (a normal binary rebuild) left the client dead in
+    // ERROR until a full page reload.
     const maxAttempts = this.reconnectionStrategy.maxAttempts === -1
-      ? DEFAULT_MAX_RECONNECT_ATTEMPTS
+      ? Infinity
       : this.reconnectionStrategy.maxAttempts;
 
     if (!store.canReconnect()) {
-      logger.warn('[ConnectionManager] Cannot reconnect - circuit breaker open or max attempts reached');
+      // The store's breaker half-opens after nextRetryTime -- but only if
+      // somebody re-enters this path. Dying here without a scheduled retry
+      // made an open breaker PERMANENT; keep the loop alive instead (the
+      // backoff delay is capped, so this stays gentle).
+      logger.warn('[ConnectionManager] Cannot reconnect now - circuit breaker open or max attempts reached');
+      if (this.reconnectAttempts < maxAttempts) {
+        this.scheduleReconnect();
+      }
       return;
     }
 
@@ -518,9 +529,14 @@ export class ConnectionManager {
     }
 
     if (!this.connectionCircuitBreaker.canExecute()) {
-      logger.warn('[ConnectionManager] Connection circuit breaker is OPEN, skipping reconnect');
-      this.onStateChange(ConnectionState.ERROR);
+      // Same rule as above: an OPEN breaker is a pause, not a death sentence.
+      // It half-opens after its resetTimeout; keep a retry scheduled so the
+      // half-open window is actually used.
+      logger.warn('[ConnectionManager] Connection circuit breaker is OPEN, delaying reconnect');
       store.setLastError('Connection circuit breaker open');
+      if (this.reconnectAttempts < maxAttempts) {
+        this.scheduleReconnect();
+      }
       return;
     }
 
@@ -945,11 +961,22 @@ export class ConnectionManager {
           }).catch(error => {
             const errorMessage = error instanceof Error ? error.message : String(error);
             logger.error('[ConnectionManager] Token refresh after auth failure failed:', errorMessage);
+            // A failed refresh here usually means the AUTH SERVER is down too
+            // (one origin restarting serves both) -- retry on the backoff
+            // schedule instead of dying; the next reconnect attempt re-enters
+            // the refresh path once the origin is back.
+            if (!this.isDestroyed) {
+              this.onStateChange(ConnectionState.RECONNECTING);
+              this.scheduleReconnect();
+            }
           });
         }
       } else if (event.code === 4429) {
-        this.onStateChange(ConnectionState.ERROR);
+        // Rate limit is transient by definition -- back off and retry, never
+        // park in ERROR forever (the backoff delay grows with each attempt).
         store.setLastError('Rate limit exceeded', event.code);
+        this.onStateChange(ConnectionState.RECONNECTING);
+        this.scheduleReconnect();
       } else if (!this.isDestroyed) {
         this.onStateChange(ConnectionState.RECONNECTING);
         this.scheduleReconnect();
