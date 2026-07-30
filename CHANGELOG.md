@@ -1,5 +1,28 @@
 # Changelog
 
+## v2.4.2 (2026-07-31)
+
+### Fixed (TS client)
+
+- **A NotRecovered subscription ACK now resyncs the gap detector.** The
+  `subscription_update` ACK stored the server-reported positions only in the
+  zustand store (the next-subscribe payload) while `EventSequencer`'s own
+  position map kept the stale offset. After a server-side `recovered: false`
+  (history evicted, or epoch changed on a restart) every later stamped
+  message read `gap`, was dropped, and the `wseRecoveryGap` re-subscribe
+  loop asked for the same unrecoverable range forever -- the topic stayed
+  black until the processor was destroyed. The ACK handler now mirrors the
+  Python client: it calls `setTopicPosition` for every position the server
+  reports with `recovered: false`, accepting the unrecoverable window (the
+  post-subscribe snapshot covers its state). Recovered replays keep
+  advancing the sequencer through the frames themselves and are not
+  resynced past.
+
+  Server note: the ACK's `recovery` entries must carry the per-topic
+  `recovered` flag for the conditional resync to engage; an absent flag
+  defaults to `recovered: true` (no resync), preserving old-server
+  behavior.
+
 ## v2.4.1 (2026-07-12)
 
 ### Fixed (TS client)
