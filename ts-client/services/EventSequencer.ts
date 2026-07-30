@@ -113,6 +113,16 @@ export class EventSequencer {
     return this.topicPositions.get(topic);
   }
 
+  /**
+   * Authoritative resync from a subscription ACK. Without it a
+   * NotRecovered response left `topicPositions` at the stale offset:
+   * every later stamped message read 'gap', was dropped, and the
+   * re-subscribe loop asked for the same unrecoverable range forever —
+   * the topic stayed black until the processor was destroyed
+   * (SQV sweep 2026-07-30 S14-P1). The server's reported head is the
+   * new truth; the snapshot request that follows the subscribe covers
+   * the skipped window's state.
+   */
   setTopicPosition(topic: string, epoch: string, offset: number): void {
     this.topicPositions.set(topic, { epoch, offset });
   }

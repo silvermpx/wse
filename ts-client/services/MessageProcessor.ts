@@ -836,6 +836,19 @@ export class MessageProcessor {
           const parsedOffset = Number(ri.offset);
           if (!isNaN(parsedOffset)) {
             positions[topic] = { epoch: String(ri.epoch), offset: parsedOffset };
+            // When the server could NOT recover (history evicted, epoch
+            // changed on restart), resync the gap detector FORWARD to the
+            // server's position — otherwise the next live message reads
+            // 'gap' and re-triggers recovery forever, and the topic stays
+            // black until the processor dies. The unrecoverable window is
+            // accepted; the post-subscribe snapshot covers its state.
+            // Recovered replays advance the sequencer through the frames
+            // themselves — resyncing then would mark them duplicates, so
+            // this mirrors the python client: resync ONLY on
+            // recovered === false (absent flag defaults to recovered).
+            if (ri.recovered === false) {
+              this.sequencer.setTopicPosition(topic, String(ri.epoch), parsedOffset);
+            }
           }
         }
       }
