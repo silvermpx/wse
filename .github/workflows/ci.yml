@@ -55,7 +55,7 @@ jobs:
 
       - name: Install
         run: |
-          pip install ruff
+          pip install 'ruff==0.15.4'
           pip install -e "python-client[all,dev]"
 
       - name: Ruff check
@@ -81,7 +81,7 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - run: pip install ruff mypy
+      - run: pip install 'ruff==0.15.4' mypy
 
       - name: Ruff check
         run: ruff check wse_server/ tests/
