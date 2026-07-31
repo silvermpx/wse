@@ -15,6 +15,7 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
+    "types": ["node"],
     "isolatedModules": true,
     "noUnusedLocals": false,
     "noUnusedParameters": false
