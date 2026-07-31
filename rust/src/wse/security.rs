@@ -20,7 +20,8 @@ type HmacSha256 = Hmac<Sha256>;
 /// Returns raw bytes (32 bytes).
 #[pyfunction]
 pub fn rust_hmac_sha256<'py>(py: Python<'py>, key: &[u8], data: &[u8]) -> PyResult<Py<PyBytes>> {
-    let mut mac = <HmacSha256 as MacKeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac =
+        <HmacSha256 as MacKeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
     let result = mac.finalize().into_bytes();
     Ok(PyBytes::new(py, &result).unbind())
@@ -47,7 +48,8 @@ pub fn rust_sign_message(_py: Python<'_>, payload_json: &str, secret: &[u8]) -> 
     let payload_hash = hex::encode(hasher.finalize());
 
     // Step 2: HMAC-SHA256 of the hash
-    let mut mac = <HmacSha256 as MacKeyInit>::new_from_slice(secret).expect("HMAC accepts any key length");
+    let mut mac =
+        <HmacSha256 as MacKeyInit>::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(payload_hash.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
