@@ -14,15 +14,15 @@ serde_json = "1.0.149"
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 rmp-serde = "1.3.1"
 rmpv = "1.3.1"
-hmac = "0.12.1"
-sha2 = "0.10.9"
+hmac = "0.13"
+sha2 = "0.11"
 hex = "0.4"
 ahash = "0.8.12"
 dashmap = "6"
 aes-gcm = "0.10"
 p256 = { version = "0.13", features = ["ecdh", "jwk"] }
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
-hkdf = "0.12"
+hkdf = "0.13"
 uuid = { version = "1.22.0", features = ["v7"] }
 base64 = "0.22"
 chrono = { version = "0.4.44", features = ["serde"] }
