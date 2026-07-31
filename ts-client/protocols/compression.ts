@@ -2,7 +2,11 @@
 // WebSocket Engine - Compression & MessagePack
 // =============================================================================
 
-import pako from 'pako';
+// Namespace import, not default: pako 3 dropped the default export from
+// its ESM build — the default form type-checked (esModuleInterop) and
+// passed node-side tests, then broke every consumer's vite/esbuild
+// bundle with "Missing export" (wellwon caught it on 2.4.2).
+import * as pako from 'pako';
 import { encode, decode } from '@msgpack/msgpack';
 import { logger } from '../utils/logger';
 import { MEMORY_LIMITS } from '../constants';

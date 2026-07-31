@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.4.3 (2026-07-31)
+
+### Fixed (TS client)
+
+- **2.4.2 broke every bundler-based consumer.** The compression module
+  used `import pako from 'pako'` while the pako 3 bump (merged the same
+  day) removed the default export from pako's ESM build -- tsc accepted
+  the default form (esModuleInterop) and node-side tests passed, but any
+  vite/esbuild consumer failed with "Missing export". Switched to the
+  namespace import. The release gate now includes a consumer-style
+  esbuild bundle of the built output, which is the check that would
+  have caught this class.
+
 ## v2.4.2 (2026-07-31)
 
 ### Fixed (TS client)
