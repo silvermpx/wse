@@ -19,7 +19,7 @@ sha2 = "0.11"
 hex = "0.4"
 ahash = "0.8.12"
 dashmap = "6"
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 p256 = { version = "0.13", features = ["ecdh", "jwk"] }
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 hkdf = "0.13"
