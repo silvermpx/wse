@@ -451,6 +451,30 @@ class TestServerLifecycle:
         server.broadcast_all("{}")
         server.broadcast_local("topic", "{}")
 
+    def test_pending_handshake_cap_answers_503(self, server_port):
+        """Past max_pending_handshakes, a new connection gets a 503 it can retry,
+        counted in wse_handshakes_dropped_total, instead of a closed socket."""
+        import socket
+
+        srv = RustWSEServer("127.0.0.1", server_port, max_pending_handshakes=1)
+        srv.enable_drain_mode()
+        srv.start()
+        time.sleep(0.05)
+        try:
+            # A socket that never sends its upgrade holds the only slot.
+            holder = socket.create_connection(("127.0.0.1", server_port), timeout=5)
+            time.sleep(0.1)
+            refused = socket.create_connection(("127.0.0.1", server_port), timeout=5)
+            refused.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n")
+            response = refused.recv(1024)
+            assert response.startswith(b"HTTP/1.1 503"), response
+            assert b"Retry-After: 1" in response
+            assert "wse_handshakes_dropped_total 1" in srv.prometheus_metrics()
+            holder.close()
+            refused.close()
+        finally:
+            srv.stop()
+
 
 # ---------------------------------------------------------------------------
 # Presence tracking

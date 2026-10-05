@@ -281,11 +281,23 @@ pub(crate) struct SharedStateConfig {
     pub idle_timeout_secs: u64,
     pub max_outbound_queue_bytes: usize,
     pub max_subscriptions_per_connection: usize,
+    pub max_pending_handshakes: usize,
 }
 
 pub(crate) struct SharedState {
     pub(crate) connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     max_connections: usize,
+    /// Connections allowed between accept and registration at once (default
+    /// 512). `max_connections` only counts REGISTERED connections (a connection
+    /// registers after the WS upgrade + JWT complete), so without this a
+    /// slowloris that opens sockets but never completes the upgrade -- each held
+    /// up to the 10s handshake timeout -- exhausts tasks and file descriptors
+    /// well before any limit fires. Past it, new connections get a 503 with
+    /// Retry-After, counted in `handshakes_dropped_total`. Configurable because a
+    /// reconnect storm after a restart can legitimately exceed the default.
+    max_pending_handshakes: usize,
+    /// Connections refused because `max_pending_handshakes` were in flight.
+    handshakes_dropped_total: AtomicU64,
     on_connect: std::sync::RwLock<Option<Py<PyAny>>>,
     on_message: std::sync::RwLock<Option<Py<PyAny>>>,
     on_disconnect: std::sync::RwLock<Option<Py<PyAny>>>,
@@ -368,6 +380,8 @@ impl SharedState {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             max_connections: cfg.max_connections,
+            max_pending_handshakes: cfg.max_pending_handshakes,
+            handshakes_dropped_total: AtomicU64::new(0),
             on_connect: std::sync::RwLock::new(None),
             on_message: std::sync::RwLock::new(None),
             on_disconnect: std::sync::RwLock::new(None),
@@ -948,13 +962,6 @@ fn build_server_ready(conn_id: &str, user_id: &str, recovery_enabled: bool) -> S
 // ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
-
-/// Max connections allowed to sit in the pre-handshake / handshake phase at once.
-/// `max_connections` only counts REGISTERED connections (a connection registers
-/// after the WS upgrade + JWT complete), so without this a slowloris that opens
-/// sockets but never completes the upgrade -- each held up to the 10s handshake
-/// timeout -- exhausts tasks and file descriptors well before any limit fires.
-const MAX_PENDING_HANDSHAKES: usize = 512;
 
 /// Max concurrent on_message callbacks (blocking tasks) per connection in
 /// callback mode. Bounds inbound flooding from exhausting the blocking pool.
@@ -2564,6 +2571,7 @@ struct ServerParams {
     idle_timeout: u64,
     max_outbound_queue_bytes: usize,
     max_subscriptions_per_connection: usize,
+    max_pending_handshakes: usize,
     rate_limit_capacity: f64,
     rate_limit_refill: f64,
 }
@@ -2733,6 +2741,7 @@ impl RustWSEServer {
                 idle_timeout_secs: srv.idle_timeout,
                 max_outbound_queue_bytes: srv.max_outbound_queue_bytes,
                 max_subscriptions_per_connection: srv.max_subscriptions_per_connection,
+                max_pending_handshakes: srv.max_pending_handshakes,
             })),
             cmd_tx: None,
             thread_handle: None,
@@ -2878,10 +2887,10 @@ impl RustWSEServer {
     /// compression, encryption, ping/pong). Python handles application logic
     /// via drain mode or callbacks.
     #[new]
-    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, jwt_previous_secret = None, jwt_key_id = None, jwt_algorithm = None, jwt_private_key = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_bytes = 16_777_216, max_subscriptions_per_connection = 0))]
+    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, jwt_previous_secret = None, jwt_key_id = None, jwt_algorithm = None, jwt_private_key = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_bytes = 16_777_216, max_subscriptions_per_connection = 0, max_pending_handshakes = 512))]
     #[expect(
         clippy::too_many_arguments,
-        reason = "PyO3 __init__: 27 Python kwargs with defaults"
+        reason = "PyO3 __init__: 28 Python kwargs with defaults"
     )]
     fn new(
         host: String,
@@ -2911,6 +2920,7 @@ impl RustWSEServer {
         idle_timeout: u64,
         max_outbound_queue_bytes: usize,
         max_subscriptions_per_connection: usize,
+        max_pending_handshakes: usize,
     ) -> PyResult<Self> {
         Self::build(
             host,
@@ -2923,6 +2933,7 @@ impl RustWSEServer {
                 idle_timeout,
                 max_outbound_queue_bytes,
                 max_subscriptions_per_connection,
+                max_pending_handshakes,
                 rate_limit_capacity,
                 rate_limit_refill,
             },
@@ -3377,13 +3388,27 @@ impl RustWSEServer {
                             res = listener.accept() => {
                                 match res {
                                     Ok((stream, addr)) => {
-                                        if handshakes_in_flight.load(Ordering::Relaxed)
-                                            >= MAX_PENDING_HANDSHAKES
-                                        {
+                                        let cap = shared.max_pending_handshakes;
+                                        if handshakes_in_flight.load(Ordering::Relaxed) >= cap {
+                                            shared.handshakes_dropped_total.fetch_add(1, Ordering::Relaxed);
                                             tracing::warn!(
-                                                "[WSE] Pre-handshake cap reached ({MAX_PENDING_HANDSHAKES}), dropping {addr}"
+                                                "[WSE] Pre-handshake cap reached ({cap}), refusing {addr}"
                                             );
-                                            continue; // drop the stream
+                                            // Answer instead of closing the socket: the client sees a
+                                            // refusal it can retry later, not a broken handshake.
+                                            tokio::spawn(async move {
+                                                use tokio::io::AsyncWriteExt;
+                                                let mut stream = stream;
+                                                let _ = tokio::time::timeout(
+                                                    Duration::from_secs(1),
+                                                    stream.write_all(
+                                                        b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                                    ),
+                                                )
+                                                .await;
+                                                let _ = stream.shutdown().await;
+                                            });
+                                            continue;
                                         }
                                         let hs_guard =
                                             HandshakeGuard::new(handshakes_in_flight.clone());
@@ -4972,6 +4997,13 @@ impl RustWSEServer {
             self.shared
                 .connections_accepted_total
                 .load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP wse_handshakes_dropped_total Connections refused (503) because max_pending_handshakes were in flight\n");
+        out.push_str("# TYPE wse_handshakes_dropped_total counter\n");
+        out.push_str(&format!(
+            "wse_handshakes_dropped_total {}\n",
+            self.shared.handshakes_dropped_total.load(Ordering::Relaxed)
         ));
 
         out.push_str("# HELP wse_connections_rejected_total Total connections rejected\n");
