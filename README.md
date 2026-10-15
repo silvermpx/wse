@@ -190,6 +190,7 @@ token = rust_jwt_encode(
 | `presence_max_members` | 0 | Max tracked members per topic (0 = unlimited) |
 | `max_outbound_queue_bytes` | 16777216 | Per-connection outbound buffer limit (bytes, default 16 MB). Messages dropped when exceeded |
 | `max_subscriptions_per_connection` | 0 | Max topics per connection (0 = unlimited). Prevents topic explosion DoS |
+| `max_pending_handshakes` | 512 | Max connections between accept and registration at once. Past it, new connections get `503` with `Retry-After: 1`. Raise it if thousands of clients may reconnect at once (e.g. after a restart) |
 | `rate_limit_capacity` | 100000.0 | Token bucket capacity per connection |
 | `rate_limit_refill` | 10000.0 | Token bucket refill rate per second |
 | `max_message_size` | 1048576 | Maximum WebSocket frame size in bytes (default 1 MB) |

@@ -1030,6 +1030,7 @@ async def metrics():
 | `wse_rate_limited_total` | Messages dropped by rate limiter (in callback mode also counts shed callback dispatches) |
 | `wse_inbound_dropped_total` | Drain queue events dropped (queue full) |
 | `wse_slow_consumer_drops_total` | Messages dropped due to slow consumer backpressure |
+| `wse_handshakes_dropped_total` | Connections refused with `503` because `max_pending_handshakes` were in flight |
 
 **Cluster counters** (when clustering is enabled):
 
