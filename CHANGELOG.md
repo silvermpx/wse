@@ -1,5 +1,30 @@
 # Changelog
 
+## v2.5.1 (2026-10-15)
+
+2.5.0 reached PyPI only as wse-server: the publish steps of the Python
+client and the npm client failed. This release ships all three packages
+again at one version, with every open dependency update.
+
+### Fixed (release)
+
+- **The Python client upload was rejected.** Current hatchling writes core
+  metadata 2.5, which the twine inside pypi-publish 1.14.1 did not accept.
+  The action is now 1.14.2 (twine 7).
+- **The npm publish token had expired** and was renewed.
+
+### Changed (dependencies)
+
+- jsonwebtoken 11 and aes-gcm 0.11. Nonces now come from
+  `Nonce::generate()`; P-256 key generation keeps rand_core 0.6's `OsRng`,
+  which p256 0.13 still takes. tokio 1.53.1, serde 1.0.229, serde_json
+  1.0.151.
+- GitHub Actions: checkout 7.0.1, rust-cache 2.9.2, setup-qemu 4.3.0,
+  action-gh-release 3.0.3, pypi-publish 1.14.2.
+- TS client dev dependencies: vitest 4.1.11, @types/node 26.3.0,
+  @types/react 19.2.18, zustand 5.0.15. @types/pako is removed: pako 3
+  ships its own types.
+
 ## v2.5.0 (2026-10-15)
 
 All three packages (wse-server, the wse-client Python package and the
