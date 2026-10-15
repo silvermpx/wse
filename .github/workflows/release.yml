@@ -134,7 +134,7 @@ jobs:
         shell: bash
         run: |
           pip install dist/*.whl
-          pip install pytest pytest-asyncio httpx websockets
+          pip install pytest pytest-asyncio httpx websockets cryptography
 
       - name: Run tests
         shell: bash
