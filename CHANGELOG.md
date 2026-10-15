@@ -1,5 +1,37 @@
 # Changelog
 
+## v2.5.0 (2026-10-15)
+
+All three packages (wse-server, the wse-client Python package and the
+wse-client npm package) now share this version. The TS client has no code
+changes in this release.
+
+### Added
+
+- **Python 3.15.** The abi3 server wheel already loads on 3.15; CI and the
+  release gate now test the server and the Python client on it, and both
+  packages list it.
+
+### Fixed (server)
+
+- **Broadcast backlogs no longer cost memory per connection.** A broadcast
+  frame was copied into every subscriber's buffer, so slow clients held
+  frames x connections bytes, up to `max_outbound_queue_bytes` each. Frames
+  over 1 KiB are now queued as shared references and written with vectored
+  writes; smaller frames are still copied. In a 500-subscriber backlog test
+  peak RSS went from 2,440 MB to 166 MB. (#74, thanks @jpsca)
+
+### Security
+
+- **rustls 0.23.46** (was 0.23.41) fixes RUSTSEC-2026-0285, -0346, -0348
+  and -0349. spin 0.9.8 (yanked) is replaced by 0.9.9.
+
+### Changed
+
+- Building from source needs Rust 1.95 or newer, now declared as
+  `rust-version`: the atomics use `try_update`, the name Rust 1.99 gave to
+  `fetch_update`.
+
 ## v2.4.3 (2026-07-31)
 
 ### Fixed (TS client)
