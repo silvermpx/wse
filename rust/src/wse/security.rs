@@ -1,12 +1,15 @@
 use aes_gcm::{
-    Aes256Gcm, KeyInit,
-    aead::{Aead, AeadCore, OsRng},
+    Aes256Gcm, KeyInit, Nonce,
+    aead::{Aead, Generate},
 };
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac, digest::KeyInit as MacKeyInit};
 use p256::{PublicKey, SecretKey, ecdh::diffie_hellman, elliptic_curve::sec1::ToEncodedPoint};
+// aes-gcm 0.11 (aead 0.6, rand_core 0.9) no longer re-exports OsRng, and p256 0.13
+// still takes a rand_core 0.6 RNG, so key generation uses the 0.6 OsRng directly.
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
@@ -72,7 +75,7 @@ pub fn rust_aes_gcm_encrypt(py: Python, key: &[u8], plaintext: &[u8]) -> PyResul
     }
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid key: {e}")))?;
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let nonce = Nonce::generate();
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Encrypt failed: {e}")))?;
@@ -199,7 +202,7 @@ mod tests {
 
         // Encrypt
         let cipher = Aes256Gcm::new_from_slice(&key).expect("key should be valid");
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let nonce = Nonce::generate();
         let ct = cipher.encrypt(&nonce, &plaintext[..]).expect("encrypt");
 
         let mut blob = Vec::with_capacity(12 + ct.len());
@@ -219,7 +222,7 @@ mod tests {
         let key2 = [0x02u8; 32];
 
         let cipher1 = Aes256Gcm::new_from_slice(&key1).unwrap();
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let nonce = Nonce::generate();
         let ct = cipher1.encrypt(&nonce, b"secret".as_ref()).unwrap();
 
         let mut blob = Vec::new();

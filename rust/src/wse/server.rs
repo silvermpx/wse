@@ -896,7 +896,7 @@ fn derive_connection_key(client_pubkey_b64: &str) -> Result<(String, aes_gcm::Ae
     let client_pk = PublicKey::from_sec1_bytes(&client_pubkey_bytes)
         .map_err(|e| format!("Invalid ECDH public key: {e}"))?;
 
-    let server_sk = SecretKey::random(&mut aes_gcm::aead::OsRng);
+    let server_sk = SecretKey::random(&mut rand_core::OsRng);
     let server_pk = server_sk.public_key();
 
     let shared = diffie_hellman(server_sk.to_nonzero_scalar(), client_pk.as_affine());
@@ -922,10 +922,9 @@ fn derive_connection_key(client_pubkey_b64: &str) -> Result<(String, aes_gcm::Ae
 
 /// Encrypt plaintext with AES-GCM-256: returns 12-byte IV + ciphertext + 16-byte tag.
 fn encrypt_outbound(cipher: &aes_gcm::Aes256Gcm, plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    use aes_gcm::AeadCore;
-    use aes_gcm::aead::Aead;
+    use aes_gcm::aead::{Aead, Generate};
 
-    let nonce = aes_gcm::Aes256Gcm::generate_nonce(&mut aes_gcm::aead::OsRng);
+    let nonce = aes_gcm::Nonce::generate();
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
         .map_err(|e| format!("AES-GCM encrypt failed: {e}"))?;
