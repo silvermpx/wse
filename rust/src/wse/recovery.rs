@@ -356,7 +356,7 @@ impl RecoveryManager {
         } else if old_bytes > new_bytes {
             let _ = self
                 .total_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                     Some(cur.saturating_sub(old_bytes - new_bytes))
                 });
         }
@@ -399,7 +399,7 @@ impl RecoveryManager {
         } else if old_bytes > new_bytes {
             let _ = self
                 .total_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                     Some(cur.saturating_sub(old_bytes - new_bytes))
                 });
         }
@@ -519,11 +519,11 @@ impl RecoveryManager {
         }
         for key in &to_remove {
             if let Some((_, removed)) = self.buffers.remove(key) {
-                let _ =
-                    self.total_bytes
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                            Some(cur.saturating_sub(removed.total_bytes))
-                        });
+                let _ = self
+                    .total_bytes
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                        Some(cur.saturating_sub(removed.total_bytes))
+                    });
             }
         }
 
@@ -536,11 +536,11 @@ impl RecoveryManager {
         }
         for key in &foreign_to_remove {
             if let Some((_, removed)) = self.foreign_buffers.remove(key) {
-                let _ =
-                    self.total_bytes
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                            Some(cur.saturating_sub(removed.total_bytes))
-                        });
+                let _ = self
+                    .total_bytes
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                        Some(cur.saturating_sub(removed.total_bytes))
+                    });
             }
         }
 
@@ -575,18 +575,18 @@ impl RecoveryManager {
                 }
                 if is_local {
                     if let Some((_, removed)) = self.buffers.remove(&key) {
-                        let _ = self.total_bytes.fetch_update(
+                        let _ = self.total_bytes.try_update(
                             Ordering::Relaxed,
                             Ordering::Relaxed,
                             |cur| Some(cur.saturating_sub(removed.total_bytes)),
                         );
                     }
                 } else if let Some((_, removed)) = self.foreign_buffers.remove(&key) {
-                    let _ = self.total_bytes.fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |cur| Some(cur.saturating_sub(removed.total_bytes)),
-                    );
+                    let _ =
+                        self.total_bytes
+                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                                Some(cur.saturating_sub(removed.total_bytes))
+                            });
                 }
             }
         }

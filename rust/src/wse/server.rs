@@ -1307,13 +1307,12 @@ async fn handle_connection(
             if let Some(data) = broadcast_data {
                 let len = data.len();
                 if raw_write.write_all(&data).await.is_err() {
-                    let _ =
-                        pending_write.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                            Some(cur.saturating_sub(len))
-                        });
+                    let _ = pending_write.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                        Some(cur.saturating_sub(len))
+                    });
                     break;
                 }
-                let _ = pending_write.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                let _ = pending_write.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                     Some(cur.saturating_sub(len))
                 });
                 continue; // check buffer again before blocking
@@ -1389,7 +1388,7 @@ async fn handle_connection(
                         }
                     }
 
-                    let _ = pending_write.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    let _ = pending_write.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                         Some(cur.saturating_sub(drained_bytes))
                     });
                     batch.clear();

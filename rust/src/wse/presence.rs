@@ -274,7 +274,7 @@ impl PresenceManager {
                     topic_map.remove_if(&user_id, |_, entry| entry.connections.is_empty())
             {
                 if let Some(stats) = self.topic_presence_stats.get(topic) {
-                    let _ = stats.num_users.fetch_update(
+                    let _ = stats.num_users.try_update(
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                         |current| Some(current.saturating_sub(1)),
@@ -439,7 +439,7 @@ impl PresenceManager {
                         if removed_count > 0
                             && let Some(stats) = self.topic_presence_stats.get(&topic)
                         {
-                            let _ = stats.num_connections.fetch_update(
+                            let _ = stats.num_connections.try_update(
                                 Ordering::Relaxed,
                                 Ordering::Relaxed,
                                 |current| Some(current.saturating_sub(removed_count)),
@@ -451,12 +451,12 @@ impl PresenceManager {
                 // Only decrement stats and emit leave if the entry was actually removed
                 if actual_conn_count > 0 {
                     if let Some(stats) = self.topic_presence_stats.get(&topic) {
-                        let _ = stats.num_users.fetch_update(
+                        let _ = stats.num_users.try_update(
                             Ordering::Relaxed,
                             Ordering::Relaxed,
                             |current| Some(current.saturating_sub(1)),
                         );
-                        let _ = stats.num_connections.fetch_update(
+                        let _ = stats.num_connections.try_update(
                             Ordering::Relaxed,
                             Ordering::Relaxed,
                             |current| Some(current.saturating_sub(actual_conn_count)),
@@ -585,7 +585,7 @@ impl PresenceManager {
                 if actually_removed.is_some()
                     && let Some(stats) = self.topic_presence_stats.get(topic)
                 {
-                    let _ = stats.num_users.fetch_update(
+                    let _ = stats.num_users.try_update(
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                         |current| Some(current.saturating_sub(1)),
@@ -594,7 +594,7 @@ impl PresenceManager {
             }
             // Decrement connection count for each removed sentinel
             if removed_sentinel && let Some(stats) = self.topic_presence_stats.get(topic) {
-                let _ = stats.num_connections.fetch_update(
+                let _ = stats.num_connections.try_update(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                     |current| Some(current.saturating_sub(1)),
@@ -712,16 +712,15 @@ impl PresenceManager {
                 let _ =
                     stats
                         .num_connections
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
                             Some(c.saturating_sub(conns_removed))
                         });
                 if users_removed > 0 {
-                    let _ =
-                        stats
-                            .num_users
-                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-                                Some(c.saturating_sub(users_removed))
-                            });
+                    let _ = stats
+                        .num_users
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                            Some(c.saturating_sub(users_removed))
+                        });
                 }
             }
         }
