@@ -21,9 +21,11 @@ sha2 = "0.11"
 hex = "0.4"
 ahash = "0.8.12"
 dashmap = "6"
-aes-gcm = "0.10"
+aes-gcm = { version = "0.11", features = ["getrandom"] }
+# p256 0.13 key generation takes a rand_core 0.6 RNG; aes-gcm 0.11 moved to rand_core 0.9.
+rand_core = { version = "0.6", features = ["getrandom"] }
 p256 = { version = "0.13", features = ["ecdh", "jwk"] }
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 hkdf = "0.13"
 uuid = { version = "1.22.0", features = ["v7"] }
 base64 = "0.23"
