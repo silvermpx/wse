@@ -71,13 +71,98 @@ fn ws_frame_size(frame: &WsFrame) -> usize {
     }
 }
 
+/// Frames up to this size are copied into the connection's own buffer; larger
+/// ones are shared. Copying a small frame costs less than a shared reference
+/// count, and it keeps every entry of a vectored write at least this big, so a
+/// write of `MAX_IOV` entries moves at least 512 KiB.
+const SHARE_FRAMES_ABOVE: usize = 1024;
+
+/// The broadcast frames waiting for one connection. A large frame is queued as
+/// a `Bytes`: one more reference to the buffer every subscriber shares, instead
+/// of a copy per connection, so the memory of a backlog is the distinct frames,
+/// not frames times connections. Small frames are copied together into `small`,
+/// as one contiguous segment, in order with the shared ones.
+#[derive(Default)]
+pub(crate) struct BroadcastQueue {
+    frames: std::collections::VecDeque<Bytes>,
+    small: BytesMut,
+}
+
+impl BroadcastQueue {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.frames.is_empty() && self.small.is_empty()
+    }
+
+    pub(crate) fn push(&mut self, frame: &Bytes) {
+        if frame.len() <= SHARE_FRAMES_ABOVE {
+            self.small.extend_from_slice(frame);
+        } else {
+            self.seal_small();
+            self.frames.push_back(frame.clone());
+        }
+    }
+
+    /// Take every queued frame, for one vectored write.
+    pub(crate) fn take(&mut self) -> std::collections::VecDeque<Bytes> {
+        self.seal_small();
+        std::mem::take(&mut self.frames)
+    }
+
+    /// Close the segment of small frames, so what comes next goes after it.
+    fn seal_small(&mut self) {
+        if !self.small.is_empty() {
+            self.frames.push_back(self.small.split().freeze());
+        }
+    }
+}
+
+/// Write `frames` in order with as few `writev` calls as the socket allows.
+async fn write_all_frames<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    frames: &std::collections::VecDeque<Bytes>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    const MAX_IOV: usize = 512;
+    let mut index = 0; // first frame not fully written
+    let mut offset = 0; // bytes of it already written
+    while index < frames.len() {
+        let mut slices: Vec<std::io::IoSlice<'_>> =
+            Vec::with_capacity(MAX_IOV.min(frames.len() - index));
+        slices.push(std::io::IoSlice::new(&frames[index][offset..]));
+        for frame in frames.iter().skip(index + 1).take(MAX_IOV - 1) {
+            slices.push(std::io::IoSlice::new(frame));
+        }
+        let mut written = w.write_vectored(&slices).await?;
+        if written == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        while written > 0 {
+            let left = frames[index].len() - offset;
+            if written >= left {
+                written -= left;
+                index += 1;
+                offset = 0;
+            } else {
+                offset += written;
+                written = 0;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub(crate) struct ConnectionHandle {
     pub(crate) tx: mpsc::UnboundedSender<WsFrame>,
     /// Pending outbound bytes (not messages) for backpressure accounting.
     pub(crate) pending: Arc<AtomicUsize>,
-    /// NATS-style direct byte buffer for broadcast_all (bypasses mpsc channel).
-    pub(crate) broadcast_buf: Arc<parking_lot::Mutex<BytesMut>>,
+    /// NATS-style direct buffer for broadcasts (bypasses mpsc channel): the frames
+    /// themselves, shared with every other connection they go to, not copies.
+    pub(crate) broadcast_buf: Arc<parking_lot::Mutex<BroadcastQueue>>,
     /// Wakes write task when broadcast data is appended to broadcast_buf.
     pub(crate) broadcast_notify: Arc<tokio::sync::Notify>,
 }
@@ -1108,7 +1193,7 @@ async fn handle_connection(
     let mut write_half = write_half;
     let (tx, mut rx) = mpsc::unbounded_channel::<WsFrame>();
     let pending = Arc::new(AtomicUsize::new(0));
-    let broadcast_buf = Arc::new(parking_lot::Mutex::new(BytesMut::with_capacity(512)));
+    let broadcast_buf = Arc::new(parking_lot::Mutex::new(BroadcastQueue::new()));
     let broadcast_notify = Arc::new(tokio::sync::Notify::new());
     let drain = state.drain_mode.load(Ordering::Relaxed);
 
@@ -1299,14 +1384,14 @@ async fn handle_connection(
             } else {
                 let mut buf = broadcast_buf_write.lock();
                 if !buf.is_empty() {
-                    Some(buf.split().freeze()) // zero-copy handoff
+                    Some(buf.take()) // the shared frames, no copy
                 } else {
                     None
                 }
             };
-            if let Some(data) = broadcast_data {
-                let len = data.len();
-                if raw_write.write_all(&data).await.is_err() {
+            if let Some(frames) = broadcast_data {
+                let len: usize = frames.iter().map(|f| f.len()).sum();
+                if write_all_frames(&mut raw_write, &frames).await.is_err() {
                     let _ = pending_write.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                         Some(cur.saturating_sub(len))
                     });
@@ -1966,7 +2051,7 @@ fn fanout_broadcast_direct(
         let was_empty = {
             let mut buf = h.broadcast_buf.lock();
             let empty = buf.is_empty();
-            buf.extend_from_slice(data);
+            buf.push(data);
             empty
         };
         if was_empty {
@@ -2012,7 +2097,7 @@ pub(crate) fn fanout_topic_direct(
                 let was_empty = {
                     let mut buf = h.broadcast_buf.lock();
                     let empty = buf.is_empty();
-                    buf.extend_from_slice(data);
+                    buf.push(data);
                     empty
                 };
                 if was_empty {
@@ -2042,7 +2127,7 @@ pub(crate) fn fanout_topic_direct(
                     let was_empty = {
                         let mut buf = h.broadcast_buf.lock();
                         let empty = buf.is_empty();
-                        buf.extend_from_slice(data);
+                        buf.push(data);
                         empty
                     };
                     if was_empty {
@@ -2072,7 +2157,7 @@ pub(crate) fn fanout_topic_direct(
                         let was_empty = {
                             let mut buf = h.broadcast_buf.lock();
                             let empty = buf.is_empty();
-                            buf.extend_from_slice(data);
+                            buf.push(data);
                             empty
                         };
                         if was_empty {
@@ -2172,7 +2257,7 @@ async fn process_commands(
                             let was_empty = {
                                 let mut buf = h.broadcast_buf.lock();
                                 let empty = buf.is_empty();
-                                buf.extend_from_slice(&preframed);
+                                buf.push(&preframed);
                                 empty
                             };
                             if was_empty {
@@ -2230,7 +2315,7 @@ async fn process_commands(
                             let was_empty = {
                                 let mut buf = h.broadcast_buf.lock();
                                 let empty = buf.is_empty();
-                                buf.extend_from_slice(&preframed);
+                                buf.push(&preframed);
                                 empty
                             };
                             if was_empty {
@@ -2334,7 +2419,7 @@ async fn process_commands(
                                     let was_empty = {
                                         let mut buf = h.broadcast_buf.lock();
                                         let empty = buf.is_empty();
-                                        buf.extend_from_slice(&preframed);
+                                        buf.push(&preframed);
                                         empty
                                     };
                                     if was_empty {
@@ -2376,7 +2461,7 @@ async fn process_commands(
                                         let was_empty = {
                                             let mut buf = h.broadcast_buf.lock();
                                             let empty = buf.is_empty();
-                                            buf.extend_from_slice(&preframed);
+                                            buf.push(&preframed);
                                             empty
                                         };
                                         if was_empty {
@@ -2435,7 +2520,7 @@ async fn process_commands(
                             let was_empty = {
                                 let mut buf = h.broadcast_buf.lock();
                                 let empty = buf.is_empty();
-                                buf.extend_from_slice(&preframed);
+                                buf.push(&preframed);
                                 empty
                             };
                             if was_empty {
@@ -5355,7 +5440,7 @@ mod tests {
         let h = ConnectionHandle {
             tx,
             pending: Arc::new(AtomicUsize::new(0)),
-            broadcast_buf: Arc::new(parking_lot::Mutex::new(BytesMut::new())),
+            broadcast_buf: Arc::new(parking_lot::Mutex::new(BroadcastQueue::new())),
             broadcast_notify: Arc::new(tokio::sync::Notify::new()),
         };
         (h, rx)
@@ -5393,7 +5478,7 @@ mod tests {
                     let (_, ref h) = g.members[idx];
                     h.pending.fetch_add(data.len(), Ordering::Relaxed);
                     let mut buf = h.broadcast_buf.lock();
-                    buf.extend_from_slice(&data);
+                    buf.push(&data);
                 }
             }
         }

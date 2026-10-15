@@ -272,6 +272,234 @@ class TestBroadcast:
 
 
 # ---------------------------------------------------------------------------
+# Broadcast delivery under backlog
+# ---------------------------------------------------------------------------
+
+
+def bulk_fill(i: int) -> str:
+    """Runs of small frames (copied per connection) between large ones (shared),
+    with odd, growing sizes so frame boundaries never line up with what one
+    write takes."""
+    size = 100 + i if i % 4 else 65_537 + i
+    return chr(97 + i % 26) * size
+
+
+def bulk_message(i: int) -> str:
+    return json.dumps({"t": "bulk", "p": {"i": i, "fill": bulk_fill(i)}})
+
+
+def assert_bulk(messages: list, first: int, count: int) -> None:
+    """Every bulk message from `first` on, each once, in order, intact."""
+    got = [json.loads(m) for m in messages]
+    assert [g["p"]["i"] for g in got] == list(range(first, first + count))
+    for g in got:
+        assert g["p"]["fill"] == bulk_fill(g["p"]["i"])
+
+
+async def connect_slow_reader(port: int, token: str):
+    """A client with a tiny receive buffer: the server's socket fills up, so
+    its writes of a backlog come back partial."""
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    sock.connect(("127.0.0.1", port))
+    sock.setblocking(False)
+    return await websockets.connect(
+        ws_url(port),
+        sock=sock,
+        additional_headers={"Authorization": f"Bearer {token}"},
+        open_timeout=2.0,
+        max_size=None,
+    )
+
+
+async def recv_n(ws, n: int, timeout: float = 20.0) -> list:
+    return [await asyncio.wait_for(ws.recv(), timeout=timeout) for _ in range(n)]
+
+
+def make_bulk_server(port: int) -> RustWSEServer:
+    from tests.conftest import JWT_AUDIENCE, JWT_ISSUER, JWT_SECRET
+
+    srv = RustWSEServer(
+        "127.0.0.1",
+        port,
+        jwt_secret=JWT_SECRET,
+        jwt_issuer=JWT_ISSUER,
+        jwt_audience=JWT_AUDIENCE,
+        # Room for the whole backlog: a slow-consumer drop would fail the test
+        # for the wrong reason.
+        max_outbound_queue_bytes=64 * 1024 * 1024,
+    )
+    srv.enable_drain_mode()
+    srv.start()
+    time.sleep(0.05)
+    return srv
+
+
+class TestBroadcastDelivery:
+    """A backlog of large broadcasts reaches every client complete and in
+    order, whichever way it is sent, while the socket only takes part of it
+    per write."""
+
+    COUNT = 400  # ~6.5 MB per client
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["broadcast_all", "broadcast_local"])
+    async def test_backlog_complete_and_in_order(self, server_port, method):
+        srv = make_bulk_server(server_port)
+        try:
+            clients = [
+                await connect_slow_reader(server_port, make_token(f"u{i}")) for i in range(3)
+            ]
+            for ws in clients:
+                await asyncio.wait_for(ws.recv(), timeout=2.0)  # server_ready
+            for _ in clients:
+                conn_id = drain_until(srv, "auth_connect")[1]
+                if method == "broadcast_local":
+                    srv.subscribe_connection(conn_id, ["bulk"])
+
+            for i in range(self.COUNT):
+                if method == "broadcast_all":
+                    srv.broadcast_all(bulk_message(i))
+                else:
+                    srv.broadcast_local("bulk", bulk_message(i))
+
+            received = await asyncio.gather(*(recv_n(ws, self.COUNT) for ws in clients))
+            for messages in received:
+                assert_bulk(messages, 0, self.COUNT)
+            for ws in clients:
+                await ws.close()
+        finally:
+            srv.stop()
+
+    @pytest.mark.asyncio
+    async def test_send_event_during_backlog(self, server_port):
+        """A direct message (its own queue) still arrives while broadcasts
+        are backed up, and does not disturb their order."""
+        srv = make_bulk_server(server_port)
+        try:
+            ws = await connect_slow_reader(server_port, make_token())
+            await asyncio.wait_for(ws.recv(), timeout=2.0)
+            conn_id = drain_until(srv, "auth_connect")[1]
+
+            for i in range(self.COUNT):
+                srv.broadcast_all(bulk_message(i))
+                if i == self.COUNT // 2:
+                    srv.send_event(conn_id, {"t": "direct", "p": {"n": 1}})
+
+            messages = await recv_n(ws, self.COUNT + 1)
+            direct = [m for m in messages if isinstance(m, bytes)]
+            assert len(direct) == 1 and b'"direct"' in direct[0]
+            assert_bulk([m for m in messages if isinstance(m, str)], 0, self.COUNT)
+            await ws.close()
+        finally:
+            srv.stop()
+
+    @pytest.mark.asyncio
+    async def test_mixed_encrypted_and_plain_subscribers(self, server_port):
+        """With one E2E-encrypted connection on the server, broadcasts take the
+        mixed path: the encrypted client gets its own E: frames, the plain one
+        the shared frames; both complete and in order."""
+        pytest.importorskip("cryptography")
+        import base64
+
+        from cryptography.hazmat.primitives.asymmetric.ec import (
+            ECDH,
+            SECP256R1,
+            EllipticCurvePublicKey,
+            generate_private_key,
+        )
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives.hashes import SHA256
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+        srv = make_bulk_server(server_port)
+        try:
+            enc_ws = await connect(server_port, make_token("enc"))
+            await asyncio.wait_for(enc_ws.recv(), timeout=2.0)
+            enc_conn = drain_until(srv, "auth_connect")[1]
+            key = generate_private_key(SECP256R1())
+            public = key.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+            await enc_ws.send(
+                json.dumps(
+                    {
+                        "c": "WSE",
+                        "t": "client_hello",
+                        "p": {
+                            "protocol_version": 2,
+                            "features": {"encryption": True},
+                            "encryption_public_key": base64.b64encode(public).decode(),
+                        },
+                    }
+                )
+            )
+            hello = json.loads(await asyncio.wait_for(enc_ws.recv(), timeout=2.0))
+            assert hello["t"] == "server_hello"
+            server_public = base64.b64decode(hello["p"]["encryption_public_key"])
+            shared = key.exchange(
+                ECDH(), EllipticCurvePublicKey.from_encoded_point(SECP256R1(), server_public)
+            )
+            aes = AESGCM(
+                HKDF(SHA256(), 32, salt=None, info=b"wse-encryption/aes-gcm-key").derive(shared)
+            )
+
+            plain_ws = await connect_slow_reader(server_port, make_token("plain"))
+            await asyncio.wait_for(plain_ws.recv(), timeout=2.0)
+            plain_conn = drain_until(srv, "auth_connect")[1]
+            srv.subscribe_connection(enc_conn, ["bulk"])
+            srv.subscribe_connection(plain_conn, ["bulk"])
+
+            for i in range(self.COUNT):
+                srv.broadcast_local("bulk", bulk_message(i))
+
+            plain, encrypted = await asyncio.gather(
+                recv_n(plain_ws, self.COUNT), recv_n(enc_ws, self.COUNT)
+            )
+            assert_bulk(plain, 0, self.COUNT)
+            assert all(isinstance(m, bytes) and m.startswith(b"E:") for m in encrypted)
+            decrypted = [aes.decrypt(m[2:14], m[14:], None).decode() for m in encrypted]
+            assert_bulk(decrypted, 0, self.COUNT)
+            await enc_ws.close()
+            await plain_ws.close()
+        finally:
+            srv.stop()
+
+    @pytest.mark.asyncio
+    async def test_recovery_live_and_replayed_in_order(self, server_with_recovery, server_port):
+        """A live subscriber gets the stamped broadcasts in order; a client that
+        recovers from the first one gets the rest replayed in order."""
+        srv = server_with_recovery
+        count = 40  # within the fixture's recovery buffer (64)
+
+        live = await connect_slow_reader(server_port, make_token("live"))
+        await asyncio.wait_for(live.recv(), timeout=2.0)
+        live_conn = drain_until(srv, "auth_connect")[1]
+        srv.subscribe_with_recovery(live_conn, ["bulk"], recover=False)
+
+        srv.broadcast_local("bulk", bulk_message(0))
+        first = json.loads(await asyncio.wait_for(live.recv(), timeout=5.0))
+        epoch, offset = first["e"], first["o"]
+        for i in range(1, count):
+            srv.broadcast_local("bulk", bulk_message(i))
+        rest = await recv_n(live, count - 1)
+        assert [json.loads(m)["o"] for m in rest] == list(range(offset + 1, offset + count))
+        assert_bulk(rest, 1, count - 1)
+
+        async with await connect(server_port, make_token("late")) as late:
+            await asyncio.wait_for(late.recv(), timeout=2.0)
+            late_conn = drain_until(srv, "auth_connect")[1]
+            result = srv.subscribe_with_recovery(
+                late_conn, ["bulk"], recover=True, epoch=epoch, offset=offset
+            )
+            assert result["topics"]["bulk"]["recovered"] is True
+            assert result["topics"]["bulk"]["count"] == count - 1
+            assert_bulk(await recv_n(late, count - 1), 1, count - 1)
+        await live.close()
+
+
+# ---------------------------------------------------------------------------
 # Subscriptions
 # ---------------------------------------------------------------------------
 

@@ -1377,7 +1377,7 @@ async fn peer_dispatch_task(
                         let was_empty = {
                             let mut buf = h.broadcast_buf.lock();
                             let empty = buf.is_empty();
-                            buf.extend_from_slice(&preframed);
+                            buf.push(&preframed);
                             empty
                         };
                         if was_empty {
@@ -4144,8 +4144,7 @@ mod tests {
 
     #[test]
     fn test_cluster_queue_group_dispatch() {
-        use crate::wse::server::QueueGroup;
-        use bytes::BytesMut;
+        use crate::wse::server::{BroadcastQueue, QueueGroup};
         use parking_lot::Mutex;
 
         // Create queue groups with 3 members
@@ -4159,7 +4158,7 @@ mod tests {
             let h = crate::wse::server::ConnectionHandle {
                 tx,
                 pending: Arc::new(AtomicUsize::new(0)),
-                broadcast_buf: Arc::new(Mutex::new(BytesMut::new())),
+                broadcast_buf: Arc::new(Mutex::new(BroadcastQueue::new())),
                 broadcast_notify: Arc::new(tokio::sync::Notify::new()),
             };
             members.push((format!("conn{i}"), h));
@@ -4193,7 +4192,7 @@ mod tests {
                         h.pending.fetch_add(data_len, Ordering::Relaxed);
                         {
                             let mut buf = h.broadcast_buf.lock();
-                            buf.extend_from_slice(&preframed);
+                            buf.push(&preframed);
                         }
                         h.broadcast_notify.notify_one();
                         break;

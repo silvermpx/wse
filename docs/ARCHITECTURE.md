@@ -474,7 +474,7 @@ The `CAP_PRESENCE` capability flag (bit 2) in the HELLO handshake controls wheth
 
 ### Pre-framed Broadcast
 
-The single largest optimization. For a broadcast to N connections, the WebSocket frame (header + payload) is encoded once into a `Bytes` object. Each connection receives an `Arc` clone (reference count bump, no copy). Write tasks send the raw bytes directly to the TCP stream, bypassing tungstenite's per-message encoding.
+The single largest optimization. For a broadcast to N connections, the WebSocket frame (header + payload) is encoded once into a `Bytes` object. Each connection's broadcast queue receives an `Arc` clone of a frame larger than 1 KiB (reference count bump, no copy), so a backlog costs memory for the distinct frames, not frames times connections. Frames up to 1 KiB are copied into the connection's own contiguous segment instead, which is cheaper than a shared reference count and keeps vectored writes large. Write tasks send the raw bytes directly to the TCP stream, bypassing tungstenite's per-message encoding.
 
 ### DashMap
 
