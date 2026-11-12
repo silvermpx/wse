@@ -1,6 +1,9 @@
 use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyNone, PyString, PyTuple};
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{
+    PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyNone, PyString, PyTuple, PyType,
+};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -16,48 +19,82 @@ fn is_clean_primitive(obj: &Bound<'_, PyAny>) -> bool {
         || obj.is_instance_of::<PyNone>()
 }
 
-#[inline]
-fn is_clean_shallow(obj: &Bound<'_, PyAny>) -> bool {
-    is_clean_primitive(obj) || obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyDict>()
+/// Containers nested deeper than this are rejected with `ValueError`; deeper
+/// recursion could overflow the thread's stack, which aborts the process.
+const MAX_DEPTH: usize = 128;
+
+static DECIMAL_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+
+fn is_decimal(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let decimal = DECIMAL_TYPE.import(obj.py(), "decimal", "Decimal")?;
+    obj.is_instance(decimal)
 }
 
-fn dict_needs_conversion(dict: &Bound<'_, PyDict>) -> bool {
-    for (_, v) in dict.iter() {
-        if !is_clean_shallow(&v) {
-            return true;
-        }
-        if let Ok(inner_list) = v.cast::<PyList>() {
-            for item in inner_list.iter() {
-                if !is_clean_shallow(&item) {
-                    return true;
-                }
-            }
-        }
-        if let Ok(inner_dict) = v.cast::<PyDict>() {
-            for (_, inner_v) in inner_dict.iter() {
-                if !is_clean_shallow(&inner_v) {
-                    return true;
-                }
-            }
-        }
+/// True when `obj` is made only of JSON-ready values - str, bool, int, float,
+/// None, and lists/dicts of them at any depth - so it can be passed through
+/// without a copy. Past `MAX_DEPTH` it answers false and lets the converter
+/// report the depth (or the reference cycle) as an error.
+fn is_json_ready(obj: &Bound<'_, PyAny>, depth: usize) -> bool {
+    if is_clean_primitive(obj) {
+        return true;
+    }
+    if depth >= MAX_DEPTH {
+        return false;
+    }
+    if let Ok(list) = obj.cast::<PyList>() {
+        return list.iter().all(|item| is_json_ready(&item, depth + 1));
+    }
+    if let Ok(dict) = obj.cast::<PyDict>() {
+        return dict.iter().all(|(_, v)| is_json_ready(&v, depth + 1));
     }
     false
 }
 
+/// Record that the converter enters the container `obj`; see
+/// `compression::enter_container` for the depth and cycle rules.
+fn enter_container(obj: &Bound<'_, PyAny>, path: &mut Vec<usize>) -> PyResult<()> {
+    let id = obj.as_ptr() as usize;
+    if path.contains(&id) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "cannot convert a value that contains a reference cycle",
+        ));
+    }
+    if path.len() >= MAX_DEPTH {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "cannot convert a value nested deeper than {MAX_DEPTH} levels"
+        )));
+    }
+    path.push(id);
+    Ok(())
+}
+
+/// Convert `obj` to JSON-safe Python values (UUID, datetime/date, Decimal,
+/// Enum, bytes and objects with `__dict__` become str/primitives), at any
+/// depth. Containers that are already JSON-ready are returned as they are.
 fn convert_value(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    convert_at(py, obj, &mut Vec::new())
+}
+
+fn convert_at(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    path: &mut Vec<usize>,
+) -> PyResult<Py<PyAny>> {
     if is_clean_primitive(obj) {
         return Ok(obj.clone().unbind());
     }
 
     if let Ok(dict) = obj.cast::<PyDict>() {
-        if !dict_needs_conversion(dict) {
+        if is_json_ready(obj, path.len()) {
             return Ok(dict.clone().into_any().unbind());
         }
+        enter_container(obj, path)?;
         let new_dict = PyDict::new(py);
         for (k, v) in dict.iter() {
-            let converted = convert_value(py, &v)?;
+            let converted = convert_at(py, &v, path)?;
             new_dict.set_item(k, converted)?;
         }
+        path.pop();
         return Ok(new_dict.into_any().unbind());
     }
 
@@ -86,34 +123,51 @@ fn convert_value(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> 
         return Ok(iso.unbind());
     }
 
+    // Decimal -> its exact decimal string (a float would lose precision)
+    if is_decimal(obj)? {
+        return Ok(obj.str()?.into_any().unbind());
+    }
+
     // Enum (has value + name)
     if obj.hasattr("value")? && obj.hasattr("name")? {
-        let val = obj.getattr("value")?;
-        return convert_value(py, &val);
+        enter_container(obj, path)?;
+        let converted = convert_at(py, &obj.getattr("value")?, path)?;
+        path.pop();
+        return Ok(converted);
     }
 
     if let Ok(list) = obj.cast::<PyList>() {
+        if is_json_ready(obj, path.len()) {
+            return Ok(list.clone().into_any().unbind());
+        }
+        enter_container(obj, path)?;
         let new_list = PyList::empty(py);
         for item in list.iter() {
-            let converted = convert_value(py, &item)?;
+            let converted = convert_at(py, &item, path)?;
             new_list.append(converted)?;
         }
+        path.pop();
         return Ok(new_list.into_any().unbind());
     }
 
     if let Ok(tuple) = obj.cast::<PyTuple>() {
+        enter_container(obj, path)?;
         let new_list = PyList::empty(py);
         for item in tuple.iter() {
-            let converted = convert_value(py, &item)?;
+            let converted = convert_at(py, &item, path)?;
             new_list.append(converted)?;
         }
+        path.pop();
         return Ok(new_list.into_any().unbind());
     }
 
     if obj.hasattr("__dict__")? {
         let dunder_dict = obj.getattr("__dict__")?;
         if let Ok(dict) = dunder_dict.cast::<PyDict>() {
-            return convert_value(py, dict.as_any());
+            enter_container(obj, path)?;
+            let converted = convert_at(py, dict.as_any(), path)?;
+            path.pop();
+            return Ok(converted);
         }
     }
 
@@ -270,10 +324,13 @@ pub fn rust_transform_event<'py>(
     let has_ts = event.contains("ts")?;
 
     if has_v && has_t && has_p && has_id && has_ts {
-        if !event.contains("seq")? {
-            event.set_item("seq", sequence)?;
+        if event.contains("seq")? {
+            return Ok(event.clone());
         }
-        return Ok(event.clone());
+        // Never mutate the caller's dict: stamp the sequence on a copy.
+        let stamped = event.copy()?;
+        stamped.set_item("seq", sequence)?;
+        return Ok(stamped);
     }
 
     // 1. Resolve event_type

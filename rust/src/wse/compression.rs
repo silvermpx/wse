@@ -143,7 +143,53 @@ pub(crate) fn check_msgpack_depth(data: &[u8], max_depth: usize) -> Result<(), (
 /// means "not safely decodable" -- callers fall back to raw bytes / JSON.
 pub(crate) fn decode_msgpack_guarded(data: &[u8]) -> Result<rmpv::Value, ()> {
     check_msgpack_depth(data, MAX_MSGPACK_DEPTH)?;
-    rmpv::decode::read_value(&mut &data[..]).map_err(|_| ())
+    let mut rest = data;
+    let value = rmpv::decode::read_value(&mut rest).map_err(|_| ())?;
+    // One msgpack value must span the whole buffer. JSON is not msgpack even
+    // though its first byte usually decodes: '{' (0x7b) is the integer 123.
+    if !rest.is_empty() {
+        return Err(());
+    }
+    Ok(value)
+}
+
+/// Inputs at least this large are compressed with the interpreter released,
+/// so other Python threads keep running; for small ones the switch costs more.
+const DETACH_COMPRESS_AT: usize = 64 * 1024;
+/// Compressed inputs at least this large are inflated with the interpreter
+/// released (the output can be up to MAX_DECOMPRESS_SIZE).
+const DETACH_DECOMPRESS_AT: usize = 16 * 1024;
+
+/// Run a pure-Rust codec step, detached from the interpreter when `detach`.
+fn run_codec<T, F>(py: Python<'_>, detach: bool, f: F) -> T
+where
+    F: FnOnce() -> T + pyo3::marker::Ungil,
+    T: pyo3::marker::Ungil,
+{
+    if detach { py.detach(f) } else { f() }
+}
+
+/// zlib levels accepted from Python. flate2's zlib-rs backend panics on
+/// anything outside 0..=9, which would surface as an uncatchable-by-default
+/// PanicException; 0 (store) is excluded to match `rust_compress`.
+fn check_level(level: u32) -> PyResult<u32> {
+    if (1..=9).contains(&level) {
+        Ok(level)
+    } else {
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "compression level must be between 1 and 9, got {level}"
+        )))
+    }
+}
+
+fn zlib_compress(data: &[u8], level: u32) -> Result<Vec<u8>, String> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
+    encoder
+        .write_all(data)
+        .map_err(|e| format!("compression write error: {e}"))?;
+    encoder
+        .finish()
+        .map_err(|e| format!("compression finish error: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -162,22 +208,21 @@ pub fn rust_compress(py: Python, data: &[u8], level: i32) -> PyResult<Py<PyBytes
             "compression level must be between 1 and 9",
         ));
     }
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level as u32));
-    encoder.write_all(data).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("compression write error: {e}"))
-    })?;
-    let compressed = encoder.finish().map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("compression finish error: {e}"))
-    })?;
+    let compressed = run_codec(py, data.len() >= DETACH_COMPRESS_AT, || {
+        zlib_compress(data, level as u32)
+    })
+    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
     Ok(PyBytes::new(py, &compressed).unbind())
 }
 
 /// Decompress zlib-compressed data (bounded to MAX_DECOMPRESS_SIZE).
 #[pyfunction]
 pub fn rust_decompress(py: Python, data: &[u8]) -> PyResult<Py<PyBytes>> {
-    bounded_decompress(data)
-        .map(|decompressed| PyBytes::new(py, &decompressed).unbind())
-        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    run_codec(py, data.len() >= DETACH_DECOMPRESS_AT, || {
+        bounded_decompress(data)
+    })
+    .map(|decompressed| PyBytes::new(py, &decompressed).unbind())
+    .map_err(pyo3::exceptions::PyRuntimeError::new_err)
 }
 
 /// Decompress with bounded output to prevent decompression bombs.
@@ -214,9 +259,39 @@ pub fn rust_should_compress(data: &[u8], threshold: usize) -> bool {
 // Helpers: Python value -> rmp_serde::Value conversion
 // ---------------------------------------------------------------------------
 
+/// Containers nested deeper than this are rejected with `ValueError`; deeper
+/// recursion could overflow the thread's stack, which aborts the process.
+const MAX_ENCODE_DEPTH: usize = 128;
+
+/// Record that the encoder enters the container `obj`. `path` holds the
+/// containers being encoded around it: its length is the depth, and meeting
+/// `obj` on it again means a reference cycle (`d["self"] = d`, or objects
+/// reached through `__dict__` that point back up).
+fn enter_container(obj: &Bound<'_, PyAny>, path: &mut Vec<usize>) -> PyResult<()> {
+    let id = obj.as_ptr() as usize;
+    if path.contains(&id) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "cannot encode a value that contains a reference cycle",
+        ));
+    }
+    if path.len() >= MAX_ENCODE_DEPTH {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "cannot encode a value nested deeper than {MAX_ENCODE_DEPTH} levels"
+        )));
+    }
+    path.push(id);
+    Ok(())
+}
+
 /// Convert a Python object to an rmpv::Value suitable for msgpack serialization.
 /// Handles UUID, datetime, date, Enum, dict, list, tuple, bytes, and primitives.
+/// Raises `ValueError` for reference cycles and nesting deeper than
+/// `MAX_ENCODE_DEPTH`.
 fn py_to_rmpv(obj: &Bound<'_, PyAny>) -> PyResult<rmpv::Value> {
+    py_to_rmpv_at(obj, &mut Vec::new())
+}
+
+fn py_to_rmpv_at(obj: &Bound<'_, PyAny>, path: &mut Vec<usize>) -> PyResult<rmpv::Value> {
     // None
     if obj.is_instance_of::<PyNone>() {
         return Ok(rmpv::Value::Nil);
@@ -262,30 +337,36 @@ fn py_to_rmpv(obj: &Bound<'_, PyAny>) -> PyResult<rmpv::Value> {
 
     // Dict
     if let Ok(dict) = obj.cast::<PyDict>() {
+        enter_container(obj, path)?;
         let mut pairs = Vec::with_capacity(dict.len());
         for (k, v) in dict.iter() {
-            let key = py_to_rmpv(&k)?;
-            let val = py_to_rmpv(&v)?;
+            let key = py_to_rmpv_at(&k, path)?;
+            let val = py_to_rmpv_at(&v, path)?;
             pairs.push((key, val));
         }
+        path.pop();
         return Ok(rmpv::Value::Map(pairs));
     }
 
     // List
     if let Ok(list) = obj.cast::<PyList>() {
+        enter_container(obj, path)?;
         let mut items = Vec::with_capacity(list.len());
         for item in list.iter() {
-            items.push(py_to_rmpv(&item)?);
+            items.push(py_to_rmpv_at(&item, path)?);
         }
+        path.pop();
         return Ok(rmpv::Value::Array(items));
     }
 
     // Tuple -> Array
     if let Ok(tuple) = obj.cast::<PyTuple>() {
+        enter_container(obj, path)?;
         let mut items = Vec::with_capacity(tuple.len());
         for item in tuple.iter() {
-            items.push(py_to_rmpv(&item)?);
+            items.push(py_to_rmpv_at(&item, path)?);
         }
+        path.pop();
         return Ok(rmpv::Value::Array(items));
     }
 
@@ -308,15 +389,20 @@ fn py_to_rmpv(obj: &Bound<'_, PyAny>) -> PyResult<rmpv::Value> {
 
     // Enum (has value + name)
     if obj.hasattr("value")? && obj.hasattr("name")? {
-        let val = obj.getattr("value")?;
-        return py_to_rmpv(&val);
+        enter_container(obj, path)?;
+        let val = py_to_rmpv_at(&obj.getattr("value")?, path)?;
+        path.pop();
+        return Ok(val);
     }
 
     // Has __dict__ -> serialize as dict
     if obj.hasattr("__dict__")? {
         let dunder_dict = obj.getattr("__dict__")?;
         if let Ok(dict) = dunder_dict.cast::<PyDict>() {
-            return py_to_rmpv(dict.as_any());
+            enter_container(obj, path)?;
+            let val = py_to_rmpv_at(dict.as_any(), path)?;
+            path.pop();
+            return Ok(val);
         }
     }
 
@@ -487,16 +573,16 @@ impl RustCompressionManager {
     /// * `compression_level` - zlib compression level 1-9 (default: 6).
     #[new]
     #[pyo3(signature = (threshold=1024, compression_level=6))]
-    fn new(threshold: usize, compression_level: u32) -> Self {
-        Self {
+    fn new(threshold: usize, compression_level: u32) -> PyResult<Self> {
+        Ok(Self {
             threshold,
-            compression_level,
+            compression_level: check_level(compression_level)?,
             total_compressed: AtomicU64::new(0),
             total_decompressed: AtomicU64::new(0),
             compression_failures: AtomicU64::new(0),
             decompression_failures: AtomicU64::new(0),
             total_bytes_saved: AtomicI64::new(0),
-        }
+        })
     }
 
     /// Check if data should be compressed based on threshold.
@@ -511,23 +597,19 @@ impl RustCompressionManager {
     /// * `level` - Optional override for compression level.
     #[pyo3(signature = (data, level=None))]
     fn compress(&self, py: Python, data: &[u8], level: Option<u32>) -> PyResult<Py<PyBytes>> {
-        let lvl = level.unwrap_or(self.compression_level);
+        let lvl = match level {
+            Some(l) => check_level(l)?,
+            None => self.compression_level,
+        };
         let original_size = data.len();
 
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(lvl));
-        if let Err(e) = encoder.write_all(data) {
-            self.compression_failures.fetch_add(1, Ordering::Relaxed);
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "compression write error: {e}"
-            )));
-        }
-        let compressed = match encoder.finish() {
+        let compressed = match run_codec(py, original_size >= DETACH_COMPRESS_AT, || {
+            zlib_compress(data, lvl)
+        }) {
             Ok(c) => c,
             Err(e) => {
                 self.compression_failures.fetch_add(1, Ordering::Relaxed);
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "compression finish error: {e}"
-                )));
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(e));
             }
         };
 
@@ -544,7 +626,9 @@ impl RustCompressionManager {
 
     /// Decompress zlib-compressed data with stats tracking (bounded).
     fn decompress(&self, py: Python, data: &[u8]) -> PyResult<Py<PyBytes>> {
-        match bounded_decompress(data) {
+        match run_codec(py, data.len() >= DETACH_DECOMPRESS_AT, || {
+            bounded_decompress(data)
+        }) {
             Ok(decompressed) => {
                 self.total_decompressed.fetch_add(1, Ordering::Relaxed);
                 Ok(PyBytes::new(py, &decompressed).unbind())
@@ -618,8 +702,12 @@ impl RustCompressionManager {
         is_msgpack: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         if is_msgpack {
-            // Try msgpack first (depth-guarded against stack-overflow frames)
+            // Try msgpack first (depth-guarded against stack-overflow frames).
+            // An event is a map; any other msgpack value means the bytes were
+            // something else (JSON's '[' is the msgpack integer 91), so fall
+            // back to JSON.
             if let Ok(val) = decode_msgpack_guarded(data)
+                && matches!(val, rmpv::Value::Map(_))
                 && let Ok(py_obj) = rmpv_to_py(py, &val)
             {
                 return Ok(py_obj);

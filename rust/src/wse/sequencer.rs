@@ -6,6 +6,17 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use super::pylock::lock;
+use super::queue::INITIAL_CAPACITY_CAP;
+
+/// A dedup window must hold at least one id.
+fn check_window(window_size: usize) -> PyResult<()> {
+    if window_size == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "window_size must be at least 1",
+        ));
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // RustSequencer -- simple version, kept for backward compatibility
@@ -39,8 +50,8 @@ impl SequencerState {
     fn new(window_size: usize) -> Self {
         Self {
             sequence: 0,
-            seen_ids: AHashSet::with_capacity(window_size),
-            seen_ids_order: VecDeque::with_capacity(window_size),
+            seen_ids: AHashSet::with_capacity(window_size.min(INITIAL_CAPACITY_CAP)),
+            seen_ids_order: VecDeque::with_capacity(window_size.min(INITIAL_CAPACITY_CAP)),
             window_size,
         }
     }
@@ -91,10 +102,11 @@ impl RustSequencer {
     /// # Arguments
     /// * `window_size` - Maximum number of event IDs to track for dedup.
     #[new]
-    fn new(window_size: usize) -> Self {
-        Self {
+    fn new(window_size: usize) -> PyResult<Self> {
+        check_window(window_size)?;
+        Ok(Self {
             state: Mutex::new(SequencerState::new(window_size)),
-        }
+        })
     }
 
     /// Increment the sequence counter and return the new value.
@@ -196,8 +208,8 @@ impl EventSequencerState {
     fn new(window_size: usize, max_out_of_order: u64) -> Self {
         Self {
             sequence: 0,
-            seen_ids: AHashSet::with_capacity(window_size),
-            seen_ids_queue: VecDeque::with_capacity(window_size),
+            seen_ids: AHashSet::with_capacity(window_size.min(INITIAL_CAPACITY_CAP)),
+            seen_ids_queue: VecDeque::with_capacity(window_size.min(INITIAL_CAPACITY_CAP)),
             window_size,
             max_out_of_order,
             expected_sequences: HashMap::new(),
@@ -516,10 +528,11 @@ impl RustEventSequencer {
     /// * `max_out_of_order` - Maximum gap before resetting topic sequence (default 100).
     #[new]
     #[pyo3(signature = (window_size=10000, max_out_of_order=100))]
-    fn new(window_size: usize, max_out_of_order: u64) -> Self {
-        Self {
+    fn new(window_size: usize, max_out_of_order: u64) -> PyResult<Self> {
+        check_window(window_size)?;
+        Ok(Self {
             state: Mutex::new(EventSequencerState::new(window_size, max_out_of_order)),
-        }
+        })
     }
 
     /// Increment the sequence counter and return the new value.
@@ -622,11 +635,10 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    // Regression (R2 #3): cleanup() must NOT drop the expected-sequence cursor
-    // of a live in-order topic just because its reorder buffer happens to be
-    // empty. Dropping it reset gap detection -- the next event was treated as a
-    // fresh topic start, so a real gap went unnoticed (and a stale/duplicate
-    // sequence could roll the cursor backwards).
+    // cleanup() must not drop the expected-sequence cursor of a live in-order
+    // topic just because its reorder buffer is empty: gap detection would
+    // reset, the next event would look like a fresh topic start, and a real
+    // gap would go unnoticed (a stale sequence could even roll the cursor back).
     #[test]
     fn cleanup_keeps_cursor_for_active_in_order_topic() {
         let mut seq = EventSequencerState::new(100, 100);

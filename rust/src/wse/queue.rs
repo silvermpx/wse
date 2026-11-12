@@ -66,17 +66,26 @@ struct PriorityQueueState {
     max_size: usize,
 }
 
+/// Collections start at most this big and grow on demand, so a large
+/// `max_size` / `window_size` does not reserve its full capacity up front.
+pub(crate) const INITIAL_CAPACITY_CAP: usize = 1024;
+
 #[pymethods]
 impl RustPriorityQueue {
     #[new]
-    fn new(max_size: usize) -> Self {
-        Self {
+    fn new(max_size: usize) -> PyResult<Self> {
+        if max_size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "max_size must be at least 1",
+            ));
+        }
+        Ok(Self {
             state: Mutex::new(PriorityQueueState {
-                heap: BinaryHeap::with_capacity(max_size),
+                heap: BinaryHeap::with_capacity(max_size.min(INITIAL_CAPACITY_CAP)),
                 sequence: 0,
                 max_size,
             }),
-        }
+        })
     }
 
     /// Push a message with the given priority. Returns false if full.
@@ -222,41 +231,39 @@ impl MessageQueueState {
     /// Queue `message`. Returns whether it was accepted, and the lower-priority
     /// message evicted to make room for it (the caller drops that one after
     /// releasing the lock).
+    ///
+    /// A full queue makes room only at the expense of a strictly lower
+    /// priority among BACKGROUND, LOW and NORMAL, lowest first and oldest
+    /// first within a level. When nothing lower is queued the newcomer is
+    /// rejected and counted as dropped under its own priority, so a burst of
+    /// low-priority messages can never push out more important ones.
     fn enqueue(&mut self, message: Py<PyAny>, priority: i32) -> (bool, Option<MessageEntry>) {
         // Normalize priority to the closest valid level
         let priority = Self::normalize_priority(priority);
         let mut evicted = None;
 
         if self.size >= self.max_size {
-            // Try to make room by dropping lower priority messages
-            let mut dropped = false;
-
-            // Try BACKGROUND(1), then LOW(3), then NORMAL(5)
             for &drop_priority in &[1, 3, 5] {
+                if drop_priority >= priority {
+                    break;
+                }
                 let idx = priority_to_index(drop_priority);
-                if !self.queues[idx].is_empty() {
-                    evicted = self.queues[idx].pop_front();
+                if let Some(entry) = self.queues[idx].pop_front() {
+                    evicted = Some(entry);
                     self.size = self.size.saturating_sub(1);
                     let dist = self.priority_distribution.entry(drop_priority).or_insert(0);
                     *dist = dist.saturating_sub(1);
                     *self.dropped_count.entry(drop_priority).or_insert(0) += 1;
-                    dropped = true;
                     break;
                 }
             }
 
-            if !dropped {
-                // Queue full with only HIGH/CRITICAL messages
-                if priority < 8 {
-                    // Not HIGH or CRITICAL -> drop the new message
-                    *self.dropped_count.entry(priority).or_insert(0) += 1;
-                    return (false, evicted);
-                }
-                // HIGH/CRITICAL but no room: queue is full of HIGH/CRITICAL only.
-                // Drop the incoming message to maintain the size invariant.
+            if evicted.is_none() {
                 *self.dropped_count.entry(priority).or_insert(0) += 1;
-                return (false, evicted);
+                return (false, None);
             }
+            // The evicted message may have been the oldest one.
+            self.refresh_oldest_timestamp();
         }
 
         let now = Instant::now();
@@ -300,36 +307,32 @@ impl MessageQueueState {
             }
         }
 
-        // Update oldest message timestamp
-        if self.size == 0 {
-            self.oldest_message_timestamp = None;
-        } else if !batch.is_empty() {
-            // Find the new oldest message across all queues
-            let mut oldest: Option<Instant> = None;
-            for q in &self.queues {
-                if let Some(front) = q.front() {
-                    match oldest {
-                        None => oldest = Some(front.timestamp),
-                        Some(current) => {
-                            if front.timestamp < current {
-                                oldest = Some(front.timestamp);
-                            }
-                        }
-                    }
-                }
-            }
-            self.oldest_message_timestamp = oldest;
+        if !batch.is_empty() {
+            self.refresh_oldest_timestamp();
         }
 
         PyList::new(py, batch)
     }
 
-    /// Empty every queue and hand back what was in them (the caller drops it
-    /// after releasing the lock).
+    /// Recompute the timestamp of the oldest queued message (the fronts of the
+    /// per-priority FIFOs are their oldest entries).
+    fn refresh_oldest_timestamp(&mut self) {
+        self.oldest_message_timestamp = self
+            .queues
+            .iter()
+            .filter_map(|q| q.front().map(|entry| entry.timestamp))
+            .min();
+    }
+
+    /// Empty every queue, reset all statistics, and hand back what was queued
+    /// (the caller drops it after releasing the lock).
     fn clear(&mut self) -> Vec<VecDeque<MessageEntry>> {
         let removed = self.queues.iter_mut().map(std::mem::take).collect();
         self.size = 0;
         for val in self.priority_distribution.values_mut() {
+            *val = 0;
+        }
+        for val in self.dropped_count.values_mut() {
             *val = 0;
         }
         self.oldest_message_timestamp = None;
@@ -416,21 +419,24 @@ impl MessageQueueState {
 impl RustPriorityMessageQueue {
     #[new]
     #[pyo3(signature = (max_size=1000, batch_size=10))]
-    fn new(max_size: usize, batch_size: usize) -> Self {
-        Self {
-            state: Mutex::new(MessageQueueState::new(max_size, batch_size)),
+    fn new(max_size: usize, batch_size: usize) -> PyResult<Self> {
+        if max_size == 0 || batch_size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "max_size and batch_size must be at least 1",
+            ));
         }
+        Ok(Self {
+            state: Mutex::new(MessageQueueState::new(max_size, batch_size)),
+        })
     }
 
     /// Add a message to the queue with priority-based dropping.
     ///
-    /// When queue is full:
-    /// 1. Try to drop BACKGROUND (1) priority messages
-    /// 2. Try to drop LOW (3) priority messages
-    /// 3. Try to drop NORMAL (5) priority messages
-    /// 4. If new message is LOW/NORMAL and still full, drop it
-    /// 5. For HIGH/CRITICAL, drop oldest NORMAL as last resort
-    /// 6. If absolutely full with only HIGH/CRITICAL, drop new message
+    /// When the queue is full, the oldest message of a strictly lower priority
+    /// is dropped to make room: BACKGROUND (1) first, then LOW (3), then
+    /// NORMAL (5); HIGH and CRITICAL messages are never dropped. If no lower
+    /// priority message is queued, the new message is rejected (returns False)
+    /// and counted under its own priority in `dropped_by_priority`.
     #[pyo3(signature = (message, priority=5))]
     fn enqueue(&self, py: Python<'_>, message: Py<PyAny>, priority: i32) -> bool {
         let (accepted, evicted) = lock(py, &self.state).enqueue(message, priority);
