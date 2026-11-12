@@ -1,5 +1,7 @@
 """WSE Server -- High-performance WebSocket engine powered by Rust."""
 
+from importlib.metadata import PackageNotFoundError, version
+
 from wse_server._wse_accel import (
     RustCompressionManager,
     RustEventSequencer,
@@ -26,7 +28,11 @@ from wse_server._wse_accel import (
 from wse_server.core.filters import EventFilter
 from wse_server.core.types import DeliveryGuarantee, EventPriority
 
-__version__ = "2.4.0"
+try:
+    # The installed distribution is the single source of the version.
+    __version__ = version("wse-server")
+except PackageNotFoundError:  # running from a source tree without installing
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     "RustWSEServer",
