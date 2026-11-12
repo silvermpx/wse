@@ -202,6 +202,7 @@ fn zlib_compress(data: &[u8], level: u32) -> Result<Vec<u8>, String> {
 /// * `data`  - Raw bytes to compress.
 /// * `level` - Compression level 1 (fastest) through 9 (smallest).
 #[pyfunction]
+#[pyo3(signature = (data, level=6))]
 pub fn rust_compress(py: Python, data: &[u8], level: i32) -> PyResult<Py<PyBytes>> {
     if !(1..=9).contains(&level) {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -251,6 +252,7 @@ fn bounded_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Return true if the data length exceeds the given threshold.
 #[pyfunction]
+#[pyo3(signature = (data, threshold=1024))]
 pub fn rust_should_compress(data: &[u8], threshold: usize) -> bool {
     data.len() > threshold
 }

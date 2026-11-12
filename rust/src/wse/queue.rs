@@ -3,7 +3,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::pylock::lock;
 
@@ -197,6 +197,58 @@ struct MessageQueueState {
     dropped_count: HashMap<i32, usize>,
     /// Timestamp of the oldest message currently in the queue (monotonic).
     oldest_message_timestamp: Option<Instant>,
+    /// Messages handed out by `dequeue_batch`, for `processing_rate`.
+    throughput: Throughput,
+}
+
+/// Trailing window over which `processing_rate` is averaged.
+const RATE_WINDOW: Duration = Duration::from_secs(10);
+/// Dequeues closer together than this share one bucket, so the window holds
+/// at most `RATE_WINDOW / RATE_BUCKET` entries however often it is called.
+const RATE_BUCKET: Duration = Duration::from_millis(100);
+
+/// Dequeue counts over the last `RATE_WINDOW`, in coarse time buckets.
+struct Throughput {
+    since: Instant,
+    buckets: VecDeque<(Instant, usize)>,
+}
+
+impl Throughput {
+    fn new(now: Instant) -> Self {
+        Self {
+            since: now,
+            buckets: VecDeque::new(),
+        }
+    }
+
+    fn record(&mut self, now: Instant, count: usize) {
+        while let Some(&(at, _)) = self.buckets.front() {
+            if now.duration_since(at) <= RATE_WINDOW {
+                break;
+            }
+            self.buckets.pop_front();
+        }
+        match self.buckets.back_mut() {
+            Some((at, n)) if now.duration_since(*at) < RATE_BUCKET => *n += count,
+            _ => self.buckets.push_back((now, count)),
+        }
+    }
+
+    /// Messages per second over the trailing window, or over the time since
+    /// the queue was created or cleared when that is shorter (at least one
+    /// second, so a single early batch does not read as a huge rate).
+    fn rate(&self, now: Instant) -> f64 {
+        let recent: usize = self
+            .buckets
+            .iter()
+            .filter(|(at, _)| now.duration_since(*at) <= RATE_WINDOW)
+            .map(|(_, n)| n)
+            .sum();
+        let span = now
+            .duration_since(self.since)
+            .clamp(Duration::from_secs(1), RATE_WINDOW);
+        recent as f64 / span.as_secs_f64()
+    }
 }
 
 impl MessageQueueState {
@@ -225,6 +277,7 @@ impl MessageQueueState {
             priority_distribution,
             dropped_count,
             oldest_message_timestamp: None,
+            throughput: Throughput::new(Instant::now()),
         }
     }
 
@@ -309,6 +362,7 @@ impl MessageQueueState {
 
         if !batch.is_empty() {
             self.refresh_oldest_timestamp();
+            self.throughput.record(Instant::now(), batch.len());
         }
 
         PyList::new(py, batch)
@@ -336,6 +390,7 @@ impl MessageQueueState {
             *val = 0;
         }
         self.oldest_message_timestamp = None;
+        self.throughput = Throughput::new(Instant::now());
         removed
     }
 
@@ -394,8 +449,8 @@ impl MessageQueueState {
         };
         stats.set_item("oldest_message_age", oldest_age)?;
 
-        // processing_rate: placeholder (matches Python)
-        stats.set_item("processing_rate", 0.0)?;
+        // processing_rate: messages dequeued per second, recent window
+        stats.set_item("processing_rate", self.throughput.rate(Instant::now()))?;
 
         Ok(stats)
     }
@@ -470,5 +525,28 @@ impl RustPriorityMessageQueue {
     #[getter]
     fn size(&self, py: Python<'_>) -> usize {
         lock(py, &self.state).size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn throughput_averages_over_the_trailing_window() {
+        let t0 = Instant::now();
+        let mut t = Throughput::new(t0);
+        t.record(t0, 20);
+        t.record(t0 + Duration::from_millis(50), 30);
+        assert_eq!(t.buckets.len(), 1, "close dequeues share a bucket");
+        // Younger than a second: averaged over the one-second floor.
+        assert_eq!(t.rate(t0 + Duration::from_millis(500)), 50.0);
+        // The same fifty spread over the five seconds since creation.
+        assert_eq!(t.rate(t0 + Duration::from_secs(5)), 10.0);
+        // Out of the window they no longer count, and are pruned on record.
+        assert_eq!(t.rate(t0 + Duration::from_secs(11)), 0.0);
+        t.record(t0 + Duration::from_secs(11), 10);
+        assert_eq!(t.buckets.len(), 1);
+        assert_eq!(t.rate(t0 + Duration::from_secs(11)), 1.0);
     }
 }

@@ -1,3 +1,4 @@
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -46,15 +47,30 @@ impl RustTokenBucket {
     /// * `initial_tokens` - Starting tokens (defaults to capacity if None).
     #[new]
     #[pyo3(signature = (capacity, refill_rate, initial_tokens=None))]
-    fn new(capacity: f64, refill_rate: f64, initial_tokens: Option<f64>) -> Self {
-        Self {
+    fn new(capacity: f64, refill_rate: f64, initial_tokens: Option<f64>) -> PyResult<Self> {
+        let tokens = initial_tokens.unwrap_or(capacity);
+        // NaN fails every comparison, so it is rejected here too.
+        if !(capacity.is_finite() && capacity > 0.0) {
+            return Err(PyValueError::new_err("capacity must be a positive number"));
+        }
+        if !(refill_rate.is_finite() && refill_rate >= 0.0) {
+            return Err(PyValueError::new_err(
+                "refill_rate must be a non-negative number",
+            ));
+        }
+        if !(0.0..=capacity).contains(&tokens) {
+            return Err(PyValueError::new_err(
+                "initial_tokens must be between 0 and capacity",
+            ));
+        }
+        Ok(Self {
             capacity,
             refill_rate,
             state: Mutex::new(BucketState {
-                tokens: initial_tokens.unwrap_or(capacity),
+                tokens,
                 last_refill: Instant::now(),
             }),
-        }
+        })
     }
 
     /// Try to acquire `tokens` from the bucket.
@@ -62,14 +78,21 @@ impl RustTokenBucket {
     /// Refills first based on elapsed time, then checks if enough tokens
     /// are available. If so, deducts them and returns `true`. Otherwise
     /// returns `false` without modifying the token count.
-    fn acquire(&self, py: Python<'_>, tokens: f64) -> bool {
+    #[pyo3(signature = (tokens=1.0))]
+    fn acquire(&self, py: Python<'_>, tokens: f64) -> PyResult<bool> {
+        // A negative count would add tokens; NaN would compare false forever.
+        if !(tokens.is_finite() && tokens >= 0.0) {
+            return Err(PyValueError::new_err(
+                "tokens must be a non-negative number",
+            ));
+        }
         let mut state = lock(py, &self.state);
         state.refill(self.capacity, self.refill_rate);
         if state.tokens >= tokens {
             state.tokens -= tokens;
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 

@@ -8,19 +8,24 @@ import pytest
 
 from wse_server import (
     EventFilter,
+    EventPriority,
     RustCompressionManager,
     RustEventSequencer,
     RustPriorityMessageQueue,
     RustPriorityQueue,
     RustSequencer,
+    RustTokenBucket,
     rust_aes_gcm_decrypt,
     rust_aes_gcm_encrypt,
+    rust_compress,
+    rust_decompress,
     rust_ecdh_derive_shared_secret,
     rust_ecdh_generate_keypair,
     rust_hmac_sha256,
     rust_jwt_decode,
     rust_jwt_encode,
     rust_match_event,
+    rust_should_compress,
     rust_transform_event,
 )
 
@@ -172,6 +177,24 @@ class TestQueues:
         assert not q.enqueue({"c": 1}, 10)
         assert q.get_stats()["dropped_by_priority"][10] == 1
 
+    def test_event_priority_members_are_accepted_as_priorities(self):
+        q = RustPriorityMessageQueue(max_size=10, batch_size=10)
+        assert q.enqueue({"a": 1}, EventPriority.HIGH)
+        assert q.enqueue({"b": 1}, EventPriority.BACKGROUND)
+        assert [p for p, _ in q.dequeue_batch()] == [8, 1]
+
+    def test_processing_rate_measures_dequeued_messages(self):
+        q = RustPriorityMessageQueue(max_size=100, batch_size=10)
+        assert q.get_stats()["processing_rate"] == 0.0
+        for i in range(25):
+            q.enqueue({"i": i})
+        while q.dequeue_batch():
+            pass
+        # 25 messages averaged over at least one second.
+        assert 0.0 < q.get_stats()["processing_rate"] <= 25.0
+        q.clear()
+        assert q.get_stats()["processing_rate"] == 0.0
+
     def test_clear_resets_drop_statistics(self):
         q = RustPriorityMessageQueue(max_size=1, batch_size=10)
         q.enqueue({"a": 1}, 5)
@@ -281,3 +304,38 @@ class TestCryptoInterop:
     def test_hmac_sha256_known_answer(self):
         tag = rust_hmac_sha256(b"Jefe", b"what do ya want for nothing?")
         assert tag.hex() == "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+
+
+# ---------------------------------------------------------------------------
+# Defaults and argument checks at the Python boundary
+# ---------------------------------------------------------------------------
+
+
+class TestBoundary:
+    def test_documented_defaults_exist(self):
+        data = b"x" * 2048
+        assert rust_decompress(rust_compress(data)) == data
+        assert rust_should_compress(data)
+        assert not rust_should_compress(b"tiny")
+        assert RustTokenBucket(2.0, 0.0).acquire()
+
+    @pytest.mark.parametrize(
+        "args",
+        [(0.0, 1.0), (-1.0, 1.0), (float("nan"), 1.0), (10.0, -1.0), (10.0, float("inf"))],
+    )
+    def test_token_bucket_rejects_bad_configuration(self, args):
+        with pytest.raises(ValueError):
+            RustTokenBucket(*args)
+
+    def test_token_bucket_rejects_initial_tokens_out_of_range(self):
+        with pytest.raises(ValueError):
+            RustTokenBucket(10.0, 1.0, initial_tokens=11.0)
+        with pytest.raises(ValueError):
+            RustTokenBucket(10.0, 1.0, initial_tokens=-1.0)
+
+    @pytest.mark.parametrize("tokens", [-1.0, float("nan"), float("inf")])
+    def test_acquire_rejects_tokens_that_would_corrupt_the_bucket(self, tokens):
+        bucket = RustTokenBucket(10.0, 0.0)
+        with pytest.raises(ValueError):
+            bucket.acquire(tokens)
+        assert bucket.tokens == 10.0

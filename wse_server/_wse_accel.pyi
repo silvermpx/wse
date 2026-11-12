@@ -283,7 +283,8 @@ class RustPriorityMessageQueue:
         priority_distribution (dict), priority_queue_depths (dict),
         dropped_by_priority (dict), total_dropped (int),
         backpressure (bool), oldest_message_age (float | None),
-        processing_rate (float).
+        processing_rate (float, messages dequeued per second over the
+        last 10 seconds).
         """
         ...
     def clear(self) -> None: ...

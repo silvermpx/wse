@@ -10,11 +10,15 @@ Type definitions for WebSocket Engine:
 - DeliveryGuarantee: Delivery semantics
 """
 
-from enum import Enum
+from enum import Enum, IntEnum
 
 
-class EventPriority(Enum):
-    """Event priority levels"""
+class EventPriority(IntEnum):
+    """Event priority levels.
+
+    The members are ints, so they can be passed wherever the queues take a
+    priority: ``queue.enqueue(msg, EventPriority.HIGH)``.
+    """
 
     CRITICAL = 10
     HIGH = 8
