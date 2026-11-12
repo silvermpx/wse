@@ -41,6 +41,7 @@ The WebSocket server runs entirely in a Rust tokio runtime - no GIL on the hot p
 WSE runs on its own port with its own TCP listener. To run it alongside FastAPI, start WSE in the FastAPI lifespan and run the drain loop in a background thread:
 
 ```python
+import json
 import threading
 from contextlib import asynccontextmanager
 
@@ -78,7 +79,9 @@ def drain_loop():
 def handle_message(conn_id: str, data: dict):
     msg_type = data.get("t", "")
     if msg_type == "chat":
-        server.broadcast("chat", f'{{"t":"chat","p":{{"text":"{data["p"]["text"]}"}}}}'  )
+        # Build the frame with json.dumps: client text pasted into a JSON
+        # string could close it and inject fields for every subscriber.
+        server.broadcast("chat", json.dumps({"t": "chat", "p": {"text": data["p"]["text"]}}))
 
 # --- FastAPI lifespan ------------------------------------------------------
 
@@ -214,7 +217,7 @@ while True:
             info = ev[2]    # {"topic": ..., "user_id": ..., "data": ...}
 ```
 
-**`drain_inbound(batch_size, timeout_ms)`** - blocks up to `timeout_ms` waiting for the first event, then drains up to `batch_size` events without blocking. Returns a list of tuples. The GIL is released during the channel wait and acquired once for the entire batch.
+**`drain_inbound(max_count, timeout_ms)`** - blocks up to `timeout_ms` waiting for the first event, then drains up to `max_count` events without blocking. Returns a list of tuples. The GIL is released during the channel wait and acquired once for the entire batch.
 
 ### Event Types
 

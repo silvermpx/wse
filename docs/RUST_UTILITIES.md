@@ -94,7 +94,7 @@ q.clear()        # empty all queues and reset stats
 | total_dropped          | int            | Total messages dropped               |
 | backpressure           | bool           | True if utilization > 80%            |
 | oldest_message_age     | float or None  | Seconds since oldest enqueued message|
-| processing_rate        | float          | Reserved for future use              |
+| processing_rate        | float          | Messages dequeued per second, last 10 s |
 
 ---
 
@@ -288,11 +288,13 @@ claims = {
     "iat": int(time.time()),
 }
 
-token = rust_jwt_encode(claims, secret=b"my-secret")
+# HS256 needs a secret of at least 32 bytes; a shorter one is refused.
+secret = b"replace-with-a-strong-secret-key!"
+token = rust_jwt_encode(claims, secret=secret)
 
 decoded = rust_jwt_decode(
     token,
-    secret=b"my-secret",
+    secret=secret,
     issuer="my-app",      # optional, validates iss claim
     audience="wse",       # optional, validates aud claim
 )
@@ -300,10 +302,11 @@ decoded = rust_jwt_decode(
 ```
 
 Validation rules:
-- `exp` claim is required and checked against current time
-- `nbf` claim is optional, allows 5 minutes of clock skew
-- `iss` validated only when `issuer` parameter is provided
-- `aud` validated only when `audience` parameter is provided (supports string or array format)
+- `exp` claim is required and checked against the current time, with 30 seconds of clock skew
+- `nbf` claim is optional, with the same 30 seconds of skew
+- `iss` is checked when `issuer` is given; the token must then carry it
+- `aud` is checked when `audience` is given (string or array); the token must then carry it
+- Algorithms: HS256 (secret of 32+ bytes; a PEM key is refused), RS256 and ES256 (PEM keys)
 
 ---
 

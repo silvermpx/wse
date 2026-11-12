@@ -125,12 +125,12 @@ Full reference with usage examples: [RUST_UTILITIES.md](RUST_UTILITIES.md)
 
 **Drain mode** (recommended for production):
 
-Events are queued in a lock-free crossbeam bounded channel. Python polls with `drain_inbound(batch_size, timeout_ms)`, which releases the GIL while waiting on the channel and acquires it once for the entire batch conversion.
+Events are queued in a lock-free crossbeam bounded channel. Python polls with `drain_inbound(max_count, timeout_ms)`, which releases the GIL while waiting on the channel and acquires it once for the entire batch conversion.
 
 ```python
 server.enable_drain_mode()
 while True:
-    events = server.drain_inbound(256, 50)  # batch_size, timeout_ms
+    events = server.drain_inbound(256, 50)  # max_count, timeout_ms
     for event in events:
         event_type, conn_id, data = event
         handle(event_type, conn_id, data)

@@ -159,18 +159,23 @@ upstream wse_cluster {
 For cluster mTLS, generate a shared CA and per-node certificates:
 
 ```bash
-# Generate CA
+# Certificate authority shared by every node
 openssl ecparam -genkey -name prime256v1 -out ca.key
-openssl req -new -x509 -key ca.key -out ca.pem -days 365 -subj "/CN=WSE CA"
+openssl req -new -x509 -sha256 -key ca.key -out ca.pem -days 365 -subj "/CN=WSE CA"
 
-# Generate node certificate
+# Node certificate. A peer checks the address it dials against the
+# certificate's subjectAltName (the CN is not used), so list every DNS name
+# and IP address other nodes use to reach this one.
+printf 'subjectAltName = DNS:wse-node-1, IP:10.0.0.11\nextendedKeyUsage = serverAuth, clientAuth\n' > node.ext
 openssl ecparam -genkey -name prime256v1 -out node.key
 openssl req -new -key node.key -out node.csr -subj "/CN=wse-node-1"
-openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key \
-    -CAcreateserial -out node.pem -days 365
+openssl x509 -req -sha256 -in node.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
+    -out node.pem -days 365 -extfile node.ext
 ```
 
-All nodes use the same CA (`ca.pem`). Each node gets its own certificate and key.
+All nodes use the same CA (`ca.pem`). Each node gets its own certificate and key, which it presents both when it dials and when it accepts.
+
+The same commands work with OpenSSL and with LibreSSL (the `openssl` on macOS). Keep `-sha256`: LibreSSL otherwise signs with SHA-1, which rustls rejects, and without `-extfile` it issues a version 1 certificate, which rustls rejects as well. A certificate without a matching subjectAltName fails every handshake with "certificate not valid for name".
 
 ---
 
