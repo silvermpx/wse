@@ -1,4 +1,18 @@
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
+use std::time::{Duration, Instant};
+
+/// A random number in [0, 1).
+///
+/// Every `RandomState` is seeded from the OS with per-instance variation, so
+/// hashing nothing yields a fresh random u64 without an extra dependency. The
+/// clock is not usable here: on macOS it has microsecond resolution, so the
+/// low digits of the nanoseconds are always zero and every node would retry
+/// in lockstep.
+fn random_unit() -> f64 {
+    let bits = RandomState::new().build_hasher().finish();
+    (bits >> 11) as f64 / (1u64 << 53) as f64
+}
 
 // ---------------------------------------------------------------------------
 // Circuit Breaker: CLOSED -> OPEN -> HALF_OPEN -> CLOSED
@@ -124,11 +138,7 @@ impl ExponentialBackoff {
 
     pub fn next_delay(&mut self) -> Duration {
         let base = self.current.as_secs_f64();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos();
-        let jitter_factor = 0.8 + 0.4 * (nanos % 1000) as f64 / 1000.0;
+        let jitter_factor = 0.8 + 0.4 * random_unit();
         let delay = Duration::from_secs_f64((base * jitter_factor).min(self.max.as_secs_f64()));
         let next = base * self.multiplier;
         self.current = Duration::from_secs_f64(next.min(self.max.as_secs_f64()));
@@ -147,6 +157,19 @@ impl ExponentialBackoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backoff_jitter_is_random() {
+        let samples: Vec<f64> = (0..64).map(|_| random_unit()).collect();
+        assert!(samples.iter().all(|x| (0.0..1.0).contains(x)));
+        let distinct: std::collections::HashSet<u64> =
+            samples.iter().map(|x| x.to_bits()).collect();
+        assert!(
+            distinct.len() > 32,
+            "only {} distinct values",
+            distinct.len()
+        );
+    }
 
     #[test]
     fn test_circuit_breaker_stays_closed() {

@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
+use std::collections::HashSet;
 
 /// Wall-clock time in milliseconds since UNIX epoch.
 pub(crate) fn epoch_ms() -> u64 {
@@ -96,11 +97,17 @@ pub(crate) struct PresenceManager {
     /// conn_id -> user_id (from JWT auth)
     conn_user_id: DashMap<String, String>,
     /// conn_id -> topics where this conn has presence
-    conn_presence_topics: DashMap<String, DashSet<String>>,
+    conn_presence_topics: DashMap<String, HashSet<String>>,
     /// Max bytes for presence data JSON
     max_data_size: usize,
     /// Max members per topic (0 = unlimited)
     max_members: usize,
+}
+
+/// A topic's member map. A few shards are plenty for one topic's members; the
+/// default shard count (cores x 4) costs several KiB per topic.
+fn new_topic_map() -> DashMap<String, PresenceEntry> {
+    DashMap::with_shard_amount(4)
 }
 
 impl PresenceManager {
@@ -153,7 +160,12 @@ impl PresenceManager {
         };
 
         let now = epoch_ms();
-        let topic_map = self.topic_presence.entry(topic.to_owned()).or_default();
+        // Lock order everywhere in this file: topic_presence before
+        // conn_presence_topics and topic_presence_stats.
+        let topic_map = self
+            .topic_presence
+            .entry(topic.to_owned())
+            .or_insert_with(new_topic_map);
 
         // Check max members limit
         if self.max_members > 0
@@ -280,6 +292,8 @@ impl PresenceManager {
                         |current| Some(current.saturating_sub(1)),
                     );
                 }
+                drop(topic_map);
+                self.remove_topic_if_empty(topic);
                 return UntrackResult::LastLeave {
                     user_id,
                     data: removed_entry.data,
@@ -290,12 +304,28 @@ impl PresenceManager {
         UntrackResult::StillPresent
     }
 
+    /// Drop a topic's member map and counters once nobody is present in it;
+    /// otherwise every topic ever tracked keeps an empty map for the life of
+    /// the process. The counters go in the same critical section, so a
+    /// concurrent track() of the topic sees either both or neither. Never call
+    /// this while holding a guard into `topic_presence`.
+    fn remove_topic_if_empty(&self, topic: &str) {
+        self.topic_presence.remove_if(topic, |_, members| {
+            if members.is_empty() {
+                self.topic_presence_stats.remove(topic);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
     /// Untrack a connection from specific topics (called on unsubscribe).
     pub fn untrack_topics(&self, conn_id: &str, topics: &[String]) -> Vec<(String, UntrackResult)> {
         let mut results = Vec::new();
         for topic in topics {
             // Remove from conn_presence_topics tracking
-            if let Some(conn_topics) = self.conn_presence_topics.get(conn_id) {
+            if let Some(mut conn_topics) = self.conn_presence_topics.get_mut(conn_id) {
                 conn_topics.remove(topic);
             }
             let result = self.untrack_conn_from_topic(conn_id, topic);
@@ -351,16 +381,20 @@ impl PresenceManager {
         let now = epoch_ms();
         let mut updated_topics = Vec::new();
 
-        if let Some(topics) = self.conn_presence_topics.get(conn_id) {
-            for topic_ref in topics.iter() {
-                let topic = topic_ref.clone();
-                if let Some(topic_map) = self.topic_presence.get(&topic)
-                    && let Some(mut entry) = topic_map.get_mut(&user_id)
-                {
-                    entry.data = new_data.clone();
-                    entry.updated_at = now;
-                    updated_topics.push(topic);
-                }
+        // Copy the topic list out first: holding this connection's entry while
+        // locking topic maps would take the two maps in the opposite order to
+        // track(), and on free-threaded Python the two calls can deadlock.
+        let topics: Vec<String> = match self.conn_presence_topics.get(conn_id) {
+            Some(topics) => topics.iter().cloned().collect(),
+            None => Vec::new(),
+        };
+        for topic in topics {
+            if let Some(topic_map) = self.topic_presence.get(&topic)
+                && let Some(mut entry) = topic_map.get_mut(&user_id)
+            {
+                entry.data = new_data.clone();
+                entry.updated_at = now;
+                updated_topics.push(topic);
             }
         }
 
@@ -390,6 +424,7 @@ impl PresenceManager {
         F: Fn(&str) -> bool,
     {
         let mut removed = Vec::new();
+        let mut thinned_topics: Vec<String> = Vec::new();
 
         for topic_entry in self.topic_presence.iter() {
             let topic = topic_entry.key().clone();
@@ -463,8 +498,17 @@ impl PresenceManager {
                         );
                     }
                     removed.push((topic.clone(), user_id, data));
+                    if thinned_topics.last() != Some(&topic) {
+                        thinned_topics.push(topic.clone());
+                    }
                 }
             }
+        }
+
+        // After the iteration: removing map entries while iterating would wait
+        // on the iterator's own shard lock.
+        for topic in &thinned_topics {
+            self.remove_topic_if_empty(topic);
         }
 
         removed
@@ -496,7 +540,10 @@ impl PresenceManager {
             );
             return;
         }
-        let topic_map = self.topic_presence.entry(topic.to_owned()).or_default();
+        let topic_map = self
+            .topic_presence
+            .entry(topic.to_owned())
+            .or_insert_with(new_topic_map);
 
         // Enforce max_members limit for remote entries too
         if self.max_members > 0
@@ -600,6 +647,10 @@ impl PresenceManager {
                     |current| Some(current.saturating_sub(1)),
                 );
             }
+            if should_remove_user {
+                drop(topic_map);
+                self.remove_topic_if_empty(topic);
+            }
         }
     }
 
@@ -674,6 +725,7 @@ impl PresenceManager {
     /// "ghost" members present forever and drift membership counts upward.
     pub fn purge_origin(&self, origin: &str) {
         let prefix = remote_origin_prefix(origin);
+        let mut thinned_topics: Vec<String> = Vec::new();
         for topic_entry in self.topic_presence.iter() {
             let topic = topic_entry.key();
             let topic_map = topic_entry.value();
@@ -723,6 +775,12 @@ impl PresenceManager {
                         });
                 }
             }
+            if users_removed > 0 {
+                thinned_topics.push(topic.clone());
+            }
+        }
+        for topic in &thinned_topics {
+            self.remove_topic_if_empty(topic);
         }
     }
 
@@ -909,5 +967,54 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), 6, "every user appears in some chunk");
+    }
+
+    #[test]
+    fn empty_topics_are_dropped_with_their_counters() {
+        let mgr = PresenceManager::new(4096, 0);
+        mgr.register_connection("c1", "u1");
+        mgr.track("c1", "room:1", &data());
+        mgr.track("c1", "room:2", &data());
+        assert_eq!(mgr.total_topics(), 2);
+        mgr.untrack_topics("c1", &["room:1".to_string()]);
+        assert_eq!(mgr.total_topics(), 1);
+        mgr.remove_connection("c1");
+        assert_eq!(mgr.total_topics(), 0);
+        assert_eq!(mgr.stats("room:2"), (0, 0));
+        assert!(mgr.topic_presence_stats.is_empty());
+    }
+
+    #[test]
+    fn track_and_update_data_do_not_deadlock() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+
+        let mgr = Arc::new(PresenceManager::new(4096, 0));
+        mgr.register_connection("c1", "u1");
+        let (done_tx, done_rx) = mpsc::channel();
+        let workers: Vec<_> = (0..4)
+            .map(|i| {
+                let mgr = Arc::clone(&mgr);
+                let done_tx = done_tx.clone();
+                std::thread::spawn(move || {
+                    for n in 0..2000 {
+                        if i % 2 == 0 {
+                            mgr.track("c1", &format!("room:{}", n % 8), &data());
+                        } else {
+                            mgr.update_data("c1", &data());
+                        }
+                    }
+                    done_tx.send(()).unwrap();
+                })
+            })
+            .collect();
+        for _ in 0..4 {
+            done_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("track() and update_data() deadlocked");
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
     }
 }

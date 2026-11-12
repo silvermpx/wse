@@ -1,7 +1,9 @@
 use bytes::Bytes;
 use dashmap::DashMap;
+use std::collections::VecDeque;
+use std::mem::size_of;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Global counter to guarantee unique epochs even for rapid buffer re-creation.
 static EPOCH_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -28,7 +30,8 @@ pub(crate) enum RecoveryResult {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct RecoveryConfig {
-    /// Power-of-two exponent for ring buffer capacity (default 7 = 128 msgs).
+    /// Power-of-two exponent for the per-topic message limit (default 7 = 128
+    /// msgs). Clamped to `MAX_BUFFER_SIZE_BITS`.
     pub(crate) buffer_size_bits: u32,
     /// How long (seconds) an idle topic buffer lives before cleanup evicts it.
     pub(crate) history_ttl_secs: u64,
@@ -49,8 +52,15 @@ impl Default for RecoveryConfig {
     }
 }
 
+/// Largest per-topic message limit: 2^16 = 65536 messages.
+pub(crate) const MAX_BUFFER_SIZE_BITS: u32 = 16;
+
+/// Bytes charged to the memory budget for a buffer's struct, its map entry and
+/// bookkeeping, on top of its topic key and its message slots.
+const BUFFER_OVERHEAD: usize = 128;
+
 // ---------------------------------------------------------------------------
-// RecoveryEntry -- single message stored in the ring buffer
+// RecoveryEntry -- single message stored in the foreign ring buffer
 // ---------------------------------------------------------------------------
 
 struct RecoveryEntry {
@@ -65,28 +75,27 @@ struct RecoveryEntry {
 // ---------------------------------------------------------------------------
 
 struct TopicRecoveryBuffer {
-    entries: Box<[Option<RecoveryEntry>]>,
-    /// Bitmask for power-of-two indexing: capacity - 1.
-    mask: u64,
+    /// Stored messages in offset order; the front holds `tail_offset()`. The
+    /// queue grows as messages arrive, so a topic that has seen a handful of
+    /// messages does not pay for `capacity` slots.
+    entries: VecDeque<Bytes>,
+    /// Maximum number of messages kept; the oldest is evicted beyond it.
+    capacity: usize,
     /// Next offset to be written (one past the newest entry).
     head_offset: u64,
-    /// Oldest valid offset still in the buffer.
-    tail_offset: u64,
     /// Random epoch generated on creation -- changes on server restart.
     epoch: u32,
     /// Total bytes of all stored entries' data.
     total_bytes: usize,
+    /// Length of the topic key this buffer is stored under.
+    key_len: usize,
     /// Timestamp of the most recent push.
     last_write: Instant,
 }
 
 impl TopicRecoveryBuffer {
-    /// Create a new ring buffer with `1 << capacity_bits` slots.
-    fn new(capacity_bits: u32) -> Self {
-        let capacity = 1u64 << capacity_bits;
-        let mut entries = Vec::with_capacity(capacity as usize);
-        entries.resize_with(capacity as usize, || None);
-
+    /// Create an empty buffer that keeps at most `1 << capacity_bits` messages.
+    fn new(capacity_bits: u32, key_len: usize) -> Self {
         // Generate a unique epoch: time + PID + counter (no external rand dependency).
         // Counter guarantees uniqueness even for rapid buffer re-creation within same process.
         let epoch = (SystemTime::now()
@@ -97,40 +106,45 @@ impl TopicRecoveryBuffer {
             .wrapping_add(EPOCH_COUNTER.fetch_add(1, Ordering::Relaxed));
 
         Self {
-            entries: entries.into_boxed_slice(),
-            mask: capacity - 1,
+            entries: VecDeque::new(),
+            capacity: 1usize << capacity_bits.min(MAX_BUFFER_SIZE_BITS),
             head_offset: 0,
-            tail_offset: 0,
             epoch,
             total_bytes: 0,
+            key_len,
             last_write: Instant::now(),
         }
     }
 
-    /// Push a message into the ring buffer. Returns the assigned offset.
-    ///
-    /// If the buffer is full (head - tail >= capacity), the oldest entry is
-    /// evicted by advancing the tail.
-    fn push(&mut self, data: Bytes) -> u64 {
-        let capacity = self.mask + 1;
+    /// Oldest offset still in the buffer (equals `head_offset` when empty).
+    fn tail_offset(&self) -> u64 {
+        self.head_offset - self.entries.len() as u64
+    }
 
-        // Evict oldest if buffer is full.
-        if self.head_offset - self.tail_offset >= capacity {
-            let evict_idx = (self.tail_offset & self.mask) as usize;
-            if let Some(old) = self.entries[evict_idx].take() {
-                self.total_bytes -= old.data.len();
-            }
-            self.tail_offset += 1;
+    /// Bytes this buffer costs: payloads, allocated queue slots, the key and
+    /// fixed overhead. This, not just the payload size, is what the memory
+    /// budget is checked against.
+    fn footprint(&self) -> usize {
+        self.total_bytes
+            + self.entries.capacity() * size_of::<Bytes>()
+            + self.key_len
+            + BUFFER_OVERHEAD
+    }
+
+    /// Push a message into the buffer. Returns the assigned offset.
+    ///
+    /// When the buffer is full, the oldest entry is evicted.
+    fn push(&mut self, data: Bytes) -> u64 {
+        if self.entries.len() >= self.capacity
+            && let Some(old) = self.entries.pop_front()
+        {
+            self.total_bytes -= old.len();
         }
 
         let offset = self.head_offset;
-        let idx = (offset & self.mask) as usize;
-        let data_len = data.len();
-
-        self.entries[idx] = Some(RecoveryEntry { data, offset });
-
+        self.total_bytes += data.len();
+        self.entries.push_back(data);
         self.head_offset += 1;
-        self.total_bytes += data_len;
         self.last_write = Instant::now();
 
         offset
@@ -148,7 +162,8 @@ impl TopicRecoveryBuffer {
             None => return Some(Vec::new()), // u64::MAX means fully up-to-date
         };
 
-        if self.head_offset > 0 && start < self.tail_offset {
+        let tail = self.tail_offset();
+        if self.head_offset > 0 && start < tail {
             return None;
         }
         if start >= self.head_offset {
@@ -157,24 +172,15 @@ impl TopicRecoveryBuffer {
         }
 
         let count = ((self.head_offset - start) as usize).min(max_messages);
-        let mut result = Vec::with_capacity(count);
-
-        for i in 0..count {
-            let offset = start + i as u64;
-            let idx = (offset & self.mask) as usize;
-            if let Some(entry) = &self.entries[idx]
-                && entry.offset == offset
-            {
-                result.push(entry.data.clone());
-            } else {
-                // Slot mismatch should be unreachable, but if it occurs in release,
-                // signal failure so the client re-subscribes rather than missing messages.
-                debug_assert!(false, "slot {} mismatch: expected offset {}", idx, offset);
-                return None;
-            }
-        }
-
-        Some(result)
+        let first = (start - tail) as usize;
+        Some(
+            self.entries
+                .iter()
+                .skip(first)
+                .take(count)
+                .cloned()
+                .collect(),
+        )
     }
 }
 
@@ -195,13 +201,15 @@ struct ForeignRecoveryBuffer {
     /// The originating node's epoch (not ours).
     epoch: u32,
     total_bytes: usize,
+    /// Length of the "topic\0epoch" key this buffer is stored under.
+    key_len: usize,
     last_write: Instant,
     initialized: bool,
 }
 
 impl ForeignRecoveryBuffer {
-    fn new(capacity_bits: u32, epoch: u32) -> Self {
-        let capacity = 1u64 << capacity_bits;
+    fn new(capacity_bits: u32, epoch: u32, key_len: usize) -> Self {
+        let capacity = 1u64 << capacity_bits.min(MAX_BUFFER_SIZE_BITS);
         let mut entries = Vec::with_capacity(capacity as usize);
         entries.resize_with(capacity as usize, || None);
         Self {
@@ -211,9 +219,19 @@ impl ForeignRecoveryBuffer {
             tail_offset: 0,
             epoch,
             total_bytes: 0,
+            key_len,
             last_write: Instant::now(),
             initialized: false,
         }
+    }
+
+    /// Bytes this buffer costs (the ring's slots are allocated up front,
+    /// because peer offsets can arrive with gaps and out of order).
+    fn footprint(&self) -> usize {
+        self.total_bytes
+            + self.entries.len() * size_of::<Option<RecoveryEntry>>()
+            + self.key_len
+            + BUFFER_OVERHEAD
     }
 
     /// Insert at the origin node's offset. Handles gaps and out-of-order arrival.
@@ -234,14 +252,25 @@ impl ForeignRecoveryBuffer {
 
         // Advance head if this is a new high-water mark.
         if origin_offset >= self.head_offset {
-            // Cap eviction to one full buffer rotation to prevent DoS via extreme offset.
             let new_tail = origin_offset.saturating_sub(capacity - 1);
-            while self.tail_offset < new_tail {
-                let evict_idx = (self.tail_offset & self.mask) as usize;
-                if let Some(old) = self.entries[evict_idx].take() {
-                    self.total_bytes -= old.data.len();
+            if new_tail.saturating_sub(self.tail_offset) >= capacity {
+                // The jump leaves the whole ring behind: drop everything in one
+                // pass. Walking offset by offset would spin for as long as the
+                // jump is wide - up to 2^64 steps for a hostile peer's offset.
+                for slot in self.entries.iter_mut() {
+                    if let Some(old) = slot.take() {
+                        self.total_bytes -= old.data.len();
+                    }
                 }
-                self.tail_offset += 1;
+                self.tail_offset = new_tail;
+            } else {
+                while self.tail_offset < new_tail {
+                    let evict_idx = (self.tail_offset & self.mask) as usize;
+                    if let Some(old) = self.entries[evict_idx].take() {
+                        self.total_bytes -= old.data.len();
+                    }
+                    self.tail_offset += 1;
+                }
             }
             self.head_offset = origin_offset.saturating_add(1);
         }
@@ -333,19 +362,20 @@ impl RecoveryManager {
     where
         F: FnOnce(u32, u64) -> Bytes,
     {
-        let mut entry = self
-            .buffers
-            .entry(topic.to_owned())
-            .or_insert_with(|| TopicRecoveryBuffer::new(self.config.buffer_size_bits));
+        let mut created = false;
+        let mut entry = self.buffers.entry(topic.to_owned()).or_insert_with(|| {
+            created = true;
+            TopicRecoveryBuffer::new(self.config.buffer_size_bits, topic.len())
+        });
 
         let buf = entry.value_mut();
         let epoch = buf.epoch;
         let offset = buf.head_offset; // the offset buf.push() is about to assign
         let data = build(epoch, offset);
 
-        let old_bytes = buf.total_bytes;
+        let old_bytes = if created { 0 } else { buf.footprint() };
         buf.push(data.clone());
-        let new_bytes = buf.total_bytes;
+        let new_bytes = buf.footprint();
 
         // Update global byte counter with the delta (accounts for evictions).
         // DashMap entry API holds the shard write lock for this entire block,
@@ -384,14 +414,17 @@ impl RecoveryManager {
         // Key: "topic\0epoch" -- null byte separator is safe (never in topic names).
         let key = format!("{topic}\0{origin_epoch}");
 
+        let key_len = key.len();
+        let mut created = false;
         let mut entry = self.foreign_buffers.entry(key).or_insert_with(|| {
-            ForeignRecoveryBuffer::new(self.config.buffer_size_bits, origin_epoch)
+            created = true;
+            ForeignRecoveryBuffer::new(self.config.buffer_size_bits, origin_epoch, key_len)
         });
 
         let buf = entry.value_mut();
-        let old_bytes = buf.total_bytes;
+        let old_bytes = if created { 0 } else { buf.footprint() };
         buf.push_at(data, origin_offset);
-        let new_bytes = buf.total_bytes;
+        let new_bytes = buf.footprint();
 
         if new_bytes > old_bytes {
             self.total_bytes
@@ -507,13 +540,15 @@ impl RecoveryManager {
     /// `last_write` (oldest first) and remove them until under budget.
     /// Both local and foreign buffers are cleaned up.
     pub(crate) fn cleanup(&self) {
-        let ttl_cutoff =
-            Instant::now() - std::time::Duration::from_secs(self.config.history_ttl_secs);
+        // Compare ages, not `now - ttl`: that subtraction panics when the TTL is
+        // longer than the machine's uptime (e.g. a service started at boot on
+        // Windows), and a panic here would stop all eviction for good.
+        let ttl = Duration::from_secs(self.config.history_ttl_secs);
 
         // First pass: remove TTL-expired local buffers.
         let mut to_remove = Vec::new();
         for entry in self.buffers.iter() {
-            if entry.value().last_write < ttl_cutoff {
+            if entry.value().last_write.elapsed() > ttl {
                 to_remove.push(entry.key().clone());
             }
         }
@@ -522,7 +557,7 @@ impl RecoveryManager {
                 let _ = self
                     .total_bytes
                     .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                        Some(cur.saturating_sub(removed.total_bytes))
+                        Some(cur.saturating_sub(removed.footprint()))
                     });
             }
         }
@@ -530,7 +565,7 @@ impl RecoveryManager {
         // First pass: remove TTL-expired foreign buffers.
         let mut foreign_to_remove = Vec::new();
         for entry in self.foreign_buffers.iter() {
-            if entry.value().last_write < ttl_cutoff {
+            if entry.value().last_write.elapsed() > ttl {
                 foreign_to_remove.push(entry.key().clone());
             }
         }
@@ -539,7 +574,7 @@ impl RecoveryManager {
                 let _ = self
                     .total_bytes
                     .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                        Some(cur.saturating_sub(removed.total_bytes))
+                        Some(cur.saturating_sub(removed.footprint()))
                     });
             }
         }
@@ -553,7 +588,7 @@ impl RecoveryManager {
                 candidates.push((
                     e.key().clone(),
                     e.value().last_write,
-                    e.value().total_bytes,
+                    e.value().footprint(),
                     true, // is_local
                 ));
             }
@@ -561,7 +596,7 @@ impl RecoveryManager {
                 candidates.push((
                     e.key().clone(),
                     e.value().last_write,
-                    e.value().total_bytes,
+                    e.value().footprint(),
                     false, // is_foreign
                 ));
             }
@@ -578,14 +613,14 @@ impl RecoveryManager {
                         let _ = self.total_bytes.try_update(
                             Ordering::Relaxed,
                             Ordering::Relaxed,
-                            |cur| Some(cur.saturating_sub(removed.total_bytes)),
+                            |cur| Some(cur.saturating_sub(removed.footprint())),
                         );
                     }
                 } else if let Some((_, removed)) = self.foreign_buffers.remove(&key) {
                     let _ =
                         self.total_bytes
                             .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                                Some(cur.saturating_sub(removed.total_bytes))
+                                Some(cur.saturating_sub(removed.footprint()))
                             });
                 }
             }
@@ -597,7 +632,15 @@ impl RecoveryManager {
         self.buffers.len()
     }
 
-    /// Return the total bytes across all topic buffers.
+    /// Return the number of buffers holding messages relayed by cluster peers
+    /// (one per origin topic and epoch).
+    #[cfg(test)]
+    pub(crate) fn foreign_buffer_count(&self) -> usize {
+        self.foreign_buffers.len()
+    }
+
+    /// Return the memory charged to recovery: payloads plus buffer overhead,
+    /// for local and foreign buffers.
     pub(crate) fn total_bytes(&self) -> usize {
         self.total_bytes.load(Ordering::Relaxed)
     }
@@ -619,7 +662,7 @@ mod tests {
 
     #[test]
     fn test_push_recover_roundtrip() {
-        let mut buf = TopicRecoveryBuffer::new(4); // 16 slots
+        let mut buf = TopicRecoveryBuffer::new(4, 0); // 16 slots
         for i in 0..5 {
             buf.push(make_data(&format!("msg{i}")));
         }
@@ -633,14 +676,14 @@ mod tests {
 
     #[test]
     fn test_buffer_overflow() {
-        let mut buf = TopicRecoveryBuffer::new(2); // 4 slots
+        let mut buf = TopicRecoveryBuffer::new(2, 0); // 4 slots
         for i in 0..10 {
             buf.push(make_data(&format!("msg{i}")));
         }
 
         // Tail should have advanced. head=10, tail=6.
         assert_eq!(buf.head_offset, 10);
-        assert_eq!(buf.tail_offset, 6);
+        assert_eq!(buf.tail_offset(), 6);
 
         // Trying to recover from offset 3 (well before tail=6) should return None.
         assert!(buf.recover_since(3, 500).is_none());
@@ -989,5 +1032,73 @@ mod tests {
             }
             _ => panic!("expected Recovered"),
         }
+    }
+
+    #[test]
+    fn foreign_offset_jump_is_bounded() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.push_foreign("t", make_data("a"), 7, 0);
+        let started = Instant::now();
+        mgr.push_foreign("t", make_data("b"), 7, 1u64 << 62);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // Only the newest message is left; anything older is a gap.
+        match mgr.recover("t", 7, (1u64 << 62) - 1) {
+            RecoveryResult::Recovered { publications, .. } => {
+                assert_eq!(publications.len(), 1);
+                assert_eq!(&publications[0][..], b"b");
+            }
+            _ => panic!("expected Recovered"),
+        }
+        assert!(matches!(
+            mgr.recover("t", 7, 0),
+            RecoveryResult::NotRecovered { .. }
+        ));
+    }
+
+    #[test]
+    fn local_buffer_memory_grows_with_use() {
+        let cfg = RecoveryConfig {
+            buffer_size_bits: 16, // allows 65536 messages per topic
+            ..RecoveryConfig::default()
+        };
+        let mgr = RecoveryManager::new(cfg);
+        mgr.push("room:1", make_data("hello"));
+        // One small message must not cost the 65536-slot maximum (~2 MiB).
+        assert!(
+            mgr.total_bytes() < 4096,
+            "charged {} bytes",
+            mgr.total_bytes()
+        );
+    }
+
+    #[test]
+    fn budget_accounting_returns_to_zero() {
+        let cfg = RecoveryConfig {
+            history_ttl_secs: 0,
+            ..RecoveryConfig::default()
+        };
+        let mgr = RecoveryManager::new(cfg);
+        for i in 0..200 {
+            mgr.push(&format!("topic-{}", i % 7), make_data("payload"));
+            mgr.push_foreign(&format!("f-{}", i % 5), make_data("payload"), 9, i);
+        }
+        assert!(mgr.total_bytes() > 0);
+        std::thread::sleep(Duration::from_millis(5));
+        mgr.cleanup();
+        assert_eq!(mgr.topic_count(), 0);
+        assert_eq!(mgr.foreign_buffer_count(), 0);
+        assert_eq!(mgr.total_bytes(), 0);
+    }
+
+    #[test]
+    fn ttl_longer_than_uptime_does_not_panic() {
+        let cfg = RecoveryConfig {
+            history_ttl_secs: u64::MAX / 4,
+            ..RecoveryConfig::default()
+        };
+        let mgr = RecoveryManager::new(cfg);
+        mgr.push("t", make_data("x"));
+        mgr.cleanup();
+        assert_eq!(mgr.topic_count(), 1);
     }
 }
