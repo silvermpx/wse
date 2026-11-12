@@ -1,0 +1,596 @@
+//! The cluster manager: owns every peer link and routes commands, interest,
+//! gossip, registrations and presence between them.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use bytes::{Bytes, BytesMut};
+use dashmap::{DashMap, DashSet};
+use socket2::SockRef;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use super::inbound::handle_cluster_inbound_generic;
+use super::peer::PeerSpawnCtx;
+use super::{
+    CAP_COMPRESSION, CAP_INTEREST_ROUTING, CAP_PRESENCE, CAP_RECOVERY, ClusterCommand,
+    ClusterContext, ClusterDlq, ClusterDlqEntry, ClusterTlsConfig, InterestUpdate,
+    LOCAL_CAPABILITIES, MAX_CLUSTER_PEERS, MAX_REMOTE_INTEREST_PER_PEER, PeerRegistration,
+    PresencePeerFrame, encode_drain, encode_msg, encode_msg_compressed, encode_msg_with_recovery,
+    encode_peer_announce, encode_presence_update, encode_shutdown, encode_sub, encode_unsub,
+};
+
+// ---------------------------------------------------------------------------
+// Cluster manager: orchestrates all peer connections
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn cluster_manager(
+    peers: Vec<String>,
+    instance_id: String,
+    channels: (
+        mpsc::UnboundedReceiver<ClusterCommand>,
+        mpsc::UnboundedReceiver<InterestUpdate>,
+    ),
+    ctx: ClusterContext,
+    dlq: Arc<std::sync::Mutex<ClusterDlq>>,
+    tls_config: Option<Arc<arc_swap::ArcSwap<ClusterTlsConfig>>>,
+    cluster_opts: (
+        Option<u16>,
+        Option<Arc<crate::wse::presence::PresenceManager>>,
+        Option<mpsc::UnboundedSender<crate::wse::server::ServerCommand>>,
+    ),
+) {
+    let (mut cmd_rx, mut interest_rx) = channels;
+    let (cluster_port, presence, server_cmd_tx) = cluster_opts;
+    let global_cancel = CancellationToken::new();
+
+    // Remote interest table: peer_addr -> set of topics that peer is interested in
+    let mut remote_interest: HashMap<String, ahash::AHashSet<String>> = HashMap::new();
+    // Track the latest session generation per peer to filter stale RESYNC continuations
+    let mut peer_generation: HashMap<String, u64> = HashMap::new();
+
+    // Static peers have their own reconnect loop; never remove them from known_peers
+    let static_peers: std::collections::HashSet<String> = peers.iter().cloned().collect();
+
+    // Manager-internal channels: peer tasks send back to the manager via these.
+    // The senders are placed into the ClusterContext that gets cloned to each task.
+    let (new_peer_tx, mut new_peer_rx) = mpsc::unbounded_channel::<String>();
+    let (gossip_cmd_tx, mut gossip_cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
+    let (peer_reg_tx, mut peer_reg_rx) = mpsc::unbounded_channel::<PeerRegistration>();
+    let (presence_peer_tx, mut presence_peer_rx) = mpsc::unbounded_channel::<PresencePeerFrame>();
+
+    // Build the full ClusterContext by overriding the manager-internal channel senders
+    let ctx = ClusterContext {
+        new_peer_tx,
+        cmd_tx: gossip_cmd_tx,
+        presence_tx: presence_peer_tx,
+        connected_instances: Arc::new(DashMap::new()),
+        known_peers: Arc::new(DashSet::new()),
+        ..ctx
+    };
+
+    // Per-peer channels: manager sends encoded BytesMut, peer task forwards to writer
+    // Each entry: (peer_addr, write_channel, negotiated_caps)
+    let mut peer_txs: Vec<(String, mpsc::Sender<Bytes>, u32)> = Vec::new();
+    let mut peer_handles = Vec::new();
+
+    let spawn_ctx = PeerSpawnCtx {
+        instance_id: instance_id.clone(),
+        ctx: ctx.clone(),
+        global_cancel: global_cancel.clone(),
+        tls_config: tls_config.clone(),
+        peer_reg_tx: peer_reg_tx.clone(),
+        presence: presence.clone(),
+    };
+
+    for peer_addr in &peers {
+        ctx.known_peers.insert(peer_addr.clone());
+        let (tx, rx) = mpsc::channel::<Bytes>(10_000);
+        // Outbound peers: caps are negotiated in run_peer_session; default to full caps
+        // since all peers in current deployment run the same version.
+        peer_txs.push((peer_addr.clone(), tx, LOCAL_CAPABILITIES));
+        peer_handles.push(spawn_ctx.spawn(peer_addr.clone(), rx));
+    }
+
+    // Prune completed peer handles every 16 additions to prevent unbounded growth
+    let mut handles_since_prune = 0u32;
+    let mut prune_handles = |handles: &mut Vec<tokio::task::JoinHandle<()>>| {
+        handles_since_prune += 1;
+        if handles_since_prune >= 16 {
+            handles.retain(|h| !h.is_finished());
+            handles_since_prune = 0;
+        }
+    };
+
+    // Start cluster listener for inbound peer connections (separate port)
+    // Limit concurrent inbound connections to prevent resource exhaustion
+    const MAX_INBOUND_CLUSTER_CONNS: usize = 128;
+    if let Some(port) = cluster_port {
+        let bind_addr = format!("0.0.0.0:{}", port);
+        match tokio::net::TcpListener::bind(&bind_addr).await {
+            Ok(cluster_listener) => {
+                tracing::info!("[WSE-Cluster] Cluster listener on {bind_addr}");
+                let tls_cfg = tls_config.clone();
+                let inst_id = instance_id.clone();
+                let cancel = global_cancel.clone();
+                let prt = peer_reg_tx.clone();
+                let inbound_ctx = ctx.clone();
+                let ppres = presence.clone();
+                let conn_semaphore =
+                    Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_CLUSTER_CONNS));
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            res = cluster_listener.accept() => {
+                                match res {
+                                    Ok((stream, addr)) => {
+                                        let permit = match conn_semaphore.clone().try_acquire_owned() {
+                                            Ok(permit) => permit,
+                                            Err(_) => {
+                                                tracing::warn!("[WSE-Cluster] Max inbound connections reached, rejecting {addr}");
+                                                drop(stream);
+                                                continue;
+                                            }
+                                        };
+                                        let _ = stream.set_nodelay(true);
+                                        let sock = SockRef::from(&stream);
+                                        let _ = sock.set_send_buffer_size(262_144);
+                                        let _ = sock.set_recv_buffer_size(262_144);
+                                        let tls = tls_cfg.clone();
+                                        let inst2 = inst_id.clone();
+                                        let prt2 = prt.clone();
+                                        let gc2 = cancel.clone();
+                                        let ctx2 = inbound_ctx.clone();
+                                        let ppres2 = ppres.clone();
+                                        tokio::spawn(async move {
+                                            let _permit = permit; // held until task completes
+                                            // Load current TLS config snapshot for this handshake
+                                            let tls_snap = tls.as_ref().map(|holder| holder.load());
+                                            if let Some(ref tls_cfg) = tls_snap {
+                                                match tokio::time::timeout(
+                                                    Duration::from_secs(5),
+                                                    tls_cfg.acceptor.accept(stream),
+                                                ).await {
+                                                    Ok(Ok(tls_stream)) => {
+                                                        handle_cluster_inbound_generic(
+                                                            tls_stream, addr, &inst2,
+                                                            ctx2, prt2, gc2, ppres2,
+                                                        ).await;
+                                                    }
+                                                    Ok(Err(e)) => {
+                                                        tracing::warn!("[WSE-Cluster] TLS accept failed from {addr}: {e}");
+                                                    }
+                                                    Err(_) => {
+                                                        tracing::warn!("[WSE-Cluster] TLS accept timeout from {addr}");
+                                                    }
+                                                }
+                                            } else {
+                                                handle_cluster_inbound_generic(
+                                                    stream, addr, &inst2,
+                                                    ctx2, prt2, gc2, ppres2,
+                                                ).await;
+                                            }
+                                        });
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("[WSE-Cluster] Cluster accept error: {e}");
+                                    }
+                                }
+                            }
+                            () = cancel.cancelled() => break,
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::error!(
+                    "[WSE-Cluster] Failed to bind cluster listener on {bind_addr}: {e}"
+                );
+            }
+        }
+    }
+
+    tracing::info!(
+        "[WSE-Cluster] Manager started, {} peers configured",
+        peers.len()
+    );
+
+    // Main loop: fan out commands to all peer channels
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(ClusterCommand::Publish { topic, payload }) => {
+                        // Get origin recovery position for cross-node recovery
+                        let rec_pos = ctx.recovery.as_ref().and_then(|rm| rm.get_position(&topic));
+
+                        // Pre-encode frames: with/without recovery, with/without compression
+                        let recovery_compressed = if let Some((epoch, offset)) = rec_pos {
+                            let mut buf = BytesMut::new();
+                            if encode_msg_with_recovery(&mut buf, &topic, &payload, epoch, offset, true) {
+                                Some(buf.freeze())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let recovery_plain = if let Some((epoch, offset)) = rec_pos {
+                            let mut buf = BytesMut::new();
+                            if encode_msg_with_recovery(&mut buf, &topic, &payload, epoch, offset, false) {
+                                Some(buf.freeze())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        let mut compressed_data = BytesMut::new();
+                        let has_compressed = encode_msg_compressed(&mut compressed_data, &topic, &payload);
+                        let compressed_bytes = if has_compressed { Some(compressed_data.freeze()) } else { None };
+
+                        let mut plain_data = BytesMut::new();
+                        if !encode_msg(&mut plain_data, &topic, &payload) {
+                            tracing::warn!(
+                                "[WSE-Cluster] Dropping publish: topic too long ({} bytes)",
+                                topic.len()
+                            );
+                            continue;
+                        }
+                        let plain_bytes = plain_data.freeze();
+
+                        for (peer_addr, tx, caps) in &peer_txs {
+                            let interested = match remote_interest.get(peer_addr) {
+                                Some(topics) => {
+                                    topics.contains(&topic)
+                                        || topics.iter().any(|pat| {
+                                            (pat.contains('*') || pat.contains('?'))
+                                                && crate::wse::server::glob_match(pat, &topic)
+                                        })
+                                }
+                                None => true, // No RESYNC yet -> safe default: send to all
+                            };
+                            if interested {
+                                let frame = if caps & CAP_RECOVERY != 0 {
+                                    if caps & CAP_COMPRESSION != 0 {
+                                        recovery_compressed.as_ref().unwrap_or(&plain_bytes).clone()
+                                    } else {
+                                        recovery_plain.as_ref().unwrap_or(&plain_bytes).clone()
+                                    }
+                                } else if caps & CAP_COMPRESSION != 0 {
+                                    compressed_bytes.as_ref().unwrap_or(&plain_bytes).clone()
+                                } else {
+                                    plain_bytes.clone()
+                                };
+                                match tx.try_send(frame) {
+                                    Ok(()) => {
+                                        ctx.metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                                        tracing::warn!("[WSE-Cluster] Peer {peer_addr} backpressure, dropping message");
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                                        if let Ok(mut dlq_guard) = dlq.lock() {
+                                            dlq_guard.push(ClusterDlqEntry {
+                                                topic: topic.clone(),
+                                                payload: payload.clone(),
+                                                peer_addr: peer_addr.clone(),
+                                                error: "peer channel closed".to_string(),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(ClusterCommand::Sub { topic }) => {
+                        let mut frame_data = BytesMut::new();
+                        if encode_sub(&mut frame_data, &topic) {
+                            let frame_bytes = frame_data.freeze();
+                            for (_, tx, caps) in &peer_txs {
+                                if caps & CAP_INTEREST_ROUTING != 0 {
+                                    let _ = tx.try_send(frame_bytes.clone());
+                                }
+                            }
+                        }
+                    }
+                    Some(ClusterCommand::Unsub { topic }) => {
+                        let mut frame_data = BytesMut::new();
+                        if encode_unsub(&mut frame_data, &topic) {
+                            let frame_bytes = frame_data.freeze();
+                            for (_, tx, caps) in &peer_txs {
+                                if caps & CAP_INTEREST_ROUTING != 0 {
+                                    let _ = tx.try_send(frame_bytes.clone());
+                                }
+                            }
+                        }
+                    }
+                    // GossipPeerAnnounce is handled exclusively via gossip_cmd_rx below
+                    Some(ClusterCommand::GossipPeerAnnounce { .. }) => {}
+                    Some(ClusterCommand::PresenceUpdate { topic, user_id, action, data, updated_at }) => {
+                        let mut frame_data = BytesMut::new();
+                        if encode_presence_update(&mut frame_data, &topic, &user_id, action, &data, updated_at) {
+                            let frame_bytes = frame_data.freeze();
+                            for (peer_addr, tx, caps) in &peer_txs {
+                                if caps & CAP_PRESENCE != 0 {
+                                    match tx.try_send(frame_bytes.clone()) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            tracing::warn!("[WSE-Cluster] Peer {peer_addr} backpressure, dropping presence update");
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            if let Ok(mut dlq_guard) = dlq.lock() {
+                                                dlq_guard.push(ClusterDlqEntry {
+                                                    topic: topic.clone(),
+                                                    payload: data.clone(),
+                                                    peer_addr: peer_addr.clone(),
+                                                    error: "presence update failed".to_string(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(ClusterCommand::Drain) => {
+                        tracing::info!("[WSE-Cluster] Sending DRAIN to all peers");
+                        let mut drain_data = BytesMut::new();
+                        encode_drain(&mut drain_data);
+                        let drain_bytes = drain_data.freeze();
+                        for (peer_addr, tx, _) in &peer_txs {
+                            if tx.try_send(drain_bytes.clone()).is_err() {
+                                tracing::warn!("[WSE-Cluster] Could not send DRAIN to {peer_addr}");
+                            }
+                        }
+                    }
+                    Some(ClusterCommand::Shutdown) | None => {
+                        tracing::info!("[WSE-Cluster] Manager shutting down");
+                        let mut shutdown_data = BytesMut::new();
+                        encode_shutdown(&mut shutdown_data);
+                        let shutdown_bytes = shutdown_data.freeze();
+                        for (peer_addr, tx, _) in &peer_txs {
+                            if tx.try_send(shutdown_bytes.clone()).is_err() {
+                                tracing::warn!("[WSE-Cluster] Could not send SHUTDOWN to {peer_addr}");
+                            }
+                        }
+                        global_cancel.cancel();
+                        break;
+                    }
+                }
+            }
+            // Dynamic peer discovery: spawn connection tasks for newly discovered peers
+            Some(new_addr) = new_peer_rx.recv() => {
+                // Validate address parses as a valid SocketAddr to prevent SSRF
+                if new_addr.parse::<std::net::SocketAddr>().is_err() {
+                    tracing::debug!("[WSE-Cluster] Ignoring invalid peer address from gossip: {new_addr}");
+                    continue;
+                }
+                // Skip if we already know this peer or it's our own address
+                let is_self = ctx.cluster_addr.as_deref() == Some(&new_addr);
+                let already_known = !ctx.known_peers.insert(new_addr.clone());
+                if !is_self && !already_known {
+                    // Prune dead peer channels FIRST so closed entries don't block re-connection
+                    peer_txs.retain(|(_, tx, _)| !tx.is_closed());
+                    if !peer_txs.iter().any(|(a, _, _)| a == &new_addr) {
+                        if peer_txs.len() >= MAX_CLUSTER_PEERS {
+                            tracing::warn!(
+                                "[WSE-Cluster] Ignoring discovered peer {new_addr}: at capacity ({MAX_CLUSTER_PEERS} peers)"
+                            );
+                        } else {
+                            let (tx, rx) = mpsc::channel::<Bytes>(10_000);
+                            peer_txs.push((new_addr.clone(), tx, LOCAL_CAPABILITIES));
+                            peer_handles.push(spawn_ctx.spawn(new_addr.clone(), rx));
+                            prune_handles(&mut peer_handles);
+                            tracing::info!("[WSE-Cluster] Discovered new peer: {new_addr}");
+                        }
+                    }
+                }
+            }
+            // Handle gossip commands from peer tasks
+            Some(gossip_cmd) = gossip_cmd_rx.recv() => {
+                if let ClusterCommand::GossipPeerAnnounce { addr, exclude_peer } = gossip_cmd {
+                    // Validate address before processing
+                    if addr.parse::<std::net::SocketAddr>().is_err() {
+                        tracing::debug!("[WSE-Cluster] Ignoring invalid gossip address: {addr}");
+                        continue;
+                    }
+                    let is_self = ctx.cluster_addr.as_deref() == Some(&addr);
+                    if is_self {
+                        continue;
+                    }
+                    // Forward PEER_ANNOUNCE only for newly discovered peers
+                    // to prevent gossip amplification in dense clusters
+                    let is_new = !ctx.known_peers.contains(&addr);
+                    if is_new {
+                        let mut frame_data = BytesMut::new();
+                        encode_peer_announce(&mut frame_data, &addr);
+                        let frame_bytes = frame_data.freeze();
+                        for (peer_addr, tx, _) in &peer_txs {
+                            if *peer_addr != exclude_peer {
+                                let _ = tx.try_send(frame_bytes.clone());
+                            }
+                        }
+                    }
+                    // Only spawn connection to this peer if we don't already know it
+                    if ctx.known_peers.insert(addr.clone())
+                        && !peer_txs.iter().any(|(a, _, _)| a == &addr)
+                    {
+                        peer_txs.retain(|(_, tx, _)| !tx.is_closed());
+                        if peer_txs.len() >= MAX_CLUSTER_PEERS {
+                            tracing::warn!(
+                                "[WSE-Cluster] Ignoring gossip peer {addr}: at capacity ({MAX_CLUSTER_PEERS} peers)"
+                            );
+                        } else {
+                            let (tx, rx) = mpsc::channel::<Bytes>(10_000);
+                            peer_txs.push((addr.clone(), tx, LOCAL_CAPABILITIES));
+                            peer_handles.push(spawn_ctx.spawn(addr.clone(), rx));
+                            prune_handles(&mut peer_handles);
+                            tracing::info!("[WSE-Cluster] Discovered peer via gossip: {addr}");
+                        }
+                    }
+                }
+            }
+            update = interest_rx.recv() => {
+                match update {
+                    Some(InterestUpdate::Sub { peer_addr, topic }) => {
+                        let set = remote_interest.entry(peer_addr).or_default();
+                        // Bound the per-peer interest set (a re-sub of an existing
+                        // topic always succeeds; a new topic past the cap is dropped).
+                        if set.len() < MAX_REMOTE_INTEREST_PER_PEER || set.contains(&topic) {
+                            set.insert(topic);
+                        }
+                    }
+                    Some(InterestUpdate::Unsub { peer_addr, topic }) => {
+                        if let Some(topics) = remote_interest.get_mut(&peer_addr) {
+                            topics.remove(&topic);
+                        }
+                    }
+                    Some(InterestUpdate::Resync { peer_addr, topics, is_continuation, generation }) => {
+                        if is_continuation {
+                            // Continuation frame: only apply if generation matches current session.
+                            // Stale continuations from a prior connection are silently dropped.
+                            if peer_generation.get(&peer_addr) == Some(&generation) {
+                                remote_interest.entry(peer_addr).or_default().extend(topics);
+                            }
+                        } else {
+                            // First/only frame: replace entire set and record generation
+                            peer_generation.insert(peer_addr.clone(), generation);
+                            let set: ahash::AHashSet<String> = topics.into_iter().collect();
+                            remote_interest.insert(peer_addr, set);
+                        }
+                    }
+                    Some(InterestUpdate::PeerDisconnected { peer_addr, generation }) => {
+                        // Only process disconnect if generation matches current session.
+                        // Prevents a stale disconnect from clearing a newer session's interest.
+                        let stale = peer_generation
+                            .get(&peer_addr)
+                            .is_some_and(|g| *g != generation);
+                        if !stale {
+                            // Purge this peer's presence sentinels so a crashed peer
+                            // (no per-user leave) leaves no ghost members behind.
+                            if let Some(ref pm) = presence {
+                                pm.purge_origin(&peer_addr);
+                            }
+                            remote_interest.remove(&peer_addr);
+                            peer_generation.remove(&peer_addr);
+                            if !static_peers.contains(&peer_addr) {
+                                ctx.known_peers.remove(&peer_addr);
+                            }
+                        }
+                    }
+                    Some(InterestUpdate::Drain { peer_addr }) => {
+                        // Lame duck: stop routing new messages to the draining peer
+                        // (clear its interest) but leave generation / known_peers /
+                        // presence intact -- the connection stays up for in-flight
+                        // delivery and the peer may resume via a later RESYNC.
+                        remote_interest.remove(&peer_addr);
+                    }
+                    None => {
+                        // Interest channel closed, continue running
+                    }
+                }
+            }
+            // Handle inbound peer registrations/deregistrations
+            Some(reg) = peer_reg_rx.recv() => {
+                match reg {
+                    PeerRegistration::Register { peer_addr, write_tx, negotiated_caps } => {
+                        // Add inbound peer's write channel so it receives Publish/Sub/Unsub
+                        if !peer_txs.iter().any(|(a, _, _)| a == &peer_addr) {
+                            peer_txs.push((peer_addr.clone(), write_tx, negotiated_caps));
+                            tracing::info!("[WSE-Cluster] Registered inbound peer: {peer_addr} (caps=0x{negotiated_caps:08x})");
+                        }
+                    }
+                    PeerRegistration::Deregister { peer_addr } => {
+                        // Remove disconnected inbound peer
+                        peer_txs.retain(|(a, _, _)| a != &peer_addr);
+                        // Allow gossip-discovered peers to be re-discovered
+                        if !static_peers.contains(&peer_addr) {
+                            ctx.known_peers.remove(&peer_addr);
+                        }
+                    }
+                    PeerRegistration::UpdateCaps { peer_addr, negotiated_caps } => {
+                        // Update outbound peer caps after handshake negotiation
+                        if let Some((_, _, caps)) = peer_txs.iter_mut().find(|(a, _, _)| a == &peer_addr) {
+                            *caps = negotiated_caps;
+                        }
+                    }
+                }
+            }
+            // Handle presence frames received from peers
+            Some(pf) = presence_peer_rx.recv() => {
+                if let Some(ref pm) = presence {
+                    match pf {
+                        PresencePeerFrame::Update { origin, topic, user_id, action, data, updated_at } => {
+                            let data_val: serde_json::Value = serde_json::from_str(&data).unwrap_or(serde_json::Value::Null);
+                            match action {
+                                0 => {
+                                    // Remote join: merge into local presence
+                                    pm.merge_remote_join(&topic, &user_id, &data_val, updated_at, &origin);
+                                    if let Some(ref tx) = server_cmd_tx {
+                                        let msg = crate::wse::server::format_presence_msg("presence_join", &user_id, &data_val);
+                                        let _ = tx.send(crate::wse::server::ServerCommand::BroadcastLocal {
+                                            topic,
+                                            data: msg,
+                                            skip_recovery: true,
+                                        });
+                                    }
+                                }
+                                1 => {
+                                    // Remote leave
+                                    pm.merge_remote_leave(&topic, &user_id, updated_at, &origin);
+                                    if let Some(ref tx) = server_cmd_tx {
+                                        let msg = crate::wse::server::format_presence_msg("presence_leave", &user_id, &data_val);
+                                        let _ = tx.send(crate::wse::server::ServerCommand::BroadcastLocal {
+                                            topic,
+                                            data: msg,
+                                            skip_recovery: true,
+                                        });
+                                    }
+                                }
+                                2 => {
+                                    // Remote data update
+                                    pm.merge_remote_update(&topic, &user_id, &data_val, updated_at);
+                                    if let Some(ref tx) = server_cmd_tx {
+                                        let msg = crate::wse::server::format_presence_msg("presence_update", &user_id, &data_val);
+                                        let _ = tx.send(crate::wse::server::ServerCommand::BroadcastLocal {
+                                            topic,
+                                            data: msg,
+                                            skip_recovery: true,
+                                        });
+                                    }
+                                }
+                                _ => {} // Ignore unknown actions
+                            }
+                        }
+                        PresencePeerFrame::Full { origin, entries } => {
+                            pm.merge_full_state(&entries, &origin);
+                        }
+                    }
+                }
+            }
+            () = global_cancel.cancelled() => break,
+        }
+
+        // Prune dead peer channels (receiver dropped = peer task exited)
+        peer_txs.retain(|(addr, tx, _)| {
+            if tx.is_closed() {
+                tracing::debug!("[WSE-Cluster] Pruning dead peer channel: {addr}");
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    // Wait for all peer tasks to finish
+    for handle in peer_handles {
+        let _ = handle.await;
+    }
+    tracing::info!("[WSE-Cluster] Manager stopped");
+}
