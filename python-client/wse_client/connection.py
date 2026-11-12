@@ -4,49 +4,69 @@
 #
 # WebSocket lifecycle management: connect, auth, heartbeat, reconnect.
 # Port of ts-client/services/ConnectionManager.ts.
+#
+# Close-code contract (the TS client follows the same rules):
+#   * A close the client initiates (disconnect() / close()) is final.
+#   * The server rejecting the credentials -- close 4401 / 4403 / 1008, or
+#     HTTP 401 / 403 on the upgrade -- ends the client with WSEAuthError.
+#     With a token_provider the client first fetches a fresh token and
+#     reconnects with backoff; AUTH_MAX_CONSECUTIVE_FAILURES rejections in a
+#     row end it.
+#   * Every other server close (1000, 1001 server stop, 1005 server kick,
+#     1011, 1012, 1013, 4300 drain, 4429, ...) and every network loss is
+#     reconnected with backoff. A failed reconnect attempt is never terminal;
+#     only ReconnectConfig.max_attempts (when not -1) ends the client.
+#   * Until the first handshake of connect() completes, a close fails
+#     connect() instead (WSEAuthError for the auth codes, WSEConnectionError
+#     otherwise) and nothing reconnects in the background.
+#
+# Heartbeat ping / PONG and client_hello are control frames: always plaintext
+# (the server answers pings on its plaintext fast path) and never rate limited.
+# With E2E encryption configured every other frame is encrypted; before the key
+# exchange completes nothing else is sent (fail closed).
 # =============================================================================
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import inspect
 import json as _json
+import math
 import random
 import time
-
-from uuid import uuid4
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Callable
+from urllib.parse import quote
+from uuid import uuid4
 
 import websockets
 import websockets.asyncio.client
-from websockets.exceptions import (
-    ConnectionClosed,
-    ConnectionClosedError,
-    ConnectionClosedOK,
-)
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from ._logging import logger
+from .connection_pool import ConnectionPool
 from .constants import (
-    CLIENT_HELLO_MAX_RETRIES,
-    CLIENT_HELLO_RETRY_DELAY,
+    AUTH_CLOSE_CODES,
+    AUTH_MAX_CONSECUTIVE_FAILURES,
     CLIENT_VERSION,
     CONNECTION_TIMEOUT,
+    DEFAULT_MAX_MESSAGE_SIZE,
     HEARTBEAT_INTERVAL,
     IDLE_TIMEOUT,
+    PREFIX_ENCRYPTED,
     PROTOCOL_VERSION,
     RECONNECT_ABSOLUTE_CAP,
-    WS_CLOSE_AUTH_EXPIRED,
-    WS_CLOSE_AUTH_FAILED,
+    WS_CLOSE_ABNORMAL,
     WS_CLOSE_GOING_AWAY,
+    WS_CLOSE_NO_STATUS,
     WS_CLOSE_NORMAL,
-    WS_CLOSE_POLICY_VIOLATION,
-    WS_CLOSE_RATE_LIMITED,
 )
-from .connection_pool import ConnectionPool
 from .errors import (
     WSEAuthError,
     WSECircuitBreakerError,
     WSEConnectionError,
+    WSEError,
     WSETimeoutError,
 )
 from .types import (
@@ -55,12 +75,48 @@ from .types import (
     MessagePriority,
     ReconnectConfig,
     ReconnectMode,
+    TokenProvider,
 )
 
 if TYPE_CHECKING:
     from .circuit_breaker import CircuitBreaker
     from .rate_limiter import TokenBucketRateLimiter
     from .security import SecurityManager
+
+
+class _TokenProviderError(WSEAuthError):
+    """The token_provider raised or returned something that is not a token."""
+
+
+def _current_task() -> asyncio.Task[Any] | None:
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
+
+
+async def _close_quietly(ws_cm: Any) -> None:
+    try:
+        await ws_cm.__aexit__(None, None, None)
+    except Exception:
+        pass
+
+
+def _received_close(ws: Any) -> tuple[int, str]:
+    """Close code and reason the peer sent (1005 when it sent none).
+
+    websockets >= 15 exposes them on the connection, 13 / 14 only on its
+    protocol object.
+    """
+    code = getattr(ws, "close_code", None)
+    reason = getattr(ws, "close_reason", None)
+    if code is None:
+        protocol = getattr(ws, "protocol", None)
+        code = getattr(protocol, "close_code", None)
+        reason = getattr(protocol, "close_reason", None)
+    if not isinstance(code, int):
+        code = WS_CLOSE_NO_STATUS
+    return code, reason if isinstance(reason, str) else ""
 
 
 class ConnectionManager:
@@ -75,6 +131,7 @@ class ConnectionManager:
         url: str,
         *,
         token: str | None = None,
+        token_provider: TokenProvider | None = None,
         reconnect: ReconnectConfig | None = None,
         circuit_breaker: CircuitBreaker | None = None,
         rate_limiter: TokenBucketRateLimiter | None = None,
@@ -84,14 +141,21 @@ class ConnectionManager:
         security: SecurityManager | None = None,
         endpoints: list[str] | None = None,
         load_balancing: LoadBalancingStrategy = LoadBalancingStrategy.WEIGHTED_RANDOM,
+        max_message_size: int | None = DEFAULT_MAX_MESSAGE_SIZE,
+        query_params: dict[str, str] | None = None,
     ) -> None:
         self._url = url
         self._token = token
+        self._token_provider = token_provider
         self._reconnect_cfg = reconnect or ReconnectConfig()
         self._circuit_breaker = circuit_breaker
+        # Optional: AsyncWSEClient applies its limiter to application sends
+        # itself and passes None here.
         self._rate_limiter = rate_limiter
         self._extra_headers = extra_headers or {}
         self._security = security
+        self._max_message_size = max_message_size
+        self._query_params = dict(query_params or {})
 
         # Connection pool for multi-endpoint failover
         all_endpoints = endpoints or []
@@ -107,6 +171,11 @@ class ConnectionManager:
         self._on_state_change = on_state_change
         self._on_pong: Callable[[float], Any] | None = None  # latency callback
         self._on_ping_sent: Callable[[], Any] | None = None
+        # Set by AsyncWSEClient: a socket opened (before any frame is read), a
+        # live socket went away, the manager gave up for good.
+        self._on_open: Callable[[], Any] | None = None
+        self._on_close: Callable[[], Any] | None = None
+        self._on_terminal: Callable[[WSEError], Any] | None = None
 
         # State
         self._ws_cm: Any | None = None  # websocket context manager
@@ -115,12 +184,21 @@ class ConnectionManager:
         self._is_connecting = False
         self._reconnect_attempts = 0
         self._consecutive_failures = 0
+        self._auth_failures = 0
         self._server_ready = False
         self._client_hello_sent = False
         self._connection_id: str | None = None
         self._connected_at: float | None = None
         self._last_pong: float | None = None
         self._destroyed = False
+        # True while the client itself is closing (disconnect / abort): a
+        # close it causes is never reconnected.
+        self._intentional_close = False
+        # False until the first handshake of connect() completed: a close
+        # before that fails connect() instead of reconnecting.
+        self._reconnect_armed = False
+        self._last_error: WSEError | None = None
+        self._last_close: tuple[int, str] | None = None
 
         # Tasks
         self._recv_task: asyncio.Task[None] | None = None
@@ -160,15 +238,78 @@ class ConnectionManager:
     def connected_since(self) -> float | None:
         return self._connected_at
 
+    @property
+    def last_error(self) -> WSEError | None:
+        """The error of the last failed connect or of the terminal failure."""
+        return self._last_error
+
+    @property
+    def last_close(self) -> tuple[int, str] | None:
+        """``(code, reason)`` of the last close the server or network caused."""
+        return self._last_close
+
+    @property
+    def reconnect_armed(self) -> bool:
+        return self._reconnect_armed
+
     # -- Connect / Disconnect -------------------------------------------------
 
     async def connect(self, initial_topics: list[str] | None = None) -> None:
-        """Open the WebSocket and complete the handshake."""
+        """Open the WebSocket (one attempt) and send ``client_hello``.
+
+        *initial_topics* is accepted for compatibility and ignored: the server
+        does not read topics from the URL, ``AsyncWSEClient`` subscribes after
+        the handshake.
+
+        Until :meth:`arm_reconnect` is called a close is reported as a
+        terminal failure instead of being reconnected, because the caller is
+        still waiting for the handshake and gets the error.
+        """
         if self._destroyed:
             raise WSEConnectionError("ConnectionManager has been destroyed")
         if self.is_connected or self._is_connecting:
             return
 
+        self._cancel_reconnect()
+        self._intentional_close = False
+        self._reconnect_armed = False
+        self._last_error = None
+        self._reconnect_attempts = 0
+        self._auth_failures = 0
+
+        self._is_connecting = True
+        self._set_state(ConnectionState.CONNECTING)
+        try:
+            await self._attempt()
+        except WSEError as exc:
+            self._last_error = exc
+            self._set_state(ConnectionState.ERROR)
+            raise
+        finally:
+            self._is_connecting = False
+
+    def arm_reconnect(self) -> None:
+        """From now on a lost connection is reconnected in the background."""
+        self._reconnect_armed = True
+
+    def mark_handshake_complete(self) -> None:
+        """The server confirmed this connection: reset the backoff, and from
+        now on reconnect a lost connection (also when connect() has not
+        resumed yet)."""
+        self._reconnect_attempts = 0
+        self._consecutive_failures = 0
+        self._reconnect_armed = True
+
+    def set_token(self, token: str | None) -> None:
+        """Use *token* for the next connect / reconnect."""
+        self._token = token
+        self._auth_failures = 0
+
+    async def _attempt(self) -> None:
+        """One connection attempt: token, socket, loops, client_hello.
+
+        Raises a :class:`WSEError` on failure.
+        """
         if self._circuit_breaker and not self._circuit_breaker.can_execute():
             raise WSECircuitBreakerError("Circuit breaker is open")
 
@@ -178,122 +319,106 @@ class ConnectionManager:
             self._url = selected
             self._active_endpoint = selected
 
-        self._is_connecting = True
-        self._set_state(ConnectionState.CONNECTING)
-
+        token = await self._resolve_token()
         try:
-            await self._connect_ws(initial_topics)
-            if self._circuit_breaker:
-                self._circuit_breaker.record_success()
-            if self._pool is not None:
-                self._pool.record_success(self._active_endpoint)
-                self._pool.add_connection(self._active_endpoint)
-            self._consecutive_failures = 0
-            self._reconnect_attempts = 0
-        except Exception:
+            ws_cm, ws = await self._open_socket(token)
+        except WSEError:
             self._consecutive_failures += 1
             if self._circuit_breaker:
                 self._circuit_breaker.record_failure()
             if self._pool is not None:
                 self._pool.record_failure(self._active_endpoint)
             raise
-        finally:
-            self._is_connecting = False
 
-    async def _connect_ws(self, topics: list[str] | None = None) -> None:
+        self._consecutive_failures = 0
+        if self._circuit_breaker:
+            self._circuit_breaker.record_success()
+        if self._pool is not None:
+            self._pool.record_success(self._active_endpoint)
+            self._pool.add_connection(self._active_endpoint)
+        await self._activate(ws_cm, ws)
+
+    async def _resolve_token(self) -> str | None:
+        """The token for this attempt: from token_provider when configured."""
+        provider = self._token_provider
+        if provider is None:
+            return self._token
+        try:
+            result = provider()
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            raise _TokenProviderError(f"token_provider failed: {exc}") from exc
+        if result is not None and not isinstance(result, str):
+            raise _TokenProviderError(
+                f"token_provider returned {type(result).__name__}, expected str or None"
+            )
+        self._token = result
+        return result
+
+    async def _open_socket(self, token: str | None) -> tuple[Any, Any]:
         """Low-level WebSocket open with auth headers."""
         headers = dict(self._extra_headers)
 
         # Auth: cookie for Rust server + Authorization header as fallback
-        if self._token and self._token != "cookie":
-            headers["Cookie"] = f"access_token={self._token}"
-            headers["Authorization"] = f"Bearer {self._token}"
+        if token and token != "cookie":
+            headers["Cookie"] = f"access_token={token}"
+            headers["Authorization"] = f"Bearer {token}"
 
-        # Build URL with query params
-        url = self._build_url(topics)
-
+        ws_cm = websockets.asyncio.client.connect(
+            self._build_url(),
+            additional_headers=headers,
+            max_size=self._max_message_size,
+            open_timeout=None,  # asyncio.wait_for handles timeout
+        )
         try:
-            self._ws_cm = websockets.asyncio.client.connect(
-                url,
-                additional_headers=headers,
-                max_size=2**20,  # 1 MB
-                open_timeout=None,  # asyncio.wait_for handles timeout
-            )
-            self._ws = await asyncio.wait_for(
-                self._ws_cm.__aenter__(),
-                timeout=CONNECTION_TIMEOUT,
-            )
+            ws = await asyncio.wait_for(ws_cm.__aenter__(), timeout=CONNECTION_TIMEOUT)
+        except asyncio.CancelledError:
+            # disconnect() during a reconnect attempt: leave no socket behind.
+            await _close_quietly(ws_cm)
+            raise
         except asyncio.TimeoutError:
-            ws_cm = self._ws_cm
-            self._ws_cm = None
-            if ws_cm is not None:
-                try:
-                    await ws_cm.__aexit__(None, None, None)
-                except Exception:
-                    pass
-            self._set_state(ConnectionState.ERROR)
+            await _close_quietly(ws_cm)
             raise WSETimeoutError(f"Connection timed out after {CONNECTION_TIMEOUT}s")
-        except Exception as exc:
-            ws_cm = self._ws_cm
-            self._ws_cm = None
-            if ws_cm is not None:
-                try:
-                    await ws_cm.__aexit__(None, None, None)
-                except Exception:
-                    pass
-            self._set_state(ConnectionState.ERROR)
+        except InvalidStatus as exc:
+            await _close_quietly(ws_cm)
+            status = exc.response.status_code
+            if status in (401, 403):
+                raise WSEAuthError(
+                    f"Server rejected the handshake with HTTP {status}"
+                ) from exc
             raise WSEConnectionError(f"Failed to connect: {exc}") from exc
+        except Exception as exc:
+            await _close_quietly(ws_cm)
+            raise WSEConnectionError(f"Failed to connect: {exc}") from exc
+        return ws_cm, ws
 
-        self._set_state(ConnectionState.CONNECTED)
+    async def _activate(self, ws_cm: Any, ws: Any) -> None:
+        """Install a freshly opened socket and send client_hello first."""
+        self._ws_cm = ws_cm
+        self._ws = ws
         self._connected_at = time.monotonic()
         self._last_pong = time.monotonic()
         self._server_ready = False
         self._client_hello_sent = False
-
-        # Start receive + heartbeat loops
-        self._recv_task = asyncio.create_task(self._recv_loop())
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-
-    async def disconnect(self) -> None:
-        """Graceful shutdown."""
-        self._cancel_reconnect()
-        self._server_ready = False
-        self._client_hello_sent = False
         self._connection_id = None
 
-        if self._pool is not None:
-            self._pool.remove_connection(self._active_endpoint)
+        # The client sets up its per-connection state before any frame of
+        # this socket is read (the receive loop starts below).
+        if self._on_open:
+            self._on_open()
+        self._set_state(ConnectionState.CONNECTED)
 
-        # Cancel tasks and await completion before closing the socket
-        tasks_to_await: list[asyncio.Task[Any]] = []
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            tasks_to_await.append(self._heartbeat_task)
-            self._heartbeat_task = None
-        if self._recv_task:
-            self._recv_task.cancel()
-            tasks_to_await.append(self._recv_task)
-            self._recv_task = None
-        for task in self._background_tasks:
-            task.cancel()
-            tasks_to_await.append(task)
-        self._background_tasks.clear()
-        if tasks_to_await:
-            await asyncio.gather(*tasks_to_await, return_exceptions=True)
+        self._recv_task = asyncio.create_task(self._recv_loop(ws))
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
+        await self._send_client_hello(ws)
 
-        if self._ws_cm:
-            try:
-                await self._ws_cm.__aexit__(None, None, None)
-            except Exception:
-                pass
-            self._ws_cm = None
-        elif self._ws:
-            try:
-                await self._ws.close(WS_CLOSE_NORMAL, "Client disconnect")
-            except Exception:
-                pass
-        self._ws = None
-
+    async def disconnect(self) -> None:
+        """Graceful, final shutdown: nothing reconnects afterwards."""
+        self._intentional_close = True
+        self._reconnect_armed = False
+        self._cancel_reconnect()
+        await self._teardown(WS_CLOSE_NORMAL, "Client disconnect")
         self._set_state(ConnectionState.DISCONNECTED)
 
     async def destroy(self) -> None:
@@ -304,24 +429,86 @@ class ConnectionManager:
             self._pool.destroy()
             self._pool = None
 
+    async def abort(self, error: WSEError) -> None:
+        """End the connection for good with *error*.
+
+        Used for failures the server cannot cure by reconnecting, e.g. a
+        failed E2E key exchange: the socket is closed, nothing reconnects,
+        the state becomes ERROR and *error* is reported as terminal.
+        """
+        if self._destroyed or self._state == ConnectionState.ERROR:
+            return
+        self._intentional_close = True
+        self._reconnect_armed = False
+        self._cancel_reconnect()
+        await self._teardown(WS_CLOSE_NORMAL, str(error)[:120])
+        self._fail(error)
+
     # -- Send -----------------------------------------------------------------
 
     async def send(self, data: str) -> bool:
-        """Send a text frame (or encrypted binary if E2E enabled).  Returns True on success."""
-        if not self._ws:
+        """Send an application frame.  Returns True on success.
+
+        With E2E configured the frame is always encrypted: until the key
+        exchange of the current connection completed nothing is sent (fail
+        closed, never plaintext).
+        """
+        ws = self._ws
+        if ws is None or self._destroyed:
             return False
 
         if self._rate_limiter and not self._rate_limiter.try_consume():
-            logger.warning("Rate limit exceeded, dropping message")
+            logger.debug("Rate limit exceeded, not sending")
             return False
 
+        frame: str | bytes = data
+        if self._security is not None:
+            if not self._security.is_enabled:
+                logger.debug("E2E key exchange not complete; not sending plaintext")
+                return False
+            try:
+                frame = PREFIX_ENCRYPTED + self._security.encrypt(data)
+            except Exception as exc:
+                logger.warning("Encryption failed, not sending: %s", exc)
+                return False
+        return await self._ws_send(ws, frame)
+
+    async def send_bytes(self, data: bytes) -> bool:
+        """Send a binary frame (encrypted if E2E is configured, fail closed)."""
+        ws = self._ws
+        if ws is None or self._destroyed:
+            return False
+        if self._rate_limiter and not self._rate_limiter.try_consume():
+            logger.debug("Rate limit exceeded, not sending binary message")
+            return False
+        frame = data
+        if self._security is not None:
+            if not self._security.is_enabled:
+                logger.debug("E2E key exchange not complete; not sending plaintext")
+                return False
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                logger.warning("send_bytes: non-UTF-8 data cannot be E2E encrypted")
+                return False
+            frame = PREFIX_ENCRYPTED + self._security.encrypt(text)
+        return await self._ws_send(ws, frame)
+
+    async def send_control(self, data: str) -> bool:
+        """Send a protocol control frame (ping, PONG, client_hello).
+
+        Control frames are plaintext even with E2E on -- the server answers
+        pings only on its plaintext path -- and are never rate limited.
+        """
+        ws = self._ws
+        if ws is None or self._destroyed:
+            return False
+        return await self._ws_send(ws, data)
+
+    @staticmethod
+    async def _ws_send(ws: Any, frame: str | bytes) -> bool:
         try:
-            # Encrypt outbound if E2E encryption is active
-            if self._security is not None and self._security.is_enabled:
-                encrypted = self._security.encrypt(data)
-                await self._ws.send(b"E:" + encrypted)
-            else:
-                await self._ws.send(data)
+            await ws.send(frame)
             return True
         except ConnectionClosed:
             logger.debug("Send failed: connection closed")
@@ -330,70 +517,47 @@ class ConnectionManager:
             logger.debug("Send failed: %s", exc)
             return False
 
-    async def send_bytes(self, data: bytes) -> bool:
-        """Send a binary frame (encrypted if E2E is active)."""
-        if not self._ws:
-            return False
-        if self._rate_limiter and not self._rate_limiter.try_consume():
-            logger.warning("Rate limit exceeded, dropping binary message")
-            return False
-        try:
-            if self._security is not None and self._security.is_enabled:
-                try:
-                    text = data.decode("utf-8")
-                except UnicodeDecodeError:
-                    logger.warning("send_bytes: non-UTF-8 data cannot be E2E encrypted")
-                    return False
-                encrypted = self._security.encrypt(text)
-                await self._ws.send(b"E:" + encrypted)
-            else:
-                await self._ws.send(data)
-            return True
-        except Exception:
-            return False
-
     # -- Public reconnect -----------------------------------------------------
 
     async def force_reconnect(self) -> None:
-        """Public: tear down current connection and reconnect."""
+        """Public: tear down the current connection and reconnect.
+
+        Also revives a manager that ended (ERROR), e.g. after
+        :meth:`set_token` replaced a rejected token.
+        """
+        if self._destroyed:
+            return
+        self._intentional_close = False
+        self._reconnect_attempts = 0
+        self._auth_failures = 0
+        self._last_error = None
         await self._force_reconnect()
 
     # -- Internal: receive loop -----------------------------------------------
 
-    async def _recv_loop(self) -> None:
-        """Read messages from the WebSocket until closed."""
-        assert self._ws is not None
+    async def _recv_loop(self, ws: Any) -> None:
+        """Read messages from the WebSocket until it closes."""
+        code, reason = WS_CLOSE_ABNORMAL, ""
         try:
-            async for message in self._ws:
-                self._handle_raw_message(message)
-        except ConnectionClosedOK:
-            logger.debug("WebSocket closed normally")
-            self._ws = None
-            if self._heartbeat_task:
-                self._heartbeat_task.cancel()
-                self._heartbeat_task = None
-            cm = self._ws_cm
-            self._ws_cm = None
-            if cm:
+            async for message in ws:
                 try:
-                    await cm.__aexit__(None, None, None)
-                except Exception:
-                    pass
-            self._set_state(ConnectionState.DISCONNECTED)
-        except ConnectionClosedError as exc:
-            code = exc.rcvd.code if exc.rcvd is not None else 1006
-            reason = exc.rcvd.reason if exc.rcvd is not None else ""
-            self._handle_close_code(code, reason)
+                    self._handle_raw_message(message)
+                except Exception as exc:
+                    # One bad frame never tears down the connection.
+                    logger.warning("Error handling a frame, dropped: %s", exc)
         except asyncio.CancelledError:
-            return
+            raise
+        except ConnectionClosed as exc:
+            if exc.rcvd is not None:
+                code, reason = exc.rcvd.code, exc.rcvd.reason
         except Exception as exc:
             logger.warning("Receive loop error: %s", exc)
-            self._ws = None
-            if self._heartbeat_task:
-                self._heartbeat_task.cancel()
-                self._heartbeat_task = None
-            self._set_state(ConnectionState.ERROR)
-            self._schedule_reconnect()
+            reason = str(exc)
+        else:
+            # websockets ends `async for` quietly on a 1000 / 1001 / 1005
+            # close (ConnectionClosedOK); read the code it received.
+            code, reason = _received_close(ws)
+        await self._connection_lost(ws, code, reason)
 
     def _handle_raw_message(self, data: str | bytes) -> None:
         """Quick-check for PONG / PING at transport level, then forward."""
@@ -460,12 +624,11 @@ class ConnectionManager:
                 pass
 
     async def _send_pong(self, timestamp: str) -> None:
-        """Respond to server PING with PONG."""
-        pong = f"PONG:{timestamp}"
-        await self.send(pong)
+        """Respond to server PING with PONG (control frame)."""
+        await self.send_control(f"PONG:{timestamp}")
 
     async def _respond_ping_json(self, data: str) -> None:
-        """Respond to a JSON-format PING from server."""
+        """Respond to a JSON-format PING from server (control frame)."""
         try:
             json_str = data[3:] if data.startswith("WSE") else data
             parsed = _json.loads(json_str)
@@ -485,78 +648,72 @@ class ConnectionManager:
             },
             "v": PROTOCOL_VERSION,
         }
-        await self.send(_json.dumps(pong_msg, separators=(",", ":")))
+        await self.send_control(_json.dumps(pong_msg, separators=(",", ":")))
 
     def handle_server_ready(self, connection_id: str | None = None) -> None:
         """Called by the client layer when ``server_ready`` is decoded."""
         self._server_ready = True
+        # server_ready follows a successful authentication.
+        self._auth_failures = 0
         if connection_id:
             self._connection_id = connection_id
-        if not self._client_hello_sent:
-            self._fire_task(self._send_client_hello())
 
-    async def _send_client_hello(self) -> None:
-        """Send the client_hello handshake message with retry."""
-        # Generate ECDH keypair if encryption is requested
+    async def _send_client_hello(self, ws: Any) -> None:
+        """Send client_hello as the first frame of the connection.
+
+        It is a plaintext control frame. With encryption it carries a fresh
+        ECDH public key; the server answers with server_hello (and its key).
+        Sent at open rather than at server_ready so the server_hello -- and
+        the server's feature list -- also arrives when the application never
+        sends server_ready.
+        """
         encryption_pubkey_b64: str | None = None
         if self._security is not None:
-            import base64
-
-            # Reset any previous key state (handles reconnect cleanly)
+            # Fresh keypair per connection; no key of an older connection
+            # survives into this one.
             self._security.reset()
             pubkey_bytes = self._security.generate_keypair()
             encryption_pubkey_b64 = base64.b64encode(pubkey_bytes).decode("ascii")
 
-        for attempt in range(CLIENT_HELLO_MAX_RETRIES):
-            p: dict[str, Any] = {
-                "client_version": CLIENT_VERSION,
-                "protocol_version": PROTOCOL_VERSION,
-                "features": {
-                    "compression": True,
-                    "encryption": encryption_pubkey_b64 is not None,
-                    "batching": True,
-                    "priority_queue": True,
-                    "circuit_breaker": True,
-                    "offline_queue": True,
-                    "message_signing": False,
-                    "rate_limiting": True,
-                    "health_check": True,
-                    "metrics": True,
-                },
-                "connection_id": self._connection_id,
-            }
-            if encryption_pubkey_b64 is not None:
-                p["encryption_public_key"] = encryption_pubkey_b64
+        p: dict[str, Any] = {
+            "client_version": CLIENT_VERSION,
+            "protocol_version": PROTOCOL_VERSION,
+            "features": {
+                "compression": True,
+                "encryption": encryption_pubkey_b64 is not None,
+                "batching": True,
+                "priority_queue": True,
+                "circuit_breaker": True,
+                "offline_queue": True,
+                "message_signing": False,
+                "rate_limiting": True,
+                "health_check": True,
+                "metrics": True,
+            },
+            "connection_id": self._connection_id,
+        }
+        if encryption_pubkey_b64 is not None:
+            p["encryption_public_key"] = encryption_pubkey_b64
 
-            msg = {
-                "c": "WSE",
-                "t": "client_hello",
-                "p": p,
-                "id": str(uuid4()),
-                "ts": datetime.now(UTC).isoformat(),
-                "v": PROTOCOL_VERSION,
-                "pri": MessagePriority.CRITICAL,
-            }
-            ok = await self.send(_json.dumps(msg, separators=(",", ":")))
-            if ok:
-                self._client_hello_sent = True
-                return
-
-            logger.warning(
-                "Failed to send client_hello (attempt %d/%d), retrying",
-                attempt + 1,
-                CLIENT_HELLO_MAX_RETRIES,
-            )
-            try:
-                await asyncio.sleep(CLIENT_HELLO_RETRY_DELAY)
-            except asyncio.CancelledError:
-                return
-
-        logger.error("client_hello failed after %d attempts", CLIENT_HELLO_MAX_RETRIES)
+        msg = {
+            "c": "WSE",
+            "t": "client_hello",
+            "p": p,
+            "id": str(uuid4()),
+            "ts": datetime.now(UTC).isoformat(),
+            "v": PROTOCOL_VERSION,
+            "pri": MessagePriority.CRITICAL,
+        }
+        if ws is not self._ws:
+            return
+        if await self._ws_send(ws, _json.dumps(msg, separators=(",", ":"))):
+            self._client_hello_sent = True
+        else:
+            logger.warning("client_hello could not be sent; the connection is closing")
 
     # -- Internal: heartbeat --------------------------------------------------
 
-    async def _heartbeat_loop(self) -> None:
+    async def _heartbeat_loop(self, ws: Any) -> None:
         """Send PING every HEARTBEAT_INTERVAL; detect idle timeout."""
         while True:
             try:
@@ -564,7 +721,7 @@ class ConnectionManager:
             except asyncio.CancelledError:
                 return
 
-            if not self._ws:
+            if ws is not self._ws:
                 return
 
             # Check idle timeout
@@ -575,77 +732,143 @@ class ConnectionManager:
                     await self._force_reconnect()
                     return
 
-            # Send PING (lowercase -- Rust server fast-path checks "ping")
-            ping_msg = {
-                "c": "WSE",
-                "t": "ping",
-                "p": {"timestamp": int(time.time() * 1000)},
-                "v": PROTOCOL_VERSION,
-            }
-            ok = await self.send(_json.dumps(ping_msg, separators=(",", ":")))
-            if ok and self._on_ping_sent:
-                self._on_ping_sent()
-            elif not ok:
-                logger.debug("PING send failed")
+            await self._send_ping()
 
-    # -- Internal: reconnection -----------------------------------------------
+    async def _send_ping(self) -> None:
+        """Send one heartbeat PING (lowercase: the Rust server's fast path)."""
+        ping_msg = {
+            "c": "WSE",
+            "t": "ping",
+            "p": {"timestamp": int(time.time() * 1000)},
+            "v": PROTOCOL_VERSION,
+        }
+        ok = await self.send_control(_json.dumps(ping_msg, separators=(",", ":")))
+        if ok and self._on_ping_sent:
+            self._on_ping_sent()
+        elif not ok:
+            logger.debug("PING send failed")
 
-    def _handle_close_code(self, code: int, reason: str) -> None:
-        """React to a WebSocket close code."""
-        logger.debug("WebSocket closed: code=%s reason=%s", code, reason)
+    # -- Internal: close handling and reconnection ----------------------------
 
+    def _detach(self) -> tuple[Any, Any, asyncio.Task[None] | None]:
+        """Drop the current socket from the manager and reset its state.
+
+        Returns ``(ws, ws_cm, recv_task)`` for the caller to close / await.
+        Never cancels the current task.
+        """
+        ws, ws_cm, recv_task = self._ws, self._ws_cm, self._recv_task
+        had_socket = ws is not None
         self._ws = None
+        self._ws_cm = None
+        self._recv_task = None
         self._server_ready = False
         self._client_hello_sent = False
-        # Schedule ws_cm cleanup (async, but we're in sync context)
-        if self._ws_cm:
-            cm = self._ws_cm
-            self._ws_cm = None
-            self._fire_task(cm.__aexit__(None, None, None))
+        self._connection_id = None
 
-        # Cancel old tasks to prevent duplicate loops
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            self._heartbeat_task = None
-        # recv_task already exited (it raised ConnectionClosedError)
-        self._recv_task = None
+        heartbeat = self._heartbeat_task
+        self._heartbeat_task = None
+        if heartbeat is not None and heartbeat is not _current_task():
+            heartbeat.cancel()
 
-        # Normal close or going away
-        if code in (WS_CLOSE_NORMAL, WS_CLOSE_GOING_AWAY):
-            self._set_state(ConnectionState.DISCONNECTED)
+        if had_socket:
+            if self._pool is not None:
+                self._pool.remove_connection(self._active_endpoint)
+            # Key state belongs to one connection: a send between the next
+            # open and its key exchange must not use this connection's key.
+            if self._security is not None:
+                self._security.reset()
+            if self._on_close:
+                self._on_close()
+        return ws, ws_cm, recv_task
+
+    async def _teardown(self, code: int, reason: str) -> None:
+        """Close the current socket on the client's initiative."""
+        current = _current_task()
+        ws, ws_cm, recv_task = self._detach()
+
+        tasks: list[asyncio.Task[Any]] = []
+        for task in (recv_task, *self._background_tasks):
+            if task is not None and task is not current and not task.done():
+                task.cancel()
+                tasks.append(task)
+        self._background_tasks.clear()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        if ws is not None:
+            try:
+                await ws.close(code, reason)
+            except Exception:
+                pass
+        if ws_cm is not None:
+            await _close_quietly(ws_cm)
+
+    async def _connection_lost(self, ws: Any, code: int, reason: str) -> None:
+        """The server or the network closed *ws*."""
+        if ws is not self._ws or self._intentional_close:
+            return  # replaced, or the client is closing it itself
+        self._last_close = (code, reason)
+        logger.info("WebSocket closed: code=%s reason=%s", code, reason)
+        _, ws_cm, _ = self._detach()
+        if ws_cm is not None:
+            await _close_quietly(ws_cm)
+        if self._intentional_close or self._destroyed or self._ws is not None:
+            return  # disconnect() / a new connection raced in meanwhile
+        self._handle_close_code(code, reason)
+
+    def _handle_close_code(self, code: int, reason: str) -> None:
+        """React to a server- or network-caused close (see module header)."""
+        detail = f"code {code}" + (f": {reason}" if reason else "")
+        if code in AUTH_CLOSE_CODES:
+            self._on_auth_rejected(
+                WSEAuthError(f"Authentication rejected by the server ({detail})")
+            )
             return
+        if not self._reconnect_armed:
+            self._fail(
+                WSEConnectionError(
+                    f"Connection closed by the server during the handshake ({detail})"
+                )
+            )
+            return
+        self._schedule_reconnect()
 
-        # Auth failures -> no retry
-        if code in (
-            WS_CLOSE_AUTH_FAILED,
-            WS_CLOSE_AUTH_EXPIRED,
-            WS_CLOSE_POLICY_VIOLATION,
+    def _on_auth_rejected(self, error: WSEAuthError) -> None:
+        self._auth_failures += 1
+        if (
+            self._token_provider is not None
+            and self._reconnect_armed
+            and self._auth_failures < AUTH_MAX_CONSECUTIVE_FAILURES
         ):
-            self._set_state(ConnectionState.ERROR)
-            self._token = None
-            logger.error("Auth/policy failure (code %d): %s", code, reason)
-            return
-
-        # Rate limited -> transient by definition: back off and retry (the
-        # delay grows with each attempt); parking in ERROR forever turned a
-        # momentary throttle into a dead client.
-        if code == WS_CLOSE_RATE_LIMITED:
-            logger.error("Rate limited by server - backing off")
+            logger.warning("%s -- fetching a fresh token and reconnecting", error)
             self._schedule_reconnect()
             return
+        self._fail(error)
 
-        # Anything else -> reconnect
-        self._schedule_reconnect()
+    def _fail(self, error: WSEError) -> None:
+        """Give up for good: ERROR state, report *error* as terminal."""
+        self._cancel_reconnect()
+        self._last_error = error
+        logger.error("Connection ended: %s", error)
+        self._set_state(ConnectionState.ERROR)
+        if self._on_terminal:
+            self._on_terminal(error)
 
     def _schedule_reconnect(self) -> None:
         """Schedule a reconnection attempt with backoff."""
-        if self._destroyed:
+        if self._destroyed or self._intentional_close:
             return
 
         cfg = self._reconnect_cfg
         if cfg.max_attempts >= 0 and self._reconnect_attempts >= cfg.max_attempts:
-            logger.error("Max reconnect attempts (%d) reached", cfg.max_attempts)
-            self._set_state(ConnectionState.ERROR)
+            last = self._last_close
+            closed = f"; last close code {last[0]}" if last else ""
+            self._fail(
+                WSEConnectionError(
+                    f"Gave up reconnecting after {self._reconnect_attempts} "
+                    f"attempt(s) (max_attempts={cfg.max_attempts}){closed}"
+                )
+            )
             return
 
         self._set_state(ConnectionState.RECONNECTING)
@@ -656,102 +879,83 @@ class ConnectionManager:
             self._reconnect_attempts + 1,
             cfg.max_attempts if cfg.max_attempts >= 0 else "inf",
         )
-
+        self._cancel_reconnect()
         self._reconnect_task = asyncio.ensure_future(self._reconnect_after(delay))
 
     async def _reconnect_after(self, delay: float) -> None:
-        """Wait, then try to reconnect."""
+        """Wait, then try to reconnect. A failed attempt schedules the next."""
         try:
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
             return
+        if self._destroyed or self._intentional_close or self.is_connected:
+            return
 
         self._reconnect_attempts += 1
+        self._is_connecting = True
         try:
-            await self.connect()
-        except WSEAuthError:
-            # No refresh machinery in this client (the token is caller-supplied)
-            # -- a rejected token cannot self-heal, so ERROR is terminal here.
-            self._set_state(ConnectionState.ERROR)
-        except WSECircuitBreakerError:
-            # An OPEN breaker is a pause, not a death sentence: it half-opens
-            # after its reset timeout, but only if another attempt arrives.
-            # Dying here made the first open breaker permanent (the TS client
-            # had the same bug, fixed in 2.4.1).
-            logger.debug("Circuit breaker open - retrying on the backoff schedule")
+            await self._attempt()
+        except asyncio.CancelledError:
+            return
+        except _TokenProviderError as exc:
+            # Usually the auth service is down too: retry on the schedule.
+            logger.warning("Reconnect attempt failed: %s", exc)
             self._schedule_reconnect()
+        except WSEAuthError as exc:
+            self._on_auth_rejected(exc)
         except Exception as exc:
-            logger.debug("Reconnect attempt failed: %s", exc)
+            logger.info(
+                "Reconnect attempt %d failed: %s", self._reconnect_attempts, exc
+            )
             self._schedule_reconnect()
+        finally:
+            self._is_connecting = False
 
     async def _force_reconnect(self) -> None:
-        """Tear down and reconnect immediately."""
-        if self._pool is not None:
-            self._pool.remove_connection(self._active_endpoint)
-
-        # Cancel tasks FIRST (before closing socket) to avoid spurious
-        # exceptions in _recv_loop triggering unintended reconnect paths.
-        #
-        # CRITICAL: never cancel-and-await the CURRENT task. _force_reconnect is
-        # called from inside _heartbeat_loop on idle timeout; cancelling
-        # self._heartbeat_task there cancels THIS coroutine, and the awaited
-        # gather then raises CancelledError into _force_reconnect before
-        # _schedule_reconnect() runs -- the socket is never closed and the
-        # reconnect is never scheduled, leaving a permanent zombie. Skip the
-        # current task (it returns on its own right after this call) and only
-        # cancel+await the others.
-        current = asyncio.current_task()
-        tasks_to_await: list[asyncio.Task[None]] = []
-        if self._heartbeat_task is not None and self._heartbeat_task is not current:
-            self._heartbeat_task.cancel()
-            tasks_to_await.append(self._heartbeat_task)
-        if self._recv_task is not None and self._recv_task is not current:
-            self._recv_task.cancel()
-            tasks_to_await.append(self._recv_task)
-        # Drop references regardless; the current task exits after this returns.
-        self._heartbeat_task = None
-        self._recv_task = None
-        if tasks_to_await:
-            await asyncio.gather(*tasks_to_await, return_exceptions=True)
-
-        if self._ws_cm:
-            try:
-                await self._ws_cm.__aexit__(None, None, None)
-            except Exception:
-                pass
-            self._ws_cm = None
-            self._ws = None
-        elif self._ws:
-            try:
-                await self._ws.close(WS_CLOSE_GOING_AWAY, "Reconnecting")
-            except Exception:
-                pass
-            self._ws = None
-
+        """Tear down and reconnect."""
+        if self._destroyed:
+            return
+        self._cancel_reconnect()
+        # _teardown never cancels the current task: this runs inside the
+        # heartbeat task on idle timeout, and cancelling it there would stop
+        # the reconnect from ever being scheduled.
+        await self._teardown(WS_CLOSE_GOING_AWAY, "Reconnecting")
+        if self._destroyed or self._intentional_close:
+            return
+        # A forced reconnect always continues in the background.
+        self._reconnect_armed = True
         self._schedule_reconnect()
 
     def _cancel_reconnect(self) -> None:
-        if self._reconnect_task:
-            self._reconnect_task.cancel()
-            self._reconnect_task = None
+        task = self._reconnect_task
+        self._reconnect_task = None
+        if task is not None and task is not _current_task():
+            task.cancel()
 
     def _calculate_delay(self) -> float:
-        """Compute reconnect delay based on strategy."""
+        """Compute reconnect delay based on strategy. Never raises."""
         cfg = self._reconnect_cfg
         attempt = self._reconnect_attempts
 
-        if cfg.mode == ReconnectMode.LINEAR:
-            delay = cfg.base_delay + attempt * 1.0
-        elif cfg.mode == ReconnectMode.FIBONACCI:
-            delay = cfg.base_delay * _fib(min(attempt, 10))
-        else:
-            # Exponential / Adaptive
-            delay = cfg.base_delay * (cfg.factor**attempt)
+        try:
+            if cfg.mode == ReconnectMode.LINEAR:
+                delay = cfg.base_delay + attempt * 1.0
+            elif cfg.mode == ReconnectMode.FIBONACCI:
+                delay = cfg.base_delay * _fib(min(attempt, 10))
+            else:
+                # Exponential / Adaptive (same curve)
+                delay = cfg.base_delay * (cfg.factor**attempt)
+        except OverflowError:
+            # factor**attempt overflows after enough attempts (about 1750 at
+            # factor 1.5, i.e. ~15 h of outage): the cap applies anyway.
+            delay = cfg.max_delay
+        if not math.isfinite(delay):
+            delay = cfg.max_delay
 
         delay = min(delay, cfg.max_delay)
 
         # Absolute cap (5 minutes) matching TS scheduleReconnect
-        delay = min(delay, RECONNECT_ABSOLUTE_CAP)
+        delay = max(0.0, min(delay, RECONNECT_ABSOLUTE_CAP))
 
         if cfg.jitter:
             jitter_amount = delay * 0.2 * (random.random() - 0.5)
@@ -773,8 +977,10 @@ class ConnectionManager:
     # -- URL building ---------------------------------------------------------
 
     def _build_url(self, topics: list[str] | None = None) -> str:
-        """Append query params to the base URL."""
-        parts = [self._url]
+        """Append query params to the base URL.
+
+        *topics* is ignored (the server reads no topics from the URL).
+        """
         sep = "&" if "?" in self._url else "?"
 
         enc = "true" if self._security is not None else "false"
@@ -784,13 +990,10 @@ class ConnectionManager:
             "compression=true",
             f"encryption={enc}",
         ]
-        if topics:
-            from urllib.parse import quote
+        for key, value in self._query_params.items():
+            params.append(f"{quote(key, safe='')}={quote(value, safe='')}")
 
-            encoded = ",".join(quote(t, safe="") for t in topics)
-            params.append(f"topics={encoded}")
-
-        return parts[0] + sep + "&".join(params)
+        return self._url + sep + "&".join(params)
 
 
 def _fib(n: int) -> int:

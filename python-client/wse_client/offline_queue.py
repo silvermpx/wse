@@ -4,6 +4,7 @@
 #
 # Buffers outgoing messages when the connection is down and flushes them
 # (in priority order) on reconnect.  Port of ts-client/services/OfflineQueue.ts.
+# Opt-in: AsyncWSEClient(offline_queue=True).
 #
 # In-memory implementation - Python processes don't need persistence across
 # restarts the way browser tabs need IndexedDB.
@@ -38,8 +39,11 @@ class OfflineQueue:
     """In-memory queue for messages that could not be sent while offline.
 
     Messages are stored with their priority and timestamp. On flush,
-    they are returned in priority order (highest priority first, i.e.
-    lowest numeric value). Expired messages are dropped automatically.
+    they are returned in priority order: the highest numeric priority first
+    (``MessagePriority.CRITICAL`` = 10 before ``BACKGROUND`` = 1), oldest
+    first within one priority. Expired messages are dropped automatically.
+
+    ``AsyncWSEClient`` uses one only with ``offline_queue=True``.
 
     Args:
         max_size: Maximum number of buffered messages. Default 1000.

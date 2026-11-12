@@ -51,3 +51,26 @@ class TestTokenBucketRateLimiter:
         rl.try_consume(10)
         rl.reset()
         assert rl.available_tokens == 10.0
+
+
+class TestSideEffectFreeReads:
+    """Stats reads refilled the bucket (a write) from any thread."""
+
+    def test_reads_do_not_mutate(self):
+        rl = TokenBucketRateLimiter(capacity=10, refill_rate=5, refill_interval=0.05)
+        rl.try_consume(10)
+        tokens, last = rl._tokens, rl._last_refill
+        time.sleep(0.12)
+        assert rl.available_tokens == 10.0  # refilled view
+        rl.get_stats()
+        rl.can_send()
+        rl.get_retry_after()
+        _ = rl.utilization
+        assert (rl._tokens, rl._last_refill) == (tokens, last)
+        assert rl.try_consume(10) is True  # the write path refills for real
+
+    def test_fractional_rate(self):
+        rl = TokenBucketRateLimiter(capacity=2, refill_rate=0.5, refill_interval=0.05)
+        rl.try_consume(2)
+        time.sleep(0.11)
+        assert rl.available_tokens == 1.0

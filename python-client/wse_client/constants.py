@@ -5,8 +5,12 @@
 # Values match client/constants.ts and docs/PROTOCOL.md.
 # =============================================================================
 
+from ._version import __version__
+
 PROTOCOL_VERSION = 1
-CLIENT_VERSION = "2.0.7"
+# Sent in client_hello and the connect URL. Derived from the package version so
+# the two can never drift apart (it used to be a hand-kept copy, "2.0.7").
+CLIENT_VERSION = __version__
 
 # -- Timing (seconds) --------------------------------------------------------
 
@@ -15,6 +19,11 @@ IDLE_TIMEOUT = 40.0
 CONNECTION_TIMEOUT = 10.0
 HEALTH_CHECK_INTERVAL = 30.0
 METRICS_INTERVAL = 60.0
+# How long connect() waits for the handshake (server_ready / server_hello, and
+# the key exchange when encryption is on) before deciding.
+SERVER_READY_TIMEOUT = 10.0
+# How long a send waits for the E2E key exchange of a fresh connection.
+KEY_EXCHANGE_TIMEOUT = 10.0
 
 # -- Reconnection -------------------------------------------------------------
 
@@ -23,6 +32,9 @@ RECONNECT_MAX_DELAY = 30.0
 RECONNECT_MAX_ATTEMPTS = -1  # -1 = infinite (matches TS client)
 RECONNECT_FACTOR = 1.5
 RECONNECT_ABSOLUTE_CAP = 300.0  # 5 minutes
+# With a token_provider, an auth rejection (4401/4403/1008) is retried with a
+# fresh token; this many rejections in a row end the client with WSEAuthError.
+AUTH_MAX_CONSECUTIVE_FAILURES = 3
 
 # -- Circuit breaker -----------------------------------------------------------
 
@@ -32,6 +44,7 @@ CIRCUIT_BREAKER_SUCCESS_THRESHOLD = 3
 
 # -- Rate limiter --------------------------------------------------------------
 
+# Outbound limiter defaults (AsyncWSEClient(rate_limit=..., rate_limit_burst=...)).
 RATE_LIMIT_CAPACITY = 1000
 RATE_LIMIT_REFILL_RATE = 100
 RATE_LIMIT_REFILL_INTERVAL = 1.0
@@ -42,6 +55,18 @@ SEQUENCE_WINDOW_SIZE = 10_000
 MAX_OUT_OF_ORDER = 100
 DUPLICATE_MAX_AGE = 300.0  # 5 minutes
 
+# -- Recovery ------------------------------------------------------------------
+
+# How long a topic waits for a recovery replay to fill an offset gap before the
+# client gives up, reports a recovery_gap event and delivers what it holds.
+RECOVERY_TIMEOUT = 3.0
+# Messages held per topic while a gap is being recovered; past this the client
+# gives up waiting at once.
+RECOVERY_BUFFER_MAX = 1000
+# Recovery requests in a row that got no reply at all before the client stops
+# asking on this connection (the application does not answer them).
+RECOVERY_MAX_UNANSWERED = 2
+
 # -- Compression ---------------------------------------------------------------
 
 COMPRESSION_THRESHOLD = 1024  # bytes
@@ -49,7 +74,11 @@ COMPRESSION_LEVEL = 6
 
 # -- Messages ------------------------------------------------------------------
 
-MAX_MESSAGE_SIZE = 1_048_576  # 1 MB
+# Legacy 1 MiB limit, kept for imports. The client default is below.
+MAX_MESSAGE_SIZE = 1_048_576
+# Default inbound limit: the largest frame accepted from the server and the
+# largest size a compressed frame may inflate to. AsyncWSEClient(max_message_size=)
+DEFAULT_MAX_MESSAGE_SIZE = 16 * 1024 * 1024
 
 # -- Wire prefixes -------------------------------------------------------------
 
@@ -93,14 +122,25 @@ CLIENT_HELLO_RETRY_DELAY = 1.0  # seconds
 
 WS_CLOSE_NORMAL = 1000
 WS_CLOSE_GOING_AWAY = 1001
+WS_CLOSE_NO_STATUS = 1005
+WS_CLOSE_ABNORMAL = 1006
 WS_CLOSE_POLICY_VIOLATION = 1008
 WS_CLOSE_SERVER_ERROR = 1011
+WS_CLOSE_DRAIN = 4300
 WS_CLOSE_AUTH_FAILED = 4401
 WS_CLOSE_AUTH_EXPIRED = 4403
 WS_CLOSE_RATE_LIMITED = 4429
 WS_CLOSE_SUBSCRIPTION_FAILED = 4430
 WS_CLOSE_INVALID_MESSAGE = 4400
 WS_CLOSE_SERVER_OVERLOAD = 4503
+
+# Server-sent close codes that end the client instead of reconnecting: the
+# server rejected the credentials (a token_provider gets a refresh first).
+# Every other server close (1000, 1001, 1005, 1011, 4300 drain, 4429, ...) and
+# every network loss is reconnected with backoff.
+AUTH_CLOSE_CODES = frozenset(
+    {WS_CLOSE_AUTH_FAILED, WS_CLOSE_AUTH_EXPIRED, WS_CLOSE_POLICY_VIOLATION}
+)
 
 # -- Send retry ----------------------------------------------------------------
 
@@ -112,3 +152,5 @@ SEND_RETRY_MAX_DELAY = 2.0  # seconds
 
 SNAPSHOT_MAX_RETRIES = 3
 SNAPSHOT_RETRY_DELAY = 1.0  # seconds
+# An identical snapshot request (same topics) inside this window is not resent.
+SNAPSHOT_DEDUP_WINDOW = 5.0  # seconds

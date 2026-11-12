@@ -21,8 +21,9 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from ._logging import logger
+from .compression import DecompressedSizeError
 from .constants import (
-    MAX_MESSAGE_SIZE,
+    DEFAULT_MAX_MESSAGE_SIZE,
     PREFIX_COMPRESSED,
     PREFIX_ENCRYPTED,
     PREFIX_MSGPACK,
@@ -97,6 +98,9 @@ class MessageCodec:
         compression: Zlib compression handler.
         security: AES-GCM encryption handler, or ``None`` to disable.
         msgpack: MsgPack handler, or ``None`` to disable binary protocol.
+        max_message_size: Largest accepted message in bytes, checked on the
+            frame and -- for compressed frames -- while inflating. ``None``
+            disables the check.
     """
 
     def __init__(
@@ -104,17 +108,31 @@ class MessageCodec:
         compression: CompressionHandler,
         security: SecurityManager | None = None,
         msgpack: MsgPackHandler | None = None,
+        *,
+        max_message_size: int | None = DEFAULT_MAX_MESSAGE_SIZE,
     ) -> None:
         self._compression = compression
         self._security = security
         self._msgpack = msgpack
+        self._max_size = max_message_size
         self._sequence = 0
 
     def decode(self, data: str | bytes) -> WSEEvent | list[WSEEvent] | None:
-        """Decode an incoming message from any wire format."""
-        if isinstance(data, str):
-            return self._decode_text(data)
-        return self._decode_binary(data)
+        """Decode an incoming message from any wire format.
+
+        Never raises: a frame that cannot be decoded is logged and dropped
+        (``None``), so one malformed frame never tears down the connection.
+        """
+        try:
+            if isinstance(data, str):
+                return self._decode_text(data)
+            return self._decode_binary(data)
+        except Exception as exc:
+            logger.warning("Dropping undecodable frame: %s", exc)
+            return None
+
+    def _too_big(self, size: int) -> bool:
+        return self._max_size is not None and size > self._max_size
 
     def encode(
         self,
@@ -163,9 +181,9 @@ class MessageCodec:
 
     # -- Text decoding ---------------------------------------------------------
 
-    def _decode_text(self, data: str) -> WSEEvent | None:
-        if len(data) > MAX_MESSAGE_SIZE:
-            logger.warning("Message exceeds max size (%d bytes), dropping", len(data))
+    def _decode_text(self, data: str) -> WSEEvent | list[WSEEvent] | None:
+        if self._too_big(len(data)):
+            logger.warning("Message exceeds max size (%d chars), dropping", len(data))
             return None
 
         category, json_str = self._strip_prefix(data)
@@ -188,28 +206,33 @@ class MessageCodec:
 
     # -- Binary decoding -------------------------------------------------------
 
-    def _decode_binary(self, data: bytes) -> WSEEvent | list[WSEEvent] | None:
-        if len(data) > MAX_MESSAGE_SIZE:
+    def _inflate(self, data: bytes, frame_len: int) -> bytes | None:
+        """Inflate a compressed payload, bounded by the size limit."""
+        try:
+            return self._compression.decompress(data, self._max_size)
+        except DecompressedSizeError:
+            logger.warning(
+                "Compressed frame (%d bytes) inflates past max size %s, dropping",
+                frame_len,
+                self._max_size,
+            )
+        except Exception:
+            logger.warning("Corrupt compressed frame (%d bytes), dropping", frame_len)
+        return None
+
+    def _decode_binary(
+        self, data: bytes, *, decrypted: bool = False
+    ) -> WSEEvent | list[WSEEvent] | None:
+        if self._too_big(len(data)):
             logger.warning("Binary message exceeds max size (%d bytes)", len(data))
             return None
 
         # Compressed: C: prefix
         if data[:2] == PREFIX_COMPRESSED:
-            try:
-                decompressed = self._compression.decompress(data[2:])
-            except Exception:
-                logger.warning(
-                    "Corrupt compressed frame (%d bytes), dropping", len(data)
-                )
+            decompressed = self._inflate(data[2:], len(data))
+            if decompressed is None:
                 return None
-            if len(decompressed) > MAX_MESSAGE_SIZE:
-                logger.warning(
-                    "Decompressed message exceeds max size (%d bytes), dropping",
-                    len(decompressed),
-                )
-                return None
-            text = decompressed.decode("utf-8")
-            return self._decode_text(text)
+            return self._decode_text(decompressed.decode("utf-8"))
 
         # MessagePack: M: prefix
         if data[:2] == PREFIX_MSGPACK:
@@ -219,35 +242,28 @@ class MessageCodec:
             parsed = self._msgpack.unpack(data[2:])
             return self._parsed_to_event(parsed, None)
 
-        # Encrypted: E: prefix
-        if data[:2] == PREFIX_ENCRYPTED:
+        # Encrypted: E: prefix (never nested inside another encrypted frame)
+        if data[:2] == PREFIX_ENCRYPTED and not decrypted:
             if self._security is None or not self._security.is_enabled:
                 logger.warning("Received encrypted frame but encryption not configured")
                 return None
             try:
-                plaintext = self._security.decrypt(data[2:])
+                plaintext = self._security.decrypt_bytes(data[2:])
             except Exception:
                 logger.warning(
                     "Decryption failed for E: frame (%d bytes), dropping", len(data)
                 )
                 return None
-            return self._decode_text(plaintext)
+            # The plaintext is JSON, or an M:-prefixed msgpack payload on a
+            # connection that negotiated wire_format="msgpack".
+            return self._decode_binary(plaintext, decrypted=True)
 
         # Raw zlib (magic byte 0x78)
         if len(data) >= 2 and data[0] == ZLIB_MAGIC and data[1] in ZLIB_METHODS:
-            try:
-                decompressed = self._compression.decompress(data)
-            except Exception:
-                logger.warning("Corrupt zlib frame (%d bytes), dropping", len(data))
+            decompressed = self._inflate(data, len(data))
+            if decompressed is None:
                 return None
-            if len(decompressed) > MAX_MESSAGE_SIZE:
-                logger.warning(
-                    "Decompressed message exceeds max size (%d bytes), dropping",
-                    len(decompressed),
-                )
-                return None
-            text = decompressed.decode("utf-8")
-            return self._decode_text(text)
+            return self._decode_text(decompressed.decode("utf-8"))
 
         # Plain JSON in binary frame (server default since v1.1)
         try:
@@ -282,7 +298,7 @@ class MessageCodec:
         p = parsed.get("p") or parsed.get("payload") or {}
 
         # Handle batch messages
-        if t == "batch" and isinstance(p, dict) and "messages" in p:
+        if t == "batch" and isinstance(p, dict) and isinstance(p.get("messages"), list):
             events = []
             for msg in p["messages"]:
                 evt = self._parsed_to_event(msg, category)
@@ -302,7 +318,7 @@ class MessageCodec:
             offset = parsed.get("offset")
 
         return WSEEvent(
-            type=t,
+            type=t if isinstance(t, str) else str(t),
             payload=p if isinstance(p, dict) else {"data": p},
             id=parsed.get("id"),
             sequence=parsed.get("seq"),

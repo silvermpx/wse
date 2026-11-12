@@ -64,10 +64,11 @@ class EventSequencer:
 
         self._seen_ids[event_id] = time.monotonic()
 
-        # Evict oldest if window full
+        # Evict oldest if window full. Entries are never re-inserted, so dict
+        # insertion order is age order and the first key is the oldest: O(1)
+        # instead of scanning the whole window on every message.
         if len(self._seen_ids) > self._window_size:
-            oldest_key = min(self._seen_ids, key=self._seen_ids.get)  # type: ignore[arg-type]
-            del self._seen_ids[oldest_key]
+            del self._seen_ids[next(iter(self._seen_ids))]
 
         return False
 
@@ -78,8 +79,10 @@ class EventSequencer:
             ``"duplicate"`` -- already delivered (offset <= last seen on the same
                 epoch); the caller should drop it. This is what makes replay /
                 reconnect overlap safe independently of the id window.
-            ``"gap"`` -- the offset jumped ahead of the expected next; the caller
-                should still deliver it but trigger recovery to fill the hole.
+            ``"gap"`` -- the offset jumped ahead of the expected next. The
+                position does not move; the caller holds the message while it
+                recovers the hole, or re-baselines with
+                :meth:`set_topic_position` when it gives up.
             ``"deliver"`` -- the next in order, or the first message on a new or
                 changed epoch (server restart -- old offsets are meaningless).
         """
@@ -103,16 +106,28 @@ class EventSequencer:
         """Last-seen ``(epoch, offset)`` for a topic, for recovery requests."""
         return self._topic_positions.get(topic)
 
+    def topic_positions(self) -> dict[str, tuple[str, int]]:
+        """Copy of every topic's last-seen ``(epoch, offset)``."""
+        return dict(self._topic_positions)
+
     def set_topic_position(self, topic: str, epoch: str, offset: int) -> None:
-        """Set a topic's position (e.g. from a subscription_update reply)."""
+        """Set a topic's position (re-baseline after an unrecoverable gap)."""
         self._topic_positions[topic] = (epoch, offset)
 
+    def clear_topic(self, topic: str) -> None:
+        """Forget a topic's position (on unsubscribe), so a later subscribe
+        re-baselines on its first message instead of seeing a gap."""
+        self._topic_positions.pop(topic, None)
+
     def _cleanup_old_entries(self) -> None:
-        now = time.monotonic()
-        cutoff = now - self._max_age
-        expired = [k for k, v in self._seen_ids.items() if v < cutoff]
-        for k in expired:
-            del self._seen_ids[k]
+        # Age order == insertion order: drop the expired prefix only.
+        cutoff = time.monotonic() - self._max_age
+        seen = self._seen_ids
+        while seen:
+            oldest = next(iter(seen))
+            if seen[oldest] >= cutoff:
+                break
+            del seen[oldest]
 
     def get_stats(self) -> dict:
         return {

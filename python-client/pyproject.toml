@@ -4,7 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wse-client"
-version = "2.5.1"
+# Single source of truth: wse_client/_version.py (also used as CLIENT_VERSION
+# in the handshake), read by hatchling below.
+dynamic = ["version"]
 description = "Python client for WSE (WebSocket Engine) -- real-time event streaming"
 readme = "README.md"
 license = "MIT"
@@ -51,11 +53,15 @@ Documentation = "https://github.com/silvermpx/wse/tree/main/python-client"
 Repository = "https://github.com/silvermpx/wse"
 Issues = "https://github.com/silvermpx/wse/issues"
 
+[tool.hatch.version]
+path = "wse_client/_version.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["wse_client"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 
 [tool.ruff]

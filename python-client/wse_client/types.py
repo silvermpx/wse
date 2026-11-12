@@ -6,14 +6,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import Any
+from typing import Any, Awaitable, Callable, Optional, Union
+
+# A callable returning the token to authenticate with (or None), sync or async.
+# The client calls it before every connect and reconnect attempt.
+TokenProvider = Callable[[], Union[Optional[str], Awaitable[Optional[str]]]]
 
 
 class ConnectionState(str, Enum):
     """WebSocket connection lifecycle state.
 
-    Typical flow: PENDING -> CONNECTING -> CONNECTED -> DISCONNECTED.
-    RECONNECTING and DEGRADED are transient, ERROR is terminal.
+    Typical flow: DISCONNECTED -> CONNECTING -> CONNECTED, then
+    RECONNECTING -> CONNECTED after every lost connection (server restart,
+    drain, network loss, failed reconnect attempts) until ``disconnect()``
+    returns the client to DISCONNECTED.
+
+    ERROR is terminal: the server rejected the credentials, the E2E key
+    exchange failed, reconnect attempts ran out, or the initial ``connect()``
+    failed. ``last_error`` on the client says which.
+
+    PENDING and DEGRADED exist for parity with the TS client; this client
+    never enters them.
     """
 
     CONNECTING = "connecting"
@@ -83,8 +96,27 @@ class MessageCategory(str, Enum):
     UPDATE = "U"
 
 
+class SendResult(IntEnum):
+    """Outcome of :meth:`AsyncWSEClient.send` / ``send_with_retry``.
+
+    Truthy when the message was accepted: ``SENT`` went out on the socket,
+    ``QUEUED`` is held by the opt-in offline queue (``offline_queue=True``) and
+    goes out once after the next reconnect. ``FAILED`` (falsy) was neither sent
+    nor queued -- not connected, rate limited, or the connection dropped -- so
+    the caller decides whether to retry.
+    """
+
+    FAILED = 0
+    SENT = 1
+    QUEUED = 2
+
+
 class ReconnectMode(str, Enum):
-    """Backoff strategy for auto-reconnection after a connection drop."""
+    """Backoff strategy for auto-reconnection after a connection drop.
+
+    ADAPTIVE is currently the same curve as EXPONENTIAL (kept for API parity
+    with the TS client).
+    """
 
     EXPONENTIAL = "exponential"
     LINEAR = "linear"

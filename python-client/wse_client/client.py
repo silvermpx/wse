@@ -9,10 +9,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import time
 
 from uuid import uuid4
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable
 
@@ -22,14 +24,22 @@ from .compression import CompressionHandler
 from .connection import ConnectionManager
 from .constants import (
     CLIENT_VERSION,
+    DEFAULT_MAX_MESSAGE_SIZE,
+    KEY_EXCHANGE_TIMEOUT,
     PROTOCOL_VERSION,
+    RATE_LIMIT_REFILL_RATE,
+    RECOVERY_BUFFER_MAX,
+    RECOVERY_MAX_UNANSWERED,
+    RECOVERY_TIMEOUT,
     SEND_MAX_RETRIES,
     SEND_RETRY_BASE_DELAY,
     SEND_RETRY_MAX_DELAY,
+    SERVER_READY_TIMEOUT,
+    SNAPSHOT_DEDUP_WINDOW,
     SNAPSHOT_MAX_RETRIES,
     SNAPSHOT_RETRY_DELAY,
 )
-from .errors import WSEConnectionError
+from .errors import WSEConnectionError, WSEEncryptionError, WSEError
 from .event_sequencer import EventSequencer
 from .network_monitor import NetworkMonitor
 from .offline_queue import OfflineQueue
@@ -42,12 +52,17 @@ from .types import (
     LoadBalancingStrategy,
     MessagePriority,
     ReconnectConfig,
+    SendResult,
+    TokenProvider,
     WSEEvent,
 )
 
 # Type alias for event handlers
 EventHandler = Callable[[WSEEvent], Any]
 AsyncEventHandler = Callable[[WSEEvent], Awaitable[Any]]
+
+# Event type of the synthetic event reporting messages a topic will never get.
+RECOVERY_GAP_EVENT = "recovery_gap"
 
 # System events consumed internally (not forwarded to user iterator)
 _INTERNAL_ONLY_EVENTS = frozenset(
@@ -68,6 +83,41 @@ _INTERNAL_ONLY_EVENTS = frozenset(
     }
 )
 
+_WIRE_FORMATS = ("json", "msgpack")
+
+
+class _StreamEnd:
+    """Queue marker: the event stream ended (cleanly when ``error`` is None)."""
+
+    __slots__ = ("error",)
+
+    def __init__(self, error: WSEError | None) -> None:
+        self.error = error
+
+
+@dataclass(eq=False)
+class _GapState:
+    """A topic waiting for a recovery replay to fill an offset gap."""
+
+    epoch: str
+    # Messages that arrived past the hole, by offset (same epoch).
+    buffer: dict[int, WSEEvent] = field(default_factory=dict)
+    timer: asyncio.TimerHandle | None = None
+    in_flight: bool = False  # a recovery request is out, no reply yet
+    requested_from: int | None = None  # anchor offset of the last request
+    answered: bool = False  # some reply for this topic arrived
+
+
+def _resolve(fut: asyncio.Future[None] | None) -> None:
+    if fut is not None and not fut.done():
+        fut.set_result(None)
+
+
+def _reject(fut: asyncio.Future[None] | None, exc: BaseException) -> None:
+    if fut is not None and not fut.done():
+        fut.set_exception(exc)
+        fut.exception()  # mark retrieved: nobody may be waiting on it
+
 
 class AsyncWSEClient:
     """Async WSE client with context manager and async iterator support.
@@ -75,12 +125,44 @@ class AsyncWSEClient:
     Args:
         url: WebSocket server URL, e.g. ``"ws://localhost:5006/wse"``.
         token: JWT token for authentication (sent as Cookie + Authorization).
-        topics: Topics to auto-subscribe after connecting.
+        token_provider: Callable (sync or async) returning the token to use;
+            called before every connect and reconnect attempt, so an expired
+            token is replaced without restarting the client. Overrides
+            *token*.
+        topics: Topics to subscribe to after connecting.
         reconnect: Reconnection config. Defaults to exponential backoff,
             infinite retries.
         extra_headers: Additional HTTP headers for the handshake.
         queue_size: Max events buffered for the async iterator. When full,
             oldest events are dropped. Default 1000.
+        encryption: Require E2E encryption (ECDH P-256 + AES-GCM-256, needs
+            the ``[crypto]`` extra). Fails closed: application messages are
+            held until the key exchange completed and never go out in
+            plaintext; if the server does not complete the exchange the
+            client ends with :class:`WSEEncryptionError`.
+        endpoints: Additional endpoints for failover.
+        load_balancing: Endpoint selection strategy when *endpoints* is set.
+        rate_limit: Outbound limit for ``send()`` / ``send_with_retry()`` /
+            ``send_batch()`` in messages per second (default 100). ``None``
+            disables it. Protocol frames (heartbeat, PONG, client_hello,
+            subscriptions, recovery requests) are never limited.
+        rate_limit_burst: Messages that may go out at once before the rate
+            applies (default 10 x *rate_limit*).
+        offline_queue: Hold messages sent while disconnected and send them
+            once after the next reconnect (``send()`` returns
+            ``SendResult.QUEUED``). Off by default: a send that cannot go out
+            returns ``SendResult.FAILED`` and is not replayed.
+        max_message_size: Largest inbound message in bytes, checked on the
+            frame and while inflating compressed frames (default 16 MiB).
+            ``None`` disables the limit.
+        recovery_timeout: Seconds a topic waits for a recovery replay after an
+            offset gap before giving up (default 3). Messages that arrive
+            meanwhile are held and delivered in order; on giving up a
+            ``recovery_gap`` event reports the missing offsets. ``0`` never
+            waits.
+        wire_format: ``"json"`` (default) or ``"msgpack"`` (asks the server
+            to send this connection's messages as MessagePack; needs the
+            ``[msgpack]`` extra).
 
     Example::
 
@@ -95,6 +177,7 @@ class AsyncWSEClient:
         url: str,
         *,
         token: str | None = None,
+        token_provider: TokenProvider | None = None,
         topics: list[str] | None = None,
         reconnect: ReconnectConfig | None = None,
         extra_headers: dict[str, str] | None = None,
@@ -102,7 +185,20 @@ class AsyncWSEClient:
         encryption: bool = False,
         endpoints: list[str] | None = None,
         load_balancing: LoadBalancingStrategy = LoadBalancingStrategy.WEIGHTED_RANDOM,
+        rate_limit: float | None = RATE_LIMIT_REFILL_RATE,
+        rate_limit_burst: int | None = None,
+        offline_queue: bool = False,
+        max_message_size: int | None = DEFAULT_MAX_MESSAGE_SIZE,
+        recovery_timeout: float = RECOVERY_TIMEOUT,
+        wire_format: str = "json",
     ) -> None:
+        if wire_format not in _WIRE_FORMATS:
+            raise ValueError(f"wire_format must be one of {_WIRE_FORMATS}")
+        if rate_limit is not None and rate_limit <= 0:
+            raise ValueError("rate_limit must be > 0, or None to disable it")
+        if max_message_size is not None and max_message_size <= 0:
+            raise ValueError("max_message_size must be > 0, or None")
+
         self._url = url
         self._token = token
         self._initial_topics = list(topics) if topics else []
@@ -121,24 +217,39 @@ class AsyncWSEClient:
         try:
             from .msgpack_handler import MsgPackHandler
 
-            if MsgPackHandler.available():
+            if MsgPackHandler.available() or wire_format == "msgpack":
+                # Raises ImportError with the install hint when missing.
                 msgpack_handler = MsgPackHandler()
         except ImportError:
-            pass
+            if wire_format == "msgpack":
+                raise
         self._codec = MessageCodec(
-            self._compression, security=self._security, msgpack=msgpack_handler
+            self._compression,
+            security=self._security,
+            msgpack=msgpack_handler,
+            max_message_size=max_message_size,
         )
-        self._rate_limiter = TokenBucketRateLimiter()
+        self._rate_limiter: TokenBucketRateLimiter | None = None
+        if rate_limit is not None:
+            burst = rate_limit_burst or max(1, round(rate_limit * 10))
+            self._rate_limiter = TokenBucketRateLimiter(
+                capacity=burst, refill_rate=rate_limit, refill_interval=1.0
+            )
+        self._rate_limited_total = 0
+        self._last_rate_limit_log = 0.0
         self._circuit_breaker = CircuitBreaker()
         self._sequencer = EventSequencer()
         self._network_monitor = NetworkMonitor()
-        self._offline_queue = OfflineQueue(max_size=1000, max_age=3600.0)
+        self._offline_queue = OfflineQueue(
+            max_size=1000, max_age=3600.0, enabled=offline_queue
+        )
 
         # Event queue for async iteration (created lazily in connect() to avoid
         # RuntimeError when instantiated outside a running event loop)
-        self._event_queue: asyncio.Queue[WSEEvent | None] | None = None
+        self._event_queue: asyncio.Queue[WSEEvent | _StreamEnd] | None = None
         self._queue_size = queue_size
-        self._disconnecting = False
+        # Why the client ended for good (auth, encryption, attempts exhausted).
+        self._terminal_error: WSEError | None = None
 
         # Callback handlers: type -> list of handlers
         self._handlers: dict[str, list[EventHandler | AsyncEventHandler]] = defaultdict(
@@ -157,15 +268,30 @@ class AsyncWSEClient:
 
         self._background_tasks: set[asyncio.Task[Any]] = set()
 
-        # Snapshot dedup
-        self._snapshot_requested = False
+        # Snapshot requests in flight: topic set -> monotonic expiry.
+        self._snapshot_inflight: dict[frozenset[str], float] = {}
 
-        # Recovery state: topic -> (epoch, offset) -- last position confirmed
-        # delivered in order. Advanced per-message; persists across reconnects.
-        self._recovery_state: dict[str, tuple[str, int]] = {}
+        # Recovery. The anchor of a topic is the sequencer's position: the
+        # last offset delivered in order (or given up on). It only moves when
+        # messages are delivered, never to a server-reported head.
         self._server_recovery_enabled = False
-        # Topics with a recovery request in flight (one at a time, anti-loop).
-        self._recovery_in_flight: set[str] = set()
+        self._recovery_timeout = recovery_timeout
+        self._gaps: dict[str, _GapState] = {}
+        # Topics with a recovery request out on this connection -> anchor sent.
+        self._recovery_requests: dict[str, tuple[str, int]] = {}
+        # Topics the server said it cannot replay -> epoch of the anchor.
+        self._unrecoverable: dict[str, str] = {}
+        self._recovery_unanswered = 0
+        self._gap_stats = {"gaps": 0, "missed": 0, "recovered": 0}
+
+        # Per-connection handshake state (see _on_transport_open)
+        self._server_ready_event: asyncio.Event | None = None
+        self._server_hello_seen = False
+        self._handshake: asyncio.Future[None] | None = None
+        self._key_ready: asyncio.Future[None] | None = None
+        self._encryption_error: WSEEncryptionError | None = None
+        self._abort_task: asyncio.Future[None] | None = None
+        self._resubscribe_pending: set[str] = set()
 
         # Reconnect config for later use
         self._reconnect_cfg = reconnect
@@ -174,21 +300,25 @@ class AsyncWSEClient:
         self._connection = ConnectionManager(
             url,
             token=token,
+            token_provider=token_provider,
             reconnect=reconnect,
             circuit_breaker=self._circuit_breaker,
-            rate_limiter=self._rate_limiter,
+            rate_limiter=None,  # applied to application sends here
             extra_headers=extra_headers,
             on_message=self._on_raw_message,
             on_state_change=self._on_state_change,
             security=self._security,
             endpoints=endpoints,
             load_balancing=load_balancing,
+            max_message_size=max_message_size,
+            query_params={"format": "msgpack"} if wire_format == "msgpack" else None,
         )
 
         self._connection._on_pong = self._on_transport_pong
         self._connection._on_ping_sent = lambda: self._network_monitor.record_ping()
-        # Created lazily in connect() to avoid RuntimeError outside event loop
-        self._server_ready_event: asyncio.Event | None = None
+        self._connection._on_open = self._on_transport_open
+        self._connection._on_close = self._on_transport_close
+        self._connection._on_terminal = self._on_transport_terminal
 
         # System handler dispatch table (dict lookup = O(1))
         self._system_handlers: dict[str, Callable[[WSEEvent], None]] = {
@@ -238,44 +368,66 @@ class AsyncWSEClient:
         return self
 
     async def __anext__(self) -> WSEEvent:
-        if self._event_queue is None:
+        """Next event. Reconnects are invisible here: the stream continues
+        across them. It ends after ``disconnect()``; when the client ends for
+        good it raises the reason (:class:`WSEAuthError`,
+        :class:`WSEEncryptionError`, :class:`WSEConnectionError`)."""
+        queue = self._event_queue
+        if queue is None:
             raise StopAsyncIteration
-        event = await self._event_queue.get()
-        if event is None:
+        item = await queue.get()
+        if isinstance(item, _StreamEnd):
+            self._requeue_end(item)
+            if item.error is not None:
+                raise item.error
             raise StopAsyncIteration
-        return event
+        return item
 
     # -- Connect / Disconnect -------------------------------------------------
 
     async def connect(self) -> None:
-        """Connect and wait for server_ready."""
-        # Lazily create asyncio primitives (requires running event loop)
-        if self._event_queue is None:
-            self._event_queue = asyncio.Queue(maxsize=self._queue_size)
-        if self._server_ready_event is None:
-            self._server_ready_event = asyncio.Event()
-        # Clear in case of reconnect (prevents stale set from prior session)
-        self._server_ready_event.clear()
+        """Connect and complete the handshake.
 
-        await self._connection.connect(self._initial_topics)
+        Returns once the server confirmed the connection with
+        ``server_ready`` or ``server_hello`` (with ``encryption=True``: once
+        the key exchange completed), then subscribes the initial *topics*.
+        If neither arrives within 10 s the client proceeds anyway (for
+        servers whose application never sends ``server_ready``) -- except
+        with encryption, which then fails closed.
 
-        # Wait for server_ready with timeout
-        try:
-            await asyncio.wait_for(self._server_ready_event.wait(), timeout=10.0)
-        except asyncio.TimeoutError:
-            logger.warning("server_ready not received within 10s, proceeding anyway")
+        Raises:
+            WSEAuthError: The server rejected the credentials (close
+                4401 / 4403 / 1008 or HTTP 401 / 403).
+            WSEEncryptionError: ``encryption=True`` and the server did not
+                complete the key exchange.
+            WSEConnectionError: The connection could not be opened, or the
+                server closed it during the handshake.
+            WSETimeoutError: Opening the connection timed out.
+        """
+        self._ensure_primitives()
+        state = self._connection.state
+        if state in (ConnectionState.CONNECTING, ConnectionState.RECONNECTING):
+            return  # already connecting in the background
+        if state != ConnectionState.CONNECTED:
+            self._reset_stream()
+            await self._connection.connect()
+        await self._await_handshake()
+        self._connection.arm_reconnect()
 
-        # Auto-subscribe to initial topics
-        if self._initial_topics:
-            await self.subscribe(self._initial_topics)
+        # Auto-subscribe to initial topics. If the connection dropped right
+        # after the handshake, the next connection subscribes them.
+        if self._initial_topics and not await self.subscribe(self._initial_topics):
+            self._subscribed_topics.update(self._initial_topics)
 
     async def disconnect(self) -> None:
-        """Disconnect gracefully."""
-        self._disconnecting = True
-
-        # Cancel background tasks
-        for task in self._background_tasks:
-            task.cancel()
+        """Disconnect gracefully. Iteration ends after the queued events."""
+        # Never cancel the calling task: an async handler (a background task)
+        # may await disconnect() itself, and cancelling it would abort the
+        # teardown half way and leave the socket open.
+        current = asyncio.current_task()
+        for task in list(self._background_tasks):
+            if task is not current:
+                task.cancel()
         self._background_tasks.clear()
 
         # Stop key rotation timer
@@ -285,24 +437,27 @@ class AsyncWSEClient:
         # Clear offline queue (no point replaying after explicit disconnect)
         self._offline_queue.clear()
 
+        # Messages held for a gap are delivered before the stream ends.
+        for topic in list(self._gaps):
+            self._give_up_gap(topic, "closed")
+
         # Signal iterator to stop (drop oldest if queue is full)
-        if self._event_queue is not None:
-            try:
-                self._event_queue.put_nowait(None)
-            except asyncio.QueueFull:
-                try:
-                    self._event_queue.get_nowait()
-                    self._event_queue.put_nowait(None)
-                except (asyncio.QueueEmpty, asyncio.QueueFull):
-                    pass
-        try:
-            await self._connection.destroy()
-        finally:
-            self._disconnecting = False
+        self._push_stream_end(_StreamEnd(None))
+        await self._connection.destroy()
 
     async def close(self) -> None:
         """Alias for disconnect."""
         await self.disconnect()
+
+    def set_token(self, token: str | None) -> None:
+        """Use *token* for the next connect / reconnect.
+
+        To apply it right away (e.g. after the client ended with
+        :class:`WSEAuthError`), call :meth:`force_reconnect` afterwards.
+        A configured ``token_provider`` still takes precedence.
+        """
+        self._token = token
+        self._connection.set_token(token)
 
     # -- Properties -----------------------------------------------------------
 
@@ -328,6 +483,11 @@ class AsyncWSEClient:
         return self._connection.state
 
     @property
+    def last_error(self) -> WSEError | None:
+        """Why the client ended for good, or ``None`` while it is healthy."""
+        return self._terminal_error
+
+    @property
     def connection_quality(self) -> ConnectionQuality:
         return self._network_monitor.quality
 
@@ -337,13 +497,15 @@ class AsyncWSEClient:
 
     @property
     def recovery_enabled(self) -> bool:
-        """Whether the server supports message recovery."""
+        """Whether the server announced message recovery (server_ready or
+        server_hello of the current connection)."""
         return self._server_recovery_enabled
 
     @property
     def recovery_state(self) -> dict[str, tuple[str, int]]:
-        """Per-topic recovery positions: ``{topic: (epoch, offset)}``."""
-        return dict(self._recovery_state)
+        """Per-topic recovery anchors: ``{topic: (epoch, offset)}`` of the last
+        message delivered in order (the position recovery resumes from)."""
+        return self._sequencer.topic_positions()
 
     @property
     def queue_size(self) -> int:
@@ -359,7 +521,7 @@ class AsyncWSEClient:
         *,
         priority: int = MessagePriority.NORMAL,
         correlation_id: str | None = None,
-    ) -> bool:
+    ) -> SendResult:
         """Send a message to the server.
 
         Args:
@@ -369,7 +531,14 @@ class AsyncWSEClient:
             correlation_id: Optional ID to correlate request/response.
 
         Returns:
-            True if sent, False if disconnected or rate-limited.
+            ``SendResult.SENT`` when it went out; ``SendResult.QUEUED`` when
+            it is held by the offline queue (``offline_queue=True``) for the
+            next reconnect; ``SendResult.FAILED`` (falsy) when it was neither
+            sent nor queued (not connected, rate limited).
+
+        Raises:
+            WSEEncryptionError: ``encryption=True`` and the key exchange of
+                the current connection failed; nothing was sent.
         """
         encoded = self._codec.encode(
             type,
@@ -377,13 +546,9 @@ class AsyncWSEClient:
             priority=priority,
             correlation_id=correlation_id,
         )
-        ok = await self._connection.send(encoded)
-        if ok:
-            self._stats.messages_sent += 1
-            self._stats.bytes_sent += len(encoded.encode("utf-8"))
-        elif self._offline_queue.enabled:
-            self._offline_queue.enqueue(encoded, priority=priority, msg_type=type)
-        return ok
+        return await self._send_app_frame(
+            encoded, priority=priority, msg_type=type, allow_queue=True
+        )
 
     async def send_with_retry(
         self,
@@ -393,8 +558,13 @@ class AsyncWSEClient:
         priority: int = MessagePriority.NORMAL,
         correlation_id: str | None = None,
         max_retries: int = SEND_MAX_RETRIES,
-    ) -> bool:
+    ) -> SendResult:
         """Send with exponential backoff retry.
+
+        The message is encoded once, so every attempt carries the same id and
+        the server can tell retries apart from new messages. Failed attempts
+        are never queued; with ``offline_queue=True`` a message that cannot
+        go out because the client is disconnected is queued once.
 
         Args:
             type: Event type string.
@@ -404,14 +574,20 @@ class AsyncWSEClient:
             max_retries: Max attempts (default 5).
 
         Returns:
-            True if sent within the retry budget, False otherwise.
+            ``SENT`` within the retry budget, ``QUEUED`` (see above), or
+            ``FAILED``.
         """
+        encoded = self._codec.encode(
+            type, payload or {}, priority=priority, correlation_id=correlation_id
+        )
         for attempt in range(max_retries):
-            ok = await self.send(
-                type, payload, priority=priority, correlation_id=correlation_id
+            result = await self._send_app_frame(
+                encoded, priority=priority, msg_type=type, allow_queue=False
             )
-            if ok:
-                return True
+            if result:
+                return result
+            if not self._connection.is_connected and self._offline_queue.enabled:
+                return self._queue_or_fail(encoded, priority, type, allow_queue=True)
 
             if attempt < max_retries - 1:
                 delay = min(
@@ -428,10 +604,10 @@ class AsyncWSEClient:
                 try:
                     await asyncio.sleep(delay)
                 except asyncio.CancelledError:
-                    return False
+                    return SendResult.FAILED
 
         logger.warning("Send failed after %d retries for '%s'", max_retries, type)
-        return False
+        return SendResult.FAILED
 
     async def send_batch(self, messages: list[tuple[str, dict[str, Any]]]) -> bool:
         """Send multiple messages in a single batch frame.
@@ -440,7 +616,7 @@ class AsyncWSEClient:
             messages: List of ``(type, payload)`` tuples.
 
         Returns:
-            True if the batch was sent.
+            True if the batch was sent (one frame against the rate limit).
         """
         if not messages:
             return True
@@ -462,7 +638,12 @@ class AsyncWSEClient:
             {"messages": batch_items, "count": len(batch_items)},
             priority=MessagePriority.NORMAL,
         )
-        ok = await self._connection.send(encoded)
+        if not self._connection.is_connected:
+            return False
+        if self._rate_limiter is not None and not self._rate_limiter.try_consume():
+            self._note_rate_limited("batch")
+            return False
+        ok = await self._transmit(encoded, strict=True)
         if ok:
             self._stats.messages_sent += len(messages)
             self._stats.bytes_sent += len(encoded.encode("utf-8"))
@@ -477,8 +658,10 @@ class AsyncWSEClient:
         """Subscribe to one or more topics, optionally recovering missed messages.
 
         When *recover* is True and the server supports recovery, the client
-        sends its last known epoch and offset for each topic so the server
-        can replay missed messages before confirming the subscription.
+        sends its last delivered epoch and offset for each topic so the
+        server can replay missed messages before confirming the subscription.
+        Subscribed topics are subscribed again automatically on every new
+        connection (reconnect, ``change_endpoint()``).
 
         Args:
             topics: Topic names, e.g. ``["notifications", "live_data"]``.
@@ -487,36 +670,30 @@ class AsyncWSEClient:
         Returns:
             True if the subscription message was sent.
         """
-        new_topics = [t for t in topics if t not in self._subscribed_topics]
+        new_topics = [
+            t for t in dict.fromkeys(topics) if t not in self._subscribed_topics
+        ]
         if not new_topics:
             return True
 
-        payload: dict[str, Any] = {"action": "subscribe", "topics": new_topics}
-
-        # Attach recovery info when requested and server supports it
-        if recover and self._server_recovery_enabled:
-            recovery_info: dict[str, dict[str, Any]] = {}
-            for topic in new_topics:
-                state = self._recovery_state.get(topic)
-                if state is not None:
-                    recovery_info[topic] = {"epoch": state[0], "offset": state[1]}
-            if recovery_info:
-                payload["recover"] = True
-                payload["recovery"] = recovery_info
-
+        payload, recovery_info = self._subscription_payload(new_topics, recover=recover)
         msg = self._codec.encode(
             "subscription_update",
             payload,
             priority=MessagePriority.HIGH,
         )
-        ok = await self._connection.send(msg)
+        ok = await self._transmit(msg, strict=True)
         if ok:
             self._subscribed_topics.update(new_topics)
+            self._note_recovery_requested(recovery_info)
             self._stats.messages_sent += 1
         return ok
 
     async def unsubscribe(self, topics: list[str]) -> bool:
         """Unsubscribe from one or more topics.
+
+        The topics' recovery positions are forgotten, so subscribing again
+        later starts from the next live message instead of a gap.
 
         Args:
             topics: Topic names to unsubscribe from.
@@ -529,11 +706,11 @@ class AsyncWSEClient:
             {"action": "unsubscribe", "topics": topics},
             priority=MessagePriority.HIGH,
         )
-        ok = await self._connection.send(msg)
+        ok = await self._transmit(msg, strict=True)
         if ok:
             self._subscribed_topics -= set(topics)
             for t in topics:
-                self._recovery_state.pop(t, None)
+                self._forget_topic(t)
             self._stats.messages_sent += 1
         return ok
 
@@ -541,18 +718,24 @@ class AsyncWSEClient:
         """Request a state snapshot from the server.
 
         The server replies with current state for the given topics so the
-        client doesn't have to wait for the next publish.
+        client doesn't have to wait for the next publish. A request for the
+        same topics within a few seconds of an earlier one is not sent again
+        (it returns True); requests for other topics always go out.
 
         Args:
             topics: Topics to snapshot. Defaults to subscribed topics.
 
         Returns:
-            True if the request was sent.
+            True if the request was sent (or an identical one is in flight).
         """
-        if self._snapshot_requested:
+        target = sorted(set(topics)) if topics else sorted(self._subscribed_topics)
+        key = frozenset(target)
+        now = time.monotonic()
+        self._snapshot_inflight = {
+            k: expiry for k, expiry in self._snapshot_inflight.items() if expiry > now
+        }
+        if key in self._snapshot_inflight:
             return True
-
-        target = topics or list(self._subscribed_topics)
 
         for attempt in range(SNAPSHOT_MAX_RETRIES):
             msg = self._codec.encode(
@@ -565,9 +748,9 @@ class AsyncWSEClient:
                 },
                 priority=MessagePriority.HIGH,
             )
-            ok = await self._connection.send(msg)
-            if ok:
-                self._snapshot_requested = True
+            if await self._transmit(msg, strict=True):
+                self._snapshot_inflight[key] = time.monotonic() + SNAPSHOT_DEDUP_WINDOW
+                self._stats.messages_sent += 1
                 return True
 
             if attempt < SNAPSHOT_MAX_RETRIES - 1:
@@ -596,52 +779,62 @@ class AsyncWSEClient:
             The next :class:`~wse_client.types.WSEEvent`.
 
         Raises:
-            WSEConnectionError: If the connection is closed.
+            WSEConnectionError: The client was disconnected, or gave up
+                reconnecting.
+            WSEAuthError: The server rejected the credentials for good.
+            WSEEncryptionError: The E2E key exchange failed.
             asyncio.TimeoutError: If *timeout* expires.
         """
-        if self._event_queue is None:
+        queue = self._event_queue
+        if queue is None:
             raise WSEConnectionError("Not connected")
         if timeout is not None:
-            event = await asyncio.wait_for(self._event_queue.get(), timeout=timeout)
+            item = await asyncio.wait_for(queue.get(), timeout=timeout)
         else:
-            event = await self._event_queue.get()
+            item = await queue.get()
 
-        if event is None:
-            # Re-queue sentinel so other callers also see the close signal
-            try:
-                self._event_queue.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
+        if isinstance(item, _StreamEnd):
+            # Re-queue the marker so other callers also see the close signal
+            self._requeue_end(item)
+            if item.error is not None:
+                raise item.error
             raise WSEConnectionError("Connection closed")
-        return event
+        return item
 
     async def force_reconnect(self) -> None:
-        """Force a reconnection (e.g. after detecting degraded quality)."""
+        """Force a reconnection (e.g. after detecting degraded quality).
+
+        Also revives a client that ended (e.g. after :meth:`set_token`
+        replaced a token the server rejected).
+        """
+        self._ensure_primitives()
         if self._server_ready_event is not None:
             self._server_ready_event.clear()
+        if self._terminal_error is not None:
+            self._reset_stream()
         await self._connection.force_reconnect()
 
     async def change_endpoint(self, new_url: str) -> None:
-        """Change the server endpoint and reconnect."""
-        self._disconnecting = True
-        try:
-            await self._connection.disconnect()
-        finally:
-            self._disconnecting = False
-        self._connection._url = new_url
-        self._connection._active_endpoint = new_url
-        self._connection._reconnect_attempts = 0
-        if self._server_ready_event is not None:
-            self._server_ready_event.clear()
+        """Switch to another server URL and reconnect.
+
+        Every subscribed topic is subscribed again on the new server once its
+        handshake completed.
+        """
+        self._ensure_primitives()
+        conn = self._connection
+        await conn.disconnect()
+        conn._url = new_url
+        conn._active_endpoint = new_url
+        conn._reconnect_attempts = 0
 
         # Register with pool if active
-        if self._connection._pool is not None:
-            self._connection._pool.add_endpoint(new_url)
-            self._connection._pool.set_active_endpoint(new_url)
+        if conn._pool is not None:
+            conn._pool.add_endpoint(new_url)
+            conn._pool.set_active_endpoint(new_url)
 
-        # Merge dynamically subscribed topics with initial topics
-        all_topics = list(set(self._initial_topics) | self._subscribed_topics)
-        await self._connection.connect(all_topics)
+        await conn.connect()
+        await self._await_handshake()
+        conn.arm_reconnect()
 
     # -- Handler registration -------------------------------------------------
 
@@ -711,16 +904,382 @@ class AsyncWSEClient:
             },
             "circuit_breaker": {
                 "state": self._circuit_breaker.state.value,
-                "can_execute": self._circuit_breaker.can_execute(),
+                "can_execute": self._circuit_breaker.state.value != "open",
             },
-            "rate_limiter": self._rate_limiter.get_stats(),
+            "rate_limiter": (
+                dict(
+                    self._rate_limiter.get_stats(),
+                    rate_limited=self._rate_limited_total,
+                )
+                if self._rate_limiter is not None
+                else None
+            ),
             "offline_queue": self._offline_queue.get_stats(),
+            "recovery": {
+                "enabled": self._server_recovery_enabled,
+                "pending_gaps": len(self._gaps),
+                "gaps": self._gap_stats["gaps"],
+                "missed": self._gap_stats["missed"],
+                "recovered": self._gap_stats["recovered"],
+            },
+            "last_error": str(self._terminal_error) if self._terminal_error else None,
             "connection_pool": (
                 self._connection._pool.get_stats()
                 if self._connection._pool is not None
                 else None
             ),
         }
+
+    # -- Internal: event stream -----------------------------------------------
+
+    def _ensure_primitives(self) -> None:
+        """Create the asyncio primitives (needs a running event loop)."""
+        if self._event_queue is None:
+            self._event_queue = asyncio.Queue(maxsize=self._queue_size)
+        if self._server_ready_event is None:
+            self._server_ready_event = asyncio.Event()
+
+    def _enqueue(self, item: WSEEvent | _StreamEnd) -> None:
+        queue = self._event_queue
+        if queue is None:
+            return
+        try:
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            # Drop oldest to make room
+            try:
+                queue.get_nowait()
+                queue.put_nowait(item)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                pass
+
+    def _push_stream_end(self, end: _StreamEnd) -> None:
+        self._enqueue(end)
+
+    def _requeue_end(self, end: _StreamEnd) -> None:
+        if self._event_queue is not None:
+            try:
+                self._event_queue.put_nowait(end)
+            except asyncio.QueueFull:
+                pass
+
+    def _reset_stream(self) -> None:
+        """Drop end markers of an earlier session (a new one is starting)."""
+        self._terminal_error = None
+        queue = self._event_queue
+        if queue is None:
+            return
+        kept: list[WSEEvent | _StreamEnd] = []
+        while True:
+            try:
+                kept.append(queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        for item in kept:
+            if not isinstance(item, _StreamEnd):
+                queue.put_nowait(item)
+
+    # -- Internal: transport callbacks ----------------------------------------
+
+    def _on_transport_open(self) -> None:
+        """A socket opened: fresh per-connection state, start the session."""
+        self._ensure_primitives()
+        loop = asyncio.get_running_loop()
+        assert self._server_ready_event is not None
+        self._server_ready_event.clear()
+        self._server_hello_seen = False
+        self._server_recovery_enabled = False
+        self._encryption_error = None
+        self._recovery_requests.clear()
+        self._unrecoverable.clear()
+        self._recovery_unanswered = 0
+        self._snapshot_inflight.clear()
+        for gap in self._gaps.values():
+            gap.in_flight = False
+        lost = WSEConnectionError("Connection replaced")
+        _reject(self._handshake, lost)
+        _reject(self._key_ready, lost)
+        self._handshake = loop.create_future()
+        self._key_ready = loop.create_future() if self._security is not None else None
+        # Topics wanted before this connection existed are subscribed again
+        # once it is ready; subscribe() sends the ones added from now on.
+        self._resubscribe_pending = set(self._subscribed_topics)
+        self._fire_task(
+            self._session_start(self._handshake, self._connection.reconnect_armed)
+        )
+
+    def _on_transport_close(self) -> None:
+        """A live socket went away (any reason)."""
+        if self._server_ready_event is not None:
+            self._server_ready_event.clear()
+        # Sends waiting for this connection's key give up (and may queue).
+        _reject(self._key_ready, WSEConnectionError("Connection lost"))
+        self._recovery_requests.clear()
+        self._snapshot_inflight.clear()
+        for gap in self._gaps.values():
+            gap.in_flight = False
+
+    def _on_transport_terminal(self, error: WSEError) -> None:
+        """The transport gave up for good: end the event stream with *error*."""
+        self._terminal_error = error
+        _reject(self._handshake, error)
+        _reject(self._key_ready, error)
+        for topic in list(self._gaps):
+            self._give_up_gap(topic, "closed")
+        self._push_stream_end(_StreamEnd(error))
+
+    async def _await_handshake(self) -> None:
+        """Wait for the handshake of the current connection (see connect())."""
+        fut = self._handshake
+        if fut is None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(fut), timeout=SERVER_READY_TIMEOUT)
+        except WSEError:
+            # Let a fail-closed abort finish so the socket is closed when
+            # connect() raises.
+            abort = self._abort_task
+            if abort is not None and not abort.done():
+                await asyncio.wait([abort], timeout=5.0)
+            raise
+        except asyncio.TimeoutError:
+            if self._security is not None and not self._security.is_enabled:
+                err = WSEEncryptionError(
+                    "E2E key exchange did not complete within "
+                    f"{SERVER_READY_TIMEOUT:.0f}s (no server_hello with a key)"
+                )
+                self._encryption_error = err
+                _reject(self._key_ready, err)
+                await self._connection.abort(err)
+                raise err from None
+            logger.warning(
+                "Neither server_ready nor server_hello received within %.0fs, "
+                "proceeding anyway",
+                SERVER_READY_TIMEOUT,
+            )
+
+    async def _session_start(
+        self, handshake: asyncio.Future[None], background: bool
+    ) -> None:
+        """After a connection's handshake: resubscribe, flush the queue."""
+        try:
+            await asyncio.wait_for(asyncio.shield(handshake), SERVER_READY_TIMEOUT)
+        except asyncio.TimeoutError:
+            if handshake is not self._handshake:
+                return
+            if self._security is not None and not self._security.is_enabled:
+                if background:  # connect() handles its own connection
+                    self._start_encryption_failure(
+                        WSEEncryptionError(
+                            "E2E key exchange did not complete within "
+                            f"{SERVER_READY_TIMEOUT:.0f}s after reconnecting"
+                        )
+                    )
+                return
+            if background:
+                logger.warning(
+                    "Neither server_ready nor server_hello within %.0fs after "
+                    "reconnecting, proceeding anyway",
+                    SERVER_READY_TIMEOUT,
+                )
+        except WSEError:
+            return  # the connection failed or was replaced
+        if handshake is not self._handshake or not self._connection.is_connected:
+            return
+        await self._resubscribe()
+        if self._offline_queue.size > 0:
+            await self._flush_offline_queue()
+
+    def _maybe_complete_handshake(self) -> None:
+        fut = self._handshake
+        if fut is None or fut.done():
+            return
+        ready = self._server_hello_seen or (
+            self._server_ready_event is not None and self._server_ready_event.is_set()
+        )
+        if not ready:
+            return
+        if self._security is not None and not self._security.is_enabled:
+            return
+        fut.set_result(None)
+        self._connection.mark_handshake_complete()
+
+    # -- Internal: sending ----------------------------------------------------
+
+    async def _wait_for_key(self, *, strict: bool) -> bool:
+        """With encryption: wait until this connection's key exists.
+
+        Returns False when the connection went away meanwhile, or the key
+        exchange failed and *strict* is False.
+
+        Raises:
+            WSEEncryptionError: The key exchange failed (only when *strict*).
+        """
+        security = self._security
+        if security is None or security.is_enabled:
+            return True
+        if self._encryption_error is not None:
+            if strict:
+                raise self._encryption_error
+            return False
+        fut = self._key_ready
+        if fut is None:
+            return False
+        try:
+            await asyncio.wait_for(asyncio.shield(fut), KEY_EXCHANGE_TIMEOUT)
+        except asyncio.TimeoutError:
+            return False
+        except WSEEncryptionError:
+            if strict:
+                raise
+            return False
+        except WSEError:
+            return False
+        return security.is_enabled
+
+    async def _transmit(self, encoded: str, *, strict: bool = False) -> bool:
+        """Send one frame on the current connection; with encryption only
+        after the key exchange (never plaintext). False if not connected.
+
+        With *strict* (the public send / subscribe methods) a failed key
+        exchange raises :class:`WSEEncryptionError` instead of returning
+        False."""
+        if not self._connection.is_connected:
+            if strict and self._encryption_error is not None:
+                raise self._encryption_error
+            return False
+        if self._security is not None and not await self._wait_for_key(strict=strict):
+            return False
+        return await self._connection.send(encoded)
+
+    async def _send_app_frame(
+        self,
+        encoded: str,
+        *,
+        priority: int,
+        msg_type: str,
+        allow_queue: bool,
+    ) -> SendResult:
+        if self._encryption_error is not None:
+            raise self._encryption_error
+        if not self._connection.is_connected:
+            return self._queue_or_fail(encoded, priority, msg_type, allow_queue)
+        if self._rate_limiter is not None and not self._rate_limiter.try_consume():
+            self._note_rate_limited(msg_type)
+            return SendResult.FAILED
+        if await self._transmit(encoded, strict=True):
+            self._stats.messages_sent += 1
+            self._stats.bytes_sent += len(encoded.encode("utf-8"))
+            return SendResult.SENT
+        return self._queue_or_fail(encoded, priority, msg_type, allow_queue)
+
+    def _queue_or_fail(
+        self, encoded: str, priority: int, msg_type: str, allow_queue: bool
+    ) -> SendResult:
+        if (
+            allow_queue
+            and self._offline_queue.enabled
+            and self._offline_queue.enqueue(
+                encoded, priority=priority, msg_type=msg_type
+            )
+        ):
+            return SendResult.QUEUED
+        return SendResult.FAILED
+
+    def _note_rate_limited(self, msg_type: str) -> None:
+        self._rate_limited_total += 1
+        now = time.monotonic()
+        if now - self._last_rate_limit_log >= 5.0:
+            self._last_rate_limit_log = now
+            logger.warning(
+                "Outbound rate limit reached, '%s' not sent (%d dropped so far; "
+                "AsyncWSEClient(rate_limit=...) sets the limit, None disables it)",
+                msg_type,
+                self._rate_limited_total,
+            )
+
+    async def _send_internal(
+        self, type: str, payload: dict[str, Any], *, priority: int
+    ) -> bool:
+        """Protocol replies (health / sync / metrics): not rate limited, never
+        queued for replay."""
+        encoded = self._codec.encode(type, payload, priority=priority)
+        ok = await self._transmit(encoded)
+        if ok:
+            self._stats.messages_sent += 1
+            self._stats.bytes_sent += len(encoded.encode("utf-8"))
+        return ok
+
+    def _subscription_payload(
+        self, topics: list[str], *, recover: bool
+    ) -> tuple[dict[str, Any], dict[str, tuple[str, int]]]:
+        payload: dict[str, Any] = {"action": "subscribe", "topics": topics}
+        info: dict[str, tuple[str, int]] = {}
+        if recover and self._server_recovery_enabled:
+            for topic in topics:
+                pos = self._sequencer.topic_position(topic)
+                if pos is not None:
+                    info[topic] = pos
+            if info:
+                payload["recover"] = True
+                payload["recovery"] = {
+                    t: {"epoch": pos[0], "offset": pos[1]} for t, pos in info.items()
+                }
+        return payload, info
+
+    def _note_recovery_requested(self, info: dict[str, tuple[str, int]]) -> None:
+        for topic, pos in info.items():
+            self._recovery_requests[topic] = pos
+            gap = self._gaps.get(topic)
+            if gap is not None and gap.epoch == pos[0]:
+                gap.in_flight = True
+                gap.requested_from = pos[1]
+
+    async def _resubscribe(self) -> None:
+        """Subscribe this connection to the topics wanted before it opened."""
+        topics = sorted(
+            t for t in self._resubscribe_pending if t in self._subscribed_topics
+        )
+        self._resubscribe_pending = set()
+        if not topics:
+            return
+        payload, info = self._subscription_payload(topics, recover=True)
+        msg = self._codec.encode(
+            "subscription_update", payload, priority=MessagePriority.HIGH
+        )
+        logger.info("Re-subscribing to %d topics (recover=%s)", len(topics), bool(info))
+        if await self._transmit(msg):
+            self._note_recovery_requested(info)
+            self._stats.messages_sent += 1
+        else:
+            logger.warning("Re-subscribe failed; retried on the next connection")
+
+    async def _flush_offline_queue(self) -> None:
+        """Replay queued messages after reconnection."""
+        messages = self._offline_queue.drain()
+        if not messages:
+            return
+        logger.info("Flushing %d offline-queued messages", len(messages))
+        for i, (encoded, priority) in enumerate(messages):
+            ok = await self._transmit(encoded)
+            if ok:
+                self._stats.messages_sent += 1
+                self._stats.bytes_sent += len(encoded.encode("utf-8"))
+                continue
+            remaining = messages[i:]
+            logger.warning(
+                "Offline queue flush interrupted, re-enqueuing %d messages",
+                len(remaining),
+            )
+            for msg, pri in remaining:
+                self._offline_queue.enqueue(msg, priority=pri)
+            break
+
+    def _fire_task(self, coro: Any) -> None:
+        """Schedule a coroutine with a strong reference to prevent GC."""
+        task = asyncio.ensure_future(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     # -- Internal: message handling -------------------------------------------
 
@@ -738,7 +1297,12 @@ class AsyncWSEClient:
 
         events = result if isinstance(result, list) else [result]
         for event in events:
-            self._process_event(event)
+            try:
+                self._process_event(event)
+            except Exception as exc:
+                logger.warning(
+                    "Error processing '%s' event, dropped: %s", event.type, exc
+                )
 
     def _process_event(self, event: WSEEvent) -> None:
         """Dedup + gap-detect, handle system events, then dispatch.
@@ -751,64 +1315,292 @@ class AsyncWSEClient:
         handshake. Unstamped messages fall back to id-based dedup.
         """
         if event.topic and event.epoch and event.offset is not None:
-            verdict = self._sequencer.check_topic_stamp(
-                event.topic, event.epoch, event.offset
-            )
-            if verdict == "duplicate":
-                return
-            if verdict == "gap":
-                # Recover the whole missed range from the last in-order position
-                # (still in _recovery_state); drop this out-of-order copy -- the
-                # recovery replay re-delivers it in order.
-                self._on_recovery_gap(event.topic)
-                return
-            # In order (or new/changed epoch): advance and deliver.
-            self._recovery_state[event.topic] = (event.epoch, event.offset)
-        elif event.id and self._sequencer.is_duplicate(event.id):
+            self._process_stamped(event)
             return
-
+        if event.id and self._sequencer.is_duplicate(event.id):
+            return
         self._dispatch_event(event)
 
-    def _on_recovery_gap(self, topic: str) -> None:
-        """A per-topic offset gap was detected -- request recovery from the last
-        in-order position, guarded against re-entrant loops (one in-flight
-        recovery per topic)."""
-        if topic in self._recovery_in_flight:
-            return
-        self._recovery_in_flight.add(topic)
-        self._fire_task(self._recover_topic(topic))
+    # -- Internal: gap recovery -----------------------------------------------
+    #
+    # A topic never goes dark after an offset gap. With recovery available the
+    # client asks the server to replay from the last delivered offset and holds
+    # the messages that arrive past the hole (bounded) for recovery_timeout
+    # seconds; replayed messages are delivered in order and the held ones
+    # follow. If the replay does not fill the hole in time -- or recovery is
+    # not available, the server says it cannot replay, or the buffer fills --
+    # a recovery_gap event reports the missing offsets and the held messages
+    # are delivered.
 
-    async def _recover_topic(self, topic: str) -> None:
-        """Send a recovery request for an already-subscribed topic (gap fill).
+    def _process_stamped(self, event: WSEEvent) -> None:
+        topic, epoch, offset = event.topic, event.epoch, event.offset
+        assert topic is not None and epoch is not None and offset is not None
+        gap = self._gaps.get(topic)
+        if gap is not None and gap.epoch != epoch:
+            # New epoch (server restart) while a hole was open: it can never
+            # be filled any more.
+            self._give_up_gap(topic, "epoch_changed")
+            gap = None
+
+        verdict = self._sequencer.check_topic_stamp(topic, epoch, offset)
+        if verdict == "duplicate":
+            return
+        if verdict == "deliver":
+            self._unrecoverable.pop(topic, None)
+            self._dispatch_event(event)
+            if gap is not None:
+                self._drain_gap(topic)
+            return
+
+        # verdict == "gap"
+        if gap is not None:
+            gap.buffer.setdefault(offset, event)
+            if len(gap.buffer) > RECOVERY_BUFFER_MAX:
+                self._give_up_gap(topic, "overflow")
+            return
+        if self._unrecoverable.get(topic) == epoch:
+            # The server already said it cannot replay this topic's history.
+            del self._unrecoverable[topic]
+            self._skip_gap(event, "not_recovered")
+            return
+        if not self._start_gap(event):
+            self._skip_gap(event, "unavailable")
+
+    def _recovery_available(self) -> bool:
+        return (
+            self._recovery_timeout > 0
+            and self._server_recovery_enabled
+            and self._recovery_unanswered < RECOVERY_MAX_UNANSWERED
+            and self._connection.is_connected
+        )
+
+    def _start_gap(self, event: WSEEvent) -> bool:
+        """Hold *event* and request recovery. False if recovery is not possible."""
+        topic, epoch, offset = event.topic, event.epoch, event.offset
+        assert topic is not None and epoch is not None and offset is not None
+        if not self._recovery_available():
+            return False
+        if self._sequencer.topic_position(topic) is None:
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        gap = _GapState(epoch=epoch)
+        gap.buffer[offset] = event
+        gap.timer = loop.call_later(
+            self._recovery_timeout, self._on_gap_deadline, topic, gap
+        )
+        self._gaps[topic] = gap
+        self._fire_task(self._request_recovery(topic, gap))
+        return True
+
+    async def _request_recovery(self, topic: str, gap: _GapState) -> None:
+        """Ask the server to replay *topic* from its anchor (gap fill).
 
         subscribe() can't be reused here because it filters already-subscribed
-        topics; this sends the recovery subscription_update directly from the
-        stored (epoch, offset)."""
+        topics; this sends the recovery subscription_update directly."""
+        if self._gaps.get(topic) is not gap or gap.in_flight:
+            return
+        pos = self._sequencer.topic_position(topic)
+        if pos is None or pos[0] != gap.epoch:
+            return
+        payload = {
+            "action": "subscribe",
+            "topics": [topic],
+            "recover": True,
+            "recovery": {topic: {"epoch": pos[0], "offset": pos[1]}},
+        }
+        msg = self._codec.encode(
+            "subscription_update", payload, priority=MessagePriority.HIGH
+        )
+        self._note_recovery_requested({topic: pos})
         try:
-            state = self._recovery_state.get(topic)
-            if not self._server_recovery_enabled or state is None:
-                return
-            payload = {
-                "action": "subscribe",
-                "topics": [topic],
-                "recover": True,
-                "recovery": {topic: {"epoch": state[0], "offset": state[1]}},
-            }
-            msg = self._codec.encode(
-                "subscription_update", payload, priority=MessagePriority.HIGH
+            ok = await self._transmit(msg)
+        except WSEError:
+            ok = False
+        if not ok and self._gaps.get(topic) is gap:
+            # Not sent: the resubscribe of the next connection or the
+            # deadline takes over.
+            gap.in_flight = False
+            self._recovery_requests.pop(topic, None)
+            logger.debug("Recovery request for '%s' not sent", topic)
+
+    def _drain_gap(self, topic: str) -> None:
+        """Deliver held messages that became in order; close a filled gap."""
+        gap = self._gaps.get(topic)
+        if gap is None:
+            return
+        while True:
+            pos = self._sequencer.topic_position(topic)
+            if pos is None or pos[0] != gap.epoch:
+                break
+            for off in [o for o in gap.buffer if o <= pos[1]]:
+                del gap.buffer[off]
+            nxt = gap.buffer.pop(pos[1] + 1, None)
+            if nxt is None:
+                break
+            self._sequencer.set_topic_position(topic, gap.epoch, pos[1] + 1)
+            self._dispatch_event(nxt)
+        if not gap.buffer and self._gaps.get(topic) is gap:
+            self._close_gap(topic, gap)
+            self._gap_stats["recovered"] += 1
+            logger.info("Recovered offset gap on '%s'", topic)
+
+    def _close_gap(self, topic: str, gap: _GapState) -> None:
+        if gap.timer is not None:
+            gap.timer.cancel()
+            gap.timer = None
+        if self._gaps.get(topic) is gap:
+            del self._gaps[topic]
+
+    def _give_up_gap(self, topic: str, reason: str) -> None:
+        """Stop waiting: report the holes, deliver the held messages."""
+        gap = self._gaps.get(topic)
+        if gap is None:
+            return
+        self._close_gap(topic, gap)
+        pos = self._sequencer.topic_position(topic)
+        last = pos[1] if pos is not None and pos[0] == gap.epoch else None
+        for off in sorted(gap.buffer):
+            if last is not None and off <= last:
+                continue
+            if last is not None and off > last + 1:
+                self._report_gap(topic, gap.epoch, last + 1, off - 1, reason)
+            self._sequencer.set_topic_position(topic, gap.epoch, off)
+            self._dispatch_event(gap.buffer[off])
+            last = off
+
+    def _skip_gap(self, event: WSEEvent, reason: str) -> None:
+        """Accept a gap at once: report it, re-baseline, deliver *event*."""
+        topic, epoch, offset = event.topic, event.epoch, event.offset
+        assert topic is not None and epoch is not None and offset is not None
+        pos = self._sequencer.topic_position(topic)
+        if pos is not None and pos[0] == epoch and offset > pos[1] + 1:
+            self._report_gap(topic, epoch, pos[1] + 1, offset - 1, reason)
+        self._sequencer.set_topic_position(topic, epoch, offset)
+        self._dispatch_event(event)
+
+    def _on_gap_deadline(self, topic: str, gap: _GapState) -> None:
+        if self._gaps.get(topic) is not gap:
+            return
+        gap.timer = None
+        if gap.in_flight and not gap.answered:
+            # Nothing came back at all: the application may not answer
+            # recovery requests. After a few, stop asking on this connection.
+            self._recovery_unanswered += 1
+        self._give_up_gap(topic, "timeout")
+
+    def _report_gap(
+        self,
+        topic: str,
+        epoch: str,
+        first: int | None,
+        last: int | None,
+        reason: str,
+    ) -> None:
+        """Surface messages a topic will not get as a ``recovery_gap`` event."""
+        missed = last - first + 1 if first is not None and last is not None else None
+        self._gap_stats["gaps"] += 1
+        if missed:
+            self._gap_stats["missed"] += missed
+        logger.warning(
+            "Topic '%s' lost offsets %s..%s (%s messages, %s)",
+            topic,
+            first,
+            last,
+            missed if missed is not None else "unknown",
+            reason,
+        )
+        event = WSEEvent(
+            type=RECOVERY_GAP_EVENT,
+            payload={
+                "topic": topic,
+                "epoch": epoch,
+                "first_missing": first,
+                "last_missing": last,
+                "missed": missed,
+                "reason": reason,
+            },
+            category="WSE",
+            topic=topic,
+            epoch=epoch,
+        )
+        self._invoke_handlers(event)
+        self._enqueue(event)
+
+    def _on_recovery_reply(self, topic: str, info: dict[str, Any]) -> None:
+        """Handle the per-topic recovery info of a subscription_update."""
+        recovered = bool(info.get("recovered", True))
+        requested = self._recovery_requests.pop(topic, None)
+        gap = self._gaps.get(topic)
+
+        if gap is not None:
+            if not gap.in_flight:
+                return  # not the answer to a request of ours
+            gap.in_flight = False
+            gap.answered = True
+            self._recovery_unanswered = 0
+            self._drain_gap(topic)  # the replay arrived before this reply
+            if self._gaps.get(topic) is not gap:
+                return  # filled
+            pos = self._sequencer.topic_position(topic)
+            progressed = (
+                pos is not None
+                and gap.requested_from is not None
+                and pos[0] == gap.epoch
+                and pos[1] > gap.requested_from
             )
-            await self._connection.send(msg)
-        except Exception as exc:
-            logger.debug("recovery request for '%s' failed: %s", topic, exc)
-        finally:
-            self._recovery_in_flight.discard(topic)
+            if recovered and progressed:
+                # Partial replay (the server stops on back-pressure but
+                # still says recovered): ask again from the new anchor.
+                self._fire_task(self._request_recovery(topic, gap))
+            else:
+                self._give_up_gap(topic, "incomplete" if recovered else "not_recovered")
+            return
+
+        if requested is None:
+            return  # informational reply (plain subscribe): never moves the anchor
+        self._recovery_unanswered = 0
+        if recovered:
+            return  # replayed messages advanced the anchor as they arrived
+
+        # The server cannot replay after our anchor. Nothing moves the anchor
+        # here -- messages still in flight would be dropped as duplicates; the
+        # next gap on this topic is reported at once instead of retried.
+        pos = self._sequencer.topic_position(topic)
+        epoch = info.get("epoch")
+        if pos is None:
+            return
+        if epoch is not None and str(epoch) != pos[0]:
+            self._report_gap(topic, str(epoch), None, None, "epoch_changed")
+            return
+        offset = info.get("offset")
+        if isinstance(offset, int) and offset <= pos[1]:
+            return  # nothing was missed
+        self._unrecoverable[topic] = pos[0]
+
+    def _forget_topic(self, topic: str) -> None:
+        """Drop a topic's recovery state (unsubscribed)."""
+        self._sequencer.clear_topic(topic)
+        gap = self._gaps.get(topic)
+        if gap is not None:
+            self._close_gap(topic, gap)
+        self._recovery_requests.pop(topic, None)
+        self._unrecoverable.pop(topic, None)
+
+    # -- Internal: dispatch ---------------------------------------------------
 
     def _dispatch_event(self, event: WSEEvent) -> None:
         """Handle system events, invoke callbacks, enqueue for iterator."""
         # Fast system handler lookup (O(1) dict)
         handler = self._system_handlers.get(event.type)
         if handler is not None:
-            handler(event)
+            try:
+                handler(event)
+            except Exception as exc:
+                # A malformed system payload is dropped, never fatal.
+                logger.warning("Malformed '%s' message ignored: %s", event.type, exc)
             # Internal-only events are NOT forwarded to user queue/handlers
             if event.type in _INTERNAL_ONLY_EVENTS:
                 return
@@ -817,23 +1609,7 @@ class AsyncWSEClient:
         self._invoke_handlers(event)
 
         # Enqueue for async iterator
-        if self._event_queue is None:
-            return
-        try:
-            self._event_queue.put_nowait(event)
-        except asyncio.QueueFull:
-            # Drop oldest to make room
-            try:
-                self._event_queue.get_nowait()
-                self._event_queue.put_nowait(event)
-            except (asyncio.QueueEmpty, asyncio.QueueFull):
-                pass
-
-    def _fire_task(self, coro: Any) -> None:
-        """Schedule a coroutine with a strong reference to prevent GC."""
-        task = asyncio.ensure_future(coro)
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        self._enqueue(event)
 
     def _invoke_handlers(self, event: WSEEvent) -> None:
         """Call registered handlers for this event type."""
@@ -849,79 +1625,36 @@ class AsyncWSEClient:
     # -- System event handlers ------------------------------------------------
 
     def _handle_server_ready(self, event: WSEEvent) -> None:
-        conn_id = event.payload.get("connection_id") or event.payload.get(
-            "details", {}
-        ).get("connection_id")
-        self._connection.handle_server_ready(conn_id)
+        payload = event.payload
+        details = payload.get("details")
+        if not isinstance(details, dict):
+            details = {}
+        conn_id = payload.get("connection_id") or details.get("connection_id")
+        self._connection.handle_server_ready(
+            conn_id if isinstance(conn_id, str) else None
+        )
         if self._server_ready_event is not None:
             self._server_ready_event.set()
-        self._snapshot_requested = False
 
         # Check if server supports recovery (from features in details)
-        details = event.payload.get("details", {})
-        features = details.get("features", {})
-        self._server_recovery_enabled = bool(features.get("recovery", False))
+        features = details.get("features")
+        if isinstance(features, dict) and features.get("recovery"):
+            self._server_recovery_enabled = True
 
         logger.info(
             "Server ready (connection_id=%s, recovery=%s)",
             conn_id,
             self._server_recovery_enabled,
         )
-
-        # Auto-resubscribe to previously subscribed topics on reconnect
-        if self._subscribed_topics and self._stats.reconnect_count > 0:
-            has_recovery_state = bool(self._recovery_state)
-            self._fire_task(
-                self._resubscribe_after_reconnect(
-                    recover=self._server_recovery_enabled and has_recovery_state,
-                )
-            )
-
-        # Flush offline queue after server is ready
-        if self._offline_queue.size > 0:
-            self._fire_task(self._flush_offline_queue())
-
-    async def _resubscribe_after_reconnect(self, *, recover: bool) -> None:
-        """Re-subscribe to all previously subscribed topics after reconnection."""
-        topics = list(self._subscribed_topics)
-        # Clear so subscribe() treats them as new
-        self._subscribed_topics.clear()
-        logger.info("Re-subscribing to %d topics (recover=%s)", len(topics), recover)
-        try:
-            ok = await self.subscribe(topics, recover=recover)
-            if not ok:
-                # Restore so the next reconnect can try again
-                self._subscribed_topics.update(topics)
-                logger.warning(
-                    "Re-subscribe failed, topics preserved for next reconnect"
-                )
-        except BaseException:
-            # Restore topics on cancellation or any exception
-            self._subscribed_topics.update(topics)
-            raise
-
-    async def _flush_offline_queue(self) -> None:
-        """Replay queued messages after reconnection."""
-        messages = self._offline_queue.drain()
-        if not messages:
-            return
-        logger.info("Flushing %d offline-queued messages", len(messages))
-        for i, (encoded, priority) in enumerate(messages):
-            ok = await self._connection.send(encoded)
-            if not ok:
-                remaining = messages[i:]
-                logger.warning(
-                    "Offline queue flush interrupted, re-enqueuing %d messages",
-                    len(remaining),
-                )
-                for msg, pri in remaining:
-                    self._offline_queue.enqueue(msg, priority=pri)
-                break
+        self._maybe_complete_handshake()
 
     def _handle_server_hello(self, event: WSEEvent) -> None:
         """Handle server_hello with negotiated features and limits."""
         p = event.payload
-        self._server_features = p.get("features", {})
+        features = p.get("features")
+        if not isinstance(features, dict):
+            features = {}
+        self._server_features = features
 
         # Server-enforced limits are nested under "limits" (max_message_size,
         # rate_limit_capacity, rate_limit_refill). They were read at the payload
@@ -942,17 +1675,31 @@ class AsyncWSEClient:
         if isinstance(ping_interval, (int, float)) and ping_interval > 0:
             self._server_ping_interval_ms = int(ping_interval)
 
-        # Complete ECDH key exchange if server confirmed encryption
-        if (
-            self._security is not None
-            and p.get("features", {}).get("encryption")
-            and p.get("encryption_public_key")
-        ):
-            import base64
+        if features.get("recovery"):
+            self._server_recovery_enabled = True
+        self._server_hello_seen = True
 
-            server_pubkey_bytes = base64.b64decode(p["encryption_public_key"])
-            self._security.derive_shared_secret(server_pubkey_bytes)
+        # Complete the ECDH key exchange -- or fail closed.
+        security = self._security
+        if security is not None and not security.is_enabled:
+            server_key = p.get("encryption_public_key")
+            if not (features.get("encryption") and isinstance(server_key, str)):
+                self._start_encryption_failure(
+                    WSEEncryptionError(
+                        "The server did not enable E2E encryption "
+                        "(server_hello without encryption key)"
+                    )
+                )
+                return
+            try:
+                security.derive_shared_secret(base64.b64decode(server_key))
+            except Exception as exc:
+                self._start_encryption_failure(
+                    WSEEncryptionError(f"E2E key exchange failed: {exc}")
+                )
+                return
             logger.info("E2E encryption enabled (ECDH P-256 + AES-GCM-256)")
+            _resolve(self._key_ready)
 
         server_version = p.get("server_version", "unknown")
         logger.info(
@@ -960,51 +1707,49 @@ class AsyncWSEClient:
             server_version,
             list(self._server_features.keys()),
         )
+        self._maybe_complete_handshake()
+
+    def _start_encryption_failure(self, err: WSEEncryptionError) -> None:
+        """Fail closed: never fall back to plaintext, end the client."""
+        if self._encryption_error is not None:
+            return
+        self._encryption_error = err
+        logger.error("%s -- closing the connection (no plaintext fallback)", err)
+        _reject(self._key_ready, err)
+        _reject(self._handshake, err)
+        self._abort_task = asyncio.ensure_future(self._connection.abort(err))
+        self._background_tasks.add(self._abort_task)
+        self._abort_task.add_done_callback(self._background_tasks.discard)
 
     def _handle_subscription_update(self, event: WSEEvent) -> None:
         p = event.payload
-        success_topics = p.get("success_topics", [])
-        failed_topics = p.get("failed_topics", [])
+        failed_topics = p.get("failed_topics")
         if failed_topics:
             logger.warning("Subscription failed for: %s", failed_topics)
+        success_topics = p.get("success_topics")
         if success_topics:
             logger.debug("Subscribed to: %s", success_topics)
 
-        # Store recovery positions from server response
-        recovery = p.get("recovery", {})
+        recovery = p.get("recovery")
+        if not isinstance(recovery, dict):
+            return
         for topic, info in recovery.items():
-            if not isinstance(info, dict):
-                continue
-            epoch = info.get("epoch")
-            offset = info.get("offset")
-            if epoch is None or offset is None:
-                continue
-            self._recovery_state[topic] = (str(epoch), int(offset))
-            # When the server could NOT recover (history evicted, or epoch
-            # changed on a server restart), resync the dedup position FORWARD to
-            # the server's current position. Otherwise the next live message
-            # looks like a gap and triggers recovery again -- forever. The
-            # unrecoverable gap is accepted. `recovered` defaults True so the
-            # behavior is unchanged when the server omits the flag.
-            if not info.get("recovered", True):
-                self._sequencer.set_topic_position(topic, str(epoch), int(offset))
-            logger.debug(
-                "Recovery position for %s: epoch=%s offset=%d recovered=%s",
-                topic,
-                epoch,
-                offset,
-                info.get("recovered", True),
-            )
+            if isinstance(topic, str) and isinstance(info, dict):
+                self._on_recovery_reply(topic, info)
 
     def _handle_error(self, event: WSEEvent) -> None:
         """Handle server error with code classification (matches TS error handler)."""
         p = event.payload
         code = p.get("code", "UNKNOWN_ERROR")
-        message = p.get("message", "Unknown error")
+        message = str(p.get("message", "Unknown error"))
         recoverable = p.get("recoverable", True)
         severity = p.get("severity", "error")
 
-        if code == "AUTH_FAILED":
+        if code == "KEY_EXCHANGE_FAILED" and self._security is not None:
+            self._start_encryption_failure(
+                WSEEncryptionError(f"Server-side key exchange failed: {message}")
+            )
+        elif code in ("AUTH_FAILED", "AUTH_REQUIRED"):
             logger.error("Auth failed: %s", message)
         elif code in ("RATE_LIMITED", "RATE_LIMIT_EXCEEDED") or "Rate limit" in message:
             retry_after = p.get("retry_after") or p.get("retryAfter", 0)
@@ -1012,7 +1757,8 @@ class AsyncWSEClient:
                 "Rate limit exceeded (retry after %ss): %s", retry_after, message
             )
         elif code == "SUBSCRIPTION_FAILED":
-            topics = p.get("details", {}).get("topics", [])
+            details = p.get("details")
+            topics = details.get("topics", []) if isinstance(details, dict) else []
             logger.warning("Subscription failed for %s: %s", topics, message)
         elif code in ("PROTOCOL_ERROR", "INVALID_MESSAGE"):
             logger.error(
@@ -1030,7 +1776,7 @@ class AsyncWSEClient:
     async def _respond_health_check(self) -> None:
         stats = self.get_stats()
         diag = self._network_monitor.analyze()
-        await self.send(
+        await self._send_internal(
             "health_check_response",
             {
                 "client_version": CLIENT_VERSION,
@@ -1062,15 +1808,16 @@ class AsyncWSEClient:
         """Handle snapshot completion notification."""
         topics = event.payload.get("topics", [])
         count = event.payload.get("count", 0)
-        self._snapshot_requested = False
-        logger.debug("Snapshot complete: %d events for topics %s", count, topics)
+        self._snapshot_inflight.clear()
+        logger.debug("Snapshot complete: %s events for topics %s", count, topics)
         # User handlers invoked by _dispatch_event fall-through (not internal-only)
 
     def _handle_rate_limit_warning(self, event: WSEEvent) -> None:
-        """Handle rate limit warning from server."""
+        """Log the server's warning (its limit on messages it sends to this
+        connection); the event also reaches user handlers."""
         remaining = event.payload.get("remaining", 0)
         limit = event.payload.get("limit", 0)
-        logger.warning("Rate limit warning: %d/%d remaining", remaining, limit)
+        logger.warning("Rate limit warning: %s/%s remaining", remaining, limit)
         # User handlers invoked by _dispatch_event fall-through (not internal-only)
 
     def _handle_connection_quality(self, event: WSEEvent) -> None:
@@ -1095,7 +1842,7 @@ class AsyncWSEClient:
         self._fire_task(self._respond_sync_request())
 
     async def _respond_sync_request(self) -> None:
-        await self.send(
+        await self._send_internal(
             "sync_response",
             {
                 "client_version": CLIENT_VERSION,
@@ -1113,7 +1860,7 @@ class AsyncWSEClient:
 
     async def _respond_metrics_request(self) -> None:
         diag = self._network_monitor.analyze()
-        await self.send(
+        await self._send_internal(
             "metrics_response",
             {
                 "client_version": CLIENT_VERSION,
@@ -1147,9 +1894,12 @@ class AsyncWSEClient:
         """Unwrap priority_message and re-route the inner message."""
         inner = event.payload.get("message")
         if isinstance(inner, dict):
+            inner_payload = inner.get("p", inner.get("payload", {}))
             inner_event = WSEEvent(
-                type=inner.get("t", inner.get("type", "unknown")),
-                payload=inner.get("p", inner.get("payload", {})),
+                type=str(inner.get("t", inner.get("type", "unknown"))),
+                payload=inner_payload
+                if isinstance(inner_payload, dict)
+                else {"data": inner_payload},
                 id=inner.get("id"),
                 sequence=inner.get("seq"),
                 timestamp=inner.get("ts"),
@@ -1183,30 +1933,7 @@ class AsyncWSEClient:
 
     def _on_state_change(self, state: ConnectionState) -> None:
         if state == ConnectionState.RECONNECTING:
+            # A connection was lost and reconnecting started. The sequencer is
+            # NOT reset: per-topic (epoch, offset) positions and the dedup window
+            # must survive so replayed/duplicate messages are recognised.
             self._stats.reconnect_count += 1
-            if self._server_ready_event is not None:
-                self._server_ready_event.clear()
-            self._snapshot_requested = False
-            # Do NOT reset the sequencer on reconnect: per-topic (epoch, offset)
-            # positions and the dedup window must survive so replayed/duplicate
-            # messages are recognised. A full reset only happens on a new session.
-        elif state == ConnectionState.CONNECTED:
-            pass  # record_ping() is called per-heartbeat via on_ping_sent
-        elif state in (ConnectionState.DISCONNECTED, ConnectionState.ERROR):
-            if self._server_ready_event is not None:
-                self._server_ready_event.clear()
-            # Wake the async iterator on ANY terminal state. ERROR (circuit
-            # breaker open / auth failure / rate limited -- all non-retrying)
-            # previously pushed no sentinel, so `async for` consumers blocked
-            # forever once the breaker tripped. DISCONNECTED is the normal/going-
-            # away close. Transient errors go through RECONNECTING, not here.
-            # Skip if disconnect() already enqueued the sentinel.
-            if not self._disconnecting and self._event_queue is not None:
-                try:
-                    self._event_queue.put_nowait(None)
-                except asyncio.QueueFull:
-                    try:
-                        self._event_queue.get_nowait()
-                        self._event_queue.put_nowait(None)
-                    except (asyncio.QueueEmpty, asyncio.QueueFull):
-                        pass

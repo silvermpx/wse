@@ -47,7 +47,12 @@ class CircuitBreaker:
 
     @property
     def state(self) -> CircuitBreakerState:
-        self._check_timeout()
+        """Current state, OPEN reading as HALF_OPEN once the reset timeout
+        passed. A pure read: the transition itself is made by the next
+        :meth:`can_execute` / ``record_*`` call, so reading stats from another
+        thread never changes the breaker."""
+        if self._timed_out():
+            return CircuitBreakerState.HALF_OPEN
         return self._state
 
     def can_execute(self) -> bool:
@@ -55,6 +60,7 @@ class CircuitBreaker:
         return self._state != CircuitBreakerState.OPEN
 
     def record_success(self) -> None:
+        self._check_timeout()
         if self._state == CircuitBreakerState.HALF_OPEN:
             self._success_count += 1
             if self._success_count >= self._success_threshold:
@@ -65,6 +71,7 @@ class CircuitBreaker:
             self._failure_count = 0
 
     def record_failure(self) -> None:
+        self._check_timeout()
         self._failure_count += 1
         self._last_failure_time = time.monotonic()
 
@@ -91,12 +98,14 @@ class CircuitBreaker:
         self._success_count = 0
         self._last_failure_time = None
 
-    def _check_timeout(self) -> None:
-        if (
+    def _timed_out(self) -> bool:
+        return (
             self._state == CircuitBreakerState.OPEN
             and self._last_failure_time is not None
-        ):
-            elapsed = time.monotonic() - self._last_failure_time
-            if elapsed >= self._reset_timeout:
-                self._state = CircuitBreakerState.HALF_OPEN
-                self._success_count = 0
+            and time.monotonic() - self._last_failure_time >= self._reset_timeout
+        )
+
+    def _check_timeout(self) -> None:
+        if self._timed_out():
+            self._state = CircuitBreakerState.HALF_OPEN
+            self._success_count = 0

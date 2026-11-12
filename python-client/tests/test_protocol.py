@@ -90,7 +90,7 @@ class TestTextDecoding:
         assert codec.decode("not json at all") is None
 
     def test_oversized_message_dropped(self):
-        codec = _make_codec()
+        codec = MessageCodec(CompressionHandler(), max_message_size=1_048_576)
         data = '{"t":"big","p":{}}' + "x" * 2_000_000
         assert codec.decode(data) is None
 
@@ -186,3 +186,71 @@ class TestEncoding:
         assert isinstance(event, WSEEvent)
         assert event.type == "roundtrip"
         assert event.payload == {"hello": "world"}
+
+
+class TestSizeLimit:
+    """The inbound limit is configurable (default 16 MiB) and
+    applies to the inflated size of compressed frames."""
+
+    def test_default_accepts_messages_above_1mib(self):
+        codec = _make_codec()
+        data = json.dumps({"t": "snapshot", "p": {"blob": "x" * 1_500_000}})
+        event = codec.decode(data.encode())
+        assert isinstance(event, WSEEvent)
+        assert event.type == "snapshot"
+
+    def test_compressed_frame_inflating_above_1mib_is_accepted(self):
+        import zlib
+
+        codec = _make_codec()
+        inner = json.dumps({"t": "big", "p": {"blob": "y" * 3_000_000}}).encode()
+        frame = b"C:" + zlib.compress(inner)
+        assert len(frame) < 1_048_576
+        event = codec.decode(frame)
+        assert isinstance(event, WSEEvent) and event.type == "big"
+
+    def test_compressed_bomb_is_dropped(self):
+        import zlib
+
+        codec = MessageCodec(CompressionHandler(), max_message_size=1_048_576)
+        frame = b"C:" + zlib.compress(b"\0" * (64 * 1024 * 1024), 9)
+        assert codec.decode(frame) is None
+        raw = zlib.compress(b" " * (64 * 1024 * 1024), 9)
+        assert codec.decode(raw) is None
+
+    def test_custom_limit_drops_oversized_frames(self):
+        codec = MessageCodec(CompressionHandler(), max_message_size=100)
+        assert codec.decode('{"t":"big","p":{"x":"' + "y" * 200 + '"}}') is None
+        assert codec.decode(b'{"t":"ok","p":{}}').type == "ok"
+
+    def test_no_limit(self):
+        import zlib
+
+        codec = MessageCodec(CompressionHandler(), max_message_size=None)
+        inner = json.dumps({"t": "big", "p": {"blob": "z" * 20_000_000}}).encode()
+        assert codec.decode(b"C:" + zlib.compress(inner)).type == "big"
+
+
+class TestMalformedFrames:
+    """Decode never raises."""
+
+    def test_garbage_msgpack_frame(self):
+        import pytest
+
+        pytest.importorskip("msgpack")
+        from wse_client.msgpack_handler import MsgPackHandler
+
+        codec = MessageCodec(CompressionHandler(), msgpack=MsgPackHandler())
+        assert codec.decode(b"M:\xc1\xc1\xc1") is None
+
+    def test_batch_with_bad_messages(self):
+        codec = _make_codec()
+        assert codec.decode('{"t":"batch","p":{"messages":"nope"}}') is not None
+        result = codec.decode('{"t":"batch","p":{"messages":[1,{"t":"a","p":{}}]}}')
+        assert [e.type for e in result] == ["a"]
+
+    def test_invalid_utf8_after_inflate(self):
+        import zlib
+
+        codec = _make_codec()
+        assert codec.decode(b"C:" + zlib.compress(b"\xff\xfe\xfd")) is None

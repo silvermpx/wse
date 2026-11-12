@@ -47,6 +47,8 @@ from .types import (
     MessagePriority,
     ReconnectConfig,
     ReconnectMode,
+    SendResult,
+    TokenProvider,
     WSEEvent,
 )
 
@@ -55,22 +57,22 @@ def connect(
     url: str,
     **kwargs,
 ) -> AsyncWSEClient:
-    """Create a WSE client connection.
+    """Create a WSE client to use as an async context manager.
 
-    Use as an async context manager. Keyword arguments are forwarded
-    to :class:`AsyncWSEClient` -- common ones: ``token``, ``topics``,
-    ``reconnect``, ``extra_headers``, ``queue_size``.
+    Keyword arguments are forwarded to :class:`AsyncWSEClient` -- common
+    ones: ``token``, ``token_provider``, ``topics``, ``reconnect``,
+    ``extra_headers``, ``queue_size``, ``encryption``. Nothing connects until
+    ``async with`` enters the client, which raises what
+    :meth:`AsyncWSEClient.connect` raises (:class:`WSEAuthError` when the
+    server rejects the credentials, :class:`WSEConnectionError` when it
+    cannot be reached, ...).
 
     Args:
         url: WebSocket server URL, e.g. ``"ws://localhost:5007/wse"``.
         **kwargs: Passed to :class:`AsyncWSEClient`.
 
     Returns:
-        An :class:`AsyncWSEClient` instance.
-
-    Raises:
-        WSEConnectionError: If the connection cannot be established.
-        WSEAuthError: If authentication is rejected.
+        An :class:`AsyncWSEClient` instance (not connected yet).
 
     Example::
 
@@ -97,6 +99,8 @@ __all__ = [
     "ReconnectConfig",
     "ReconnectMode",
     "LoadBalancingStrategy",
+    "SendResult",
+    "TokenProvider",
     "WSEError",
     "WSEConnectionError",
     "WSEAuthError",

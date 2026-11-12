@@ -94,3 +94,48 @@ class TestTopicStamp:
         seq.check_topic_stamp("room", "0000000a", 5)
         seq.reset()
         assert seq.topic_position("room") is None
+
+
+class TestDedupWindowCost:
+    """Eviction scanned the whole 10 000-entry window per message."""
+
+    def test_eviction_drops_the_oldest(self):
+        seq = EventSequencer(window_size=3)
+        for key in ("a", "b", "c", "d", "e"):
+            seq.is_duplicate(key)
+        assert list(seq._seen_ids) == ["c", "d", "e"]
+        assert seq.is_duplicate("e") is True
+        assert seq.is_duplicate("b") is False
+
+    def test_full_window_stays_fast(self):
+        import time
+
+        seq = EventSequencer(window_size=10_000)
+        start = time.perf_counter()
+        for i in range(60_000):
+            seq.is_duplicate(f"id-{i}")
+        # The old min() scan took seconds here; O(1) eviction takes ~0.1 s.
+        assert time.perf_counter() - start < 2.0
+        assert len(seq._seen_ids) == 10_000
+
+    def test_cleanup_drops_only_expired_prefix(self, monkeypatch):
+        import wse_client.event_sequencer as mod
+
+        now = [1000.0]
+        monkeypatch.setattr(mod.time, "monotonic", lambda: now[0])
+        seq = EventSequencer(max_age=10.0)
+        seq.is_duplicate("old-1")
+        seq.is_duplicate("old-2")
+        now[0] = 1008.0
+        seq.is_duplicate("new-1")
+        now[0] = 1012.0
+        seq._cleanup_old_entries()
+        assert list(seq._seen_ids) == ["new-1"]
+
+    def test_clear_topic(self):
+        seq = EventSequencer()
+        seq.check_topic_stamp("room", "0000000a", 5)
+        seq.clear_topic("room")
+        assert seq.topic_position("room") is None
+        # Re-subscribing later baselines on the first message (no gap).
+        assert seq.check_topic_stamp("room", "0000000a", 50) == "deliver"

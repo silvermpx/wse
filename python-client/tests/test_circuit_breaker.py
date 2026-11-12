@@ -76,3 +76,15 @@ class TestCircuitBreaker:
         cb.record_failure()
         # failure_count = 2, still below threshold 3
         assert cb.state == CircuitBreakerState.CLOSED
+
+
+class TestSideEffectFreeState:
+    def test_state_read_does_not_transition(self):
+        """Reading .state flipped OPEN -> HALF_OPEN from any thread."""
+        cb = CircuitBreaker(failure_threshold=1, reset_timeout=0.05)
+        cb.record_failure()
+        time.sleep(0.1)
+        assert cb.state == CircuitBreakerState.HALF_OPEN
+        assert cb._state == CircuitBreakerState.OPEN  # not written by the read
+        assert cb.can_execute() is True  # the act path transitions
+        assert cb._state == CircuitBreakerState.HALF_OPEN

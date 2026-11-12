@@ -132,6 +132,14 @@ class SecurityManager:
 
     def decrypt(self, data: bytes) -> str:
         """Decrypt bytes (without E: prefix) -> plaintext string."""
+        return self.decrypt_bytes(data).decode("utf-8")
+
+    def decrypt_bytes(self, data: bytes) -> bytes:
+        """Decrypt bytes (without E: prefix) -> plaintext bytes.
+
+        The plaintext is JSON text, or an ``M:``-prefixed msgpack payload on
+        a connection that negotiated msgpack, so it is not decoded here.
+        """
         if self._aes_key is None:
             raise WSEEncryptionError("Encryption not initialised")
 
@@ -143,11 +151,9 @@ class SecurityManager:
 
         aes = AESGCM(self._aes_key)
         try:
-            plaintext = aes.decrypt(iv, ciphertext_and_tag, None)
+            return aes.decrypt(iv, ciphertext_and_tag, None)
         except Exception as exc:
             raise WSEEncryptionError(f"Decryption failed: {exc}") from exc
-
-        return plaintext.decode("utf-8")
 
     # -- HMAC-SHA256 signing ---------------------------------------------------
 
@@ -208,12 +214,12 @@ class SecurityManager:
     # -- Key rotation ---------------------------------------------------------
 
     def start_key_rotation(self, interval: float = 3600.0) -> None:
-        """Start periodic key rotation (default: 1 hour).
+        """Start periodic rotation of the HMAC signing key (default: 1 hour).
 
-        Matches TS ``scheduleKeyRotation()``. Rotation is skipped when an
-        ECDH shared secret is active because replacing the ECDH-derived key
-        with a random one would break encryption (server still holds the
-        old shared secret).
+        Matches TS ``scheduleKeyRotation()``. Only the signing key rotates:
+        the ECDH-derived AES key stays for the life of the connection, since
+        the server holds the same shared secret and a new key needs a new
+        connection (and key exchange).
         """
         if self._rotation_task is not None:
             return
