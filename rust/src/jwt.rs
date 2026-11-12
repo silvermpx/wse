@@ -1519,4 +1519,43 @@ mod tests {
         assert!(acl.is_allowed("chat.room"));
         assert!(!acl.is_allowed("admin.users"));
     }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn valid_token() -> String {
+            let config = hs256_config();
+            let claims = serde_json::json!({
+                "sub": "user", "exp": future_exp(),
+                "iss": config.issuer, "aud": config.audience,
+            });
+            jwt_encode(&claims, &test_secret(), JwtAlgorithm::HS256, None).unwrap()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(2000))]
+
+            #[test]
+            fn garbage_tokens_are_rejected(token in ".{0,600}") {
+                prop_assert!(jwt_decode(&token, &hs256_config()).is_err());
+            }
+
+            #[test]
+            fn any_changed_character_is_rejected(pos in any::<prop::sample::Index>(), alt in "[A-Za-z0-9_-]") {
+                let token = valid_token();
+                let i = pos.index(token.len());
+                let original = &token[i..=i];
+                prop_assume!(original != "." && original != alt.as_str());
+                let mut mutated = token.clone();
+                mutated.replace_range(i..=i, &alt);
+                prop_assert!(jwt_decode(&mutated, &hs256_config()).is_err());
+            }
+        }
+
+        #[test]
+        fn the_unchanged_token_is_accepted() {
+            assert!(jwt_decode(&valid_token(), &hs256_config()).is_ok());
+        }
+    }
 }

@@ -1101,4 +1101,59 @@ mod tests {
         mgr.cleanup();
         assert_eq!(mgr.topic_count(), 1);
     }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1000))]
+
+            /// Whatever the history and the client's position, recovery returns
+            /// exactly the missing suffix in order, or says it cannot.
+            #[test]
+            fn recovery_returns_exactly_the_missing_suffix(
+                bits in 1u32..6,
+                pushed in 0usize..200,
+                after in 0u64..210,
+                max_messages in 1usize..300,
+            ) {
+                let cfg = RecoveryConfig {
+                    buffer_size_bits: bits,
+                    max_recovery_messages: max_messages,
+                    ..RecoveryConfig::default()
+                };
+                let mgr = RecoveryManager::new(cfg);
+                for i in 0..pushed {
+                    mgr.push("t", make_data(&format!("m{i}")));
+                }
+                let Some((epoch, head)) = mgr.get_position("t") else {
+                    prop_assert_eq!(pushed, 0);
+                    return Ok(());
+                };
+                prop_assert_eq!(head, pushed as u64);
+                let capacity = 1u64 << bits;
+                let tail = head.saturating_sub(capacity);
+                match mgr.recover("t", epoch, after) {
+                    RecoveryResult::Recovered { publications, offset, .. } => {
+                        let start = after + 1;
+                        prop_assert!(start >= tail);
+                        prop_assert_eq!(offset, head - 1);
+                        let expected: Vec<String> =
+                            (start..head).map(|o| format!("m{o}")).collect();
+                        let got: Vec<String> = publications
+                            .iter()
+                            .map(|b| String::from_utf8(b.to_vec()).unwrap())
+                            .collect();
+                        prop_assert_eq!(got, expected);
+                    }
+                    RecoveryResult::NotRecovered { .. } => {
+                        let missing = head.saturating_sub(after + 1);
+                        prop_assert!(after + 1 < tail || missing > max_messages as u64);
+                    }
+                    RecoveryResult::NoHistory => prop_assert!(false, "history exists"),
+                }
+            }
+        }
+    }
 }

@@ -949,4 +949,62 @@ mod tests {
         // Bomb is rejected before rmpv ever recurses.
         assert!(decode_msgpack_guarded(&nested_arrays(MAX_MSGPACK_DEPTH + 5)).is_err());
     }
+
+    mod properties {
+        use super::super::*;
+        use proptest::prelude::*;
+
+        fn rmpv_value() -> impl Strategy<Value = rmpv::Value> {
+            let leaf = prop_oneof![
+                Just(rmpv::Value::Nil),
+                any::<bool>().prop_map(rmpv::Value::Boolean),
+                any::<i64>().prop_map(|i| rmpv::Value::Integer(i.into())),
+                any::<u64>().prop_map(|u| rmpv::Value::Integer(u.into())),
+                any::<f64>()
+                    .prop_filter("NaN never equals itself", |f| !f.is_nan())
+                    .prop_map(rmpv::Value::F64),
+                ".{0,24}".prop_map(|s| rmpv::Value::String(s.into())),
+                proptest::collection::vec(any::<u8>(), 0..24).prop_map(rmpv::Value::Binary),
+            ];
+            leaf.prop_recursive(6, 64, 6, |inner| {
+                prop_oneof![
+                    proptest::collection::vec(inner.clone(), 0..6).prop_map(rmpv::Value::Array),
+                    proptest::collection::vec((inner.clone(), inner), 0..6)
+                        .prop_map(rmpv::Value::Map),
+                ]
+            })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(2000))]
+
+            #[test]
+            fn arbitrary_bytes_never_panic(data in proptest::collection::vec(any::<u8>(), 0..2048)) {
+                let _ = check_msgpack_depth(&data, MAX_MSGPACK_DEPTH);
+                let _ = decode_msgpack_guarded(&data);
+                let _ = bounded_decompress(&data);
+            }
+
+            #[test]
+            fn msgpack_round_trips(value in rmpv_value()) {
+                let mut buf = Vec::new();
+                rmpv::encode::write_value(&mut buf, &value).unwrap();
+                prop_assert_eq!(decode_msgpack_guarded(&buf), Ok(value));
+            }
+
+            #[test]
+            fn trailing_bytes_are_rejected(value in rmpv_value(), extra in proptest::collection::vec(any::<u8>(), 1..16)) {
+                let mut buf = Vec::new();
+                rmpv::encode::write_value(&mut buf, &value).unwrap();
+                buf.extend_from_slice(&extra);
+                prop_assert!(decode_msgpack_guarded(&buf).is_err());
+            }
+
+            #[test]
+            fn zlib_round_trips(data in proptest::collection::vec(any::<u8>(), 0..8192), level in 1u32..=9) {
+                let packed = zlib_compress(&data, level).unwrap();
+                prop_assert_eq!(bounded_decompress(&packed).unwrap(), data);
+            }
+        }
+    }
 }

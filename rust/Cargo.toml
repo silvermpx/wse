@@ -57,6 +57,8 @@ arc-swap = "1"
 
 [dev-dependencies]
 rcgen = "0.14"
+# Property tests: parsers and buffers fed thousands of random inputs per run.
+proptest = "1.12"
 
 [profile.release]
 lto = true
