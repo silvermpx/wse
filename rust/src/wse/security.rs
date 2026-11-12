@@ -1,18 +1,27 @@
-use aes_gcm::{
-    Aes256Gcm, KeyInit, Nonce,
-    aead::{Aead, Generate},
-};
-use hkdf::Hkdf;
-use hmac::{Hmac, Mac, digest::KeyInit as MacKeyInit};
-use p256::{PublicKey, SecretKey, ecdh::diffie_hellman, elliptic_curve::sec1::ToSec1Point};
-// Random keys and nonces come from `Generate` (crypto-common), which draws from the
-// operating system's RNG through getrandom: `Nonce::generate()`, `SecretKey::try_generate()`.
+//! Cryptographic helpers exposed to Python: HMAC/SHA-256, AES-256-GCM and
+//! ECDH P-256 with HKDF. All of it runs on aws-lc-rs, the same library that
+//! backs the cluster's TLS and JWT validation.
+
+use aws_lc_rs::encoding::{AsBigEndian, EcPrivateKeyBin};
+use aws_lc_rs::{aead, agreement, digest, hkdf, hmac, rand};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
-type HmacSha256 = Hmac<Sha256>;
+/// HKDF info label of the E2E session key; the clients use the same label.
+pub(crate) const E2E_KEY_INFO: &[u8] = b"wse-encryption/aes-gcm-key";
+
+const NONCE_LEN: usize = aead::NONCE_LEN;
+const TAG_LEN: usize = 16;
+
+fn sha256_hex(data: &[u8]) -> String {
+    hex::encode(digest::digest(&digest::SHA256, data))
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
+    hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data)
+}
 
 // ---------------------------------------------------------------------------
 // HMAC / SHA-256 signing
@@ -22,19 +31,13 @@ type HmacSha256 = Hmac<Sha256>;
 /// Returns raw bytes (32 bytes).
 #[pyfunction]
 pub fn rust_hmac_sha256<'py>(py: Python<'py>, key: &[u8], data: &[u8]) -> PyResult<Py<PyBytes>> {
-    let mut mac =
-        <HmacSha256 as MacKeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    let result = mac.finalize().into_bytes();
-    Ok(PyBytes::new(py, &result).unbind())
+    Ok(PyBytes::new(py, hmac_sha256(key, data).as_ref()).unbind())
 }
 
 /// Compute SHA-256 hash of data. Returns hex digest string.
 #[pyfunction]
 pub fn rust_sha256(_py: Python<'_>, data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
+    sha256_hex(data)
 }
 
 /// Sign a JSON payload string using HMAC-SHA256.
@@ -44,21 +47,22 @@ pub fn rust_sha256(_py: Python<'_>, data: &[u8]) -> String {
 /// 3. Return hex-encoded HMAC
 #[pyfunction]
 pub fn rust_sign_message(_py: Python<'_>, payload_json: &str, secret: &[u8]) -> String {
-    // Step 1: SHA-256 hash of payload
-    let mut hasher = Sha256::new();
-    hasher.update(payload_json.as_bytes());
-    let payload_hash = hex::encode(hasher.finalize());
-
-    // Step 2: HMAC-SHA256 of the hash
-    let mut mac =
-        <HmacSha256 as MacKeyInit>::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(payload_hash.as_bytes());
-    hex::encode(mac.finalize().into_bytes())
+    let payload_hash = sha256_hex(payload_json.as_bytes());
+    hex::encode(hmac_sha256(secret, payload_hash.as_bytes()))
 }
 
 // ---------------------------------------------------------------------------
 // AES-GCM-256 encryption / decryption
 // ---------------------------------------------------------------------------
+
+fn aes_256_gcm(key: &[u8]) -> PyResult<aead::LessSafeKey> {
+    if key.len() != 32 {
+        return Err(PyValueError::new_err("AES-GCM-256 key must be 32 bytes"));
+    }
+    let unbound = aead::UnboundKey::new(&aead::AES_256_GCM, key)
+        .map_err(|_| PyValueError::new_err("Invalid AES-GCM-256 key"))?;
+    Ok(aead::LessSafeKey::new(unbound))
+}
 
 /// Encrypt plaintext using AES-GCM-256.
 ///
@@ -67,23 +71,24 @@ pub fn rust_sign_message(_py: Python<'_>, payload_json: &str, secret: &[u8]) -> 
 /// Wire format matches frontend security.ts.
 #[pyfunction]
 pub fn rust_aes_gcm_encrypt(py: Python, key: &[u8], plaintext: &[u8]) -> PyResult<Py<PyBytes>> {
-    if key.len() != 32 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "AES-GCM-256 key must be 32 bytes",
-        ));
-    }
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid key: {e}")))?;
-    let nonce = Nonce::generate();
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Encrypt failed: {e}")))?;
+    let cipher = aes_256_gcm(key)?;
+    let mut nonce = [0u8; NONCE_LEN];
+    rand::fill(&mut nonce).map_err(|_| PyRuntimeError::new_err("System RNG failed"))?;
 
     // [12-byte nonce][ciphertext + 16-byte tag]
-    let mut result = Vec::with_capacity(12 + ciphertext.len());
-    result.extend_from_slice(&nonce);
-    result.extend_from_slice(&ciphertext);
-    Ok(PyBytes::new(py, &result).unbind())
+    let mut out = Vec::with_capacity(NONCE_LEN + plaintext.len() + TAG_LEN);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(plaintext);
+    let mut body = out.split_off(NONCE_LEN);
+    cipher
+        .seal_in_place_append_tag(
+            aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::empty(),
+            &mut body,
+        )
+        .map_err(|_| PyRuntimeError::new_err("Encrypt failed"))?;
+    out.extend_from_slice(&body);
+    Ok(PyBytes::new(py, &out).unbind())
 }
 
 /// Decrypt AES-GCM-256 ciphertext.
@@ -94,31 +99,46 @@ pub fn rust_aes_gcm_encrypt(py: Python, key: &[u8], plaintext: &[u8]) -> PyResul
 #[pyfunction]
 pub fn rust_aes_gcm_decrypt(py: Python, key: &[u8], data: &[u8]) -> PyResult<Py<PyBytes>> {
     // Minimum: 12 (IV) + 16 (tag) = 28 bytes for empty plaintext
-    if data.len() < 28 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
+    if data.len() < NONCE_LEN + TAG_LEN {
+        return Err(PyValueError::new_err(
             "Encrypted data too short (min 28 bytes: 12 IV + 16 tag)",
         ));
     }
-    if key.len() != 32 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "AES-GCM-256 key must be 32 bytes",
-        ));
-    }
-    let (nonce_bytes, ciphertext) = data.split_at(12);
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid key: {e}")))?;
-    let nonce_arr: [u8; 12] = nonce_bytes
-        .try_into()
-        .expect("split_at(12) guarantees 12 bytes");
+    let cipher = aes_256_gcm(key)?;
+    let (nonce_bytes, ciphertext) = data.split_at(NONCE_LEN);
+    let nonce = aead::Nonce::try_assume_unique_for_key(nonce_bytes)
+        .map_err(|_| PyValueError::new_err("Invalid nonce"))?;
+    let mut buf = ciphertext.to_vec();
     let plaintext = cipher
-        .decrypt(&nonce_arr.into(), ciphertext)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Decrypt failed: {e}")))?;
-    Ok(PyBytes::new(py, &plaintext).unbind())
+        .open_in_place(nonce, aead::Aad::empty(), &mut buf)
+        .map_err(|_| PyRuntimeError::new_err("Decrypt failed: wrong key or corrupted data"))?;
+    Ok(PyBytes::new(py, plaintext).unbind())
 }
 
 // ---------------------------------------------------------------------------
 // ECDH P-256 key exchange
 // ---------------------------------------------------------------------------
+
+/// HKDF output length of an AES-256 key.
+struct AesKeyLen;
+
+impl hkdf::KeyType for AesKeyLen {
+    fn len(&self) -> usize {
+        32
+    }
+}
+
+/// HKDF-SHA256 over an ECDH shared secret into the 32-byte E2E key.
+///
+/// salt = none (RFC 5869's default of HashLen zero bytes; an empty HMAC key is
+/// the same key), info = `E2E_KEY_INFO`. Clients derive the identical key.
+pub(crate) fn e2e_key_from_shared_secret(shared_secret: &[u8], out: &mut [u8; 32]) -> bool {
+    hkdf::Salt::new(hkdf::HKDF_SHA256, &[])
+        .extract(shared_secret)
+        .expand(&[E2E_KEY_INFO], AesKeyLen)
+        .and_then(|okm| okm.fill(out))
+        .is_ok()
+}
 
 /// Generate an ECDH P-256 keypair.
 ///
@@ -126,25 +146,19 @@ pub fn rust_aes_gcm_decrypt(py: Python, key: &[u8], data: &[u8]) -> PyResult<Py<
 /// Public key format: 0x04 || X (32 bytes) || Y (32 bytes) — SEC1 uncompressed.
 #[pyfunction]
 pub fn rust_ecdh_generate_keypair(py: Python) -> PyResult<(Py<PyBytes>, Py<PyBytes>)> {
-    let secret = SecretKey::try_generate().map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("System RNG failed: {e}"))
-    })?;
-    let public = secret.public_key();
-
-    // Private key: 32-byte scalar. `secret` itself zeroizes on drop; we also wipe
-    // our serialized copy after handing the bytes to Python so it does not linger
-    // in freed stack/heap (crash dumps, core files).
-    let mut sk_bytes = secret.to_bytes();
-
-    // Public key: uncompressed SEC1 point (65 bytes)
-    let pk_point = public.to_sec1_point(false);
-
-    let result = (
-        PyBytes::new(py, &sk_bytes).unbind(),
-        PyBytes::new(py, pk_point.as_bytes()).unbind(),
-    );
-    sk_bytes[..].zeroize();
-    Ok(result)
+    let private = agreement::PrivateKey::generate(&agreement::ECDH_P256)
+        .map_err(|_| PyRuntimeError::new_err("System RNG failed"))?;
+    let public = private
+        .compute_public_key()
+        .map_err(|_| PyRuntimeError::new_err("Key generation failed"))?;
+    // The raw scalar's buffer is wiped when it is dropped.
+    let scalar: EcPrivateKeyBin = private
+        .as_be_bytes()
+        .map_err(|_| PyRuntimeError::new_err("Key export failed"))?;
+    Ok((
+        PyBytes::new(py, scalar.as_ref()).unbind(),
+        PyBytes::new(py, public.as_ref()).unbind(),
+    ))
 }
 
 /// Derive a 32-byte AES key from ECDH shared secret + HKDF-SHA256.
@@ -163,24 +177,19 @@ pub fn rust_ecdh_derive_shared_secret(
     private_key: &[u8],
     peer_public_key: &[u8],
 ) -> PyResult<Py<PyBytes>> {
-    let secret = SecretKey::from_slice(private_key).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("Invalid private key: {e}"))
-    })?;
-    let peer_pk = PublicKey::from_sec1_bytes(peer_public_key).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("Invalid peer public key: {e}"))
-    })?;
+    let private = agreement::PrivateKey::from_private_key(&agreement::ECDH_P256, private_key)
+        .map_err(|_| PyValueError::new_err("Invalid private key"))?;
+    let peer = agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, peer_public_key);
 
-    // ECDH key agreement
-    let shared = diffie_hellman(secret.to_nonzero_scalar(), peer_pk.as_affine());
-
-    // HKDF-SHA256 (RFC 5869): IKM = ECDH shared secret, salt = None (zero-salt),
-    // info = context label for domain separation. All 4 components must match.
-    let hkdf = Hkdf::<Sha256>::new(None, shared.raw_secret_bytes());
     let mut aes_key = [0u8; 32];
-    hkdf.expand(b"wse-encryption/aes-gcm-key", &mut aes_key)
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("HKDF expand failed: {e}"))
-        })?;
+    agreement::agree(&private, peer, (), |shared| {
+        if e2e_key_from_shared_secret(shared, &mut aes_key) {
+            Ok(())
+        } else {
+            Err(())
+        }
+    })
+    .map_err(|()| PyValueError::new_err("Invalid peer public key"))?;
 
     // Hand the key to Python, then wipe our copy from the stack.
     let result = PyBytes::new(py, &aes_key).unbind();
@@ -196,88 +205,99 @@ pub fn rust_ecdh_derive_shared_secret(
 mod tests {
     use super::*;
 
+    fn seal(key: &[u8], plaintext: &[u8]) -> Vec<u8> {
+        let cipher =
+            aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_256_GCM, key).unwrap());
+        let mut nonce = [0u8; NONCE_LEN];
+        rand::fill(&mut nonce).unwrap();
+        let mut body = plaintext.to_vec();
+        cipher
+            .seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::empty(),
+                &mut body,
+            )
+            .unwrap();
+        [nonce.as_slice(), &body].concat()
+    }
+
+    fn open(key: &[u8], blob: &[u8]) -> Option<Vec<u8>> {
+        let cipher =
+            aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_256_GCM, key).unwrap());
+        let (n, c) = blob.split_at(NONCE_LEN);
+        let mut buf = c.to_vec();
+        cipher
+            .open_in_place(
+                aead::Nonce::try_assume_unique_for_key(n).unwrap(),
+                aead::Aad::empty(),
+                &mut buf,
+            )
+            .ok()
+            .map(|p| p.to_vec())
+    }
+
     #[test]
     fn aes_gcm_roundtrip() {
         let key = [0xABu8; 32];
-        let plaintext = b"Hello, WSE!";
-
-        // Encrypt
-        let cipher = Aes256Gcm::new_from_slice(&key).expect("key should be valid");
-        let nonce = Nonce::generate();
-        let ct = cipher.encrypt(&nonce, &plaintext[..]).expect("encrypt");
-
-        let mut blob = Vec::with_capacity(12 + ct.len());
-        blob.extend_from_slice(&nonce);
-        blob.extend_from_slice(&ct);
-
-        // Decrypt
-        let (n, c) = blob.split_at(12);
-        let nonce_arr: [u8; 12] = n.try_into().unwrap();
-        let dec = cipher.decrypt(&nonce_arr.into(), c).expect("decrypt");
-        assert_eq!(&dec, plaintext);
+        let blob = seal(&key, b"Hello, WSE!");
+        assert_eq!(open(&key, &blob).as_deref(), Some(&b"Hello, WSE!"[..]));
     }
 
     #[test]
     fn aes_gcm_wrong_key_fails() {
-        let key1 = [0x01u8; 32];
-        let key2 = [0x02u8; 32];
-
-        let cipher1 = Aes256Gcm::new_from_slice(&key1).unwrap();
-        let nonce = Nonce::generate();
-        let ct = cipher1.encrypt(&nonce, b"secret".as_ref()).unwrap();
-
-        let mut blob = Vec::new();
-        blob.extend_from_slice(&nonce);
-        blob.extend_from_slice(&ct);
-
-        let cipher2 = Aes256Gcm::new_from_slice(&key2).unwrap();
-        let (n, c) = blob.split_at(12);
-        let nonce_arr: [u8; 12] = n.try_into().unwrap();
-        assert!(cipher2.decrypt(&nonce_arr.into(), c).is_err());
+        let blob = seal(&[0x01u8; 32], b"secret");
+        assert!(open(&[0x02u8; 32], &blob).is_none());
     }
 
     #[test]
     fn ecdh_shared_secret_symmetric() {
-        let sk_a = SecretKey::generate();
-        let pk_a = sk_a.public_key();
-        let sk_b = SecretKey::generate();
-        let pk_b = sk_b.public_key();
-
-        let shared_ab = diffie_hellman(sk_a.to_nonzero_scalar(), pk_b.as_affine());
-        let shared_ba = diffie_hellman(sk_b.to_nonzero_scalar(), pk_a.as_affine());
-
-        assert_eq!(shared_ab.raw_secret_bytes(), shared_ba.raw_secret_bytes());
+        let a = agreement::PrivateKey::generate(&agreement::ECDH_P256).unwrap();
+        let b = agreement::PrivateKey::generate(&agreement::ECDH_P256).unwrap();
+        let pub_a = a.compute_public_key().unwrap();
+        let pub_b = b.compute_public_key().unwrap();
+        let ab = agreement::agree(
+            &a,
+            agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, pub_b.as_ref()),
+            (),
+            |s| Ok(s.to_vec()),
+        )
+        .unwrap();
+        let ba = agreement::agree(
+            &b,
+            agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, pub_a.as_ref()),
+            (),
+            |s| Ok(s.to_vec()),
+        )
+        .unwrap();
+        assert_eq!(ab, ba);
+        assert_eq!(pub_a.as_ref().len(), 65);
+        assert_eq!(pub_a.as_ref()[0], 0x04);
     }
 
     #[test]
-    fn ecdh_hkdf_derives_32_byte_key() {
-        let sk = SecretKey::generate();
-        let pk = sk.public_key();
-        // Self-exchange just to test HKDF
-        let shared = diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine());
-        // Must match production: salt=None, info="wse-encryption/aes-gcm-key"
-        let hkdf = Hkdf::<Sha256>::new(None, shared.raw_secret_bytes());
-        let mut key = [0u8; 32];
-        hkdf.expand(b"wse-encryption/aes-gcm-key", &mut key)
+    fn hkdf_matches_rfc5869_zero_salt() {
+        // An empty salt and HashLen zero bytes must give the same key: the
+        // clients use the RFC default (salt=None), aws-lc-rs gets an empty one.
+        let shared = [7u8; 32];
+        let mut ours = [0u8; 32];
+        assert!(e2e_key_from_shared_secret(&shared, &mut ours));
+        let mut explicit = [0u8; 32];
+        hkdf::Salt::new(hkdf::HKDF_SHA256, &[0u8; 32])
+            .extract(&shared)
+            .expand(&[E2E_KEY_INFO], AesKeyLen)
+            .unwrap()
+            .fill(&mut explicit)
             .unwrap();
-        assert_eq!(key.len(), 32);
-        // Key should not be all zeros
-        assert!(key.iter().any(|&b| b != 0));
+        assert_eq!(ours, explicit);
+        assert!(ours.iter().any(|&b| b != 0));
     }
 
     #[test]
-    fn hmac_sha256_deterministic() {
-        let key = b"test-key";
-        let data = b"test-data";
-
-        let mut mac1 = <HmacSha256 as MacKeyInit>::new_from_slice(key).unwrap();
-        mac1.update(data);
-        let r1 = mac1.finalize().into_bytes();
-
-        let mut mac2 = <HmacSha256 as MacKeyInit>::new_from_slice(key).unwrap();
-        mac2.update(data);
-        let r2 = mac2.finalize().into_bytes();
-
-        assert_eq!(r1, r2);
+    fn hmac_sha256_matches_rfc4231_case_2() {
+        let tag = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            hex::encode(tag.as_ref()),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
     }
 }

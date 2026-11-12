@@ -2286,6 +2286,7 @@ dependencies = [
  "aes-gcm",
  "ahash",
  "arc-swap",
+ "aws-lc-rs",
  "base64 0.23.1",
  "bytes",
  "chrono",

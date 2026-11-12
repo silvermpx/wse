@@ -13,6 +13,11 @@ from wse_server import (
     RustPriorityMessageQueue,
     RustPriorityQueue,
     RustSequencer,
+    rust_aes_gcm_decrypt,
+    rust_aes_gcm_encrypt,
+    rust_ecdh_derive_shared_secret,
+    rust_ecdh_generate_keypair,
+    rust_hmac_sha256,
     rust_jwt_decode,
     rust_jwt_encode,
     rust_match_event,
@@ -218,3 +223,61 @@ class TestJwtEncode:
             rust_jwt_encode({"sub": "u", "big": 2**70}, SECRET)
         with pytest.raises(TypeError):
             rust_jwt_encode({"sub": "u", "x": float("nan")}, SECRET)
+
+
+# ---------------------------------------------------------------------------
+# Crypto helpers: byte-for-byte interop with the `cryptography` package
+# ---------------------------------------------------------------------------
+
+
+class TestCryptoInterop:
+    def test_ecdh_hkdf_key_matches_cryptography(self):
+        ec = pytest.importorskip("cryptography.hazmat.primitives.asymmetric.ec")
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+        ours_private, ours_public = rust_ecdh_generate_keypair()
+        assert len(ours_private) == 32 and len(ours_public) == 65
+        theirs = ec.generate_private_key(ec.SECP256R1())
+        theirs_public = theirs.public_key().public_bytes(
+            serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
+        )
+
+        key_rust = rust_ecdh_derive_shared_secret(ours_private, theirs_public)
+
+        shared = theirs.exchange(
+            ec.ECDH(), ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), ours_public)
+        )
+        key_py = HKDF(
+            algorithm=hashes.SHA256(), length=32, salt=None, info=b"wse-encryption/aes-gcm-key"
+        ).derive(shared)
+        assert key_rust == key_py
+
+    def test_aes_gcm_interop_both_ways(self):
+        aead = pytest.importorskip("cryptography.hazmat.primitives.ciphers.aead")
+        key = bytes(range(32))
+        blob = rust_aes_gcm_encrypt(key, b"hello")
+        assert aead.AESGCM(key).decrypt(blob[:12], blob[12:], None) == b"hello"
+        nonce = b"\x01" * 12
+        theirs = nonce + aead.AESGCM(key).encrypt(nonce, b"world", None)
+        assert rust_aes_gcm_decrypt(key, theirs) == b"world"
+
+    def test_aes_gcm_rejects_tampering_and_bad_input(self):
+        key = bytes(32)
+        blob = bytearray(rust_aes_gcm_encrypt(key, b"data"))
+        blob[-1] ^= 1
+        with pytest.raises(RuntimeError):
+            rust_aes_gcm_decrypt(key, bytes(blob))
+        with pytest.raises(ValueError):
+            rust_aes_gcm_encrypt(b"short", b"x")
+        with pytest.raises(ValueError):
+            rust_aes_gcm_decrypt(key, b"too short")
+
+    def test_invalid_peer_key_is_a_value_error(self):
+        private, _ = rust_ecdh_generate_keypair()
+        with pytest.raises(ValueError):
+            rust_ecdh_derive_shared_secret(private, b"\x04" + bytes(64))
+
+    def test_hmac_sha256_known_answer(self):
+        tag = rust_hmac_sha256(b"Jefe", b"what do ya want for nothing?")
+        assert tag.hex() == "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
