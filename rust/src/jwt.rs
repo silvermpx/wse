@@ -156,6 +156,11 @@ fn make_decoding_key(
             if key.len() < MIN_HS256_KEY_LEN {
                 return Err(JwtError::KeyTooShort);
             }
+            if key.starts_with(b"-----BEGIN") {
+                return Err(JwtError::InvalidKey(
+                    "HS256 secret is a PEM key; set the algorithm to RS256 or ES256".into(),
+                ));
+            }
             Ok(jsonwebtoken::DecodingKey::from_secret(key))
         }
         JwtAlgorithm::RS256 => Ok(jsonwebtoken::DecodingKey::from_rsa_pem(key)?),
@@ -172,6 +177,11 @@ fn make_encoding_key(
         JwtAlgorithm::HS256 => {
             if key.len() < MIN_HS256_KEY_LEN {
                 return Err(JwtError::KeyTooShort);
+            }
+            if key.starts_with(b"-----BEGIN") {
+                return Err(JwtError::InvalidKey(
+                    "HS256 secret is a PEM key; set the algorithm to RS256 or ES256".into(),
+                ));
             }
             Ok(jsonwebtoken::EncodingKey::from_secret(key))
         }
@@ -190,17 +200,21 @@ fn make_validation(
     v.leeway = CLOCK_SKEW_SECS;
     v.validate_exp = true;
     v.validate_nbf = true;
-    v.set_required_spec_claims(&["exp"]);
 
+    // A configured issuer or audience is also a required claim: otherwise a
+    // token that simply omits it (or carries an unparseable value) passes.
+    let mut required = vec!["exp"];
     if let Some(iss) = issuer {
         v.set_issuer(&[iss]);
+        required.push("iss");
     }
-
     if let Some(aud) = audience {
         v.set_audience(&[aud]);
+        required.push("aud");
     } else {
         v.validate_aud = false;
     }
+    v.set_required_spec_claims(&required);
 
     v
 }
@@ -414,7 +428,7 @@ pub fn rust_jwt_encode(
         ))
     })?;
 
-    let json_val = pydict_to_json(claims);
+    let json_val = pydict_to_json(claims)?;
 
     jwt_encode(&json_val, secret, alg, key_id)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("JWT encode error: {e}")))
@@ -424,67 +438,80 @@ pub fn rust_jwt_encode(
 // PyDict <-> serde_json conversion helpers
 // ---------------------------------------------------------------------------
 
-use pyo3::types::{PyBool, PyFloat, PyInt, PyList, PyString};
+use pyo3::types::{PyBool, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyString, PyTuple};
 
-fn pydict_to_json(dict: &Bound<'_, PyDict>) -> serde_json::Value {
+fn pydict_to_json(dict: &Bound<'_, PyDict>) -> PyResult<serde_json::Value> {
     let mut map = serde_json::Map::new();
     for (k, v) in dict.iter() {
         let key = k.extract::<String>().unwrap_or_else(|_| format!("{}", k));
-        map.insert(key, pyany_to_json(&v));
+        map.insert(key, pyany_to_json(&v)?);
     }
-    serde_json::Value::Object(map)
+    Ok(serde_json::Value::Object(map))
 }
 
-fn pyany_to_json(obj: &Bound<'_, PyAny>) -> serde_json::Value {
+/// Convert one claim value. datetime becomes an integer UTC timestamp (as
+/// PyJWT does for exp/iat/nbf), tuples, lists, sets and frozensets become
+/// arrays. Anything JSON cannot represent raises TypeError rather than turning
+/// into a string the token's consumers would misread.
+fn pyany_to_json(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+    let unsupported = || {
+        pyo3::exceptions::PyTypeError::new_err(format!(
+            "JWT claim value of type {} is not JSON serializable",
+            obj.get_type()
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_default()
+        ))
+    };
     if obj.is_none() {
-        return serde_json::Value::Null;
+        return Ok(serde_json::Value::Null);
     }
     // Bool before int (bool is subclass of int in Python)
-    if obj.is_instance_of::<PyBool>()
-        && let Ok(b) = obj.extract::<bool>()
-    {
-        return serde_json::Value::Bool(b);
+    if obj.is_instance_of::<PyBool>() {
+        return Ok(serde_json::Value::Bool(obj.extract::<bool>()?));
     }
-    if obj.is_instance_of::<PyInt>()
-        && let Ok(i) = obj.extract::<i64>()
-    {
-        return serde_json::Value::Number(i.into());
+    if obj.is_instance_of::<PyInt>() {
+        if let Ok(i) = obj.extract::<i64>() {
+            return Ok(serde_json::Value::Number(i.into()));
+        }
+        if let Ok(u) = obj.extract::<u64>() {
+            return Ok(serde_json::Value::Number(u.into()));
+        }
+        return Err(unsupported());
     }
-    if obj.is_instance_of::<PyFloat>()
-        && let Ok(f) = obj.extract::<f64>()
-        && let Some(n) = serde_json::Number::from_f64(f)
-    {
-        return serde_json::Value::Number(n);
+    if obj.is_instance_of::<PyFloat>() {
+        return serde_json::Number::from_f64(obj.extract::<f64>()?)
+            .map(serde_json::Value::Number)
+            .ok_or_else(unsupported);
     }
-    if obj.is_instance_of::<PyString>()
-        && let Ok(s) = obj.extract::<String>()
-    {
-        return serde_json::Value::String(s);
+    if obj.is_instance_of::<PyString>() {
+        return Ok(serde_json::Value::String(obj.extract::<String>()?));
     }
-    if obj.is_instance_of::<PyDict>()
-        && let Ok(dict) = obj.cast::<PyDict>()
-    {
+    if let Ok(dict) = obj.cast::<PyDict>() {
         return pydict_to_json(dict);
     }
     if obj.is_instance_of::<PyList>()
-        && let Ok(list) = obj.cast::<PyList>()
+        || obj.is_instance_of::<PyTuple>()
+        || obj.is_instance_of::<PySet>()
+        || obj.is_instance_of::<PyFrozenSet>()
     {
-        let arr: Vec<serde_json::Value> = list.iter().map(|item| pyany_to_json(&item)).collect();
-        return serde_json::Value::Array(arr);
+        let mut arr = Vec::new();
+        for item in obj.try_iter()? {
+            arr.push(pyany_to_json(&item?)?);
+        }
+        return Ok(serde_json::Value::Array(arr));
     }
-    // Datetime objects: try isoformat()
-    if let Ok(iso) = obj.call_method0("isoformat")
-        && let Ok(s) = iso.extract::<String>()
-    {
-        return serde_json::Value::String(s);
+    // datetime: integer seconds since the epoch, naive values read as UTC.
+    if obj.hasattr("utctimetuple")? && obj.hasattr("hour")? {
+        let utc = obj.call_method0("utctimetuple")?;
+        let ts: i64 = obj
+            .py()
+            .import("calendar")?
+            .call_method1("timegm", (utc,))?
+            .extract()?;
+        return Ok(serde_json::Value::Number(ts.into()));
     }
-    // Fallback: str(obj)
-    if let Ok(s) = obj.str()
-        && let Ok(s) = s.extract::<String>()
-    {
-        return serde_json::Value::String(s);
-    }
-    serde_json::Value::Null
+    Err(unsupported())
 }
 
 fn json_value_to_py(py: Python<'_>, val: &serde_json::Value) -> Py<PyAny> {
@@ -542,6 +569,14 @@ pub struct TopicAcl {
 }
 
 impl TopicAcl {
+    /// An ACL that allows no topic at all.
+    pub fn deny_all() -> Self {
+        Self {
+            allow: Vec::new(),
+            deny: vec!["*".to_string()],
+        }
+    }
+
     /// Check if a topic is allowed by this ACL.
     ///
     /// Deny rules take precedence. Empty allow = allow all.
@@ -571,32 +606,47 @@ impl TopicAcl {
 
 /// Extract optional topic ACL from JWT claims.
 ///
-/// Returns `None` if no `wse_topics` claim is present (backward compatible).
+/// No `wse_topics` claim means no restriction (`None`). Inside the claim, an
+/// absent `allow` key allows every topic not denied, and an `allow` list
+/// allows only what it matches - so an explicit empty list allows nothing. A
+/// claim that is not an object of string lists denies everything: a
+/// restriction the issuer meant to set must never turn into "allow all".
 pub fn extract_topic_acl(claims: &serde_json::Value) -> Option<TopicAcl> {
     let topics = claims.get("wse_topics")?;
-    let obj = topics.as_object()?;
+    let Some(obj) = topics.as_object() else {
+        tracing::warn!("[WSE] wse_topics claim is not an object; denying all topics");
+        return Some(TopicAcl::deny_all());
+    };
 
-    let allow = obj
-        .get("allow")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let deny = obj
-        .get("deny")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut lists = [Vec::new(), Vec::new()];
+    for (slot, key) in lists.iter_mut().zip(["allow", "deny"]) {
+        if let Some(value) = obj.get(key) {
+            match string_list(value) {
+                Some(list) => *slot = list,
+                None => {
+                    tracing::warn!(
+                        "[WSE] wse_topics.{key} is not a list of strings; denying all topics"
+                    );
+                    return Some(TopicAcl::deny_all());
+                }
+            }
+        }
+    }
+    let [allow, deny] = lists;
+    if obj.contains_key("allow") && allow.is_empty() {
+        return Some(TopicAcl::deny_all());
+    }
 
     Some(TopicAcl { allow, deny })
+}
+
+/// A JSON array of strings, or `None` if the value is anything else.
+fn string_list(value: &serde_json::Value) -> Option<Vec<String>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|v| v.as_str().map(String::from))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,5 +1456,67 @@ mod tests {
         // No wse_topics claim = no ACL = extract returns None
         let claims = serde_json::json!({"sub": "user1", "iss": "myapp"});
         assert!(extract_topic_acl(&claims).is_none());
+    }
+
+    #[test]
+    fn configured_issuer_and_audience_are_required() {
+        let config = hs256_config();
+        let claims_no_iss = serde_json::json!({
+            "sub": "u", "exp": future_exp(), "aud": config.audience.clone(),
+        });
+        let token = jwt_encode(&claims_no_iss, &test_secret(), JwtAlgorithm::HS256, None).unwrap();
+        assert!(
+            jwt_decode(&token, &config).is_err(),
+            "token without iss accepted"
+        );
+
+        let claims_no_aud = serde_json::json!({
+            "sub": "u", "exp": future_exp(), "iss": config.issuer.clone(),
+        });
+        let token = jwt_encode(&claims_no_aud, &test_secret(), JwtAlgorithm::HS256, None).unwrap();
+        assert!(
+            jwt_decode(&token, &config).is_err(),
+            "token without aud accepted"
+        );
+
+        let claims_bad_aud = serde_json::json!({
+            "sub": "u", "exp": future_exp(), "iss": config.issuer.clone(), "aud": 1,
+        });
+        let token = jwt_encode(&claims_bad_aud, &test_secret(), JwtAlgorithm::HS256, None).unwrap();
+        assert!(
+            jwt_decode(&token, &config).is_err(),
+            "token with aud=1 accepted"
+        );
+    }
+
+    #[test]
+    fn pem_key_is_not_an_hs256_secret() {
+        let pem = b"-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE\n-----END PUBLIC KEY-----\n";
+        let claims = serde_json::json!({"sub": "u", "exp": future_exp()});
+        assert!(jwt_encode(&claims, pem, JwtAlgorithm::HS256, None).is_err());
+    }
+
+    #[test]
+    fn malformed_topic_acl_denies_everything() {
+        for claim in [
+            serde_json::json!(["chat.*"]),
+            serde_json::json!({"allow": "chat.*"}),
+            serde_json::json!({"allow": [1, 2]}),
+            serde_json::json!({"deny": "admin.*"}),
+            serde_json::json!({"allow": []}),
+        ] {
+            let acl = extract_topic_acl(&serde_json::json!({"wse_topics": claim.clone()}))
+                .expect("an ACL must be installed");
+            assert!(!acl.is_allowed("chat.room"), "{claim} allowed chat.room");
+            assert!(!acl.is_allowed("a.b:c"), "{claim} allowed a.b:c");
+        }
+    }
+
+    #[test]
+    fn topic_acl_without_allow_key_allows_what_is_not_denied() {
+        let acl =
+            extract_topic_acl(&serde_json::json!({"wse_topics": {"deny": ["admin.*"]}})).unwrap();
+        assert!(acl.is_allowed("chat.room"));
+        assert!(!acl.is_allowed("admin.users"));
     }
 }

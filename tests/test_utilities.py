@@ -1,5 +1,6 @@
 """Regression tests for the Rust utility classes and functions in wse_server."""
 
+import datetime
 import decimal
 import uuid
 
@@ -12,6 +13,8 @@ from wse_server import (
     RustPriorityMessageQueue,
     RustPriorityQueue,
     RustSequencer,
+    rust_jwt_decode,
+    rust_jwt_encode,
     rust_match_event,
     rust_transform_event,
 )
@@ -185,3 +188,33 @@ class TestQueues:
         q = RustPriorityQueue(10**12)
         assert q.push(1, "x")
         assert RustSequencer(10**12).next_seq() == 1
+
+
+# ---------------------------------------------------------------------------
+# JWT claim encoding
+# ---------------------------------------------------------------------------
+
+SECRET = b"a-test-secret-that-is-long-enough!!"
+
+
+class TestJwtEncode:
+    def test_datetime_claims_become_timestamps(self):
+        exp = datetime.datetime(2099, 1, 1, tzinfo=datetime.UTC)
+        token = rust_jwt_encode({"sub": "u", "exp": exp}, SECRET)
+        claims = rust_jwt_decode(token, SECRET)
+        assert claims["exp"] == int(exp.timestamp())
+
+    def test_tuples_and_sets_become_arrays(self):
+        exp = int(datetime.datetime(2099, 1, 1, tzinfo=datetime.UTC).timestamp())
+        claims = {"sub": "u", "exp": exp, "wse_topics": {"allow": ("chat.*",)}, "roles": {"a"}}
+        decoded = rust_jwt_decode(rust_jwt_encode(claims, SECRET), SECRET)
+        assert decoded["wse_topics"] == {"allow": ["chat.*"]}
+        assert decoded["roles"] == ["a"]
+
+    def test_unsupported_values_raise(self):
+        with pytest.raises(TypeError):
+            rust_jwt_encode({"sub": "u", "obj": object()}, SECRET)
+        with pytest.raises(TypeError):
+            rust_jwt_encode({"sub": "u", "big": 2**70}, SECRET)
+        with pytest.raises(TypeError):
+            rust_jwt_encode({"sub": "u", "x": float("nan")}, SECRET)

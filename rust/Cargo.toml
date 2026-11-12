@@ -24,7 +24,8 @@ sha2 = "0.11"
 hex = "0.4"
 ahash = "0.8.12"
 dashmap = "6"
-aes-gcm = { version = "0.11", features = ["getrandom"] }
+# zeroize: AES key schedules are wiped when a cipher is dropped.
+aes-gcm = { version = "0.11", features = ["getrandom", "zeroize"] }
 # Key generation uses p256's own getrandom-backed `Generate` (default `std` feature).
 p256 = { version = "0.14", features = ["ecdh"] }
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
