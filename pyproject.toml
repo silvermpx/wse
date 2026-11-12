@@ -68,7 +68,7 @@ Issues = "https://github.com/silvermpx/wse/issues"
 Changelog = "https://github.com/silvermpx/wse/releases"
 
 [tool.maturin]
-features = ["pyo3/extension-module", "pyo3/abi3-py312"]
+features = ["pyo3/abi3-py312"]
 module-name = "wse_server._wse_accel"
 manifest-path = "rust/Cargo.toml"
 

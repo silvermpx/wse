@@ -10,7 +10,10 @@ name = "_wse_accel"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.30", features = ["extension-module", "abi3-py312"] }
+# No `extension-module` feature (deprecated since PyO3 0.26): maturin sets
+# PYO3_BUILD_EXTENSION_MODULE for wheel builds, and without the feature
+# `cargo test` links libpython, so the Rust unit tests can run.
+pyo3 = { version = "0.30", features = ["abi3-py312"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs"] }
