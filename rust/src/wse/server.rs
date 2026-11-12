@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use super::cluster::{ClusterCommand, ClusterDlq, ClusterMetrics};
 use super::compression::{decode_msgpack_guarded, rmpv_to_serde_json, serde_json_to_rmpv};
+use super::pylock::lock;
 use crate::jwt::{self, JwtConfig, parse_cookie_value};
 use ahash::AHashSet;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -29,6 +30,7 @@ use flate2::write::ZlibEncoder;
 use futures_util::{SinkExt, StreamExt};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::sync::RwLockExt;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -885,7 +887,8 @@ fn derive_connection_key(client_pubkey_b64: &str) -> Result<(String, aes_gcm::Ae
     use base64::Engine;
     use hkdf::Hkdf;
     use p256::ecdh::diffie_hellman;
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::Generate;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     use p256::{PublicKey, SecretKey};
     use sha2::Sha256;
 
@@ -896,7 +899,7 @@ fn derive_connection_key(client_pubkey_b64: &str) -> Result<(String, aes_gcm::Ae
     let client_pk = PublicKey::from_sec1_bytes(&client_pubkey_bytes)
         .map_err(|e| format!("Invalid ECDH public key: {e}"))?;
 
-    let server_sk = SecretKey::random(&mut rand_core::OsRng);
+    let server_sk = SecretKey::try_generate().map_err(|e| format!("System RNG failed: {e}"))?;
     let server_pk = server_sk.public_key();
 
     let shared = diffie_hellman(server_sk.to_nonzero_scalar(), client_pk.as_affine());
@@ -913,7 +916,7 @@ fn derive_connection_key(client_pubkey_b64: &str) -> Result<(String, aes_gcm::Ae
     // The cipher now owns the key material; wipe our stack copy.
     aes_key.zeroize();
 
-    let server_pk_point = server_pk.to_encoded_point(false);
+    let server_pk_point = server_pk.to_sec1_point(false);
     let server_pk_b64 =
         base64::engine::general_purpose::STANDARD.encode(server_pk_point.as_bytes());
 
@@ -2625,17 +2628,42 @@ async fn process_commands(
 // PyO3 class
 // ---------------------------------------------------------------------------
 
-#[pyclass]
+/// The server object is shared by every Python thread that uses it: a drain
+/// loop sits in `drain_inbound()` while other threads broadcast, and `stop()`
+/// comes from yet another one. So every method takes `&self` (`frozen`) and the
+/// few fields that change do so behind their own synchronization. A `&mut self`
+/// method would fail with "Already borrowed" whenever another thread is inside
+/// the object - with the GIL too, since `drain_inbound()` releases it while it
+/// waits.
+#[pyclass(frozen)]
 pub struct RustWSEServer {
     host: String,
     port: u16,
     shared: Arc<SharedState>,
-    cmd_tx: Option<mpsc::UnboundedSender<ServerCommand>>,
-    thread_handle: Option<thread::JoinHandle<()>>,
+    /// Command channel into the running server, `None` while stopped. Loaded on
+    /// every send and broadcast, replaced only by `start()` and `stop()`.
+    cmd_tx: arc_swap::ArcSwapOption<mpsc::UnboundedSender<ServerCommand>>,
+    /// The server thread while one exists. Its lock also serializes `start()`
+    /// and `stop()` against each other.
+    lifecycle: std::sync::Mutex<Option<thread::JoinHandle<()>>>,
     running: Arc<AtomicBool>,
     dedup: Arc<std::sync::Mutex<DeduplicationState>>,
-    rt_handle: Option<tokio::runtime::Handle>,
-    started_at: Option<std::time::Instant>,
+    rt_handle: parking_lot::RwLock<Option<tokio::runtime::Handle>>,
+    started_at: parking_lot::Mutex<Option<std::time::Instant>>,
+}
+
+/// The command sender of the running server, loaded from `RustWSEServer::cmd_tx`
+/// without touching its reference count.
+struct CommandTx(arc_swap::Guard<Option<Arc<mpsc::UnboundedSender<ServerCommand>>>>);
+
+impl std::ops::Deref for CommandTx {
+    type Target = mpsc::UnboundedSender<ServerCommand>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .as_deref()
+            .expect("CommandTx is only built while a sender is stored")
+    }
 }
 
 // Parameter groups for RustWSEServer::new() -- keeps the PyO3 #[new] shim clean
@@ -2817,17 +2845,38 @@ impl RustWSEServer {
                 max_outbound_queue_bytes: srv.max_outbound_queue_bytes,
                 max_subscriptions_per_connection: srv.max_subscriptions_per_connection,
             })),
-            cmd_tx: None,
-            thread_handle: None,
+            cmd_tx: arc_swap::ArcSwapOption::empty(),
+            lifecycle: std::sync::Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
             dedup: Arc::new(std::sync::Mutex::new(DeduplicationState {
                 seen: AHashSet::with_capacity(50_000),
                 queue: std::collections::VecDeque::with_capacity(50_000),
                 max_entries: 50_000,
             })),
-            rt_handle: None,
-            started_at: None,
+            rt_handle: parking_lot::RwLock::new(None),
+            started_at: parking_lot::Mutex::new(None),
         })
+    }
+
+    /// The command channel of the running server, or `RuntimeError("Not running")`.
+    fn command_tx(&self) -> PyResult<CommandTx> {
+        let guard = self.cmd_tx.load();
+        if guard.is_none() {
+            return Err(PyRuntimeError::new_err("Not running"));
+        }
+        Ok(CommandTx(guard))
+    }
+
+    /// The tokio runtime of the server, once it has been started.
+    fn runtime(&self) -> Option<tokio::runtime::Handle> {
+        self.rt_handle.read().clone()
+    }
+
+    /// Seconds since the last `start()`, 0.0 before the first one.
+    fn uptime_secs(&self) -> f64 {
+        self.started_at
+            .lock()
+            .map_or(0.0, |s| s.elapsed().as_secs_f64())
     }
 
     fn connect_cluster_inner(
@@ -2890,8 +2939,7 @@ impl RustWSEServer {
         *self.shared.cluster_tls_holder.write().unwrap() = tls_holder.clone();
 
         let rt_handle = self
-            .rt_handle
-            .as_ref()
+            .runtime()
             .ok_or_else(|| PyRuntimeError::new_err("Server not started"))?;
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
@@ -2945,7 +2993,7 @@ impl RustWSEServer {
             (
                 cluster_port,
                 self.shared.presence.clone(),
-                self.cmd_tx.clone(),
+                self.cmd_tx.load_full().map(|tx| (*tx).clone()),
             ),
         ));
 
@@ -3054,10 +3102,29 @@ impl RustWSEServer {
         {
             return Err(PyRuntimeError::new_err("All callbacks must be callable"));
         }
+        // Server threads read these slots and then attach to Python while still
+        // holding the read guard (to clone the callback). Waiting for the write
+        // lock attached would block that attach - the GIL, or a stop-the-world
+        // pause of the free-threaded build - and neither side could go on, so
+        // the wait happens detached (`write_py_attached`). The callbacks being
+        // replaced are dropped after the guards: that may run Python code.
         let shared = self.shared.clone();
-        *shared.on_connect.write().unwrap() = Some(on_connect);
-        *shared.on_message.write().unwrap() = Some(on_message);
-        *shared.on_disconnect.write().unwrap() = Some(on_disconnect);
+        let old_connect = shared
+            .on_connect
+            .write_py_attached(py)
+            .unwrap()
+            .replace(on_connect);
+        let old_message = shared
+            .on_message
+            .write_py_attached(py)
+            .unwrap()
+            .replace(on_message);
+        let old_disconnect = shared
+            .on_disconnect
+            .write_py_attached(py)
+            .unwrap()
+            .replace(on_disconnect);
+        drop((old_connect, old_message, old_disconnect));
         Ok(())
     }
 
@@ -3065,9 +3132,18 @@ impl RustWSEServer {
     ///
     /// Spawns a dedicated tokio runtime, binds to host:port, and begins
     /// accepting connections. Raises RuntimeError if already running.
-    fn start(&mut self) -> PyResult<()> {
-        if self.running.load(Ordering::SeqCst) {
+    fn start(&self, py: Python<'_>) -> PyResult<()> {
+        let mut server_thread = lock(py, &self.lifecycle);
+        if server_thread
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
             return Err(PyRuntimeError::new_err("Server is already running"));
+        }
+        // A server thread that ended by itself (it could not bind) is reaped
+        // here; it has finished, so the join returns at once.
+        if let Some(handle) = server_thread.take() {
+            let _ = handle.join();
         }
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
@@ -3077,7 +3153,7 @@ impl RustWSEServer {
             .with_target(false)
             .try_init();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ServerCommand>();
-        self.cmd_tx = Some(cmd_tx.clone());
+        self.cmd_tx.store(Some(Arc::new(cmd_tx.clone())));
         // Store a clone for presence broadcasts from disconnect cleanup paths
         *self.shared.presence_broadcast_tx.write().unwrap() = Some(cmd_tx.clone());
         let host = self.host.clone();
@@ -3087,6 +3163,11 @@ impl RustWSEServer {
         let (rt_handle_tx, rt_handle_rx) =
             std::sync::mpsc::sync_channel::<tokio::runtime::Handle>(1);
 
+        // Running from here on, before the listener is bound: a drain loop
+        // started right after start() (`while server.is_running(): ...`) must
+        // not see a stale `false` and quit. The server thread clears the flag
+        // again if it cannot create its runtime or bind the address.
+        self.running.store(true, Ordering::SeqCst);
         let handle = thread::Builder::new()
             .name("wse-tokio-rt".into())
             .spawn(move || {
@@ -3094,6 +3175,7 @@ impl RustWSEServer {
                     Ok(rt) => rt,
                     Err(e) => {
                         tracing::error!("[WSE] Failed to create runtime: {e}");
+                        running.store(false, Ordering::SeqCst);
                         return;
                     }
                 };
@@ -3107,10 +3189,10 @@ impl RustWSEServer {
                         }
                         Err(e) => {
                             tracing::error!("[WSE] Failed to bind {bind_addr}: {e}");
+                            running.store(false, Ordering::SeqCst);
                             return;
                         }
                     };
-                    running.store(true, Ordering::SeqCst);
                     let cmd_handle = tokio::spawn(process_commands(cmd_rx, shared.clone()));
                     // Spawn periodic recovery cleanup if recovery is enabled
                     if let Some(ref recovery) = shared.recovery {
@@ -3559,10 +3641,17 @@ impl RustWSEServer {
                     tracing::info!("[WSE] Shut down");
                 });
             })
-            .map_err(|e| PyRuntimeError::new_err(format!("Spawn error: {e}")))?;
-        self.thread_handle = Some(handle);
-        self.rt_handle = rt_handle_rx.recv().ok();
-        self.started_at = Some(std::time::Instant::now());
+            .map_err(|e| {
+                self.running.store(false, Ordering::SeqCst);
+                self.cmd_tx.store(None);
+                PyRuntimeError::new_err(format!("Spawn error: {e}"))
+            })?;
+        // The runtime hands its handle over as soon as it exists; wait for it
+        // detached, so other Python threads keep running meanwhile.
+        let rt_handle = py.detach(move || rt_handle_rx.recv().ok());
+        *self.rt_handle.write() = rt_handle;
+        *self.started_at.lock() = Some(std::time::Instant::now());
+        *server_thread = Some(handle);
         Ok(())
     }
 
@@ -3576,10 +3665,7 @@ impl RustWSEServer {
     /// Call `stop()` after `drain()` to fully shut down.
     #[pyo3(signature = (close_code = 4300, close_reason = "", timeout = 30))]
     fn drain(&self, close_code: u16, close_reason: &str, timeout: u64) -> PyResult<()> {
-        let tx = self
-            .cmd_tx
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
+        let tx = self.command_tx()?;
         tx.send(ServerCommand::Drain {
             close_code,
             close_reason: close_reason.to_owned(),
@@ -3593,28 +3679,34 @@ impl RustWSEServer {
     ///
     /// Shuts down the cluster mesh, sends a Shutdown command, and joins
     /// the server thread. Safe to call if not running (returns Ok).
-    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
-        if !self.running.load(Ordering::SeqCst) {
+    ///
+    /// Callable from any thread, also while other threads are inside the
+    /// server (for example a drain loop waiting in `drain_inbound()`).
+    fn stop(&self, py: Python<'_>) -> PyResult<()> {
+        let mut server_thread = lock(py, &self.lifecycle);
+        let Some(handle) = server_thread.take() else {
             return Ok(());
-        }
+        };
         // Shutdown cluster
         if let Ok(guard) = self.shared.cluster_cmd_tx.read()
             && let Some(ref tx) = *guard
         {
             let _ = tx.send(ClusterCommand::Shutdown);
         }
-        if let Some(ref tx) = self.cmd_tx {
+        if let Ok(tx) = self.command_tx() {
             let _ = tx.send(ServerCommand::Shutdown);
         }
         self.running.store(false, Ordering::SeqCst);
-        if let Some(handle) = self.thread_handle.take() {
-            let panicked = py.detach(|| handle.join().is_err());
-            if panicked {
-                return Err(PyRuntimeError::new_err("Server thread panicked"));
-            }
-        }
-        self.cmd_tx = None;
+        // Detached while the server drains (about two seconds): other Python
+        // threads keep running, and a start() from another thread waits for
+        // the `lifecycle` lock without holding up the interpreter.
+        let panicked = py.detach(move || handle.join().is_err());
+        self.cmd_tx.store(None);
         *self.shared.cluster_cmd_tx.write().unwrap() = None;
+        drop(server_thread);
+        if panicked {
+            return Err(PyRuntimeError::new_err("Server thread panicked"));
+        }
         Ok(())
     }
 
@@ -3622,10 +3714,7 @@ impl RustWSEServer {
 
     /// Send a raw text frame to a single connection.
     fn send(&self, conn_id: &str, data: &str) -> PyResult<()> {
-        let tx = self
-            .cmd_tx
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
+        let tx = self.command_tx()?;
         tx.send(ServerCommand::SendText {
             conn_id: conn_id.to_owned(),
             data: data.to_owned(),
@@ -3636,10 +3725,7 @@ impl RustWSEServer {
 
     /// Send a raw binary frame to a single connection.
     fn send_bytes(&self, conn_id: &str, data: &[u8]) -> PyResult<()> {
-        let tx = self
-            .cmd_tx
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
+        let tx = self.command_tx()?;
         tx.send(ServerCommand::SendBytes {
             conn_id: conn_id.to_owned(),
             data: data.to_vec(),
@@ -3658,10 +3744,7 @@ impl RustWSEServer {
         event: &Bound<'_, PyDict>,
         compression_threshold: usize,
     ) -> PyResult<usize> {
-        let cmd_tx = self
-            .cmd_tx
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
+        let cmd_tx = self.command_tx()?;
 
         // #7: Dedup — skip if this event ID was already sent
         if let Ok(Some(id_val)) = event.get_item("id")
@@ -3910,10 +3993,7 @@ impl RustWSEServer {
 
     /// Send a text frame to all connected clients (no topic filtering).
     fn broadcast_all(&self, data: &str) -> PyResult<()> {
-        let tx = self
-            .cmd_tx
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
+        let tx = self.command_tx()?;
         let data = inject_category(data);
         tx.send(ServerCommand::BroadcastText { data })
             .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
@@ -3922,10 +4002,7 @@ impl RustWSEServer {
 
     /// Send a binary frame to all connected clients.
     fn broadcast_all_bytes(&self, data: &[u8]) -> PyResult<()> {
-        let tx = self
-            .cmd_tx
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
+        let tx = self.command_tx()?;
         tx.send(ServerCommand::BroadcastBytes {
             data: data.to_vec(),
         })
@@ -3942,10 +4019,7 @@ impl RustWSEServer {
 
     /// List all active connection IDs.
     fn get_connections(&self) -> PyResult<Vec<String>> {
-        let tx = self
-            .cmd_tx
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
+        let tx = self.command_tx()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(ServerCommand::GetConnections { reply: reply_tx })
             .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
@@ -3956,10 +4030,7 @@ impl RustWSEServer {
 
     /// Force-disconnect a connection by sending a Close frame.
     fn disconnect(&self, conn_id: &str) -> PyResult<()> {
-        let tx = self
-            .cmd_tx
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
+        let tx = self.command_tx()?;
         tx.send(ServerCommand::Disconnect {
             conn_id: conn_id.to_owned(),
         })
@@ -4226,13 +4297,23 @@ impl RustWSEServer {
     /// List connected cluster peers with address, instance_id, capabilities,
     /// and connected_at timestamp. Returns a list of dicts.
     fn cluster_info(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        // Copy first, build Python objects after: no map shard lock is held
+        // while Python allocates (a GC pause then would wait on any Python
+        // thread blocked on that shard).
+        let peers: Vec<super::cluster::PeerInfo> = self
+            .shared
+            .cluster_metrics
+            .peer_info
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
         let list = PyList::empty(py);
-        for entry in self.shared.cluster_metrics.peer_info.iter() {
+        for peer in &peers {
             let d = PyDict::new(py);
-            d.set_item("address", &entry.value().address)?;
-            d.set_item("instance_id", &entry.value().instance_id)?;
-            d.set_item("capabilities", entry.value().capabilities)?;
-            d.set_item("connected_at", entry.value().connected_at)?;
+            d.set_item("address", &peer.address)?;
+            d.set_item("instance_id", &peer.instance_id)?;
+            d.set_item("capabilities", peer.capabilities)?;
+            d.set_item("connected_at", peer.connected_at)?;
             list.append(d)?;
         }
         Ok(list.unbind())
@@ -4331,7 +4412,7 @@ impl RustWSEServer {
         // Get ConnectionHandle FIRST (may block_on tokio), before acquiring any mutexes.
         // This prevents deadlock: tokio tasks acquire connections.write() then local_topic_refcount,
         // so we must follow the same order.
-        let handle = self.rt_handle.as_ref().and_then(|rt| {
+        let handle = self.runtime().and_then(|rt| {
             let guard = rt.block_on(self.shared.connections.read());
             guard.get(conn_id).cloned()
         });
@@ -4425,6 +4506,9 @@ impl RustWSEServer {
                 }
             }
         }
+        // Released before the presence data is read from Python below: no
+        // Python code runs while this thread holds the refcount lock.
+        drop(refcounts);
 
         // Presence tracking
         if let (Some(pm), Some(pd)) = (&self.shared.presence, &presence_data) {
@@ -4445,7 +4529,7 @@ impl RustWSEServer {
                         });
                     }
                     // Broadcast to topic subscribers via WebSocket
-                    if let Some(ref tx) = self.cmd_tx {
+                    if let Ok(tx) = self.command_tx() {
                         let msg = format_presence_msg("presence_join", &user_id, &join_data);
                         let _ = tx.send(ServerCommand::BroadcastLocal {
                             topic: topic.clone(),
@@ -4514,8 +4598,7 @@ impl RustWSEServer {
         // Step 2: Get connection tx + pending counter (clone them, drop the lock)
         let (tx, tx_pending) = if recover {
             let rt = self
-                .rt_handle
-                .as_ref()
+                .runtime()
                 .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
             let guard = rt.block_on(self.shared.connections.read());
             match guard.get(conn_id) {
@@ -4803,7 +4886,7 @@ impl RustWSEServer {
                         });
                     }
                     // Broadcast to topic subscribers via WebSocket
-                    if let Some(ref tx) = self.cmd_tx {
+                    if let Ok(tx) = self.command_tx() {
                         let msg = format_presence_msg("presence_leave", &user_id, &data);
                         let _ = tx.send(ServerCommand::BroadcastLocal {
                             topic: topic.clone(),
@@ -4847,10 +4930,7 @@ impl RustWSEServer {
 
     /// Fan-out to topic subscribers locally.
     fn broadcast_local(&self, topic: &str, data: &str) -> PyResult<()> {
-        let tx = self
-            .cmd_tx
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
+        let tx = self.command_tx()?;
         let data = inject_category(data);
         tx.send(ServerCommand::BroadcastLocal {
             topic: topic.to_owned(),
@@ -4866,7 +4946,7 @@ impl RustWSEServer {
         let data = inject_category(data);
 
         // Local dispatch (always)
-        if let Some(ref tx) = self.cmd_tx {
+        if let Ok(tx) = self.command_tx() {
             let _ = tx.send(ServerCommand::BroadcastLocal {
                 topic: topic.to_owned(),
                 data: data.clone(),
@@ -4897,11 +4977,17 @@ impl RustWSEServer {
 
     /// Get queue group info for a topic. Returns dict of group_name -> member_count.
     fn get_queue_group_info(&self, py: Python<'_>, topic: &str) -> PyResult<Py<PyDict>> {
+        // Copy first, build the dict after (see `cluster_info`).
+        let groups: Vec<(String, usize)> = match self.shared.queue_groups.get(topic) {
+            Some(topic_groups) => topic_groups
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.value().members.len()))
+                .collect(),
+            None => Vec::new(),
+        };
         let dict = PyDict::new(py);
-        if let Some(topic_groups) = self.shared.queue_groups.get(topic) {
-            for entry in topic_groups.iter() {
-                dict.set_item(entry.key().as_str(), entry.value().members.len())?;
-            }
+        for (group, members) in &groups {
+            dict.set_item(group.as_str(), *members)?;
         }
         Ok(dict.into())
     }
@@ -4967,12 +5053,7 @@ impl RustWSEServer {
                 .map(|d| d.len())
                 .unwrap_or(0),
         )?;
-        dict.set_item(
-            "uptime_secs",
-            self.started_at
-                .map(|s| s.elapsed().as_secs_f64())
-                .unwrap_or(0.0),
-        )?;
+        dict.set_item("uptime_secs", self.uptime_secs())?;
         // Recovery metrics
         if let Some(ref recovery) = self.shared.recovery {
             dict.set_item("recovery_enabled", true)?;
@@ -5019,12 +5100,7 @@ impl RustWSEServer {
 
         out.push_str("# HELP wse_uptime_seconds Server uptime in seconds\n");
         out.push_str("# TYPE wse_uptime_seconds gauge\n");
-        out.push_str(&format!(
-            "wse_uptime_seconds {:.1}\n",
-            self.started_at
-                .map(|s| s.elapsed().as_secs_f64())
-                .unwrap_or(0.0)
-        ));
+        out.push_str(&format!("wse_uptime_seconds {:.1}\n", self.uptime_secs()));
 
         out.push_str("# HELP wse_topics Number of active topics\n");
         out.push_str("# TYPE wse_topics gauge\n");
@@ -5297,7 +5373,7 @@ impl RustWSEServer {
                     let data_str = serde_json::to_string(&new_data).unwrap_or_default();
                     let now = super::presence::epoch_ms();
                     let cluster_tx = self.shared.cluster_cmd_tx.read().unwrap().clone();
-                    if let Some(ref tx) = self.cmd_tx {
+                    if let Ok(tx) = self.command_tx() {
                         let msg = format_presence_msg("presence_update", &user_id, &new_data);
                         for topic in &topics {
                             let _ = tx.send(ServerCommand::BroadcastLocal {

@@ -50,7 +50,7 @@ jobs:
 
       - name: Setup QEMU (for cross-compilation)
         if: matrix.os == 'linux' && matrix.target == 'aarch64-unknown-linux-gnu'
-        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a  # v4.3.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1  # v4.4.0
 
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b  # v1.51.0
@@ -60,7 +60,26 @@ jobs:
           args: --release --out dist --find-interpreter
           sccache: ${{ matrix.os != 'windows' }}
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      # Free-threaded CPython cannot load abi3 wheels, so 3.14t and 3.15t get
+      # version-specific wheels. The Linux build containers ship these
+      # interpreters; macOS and Windows runners get them from setup-python.
+      - name: Set up free-threaded Python
+        if: matrix.os != 'linux'
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: |
+            3.14t
+            3.15t
+
+      - name: Build free-threaded wheels
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b  # v1.51.0
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --out dist -i python3.14t python3.15t
+          sccache: ${{ matrix.os != 'windows' }}
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist/*.whl
@@ -81,7 +100,7 @@ jobs:
           command: sdist
           args: --out dist
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -117,15 +136,34 @@ jobs:
           - os: windows-latest
             python: '3.12'
             target: windows-x86_64-pc-windows-msvc
+          # Free-threaded builds (no GIL)
+          - os: ubuntu-latest
+            python: '3.14t'
+            target: linux-x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            python: '3.15t'
+            target: linux-x86_64-unknown-linux-gnu
+          - os: macos-14
+            python: '3.14t'
+            target: macos-aarch64-apple-darwin
+          - os: macos-14
+            python: '3.15t'
+            target: macos-aarch64-apple-darwin
+          - os: windows-latest
+            python: '3.14t'
+            target: windows-x86_64-pc-windows-msvc
+          - os: windows-latest
+            python: '3.15t'
+            target: windows-x86_64-pc-windows-msvc
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ matrix.python }}
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: wheels-${{ matrix.target }}
           path: dist/
@@ -133,7 +171,9 @@ jobs:
       - name: Install wheel + test deps
         shell: bash
         run: |
-          pip install dist/*.whl
+          # dist/ holds the abi3 wheel and the free-threaded ones; pip picks
+          # the one this interpreter can load.
+          pip install --no-index --find-links dist wse-server
           pip install pytest pytest-asyncio httpx websockets cryptography
 
       - name: Run tests
@@ -160,19 +200,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Download all artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           path: dist/
           merge-multiple: true
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
         with:
           packages-dir: dist/
           skip-existing: true
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3  # v3.0.4
         with:
           generate_release_notes: true
           files: dist/*
@@ -194,7 +234,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -212,7 +252,7 @@ jobs:
         run: python -m build python-client/ --outdir python-client-dist/
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
         with:
           packages-dir: python-client-dist/
           skip-existing: true
@@ -230,7 +270,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'

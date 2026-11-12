@@ -3,6 +3,7 @@ use flate2::write::ZlibEncoder;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyNone, PyString, PyTuple};
 use std::io::Write;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 /// Maximum decompressed output size (10 MB). Prevents decompression bombs
 /// where a small compressed payload expands to gigabytes of RAM.
@@ -461,16 +462,20 @@ fn json_to_py<'py>(py: Python<'py>, val: &serde_json::Value) -> PyResult<Bound<'
 
 /// Full-featured compression manager with stats tracking, msgpack support,
 /// and event packing/unpacking. Mirrors Python CompressionManager API.
-#[pyclass]
+///
+/// Safe to share between threads, also on free-threaded Python: the settings
+/// never change and the statistics are atomic counters, so threads compress
+/// in parallel without waiting for each other.
+#[pyclass(frozen)]
 pub struct RustCompressionManager {
     threshold: usize,
     compression_level: u32,
     // Stats
-    total_compressed: u64,
-    total_decompressed: u64,
-    compression_failures: u64,
-    decompression_failures: u64,
-    total_bytes_saved: i64,
+    total_compressed: AtomicU64,
+    total_decompressed: AtomicU64,
+    compression_failures: AtomicU64,
+    decompression_failures: AtomicU64,
+    total_bytes_saved: AtomicI64,
 }
 
 #[pymethods]
@@ -486,11 +491,11 @@ impl RustCompressionManager {
         Self {
             threshold,
             compression_level,
-            total_compressed: 0,
-            total_decompressed: 0,
-            compression_failures: 0,
-            decompression_failures: 0,
-            total_bytes_saved: 0,
+            total_compressed: AtomicU64::new(0),
+            total_decompressed: AtomicU64::new(0),
+            compression_failures: AtomicU64::new(0),
+            decompression_failures: AtomicU64::new(0),
+            total_bytes_saved: AtomicI64::new(0),
         }
     }
 
@@ -505,13 +510,13 @@ impl RustCompressionManager {
     /// * `data`  - Raw bytes to compress.
     /// * `level` - Optional override for compression level.
     #[pyo3(signature = (data, level=None))]
-    fn compress(&mut self, py: Python, data: &[u8], level: Option<u32>) -> PyResult<Py<PyBytes>> {
+    fn compress(&self, py: Python, data: &[u8], level: Option<u32>) -> PyResult<Py<PyBytes>> {
         let lvl = level.unwrap_or(self.compression_level);
         let original_size = data.len();
 
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(lvl));
         if let Err(e) = encoder.write_all(data) {
-            self.compression_failures += 1;
+            self.compression_failures.fetch_add(1, Ordering::Relaxed);
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "compression write error: {e}"
             )));
@@ -519,7 +524,7 @@ impl RustCompressionManager {
         let compressed = match encoder.finish() {
             Ok(c) => c,
             Err(e) => {
-                self.compression_failures += 1;
+                self.compression_failures.fetch_add(1, Ordering::Relaxed);
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "compression finish error: {e}"
                 )));
@@ -529,22 +534,23 @@ impl RustCompressionManager {
         let compressed_size = compressed.len();
         let saved_bytes = original_size as i64 - compressed_size as i64;
         if saved_bytes > 0 {
-            self.total_bytes_saved += saved_bytes;
+            self.total_bytes_saved
+                .fetch_add(saved_bytes, Ordering::Relaxed);
         }
-        self.total_compressed += 1;
+        self.total_compressed.fetch_add(1, Ordering::Relaxed);
 
         Ok(PyBytes::new(py, &compressed).unbind())
     }
 
     /// Decompress zlib-compressed data with stats tracking (bounded).
-    fn decompress(&mut self, py: Python, data: &[u8]) -> PyResult<Py<PyBytes>> {
+    fn decompress(&self, py: Python, data: &[u8]) -> PyResult<Py<PyBytes>> {
         match bounded_decompress(data) {
             Ok(decompressed) => {
-                self.total_decompressed += 1;
+                self.total_decompressed.fetch_add(1, Ordering::Relaxed);
                 Ok(PyBytes::new(py, &decompressed).unbind())
             }
             Err(e) => {
-                self.decompression_failures += 1;
+                self.decompression_failures.fetch_add(1, Ordering::Relaxed);
                 Err(pyo3::exceptions::PyRuntimeError::new_err(e))
             }
         }
@@ -648,32 +654,40 @@ impl RustCompressionManager {
 
     /// Get compression statistics as a dict.
     fn get_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        // Each counter is read once, so the derived rates below agree with the
+        // raw numbers in this snapshot even while other threads keep counting.
+        let total_compressed = self.total_compressed.load(Ordering::Relaxed);
+        let total_decompressed = self.total_decompressed.load(Ordering::Relaxed);
+        let compression_failures = self.compression_failures.load(Ordering::Relaxed);
+        let decompression_failures = self.decompression_failures.load(Ordering::Relaxed);
+        let total_bytes_saved = self.total_bytes_saved.load(Ordering::Relaxed);
+
         let dict = PyDict::new(py);
-        dict.set_item("total_compressed", self.total_compressed)?;
-        dict.set_item("total_decompressed", self.total_decompressed)?;
-        dict.set_item("compression_failures", self.compression_failures)?;
-        dict.set_item("decompression_failures", self.decompression_failures)?;
-        dict.set_item("total_bytes_saved", self.total_bytes_saved)?;
+        dict.set_item("total_compressed", total_compressed)?;
+        dict.set_item("total_decompressed", total_decompressed)?;
+        dict.set_item("compression_failures", compression_failures)?;
+        dict.set_item("decompression_failures", decompression_failures)?;
+        dict.set_item("total_bytes_saved", total_bytes_saved)?;
 
         // Derived stats
-        let total_comp_attempts = self.total_compressed + self.compression_failures;
+        let total_comp_attempts = total_compressed + compression_failures;
         let compression_success_rate = if total_comp_attempts > 0 {
-            self.total_compressed as f64 / total_comp_attempts as f64
+            total_compressed as f64 / total_comp_attempts as f64
         } else {
             0.0
         };
         dict.set_item("compression_success_rate", compression_success_rate)?;
 
-        let total_decomp_attempts = self.total_decompressed + self.decompression_failures;
+        let total_decomp_attempts = total_decompressed + decompression_failures;
         let decompression_success_rate = if total_decomp_attempts > 0 {
-            self.total_decompressed as f64 / total_decomp_attempts as f64
+            total_decompressed as f64 / total_decomp_attempts as f64
         } else {
             0.0
         };
         dict.set_item("decompression_success_rate", decompression_success_rate)?;
 
-        let average_bytes_saved = if self.total_compressed > 0 {
-            self.total_bytes_saved as f64 / self.total_compressed as f64
+        let average_bytes_saved = if total_compressed > 0 {
+            total_bytes_saved as f64 / total_compressed as f64
         } else {
             0.0
         };
@@ -683,12 +697,12 @@ impl RustCompressionManager {
     }
 
     /// Reset all compression statistics to zero.
-    fn reset_stats(&mut self) {
-        self.total_compressed = 0;
-        self.total_decompressed = 0;
-        self.compression_failures = 0;
-        self.decompression_failures = 0;
-        self.total_bytes_saved = 0;
+    fn reset_stats(&self) {
+        self.total_compressed.store(0, Ordering::Relaxed);
+        self.total_decompressed.store(0, Ordering::Relaxed);
+        self.compression_failures.store(0, Ordering::Relaxed);
+        self.decompression_failures.store(0, Ordering::Relaxed);
+        self.total_bytes_saved.store(0, Ordering::Relaxed);
     }
 }
 

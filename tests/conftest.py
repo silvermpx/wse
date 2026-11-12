@@ -1,13 +1,15 @@
 """Shared fixtures for WSE integration tests."""
 
+import os
 import time
 
 import pytest
 
 from wse_server._wse_accel import RustWSEServer, rust_jwt_encode
 
-# Use high ports to avoid conflicts
-BASE_PORT = 15_007
+# Use high ports to avoid conflicts. WSE_TEST_BASE_PORT moves the range, so several
+# interpreters can run the suite side by side on one machine.
+BASE_PORT = int(os.environ.get("WSE_TEST_BASE_PORT", "15007"))
 
 # Shared JWT config
 JWT_SECRET = b"test-secret-key-for-integration!"

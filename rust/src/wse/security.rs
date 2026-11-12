@@ -4,12 +4,11 @@ use aes_gcm::{
 };
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac, digest::KeyInit as MacKeyInit};
-use p256::{PublicKey, SecretKey, ecdh::diffie_hellman, elliptic_curve::sec1::ToEncodedPoint};
-// aes-gcm 0.11 (aead 0.6, rand_core 0.9) no longer re-exports OsRng, and p256 0.13
-// still takes a rand_core 0.6 RNG, so key generation uses the 0.6 OsRng directly.
+use p256::{PublicKey, SecretKey, ecdh::diffie_hellman, elliptic_curve::sec1::ToSec1Point};
+// Random keys and nonces come from `Generate` (crypto-common), which draws from the
+// operating system's RNG through getrandom: `Nonce::generate()`, `SecretKey::try_generate()`.
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
@@ -127,7 +126,9 @@ pub fn rust_aes_gcm_decrypt(py: Python, key: &[u8], data: &[u8]) -> PyResult<Py<
 /// Public key format: 0x04 || X (32 bytes) || Y (32 bytes) — SEC1 uncompressed.
 #[pyfunction]
 pub fn rust_ecdh_generate_keypair(py: Python) -> PyResult<(Py<PyBytes>, Py<PyBytes>)> {
-    let secret = SecretKey::random(&mut OsRng);
+    let secret = SecretKey::try_generate().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("System RNG failed: {e}"))
+    })?;
     let public = secret.public_key();
 
     // Private key: 32-byte scalar. `secret` itself zeroizes on drop; we also wipe
@@ -136,7 +137,7 @@ pub fn rust_ecdh_generate_keypair(py: Python) -> PyResult<(Py<PyBytes>, Py<PyByt
     let mut sk_bytes = secret.to_bytes();
 
     // Public key: uncompressed SEC1 point (65 bytes)
-    let pk_point = public.to_encoded_point(false);
+    let pk_point = public.to_sec1_point(false);
 
     let result = (
         PyBytes::new(py, &sk_bytes).unbind(),
@@ -237,9 +238,9 @@ mod tests {
 
     #[test]
     fn ecdh_shared_secret_symmetric() {
-        let sk_a = SecretKey::random(&mut OsRng);
+        let sk_a = SecretKey::generate();
         let pk_a = sk_a.public_key();
-        let sk_b = SecretKey::random(&mut OsRng);
+        let sk_b = SecretKey::generate();
         let pk_b = sk_b.public_key();
 
         let shared_ab = diffie_hellman(sk_a.to_nonzero_scalar(), pk_b.as_affine());
@@ -250,7 +251,7 @@ mod tests {
 
     #[test]
     fn ecdh_hkdf_derives_32_byte_key() {
-        let sk = SecretKey::random(&mut OsRng);
+        let sk = SecretKey::generate();
         let pk = sk.public_key();
         // Self-exchange just to test HKDF
         let shared = diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine());

@@ -1,12 +1,13 @@
 use crate::config::Cli;
 use crate::protocol::{self, parse_wse_message, WsStream};
 use crate::report::TierResult;
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
+use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use hkdf::Hkdf;
 use p256::ecdh::EphemeralSecret;
+use p256::elliptic_curve::Generate;
 use p256::PublicKey;
 use sha2::Sha256;
 use std::time::Duration;
@@ -97,8 +98,8 @@ fn derive_cipher(shared_secret: &[u8]) -> Aes256Gcm {
 /// Encrypt plaintext with AES-GCM. Returns IV + ciphertext + tag.
 fn encrypt(cipher: &Aes256Gcm, plaintext: &[u8]) -> Vec<u8> {
     let iv_bytes: [u8; 12] = rand::random();
-    let nonce = Nonce::from_slice(&iv_bytes);
-    let ciphertext = cipher.encrypt(nonce, plaintext).expect("encrypt failed");
+    let nonce = Nonce::from(iv_bytes);
+    let ciphertext = cipher.encrypt(&nonce, plaintext).expect("encrypt failed");
     let mut result = Vec::with_capacity(12 + ciphertext.len());
     result.extend_from_slice(&iv_bytes);
     result.extend_from_slice(&ciphertext);
@@ -110,9 +111,9 @@ fn decrypt(cipher: &Aes256Gcm, data: &[u8]) -> Result<Vec<u8>, String> {
     if data.len() < 28 {
         return Err("data too short".into());
     }
-    let nonce = Nonce::from_slice(&data[..12]);
+    let nonce = Nonce::try_from(&data[..12]).expect("IV is 12 bytes");
     cipher
-        .decrypt(nonce, &data[12..])
+        .decrypt(&nonce, &data[12..])
         .map_err(|e| format!("decrypt failed: {}", e))
 }
 
@@ -194,7 +195,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     println!("\n  Test 1: ECDH key exchange handshake");
 
-    let client_secret = EphemeralSecret::random(&mut OsRng);
+    let client_secret = EphemeralSecret::generate();
     let client_pubkey = PublicKey::from(&client_secret);
     let client_pubkey_bytes = client_pubkey.to_sec1_bytes();
     let client_pubkey_b64 = b64.encode(&client_pubkey_bytes);
@@ -381,7 +382,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     println!("\n  Test 5: send_event to encrypted connection");
 
     // Connect with encryption again
-    let client_secret2 = EphemeralSecret::random(&mut OsRng);
+    let client_secret2 = EphemeralSecret::generate();
     let client_pubkey2 = PublicKey::from(&client_secret2);
     let client_pubkey2_b64 = b64.encode(client_pubkey2.to_sec1_bytes());
 

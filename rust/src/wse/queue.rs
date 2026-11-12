@@ -2,7 +2,16 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::sync::Mutex;
 use std::time::Instant;
+
+use super::pylock::lock;
+
+// Both queues hold Python objects. A message the queue lets go of (evicted to
+// make room, or removed by `clear`) is dropped only after the queue's lock is
+// released: dropping the last reference to it runs Python code (`__del__`,
+// weakref callbacks), and that code could call back into the same queue and
+// wait for the lock forever.
 
 // =============================================================================
 // RustPriorityQueue - Original BinaryHeap version (backward compat)
@@ -42,8 +51,16 @@ impl Ord for QueueItem {
 ///
 /// Higher priority numbers are dequeued first. Within the same priority,
 /// items are dequeued in FIFO order.
-#[pyclass]
+///
+/// Safe to share between threads, also on free-threaded Python: every call
+/// runs under the queue's lock.
+#[pyclass(frozen)]
 pub struct RustPriorityQueue {
+    state: Mutex<PriorityQueueState>,
+}
+
+/// The mutable part of [`RustPriorityQueue`], behind its lock.
+struct PriorityQueueState {
     heap: BinaryHeap<QueueItem>,
     sequence: u64,
     max_size: usize,
@@ -54,53 +71,63 @@ impl RustPriorityQueue {
     #[new]
     fn new(max_size: usize) -> Self {
         Self {
-            heap: BinaryHeap::with_capacity(max_size),
-            sequence: 0,
-            max_size,
+            state: Mutex::new(PriorityQueueState {
+                heap: BinaryHeap::with_capacity(max_size),
+                sequence: 0,
+                max_size,
+            }),
         }
     }
 
     /// Push a message with the given priority. Returns false if full.
-    fn push(&mut self, _py: Python, priority: i32, message: Py<PyAny>) -> bool {
-        if self.heap.len() >= self.max_size {
+    fn push(&self, py: Python<'_>, priority: i32, message: Py<PyAny>) -> bool {
+        let mut state = lock(py, &self.state);
+        if state.heap.len() >= state.max_size {
             return false;
         }
-        self.sequence += 1;
-        self.heap.push(QueueItem {
+        state.sequence += 1;
+        let sequence = state.sequence;
+        state.heap.push(QueueItem {
             neg_priority: -priority,
-            sequence: self.sequence,
+            sequence,
             message,
         });
         true
     }
 
     /// Pop the highest-priority message. Returns None if empty.
-    fn pop<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        match self.heap.pop() {
+    fn pop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let item = lock(py, &self.state).heap.pop();
+        match item {
             Some(item) => Ok(item.message.into_bound(py)),
             None => Ok(py.None().into_bound(py)),
         }
     }
 
     /// Drain up to `max_count` messages, highest priority first.
-    fn drain<'py>(&mut self, py: Python<'py>, max_count: usize) -> PyResult<Bound<'py, PyList>> {
-        let count = max_count.min(self.heap.len());
-        let items: Vec<Py<PyAny>> = (0..count)
-            .filter_map(|_| self.heap.pop().map(|item| item.message))
-            .collect();
+    fn drain<'py>(&self, py: Python<'py>, max_count: usize) -> PyResult<Bound<'py, PyList>> {
+        let items: Vec<Py<PyAny>> = {
+            let mut state = lock(py, &self.state);
+            let count = max_count.min(state.heap.len());
+            (0..count)
+                .filter_map(|_| state.heap.pop().map(|item| item.message))
+                .collect()
+        };
         PyList::new(py, items)
     }
 
-    fn len(&self) -> usize {
-        self.heap.len()
+    fn len(&self, py: Python<'_>) -> usize {
+        lock(py, &self.state).heap.len()
     }
 
-    fn is_full(&self) -> bool {
-        self.heap.len() >= self.max_size
+    fn is_full(&self, py: Python<'_>) -> bool {
+        let state = lock(py, &self.state);
+        state.heap.len() >= state.max_size
     }
 
-    fn clear(&mut self) {
-        self.heap.clear();
+    fn clear(&self, py: Python<'_>) {
+        let removed = std::mem::take(&mut lock(py, &self.state).heap);
+        drop(removed); // after the lock, see the note at the top of this file
     }
 }
 
@@ -139,8 +166,16 @@ struct MessageEntry {
 /// - Smart dropping: when full, drops lower priority messages first
 /// - Batch dequeue ordered by priority (highest first)
 /// - Full stats tracking (size, drops, utilization, backpressure)
-#[pyclass]
+///
+/// Safe to share between threads, also on free-threaded Python: every call
+/// runs under the queue's lock.
+#[pyclass(frozen)]
 pub struct RustPriorityMessageQueue {
+    state: Mutex<MessageQueueState>,
+}
+
+/// The mutable part of [`RustPriorityMessageQueue`], behind its lock.
+struct MessageQueueState {
     /// Per-priority FIFO queues. Index via priority_to_index().
     queues: Vec<VecDeque<MessageEntry>>,
     max_size: usize,
@@ -155,10 +190,7 @@ pub struct RustPriorityMessageQueue {
     oldest_message_timestamp: Option<Instant>,
 }
 
-#[pymethods]
-impl RustPriorityMessageQueue {
-    #[new]
-    #[pyo3(signature = (max_size=1000, batch_size=10))]
+impl MessageQueueState {
     fn new(max_size: usize, batch_size: usize) -> Self {
         // Create 5 VecDeques, one per priority level (indexed 0..5)
         let queues = vec![
@@ -187,19 +219,13 @@ impl RustPriorityMessageQueue {
         }
     }
 
-    /// Add a message to the queue with priority-based dropping.
-    ///
-    /// When queue is full:
-    /// 1. Try to drop BACKGROUND (1) priority messages
-    /// 2. Try to drop LOW (3) priority messages
-    /// 3. Try to drop NORMAL (5) priority messages
-    /// 4. If new message is LOW/NORMAL and still full, drop it
-    /// 5. For HIGH/CRITICAL, drop oldest NORMAL as last resort
-    /// 6. If absolutely full with only HIGH/CRITICAL, drop new message
-    #[pyo3(signature = (message, priority=5))]
-    fn enqueue(&mut self, message: Py<PyAny>, priority: i32) -> bool {
+    /// Queue `message`. Returns whether it was accepted, and the lower-priority
+    /// message evicted to make room for it (the caller drops that one after
+    /// releasing the lock).
+    fn enqueue(&mut self, message: Py<PyAny>, priority: i32) -> (bool, Option<MessageEntry>) {
         // Normalize priority to the closest valid level
         let priority = Self::normalize_priority(priority);
+        let mut evicted = None;
 
         if self.size >= self.max_size {
             // Try to make room by dropping lower priority messages
@@ -209,7 +235,7 @@ impl RustPriorityMessageQueue {
             for &drop_priority in &[1, 3, 5] {
                 let idx = priority_to_index(drop_priority);
                 if !self.queues[idx].is_empty() {
-                    self.queues[idx].pop_front();
+                    evicted = self.queues[idx].pop_front();
                     self.size = self.size.saturating_sub(1);
                     let dist = self.priority_distribution.entry(drop_priority).or_insert(0);
                     *dist = dist.saturating_sub(1);
@@ -224,12 +250,12 @@ impl RustPriorityMessageQueue {
                 if priority < 8 {
                     // Not HIGH or CRITICAL -> drop the new message
                     *self.dropped_count.entry(priority).or_insert(0) += 1;
-                    return false;
+                    return (false, evicted);
                 }
                 // HIGH/CRITICAL but no room: queue is full of HIGH/CRITICAL only.
                 // Drop the incoming message to maintain the size invariant.
                 *self.dropped_count.entry(priority).or_insert(0) += 1;
-                return false;
+                return (false, evicted);
             }
         }
 
@@ -247,12 +273,9 @@ impl RustPriorityMessageQueue {
             self.oldest_message_timestamp = Some(now);
         }
 
-        true
+        (true, evicted)
     }
 
-    /// Get a batch of messages ordered by priority (highest first).
-    ///
-    /// Returns a list of (priority, message) tuples.
     fn dequeue_batch<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let mut batch: Vec<Bound<'py, PyTuple>> = Vec::with_capacity(self.batch_size);
 
@@ -301,23 +324,18 @@ impl RustPriorityMessageQueue {
         PyList::new(py, batch)
     }
 
-    /// Clear all queues.
-    fn clear(&mut self) {
-        for q in &mut self.queues {
-            q.clear();
-        }
+    /// Empty every queue and hand back what was in them (the caller drops it
+    /// after releasing the lock).
+    fn clear(&mut self) -> Vec<VecDeque<MessageEntry>> {
+        let removed = self.queues.iter_mut().map(std::mem::take).collect();
         self.size = 0;
         for val in self.priority_distribution.values_mut() {
             *val = 0;
         }
         self.oldest_message_timestamp = None;
+        removed
     }
 
-    /// Get queue statistics.
-    ///
-    /// Returns a dict with: size, capacity, utilization_percent,
-    /// priority_distribution, priority_queue_depths, dropped_by_priority,
-    /// total_dropped, backpressure, oldest_message_age, processing_rate.
     fn get_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let stats = PyDict::new(py);
 
@@ -379,14 +397,6 @@ impl RustPriorityMessageQueue {
         Ok(stats)
     }
 
-    /// Current total message count.
-    #[getter]
-    fn size(&self) -> usize {
-        self.size
-    }
-}
-
-impl RustPriorityMessageQueue {
     /// Normalize an arbitrary priority value to the closest valid level.
     fn normalize_priority(priority: i32) -> i32 {
         let mut best = 5; // default NORMAL
@@ -399,5 +409,60 @@ impl RustPriorityMessageQueue {
             }
         }
         best
+    }
+}
+
+#[pymethods]
+impl RustPriorityMessageQueue {
+    #[new]
+    #[pyo3(signature = (max_size=1000, batch_size=10))]
+    fn new(max_size: usize, batch_size: usize) -> Self {
+        Self {
+            state: Mutex::new(MessageQueueState::new(max_size, batch_size)),
+        }
+    }
+
+    /// Add a message to the queue with priority-based dropping.
+    ///
+    /// When queue is full:
+    /// 1. Try to drop BACKGROUND (1) priority messages
+    /// 2. Try to drop LOW (3) priority messages
+    /// 3. Try to drop NORMAL (5) priority messages
+    /// 4. If new message is LOW/NORMAL and still full, drop it
+    /// 5. For HIGH/CRITICAL, drop oldest NORMAL as last resort
+    /// 6. If absolutely full with only HIGH/CRITICAL, drop new message
+    #[pyo3(signature = (message, priority=5))]
+    fn enqueue(&self, py: Python<'_>, message: Py<PyAny>, priority: i32) -> bool {
+        let (accepted, evicted) = lock(py, &self.state).enqueue(message, priority);
+        drop(evicted); // after the lock, see the note at the top of this file
+        accepted
+    }
+
+    /// Get a batch of messages ordered by priority (highest first).
+    ///
+    /// Returns a list of (priority, message) tuples.
+    fn dequeue_batch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        lock(py, &self.state).dequeue_batch(py)
+    }
+
+    /// Clear all queues.
+    fn clear(&self, py: Python<'_>) {
+        let removed = lock(py, &self.state).clear();
+        drop(removed); // after the lock, see the note at the top of this file
+    }
+
+    /// Get queue statistics.
+    ///
+    /// Returns a dict with: size, capacity, utilization_percent,
+    /// priority_distribution, priority_queue_depths, dropped_by_priority,
+    /// total_dropped, backpressure, oldest_message_age, processing_rate.
+    fn get_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        lock(py, &self.state).get_stats(py)
+    }
+
+    /// Current total message count.
+    #[getter]
+    fn size(&self, py: Python<'_>) -> usize {
+        lock(py, &self.state).size
     }
 }

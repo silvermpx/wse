@@ -3,7 +3,7 @@
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -15,7 +15,8 @@ pub fn jwt_encode(claims: &serde_json::Value, secret: &[u8]) -> String {
     let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
 
     let signing_input = format!("{}.{}", header_b64, payload_b64);
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(signing_input.as_bytes());
     let signature = mac.finalize().into_bytes();
     let sig_b64 = URL_SAFE_NO_PAD.encode(signature);
