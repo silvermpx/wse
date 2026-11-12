@@ -2,8 +2,8 @@
 // WebSocket Engine - Circuit Breaker
 // =============================================================================
 
-import { CircuitBreakerState } from '../types';
-import { logger } from './logger';
+import { CircuitBreakerState } from '../types.js';
+import { logger } from './logger.js';
 
 export interface CircuitBreakerConfig {
   failureThreshold: number;

@@ -2,7 +2,7 @@
 // WebSocket Engine - Event Handlers Wrapper
 // =============================================================================
 
-import { registerAllHandlers } from './index';
+import { registerAllHandlers } from './index.js';
 
 /**
  * EventHandlers static class for compatibility with useWSE hook.

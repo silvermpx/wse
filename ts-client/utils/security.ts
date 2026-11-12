@@ -2,7 +2,7 @@
 // WebSocket Engine - Security Manager
 // =============================================================================
 
-import { logger } from './logger';
+import { logger } from './logger.js';
 
 // Check for Web Crypto API availability
 if (typeof window !== 'undefined' && !window.crypto?.subtle) {
@@ -37,6 +37,13 @@ export class SecurityManager {
   private sessionKeyPair: CryptoKeyPair | null = null;
   private sharedSecret: CryptoKey | null = null;
   private serverPublicKey: CryptoKey | null = null;
+
+  // In-flight ECDH derivation (resolves true once the AES key exists, false on
+  // failure) and a generation counter bumped by every reset, so a derivation
+  // started for a connection that has since closed can never install its key
+  // for the next connection.
+  private keyDerivation: Promise<boolean> | null = null;
+  private keyGeneration = 0;
 
   private usedIVs = new Set<string>();
 
@@ -147,23 +154,62 @@ export class SecurityManager {
   }
 
   async setServerPublicKeyRaw(b64key: string): Promise<void> {
-    try {
+    const generation = this.keyGeneration;
+    const run = (async () => {
       const keyData = this.base64ToArrayBuffer(b64key);
-      this.serverPublicKey = await crypto.subtle.importKey(
+      const serverKey = await crypto.subtle.importKey(
         'raw', keyData,
         { name: 'ECDH', namedCurve: 'P-256' },
         false, []
       );
-
-      if (this.sessionKeyPair && this.serverPublicKey) {
-        await this.deriveSharedSecret();
-        this.encryptionEnabled = true;
-        logger.info('E2E encryption enabled via raw key exchange (ECDH P-256 + AES-GCM-256)');
+      if (generation !== this.keyGeneration) {
+        throw new SecurityError('Key exchange superseded by a newer connection', 'KEY_EXCHANGE_FAILED');
       }
+      if (!this.sessionKeyPair) {
+        throw new SecurityError('No local ECDH key pair', 'KEY_EXCHANGE_FAILED');
+      }
+      this.serverPublicKey = serverKey;
+      await this.deriveSharedSecret(generation);
+      if (generation !== this.keyGeneration) {
+        throw new SecurityError('Key exchange superseded by a newer connection', 'KEY_EXCHANGE_FAILED');
+      }
+      this.encryptionEnabled = true;
+      logger.info('E2E encryption enabled via raw key exchange (ECDH P-256 + AES-GCM-256)');
+    })();
+
+    const derivation = run.then(() => true, () => false);
+    this.keyDerivation = derivation;
+    try {
+      await run;
     } catch (error) {
-      this.serverPublicKey = null;
+      if (generation === this.keyGeneration) {
+        this.serverPublicKey = null;
+      }
+      if (error instanceof SecurityError) throw error;
       throw new SecurityError('Failed to import raw server public key', 'KEY_EXCHANGE_FAILED', error);
+    } finally {
+      if (this.keyDerivation === derivation) {
+        this.keyDerivation = null;
+      }
     }
+  }
+
+  /** True while a server key has been received and the AES key is being derived. */
+  hasPendingKeyDerivation(): boolean {
+    return this.keyDerivation !== null;
+  }
+
+  /**
+   * Resolve true once the transport key exists: immediately when it already
+   * does, after the in-flight derivation otherwise. Resolves false when there
+   * is no key and none is being derived, or when the derivation fails.
+   */
+  async waitForTransportKey(): Promise<boolean> {
+    if (this.isTransportEncryptionReady()) return true;
+    const pending = this.keyDerivation;
+    if (!pending) return false;
+    const ok = await pending;
+    return ok && this.isTransportEncryptionReady();
   }
 
   async setServerPublicKey(publicKeyJwk: JsonWebKey): Promise<void> {
@@ -190,7 +236,7 @@ export class SecurityManager {
     }
   }
 
-  private async deriveSharedSecret(): Promise<void> {
+  private async deriveSharedSecret(generation: number = this.keyGeneration): Promise<void> {
     if (!this.sessionKeyPair || !this.serverPublicKey) return;
 
     try {
@@ -200,24 +246,29 @@ export class SecurityManager {
         256
       );
 
-      this.sharedSecret = await crypto.subtle.importKey(
+      const sharedSecret = await crypto.subtle.importKey(
         'raw', sharedSecretBits, 'HKDF', false, ['deriveKey']
       );
 
       // RFC 5869: salt = empty (zero-salt default), info = context label
       // Must match server.rs, security.rs, and Python client exactly
-      this.encryptionKey = await crypto.subtle.deriveKey(
+      const encryptionKey = await crypto.subtle.deriveKey(
         {
           name: 'HKDF',
           hash: 'SHA-256',
           salt: new Uint8Array(0),
           info: new TextEncoder().encode('wse-encryption/aes-gcm-key')
         },
-        this.sharedSecret,
+        sharedSecret,
         { name: 'AES-GCM', length: 256 },
         true,
         ['encrypt', 'decrypt']
       );
+
+      // Install both keys together, and only for the connection that asked.
+      if (generation !== this.keyGeneration) return;
+      this.sharedSecret = sharedSecret;
+      this.encryptionKey = encryptionKey;
 
       logger.info('Derived shared encryption key from ECDH exchange');
     } catch (error) {
@@ -398,25 +449,17 @@ export class SecurityManager {
   }
 
   async rotateKeys(): Promise<void> {
-    // Skip rotation if ECDH shared secret is active -- rotating would
-    // replace the ECDH-derived key with a random one, breaking encryption
-    // since the server still has the old shared secret.
-    if (this.sharedSecret) {
-      logger.debug('Skipping key rotation (ECDH session active)');
-      return;
-    }
-
-    logger.info('Rotating cryptographic keys');
+    // Transport keys are never rotated here: the ECDH key pair and the derived
+    // AES key belong to one connection (a fresh pair is generated for every
+    // client_hello and dropped on close). Replacing them on a timer could swap
+    // the key pair between client_hello and server_hello, or install a random
+    // AES key the server does not have.
+    logger.debug('Rotating signing key');
 
     try {
-      if (this.encryptionEnabled) {
-        await this.generateEncryptionKey();
-        this.usedIVs.clear();
-      }
       if (this.messageSigningEnabled) {
         await this.generateSigningKey();
       }
-      await this.generateKeyPair();
       this.lastKeyRotation = Date.now();
       logger.info('Keys rotated successfully');
     } catch (error) {
@@ -493,6 +536,8 @@ export class SecurityManager {
   }
 
   resetEncryption(): void {
+    this.keyGeneration++;
+    this.keyDerivation = null;
     this.encryptionKey = null;
     this.sharedSecret = null;
     this.serverPublicKey = null;
@@ -506,6 +551,8 @@ export class SecurityManager {
   }
 
   destroy(): void {
+    this.keyGeneration++;
+    this.keyDerivation = null;
     if (this.keyRotationTimer) {
       clearInterval(this.keyRotationTimer);
       this.keyRotationTimer = null;

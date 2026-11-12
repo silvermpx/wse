@@ -1,6 +1,6 @@
 # wse-client (TypeScript / React)
 
-React client for [WSE (WebSocket Engine)](https://github.com/niceguy135/wse) - real-time event streaming with a single React hook.
+React client for [WSE (WebSocket Engine)](https://github.com/silvermpx/wse) - real-time event streaming with a single React hook.
 
 [![npm](https://img.shields.io/npm/v/wse-client)](https://www.npmjs.com/package/wse-client)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue)](https://www.typescriptlang.org/)
@@ -14,201 +14,257 @@ npm install wse-client
 
 Peer dependencies: `react >= 18`, `zustand >= 4`.
 
+The package is ESM (`"type": "module"`, explicit `.js` import paths). It loads in bundlers
+(Vite, webpack, esbuild, Next.js) and directly in Node.js (SSR, tests, scripts) without a bundler.
+
 ## Quick Start
 
 ```tsx
-import { useWSE, ConnectionState } from 'wse-client';
+import { useMemo, useState } from 'react';
+import { useWSE, type UseWSEConfig } from 'wse-client';
 
-function Dashboard() {
-  const { connectionHealth, activeTopics } = useWSE(
-    'jwt-token',                                   // token
-    ['notifications', 'live_data'],                // initial topics
-    { endpoints: ['ws://localhost:5007/wse'] }     // config
+function Prices({ signedIn }: { signedIn: boolean }) {
+  const [prices, setPrices] = useState<Record<string, number>>({});
+
+  // Handlers are registered by message type (the "t" your server publishes).
+  const config = useMemo<UseWSEConfig>(() => ({
+    endpoints: ['ws://localhost:5007/wse'],
+    registerHandlers: (processor) => {
+      processor.registerHandler('price_update', (msg) => {
+        setPrices((prev) => ({ ...prev, [msg.p.symbol]: msg.p.price }));
+      });
+    },
+  }), []);
+
+  const { connectionHealth, stats } = useWSE(
+    signedIn ? 'cookie' : undefined, // auth mode, see "Authentication"
+    ['prices'],                      // topics
+    config,
   );
 
-  useEffect(() => {
-    const handler = (e: CustomEvent) => {
-      console.log('New notification:', e.detail);
-    };
-    window.addEventListener('notifications', handler);
-    return () => window.removeEventListener('notifications', handler);
-  }, []);
-
-  return <div>Status: {connectionHealth}</div>;
+  return (
+    <div>
+      Status: {connectionHealth} | Latency: {stats.avgLatency?.toFixed(1) ?? '-'} ms
+      <ul>{Object.entries(prices).map(([s, p]) => <li key={s}>{s}: {p}</li>)}</ul>
+    </div>
+  );
 }
 ```
 
+## Authentication
+
+Browsers cannot attach an `Authorization` header to a WebSocket, so the server authenticates a
+browser by its **cookie** (`jwt_cookie_name` on the server, default `access_token`). The client never
+sends the first argument of `useWSE` anywhere; it is the auth *mode*:
+
+| Value | Meaning |
+|-------|---------|
+| `'cookie'` | Connect; the browser sends its cookies on the upgrade. Also enables the periodic `refreshAuthToken` call. Use it for a server without `jwt_secret` too. |
+| `undefined` / `''` | Signed out: close the connection and clear per-user data (outgoing queues, IndexedDB offline queue, recovery positions, saved subscriptions, the opt-in error log). |
+| any other string | Connect like `'cookie'`; a change from one non-empty value to another is treated as a different user (reconnect and clear per-user data). Do not pass a rotating JWT here - it is not sent, and each rotation would reset the session. A JWT-shaped value logs a warning. |
+
+When the server rejects the credentials (close code 4401/4403, or an `AUTH_FAILED` error before the
+close) the client calls `refreshAuthToken` once (if configured) and retries once; when that is
+rejected too, or without `refreshAuthToken`, it **stops reconnecting**, enters `ERROR` and dispatches
+`wseAuthFailed`. Sign the user in again and call `forceReconnect()` (or remount with a new auth value).
+
+`refreshAuthToken` must reject when the refresh fails - with `fetch`, check `response.ok`:
+
+```ts
+refreshAuthToken: async () => {
+  const res = await fetch('/api/auth/refresh', { method: 'POST', credentials: 'include' });
+  if (!res.ok) throw new Error(`refresh failed: ${res.status}`);
+},
+```
+
+In cookie mode it runs every 10 minutes. A failed periodic refresh never closes a healthy connection;
+it is retried with backoff and reported with `wseTokenRefreshFailed`.
+
 ## useWSE Hook
-
-The main entry point. Manages connection lifecycle, subscriptions, and message dispatch.
-
-### Signature
 
 ```tsx
 useWSE(token?: string, initialTopics?: string[], config?: UseWSEConfig): UseWSEReturn
 ```
 
-- **token** - JWT auth token (optional, pass `undefined` to skip authentication)
-- **initialTopics** - topics to subscribe to on connect
-- **config** - connection and behavior options (see Configuration below)
+- **token** - auth mode (see above)
+- **initialTopics** - topics to subscribe to. Without them the signed-in user's saved subscriptions
+  (stored per user id from `server_ready`) or `DEFAULT_TOPICS` are used
+- **config** - options (below). Read when the connection is created; inline objects are fine
+
+All `useWSE()` calls on a page share **one connection** per auth value and endpoint list. It is
+created by the first consumer and closed one tick after the last consumer unmounts (React StrictMode
+safe). Every returned function is **stable** - the same identity on every render, acting on live
+state - so it is safe in effect dependency lists:
+
+```tsx
+useEffect(() => {
+  subscribe([`chat:${channelId}`]);
+  return () => unsubscribe([`chat:${channelId}`]);
+}, [channelId, subscribe, unsubscribe]); // runs once per channel, never in a loop
+```
 
 ### Return Values
 
 ```tsx
 const {
-  // Connection management
-  subscribe,          // (topics: string[], options?: { recover?: boolean }) => void
-  unsubscribe,        // (topics: string[]) => void
-  forceReconnect,     // () => void
-  changeEndpoint,     // (endpoint: string) => void
+  subscribe,          // (topics, options?: { recover?: boolean }) => void
+  unsubscribe,        // (topics) => void
+  forceReconnect,     // () => void - also leaves ERROR after an auth/encryption failure
+  changeEndpoint,     // (endpoint) => void
 
-  // Messaging
-  sendMessage,        // (type: string, payload: any, options?: MessageOptions) => void
-  sendBatch,          // (messages: Array<{ type: string; payload: any }>) => void
+  sendMessage,        // (type, payload, options?: MessageOptions) => 'sent' | 'queued' | 'dropped'
+  sendBatch,          // (Array<{ type, payload, options? }>) => SendStatus[]
 
-  // Status and monitoring
-  stats,              // ConnectionMetrics object
-  activeTopics,       // string[] - currently subscribed topics
-  connectionHealth,   // ConnectionState enum
-  diagnostics,        // NetworkDiagnostics | null
+  stats,              // ConnectionMetrics, refreshed at most once per second
+  activeTopics,       // string[]
+  connectionHealth,   // ConnectionState
+  diagnostics,        // NetworkDiagnostics | null (only with diagnostics.enabled)
 
-  // Advanced features
-  setCompression,     // (enabled: boolean) => void
   downloadDiagnostics,// () => void
   clearOfflineQueue,  // () => Promise<void>
-  getQueueSize,       // () => number
-  requestSnapshot,    // (topics?: string[]) => void
+  getQueueSize,       // () => number (in-memory + IndexedDB)
+  requestSnapshot,    // (topics?) => void - sends a sync_request
   debugHandlers,      // () => void
 } = useWSE(token, topics, config);
 ```
 
 ### Configuration
 
-The third argument to `useWSE` accepts a `UseWSEConfig` object. Token and topics are passed as separate arguments (see Signature above).
-
 ```tsx
-useWSE('jwt-token', ['notifications'], {
-  // Endpoints (optional, defaults to same-origin /wse)
-  endpoints: ['ws://localhost:5007/wse'],
+useWSE('cookie', ['notifications'], {
+  endpoints: ['ws://localhost:5007/wse'],     // default: same origin, path /wse
 
-  // Token refresh callback (optional, called on auth failure)
-  refreshAuthToken: async () => {
-    const res = await fetch('/api/refresh');
-    // Update your token state; no return value needed
+  refreshAuthToken: async () => { /* see Authentication */ },
+
+  registerHandlers: (processor) => {          // application handlers by message type
+    processor.registerHandler('my_event', (msg) => console.log(msg.p));
   },
+  criticalHandlers: ['my_event'],             // refuse to start if these are missing
+  eventThrottleMs: 0,                         // opt-in: drop same-type events faster than this (ms)
 
-  // Handler registration (optional)
-  registerHandlers: (processor) => {
-    processor.registerHandler('my_event', (msg) => {
-      console.log('Received:', msg);
-    });
-  },
-  criticalHandlers: ['my_event'],              // Block until these handlers are registered
-
-  eventThrottleMs: 0,                          // Throttle same-type non-system events (ms); 0 = disabled
-
-  // TanStack Query integration (optional)
-  queryClient: queryClient,                    // Adapts stale times based on connection quality
-
-  // Reconnection (all optional)
   reconnection: {
-    mode: 'adaptive',                          // 'exponential' | 'linear' | 'fibonacci' | 'adaptive'
-    baseDelay: 1000,                           // ms
-    maxDelay: 30000,                           // ms
-    maxAttempts: 10,                           // -1 for infinite
-    factor: 1.5,
+    mode: 'adaptive',                         // 'exponential' | 'linear' | 'fibonacci' | 'adaptive'
+    baseDelay: 1000,                          // ms
+    maxDelay: 30000,                          // ms, the backoff never exceeds this
+    maxAttempts: -1,                          // consecutive failures before giving up; -1 = forever (default)
+    factor: 1.5,                              // for 'exponential'
     jitter: true,
   },
 
-  // Encryption (optional)
   security: {
-    encryptionEnabled: false,                  // ECDH P-256 + AES-GCM-256
-    messageSignature: false,                   // HMAC-SHA256 signing
+    encryptionEnabled: false,                 // require E2E encryption (fails closed, see below)
+    messageSignature: false,
   },
 
-  // Performance tuning (optional)
   performance: {
-    batchSize: 10,                             // Messages per batch
-    batchTimeout: 500,                         // ms - batch flush interval
-    compressionThreshold: 1024,                // bytes - zlib threshold
-    maxQueueSize: 10000,                       // Max pending outbound messages
-    memoryLimit: 50 * 1024 * 1024,             // 50 MB memory budget
+    batchSize: 10,                            // messages per flush step of the outgoing queue
+    batchTimeout: 500,                        // ms
+    maxQueueSize: 10000,                      // capacity of the in-memory outgoing queue
   },
 
-  // Offline queue (optional)
   offline: {
-    enabled: true,                             // Enable offline message queueing
-    maxSize: 1000,                             // Max queued messages
-    maxAge: 3600000,                           // 1 hour max age (ms)
-    persistToStorage: true,                    // Persist to IndexedDB
+    enabled: true,                            // allow { offline: true } sends
+    maxSize: 1000,
+    maxAge: 3600000,                          // ms
+    persistToStorage: true,                   // IndexedDB
   },
 
-  // Diagnostics (optional)
   diagnostics: {
-    enabled: false,                            // Enable metrics collection
-    sampleRate: 0.1,                           // Sample 10% of messages
-    metricsInterval: 60000,                    // Metrics report interval (ms)
-    healthCheckInterval: 30000,                // Health check interval (ms)
+    enabled: false,                           // run the network monitor (no timer when false)
+    metricsInterval: 60000,                   // ms between diagnostics updates
   },
+
+  rateLimit: { capacity: 1000, refillRate: 100 }, // outbound token bucket (msg burst, msg/s); false = off
+  maxMessageSize: 16 * 1024 * 1024,           // inbound limit in bytes, checked while inflating
+  recoveryTimeoutMs: 3000,                    // hold window for replays after a reconnect; 0 = off
+  serverReadyTimeout: 10000,                  // proceed without server_ready (server without jwt_secret); 0 = wait
 });
 ```
 
-## Receiving Events
+## Receiving Messages
 
-WSE dispatches events as browser `CustomEvent`s on `window`, keyed by topic name:
+Register handlers by message type with `registerHandlers` (above). Messages that no handler claims
+are dispatched as **one** window event, `wseMessage`, whose `detail` is the whole message:
 
 ```tsx
 useEffect(() => {
-  const handler = (e: CustomEvent) => {
-    const { type, payload } = e.detail;
-    console.log(type, payload);
+  const onMessage = (e: Event) => {
+    const msg = (e as CustomEvent).detail;   // { t, p, tp?, e?, o?, ... }
+    if (msg.t === 'notification') notify(msg.p);
   };
-  window.addEventListener('my_topic', handler);
-  return () => window.removeEventListener('my_topic', handler);
+  window.addEventListener('wseMessage', onMessage);
+  return () => window.removeEventListener('wseMessage', onMessage);
 }, []);
 ```
 
-Or use `registerHandlers` for centralized handling:
+Other window events the client dispatches:
 
-```tsx
-const { stats } = useWSE('token', ['prices'], {
-  endpoints: ['ws://localhost:5007/wse'],
-  registerHandlers: (processor) => {
-    processor.registerHandler('price_update', (msg) => {
-      updateChart(msg.p);
-    });
-  },
-});
-```
+| Event | When |
+|-------|------|
+| `wseGap` | Messages of a recovery-stamped topic were skipped (`WSEGapEvent`: topic, epoch, fromOffset, toOffset, missed, reason) |
+| `wseAuthFailed` | The client stopped reconnecting because the server rejected the credentials |
+| `wseEncryptionFailed` | Encryption was required but could not be established; the connection was closed |
+| `wseTokenRefreshFailed` | A periodic `refreshAuthToken` call failed (connection kept, retried later) |
+| `wseReconnectFailed` | `reconnection.maxAttempts` consecutive attempts failed |
+| `presenceJoin` / `presenceLeave` / `presenceUpdate` | Presence events (`presence_join` / `presence_leave` / `presence_update`) |
+| `subscriptionUpdate` | The server answered a subscription request |
+| `serverError`, `rateLimitExceeded`, `clientRateLimitExceeded` | Server errors and rate limits |
+| `snapshotComplete` | The server finished sending a snapshot |
 
 ## Sending Messages
 
 ```tsx
-const { sendMessage } = useWSE(token, topics, config);
+const { sendMessage } = useWSE('cookie', topics, config);
 
-// Basic message
-sendMessage('chat_message', { text: 'Hello' });
-
-// With priority
-sendMessage('alert', { msg: 'critical' }, {
-  priority: MessagePriority.CRITICAL,
-});
-
-// With correlation ID (for request-response patterns)
-sendMessage('query', { filter: 'active' }, {
-  correlation_id: 'req-123',
-});
+sendMessage('chat_message', { text: 'Hello' });                          // 'sent' | 'queued' | 'dropped'
+sendMessage('alert', { msg: 'critical' }, { priority: MessagePriority.CRITICAL });
+sendMessage('query', { filter: 'active' }, { correlation_id: 'req-123' });
+sendMessage('draft', { text }, { offline: true });                       // survives reloads (IndexedDB)
 ```
 
-### Message Priority Levels
+Nothing is lost because the connection was busy: a message that cannot go out at once (before
+`server_ready`, while reconnecting, before the encryption key exists, or over the rate limit) is kept
+and sent automatically, in priority then FIFO order, as soon as possible. `'dropped'` means the
+outgoing queue was full or the message cannot be sent safely (see encryption).
 
-| Level | Value | Use Case |
-|-------|-------|----------|
-| `CRITICAL` | 10 | Alerts, errors, urgent notifications |
-| `HIGH` | 8 | User actions, real-time updates |
-| `NORMAL` | 5 | Standard messages (default) |
-| `LOW` | 3 | Background sync, non-urgent data |
-| `BACKGROUND` | 1 | Logging, analytics, telemetry |
+## Reconnection and Close Codes
+
+- Any close the server or network initiates - `1000`/`1001` (server stop), `1005` (kick), `1006`,
+  `1011`-`1013`, `4300` (drain), `4429` - is followed by a reconnect with backoff.
+- `4401`/`4403` stop reconnecting (see Authentication).
+- A single failed attempt is never terminal. With the default `maxAttempts: -1` the client retries
+  forever; the backoff resets only when a connection reaches `server_ready`.
+- It reconnects at once when the browser goes back online or the tab becomes visible again, and
+  replaces a socket that went silent (no data for 2.5 server ping intervals).
+- A close the client initiates (`forceReconnect`, `changeEndpoint`, unmount, sign-out) never
+  disturbs the next socket.
+
+## Recovery and Gaps
+
+When the server runs with `recovery_enabled`, topic publications carry `tp`/`e`/`o`
+(topic, epoch, offset). The client:
+
+- drops duplicates by `(epoch, offset)`;
+- delivers past a gap at once and reports it with `wseGap` (and `stats.gapsDetected` /
+  `stats.messagesMissed`) - a topic is never blacked out;
+- after a reconnect resubscribes with `recover: true` from the **last delivered** offset of each
+  topic, and holds out-of-order messages for up to `recoveryTimeoutMs` while the replay fills the hole;
+- forgets a topic's position when you unsubscribe from it.
+
+## Encryption
+
+With `security.encryptionEnabled: true` the client **fails closed**:
+
+- Only the control frames `client_hello` (which carries the client's public key), heartbeat `ping`
+  and `PONG` are ever sent in plaintext. Every application message, including the resubscribe, waits
+  until the ECDH key exchange completes and is then sent AES-GCM encrypted.
+- Encrypted frames that arrive while the key is being derived are kept and decrypted once it exists.
+- If the server does not confirm encryption in `server_hello`, reports `KEY_EXCHANGE_FAILED`, or no
+  key arrives in time, the connection is closed, the state becomes `ERROR` and `wseEncryptionFailed`
+  is dispatched. Nothing is sent in plaintext instead.
+- Web Crypto needs a secure context (https:// or localhost); without it an encrypted session does not
+  connect at all.
+- A message sent with `{ encrypted: true }` on a session without encryption is refused (`'dropped'`).
 
 ## Stores (Zustand)
 
@@ -217,82 +273,70 @@ For accessing WSE state outside of React components:
 ```tsx
 import { useWSEStore, useMessageQueueStore } from 'wse-client';
 
-// Connection state
 const state = useWSEStore.getState().connectionState;
 const metrics = useWSEStore.getState().metrics;
-
-// Message queue
 const queueSize = useMessageQueueStore.getState().size;
+
+// Select narrowly in components to avoid re-rendering on every message:
+const health = useWSEStore((s) => s.connectionState);
 ```
+
+## Logging
+
+The logger defaults to `WARN` in production and `INFO` in development (`WSE_LOG_LEVEL` /
+`VITE_LOG_LEVEL` override it). Error entries are kept in localStorage only after
+`logger.setPersistErrors(true)`, and never with their data.
 
 ## Features
 
 | Feature | Description |
 |---------|-------------|
-| **Auto-reconnection** | Exponential, linear, fibonacci, or adaptive backoff with jitter |
-| **Offline queue** | IndexedDB persistence for messages sent while disconnected, replayed on reconnect |
-| **E2E encryption** | ECDH P-256 key exchange + AES-GCM-256 encryption, per-connection session keys via Web Crypto API |
-| **Message signing** | HMAC-SHA256 integrity verification with nonce-based replay prevention |
-| **Compression** | Automatic zlib compression for messages above threshold (default 1 KB) |
-| **MessagePack** | Binary encoding support via `@msgpack/msgpack` for smaller payloads |
-| **Batching** | Automatic message batching to reduce WebSocket frame overhead |
-| **Rate limiting** | Client-side token bucket (1000 tokens, 100/sec refill) |
-| **Circuit breaker** | Connection storm prevention (5 failures -> 60s cooldown -> half-open probe) |
-| **Idempotent delivery** | Per-topic `(epoch, offset)` dedup + gap-triggered recovery; positions survive reconnects |
-| **Connection pool** | Multi-endpoint with adaptive health scoring and load balancing |
-| **Network monitor** | Real-time latency and jitter from PONG round-trips, quality scoring (UNKNOWN until samples arrive) |
+| **Auto-reconnection** | Exponential, linear, fibonacci or adaptive backoff with jitter, infinite by default |
+| **Offline queue** | `{ offline: true }` messages persist in IndexedDB and replay after reconnecting |
+| **E2E encryption** | ECDH P-256 + AES-GCM-256, per-connection keys via Web Crypto; fails closed |
+| **Compression** | Inflates `C:` (zlib) frames from the server with a size limit |
+| **MessagePack** | Decodes `M:` binary frames via `@msgpack/msgpack` |
+| **Rate limiting** | Configurable client-side token bucket (default 1000 burst, 100 msg/s); control frames exempt |
+| **Circuit breaker** | Pauses reconnects after 5 consecutive failures (60 s), reset by `forceReconnect` |
+| **Idempotent delivery** | Per-topic `(epoch, offset)` dedup, gap reporting, recovery from the last delivered offset |
+| **Connection pool** | Multi-endpoint with health scoring |
+| **Network monitor** | Latency and jitter from PONG round-trips (with `diagnostics.enabled`) |
 | **Priority queues** | 5 priority levels from CRITICAL to BACKGROUND |
-| **Adaptive quality** | Dynamic adjustment of compression and batching based on network conditions |
-| **Token refresh** | Automatic token refresh via `refreshAuthToken` callback on auth failure |
+| **Token refresh** | `refreshAuthToken` every 10 minutes (cookie mode) and once after an auth rejection |
 
 ## Exports
 
 ```tsx
-// Main hook and config type
 import { useWSE } from 'wse-client';
-import type { UseWSEConfig } from 'wse-client';
-
-// Types (enums and interfaces)
-import {
-  MessagePriority,
-  ConnectionState,
-  ConnectionQuality,
-  CircuitBreakerState,
-} from 'wse-client';
-import type {
-  WSEConfig,
-  UseWSEReturn,
-  ConnectionMetrics,
-  MessageOptions,
-  NetworkDiagnostics,
-} from 'wse-client';
-
-// Stores (Zustand)
+import type { UseWSEConfig, UseWSEReturn, SendStatus, WSEGapEvent, MessageOptions } from 'wse-client';
+import { MessagePriority, ConnectionState, ConnectionQuality, CircuitBreakerState } from 'wse-client';
 import { useWSEStore, useMessageQueueStore } from 'wse-client';
-
-// Services (advanced usage)
 import {
-  ConnectionManager,
-  MessageProcessor,
-  RateLimiter,
-  ConnectionPool,
-  NetworkMonitor,
-  OfflineQueue,
-  EventSequencer,
-  AdaptiveQualityManager,
+  ConnectionManager, MessageProcessor, RateLimiter, ConnectionPool,
+  NetworkMonitor, OfflineQueue, EventSequencer,
 } from 'wse-client';
-
-// Utils
-import { logger, CircuitBreaker, createCircuitBreaker } from 'wse-client';
-import { compressionManager } from 'wse-client';
-import { eventTransformer } from 'wse-client';
-
-// Handlers (for extending)
+import { logger, CircuitBreaker, createCircuitBreaker, generateId, compressionManager, eventTransformer } from 'wse-client';
 import { EventHandlers, registerAllHandlers } from 'wse-client';
-
-// Constants
-import { WSE_VERSION, WS_CLIENT_VERSION, WS_PROTOCOL_VERSION } from 'wse-client';
+import { WSE_VERSION, WS_CLIENT_VERSION, WS_PROTOCOL_VERSION, clearWSEStorage } from 'wse-client';
 ```
+
+## Upgrading from 2.x
+
+- The package is ESM-only (`"type": "module"`).
+- `maxAttempts` defaults to `-1` (infinite) and `-1` really means infinite; the store no longer caps
+  reconnects at 10.
+- Server closes `1000`/`1001` reconnect; `4401`/`4403` stop reconnecting.
+- `sendMessage` returns `'sent' | 'queued' | 'dropped'`; queued messages are no longer lost.
+- Messages are no longer dropped for their timestamp age, and `heartbeat`/`health_check`/`metrics_response`
+  events are no longer throttled by name (`eventThrottleMs` remains as an opt-in).
+- Removed: `AdaptiveQualityManager`, the `queryClient` option, `setCompression()`,
+  `performance.compressionThreshold`, `performance.memoryLimit`, `diagnostics.sampleRate`,
+  `diagnostics.healthCheckInterval` and `MessageOptions.ttl` - none of them had any effect.
+- `wseRecoveryGap` became `wseGap` (with the missing range) and no longer triggers a resubscribe.
+- The periodic refresh failure event is `wseTokenRefreshFailed` (was `authTokenExpired`, which also
+  closed the connection).
+- Saved subscriptions are stored per user id; the 2.x format is only reused when the server reports no user.
+- The `topics` query parameter is no longer added to the WebSocket URL (the server never read it).
 
 ## Wire Protocol
 
@@ -300,7 +344,7 @@ Speaks WSE wire protocol v1, identical to the Python client:
 
 - **Text frames:** JSON with `c` field for category (`WSE`, `S`, `U`)
 - **Binary frames:** Codec prefix (`C:` zlib, `M:` msgpack, `E:` AES-GCM) + payload
-- **Recovery stamp:** topic publications carry `tp` (topic), `e` (epoch, 8-hex), `o` (offset) for idempotent dedup + gap recovery
+- **Recovery stamp:** topic publications carry `tp` (topic), `e` (epoch, 8-hex), `o` (offset)
 - **Heartbeat:** JSON PING/PONG with latency tracking
 - **Protocol negotiation:** `client_hello`/`server_hello` handshake with feature discovery
 
@@ -309,12 +353,8 @@ Full protocol specification: [PROTOCOL.md](../docs/PROTOCOL.md)
 ## Requirements
 
 - React 18+
-- TypeScript 5+
 - zustand 4+ (peer dependency)
-
-Optional:
-- `@msgpack/msgpack` (MessagePack binary transport)
-- `pako` (zlib compression, bundled)
+- A browser, or Node.js with a global `WebSocket` (Node 22+)
 
 ## License
 

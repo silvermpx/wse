@@ -2,8 +2,9 @@
 // WebSocket Engine - Event Transformer
 // =============================================================================
 
-import { WSMessage } from '../types';
-import { INTERNAL_TO_WS_EVENT_TYPE_MAP } from '../constants';
+import { WSMessage } from '../types.js';
+import { INTERNAL_TO_WS_EVENT_TYPE_MAP } from '../constants.js';
+import { generateId } from '../utils/id.js';
 
 export class EventTransformer {
   // ---------------------------------------------------------------------------
@@ -23,7 +24,7 @@ export class EventTransformer {
 
     const wsEvent: WSMessage = {
       v: 2,
-      id: metadata.event_id || event.event_id || crypto.randomUUID(),
+      id: metadata.event_id || event.event_id || generateId(),
       t: wsEventType,
       ts: metadata.timestamp || event.timestamp || new Date().toISOString(),
       seq: sequence,

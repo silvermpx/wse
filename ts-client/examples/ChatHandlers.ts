@@ -1,9 +1,16 @@
 /**
- * Example: Chat application event handlers for WSE.
+ * Example: chat handlers for WSE.
  *
- * Register these handlers via the useWSE config to handle
- * domain-specific events from your server.
+ * Messages reach the application through handlers registered by message
+ * type (the `t` the server publishes). Pass the result of createChatHandlers
+ * as `registerHandlers` in the useWSE config:
+ *
+ *   const handlers = useMemo(() => createChatHandlers({ onMessage: addMessage }), []);
+ *   useWSE('cookie', ['chat:general'], { registerHandlers: handlers });
  */
+
+import type { HandlerRegistry } from '../services/WSESession.js';
+import type { WSMessage } from '../types.js';
 
 export interface ChatMessage {
   id: string;
@@ -13,18 +20,27 @@ export interface ChatMessage {
   timestamp: string;
 }
 
-export function registerChatHandlers() {
-  // Register handlers for chat events
-  window.addEventListener('chat_message', ((e: CustomEvent<ChatMessage>) => {
-    console.log('New message:', e.detail);
-    // Update your UI state here
-  }) as EventListener);
+export interface ChatCallbacks {
+  onMessage: (message: ChatMessage) => void;
+  onTyping?: (event: { userId: string; channelId: string }) => void;
+  onPresence?: (event: { user_id: string; data?: Record<string, unknown> }) => void;
+}
 
-  window.addEventListener('typing_start', ((e: CustomEvent<{ userId: string; channelId: string }>) => {
-    console.log('User typing:', e.detail.userId);
-  }) as EventListener);
+export function createChatHandlers(callbacks: ChatCallbacks) {
+  return (processor: HandlerRegistry): void => {
+    processor.registerHandler('chat_message', (msg: WSMessage) => {
+      callbacks.onMessage(msg.p as ChatMessage);
+    });
 
-  window.addEventListener('presence_update', ((e: CustomEvent<{ userId: string; status: string }>) => {
-    console.log('Presence:', e.detail);
-  }) as EventListener);
+    processor.registerHandler('typing_start', (msg: WSMessage) => {
+      callbacks.onTyping?.(msg.p);
+    });
+
+    // The server's presence events are `presence_join`, `presence_leave` and
+    // `presence_update`. Registering a handler replaces the default one,
+    // which dispatches the window events presenceJoin/presenceLeave/presenceUpdate.
+    processor.registerHandler('presence_update', (msg: WSMessage) => {
+      callbacks.onPresence?.(msg.p);
+    });
+  };
 }

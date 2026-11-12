@@ -55,12 +55,23 @@ export interface ReconnectionStrategy {
   mode: 'exponential' | 'linear' | 'fibonacci' | 'adaptive';
   baseDelay: number;
   maxDelay: number;
+  /**
+   * Consecutive failed attempts before giving up. -1 (the default) retries
+   * forever; 0 disables automatic reconnection. The count resets whenever a
+   * connection reaches server_ready.
+   */
   maxAttempts: number;
   factor: number;
   jitter: boolean;
 }
 
 export interface SecurityConfig {
+  /**
+   * Require E2E encryption (ECDH P-256 + AES-GCM-256). When true the client
+   * never sends application messages in plaintext: they are held until the
+   * key exchange completes, and the connection is closed with an error when
+   * the server does not confirm encryption.
+   */
   encryptionEnabled: boolean;
   publicKey?: string;
   sessionKey?: CryptoKey;
@@ -68,11 +79,12 @@ export interface SecurityConfig {
 }
 
 export interface PerformanceConfig {
+  /** Messages sent per flush step of the outgoing queue. */
   batchSize: number;
+  /** Delay (ms) before a queued message is flushed when it could not go out at once. */
   batchTimeout: number;
-  compressionThreshold: number;
+  /** Capacity of the in-memory outgoing queue. */
   maxQueueSize: number;
-  memoryLimit: number;
 }
 
 export interface OfflineConfig {
@@ -83,10 +95,21 @@ export interface OfflineConfig {
 }
 
 export interface DiagnosticsConfig {
+  /** Run the network monitor and refresh `diagnostics` every metricsInterval ms. */
   enabled: boolean;
-  sampleRate: number;
   metricsInterval: number;
-  healthCheckInterval: number;
+}
+
+/**
+ * Client-side outbound rate limit (token bucket). Control frames (heartbeat
+ * ping, PONG, client_hello) are never limited. A message that hits the limit
+ * stays queued and is sent when tokens are available.
+ */
+export interface RateLimitConfig {
+  /** Burst size in messages (default 1000). */
+  capacity?: number;
+  /** Sustained rate in messages per second (default 100). */
+  refillRate?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +147,10 @@ export interface ConnectionMetrics {
   protocolErrors: number;
   networkJitter: number;
   packetLoss: number;
+  /** Offset gaps detected on recovery-stamped topics (see the `wseGap` event). */
+  gapsDetected: number;
+  /** Messages known to be missing across all gaps (when the range is known). */
+  messagesMissed: number;
 }
 
 export interface ConnectionInfo {
@@ -197,14 +224,46 @@ export interface QueuedMessage {
   retries: number;
   encrypted?: boolean;
   correlation_id?: string;
+  /** The complete wire message (keeps cid/enc and the original id). */
+  message?: WSMessage;
 }
 
 export interface MessageOptions {
   priority?: MessagePriority;
+  /**
+   * Refuse to send this message unless the session has E2E encryption
+   * enabled (security.encryptionEnabled). It never falls back to plaintext.
+   */
   encrypted?: boolean;
+  /** Persist to IndexedDB while disconnected and replay after reconnecting. */
   offline?: boolean;
   correlation_id?: string;
-  ttl?: number;
+}
+
+/**
+ * Result of sendMessage():
+ * - 'sent'    handed to the open socket (encrypted when encryption is on)
+ * - 'queued'  held and sent automatically once the connection is ready
+ * - 'dropped' rejected (outgoing queue full, encryption required but not
+ *             enabled, or the message could not be serialised)
+ */
+export type SendStatus = 'sent' | 'queued' | 'dropped';
+
+/**
+ * Detail of the `wseGap` window event: messages of a recovery-stamped topic
+ * were skipped. Delivery continues with the next available message; the
+ * application can request a snapshot to resync its state.
+ */
+export interface WSEGapEvent {
+  topic: string;
+  epoch: string;
+  /** First missing offset, or null when unknown (epoch changed). */
+  fromOffset: number | null;
+  /** Last missing offset (inclusive), or null when unknown. */
+  toOffset: number | null;
+  /** Number of missing messages, or null when unknown. */
+  missed: number | null;
+  reason: 'offset_gap' | 'not_recovered' | 'epoch_changed';
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +389,7 @@ export interface WSEState {
   }>;
   config: {
     reconnectEnabled: boolean;
+    /** Mirror of reconnection.maxAttempts (-1 = infinite); the ConnectionManager owns the policy. */
     maxReconnectAttempts: number;
     compressionEnabled: boolean;
     batchingEnabled: boolean;
@@ -404,18 +464,23 @@ export interface ClientCapabilities {
 // Hook Return Types
 // ---------------------------------------------------------------------------
 
+/**
+ * Value returned by useWSE(). Every function is stable (same identity on
+ * every render) and acts on the live connection, so it is safe in effect
+ * dependency lists.
+ */
 export interface UseWSEReturn {
   subscribe: (topics: string[], options?: { recover?: boolean }) => void;
   unsubscribe: (topics: string[]) => void;
   forceReconnect: () => void;
   changeEndpoint: (endpoint: string) => void;
-  sendMessage: (type: string, payload: any, options?: MessageOptions) => void;
-  sendBatch: (messages: Array<{ type: string; payload: any }>) => void;
+  sendMessage: (type: string, payload: any, options?: MessageOptions) => SendStatus;
+  sendBatch: (messages: Array<{ type: string; payload: any; options?: MessageOptions }>) => SendStatus[];
+  /** Connection metrics, refreshed at most once per second. */
   stats: ConnectionMetrics;
   activeTopics: string[];
   connectionHealth: ConnectionState;
   diagnostics: NetworkDiagnostics | null;
-  setCompression: (enabled: boolean) => void;
   downloadDiagnostics: () => void;
   clearOfflineQueue: () => Promise<void>;
   getQueueSize: () => number;

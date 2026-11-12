@@ -2,7 +2,7 @@
 // WebSocket Engine - Event Sequencer
 // =============================================================================
 
-import { logger } from '../utils/logger';
+import { logger } from '../utils/logger.js';
 
 export class EventSequencer {
   private sequence = 0;
@@ -12,21 +12,16 @@ export class EventSequencer {
   // seq-based reorder buffer, which the server's global `seq` made unsound.
   private topicPositions = new Map<string, { epoch: string; offset: number }>();
   private readonly windowSize: number;
-  private cleanupInterval: NodeJS.Timeout | null = null;
 
   private cleanupCounter = 0;
   private readonly CLEANUP_INTERVAL = 100;
   private readonly MAX_AGE_MS = 300000; // 5 minutes
 
+  // No background timer: old ids are evicted every CLEANUP_INTERVAL inserts,
+  // which bounds memory without keeping a timer alive for the page's life.
   constructor(windowSize = 10000) {
     this.windowSize = windowSize;
     this.seenIds = new Map();
-
-    if (typeof window !== 'undefined') {
-      this.cleanupInterval = setInterval(() => {
-        this.cleanup();
-      }, 60000);
-    }
   }
 
   getNextSequence(): number {
@@ -87,9 +82,11 @@ export class EventSequencer {
    * Idempotent dedup + gap detection by per-topic (epoch, offset). Mirrors the
    * Python client's check_topic_stamp.
    *   'duplicate' -- already delivered (offset <= last on same epoch); drop.
-   *   'gap'       -- offset jumped ahead; deliver but recover the missed range
-   *                  (this does NOT advance the position, so recovery from
-   *                  `last` replays last+1..head in order without re-dedup).
+   *   'gap'       -- offset jumped ahead. This does NOT advance the position:
+   *                  the caller decides (MessageProcessor holds the message
+   *                  while a requested replay may still fill the hole, then
+   *                  delivers it, advances with setTopicPosition() and emits a
+   *                  gap event -- a gap never blacks the topic out).
    *   'deliver'   -- next in order, or first message on a new/changed epoch.
    */
   checkTopicStamp(topic: string, epoch: string, offset: number): 'duplicate' | 'gap' | 'deliver' {
@@ -111,6 +108,32 @@ export class EventSequencer {
 
   getTopicPosition(topic: string): { epoch: string; offset: number } | undefined {
     return this.topicPositions.get(topic);
+  }
+
+  /**
+   * Last delivered (epoch, offset) per topic -- the recovery anchor sent with
+   * a resubscribe. Restricted to `topics` when given.
+   */
+  getTopicPositions(topics?: string[]): Record<string, { epoch: string; offset: number }> {
+    const out: Record<string, { epoch: string; offset: number }> = {};
+    if (topics) {
+      for (const topic of topics) {
+        const pos = this.topicPositions.get(topic);
+        if (pos) out[topic] = { ...pos };
+      }
+    } else {
+      for (const [topic, pos] of this.topicPositions) {
+        out[topic] = { ...pos };
+      }
+    }
+    return out;
+  }
+
+  /** Forget positions of topics the client unsubscribed from. */
+  clearTopics(topics: string[]): void {
+    for (const topic of topics) {
+      this.topicPositions.delete(topic);
+    }
   }
 
   /**
@@ -150,11 +173,6 @@ export class EventSequencer {
   }
 
   destroy(): void {
-    if (this.cleanupInterval) {
-      clearInterval(this.cleanupInterval);
-      this.cleanupInterval = null;
-    }
-
     this.seenIds.clear();
     this.topicPositions.clear();
     this.sequence = 0;

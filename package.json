@@ -2,24 +2,28 @@
   "name": "wse-client",
   "version": "2.5.1",
   "description": "WSE (WebSocket Engine) React client. Type-safe hooks, auto-reconnect, offline queue, E2E encryption.",
-  "main": "dist/index.js",
-  "module": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "type": "module",
+  "main": "./dist/npm/index.js",
+  "types": "./dist/npm/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "default": "./dist/index.js"
-    }
+      "types": "./dist/npm/index.d.ts",
+      "import": "./dist/npm/index.js",
+      "default": "./dist/npm/index.js"
+    },
+    "./package.json": "./package.json"
   },
   "files": [
-    "dist/"
+    "dist/npm/"
   ],
   "scripts": {
-    "build": "tsc",
+    "clean": "node -e \"require('node:fs').rmSync('dist/npm', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc",
     "lint": "tsc --noEmit",
-    "prepublishOnly": "npm run build",
-    "test": "vitest"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "smoke": "node --input-type=module -e \"const m = await import('wse-client'); if (typeof m.useWSE !== 'function') throw new Error('useWSE missing'); console.log('wse-client ESM import OK:', Object.keys(m).length, 'exports')\"",
+    "prepublishOnly": "npm run build && npm run smoke"
   },
   "keywords": [
     "websocket",
@@ -59,9 +63,14 @@
     "zustand": ">=4"
   },
   "devDependencies": {
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/react": "^16.3.3",
     "@types/node": "^26.6.6",
     "@types/react": "^19.3.0",
+    "fake-indexeddb": "^6.2.6",
+    "happy-dom": "^21.0.4",
     "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "typescript": "^7.0.2",
     "vitest": "^5.1.0",
     "zustand": "^5.1.0"

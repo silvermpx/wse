@@ -8,12 +8,18 @@ import {
   QueuedMessage,
   MessagePriority,
   QueueStats
-} from '../types';
+} from '../types.js';
 
 interface MessageQueueStore extends MessageQueueState {
   // Actions
   enqueue: (message: QueuedMessage) => boolean;
   dequeue: (count?: number) => QueuedMessage[];
+  /**
+   * Put messages that were dequeued but could not be sent back into the
+   * queue. They keep their priority and timestamp, so they come out first
+   * again and the original order is preserved.
+   */
+  requeue: (messages: QueuedMessage[]) => void;
   removeMessage: (id: string) => void;
   clearQueue: () => void;
   updateStats: () => void;
@@ -136,6 +142,26 @@ export const useMessageQueueStore = create<MessageQueueStore>((set, get) => ({
     return dequeued;
   },
 
+  requeue: (messages) => {
+    if (messages.length === 0) return;
+    set((s) => {
+      const known = new Set(s.messages.map(m => m.id));
+      const back = messages.filter(m => !known.has(m.id));
+      const merged = [...back, ...s.messages];
+      const size = merged.length;
+      return {
+        messages: merged,
+        size,
+        stats: {
+          ...s.stats,
+          size,
+          utilizationPercent: (size / s.capacity) * 100,
+          backpressure: size > s.capacity * 0.8,
+        },
+      };
+    });
+  },
+
   removeMessage: (id) => {
     set((s) => {
       const messages = s.messages.filter(m => m.id !== id);
@@ -157,6 +183,8 @@ export const useMessageQueueStore = create<MessageQueueStore>((set, get) => ({
   clearQueue: () => {
     processedCount = 0;
     lastProcessedTime = Date.now();
+
+    if (get().size === 0 && get().messages.length === 0) return;
 
     set({
       messages: [],
@@ -190,7 +218,12 @@ export const useMessageQueueStore = create<MessageQueueStore>((set, get) => ({
     }));
   },
 
-  setProcessing: (processing) => set({ processing }),
+  // Skip no-op writes: an idle flush loop used to toggle this twice per tick
+  // and re-render every subscriber twice a second.
+  setProcessing: (processing) => {
+    if (get().processing === processing) return;
+    set({ processing });
+  },
 
   setCapacity: (capacity) => set((s) => ({
     capacity,

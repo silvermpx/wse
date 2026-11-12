@@ -8,21 +8,90 @@
 // bundle with "Missing export" (wellwon caught it on 2.4.2).
 import * as pako from 'pako';
 import { encode, decode } from '@msgpack/msgpack';
-import { logger } from '../utils/logger';
-import { MEMORY_LIMITS } from '../constants';
+import { logger } from '../utils/logger.js';
+import { DEFAULT_MAX_INBOUND_MESSAGE_SIZE } from '../constants.js';
 
 type CompressionLevel = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | -1;
+
+/** Thrown when a compressed frame inflates past the configured size limit. */
+export class DecompressedSizeLimitError extends Error {
+  constructor(readonly limit: number) {
+    super(`Decompressed message exceeds the ${limit}-byte limit`);
+    this.name = 'DecompressedSizeLimitError';
+  }
+}
+
+// Output is produced (and counted) in chunks of this size, so at most
+// limit + INFLATE_CHUNK bytes are ever allocated for a hostile frame.
+const INFLATE_CHUNK = 64 * 1024;
+
+/**
+ * Inflate `input`, aborting as soon as the output passes `limit` bytes.
+ * pako.inflate() inflated the whole frame before the size check, so a 1 MiB
+ * frame inflating ~1000x made the tab allocate about 1 GiB first.
+ */
+function inflateWithLimit(input: Uint8Array, limit: number, raw: boolean): Uint8Array {
+  const inflator = new pako.Inflate({ raw, chunkSize: INFLATE_CHUNK });
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  inflator.onData = (chunk: Uint8Array) => {
+    total += chunk.length;
+    if (total > limit) {
+      throw new DecompressedSizeLimitError(limit);
+    }
+    // pako reuses nothing after onData, but copy defensively when the chunk
+    // is a view into a larger buffer.
+    chunks.push(chunk.length === chunk.buffer.byteLength ? chunk : chunk.slice());
+  };
+  inflator.onEnd = () => {
+    // Result assembled below; keep pako from concatenating its own copy.
+  };
+
+  inflator.push(input, true);
+  if (inflator.err) {
+    throw new Error(inflator.msg || `inflate failed (${inflator.err})`);
+  }
+  if (!inflator.ended) {
+    throw new Error('inflate failed: truncated stream');
+  }
+
+  if (chunks.length === 1) return chunks[0];
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
+}
+
+function toArrayBuffer(view: Uint8Array): ArrayBuffer {
+  return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength) as ArrayBuffer;
+}
 
 export class CompressionManager {
   private compressionThreshold: number;
   private compressionLevel: CompressionLevel;
+  private maxDecompressedSize: number;
 
   constructor(
     compressionThreshold = 1024,
-    compressionLevel: CompressionLevel = 6
+    compressionLevel: CompressionLevel = 6,
+    maxDecompressedSize: number = DEFAULT_MAX_INBOUND_MESSAGE_SIZE,
   ) {
     this.compressionThreshold = compressionThreshold;
     this.compressionLevel = compressionLevel;
+    this.maxDecompressedSize = maxDecompressedSize;
+  }
+
+  /** Inbound size limit applied while inflating (bytes). */
+  setMaxDecompressedSize(limit: number): void {
+    this.maxDecompressedSize = limit > 0 ? limit : DEFAULT_MAX_INBOUND_MESSAGE_SIZE;
+  }
+
+  getMaxDecompressedSize(): number {
+    return this.maxDecompressedSize;
   }
 
   // ---------------------------------------------------------------------------
@@ -41,75 +110,44 @@ export class CompressionManager {
     try {
       const compressed = pako.deflate(new Uint8Array(data), { level: this.compressionLevel });
       logger.debug(`Compressed ${data.byteLength} -> ${compressed.byteLength} bytes`);
-      return compressed.buffer.slice(compressed.byteOffset, compressed.byteOffset + compressed.byteLength);
+      return toArrayBuffer(compressed);
     } catch (error) {
       logger.error('Compression failed:', error);
       throw error;
     }
   }
 
-  decompress(data: ArrayBuffer): ArrayBuffer {
+  /**
+   * Inflate zlib, gzip (auto-detected from the header) or raw deflate data.
+   * Throws DecompressedSizeLimitError as soon as the output passes the limit.
+   */
+  decompress(data: ArrayBuffer, maxSize: number = this.maxDecompressedSize): ArrayBuffer {
+    const view = new Uint8Array(data);
     try {
-      const view = new Uint8Array(data);
-
-      logger.debug('Decompressing data:', {
-        length: data.byteLength,
-        first10Bytes: Array.from(view.slice(0, 10)),
-        hexFirst10: Array.from(view.slice(0, 10)).map(b => b.toString(16).padStart(2, '0')).join(' ')
-      });
-
-      // Try standard inflate (for zlib format)
-      try {
-        const decompressed = pako.inflate(view);
-        if (decompressed.byteLength > MEMORY_LIMITS.MAX_MESSAGE_SIZE) {
-          throw new Error(`Decompressed size ${decompressed.byteLength} exceeds limit ${MEMORY_LIMITS.MAX_MESSAGE_SIZE}`);
-        }
-        logger.debug(`Decompressed ${data.byteLength} -> ${decompressed.byteLength} bytes (standard inflate)`);
-        return decompressed.buffer.slice(decompressed.byteOffset, decompressed.byteOffset + decompressed.byteLength);
-      } catch (inflateError: any) {
-        logger.debug('Standard inflate failed:', inflateError.message);
-
-        if (inflateError.message && inflateError.message.includes('header')) {
-          logger.debug('Trying raw inflate (no zlib header)...');
-          try {
-            const decompressed = pako.inflateRaw(view);
-            if (decompressed.byteLength > MEMORY_LIMITS.MAX_MESSAGE_SIZE) {
-              throw new Error(`Decompressed size ${decompressed.byteLength} exceeds limit ${MEMORY_LIMITS.MAX_MESSAGE_SIZE}`);
-            }
-            logger.debug(`Decompressed ${data.byteLength} -> ${decompressed.byteLength} bytes (raw inflate)`);
-            return decompressed.buffer.slice(decompressed.byteOffset, decompressed.byteOffset + decompressed.byteLength);
-          } catch (rawError) {
-            logger.debug('Raw inflate also failed:', rawError);
-          }
-        }
-
-        // Try gzip as last resort
-        try {
-          const decompressed = pako.ungzip(view);
-          if (decompressed.byteLength > MEMORY_LIMITS.MAX_MESSAGE_SIZE) {
-            throw new Error(`Decompressed size ${decompressed.byteLength} exceeds limit ${MEMORY_LIMITS.MAX_MESSAGE_SIZE}`);
-          }
-          logger.debug(`Decompressed ${data.byteLength} -> ${decompressed.byteLength} bytes (gzip)`);
-          return decompressed.buffer.slice(decompressed.byteOffset, decompressed.byteOffset + decompressed.byteLength);
-        } catch (gzipError) {
-          logger.debug('Gzip decompression also failed');
-        }
-
-        throw inflateError;
-      }
+      // Default windowBits auto-detects the zlib and gzip wrappers.
+      return toArrayBuffer(inflateWithLimit(view, maxSize, false));
     } catch (error) {
-      logger.error('Decompression failed:', error);
-      throw error;
+      if (error instanceof DecompressedSizeLimitError) {
+        logger.warn(error.message);
+        throw error;
+      }
+      // No zlib/gzip header: try raw deflate.
+      try {
+        return toArrayBuffer(inflateWithLimit(view, maxSize, true));
+      } catch (rawError) {
+        if (rawError instanceof DecompressedSizeLimitError) {
+          logger.warn(rawError.message);
+          throw rawError;
+        }
+        logger.error('Decompression failed:', error);
+        throw error;
+      }
     }
   }
 
-  decompressGzip(data: ArrayBuffer): ArrayBuffer {
+  decompressGzip(data: ArrayBuffer, maxSize: number = this.maxDecompressedSize): ArrayBuffer {
     try {
-      const result = pako.ungzip(new Uint8Array(data));
-      if (result.byteLength > MEMORY_LIMITS.MAX_MESSAGE_SIZE) {
-        throw new Error(`Decompressed gzip size ${result.byteLength} exceeds limit ${MEMORY_LIMITS.MAX_MESSAGE_SIZE}`);
-      }
-      return result.buffer.slice(result.byteOffset, result.byteOffset + result.byteLength);
+      return toArrayBuffer(inflateWithLimit(new Uint8Array(data), maxSize, false));
     } catch (error) {
       logger.error('Gzip decompression failed:', error);
       throw error;
@@ -123,7 +161,7 @@ export class CompressionManager {
   packMsgPack(data: any): ArrayBuffer {
     try {
       const encoded = encode(data);
-      return encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength) as ArrayBuffer;
+      return toArrayBuffer(encoded);
     } catch (error) {
       logger.error('MessagePack encoding failed:', error);
       throw error;
@@ -134,7 +172,7 @@ export class CompressionManager {
     try {
       return decode(data);
     } catch (error) {
-      logger.error('MessagePack decoding failed:', error);
+      logger.debug('MessagePack decoding failed:', error);
       throw error;
     }
   }

@@ -19,27 +19,59 @@ export interface LogEntry {
   error?: Error;
 }
 
+/** localStorage key of the opt-in persisted error log (cleared by clearWSEStorage()). */
+export const ERROR_LOG_STORAGE_KEY = 'wse_error_logs';
+
+/**
+ * Level used when neither WSE_LOG_LEVEL nor VITE_LOG_LEVEL is set: INFO in
+ * development, WARN in production (per-message INFO logging costs main-thread
+ * time at high message rates).
+ */
+export function defaultLogLevel(isDevelopment: boolean): LogLevel {
+  return isDevelopment ? LogLevel.INFO : LogLevel.WARN;
+}
+
+function detectDevelopment(): boolean {
+  try {
+    if (typeof import.meta !== 'undefined' && (import.meta as any).env?.DEV) return true;
+  } catch {
+    // import.meta.env is a bundler convention; absent in plain Node.
+  }
+  return typeof process !== 'undefined' && process.env?.NODE_ENV === 'development';
+}
+
+function detectEnvLevel(): string | undefined {
+  try {
+    const viteLevel = typeof import.meta !== 'undefined' ? (import.meta as any).env?.VITE_LOG_LEVEL : undefined;
+    if (viteLevel) return viteLevel;
+  } catch {
+    // ignore
+  }
+  return typeof process !== 'undefined' ? process.env?.WSE_LOG_LEVEL : undefined;
+}
+
 class Logger {
-  private level: LogLevel = LogLevel.INFO;
+  private level: LogLevel;
   private context: string;
   private history: LogEntry[] = [];
   private maxHistorySize = 1000;
   private isDevelopment: boolean;
+  // Persisting error entries to localStorage is opt-in: they used to be written
+  // by default together with their data (e.g. a failed send's payload) and
+  // survived logout on shared browsers.
+  private persistErrors = false;
 
   constructor(context: string = 'WSE') {
     this.context = context;
 
     // Detect development mode from common bundler conventions
-    this.isDevelopment =
-      (typeof import.meta !== 'undefined' && (import.meta as any).env?.DEV) ||
-      (typeof process !== 'undefined' && process.env?.NODE_ENV === 'development') ||
-      false;
+    this.isDevelopment = detectDevelopment();
+
+    this.level = defaultLogLevel(this.isDevelopment);
 
     // Set log level from environment if available
-    const envLevel =
-      (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_LOG_LEVEL) ||
-      (typeof process !== 'undefined' && process.env?.WSE_LOG_LEVEL);
-    if (envLevel && envLevel in LogLevel) {
+    const envLevel = detectEnvLevel();
+    if (envLevel && envLevel in LogLevel && Number.isNaN(Number(envLevel))) {
       this.level = LogLevel[envLevel as keyof typeof LogLevel];
     }
   }
@@ -111,7 +143,7 @@ class Logger {
         break;
     }
 
-    if (!this.isDevelopment && level >= LogLevel.ERROR) {
+    if (this.persistErrors && level >= LogLevel.ERROR) {
       this.sendToLoggingService(entry);
     }
   }
@@ -140,6 +172,26 @@ class Logger {
 
   getLevel(): LogLevel {
     return this.level;
+  }
+
+  /**
+   * Opt in to keeping the last 100 ERROR entries in localStorage
+   * (`wse_error_logs`). Only level, time, context and message are stored --
+   * never the attached data, which can hold message payloads.
+   */
+  setPersistErrors(enabled: boolean): void {
+    this.persistErrors = enabled;
+  }
+
+  /** Remove the persisted error log from localStorage. */
+  clearPersistedErrors(): void {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.removeItem(ERROR_LOG_STORAGE_KEY);
+      }
+    } catch {
+      // Ignore storage errors
+    }
   }
 
   setContext(context: string): void {
@@ -197,23 +249,26 @@ class Logger {
   // ---------------------------------------------------------------------------
 
   private sendToLoggingService(entry: LogEntry): void {
-    if (typeof window === 'undefined') return;
+    if (typeof localStorage === 'undefined') return;
     try {
-      const key = 'wse_error_logs';
-      const existing = localStorage.getItem(key);
-      const logs = existing ? JSON.parse(existing) : [];
+      const existing = localStorage.getItem(ERROR_LOG_STORAGE_KEY);
+      const parsed = existing ? JSON.parse(existing) : [];
+      const logs: unknown[] = Array.isArray(parsed) ? parsed : [];
 
+      // Deliberately no `data`/`error` fields: they may carry message payloads.
       logs.push({
-        ...entry,
+        level: LogLevel[entry.level],
         timestamp: entry.timestamp.toISOString(),
+        context: entry.context,
+        message: entry.message,
       });
 
       if (logs.length > 100) {
         logs.splice(0, logs.length - 100);
       }
 
-      localStorage.setItem(key, JSON.stringify(logs));
-    } catch (error) {
+      localStorage.setItem(ERROR_LOG_STORAGE_KEY, JSON.stringify(logs));
+    } catch {
       // Ignore storage errors
     }
   }

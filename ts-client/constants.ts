@@ -14,10 +14,32 @@ export const WS_CLIENT_VERSION = '2.5.1';
 // ---------------------------------------------------------------------------
 
 export const HEARTBEAT_INTERVAL = 15000; // 15 seconds
-export const IDLE_TIMEOUT = 40000; // 40 seconds
+export const IDLE_TIMEOUT = 40000; // 40 seconds (lower bound of the dead-socket watchdog)
 export const CONNECTION_TIMEOUT = 10000; // 10 seconds
 export const HEALTH_CHECK_INTERVAL = 30000; // 30 seconds
 export const METRICS_INTERVAL = 60000; // 60 seconds
+
+/**
+ * How long to wait for `server_ready` after the socket opens. A server without
+ * `jwt_secret` sends no server_ready unless the application does; after this
+ * delay the client proceeds as if it had arrived (same as the Python client).
+ * 0 disables the fallback.
+ */
+export const SERVER_READY_TIMEOUT = 10000;
+
+/** How long an encrypted connection may wait for the server's key in `server_hello`. */
+export const ENCRYPTION_HANDSHAKE_TIMEOUT = 10000;
+
+/**
+ * After a reconnect that asks the server to replay missed messages, how long
+ * out-of-order messages of a topic are held while the replay fills the hole.
+ * When the window ends with a hole left, the held messages are delivered and a
+ * `wseGap` event reports the missing range. 0 disables holding.
+ */
+export const DEFAULT_RECOVERY_TIMEOUT_MS = 3000;
+
+/** Default inbound message size limit (bytes, checked while inflating). */
+export const DEFAULT_MAX_INBOUND_MESSAGE_SIZE = 16 * 1024 * 1024; // 16 MiB
 
 // ---------------------------------------------------------------------------
 // Reconnection Constants
@@ -103,7 +125,7 @@ export const MESSAGE_HEADERS = {
 // ---------------------------------------------------------------------------
 
 export const MEMORY_LIMITS = {
-    MAX_MESSAGE_SIZE: 1048576, // 1MB
+    MAX_MESSAGE_SIZE: DEFAULT_MAX_INBOUND_MESSAGE_SIZE, // default inbound limit; configurable via maxMessageSize
     MAX_QUEUE_MEMORY: 50 * 1024 * 1024, // 50MB
     MAX_HISTORY_SIZE: 1000,
     MAX_ERROR_HISTORY: 50,
@@ -146,9 +168,13 @@ export const ERROR_CODES = {
     UNSUPPORTED_DATA: 1003,
     POLICY_VIOLATION: 1008,
     MESSAGE_TOO_BIG: 1009,
+    NO_STATUS_RECEIVED: 1005,
     SERVER_ERROR: 1011,
+    SERVICE_RESTART: 1012,
+    TRY_AGAIN_LATER: 1013,
 
     // Custom application codes (4000-4999)
+    SERVER_DRAINING: 4300,
     AUTH_FAILED: 4401,
     AUTH_EXPIRED: 4403,
     RATE_LIMIT_EXCEEDED: 4429,
@@ -231,30 +257,78 @@ export function getEndpoints(): string[] {
     return singleEndpoint;
 }
 
-export function getSavedSubscriptions(): string[] {
+function toTopicList(value: unknown): string[] | null {
+    if (!Array.isArray(value)) return null;
+    return value.filter((t): t is string => typeof t === 'string' && t.length > 0);
+}
+
+/**
+ * Read the saved subscriptions of `userId`, or null when nothing valid is
+ * saved for that user. Saved topics are keyed by the user id the server
+ * reports in `server_ready`, so user B never inherits user A's per-user
+ * channels on a shared browser. Malformed storage reads as "nothing saved".
+ */
+export function loadSavedSubscriptions(userId?: string | null): string[] | null {
     try {
-        const saved = localStorage.getItem(SUBSCRIPTION_STORAGE_KEY);
-        return saved ? JSON.parse(saved) : DEFAULT_TOPICS;
+        if (typeof localStorage === 'undefined') return null;
+        const raw = localStorage.getItem(SUBSCRIPTION_STORAGE_KEY);
+        if (!raw) return null;
+        const parsed: unknown = JSON.parse(raw);
+        const wanted = userId ?? null;
+        if (Array.isArray(parsed)) {
+            // Pre-3.0 format carried no user; only trust it without a user id.
+            return wanted === null ? toTopicList(parsed) : null;
+        }
+        if (parsed && typeof parsed === 'object') {
+            const record = parsed as { userId?: unknown; topics?: unknown };
+            const owner = typeof record.userId === 'string' ? record.userId : null;
+            if (owner !== wanted) return null;
+            return toTopicList(record.topics);
+        }
+        return null;
     } catch {
-        return DEFAULT_TOPICS;
+        return null;
     }
 }
 
-export function saveSubscriptions(topics: string[]): void {
+/** Saved subscriptions of `userId`, or DEFAULT_TOPICS when none are saved. */
+export function getSavedSubscriptions(userId?: string | null): string[] {
+    return loadSavedSubscriptions(userId) ?? [...DEFAULT_TOPICS];
+}
+
+export function saveSubscriptions(topics: string[], userId?: string | null): void {
     try {
-        localStorage.setItem(SUBSCRIPTION_STORAGE_KEY, JSON.stringify(topics));
+        if (typeof localStorage === 'undefined') return;
+        localStorage.setItem(
+            SUBSCRIPTION_STORAGE_KEY,
+            JSON.stringify({ userId: userId ?? null, topics: toTopicList(topics) ?? [] }),
+        );
     } catch {
         // Ignore storage errors
     }
 }
 
+/**
+ * Remove everything the client stored in localStorage and sessionStorage
+ * (saved subscriptions, the opt-in error log, the debug log). The hook calls
+ * this on logout and when the signed-in session changes.
+ */
 export function clearWSEStorage(): void {
-    try {
-        Object.keys(localStorage)
-            .filter(key => key.startsWith(STORAGE_KEY_PREFIX))
-            .forEach(key => localStorage.removeItem(key));
-    } catch {
-        // Ignore storage errors
+    for (const storage of [
+        typeof localStorage !== 'undefined' ? localStorage : undefined,
+        typeof sessionStorage !== 'undefined' ? sessionStorage : undefined,
+    ]) {
+        if (!storage) continue;
+        try {
+            const keys: string[] = [];
+            for (let i = 0; i < storage.length; i++) {
+                const key = storage.key(i);
+                if (key && key.startsWith(STORAGE_KEY_PREFIX)) keys.push(key);
+            }
+            keys.forEach(key => storage.removeItem(key));
+        } catch {
+            // Ignore storage errors
+        }
     }
 }
 
@@ -298,6 +372,10 @@ export default {
     CONNECTION_TIMEOUT,
     HEALTH_CHECK_INTERVAL,
     METRICS_INTERVAL,
+    SERVER_READY_TIMEOUT,
+    ENCRYPTION_HANDSHAKE_TIMEOUT,
+    DEFAULT_RECOVERY_TIMEOUT_MS,
+    DEFAULT_MAX_INBOUND_MESSAGE_SIZE,
     RECONNECT_BASE_DELAY,
     RECONNECT_MAX_DELAY,
     RECONNECT_MAX_ATTEMPTS,

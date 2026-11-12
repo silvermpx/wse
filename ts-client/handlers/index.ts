@@ -7,14 +7,13 @@
 //
 // Example (in your application code):
 //
-//   import { MessageProcessor } from 'wse-client/services/MessageProcessor';
-//
-//   function registerMyHandlers(processor: MessageProcessor) {
-//     processor.registerHandler('my_event', (msg) => { ... });
-//     processor.registerHandler('another_event', (msg) => { ... });
-//   }
+//   useWSE('cookie', ['orders'], {
+//     registerHandlers: (processor) => {
+//       processor.registerHandler('order_update', (msg) => { ... });
+//     },
+//   });
 
-import { logger } from '../utils/logger';
+import { logger } from '../utils/logger.js';
 
 /**
  * Register all application-specific event handlers with the message processor.
@@ -29,13 +28,9 @@ export function registerAllHandlers(messageProcessor: {
   registerHandler: (type: string, handler: (msg: any) => void) => void;
   getRegisteredHandlers?: () => string[];
 }): void {
-  logger.info('=== REGISTERING EVENT HANDLERS ===');
-
   // No domain-specific handlers in standalone mode.
-  // Applications should register their own handlers here or via
-  // messageProcessor.registerHandler() calls.
-
-  logger.info('Handler registration complete (no domain handlers in standalone mode)');
+  // Applications register their own through the `registerHandlers` option of
+  // useWSE() or messageProcessor.registerHandler() calls.
 
   if (messageProcessor.getRegisteredHandlers) {
     const registeredHandlers = messageProcessor.getRegisteredHandlers();

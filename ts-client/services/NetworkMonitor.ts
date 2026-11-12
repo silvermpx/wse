@@ -2,20 +2,26 @@
 // WebSocket Engine - Network Monitor
 // =============================================================================
 
-import { NetworkDiagnostics, ConnectionQuality } from '../types';
-import { useWSEStore } from '../stores/useWSEStore';
-import { logger } from '../utils/logger';
+import { NetworkDiagnostics, ConnectionQuality } from '../types.js';
+import { useWSEStore } from '../stores/useWSEStore.js';
+import { logger } from '../utils/logger.js';
 
 export class NetworkMonitor {
   private latencyHistory: number[] = [];
   private lastDiagnostics: NetworkDiagnostics | null = null;
-  private diagnosticsInterval: NodeJS.Timeout | null = null;
+  private diagnosticsInterval: ReturnType<typeof setInterval> | null = null;
 
+  /**
+   * @param autoAnalyze run analyze() every diagnosticsIntervalMs and publish
+   *   the result to the store. useWSE passes diagnostics.enabled here, so
+   *   `diagnostics: { enabled: false }` really leaves no timer running.
+   */
   constructor(
     private maxHistorySize = 100,
-    private diagnosticsIntervalMs = 30000
+    private diagnosticsIntervalMs = 30000,
+    autoAnalyze = true,
   ) {
-    if (typeof window !== 'undefined') {
+    if (autoAnalyze && typeof window !== 'undefined' && diagnosticsIntervalMs > 0) {
       this.startDiagnostics();
     }
   }

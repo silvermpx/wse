@@ -20,7 +20,14 @@ import {
   SubscriptionInfo,
   OfflineQueueStats,
   TopicRecoveryPosition,
-} from '../types';
+} from '../types.js';
+
+/** Recovery position written together with an inbound message (see recordInbound). */
+export interface InboundRecoveryPosition {
+  topic: string;
+  epoch: string;
+  offset: number;
+}
 
 interface WSEStore extends WSEState {
   // Actions - Connection
@@ -42,8 +49,15 @@ interface WSEStore extends WSEState {
   resetCircuitBreaker: () => void;
   checkCircuitBreakerTimeout: () => void;
 
+  // Actions - Inbound traffic (one store write per message)
+  recordInbound: (bytes: number, position?: InboundRecoveryPosition) => void;
+
   // Actions - Subscriptions
   setActiveTopics: (topics: string[]) => void;
+  /** Add topics to activeTopics atomically (reads the live state, never a render snapshot). */
+  addTopics: (topics: string[]) => void;
+  /** Remove topics from activeTopics atomically. */
+  removeTopics: (topics: string[]) => void;
   addPendingSubscription: (topic: string) => void;
   confirmSubscription: (topic: string) => void;
   failSubscription: (topic: string) => void;
@@ -111,6 +125,8 @@ const initialMetrics: ConnectionMetrics = {
   protocolErrors: 0,
   networkJitter: 0,
   packetLoss: 0,
+  gapsDetected: 0,
+  messagesMissed: 0,
 };
 
 const initialCircuitBreaker: CircuitBreakerInfo = {
@@ -198,7 +214,7 @@ const initialState: WSEState = {
   // Configuration
   config: {
     reconnectEnabled: true,
-    maxReconnectAttempts: 10,
+    maxReconnectAttempts: -1,
     compressionEnabled: true,
     batchingEnabled: true,
     offlineModeEnabled: true,
@@ -209,6 +225,14 @@ const initialState: WSEState = {
   // Sequence
   sequence: 0,
 };
+
+function sameTopics(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
 
 // Latency tracking with bounded history
 const LATENCY_HISTORY_SIZE = 100;
@@ -432,14 +456,67 @@ export const useWSEStore = create<WSEStore>()(
       return state;
     }),
 
+    // Inbound traffic: metrics and (for stamped messages) the recovery anchor
+    // in ONE write, instead of two or three store updates per message.
+    recordInbound: (bytes, position) => set((state) => {
+      const metrics = {
+        ...state.metrics,
+        messagesReceived: state.metrics.messagesReceived + 1,
+        bytesReceived: state.metrics.bytesReceived + bytes,
+        lastMessageReceived: Date.now(),
+      };
+      if (!position) return { metrics };
+      return {
+        metrics,
+        subscriptions: {
+          ...state.subscriptions,
+          recoveryState: {
+            ...state.subscriptions.recoveryState,
+            [position.topic]: { epoch: position.epoch, offset: position.offset },
+          },
+        },
+      };
+    }),
+
     // Subscription Actions
-    setActiveTopics: (topics) => set({
-      activeTopics: topics,
-      subscriptions: {
-        ...get().subscriptions,
-        topics,
-        lastUpdate: Date.now(),
-      }
+    setActiveTopics: (topics) => set((state) => {
+      const next = [...new Set(topics)];
+      if (sameTopics(state.activeTopics, next)) return state;
+      return {
+        activeTopics: next,
+        subscriptions: {
+          ...state.subscriptions,
+          topics: next,
+          lastUpdate: Date.now(),
+        },
+      };
+    }),
+
+    addTopics: (topics) => set((state) => {
+      const next = [...new Set([...state.activeTopics, ...topics])];
+      if (sameTopics(state.activeTopics, next)) return state;
+      return {
+        activeTopics: next,
+        subscriptions: {
+          ...state.subscriptions,
+          topics: next,
+          lastUpdate: Date.now(),
+        },
+      };
+    }),
+
+    removeTopics: (topics) => set((state) => {
+      const drop = new Set(topics);
+      const next = state.activeTopics.filter(t => !drop.has(t));
+      if (sameTopics(state.activeTopics, next)) return state;
+      return {
+        activeTopics: next,
+        subscriptions: {
+          ...state.subscriptions,
+          topics: next,
+          lastUpdate: Date.now(),
+        },
+      };
     }),
 
     addPendingSubscription: (topic) => set((state) => ({
@@ -571,11 +648,10 @@ export const useWSEStore = create<WSEStore>()(
         return false;
       }
 
-      if (state.config.maxReconnectAttempts > 0 &&
-          state.metrics.reconnectCount >= state.config.maxReconnectAttempts) {
-        return false;
-      }
-
+      // No attempt cap here: the ConnectionManager owns the reconnection
+      // policy (reconnection.maxAttempts, -1 = infinite). A second hard-coded
+      // cap of 10 in this store used to park every tab after ~5 minutes of
+      // outage, whatever maxAttempts said.
       return true;
     },
 

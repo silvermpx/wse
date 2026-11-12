@@ -1,94 +1,170 @@
 // =============================================================================
 // WebSocket Engine - Connection Manager
 // =============================================================================
+//
+// Owns one WebSocket at a time and the whole reconnection policy.
+//
+// Close-code contract (shared with the Python client):
+//   - A close the client initiated (disconnect(), destroy(), forceReconnect(),
+//     changeEndpoint(), fail-closed encryption) is final for that socket; the
+//     old socket's handlers are detached first, so a late close event can
+//     never touch the new socket.
+//   - Every server- or network-initiated close (1000/1001 server stop, 1005
+//     kick, 1006, 1011-1013, 4300 drain, 4429 rate limit, ...) reconnects with
+//     backoff. A single failed attempt is never terminal.
+//   - 4401/4403 (or an AUTH_FAILED/AUTH_REQUIRED error before the close) is an
+//     auth rejection: with refreshAuthToken the credentials are refreshed and
+//     the client retries once; otherwise (or when that retry is rejected too)
+//     it stops reconnecting, enters ERROR and dispatches `wseAuthFailed`.
+//   - reconnection.maxAttempts counts consecutive failed attempts; -1 means
+//     infinite. The count (and the backoff) resets only when a connection
+//     reaches server_ready -- a socket that opens and is then rejected does
+//     not reset it.
 
 import {
   ConnectionState,
-  ConnectionQuality,
   WSMessage,
   ReconnectionStrategy,
   MessagePriority,
-} from '../types';
-import { useWSEStore } from '../stores/useWSEStore';
-import { logger } from '../utils/logger';
-import { RateLimiter } from './RateLimiter';
-import { ConnectionPool } from './ConnectionPool';
-import { CircuitBreaker } from '../utils/circuitBreaker';
-import { WS_PROTOCOL_VERSION, WS_CLIENT_VERSION, FEATURES } from '../constants';
-import { securityManager } from '../utils/security';
-import { AdaptiveQualityManager } from './AdaptiveQualityManager';
+  RateLimitConfig,
+  CircuitBreakerState,
+} from '../types.js';
+import { useWSEStore } from '../stores/useWSEStore.js';
+import { logger } from '../utils/logger.js';
+import { RateLimiter } from './RateLimiter.js';
+import { ConnectionPool } from './ConnectionPool.js';
+import { CircuitBreaker } from '../utils/circuitBreaker.js';
+import {
+  WS_PROTOCOL_VERSION,
+  WS_CLIENT_VERSION,
+  FEATURES,
+  HEARTBEAT_INTERVAL,
+  IDLE_TIMEOUT,
+  CONNECTION_TIMEOUT,
+  SERVER_READY_TIMEOUT,
+  ENCRYPTION_HANDSHAKE_TIMEOUT,
+  RATE_LIMIT_CAPACITY,
+  RATE_LIMIT_REFILL_RATE,
+} from '../constants.js';
+import { securityManager } from '../utils/security.js';
+import { generateId } from '../utils/id.js';
+import { dispatchWSEEvent } from '../utils/events.js';
 
 /**
- * Configuration for pluggable auth token refresh.
- * Applications provide their own refresh logic via this callback.
+ * Outcome of trySend():
+ * - 'sent'         handed to the socket (or to the encryption pipeline)
+ * - 'not_ready'    no open socket, no server_ready yet, or encryption pending
+ * - 'rate_limited' the client-side rate limit is exhausted; retry later
+ * - 'error'        the message cannot be serialised; retrying will not help
+ */
+export type SendResult = 'sent' | 'not_ready' | 'rate_limited' | 'error';
+
+/**
+ * Configuration for the connection manager.
  */
 export interface ConnectionManagerConfig {
   /**
-   * Optional callback to refresh the auth token.
-   * Called periodically and on auth failure. Should throw on failure.
+   * Optional callback to refresh the auth cookie. Called every 10 minutes in
+   * cookie mode and once after an auth rejection. Must throw (reject) when the
+   * refresh fails.
    */
   refreshAuthToken?: () => Promise<void>;
 
   /**
-   * Optional QueryClient-like object for AdaptiveQualityManager integration.
+   * Require E2E encryption: application messages are held until the ECDH key
+   * exchange completes and the connection fails closed when it cannot.
    */
-  queryClient?: {
-    setDefaultOptions: (options: { queries: Record<string, any> }) => void;
-    invalidateQueries: () => void;
-  } | null;
+  encryptionRequired?: boolean;
+
+  /** Outbound rate limit; false disables it. Default 1000 burst, 100/s. */
+  rateLimit?: RateLimitConfig | false;
+
+  /** Proceed without server_ready after this many ms (0 = wait forever). */
+  serverReadyTimeout?: number;
+
+  /** Fail closed when the server's key does not arrive within this many ms. */
+  encryptionHandshakeTimeout?: number;
+
+  /** Give up on a socket that has not opened after this many ms. */
+  connectionTimeout?: number;
+
+  /** Called whenever application messages can be sent again. */
+  onTransportReady?: () => void;
+
+  /** Called after the current socket is gone (closed, timed out, replaced). */
+  onSocketClosed?: () => void;
+
+  /** Called with a message accepted by trySend() whose socket vanished before it went out. */
+  onUndeliverable?: (message: WSMessage) => void;
 }
 
-const MAX_TOKEN_REFRESH_ATTEMPTS = 3;
+type StopReason = 'none' | 'manual' | 'auth' | 'encryption' | 'max_attempts';
+type EncryptionState = 'off' | 'pending' | 'ready' | 'failed';
 
-// Cached TextEncoder for efficient byte size calculation
-const textEncoder = new TextEncoder();
+const WS_CONNECTING = 0;
+const WS_OPEN = 1;
+
+const MAX_TOKEN_REFRESH_ATTEMPTS = 3;
+const TOKEN_REFRESH_INTERVAL = 10 * 60 * 1000; // 10 minutes
+const TOKEN_REFRESH_RETRY_BASE = 30 * 1000;
+const DEFAULT_SERVER_PING_INTERVAL = 25000;
+
+function createRateLimiter(config: RateLimitConfig | false | undefined): RateLimiter | null {
+  if (config === false) return null;
+  const capacity = config?.capacity ?? RATE_LIMIT_CAPACITY;
+  const refillRate = config?.refillRate ?? RATE_LIMIT_REFILL_RATE;
+  if (!(capacity > 0) || !(refillRate > 0)) return null;
+  return new RateLimiter(capacity, refillRate, 1000);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 export class ConnectionManager {
   private ws: WebSocket | null = null;
-  private reconnectTimer: NodeJS.Timeout | null = null;
+  private socketId = 0;
+  private pendingAttempt: { socketId: number; settle: (error?: Error) => void } | null = null;
+
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private connectTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
+  private serverReadyTimer: ReturnType<typeof setTimeout> | null = null;
+  private encryptionTimer: ReturnType<typeof setTimeout> | null = null;
+  private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+  private tokenRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
   private reconnectAttempts = 0;
-  private heartbeatInterval: NodeJS.Timeout | null = null;
   private token: string | null = null;
-  private rateLimiter: RateLimiter;
+  private usesCookieAuth = false;
+  private rateLimiter: RateLimiter | null;
   private serverReady = false;
   private clientHelloSent = false;
   private connectionId: string | null = null;
-
-  // Token management
-  private tokenRefreshTimer: NodeJS.Timeout | null = null;
-  private tokenRefreshAttempts = 0;
-  private usesCookieAuth = false;
-
-  // Client hello retry tracking
-  private clientHelloRetries = 0;
-  private clientHelloRetryTimer: ReturnType<typeof setTimeout> | null = null;
-  private readonly MAX_CLIENT_HELLO_RETRIES = 10;
+  private readonly encryptionRequired: boolean;
+  private encryptionState: EncryptionState = 'off';
+  private authRejectedOnSocket = false;
+  private authRefreshTried = false;
+  private stopReason: StopReason = 'manual'; // nothing to reconnect before connect()
+  private tokenRefreshFailures = 0;
+  private lastInboundAt = 0;
+  private serverPingInterval = DEFAULT_SERVER_PING_INTERVAL;
+  private state: ConnectionState = ConnectionState.PENDING;
 
   // Connection pool
   private connectionPool: ConnectionPool;
   private currentEndpoint: string | null = null;
 
-  // State tracking
   private isDestroyed = false;
-  private isConnecting = false;
-  private lastConnectionAttempt = 0;
-  private consecutiveFailures = 0;
 
-  // Circuit breaker for connection attempts
+  // Circuit breaker for connection attempts: a pause, never a death sentence.
   private connectionCircuitBreaker: CircuitBreaker;
-
-  // Adaptive quality management
-  private adaptiveQuality: AdaptiveQualityManager;
-
-  // Store server ready details temporarily
-  private serverReadyDetails: any = null;
-  private serverReadyProcessed = false;
 
   // Serialized queue for encrypted sends (preserves message ordering)
   private encryptedSendQueue: Promise<void> = Promise.resolve();
 
-  // Pluggable auth refresh
-  private refreshAuthTokenFn: (() => Promise<void>) | null = null;
+  private refreshAuthTokenFn: (() => Promise<void>) | null;
+  private readonly config: ConnectionManagerConfig;
+  private browserListenersInstalled = false;
 
   constructor(
     private endpoints: string[],
@@ -98,7 +174,9 @@ export class ConnectionManager {
     private onServerReady?: (details: any) => void,
     config?: ConnectionManagerConfig
   ) {
-    this.rateLimiter = new RateLimiter(1000, 100, 1000);
+    this.config = config ?? {};
+    this.encryptionRequired = !!this.config.encryptionRequired;
+    this.rateLimiter = createRateLimiter(this.config.rateLimit);
 
     this.connectionPool = new ConnectionPool({
       endpoints: this.endpoints,
@@ -110,301 +188,424 @@ export class ConnectionManager {
     this.connectionCircuitBreaker = new CircuitBreaker({
       failureThreshold: 5,
       resetTimeout: 60000,
-      successThreshold: 3,
+      successThreshold: 1,
     });
 
-    // Initialize adaptive quality manager (QueryClient is optional)
-    this.adaptiveQuality = new AdaptiveQualityManager(config?.queryClient ?? null);
+    this.refreshAuthTokenFn = this.config.refreshAuthToken ?? null;
 
-    // Store pluggable auth refresh callback
-    this.refreshAuthTokenFn = config?.refreshAuthToken ?? null;
-
-    logger.info('[ConnectionManager] Initialized with endpoints:', this.endpoints);
+    logger.debug('[ConnectionManager] Initialized with endpoints:', this.endpoints);
   }
 
   // ---------------------------------------------------------------------------
   // Connection Management
   // ---------------------------------------------------------------------------
 
-  async connect(token: string, topics: string[] = []): Promise<void> {
+  /**
+   * Start connecting (and keep reconnecting per the policy). Resolves when the
+   * socket opens; rejects when this first attempt fails -- reconnection then
+   * continues in the background unless the failure was an auth rejection.
+   *
+   * `token` is the auth mode, not a credential: browsers cannot attach an
+   * Authorization header to a WebSocket, so the server authenticates the
+   * browser by its cookie (jwt_cookie_name). 'cookie' additionally enables the
+   * periodic refreshAuthToken call.
+   */
+  async connect(token: string, _topics: string[] = []): Promise<void> {
     if (!token) {
       logger.error('[ConnectionManager] No auth signal provided');
       throw new Error('Authentication required');
     }
 
-    // Check if using cookie auth
-    this.usesCookieAuth = token === 'cookie';
-
     if (this.isDestroyed) {
       throw new Error('ConnectionManager has been destroyed');
     }
 
-    if (this.isConnecting) {
-      logger.warn('[ConnectionManager] Connection already in progress');
-      return;
-    }
-
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      logger.info('[ConnectionManager] Already connected');
-      return;
-    }
-
-    if (this.ws) {
-      logger.info('[ConnectionManager] Disconnecting existing connection');
-      this.disconnect();
-    }
-
-    const now = Date.now();
-    const timeSinceLastAttempt = now - this.lastConnectionAttempt;
-    const minDelay = this.calculateMinConnectionDelay();
-
-    if (timeSinceLastAttempt < minDelay) {
-      const waitTime = minDelay - timeSinceLastAttempt;
-      logger.info(`[ConnectionManager] Rate limiting connection attempt, waiting ${waitTime}ms`);
-      await new Promise(resolve => setTimeout(resolve, waitTime));
-    }
-
     this.token = token;
-    this.serverReady = false;
-    this.clientHelloSent = false;
-    this.clientHelloRetries = 0;
-    this.tokenRefreshAttempts = 0;
-    this.lastConnectionAttempt = Date.now();
+    this.usesCookieAuth = token === 'cookie';
+    this.stopReason = 'none';
+    this.installBrowserListeners();
 
-    // Setup token refresh
+    if (this.ws && (this.ws.readyState === WS_OPEN || this.ws.readyState === WS_CONNECTING)) {
+      logger.debug('[ConnectionManager] Already connected or connecting');
+      return;
+    }
+
+    this.clearReconnectTimer();
     this.setupTokenRefresh();
+    await this.openSocket();
+  }
 
-    try {
-      await this.connectionCircuitBreaker.execute(async () => {
-        const endpoint = this.selectBestEndpoint();
+  private get maxAttempts(): number {
+    const max = this.reconnectionStrategy.maxAttempts;
+    if (typeof max !== 'number' || Number.isNaN(max) || max < 0) return Infinity;
+    return max;
+  }
 
-        if (!endpoint) {
-          throw new Error('No available endpoints');
-        }
+  private buildUrl(endpoint: string): string {
+    const url = new URL(endpoint);
+    url.searchParams.set('client_version', WS_CLIENT_VERSION);
+    url.searchParams.set('protocol_version', String(WS_PROTOCOL_VERSION));
+    url.searchParams.set('compression', String(FEATURES.COMPRESSION));
+    url.searchParams.set('encryption', String(this.encryptionRequired));
+    return url.toString();
+  }
 
-        await this.connectToEndpoint(endpoint, topics);
-      });
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
+  private openSocket(): Promise<void> {
+    if (this.isDestroyed || this.stopReason !== 'none') return Promise.resolve();
 
-      if (errorMessage === 'Circuit breaker is OPEN') {
-        logger.error('[ConnectionManager] Connection circuit breaker is OPEN - too many failures');
-        this.onStateChange(ConnectionState.ERROR);
-        const store = useWSEStore.getState();
-        store.setLastError('Connection circuit breaker open - too many failures');
-      }
-      throw error;
+    this.clearReconnectTimer();
+
+    // Never orphan a live socket: one connection at a time.
+    const previous = this.ws;
+    if (previous) {
+      this.closeQuietly(previous, 1000, 'Client reconnect');
+      this.teardownSocket(previous);
     }
+
+    if (!this.connectionCircuitBreaker.canExecute()) {
+      logger.warn('[ConnectionManager] Connection circuit breaker is OPEN, delaying reconnect');
+      this.setState(ConnectionState.RECONNECTING);
+      this.scheduleReconnect();
+      return Promise.resolve();
+    }
+
+    let endpoint: string;
+    let ws: WebSocket;
+    try {
+      if (typeof WebSocket === 'undefined') {
+        throw new Error('WebSocket is not available in this environment');
+      }
+      endpoint = this.connectionPool.getBestEndpoint();
+      ws = new WebSocket(this.buildUrl(endpoint));
+    } catch (error) {
+      logger.error('[ConnectionManager] Cannot open a WebSocket:', errorMessage(error));
+      useWSEStore.getState().setLastError(`Cannot open a WebSocket: ${errorMessage(error)}`);
+      this.recordAttemptFailure(null);
+      this.setState(ConnectionState.RECONNECTING);
+      this.scheduleReconnect();
+      return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+
+    ws.binaryType = 'arraybuffer';
+    const socketId = ++this.socketId;
+    this.ws = ws;
+    this.currentEndpoint = endpoint;
+    this.resetSocketState();
+
+    if (this.state !== ConnectionState.RECONNECTING) {
+      this.setState(ConnectionState.CONNECTING);
+    }
+    useWSEStore.getState().incrementMetric('connectionAttempts');
+    logger.info(`[ConnectionManager] Connecting to ${endpoint}`);
+
+    const startedAt = Date.now();
+
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const settle = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (this.pendingAttempt?.socketId === socketId) this.pendingAttempt = null;
+        if (error) reject(error);
+        else resolve();
+      };
+      this.pendingAttempt = { socketId, settle };
+
+      this.connectTimeoutTimer = setTimeout(() => {
+        this.connectTimeoutTimer = null;
+        if (socketId !== this.socketId || ws.readyState === WS_OPEN) return;
+        logger.warn(`[ConnectionManager] Connection to ${endpoint} timed out`);
+        settle(new Error('Connection timeout'));
+        this.handleSocketGone(ws, endpoint, 1006, 'Connection timeout');
+      }, this.config.connectionTimeout ?? CONNECTION_TIMEOUT);
+
+      ws.onopen = () => {
+        if (socketId !== this.socketId) return;
+        this.clearConnectTimeout();
+        this.handleOpen(endpoint, Date.now() - startedAt);
+        settle();
+      };
+
+      ws.onmessage = (event: MessageEvent) => {
+        if (socketId !== this.socketId || this.isDestroyed) return;
+        this.lastInboundAt = Date.now();
+        this.onMessage(event.data);
+      };
+
+      ws.onerror = () => {
+        if (socketId !== this.socketId) return;
+        logger.warn(`[ConnectionManager] WebSocket error on ${endpoint}`);
+      };
+
+      ws.onclose = (event: CloseEvent) => {
+        if (socketId !== this.socketId) return;
+        settle(new Error(`Connection closed (code ${event.code})`));
+        this.handleSocketGone(ws, endpoint, event.code, event.reason);
+      };
+    });
   }
 
-  private calculateMinConnectionDelay(): number {
-    if (this.consecutiveFailures === 0) return 0;
-
-    const baseDelay = 1000;
-    const maxDelay = 60000;
-    const delay = Math.min(baseDelay * Math.pow(2, this.consecutiveFailures - 1), maxDelay);
-
-    return delay;
-  }
-
-  private async connectToEndpoint(endpoint: string, topics: string[]): Promise<void> {
-    if (this.isDestroyed) return;
-
-    logger.info(`[ConnectionManager] Connecting to endpoint: ${endpoint}`);
-    logger.info(`[ConnectionManager] Topics: ${topics.join(', ')}`);
-
-    this.isConnecting = true;
-
+  private handleOpen(endpoint: string, connectMs: number): void {
     const store = useWSEStore.getState();
+    this.lastInboundAt = Date.now();
 
-    try {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        logger.info('[ConnectionManager] WebSocket already open, skipping connection');
-        this.isConnecting = false;
-        return;
-      }
+    this.connectionPool.recordSuccess(endpoint, connectMs);
+    this.connectionPool.setActiveEndpoint(endpoint);
+    store.setActiveEndpoint(endpoint);
+    store.updateMetrics({
+      connectedSince: Date.now(),
+      successfulConnections: store.metrics.successfulConnections + 1,
+    });
 
-      if (this.ws) {
-        logger.info('[ConnectionManager] Closing existing WebSocket connection');
-        this.ws.close();
-        this.ws = null;
-      }
+    // Deliberately NOT resetting the backoff here: the server upgrades the
+    // socket before it rejects bad credentials, so "opened" is not "accepted".
+    this.setState(ConnectionState.CONNECTED);
+    this.startHeartbeat();
+    this.startServerReadyTimer();
 
-      this.onStateChange(ConnectionState.CONNECTING);
-      this.currentEndpoint = endpoint;
-
-      const url = new URL(endpoint);
-      if (topics.length > 0) {
-        url.searchParams.set('topics', topics.join(','));
-      }
-      url.searchParams.set('client_version', WS_CLIENT_VERSION);
-      url.searchParams.set('protocol_version', String(WS_PROTOCOL_VERSION));
-      url.searchParams.set('compression', String(FEATURES.COMPRESSION));
-      url.searchParams.set('encryption', String(FEATURES.ENCRYPTION));
-
-      logger.info(`[ConnectionManager] WebSocket URL: ${url.toString()}`);
-
-      const connectionStart = Date.now();
-      const ws = new WebSocket(url.toString());
-      ws.binaryType = 'arraybuffer';
-
-      this.ws = ws;
-      this.setupWebSocketHandlers(ws, endpoint);
-
-      await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          reject(new Error('Connection timeout'));
-        }, 10000);
-
-        const handleOpen = () => {
-          clearTimeout(timeout);
-          ws.removeEventListener('open', handleOpen);
-          ws.removeEventListener('error', handleError);
-          ws.removeEventListener('close', handleClose);
-          resolve();
-        };
-
-        const handleError = (event: Event) => {
-          clearTimeout(timeout);
-          ws.removeEventListener('open', handleOpen);
-          ws.removeEventListener('error', handleError);
-          ws.removeEventListener('close', handleClose);
-          reject(new Error('Connection failed'));
-        };
-
-        const handleClose = (event: CloseEvent) => {
-          clearTimeout(timeout);
-          ws.removeEventListener('open', handleOpen);
-          ws.removeEventListener('error', handleError);
-          ws.removeEventListener('close', handleClose);
-
-          if (event.code === 4401 || event.code === 4403 || event.code === 1008) {
-            reject(new Error(`Authentication failed: ${event.reason || 'Invalid token'}`));
-          } else {
-            reject(new Error(`Connection closed: ${event.reason || 'Unknown reason'}`));
-          }
-        };
-
-        ws.addEventListener('open', handleOpen);
-        ws.addEventListener('error', handleError);
-        ws.addEventListener('close', handleClose);
-      });
-
-      const connectionTime = Date.now() - connectionStart;
-
-      this.onStateChange(ConnectionState.CONNECTED);
-      store.setConnectionState(ConnectionState.CONNECTED);
-      store.updateMetrics({ connectedSince: Date.now() });
-
-      this.connectionPool.recordSuccess(endpoint, connectionTime);
-      this.connectionPool.setActiveEndpoint(endpoint);
-      this.connectionCircuitBreaker.recordSuccess();
-
-      this.reconnectAttempts = 0;
-      this.consecutiveFailures = 0;
-      // Reset the store reconnect counter on success. It gates canReconnect(),
-      // so it must count CONSECUTIVE FAILURES, not lifetime reconnects -- it used
-      // to be incremented on every successful reconnect and never reset, locking
-      // out a long-lived flaky-network session after maxReconnectAttempts (10)
-      // successful reconnects.
-      store.updateMetrics({ reconnectCount: 0 });
-
-      this.startHeartbeat();
-
-      logger.info(`[ConnectionManager] Connected successfully to ${endpoint} in ${connectionTime}ms`);
-
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      logger.error('[ConnectionManager] Connection failed:', errorMessage);
-
-      this.consecutiveFailures++;
-      store.incrementMetric('reconnectCount'); // consecutive failures (gates canReconnect)
-      this.connectionPool.recordFailure(endpoint);
-      this.connectionCircuitBreaker.recordFailure();
-
-      if (this.ws) {
-        this.ws.close();
-        this.ws = null;
-      }
-
-      if (errorMessage.includes('Authentication failed')) {
-        // For cookie auth the credential is the HTTP-only cookie (token is just
-        // the 'cookie' sentinel). Nulling it would make every later reconnect
-        // throw 'No token available' even after the cookie is refreshed
-        // server-side, so keep the sentinel; only clear a real bearer token.
-        if (!this.usesCookieAuth) {
-          this.token = null;
-        }
-        store.setLastError('Authentication failed', 401);
-        store.incrementMetric('authFailures');
-
-        window.dispatchEvent(new CustomEvent('wseAuthFailed', {
-          detail: { reason: 'Backend rejected token' }
-        }));
-      }
-
-      throw error;
-    } finally {
-      this.isConnecting = false;
-    }
+    logger.info(`[ConnectionManager] Connected to ${endpoint} in ${connectMs}ms`);
   }
 
+  /** The current socket is gone (close event, timeout, idle watchdog). */
+  private handleSocketGone(ws: WebSocket, endpoint: string, code: number, reason: string): void {
+    if (ws !== this.ws) return;
+
+    const reachedReady = this.serverReady;
+    const authRejected = code === 4401 || code === 4403 || this.authRejectedOnSocket;
+
+    this.closeQuietly(ws, 4000, reason || 'closed');
+    this.teardownSocket(ws);
+
+    logger.info(`[ConnectionManager] WebSocket closed on ${endpoint}: code=${code}${reason ? `, reason=${reason}` : ''}`);
+
+    if (this.isDestroyed || this.stopReason !== 'none') return;
+
+    if (!reachedReady) {
+      this.recordAttemptFailure(endpoint);
+    }
+
+    if (authRejected) {
+      this.handleAuthRejection(code, reason);
+      return;
+    }
+
+    if (code !== 1000 && code !== 1001) {
+      useWSEStore.getState().setLastError(
+        `Connection closed (code ${code}${reason ? `: ${reason}` : ''})`,
+        code,
+      );
+    }
+
+    this.setState(ConnectionState.RECONNECTING);
+    this.scheduleReconnect();
+  }
+
+  private recordAttemptFailure(endpoint: string | null): void {
+    this.reconnectAttempts++;
+    this.connectionCircuitBreaker.recordFailure();
+    if (endpoint) this.connectionPool.recordFailure(endpoint);
+    const store = useWSEStore.getState();
+    store.updateMetrics({
+      reconnectCount: this.reconnectAttempts, // consecutive failed attempts
+      failedConnections: store.metrics.failedConnections + 1,
+    });
+    this.mirrorCircuitBreaker();
+  }
+
+  private handleAuthRejection(code: number, reason: string): void {
+    const store = useWSEStore.getState();
+    const effectiveCode = code === 4403 ? 4403 : 4401;
+    store.setLastError('Authentication failed', effectiveCode);
+    store.incrementMetric('authFailures');
+
+    if (this.refreshAuthTokenFn && !this.authRefreshTried) {
+      this.authRefreshTried = true;
+      logger.warn('[ConnectionManager] Authentication rejected; refreshing credentials before one more attempt');
+      this.setState(ConnectionState.RECONNECTING);
+      this.refreshTokenWithRetry().then(
+        () => {
+          // Skip when forceReconnect() already opened a socket meanwhile.
+          if (!this.isDestroyed && this.stopReason === 'none' && !this.ws && !this.reconnectTimer) {
+            this.scheduleReconnect();
+          }
+        },
+        (error) => {
+          if (!this.isDestroyed && this.stopReason === 'none') {
+            this.enterAuthFailed(effectiveCode, reason, errorMessage(error));
+          }
+        },
+      );
+      return;
+    }
+
+    this.enterAuthFailed(effectiveCode, reason);
+  }
+
+  private enterAuthFailed(code: number, reason: string, refreshError?: string): void {
+    this.stopReason = 'auth';
+    this.clearReconnectTimer();
+    this.clearTokenRefreshTimer();
+    logger.error(
+      '[ConnectionManager] Authentication rejected; not reconnecting until new credentials arrive ' +
+      '(sign in again, then call forceReconnect() or remount with a new auth value)'
+    );
+    this.setState(ConnectionState.ERROR);
+    dispatchWSEEvent('wseAuthFailed', {
+      code,
+      reason: reason || 'Authentication failed',
+      refreshFailed: refreshError !== undefined,
+      refreshError,
+    });
+  }
+
+  /**
+   * Close the current socket on purpose and stop reconnecting. A later
+   * connect() or forceReconnect() starts again.
+   */
   disconnect(): void {
     logger.info('[ConnectionManager] Disconnect called');
 
-    this.serverReady = false;
-    this.clientHelloSent = false;
-    this.connectionId = null;
-    this.isConnecting = false;
-    this.serverReadyProcessed = false;
-    this.serverReadyDetails = null;
+    this.stopReason = 'manual';
+    this.clearReconnectTimer();
+    this.clearTokenRefreshTimer();
 
-    this.adaptiveQuality.reset();
-
-    this.clearAllTimers();
-
-    if (this.ws && this.currentEndpoint) {
-      try {
-        this.connectionPool.removeConnection(this.currentEndpoint, this.ws);
-      } catch (e) {
-        logger.error('[ConnectionManager] Error removing from connection pool:', e);
-      }
-    }
-
-    if (this.ws) {
-      if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
-        logger.info('[ConnectionManager] Closing WebSocket connection');
-        this.ws.close(1000, 'Client disconnect');
-      }
-      this.ws = null;
+    const ws = this.ws;
+    if (ws) {
+      this.closeQuietly(ws, 1000, 'Client disconnect');
+      this.teardownSocket(ws);
     }
 
     this.currentEndpoint = null;
-    this.onStateChange(ConnectionState.DISCONNECTED);
-
-    logger.info('[ConnectionManager] Disconnected');
+    this.setState(ConnectionState.DISCONNECTED);
   }
 
-  private clearAllTimers(): void {
+  /** Detach every handler of `ws`, then close it if it is still alive. */
+  private closeQuietly(ws: WebSocket, code: number, reason: string): void {
+    ws.onopen = null;
+    ws.onmessage = null;
+    ws.onerror = null;
+    ws.onclose = null;
+    try {
+      if (ws.readyState === WS_OPEN || ws.readyState === WS_CONNECTING) {
+        ws.close(code, reason);
+      }
+    } catch (error) {
+      logger.debug('[ConnectionManager] Error closing WebSocket:', error);
+    }
+  }
+
+  /** Reset everything that belongs to one socket. */
+  private resetSocketState(): void {
+    this.serverReady = false;
+    this.clientHelloSent = false;
+    this.connectionId = null;
+    this.authRejectedOnSocket = false;
+    this.encryptionState = this.encryptionRequired ? 'pending' : 'off';
+  }
+
+  private teardownSocket(ws: WebSocket): void {
+    const wasCurrent = ws === this.ws;
+    if (wasCurrent) this.ws = null;
+
+    if (this.currentEndpoint) {
+      try {
+        this.connectionPool.removeConnection(this.currentEndpoint, ws);
+      } catch (e) {
+        logger.debug('[ConnectionManager] Error removing from connection pool:', e);
+      }
+    }
+
+    this.stopHeartbeat();
+    this.clearConnectTimeout();
+    this.clearServerReadyTimer();
+    this.clearEncryptionTimer();
+    this.resetSocketState();
+    this.encryptedSendQueue = Promise.resolve();
+
+    // Fresh ECDH key pair for the next connection; a derivation still in
+    // flight for this one can no longer install its key.
+    if (this.encryptionRequired) {
+      securityManager.resetEncryption();
+    }
+
+    if (this.pendingAttempt) {
+      const pending = this.pendingAttempt;
+      this.pendingAttempt = null;
+      pending.settle(new Error('Connection attempt ended'));
+    }
+
+    if (wasCurrent) {
+      try {
+        this.config.onSocketClosed?.();
+      } catch (error) {
+        logger.error('[ConnectionManager] onSocketClosed callback failed:', error);
+      }
+    }
+  }
+
+  private setState(state: ConnectionState): void {
+    this.state = state;
+    try {
+      useWSEStore.getState().setConnectionState(state);
+    } catch {
+      // Store unavailable (should not happen)
+    }
+    try {
+      this.onStateChange(state);
+    } catch (error) {
+      logger.error('[ConnectionManager] onStateChange callback failed:', error);
+    }
+  }
+
+  private clearReconnectTimer(): void {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+  }
 
-    if (this.heartbeatInterval) {
-      clearInterval(this.heartbeatInterval);
-      this.heartbeatInterval = null;
+  private clearConnectTimeout(): void {
+    if (this.connectTimeoutTimer) {
+      clearTimeout(this.connectTimeoutTimer);
+      this.connectTimeoutTimer = null;
     }
+  }
 
+  private clearServerReadyTimer(): void {
+    if (this.serverReadyTimer) {
+      clearTimeout(this.serverReadyTimer);
+      this.serverReadyTimer = null;
+    }
+  }
+
+  private clearEncryptionTimer(): void {
+    if (this.encryptionTimer) {
+      clearTimeout(this.encryptionTimer);
+      this.encryptionTimer = null;
+    }
+  }
+
+  private clearTokenRefreshTimer(): void {
     if (this.tokenRefreshTimer) {
       clearTimeout(this.tokenRefreshTimer);
       this.tokenRefreshTimer = null;
     }
+  }
 
-    if (this.clientHelloRetryTimer) {
-      clearTimeout(this.clientHelloRetryTimer);
-      this.clientHelloRetryTimer = null;
+  private stopHeartbeat(): void {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
     }
+  }
+
+  private clearAllTimers(): void {
+    this.clearReconnectTimer();
+    this.clearConnectTimeout();
+    this.clearServerReadyTimer();
+    this.clearEncryptionTimer();
+    this.clearTokenRefreshTimer();
+    this.stopHeartbeat();
   }
 
   // ---------------------------------------------------------------------------
@@ -412,43 +613,70 @@ export class ConnectionManager {
   // ---------------------------------------------------------------------------
 
   private setupTokenRefresh(): void {
-    // Token refresh is only needed for cookie-based auth where the server
-    // manages session cookies. For JWT bearer tokens, the application should
-    // handle token refresh externally and reconnect with the new token.
+    // Periodic refresh keeps the auth cookie fresh in cookie mode. It never
+    // tears the connection down: a failed refresh is retried with backoff,
+    // and only a real rejection by the server (4401/4403) ends the session.
+    this.clearTokenRefreshTimer();
     if (this.isDestroyed || !this.usesCookieAuth || !this.refreshAuthTokenFn) return;
-
-    if (this.tokenRefreshTimer) {
-      clearTimeout(this.tokenRefreshTimer);
-      this.tokenRefreshTimer = null;
-    }
-
-    const REFRESH_INTERVAL = 10 * 60 * 1000; // 10 minutes
-
-    this.tokenRefreshTimer = setTimeout(() => {
-      this.refreshTokenWithRetry().catch(error => {
-        logger.error('[ConnectionManager] Token refresh with retry failed:', error);
-      });
-    }, REFRESH_INTERVAL);
-
-    logger.info(`[ConnectionManager] Token refresh scheduled in ${REFRESH_INTERVAL / 1000}s`);
+    this.scheduleTokenRefresh(TOKEN_REFRESH_INTERVAL);
   }
 
+  private scheduleTokenRefresh(delay: number): void {
+    this.clearTokenRefreshTimer();
+    this.tokenRefreshTimer = setTimeout(() => {
+      this.tokenRefreshTimer = null;
+      void this.runPeriodicTokenRefresh();
+    }, delay);
+  }
+
+  private async runPeriodicTokenRefresh(): Promise<void> {
+    if (this.isDestroyed || this.stopReason !== 'none') return;
+
+    try {
+      await this.refreshTokenWithRetry();
+      this.tokenRefreshFailures = 0;
+      if (!this.isDestroyed && this.stopReason === 'none') {
+        this.scheduleTokenRefresh(TOKEN_REFRESH_INTERVAL);
+      }
+    } catch (error) {
+      if (this.isDestroyed || this.stopReason !== 'none') return;
+      this.tokenRefreshFailures++;
+      const retryIn = Math.min(
+        TOKEN_REFRESH_INTERVAL,
+        TOKEN_REFRESH_RETRY_BASE * Math.pow(2, Math.min(this.tokenRefreshFailures - 1, 10)),
+      );
+      logger.warn(
+        `[ConnectionManager] Periodic token refresh failed (${errorMessage(error)}); ` +
+        `keeping the connection, retrying in ${Math.round(retryIn / 1000)}s`
+      );
+      useWSEStore.getState().setLastError('Token refresh failed (connection kept)');
+      dispatchWSEEvent('wseTokenRefreshFailed', {
+        error: errorMessage(error),
+        failures: this.tokenRefreshFailures,
+        retryInMs: retryIn,
+      });
+      this.scheduleTokenRefresh(retryIn);
+    }
+  }
+
+  /** Call refreshAuthToken up to 3 times; rejects when every attempt failed. */
   private async refreshTokenWithRetry(): Promise<void> {
-    if (this.isDestroyed || !this.refreshAuthTokenFn) return;
+    if (!this.refreshAuthTokenFn) {
+      throw new Error('No refreshAuthToken callback configured');
+    }
 
-    // Reset per-invocation counter (prevent permanent block from prior failures)
-    this.tokenRefreshAttempts = 0;
-
+    let lastError: unknown = null;
     for (let attempt = 0; attempt < MAX_TOKEN_REFRESH_ATTEMPTS; attempt++) {
+      if (this.isDestroyed) throw new Error('ConnectionManager has been destroyed');
       try {
-        await this.refreshToken();
-        this.tokenRefreshAttempts = 0;
+        await this.refreshAuthTokenFn();
         return;
       } catch (error) {
-        this.tokenRefreshAttempts++;
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        logger.warn(`[ConnectionManager] Token refresh attempt ${attempt + 1}/${MAX_TOKEN_REFRESH_ATTEMPTS} failed:`, errorMessage);
-
+        lastError = error;
+        logger.warn(
+          `[ConnectionManager] Token refresh attempt ${attempt + 1}/${MAX_TOKEN_REFRESH_ATTEMPTS} failed:`,
+          errorMessage(error),
+        );
         if (attempt < MAX_TOKEN_REFRESH_ATTEMPTS - 1) {
           const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
           await new Promise(resolve => setTimeout(resolve, delay));
@@ -456,154 +684,55 @@ export class ConnectionManager {
       }
     }
 
-    logger.error('[ConnectionManager] All token refresh attempts failed');
-    this.disconnect();
-    window.dispatchEvent(new CustomEvent('authTokenExpired', {
-      detail: {
-        error: 'Token refresh failed after all attempts',
-        attempts: this.tokenRefreshAttempts
-      }
-    }));
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
-
-  private async refreshToken(): Promise<void> {
-    if (this.isDestroyed || !this.refreshAuthTokenFn) return;
-
-    try {
-      logger.info('[ConnectionManager] Refreshing token');
-      await this.refreshAuthTokenFn();
-      logger.info('[ConnectionManager] Token refreshed');
-
-      // Schedule next refresh
-      this.setupTokenRefresh();
-
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      logger.error('[ConnectionManager] Token refresh failed:', errorMessage);
-
-      this.onStateChange(ConnectionState.ERROR);
-      const store = useWSEStore.getState();
-      store.setLastError('Authentication token refresh failed', 401);
-
-      throw error;
-    }
-  }
-
-
 
   // ---------------------------------------------------------------------------
-  // Reconnection with Circuit Breaker
+  // Reconnection
   // ---------------------------------------------------------------------------
-
-  private async reconnect(): Promise<void> {
-    if (this.isDestroyed) return;
-
-    const store = useWSEStore.getState();
-
-    // -1 means INFINITE retries (the documented contract of
-    // RECONNECT_MAX_ATTEMPTS). It used to clamp to a 10-attempt default,
-    // which with exponential backoff exhausts in ~105s -- any server restart
-    // longer than that (a normal binary rebuild) left the client dead in
-    // ERROR until a full page reload.
-    const maxAttempts = this.reconnectionStrategy.maxAttempts === -1
-      ? Infinity
-      : this.reconnectionStrategy.maxAttempts;
-
-    if (!store.canReconnect()) {
-      // The store's breaker half-opens after nextRetryTime -- but only if
-      // somebody re-enters this path. Dying here without a scheduled retry
-      // made an open breaker PERMANENT; keep the loop alive instead (the
-      // backoff delay is capped, so this stays gentle).
-      logger.warn('[ConnectionManager] Cannot reconnect now - circuit breaker open or max attempts reached');
-      if (this.reconnectAttempts < maxAttempts) {
-        this.scheduleReconnect();
-      }
-      return;
-    }
-
-    if (this.reconnectAttempts >= maxAttempts) {
-      logger.error('[ConnectionManager] Max reconnection attempts reached');
-      this.onStateChange(ConnectionState.ERROR);
-      store.setLastError('Max reconnection attempts reached');
-      return;
-    }
-
-    if (!this.connectionCircuitBreaker.canExecute()) {
-      // Same rule as above: an OPEN breaker is a pause, not a death sentence.
-      // It half-opens after its resetTimeout; keep a retry scheduled so the
-      // half-open window is actually used.
-      logger.warn('[ConnectionManager] Connection circuit breaker is OPEN, delaying reconnect');
-      store.setLastError('Connection circuit breaker open');
-      if (this.reconnectAttempts < maxAttempts) {
-        this.scheduleReconnect();
-      }
-      return;
-    }
-
-    try {
-      if (!this.token) {
-        throw new Error('No token available for reconnection');
-      }
-
-      const endpoint = this.selectBestEndpoint();
-      if (!endpoint) {
-        throw new Error('No available endpoints for reconnection');
-      }
-
-      await this.connectToEndpoint(endpoint, store.activeTopics);
-      // (reconnectCount is reset on connect success and incremented on failure,
-      // so it tracks consecutive failures -- do not increment it here.)
-
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      logger.error('[ConnectionManager] Reconnection failed:', errorMessage);
-
-      if (this.reconnectAttempts < maxAttempts && !this.isDestroyed) {
-        this.scheduleReconnect();
-      } else {
-        this.onStateChange(ConnectionState.ERROR);
-        store.setLastError('Max reconnection attempts reached');
-      }
-    }
-  }
 
   private scheduleReconnect(): void {
-    if (this.isDestroyed) return;
+    if (this.isDestroyed || this.stopReason !== 'none') return;
 
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
+    if (this.reconnectAttempts >= this.maxAttempts) {
+      this.stopReason = 'max_attempts';
+      logger.error(`[ConnectionManager] Max reconnection attempts (${this.maxAttempts}) reached`);
+      useWSEStore.getState().setLastError('Max reconnection attempts reached');
+      this.setState(ConnectionState.ERROR);
+      dispatchWSEEvent('wseReconnectFailed', { attempts: this.reconnectAttempts });
+      return;
     }
 
-    const baseDelay = this.calculateReconnectDelay();
-    const minDelay = this.calculateMinConnectionDelay();
-    const delay = Math.max(baseDelay, minDelay);
-    const finalDelay = Math.min(delay, 300000); // Cap at 5 minutes
+    let delay = this.calculateReconnectDelay();
+    const breaker = this.connectionCircuitBreaker.getMetrics();
+    if (breaker.state === CircuitBreakerState.OPEN && breaker.nextRetryTime) {
+      delay = Math.max(delay, breaker.nextRetryTime - Date.now());
+    }
+    delay = Math.max(0, Math.round(delay));
 
-    logger.info(`[ConnectionManager] Scheduling reconnect in ${finalDelay}ms (attempt ${this.reconnectAttempts + 1})`);
+    this.clearReconnectTimer();
+    logger.info(`[ConnectionManager] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts + 1})`);
 
     this.reconnectTimer = setTimeout(() => {
-      if (!this.isDestroyed) {
-        this.reconnectAttempts++;
-        this.lastConnectionAttempt = Date.now();
-        this.reconnect().catch(error => {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          logger.error('[ConnectionManager] Reconnect failed:', errorMessage);
-        });
-      }
-    }, finalDelay);
+      this.reconnectTimer = null;
+      this.openSocket().catch(() => {
+        // Failure already handled (another attempt is scheduled)
+      });
+    }, delay);
   }
 
   private calculateReconnectDelay(): number {
     const { mode, baseDelay, maxDelay, factor, jitter } = this.reconnectionStrategy;
+    const attempts = Math.min(this.reconnectAttempts, 64); // no overflow after hours of outage
     let delay: number;
 
     switch (mode) {
       case 'exponential':
-        delay = Math.min(maxDelay, baseDelay * Math.pow(factor, this.reconnectAttempts));
+        delay = Math.min(maxDelay, baseDelay * Math.pow(factor, attempts));
         break;
 
       case 'linear':
-        delay = Math.min(maxDelay, baseDelay + (this.reconnectAttempts * 1000));
+        delay = Math.min(maxDelay, baseDelay + (attempts * 1000));
         break;
 
       case 'fibonacci': {
@@ -612,15 +741,17 @@ export class ConnectionManager {
           for (let i = 0; i < n; i++) { [a, b] = [b, a + b]; }
           return a;
         };
-        delay = Math.min(maxDelay, baseDelay * fib(Math.min(this.reconnectAttempts, 10)));
+        delay = Math.min(maxDelay, baseDelay * fib(Math.min(attempts, 10) + 1));
         break;
       }
 
       case 'adaptive':
       default:
-        delay = Math.min(maxDelay, baseDelay * Math.pow(1.5, this.reconnectAttempts));
+        delay = Math.min(maxDelay, baseDelay * Math.pow(1.5, attempts));
         break;
     }
+
+    if (!Number.isFinite(delay)) delay = maxDelay;
 
     if (jitter) {
       const jitterAmount = delay * 0.2 * (Math.random() - 0.5);
@@ -630,45 +761,117 @@ export class ConnectionManager {
     return delay;
   }
 
+  // Reconnect at once when the network comes back or the tab becomes visible
+  // (laptop wake), instead of sleeping through the remaining backoff.
+  private readonly handleOnline = (): void => {
+    this.wakeUp('network back online');
+  };
+
+  private readonly handleVisibilityChange = (): void => {
+    if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+      this.wakeUp('page visible again');
+    }
+  };
+
+  private wakeUp(reason: string): void {
+    if (this.isDestroyed || !this.token) return;
+    if (this.stopReason !== 'none' && this.stopReason !== 'max_attempts') return;
+    if (this.ws && (this.ws.readyState === WS_OPEN || this.ws.readyState === WS_CONNECTING)) return;
+
+    if (this.stopReason === 'max_attempts') {
+      this.stopReason = 'none';
+      this.reconnectAttempts = 0;
+    }
+    this.connectionCircuitBreaker.reset();
+    this.mirrorCircuitBreaker();
+    logger.info(`[ConnectionManager] ${reason}: reconnecting now`);
+    this.clearReconnectTimer();
+    this.openSocket().catch(() => {
+      // Failure already handled
+    });
+  }
+
+  private installBrowserListeners(): void {
+    if (this.browserListenersInstalled) return;
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+    window.addEventListener('online', this.handleOnline);
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      document.addEventListener('visibilitychange', this.handleVisibilityChange);
+    }
+    this.browserListenersInstalled = true;
+  }
+
+  private removeBrowserListeners(): void {
+    if (!this.browserListenersInstalled) return;
+    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      window.removeEventListener('online', this.handleOnline);
+    }
+    if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+      document.removeEventListener('visibilitychange', this.handleVisibilityChange);
+    }
+    this.browserListenersInstalled = false;
+  }
+
+  private mirrorCircuitBreaker(): void {
+    const m = this.connectionCircuitBreaker.getMetrics();
+    try {
+      useWSEStore.getState().updateCircuitBreaker({
+        state: m.state,
+        failures: m.failures,
+        successCount: m.successes,
+        lastFailureTime: m.lastFailureTime || null,
+        nextRetryTime: m.nextRetryTime,
+      });
+    } catch {
+      // ignore
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Message Handling
   // ---------------------------------------------------------------------------
 
-  send(message: WSMessage): boolean {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.isDestroyed) {
-      logger.debug('[ConnectionManager] Cannot send - WebSocket not open');
-      return false;
+  /**
+   * True when application messages can go out now: socket open, server_ready
+   * received and -- when encryption is required -- the transport key derived.
+   */
+  isTransportReady(): boolean {
+    if (this.isDestroyed || !this.ws || this.ws.readyState !== WS_OPEN || !this.serverReady) return false;
+    return !this.encryptionRequired || this.encryptionState === 'ready';
+  }
+
+  /** True between server_ready and the end of the key exchange on an encrypted connection. */
+  isAwaitingEncryptionKey(): boolean {
+    return this.encryptionRequired && this.encryptionState === 'pending' && this.ws !== null;
+  }
+
+  /** Milliseconds until the rate limiter has a token again (0 when unlimited). */
+  getRetryAfterMs(): number {
+    if (!this.rateLimiter) return 0;
+    return Math.max(10, Math.ceil(this.rateLimiter.getRetryAfter() * 1000));
+  }
+
+  /**
+   * Send one application message. Never sends plaintext when encryption is
+   * required; never drops silently -- the caller re-queues on anything but
+   * 'sent'/'error'.
+   */
+  trySend(message: WSMessage): SendResult {
+    if (!this.isTransportReady()) {
+      return 'not_ready';
     }
 
-    const isCriticalMessage = ['subscription_update', 'sync_request', 'client_hello'].includes(message.t);
-
-    if (isCriticalMessage) {
-      if (!this.serverReady) {
-        logger.debug(`[ConnectionManager] Cannot send critical message ${message.t} - server not ready yet`);
-        return false;
-      }
-    } else {
-      if (!this.isReady()) {
-        logger.debug(`[ConnectionManager] Cannot send non-critical message ${message.t} - not fully ready`);
-        return false;
-      }
-    }
-
-    if (!this.rateLimiter.canSend()) {
-      logger.warn('[ConnectionManager] Rate limit exceeded');
-      const store = useWSEStore.getState();
-      store.incrementMetric('messagesDropped');
-
+    if (this.rateLimiter && !this.rateLimiter.canSend()) {
       const retryAfter = this.rateLimiter.getRetryAfter();
-      logger.info(`[ConnectionManager] Rate limited. Retry after ${retryAfter}s`);
-
-      window.dispatchEvent(new CustomEvent('clientRateLimitExceeded', {
-        detail: { retryAfter, stats: this.rateLimiter.getStats() }
-      }));
-
-      return false;
+      logger.debug(`[ConnectionManager] Rate limited. Retry after ${retryAfter}s`);
+      dispatchWSEEvent('clientRateLimitExceeded', {
+        retryAfter,
+        stats: this.rateLimiter.getStats(),
+      });
+      return 'rate_limited';
     }
 
+    let data: string;
     try {
       const msgType = message.t || '';
       let category: 'U' | 'S' | 'WSE' = 'U';
@@ -677,122 +880,194 @@ export class ConnectionManager {
       } else if (msgType === 'sync_request' || msgType.startsWith('request_')) {
         category = 'S';
       }
+      data = JSON.stringify({ c: category, ...message });
+    } catch (error) {
+      logger.error('[ConnectionManager] Cannot serialise message:', errorMessage(error));
+      return 'error';
+    }
 
-      const envelope = { c: category, ...message };
-      const data = JSON.stringify(envelope);
-
-      // Encrypt outbound only once the ECDH shared secret exists. Before that
-      // (e.g. client_hello), send plaintext -- encrypting with a not-yet-shared
-      // key would deadlock the handshake.
-      if (securityManager.isTransportEncryptionReady()) {
-        // Queue encrypted send to preserve message ordering
-        this.encryptedSendQueue = (this.encryptedSendQueue || Promise.resolve()).then(async () => {
-          try {
-            const encrypted = await securityManager.encryptForTransport(data);
-            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-              this.ws.send(encrypted);
-            }
-          } catch (err) {
-            logger.error('[ConnectionManager] Encryption failed, dropping message:', err);
+    const ws = this.ws!;
+    try {
+      if (this.encryptionRequired) {
+        const socketId = this.socketId;
+        this.encryptedSendQueue = this.encryptedSendQueue.then(async () => {
+          if (socketId !== this.socketId || this.ws !== ws || ws.readyState !== WS_OPEN) {
+            this.reportUndeliverable(message);
+            return;
           }
+          let frame: ArrayBuffer;
+          try {
+            frame = await securityManager.encryptForTransport(data);
+          } catch (error) {
+            if (socketId !== this.socketId) {
+              this.reportUndeliverable(message);
+            } else {
+              logger.error('[ConnectionManager] Encryption failed, message dropped:', errorMessage(error));
+            }
+            return;
+          }
+          if (socketId !== this.socketId || this.ws !== ws || ws.readyState !== WS_OPEN) {
+            this.reportUndeliverable(message);
+            return;
+          }
+          ws.send(frame);
         });
       } else {
-        this.ws.send(data);
+        ws.send(data);
       }
-
-      const store = useWSEStore.getState();
-      store.incrementMetric('messagesSent');
-      store.incrementMetric('bytesSent', textEncoder.encode(data).byteLength);
-
-      logger.debug(`[ConnectionManager] Sent ${isCriticalMessage ? 'critical' : ''} message: ${message.t}`);
-      return true;
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      logger.error('[ConnectionManager] Failed to send message:', errorMessage);
-      return false;
+      logger.error('[ConnectionManager] Failed to send message:', errorMessage(error));
+      return 'not_ready';
+    }
+
+    this.recordSent(data.length);
+    return 'sent';
+  }
+
+  /** Boolean form of trySend() (true = handed to the socket). */
+  send(message: WSMessage): boolean {
+    return this.trySend(message) === 'sent';
+  }
+
+  private reportUndeliverable(message: WSMessage): void {
+    try {
+      this.config.onUndeliverable?.(message);
+    } catch (error) {
+      logger.error('[ConnectionManager] onUndeliverable callback failed:', error);
     }
   }
 
-  sendRaw(data: string | ArrayBuffer): boolean {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.isDestroyed) {
-      return false;
-    }
-
-    if (!this.rateLimiter.canSend()) {
-      logger.warn('[ConnectionManager] Rate limit exceeded for raw message');
-      return false;
-    }
-
-    return this._sendDirect(data);
+  private recordSent(bytes: number): void {
+    const store = useWSEStore.getState();
+    store.updateMetrics({
+      messagesSent: store.metrics.messagesSent + 1,
+      bytesSent: store.metrics.bytesSent + bytes,
+      lastMessageSent: Date.now(),
+    });
   }
 
   /**
-   * Send a protocol-level control message (PONG) bypassing the rate limiter.
-   * RFC 6455 requires PONG responses "as soon as is practical" -- they must
-   * not be dropped due to application-level rate limiting.
+   * Send a raw frame through the rate limiter. Refused on an encrypted
+   * connection: raw frames cannot be encrypted and must never leak plaintext.
+   */
+  sendRaw(data: string | ArrayBuffer): boolean {
+    if (!this.ws || this.ws.readyState !== WS_OPEN || this.isDestroyed) {
+      return false;
+    }
+    if (this.encryptionRequired) {
+      logger.warn('[ConnectionManager] sendRaw refused: encryption is required on this connection');
+      return false;
+    }
+    if (this.rateLimiter && !this.rateLimiter.canSend()) {
+      logger.warn('[ConnectionManager] Rate limit exceeded for raw message');
+      return false;
+    }
+    return this.sendDirect(data);
+  }
+
+  /**
+   * Send a protocol control frame (heartbeat ping, PONG, client_hello):
+   * plaintext and never rate limited. RFC 6455 wants PONGs "as soon as is
+   * practical", and the server answers only plaintext pings.
    */
   sendControl(data: string | ArrayBuffer): boolean {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.isDestroyed) {
+    if (!this.ws || this.ws.readyState !== WS_OPEN || this.isDestroyed) {
       return false;
     }
-    return this._sendDirect(data);
+    return this.sendDirect(data);
   }
 
-  private _sendDirect(data: string | ArrayBuffer): boolean {
+  private sendDirect(data: string | ArrayBuffer): boolean {
     try {
       this.ws!.send(data);
-
-      const store = useWSEStore.getState();
-      store.incrementMetric('messagesSent');
-
-      if (typeof data === 'string') {
-        store.incrementMetric('bytesSent', textEncoder.encode(data).byteLength);
-      } else {
-        store.incrementMetric('bytesSent', data.byteLength);
-      }
-
+      this.recordSent(typeof data === 'string' ? data.length : data.byteLength);
       return true;
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      logger.error('[ConnectionManager] Failed to send message:', errorMessage);
+      logger.error('[ConnectionManager] Failed to send message:', errorMessage(error));
       return false;
     }
   }
 
   // ---------------------------------------------------------------------------
-  // Server Ready and Client Hello
+  // Server Ready, Client Hello, Server Hello
   // ---------------------------------------------------------------------------
 
+  private startServerReadyTimer(): void {
+    this.clearServerReadyTimer();
+    const timeout = this.config.serverReadyTimeout ?? SERVER_READY_TIMEOUT;
+    if (!(timeout > 0)) return;
+    const socketId = this.socketId;
+    this.serverReadyTimer = setTimeout(() => {
+      this.serverReadyTimer = null;
+      if (socketId !== this.socketId || this.serverReady) return;
+      logger.info(
+        `[ConnectionManager] No server_ready within ${timeout}ms (server without jwt_secret?); proceeding`
+      );
+      this.handleServerReady({ connection_id: null, synthesized: true });
+    }, timeout);
+  }
+
   handleServerReady(details: any): void {
-    this.serverReady = true;
-    this.connectionId = details.connection_id || null;
-    this.serverReadyProcessed = true;
-    this.serverReadyDetails = details;
+    if (this.isDestroyed || !this.ws || this.ws.readyState !== WS_OPEN) return;
 
-    logger.info('[ConnectionManager] Server ready received:', details);
-
-    if (!this.clientHelloSent) {
-      this.sendClientHello();
+    if (details && typeof details.connection_id === 'string') {
+      this.connectionId = details.connection_id;
     }
+    if (this.serverReady) {
+      logger.debug('[ConnectionManager] server_ready already processed for this socket');
+      return;
+    }
+
+    this.serverReady = true;
+    this.clearServerReadyTimer();
+
+    // The connection was accepted: this is where the backoff resets.
+    this.reconnectAttempts = 0;
+    this.authRefreshTried = false;
+    this.connectionCircuitBreaker.recordSuccess();
+    this.mirrorCircuitBreaker();
+    useWSEStore.getState().updateMetrics({ reconnectCount: 0 });
+
+    logger.info('[ConnectionManager] Server ready');
+
+    if (this.encryptionRequired) {
+      this.encryptionState = 'pending';
+      this.startEncryptionTimer();
+    }
+    void this.sendClientHello();
 
     if (this.onServerReady && !this.isDestroyed) {
-      logger.info('[ConnectionManager] Notifying onServerReady callback');
-      this.onServerReady(details);
-    }
-  }
-
-  processPendingServerReady(): void {
-    if (this.serverReadyProcessed && this.serverReadyDetails && !this.isDestroyed) {
-      // Only fire onServerReady callback (don't re-process the full handleServerReady)
-      if (this.onServerReady) {
-        this.onServerReady(this.serverReadyDetails);
+      try {
+        this.onServerReady(details);
+      } catch (error) {
+        logger.error('[ConnectionManager] onServerReady callback failed:', error);
       }
     }
+
+    if (!this.encryptionRequired) {
+      this.notifyTransportReady();
+    }
   }
 
-  resetServerReadyFlag(): void {
-    this.serverReadyProcessed = false;
-    this.serverReadyDetails = null;
+  private startEncryptionTimer(): void {
+    this.clearEncryptionTimer();
+    const timeout = this.config.encryptionHandshakeTimeout ?? ENCRYPTION_HANDSHAKE_TIMEOUT;
+    if (!(timeout > 0)) return;
+    const socketId = this.socketId;
+    this.encryptionTimer = setTimeout(() => {
+      this.encryptionTimer = null;
+      if (socketId === this.socketId && this.encryptionState === 'pending') {
+        this.failEncryption(`no server key within ${timeout}ms`);
+      }
+    }, timeout);
+  }
+
+  private notifyTransportReady(): void {
+    try {
+      this.config.onTransportReady?.();
+    } catch (error) {
+      logger.error('[ConnectionManager] onTransportReady callback failed:', error);
+    }
   }
 
   private async sendClientHello(): Promise<void> {
@@ -800,12 +1075,24 @@ export class ConnectionManager {
       return;
     }
 
-    // Get raw public key if encryption is enabled (generate fresh keypair if needed)
-    const encryptionEnabled = securityManager.isEncryptionEnabled();
+    const socketId = this.socketId;
     let encryptionPublicKey: string | null = null;
-    if (encryptionEnabled) {
-      await securityManager.generateKeyPair();
-      encryptionPublicKey = await securityManager.getPublicKeyRaw();
+    if (this.encryptionRequired) {
+      try {
+        await securityManager.generateKeyPair();
+        encryptionPublicKey = await securityManager.getPublicKeyRaw();
+      } catch (error) {
+        if (socketId === this.socketId) this.failEncryption(`cannot generate the ECDH key pair (${errorMessage(error)})`);
+        return;
+      }
+      if (!encryptionPublicKey) {
+        if (socketId === this.socketId) this.failEncryption('cannot export the ECDH public key');
+        return;
+      }
+    }
+
+    if (socketId !== this.socketId || this.clientHelloSent || !this.ws || this.ws.readyState !== WS_OPEN) {
+      return;
     }
 
     const payload: Record<string, any> = {
@@ -813,7 +1100,7 @@ export class ConnectionManager {
       protocol_version: WS_PROTOCOL_VERSION,
       features: {
         compression: FEATURES.COMPRESSION,
-        encryption: encryptionEnabled && encryptionPublicKey !== null,
+        encryption: this.encryptionRequired && encryptionPublicKey !== null,
         batching: FEATURES.BATCHING,
         priority_queue: FEATURES.PRIORITY_QUEUE,
         circuit_breaker: FEATURES.CIRCUIT_BREAKER,
@@ -833,215 +1120,184 @@ export class ConnectionManager {
     const message: WSMessage = {
       t: 'client_hello',
       p: payload,
-      id: crypto.randomUUID(),
+      id: generateId(),
       ts: new Date().toISOString(),
       v: WS_PROTOCOL_VERSION,
       pri: MessagePriority.CRITICAL,
     };
 
-    const sent = this.send(message);
-    if (sent) {
+    // A control frame: plaintext by necessity (it carries our public key)
+    // and exempt from the rate limiter.
+    if (this.sendControl(JSON.stringify({ c: 'WSE', ...message }))) {
       this.clientHelloSent = true;
-      this.clientHelloRetries = 0;
-      logger.info('[ConnectionManager] Client hello sent successfully');
-    } else if (!this.isDestroyed && this.clientHelloRetries < this.MAX_CLIENT_HELLO_RETRIES) {
-      this.clientHelloRetries++;
-      logger.warn(`[ConnectionManager] Failed to send client hello, retrying in 1s (attempt ${this.clientHelloRetries}/${this.MAX_CLIENT_HELLO_RETRIES})`);
-      this.clientHelloRetryTimer = setTimeout(() => this.sendClientHello(), 1000);
-    } else if (this.clientHelloRetries >= this.MAX_CLIENT_HELLO_RETRIES) {
-      logger.error('[ConnectionManager] Max client hello retries reached, giving up');
+      logger.debug('[ConnectionManager] Client hello sent');
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // WebSocket Event Handlers
-  // ---------------------------------------------------------------------------
+  /**
+   * Process server_hello. On an encrypted connection this completes the key
+   * exchange and only then releases the held messages; anything else fails
+   * closed.
+   */
+  async handleServerHello(payload: any): Promise<void> {
+    if (typeof payload?.ping_interval === 'number' && payload.ping_interval > 0) {
+      this.serverPingInterval = payload.ping_interval;
+    }
 
-  private setupWebSocketHandlers(ws: WebSocket, endpoint: string): void {
-    ws.onopen = () => {
-      logger.info('[ConnectionManager] WebSocket connection opened');
-      this.connectionPool.recordSuccess(endpoint);
-    };
+    if (!this.encryptionRequired || this.encryptionState !== 'pending' || this.isDestroyed) return;
 
-    ws.onmessage = (event) => {
-      if (this.isDestroyed) return;
+    const socketId = this.socketId;
+    const key = payload?.encryption_public_key;
+    if (!payload?.features?.encryption || typeof key !== 'string' || key.length === 0) {
+      this.failEncryption('the server did not confirm encryption in server_hello');
+      return;
+    }
 
-      if (typeof event.data === 'string' && event.data.startsWith('PONG:')) {
-        try {
-          const timestamp = parseInt(event.data.substring(5), 10);
-          const latency = Date.now() - timestamp;
-          this.connectionPool.recordSuccess(endpoint, latency);
-
-          let quality: ConnectionQuality;
-          if (latency < 100) quality = ConnectionQuality.EXCELLENT;
-          else if (latency < 300) quality = ConnectionQuality.GOOD;
-          else if (latency < 1000) quality = ConnectionQuality.FAIR;
-          else quality = ConnectionQuality.POOR;
-
-          this.adaptiveQuality.updateQuality(quality, { latency });
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          logger.warn('[ConnectionManager] Failed to parse PONG timestamp:', errorMessage);
-        }
+    try {
+      await securityManager.setServerPublicKeyRaw(key);
+    } catch (error) {
+      if (socketId === this.socketId) {
+        this.failEncryption(`key exchange failed (${errorMessage(error)})`);
       }
+      return;
+    }
 
-      this.onMessage(event.data);
-    };
+    if (socketId !== this.socketId || this.encryptionState !== 'pending') return;
+    if (!securityManager.isTransportEncryptionReady()) {
+      this.failEncryption('no transport key after the key exchange');
+      return;
+    }
 
-    ws.onerror = (error) => {
-      if (this.isDestroyed) return;
-
-      logger.error(`[ConnectionManager] WebSocket error on ${endpoint}:`, error);
-      const store = useWSEStore.getState();
-      store.recordCircuitBreakerFailure();
-      this.connectionPool.recordFailure(endpoint);
-    };
-
-    ws.onclose = (event) => {
-      if (this.isDestroyed) return;
-
-      logger.info(`[ConnectionManager] WebSocket closed on ${endpoint}: code=${event.code}, reason=${event.reason}`);
-
-      // Always stop heartbeat on close to prevent leaked intervals.
-      // startHeartbeat() re-arms on reconnect success.
-      if (this.heartbeatInterval) {
-        clearInterval(this.heartbeatInterval);
-        this.heartbeatInterval = null;
-      }
-
-      this.ws = null;
-      this.serverReady = false;
-      this.clientHelloSent = false;
-      this.serverReadyProcessed = false;
-      this.encryptedSendQueue = Promise.resolve();
-
-      // Reset encryption state so a fresh ECDH keypair is generated on reconnect
-      if (securityManager.isEncryptionEnabled()) {
-        securityManager.resetEncryption();
-      }
-
-      const store = useWSEStore.getState();
-
-      if (this.currentEndpoint) {
-        try {
-          this.connectionPool.removeConnection(this.currentEndpoint, ws);
-        } catch (e) {
-          logger.error('[ConnectionManager] Error removing from pool on close:', e);
-        }
-      }
-
-      if (event.code === 1000 || event.code === 1001) {
-        this.onStateChange(ConnectionState.DISCONNECTED);
-      } else if (event.code === 4401 || event.code === 4403) {
-        this.onStateChange(ConnectionState.ERROR);
-        store.setLastError('Authentication failed', event.code);
-        store.incrementMetric('authFailures');
-
-        // Keep the 'cookie' sentinel for cookie auth (only clear a real bearer
-        // token) so the post-refresh reconnect below does not throw
-        // 'No token available'.
-        if (!this.usesCookieAuth) {
-          this.token = null;
-        }
-
-        window.dispatchEvent(new CustomEvent('wseAuthFailed', {
-          detail: {
-            code: event.code,
-            reason: event.reason || 'Backend authentication failed'
-          }
-        }));
-
-        if (this.refreshAuthTokenFn) {
-          this.refreshTokenWithRetry().then(() => {
-            if (!this.isDestroyed) {
-              logger.info('[ConnectionManager] Token refreshed after auth close, reconnecting');
-              this.onStateChange(ConnectionState.RECONNECTING);
-              this.scheduleReconnect();
-            }
-          }).catch(error => {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            logger.error('[ConnectionManager] Token refresh after auth failure failed:', errorMessage);
-            // A failed refresh here usually means the AUTH SERVER is down too
-            // (one origin restarting serves both) -- retry on the backoff
-            // schedule instead of dying; the next reconnect attempt re-enters
-            // the refresh path once the origin is back.
-            if (!this.isDestroyed) {
-              this.onStateChange(ConnectionState.RECONNECTING);
-              this.scheduleReconnect();
-            }
-          });
-        }
-      } else if (event.code === 4429) {
-        // Rate limit is transient by definition -- back off and retry, never
-        // park in ERROR forever (the backoff delay grows with each attempt).
-        store.setLastError('Rate limit exceeded', event.code);
-        this.onStateChange(ConnectionState.RECONNECTING);
-        this.scheduleReconnect();
-      } else if (!this.isDestroyed) {
-        this.onStateChange(ConnectionState.RECONNECTING);
-        this.scheduleReconnect();
-      }
-    };
+    this.encryptionState = 'ready';
+    this.clearEncryptionTimer();
+    useWSEStore.getState().updateSecurity({
+      encryptionEnabled: true,
+      encryptionAlgorithm: 'AES-GCM-256',
+    });
+    logger.info('[ConnectionManager] E2E encryption established');
+    this.notifyTransportReady();
   }
 
-  private selectBestEndpoint(): string | null {
-    return this.connectionPool.getBestEndpoint();
+  /**
+   * Encryption is required but cannot be established: close the connection,
+   * stop reconnecting and report the error. Held messages stay queued and are
+   * sent (encrypted) after a later successful forceReconnect().
+   */
+  failEncryption(reason: string): void {
+    if (!this.encryptionRequired || this.isDestroyed) return;
+    if (this.stopReason === 'encryption') return;
+
+    logger.error(
+      `[ConnectionManager] E2E encryption could not be established (${reason}); ` +
+      'closing the connection without sending any plaintext'
+    );
+
+    this.stopReason = 'encryption';
+    this.clearReconnectTimer();
+    const ws = this.ws;
+    if (ws) {
+      this.closeQuietly(ws, 1000, 'Encryption negotiation failed');
+      this.teardownSocket(ws);
+    }
+    this.encryptionState = 'failed';
+
+    useWSEStore.getState().setLastError(`Encryption failed: ${reason}`);
+    this.setState(ConnectionState.ERROR);
+    dispatchWSEEvent('wseEncryptionFailed', { reason });
   }
+
+  /** The server reported AUTH_FAILED/AUTH_REQUIRED: treat the coming close as an auth rejection. */
+  markAuthRejected(): void {
+    if (this.ws) this.authRejectedOnSocket = true;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Heartbeat and dead-socket watchdog
+  // ---------------------------------------------------------------------------
 
   private startHeartbeat(): void {
-    if (this.heartbeatInterval) {
-      clearInterval(this.heartbeatInterval);
-    }
+    this.stopHeartbeat();
 
     this.heartbeatInterval = setInterval(() => {
       if (this.isDestroyed) {
-        if (this.heartbeatInterval) {
-          clearInterval(this.heartbeatInterval);
-          this.heartbeatInterval = null;
-        }
+        this.stopHeartbeat();
         return;
       }
 
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        const pingMessage = {
-          t: 'ping',
-          p: { timestamp: Date.now() },
-          v: WS_PROTOCOL_VERSION
-        };
-        this.sendControl(JSON.stringify({ c: 'WSE', ...pingMessage }));
+      const ws = this.ws;
+      if (!ws || ws.readyState !== WS_OPEN) return;
+
+      // The server pings every ping_interval and answers our pings, so a
+      // healthy socket never stays silent this long; a half-open one does
+      // (e.g. after a laptop sleep).
+      const idleLimit = Math.max(IDLE_TIMEOUT, this.serverPingInterval * 2.5);
+      if (Date.now() - this.lastInboundAt > idleLimit) {
+        logger.warn(`[ConnectionManager] No data from the server for ${idleLimit}ms; reconnecting`);
+        this.handleSocketGone(ws, this.currentEndpoint ?? '', 1006, 'Idle timeout');
+        return;
       }
-    }, 15000);
+
+      this.sendControl(JSON.stringify({
+        c: 'WSE',
+        t: 'ping',
+        p: { timestamp: Date.now() },
+        v: WS_PROTOCOL_VERSION,
+      }));
+    }, HEARTBEAT_INTERVAL);
   }
 
   // ---------------------------------------------------------------------------
   // Public Methods
   // ---------------------------------------------------------------------------
 
+  /**
+   * Drop the current socket and connect again at once, clearing the backoff,
+   * the circuit breaker and any auth/encryption stop. Safe while connected,
+   * connecting or parked in ERROR.
+   */
+  forceReconnect(): void {
+    if (this.isDestroyed) return;
+
+    logger.info('[ConnectionManager] Force reconnect');
+    this.connectionCircuitBreaker.reset();
+    this.mirrorCircuitBreaker();
+    this.reconnectAttempts = 0;
+    this.authRefreshTried = false;
+    this.stopReason = 'none';
+    this.clearReconnectTimer();
+    useWSEStore.getState().updateMetrics({ reconnectCount: 0 });
+
+    const ws = this.ws;
+    if (ws) {
+      this.closeQuietly(ws, 1000, 'Client reconnect');
+      this.teardownSocket(ws);
+    }
+
+    if (!this.token) {
+      logger.warn('[ConnectionManager] Cannot reconnect: connect() was never called');
+      return;
+    }
+
+    this.installBrowserListeners();
+    this.setupTokenRefresh();
+    this.setState(ConnectionState.RECONNECTING);
+    this.openSocket().catch(() => {
+      // Failure already handled
+    });
+  }
+
   changeEndpoint(endpoint: string): void {
     if (this.isDestroyed) return;
 
     logger.info(`[ConnectionManager] Changing endpoint to: ${endpoint}`);
 
-    this.connectionPool.setPreferredEndpoint(endpoint);
     this.connectionPool.addEndpoint(endpoint);
-
-    this.disconnect();
-    this.reconnectAttempts = 0;
-    this.consecutiveFailures = 0;
-
-    if (this.token) {
-      const store = useWSEStore.getState();
-      this.connect(this.token, store.activeTopics).catch(error => {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        logger.error('[ConnectionManager] Failed to change endpoint:', errorMessage);
-      });
-    } else {
-      logger.warn('[ConnectionManager] Cannot change endpoint: no token available');
-    }
+    this.connectionPool.setPreferredEndpoint(endpoint);
+    this.forceReconnect();
   }
 
   isConnected(): boolean {
-    return !this.isDestroyed && this.ws !== null && this.ws.readyState === WebSocket.OPEN;
+    return !this.isDestroyed && this.ws !== null && this.ws.readyState === WS_OPEN;
   }
 
   isReady(): boolean {
@@ -1049,15 +1305,19 @@ export class ConnectionManager {
   }
 
   isFullyReady(): boolean {
-    return this.isConnected() && this.serverReady && this.clientHelloSent;
+    return this.isTransportReady() && this.clientHelloSent;
   }
 
   getConnectionId(): string | null {
     return this.connectionId;
   }
 
+  getState(): ConnectionState {
+    return this.state;
+  }
+
   getRateLimiterStats(): any {
-    return this.rateLimiter.getStats();
+    return this.rateLimiter ? this.rateLimiter.getStats() : null;
   }
 
   getConnectionPoolStats(): any {
@@ -1076,36 +1336,19 @@ export class ConnectionManager {
     return this.connectionPool;
   }
 
-  getAdaptiveQuality(): { quality: string | null; strategy: string } {
-    return {
-      quality: this.adaptiveQuality.getCurrentQuality(),
-      strategy: this.adaptiveQuality.getCurrentStrategyName(),
-    };
-  }
-
   destroy(): void {
-    logger.info('[ConnectionManager] Destroy called');
+    logger.debug('[ConnectionManager] Destroy called');
 
     this.isDestroyed = true;
-
-    if (this.ws) {
-      try {
-        this.ws.onopen = null;
-        this.ws.onmessage = null;
-        this.ws.onerror = null;
-        this.ws.onclose = null;
-
-        if (this.ws.readyState === WebSocket.OPEN ||
-            this.ws.readyState === WebSocket.CONNECTING) {
-          this.ws.close(1000, 'Destroying connection manager');
-        }
-      } catch (e) {
-        logger.error('[ConnectionManager] Error closing WebSocket:', e);
-      }
-      this.ws = null;
-    }
-
+    this.stopReason = 'manual';
+    this.removeBrowserListeners();
     this.clearAllTimers();
+
+    const ws = this.ws;
+    if (ws) {
+      this.closeQuietly(ws, 1000, 'Destroying connection manager');
+      this.teardownSocket(ws);
+    }
 
     try {
       this.connectionPool.destroy();
@@ -1114,7 +1357,5 @@ export class ConnectionManager {
     }
 
     this.connectionCircuitBreaker.reset();
-
-    logger.info('[ConnectionManager] Destroyed');
   }
 }

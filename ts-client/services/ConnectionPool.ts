@@ -2,7 +2,7 @@
 // WebSocket Engine - Connection Pool
 // =============================================================================
 
-import { logger } from '../utils/logger';
+import { logger } from '../utils/logger.js';
 
 interface EndpointHealth {
   url: string;

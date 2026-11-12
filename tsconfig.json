@@ -1,14 +1,14 @@
 {
   "compilerOptions": {
     "target": "ES2020",
-    "module": "ESNext",
-    "moduleResolution": "bundler",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
     "lib": ["ES2020", "DOM", "DOM.Iterable"],
     "jsx": "react-jsx",
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
-    "outDir": "dist",
+    "outDir": "dist/npm",
     "rootDir": "ts-client",
     "strict": true,
     "esModuleInterop": true,
@@ -21,5 +21,5 @@
     "noUnusedParameters": false
   },
   "include": ["ts-client/**/*.ts", "ts-client/**/*.tsx"],
-  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+  "exclude": ["node_modules", "dist", "**/*.test.ts", "**/*.test.tsx", "ts-client/__tests__/**"]
 }
