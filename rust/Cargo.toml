@@ -28,7 +28,9 @@ dashmap = "6"
 aes-gcm = { version = "0.11", features = ["getrandom", "zeroize"] }
 # Key generation uses p256's own getrandom-backed `Generate` (default `std` feature).
 p256 = { version = "0.14", features = ["ecdh"] }
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+# aws_lc_rs: the same crypto library rustls already uses; the rust_crypto
+# backend pulled a second, older RustCrypto stack and the rsa crate.
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 hkdf = "0.13"
 uuid = { version = "1.29.2", features = ["v7"] }
 base64 = "0.23"
