@@ -86,10 +86,10 @@ pub(super) async fn process_commands(
                 }
             }
             ServerCommand::BroadcastText { data } => {
-                fanout.broadcast(Outgoing::text(Bytes::from(data)));
+                fanout.broadcast(Outgoing::text(Bytes::from(data))).await;
             }
             ServerCommand::BroadcastBytes { data } => {
-                fanout.broadcast(Outgoing::binary(Bytes::from(data)));
+                fanout.broadcast(Outgoing::binary(Bytes::from(data))).await;
             }
             ServerCommand::BroadcastLocal {
                 topic,
@@ -124,14 +124,18 @@ pub(super) async fn process_commands(
                 count_message(&state.topic_message_counts, &topic);
                 // A queue-group member sees only some offsets of the topic: it
                 // gets the message without the recovery stamp.
-                fanout.queue_groups(
-                    &state.queue_groups,
-                    &topic,
-                    || Outgoing::text(original),
-                    state.max_outbound_queue_bytes,
-                    &state.slow_consumer_drops,
-                );
-                fanout.publish(topic, || Outgoing::text(stamped), None);
+                fanout
+                    .queue_groups(
+                        &state.queue_groups,
+                        &topic,
+                        || Outgoing::text(original),
+                        state.max_outbound_queue_bytes,
+                        &state.slow_consumer_drops,
+                    )
+                    .await;
+                fanout
+                    .publish(topic, || Outgoing::text(stamped), None)
+                    .await;
             }
             ServerCommand::Disconnect { conn_id } => {
                 let guard = state.connections.read().await;

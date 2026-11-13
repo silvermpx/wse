@@ -291,7 +291,7 @@ async fn a_large_fanout_reaches_everyone_once_and_in_order() {
     let fanout = Fanout::start(index.clone(), 0, Arc::clone(&drops));
     for n in 0..3 {
         let msg = || Outgoing::text(bytes::Bytes::from(format!("{{\"n\":{n}}}")));
-        fanout.publish("big".to_owned(), msg, None);
+        fanout.publish("big".to_owned(), msg, None).await;
     }
     // Each connection's queue holds the three frames, in order.
     let expected: Vec<u8> = (0..3)
@@ -301,7 +301,9 @@ async fn a_large_fanout_reaches_everyone_once_and_in_order() {
         assert_eq!(delivered(h, expected.len()).await, expected);
     }
 
-    fanout.broadcast(Outgoing::text(bytes::Bytes::from_static(b"{}")));
+    fanout
+        .broadcast(Outgoing::text(bytes::Bytes::from_static(b"{}")))
+        .await;
     let frame = encode_ws_frame(0x01, b"{}");
     for (h, _) in &handles {
         assert_eq!(delivered(h, frame.len()).await, frame.to_vec());
@@ -310,7 +312,9 @@ async fn a_large_fanout_reaches_everyone_once_and_in_order() {
     // without connections gets no job.
     assert_eq!(index.occupied.load(Ordering::Relaxed), 0b1111);
     index.leave("c0", handles[0].0.lane);
-    fanout.broadcast(Outgoing::text(bytes::Bytes::from_static(b"{}")));
+    fanout
+        .broadcast(Outgoing::text(bytes::Bytes::from_static(b"{}")))
+        .await;
     assert_eq!(delivered(&handles[1].0, frame.len()).await, frame.to_vec());
     assert!(queued(&handles[0].0).is_empty());
     assert_eq!(drops.load(Ordering::Relaxed), 0);

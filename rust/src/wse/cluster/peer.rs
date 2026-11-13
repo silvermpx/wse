@@ -349,21 +349,26 @@ pub(super) async fn peer_dispatch_task(
 
             // Queue groups: one member each, round-robin, without the
             // recovery stamp (a member sees only some of the offsets).
-            let (d, f) = ctx.fanout.queue_groups(
-                &ctx.queue_groups,
-                &topic,
-                || crate::wse::server::Outgoing::text(crate::wse::server::unstamped(&payload)),
-                ctx.max_outbound,
-                &ctx.slow_drops,
-            );
+            let (d, f) = ctx
+                .fanout
+                .queue_groups(
+                    &ctx.queue_groups,
+                    &topic,
+                    || crate::wse::server::Outgoing::text(crate::wse::server::unstamped(&payload)),
+                    ctx.max_outbound,
+                    &ctx.slow_drops,
+                )
+                .await;
             total_delivered += d;
             total_dropped += f;
 
-            ctx.fanout.publish(
-                topic,
-                || crate::wse::server::Outgoing::text(payload),
-                Some(&ctx.metrics),
-            );
+            ctx.fanout
+                .publish(
+                    topic,
+                    || crate::wse::server::Outgoing::text(payload),
+                    Some(&ctx.metrics),
+                )
+                .await;
         }
 
         if total_delivered > 0 {

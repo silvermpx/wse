@@ -304,6 +304,11 @@ const MAX_LANES: usize = 64;
 /// How many jobs a lane's task takes off its queue at once.
 const LANE_BATCH: usize = 64;
 
+/// How many jobs wait for a lane at most. A sender that finds the queue full
+/// waits for room: a publisher faster than the delivery then backs up in its
+/// own queue, a message each, not in a job for every lane.
+const LANE_QUEUE: usize = 1024;
+
 /// How many lanes the server delivers on: one per core, at most `MAX_LANES`.
 pub(crate) fn lane_count() -> usize {
     std::thread::available_parallelism()
@@ -626,7 +631,14 @@ struct TopicMessage {
 #[derive(Clone)]
 pub(crate) struct Fanout {
     index: TopicIndex,
-    lanes: Arc<[mpsc::UnboundedSender<Job>]>,
+    lanes: Arc<[mpsc::Sender<Job>]>,
+}
+
+/// Queue `job` for `lane`, waiting for room when the lane is behind.
+async fn hand(lane: &mpsc::Sender<Job>, job: Job) {
+    if let Err(mpsc::error::TrySendError::Full(job)) = lane.try_send(job) {
+        let _ = lane.send(job).await;
+    }
 }
 
 impl Fanout {
@@ -634,7 +646,7 @@ impl Fanout {
     pub(crate) fn start(index: TopicIndex, max_pending: usize, slow_drops: Arc<AtomicU64>) -> Self {
         let lanes = (0..index.lanes())
             .map(|lane| {
-                let (tx, rx) = mpsc::unbounded_channel();
+                let (tx, rx) = mpsc::channel(LANE_QUEUE);
                 tokio::spawn(run_lane(
                     lane as u8,
                     rx,
@@ -649,14 +661,14 @@ impl Fanout {
     }
 
     /// Deliver `msg` to every connection.
-    pub(crate) fn broadcast(&self, msg: Outgoing) {
+    pub(crate) async fn broadcast(&self, msg: Outgoing) {
         let occupied = self.index.occupied.load(Ordering::Acquire);
         if occupied == 0 {
             return;
         }
         let msg = Arc::new(msg);
         for lane in lanes_of(occupied) {
-            let _ = self.lanes[lane].send(Job::All(Arc::clone(&msg)));
+            hand(&self.lanes[lane], Job::All(Arc::clone(&msg))).await;
         }
     }
 
@@ -664,7 +676,7 @@ impl Fanout {
     /// patterns matching it (see `TopicIndex::deliver_topic`); `msg` makes
     /// it, only when someone is subscribed. The deliveries are counted in
     /// `tally` when given.
-    pub(crate) fn publish(
+    pub(crate) async fn publish(
         &self,
         topic: String,
         msg: impl FnOnce() -> Outgoing,
@@ -681,7 +693,7 @@ impl Fanout {
             tally: tally.cloned(),
         });
         for lane in lanes_of(mask) {
-            let _ = self.lanes[lane].send(Job::Topic(Arc::clone(&message)));
+            hand(&self.lanes[lane], Job::Topic(Arc::clone(&message))).await;
         }
     }
 
@@ -689,7 +701,7 @@ impl Fanout {
     /// groups, round-robin; a member that is gone or over its outbound budget
     /// is passed over. `msg` makes the message, only when there is a group.
     /// Returns (delivered, dropped).
-    pub(crate) fn queue_groups(
+    pub(crate) async fn queue_groups(
         &self,
         queue_groups: &DashMap<String, DashMap<String, QueueGroup>>,
         topic: &str,
@@ -697,38 +709,47 @@ impl Fanout {
         max_pending: usize,
         slow_drops: &AtomicU64,
     ) -> (u64, u64) {
-        let Some(topic_groups) = queue_groups.get(topic) else {
-            return (0, 0);
-        };
-        let msg = Arc::new(msg());
-        let mut delivered = 0u64;
+        // The members are chosen under the map's lock, and handed to their
+        // lanes after it is let go: no lock is held while waiting for room.
+        let mut chosen = Vec::new();
         let mut dropped = 0u64;
-        for group in topic_groups.iter() {
-            let len = group.members.len();
-            if len == 0 {
-                continue;
-            }
-            let base = group.next.fetch_add(1, Ordering::Relaxed);
-            let member = (0..len)
-                .map(|attempt| &group.members[(base + attempt) % len].1)
-                .find(|h| h.has_room(max_pending, slow_drops));
-            match member {
-                Some(h) => {
-                    let _ =
-                        self.lanes[usize::from(h.lane)].send(Job::One(h.clone(), Arc::clone(&msg)));
-                    delivered += 1;
+        {
+            let Some(topic_groups) = queue_groups.get(topic) else {
+                return (0, 0);
+            };
+            for group in topic_groups.iter() {
+                let len = group.members.len();
+                if len == 0 {
+                    continue;
                 }
-                None => dropped += 1,
+                let base = group.next.fetch_add(1, Ordering::Relaxed);
+                let member = (0..len)
+                    .map(|attempt| &group.members[(base + attempt) % len].1)
+                    .find(|h| h.has_room(max_pending, slow_drops));
+                match member {
+                    Some(h) => chosen.push(h.clone()),
+                    None => dropped += 1,
+                }
             }
         }
-        (delivered, dropped)
+        if !chosen.is_empty() {
+            let msg = Arc::new(msg());
+            for h in &chosen {
+                hand(
+                    &self.lanes[usize::from(h.lane)],
+                    Job::One(h.clone(), Arc::clone(&msg)),
+                )
+                .await;
+            }
+        }
+        (chosen.len() as u64, dropped)
     }
 }
 
 /// A lane's task: the deliveries handed to the lane, in order.
 async fn run_lane(
     lane: u8,
-    mut jobs: mpsc::UnboundedReceiver<Job>,
+    mut jobs: mpsc::Receiver<Job>,
     index: TopicIndex,
     max_pending: usize,
     slow_drops: Arc<AtomicU64>,

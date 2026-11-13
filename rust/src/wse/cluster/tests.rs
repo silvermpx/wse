@@ -1351,13 +1351,15 @@ async fn test_cluster_queue_group_dispatch() {
         Arc::clone(&drops),
     );
     for _ in 0..6 {
-        let (delivered, dropped) = fanout.queue_groups(
-            &queue_groups,
-            "tasks",
-            || crate::wse::server::Outgoing::text(bytes::Bytes::from_static(b"test-payload")),
-            0,
-            &drops,
-        );
+        let (delivered, dropped) = fanout
+            .queue_groups(
+                &queue_groups,
+                "tasks",
+                || crate::wse::server::Outgoing::text(bytes::Bytes::from_static(b"test-payload")),
+                0,
+                &drops,
+            )
+            .await;
         assert_eq!((delivered, dropped), (1, 0));
     }
 
