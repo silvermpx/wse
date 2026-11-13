@@ -312,13 +312,15 @@ const LANE_BATCH: usize = 64;
 const LANE_SLICE: usize = 512;
 
 /// A connection with this many bytes still to write is behind.
-const BEHIND_BYTES: usize = 64 * 1024;
+pub(crate) const BEHIND_BYTES: usize = 64 * 1024;
 
-/// How long a lane waits when most connections a delivery reached were
-/// behind: it does not run further ahead of the sockets than they can write.
-/// Its queue fills meanwhile, and then the senders wait in turn. Only a
-/// delivery to at least `PACE_MIN` connections counts, so one slow client
-/// never holds back its lane: over its own budget it just misses messages.
+/// When most connections a delivery reached were behind, the lane waits
+/// until one of its connections has written down to `BEHIND_BYTES` (its
+/// write task wakes the lane), at most `LANE_PACE`: the lane goes on at the
+/// pace the sockets write, not further ahead. Its queue fills meanwhile, and
+/// then the senders wait in turn. Only a delivery to at least `PACE_MIN`
+/// connections counts, so one slow client never holds back its lane: over
+/// its own budget it just misses messages.
 const LANE_PACE: std::time::Duration = std::time::Duration::from_millis(1);
 const PACE_MIN: usize = 32;
 
@@ -462,6 +464,9 @@ pub(crate) struct TopicIndex {
     /// The lanes that have connections, one bit each: what a broadcast
     /// goes to. Changed under the lane's write lock.
     pub(super) occupied: Arc<AtomicU64>,
+    /// Wakes a waiting lane: one of its connections wrote down to
+    /// `BEHIND_BYTES`.
+    drained: Arc<[Arc<tokio::sync::Notify>]>,
     /// Counts the connections that joined, to give each the next lane.
     joined: Arc<AtomicUsize>,
 }
@@ -481,12 +486,21 @@ impl TopicIndex {
                 .map(|_| parking_lot::RwLock::new(ConnMap::default()))
                 .collect(),
             occupied: Arc::default(),
+            drained: (0..lanes.clamp(1, MAX_LANES))
+                .map(|_| Arc::new(tokio::sync::Notify::new()))
+                .collect(),
             joined: Arc::default(),
         }
     }
 
     pub(crate) fn lanes(&self) -> usize {
         self.everyone.len()
+    }
+
+    /// What a connection's write task wakes when it has written down to
+    /// `BEHIND_BYTES`: its lane may be waiting for it.
+    pub(crate) fn drained(&self, lane: u8) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.drained[usize::from(lane)])
     }
 
     /// The lane for a new connection: each in turn.
@@ -817,6 +831,7 @@ async fn run_lane(
 ) {
     let mut batch = Vec::with_capacity(LANE_BATCH);
     let mut seen = AHashSet::new();
+    let drained = index.drained(lane);
     while jobs.recv_many(&mut batch, LANE_BATCH).await > 0 {
         // Connections served since the lane last gave way.
         let mut since = 0;
@@ -850,7 +865,10 @@ async fn run_lane(
             since += served.connections();
             if served.lagging() {
                 // The sockets are behind: they write before more is queued.
-                tokio::time::sleep(LANE_PACE).await;
+                tokio::select! {
+                    () = drained.notified() => {}
+                    () = tokio::time::sleep(LANE_PACE) => {}
+                }
                 since = 0;
             } else if since >= LANE_SLICE {
                 // The write tasks it woke wait in this thread's run queue:

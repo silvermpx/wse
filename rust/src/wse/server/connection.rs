@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use super::e2e::{decrypt_inbound, derive_connection_key};
 use super::e2e_session::{self, RecvState, SendState};
+use super::fanout::BEHIND_BYTES;
 use super::frames::{
     close_frame, encode_message, encode_ws_frame, write_all_frames, ws_frame_size,
 };
@@ -324,10 +325,13 @@ impl FrameErrorLog {
 /// turns to the broadcast frames again.
 const CONTROL_BATCH: usize = 256;
 
-fn release(pending: &AtomicUsize, bytes: usize) {
-    let _ = pending.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-        Some(cur.saturating_sub(bytes))
-    });
+/// Count `bytes` written off `pending`; returns what was pending before.
+fn release(pending: &AtomicUsize, bytes: usize) -> usize {
+    pending
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(bytes))
+        })
+        .unwrap_or_else(|cur| cur)
 }
 
 /// How a batch of control frames went out.
@@ -378,7 +382,7 @@ async fn write_control(
     }
     let result = write_all_frames(sock, wire).await;
     wire.clear();
-    release(pending, queued);
+    let _ = release(pending, queued);
     match (result, close) {
         (Err(_), _) => Sent::Failed,
         (Ok(()), true) => Sent::Close,
@@ -808,6 +812,7 @@ pub(super) async fn handle_connection(
     // queue (server_ready, replies, send_event, close) and the broadcast buffer
     // (fan-out frames shared with every subscriber, not copied).
     let out_write = Arc::clone(&out);
+    let lane_drained = state.topics.drained(own_handle.lane);
     // `finish`: the read side is done, send nothing more but the close reply.
     // The closer's token: the socket goes now, even in the middle of a frame.
     let finish = Arc::new(AtomicBool::new(false));
@@ -872,7 +877,11 @@ pub(super) async fn handle_connection(
                     let len: usize = shared.iter().map(Bytes::len).sum();
                     let result = write_all_frames(&mut raw_write, &shared).await;
                     shared.clear();
-                    release(&out_write.pending, len);
+                    let before = release(&out_write.pending, len);
+                    // Its lane may wait for the connections to catch up.
+                    if before >= BEHIND_BYTES && before.saturating_sub(len) < BEHIND_BYTES {
+                        lane_drained.notify_one();
+                    }
                     if result.is_err() {
                         break;
                     }
