@@ -491,7 +491,7 @@ Each connection belongs to a lane: one lane per core (at most 64), given in turn
 
 A publisher faster than the clients can read is held back step by step instead of filling memory:
 
-- **Sockets to lanes.** While a lane delivers, it counts the connections that still have 64 KiB or more to write. When most connections of a delivery to at least 32 of them are behind, the lane waits a millisecond before its next job. One slow client never holds back its lane: past its own budget (`max_outbound_queue_bytes`) it misses messages and the slow-consumer check closes it.
+- **Sockets to lanes.** While a lane delivers, it counts the connections that still have 64 KiB or more to write. When most connections of a delivery to at least 32 of them are behind, the lane waits before its next job until one of its connections has written down to 64 KiB (that connection's write task wakes it), at most a millisecond: the lane runs at the pace the sockets write. One slow client never holds back its lane: past its own budget (`max_outbound_queue_bytes`) it misses messages and the slow-consumer check closes it.
 - **Lanes to senders.** A lane's queue holds 1024 jobs; the command task or a cluster link that finds it full waits for room.
 - **Senders to the application.** The command queue counts what waits in it. `send()`, `send_event()` and the broadcasts wait, without the GIL, while 65,536 commands are queued, so a publisher loop runs at the speed the server delivers.
 
