@@ -326,6 +326,48 @@ fn test_encode_decode_resync_empty() {
     );
 }
 
+// Every RESYNC frame, header included, fits the receiver's frame limit, even
+// a payload just under the limit, which used to go out as one oversized frame.
+#[test]
+fn resync_frames_never_exceed_the_frame_limit() {
+    for target in [
+        MAX_FRAME_SIZE - 12,
+        MAX_FRAME_SIZE - 8,
+        MAX_FRAME_SIZE - 3,
+        3 * MAX_FRAME_SIZE,
+    ] {
+        let mut topics = Vec::new();
+        let mut len = 0;
+        let mut i = 0;
+        while len < target {
+            let t = format!("topic.{i:06}");
+            len += t.len() + 1;
+            topics.push(t);
+            i += 1;
+        }
+        let frames = encode_resync(&topics);
+        let mut decoded = Vec::new();
+        for (n, frame) in frames.into_iter().enumerate() {
+            assert!(
+                frame.len() <= MAX_FRAME_SIZE,
+                "frame {n} of {target}: {}",
+                frame.len()
+            );
+            match decode_frame(frame).unwrap() {
+                ClusterFrame::Resync {
+                    topics,
+                    is_continuation,
+                } => {
+                    assert_eq!(is_continuation, n > 0);
+                    decoded.extend(topics);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(decoded, topics);
+    }
+}
+
 #[test]
 fn test_encode_decode_peer_announce() {
     let mut buf = BytesMut::new();
@@ -1504,4 +1546,28 @@ fn tls_server_names_handle_ipv6_and_dns_peers() {
         Some(ServerName::DnsName(_))
     ));
     assert!(super::peer::server_name_for("no-port").is_none());
+}
+
+#[test]
+fn peer_interest_routes_exact_topics_and_patterns_within_its_cap() {
+    let mut interest = PeerInterest::default();
+    assert!(interest.insert("chat.general".into(), 3));
+    assert!(interest.insert("prices.*".into(), 3));
+    assert!(
+        interest.insert("chat.general".into(), 3),
+        "a topic already held always fits"
+    );
+    assert!(interest.insert("orders".into(), 3));
+    assert!(!interest.insert("one.too.many".into(), 3));
+    assert_eq!(interest.len(), 3);
+
+    assert!(interest.wants("chat.general"));
+    assert!(interest.wants("prices.AAPL"));
+    assert!(!interest.wants("chat.private"));
+
+    interest.remove("prices.*");
+    assert!(!interest.wants("prices.AAPL"));
+    interest.remove("chat.general");
+    assert!(!interest.wants("chat.general"));
+    assert_eq!(interest.len(), 1);
 }

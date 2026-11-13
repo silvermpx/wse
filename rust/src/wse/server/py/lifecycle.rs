@@ -406,7 +406,6 @@ impl RustWSEServer {
                                         );
                                     }
                                     // Topic subscription cleanup for zombies (only if we actually removed them)
-                                    let cluster_tx = ping_state.cluster_cmd_tx.read().unwrap().clone();
                                     for cid in &force_remove {
                                         if !was_present.contains(cid) {
                                             continue; // handle_connection already cleaned up
@@ -425,23 +424,7 @@ impl RustWSEServer {
                                                 }
                                                 disconnected_topics.push(topic);
                                             }
-                                            if let Some(ref tx) = cluster_tx {
-                                                let mut refcounts = ping_state
-                                                    .local_topic_refcount
-                                                    .lock()
-                                                    .unwrap_or_else(|e| e.into_inner());
-                                                for topic in &disconnected_topics {
-                                                    if let Some(count) = refcounts.get_mut(topic) {
-                                                        *count = count.saturating_sub(1);
-                                                        if *count == 0 {
-                                                            refcounts.remove(topic);
-                                                            let _ = tx.send(ClusterCommand::Unsub {
-                                                                topic: topic.clone(),
-                                                            });
-                                                        }
-                                                    }
-                                                }
-                                            }
+                                            ping_state.remove_local_interest(&disconnected_topics);
                                         }
                                         // Emit disconnect event AFTER cleanup (mirrors normal path)
                                         if drain {

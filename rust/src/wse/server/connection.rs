@@ -934,25 +934,7 @@ pub(super) async fn handle_connection(
             disconnected_topics.push(topic);
         }
 
-        // Emit UNSUB to cluster for topics whose refcount went 1->0
-        let cluster_tx = state.cluster_cmd_tx.read().unwrap().clone();
-        if let Some(tx) = cluster_tx {
-            let mut refcounts = state
-                .local_topic_refcount
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            for topic in &disconnected_topics {
-                if let Some(count) = refcounts.get_mut(topic) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        refcounts.remove(topic);
-                        let _ = tx.send(ClusterCommand::Unsub {
-                            topic: topic.clone(),
-                        });
-                    }
-                }
-            }
-        }
+        state.remove_local_interest(&disconnected_topics);
     }
     if drain {
         state.push_inbound(InboundEvent::Disconnect {

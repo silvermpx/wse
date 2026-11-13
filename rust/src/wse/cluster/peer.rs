@@ -585,7 +585,9 @@ where
         .keys()
         .cloned()
         .collect();
-    if !local_topics.is_empty() {
+    {
+        // Sent even when empty: until a peer's first RESYNC arrives, it is
+        // sent every publish.
         let mut wire_buf = BytesMut::new();
         for frame in &encode_resync(&local_topics) {
             write_framed(&mut wire_buf, frame);

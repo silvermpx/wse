@@ -93,27 +93,15 @@ impl RustWSEServer {
             }
         }
 
-        let cluster_tx = self.shared.cluster_cmd_tx.read().unwrap().clone();
-
-        // Get ConnectionHandle FIRST (may block_on tokio), before acquiring any mutexes.
-        // This prevents deadlock: tokio tasks acquire connections.write() then local_topic_refcount,
-        // so we must follow the same order.
+        // Get the ConnectionHandle (may block_on tokio) before taking any lock.
         let handle = self.runtime().and_then(|rt| {
             let guard = rt.block_on(self.shared.connections.read());
             guard.get(conn_id).cloned()
         });
 
-        // Acquire refcount lock AFTER block_on completes
-        let mut refcounts = if cluster_tx.is_some() {
-            Some(
-                self.shared
-                    .local_topic_refcount
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            )
-        } else {
-            None
-        };
+        // Topics this connection newly subscribed: counted for cluster interest
+        // once the loop is done.
+        let mut newly_subscribed: Vec<String> = Vec::new();
 
         for topic in &topics {
             if let Some(ref h) = handle {
@@ -182,19 +170,13 @@ impl RustWSEServer {
                 .or_default()
                 .insert(topic.clone());
 
-            if is_new && let (Some(tx), Some(rc)) = (&cluster_tx, &mut refcounts) {
-                let count = rc.entry(topic.clone()).or_insert(0);
-                *count += 1;
-                if *count == 1 {
-                    let _ = tx.send(ClusterCommand::Sub {
-                        topic: topic.clone(),
-                    });
-                }
+            if is_new {
+                newly_subscribed.push(topic.clone());
             }
         }
-        // Released before the presence data is read from Python below: no
-        // Python code runs while this thread holds the refcount lock.
-        drop(refcounts);
+        // No Python code runs under the refcount lock: it is taken and released
+        // here, before the presence data is read from Python below.
+        self.shared.add_local_interest(&newly_subscribed);
 
         // Presence tracking
         if let (Some(pm), Some(pd)) = (&self.shared.presence, &presence_data) {
@@ -448,19 +430,6 @@ impl RustWSEServer {
         conn_id: &str,
         topics: Option<Vec<String>>,
     ) -> PyResult<()> {
-        // Acquire refcount lock first to keep subscription + refcount atomic
-        let cluster_tx = self.shared.cluster_cmd_tx.read().unwrap().clone();
-        let mut refcounts = if cluster_tx.is_some() {
-            Some(
-                self.shared
-                    .local_topic_refcount
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            )
-        } else {
-            None
-        };
-
         let unsubscribe_all = topics.is_none();
         // Save requested topics for queue group cleanup (conn_queue_groups tracks separately from conn_topics)
         let requested_unsub: Vec<String> = match &topics {
@@ -574,6 +543,7 @@ impl RustWSEServer {
                         });
                     }
                     // Cluster sync: notify peers of presence leave
+                    let cluster_tx = self.shared.cluster_cmd_tx.read().unwrap().clone();
                     if let Some(ref ctx) = cluster_tx {
                         let data_str = serde_json::to_string(&data).unwrap_or_default();
                         let now = crate::wse::presence::epoch_ms();
@@ -589,20 +559,7 @@ impl RustWSEServer {
             }
         }
 
-        // Emit UNSUB to cluster for topics whose refcount went 1->0
-        if let (Some(tx), Some(rc)) = (&cluster_tx, &mut refcounts) {
-            for topic in &removed_topics {
-                if let Some(count) = rc.get_mut(topic) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        rc.remove(topic);
-                        let _ = tx.send(ClusterCommand::Unsub {
-                            topic: topic.clone(),
-                        });
-                    }
-                }
-            }
-        }
+        self.shared.remove_local_interest(&removed_topics);
 
         Ok(())
     }

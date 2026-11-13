@@ -280,7 +280,8 @@ pub(crate) fn encode_resync(topics: &[String]) -> Vec<BytesMut> {
         buf
     }
 
-    if payload_bytes.is_empty() || payload_bytes.len() <= MAX_FRAME_SIZE {
+    // The 8-byte header counts against the frame limit the receiver enforces.
+    if payload_bytes.len() <= MAX_FRAME_SIZE - 8 {
         return vec![encode_single(payload_bytes, 0x00)];
     }
     // Multi-frame: split at newline boundaries to stay under MAX_FRAME_SIZE

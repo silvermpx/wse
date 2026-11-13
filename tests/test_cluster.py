@@ -4,8 +4,10 @@ Instance ids are time-ordered and made in connect_cluster(), so the node that
 joins first holds the lower id. Each scenario names which node dials.
 """
 
+import asyncio
 import datetime
 import ipaddress
+import json
 import time
 
 import pytest
@@ -25,7 +27,8 @@ def wait_for(predicate, timeout=10.0):
 
 class Node:
     def __init__(self):
-        self.server = RustWSEServer("127.0.0.1", _next_port(), max_connections=10)
+        self.port = _next_port()
+        self.server = RustWSEServer("127.0.0.1", self.port, max_connections=10)
         self.server.enable_drain_mode()
         self.server.start()
         self.cluster_port = _next_port()
@@ -111,6 +114,36 @@ def test_restarted_peer_is_connected_again(nodes):
     c.cluster_port = port  # same address, new instance
     c.join(a)
     assert wait_for(lambda: a.peers == 1 and c.peers == 1, timeout=20.0)
+
+
+def test_subscriptions_made_before_joining_reach_peers(nodes):
+    websockets = pytest.importorskip("websockets")
+    a, b = nodes(), nodes()
+
+    async def scenario():
+        async with websockets.connect(f"ws://127.0.0.1:{a.port}/wse") as ws:
+            # Subscribe the client while node a is not in a cluster yet.
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                events = a.server.drain_inbound(16, 50)
+                connected = [e for e in events if e[0] == "connect"]
+                if connected:
+                    a.server.subscribe_connection(connected[0][1], ["news"])
+                    break
+                await asyncio.sleep(0.05)
+            a.join(b)
+            b.join(a)
+            assert wait_for(lambda: a.peers == 1 and b.peers == 1)
+            await asyncio.sleep(0.5)  # the link's RESYNC carries the topic
+            b.server.broadcast("news", '{"t":"news","p":{"n":1}}')
+            while True:
+                frame = await asyncio.wait_for(ws.recv(), timeout=5)
+                text = frame if isinstance(frame, str) else frame.decode(errors="replace")
+                if '"news"' in text:
+                    return json.loads(text[text.index("{") :])
+
+    message = asyncio.run(scenario())
+    assert message["p"] == {"n": 1}
 
 
 # ---------------------------------------------------------------------------

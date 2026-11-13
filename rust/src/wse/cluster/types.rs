@@ -82,6 +82,65 @@ pub(crate) fn claim_link(
     }
 }
 
+/// The topics one peer has subscribers for. Exact names and glob patterns
+/// are kept apart, so routing a publish costs one lookup plus the patterns,
+/// not a pass over every topic the peer holds.
+#[derive(Default)]
+pub(crate) struct PeerInterest {
+    exact: ahash::AHashSet<String>,
+    patterns: Vec<String>,
+}
+
+impl PeerInterest {
+    fn is_pattern(topic: &str) -> bool {
+        topic.contains('*') || topic.contains('?')
+    }
+
+    pub fn len(&self) -> usize {
+        self.exact.len() + self.patterns.len()
+    }
+
+    /// Add a topic unless the peer already holds `cap` of them. Returns
+    /// whether the topic is held afterwards.
+    pub fn insert(&mut self, topic: String, cap: usize) -> bool {
+        if Self::is_pattern(&topic) {
+            if self.patterns.contains(&topic) {
+                return true;
+            }
+            if self.len() >= cap {
+                return false;
+            }
+            self.patterns.push(topic);
+        } else {
+            if self.exact.contains(&topic) {
+                return true;
+            }
+            if self.len() >= cap {
+                return false;
+            }
+            self.exact.insert(topic);
+        }
+        true
+    }
+
+    pub fn remove(&mut self, topic: &str) {
+        if Self::is_pattern(topic) {
+            self.patterns.retain(|p| p != topic);
+        } else {
+            self.exact.remove(topic);
+        }
+    }
+
+    /// Whether a publish to `topic` reaches a subscriber on this peer.
+    pub fn wants(&self, topic: &str) -> bool {
+        self.exact.contains(topic)
+            || self
+                .patterns
+                .iter()
+                .any(|p| crate::wse::server::glob_match(p, topic))
+    }
+}
+
 /// Forget the link to `peer` if it is still the one from `session`.
 pub(crate) fn release_link(links: &Links, peer: &str, session: u64) {
     links.remove_if(peer, |_, link| link.session == session);

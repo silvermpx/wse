@@ -17,9 +17,10 @@ use super::peer::PeerSpawnCtx;
 use super::{
     CAP_COMPRESSION, CAP_INTEREST_ROUTING, CAP_PRESENCE, CAP_RECOVERY, ClusterCommand,
     ClusterContext, ClusterDlq, ClusterDlqEntry, ClusterTlsConfig, InterestUpdate,
-    MAX_CLUSTER_PEERS, MAX_REMOTE_INTEREST_PER_PEER, PeerRegistration, PresencePeerFrame,
-    encode_drain, encode_msg, encode_msg_compressed, encode_msg_with_recovery,
-    encode_peer_announce, encode_presence_update, encode_shutdown, encode_sub, encode_unsub,
+    MAX_CLUSTER_PEERS, MAX_FRAME_SIZE, MAX_REMOTE_INTEREST_PER_PEER, PeerInterest,
+    PeerRegistration, PresencePeerFrame, encode_drain, encode_msg, encode_msg_compressed,
+    encode_msg_with_recovery, encode_peer_announce, encode_presence_update, encode_shutdown,
+    encode_sub, encode_unsub,
 };
 
 // ---------------------------------------------------------------------------
@@ -46,8 +47,11 @@ pub(crate) async fn cluster_manager(
     let (cluster_port, presence, server_cmd_tx) = cluster_opts;
     let global_cancel = CancellationToken::new();
 
-    // Remote interest table: peer_addr -> set of topics that peer is interested in
-    let mut remote_interest: HashMap<String, ahash::AHashSet<String>> = HashMap::new();
+    // Remote interest: the topics each peer has subscribers for. A peer with
+    // no entry yet (no RESYNC received) gets every publish.
+    let mut remote_interest: HashMap<String, PeerInterest> = HashMap::new();
+    // Peers in drain mode: they get nothing new until they disconnect.
+    let mut draining: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Track the latest session generation per peer to filter stale RESYNC continuations
     let mut peer_generation: HashMap<String, u64> = HashMap::new();
 
@@ -234,16 +238,12 @@ pub(crate) async fn cluster_manager(
                         let plain_bytes = plain_data.freeze();
 
                         for (peer_addr, tx, caps) in &peer_txs {
-                            let interested = match remote_interest.get(peer_addr) {
-                                Some(topics) => {
-                                    topics.contains(&topic)
-                                        || topics.iter().any(|pat| {
-                                            (pat.contains('*') || pat.contains('?'))
-                                                && crate::wse::server::glob_match(pat, &topic)
-                                        })
-                                }
-                                None => true, // No RESYNC yet -> safe default: send to all
-                            };
+                            if draining.contains(peer_addr) {
+                                continue;
+                            }
+                            let interested = remote_interest
+                                .get(peer_addr)
+                                .is_none_or(|interest| interest.wants(&topic));
                             if interested {
                                 let frame = if caps & CAP_RECOVERY != 0 {
                                     if caps & CAP_COMPRESSION != 0 {
@@ -256,6 +256,13 @@ pub(crate) async fn cluster_manager(
                                 } else {
                                     plain_bytes.clone()
                                 };
+                                // The peer drops a frame over its limit together
+                                // with the link, so an oversized one is not sent.
+                                if frame.len() > MAX_FRAME_SIZE {
+                                    ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                                    warn_oversized(&topic, frame.len());
+                                    continue;
+                                }
                                 match tx.try_send(frame) {
                                     Ok(()) => {
                                         ctx.metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
@@ -421,30 +428,38 @@ pub(crate) async fn cluster_manager(
             update = interest_rx.recv() => {
                 match update {
                     Some(InterestUpdate::Sub { peer_addr, topic }) => {
-                        let set = remote_interest.entry(peer_addr).or_default();
-                        // Bound the per-peer interest set (a re-sub of an existing
-                        // topic always succeeds; a new topic past the cap is dropped).
-                        if set.len() < MAX_REMOTE_INTEREST_PER_PEER || set.contains(&topic) {
-                            set.insert(topic);
-                        }
+                        // Bounded: a new topic past the cap is dropped.
+                        remote_interest
+                            .entry(peer_addr)
+                            .or_default()
+                            .insert(topic, MAX_REMOTE_INTEREST_PER_PEER);
                     }
                     Some(InterestUpdate::Unsub { peer_addr, topic }) => {
-                        if let Some(topics) = remote_interest.get_mut(&peer_addr) {
-                            topics.remove(&topic);
+                        if let Some(interest) = remote_interest.get_mut(&peer_addr) {
+                            interest.remove(&topic);
                         }
                     }
                     Some(InterestUpdate::Resync { peer_addr, topics, is_continuation, generation }) => {
-                        if is_continuation {
-                            // Continuation frame: only apply if generation matches current session.
-                            // Stale continuations from a prior connection are silently dropped.
-                            if peer_generation.get(&peer_addr) == Some(&generation) {
-                                remote_interest.entry(peer_addr).or_default().extend(topics);
-                            }
-                        } else {
-                            // First/only frame: replace entire set and record generation
+                        // The first frame of a RESYNC replaces the set; a continuation
+                        // extends it, and only for the session that started it.
+                        if is_continuation && peer_generation.get(&peer_addr) != Some(&generation) {
+                            continue;
+                        }
+                        if !is_continuation {
                             peer_generation.insert(peer_addr.clone(), generation);
-                            let set: ahash::AHashSet<String> = topics.into_iter().collect();
-                            remote_interest.insert(peer_addr, set);
+                            remote_interest.insert(peer_addr.clone(), PeerInterest::default());
+                        }
+                        let interest = remote_interest.entry(peer_addr.clone()).or_default();
+                        let offered = topics.len();
+                        let kept = topics
+                            .into_iter()
+                            .filter(|t| interest.insert(t.clone(), MAX_REMOTE_INTEREST_PER_PEER))
+                            .count();
+                        if kept < offered {
+                            tracing::warn!(
+                                "[WSE-Cluster] {peer_addr} advertised more than {MAX_REMOTE_INTEREST_PER_PEER} topics; {} ignored",
+                                offered - kept
+                            );
                         }
                     }
                     Some(InterestUpdate::PeerDisconnected { peer_addr, generation }) => {
@@ -461,17 +476,16 @@ pub(crate) async fn cluster_manager(
                             }
                             remote_interest.remove(&peer_addr);
                             peer_generation.remove(&peer_addr);
+                            draining.remove(&peer_addr);
                             if !static_peers.contains(&peer_addr) {
                                 ctx.known_peers.remove(&peer_addr);
                             }
                         }
                     }
                     Some(InterestUpdate::Drain { peer_addr }) => {
-                        // Lame duck: stop routing new messages to the draining peer
-                        // (clear its interest) but leave generation / known_peers /
-                        // presence intact -- the connection stays up for in-flight
-                        // delivery and the peer may resume via a later RESYNC.
-                        remote_interest.remove(&peer_addr);
+                        // Lame duck: route nothing new to the draining peer until it
+                        // disconnects. The link stays up for in-flight delivery.
+                        draining.insert(peer_addr);
                     }
                     None => {
                         // Interest channel closed, continue running
@@ -591,4 +605,22 @@ pub(super) fn valid_peer_addr(addr: &str) -> bool {
                 && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         });
     port_ok && host_ok
+}
+
+/// Warn about a publish too large to send to peers, at most every ten seconds.
+fn warn_oversized(topic: &str, size: usize) {
+    use std::sync::atomic::AtomicU64;
+    static LAST_WARN_MS: AtomicU64 = AtomicU64::new(0);
+    let now = super::epoch_ms();
+    let last = LAST_WARN_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 10_000
+        && LAST_WARN_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::warn!(
+            "[WSE-Cluster] Not sending a {size}-byte publish to '{topic}' to cluster peers: \
+             the frame limit is {MAX_FRAME_SIZE} bytes (local subscribers still get it)"
+        );
+    }
 }

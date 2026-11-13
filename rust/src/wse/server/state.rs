@@ -237,6 +237,60 @@ pub(crate) struct SharedState {
 }
 
 impl SharedState {
+    /// One more local subscriber for each of `topics`; a topic's first one is
+    /// advertised to cluster peers. Counted with or without a cluster, so
+    /// connect_cluster() advertises (by RESYNC) what was subscribed before it.
+    pub(crate) fn add_local_interest<'a>(&self, topics: impl IntoIterator<Item = &'a String>) {
+        let cluster_tx = self
+            .cluster_cmd_tx
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut refcounts = self
+            .local_topic_refcount
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for topic in topics {
+            let count = refcounts.entry(topic.clone()).or_insert(0);
+            *count += 1;
+            if *count == 1
+                && let Some(tx) = &cluster_tx
+            {
+                let _ = tx.send(ClusterCommand::Sub {
+                    topic: topic.clone(),
+                });
+            }
+        }
+    }
+
+    /// One fewer local subscriber for each of `topics`; a topic's last one
+    /// leaving withdraws it from cluster peers.
+    pub(crate) fn remove_local_interest<'a>(&self, topics: impl IntoIterator<Item = &'a String>) {
+        let cluster_tx = self
+            .cluster_cmd_tx
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut refcounts = self
+            .local_topic_refcount
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for topic in topics {
+            let Some(count) = refcounts.get_mut(topic) else {
+                continue;
+            };
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                refcounts.remove(topic);
+                if let Some(tx) = &cluster_tx {
+                    let _ = tx.send(ClusterCommand::Unsub {
+                        topic: topic.clone(),
+                    });
+                }
+            }
+        }
+    }
+
     pub(super) fn new(cfg: SharedStateConfig) -> Self {
         let (tx, rx) = bounded(cfg.max_inbound_queue_size);
         Self {

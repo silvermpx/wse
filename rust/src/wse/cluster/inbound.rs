@@ -116,7 +116,9 @@ pub(super) async fn handle_cluster_inbound_generic<S>(
                 .unwrap_or_else(|e| e.into_inner());
             refcounts.keys().cloned().collect()
         };
-        if !local_topics.is_empty() {
+        {
+            // Sent even when empty: until a peer's first RESYNC arrives, it is
+            // sent every publish.
             let resync_frames = encode_resync(&local_topics);
             let mut wire_buf = BytesMut::new();
             for frame in &resync_frames {

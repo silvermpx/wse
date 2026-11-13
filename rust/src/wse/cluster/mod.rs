@@ -36,8 +36,8 @@ pub(crate) use protocol::{
 pub(crate) use tls::{ClusterTlsConfig, build_cluster_tls};
 pub(crate) use types::{
     ClusterCommand, ClusterContext, ClusterDlq, ClusterDlqEntry, ClusterMetrics, InterestUpdate,
-    Link, LinkRefused, Links, PeerInfo, PeerRegistration, PresencePeerFrame, claim_link,
-    release_link,
+    Link, LinkRefused, Links, PeerInfo, PeerInterest, PeerRegistration, PresencePeerFrame,
+    claim_link, release_link,
 };
 
 use std::sync::atomic::AtomicU64;
