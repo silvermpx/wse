@@ -81,7 +81,7 @@ def publisher(server: RustWSEServer, stop: threading.Event):
             recovery_topics = health.get("recovery_topic_count", 0)
             recovery_bytes = health.get("recovery_total_bytes", 0)
             print(
-                f"[pub] {seq} ticks | {conns} conns | "
+                f"[pub] {seq} ticks in {elapsed:.0f}s | {conns} conns | "
                 f"recovery: {recovery_topics} topics, {recovery_bytes} bytes"
             )
 

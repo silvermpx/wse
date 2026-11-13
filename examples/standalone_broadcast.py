@@ -92,7 +92,10 @@ def publisher(server: RustWSEServer, stop: threading.Event):
             conns = server.get_connection_count()
             subs = server.get_topic_subscriber_count("prices")
             if conns > 0:
-                print(f"[pub] {seq} ticks, {conns} connections, {subs} subscribed to prices")
+                print(
+                    f"[pub] {seq} ticks in {elapsed:.0f}s, {conns} connections, "
+                    f"{subs} subscribed to prices"
+                )
 
         time.sleep(0.1)
 
