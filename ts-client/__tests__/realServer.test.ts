@@ -172,4 +172,36 @@ describe.skipIf(!PYTHON || typeof WebSocket === 'undefined')('real RustWSEServer
     expect(wseActions.sendMessage('echo', { n: 7 })).toBe('sent');
     await vi.waitFor(() => expect(echoes.some((p) => p.n === 7)).toBe(true), { timeout: 5_000 });
   }, 30_000);
+
+  it('speaks msgpack with the server both ways', async () => {
+    destroyCurrentSession({ clearUserData: true });
+    const echoes: any[] = [];
+    const prices: number[] = [];
+    const subscribed = events.filter((e) => e.event === 'subscribe').length;
+    acquireSession({
+      key: makeSessionKey('cookie', [endpoint]),
+      auth: 'cookie',
+      initialTopics: ['prices'],
+      config: {
+        endpoints: [endpoint],
+        offline: { enabled: false },
+        wireFormat: 'msgpack',
+        registerHandlers: (p) => {
+          p.registerHandler('echo_reply', (m) => echoes.push(m.p));
+          p.registerHandler('price_update', (m) => prices.push(m.p.seq));
+        },
+      },
+    });
+
+    // The subscription went in msgpack, and the server read it.
+    await vi.waitFor(() => expect(transportReady()).toBe(true), { timeout: 10_000 });
+    await vi.waitFor(
+      () => expect(events.filter((e) => e.event === 'subscribe').length).toBeGreaterThan(subscribed),
+      { timeout: 5_000 },
+    );
+    send('publish 2');
+    await vi.waitFor(() => expect(prices.length).toBeGreaterThanOrEqual(2), { timeout: 5_000 });
+    expect(wseActions.sendMessage('echo', { n: 9 })).toBe('sent');
+    await vi.waitFor(() => expect(echoes.some((p) => p.n === 9)).toBe(true), { timeout: 5_000 });
+  }, 30_000);
 });

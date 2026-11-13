@@ -21,6 +21,7 @@
 //     reaches server_ready -- a socket that opens and is then rejected does
 //     not reset it.
 
+import { encode as encodeMsgPack } from '@msgpack/msgpack';
 import {
   ConnectionState,
   WSMessage,
@@ -111,6 +112,21 @@ export interface ConnectionManagerConfig {
    * from which size on (bytes). Default: enabled, 1024.
    */
   compression?: { enabled: boolean; threshold: number };
+
+  /**
+   * 'msgpack' asks the server for msgpack (binary, smaller than JSON) and
+   * sends in it too, except frames sealed for E2E. Default 'json'.
+   */
+  wireFormat?: 'json' | 'msgpack';
+}
+
+/** A message as the server reads msgpack: `M:` and the encoded value. */
+function packMessage(value: unknown): ArrayBuffer {
+  const body = encodeMsgPack(value, { ignoreUndefined: true });
+  const frame = new Uint8Array(2 + body.byteLength);
+  frame.set([77, 58]); // 'M:'
+  frame.set(body, 2);
+  return frame.buffer;
 }
 
 type StopReason = 'none' | 'manual' | 'auth' | 'encryption' | 'max_attempts';
@@ -177,6 +193,8 @@ export class ConnectionManager {
   private connectionCircuitBreaker: CircuitBreaker;
 
   // Serialized queue for encrypted sends (preserves message ordering)
+  /** The server sends msgpack to this client, and gets it back. */
+  private readonly msgpack: boolean;
   private encryptedSendQueue: Promise<void> = Promise.resolve();
 
   private refreshAuthTokenFn: (() => Promise<void>) | null;
@@ -207,6 +225,7 @@ export class ConnectionManager {
     );
     this.compressionEnabled = this.config.compression?.enabled ?? true;
     this.compressionThreshold = this.config.compression?.threshold ?? 1024;
+    this.msgpack = this.config.wireFormat === 'msgpack';
     this.rateLimiter = createRateLimiter(this.config.rateLimit);
 
     this.connectionPool = new ConnectionPool({
@@ -278,6 +297,7 @@ export class ConnectionManager {
     url.searchParams.set('protocol_version', String(WS_PROTOCOL_VERSION));
     url.searchParams.set('compression', String(this.compressionEnabled && this.compressionThreshold > 0));
     url.searchParams.set('encryption', String(this.encryptionRequired));
+    if (this.msgpack) url.searchParams.set('format', 'msgpack');
     return url.toString();
   }
 
@@ -943,6 +963,12 @@ export class ConnectionManager {
           }
           ws.send(frame);
         });
+      } else if (this.msgpack) {
+        // The JSON value as msgpack, so both formats carry the same message.
+        const frame = packMessage(JSON.parse(data));
+        ws.send(frame);
+        this.recordSent(frame.byteLength);
+        return 'sent';
       } else {
         ws.send(data);
       }

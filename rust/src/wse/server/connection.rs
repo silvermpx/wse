@@ -38,7 +38,7 @@ use super::{
     SharedState, WsFrame,
 };
 use crate::jwt::{self, parse_cookie_value};
-use crate::wse::compression::{decode_msgpack_guarded, rmpv_to_serde_json};
+use crate::wse::msgpack::{decode_msgpack_guarded, rmpv_to_serde_json};
 
 // ---------------------------------------------------------------------------
 // Connection handler
@@ -102,6 +102,42 @@ impl CallbackLane {
             job();
         }
     }
+}
+
+/// Answer a protocol message the server handles itself (a ping, a client's
+/// compression wish, a subscription request when the server takes them),
+/// whatever form it came in: sealed or in msgpack. True when `val` was one.
+fn answer_protocol_message(
+    state: &SharedState,
+    conn_id: &str,
+    handle: &ConnectionHandle,
+    max_pending: usize,
+    val: &serde_json::Value,
+) -> bool {
+    match val.get("t").and_then(|t| t.as_str()) {
+        Some("ping") => {
+            queue_reply(handle, max_pending, Message::Text(pong_for(val).into()));
+            true
+        }
+        Some("pong" | "PONG" | "client_hello") => true,
+        Some("client_config") => {
+            apply_client_config(state, conn_id, val.get("p"));
+            true
+        }
+        Some("subscription_update") if state.client_subscriptions => {
+            if let Some(p) = val.get("p") {
+                answer_subscription_request(state, conn_id, handle, p);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// A msgpack frame from a client that asked for msgpack: one value, as is or
+/// behind the `M:` prefix the server's own msgpack frames carry.
+fn inbound_msgpack(data: &[u8]) -> Result<rmpv::Value, ()> {
+    decode_msgpack_guarded(data.strip_prefix(b"M:").unwrap_or(data))
 }
 
 /// Queue an on_message callback. It needs a place among the connection's
@@ -687,6 +723,7 @@ pub(super) async fn handle_connection(
         broadcast_notify: broadcast_notify.clone(),
         closer: closer.clone(),
         cipher: cipher_slot.clone(),
+        msgpack: use_msgpack,
     };
 
     // Register connection
@@ -1281,36 +1318,13 @@ pub(super) async fn handle_connection(
                                         let val = normalize_json_keys(val);
                                         // The clients encrypt their protocol
                                         // messages too (all of them in a session).
-                                        match val.get("t").and_then(|t| t.as_str()) {
-                                            Some("ping") => {
-                                                queue_reply(
-                                                    &own_handle,
-                                                    max_pending,
-                                                    Message::Text(pong_for(&val).into()),
-                                                );
-                                                continue;
-                                            }
-                                            Some("pong" | "PONG" | "client_hello") => continue,
-                                            _ => {}
-                                        }
-                                        if val.get("t").and_then(|t| t.as_str())
-                                            == Some("client_config")
-                                        {
-                                            apply_client_config(&state, &conn_id, val.get("p"));
-                                            continue;
-                                        }
-                                        if state.client_subscriptions
-                                            && val.get("t").and_then(|t| t.as_str())
-                                                == Some("subscription_update")
-                                        {
-                                            if let Some(p) = val.get("p") {
-                                                answer_subscription_request(
-                                                    &state,
-                                                    &conn_id,
-                                                    &own_handle,
-                                                    p,
-                                                );
-                                            }
+                                        if answer_protocol_message(
+                                            &state,
+                                            &conn_id,
+                                            &own_handle,
+                                            max_pending,
+                                            &val,
+                                        ) {
                                             continue;
                                         }
                                         if drain {
@@ -1362,75 +1376,55 @@ pub(super) async fn handle_connection(
                     .map(|v| *v)
                     .unwrap_or(false);
 
+                // A msgpack client's message, decoded once here (the same
+                // dict the JSON text path makes); anything else stays bytes.
+                let decoded = if is_msgpack {
+                    inbound_msgpack(&data[..])
+                        .ok()
+                        .map(|value| normalize_json_keys(rmpv_to_serde_json(&value)))
+                } else {
+                    None
+                };
+                // Its protocol messages come in msgpack too: the server
+                // answers those itself.
+                if let Some(val) = &decoded
+                    && answer_protocol_message(&state, &conn_id, &own_handle, max_pending, val)
+                {
+                    continue;
+                }
+
                 if drain {
-                    if is_msgpack {
-                        // Parse msgpack in Rust → push pre-parsed dict (same as JSON text path)
-                        match decode_msgpack_guarded(&data[..]) {
-                            Ok(rmpv_val) => {
-                                let json_val = rmpv_to_serde_json(&rmpv_val);
-                                let json_val = normalize_json_keys(json_val);
-                                state.push_message(
-                                    InboundEvent::Message {
-                                        conn_id: (*conn_id).clone(),
-                                        value: json_val,
-                                    },
-                                    data.len(),
-                                );
-                            }
-                            Err(_) => {
-                                // Not valid msgpack — pass raw bytes
-                                state.push_message(
-                                    InboundEvent::Binary {
-                                        conn_id: (*conn_id).clone(),
-                                        data: data.to_vec(),
-                                    },
-                                    data.len(),
-                                );
-                            }
-                        }
-                    } else {
-                        state.push_message(
-                            InboundEvent::Binary {
-                                conn_id: (*conn_id).clone(),
-                                data: data.to_vec(),
-                            },
-                            data.len(),
-                        );
-                    }
+                    let event = match decoded {
+                        Some(value) => InboundEvent::Message {
+                            conn_id: (*conn_id).clone(),
+                            value,
+                        },
+                        None => InboundEvent::Binary {
+                            conn_id: (*conn_id).clone(),
+                            data: data.to_vec(),
+                        },
+                    };
+                    state.push_message(event, data.len());
                 } else if let (Some(cb), Some(callback_lane)) = (&cached_on_message, &lane) {
                     let cb_arc = cb.clone();
                     let cid = Arc::clone(&conn_id);
-                    let d = data.to_vec();
-                    if is_msgpack {
-                        // Parse msgpack and pass as dict to callback (same as JSON text)
-                        spawn_bounded_callback(callback_lane, &state, d.len(), move || {
-                            Python::try_attach(|py| match decode_msgpack_guarded(&d[..]) {
-                                Ok(rmpv_val) => {
-                                    let json_val = rmpv_to_serde_json(&rmpv_val);
-                                    let json_val = normalize_json_keys(json_val);
-                                    let py_obj = json_to_pyobj(py, &json_val);
-                                    if let Err(e) = cb_arc.call1(py, (&**cid, py_obj)) {
-                                        tracing::warn!("[WSE] on_message (msgpack) error: {e}");
-                                    }
-                                }
-                                Err(_) => {
-                                    let py_bytes = PyBytes::new(py, &d);
-                                    if let Err(e) = cb_arc.call1(py, (&**cid, py_bytes)) {
-                                        tracing::warn!("[WSE] on_message (binary) error: {e}");
-                                    }
-                                }
-                            });
-                        });
+                    let size = data.len();
+                    let raw = if decoded.is_none() {
+                        data.to_vec()
                     } else {
-                        spawn_bounded_callback(callback_lane, &state, d.len(), move || {
-                            Python::try_attach(|py| {
-                                let py_bytes = PyBytes::new(py, &d);
-                                if let Err(e) = cb_arc.call1(py, (&**cid, py_bytes)) {
-                                    tracing::warn!("[WSE] on_message (binary) error: {e}");
-                                }
-                            });
+                        Vec::new()
+                    };
+                    spawn_bounded_callback(callback_lane, &state, size, move || {
+                        Python::try_attach(|py| {
+                            let result = match &decoded {
+                                Some(val) => cb_arc.call1(py, (&**cid, json_to_pyobj(py, val))),
+                                None => cb_arc.call1(py, (&**cid, PyBytes::new(py, &raw))),
+                            };
+                            if let Err(e) = result {
+                                tracing::warn!("[WSE] on_message (binary) error: {e}");
+                            }
                         });
-                    }
+                    });
                 }
             }
             Message::Ping(payload) => {

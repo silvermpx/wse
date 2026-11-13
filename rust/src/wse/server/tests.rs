@@ -117,6 +117,7 @@ fn make_handle() -> (ConnectionHandle, mpsc::UnboundedReceiver<WsFrame>) {
         broadcast_notify: Arc::new(tokio::sync::Notify::new()),
         closer: super::Closer::new(),
         cipher: Arc::new(std::sync::OnceLock::new()),
+        msgpack: false,
     };
     (h, rx)
 }
@@ -203,6 +204,59 @@ fn an_encrypted_connection_gets_its_own_sealed_frame() {
     let body = &sealed_frame[2..];
     assert_eq!(&body[..2], b"E:");
     assert_eq!(key.open_nonce_prefixed(&body[2..]).unwrap(), b"{\"x\":1}");
+}
+
+#[test]
+fn a_msgpack_connection_gets_json_as_msgpack() {
+    use tokio_tungstenite::tungstenite::protocol::Message;
+
+    let index = TopicIndex::default();
+    let (json, _rx1) = make_handle();
+    let (mut packed, mut rx2) = make_handle();
+    packed.msgpack = true;
+    index.subscribe("t", "json", &json);
+    index.subscribe("t", "packed", &packed);
+    let drops = AtomicU64::new(0);
+    let body = br#"{"t":"tick","p":{"n":1}}"#;
+    index.fanout(
+        "t",
+        &Outgoing::text(bytes::Bytes::from_static(body)),
+        0,
+        &drops,
+    );
+
+    let json_frame = queued(&json).concat();
+    assert_eq!(json_frame[0], 0x81); // text
+    assert_eq!(&json_frame[2..], body);
+    let packed_frame = queued(&packed).concat();
+    assert_eq!(packed_frame[0], 0x82); // binary
+    assert_eq!(&packed_frame[2..4], b"M:");
+    let value = rmpv::decode::read_value(&mut &packed_frame[4..]).unwrap();
+    assert_eq!(
+        crate::wse::msgpack::rmpv_to_serde_json(&value),
+        serde_json::json!({"t": "tick", "p": {"n": 1}})
+    );
+
+    // Bytes the application sent as bytes go as they are.
+    index.fanout(
+        "t",
+        &Outgoing::binary(bytes::Bytes::from_static(b"raw")),
+        0,
+        &drops,
+    );
+    assert_eq!(&queued(&packed).concat()[2..], b"raw");
+
+    // Its own sends too (a replay, a reply); text that is not JSON as is.
+    assert!(packed.send_one(Message::Text("{\"t\":\"x\"}".into()), 0, &drops));
+    assert!(packed.send_one(Message::Text("plain".into()), 0, &drops));
+    match rx2.try_recv() {
+        Ok(WsFrame::Msg(Message::Binary(b))) => assert_eq!(&b[..2], b"M:"),
+        _ => panic!("expected a msgpack frame"),
+    }
+    match rx2.try_recv() {
+        Ok(WsFrame::Msg(Message::Text(t))) => assert_eq!(t.as_str(), "plain"),
+        _ => panic!("expected the text as is"),
+    }
 }
 
 #[test]

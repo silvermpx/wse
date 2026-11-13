@@ -2,8 +2,8 @@
 //! groups), topic patterns and recovery stamping.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use ahash::AHashSet;
 use bytes::Bytes;
@@ -15,6 +15,7 @@ use super::e2e::{e2e_frame, e2e_message};
 use super::frames::{encode_ws_frame, ws_frame_size};
 use super::state::Seal;
 use super::{ConnectionHandle, QueueGroup, WsFrame};
+use crate::wse::msgpack::serde_json_to_rmpv;
 
 // ---------------------------------------------------------------------------
 // Glob matching
@@ -112,18 +113,59 @@ impl TopicAcl {
 pub(crate) struct Outgoing {
     payload: Bytes,
     frame: Bytes,
+    /// JSON text, which the server may send as msgpack.
+    text: bool,
+    /// The message as `M:` msgpack and its frame, for the connections that
+    /// asked for msgpack: made on first use, then shared by all of them.
+    /// None when the text is not JSON: they get it as is then.
+    packed: OnceLock<Option<(Bytes, Bytes)>>,
 }
 
 impl Outgoing {
     pub(crate) fn text(payload: Bytes) -> Self {
         let frame = encode_ws_frame(0x01, &payload);
-        Self { payload, frame }
+        Self {
+            payload,
+            frame,
+            text: true,
+            packed: OnceLock::new(),
+        }
     }
 
     pub(crate) fn binary(payload: Bytes) -> Self {
         let frame = encode_ws_frame(0x02, &payload);
-        Self { payload, frame }
+        Self {
+            payload,
+            frame,
+            text: false,
+            packed: OnceLock::new(),
+        }
     }
+
+    /// The payload and frame `h` gets: msgpack when it asked for msgpack.
+    fn for_handle(&self, h: &ConnectionHandle) -> (&Bytes, &Bytes) {
+        if h.msgpack
+            && self.text
+            && let Some((payload, frame)) = self.packed.get_or_init(|| {
+                let payload = to_msgpack(&self.payload)?;
+                let frame = encode_ws_frame(0x02, &payload);
+                Some((payload, frame))
+            })
+        {
+            return (payload, frame);
+        }
+        (&self.payload, &self.frame)
+    }
+}
+
+/// JSON text as an `M:` msgpack message, what a client that asked for msgpack
+/// reads; None when the text is not JSON.
+pub(crate) fn to_msgpack(json: &[u8]) -> Option<Bytes> {
+    let value: serde_json::Value = serde_json::from_slice(json).ok()?;
+    let mut buf = Vec::with_capacity(json.len());
+    buf.extend_from_slice(b"M:");
+    rmpv::encode::write_value(&mut buf, &serde_json_to_rmpv(&value)).ok()?;
+    Some(Bytes::from(buf))
 }
 
 impl ConnectionHandle {
@@ -145,13 +187,14 @@ impl ConnectionHandle {
             slow_drops.fetch_add(1, Ordering::Relaxed);
             return false;
         }
+        let (payload, frame) = msg.for_handle(self);
         match self.cipher.get() {
-            None => self.push_frame(&msg.frame),
-            Some(Seal::Legacy(cipher)) => match e2e_frame(cipher, &msg.payload) {
+            None => self.push_frame(frame),
+            Some(Seal::Legacy(cipher)) => match e2e_frame(cipher, payload) {
                 Some(frame) => self.push_frame(&frame),
                 None => return false,
             },
-            Some(Seal::Session) => return self.queue(WsFrame::Seal(msg.payload.clone())),
+            Some(Seal::Session) => return self.queue(WsFrame::Seal(payload.clone())),
         }
         true
     }
@@ -194,6 +237,14 @@ impl ConnectionHandle {
             slow_drops.fetch_add(1, Ordering::Relaxed);
             return false;
         }
+        // JSON text in msgpack, for a connection that asked for msgpack.
+        let msg = match msg {
+            Message::Text(text) if self.msgpack => match to_msgpack(text.as_bytes()) {
+                Some(packed) => Message::Binary(packed),
+                None => Message::Text(text),
+            },
+            msg => msg,
+        };
         let frame = match (self.cipher.get(), msg) {
             (Some(Seal::Legacy(cipher)), Message::Text(text)) => {
                 match e2e_message(cipher, text.as_bytes()) {

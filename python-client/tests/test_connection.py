@@ -235,6 +235,21 @@ class TestUrl:
         assert "format=msgpack" in client._connection._build_url()
         assert "format=" not in AsyncWSEClient("ws://x/wse")._connection._build_url()
 
+    async def test_a_msgpack_client_sends_in_msgpack(self) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        from wse_client import AsyncWSEClient
+
+        client = AsyncWSEClient("ws://x/wse", wire_format="msgpack")
+        ws = FakeWS()
+        client._connection._ws = ws
+        client._connection._state = ConnectionState.CONNECTED
+        await client.send("order", {"id": 1})
+        assert len(ws.sent) == 1
+        frame = ws.sent[0]
+        assert isinstance(frame, bytes) and frame.startswith(b"M:")
+        message = msgpack.unpackb(frame[2:])
+        assert (message["t"], message["p"]) == ("order", {"id": 1})
+
     def test_msgpack_without_the_extra_fails_early(self, monkeypatch) -> None:
         import wse_client.msgpack_handler as mp
         from wse_client import AsyncWSEClient

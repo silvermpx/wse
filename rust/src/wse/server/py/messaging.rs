@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::RustWSEServer;
 use super::convert::pyobj_to_json;
-use crate::wse::compression::serde_json_to_rmpv;
+use crate::wse::msgpack::serde_json_to_rmpv;
 use crate::wse::server::ServerCommand;
 use crate::wse::server::messages::{build_server_ready, inject_category, message_category};
 

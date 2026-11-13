@@ -16,7 +16,7 @@ reason = "SharedState stores the callback-mode Python callbacks as Py<PyAny>; th
 [[allow]]
 rule = "engine-imports"
 file = "rust/src/wse/server/connection.rs"
-reason = "Callback mode calls the Python layer's fire_on_connect, fire_on_disconnect and json_to_pyobj. Token validation (crate::jwt) and msgpack decoding (crate::wse::compression) live in modules that also define Python functions; split each into an engine half and a binding half."
+reason = "Callback mode calls the Python layer's fire_on_connect, fire_on_disconnect and json_to_pyobj. Token validation (crate::jwt) lives in a module that also defines Python functions; split it into an engine half and a binding half."
 
 [[allow]]
 rule = "engine-imports"

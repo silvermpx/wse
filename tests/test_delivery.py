@@ -1,5 +1,5 @@
 """What reaches whom: E2E connections on every delivery path, topic ACLs with
-pattern subscriptions, queue groups with recovery."""
+pattern subscriptions, queue groups with recovery, msgpack clients."""
 
 import asyncio
 import base64
@@ -10,6 +10,7 @@ import pytest
 from tests.conftest import JWT_AUDIENCE, JWT_ISSUER, JWT_SECRET, make_token
 from tests.test_integration import connect, drain_all, drain_until
 from wse_server._wse_accel import (
+    RustCompressionManager,
     RustWSEServer,
     rust_aes_gcm_decrypt,
     rust_aes_gcm_encrypt,
@@ -236,6 +237,58 @@ class TestClientCompression:
                 _, conn_id, _ = drain_until(srv, "auth_connect")
                 srv.send_event(conn_id, {"t": "big", "p": {"fill": "x" * 4000}})
                 assert not (await self.received(ws)).startswith(b"C:")
+        finally:
+            srv.stop()
+
+
+class TestMsgpack:
+    """A client that asks for msgpack (?format=msgpack) gets topic messages,
+    replays and direct sends in it, and may send in it."""
+
+    async def binary(self, ws) -> bytes:
+        async with asyncio.timeout(5):
+            while True:
+                frame = await ws.recv()
+                if isinstance(frame, bytes):
+                    return frame
+
+    @pytest.mark.asyncio
+    async def test_topics_replays_and_sends_go_in_msgpack(self, server_port):
+        import websockets
+
+        cm = RustCompressionManager()
+        srv = start_server(server_port, recovery_enabled=True)
+        url = f"ws://127.0.0.1:{server_port}/wse?format=msgpack"
+        headers = {"Authorization": f"Bearer {make_token()}"}
+        try:
+            async with websockets.connect(url, additional_headers=headers) as ws:
+                _, conn_id, _ = drain_until(srv, "auth_connect")
+                srv.subscribe_connection(conn_id, ["news"])
+                srv.broadcast_local("news", json.dumps({"t": "tick", "p": {"n": 1}}))
+                frame = await self.binary(ws)
+                assert frame.startswith(b"M:")
+                first = cm.unpack_msgpack(frame[2:])
+                assert (first["t"], first["p"], first["tp"]) == ("tick", {"n": 1}, "news")
+
+                srv.send_event(conn_id, {"t": "direct", "p": {"k": "v"}})
+                frame = await self.binary(ws)
+                assert cm.unpack_msgpack(frame[2:])["p"] == {"k": "v"}
+
+                # The client's msgpack, behind the M: prefix or without it.
+                await ws.send(b"M:" + cm.pack_msgpack({"t": "chat", "p": {"x": 1}}))
+                await ws.send(cm.pack_msgpack({"t": "chat", "p": {"x": 2}}))
+                got = [drain_until(srv, "msg")[2]["p"]["x"] for _ in range(2)]
+                assert got == [1, 2]
+
+            srv.broadcast_local("news", json.dumps({"t": "tick", "p": {"n": 2}}))
+            async with websockets.connect(url, additional_headers=headers) as ws:
+                _, conn_id, _ = drain_until(srv, "auth_connect")
+                srv.subscribe_with_recovery(
+                    conn_id, ["news"], recover=True, epoch=first["e"], offset=first["o"]
+                )
+                frame = await self.binary(ws)
+                assert frame.startswith(b"M:")
+                assert cm.unpack_msgpack(frame[2:])["p"] == {"n": 2}
         finally:
             srv.stop()
 

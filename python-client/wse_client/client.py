@@ -42,7 +42,7 @@ from .errors import WSEConnectionError, WSEEncryptionError, WSEError
 from .event_sequencer import EventSequencer
 from .network_monitor import NetworkMonitor
 from .offline_queue import OfflineQueue
-from .protocol import MessageCodec
+from .protocol import MessageCodec, _json_loads
 from .rate_limiter import TokenBucketRateLimiter
 from .types import (
     ConnectionQuality,
@@ -160,7 +160,8 @@ class AsyncWSEClient:
             ``recovery_gap`` event reports the missing offsets. ``0`` never
             waits.
         wire_format: ``"json"`` (default) or ``"msgpack"`` (asks the server
-            to send this connection's messages as MessagePack; needs the
+            to send this connection's messages as MessagePack, and sends
+            the client's in it too, except frames sealed for E2E; needs the
             ``[msgpack]`` extra).
 
     Example::
@@ -234,6 +235,12 @@ class AsyncWSEClient:
             security=self._security,
             msgpack=msgpack_handler,
             max_message_size=max_message_size,
+        )
+        # Messages go out in msgpack too, except frames sealed for E2E.
+        self._send_packed = (
+            msgpack_handler
+            if wire_format == "msgpack" and self._security is None
+            else None
         )
         self._rate_limiter: TokenBucketRateLimiter | None = None
         if rate_limit is not None:
@@ -1152,6 +1159,9 @@ class AsyncWSEClient:
             return False
         if self._security is not None and not await self._wait_for_key(strict=strict):
             return False
+        if self._send_packed is not None:
+            packed = b"M:" + self._send_packed.pack(_json_loads(encoded))
+            return await self._connection.send_bytes(packed)
         return await self._connection.send(encoded)
 
     async def _send_app_frame(

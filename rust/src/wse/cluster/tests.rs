@@ -1332,6 +1332,7 @@ fn test_cluster_queue_group_dispatch() {
             broadcast_notify: Arc::new(tokio::sync::Notify::new()),
             closer: crate::wse::server::Closer::new(),
             cipher: Arc::new(std::sync::OnceLock::new()),
+            msgpack: false,
         };
         members.push((format!("conn{i}"), h));
         _rxs.push(rx);

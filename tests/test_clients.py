@@ -106,6 +106,29 @@ class TestPlain:
             srv.stop()
 
 
+class TestMsgpack:
+    @pytest.mark.asyncio
+    async def test_msgpack_both_ways(self, server_port):
+        pytest.importorskip("msgpack")
+        srv = start_server(server_port)
+        try:
+            client = client_for(server_port, topics=["news"], wire_format="msgpack")
+            await client.connect()
+            await subscribed(srv, "news")
+            publish(srv, "news", 3)
+            assert (await next_of_type(client, "tick")).payload == {"n": 3}
+            await client.send("chat", {"text": "packed"})
+            async with asyncio.timeout(5):
+                while True:
+                    events = [e for e in srv.drain_inbound(64, 50) if e[0] == "msg"]
+                    if events:
+                        break
+            assert events[0][2]["p"] == {"text": "packed"}
+            await client.disconnect()
+        finally:
+            srv.stop()
+
+
 @needs_crypto
 class TestEncryption:
     @pytest.mark.asyncio

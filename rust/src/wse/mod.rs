@@ -2,6 +2,7 @@ pub mod cluster;
 
 pub mod compression;
 pub mod filters;
+pub(crate) mod msgpack;
 pub(crate) mod presence;
 pub(crate) mod pylock;
 pub mod queue;

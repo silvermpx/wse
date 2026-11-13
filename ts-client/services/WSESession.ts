@@ -100,6 +100,12 @@ export interface UseWSEConfig {
   rateLimit?: RateLimitConfig | false;
 
   /**
+   * 'msgpack' has the server send msgpack (binary, smaller than JSON), and
+   * the client send in it too, except frames sealed for E2E. Default 'json'.
+   */
+  wireFormat?: 'json' | 'msgpack';
+
+  /**
    * Inbound size limit in bytes (characters for text frames), checked while
    * inflating compressed frames. Default 16 MiB.
    */
@@ -137,6 +143,7 @@ export interface ResolvedWSEOptions {
   diagnostics: DiagnosticsConfig;
   rateLimit: RateLimitConfig | false;
   maxMessageSize: number;
+  wireFormat: 'json' | 'msgpack';
   recoveryTimeoutMs: number;
   serverReadyTimeout: number;
   eventThrottleMs: number;
@@ -198,6 +205,7 @@ export function resolveOptions(config: UseWSEConfig | undefined): ResolvedWSEOpt
     maxMessageSize: config?.maxMessageSize && config.maxMessageSize > 0
       ? config.maxMessageSize
       : DEFAULT_MAX_INBOUND_MESSAGE_SIZE,
+    wireFormat: config?.wireFormat === 'msgpack' ? 'msgpack' : 'json',
     recoveryTimeoutMs: config?.recoveryTimeoutMs ?? DEFAULT_RECOVERY_TIMEOUT_MS,
     serverReadyTimeout: config?.serverReadyTimeout ?? SERVER_READY_TIMEOUT,
     eventThrottleMs: config?.eventThrottleMs ?? 0,
@@ -409,6 +417,7 @@ export class WSESession {
           enabled: compressionOverride ?? o.performance.compressionThreshold > 0,
           threshold: o.performance.compressionThreshold,
         },
+        wireFormat: o.wireFormat,
       },
     );
     this.connection = connection;

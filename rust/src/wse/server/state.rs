@@ -115,6 +115,9 @@ pub(crate) struct ConnectionHandle {
     /// How the connection's frames are encrypted, set once by its key
     /// exchange.
     pub(crate) cipher: Arc<std::sync::OnceLock<Seal>>,
+    /// The client asked for msgpack (`?format=msgpack`): what goes to it as
+    /// JSON text is sent as an `M:` msgpack frame instead.
+    pub(crate) msgpack: bool,
 }
 
 /// A connection's end-to-end encryption.
