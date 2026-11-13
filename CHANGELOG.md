@@ -5,7 +5,8 @@
 A security and correctness release: end-to-end encryption with an
 authenticated server, every delivery path through one per-connection
 route, closes the server enforces, a cluster whose links, interest and
-presence stay consistent, and msgpack on every path. Breaking changes and
+presence stay consistent, msgpack on every path, and fan-out on every
+core with flow control back to the application. Breaking changes and
 the steps to take are in [docs/MIGRATION.md](docs/MIGRATION.md#migrating-from-v2x-to-v30).
 
 ### Breaking changes
