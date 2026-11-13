@@ -332,6 +332,7 @@ class RustWSEServer:
         max_subscriptions_per_connection: int = 0,
         max_inbound_queue_bytes: int = 67_108_864,
         allowed_origins: list[str] | None = None,
+        client_subscriptions: bool = False,
     ) -> None: ...
 
     # -- Lifecycle ------------------------------------------------------------
@@ -540,8 +541,19 @@ class RustWSEServer:
         recover: bool = False,
         epoch: str | None = None,
         offset: int | None = None,
+        positions: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Subscribe with message recovery. Returns per-topic recovery status."""
+        """Subscribe with message recovery.
+
+        positions maps each topic to its own {"epoch": "<8 hex>", "offset": n}
+        (the shape the clients send in p["recovery"]); a single epoch and
+        offset apply to every topic. Missed messages are replayed before
+        anything sent to the connection afterwards. Returns {"recovered":
+        bool, "topics": {topic: {"epoch", "offset", "recoverable",
+        "recovered", "count", "subscribed"}}}; "offset" is the last offset the
+        client has (or may take as had). Raises ValueError for a malformed
+        position.
+        """
         ...
     def unsubscribe_connection(self, conn_id: str, topics: list[str] | None = None) -> None:
         """Unsubscribe from topics. If topics is None, unsubscribe from all."""

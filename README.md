@@ -197,6 +197,7 @@ token = rust_jwt_encode(
 | `idle_timeout` | 60 | Close connections that sent nothing for this many seconds (code 4408) |
 | `max_inbound_queue_bytes` | 67108864 | The same budget in bytes (default 64 MB); a single larger message still gets into an empty queue |
 | `allowed_origins` | None | Origins (`scheme://host[:port]`) browsers may connect from; others get HTTP 403. `None` checks nothing |
+| `client_subscriptions` | False | Answer the clients' own subscribe, unsubscribe and recovery requests in the server, within each connection's topic ACL; otherwise they reach the application as messages |
 
 ---
 

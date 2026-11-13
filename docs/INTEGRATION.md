@@ -487,28 +487,32 @@ server = RustWSEServer(
 )
 ```
 
-**Subscribing with recovery on reconnect:**
+**Recovery on reconnect.** After every reconnect both client SDKs re-subscribe their topics in one `subscription_update` request carrying, per topic, the epoch and offset of the last message they delivered. Two ways to answer it:
+
+- Let the server do it: `RustWSEServer(..., client_subscriptions=True)`. It subscribes the topics the connection's topic ACL allows (set one with `set_topic_acl` or the JWT `wse_topics` claim: without an ACL a client may subscribe to any topic), replays what each one missed, then replies. No application code.
+- Or handle the request in your drain loop (`t == "subscription_update"`):
 
 ```python
+p = event["p"]
 result = server.subscribe_with_recovery(
-    conn_id, ["prices"],
-    recover=True,
-    epoch=client_epoch,    # from previous session
-    offset=client_offset,  # from previous session
+    conn_id, p["topics"],
+    recover=p.get("recover", False),
+    positions=p.get("recovery"),   # {topic: {"epoch": ..., "offset": ...}}
 )
-# result: {"topics": {"prices": {"epoch": "0000007b", "offset": 456, "recovered": True, "count": 12}}}
+# result: {"recovered": True, "topics": {"prices": {"epoch": "0000007b", "offset": 456,
+#          "recovered": True, "count": 12, "recoverable": True, "subscribed": True}}}
 ```
+
+and send the reply described in [PROTOCOL.md](PROTOCOL.md#recovery-reply). The replayed messages are queued before anything you send afterwards, so the reply follows them.
 
 | Parameter | Description |
 |-----------|-------------|
 | `recovery_buffer_size` | Ring buffer slots per topic. Must be a power of 2. |
 | `recovery_ttl` | Maximum age (seconds) of recoverable messages. |
-| `recovery_max_messages` | Maximum messages returned in a single recovery. |
+| `recovery_max_messages` | Most messages one recovery replays; a longer gap is reported as not recovered. |
 | `recovery_memory_budget` | Hard cap on total memory used by all recovery buffers. |
 
-The client stores the `epoch` and `offset` from its last received message. On reconnect, it passes these values to `subscribe_with_recovery`, and the server replays any messages the client missed (up to the buffer limits).
-
-When recovery is enabled, every topic broadcast is stamped with `tp` (topic), `e` (epoch, 8-hex) and `o` (offset) fields injected into the JSON payload, so the client SDKs track their per-topic position from the messages themselves. They drop duplicates idempotently by `(epoch, offset)` and, on a detected offset gap, automatically re-request recovery from their last in-order position — no application code required.
+When recovery is enabled, every topic broadcast is stamped with `tp` (topic), `e` (epoch, 8-hex) and `o` (offset) fields injected into the JSON payload, so the client SDKs track their per-topic position from the messages themselves and drop duplicates idempotently by `(epoch, offset)`. On an offset gap in a live stream the Python client asks for recovery by itself; the TypeScript client reports the gap (`wseGap`) and recovers at its next reconnect.
 
 ---
 

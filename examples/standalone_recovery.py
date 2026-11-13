@@ -9,9 +9,9 @@ using epoch+offset tracking.
     # Terminal 1: Start server with recovery enabled
     python examples/standalone_recovery.py
 
-    # Terminal 2: Connect a WebSocket client, subscribe to 'prices',
-    # disconnect, wait a few seconds, reconnect with recover=true
-    # to receive missed messages.
+    # Terminal 2: connect a client (wse-client or the TypeScript client),
+    # subscribe to 'prices', disconnect, wait a few seconds, reconnect:
+    # the client recovers the missed messages by itself.
 """
 
 import json
@@ -42,80 +42,17 @@ def make_token(user_id: str = "user-1") -> str:
 
 
 def event_loop(server: RustWSEServer, stop: threading.Event):
-    """Handle connections and subscriptions with recovery support."""
+    """Handle connections. The clients' subscribe and recovery requests are
+    answered by the server itself (client_subscriptions=True): it replays
+    what each topic missed from the client's own position, then replies."""
     while not stop.is_set():
-        events = server.drain_inbound(256, 50)
-        for event in events:
-            event_type = event[0]
-            conn_id = event[1]
-
+        for event_type, conn_id, data in server.drain_inbound(256, 50):
             if event_type == "auth_connect":
-                user_id = event[2]
-                print(f"[+] {user_id} connected ({conn_id})")
-                # Subscribe with recovery -- returns per-topic epoch/offset
-                result = server.subscribe_with_recovery(
-                    conn_id, ["prices"], recover=False,
-                )
-                print(f"    subscribe result: {result}")
-
+                print(f"[+] {data} connected ({conn_id})")
+                # What this user's clients may subscribe to.
+                server.set_topic_acl(conn_id, allow=["prices", "news:*"])
             elif event_type == "msg":
-                data = event[2]
-                if isinstance(data, dict):
-                    msg_type = data.get("t")
-                    payload = data.get("p", {})
-
-                    if msg_type == "subscription_update":
-                        action = payload.get("action")
-                        topics = payload.get("topics", [])
-                        recover = payload.get("recover", False)
-                        recovery_info = payload.get("recovery", {})
-
-                        if action == "subscribe" and topics:
-                            # Use per-topic epoch/offset from client
-                            epoch = None
-                            offset = None
-                            if recover and recovery_info:
-                                # Use the first topic's recovery info
-                                first_info = next(iter(recovery_info.values()), {})
-                                epoch = first_info.get("epoch")
-                                offset = first_info.get("offset")
-
-                            result = server.subscribe_with_recovery(
-                                conn_id, topics,
-                                recover=recover,
-                                epoch=epoch,
-                                offset=int(offset) if offset is not None else None,
-                            )
-                            recovered = result.get("recovered", False)
-                            topics_info = result.get("topics", {})
-
-                            # Send subscription confirmation with recovery info
-                            response = json.dumps({
-                                "c": "WSE",
-                                "t": "subscription_update",
-                                "p": {
-                                    "action": "subscribe",
-                                    "success": True,
-                                    "success_topics": topics,
-                                    "failed_topics": [],
-                                    "recoverable": True,
-                                    "recovered": recovered,
-                                    "recovery": {
-                                        t: {
-                                            "epoch": info.get("epoch"),
-                                            "offset": info.get("offset"),
-                                            "recovered": info.get("recovered", False),
-                                            "count": info.get("count", 0),
-                                        }
-                                        for t, info in topics_info.items()
-                                        if isinstance(info, dict)
-                                    },
-                                },
-                                "v": 1,
-                            })
-                            server.send(conn_id, response)
-                            print(f"    [{conn_id}] subscribe {topics} recover={recover} -> {result}")
-
+                print(f"    [{conn_id}] {data}")
             elif event_type == "disconnect":
                 print(f"[-] {conn_id} disconnected")
 
@@ -160,6 +97,8 @@ def main():
         jwt_audience=JWT_AUDIENCE,
         # Enable message recovery
         recovery_enabled=True,
+        # Answer the clients' subscribe/recover requests in the server
+        client_subscriptions=True,
         recovery_buffer_size=256,  # 256 messages per topic
         recovery_ttl=300,          # 5 minutes
         recovery_max_messages=500,
@@ -171,13 +110,11 @@ def main():
     print(f"WSE listening on {HOST}:{PORT} (recovery enabled)")
     print(f"Token: {token}")
     print()
-    print("Recovery demo:")
-    print("  1. Connect a client and subscribe to 'prices'")
-    print("  2. Note the epoch+offset from subscription response")
-    print("  3. Disconnect the client")
-    print("  4. Wait a few seconds (messages accumulate in buffer)")
-    print("  5. Reconnect with recover=true and epoch+offset")
-    print("  6. Client receives missed messages before new ones")
+    print("Recovery demo (with wse-client or the TypeScript client):")
+    print("  1. Connect and subscribe to 'prices'")
+    print("  2. Disconnect, wait a few seconds (messages accumulate in the buffer)")
+    print("  3. Reconnect: the client re-subscribes with its last position")
+    print("  4. It receives the missed messages before new ones")
     print()
     print("Press Ctrl+C to stop.\n")
 

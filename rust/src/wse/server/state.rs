@@ -255,6 +255,7 @@ pub(crate) struct SharedStateConfig {
     pub max_inbound_queue_size: usize,
     pub max_inbound_queue_bytes: usize,
     pub allowed_origins: Option<AHashSet<String>>,
+    pub client_subscriptions: bool,
     pub recovery: Option<Arc<crate::wse::recovery::RecoveryManager>>,
     pub presence_enabled: bool,
     pub presence_max_data_size: usize,
@@ -273,6 +274,8 @@ pub(crate) struct SharedState {
     pub(super) max_connections: usize,
     // Origins a browser may open a connection from (None: any)
     pub(super) allowed_origins: Option<AHashSet<String>>,
+    // The server answers the clients' own subscribe/unsubscribe requests
+    pub(super) client_subscriptions: bool,
     // Callback mode. Shared, so a runtime thread takes one without attaching
     // to Python.
     pub(super) on_connect: std::sync::RwLock<Option<Arc<Py<PyAny>>>>,
@@ -419,6 +422,7 @@ impl SharedState {
             connections: Arc::new(RwLock::new(HashMap::new())),
             max_connections: cfg.max_connections,
             allowed_origins: cfg.allowed_origins,
+            client_subscriptions: cfg.client_subscriptions,
             on_connect: std::sync::RwLock::new(None),
             on_message: std::sync::RwLock::new(None),
             on_disconnect: std::sync::RwLock::new(None),

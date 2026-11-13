@@ -82,6 +82,7 @@ mod handshake;
 mod messages;
 mod py;
 mod state;
+pub(crate) mod subscribe;
 
 pub use py::RustWSEServer;
 

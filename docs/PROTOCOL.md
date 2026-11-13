@@ -229,11 +229,14 @@ Sent after authentication succeeds (from Rust when JWT is configured, from Pytho
 
 When `rust_jwt` is `true`, JWT validation was performed by the Rust server during the handshake (before this message was sent). The `user_id` field is the validated subject from the JWT.
 
-Encryption key exchange happens separately via `encryption_request`/`encryption_response` messages, not in `server_ready`.
+Encryption key exchange happens separately, in `client_hello` / `server_hello` (see [Protocol Negotiation](#protocol-negotiation)), not in `server_ready`.
 
 ### 4. Subscriptions
 
-The Python application subscribes connections to topics via `subscribe_connection(conn_id, topics)`. Subscription management is server-side only - there is no auto-subscribe mechanism.
+Two ways, often both:
+
+- The application subscribes a connection with `subscribe_connection(conn_id, topics)` (for example from its `auth_connect` handler).
+- The client asks itself: both SDKs send `subscription_update` requests for the topics their application subscribes to, and again for all of them after every reconnect, with their recovery positions (see [Subscribe / Unsubscribe](#subscribe--unsubscribe)). A server created with `client_subscriptions=True` answers those requests itself, checking each topic against the connection's topic ACL; otherwise they reach the application as ordinary messages.
 
 ### 5. Updates
 
@@ -309,47 +312,60 @@ Presence is queried through the Python API (`server.presence(topic)`, `server.pr
 
 ### Subscribe / Unsubscribe
 
-Subscribe with optional presence data. The `presence` field attaches user metadata for presence tracking (requires `presence_enabled=True` on the server):
-
-```json
-{"c":"WSE","t":"subscription","p":{
-  "action": "subscribe",
-  "topics": ["notifications", "chat_messages"],
-  "presence": {"status": "online", "name": "Alice"}
-},"v":1}
-```
-
-### Recovery Request / Reply
-
-To resume an already-subscribed topic after a gap or reconnect, the client sends
-a `subscription_update` carrying `recover: true` and its last-seen position per
-topic:
+One request covers many topics:
 
 ```json
 {"c":"WSE","t":"subscription_update","p":{
   "action": "subscribe",
-  "topics": ["chat_messages"],
+  "topics": ["notifications", "chat_messages"]
+},"id":"...","v":1}
+```
+
+```json
+{"c":"WSE","t":"subscription_update","p":{
+  "action": "unsubscribe",
+  "topics": ["chat_messages"]
+},"id":"...","v":1}
+```
+
+To resume after a gap or a reconnect, a subscribe carries `recover: true` and, under `recovery`, the last position the client has for each topic that has one: the `e` and `o` of the last message it delivered in order. Topics without a position are only listed in `topics`. Subscribing to a topic already subscribed is harmless and still recovers.
+
+```json
+{"c":"WSE","t":"subscription_update","p":{
+  "action": "subscribe",
+  "topics": ["chat_messages", "prices"],
   "recover": true,
   "recovery": {"chat_messages": {"epoch": "0000abcd", "offset": 456}}
 },"v":1}
 ```
 
-The server replies with a `subscription_update` that lists the resolved topics
-and, per topic, the server's current `(epoch, offset)` plus whether history was
-actually replayed:
+### Recovery Reply
+
+A subscribe gets one reply; an unsubscribe gets none. The missed messages of each topic, offsets after the given one, come first, byte-identical to live ones (with their `tp`/`e`/`o`), then the reply:
 
 ```json
-{"c":"WSE","t":"subscription_update","p":{
-  "success_topics": ["chat_messages"],
+{"c":"WSE","t":"subscription_update","id":"...","p":{
+  "success": true,
+  "success_topics": ["chat_messages", "prices"],
   "failed_topics": [],
-  "recovery": {"chat_messages": {"epoch": "0000abce", "offset": 512, "recovered": true, "count": 12}}
+  "recovery": {
+    "chat_messages": {"epoch": "0000abcd", "offset": 512, "recovered": true, "count": 56},
+    "prices": {"epoch": "00001f2e", "offset": 90, "recovered": false, "count": 0}
+  }
 },"v":1}
 ```
 
-When `recovered` is `false` (history was evicted, or the epoch changed on a
-server restart), the missed range cannot be replayed; the client re-baselines its
-dedup position **forward** to the returned `(epoch, offset)` so the next live
-message isn't mistaken for a gap. `recovered` defaults to `true` if omitted.
+| Field | Meaning |
+|-------|---------|
+| `success` | `true` unless every topic failed |
+| `success_topics` | Topics subscribed |
+| `failed_topics` | Topics refused: denied by the connection's topic ACL, invalid names, or over its subscription limits |
+| `recovery[topic].epoch` | The topic's epoch, 8 hex digits; `null` when the topic has no history yet |
+| `recovery[topic].offset` | Inclusive: the last offset the client now has. When `recovered` is `false`, the last offset published before the subscription began; everything after it arrives live, so a client may take it as its position without skipping anything |
+| `recovery[topic].recovered` | `true` when every missed message was replayed. `false` when there was no position, the epoch changed (a server restart), the history was evicted or too long (`recovery_max_messages`), or the connection's outbound budget cut the replay short (then `offset` is the last one replayed) |
+| `recovery[topic].count` | Messages replayed |
+
+An omitted `recovered` means `true`. With `client_subscriptions=True` the server answers these requests itself; otherwise the application answers them, with `subscribe_with_recovery(conn_id, topics, recover=True, positions=p["recovery"])` and a reply built from its result.
 
 ### Sync Request
 

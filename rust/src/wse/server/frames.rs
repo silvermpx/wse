@@ -8,13 +8,11 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 // Internal types
 // ---------------------------------------------------------------------------
 
-/// Frame types sent through per-connection channels. The connection's write
-/// task encodes `Msg` itself (`encode_message`); `PreFramed` is complete wire
-/// bytes, built once for a broadcast and sent to every connection.
+/// What goes through a connection's control queue; the write task encodes
+/// it (`encode_message`). Broadcast frames go through the broadcast buffer.
 #[derive(Clone)]
 pub(crate) enum WsFrame {
     Msg(Message),
-    PreFramed(Bytes),
 }
 
 /// Byte size of a WsFrame for backpressure accounting.
@@ -22,7 +20,6 @@ pub(crate) enum WsFrame {
 #[inline]
 pub(super) fn ws_frame_size(frame: &WsFrame) -> usize {
     match frame {
-        WsFrame::PreFramed(bytes) => bytes.len(),
         WsFrame::Msg(msg) => match msg {
             Message::Text(s) => s.len() + 4,
             Message::Binary(b) => b.len() + 4,

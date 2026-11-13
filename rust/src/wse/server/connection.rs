@@ -28,6 +28,7 @@ use super::handshake::{HandshakeGuard, normalize_origin, reject_ws_auth};
 use super::messages::{build_server_hello, build_server_ready, normalize_json_keys};
 use super::py::{fire_on_connect, fire_on_disconnect, json_to_pyobj};
 use super::state::InboundEvent;
+use super::subscribe::answer_subscription_request;
 use super::{
     BroadcastQueue, CLOSE_GRACE, CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED, CLOSE_TRY_AGAIN_LATER,
     Closer, ConnectionHandle, ServerCommand, SharedState, WsFrame, format_presence_msg,
@@ -278,18 +279,13 @@ async fn write_control(
 ) -> Sent {
     let queued: usize = batch.iter().map(ws_frame_size).sum();
     let mut close = false;
-    for frame in batch.drain(..) {
-        match frame {
-            WsFrame::PreFramed(bytes) => wire.push_back(bytes),
-            WsFrame::Msg(msg) => {
-                close = matches!(msg, Message::Close(_));
-                if let Some(bytes) = encode_message(&msg) {
-                    wire.push_back(bytes);
-                }
-                if close {
-                    break;
-                }
-            }
+    for WsFrame::Msg(msg) in batch.drain(..) {
+        close = matches!(msg, Message::Close(_));
+        if let Some(bytes) = encode_message(&msg) {
+            wire.push_back(bytes);
+        }
+        if close {
+            break;
         }
     }
     let result = write_all_frames(sock, wire).await;
@@ -638,6 +634,16 @@ pub(super) async fn handle_connection(
     let cipher_slot: Arc<std::sync::OnceLock<Arc<crate::crypto::Aes256Gcm>>> =
         Arc::new(std::sync::OnceLock::new());
 
+    // This connection as the rest of the server sees it.
+    let own_handle = ConnectionHandle {
+        tx: tx.clone(),
+        pending: pending.clone(),
+        broadcast_buf: broadcast_buf.clone(),
+        broadcast_notify: broadcast_notify.clone(),
+        closer: closer.clone(),
+        cipher: cipher_slot.clone(),
+    };
+
     // Register connection
     let registered = {
         let mut conns = state.connections.write().await;
@@ -658,17 +664,7 @@ pub(super) async fn handle_connection(
                     pending.fetch_sub(sr_bytes, Ordering::Relaxed);
                 }
             }
-            conns.insert(
-                (*conn_id).clone(),
-                ConnectionHandle {
-                    tx: tx.clone(),
-                    pending: pending.clone(),
-                    broadcast_buf: broadcast_buf.clone(),
-                    broadcast_notify: broadcast_notify.clone(),
-                    closer: closer.clone(),
-                    cipher: cipher_slot.clone(),
-                },
-            );
+            conns.insert((*conn_id).clone(), own_handle.clone());
             state.connection_count.store(conns.len(), Ordering::Relaxed);
         }
         room
@@ -1039,6 +1035,12 @@ pub(super) async fn handle_connection(
                             if t_val == "pong" || t_val == "PONG" {
                                 continue;
                             }
+                            if t_val == "subscription_update" && state.client_subscriptions {
+                                if let Some(p) = val.get("p") {
+                                    answer_subscription_request(&state, &conn_id, &own_handle, p);
+                                }
+                                continue;
+                            }
                         }
 
                         // Normalize type→t, payload→p in serde_json (no GIL needed)
@@ -1131,6 +1133,22 @@ pub(super) async fn handle_connection(
                                         serde_json::from_str::<serde_json::Value>(json_str)
                                     {
                                         let val = normalize_json_keys(val);
+                                        // The clients encrypt their subscription
+                                        // requests too.
+                                        if state.client_subscriptions
+                                            && val.get("t").and_then(|t| t.as_str())
+                                                == Some("subscription_update")
+                                        {
+                                            if let Some(p) = val.get("p") {
+                                                answer_subscription_request(
+                                                    &state,
+                                                    &conn_id,
+                                                    &own_handle,
+                                                    p,
+                                                );
+                                            }
+                                            continue;
+                                        }
                                         if drain {
                                             state.push_message(
                                                 InboundEvent::Message {
