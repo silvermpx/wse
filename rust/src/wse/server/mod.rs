@@ -94,8 +94,8 @@ pub(crate) use handshake::normalize_origin;
 pub(crate) use messages::format_presence_msg;
 pub(crate) use state::{
     CLOSE_GOING_AWAY, CLOSE_GRACE, CLOSE_IDLE, CLOSE_NORMAL, CLOSE_RATE_LIMITED,
-    CLOSE_TRY_AGAIN_LATER, Closer, ConnectionHandle, QueueGroup, ServerCommand, SharedState,
-    SharedStateConfig,
+    CLOSE_TOKEN_EXPIRED, CLOSE_TRY_AGAIN_LATER, Closer, ConnectionHandle, QueueGroup,
+    ServerCommand, SharedState, SharedStateConfig,
 };
 
 // ---------------------------------------------------------------------------

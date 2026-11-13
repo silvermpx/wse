@@ -15,11 +15,13 @@ use super::{BroadcastQueue, WsFrame};
 use crate::jwt::JwtConfig;
 use crate::wse::cluster::{ClusterCommand, ClusterDlq, ClusterMetrics};
 
-/// Close codes the server sends. The clients reconnect on all of them; only
-/// the auth codes (4401, 4403) stop them.
+/// Close codes the server sends. The clients reconnect on all of them but
+/// the auth codes (4401 at the upgrade, 4403): those they retry only with a
+/// new token from their token provider.
 pub(crate) const CLOSE_NORMAL: u16 = 1000; // disconnect() by the application
 pub(crate) const CLOSE_GOING_AWAY: u16 = 1001; // the server stops
 pub(crate) const CLOSE_TRY_AGAIN_LATER: u16 = 1013; // too slow to read, or the server is full
+pub(crate) const CLOSE_TOKEN_EXPIRED: u16 = 4403; // the JWT the connection opened with expired
 pub(crate) const CLOSE_IDLE: u16 = 4408; // nothing received within idle_timeout
 pub(crate) const CLOSE_RATE_LIMITED: u16 = 4429; // kept sending past the rate limit
 

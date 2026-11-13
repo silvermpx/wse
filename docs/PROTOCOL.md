@@ -197,7 +197,7 @@ Two paths depending on server configuration:
 **Python fallback (when `jwt_secret` is not configured):**
 1. Rust pushes raw `Connect{conn_id, cookies}` to drain queue
 2. Python extracts and validates JWT from cookies
-3. Python sends `server_ready` after validation
+3. Python calls `accept_connection(conn_id, user_id)`, which sends `server_ready`
 
 The Rust JWT path eliminates GIL acquisition from the connection critical path, reducing median connection latency from ~23ms to 0.53ms.
 
@@ -465,7 +465,8 @@ payment_completed, account_transfer, config_change, ...
 | 1001 | The server stops | reconnect |
 | 1013 | The client reads too slowly: its outbound queue stayed over `max_outbound_queue_bytes` for two ping intervals. Also: the server filled up during the upgrade | reconnect |
 | 4300 | Graceful drain (the code passed to `drain()`, 4300 by default) | reconnect |
-| 4401 | Authentication failed | stop (a client with a token provider retries with a new token) |
+| 4401 | Authentication failed at the upgrade | stop (a client with a token provider retries with a new token) |
+| 4403 | The token the connection opened with expired | stop (a client with a token provider retries with a new token) |
 | 4408 | Nothing received from the client for `idle_timeout` seconds | reconnect |
 | 4429 | The client kept sending past the rate limit for 10 seconds | reconnect |
 

@@ -441,6 +441,17 @@ class RustWSEServer:
     def get_connections(self) -> list[str]:
         """List of active connection IDs."""
         ...
+    def accept_connection(self, conn_id: str, user_id: str) -> bool:
+        """Accept a connection the application authenticated itself.
+
+        For a server without jwt_secret: the connection gets server_ready, the
+        message the clients wait for before they send anything, and user_id
+        becomes its user for presence. Call it once per connection, after
+        checking the cookies of its "connect" event. Returns False when the
+        connection is gone; raises RuntimeError on a server that validates
+        tokens itself.
+        """
+        ...
     def disconnect(self, conn_id: str) -> None:
         """Close a connection with code 1000.
 

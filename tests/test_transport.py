@@ -394,3 +394,40 @@ class TestAllowedOrigins:
     def test_malformed_origins_are_refused(self, origin):
         with pytest.raises(ValueError):
             RustWSEServer("127.0.0.1", 0, allowed_origins=[origin])
+
+
+class TestApplicationAuth:
+    @pytest.mark.asyncio
+    async def test_accept_connection_sends_server_ready_and_sets_the_user(self, server_port):
+        srv = RustWSEServer("127.0.0.1", server_port, presence_enabled=True)
+        srv.enable_drain_mode()
+        srv.start()
+        time.sleep(0.05)
+        try:
+            async with websockets.connect(ws_url(server_port)) as ws:
+                _, conn_id, _ = drain_until(srv, "connect")
+                assert srv.accept_connection(conn_id, "bob")
+                ready = json.loads(await asyncio.wait_for(ws.recv(), timeout=2))
+                assert ready["t"] == "server_ready"
+                assert ready["p"]["details"]["user_id"] == "bob"
+                srv.subscribe_connection(conn_id, ["room"], {"status": "here"})
+                await asyncio.sleep(0.2)
+                assert "bob" in srv.presence("room")
+            assert not srv.accept_connection("no-such-connection", "bob")
+        finally:
+            srv.stop()
+
+    def test_a_jwt_server_accepts_on_its_own(self, server):
+        with pytest.raises(RuntimeError, match="jwt_secret"):
+            server.accept_connection("any", "bob")
+
+
+class TestTokenExpiry:
+    @pytest.mark.asyncio
+    async def test_a_connection_is_closed_when_its_token_expires(self, server, server_port):
+        # Expired 25 s ago: still valid for 5 s of the 30 s clock skew.
+        ws = await connect(server_port, make_token(exp_offset=-25))
+        drain_until(server, "auth_connect")
+        started = time.monotonic()
+        assert await close_code(ws, timeout=15) == 4403
+        assert 3 < time.monotonic() - started < 10

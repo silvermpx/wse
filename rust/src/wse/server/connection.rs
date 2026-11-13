@@ -29,8 +29,8 @@ use super::messages::{build_server_hello, build_server_ready, normalize_json_key
 use super::py::{fire_on_connect, fire_on_disconnect, json_to_pyobj};
 use super::state::InboundEvent;
 use super::{
-    BroadcastQueue, CLOSE_GRACE, CLOSE_RATE_LIMITED, CLOSE_TRY_AGAIN_LATER, Closer,
-    ConnectionHandle, ServerCommand, SharedState, WsFrame, format_presence_msg,
+    BroadcastQueue, CLOSE_GRACE, CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED, CLOSE_TRY_AGAIN_LATER,
+    Closer, ConnectionHandle, ServerCommand, SharedState, WsFrame, format_presence_msg,
 };
 use crate::jwt::{self, parse_cookie_value};
 use crate::wse::cluster::ClusterCommand;
@@ -79,6 +79,20 @@ fn clone_tcp_stream(stream: TcpStream) -> std::io::Result<(TcpStream, TcpStream)
         TcpStream::from_std(std_stream)?,
         TcpStream::from_std(std_clone)?,
     ))
+}
+
+/// The moment a token with expiry `exp` (seconds since the epoch) stops
+/// being valid: `exp` plus the clock skew the validation allows.
+fn token_valid_until(exp: u64) -> tokio::time::Instant {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let left = exp
+        .saturating_add(jwt::CLOCK_SKEW_SECS)
+        .saturating_sub(now_unix);
+    // Far-future values would overflow the timer; a year is never reached.
+    tokio::time::Instant::now() + Duration::from_secs(left.min(365 * 24 * 3600))
 }
 
 /// Why the upgrade was refused, if it was.
@@ -490,6 +504,9 @@ pub(super) async fn handle_connection(
     // When jwt_config is set, validate JWT from cookie or Authorization header.
     // On success: send server_ready immediately, push AuthConnect to drain queue.
     // On failure: send error + close — connection never registered.
+    // When the token stops being valid (its exp, plus the clock skew the
+    // validation allows).
+    let mut token_deadline: Option<tokio::time::Instant> = None;
     let rust_auth_user_id: Option<String> = if let Some(ref jwt_cfg) = state.jwt_config {
         let token = parse_cookie_value(&cookie_str, &jwt_cfg.cookie_name).or_else(|| {
             auth_header.as_deref().and_then(|h| {
@@ -515,6 +532,10 @@ pub(super) async fn handle_connection(
                         if let Some(acl) = jwt::extract_topic_acl(&claims) {
                             state.conn_topic_acl.insert(conn_id.to_string(), acl);
                         }
+                        token_deadline = claims
+                            .get("exp")
+                            .and_then(serde_json::Value::as_u64)
+                            .map(token_valid_until);
                         Some(user_id.to_string())
                     } else {
                         state.auth_failures_total.fetch_add(1, Ordering::Relaxed);
@@ -768,6 +789,10 @@ pub(super) async fn handle_connection(
     let mut hello_answered = false;
     let mut frame_errors = FrameErrorLog::default();
 
+    // A connection whose token expires is closed (4403): the clients come
+    // back with a new token from their token provider.
+    let mut expiry = token_deadline.map(|deadline| Box::pin(tokio::time::sleep_until(deadline)));
+
     // Read loop. It ends when the client closes or the socket fails, and when
     // the server closed the connection and the client did not answer in time.
     let read_cancel = closer.token().clone();
@@ -775,6 +800,11 @@ pub(super) async fn handle_connection(
         let msg = tokio::select! {
             biased;
             () = read_cancel.cancelled() => break,
+            () = async { if let Some(sleep) = expiry.as_mut() { sleep.await } }, if expiry.is_some() => {
+                expiry = None;
+                closer.close(&tx, &pending, CLOSE_TOKEN_EXPIRED, "token expired");
+                continue;
+            }
             next = read_half.next() => match next {
                 Some(Ok(msg)) => msg,
                 _ => break,

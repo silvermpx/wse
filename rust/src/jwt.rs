@@ -222,7 +222,7 @@ pub struct JwtConfig {
 // Reject tokens larger than 8KB to prevent DoS
 const MAX_TOKEN_LEN: usize = 8192;
 // Clock skew tolerance for exp/nbf (seconds) -- RFC 8725 recommendation
-const CLOCK_SKEW_SECS: u64 = 30;
+pub(crate) const CLOCK_SKEW_SECS: u64 = 30;
 
 /// A shared secret for an HS* algorithm: long enough, and not a PEM key
 /// (an asymmetric key used as an HMAC secret lets anyone holding the public

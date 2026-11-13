@@ -16,9 +16,38 @@ use super::convert::pyobj_to_json;
 use crate::wse::compression::serde_json_to_rmpv;
 use crate::wse::server::ServerCommand;
 use crate::wse::server::e2e::encrypt_outbound;
-use crate::wse::server::messages::{inject_category, message_category};
+use crate::wse::server::messages::{build_server_ready, inject_category, message_category};
 
 impl RustWSEServer {
+    pub(super) fn accept_connection_impl(&self, conn_id: &str, user_id: &str) -> PyResult<bool> {
+        if self.shared.jwt_config.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "this server validates tokens itself (jwt_secret) and accepts connections on \
+                 its own; accept_connection() is for applications that authenticate them",
+            ));
+        }
+        let tx = self.command_tx()?;
+        // Its activity entry lives from registration to cleanup.
+        if !self.shared.conn_last_activity.contains_key(conn_id) {
+            return Ok(false);
+        }
+        if let Some(ref pm) = self.shared.presence {
+            pm.register_connection(conn_id, user_id);
+            // Gone meanwhile: its cleanup may have run before the register.
+            if !self.shared.conn_last_activity.contains_key(conn_id) {
+                pm.remove_connection(conn_id);
+                return Ok(false);
+            }
+        }
+        let ready = build_server_ready(conn_id, user_id, self.shared.recovery.is_some());
+        tx.send(ServerCommand::SendText {
+            conn_id: conn_id.to_owned(),
+            data: ready,
+        })
+        .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
+        Ok(true)
+    }
+
     pub(super) fn send_impl(&self, conn_id: &str, data: &str) -> PyResult<()> {
         let tx = self.command_tx()?;
         tx.send(ServerCommand::SendText {

@@ -98,6 +98,8 @@ The Rust server extracts the JWT from cookies (configured via `jwt_cookie_name`)
 
 **Key requirements:** HS256 secret must be >= 32 bytes (RFC 7518). RS256/ES256 keys must be valid PEM. Tokens without `exp` are rejected.
 
+**Expiry of open connections:** a connection is closed with code 4403 when the token it opened with expires (its `exp` plus the 30-second skew). The clients reconnect with a fresh token from their token provider; without one they stop. Keep tokens short-lived: an open WebSocket is authorized exactly as long as its token.
+
 **Key rotation:** Set `jwt_previous_secret` to the old key when rotating. For HS256: old shared secret. For RS256/ES256: old public key PEM. Tokens signed with either key are accepted during the transition window. Remove `jwt_previous_secret` after all old tokens have expired.
 
 On success, the server sends `server_ready` directly from Rust and pushes an `AuthConnect` event to the drain queue with the validated `user_id`.

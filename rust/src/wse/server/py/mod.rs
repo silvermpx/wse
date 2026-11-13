@@ -509,6 +509,17 @@ impl RustWSEServer {
         Ok(())
     }
 
+    /// Accept a connection the application authenticated itself (a server
+    /// without `jwt_secret`): it gets server_ready, the message the clients
+    /// wait for before they send anything, and `user_id` becomes its user
+    /// for presence. Call it once per connection, after checking the
+    /// cookies of its "connect" event. Returns False when the connection is
+    /// gone. A server that validates tokens itself sends server_ready on its
+    /// own and raises RuntimeError here.
+    fn accept_connection(&self, conn_id: &str, user_id: &str) -> PyResult<bool> {
+        self.accept_connection_impl(conn_id, user_id)
+    }
+
     /// Return True if the server is running.
     fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
