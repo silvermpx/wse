@@ -1,0 +1,5 @@
+# `cargo xtask <command>` runs the repository checks (xtask/src/main.rs).
+# Only an alias lives here: build flags for the extension do not belong in a
+# committed cargo config (see rust/.cargo/config.toml).
+[alias]
+xtask = "run --quiet --locked --manifest-path xtask/Cargo.toml --"

@@ -1,0 +1,24 @@
+# Places where the engine still depends on the Python layer, checked by
+# `cargo xtask arch`. Every entry needs a reason. An entry that matches nothing
+# any more fails the check, so this list can only shrink with the code it
+# excuses. Untangling these is the work before the engine can stand alone.
+
+[[allow]]
+rule = "engine-pyo3"
+file = "rust/src/wse/server/connection.rs"
+reason = "Callback mode runs inside the connection task: it attaches to Python, wraps frames in PyBytes and calls the Python callbacks. Move it behind a callback trait that the Python layer implements."
+
+[[allow]]
+rule = "engine-pyo3"
+file = "rust/src/wse/server/state.rs"
+reason = "SharedState stores the callback-mode Python callbacks as Py<PyAny>; they belong to the Python layer behind the same callback trait."
+
+[[allow]]
+rule = "engine-imports"
+file = "rust/src/wse/server/connection.rs"
+reason = "Callback mode calls the Python layer's fire_on_connect, fire_on_disconnect and json_to_pyobj. Token validation (crate::jwt) and msgpack decoding (crate::wse::compression) live in modules that also define Python functions; split each into an engine half and a binding half."
+
+[[allow]]
+rule = "engine-imports"
+file = "rust/src/wse/server/state.rs"
+reason = "JwtConfig and TopicAcl come from crate::jwt, which also holds the rust_jwt_* Python functions; they move to the engine half of that split."

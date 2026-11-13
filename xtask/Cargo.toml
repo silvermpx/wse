@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "Repository checks for WSE: comments, architecture, the fast local gate"
+
+[dependencies]
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.1"

@@ -13,6 +13,7 @@ build/
 # Rust
 rust/target/
 benchmarks/rust-bench/target/
+xtask/target/
 # rust/Cargo.lock is committed for reproducible builds
 
 # Virtual environments
