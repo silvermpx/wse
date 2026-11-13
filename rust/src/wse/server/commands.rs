@@ -24,8 +24,30 @@ pub(super) async fn process_commands(
     mut cmd_rx: mpsc::UnboundedReceiver<ServerCommand>,
     state: Arc<SharedState>,
 ) {
-    while let Some(cmd) = cmd_rx.recv().await {
-        state.commands_queued.store(cmd_rx.len(), Ordering::Relaxed);
+    // The queue's depth for the metrics: 0 whenever it runs empty, otherwise
+    // measured once every DEPTH_EVERY commands. Measuring walks the queue's
+    // blocks when it is long, and doing it for every command made a long
+    // queue slower to drain the longer it got.
+    const DEPTH_EVERY: u32 = 1024;
+    let mut until_depth = 0u32;
+    loop {
+        let cmd = match cmd_rx.try_recv() {
+            Ok(cmd) => cmd,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                state.commands_queued.store(0, Ordering::Relaxed);
+                until_depth = 0;
+                match cmd_rx.recv().await {
+                    Some(cmd) => cmd,
+                    None => break,
+                }
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+        };
+        if until_depth == 0 {
+            state.commands_queued.store(cmd_rx.len(), Ordering::Relaxed);
+            until_depth = DEPTH_EVERY;
+        }
+        until_depth -= 1;
         match cmd {
             ServerCommand::SendText { conn_id, data } => {
                 let guard = state.connections.read().await;

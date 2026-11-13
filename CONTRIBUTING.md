@@ -99,6 +99,25 @@ wse/
 - Use `DashMap` for concurrent state, `crossbeam` for channels.
 - Prefer `Arc<Bytes>` for shared message payloads (zero-copy broadcast).
 
+### Performance
+
+Speed is a requirement from the first line, not something to win back later.
+
+- The hot paths (fan-out, each connection's write task and read loop, the
+  cluster links, the codecs) take no new lock, allocation, syscall, clock read
+  or map lookup per message. Work that does not depend on the connection is
+  done once per message, not once per subscriber; shared payloads are `Bytes`.
+- Know what a primitive costs before it goes into a loop that runs per
+  message: `CancellationToken::is_cancelled()` locks a mutex, a `Notify` wait
+  registers under one. Atomics, `Abortable` and the stack (arrays, `SmallVec`)
+  are the defaults.
+- Use every core where ordering allows it.
+- A change that touches a hot path is measured against the previous release
+  on the same machine and with the same build flags, and the numbers go in the
+  pull request: `benchmarks/rust-bench` (`--test fanout-broadcast`,
+  `--test throughput`, `--test fanout-cluster`) against
+  `benchmarks/bench_fanout_server.py` and `benchmarks/bench_server.py`.
+
 ### Python
 
 - Format with `ruff format`.
