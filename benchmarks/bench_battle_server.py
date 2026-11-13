@@ -27,15 +27,17 @@ Usage:
     python benchmarks/bench_battle_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:5006
     wse-bench --test battle-cluster --port 5006 --port2 5007
 
-    # Cluster with TLS
-    python benchmarks/bench_battle_server.py --mode cluster --port 5006 --peers 127.0.0.1:5007 --generate-tls
-    python benchmarks/bench_battle_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:5006 \\
+    # Cluster with TLS (cluster links on their own ports)
+    python benchmarks/bench_battle_server.py --mode cluster --port 5006 --peers 127.0.0.1:6007 \\
+        --cluster-port 6006 --cluster-addr 127.0.0.1:6006 --generate-tls
+    python benchmarks/bench_battle_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:6006 \\
+        --cluster-port 6007 --cluster-addr 127.0.0.1:6007 \\
         --tls-cert /tmp/wse_tls_test/server.crt --tls-key /tmp/wse_tls_test/server.key --tls-ca /tmp/wse_tls_test/ca.crt
 
     # Cluster with gossip discovery (3 nodes)
-    python benchmarks/bench_battle_server.py --mode cluster --port 5006 --peers 127.0.0.1:5007 \\
+    python benchmarks/bench_battle_server.py --mode cluster --port 5006 --peers 127.0.0.1:6007 \\
         --cluster-port 6006 --cluster-addr 127.0.0.1:6006
-    python benchmarks/bench_battle_server.py --mode cluster --port 5007 --peers 127.0.0.1:5006 \\
+    python benchmarks/bench_battle_server.py --mode cluster --port 5007 --peers 127.0.0.1:6006 \\
         --cluster-port 6007 --cluster-addr 127.0.0.1:6007
     python benchmarks/bench_battle_server.py --mode cluster-subscribe --port 5008 \\
         --cluster-port 6008 --cluster-addr 127.0.0.1:6008 --seeds 127.0.0.1:6007
@@ -358,6 +360,20 @@ def publish_loop(server, mode: str, message_size: int, stop_event: threading.Eve
             interval_count = 0
 
 
+
+def connect_cluster(server, peers, **kwargs):
+    """Join the cluster. Without a cluster port, peers come in on the
+    WebSocket port: 3.x does that only when asked (single_port), 2.x always
+    did and has no such option."""
+    if kwargs.get("cluster_port") is None:
+        try:
+            server.connect_cluster(peers, single_port=True, **kwargs)
+            return
+        except TypeError:
+            pass
+    server.connect_cluster(peers, **kwargs)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Battle test server")
     parser.add_argument(
@@ -430,7 +446,8 @@ def main():
 
     if args.peers or args.seeds or args.cluster_port:
         peers = args.peers or []
-        server.connect_cluster(
+        connect_cluster(
+            server,
             peers,
             tls_cert=args.tls_cert,
             tls_key=args.tls_key,

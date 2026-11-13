@@ -92,6 +92,20 @@ def generate_token(user_id: str = "bench-user") -> str:
     return rust_jwt_encode(claims, JWT_SECRET)
 
 
+
+def connect_cluster(server, peers, **kwargs):
+    """Join the cluster. Without a cluster port, peers come in on the
+    WebSocket port: 3.x does that only when asked (single_port), 2.x always
+    did and has no such option."""
+    if kwargs.get("cluster_port") is None:
+        try:
+            server.connect_cluster(peers, single_port=True, **kwargs)
+            return
+        except TypeError:
+            pass
+    server.connect_cluster(peers, **kwargs)
+
+
 def start_metrics_server(server, port: int):
     """Start a tiny HTTP server that exposes Prometheus metrics."""
 
@@ -228,7 +242,8 @@ def main():
 
     if args.peers or args.cluster_port:
         peers = args.peers or []
-        server.connect_cluster(
+        connect_cluster(
+            server,
             peers,
             tls_cert=args.tls_cert,
             tls_key=args.tls_key,

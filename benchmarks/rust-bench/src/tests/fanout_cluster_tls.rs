@@ -15,8 +15,10 @@ use std::time::Duration;
 ///   Benchmark clients connect to Server B via plain WebSocket.
 ///
 /// Requires:
-///   bench_fanout_server.py --mode cluster --port 5006 --peers 127.0.0.1:5007 --generate-tls
-///   bench_fanout_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:5006 \
+///   bench_fanout_server.py --mode cluster --port 5006 --peers 127.0.0.1:6007 \
+///       --cluster-port 6006 --cluster-addr 127.0.0.1:6006 --generate-tls
+///   bench_fanout_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:6006 \
+///       --cluster-port 6007 --cluster-addr 127.0.0.1:6007 \
 ///       --tls-cert /tmp/wse_tls_test/server.crt --tls-key /tmp/wse_tls_test/server.key --tls-ca /tmp/wse_tls_test/ca.crt
 pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let port2 = cli.port2.unwrap_or(cli.port + 1);
