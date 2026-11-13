@@ -1,7 +1,6 @@
 //! One peer link: writer, reader, dispatch and heartbeat tasks, the outbound
 //! session and its reconnect loop.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -16,13 +15,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::protocol::write_framed;
 use super::{
-    CAP_PRESENCE, CLUSTER_RESYNC_INTERVAL_SECS, ClusterCommand, ClusterContext, ClusterFrame,
-    ClusterMetrics, ClusterTlsConfig, DispatchItem, HEARTBEAT_INTERVAL_SECS,
-    HEARTBEAT_TIMEOUT_SECS, InterestUpdate, LOCAL_CAPABILITIES, Link, LinkRefused, MAX_BATCH_BYTES,
-    MAX_FRAME_SIZE, PEER_DISPATCH_QUEUE_CAP, PEER_SESSION_GENERATION, PROTOCOL_VERSION, PeerInfo,
-    PeerRegistration, PresencePeerFrame, claim_link, decode_frame, encode_hello,
-    encode_peer_announce, encode_peer_list, encode_ping, encode_pong, encode_presence_full,
-    encode_resync, epoch_ms, negotiate_capabilities, negotiate_version, release_link,
+    ClusterCommand, ClusterContext, ClusterFrame, ClusterMetrics, ClusterTlsConfig, DispatchItem,
+    HEARTBEAT_INTERVAL_SECS, HEARTBEAT_TIMEOUT_SECS, InterestUpdate, LOCAL_CAPABILITIES, Link,
+    LinkRefused, MAX_BATCH_BYTES, MAX_FRAME_SIZE, PEER_DISPATCH_QUEUE_CAP, PEER_SESSION_GENERATION,
+    PRESENCE_ROUND, PRESENCE_ROUND_FIRST, PRESENCE_ROUND_LAST, PROTOCOL_VERSION, PeerInfo,
+    PeerRegistration, PresencePeerFrame, RoundPart, claim_link, decode_frame, encode_hello,
+    encode_peer_announce, encode_peer_list, encode_ping, encode_pong, epoch_ms,
+    negotiate_capabilities, negotiate_version, release_link,
 };
 use crate::wse::reliability::{CircuitBreaker, ExponentialBackoff};
 
@@ -160,9 +159,12 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
                 // Stop routing NEW messages to the draining peer (clear its remote
                 // interest) but keep the connection open for in-flight delivery.
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
-                let _ = ctx.interest_tx.send(InterestUpdate::Drain {
+                let update = InterestUpdate::Drain {
                     peer_addr: peer_addr.clone(),
-                });
+                };
+                if !to_manager(&ctx.interest_tx, update, &cancel).await {
+                    break;
+                }
             }
             Some(ClusterFrame::Hello { .. }) => {
                 // Unexpected HELLO after handshake, ignore
@@ -178,29 +180,38 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
             }
             Some(ClusterFrame::Sub { topic }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
-                let _ = ctx.interest_tx.send(InterestUpdate::Sub {
+                let update = InterestUpdate::Sub {
                     peer_addr: peer_addr.clone(),
                     topic,
-                });
+                };
+                if !to_manager(&ctx.interest_tx, update, &cancel).await {
+                    break;
+                }
             }
             Some(ClusterFrame::Unsub { topic }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
-                let _ = ctx.interest_tx.send(InterestUpdate::Unsub {
+                let update = InterestUpdate::Unsub {
                     peer_addr: peer_addr.clone(),
                     topic,
-                });
+                };
+                if !to_manager(&ctx.interest_tx, update, &cancel).await {
+                    break;
+                }
             }
             Some(ClusterFrame::Resync {
                 topics,
                 is_continuation,
             }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
-                let _ = ctx.interest_tx.send(InterestUpdate::Resync {
+                let update = InterestUpdate::Resync {
                     peer_addr: peer_addr.clone(),
                     topics,
                     is_continuation,
                     generation,
-                });
+                };
+                if !to_manager(&ctx.interest_tx, update, &cancel).await {
+                    break;
+                }
             }
             Some(ClusterFrame::PeerAnnounce { addr }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
@@ -226,27 +237,68 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
                 updated_at,
             }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
-                let _ = ctx.presence_tx.send(PresencePeerFrame::Update {
+                let frame = PresencePeerFrame::Update {
                     origin: peer_addr.clone(),
                     topic,
                     user_id,
                     action,
                     data,
                     updated_at,
-                });
+                };
+                if !to_manager(&ctx.presence_tx, frame, &cancel).await {
+                    break;
+                }
             }
-            Some(ClusterFrame::PresenceFull { entries }) => {
+            Some(ClusterFrame::PresenceFull { entries, flags }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
-                let _ = ctx.presence_tx.send(PresencePeerFrame::Full {
+                let round = (flags & PRESENCE_ROUND != 0).then_some(RoundPart {
+                    first: flags & PRESENCE_ROUND_FIRST != 0,
+                    last: flags & PRESENCE_ROUND_LAST != 0,
+                });
+                let frame = PresencePeerFrame::Full {
                     origin: peer_addr.clone(),
                     entries,
-                });
+                    round,
+                    generation,
+                };
+                if !to_manager(&ctx.presence_tx, frame, &cancel).await {
+                    break;
+                }
             }
             None => {
                 tracing::error!("[WSE-Cluster] Failed to decode frame, disconnecting");
                 break;
             }
         }
+    }
+}
+
+/// Hand an update to the manager, waiting while its queue is full: a peer
+/// sending faster than the manager keeps up is slowed down at its socket,
+/// not buffered without bound. False once the link ends.
+async fn to_manager<T>(tx: &mpsc::Sender<T>, item: T, cancel: &CancellationToken) -> bool {
+    tokio::select! {
+        sent = tx.send(item) => sent.is_ok(),
+        () = cancel.cancelled() => false,
+    }
+}
+
+/// Tell the manager a link ended. It must hear of every one (its interest
+/// and presence go with it), so this waits for room, except on shutdown:
+/// the manager reads no more then.
+pub(super) async fn tell_disconnected(
+    ctx: &ClusterContext,
+    peer_addr: String,
+    generation: u64,
+    global_cancel: &CancellationToken,
+) {
+    let update = InterestUpdate::PeerDisconnected {
+        peer_addr,
+        generation,
+    };
+    tokio::select! {
+        _ = ctx.interest_tx.send(update) => {}
+        () = global_cancel.cancelled() => {}
     }
 }
 
@@ -335,31 +387,12 @@ pub(super) async fn heartbeat_task(
     peer_write_tx: mpsc::Sender<Bytes>,
     cancel: CancellationToken,
     last_activity: Arc<AtomicU64>,
-    local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
 ) {
     let _end_link = cancel.clone().drop_guard();
     let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
-    let mut resync_interval =
-        tokio::time::interval(Duration::from_secs(CLUSTER_RESYNC_INTERVAL_SECS));
-    resync_interval.reset(); // don't RESYNC immediately (the handshake already did)
     let timeout_ms = HEARTBEAT_TIMEOUT_SECS * 1000;
     loop {
         tokio::select! {
-            _ = resync_interval.tick() => {
-                // Self-heal interest divergence from a dropped SUB/UNSUB: re-send
-                // the full local interest set. Inner frames go through the channel
-                // unframed (peer_writer adds the length prefix), like every other
-                // peer send.
-                let local_topics: Vec<String> = match local_topic_refcount.lock() {
-                    Ok(g) => g.keys().cloned().collect(),
-                    Err(e) => e.into_inner().keys().cloned().collect(),
-                };
-                for frame_buf in encode_resync(&local_topics) {
-                    if peer_write_tx.try_send(frame_buf.freeze()).is_err() {
-                        break; // channel full/closed; the next tick retries
-                    }
-                }
-            }
             _ = interval.tick() => {
                 // Check if peer is dead (no activity for HEARTBEAT_TIMEOUT_SECS)
                 let last = last_activity.load(Ordering::Relaxed);
@@ -444,17 +477,13 @@ async fn run_peer_session<R, W>(
     ids: (&str, &str),
     ctx: &ClusterContext,
     peer_reg_tx: &mpsc::UnboundedSender<PeerRegistration>,
-    session: (
-        &Option<Arc<crate::wse::presence::PresenceManager>>,
-        &CancellationToken,
-    ),
+    global_cancel: &CancellationToken,
 ) -> Outcome
 where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
     let (peer_addr, instance_id) = ids;
-    let (presence, global_cancel) = session;
 
     let mut hello_buf = BytesMut::new();
     encode_hello(&mut hello_buf, instance_id, LOCAL_CAPABILITIES);
@@ -540,29 +569,8 @@ where
         },
     );
 
-    // RESYNC with all current local topics, before the writer task starts.
-    let local_topics: Vec<String> = ctx
-        .local_topic_refcount
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .keys()
-        .cloned()
-        .collect();
-    {
-        // Sent even when empty: until a peer's first RESYNC arrives, it is
-        // sent every publish.
-        let mut wire_buf = BytesMut::new();
-        for frame in &encode_resync(&local_topics) {
-            write_framed(&mut wire_buf, frame);
-        }
-        if writer.write_all(&wire_buf).await.is_err() || writer.flush().await.is_err() {
-            tracing::warn!("[WSE-Cluster] Failed to send RESYNC to {peer_addr}");
-            release_link(&ctx.links, &peer_instance_id, session_gen);
-            ctx.metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
-            ctx.metrics.peer_info.remove(peer_addr);
-            return Outcome::Failed;
-        }
-    }
+    // This node's interest (RESYNC) and presence follow from the manager once
+    // the link is registered, in order with every change after them.
 
     // PEER_ANNOUNCE with our cluster address (discovery mode)
     if let Some(ref our_addr) = ctx.cluster_addr {
@@ -583,23 +591,6 @@ where
         write_framed(&mut list_frame, &list_buf);
         let _ = writer.write_all(&list_frame).await;
         let _ = writer.flush().await;
-    }
-
-    // Full presence state, chunked so a large state still arrives whole.
-    if peer_caps & CAP_PRESENCE != 0
-        && let Some(pm) = presence
-    {
-        for entries in pm.serialize_full_state_chunked(MAX_FRAME_SIZE - 1024) {
-            let mut buf = BytesMut::new();
-            if encode_presence_full(&mut buf, &entries) {
-                let mut frame = BytesMut::new();
-                write_framed(&mut frame, &buf);
-                if let Err(e) = writer.write_all(&frame).await {
-                    tracing::warn!("[WSE-Cluster] Failed to send PresenceFull: {e}");
-                }
-                let _ = writer.flush().await;
-            }
-        }
     }
 
     let (peer_write_tx, peer_write_rx) = mpsc::channel::<Bytes>(10_000);
@@ -633,11 +624,11 @@ where
         peer_write_tx.clone(),
         peer_cancel.clone(),
         last_activity,
-        ctx.local_topic_refcount.clone(),
     ));
 
     // From now on the manager routes publishes, interest and presence here,
-    // with the capabilities this handshake negotiated.
+    // with the capabilities this handshake negotiated, starting with this
+    // node's RESYNC and presence.
     let _ = peer_reg_tx.send(PeerRegistration::Register {
         peer_addr: peer_addr.to_owned(),
         write_tx: peer_write_tx,
@@ -658,10 +649,7 @@ where
     ctx.metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
     ctx.metrics.peer_info.remove(peer_addr);
     release_link(&ctx.links, &peer_instance_id, session_gen);
-    let _ = ctx.interest_tx.send(InterestUpdate::PeerDisconnected {
-        peer_addr: peer_addr.to_owned(),
-        generation: session_gen,
-    });
+    tell_disconnected(ctx, peer_addr.to_owned(), session_gen, global_cancel).await;
     tracing::info!("[WSE-Cluster] Disconnected from {peer_addr}");
 
     if global_cancel.is_cancelled() {
@@ -683,12 +671,8 @@ async fn peer_connection_task(
     ctx: ClusterContext,
     tls_config: Option<Arc<arc_swap::ArcSwap<ClusterTlsConfig>>>,
     peer_reg_tx: mpsc::UnboundedSender<PeerRegistration>,
-    session: (
-        Option<Arc<crate::wse::presence::PresenceManager>>,
-        CancellationToken,
-    ),
+    global_cancel: CancellationToken,
 ) {
-    let (presence, global_cancel) = session;
     let mut backoff = ExponentialBackoff::new();
     let mut breaker = CircuitBreaker::new();
     let mut unreachable = 0u32;
@@ -777,7 +761,7 @@ async fn peer_connection_task(
                         (&peer_addr, &instance_id),
                         &ctx,
                         &peer_reg_tx,
-                        (&presence, &global_cancel),
+                        &global_cancel,
                     )
                     .await
                 }
@@ -798,7 +782,7 @@ async fn peer_connection_task(
                 (&peer_addr, &instance_id),
                 &ctx,
                 &peer_reg_tx,
-                (&presence, &global_cancel),
+                &global_cancel,
             )
             .await
         };
@@ -837,7 +821,6 @@ pub(super) struct PeerSpawnCtx {
     pub(super) global_cancel: CancellationToken,
     pub(super) tls_config: Option<Arc<arc_swap::ArcSwap<ClusterTlsConfig>>>,
     pub(super) peer_reg_tx: mpsc::UnboundedSender<PeerRegistration>,
-    pub(super) presence: Option<Arc<crate::wse::presence::PresenceManager>>,
 }
 
 impl PeerSpawnCtx {
@@ -852,7 +835,7 @@ impl PeerSpawnCtx {
             self.ctx.clone(),
             self.tls_config.clone(),
             self.peer_reg_tx.clone(),
-            (self.presence.clone(), self.global_cancel.clone()),
+            self.global_cancel.clone(),
         ))
     }
 }

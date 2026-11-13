@@ -1,9 +1,10 @@
 //! The cluster manager: owns every peer link and routes commands, interest,
 //! gossip, registrations and presence between them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::{DashMap, DashSet};
@@ -13,13 +14,74 @@ use tokio_util::sync::CancellationToken;
 use super::inbound::{InboundGate, InboundLinks, InboundSessionCtx, accept_cluster_links};
 use super::peer::PeerSpawnCtx;
 use super::{
-    CAP_COMPRESSION, CAP_INTEREST_ROUTING, CAP_PRESENCE, CAP_RECOVERY, ClusterCommand,
-    ClusterContext, ClusterDlq, ClusterDlqEntry, ClusterTlsConfig, InterestUpdate,
-    MAX_CLUSTER_PEERS, MAX_FRAME_SIZE, MAX_REMOTE_INTEREST_PER_PEER, PeerInterest,
+    CAP_COMPRESSION, CAP_INTEREST_ROUTING, CAP_PRESENCE, CAP_RECOVERY,
+    CLUSTER_RESYNC_INTERVAL_SECS, ClusterCommand, ClusterContext, ClusterDlq, ClusterDlqEntry,
+    ClusterTlsConfig, InterestUpdate, MANAGER_QUEUE_CAP, MAX_CLUSTER_PEERS, MAX_FRAME_SIZE,
+    MAX_REMOTE_INTEREST_PER_PEER, PRESENCE_ROUND_FIRST, PRESENCE_ROUND_LAST, PeerInterest,
     PeerRegistration, PresencePeerFrame, encode_drain, encode_msg, encode_msg_compressed,
-    encode_msg_with_recovery, encode_peer_announce, encode_presence_update, encode_shutdown,
-    encode_sub, encode_unsub,
+    encode_msg_with_recovery, encode_peer_announce, encode_presence_round, encode_presence_update,
+    encode_resync, encode_shutdown, encode_sub, encode_unsub,
 };
+use crate::wse::presence::PresenceManager;
+use crate::wse::server::subscribe::MAX_TOPIC_LEN;
+
+/// Queue `frames` on a link whole or not at all: a RESYNC or a presence
+/// round cut short would leave the peer with part of the set.
+pub(super) fn queue_whole(tx: &mpsc::Sender<Bytes>, frames: &[Bytes]) -> bool {
+    match tx.try_reserve_many(frames.len()) {
+        Ok(permits) => {
+            for (permit, frame) in permits.zip(frames) {
+                permit.send(frame.clone());
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// This node's interest as RESYNC frames; sent even when empty: until a
+/// peer's first RESYNC arrives, it gets every publish.
+fn interest_frames(local: &std::sync::Mutex<HashMap<String, usize>>) -> Vec<Bytes> {
+    let topics: Vec<String> = local
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    encode_resync(&topics)
+        .into_iter()
+        .map(BytesMut::freeze)
+        .collect()
+}
+
+/// This node's local presence as one sync round: the receiver keeps of this
+/// node exactly what the round holds. An empty state is a round too.
+pub(super) fn presence_round(pm: &PresenceManager) -> Vec<Bytes> {
+    let mut chunks: Vec<String> = pm
+        .serialize_full_state_chunked(MAX_FRAME_SIZE - 1024)
+        .into_iter()
+        .filter(|chunk| chunk.len() <= MAX_FRAME_SIZE - 8)
+        .collect();
+    if chunks.is_empty() {
+        chunks.push("{}".to_owned());
+    }
+    let last = chunks.len() - 1;
+    chunks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, entries)| {
+            let mut edges = 0;
+            if i == 0 {
+                edges |= PRESENCE_ROUND_FIRST;
+            }
+            if i == last {
+                edges |= PRESENCE_ROUND_LAST;
+            }
+            let mut buf = BytesMut::new();
+            encode_presence_round(&mut buf, entries, edges).then(|| buf.freeze())
+        })
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Cluster manager: orchestrates all peer connections
@@ -49,7 +111,7 @@ pub(crate) async fn cluster_manager(
     instance_id: String,
     channels: (
         mpsc::UnboundedReceiver<ClusterCommand>,
-        mpsc::UnboundedReceiver<InterestUpdate>,
+        mpsc::Receiver<InterestUpdate>,
     ),
     ctx: ClusterContext,
     dlq: Arc<std::sync::Mutex<ClusterDlq>>,
@@ -71,6 +133,17 @@ pub(crate) async fn cluster_manager(
     let mut draining: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Track the latest session generation per peer to filter stale RESYNC continuations
     let mut peer_generation: HashMap<String, u64> = HashMap::new();
+    // Peers that missed a presence frame of this node (a full link): they get
+    // a sync round on the next tick.
+    let mut presence_dirty: HashSet<String> = HashSet::new();
+    // Presence sync rounds being received, per origin: the link session they
+    // came on and the users of each topic seen so far.
+    let mut presence_rounds: HashMap<String, (u64, HashMap<String, HashSet<String>>)> =
+        HashMap::new();
+    // The full interest to every peer, and the rounds owed, once a period.
+    let mut sync_tick = tokio::time::interval(Duration::from_secs(CLUSTER_RESYNC_INTERVAL_SECS));
+    sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    sync_tick.reset();
 
     // Static peers have their own reconnect loop; never remove them from known_peers
     let static_peers: std::collections::HashSet<String> = peers.iter().cloned().collect();
@@ -80,7 +153,8 @@ pub(crate) async fn cluster_manager(
     let (new_peer_tx, mut new_peer_rx) = mpsc::unbounded_channel::<String>();
     let (gossip_cmd_tx, mut gossip_cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
     let (peer_reg_tx, mut peer_reg_rx) = mpsc::unbounded_channel::<PeerRegistration>();
-    let (presence_peer_tx, mut presence_peer_rx) = mpsc::unbounded_channel::<PresencePeerFrame>();
+    let (presence_peer_tx, mut presence_peer_rx) =
+        mpsc::channel::<PresencePeerFrame>(MANAGER_QUEUE_CAP);
 
     // Build the full ClusterContext by overriding the manager-internal channel senders
     let ctx = ClusterContext {
@@ -106,7 +180,6 @@ pub(crate) async fn cluster_manager(
         global_cancel: global_cancel.clone(),
         tls_config: tls_config.clone(),
         peer_reg_tx: peer_reg_tx.clone(),
-        presence: presence.clone(),
     };
 
     for peer_addr in &peers {
@@ -124,7 +197,6 @@ pub(crate) async fn cluster_manager(
         ctx: ctx.clone(),
         peer_reg_tx: peer_reg_tx.clone(),
         global_cancel: global_cancel.clone(),
-        presence: presence.clone(),
     };
     match inbound_links {
         InboundLinks::Listener(listener) => {
@@ -290,6 +362,7 @@ pub(crate) async fn cluster_manager(
                                         Ok(()) => {}
                                         Err(mpsc::error::TrySendError::Full(_)) => {
                                             tracing::warn!("[WSE-Cluster] Peer {peer_addr} backpressure, dropping presence update");
+                                            presence_dirty.insert(peer_addr.clone());
                                         }
                                         Err(mpsc::error::TrySendError::Closed(_)) => {
                                             if let Ok(mut dlq_guard) = dlq.lock() {
@@ -398,11 +471,14 @@ pub(crate) async fn cluster_manager(
             update = interest_rx.recv() => {
                 match update {
                     Some(InterestUpdate::Sub { peer_addr, topic }) => {
-                        // Bounded: a new topic past the cap is dropped.
-                        remote_interest
-                            .entry(peer_addr)
-                            .or_default()
-                            .insert(topic, MAX_REMOTE_INTEREST_PER_PEER);
+                        // Bounded: a new topic past the cap is dropped, and so is
+                        // a name longer than any node subscribes.
+                        if topic.len() <= MAX_TOPIC_LEN {
+                            remote_interest
+                                .entry(peer_addr)
+                                .or_default()
+                                .insert(topic, MAX_REMOTE_INTEREST_PER_PEER);
+                        }
                     }
                     Some(InterestUpdate::Unsub { peer_addr, topic }) => {
                         if let Some(interest) = remote_interest.get_mut(&peer_addr) {
@@ -423,11 +499,14 @@ pub(crate) async fn cluster_manager(
                         let offered = topics.len();
                         let kept = topics
                             .into_iter()
-                            .filter(|t| interest.insert(t.clone(), MAX_REMOTE_INTEREST_PER_PEER))
+                            .filter(|t| {
+                                t.len() <= MAX_TOPIC_LEN
+                                    && interest.insert(t.clone(), MAX_REMOTE_INTEREST_PER_PEER)
+                            })
                             .count();
                         if kept < offered {
                             tracing::warn!(
-                                "[WSE-Cluster] {peer_addr} advertised more than {MAX_REMOTE_INTEREST_PER_PEER} topics; {} ignored",
+                                "[WSE-Cluster] {peer_addr} advertised {} topics past {MAX_REMOTE_INTEREST_PER_PEER} or longer than {MAX_TOPIC_LEN} bytes; ignored",
                                 offered - kept
                             );
                         }
@@ -448,6 +527,7 @@ pub(crate) async fn cluster_manager(
                             }
                             remote_interest.remove(&peer_addr);
                             peer_generation.remove(&peer_addr);
+                            presence_rounds.remove(&peer_addr);
                             draining.remove(&peer_addr);
                             if !static_peers.contains(&peer_addr) {
                                 ctx.known_peers.remove(&peer_addr);
@@ -469,13 +549,29 @@ pub(crate) async fn cluster_manager(
                 match reg {
                     PeerRegistration::Register { peer_addr, write_tx, negotiated_caps } => {
                         // A live session, outbound or inbound, with the caps its
-                        // handshake negotiated.
+                        // handshake negotiated. This node's interest and presence
+                        // go out from here, in the order of every SUB, UNSUB and
+                        // presence update after them: a change made while the
+                        // link came up reaches the peer after its snapshot.
+                        if !queue_whole(&write_tx, &interest_frames(&ctx.local_topic_refcount)) {
+                            tracing::warn!(
+                                "[WSE-Cluster] Could not queue RESYNC for {peer_addr}; the next follows within {CLUSTER_RESYNC_INTERVAL_SECS}s"
+                            );
+                        }
+                        presence_dirty.remove(&peer_addr);
+                        if negotiated_caps & CAP_PRESENCE != 0
+                            && let Some(pm) = &presence
+                            && !queue_whole(&write_tx, &presence_round(pm))
+                        {
+                            presence_dirty.insert(peer_addr.clone());
+                        }
                         peer_txs.retain(|(a, _, _)| a != &peer_addr);
                         peer_txs.push((peer_addr.clone(), write_tx, negotiated_caps));
                         tracing::debug!("[WSE-Cluster] Link up: {peer_addr} (caps=0x{negotiated_caps:08x})");
                     }
                     PeerRegistration::Deregister { peer_addr } => {
                         peer_txs.retain(|(a, _, _)| a != &peer_addr);
+                        presence_dirty.remove(&peer_addr);
                         // A gossip-discovered peer that is no longer dialed can be
                         // discovered again.
                         if !static_peers.contains(&peer_addr) && !dialing.contains_key(&peer_addr) {
@@ -509,11 +605,53 @@ pub(crate) async fn cluster_manager(
                                 tell_presence(&server_cmd_tx, kind, topic, &user_id, &data);
                             }
                         }
-                        PresencePeerFrame::Full { origin, entries } => {
-                            for (topic, user_id, data) in pm.merge_full_state(&entries, &origin) {
+                        PresencePeerFrame::Full { origin, entries, round, generation } => {
+                            if round.is_some_and(|part| part.first) {
+                                presence_rounds.insert(origin.clone(), (generation, HashMap::new()));
+                            }
+                            // A frame of a round whose start was not seen here (an
+                            // older session's) is merged like any full state.
+                            let joined = match presence_rounds.get_mut(&origin) {
+                                Some((session, held)) if round.is_some() && *session == generation => {
+                                    pm.merge_round_frame(&entries, &origin, held)
+                                }
+                                _ => pm.merge_full_state(&entries, &origin),
+                            };
+                            for (topic, user_id, data) in joined {
                                 tell_presence(&server_cmd_tx, "presence_join", topic, &user_id, &data);
                             }
+                            // The round is complete: what it did not hold is gone.
+                            if round.is_some_and(|part| part.last)
+                                && presence_rounds.get(&origin).is_some_and(|(session, _)| *session == generation)
+                                && let Some((_, held)) = presence_rounds.remove(&origin)
+                            {
+                                for (topic, user_id, data) in pm.retain_origin(&origin, &held) {
+                                    tell_presence(&server_cmd_tx, "presence_leave", topic, &user_id, &data);
+                                }
+                            }
                         }
+                    }
+                }
+            }
+            _ = sync_tick.tick() => {
+                // Self-heal: the full interest to every peer (a SUB or UNSUB
+                // dropped on a full link is corrected), and a presence round
+                // to the peers that missed a presence frame.
+                let interest = interest_frames(&ctx.local_topic_refcount);
+                let round = match &presence {
+                    Some(pm) if !presence_dirty.is_empty() => Some(presence_round(pm)),
+                    _ => None,
+                };
+                for (peer_addr, tx, caps) in &peer_txs {
+                    if !queue_whole(tx, &interest) {
+                        tracing::debug!("[WSE-Cluster] {peer_addr} busy; its RESYNC waits a period");
+                    }
+                    if let Some(round) = &round
+                        && caps & CAP_PRESENCE != 0
+                        && presence_dirty.contains(peer_addr)
+                        && queue_whole(tx, round)
+                    {
+                        presence_dirty.remove(peer_addr);
                     }
                 }
             }

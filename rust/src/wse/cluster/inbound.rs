@@ -14,14 +14,15 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::peer::{heartbeat_task, peer_dispatch_task, peer_reader, peer_writer, read_frame};
+use super::peer::{
+    heartbeat_task, peer_dispatch_task, peer_reader, peer_writer, read_frame, tell_disconnected,
+};
 use super::protocol::write_framed;
 use super::{
-    CAP_PRESENCE, ClusterContext, ClusterFrame, ClusterTlsConfig, DispatchItem, InterestUpdate,
-    LOCAL_CAPABILITIES, Link, LinkRefused, MAX_CLUSTER_PEERS, MAX_FRAME_SIZE,
-    PEER_DISPATCH_QUEUE_CAP, PEER_SESSION_GENERATION, PROTOCOL_VERSION, PeerInfo, PeerRegistration,
-    claim_link, encode_hello, encode_peer_announce, encode_peer_list, encode_presence_full,
-    encode_resync, epoch_ms, negotiate_capabilities, negotiate_version, release_link,
+    ClusterContext, ClusterFrame, ClusterTlsConfig, DispatchItem, LOCAL_CAPABILITIES, Link,
+    LinkRefused, MAX_CLUSTER_PEERS, PEER_DISPATCH_QUEUE_CAP, PEER_SESSION_GENERATION,
+    PROTOCOL_VERSION, PeerInfo, PeerRegistration, claim_link, encode_hello, encode_peer_announce,
+    encode_peer_list, epoch_ms, negotiate_capabilities, negotiate_version, release_link,
 };
 
 // ---------------------------------------------------------------------------
@@ -131,7 +132,6 @@ pub(super) struct InboundSessionCtx {
     pub(super) ctx: ClusterContext,
     pub(super) peer_reg_tx: mpsc::UnboundedSender<PeerRegistration>,
     pub(super) global_cancel: CancellationToken,
-    pub(super) presence: Option<Arc<crate::wse::presence::PresenceManager>>,
 }
 
 impl InboundSessionCtx {
@@ -222,7 +222,6 @@ async fn handle_cluster_inbound_generic<S>(
         ctx,
         peer_reg_tx,
         global_cancel,
-        presence,
     } = session;
     let instance_id: &str = &instance_id;
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -299,30 +298,8 @@ async fn handle_cluster_inbound_generic<S>(
         return;
     }
 
-    // Send RESYNC with all current local topics (before spawning writer task)
-    {
-        let local_topics: Vec<String> = {
-            let refcounts = ctx
-                .local_topic_refcount
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            refcounts.keys().cloned().collect()
-        };
-        {
-            // Sent even when empty: until a peer's first RESYNC arrives, it is
-            // sent every publish.
-            let resync_frames = encode_resync(&local_topics);
-            let mut wire_buf = BytesMut::new();
-            for frame in &resync_frames {
-                write_framed(&mut wire_buf, frame);
-            }
-            if writer.write_all(&wire_buf).await.is_err() || writer.flush().await.is_err() {
-                tracing::warn!("[WSE-Cluster] Failed to send RESYNC to inbound {addr}");
-                release_link(&ctx.links, &peer_instance_id, session_gen);
-                return;
-            }
-        }
-    }
+    // This node's interest (RESYNC) and presence follow from the manager once
+    // the link is registered, in order with every change after them.
 
     // Send PEER_ANNOUNCE with our cluster address (if in discovery mode)
     if let Some(ref our_addr) = ctx.cluster_addr {
@@ -344,27 +321,6 @@ async fn handle_cluster_inbound_generic<S>(
             write_framed(&mut list_frame, &list_buf);
             let _ = writer.write_all(&list_frame).await;
             let _ = writer.flush().await;
-        }
-    }
-
-    // Send full presence state to new peer (only if peer supports presence)
-    if peer_caps & CAP_PRESENCE != 0
-        && let Some(pm) = presence
-    {
-        // Chunked so a node with >1 frame of presence still sends its full state
-        // (a single oversized frame was previously dropped, leaving the peer blind).
-        for entries in pm.serialize_full_state_chunked(MAX_FRAME_SIZE - 1024) {
-            let mut buf = BytesMut::new();
-            if encode_presence_full(&mut buf, &entries) {
-                let mut frame = BytesMut::new();
-                write_framed(&mut frame, &buf);
-                if let Err(e) = writer.write_all(&frame).await {
-                    tracing::warn!(
-                        "[WSE-Cluster] Failed to send PresenceFull to inbound {addr}: {e}"
-                    );
-                }
-                let _ = writer.flush().await;
-            }
         }
     }
 
@@ -416,12 +372,7 @@ async fn handle_cluster_inbound_generic<S>(
         (last_activity.clone(), session_gen),
     ));
 
-    let heartbeat_handle = tokio::spawn(heartbeat_task(
-        write_tx,
-        cancel.clone(),
-        last_activity,
-        ctx.local_topic_refcount.clone(),
-    ));
+    let heartbeat_handle = tokio::spawn(heartbeat_task(write_tx, cancel.clone(), last_activity));
 
     // The link ends when any of its tasks ends (each cancels the token as it
     // exits), when a better duplicate replaces it, or on shutdown. Only then
@@ -439,9 +390,6 @@ async fn handle_cluster_inbound_generic<S>(
     release_link(&ctx.links, &peer_instance_id, session_gen);
     ctx.metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
     ctx.metrics.peer_info.remove(&peer_addr_str);
-    let _ = ctx.interest_tx.send(InterestUpdate::PeerDisconnected {
-        peer_addr: peer_addr_str,
-        generation: session_gen,
-    });
+    tell_disconnected(&ctx, peer_addr_str, session_gen, &global_cancel).await;
     tracing::info!("[WSE-Cluster] Inbound peer {addr} disconnected");
 }

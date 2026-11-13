@@ -153,12 +153,12 @@ pub(crate) fn release_link(links: &Links, peer: &str, session: u64) {
 /// Eliminates 15+ repeated arguments from function signatures.
 #[derive(Clone)]
 pub(crate) struct ClusterContext {
-    pub interest_tx: mpsc::UnboundedSender<InterestUpdate>,
+    pub interest_tx: mpsc::Sender<InterestUpdate>,
     pub topics: crate::wse::server::TopicIndex,
     pub metrics: Arc<ClusterMetrics>,
     pub new_peer_tx: mpsc::UnboundedSender<String>,
     pub cmd_tx: mpsc::UnboundedSender<ClusterCommand>,
-    pub presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
+    pub presence_tx: mpsc::Sender<PresencePeerFrame>,
     pub links: Arc<Links>,
     pub known_peers: Arc<DashSet<String>>,
     pub local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
@@ -236,7 +236,18 @@ pub(crate) enum PresencePeerFrame {
         /// Reporting peer's address -- keys the per-origin presence sentinels.
         origin: String,
         entries: String,
+        /// Where the frame stands in a sync round; None from older nodes.
+        round: Option<RoundPart>,
+        /// The link session it came on: a round never spans two.
+        generation: u64,
     },
+}
+
+/// A frame's place in a presence sync round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RoundPart {
+    pub first: bool,
+    pub last: bool,
 }
 
 pub(crate) enum InterestUpdate {

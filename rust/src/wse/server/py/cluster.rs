@@ -125,8 +125,9 @@ impl RustWSEServer {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
         *self.shared.cluster_cmd_tx.write().unwrap() = Some(cmd_tx);
 
-        let (interest_tx, interest_rx) =
-            mpsc::unbounded_channel::<crate::wse::cluster::InterestUpdate>();
+        let (interest_tx, interest_rx) = mpsc::channel::<crate::wse::cluster::InterestUpdate>(
+            crate::wse::cluster::MANAGER_QUEUE_CAP,
+        );
         *self.shared.cluster_main_port.write().unwrap() = main_port_tx;
 
         let instance_id = uuid::Uuid::now_v7().to_string();
@@ -143,7 +144,7 @@ impl RustWSEServer {
         let (placeholder_cmd_tx, _) =
             mpsc::unbounded_channel::<crate::wse::cluster::ClusterCommand>();
         let (placeholder_presence_tx, _) =
-            mpsc::unbounded_channel::<crate::wse::cluster::PresencePeerFrame>();
+            mpsc::channel::<crate::wse::cluster::PresencePeerFrame>(1);
 
         let ctx = crate::wse::cluster::ClusterContext {
             interest_tx,

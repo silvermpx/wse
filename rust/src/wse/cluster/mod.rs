@@ -27,19 +27,22 @@ mod types;
 
 pub(crate) use inbound::InboundLinks;
 pub(crate) use manager::cluster_manager;
+#[cfg(test)]
+pub(crate) use protocol::encode_presence_full;
 pub(crate) use protocol::{
-    ClusterFrame, decode_frame, encode_drain, encode_hello, encode_msg, encode_msg_compressed,
-    encode_msg_with_recovery, encode_peer_announce, encode_peer_list, encode_ping, encode_pong,
-    encode_presence_full, encode_presence_update, encode_resync, encode_shutdown, encode_sub,
-    encode_unsub, negotiate_capabilities, negotiate_version,
+    ClusterFrame, PRESENCE_ROUND, PRESENCE_ROUND_FIRST, PRESENCE_ROUND_LAST, decode_frame,
+    encode_drain, encode_hello, encode_msg, encode_msg_compressed, encode_msg_with_recovery,
+    encode_peer_announce, encode_peer_list, encode_ping, encode_pong, encode_presence_round,
+    encode_presence_update, encode_resync, encode_shutdown, encode_sub, encode_unsub,
+    negotiate_capabilities, negotiate_version,
 };
 pub(crate) use tls::{ClusterTlsConfig, build_cluster_tls};
 #[cfg(test)]
 use types::Links;
 pub(crate) use types::{
     ClusterCommand, ClusterContext, ClusterDlq, ClusterDlqEntry, ClusterMetrics, InterestUpdate,
-    Link, LinkRefused, PeerInfo, PeerInterest, PeerRegistration, PresencePeerFrame, claim_link,
-    release_link,
+    Link, LinkRefused, PeerInfo, PeerInterest, PeerRegistration, PresencePeerFrame, RoundPart,
+    claim_link, release_link,
 };
 
 use std::sync::atomic::AtomicU64;
@@ -64,11 +67,16 @@ pub(crate) const PROTOCOL_VERSION: u16 = 1;
 pub(crate) const MAX_FRAME_SIZE: usize = 1_048_576; // 1MB
 pub(crate) const HEARTBEAT_INTERVAL_SECS: u64 = 5;
 pub(crate) const HEARTBEAT_TIMEOUT_SECS: u64 = 15;
-/// How often each peer link re-sends its full local interest (RESYNC). SUB/UNSUB
-/// deltas are best-effort (try_send drops under back-pressure), so a dropped one
-/// would otherwise leave the peer's view of our interest permanently wrong; the
-/// periodic full set heals it.
+/// How often the manager re-sends this node's full interest (RESYNC) to every
+/// peer, and a presence sync round to the peers that missed a presence
+/// frame. SUB/UNSUB and presence deltas are best-effort (try_send drops under
+/// back-pressure), so a dropped one would otherwise leave the peer's view of
+/// this node wrong for good; the periodic full set heals it.
 pub(crate) const CLUSTER_RESYNC_INTERVAL_SECS: u64 = 60;
+/// Interest and presence updates the peer links hand to the manager, queued
+/// at most: a peer sending them faster than the manager keeps up is slowed
+/// down at its socket instead of growing the queue.
+pub(crate) const MANAGER_QUEUE_CAP: usize = 65_536;
 pub(crate) const MAX_BATCH_BYTES: usize = 65_536;
 
 /// Monotonic generation counter for peer sessions. Prevents stale RESYNC
@@ -101,8 +109,9 @@ pub(crate) const CAP_RECOVERY: u32 = 1 << 3; // Cross-node recovery
 pub(crate) const LOCAL_CAPABILITIES: u32 =
     CAP_INTEREST_ROUTING | CAP_COMPRESSION | CAP_PRESENCE | CAP_RECOVERY;
 
-// Per-frame flags (bit 0 of the flags byte in every frame header)
-// bit 0: compressed (zstd), bit 1: has recovery trailer, bits 2-7: reserved
+// Per-frame flags of MSG frames (the flags byte of the frame header)
+// bit 0: compressed (zstd), bit 1: has recovery trailer, bits 2-7: reserved.
+// PRESENCE_FULL frames carry their sync round bits there (protocol.rs).
 const FLAG_COMPRESSED: u8 = 0x01;
 const FLAG_HAS_RECOVERY: u8 = 0x02;
 

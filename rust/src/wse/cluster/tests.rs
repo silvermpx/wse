@@ -1081,8 +1081,9 @@ fn test_encode_decode_presence_full() {
     assert!(ok);
     let frame = decode_frame(buf).unwrap();
     match frame {
-        ClusterFrame::PresenceFull { entries } => {
+        ClusterFrame::PresenceFull { entries, flags } => {
             assert_eq!(entries, json);
+            assert_eq!(flags, 0);
         }
         other => panic!("Expected PresenceFull, got {:?}", other),
     }
@@ -1095,7 +1096,7 @@ fn test_encode_decode_presence_full_empty() {
     assert!(ok);
     let frame = decode_frame(buf).unwrap();
     match frame {
-        ClusterFrame::PresenceFull { entries } => {
+        ClusterFrame::PresenceFull { entries, .. } => {
             assert_eq!(entries, "{}");
         }
         other => panic!("Expected PresenceFull, got {:?}", other),
@@ -1553,4 +1554,71 @@ fn peer_interest_routes_exact_topics_and_patterns_within_its_cap() {
     interest.remove("chat.general");
     assert!(!interest.wants("chat.general"));
     assert_eq!(interest.len(), 1);
+}
+
+#[test]
+fn presence_rounds_carry_their_edges() {
+    let mut buf = BytesMut::new();
+    assert!(encode_presence_round(
+        &mut buf,
+        "{}",
+        PRESENCE_ROUND_FIRST | PRESENCE_ROUND_LAST
+    ));
+    match decode_frame(buf).unwrap() {
+        ClusterFrame::PresenceFull { entries, flags } => {
+            assert_eq!(entries, "{}");
+            assert_eq!(
+                flags,
+                PRESENCE_ROUND | PRESENCE_ROUND_FIRST | PRESENCE_ROUND_LAST
+            );
+        }
+        other => panic!("Expected PresenceFull, got {other:?}"),
+    }
+}
+
+/// The flags of every frame of the round `pm` sends now.
+fn round_flags(pm: &crate::wse::presence::PresenceManager) -> Vec<u8> {
+    super::manager::presence_round(pm)
+        .into_iter()
+        .map(|frame| match decode_frame(BytesMut::from(&frame[..])) {
+            Some(ClusterFrame::PresenceFull { flags, .. }) => flags,
+            other => panic!("Expected PresenceFull, got {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn a_presence_round_marks_its_first_and_last_frame() {
+    const ONLY: u8 = PRESENCE_ROUND | PRESENCE_ROUND_FIRST | PRESENCE_ROUND_LAST;
+    let pm = crate::wse::presence::PresenceManager::new(65_536, 0);
+    // Nothing present is a round too: it clears what the peer held.
+    assert_eq!(round_flags(&pm), [ONLY]);
+
+    let big = serde_json::json!({ "bio": "x".repeat(60_000) });
+    for i in 0..40 {
+        let conn = format!("conn{i}");
+        pm.register_connection(&conn, &format!("user{i}"));
+        pm.track(&conn, "room", &big);
+    }
+    let flags = round_flags(&pm);
+    assert!(flags.len() > 1, "the state spans several frames");
+    assert_eq!(flags[0], PRESENCE_ROUND | PRESENCE_ROUND_FIRST);
+    assert_eq!(*flags.last().unwrap(), PRESENCE_ROUND | PRESENCE_ROUND_LAST);
+    assert!(
+        flags[1..flags.len() - 1]
+            .iter()
+            .all(|f| *f == PRESENCE_ROUND)
+    );
+}
+
+#[test]
+fn snapshots_are_queued_whole_or_not_at_all() {
+    let (tx, mut rx) = mpsc::channel::<Bytes>(3);
+    tx.try_send(Bytes::from_static(b"a")).unwrap();
+    tx.try_send(Bytes::from_static(b"b")).unwrap();
+    let frames = [Bytes::from_static(b"1"), Bytes::from_static(b"2")];
+    assert!(!super::manager::queue_whole(&tx, &frames));
+    assert!(super::manager::queue_whole(&tx, &frames[..1]));
+    let queued: Vec<Bytes> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert_eq!(queued, [&b"a"[..], &b"b"[..], &b"1"[..]]);
 }

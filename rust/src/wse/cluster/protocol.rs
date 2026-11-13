@@ -400,8 +400,28 @@ pub(crate) fn encode_presence_update(
     true
 }
 
-/// Encode a PRESENCE_FULL frame (full presence state sync).
+/// PRESENCE_FULL flags of a sync round: its frames carry the sender's whole
+/// local presence, from the first frame to the last, and whatever the
+/// receiver holds for the sender outside them is gone. Older nodes ignore
+/// the flags and merge every frame as it comes, like a frame without them.
+pub(crate) const PRESENCE_ROUND: u8 = 0x04;
+pub(crate) const PRESENCE_ROUND_FIRST: u8 = 0x01;
+pub(crate) const PRESENCE_ROUND_LAST: u8 = 0x02;
+
+/// Encode a PRESENCE_FULL frame outside any round: what older nodes send, a
+/// full state merged as it comes.
+#[cfg(test)]
 pub(crate) fn encode_presence_full(buf: &mut BytesMut, entries_json: &str) -> bool {
+    encode_presence_frame(buf, entries_json, 0)
+}
+
+/// Encode one PRESENCE_FULL frame of a sync round; `edges` holds
+/// PRESENCE_ROUND_FIRST and/or PRESENCE_ROUND_LAST.
+pub(crate) fn encode_presence_round(buf: &mut BytesMut, entries_json: &str, edges: u8) -> bool {
+    encode_presence_frame(buf, entries_json, PRESENCE_ROUND | edges)
+}
+
+fn encode_presence_frame(buf: &mut BytesMut, entries_json: &str, flags: u8) -> bool {
     let payload_bytes = entries_json.as_bytes();
     let total_frame = 8 + payload_bytes.len();
     if total_frame > MAX_FRAME_SIZE {
@@ -413,7 +433,7 @@ pub(crate) fn encode_presence_full(buf: &mut BytesMut, entries_json: &str) -> bo
     let topic_len: u16 = 0; // No topic for full sync
     buf.reserve(total_frame);
     buf.put_u8(MsgType::PresenceFull as u8);
-    buf.put_u8(0); // flags
+    buf.put_u8(flags);
     buf.put_u16_le(topic_len);
     buf.put_u32_le(payload_bytes.len() as u32);
     buf.put_slice(payload_bytes);
@@ -476,6 +496,8 @@ pub(crate) enum ClusterFrame {
     },
     PresenceFull {
         entries: String,
+        /// PRESENCE_ROUND bits; 0 from older nodes.
+        flags: u8,
     },
     /// Graceful drain: this node is shutting down, migrate connections.
     Drain,
@@ -674,7 +696,7 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                 return None;
             }
             let entries = String::from_utf8(data.split_to(payload_len).to_vec()).ok()?;
-            Some(ClusterFrame::PresenceFull { entries })
+            Some(ClusterFrame::PresenceFull { entries, flags })
         }
         None => {
             // Unknown message type from a newer peer -- safe to skip

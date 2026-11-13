@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dashmap::DashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Wall-clock time in milliseconds since UNIX epoch.
 pub(crate) fn epoch_ms() -> u64 {
@@ -702,13 +702,35 @@ impl PresenceManager {
         false
     }
 
-    /// Merge full presence state from a peer (called on peer connect).
+    /// Merge full presence state from a peer, as it comes (older nodes send
+    /// it so on connect).
     /// Expected JSON format: {"topic": {"user_id": {"data": {...}, "updated_at": 123}}}
     /// Returns (topic, user_id, data) of the users who were not present before.
     pub fn merge_full_state(
         &self,
         entries_json: &str,
         origin: &str,
+    ) -> Vec<(String, String, serde_json::Value)> {
+        self.merge_entries(entries_json, origin, None)
+    }
+
+    /// Merge one frame of a sync round from `origin` like a full state, and
+    /// note each user it holds, per topic, in `held` for the round's end
+    /// (`retain_origin`).
+    pub fn merge_round_frame(
+        &self,
+        entries_json: &str,
+        origin: &str,
+        held: &mut HashMap<String, HashSet<String>>,
+    ) -> Vec<(String, String, serde_json::Value)> {
+        self.merge_entries(entries_json, origin, Some(held))
+    }
+
+    fn merge_entries(
+        &self,
+        entries_json: &str,
+        origin: &str,
+        mut held: Option<&mut HashMap<String, HashSet<String>>>,
     ) -> Vec<(String, String, serde_json::Value)> {
         let mut joined = Vec::new();
         // Cap incoming full state to 10MB to prevent OOM
@@ -741,6 +763,11 @@ impl PresenceManager {
                     .get("updated_at")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
+                if let Some(held) = held.as_deref_mut() {
+                    held.entry(topic.clone())
+                        .or_default()
+                        .insert(user_id.clone());
+                }
                 if self.merge_remote_join(topic, user_id, &data, updated_at, origin) {
                     joined.push((topic.clone(), user_id.clone(), data));
                 }
@@ -755,6 +782,30 @@ impl PresenceManager {
     /// "ghost" members present forever and drift membership counts upward.
     /// Returns (topic, user_id, data) of the users gone with it.
     pub fn purge_origin(&self, origin: &str) -> Vec<(String, String, serde_json::Value)> {
+        self.drop_origin_where(origin, |_, _| true)
+    }
+
+    /// The end of a sync round from `origin`: drop its sentinels of every
+    /// user the round did not hold (`held`, per topic), so a leave lost on
+    /// the way leaves no ghost. Returns (topic, user_id, data) of the users
+    /// gone with them.
+    pub fn retain_origin(
+        &self,
+        origin: &str,
+        held: &HashMap<String, HashSet<String>>,
+    ) -> Vec<(String, String, serde_json::Value)> {
+        self.drop_origin_where(origin, |topic, user| {
+            !held.get(topic).is_some_and(|users| users.contains(user))
+        })
+    }
+
+    /// Drop the sentinels of `origin` for the users `gone(topic, user)`
+    /// names; users left with no connection are removed and returned.
+    fn drop_origin_where(
+        &self,
+        origin: &str,
+        gone_user: impl Fn(&str, &str) -> bool,
+    ) -> Vec<(String, String, serde_json::Value)> {
         let prefix = remote_origin_prefix(origin);
         let mut thinned_topics: Vec<String> = Vec::new();
         let mut gone = Vec::new();
@@ -765,6 +816,9 @@ impl PresenceManager {
             let mut emptied_users: Vec<String> = Vec::new();
 
             for mut user_entry in topic_map.iter_mut() {
+                if !gone_user(topic, user_entry.key()) {
+                    continue;
+                }
                 let before = user_entry.connections.len();
                 user_entry
                     .connections
@@ -821,11 +875,10 @@ impl PresenceManager {
     /// local connection are included (remote sentinels are not re-synced).
     ///
     /// The receiver merges each chunk additively (per-user via merge_remote_join),
-    /// so several partial chunks reconstruct the same set as a single frame would
-    /// -- no continuation flag or reassembly buffer is needed. This replaces a
-    /// single-frame serialization that was SILENTLY DROPPED when a busy node's
-    /// full state exceeded the max cluster frame size, leaving a joining peer
-    /// with no initial presence at all (only future deltas).
+    /// so several partial chunks reconstruct the same set as a single frame would;
+    /// sent as a sync round, the round's end also drops what none of its chunks
+    /// held. One frame for the whole state would be dropped once a busy node's
+    /// state passed the cluster frame limit, leaving a joining peer blind.
     pub fn serialize_full_state_chunked(&self, max_payload_bytes: usize) -> Vec<String> {
         let mut chunks: Vec<String> = Vec::new();
         let mut current = serde_json::Map::new();
@@ -1034,6 +1087,43 @@ mod tests {
         let stats = mgr.topic_presence_stats.get("room").expect("stats exist");
         assert_eq!(stats.num_users.load(Ordering::Relaxed), 1);
         assert_eq!(stats.num_connections.load(Ordering::Relaxed), 1);
+    }
+
+    // A sync round keeps of its origin exactly what it held: a leave lost on
+    // the way leaves no ghost, and a user also on another peer stays.
+    #[test]
+    fn a_sync_round_drops_what_it_did_not_hold() {
+        let mgr = PresenceManager::new(4096, 0);
+        for user in ["alice", "bob", "dave"] {
+            mgr.merge_remote_join("room", user, &data(), 10, "peerA");
+        }
+        mgr.merge_remote_join("lobby", "carol", &data(), 10, "peerA");
+        mgr.merge_remote_join("room", "dave", &data(), 10, "peerB");
+
+        // peerA's round in two frames: alice, and erin who is new.
+        let mut held = HashMap::new();
+        let first = r#"{"room": {"alice": {"data": {}, "updated_at": 20}}}"#;
+        assert!(mgr.merge_round_frame(first, "peerA", &mut held).is_empty());
+        let last = r#"{"room": {"erin": {"data": {}, "updated_at": 20}}}"#;
+        let joined = mgr.merge_round_frame(last, "peerA", &mut held);
+        assert_eq!(
+            joined.iter().map(|j| j.1.as_str()).collect::<Vec<_>>(),
+            ["erin"]
+        );
+
+        let mut gone: Vec<String> = mgr
+            .retain_origin("peerA", &held)
+            .into_iter()
+            .map(|(topic, user, _)| format!("{topic}/{user}"))
+            .collect();
+        gone.sort();
+        assert_eq!(gone, ["lobby/carol", "room/bob"]);
+        assert_eq!(members(&mgr, "room"), ["alice", "dave", "erin"]);
+        let room = mgr.topic_presence.get("room").expect("room");
+        let dave = room.get("dave").expect("dave stays on peerB");
+        assert_eq!(dave.connections.len(), 1);
+        assert!(dave.connections[0].conn_id.contains("peerB"));
+        assert!(mgr.topic_presence.get("lobby").is_none());
     }
 
     // Full-state sync is chunked, so a node with more presence than fits in one
