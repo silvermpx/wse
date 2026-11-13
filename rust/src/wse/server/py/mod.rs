@@ -239,11 +239,11 @@ impl RustWSEServer {
         if let Some(ref key) = jwt.jwt_private_key {
             jwt::check_signing_key(jwt_alg, key).map_err(|e| key_error("jwt_private_key", e))?;
         }
-        drop(jwt.jwt_private_key);
         let jwt_config = jwt.jwt_secret.map(|secret| JwtConfig {
             algorithm: jwt_alg,
             secret: Zeroizing::new(secret),
             previous_secret: jwt.jwt_previous_secret.map(Zeroizing::new),
+            signing_key: jwt.jwt_private_key.map(Zeroizing::new),
             key_id: jwt.jwt_key_id,
             issuer: jwt.jwt_issuer.unwrap_or_default(),
             audience: jwt.jwt_audience.unwrap_or_default(),
@@ -703,6 +703,60 @@ impl RustWSEServer {
             .load(Ordering::Relaxed)
     }
 
+    /// Sign a token for user `sub` with this server's configuration: its
+    /// algorithm and key (the HMAC secret, or `jwt_private_key` for the
+    /// asymmetric algorithms), `jwt_key_id`, and its issuer and audience when
+    /// set. Valid for `ttl` seconds; `claims` adds or overrides others.
+    /// Raises RuntimeError on a server without jwt_secret, or with an
+    /// asymmetric algorithm but no jwt_private_key.
+    #[pyo3(signature = (sub, ttl = 900, claims = None))]
+    fn issue_token(
+        &self,
+        sub: &str,
+        ttl: u64,
+        claims: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<String> {
+        let holder = self.shared.jwt_config.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err("this server does not validate tokens (no jwt_secret)")
+        })?;
+        let cfg = holder.load();
+        let key: &[u8] = match cfg.algorithm.key_kind() {
+            jwt::KeyKind::Secret { .. } => &cfg.secret,
+            _ => cfg.signing_key.as_deref().ok_or_else(|| {
+                PyRuntimeError::new_err(format!(
+                    "{:?} signs with jwt_private_key, which this server was not given",
+                    cfg.algorithm
+                ))
+            })?,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut token = serde_json::Map::new();
+        token.insert("iat".into(), now.into());
+        token.insert("exp".into(), now.saturating_add(ttl).into());
+        if !cfg.issuer.is_empty() {
+            token.insert("iss".into(), cfg.issuer.clone().into());
+        }
+        if !cfg.audience.is_empty() {
+            token.insert("aud".into(), cfg.audience.clone().into());
+        }
+        if let Some(claims) = claims
+            && let serde_json::Value::Object(extra) = jwt::pydict_to_json(claims)?
+        {
+            token.extend(extra);
+        }
+        token.insert("sub".into(), sub.into());
+        jwt::jwt_encode(
+            &serde_json::Value::Object(token),
+            key,
+            cfg.algorithm,
+            cfg.key_id.as_deref(),
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("JWT encode error: {e}")))
+    }
+
     /// Replace the JWT verification keys without a restart, for a key
     /// rotation: `jwt_secret` (the HMAC secret, or the public key of the
     /// asymmetric algorithms) and optionally `jwt_previous_secret`, accepted
@@ -710,12 +764,13 @@ impl RustWSEServer {
     /// audience and cookie name stay. Open connections are not affected; new
     /// ones are checked with the new keys. Raises RuntimeError on a server
     /// without jwt_secret, ValueError for a key that does not fit.
-    #[pyo3(signature = (jwt_secret, jwt_previous_secret = None, jwt_key_id = None))]
+    #[pyo3(signature = (jwt_secret, jwt_previous_secret = None, jwt_key_id = None, jwt_private_key = None))]
     fn reload_jwt_keys(
         &self,
         jwt_secret: Vec<u8>,
         jwt_previous_secret: Option<Vec<u8>>,
         jwt_key_id: Option<String>,
+        jwt_private_key: Option<Vec<u8>>,
     ) -> PyResult<()> {
         let holder = self.shared.jwt_config.as_ref().ok_or_else(|| {
             PyRuntimeError::new_err("this server does not validate tokens (no jwt_secret)")
@@ -730,10 +785,16 @@ impl RustWSEServer {
             jwt::check_verification_key(alg, key)
                 .map_err(|e| key_error("jwt_previous_secret", e))?;
         }
+        if let Some(ref key) = jwt_private_key {
+            jwt::check_signing_key(alg, key).map_err(|e| key_error("jwt_private_key", e))?;
+        }
         holder.store(Arc::new(JwtConfig {
             algorithm: alg,
             secret: Zeroizing::new(jwt_secret),
             previous_secret: jwt_previous_secret.map(Zeroizing::new),
+            signing_key: jwt_private_key
+                .map(Zeroizing::new)
+                .or_else(|| current.signing_key.clone()),
             key_id: jwt_key_id.or_else(|| current.key_id.clone()),
             issuer: current.issuer.clone(),
             audience: current.audience.clone(),

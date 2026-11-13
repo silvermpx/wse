@@ -60,7 +60,7 @@ server = RustWSEServer(
     port=5006,
     jwt_secret=open("public_key.pem", "rb").read(),      # RSA public key (PEM)
     jwt_algorithm="RS256",
-    # jwt_private_key=open("private_key.pem", "rb").read(), # only if server needs to encode tokens
+    # jwt_private_key=open("private_key.pem", "rb").read(), # only for server.issue_token()
     jwt_issuer="auth-service",
     jwt_audience="my-api",
 )
@@ -71,7 +71,7 @@ server = RustWSEServer(
     port=5006,
     jwt_secret=open("ec_public.pem", "rb").read(),       # EC P-256 public key (PEM)
     jwt_algorithm="ES256",
-    # jwt_private_key=open("ec_private.pem", "rb").read(),  # only if server needs to encode tokens
+    # jwt_private_key=open("ec_private.pem", "rb").read(),  # only for server.issue_token()
     jwt_issuer="auth-service",
     jwt_audience="my-api",
 )
@@ -95,6 +95,8 @@ The Rust server extracts the JWT from cookies (configured via `jwt_cookie_name`)
 | HS256 (default) | Symmetric | Shared secret (>= 32 bytes) | Not needed |
 | RS256 | Asymmetric | RSA public key (PEM) | RSA private key (PEM, for encoding) |
 | ES256 | Asymmetric | EC P-256 public key (PEM) | EC P-256 private key (PEM, for encoding) |
+
+**Issuing tokens:** `server.issue_token(sub, ttl=900, claims=None)` signs a token with the server's own configuration (algorithm, key, `jwt_key_id`, issuer and audience), for a login endpoint in the same process. The HMAC algorithms sign with `jwt_secret`; the asymmetric ones need `jwt_private_key`, kept in memory that is wiped when the server is dropped.
 
 **Key requirements:** HS256 secret must be >= 32 bytes (RFC 7518). RS256/ES256 keys must be valid PEM. Tokens without `exp` are rejected.
 

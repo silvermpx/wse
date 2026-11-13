@@ -317,3 +317,43 @@ class TestConversion:
             # Shared, not cyclic: fine.
             shared = {"k": 1}
             assert server.send_event(conn_id, {"t": "x", "p": {"a": shared, "b": shared}}) > 0
+
+
+class TestIssueToken:
+    @pytest.mark.asyncio
+    async def test_tokens_the_server_issues_are_accepted(self, server, server_port):
+        token = server.issue_token("erin", ttl=60, claims={"role": "admin"})
+        async with await connect(server_port, token):
+            assert drain_until(server, "auth_connect")[2] == "erin"
+
+    def test_asymmetric_algorithms_need_the_private_key(self, server_port):
+        ec = pytest.importorskip("cryptography.hazmat.primitives.asymmetric.ec")
+        serialization = pytest.importorskip("cryptography.hazmat.primitives.serialization")
+        private = ec.generate_private_key(ec.SECP256R1())
+        public_pem = private.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        private_pem = private.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        verify_only = RustWSEServer(
+            "127.0.0.1", server_port, jwt_secret=public_pem, jwt_algorithm="ES256"
+        )
+        with pytest.raises(RuntimeError, match="jwt_private_key"):
+            verify_only.issue_token("erin")
+        signing = RustWSEServer(
+            "127.0.0.1",
+            server_port,
+            jwt_secret=public_pem,
+            jwt_algorithm="ES256",
+            jwt_private_key=private_pem,
+            jwt_issuer="me",
+        )
+        from wse_server._wse_accel import rust_jwt_decode
+
+        claims = rust_jwt_decode(
+            signing.issue_token("erin", ttl=60), public_pem, algorithm="ES256", issuer="me"
+        )
+        assert claims["sub"] == "erin" and claims["iss"] == "me"

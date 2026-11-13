@@ -25,7 +25,7 @@ server = RustWSEServer(
     jwt_previous_secret=None,          # optional: old secret for zero-downtime rotation
     jwt_key_id=None,                   # optional: expected kid header claim
     # jwt_algorithm="RS256",           # optional: any of HS256/384/512, RS*, PS*, ES256/384, EdDSA
-    # jwt_private_key=open("key.pem", "rb").read(),  # optional: private key for token encoding
+    # jwt_private_key=open("key.pem", "rb").read(),  # optional: server.issue_token() signs with it
 )
 server.enable_drain_mode()
 server.start()

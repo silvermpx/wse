@@ -206,9 +206,9 @@ pub struct JwtConfig {
     /// For HS256: previous shared secret for key rotation.
     /// For RS256/ES256: previous public key in PEM format.
     pub previous_secret: Option<Zeroizing<Vec<u8>>>,
-    // private_key validated at startup but not stored -- PyO3 rust_jwt_encode
-    // takes the key directly as an argument. Keeping key material out of
-    // long-lived SharedState reduces exposure in crash dumps.
+    /// For the asymmetric algorithms: the private key `issue_token()` signs
+    /// with (PEM). The HMAC algorithms sign with `secret`.
+    pub signing_key: Option<Zeroizing<Vec<u8>>>,
     pub key_id: Option<String>,
     pub issuer: String,
     pub audience: String,
@@ -539,7 +539,7 @@ pub fn rust_jwt_encode(
 
 use pyo3::types::{PyBool, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyString, PyTuple};
 
-fn pydict_to_json(dict: &Bound<'_, PyDict>) -> PyResult<serde_json::Value> {
+pub(crate) fn pydict_to_json(dict: &Bound<'_, PyDict>) -> PyResult<serde_json::Value> {
     let mut map = serde_json::Map::new();
     for (k, v) in dict.iter() {
         let key = k.extract::<String>().unwrap_or_else(|_| format!("{}", k));
@@ -717,6 +717,7 @@ mod tests {
             algorithm: JwtAlgorithm::HS256,
             secret: Zeroizing::new(test_secret()),
             previous_secret: None,
+            signing_key: None,
             key_id: None,
             issuer: "wse-test".to_string(),
             audience: "wse-test-api".to_string(),
@@ -921,6 +922,7 @@ mod tests {
             algorithm: JwtAlgorithm::HS256,
             secret: Zeroizing::new(secret.clone()),
             previous_secret: None,
+            signing_key: None,
             key_id: None,
             issuer: String::new(),
             audience: String::new(),
@@ -1027,6 +1029,7 @@ mod tests {
             algorithm: JwtAlgorithm::HS256,
             secret: Zeroizing::new(new_secret),
             previous_secret: Some(Zeroizing::new(old_secret)),
+            signing_key: None,
             key_id: None,
             issuer: "wse-test".to_string(),
             audience: "wse-test-api".to_string(),
@@ -1052,6 +1055,7 @@ mod tests {
             algorithm: JwtAlgorithm::HS256,
             secret: Zeroizing::new(b"current-secret-key-32-bytes-ok!!".to_vec()),
             previous_secret: Some(Zeroizing::new(b"previous-secret-key-32bytes-ok!!".to_vec())),
+            signing_key: None,
             key_id: None,
             issuer: "wse-test".to_string(),
             audience: "wse-test-api".to_string(),
@@ -1082,6 +1086,7 @@ mod tests {
             algorithm: JwtAlgorithm::HS256,
             secret: Zeroizing::new(secret),
             previous_secret: None,
+            signing_key: None,
             key_id: Some("key-2024-03".to_string()),
             issuer: String::new(),
             audience: String::new(),
@@ -1105,6 +1110,7 @@ mod tests {
             algorithm: JwtAlgorithm::HS256,
             secret: Zeroizing::new(secret),
             previous_secret: None,
+            signing_key: None,
             key_id: Some("key-new".to_string()),
             issuer: String::new(),
             audience: String::new(),
@@ -1128,6 +1134,7 @@ mod tests {
             algorithm: JwtAlgorithm::HS256,
             secret: Zeroizing::new(secret),
             previous_secret: None,
+            signing_key: None,
             key_id: Some("expected-kid".to_string()),
             issuer: String::new(),
             audience: String::new(),
@@ -1150,6 +1157,7 @@ mod tests {
             algorithm: JwtAlgorithm::HS256,
             secret: Zeroizing::new(secret),
             previous_secret: None,
+            signing_key: None,
             key_id: None,
             issuer: String::new(),
             audience: String::new(),
@@ -1180,6 +1188,7 @@ mod tests {
             algorithm: JwtAlgorithm::RS256,
             secret: Zeroizing::new(RSA_PUBLIC_KEY.to_vec()),
             previous_secret: None,
+            signing_key: None,
             key_id: None,
             issuer: "test".to_string(),
             audience: "test-api".to_string(),
@@ -1204,6 +1213,7 @@ mod tests {
             algorithm: JwtAlgorithm::RS256,
             secret: Zeroizing::new(RSA2_PUBLIC_KEY.to_vec()),
             previous_secret: None,
+            signing_key: None,
             key_id: None,
             issuer: String::new(),
             audience: String::new(),
@@ -1228,6 +1238,7 @@ mod tests {
             algorithm: JwtAlgorithm::RS256,
             secret: Zeroizing::new(RSA2_PUBLIC_KEY.to_vec()),
             previous_secret: Some(Zeroizing::new(RSA_PUBLIC_KEY.to_vec())),
+            signing_key: None,
             key_id: None,
             issuer: String::new(),
             audience: String::new(),
@@ -1260,6 +1271,7 @@ mod tests {
             algorithm: JwtAlgorithm::RS256,
             secret: Zeroizing::new(RSA_PUBLIC_KEY.to_vec()),
             previous_secret: None,
+            signing_key: None,
             key_id: Some("rsa-key-1".to_string()),
             issuer: String::new(),
             audience: String::new(),
@@ -1289,6 +1301,7 @@ mod tests {
             algorithm: JwtAlgorithm::ES256,
             secret: Zeroizing::new(EC_PUBLIC_KEY.to_vec()),
             previous_secret: None,
+            signing_key: None,
             key_id: None,
             issuer: "test".to_string(),
             audience: "test-api".to_string(),
@@ -1311,6 +1324,7 @@ mod tests {
             algorithm: JwtAlgorithm::ES256,
             secret: Zeroizing::new(EC2_PUBLIC_KEY.to_vec()),
             previous_secret: None,
+            signing_key: None,
             key_id: None,
             issuer: String::new(),
             audience: String::new(),
@@ -1333,6 +1347,7 @@ mod tests {
             algorithm: JwtAlgorithm::ES256,
             secret: Zeroizing::new(EC2_PUBLIC_KEY.to_vec()),
             previous_secret: Some(Zeroizing::new(EC_PUBLIC_KEY.to_vec())),
+            signing_key: None,
             key_id: None,
             issuer: String::new(),
             audience: String::new(),
@@ -1365,6 +1380,7 @@ mod tests {
             algorithm: JwtAlgorithm::ES256,
             secret: Zeroizing::new(EC_PUBLIC_KEY.to_vec()),
             previous_secret: None,
+            signing_key: None,
             key_id: Some("ec-key-1".to_string()),
             issuer: String::new(),
             audience: String::new(),
@@ -1390,6 +1406,7 @@ mod tests {
             algorithm: JwtAlgorithm::RS256,
             secret: Zeroizing::new(RSA_PUBLIC_KEY.to_vec()),
             previous_secret: None,
+            signing_key: None,
             key_id: None,
             issuer: String::new(),
             audience: String::new(),
@@ -1412,6 +1429,7 @@ mod tests {
             algorithm: JwtAlgorithm::ES256,
             secret: Zeroizing::new(EC_PUBLIC_KEY.to_vec()),
             previous_secret: None,
+            signing_key: None,
             key_id: None,
             issuer: String::new(),
             audience: String::new(),

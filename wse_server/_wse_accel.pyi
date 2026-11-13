@@ -530,11 +530,22 @@ class RustWSEServer:
         Returns False (and stores nothing) when the connection is gone.
         """
         ...
+    def issue_token(self, sub: str, ttl: int = 900, claims: dict[str, Any] | None = None) -> str:
+        """Sign a token for user sub with this server's configuration.
+
+        The algorithm and key (the HMAC secret, or jwt_private_key for the
+        asymmetric algorithms), jwt_key_id, and the issuer and audience when
+        set. Valid for ttl seconds; claims adds or overrides others. Raises
+        RuntimeError on a server without jwt_secret, or with an asymmetric
+        algorithm but no jwt_private_key.
+        """
+        ...
     def reload_jwt_keys(
         self,
         jwt_secret: bytes,
         jwt_previous_secret: bytes | None = None,
         jwt_key_id: str | None = None,
+        jwt_private_key: bytes | None = None,
     ) -> None:
         """Replace the JWT verification keys without a restart.
 

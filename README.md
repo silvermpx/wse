@@ -178,7 +178,7 @@ token = rust_jwt_encode(
 | `jwt_previous_secret` | None | Previous key for zero-downtime rotation. HS256: previous secret. RS256/ES256: previous public key PEM |
 | `jwt_key_id` | None | Expected `kid` header claim. Rejects tokens with mismatched key ID |
 | `jwt_algorithm` | None | JWT algorithm the server expects: `"HS256"` (default), `"HS384"`, `"HS512"`, `"RS256"`, `"RS384"`, `"RS512"`, `"PS256"`, `"PS384"`, `"PS512"`, `"ES256"`, `"ES384"` or `"EdDSA"`. The token's own `alg` header never overrides it. |
-| `jwt_private_key` | None | PEM private key for RS256/ES256 token encoding. Not needed for HS256 |
+| `jwt_private_key` | None | PEM private key `issue_token()` signs with for the asymmetric algorithms (RS*, PS*, ES*, EdDSA). Not needed for the HMAC ones (HS*), which sign with `jwt_secret` |
 | `max_inbound_queue_size` | 131072 | Client messages waiting for the application (drain queue or running callbacks) before new ones are dropped; connect, disconnect and presence events are never dropped |
 | `recovery_enabled` | False | Enable per-topic message recovery buffers |
 | `recovery_buffer_size` | 128 | Ring buffer slots per topic (rounded to power-of-2) |
