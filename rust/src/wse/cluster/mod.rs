@@ -89,8 +89,8 @@ pub(crate) const MAX_REMOTE_INTEREST_PER_PEER: usize = 1_000_000;
 pub(crate) const PROTOCOL_VERSION_MIN: u16 = 1;
 
 // Capability flags (negotiated via bitwise AND of both peers' values)
-pub(crate) const CAP_INTEREST_ROUTING: u32 = 1 << 0; // Phase 2: SUB/UNSUB
-pub(crate) const CAP_COMPRESSION: u32 = 1 << 1; // Phase 6: zstd compression
+pub(crate) const CAP_INTEREST_ROUTING: u32 = 1 << 0; // SUB/UNSUB interest routing
+pub(crate) const CAP_COMPRESSION: u32 = 1 << 1; // zstd frame compression
 pub(crate) const CAP_PRESENCE: u32 = 1 << 2; // Presence sync
 pub(crate) const CAP_RECOVERY: u32 = 1 << 3; // Cross-node recovery
 

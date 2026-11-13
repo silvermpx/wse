@@ -51,7 +51,7 @@ impl RustWSEServer {
     ) -> PyResult<usize> {
         let cmd_tx = self.command_tx()?;
 
-        // #7: Dedup — skip if this event ID was already sent
+        // Dedup: skip if this event ID was already sent
         if let Ok(Some(id_val)) = event.get_item("id")
             && let Ok(id_str) = id_val.extract::<String>()
         {
@@ -72,7 +72,7 @@ impl RustWSEServer {
             }
         }
 
-        // #8: Per-connection rate limiter (token bucket) with client feedback
+        // Per-connection rate limiter (token bucket) with client feedback
         {
             let mut entry = self
                 .shared

@@ -667,8 +667,8 @@ mod tests {
             secret: Zeroizing::new(test_secret()),
             previous_secret: None,
             key_id: None,
-            issuer: "sqv".to_string(),
-            audience: "sqv-api".to_string(),
+            issuer: "wse-test".to_string(),
+            audience: "wse-test-api".to_string(),
             cookie_name: "access_token".to_string(),
         }
     }
@@ -690,8 +690,8 @@ mod tests {
             "sub": "user-123",
             "exp": future_exp(),
             "iat": 1700000000,
-            "iss": "sqv",
-            "aud": "sqv-api",
+            "iss": "wse-test",
+            "aud": "wse-test-api",
             "type": "access",
             "jti": "test-jti-001",
         });
@@ -704,8 +704,8 @@ mod tests {
 
         let decoded = jwt_decode(&token, &config).expect("decode ok");
         assert_eq!(decoded["sub"], "user-123");
-        assert_eq!(decoded["iss"], "sqv");
-        assert_eq!(decoded["aud"], "sqv-api");
+        assert_eq!(decoded["iss"], "wse-test");
+        assert_eq!(decoded["aud"], "wse-test-api");
         assert_eq!(decoded["type"], "access");
     }
 
@@ -715,8 +715,8 @@ mod tests {
         let claims = serde_json::json!({
             "sub": "user-123",
             "exp": 1000000000, // far in the past
-            "iss": "sqv",
-            "aud": "sqv-api",
+            "iss": "wse-test",
+            "aud": "wse-test-api",
         });
 
         let token = jwt_encode(&claims, &config.secret, JwtAlgorithm::HS256, None).unwrap();
@@ -730,8 +730,8 @@ mod tests {
         let claims = serde_json::json!({
             "sub": "user-123",
             "exp": future_exp(),
-            "iss": "sqv",
-            "aud": "sqv-api",
+            "iss": "wse-test",
+            "aud": "wse-test-api",
         });
 
         let token = jwt_encode(&claims, &config.secret, JwtAlgorithm::HS256, None).unwrap();
@@ -751,7 +751,7 @@ mod tests {
             "sub": "user-123",
             "exp": future_exp(),
             "iss": "other-service",
-            "aud": "sqv-api",
+            "aud": "wse-test-api",
         });
 
         let token = jwt_encode(&claims, &config.secret, JwtAlgorithm::HS256, None).unwrap();
@@ -765,7 +765,7 @@ mod tests {
         let claims = serde_json::json!({
             "sub": "user-123",
             "exp": future_exp(),
-            "iss": "sqv",
+            "iss": "wse-test",
             "aud": "other-api",
         });
 
@@ -798,8 +798,8 @@ mod tests {
         let claims = serde_json::json!({
             "sub": "user-123",
             "exp": future_exp(),
-            "iss": "sqv",
-            "aud": "sqv-api",
+            "iss": "wse-test",
+            "aud": "wse-test-api",
         });
 
         let token = jwt_encode(&claims, &config.secret, JwtAlgorithm::HS256, None).unwrap();
@@ -853,8 +853,8 @@ mod tests {
         let config = hs256_config();
         let claims = serde_json::json!({
             "sub": "user-123",
-            "iss": "sqv",
-            "aud": "sqv-api",
+            "iss": "wse-test",
+            "aud": "wse-test-api",
         });
 
         let token = jwt_encode(&claims, &config.secret, JwtAlgorithm::HS256, None).unwrap();
@@ -938,8 +938,8 @@ mod tests {
         let claims = serde_json::json!({
             "sub": "user-123",
             "exp": now - 10,
-            "iss": "sqv",
-            "aud": "sqv-api",
+            "iss": "wse-test",
+            "aud": "wse-test-api",
         });
         let token = jwt_encode(&claims, &config.secret, JwtAlgorithm::HS256, None).unwrap();
         let result = jwt_decode(&token, &config);
@@ -949,8 +949,8 @@ mod tests {
         let claims_old = serde_json::json!({
             "sub": "user-123",
             "exp": now - 60,
-            "iss": "sqv",
-            "aud": "sqv-api",
+            "iss": "wse-test",
+            "aud": "wse-test-api",
         });
         let token_old = jwt_encode(&claims_old, &config.secret, JwtAlgorithm::HS256, None).unwrap();
         let result_old = jwt_decode(&token_old, &config);
@@ -967,8 +967,8 @@ mod tests {
         let claims = serde_json::json!({
             "sub": "user-123",
             "exp": future_exp(),
-            "iss": "sqv",
-            "aud": "sqv-api",
+            "iss": "wse-test",
+            "aud": "wse-test-api",
         });
         let token = jwt_encode(&claims, &old_secret, JwtAlgorithm::HS256, None).unwrap();
 
@@ -977,8 +977,8 @@ mod tests {
             secret: Zeroizing::new(new_secret),
             previous_secret: Some(Zeroizing::new(old_secret)),
             key_id: None,
-            issuer: "sqv".to_string(),
-            audience: "sqv-api".to_string(),
+            issuer: "wse-test".to_string(),
+            audience: "wse-test-api".to_string(),
             cookie_name: "access_token".to_string(),
         };
         let result = jwt_decode(&token, &config);
@@ -992,8 +992,8 @@ mod tests {
         let claims = serde_json::json!({
             "sub": "user-123",
             "exp": future_exp(),
-            "iss": "sqv",
-            "aud": "sqv-api",
+            "iss": "wse-test",
+            "aud": "wse-test-api",
         });
         let token = jwt_encode(&claims, &unknown, JwtAlgorithm::HS256, None).unwrap();
 
@@ -1002,8 +1002,8 @@ mod tests {
             secret: Zeroizing::new(b"current-secret-key-32-bytes-ok!!".to_vec()),
             previous_secret: Some(Zeroizing::new(b"previous-secret-key-32bytes-ok!!".to_vec())),
             key_id: None,
-            issuer: "sqv".to_string(),
-            audience: "sqv-api".to_string(),
+            issuer: "wse-test".to_string(),
+            audience: "wse-test-api".to_string(),
             cookie_name: "access_token".to_string(),
         };
         let result = jwt_decode(&token, &config);

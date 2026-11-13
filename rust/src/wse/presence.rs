@@ -860,7 +860,7 @@ mod tests {
         serde_json::json!({"status": "online"})
     }
 
-    // R1 #3: per-origin sentinels -- a leave from one peer must not erase a user
+    // Per-origin sentinels: a leave from one peer must not erase a user
     // still present on another peer.
     #[test]
     fn per_origin_sentinel_survives_other_peers_leave() {
@@ -877,7 +877,7 @@ mod tests {
         assert!(entry.connections[0].conn_id.contains("peerB"));
     }
 
-    // R1 #2: last-write-wins -- a stale (reordered) leave must not remove a user
+    // Last write wins: a stale (reordered) leave must not remove a user
     // whose newer re-join already landed.
     #[test]
     fn lww_ignores_stale_leave() {
@@ -893,7 +893,7 @@ mod tests {
         );
     }
 
-    // R1 #4: ghost cleanup -- purge_origin removes only the crashed peer's
+    // Ghost cleanup: purge_origin removes only the crashed peer's
     // sentinels and the users left with no connections.
     #[test]
     fn purge_origin_removes_only_that_peers_ghosts() {
@@ -933,8 +933,8 @@ mod tests {
         assert_eq!(stats.num_connections.load(Ordering::Relaxed), 1);
     }
 
-    // R1 #6: full-state sync is chunked, so a node with more presence than fits
-    // in one frame still sends ALL of it (the old single frame was dropped).
+    // Full-state sync is chunked, so a node with more presence than fits in one
+    // frame still sends all of it.
     #[test]
     fn full_state_chunked_covers_all_users_and_splits() {
         let mgr = PresenceManager::new(4096, 0);
