@@ -166,7 +166,6 @@ class TestSendPaths:
         peer = SecurityManager(legacy=True)
         security.generate_keypair()
         security.derive_shared_secret(peer.generate_keypair())
-        security.stop_key_rotation()
 
         conn = ConnectionManager("ws://x/wse", rate_limiter=limiter, security=security)
         ws = FakeWS()

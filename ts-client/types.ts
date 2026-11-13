@@ -86,7 +86,6 @@ export interface SecurityConfig {
   legacyE2e?: boolean;
   publicKey?: string;
   sessionKey?: CryptoKey;
-  messageSignature: boolean;
 }
 
 export interface PerformanceConfig {
@@ -393,7 +392,6 @@ export interface AdaptiveReconnectionStats {
 export interface SecurityInfo {
   encryptionEnabled: boolean;
   encryptionAlgorithm: string | null;
-  messageSigningEnabled: boolean;
   sessionKeyRotation: number | null;
   lastKeyRotation: number | null;
 }
@@ -500,7 +498,6 @@ export interface ClientFeatures {
   priority_queue: boolean;
   circuit_breaker: boolean;
   offline_queue: boolean;
-  message_signing: boolean;
   health_check: boolean;
   metrics: boolean;
 }

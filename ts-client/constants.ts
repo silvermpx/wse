@@ -142,7 +142,6 @@ export const FEATURES = {
     PRIORITY_QUEUE: true,
     CIRCUIT_BREAKER: true,
     OFFLINE_QUEUE: true,
-    MESSAGE_SIGNING: false,
     RATE_LIMITING: true,
     HEALTH_CHECK: true,
     METRICS: true,

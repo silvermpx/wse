@@ -50,29 +50,6 @@ class TestSecurityManager:
         decrypted = server.decrypt(encrypted)
         assert decrypted == plaintext
 
-    def test_sign_verify_roundtrip(self):
-        # Signing keys are per-side (random), so sign+verify on same instance
-        mgr = SecurityManager(legacy=True)
-        mgr.generate_keypair()
-        # Manually set a signing key (derive_shared_secret sets one randomly)
-        peer = SecurityManager(legacy=True)
-        peer_pub = peer.generate_keypair()
-        mgr.derive_shared_secret(peer_pub)
-
-        payload = '{"t":"test","p":{}}'
-        sig = mgr.sign(payload)
-        assert mgr.verify(payload, sig) is True
-
-    def test_verify_rejects_tampered(self):
-        mgr = SecurityManager(legacy=True)
-        mgr.generate_keypair()
-        peer = SecurityManager(legacy=True)
-        peer_pub = peer.generate_keypair()
-        mgr.derive_shared_secret(peer_pub)
-
-        sig = mgr.sign('{"original":true}')
-        assert mgr.verify('{"tampered":true}', sig) is False
-
     def test_reset_disables(self):
         sm = SecurityManager(legacy=True)
         server = SecurityManager(legacy=True)

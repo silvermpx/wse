@@ -698,7 +698,6 @@ class ConnectionManager:
                 "priority_queue": True,
                 "circuit_breaker": True,
                 "offline_queue": True,
-                "message_signing": False,
                 "rate_limiting": True,
                 "health_check": True,
                 "metrics": True,

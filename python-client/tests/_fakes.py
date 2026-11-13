@@ -266,7 +266,6 @@ class FakeWSEServer:
             server = SecurityManager(legacy=True)
             server_pub = server.generate_keypair()
             server.derive_shared_secret(base64.b64decode(client_key))
-            server.stop_key_rotation()
             conn.cipher = server
             conn.client_public_key = client_key
             features["encryption"] = True

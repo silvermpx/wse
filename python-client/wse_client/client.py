@@ -436,10 +436,6 @@ class AsyncWSEClient:
                 task.cancel()
         self._background_tasks.clear()
 
-        # Stop key rotation timer
-        if self._security is not None:
-            self._security.stop_key_rotation()
-
         # Clear offline queue (no point replaying after explicit disconnect)
         self._offline_queue.clear()
 

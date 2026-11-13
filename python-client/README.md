@@ -178,7 +178,6 @@ class WSEEvent:
     category: str | None = None      # Message category (system/snapshot/update)
     priority: int | None = None      # Message priority (see MessagePriority)
     correlation_id: str | None = None  # Request correlation ID
-    signature: str | None = None     # Message signature (if signed)
     topic: str | None = None         # Recovery stamp: topic ("tp" field)
     epoch: str | None = None         # Recovery stamp: buffer epoch, 8-hex ("e")
     offset: int | None = None        # Recovery stamp: per-topic offset ("o")

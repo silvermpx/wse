@@ -2,16 +2,14 @@
 # WSE Python Client -- Security Manager
 # =============================================================================
 #
-# ECDH P-256 key exchange, AES-GCM-256 encryption, HMAC-SHA256 signing.
-# Wire-compatible with rust/src/wse/security.rs and client/utils/security.ts.
+# End-to-end encryption: sessions with an authenticated server
+# (e2e_session.py), or the first design (ECDH P-256 + AES-GCM-256) for
+# servers before 3.0. Wire-compatible with the server and the TS client.
 # =============================================================================
 
 from __future__ import annotations
 
-import asyncio
 import base64
-import hashlib
-import hmac
 import os
 from typing import Any
 
@@ -47,7 +45,7 @@ GCM_TAG_LEN = 16  # 128 bits
 
 
 class SecurityManager:
-    """ECDH P-256 + AES-GCM-256 + HMAC-SHA256.
+    """End-to-end encryption of one client's connections.
 
     Wire-compatible with the Rust server and TS client.
     Requires ``cryptography`` package (``pip install wse-client[crypto]``).
@@ -88,14 +86,8 @@ class SecurityManager:
 
         self._private_key: EllipticCurvePrivateKey | None = None
         self._aes_key: bytes | None = None
-        self._signing_key: bytes | None = None
-        self._signing_enabled_flag = False  # explicit opt-in via enable_signing()
         self._enabled = False
         self._iv_cache: dict[bytes, None] = {}  # ordered dict for FIFO eviction
-
-        # Key rotation
-        self._rotation_task: asyncio.Task[None] | None = None
-        self._rotation_interval: float = 3600.0  # 1 hour default
 
     @property
     def is_enabled(self) -> bool:
@@ -179,12 +171,8 @@ class SecurityManager:
             info=HKDF_INFO,
         ).derive(shared_secret)
 
-        # Signing key = random (matches TS client behavior; server uses
-        # application-provided key, not derived from ECDH shared secret)
-        self._signing_key = os.urandom(32)
         self._enabled = True
         self._iv_cache = {}
-        self.start_key_rotation()
         logger.debug("Encryption enabled (AES-GCM-256)")
 
     # -- AES-GCM-256 encrypt / decrypt ----------------------------------------
@@ -236,42 +224,6 @@ class SecurityManager:
         except Exception as exc:
             raise WSEEncryptionError(f"Decryption failed: {exc}") from exc
 
-    # -- HMAC-SHA256 signing ---------------------------------------------------
-
-    @property
-    def signing_enabled(self) -> bool:
-        return self._signing_enabled_flag and self._signing_key is not None
-
-    def enable_signing(self) -> None:
-        """Explicitly enable HMAC signing for outgoing messages."""
-        self._signing_enabled_flag = True
-
-    def sign(self, payload_json: str) -> str:
-        """Sign a JSON payload.  Returns base64-encoded HMAC-SHA256.
-
-        Wire-compatible with TS client ``signMessage()``: direct HMAC-SHA256
-        over raw UTF-8 bytes, base64-encoded output.
-        """
-        if self._signing_key is None:
-            raise WSEEncryptionError("Signing key not available")
-
-        import base64
-
-        sig_bytes = hmac.new(
-            self._signing_key,
-            payload_json.encode("utf-8"),
-            hashlib.sha256,
-        ).digest()
-        return base64.b64encode(sig_bytes).decode("ascii")
-
-    def verify(self, payload_json: str, signature_b64: str) -> bool:
-        """Verify a base64-encoded HMAC-SHA256 signature."""
-        try:
-            expected = self.sign(payload_json)
-            return hmac.compare_digest(expected, signature_b64)
-        except Exception:
-            return False
-
     # -- Helpers --------------------------------------------------------------
 
     def _generate_iv(self) -> bytes:
@@ -292,65 +244,14 @@ class SecurityManager:
         self._iv_cache[iv] = None
         return iv
 
-    # -- Key rotation ---------------------------------------------------------
-
-    def start_key_rotation(self, interval: float = 3600.0) -> None:
-        """Start periodic rotation of the HMAC signing key (default: 1 hour).
-
-        Matches TS ``scheduleKeyRotation()``. Only the signing key rotates:
-        the ECDH-derived AES key stays for the life of the connection, since
-        the server holds the same shared secret and a new key needs a new
-        connection (and key exchange).
-        """
-        if self._rotation_task is not None:
-            return
-        self._rotation_interval = interval
-        try:
-            loop = asyncio.get_running_loop()
-            self._rotation_task = loop.create_task(self._rotation_loop())
-        except RuntimeError:
-            # No running event loop; caller must start rotation later
-            pass
-
-    def stop_key_rotation(self) -> None:
-        """Cancel the key rotation timer."""
-        if self._rotation_task is not None:
-            self._rotation_task.cancel()
-            self._rotation_task = None
-
-    async def _rotation_loop(self) -> None:
-        """Periodic key rotation coroutine."""
-        failures = 0
-        while True:
-            try:
-                await asyncio.sleep(self._rotation_interval)
-            except asyncio.CancelledError:
-                return
-
-            try:
-                # Signing key rotates regardless of ECDH session state --
-                # it is independent of the AES key derived from ECDH
-                self._signing_key = os.urandom(32)
-                self._iv_cache = {}
-                failures = 0
-                logger.debug("Signing key rotated successfully")
-            except Exception as exc:
-                failures += 1
-                logger.error("Key rotation failed: %s", exc)
-                if failures >= 3:
-                    logger.error("Key rotation disabled after 3 consecutive failures")
-                    return
-
     # -- Reset ----------------------------------------------------------------
 
     def reset(self) -> None:
-        """Clear all keys, disable encryption, and cancel rotation."""
+        """Clear all keys and disable encryption."""
         self._offer = None
         self._session = None
         self.broken = None
         self._private_key = None
         self._aes_key = None
-        self._signing_key = None
         self._enabled = False
         self._iv_cache = {}
-        self.stop_key_rotation()

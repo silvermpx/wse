@@ -15,8 +15,7 @@ export class SecurityError extends Error {
   constructor(
     message: string,
     public readonly code: 'ENCRYPTION_FAILED' | 'DECRYPTION_FAILED' |
-           'SIGNING_FAILED' | 'VERIFICATION_FAILED' | 'KEY_GENERATION_FAILED' |
-           'KEY_EXCHANGE_FAILED' | 'REPLAY_ATTACK' | 'NEGOTIATION_FAILED' |
+           'KEY_GENERATION_FAILED' | 'KEY_EXCHANGE_FAILED' | 'REPLAY_ATTACK' |
            'IV_REUSE',
     public readonly details?: any
   ) {
@@ -27,13 +26,7 @@ export class SecurityError extends Error {
 
 export class SecurityManager {
   private encryptionEnabled = false;
-  private messageSigningEnabled = false;
   private encryptionKey: CryptoKey | null = null;
-  private signingKey: CryptoKey | null = null;
-  private keyRotationInterval: number | null = null;
-  private lastKeyRotation: number | null = null;
-  private keyRotationTimer: NodeJS.Timeout | null = null;
-  private keyRotationFailures = 0;
 
   private sessionKeyPair: CryptoKeyPair | null = null;
   private sharedSecret: CryptoKey | null = null;
@@ -54,24 +47,9 @@ export class SecurityManager {
   private e2eOffer: E2eOffer | null = null;
   private e2eSession: E2eSession | null = null;
 
-  private backendCompatibilityMode = false;
-  private readonly supportedAlgorithms = {
-    encryption: 'AES-GCM',
-    signing: 'HMAC-SHA256',
-    keyExchange: 'ECDH-P256'
-  };
-
-  async initialize(config: {
-    encryptionEnabled: boolean;
-    messageSigningEnabled: boolean;
-    keyRotationInterval?: number;
-    backendCompatibilityMode?: boolean;
-  }) {
+  async initialize(config: { encryptionEnabled: boolean }) {
     try {
       this.encryptionEnabled = config.encryptionEnabled;
-      this.messageSigningEnabled = config.messageSigningEnabled;
-      this.keyRotationInterval = config.keyRotationInterval || 3600000;
-      this.backendCompatibilityMode = config.backendCompatibilityMode || false;
 
       // The transport AES key is NOT generated here -- it is derived from the
       // ECDH exchange (deriveSharedSecret) after server_hello. Generating a
@@ -84,16 +62,7 @@ export class SecurityManager {
         logger.info('Encryption requested; AES key derived via ECDH after server_hello');
       }
 
-      if (this.messageSigningEnabled) {
-        await this.generateSigningKey();
-        logger.info('Message signing enabled for WebSocket messages with HMAC-SHA256');
-      }
-
       await this.generateKeyPair();
-
-      if (this.encryptionEnabled || this.messageSigningEnabled) {
-        this.scheduleKeyRotation();
-      }
     } catch (error) {
       throw new SecurityError(
         'Failed to initialize security manager',
@@ -112,18 +81,6 @@ export class SecurityManager {
       );
     } catch (error) {
       throw new SecurityError('Failed to generate encryption key', 'KEY_GENERATION_FAILED', error);
-    }
-  }
-
-  private async generateSigningKey(): Promise<void> {
-    try {
-      this.signingKey = await crypto.subtle.generateKey(
-        { name: 'HMAC', hash: 'SHA-256' },
-        true,
-        ['sign', 'verify']
-      );
-    } catch (error) {
-      throw new SecurityError('Failed to generate signing key', 'KEY_GENERATION_FAILED', error);
     }
   }
 
@@ -329,26 +286,6 @@ export class SecurityManager {
     }
   }
 
-  async decryptMessage(data: ArrayBuffer): Promise<string | null> {
-    if (!this.encryptionEnabled || !this.encryptionKey) return null;
-
-    try {
-      const dataArray = new Uint8Array(data);
-      const iv = dataArray.slice(0, 12);
-      const encrypted = dataArray.slice(12);
-
-      const decrypted = await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: iv },
-        this.encryptionKey,
-        encrypted
-      );
-
-      return new TextDecoder().decode(decrypted);
-    } catch (error) {
-      throw new SecurityError('Decryption failed', 'DECRYPTION_FAILED', error);
-    }
-  }
-
   /** Use E2E sessions with this trust; null for the first design. */
   configureE2e(trust: E2eTrust | null): void {
     this.e2eTrust = trust;
@@ -422,118 +359,6 @@ export class SecurityManager {
     return combined.buffer;
   }
 
-  async decryptFromTransport(data: ArrayBuffer): Promise<string | null> {
-    const view = new Uint8Array(data);
-    if (view.length >= 2 && view[0] === 69 && view[1] === 58) {
-      return this.decryptMessage(data.slice(2));
-    }
-    // Not an E:-prefixed encrypted frame
-    return null;
-  }
-
-  async signMessage(data: any): Promise<string | null> {
-    if (!this.messageSigningEnabled || !this.signingKey) return null;
-
-    try {
-      const encoder = new TextEncoder();
-      const encoded = encoder.encode(JSON.stringify(data));
-      const signature = await crypto.subtle.sign('HMAC', this.signingKey, encoded);
-      return this.arrayBufferToBase64(signature);
-    } catch (error) {
-      logger.error('Message signing failed:', error);
-      return null;
-    }
-  }
-
-  async verifySignature(data: any, signature: string): Promise<boolean> {
-    if (!this.messageSigningEnabled || !this.signingKey) return true;
-
-    try {
-      const encoder = new TextEncoder();
-      const encoded = encoder.encode(JSON.stringify(data));
-      const signatureBuffer = this.base64ToArrayBuffer(signature);
-
-      return await crypto.subtle.verify('HMAC', this.signingKey, signatureBuffer, encoded);
-    } catch (error) {
-      logger.error('Signature verification failed:', error);
-      return false;
-    }
-  }
-
-  async negotiateSecurity(serverCapabilities: {
-    encryption?: boolean;
-    signing?: boolean;
-    algorithms?: string[];
-    publicKey?: JsonWebKey;
-  }): Promise<{
-    encryption: boolean;
-    signing: boolean;
-    keyExchange: boolean;
-    algorithms: { encryption: string; signing: string; keyExchange: string; };
-  }> {
-    try {
-      this.encryptionEnabled = this.encryptionEnabled && (serverCapabilities.encryption ?? false);
-      this.messageSigningEnabled = this.messageSigningEnabled && (serverCapabilities.signing ?? false);
-
-      if (serverCapabilities.publicKey && this.encryptionEnabled) {
-        await this.setServerPublicKey(serverCapabilities.publicKey);
-      }
-
-      const negotiated = {
-        encryption: this.encryptionEnabled,
-        signing: this.messageSigningEnabled,
-        keyExchange: !!serverCapabilities.publicKey,
-        algorithms: this.supportedAlgorithms
-      };
-
-      logger.info('Security negotiated:', negotiated);
-      return negotiated;
-    } catch (error) {
-      throw new SecurityError('Security negotiation failed', 'NEGOTIATION_FAILED', error);
-    }
-  }
-
-  private scheduleKeyRotation(): void {
-    if (!this.keyRotationInterval || this.keyRotationTimer) return;
-
-    this.keyRotationTimer = setInterval(async () => {
-      try {
-        await this.rotateKeys();
-        this.keyRotationFailures = 0;
-      } catch (error) {
-        logger.error('Key rotation failed:', error);
-        this.keyRotationFailures++;
-        if (this.keyRotationFailures >= 3) {
-          logger.error('Key rotation disabled after 3 consecutive failures');
-          if (this.keyRotationTimer) {
-            clearInterval(this.keyRotationTimer);
-            this.keyRotationTimer = null;
-          }
-        }
-      }
-    }, this.keyRotationInterval);
-  }
-
-  async rotateKeys(): Promise<void> {
-    // Transport keys are never rotated here: the ECDH key pair and the derived
-    // AES key belong to one connection (a fresh pair is generated for every
-    // client_hello and dropped on close). Replacing them on a timer could swap
-    // the key pair between client_hello and server_hello, or install a random
-    // AES key the server does not have.
-    logger.debug('Rotating signing key');
-
-    try {
-      if (this.messageSigningEnabled) {
-        await this.generateSigningKey();
-      }
-      this.lastKeyRotation = Date.now();
-      logger.info('Keys rotated successfully');
-    } catch (error) {
-      logger.error('Key rotation failed:', error);
-      throw error;
-    }
-  }
-
   // ---------------------------------------------------------------------------
   // Utilities
   // ---------------------------------------------------------------------------
@@ -576,32 +401,6 @@ export class SecurityManager {
     return this.encryptionEnabled && this.sharedSecret !== null;
   }
 
-  isMessageSigningEnabled(): boolean {
-    return this.messageSigningEnabled;
-  }
-
-  getSecurityInfo(): {
-    encryptionEnabled: boolean;
-    encryptionAlgorithm: string | null;
-    messageSigningEnabled: boolean;
-    signatureAlgorithm: string | null;
-    keyRotationInterval: number | null;
-    lastKeyRotation: number | null;
-    keyExchangeEnabled: boolean;
-    backendCompatibilityMode: boolean;
-  } {
-    return {
-      encryptionEnabled: this.encryptionEnabled,
-      encryptionAlgorithm: this.encryptionEnabled ? 'AES-GCM-256' : null,
-      messageSigningEnabled: this.messageSigningEnabled,
-      signatureAlgorithm: this.messageSigningEnabled ? 'HMAC-SHA256' : null,
-      keyRotationInterval: this.keyRotationInterval,
-      lastKeyRotation: this.lastKeyRotation,
-      keyExchangeEnabled: !!this.sessionKeyPair,
-      backendCompatibilityMode: this.backendCompatibilityMode,
-    };
-  }
-
   resetEncryption(): void {
     this.keyGeneration++;
     this.keyDerivation = null;
@@ -622,21 +421,16 @@ export class SecurityManager {
   destroy(): void {
     this.keyGeneration++;
     this.keyDerivation = null;
-    if (this.keyRotationTimer) {
-      clearInterval(this.keyRotationTimer);
-      this.keyRotationTimer = null;
-    }
+    this.e2eOffer = null;
+    this.e2eSession = null;
     if (this.usedIVs) {
       this.usedIVs.clear();
     }
     this.encryptionKey = null;
-    this.signingKey = null;
     this.sessionKeyPair = null;
     this.sharedSecret = null;
     this.serverPublicKey = null;
     this.encryptionEnabled = false;
-    this.messageSigningEnabled = false;
-    this.keyRotationFailures = 0;
 
     logger.info('Security manager destroyed, all keys and caches cleared');
   }

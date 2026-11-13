@@ -186,8 +186,6 @@ class TestEncryptedMsgpack:
         server_pub = server_sm.generate_keypair()
         client_sm.derive_shared_secret(server_pub)
         server_sm.derive_shared_secret(client_pub)
-        client_sm.stop_key_rotation()
-        server_sm.stop_key_rotation()
 
         packed = b"M:" + msgpack.packb({"c": "U", "t": "tick", "p": {"px": 1.5}})
         iv = os.urandom(12)

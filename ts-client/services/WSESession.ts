@@ -170,7 +170,6 @@ export function resolveOptions(config: UseWSEConfig | undefined): ResolvedWSEOpt
     reconnection,
     security: {
       encryptionEnabled: false,
-      messageSignature: false,
       ...config?.security,
     },
     performance: {
@@ -330,26 +329,20 @@ export class WSESession {
     }
     this.processor.setReady(true);
 
-    if (o.security.encryptionEnabled || o.security.messageSignature) {
+    if (o.security.encryptionEnabled) {
       try {
-        await securityManager.initialize({
-          encryptionEnabled: o.security.encryptionEnabled,
-          messageSigningEnabled: o.security.messageSignature,
-        });
+        await securityManager.initialize({ encryptionEnabled: true });
       } catch (error) {
         if (this.destroyed) return;
-        if (o.security.encryptionEnabled) {
-          // Fail closed: no Web Crypto (e.g. a plain-http page) means no
-          // encryption, and encryption was required -- do not connect.
-          const reason = `encryption unavailable (${error instanceof Error ? error.message : String(error)})`;
-          logger.error(`WSE: ${reason}; not connecting`);
-          const store = useWSEStore.getState();
-          store.setLastError(`Encryption failed: ${reason}`);
-          store.setConnectionState(ConnectionState.ERROR);
-          dispatchWSEEvent('wseEncryptionFailed', { reason });
-          return;
-        }
-        logger.warn('Message signing unavailable:', error);
+        // Fail closed: no Web Crypto (e.g. a plain-http page) means no
+        // encryption, and encryption was required -- do not connect.
+        const reason = `encryption unavailable (${error instanceof Error ? error.message : String(error)})`;
+        logger.error(`WSE: ${reason}; not connecting`);
+        const store = useWSEStore.getState();
+        store.setLastError(`Encryption failed: ${reason}`);
+        store.setConnectionState(ConnectionState.ERROR);
+        dispatchWSEEvent('wseEncryptionFailed', { reason });
+        return;
       }
     }
     if (this.destroyed) return;

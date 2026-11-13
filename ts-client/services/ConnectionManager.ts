@@ -1170,7 +1170,6 @@ export class ConnectionManager {
         priority_queue: FEATURES.PRIORITY_QUEUE,
         circuit_breaker: FEATURES.CIRCUIT_BREAKER,
         offline_queue: FEATURES.OFFLINE_QUEUE,
-        message_signing: FEATURES.MESSAGE_SIGNING,
         rate_limiting: FEATURES.RATE_LIMITING,
         health_check: FEATURES.HEALTH_CHECK,
         metrics: FEATURES.METRICS,

@@ -139,7 +139,6 @@ class WSEEvent:
         category: ``"WSE"`` (system), ``"S"`` (snapshot), ``"U"`` (update).
         priority: Numeric priority (see :class:`MessagePriority`).
         correlation_id: Links a request to its response.
-        signature: HMAC-SHA256 hex signature when message signing is on.
         topic: Recovery stamp -- the topic this message was published to (``tp``).
         epoch: Recovery stamp -- the topic buffer epoch as an 8-hex string (``e``).
         offset: Recovery stamp -- the per-topic monotonic offset (``o``). Together
@@ -157,7 +156,6 @@ class WSEEvent:
     category: str | None = None
     priority: int | None = None
     correlation_id: str | None = None
-    signature: str | None = None
     topic: str | None = None
     epoch: str | None = None
     offset: int | None = None

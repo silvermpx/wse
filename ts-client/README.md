@@ -154,7 +154,6 @@ useWSE('cookie', ['notifications'], {
 
   security: {
     encryptionEnabled: false,                 // require E2E encryption (fails closed, see below)
-    messageSignature: false,
   },
 
   performance: {

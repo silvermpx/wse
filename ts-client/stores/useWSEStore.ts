@@ -173,7 +173,6 @@ const initialPerformance: PerformanceMetrics = {
 const initialSecurity: SecurityInfo = {
   encryptionEnabled: false,
   encryptionAlgorithm: null,
-  messageSigningEnabled: false,
   sessionKeyRotation: null,
   lastKeyRotation: null,
 };
