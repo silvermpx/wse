@@ -203,6 +203,7 @@ impl RustWSEServer {
                             topic: topic.clone(),
                             data: msg,
                             skip_recovery: true,
+                            publish: false,
                         });
                     }
                     // Cluster sync: notify peers of presence join
@@ -540,6 +541,7 @@ impl RustWSEServer {
                             topic: topic.clone(),
                             data: msg,
                             skip_recovery: true,
+                            publish: false,
                         });
                     }
                     // Cluster sync: notify peers of presence leave

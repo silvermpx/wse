@@ -197,9 +197,10 @@ pub(crate) async fn cluster_manager(
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(ClusterCommand::Publish { topic, payload }) => {
-                        // Get origin recovery position for cross-node recovery
-                        let rec_pos = ctx.recovery.as_ref().and_then(|rm| rm.get_position(&topic));
+                    Some(ClusterCommand::Publish { topic, payload, position }) => {
+                        // The position the origin's command task reserved for this
+                        // very message (reading the head here raced with it).
+                        let rec_pos = position;
 
                         // Pre-encode frames: with/without recovery, with/without compression
                         let recovery_compressed = if let Some((epoch, offset)) = rec_pos {
@@ -528,6 +529,7 @@ pub(crate) async fn cluster_manager(
                                             topic,
                                             data: msg,
                                             skip_recovery: true,
+                                            publish: false,
                                         });
                                     }
                                 }
@@ -540,6 +542,7 @@ pub(crate) async fn cluster_manager(
                                             topic,
                                             data: msg,
                                             skip_recovery: true,
+                                            publish: false,
                                         });
                                     }
                                 }
@@ -552,6 +555,7 @@ pub(crate) async fn cluster_manager(
                                             topic,
                                             data: msg,
                                             skip_recovery: true,
+                                            publish: false,
                                         });
                                     }
                                 }

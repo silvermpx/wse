@@ -14,7 +14,6 @@ use uuid::Uuid;
 
 use super::RustWSEServer;
 use super::convert::pyobj_to_json;
-use crate::wse::cluster::ClusterCommand;
 use crate::wse::compression::serde_json_to_rmpv;
 use crate::wse::server::ServerCommand;
 use crate::wse::server::e2e::encrypt_outbound;
@@ -320,6 +319,7 @@ impl RustWSEServer {
             topic: topic.to_owned(),
             data,
             skip_recovery: false,
+            publish: false,
         })
         .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         Ok(())
@@ -328,24 +328,17 @@ impl RustWSEServer {
     pub(super) fn broadcast_impl(&self, topic: &str, data: &str) -> PyResult<()> {
         let data = inject_category(data);
 
-        // Local dispatch (always)
-        if let Ok(tx) = self.command_tx() {
-            let _ = tx.send(ServerCommand::BroadcastLocal {
+        // The command task stamps the message (recovery position) and fans it
+        // out locally, then publishes the same stamped bytes to cluster peers:
+        // every node delivers one wire form per message, with one position.
+        self.command_tx()?
+            .send(ServerCommand::BroadcastLocal {
                 topic: topic.to_owned(),
-                data: data.clone(),
+                data,
                 skip_recovery: false,
-            });
-        }
-
-        // Cluster publish (if connected)
-        let cluster_tx = self.shared.cluster_cmd_tx.read().unwrap().clone();
-        if let Some(tx) = cluster_tx {
-            tx.send(ClusterCommand::Publish {
-                topic: topic.to_owned(),
-                payload: data,
+                publish: true,
             })
-            .map_err(|_| PyRuntimeError::new_err("Cluster command channel closed"))?;
-        }
+            .map_err(|_| PyRuntimeError::new_err("Server command channel closed"))?;
         Ok(())
     }
 }

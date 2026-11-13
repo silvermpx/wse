@@ -63,6 +63,7 @@ impl RustWSEServer {
                                 topic: topic.clone(),
                                 data: msg.clone(),
                                 skip_recovery: true,
+                                publish: false,
                             });
                         }
                     }

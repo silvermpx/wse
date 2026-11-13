@@ -197,6 +197,7 @@ pub(super) async fn process_commands(
                 topic,
                 data,
                 skip_recovery,
+                publish,
             } => {
                 // Stamp the JSON with this message's (topic, epoch, offset) and store
                 // the UNFRAMED stamped payload, so the live copy and any replayed copy
@@ -206,14 +207,30 @@ pub(super) async fn process_commands(
                 // stored. The encrypted fan-out below encrypts this same `stamped` JSON
                 // and the recovery-replay path frames/encrypts it per connection, so
                 // there is exactly one wire form per (topic, offset).
+                let mut position = None;
                 let stamped: Bytes = if !skip_recovery && let Some(ref recovery) = state.recovery {
                     recovery.push_stamped(&topic, |epoch, offset| {
+                        position = Some((epoch, offset));
                         Bytes::from(stamp_recovery_fields(&data, &topic, epoch, offset))
                     })
                 } else {
                     Bytes::from(data)
                 };
                 let stamped_str = std::str::from_utf8(&stamped).unwrap_or("");
+                if publish {
+                    let cluster_tx = state
+                        .cluster_cmd_tx
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    if let Some(tx) = cluster_tx {
+                        let _ = tx.send(ClusterCommand::Publish {
+                            topic: topic.clone(),
+                            payload: stamped_str.to_owned(),
+                            position,
+                        });
+                    }
+                }
                 let preframed = pre_frame_text(stamped_str);
                 let max_pending = state.max_outbound_queue_bytes;
                 let slow_drops = &state.slow_consumer_drops;

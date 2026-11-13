@@ -200,6 +200,7 @@ impl RustWSEServer {
                                                 topic: topic.clone(),
                                                 data: msg,
                                                 skip_recovery: true,
+                                                publish: false,
                                             },
                                         );
                                     }
@@ -354,6 +355,7 @@ impl RustWSEServer {
                                                             topic: topic.clone(),
                                                             data: msg,
                                                             skip_recovery: true,
+                                                            publish: false,
                                                         });
                                                     }
                                                     if let Some(ref ctx) = cluster_tx {

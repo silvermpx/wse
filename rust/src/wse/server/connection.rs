@@ -898,6 +898,7 @@ pub(super) async fn handle_connection(
                         topic: topic.clone(),
                         data: msg,
                         skip_recovery: true,
+                        publish: false,
                     });
                 }
                 // Cluster sync: notify peers of presence leave

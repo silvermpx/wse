@@ -122,6 +122,9 @@ pub(crate) enum ServerCommand {
         topic: String,
         data: String,
         skip_recovery: bool,
+        /// Also publish to cluster peers, after stamping, with the exact
+        /// recovery position the message got here.
+        publish: bool,
     },
     Disconnect {
         conn_id: String,

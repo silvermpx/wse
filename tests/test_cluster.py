@@ -26,9 +26,11 @@ def wait_for(predicate, timeout=10.0):
 
 
 class Node:
-    def __init__(self):
+    def __init__(self, recovery=False):
         self.port = _next_port()
-        self.server = RustWSEServer("127.0.0.1", self.port, max_connections=10)
+        self.server = RustWSEServer(
+            "127.0.0.1", self.port, max_connections=10, recovery_enabled=recovery
+        )
         self.server.enable_drain_mode()
         self.server.start()
         self.cluster_port = _next_port()
@@ -57,8 +59,8 @@ class Node:
 def nodes():
     made = []
 
-    def make():
-        node = Node()
+    def make(**options):
+        node = Node(**options)
         made.append(node)
         return node
 
@@ -114,6 +116,51 @@ def test_restarted_peer_is_connected_again(nodes):
     c.cluster_port = port  # same address, new instance
     c.join(a)
     assert wait_for(lambda: a.peers == 1 and c.peers == 1, timeout=20.0)
+
+
+async def subscribe_next_client(node, topics):
+    """Wait for the next client's connect event on `node` and subscribe it."""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        for event in node.server.drain_inbound(16, 50):
+            if event[0] == "connect":
+                node.server.subscribe_connection(event[1], topics)
+                return
+        await asyncio.sleep(0.05)
+    raise AssertionError("no client connected")
+
+
+async def messages_of_type(ws, kind, count):
+    found = []
+    while len(found) < count:
+        frame = await asyncio.wait_for(ws.recv(), timeout=5)
+        text = frame if isinstance(frame, str) else frame.decode(errors="replace")
+        if f'"{kind}"' in text:
+            found.append(json.loads(text[text.index("{") :]))
+    return found
+
+
+def test_relayed_messages_carry_the_position_they_got_at_their_origin(nodes):
+    websockets = pytest.importorskip("websockets")
+    origin, relay = nodes(recovery=True), nodes(recovery=True)
+    origin.join(relay)
+    relay.join(origin)
+    assert wait_for(lambda: origin.peers == 1 and relay.peers == 1)
+
+    async def scenario():
+        async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as ws:
+            await subscribe_next_client(relay, ["news"])
+            await asyncio.sleep(0.5)  # the SUB reaches the origin
+            for n in range(5):
+                origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": n}}))
+            return await messages_of_type(ws, "news", 5)
+
+    messages = asyncio.run(scenario())
+    assert [m["p"]["n"] for m in messages] == list(range(5))
+    assert all(m["tp"] == "news" for m in messages)
+    assert len({m["e"] for m in messages}) == 1
+    offsets = [m["o"] for m in messages]
+    assert offsets == list(range(offsets[0], offsets[0] + 5)), offsets
 
 
 def test_subscriptions_made_before_joining_reach_peers(nodes):

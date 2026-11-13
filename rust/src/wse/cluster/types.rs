@@ -180,7 +180,12 @@ pub(crate) struct ClusterContext {
 pub(crate) enum ClusterCommand {
     Publish {
         topic: String,
+        /// The message as local subscribers got it: stamped with its recovery
+        /// position when recovery is on.
         payload: String,
+        /// That position (epoch, offset), carried in the frame so peers store
+        /// the message for cross-node recovery under the same position.
+        position: Option<(u32, u64)>,
     },
     Sub {
         topic: String,
