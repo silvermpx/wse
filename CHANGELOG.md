@@ -36,6 +36,8 @@ the steps to take are in [docs/MIGRATION.md](docs/MIGRATION.md#migrating-from-v2
   checked and a connection holds at most 16 patterns.
 - **Out-of-range options and values that cannot be JSON raise
   `ValueError`** instead of disabling features or crashing the process.
+- **The server's `msgpack` extra is gone**: MessagePack is packed in Rust
+  and the package was never imported.
 
 ### Added
 

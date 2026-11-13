@@ -21,6 +21,7 @@
 - **Values that cannot be JSON raise `ValueError`**: a dict containing itself, or nesting deeper than 128 levels, in `send_event()`, presence data and `rust_jwt_encode()`.
 - **Applications that authenticate connections themselves** (no `jwt_secret`) call `accept_connection(conn_id, user_id)` to send `server_ready`.
 - **msgpack clients get msgpack everywhere** (topic messages, broadcasts, replays, replies), not only from `send_event()`.
+- **The `msgpack` extra is gone**: the server packs MessagePack in Rust and never imported the package. `pip install wse-server[msgpack]` still installs the server, with a warning about the unknown extra; drop the extra from your requirements.
 
 ### End-to-end encryption
 

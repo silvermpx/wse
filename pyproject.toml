@@ -44,9 +44,6 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-msgpack = [
-    "msgpack>=1.0",
-]
 prometheus = [
     "prometheus-client>=0.21",
 ]
