@@ -17,13 +17,15 @@ RustWSEServer (PyO3)
     +-- tokio runtime (multi-threaded)
     |     +-- TCP listener (tungstenite WebSocket)
     |     +-- Connection tasks (one per client)
+    |     +-- Lane tasks (one per core: fan-out delivery)
     |     +-- Cluster peer tasks (TCP mesh)
     |     +-- Ping / idle / slow-consumer task
     |     +-- Recovery cleanup task
     |
     +-- SharedState
           +-- connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>
-          +-- topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>
+          +-- topics: TopicIndex (each topic's subscribers by lane, every connection by lane)
+          +-- fanout: the lanes' job queues, while the server runs
           +-- conn_topics: DashMap<String, DashSet<String>>
           +-- conn_formats: DashMap<String, bool>
           +-- conn_last_activity: DashMap<String, Instant>
@@ -207,16 +209,19 @@ server.send(conn_id, event_dict)
 
 ```
 server.broadcast_all(data)
-  -> pre_frame_text(data) - build WebSocket frame once
-  -> Clone Bytes (Arc refcount bump) to each connection channel
+  -> Build the WebSocket frame once
+  -> One job per lane (an Arc clone); each lane's task appends the frame
+     to its connections' broadcast queues
   -> Write tasks: raw TCP write via write_vectored
 
 server.broadcast_local(topic, data)
-  -> pre_frame_text(data)
-  -> Store in RecoveryManager (if enabled, zero-copy Bytes sharing)
-  -> Lookup topic_subscribers DashMap
-  -> Collect matching ConnectionHandle senders (with dedup via AHashSet)
-  -> Fan-out PreFramed to matched connections
+  -> Stamp and store in RecoveryManager (if enabled, zero-copy Bytes sharing)
+  -> Look the topic up once: the subscribed patterns matching it, and the
+     lanes holding a subscriber of either (a bit mask)
+  -> One job per such lane; each lane delivers to its own subscribers,
+     a connection subscribed several ways once
+  -> Queue groups: one member per group, chosen by the sender, delivered
+     by that member's lane
 
 server.broadcast(topic, data)
   -> broadcast_local(topic, data)          - local fan-out
@@ -478,9 +483,15 @@ The `CAP_PRESENCE` capability flag (bit 2) in the HELLO handshake controls wheth
 
 The single largest optimization. For a broadcast to N connections, the WebSocket frame (header + payload) is encoded once into a `Bytes` object. Each connection's broadcast queue receives an `Arc` clone of a frame larger than 1 KiB (reference count bump, no copy), so a backlog costs memory for the distinct frames, not frames times connections. Frames up to 1 KiB are copied into the connection's own contiguous segment instead, which is cheaper than a shared reference count and keeps vectored writes large. Write tasks send the raw bytes directly to the TCP stream, bypassing tungstenite's per-message encoding.
 
+### Lanes: fan-out on every core
+
+Each connection belongs to a lane: one lane per core (at most 64), given in turn as connections join. Each lane has a tokio task of its own that delivers to its connections, so a broadcast to 10,000 connections is delivered by every core at once, and each lane wakes its connections' write tasks from its own runtime thread. The sender (the command task, a cluster link) only hands the message over: one job per lane that has someone to get it, in the order it publishes, so a connection gets one sender's messages in order. No lock is held across an await: a lane holds its own maps' read locks while it appends frames, nothing longer.
+
+The topic index keeps each topic's subscribers by lane, with a bit mask of the lanes that have some, so a topic with a few subscribers costs a job for each of their lanes only, and a topic nobody subscribes to costs a single lookup. Every connection is also kept by lane for broadcasts to all.
+
 ### DashMap
 
-Most shared state maps (`topic_subscribers`, `conn_topics`, `conn_formats`, `conn_rates`, `conn_last_activity`) use `DashMap` - a sharded concurrent hash map. The `connections` map uses `Arc<RwLock<HashMap>>` since connection registration and removal are relatively infrequent compared to reads during fan-out.
+Most shared state maps (the topic index, `conn_topics`, `conn_formats`, `conn_rates`, `conn_last_activity`) use `DashMap` - a sharded concurrent hash map. The `connections` map uses `Arc<RwLock<HashMap>>`; delivery does not read it.
 
 ### Vectored Writes (writev)
 
@@ -700,7 +711,7 @@ The Python client and TS client speak the same wire protocol. All prefix formats
 
 ### Single Instance
 
-A single WSE server handles all connections locally. Topic fan-out goes through `broadcast_local()`, which looks up subscribers in the `topic_subscribers` DashMap and enqueues pre-framed messages to matching connections.
+A single WSE server handles all connections locally. Topic fan-out goes through `broadcast_local()`, which looks the topic up in the topic index and hands the frame to the lanes holding its subscribers (see Lanes above).
 
 ### Multi-Instance (Cluster)
 
@@ -718,7 +729,7 @@ When `broadcast(topic, data)` is called:
 2. `ClusterCommand::Publish` sent to the cluster manager task.
 3. Cluster manager checks each peer's interest table.
 4. MSG frame sent only to peers with matching topic subscriptions.
-5. Receiving peers dispatch to their local subscribers via `collect_topic_senders()`.
+5. Receiving peers hand the message to the lanes holding their local subscribers.
 
 ---
 
@@ -729,7 +740,9 @@ When `broadcast(topic, data)` is called:
 | Component         | Concurrency Primitive      | Access Pattern            |
 +-------------------+----------------------------+---------------------------+
 | connections       | Arc<RwLock<HashMap>>        | Read-heavy, write on connect/disconnect |
-| topic_subscribers | Arc<DashMap<String, DashMap<String, ConnectionHandle>>>| Direct handle access, no HashMap lookup |
+| topic index       | Arc<DashMap<String, Subscribers>> | Per topic: subscribers by lane, lane bit mask |
+| lane connections  | parking_lot::RwLock per lane | Read by the lane's task, write on connect/disconnect |
+| lane jobs         | tokio mpsc::unbounded per lane | Senders hand messages over in order |
 | conn_topics       | DashMap<String, DashSet>    | Concurrent read/write     |
 | queue_groups      | Arc<DashMap<String, DashMap<String, QueueGroup>>>| Per-topic per-group       |
 | conn_formats      | DashMap<String, bool>       | Per-connection read/write  |
