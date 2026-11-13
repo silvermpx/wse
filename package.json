@@ -1,6 +1,6 @@
 {
   "name": "wse-client",
-  "version": "2.5.1",
+  "version": "3.0.0",
   "description": "WSE (WebSocket Engine) React client. Type-safe hooks, auto-reconnect, offline queue, E2E encryption.",
   "type": "module",
   "main": "./dist/npm/index.js",

@@ -5,7 +5,7 @@ build-backend = "maturin"
 
 [project]
 name = "wse-server"
-version = "2.5.1"
+version = "3.0.0"
 description = "Rust-powered WebSocket engine for Python. Up to 5M fan-out del/s. Zero-GIL JWT."
 readme = "README.md"
 # PEP 639: an SPDX expression (core metadata License-Expression). The table
