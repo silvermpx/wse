@@ -454,10 +454,10 @@ class RustWSEServer:
     # -- Send -----------------------------------------------------------------
 
     def send(self, conn_id: str, data: str) -> None:
-        """Send a text frame to a connection."""
+        """Send a text frame to a connection. Waits, without the GIL, while 65,536 commands are queued for the server."""
         ...
     def send_bytes(self, conn_id: str, data: bytes) -> None:
-        """Send a binary frame to a connection."""
+        """Send a binary frame to a connection. Waits, without the GIL, while 65,536 commands are queued for the server."""
         ...
     def send_event(
         self,
@@ -470,23 +470,23 @@ class RustWSEServer:
         Returns the size of the frame handed to the connection, 0 for an
         event id this connection already got or a connection that is gone. A
         connection whose outbound queue is over max_outbound_queue_bytes
-        drops it.
+        drops it. Waits, without the GIL, while 65,536 commands are queued for the server.
         """
         ...
 
     # -- Broadcast ------------------------------------------------------------
 
     def broadcast_all(self, data: str) -> None:
-        """Send text to all connected clients (no topic filtering)."""
+        """Send text to all connected clients (no topic filtering). Waits, without the GIL, while 65,536 commands are queued for the server."""
         ...
     def broadcast_all_bytes(self, data: bytes) -> None:
-        """Send binary to all connected clients."""
+        """Send binary to all connected clients. Waits, without the GIL, while 65,536 commands are queued for the server."""
         ...
     def broadcast_local(self, topic: str, data: str) -> None:
-        """Fan-out to local topic subscribers only (no cluster)."""
+        """Fan-out to local topic subscribers only (no cluster). Waits, without the GIL, while 65,536 commands are queued for the server."""
         ...
     def broadcast(self, topic: str, data: str) -> None:
-        """Fan-out to topic subscribers locally and across cluster peers."""
+        """Fan-out to topic subscribers locally and across cluster peers. Waits, without the GIL, while 65,536 commands are queued for the server."""
         ...
 
     # -- Connection Management ------------------------------------------------
