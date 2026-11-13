@@ -398,6 +398,9 @@ pub(crate) struct TopicIndex {
     pub(crate) acls: Arc<DashMap<String, TopicAcl>>,
     /// Every connection, by lane.
     everyone: Arc<[parking_lot::RwLock<ConnMap>]>,
+    /// The lanes that have connections, one bit each: what a broadcast
+    /// goes to. Changed under the lane's write lock.
+    pub(super) occupied: Arc<AtomicU64>,
     /// Counts the connections that joined, to give each the next lane.
     joined: Arc<AtomicUsize>,
 }
@@ -416,6 +419,7 @@ impl TopicIndex {
             everyone: (0..lanes.clamp(1, MAX_LANES))
                 .map(|_| parking_lot::RwLock::new(ConnMap::default()))
                 .collect(),
+            occupied: Arc::default(),
             joined: Arc::default(),
         }
     }
@@ -431,14 +435,19 @@ impl TopicIndex {
 
     /// A connection joins its lane: broadcasts reach it from now on.
     pub(crate) fn join(&self, conn_id: &str, handle: &ConnectionHandle) {
-        self.everyone[usize::from(handle.lane)]
-            .write()
-            .insert(conn_id.to_owned(), handle.clone());
+        let mut conns = self.everyone[usize::from(handle.lane)].write();
+        conns.insert(conn_id.to_owned(), handle.clone());
+        self.occupied
+            .fetch_or(1u64 << handle.lane, Ordering::Release);
     }
 
     /// A connection leaves its lane.
     pub(crate) fn leave(&self, conn_id: &str, lane: u8) {
-        self.everyone[usize::from(lane)].write().remove(conn_id);
+        let mut conns = self.everyone[usize::from(lane)].write();
+        conns.remove(conn_id);
+        if conns.is_empty() {
+            self.occupied.fetch_and(!(1u64 << lane), Ordering::Release);
+        }
     }
 
     /// Add `conn_id` to `topic`; true when it was not subscribed yet.
@@ -640,9 +649,13 @@ impl Fanout {
 
     /// Deliver `msg` to every connection.
     pub(crate) fn broadcast(&self, msg: Outgoing) {
+        let occupied = self.index.occupied.load(Ordering::Acquire);
+        if occupied == 0 {
+            return;
+        }
         let msg = Arc::new(msg);
-        for lane in self.lanes.iter() {
-            let _ = lane.send(Job::All(Arc::clone(&msg)));
+        for lane in lanes_of(occupied) {
+            let _ = self.lanes[lane].send(Job::All(Arc::clone(&msg)));
         }
     }
 
@@ -747,6 +760,11 @@ async fn run_lane(
                 }
             }
         }
+        // The write tasks this batch woke wait in this thread's run queue:
+        // they run, and so does the rest of the runtime, before the next
+        // batch. A lane with work does not give way by itself until tokio's
+        // budget runs out, after thousands of deliveries.
+        tokio::task::yield_now().await;
     }
 }
 

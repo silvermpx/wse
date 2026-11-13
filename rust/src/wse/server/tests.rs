@@ -304,12 +304,18 @@ async fn a_large_fanout_reaches_everyone_once_and_in_order() {
     for (h, _) in &handles {
         assert_eq!(delivered(h, frame.len()).await, frame.to_vec());
     }
-    // A connection that left its lane gets no more broadcasts.
+    // A connection that left its lane gets no more broadcasts; a lane
+    // without connections gets no job.
+    assert_eq!(index.occupied.load(Ordering::Relaxed), 0b1111);
     index.leave("c0", handles[0].0.lane);
     fanout.broadcast(Outgoing::text(bytes::Bytes::from_static(b"{}")));
     assert_eq!(delivered(&handles[1].0, frame.len()).await, frame.to_vec());
     assert!(queued(&handles[0].0).is_empty());
     assert_eq!(drops.load(Ordering::Relaxed), 0);
+    for (i, (h, _)) in handles.iter().enumerate().filter(|(_, (h, _))| h.lane == 1) {
+        index.leave(&format!("c{i}"), h.lane);
+    }
+    assert_eq!(index.occupied.load(Ordering::Relaxed), 0b1101);
 }
 
 #[test]
