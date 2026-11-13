@@ -746,6 +746,7 @@ pub(super) async fn handle_connection(
                 }
             }
             conns.insert((*conn_id).clone(), own_handle.clone());
+            state.conn_list.store(None);
             state.connection_count.store(conns.len(), Ordering::Relaxed);
         }
         room
@@ -1474,6 +1475,7 @@ pub(super) async fn handle_connection(
     {
         let mut conns = state.connections.write().await;
         conns.remove(&*conn_id);
+        state.conn_list.store(None);
         state.connection_count.store(conns.len(), Ordering::Relaxed);
     }
     state.conn_formats.remove(&*conn_id);
