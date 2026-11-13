@@ -1759,6 +1759,12 @@ class AsyncWSEClient:
             self._start_encryption_failure(
                 WSEEncryptionError(f"Server-side key exchange failed: {message}")
             )
+        elif code == "E2E_UNSUPPORTED" and self._security is not None:
+            # Another attempt would be refused the same way (a server
+            # without this E2E design): stop instead of reconnecting.
+            self._start_encryption_failure(
+                WSEEncryptionError(f"The server refused this E2E design: {message}")
+            )
         elif code in ("AUTH_FAILED", "AUTH_REQUIRED"):
             logger.error("Auth failed: %s", message)
         elif code in ("RATE_LIMITED", "RATE_LIMIT_EXCEEDED") or "Rate limit" in message:

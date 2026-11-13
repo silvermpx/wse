@@ -492,6 +492,9 @@ export class MessageProcessor {
     const code = message.p?.code;
     if (code === 'KEY_EXCHANGE_FAILED') {
       this.connectionManager?.failEncryption('the server reported KEY_EXCHANGE_FAILED');
+    } else if (code === 'E2E_UNSUPPORTED') {
+      // Another attempt would be refused the same way: stop instead.
+      this.connectionManager?.failEncryption('the server refused this E2E design (E2E_UNSUPPORTED)');
     } else if (code === 'AUTH_FAILED' || code === 'AUTH_REQUIRED') {
       this.connectionManager?.markAuthRejected();
     }

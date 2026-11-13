@@ -130,6 +130,19 @@ describe('E2E encryption, first design', () => {
     expect(FakeWebSocket.instances).toHaveLength(1);
   });
 
+  it('stops on an E2E_UNSUPPORTED error from the server', async () => {
+    const failures = recordEvents('wseEncryptionFailed');
+    start();
+    const { ws } = await openAndHello();
+    ws.serverSend({ c: 'WSE', t: 'error', p: { code: 'E2E_UNSUPPORTED', message: 'no', recoverable: false } });
+    ws.serverClose(4800);
+
+    await vi.waitFor(() => expect(failures).toHaveLength(1));
+    expect(useWSEStore.getState().connectionState).toBe(ConnectionState.ERROR);
+    await new Promise((r) => setTimeout(r, 1_200));
+    expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+
   it('fails closed on a KEY_EXCHANGE_FAILED error from the server', async () => {
     const failures = recordEvents('wseEncryptionFailed');
     start();

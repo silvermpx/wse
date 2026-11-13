@@ -108,6 +108,30 @@ class TestFailClosed:
             assert_no_plaintext_app_frames(srv.connections[0])
             await client.disconnect()
 
+    async def test_a_refused_e2e_design_stops_reconnecting(self):
+        async def on_message(conn, msg):
+            if msg.get("t") == "client_hello":
+                error = {
+                    "c": "WSE",
+                    "t": "error",
+                    "p": {
+                        "code": "E2E_UNSUPPORTED",
+                        "message": "no",
+                        "recoverable": False,
+                    },
+                }
+                await conn.ws.send(json.dumps(error))
+                await conn.ws.close(4800)
+
+        async with FakeWSEServer(answer_hello=False, on_message=on_message) as srv:
+            client = make_client(srv.url)
+            with pytest.raises(WSEEncryptionError):
+                await client.connect()
+            assert client.state == ConnectionState.ERROR
+            await asyncio.sleep(0.3)
+            assert len(srv.connections) == 1  # no reconnect loop
+            await client.disconnect()
+
     async def test_no_server_hello_fails_closed_after_timeout(self, monkeypatch):
         import wse_client.client as client_mod
 
