@@ -3,56 +3,33 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use futures_util::SinkExt;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 
-use super::WsFrame;
+use super::frames::{close_frame, write_all_frames};
 use super::messages::build_error_json;
+use super::pre_frame_text;
 
 // ---------------------------------------------------------------------------
 // JWT helper functions (used by handle_connection)
 // ---------------------------------------------------------------------------
 
-/// Send an auth error + Close frame over the WS channel, drain it, and return.
-/// Used for JWT rejection to avoid duplicating the send+drain pattern.
-/// Reject a WebSocket connection with an auth error JSON body and close code 4401.
-/// `code` and `message` are included in the JSON error body only; the WS close
-/// frame always uses generic code 4401 to avoid leaking auth failure details.
-pub(super) async fn reject_ws_auth(
-    tx: &mpsc::UnboundedSender<WsFrame>,
-    mut rx: mpsc::UnboundedReceiver<WsFrame>,
-    mut write_half: futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<TcpStream>,
-        Message,
-    >,
-    code: &str,
-    message: &str,
-) {
-    let err = build_error_json(code, message);
-    let _ = tx.send(WsFrame::Msg(Message::Text(err.into())));
-    let _ = tx.send(WsFrame::Msg(Message::Close(Some(CloseFrame {
-        code: CloseCode::Library(4401),
-        reason: "Authentication failed".into(),
-    }))));
-    let write_task = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if let WsFrame::Msg(msg) = frame {
-                let is_close = matches!(msg, Message::Close(_));
-                if write_half.feed(msg).await.is_err() {
-                    break;
-                }
-                if is_close {
-                    break;
-                }
-            }
-        }
-        let _ = write_half.flush().await;
-        let _ = write_half.close().await;
-    });
-    let _ = write_task.await;
+/// Refuse a connection whose token failed: an error message with `code` and
+/// `message`, then a close frame with the generic code 4401, so the close
+/// code does not tell which check failed. Written straight to the socket:
+/// the connection never got a write task.
+pub(super) async fn reject_ws_auth(sock: &mut TcpStream, code: &str, message: &str) {
+    use tokio::io::AsyncWriteExt;
+
+    let frames = std::collections::VecDeque::from([
+        pre_frame_text(&build_error_json(code, message)),
+        close_frame(4401, "Authentication failed"),
+    ]);
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        write_all_frames(sock, &frames),
+    )
+    .await;
+    let _ = sock.shutdown().await;
 }
 
 /// Max connections allowed to sit in the pre-handshake / handshake phase at once.

@@ -15,6 +15,87 @@ use super::{BroadcastQueue, WsFrame};
 use crate::jwt::JwtConfig;
 use crate::wse::cluster::{ClusterCommand, ClusterDlq, ClusterMetrics};
 
+/// Close codes the server sends. The clients reconnect on all of them; only
+/// the auth codes (4401, 4403) stop them.
+pub(crate) const CLOSE_NORMAL: u16 = 1000; // disconnect() by the application
+pub(crate) const CLOSE_GOING_AWAY: u16 = 1001; // the server stops
+pub(crate) const CLOSE_TRY_AGAIN_LATER: u16 = 1013; // too slow to read, or the server is full
+pub(crate) const CLOSE_IDLE: u16 = 4408; // nothing received within idle_timeout
+pub(crate) const CLOSE_RATE_LIMITED: u16 = 4429; // kept sending past the rate limit
+
+/// How long a client gets to answer the server's close frame before its
+/// socket is closed for it.
+pub(crate) const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ends a connection from the server side.
+#[derive(Clone)]
+pub(crate) struct Closer {
+    /// Cancelled when the connection must go now: its read and write tasks
+    /// stop and the socket is closed.
+    token: tokio_util::sync::CancellationToken,
+    /// Set once the server queued a close frame: the client's further
+    /// messages are no longer delivered.
+    closing: Arc<AtomicBool>,
+}
+
+impl Closer {
+    pub(crate) fn new() -> Self {
+        Self {
+            token: tokio_util::sync::CancellationToken::new(),
+            closing: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn token(&self) -> &tokio_util::sync::CancellationToken {
+        &self.token
+    }
+
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    /// Drop the connection now, without a close handshake.
+    pub(crate) fn abort(&self) {
+        self.closing.store(true, Ordering::Release);
+        self.token.cancel();
+    }
+
+    /// Close from the server: queue a close frame with `code` on the
+    /// connection's queue `tx`, stop delivering the client's messages, and
+    /// close the socket if the client has not closed within `CLOSE_GRACE`.
+    /// Only the first call counts. Runs on the tokio runtime.
+    pub(crate) fn close(
+        &self,
+        tx: &mpsc::UnboundedSender<WsFrame>,
+        pending: &AtomicUsize,
+        code: u16,
+        reason: &str,
+    ) {
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
+
+        if self.closing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let frame = Message::Close(Some(CloseFrame {
+            code: CloseCode::from(code),
+            reason: reason.to_owned().into(),
+        }));
+        let bytes = 8 + reason.len();
+        pending.fetch_add(bytes, Ordering::Relaxed);
+        if tx.send(WsFrame::Msg(frame)).is_err() {
+            pending.fetch_sub(bytes, Ordering::Relaxed);
+        }
+        let token = self.token.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = tokio::time::sleep(CLOSE_GRACE) => token.cancel(),
+                () = token.cancelled() => {}
+            }
+        });
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ConnectionHandle {
     pub(crate) tx: mpsc::UnboundedSender<WsFrame>,
@@ -25,6 +106,14 @@ pub(crate) struct ConnectionHandle {
     pub(crate) broadcast_buf: Arc<parking_lot::Mutex<BroadcastQueue>>,
     /// Wakes write task when broadcast data is appended to broadcast_buf.
     pub(crate) broadcast_notify: Arc<tokio::sync::Notify>,
+    pub(crate) closer: Closer,
+}
+
+impl ConnectionHandle {
+    /// See `Closer::close`.
+    pub(crate) fn close(&self, code: u16, reason: &str) {
+        self.closer.close(&self.tx, &self.pending, code, reason);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -83,20 +172,13 @@ pub(super) enum InboundEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Dedup + Rate limiter state (accessed from send_event on Python thread)
+// Dedup state (accessed from send_event on the Python thread)
 // ---------------------------------------------------------------------------
 
 pub(super) struct DeduplicationState {
     pub(super) seen: AHashSet<String>,
     pub(super) queue: std::collections::VecDeque<String>,
     pub(super) max_entries: usize,
-}
-
-pub(super) struct PerConnRate {
-    pub(super) tokens: f64,
-    pub(super) last_refill: std::time::Instant,
-    pub(super) last_rate_limited: Option<std::time::Instant>,
-    pub(super) last_warning: Option<std::time::Instant>,
 }
 
 pub(crate) enum ServerCommand {
@@ -175,7 +257,6 @@ pub(crate) struct SharedState {
     // Per-connection format preference (lock-free sync access for send_event)
     pub(super) conn_formats: DashMap<String, bool>,
     // Per-connection rate limiter state (cleaned up on disconnect)
-    pub(super) conn_rates: DashMap<String, PerConnRate>,
     // Atomic connection count (lock-free read from Python without GIL blocking)
     pub(super) connection_count: AtomicUsize,
     // JWT config: when set, Rust validates JWT in handshake (zero GIL)
@@ -307,7 +388,6 @@ impl SharedState {
             inbound_rx: rx,
             inbound_dropped: AtomicU64::new(0),
             conn_formats: DashMap::new(),
-            conn_rates: DashMap::new(),
             connection_count: AtomicUsize::new(0),
             jwt_config: cfg.jwt_config,
             draining: AtomicBool::new(false),

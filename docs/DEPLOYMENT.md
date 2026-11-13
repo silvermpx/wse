@@ -436,7 +436,7 @@ async def health():
 | `wse_inbound_queue_depth` | gauge | Sustained growth (drain loop too slow) |
 | `wse_inbound_dropped_total` | counter | Any increase (events lost) |
 | `wse_auth_failures_total` | counter | Spike (brute force or misconfigured clients) |
-| `wse_rate_limited_total` | counter | Sustained growth (publisher too fast) |
+| `wse_rate_limited_total` | counter | Sustained growth (clients sending faster than `rate_limit_refill`) |
 | `wse_slow_consumer_drops_total` | counter | Any increase (slow clients, tune `max_outbound_queue_bytes`) |
 | `wse_cluster_peers` | gauge | Below expected count (peer down) |
 | `wse_recovery_bytes` | gauge | Above 80% of `recovery_memory_budget` |

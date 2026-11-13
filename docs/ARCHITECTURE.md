@@ -18,7 +18,7 @@ RustWSEServer (PyO3)
     |     +-- TCP listener (tungstenite WebSocket)
     |     +-- Connection tasks (one per client)
     |     +-- Cluster peer tasks (TCP mesh)
-    |     +-- Ping/zombie detection task
+    |     +-- Ping / idle / slow-consumer task
     |     +-- Recovery cleanup task
     |
     +-- SharedState
@@ -26,7 +26,6 @@ RustWSEServer (PyO3)
           +-- topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>
           +-- conn_topics: DashMap<String, DashSet<String>>
           +-- conn_formats: DashMap<String, bool>
-          +-- conn_rates: DashMap<String, PerConnRate>
           +-- conn_last_activity: DashMap<String, Instant>
           +-- connection_count: AtomicUsize
           +-- inbound_tx/rx: crossbeam bounded channel
@@ -63,35 +62,35 @@ TCP accept
   -> Register in SharedState (connections, conn_topics, conn_last_activity)
   -> Push Connect/AuthConnect event to inbound channel
   ...
-  -> Client disconnects or zombie detected
-  -> Clean up all maps (connections, topics, rates, activity)
+  -> Client disconnects, or the server closes it (see Closing a Connection)
+  -> Clean up all maps (connections, topics, activity)
   -> Push Disconnect event to inbound channel
 ```
 
 ### Dual Write Path
 
-Each connection has a write task that receives `WsFrame` variants through an unbounded mpsc channel:
+Each connection has one write task, the only writer to its socket. It has two sources:
 
-- **`WsFrame::Msg(Message)`** - Per-connection messages (control frames, individual sends). Goes through tungstenite's framing pipeline: `feed()` then `flush()`.
-- **`WsFrame::PreFramed(Bytes)`** - Broadcast messages with pre-built WebSocket frames. Bypasses tungstenite entirely and writes raw bytes to the TCP stream.
+- **The control queue** (unbounded mpsc of `WsFrame`): server_ready, replies, `send_event`, close frames. `WsFrame::Msg(Message)` is encoded by the write task; `WsFrame::PreFramed(Bytes)` is already wire bytes.
+- **The broadcast buffer**: fan-out frames built once and shared by every subscriber (`Bytes`, reference counted), not copied per connection.
 
-This separation means broadcasts avoid per-connection frame encoding. The WebSocket frame is built once and the resulting `Bytes` (backed by `Arc`) is shared across all connections.
+tungstenite only reads. After the upgrade its writes are discarded, so its automatic pongs and close replies can never land inside a frame the write task is in the middle of; the read loop queues pongs and the write task answers a client's close frame.
 
 ### Write Coalescing
 
-The write task batches up to 256 frames per iteration using `recv_many`:
-
 ```
 Write Task Loop:
-  1. rx.recv_many(&mut batch, 256)    - bulk atomic drain
-  2. Separate batch into PreFramed and Msg vectors
-  3. PreFramed: collect into IoSlice[], write_vectored (single writev syscall)
-     - If partial write, write_all for remainder
-  4. Msg: feed() each to tungstenite, single flush()
-  5. Clear batch, loop
+  1. Up to 256 control frames, without waiting: encoded in order, one writev
+     (a close frame ends the writing: nothing follows it)
+  2. Every broadcast frame queued so far: one writev, no copies
+  3. Nothing written? Wait for the control queue or the broadcast wakeup
 ```
 
-The `write_vectored` (writev) path sends all pending broadcast frames in a single syscall with zero memcpy - each `IoSlice` points directly into the `Bytes` buffer.
+The control queue is served on every turn, so a close, a pong or a reply is never held back by a busy topic, and server_ready, queued before the connection is visible to broadcasts, is always the first frame. The `write_vectored` (writev) path sends the pending frames in as few syscalls as the socket allows; each `IoSlice` points directly into a `Bytes` buffer.
+
+### Closing a Connection
+
+The server closes a connection for `disconnect()`, `drain()`, `stop()`, the idle timeout, a slow consumer and rate-limit abuse (codes in [PROTOCOL.md](PROTOCOL.md#websocket-close-codes)). It queues a close frame, stops delivering what the client sends, and gives the client 5 seconds to answer with its own close frame. Then the read and write tasks are cancelled and the socket is closed, even if the client is not reading. Accepted sockets also have TCP keepalive (first probe after 60 s of silence), so a peer that vanished without a FIN is found even with long timeouts.
 
 ### Pre-framed WebSocket Broadcast
 
@@ -193,7 +192,6 @@ Client WebSocket frame
 ```
 server.send(conn_id, event_dict)
   -> Deduplication check (AHashSet, 50K FIFO window)
-  -> Rate limit check (token bucket)
   -> Serialize: JSON with serde_json, or msgpack via rmpv
   -> Compress if above threshold (zlib)
   -> Build WSE envelope: {"t": type, "p": payload, "id": uuid, "seq": N, "ts": timestamp, "v": 1}
@@ -494,7 +492,7 @@ The Rust binary uses mimalloc as the global allocator. This provides better perf
 
 ### Rate Limiting
 
-Token bucket per connection:
+The messages a client sends, per connection, go through a token bucket in the read loop, before they are parsed:
 
 | Parameter    | Value   |
 |--------------|---------|
@@ -502,9 +500,11 @@ Token bucket per connection:
 | Refill rate  | 10,000/s|
 
 When a connection exceeds its rate limit:
-1. An error event with `RATE_LIMITED` code and `retry_after` hint is sent to the client.
-2. A warning is emitted at 20% remaining capacity (throttled via `last_warning` timestamp to avoid log spam).
-3. The offending message is dropped.
+1. The message is dropped and counted in `wse_rate_limited_total`.
+2. An error event with `RATE_LIMITED` code and `retry_after` hint is sent to the client, at most once a second. A `rate_limit_warning` goes out at 20% remaining capacity, also at most once a second.
+3. A client that keeps sending into the empty bucket for 10 seconds is closed with code 4429.
+
+What the server sends (`send_event`, broadcasts) is not rate limited; `max_outbound_queue_bytes` bounds it per connection.
 
 ### Backpressure (Slow Consumer Protection)
 
@@ -513,7 +513,8 @@ Per-connection byte-based backpressure via `max_outbound_queue_bytes` (default 1
 - Each connection tracks pending outbound bytes in an `AtomicUsize` counter
 - Before fan-out, the counter is checked: if `pending >= max_outbound_queue_bytes`, the message is dropped for that connection (others still receive it)
 - The counter uses `saturating_sub` on flush to prevent underflow wraparound
-- Two-phase slow consumer detection: first tick marks as suspected, second tick sends WebSocket Close, third tick force-removes as zombie
+- Replies the server makes on its own (PONG, server_hello, protocol pongs, rate-limit notices) obey the same budget: a client that sends but does not read cannot grow its queue with them
+- Two-phase slow consumer detection: a connection whose queue is over the budget on one ping tick is suspected; still over it on the next, it is closed with code 1013 (and dropped 5 seconds later if it does not answer)
 
 ### Subscription Limits
 

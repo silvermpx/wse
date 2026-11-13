@@ -19,12 +19,12 @@ High-performance WebSocket server built in Rust with native clustering, E2E encr
 | **Topic subscriptions** | Per-connection topic subscriptions with automatic cleanup on disconnect |
 | **Pre-framed broadcast** | WebSocket frame built once, shared via Arc across all connections, single allocation per broadcast |
 | **Vectored writes** | `write_vectored` (writev syscall) batches multiple frames per connection in a single kernel call |
-| **Write coalescing** | Write task drains up to 256 pending frames per iteration via `recv_many` |
-| **DashMap state** | Lock-free sharded concurrent hash maps for topics, rates, formats, activity tracking |
+| **Write coalescing** | One write task per connection, the only writer to its socket: up to 256 control frames and every queued broadcast frame per turn |
+| **DashMap state** | Lock-free sharded concurrent hash maps for topics, formats, activity tracking |
 | **mimalloc allocator** | Global allocator optimized for multi-threaded workloads with frequent small allocations |
 | **Deduplication** | 50,000-entry AHashSet with FIFO eviction per `send_event()` call |
-| **Rate limiting** | Per-connection token bucket: 100K capacity, 10K/s refill, client warning at 20% remaining |
-| **Zombie detection** | Server pings every 25s, force-closes connections with no activity for 60s |
+| **Rate limiting** | Per-connection token bucket on what clients send: 100K capacity, 10K/s refill, client warning at 20% remaining |
+| **Idle detection** | Server pings every 25s, closes connections that sent nothing for 60s; every server close is enforced 5s later |
 | **Drain mode** | Lock-free crossbeam bounded channel, Python acquires GIL once per batch (not per event) |
 | **Compression** | zlib for client-facing messages above threshold (default 1024 bytes) |
 | **MessagePack** | Opt-in binary transport via `?format=msgpack`, roughly 2x faster serialization, 30% smaller |
@@ -190,11 +190,11 @@ token = rust_jwt_encode(
 | `presence_max_members` | 0 | Max tracked members per topic (0 = unlimited) |
 | `max_outbound_queue_bytes` | 16777216 | Per-connection outbound buffer limit (bytes, default 16 MB). Messages dropped when exceeded |
 | `max_subscriptions_per_connection` | 0 | Max topics per connection (0 = unlimited). Prevents topic explosion DoS |
-| `rate_limit_capacity` | 100000.0 | Token bucket capacity per connection |
-| `rate_limit_refill` | 10000.0 | Token bucket refill rate per second |
+| `rate_limit_capacity` | 100000.0 | Messages a client may send in a burst (token bucket capacity per connection, at least 1; `float("inf")` for no limit) |
+| `rate_limit_refill` | 10000.0 | Messages per second a client may send after the burst (refill rate, above 0) |
 | `max_message_size` | 1048576 | Maximum WebSocket frame size in bytes (default 1 MB) |
-| `ping_interval` | 25 | Server-initiated ping interval in seconds |
-| `idle_timeout` | 60 | Force-close connections idle for this many seconds |
+| `ping_interval` | 25 | Server-initiated ping interval in seconds (at least 1, below `idle_timeout`) |
+| `idle_timeout` | 60 | Close connections that sent nothing for this many seconds (code 4408) |
 
 ---
 
@@ -432,15 +432,15 @@ Enable on the client side - the server handles key exchange automatically during
 
 ### Rate Limiting
 
-Per-connection token bucket: 100,000 token capacity, 10,000 tokens/second refill. Clients receive a `rate_limit_warning` at 20% remaining capacity, and `RATE_LIMITED` error when exceeded.
+Per-connection token bucket on the messages clients send: 100,000 messages capacity, 10,000 messages/second refill. Clients receive a `rate_limit_warning` at 20% remaining capacity, and a `RATE_LIMITED` error when their messages are dropped; a client that keeps sending for 10 seconds after that is closed with code 4429. What the server sends is bounded by `max_outbound_queue_bytes` instead.
 
 ### Deduplication
 
 `send_event()` maintains a 50,000-entry AHashSet with FIFO eviction. Duplicate message IDs are dropped before serialization.
 
-### Zombie Detection
+### Idle Detection
 
-Server pings every connected client every 25 seconds. Connections with no activity for 60 seconds are force-closed.
+Server pings every connected client every 25 seconds. Connections that sent nothing for 60 seconds are closed with code 4408; WebSocket protocol pings count as activity. A client that does not answer a close frame within 5 seconds is disconnected.
 
 Full security documentation: [docs/SECURITY.md](docs/SECURITY.md)
 

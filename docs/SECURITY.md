@@ -333,20 +333,28 @@ settings are left alone.
 
 ### Rate Limiting
 
-Per-connection token bucket rate limiter:
-- **Capacity**: 100,000 tokens
-- **Refill rate**: 10,000 tokens/second
-- **Exceeded**: client receives error with code `RATE_LIMITED`
+The messages each client sends go through a per-connection token bucket
+before the server parses them (`rate_limit_capacity`, `rate_limit_refill`):
+- **Capacity**: 100,000 messages
+- **Refill rate**: 10,000 messages/second
+- **Exceeded**: the message is dropped; the client receives an error with code `RATE_LIMITED` (at most once a second)
 - **Warning**: sent at 20% remaining capacity
+- **Abuse**: a client that keeps sending into the empty bucket for 10 seconds is closed with code 4429
+
+Callback mode additionally bounds the callbacks in flight per connection
+(256); drain mode bounds the shared inbound queue (`max_inbound_queue_size`).
 
 ### Client-Side
 
 The frontend `RateLimiter` prevents excessive sends.
 
-### Zombie Detection
+### Idle and Unresponsive Clients
 
-- Server pings every 25 seconds
-- Connections with no activity for 60 seconds are force-closed
+- The server pings every `ping_interval` seconds (25 by default)
+- A connection that has sent no frame for `idle_timeout` seconds (60 by default) is closed with code 4408; protocol pings count as activity
+- A client that does not read: its outbound queue is capped at `max_outbound_queue_bytes`, and a queue still over it on the next ping tick closes the connection with code 1013
+- Every server-initiated close gives the client 5 seconds to answer; then the socket is closed and the connection's tasks end, whether the client reads or not
+- Accepted sockets use TCP keepalive, so peers that vanished without closing are found by the kernel as well
 
 ### Handshake Protection
 
@@ -356,7 +364,7 @@ The frontend `RateLimiter` prevents excessive sends.
 
 ### Connection Limits
 
-- `max_connections` caps total concurrent WebSocket connections
+- `max_connections` caps total concurrent WebSocket connections; a full server answers the upgrade with HTTP 503 and `Retry-After: 5`
 - `max_subscriptions_per_connection` caps topics per connection (0 = unlimited). Prevents topic explosion DoS where a single client creates millions of unique topics
 - Inbound queue bounded at 131,072 events
 - Per-connection deduplication: 50,000-entry AHashSet with FIFO eviction

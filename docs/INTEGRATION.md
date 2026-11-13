@@ -1030,7 +1030,7 @@ async def metrics():
 | `wse_connections_accepted_total` | Total connections accepted |
 | `wse_connections_rejected_total` | Connections rejected (max limit or auth failure) |
 | `wse_auth_failures_total` | JWT authentication failures |
-| `wse_rate_limited_total` | Messages dropped by rate limiter (in callback mode also counts shed callback dispatches) |
+| `wse_rate_limited_total` | Client messages dropped by the inbound rate limit (in callback mode also counts shed callback dispatches) |
 | `wse_inbound_dropped_total` | Drain queue events dropped (queue full) |
 | `wse_slow_consumer_drops_total` | Messages dropped due to slow consumer backpressure |
 

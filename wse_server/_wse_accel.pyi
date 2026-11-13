@@ -337,7 +337,7 @@ class RustWSEServer:
         """Start the WebSocket server."""
         ...
     def stop(self) -> None:
-        """Stop the server and close all connections."""
+        """Stop the server and close all connections (close code 1001)."""
         ...
     def drain(
         self,
@@ -347,9 +347,11 @@ class RustWSEServer:
     ) -> None:
         """Enter graceful drain mode (lame duck).
 
-        Stops accepting new connections, sends Close frame with custom code
-        to all clients, notifies cluster peers, and waits for clients to
-        disconnect or timeout. Call stop() after drain() to fully shut down.
+        Stops accepting new connections (upgrades get HTTP 503), closes every
+        client with close_code (a client that does not answer within 5
+        seconds is disconnected), notifies cluster peers, and waits up to
+        timeout seconds for clients to disconnect. Call stop() after drain()
+        to fully shut down.
         """
         ...
     def is_running(self) -> bool:
@@ -403,7 +405,12 @@ class RustWSEServer:
         event: dict[str, Any],
         compression_threshold: int = 1024,
     ) -> int:
-        """Send an event through the full outbound pipeline. Returns bytes sent."""
+        """Send an event through the full outbound pipeline.
+
+        Returns the size of the frame handed to the connection, 0 for an
+        event id this connection already got. A connection whose outbound
+        queue is over max_outbound_queue_bytes drops it.
+        """
         ...
 
     # -- Broadcast ------------------------------------------------------------
@@ -430,7 +437,11 @@ class RustWSEServer:
         """List of active connection IDs."""
         ...
     def disconnect(self, conn_id: str) -> None:
-        """Force-disconnect a connection."""
+        """Close a connection with code 1000.
+
+        Its messages after that are not delivered, and a client that does not
+        answer within 5 seconds is disconnected.
+        """
         ...
 
     # -- Topic Authorization ---------------------------------------------------

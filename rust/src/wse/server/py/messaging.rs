@@ -2,7 +2,6 @@
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
@@ -18,7 +17,6 @@ use crate::wse::compression::serde_json_to_rmpv;
 use crate::wse::server::ServerCommand;
 use crate::wse::server::e2e::encrypt_outbound;
 use crate::wse::server::messages::{inject_category, message_category};
-use crate::wse::server::state::PerConnRate;
 
 impl RustWSEServer {
     pub(super) fn send_impl(&self, conn_id: &str, data: &str) -> PyResult<()> {
@@ -69,71 +67,6 @@ impl RustWSEServer {
                     dedup.seen.remove(&old);
                 }
             }
-        }
-
-        // Per-connection rate limiter (token bucket) with client feedback
-        {
-            let mut entry = self
-                .shared
-                .conn_rates
-                .entry(conn_id.to_owned())
-                .or_insert_with(|| PerConnRate {
-                    tokens: self.shared.rate_capacity,
-                    last_refill: std::time::Instant::now(),
-                    last_rate_limited: None,
-                    last_warning: None,
-                });
-            let rate = entry.value_mut();
-            let elapsed = rate.last_refill.elapsed().as_secs_f64();
-            rate.tokens =
-                (rate.tokens + elapsed * self.shared.rate_refill).min(self.shared.rate_capacity);
-            rate.last_refill = std::time::Instant::now();
-
-            if rate.tokens < 1.0 {
-                self.shared
-                    .rate_limited_total
-                    .fetch_add(1, Ordering::Relaxed);
-                // Send rate_limited error to client (throttled: max once per second)
-                let should_notify = rate
-                    .last_rate_limited
-                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
-                if should_notify {
-                    let err = "{\"c\":\"WSE\",\"t\":\"error\",\"p\":{\"code\":\"RATE_LIMITED\",\"message\":\"Rate limit exceeded\",\"retry_after\":1.0},\"v\":1}".to_string();
-                    cmd_tx
-                        .send(ServerCommand::SendText {
-                            conn_id: conn_id.to_owned(),
-                            data: err,
-                        })
-                        .ok();
-                    rate.last_rate_limited = Some(std::time::Instant::now());
-                }
-                return Ok(0);
-            }
-
-            // Warning at 20% remaining capacity (throttled: max once per second)
-            let warning_threshold = self.shared.rate_capacity * 0.2;
-            if rate.tokens < warning_threshold {
-                let should_warn = rate
-                    .last_warning
-                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
-                if should_warn {
-                    let warning = format!(
-                        "{{\"c\":\"WSE\",\"t\":\"rate_limit_warning\",\"p\":{{\"current_rate\":{},\"limit\":{},\"remaining\":{},\"retry_after\":1.0}},\"v\":1}}",
-                        (self.shared.rate_capacity - rate.tokens) as u64,
-                        self.shared.rate_capacity as u64,
-                        rate.tokens as u64,
-                    );
-                    cmd_tx
-                        .send(ServerCommand::SendText {
-                            conn_id: conn_id.to_owned(),
-                            data: warning,
-                        })
-                        .ok();
-                    rate.last_warning = Some(std::time::Instant::now());
-                }
-            }
-
-            rate.tokens -= 1.0;
         }
 
         // Build serde_json map from PyDict: c first, t second, v last

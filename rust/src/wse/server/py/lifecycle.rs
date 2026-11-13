@@ -18,14 +18,25 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 use super::RustWSEServer;
-use super::callbacks::fire_on_disconnect;
 use crate::wse::cluster::ClusterCommand;
 use crate::wse::pylock::lock;
 use crate::wse::server::commands::process_commands;
 use crate::wse::server::connection::handle_connection;
 use crate::wse::server::handshake::{HandshakeGuard, MAX_PENDING_HANDSHAKES};
 use crate::wse::server::state::InboundEvent;
-use crate::wse::server::{ServerCommand, WsFrame, format_presence_msg};
+use crate::wse::server::{
+    CLOSE_IDLE, CLOSE_TRY_AGAIN_LATER, ConnectionHandle, ServerCommand, WsFrame,
+    format_presence_msg,
+};
+
+/// TCP keepalive of accepted connections: the first probe after a minute of
+/// silence, then every 10 seconds.
+fn tcp_keepalive() -> socket2::TcpKeepalive {
+    let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(60));
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    let keepalive = keepalive.with_interval(Duration::from_secs(10));
+    keepalive
+}
 
 impl RustWSEServer {
     pub(super) fn set_callbacks_impl(
@@ -240,216 +251,66 @@ impl RustWSEServer {
                             loop {
                                 interval.tick().await;
                                 let now = std::time::Instant::now();
-                                // Collect senders + pending counters under read lock
-                                let snapshot: Vec<(
-                                    String,
-                                    mpsc::UnboundedSender<WsFrame>,
-                                    Arc<AtomicUsize>,
-                                )> = {
-                                    let conns =
-                                        ping_state.connections.read().await;
+                                let snapshot: Vec<(String, ConnectionHandle)> = {
+                                    let conns = ping_state.connections.read().await;
                                     conns
                                         .iter()
-                                        .map(|(cid, h)| {
-                                            (cid.clone(), h.tx.clone(), h.pending.clone())
-                                        })
+                                        .map(|(cid, h)| (cid.clone(), h.clone()))
                                         .collect()
                                 };
-                                // Trim stale entries from suspected_slow (disconnected connections)
+                                // Forget suspects that disconnected meanwhile.
                                 if !suspected_slow.is_empty() {
-                                    let snapshot_ids: ahash::AHashSet<&str> = snapshot.iter().map(|(cid, _, _)| cid.as_str()).collect();
-                                    suspected_slow.retain(|id| snapshot_ids.contains(id.as_str()));
+                                    let live: AHashSet<&str> =
+                                        snapshot.iter().map(|(cid, _)| cid.as_str()).collect();
+                                    suspected_slow.retain(|id| live.contains(id.as_str()));
                                 }
-                                let mut force_remove = Vec::new();
-                                for (cid, tx, pending) in &snapshot {
-                                    // Slow consumer detection via pending counter
+                                for (cid, handle) in &snapshot {
+                                    // A slow consumer: its queue is still full on a
+                                    // second tick. It gets a close frame; if it does
+                                    // not read that either, the close grace drops it.
                                     if max_pending > 0
-                                        && pending.load(Ordering::Relaxed) >= max_pending
+                                        && handle.pending.load(Ordering::Relaxed) >= max_pending
                                     {
-                                        if suspected_slow.contains(cid) {
-                                            // Second tick still full: disconnect
-                                            pending.fetch_add(8, Ordering::Relaxed);
-                                            if tx.send(WsFrame::Msg(
-                                                Message::Close(None),
-                                            )).is_err() {
-                                                pending.fetch_sub(8, Ordering::Relaxed);
-                                            }
-                                            ping_state
-                                                .conn_last_activity
-                                                .remove(cid);
-                                            suspected_slow.remove(cid);
-                                            continue;
+                                        if suspected_slow.remove(cid) {
+                                            handle.close(CLOSE_TRY_AGAIN_LATER, "too slow to read");
                                         } else {
-                                            // First tick: suspect -- skip ping for this connection
                                             suspected_slow.insert(cid.clone());
-                                            continue;
                                         }
-                                    } else {
-                                        // Queue not full: clear suspicion
-                                        suspected_slow.remove(cid);
+                                        continue;
                                     }
+                                    suspected_slow.remove(cid);
 
-                                    if let Some(last) =
-                                        ping_state.conn_last_activity.get(cid)
-                                    {
-                                        // Check zombie (no activity for idle_timeout)
-                                        if now.duration_since(*last) > idle_timeout
-                                        {
-                                            pending.fetch_add(8, Ordering::Relaxed);
-                                            if tx.send(WsFrame::Msg(
-                                                Message::Close(None),
-                                            )).is_err() {
-                                                pending.fetch_sub(8, Ordering::Relaxed);
-                                            }
-                                            // Remove activity entry; next tick
-                                            // will force-remove if still present
-                                            ping_state
-                                                .conn_last_activity
-                                                .remove(cid);
-                                            continue;
-                                        }
-                                        // Send server ping
-                                        let ts =
-                                            chrono::Utc::now().to_rfc3339_opts(
-                                                chrono::SecondsFormat::Millis,
-                                                true,
-                                            );
-                                        let ping_msg = format!(
-                                            "{{\"c\":\"WSE\",\"t\":\"ping\",\"p\":{{\"server_time\":\"{ts}\"}}}}"
-                                        );
-                                        let pm_bytes = ping_msg.len() + 4;
-                                        pending.fetch_add(pm_bytes, Ordering::Relaxed);
-                                        if tx.send(WsFrame::Msg(
-                                            Message::Text(ping_msg.into()),
-                                        )).is_err() {
-                                            pending.fetch_sub(pm_bytes, Ordering::Relaxed);
-                                        }
-                                    } else {
-                                        // No activity entry = Close was sent last
-                                        // tick but connection didn't terminate.
-                                        // Force-remove this zombie.
-                                        force_remove.push(cid.clone());
+                                    // Copied out: holding the map entry while the
+                                    // connection's cleanup removes it would deadlock
+                                    // on its shard lock.
+                                    let last_seen = ping_state
+                                        .conn_last_activity
+                                        .get(cid)
+                                        .map(|entry| *entry);
+                                    let Some(last) = last_seen else {
+                                        continue; // gone since the snapshot
+                                    };
+                                    if now.duration_since(last) > idle_timeout {
+                                        handle.close(CLOSE_IDLE, "idle timeout");
+                                        continue;
                                     }
-                                }
-                                // Force-remove zombies that didn't respond to Close
-                                if !force_remove.is_empty() {
-                                    let drain = ping_state.drain_mode.load(Ordering::Relaxed);
-                                    // Presence cleanup for zombies
-                                    if let Some(ref pm) = ping_state.presence {
-                                        let broadcast_tx = ping_state.presence_broadcast_tx.read().unwrap().clone();
-                                        let cluster_tx = ping_state.cluster_cmd_tx.read().unwrap().clone();
-                                        for cid in &force_remove {
-                                            let results = pm.remove_connection(cid);
-                                            for (topic, result) in results {
-                                                if let crate::wse::presence::UntrackResult::LastLeave { user_id, data } = result {
-                                                    if drain {
-                                                        ping_state.push_inbound(InboundEvent::PresenceLeave {
-                                                            topic: topic.clone(),
-                                                            user_id: user_id.clone(),
-                                                            data: data.clone(),
-                                                        });
-                                                    }
-                                                    if let Some(ref tx) = broadcast_tx {
-                                                        let msg = format_presence_msg("presence_leave", &user_id, &data);
-                                                        let _ = tx.send(ServerCommand::BroadcastLocal {
-                                                            topic: topic.clone(),
-                                                            data: msg,
-                                                            skip_recovery: true,
-                                                            publish: false,
-                                                        });
-                                                    }
-                                                    if let Some(ref ctx) = cluster_tx {
-                                                        let data_str = serde_json::to_string(&data).unwrap_or_default();
-                                                        let now = crate::wse::presence::epoch_ms();
-                                                        let _ = ctx.send(ClusterCommand::PresenceUpdate {
-                                                            topic,
-                                                            user_id,
-                                                            action: 1,
-                                                            data: data_str,
-                                                            updated_at: now,
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                        }
+                                    if handle.closer.is_closing() {
+                                        continue;
                                     }
-                                    // Remove connections FIRST (mirrors normal disconnect order).
-                                    // Track which cids were actually present -- handle_connection
-                                    // may have already cleaned up if the connection closed naturally.
-                                    let mut was_present: ahash::AHashSet<String> = ahash::AHashSet::new();
-                                    {
-                                        let mut conns =
-                                            ping_state.connections.write().await;
-                                        for cid in &force_remove {
-                                            if conns.remove(cid).is_some() {
-                                                was_present.insert(cid.clone());
-                                            }
-                                            ping_state.conn_formats.remove(cid);
-                                            ping_state.conn_rates.remove(cid);
-                                            ping_state.conn_last_activity.remove(cid);
-                                            ping_state.conn_encryption.remove(cid);
-                                            ping_state.conn_topic_acl.remove(cid);
-                                            // Queue group cleanup for zombies
-                                            if let Some((_, memberships)) = ping_state.conn_queue_groups.remove(cid) {
-                                                for (topic, group_name) in memberships {
-                                                    if let Some(tg) = ping_state.queue_groups.get(&topic) {
-                                                        if let Some(mut g) = tg.get_mut(&group_name) {
-                                                            g.members.retain(|(id, _)| id != cid);
-                                                        }
-                                                        tg.remove_if(&group_name, |_, g| g.members.is_empty());
-                                                    }
-                                                    ping_state.queue_groups.remove_if(&topic, |_, groups| groups.is_empty());
-                                                }
-                                            }
-                                        }
-                                        ping_state.connection_count.store(
-                                            conns.len(),
-                                            Ordering::Relaxed,
-                                        );
-                                    }
-                                    // Topic subscription cleanup for zombies (only if we actually removed them)
-                                    for cid in &force_remove {
-                                        if !was_present.contains(cid) {
-                                            continue; // handle_connection already cleaned up
-                                        }
-                                        if let Some((_, topics)) = ping_state.conn_topics.remove(cid) {
-                                            let mut disconnected_topics = Vec::new();
-                                            for topic_ref in topics.iter() {
-                                                let topic = topic_ref.clone();
-                                                if let Some(subscribers) = ping_state.topic_subscribers.get(&topic) {
-                                                    subscribers.remove(cid);
-                                                }
-                                                if ping_state.topic_subscribers.remove_if(&topic, |_, subs| subs.is_empty()).is_some()
-                                                    && (topic.contains('*') || topic.contains('?'))
-                                                {
-                                                    ping_state.glob_topic_count.fetch_sub(1, Ordering::Relaxed);
-                                                }
-                                                disconnected_topics.push(topic);
-                                            }
-                                            ping_state.remove_local_interest(&disconnected_topics);
-                                        }
-                                        // Emit disconnect event AFTER cleanup (mirrors normal path)
-                                        if drain {
-                                            ping_state.push_inbound(InboundEvent::Disconnect {
-                                                conn_id: cid.clone(),
-                                            });
-                                        } else {
-                                            let cb_guard = ping_state.on_disconnect.read().unwrap();
-                                            if let Some(ref cb) = *cb_guard
-                                                && let Some(cb_clone) = Python::try_attach(|py| cb.clone_ref(py))
-                                            {
-                                                let cid_owned = cid.clone();
-                                                drop(cb_guard);
-                                                tokio::task::spawn_blocking(move || {
-                                                    fire_on_disconnect(&cb_clone, &cid_owned);
-                                                });
-                                            }
-                                        }
-                                    }
-                                    tracing::warn!(
-                                        "[WSE] Force-removed {} zombie connections",
-                                        force_remove.len()
+                                    let ts = chrono::Utc::now()
+                                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                                    let ping_msg = format!(
+                                        "{{\"c\":\"WSE\",\"t\":\"ping\",\"p\":{{\"server_time\":\"{ts}\"}}}}"
                                     );
+                                    let pm_bytes = ping_msg.len() + 4;
+                                    handle.pending.fetch_add(pm_bytes, Ordering::Relaxed);
+                                    if handle
+                                        .tx
+                                        .send(WsFrame::Msg(Message::Text(ping_msg.into())))
+                                        .is_err()
+                                    {
+                                        handle.pending.fetch_sub(pm_bytes, Ordering::Relaxed);
+                                    }
                                 }
                             }
                         });
@@ -476,6 +337,9 @@ impl RustWSEServer {
                                         // Larger send buffer for broadcast throughput (default 16KB -> 256KB)
                                         let sock = socket2::SockRef::from(&stream);
                                         let _ = sock.set_send_buffer_size(262_144);
+                                        // A peer that vanished without a FIN is found
+                                        // by the kernel too, not only by idle_timeout.
+                                        let _ = sock.set_tcp_keepalive(&tcp_keepalive());
                                         let shared2 = shared.clone();
                                         tokio::spawn(async move {
                                             // Protocol detection: peek first 4 bytes to distinguish

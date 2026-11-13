@@ -114,6 +114,7 @@ fn make_handle() -> (ConnectionHandle, mpsc::UnboundedReceiver<WsFrame>) {
         pending: Arc::new(AtomicUsize::new(0)),
         broadcast_buf: Arc::new(parking_lot::Mutex::new(BroadcastQueue::new())),
         broadcast_notify: Arc::new(tokio::sync::Notify::new()),
+        closer: super::Closer::new(),
     };
     (h, rx)
 }

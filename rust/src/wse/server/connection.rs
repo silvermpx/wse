@@ -1,15 +1,18 @@
 //! One client connection, from the WebSocket upgrade to the cleanup.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
-use bytes::{Bytes, BytesMut};
-use futures_util::{SinkExt, StreamExt};
+use bytes::Bytes;
+use futures_util::StreamExt;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
@@ -17,13 +20,16 @@ use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use uuid::Uuid;
 
 use super::e2e::{decrypt_inbound, derive_connection_key};
-use super::frames::{write_all_frames, ws_frame_size};
+use super::frames::{
+    close_frame, encode_message, encode_ws_frame, write_all_frames, ws_frame_size,
+};
 use super::handshake::{HandshakeGuard, reject_ws_auth};
 use super::messages::{build_server_hello, build_server_ready, normalize_json_keys};
 use super::py::{fire_on_connect, fire_on_disconnect, json_to_pyobj};
 use super::state::InboundEvent;
 use super::{
-    BroadcastQueue, ConnectionHandle, ServerCommand, SharedState, WsFrame, format_presence_msg,
+    BroadcastQueue, CLOSE_GRACE, CLOSE_RATE_LIMITED, CLOSE_TRY_AGAIN_LATER, Closer,
+    ConnectionHandle, ServerCommand, SharedState, WsFrame, format_presence_msg,
 };
 use crate::jwt::{self, parse_cookie_value};
 use crate::wse::cluster::ClusterCommand;
@@ -70,29 +76,244 @@ fn clone_tcp_stream(stream: TcpStream) -> std::io::Result<(TcpStream, TcpStream)
     ))
 }
 
+/// The answer to an upgrade the server cannot take now.
+fn service_unavailable() -> ErrorResponse {
+    use tokio_tungstenite::tungstenite::http::{StatusCode, header};
+
+    let mut response = ErrorResponse::new(None);
+    *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
+    response
+}
+
+/// The client socket as tungstenite sees it. Once the upgrade is done its
+/// writes go nowhere: the connection's write task writes every frame to the
+/// client, so an automatic pong or close reply of tungstenite's cannot land in
+/// the middle of one of its frames.
+struct ServerSocket {
+    inner: TcpStream,
+    silent: bool,
+}
+
+impl AsyncRead for ServerSocket {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ServerSocket {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.silent {
+            return Poll::Ready(Ok(buf.len()));
+        }
+        Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.silent {
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.silent {
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
+const RATE_LIMITED_ERROR: &str = "{\"c\":\"WSE\",\"t\":\"error\",\"p\":{\"code\":\"RATE_LIMITED\",\"message\":\"Rate limit exceeded\",\"retry_after\":1.0},\"v\":1}";
+
+/// Control frames the write task takes from the queue at a time, before it
+/// turns to the broadcast frames again.
+const CONTROL_BATCH: usize = 256;
+
+fn release(pending: &AtomicUsize, bytes: usize) {
+    let _ = pending.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        Some(cur.saturating_sub(bytes))
+    });
+}
+
+/// How a batch of control frames went out.
+enum Sent {
+    Frames,
+    /// The server's close frame went out: nothing may follow it.
+    Close,
+    Failed,
+}
+
+/// Write the queued control frames in order, up to the server's close frame;
+/// whatever was queued after the close is dropped.
+async fn write_control(
+    sock: &mut TcpStream,
+    batch: &mut Vec<WsFrame>,
+    wire: &mut VecDeque<Bytes>,
+    pending: &AtomicUsize,
+) -> Sent {
+    let queued: usize = batch.iter().map(ws_frame_size).sum();
+    let mut close = false;
+    for frame in batch.drain(..) {
+        match frame {
+            WsFrame::PreFramed(bytes) => wire.push_back(bytes),
+            WsFrame::Msg(msg) => {
+                close = matches!(msg, Message::Close(_));
+                if let Some(bytes) = encode_message(&msg) {
+                    wire.push_back(bytes);
+                }
+                if close {
+                    break;
+                }
+            }
+        }
+    }
+    let result = write_all_frames(sock, wire).await;
+    wire.clear();
+    release(pending, queued);
+    match (result, close) {
+        (Err(_), _) => Sent::Failed,
+        (Ok(()), true) => Sent::Close,
+        (Ok(()), false) => Sent::Frames,
+    }
+}
+
+/// What the read side saw of the client's close frame, for the reply: no
+/// close frame, a close frame without a code, or the code.
+const NO_PEER_CLOSE: u32 = 0;
+const PEER_CLOSE_WITHOUT_CODE: u32 = u32::MAX;
+
+/// The reply to a close the client started: its own code (RFC 6455 5.5.1).
+fn close_reply(peer: u32) -> Option<Bytes> {
+    match peer {
+        NO_PEER_CLOSE => None,
+        PEER_CLOSE_WITHOUT_CODE => Some(encode_ws_frame(0x08, &[])),
+        code => Some(close_frame(code as u16, "")),
+    }
+}
+
+/// Queue a frame the server makes on its own (server_hello, PONG, an error).
+/// A client that sends but does not read must not grow its queue with them:
+/// over `max_outbound_queue_bytes` the frame is dropped.
+fn queue_reply(
+    tx: &mpsc::UnboundedSender<WsFrame>,
+    pending: &AtomicUsize,
+    max_pending: usize,
+    msg: Message,
+) {
+    let frame = WsFrame::Msg(msg);
+    let bytes = ws_frame_size(&frame);
+    if max_pending > 0 && pending.load(Ordering::Relaxed) + bytes > max_pending {
+        return;
+    }
+    pending.fetch_add(bytes, Ordering::Relaxed);
+    if tx.send(frame).is_err() {
+        release(pending, bytes);
+    }
+}
+
+/// The client's messages per connection: a token bucket of
+/// `rate_limit_capacity` messages, refilled at `rate_limit_refill` per second.
+/// The client is warned at 20% left, its messages are dropped below one token,
+/// and it is closed once it has kept sending into an empty bucket for
+/// `ABUSE_AFTER`.
+struct InboundLimit {
+    capacity: f64,
+    refill: f64,
+    tokens: f64,
+    last_refill: Instant,
+    last_warning: Option<Instant>,
+    last_notice: Option<Instant>,
+    last_drop: Option<Instant>,
+    /// First drop of the current run of drops, none more than a second apart.
+    drops_since: Option<Instant>,
+}
+
+enum Inbound {
+    Pass,
+    /// Passed; tell the client how close it is to the limit.
+    Warn {
+        used: f64,
+        left: f64,
+    },
+    /// Dropped; `notify`: tell the client (at most once a second).
+    Limited {
+        notify: bool,
+    },
+    Close,
+}
+
+impl InboundLimit {
+    const ABUSE_AFTER: Duration = Duration::from_secs(10);
+
+    fn new(capacity: f64, refill: f64) -> Self {
+        Self {
+            capacity,
+            refill,
+            tokens: capacity,
+            last_refill: Instant::now(),
+            last_warning: None,
+            last_notice: None,
+            last_drop: None,
+            drops_since: None,
+        }
+    }
+
+    fn check(&mut self) -> Inbound {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill).min(self.capacity);
+        self.last_refill = now;
+        let a_second_since = |last: Option<Instant>| {
+            last.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1))
+        };
+        if self.tokens < 1.0 {
+            let since = match self.drops_since {
+                Some(since) if !a_second_since(self.last_drop) => since,
+                _ => now,
+            };
+            self.drops_since = Some(since);
+            self.last_drop = Some(now);
+            if now.duration_since(since) >= Self::ABUSE_AFTER {
+                return Inbound::Close;
+            }
+            let notify = a_second_since(self.last_notice);
+            if notify {
+                self.last_notice = Some(now);
+            }
+            return Inbound::Limited { notify };
+        }
+        self.tokens -= 1.0;
+        if self.tokens < self.capacity * 0.2 && a_second_since(self.last_warning) {
+            self.last_warning = Some(now);
+            return Inbound::Warn {
+                used: self.capacity - self.tokens,
+                left: self.tokens,
+            };
+        }
+        Inbound::Pass
+    }
+}
+
 pub(super) async fn handle_connection(
     stream: TcpStream,
     addr: SocketAddr,
     state: Arc<SharedState>,
     hs_guard: HandshakeGuard,
 ) {
-    // Reject new connections during graceful drain
-    if state.draining.load(Ordering::Relaxed) {
-        state
-            .connections_rejected_total
-            .fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-
-    // Early rejection before expensive handshake (best-effort, authoritative check below)
-    if state.connection_count.load(Ordering::Relaxed) >= state.max_connections {
-        state
-            .connections_rejected_total
-            .fetch_add(1, Ordering::Relaxed);
-        tracing::warn!("[WSE] Max connections reached (early check), rejecting {addr}");
-        return;
-    }
-
     // Clone the TCP stream FD for pre-framed raw writes (bypasses tungstenite).
     let (stream, mut raw_write) = match clone_tcp_stream(stream) {
         Ok(pair) => pair,
@@ -111,6 +332,11 @@ pub(super) async fn handle_connection(
     let handshake_data: Arc<std::sync::OnceLock<HandshakeResult>> =
         Arc::new(std::sync::OnceLock::new());
     let hd_clone = handshake_data.clone();
+    // A draining or full server answers the upgrade with 503 and Retry-After
+    // (the count is checked again when the connection registers).
+    let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let refused_in_upgrade = refused.clone();
+    let gate = state.clone();
 
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_message_size = Some(state.max_message_size);
@@ -119,12 +345,21 @@ pub(super) async fn handle_connection(
     let ws_stream = match tokio::time::timeout(
         Duration::from_secs(10),
         tokio_tungstenite::accept_hdr_async_with_config(
-            stream,
+            ServerSocket {
+                inner: stream,
+                silent: false,
+            },
             #[expect(
                 clippy::result_large_err,
                 reason = "the tungstenite accept_hdr callback signature fixes Err = ErrorResponse; we cannot box it"
             )]
             move |req: &Request, response: Response| -> Result<Response, ErrorResponse> {
+                if gate.draining.load(Ordering::Relaxed)
+                    || gate.connection_count.load(Ordering::Relaxed) >= gate.max_connections
+                {
+                    refused_in_upgrade.store(true, Ordering::Relaxed);
+                    return Err(service_unavailable());
+                }
                 let cookies = req
                     .headers()
                     .get("cookie")
@@ -153,6 +388,15 @@ pub(super) async fn handle_connection(
     .await
     {
         Ok(Ok(ws)) => ws,
+        Ok(Err(_)) if refused.load(Ordering::Relaxed) => {
+            state
+                .connections_rejected_total
+                .fetch_add(1, Ordering::Relaxed);
+            if !state.draining.load(Ordering::Relaxed) {
+                tracing::warn!("[WSE] Max connections reached, refused {addr}");
+            }
+            return;
+        }
         Ok(Err(e)) => {
             tracing::warn!("[WSE] WS handshake failed for {addr}: {e}");
             return;
@@ -162,6 +406,10 @@ pub(super) async fn handle_connection(
             return;
         }
     };
+
+    // From here on tungstenite only reads.
+    let mut read_half = ws_stream;
+    read_half.get_mut().silent = true;
 
     let (cookie_str, use_msgpack, auth_header) = handshake_data
         .get()
@@ -174,9 +422,6 @@ pub(super) async fn handle_connection(
         })
         .unwrap_or_default();
     let conn_id: Arc<String> = Arc::new(Uuid::now_v7().to_string());
-    let (write_half, read_half) = ws_stream.split();
-    let mut read_half = read_half;
-    let mut write_half = write_half;
     let (tx, mut rx) = mpsc::unbounded_channel::<WsFrame>();
     let pending = Arc::new(AtomicUsize::new(0));
     let broadcast_buf = Arc::new(parking_lot::Mutex::new(BroadcastQueue::new()));
@@ -218,7 +463,7 @@ pub(super) async fn handle_connection(
                         state
                             .connections_rejected_total
                             .fetch_add(1, Ordering::Relaxed);
-                        reject_ws_auth(&tx, rx, write_half, "AUTH_FAILED", "Token missing user ID")
+                        reject_ws_auth(&mut raw_write, "AUTH_FAILED", "Token missing user ID")
                             .await;
                         return;
                     }
@@ -229,8 +474,7 @@ pub(super) async fn handle_connection(
                     state
                         .connections_rejected_total
                         .fetch_add(1, Ordering::Relaxed);
-                    reject_ws_auth(&tx, rx, write_half, "AUTH_FAILED", "Authentication failed")
-                        .await;
+                    reject_ws_auth(&mut raw_write, "AUTH_FAILED", "Authentication failed").await;
                     return;
                 }
             },
@@ -240,9 +484,7 @@ pub(super) async fn handle_connection(
                     .connections_rejected_total
                     .fetch_add(1, Ordering::Relaxed);
                 reject_ws_auth(
-                    &tx,
-                    rx,
-                    write_half,
+                    &mut raw_write,
                     "AUTH_REQUIRED",
                     "No JWT cookie or Authorization header",
                 )
@@ -254,48 +496,61 @@ pub(super) async fn handle_connection(
         None // No JWT config — delegate auth to Python
     };
 
+    // Lets the server end this connection: a close frame, then the socket.
+    let closer = Closer::new();
+
     // Register connection
-    {
+    let registered = {
         let mut conns = state.connections.write().await;
-        if conns.len() >= state.max_connections {
-            state
-                .connections_rejected_total
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!("[WSE] Max connections reached, rejecting {addr}");
-            // Clean up ACL entry inserted before registration check
-            state.conn_topic_acl.remove(&*conn_id);
-            let _ = write_half.close().await;
-            return;
-        }
-        // Send server_ready BEFORE inserting into connections map.
-        // While we hold the write lock, no broadcast can acquire a read lock,
-        // so server_ready is guaranteed to be first in the channel.
-        if let Some(ref user_id) = rust_auth_user_id {
-            let recovery_enabled = state.recovery.is_some();
-            let server_ready = build_server_ready(&conn_id, user_id, recovery_enabled);
-            let sr_bytes = server_ready.len() + 4;
-            pending.fetch_add(sr_bytes, Ordering::Relaxed);
-            if tx
-                .send(WsFrame::Msg(Message::Text(server_ready.into())))
-                .is_err()
-            {
-                pending.fetch_sub(sr_bytes, Ordering::Relaxed);
+        let room = conns.len() < state.max_connections;
+        if room {
+            // server_ready goes into the queue before the connection is in the
+            // map: while the write lock is held no broadcast can reach it, so
+            // server_ready is the first frame.
+            if let Some(ref user_id) = rust_auth_user_id {
+                let recovery_enabled = state.recovery.is_some();
+                let server_ready = build_server_ready(&conn_id, user_id, recovery_enabled);
+                let sr_bytes = server_ready.len() + 4;
+                pending.fetch_add(sr_bytes, Ordering::Relaxed);
+                if tx
+                    .send(WsFrame::Msg(Message::Text(server_ready.into())))
+                    .is_err()
+                {
+                    pending.fetch_sub(sr_bytes, Ordering::Relaxed);
+                }
             }
+            conns.insert(
+                (*conn_id).clone(),
+                ConnectionHandle {
+                    tx: tx.clone(),
+                    pending: pending.clone(),
+                    broadcast_buf: broadcast_buf.clone(),
+                    broadcast_notify: broadcast_notify.clone(),
+                    closer: closer.clone(),
+                },
+            );
+            state.connection_count.store(conns.len(), Ordering::Relaxed);
         }
-        conns.insert(
-            (*conn_id).clone(),
-            ConnectionHandle {
-                tx: tx.clone(),
-                pending: pending.clone(),
-                broadcast_buf: broadcast_buf.clone(),
-                broadcast_notify: broadcast_notify.clone(),
-            },
-        );
-        state.connection_count.store(conns.len(), Ordering::Relaxed);
+        room
+    };
+    if !registered {
         state
-            .connections_accepted_total
+            .connections_rejected_total
             .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!("[WSE] Max connections reached, rejecting {addr}");
+        // The ACL was stored before the check.
+        state.conn_topic_acl.remove(&*conn_id);
+        let frames = VecDeque::from([close_frame(CLOSE_TRY_AGAIN_LATER, "server full")]);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            write_all_frames(&mut raw_write, &frames),
+        )
+        .await;
+        return;
     }
+    state
+        .connections_accepted_total
+        .fetch_add(1, Ordering::Relaxed);
     // Handshake + registration complete -- release the pre-handshake slot. (On any
     // earlier return, e.g. a failed/timed-out handshake, hs_guard drops here too.)
     drop(hs_guard);
@@ -342,140 +597,95 @@ pub(super) async fn handle_connection(
         }
     }
 
-    // Write task: dual-path (NATS-style broadcast buffer + mpsc control channel).
-    //
-    // Phase 1 (top of loop): drain broadcast_buf (direct bytes from broadcast_all)
-    // Phase 2 (select!): wait for control mpsc OR broadcast notify
-    //
-    // Control messages (server_ready, pong, close, send_event, topic) go through mpsc.
-    // Broadcast data goes through direct buffer (bypasses mpsc entirely).
+    // Write task: the only writer to the socket. Two sources: the control
+    // queue (server_ready, replies, send_event, close) and the broadcast buffer
+    // (fan-out frames shared with every subscriber, not copied).
     let pending_write = pending.clone();
     let broadcast_buf_write = broadcast_buf;
     let broadcast_notify_write = broadcast_notify;
+    // `finish`: the read side is done, send nothing more but the close reply.
+    // The closer's token: the socket goes now, even in the middle of a frame.
+    let finish = tokio_util::sync::CancellationToken::new();
+    let write_finish = finish.clone();
+    let write_abort = closer.token().clone();
+    let peer_close = Arc::new(AtomicU32::new(NO_PEER_CLOSE));
+    let write_peer_close = peer_close.clone();
     let write_task = tokio::spawn(async move {
-        let mut batch: Vec<WsFrame> = Vec::with_capacity(256);
-        let mut raw_slices: Vec<Bytes> = Vec::with_capacity(256);
-        // Skip Phase 1 on first iteration so server_ready (in mpsc) is sent before
-        // any broadcast data (in broadcast_buf). After the first iteration, Phase 1
-        // always runs to avoid the Notify lost-permit race.
-        let mut first_iteration = true;
-
-        loop {
-            // Phase 1: Drain broadcast buffer (skip on first iteration for server_ready ordering).
-            // This avoids the Notify lost-permit race: if select! cancelled notified()
-            // on a previous iteration, the data is still in the buffer.
-            let broadcast_data = if first_iteration {
-                first_iteration = false;
-                None
-            } else {
-                let mut buf = broadcast_buf_write.lock();
-                if !buf.is_empty() {
-                    Some(buf.take()) // the shared frames, no copy
-                } else {
-                    None
-                }
-            };
-            if let Some(frames) = broadcast_data {
-                let len: usize = frames.iter().map(|f| f.len()).sum();
-                if write_all_frames(&mut raw_write, &frames).await.is_err() {
-                    let _ = pending_write.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                        Some(cur.saturating_sub(len))
-                    });
+        let mut batch: Vec<WsFrame> = Vec::with_capacity(CONTROL_BATCH);
+        let mut wire: VecDeque<Bytes> = VecDeque::with_capacity(CONTROL_BATCH);
+        let mut close_sent = false;
+        let work = async {
+            loop {
+                if write_finish.is_cancelled() {
                     break;
                 }
-                let _ = pending_write.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    Some(cur.saturating_sub(len))
-                });
-                continue; // check buffer again before blocking
-            }
-
-            // Phase 2: Buffer empty, wait for either source.
-            tokio::select! {
-                biased;
-
-                // Control/topic messages (server_ready, close, pong, send_event, topic)
-                n = rx.recv_many(&mut batch, 256) => {
-                    if n == 0 {
-                        break; // channel closed
+                // Control frames first, without waiting: server_ready goes out
+                // before any broadcast, and a close, a pong or a reply is not
+                // held back by a busy topic.
+                while batch.len() < CONTROL_BATCH {
+                    match rx.try_recv() {
+                        Ok(frame) => batch.push(frame),
+                        Err(_) => break,
                     }
-                    let drained_bytes: usize = batch.iter().map(ws_frame_size).sum();
-
-                    // Separate: PreFramed -> slices for writev, Msg -> tungstenite
-                    raw_slices.clear();
-                    let mut has_tung = false;
-                    for frame in &batch {
-                        match frame {
-                            WsFrame::PreFramed(bytes) => raw_slices.push(bytes.clone()),
-                            WsFrame::Msg(_) => has_tung = true,
+                }
+                let mut wrote = false;
+                if !batch.is_empty() {
+                    wrote = true;
+                    match write_control(&mut raw_write, &mut batch, &mut wire, &pending_write).await
+                    {
+                        Sent::Frames => {}
+                        Sent::Close => {
+                            close_sent = true;
+                            break;
                         }
+                        Sent::Failed => break,
                     }
-
-                    let mut ok = true;
-
-                    // Flush tungstenite Msgs FIRST to ensure its internal buffer
-                    // is drained before raw_write uses the same fd
-                    if has_tung && ok {
-                        for frame in batch.drain(..) {
-                            if let WsFrame::Msg(msg) = frame
-                                && write_half.feed(msg).await.is_err()
-                            {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        if ok && write_half.flush().await.is_err() {
-                            ok = false;
-                        }
-                    }
-
-                    // Write PreFramed via write_vectored (writev syscall)
-                    if !raw_slices.is_empty() && ok {
-                        let io_slices: Vec<std::io::IoSlice<'_>> = raw_slices
-                            .iter()
-                            .map(|b| std::io::IoSlice::new(b))
-                            .collect();
-                        let total: usize = raw_slices.iter().map(|b| b.len()).sum();
-
-                        let written = match raw_write.write_vectored(&io_slices).await {
-                            Ok(0) => { ok = false; 0 }
-                            Ok(n) => n,
-                            Err(_) => { ok = false; 0 }
-                        };
-
-                        if ok && written < total {
-                            let mut remaining = BytesMut::with_capacity(total - written);
-                            let mut skip = written;
-                            for slice in &raw_slices {
-                                if skip >= slice.len() {
-                                    skip -= slice.len();
-                                } else {
-                                    remaining.extend_from_slice(&slice[skip..]);
-                                    skip = 0;
-                                }
-                            }
-                            if raw_write.write_all(&remaining).await.is_err() {
-                                ok = false;
-                            }
-                        }
-                    }
-
-                    let _ = pending_write.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                        Some(cur.saturating_sub(drained_bytes))
-                    });
-                    batch.clear();
-
-                    if !ok {
+                }
+                // Then the broadcast frames queued so far.
+                let shared = {
+                    let mut buf = broadcast_buf_write.lock();
+                    (!buf.is_empty()).then(|| buf.take())
+                };
+                if let Some(frames) = shared {
+                    wrote = true;
+                    let len: usize = frames.iter().map(Bytes::len).sum();
+                    let result = write_all_frames(&mut raw_write, &frames).await;
+                    release(&pending_write, len);
+                    if result.is_err() {
                         break;
                     }
                 }
-
-                // Broadcast buffer wakeup -- loop back to Phase 1 to drain
-                _ = broadcast_notify_write.notified() => {
+                if wrote {
                     continue;
                 }
+                tokio::select! {
+                    biased;
+                    () = write_finish.cancelled() => break,
+                    n = rx.recv_many(&mut batch, CONTROL_BATCH) => {
+                        if n == 0 {
+                            break; // every sender is gone
+                        }
+                    }
+                    () = broadcast_notify_write.notified() => {}
+                }
+            }
+        };
+        let finished = tokio::select! {
+            biased;
+            () = write_abort.cancelled() => false,
+            () = work => true,
+        };
+        // The client closed first: answer it.
+        if finished
+            && !close_sent
+            && let Some(reply) = close_reply(write_peer_close.load(Ordering::Acquire))
+        {
+            let frames = VecDeque::from([reply]);
+            tokio::select! {
+                () = write_abort.cancelled() => {}
+                _ = write_all_frames(&mut raw_write, &frames) => {}
             }
         }
-        let _ = write_half.close().await;
     });
 
     // Cache on_message callback (only needed in callback mode)
@@ -493,8 +703,63 @@ pub(super) async fn handle_connection(
     // (counted as rate-limited). Drain mode uses the bounded inbound_tx instead.
     let callback_sem = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_CALLBACKS));
 
-    // Read loop
-    while let Some(Ok(msg)) = read_half.next().await {
+    let max_pending = state.max_outbound_queue_bytes;
+    let mut inbound_limit = InboundLimit::new(state.rate_capacity, state.rate_refill);
+    // One server_hello per connection: a client repeating client_hello would
+    // otherwise get one back each time.
+    let mut hello_answered = false;
+
+    // Read loop. It ends when the client closes or the socket fails, and when
+    // the server closed the connection and the client did not answer in time.
+    let read_cancel = closer.token().clone();
+    loop {
+        let msg = tokio::select! {
+            biased;
+            () = read_cancel.cancelled() => break,
+            next = read_half.next() => match next {
+                Some(Ok(msg)) => msg,
+                _ => break,
+            },
+        };
+        // After the server queued a close, the client's further messages are
+        // not delivered: only its close frame, or the grace period, ends this.
+        if closer.is_closing() && !matches!(msg, Message::Close(_)) {
+            continue;
+        }
+        // Every frame counts as activity, protocol pings and pongs included:
+        // a plain WebSocket client may keep the link alive with those alone.
+        if let Some(mut last) = state.conn_last_activity.get_mut(&*conn_id) {
+            *last = std::time::Instant::now();
+        }
+        if matches!(msg, Message::Text(_) | Message::Binary(_)) {
+            match inbound_limit.check() {
+                Inbound::Pass => {}
+                Inbound::Warn { used, left } => {
+                    let warning = format!(
+                        "{{\"c\":\"WSE\",\"t\":\"rate_limit_warning\",\"p\":{{\"current_rate\":{},\"limit\":{},\"remaining\":{},\"retry_after\":1.0}},\"v\":1}}",
+                        used as u64, inbound_limit.capacity as u64, left as u64,
+                    );
+                    queue_reply(&tx, &pending, max_pending, Message::Text(warning.into()));
+                }
+                Inbound::Limited { notify } => {
+                    state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
+                    if notify {
+                        queue_reply(
+                            &tx,
+                            &pending,
+                            max_pending,
+                            Message::Text(RATE_LIMITED_ERROR.into()),
+                        );
+                    }
+                    continue;
+                }
+                Inbound::Close => {
+                    state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
+                    closer.close(&tx, &pending, CLOSE_RATE_LIMITED, "rate limit exceeded");
+                    continue;
+                }
+            }
+        }
         match msg {
             Message::Text(text) => {
                 state
@@ -503,10 +768,6 @@ pub(super) async fn handle_connection(
                 state
                     .bytes_received_total
                     .fetch_add(text.len() as u64, Ordering::Relaxed);
-                // Update last activity for zombie detection
-                state
-                    .conn_last_activity
-                    .insert((*conn_id).clone(), std::time::Instant::now());
                 let text_ref: &str = text.as_ref();
 
                 // Strip prefix for JSON parsing
@@ -544,6 +805,10 @@ pub(super) async fn handle_connection(
                         // Fast-path: protocol messages handled entirely in Rust
                         if let Some(t_val) = val.get("t").and_then(|t| t.as_str()) {
                             if t_val == "client_hello" {
+                                if hello_answered {
+                                    continue;
+                                }
+                                hello_answered = true;
                                 let p = val.get("p");
                                 let client_proto =
                                     p.and_then(|p| p.get("protocol_version"))
@@ -562,20 +827,13 @@ pub(super) async fn handle_connection(
                                 // client_hello would otherwise overwrite the AES key
                                 // mid-session (making in-flight encrypted messages
                                 // undecryptable) and is a cheap ECDH-keygen DoS amplifier.
-                                let server_pubkey: Option<String> = if wants_encryption
-                                    && !state.conn_encryption.contains_key(&*conn_id)
-                                {
+                                let key = if wants_encryption {
                                     p.and_then(|p| p.get("encryption_public_key"))
                                         .and_then(|v| v.as_str())
                                         .and_then(|b64| match derive_connection_key(b64) {
-                                            Ok((server_pk_b64, cipher)) => {
-                                                state
-                                                    .conn_encryption
-                                                    .insert((*conn_id).clone(), cipher);
-                                                Some(server_pk_b64)
-                                            }
+                                            Ok(key) => Some(key),
                                             Err(e) => {
-                                                tracing::error!(
+                                                tracing::warn!(
                                                     "[WSE] ECDH key exchange failed for {}: {}",
                                                     conn_id, e
                                                 );
@@ -583,11 +841,12 @@ pub(super) async fn handle_connection(
                                                     "{{\"c\":\"WSE\",\"t\":\"error\",\"p\":{{\"code\":\"KEY_EXCHANGE_FAILED\",\"message\":\"ECDH key exchange failed: {}\",\"recoverable\":true}}}}",
                                                     e.replace('\"', "\\\"")
                                                 );
-                                                let em_bytes = err_msg.len() + 4;
-                                                pending.fetch_add(em_bytes, Ordering::Relaxed);
-                                                if tx.send(WsFrame::Msg(Message::Text(err_msg.into()))).is_err() {
-                                                    pending.fetch_sub(em_bytes, Ordering::Relaxed);
-                                                }
+                                                queue_reply(
+                                                    &tx,
+                                                    &pending,
+                                                    max_pending,
+                                                    Message::Text(err_msg.into()),
+                                                );
                                                 None
                                             }
                                         })
@@ -599,12 +858,20 @@ pub(super) async fn handle_connection(
                                     &conn_id,
                                     client_proto,
                                     &state,
-                                    server_pubkey.as_deref(),
+                                    key.as_ref()
+                                        .map(|(server_public, _)| server_public.as_str()),
                                 );
-                                let h_bytes = hello.len() + 4;
-                                pending.fetch_add(h_bytes, Ordering::Relaxed);
-                                if tx.send(WsFrame::Msg(Message::Text(hello.into()))).is_err() {
-                                    pending.fetch_sub(h_bytes, Ordering::Relaxed);
+                                queue_reply(
+                                    &tx,
+                                    &pending,
+                                    max_pending,
+                                    Message::Text(hello.into()),
+                                );
+                                // The key is in use only after server_hello is queued:
+                                // an encrypted frame never reaches the client before
+                                // the server's public key.
+                                if let Some((_, cipher)) = key {
+                                    state.conn_encryption.insert((*conn_id).clone(), cipher);
                                 }
                                 continue;
                             }
@@ -625,11 +892,7 @@ pub(super) async fn handle_connection(
                                     server_ts,
                                     server_ts.saturating_sub(timestamp).max(0)
                                 );
-                                let po_bytes = pong.len() + 4;
-                                pending.fetch_add(po_bytes, Ordering::Relaxed);
-                                if tx.send(WsFrame::Msg(Message::Text(pong.into()))).is_err() {
-                                    pending.fetch_sub(po_bytes, Ordering::Relaxed);
-                                }
+                                queue_reply(&tx, &pending, max_pending, Message::Text(pong.into()));
                                 continue;
                             }
                             if t_val == "pong" || t_val == "PONG" {
@@ -689,10 +952,6 @@ pub(super) async fn handle_connection(
                 state
                     .bytes_received_total
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
-                // Update last activity for zombie detection
-                state
-                    .conn_last_activity
-                    .insert((*conn_id).clone(), std::time::Instant::now());
 
                 // E2E encryption: detect E: prefix and decrypt before processing
                 if data.len() >= 2 && data[0] == b'E' && data[1] == b':' {
@@ -831,26 +1090,31 @@ pub(super) async fn handle_connection(
                 }
             }
             Message::Ping(payload) => {
-                let pong_bytes = payload.len() + 4;
-                pending.fetch_add(pong_bytes, Ordering::Relaxed);
-                if tx.send(WsFrame::Msg(Message::Pong(payload))).is_err() {
-                    pending.fetch_sub(pong_bytes, Ordering::Relaxed);
-                }
+                queue_reply(&tx, &pending, max_pending, Message::Pong(payload));
             }
-            Message::Close(_) => break,
+            Message::Close(frame) => {
+                let code = frame.map_or(PEER_CLOSE_WITHOUT_CODE, |f| {
+                    if f.code.is_allowed() {
+                        u32::from(u16::from(f.code))
+                    } else {
+                        1002 // protocol error
+                    }
+                });
+                peer_close.store(code, Ordering::Release);
+                break;
+            }
             Message::Pong(_) | Message::Frame(_) => {}
         }
     }
+    finish.cancel();
 
-    // Cleanup - check if zombie detection already removed this connection
-    let already_removed = {
+    // Cleanup
+    {
         let mut conns = state.connections.write().await;
-        let was_present = conns.remove(&*conn_id).is_some();
+        conns.remove(&*conn_id);
         state.connection_count.store(conns.len(), Ordering::Relaxed);
-        !was_present
-    };
+    }
     state.conn_formats.remove(&*conn_id);
-    state.conn_rates.remove(&*conn_id);
     state.conn_last_activity.remove(&*conn_id);
     state.conn_encryption.remove(&*conn_id);
     state.conn_topic_acl.remove(&*conn_id);
@@ -869,13 +1133,6 @@ pub(super) async fn handle_connection(
                 .queue_groups
                 .remove_if(&topic, |_, groups| groups.is_empty());
         }
-    }
-    // If zombie detection already removed this connection and emitted
-    // a disconnect event, skip the rest to avoid duplicate events.
-    if already_removed {
-        drop(tx);
-        let _ = write_task.await;
-        return;
     }
     // Presence cleanup: untrack from all topics before disconnect event
     if let Some(ref pm) = state.presence {
@@ -955,5 +1212,13 @@ pub(super) async fn handle_connection(
         }
     }
     drop(tx);
-    let _ = write_task.await;
+    // A client that reads nothing more is not waited for past the grace.
+    let mut write_task = write_task;
+    if tokio::time::timeout(CLOSE_GRACE, &mut write_task)
+        .await
+        .is_err()
+    {
+        closer.abort();
+        let _ = write_task.await;
+    }
 }

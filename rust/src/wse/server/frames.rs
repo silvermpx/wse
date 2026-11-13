@@ -8,10 +8,9 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 // Internal types
 // ---------------------------------------------------------------------------
 
-/// Frame types sent through per-connection channels.
-/// `Msg` goes through tungstenite's framing pipeline (per-connection sends, control frames).
-/// `PreFramed` contains complete WebSocket wire bytes that bypass tungstenite entirely
-/// (broadcasts -- constructed once, sent to all connections).
+/// Frame types sent through per-connection channels. The connection's write
+/// task encodes `Msg` itself (`encode_message`); `PreFramed` is complete wire
+/// bytes, built once for a broadcast and sent to every connection.
 #[derive(Clone)]
 pub(crate) enum WsFrame {
     Msg(Message),
@@ -28,7 +27,7 @@ pub(super) fn ws_frame_size(frame: &WsFrame) -> usize {
             Message::Text(s) => s.len() + 4,
             Message::Binary(b) => b.len() + 4,
             Message::Ping(p) | Message::Pong(p) => p.len() + 4,
-            Message::Close(_) => 8,
+            Message::Close(frame) => 8 + frame.as_ref().map_or(0, |f| f.reason.len()),
             Message::Frame(_) => 16,
         },
     }
@@ -146,6 +145,33 @@ pub(crate) fn encode_ws_frame(opcode: u8, payload: &[u8]) -> Bytes {
     }
     buf.extend_from_slice(payload);
     buf.freeze()
+}
+
+/// A close frame: the code, then the reason cut to the 123 bytes a control
+/// frame leaves for it (at a character boundary).
+pub(crate) fn close_frame(code: u16, reason: &str) -> Bytes {
+    let mut end = reason.len().min(123);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut payload = Vec::with_capacity(2 + end);
+    payload.extend_from_slice(&code.to_be_bytes());
+    payload.extend_from_slice(&reason.as_bytes()[..end]);
+    encode_ws_frame(0x08, &payload)
+}
+
+/// The wire bytes of a message, as the server sends it (unmasked). `None`
+/// for a raw tungstenite frame, which the server never queues.
+pub(crate) fn encode_message(msg: &Message) -> Option<Bytes> {
+    Some(match msg {
+        Message::Text(text) => encode_ws_frame(0x01, text.as_bytes()),
+        Message::Binary(data) => encode_ws_frame(0x02, data),
+        Message::Ping(data) => encode_ws_frame(0x09, data),
+        Message::Pong(data) => encode_ws_frame(0x0A, data),
+        Message::Close(Some(frame)) => close_frame(u16::from(frame.code), &frame.reason),
+        Message::Close(None) => encode_ws_frame(0x08, &[]),
+        Message::Frame(_) => return None,
+    })
 }
 
 pub(crate) fn pre_frame_text(data: &str) -> Bytes {

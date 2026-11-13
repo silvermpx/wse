@@ -7,15 +7,14 @@ use std::time::Duration;
 use ahash::AHashSet;
 use bytes::Bytes;
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
+use tokio_tungstenite::tungstenite::protocol::Message;
 
 use super::e2e::encrypt_outbound;
 use super::fanout::fanout_broadcast_direct;
 use super::frames::ws_frame_size;
 use super::{
-    ServerCommand, SharedState, WsFrame, fanout_topic_direct, glob_match, pre_frame_binary,
-    pre_frame_text, stamp_recovery_fields,
+    CLOSE_GOING_AWAY, CLOSE_NORMAL, ServerCommand, SharedState, WsFrame, fanout_topic_direct,
+    glob_match, pre_frame_binary, pre_frame_text, stamp_recovery_fields,
 };
 use crate::wse::cluster::ClusterCommand;
 
@@ -399,13 +398,9 @@ pub(super) async fn process_commands(
                 }
             }
             ServerCommand::Disconnect { conn_id } => {
-                // Control message: send unconditionally
                 let guard = state.connections.read().await;
                 if let Some(h) = guard.get(&conn_id) {
-                    h.pending.fetch_add(8, Ordering::Relaxed);
-                    if h.tx.send(WsFrame::Msg(Message::Close(None))).is_err() {
-                        h.pending.fetch_sub(8, Ordering::Relaxed);
-                    }
+                    h.close(CLOSE_NORMAL, "");
                 }
             }
             ServerCommand::GetConnections { reply } => {
@@ -426,18 +421,12 @@ pub(super) async fn process_commands(
                     let _ = tx.send(ClusterCommand::Drain);
                 }
 
-                // Send close frame with custom code to all clients
-                let close_frame = Message::Close(Some(CloseFrame {
-                    code: CloseCode::from(close_code),
-                    reason: close_reason.into(),
-                }));
+                // Close every client with the drain code; one that does not answer
+                // is dropped after the close grace.
                 let guard = state.connections.read().await;
                 let n = guard.len();
                 for h in guard.values() {
-                    h.pending.fetch_add(8, Ordering::Relaxed);
-                    if h.tx.send(WsFrame::Msg(close_frame.clone())).is_err() {
-                        h.pending.fetch_sub(8, Ordering::Relaxed);
-                    }
+                    h.close(close_code, &close_reason);
                 }
                 drop(guard);
                 tracing::info!(
@@ -465,16 +454,9 @@ pub(super) async fn process_commands(
                 });
             }
             ServerCommand::Shutdown => {
-                let close_frame = Message::Close(Some(CloseFrame {
-                    code: CloseCode::Away,
-                    reason: "server shutting down".into(),
-                }));
                 let guard = state.connections.read().await;
                 for h in guard.values() {
-                    h.pending.fetch_add(8, Ordering::Relaxed);
-                    if h.tx.send(WsFrame::Msg(close_frame.clone())).is_err() {
-                        h.pending.fetch_sub(8, Ordering::Relaxed);
-                    }
+                    h.close(CLOSE_GOING_AWAY, "server shutting down");
                 }
                 drop(guard);
                 // Drain period: allow in-flight messages to flush before exiting

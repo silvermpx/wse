@@ -123,6 +123,36 @@ impl RustWSEServer {
         rec: RecoveryParams,
         pres: PresenceParams,
     ) -> PyResult<Self> {
+        let at_least_one = [
+            ("max_connections", srv.max_connections),
+            ("max_inbound_queue_size", srv.max_inbound_queue_size),
+            ("max_message_size", srv.max_message_size),
+        ];
+        for (name, value) in at_least_one {
+            if value == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "{name} must be at least 1"
+                )));
+            }
+        }
+        if srv.ping_interval == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "ping_interval must be at least 1 second",
+            ));
+        }
+        // NaN is refused; infinity means no limit.
+        if srv.rate_limit_capacity.is_nan() || srv.rate_limit_capacity < 1.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "rate_limit_capacity must be at least 1, got {}",
+                srv.rate_limit_capacity
+            )));
+        }
+        if srv.rate_limit_refill.is_nan() || srv.rate_limit_refill <= 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "rate_limit_refill must be above 0, got {}",
+                srv.rate_limit_refill
+            )));
+        }
         if srv.ping_interval >= srv.idle_timeout {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "ping_interval ({}s) must be less than idle_timeout ({}s)",
@@ -370,9 +400,10 @@ impl RustWSEServer {
 
     /// Enter graceful drain mode (lame duck).
     ///
-    /// 1. Stops accepting new connections
+    /// 1. Stops accepting new connections (upgrades get HTTP 503)
     /// 2. Notifies cluster peers via DRAIN frame
-    /// 3. Sends Close frame with custom code to all clients
+    /// 3. Closes every client with `close_code`; a client that does not
+    ///    answer within 5 seconds is disconnected
     /// 4. Waits up to `timeout` seconds for clients to disconnect
     ///
     /// Call `stop()` after `drain()` to fully shut down.
@@ -381,7 +412,7 @@ impl RustWSEServer {
         self.drain_impl(close_code, close_reason, timeout)
     }
 
-    /// Stop the server and close all connections.
+    /// Stop the server and close all connections (close code 1001).
     ///
     /// Shuts down the cluster mesh, sends a Shutdown command, and joins
     /// the server thread. Safe to call if not running (returns Ok).
@@ -405,7 +436,9 @@ impl RustWSEServer {
     }
 
     /// Full outbound pipeline in Rust: PyDict -> envelope -> JSON -> compress -> send.
-    /// Returns byte count sent.
+    /// Returns the size of the frame handed to the connection, 0 for an event
+    /// id this connection already got. A connection whose outbound queue is
+    /// over `max_outbound_queue_bytes` drops it.
     #[pyo3(signature = (conn_id, event, compression_threshold = 1024))]
     fn send_event(
         &self,
@@ -445,7 +478,9 @@ impl RustWSEServer {
             .map_err(|_| PyRuntimeError::new_err("Reply dropped"))
     }
 
-    /// Force-disconnect a connection by sending a Close frame.
+    /// Close a connection with code 1000. Its messages after that are not
+    /// delivered, and a client that does not answer within 5 seconds is
+    /// disconnected.
     fn disconnect(&self, conn_id: &str) -> PyResult<()> {
         let tx = self.command_tx()?;
         tx.send(ServerCommand::Disconnect {

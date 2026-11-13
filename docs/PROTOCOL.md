@@ -263,10 +263,15 @@ Client responds with a PONG echoing the server timestamp plus its own:
 
 ### 7. Disconnect
 
-- **Idle timeout**: Server closes after 60s of inactivity (code 1000)
-- **Circuit breaker**: Server closes after too many errors (code 1011)
-- **Auth failure**: Server closes with code 4401
-- **Normal close**: Code 1000
+The server closes a connection with a close frame and one of the codes under
+[WebSocket Close Codes](#websocket-close-codes). From then on it delivers
+nothing more the client sends, and it waits 5 seconds for the client's close
+frame; a client that has not answered by then is disconnected.
+
+A client that closes first gets its own close code back.
+
+A server that is full (`max_connections`) or draining answers the upgrade
+request with HTTP `503 Service Unavailable` and `Retry-After: 5`.
 
 ## Presence Events
 
@@ -454,11 +459,15 @@ payment_completed, account_transfer, config_change, ...
 
 ## WebSocket Close Codes
 
-| Code | Meaning |
-|------|---------|
-| 1000 | Normal closure / idle timeout |
-| 1011 | Server error / circuit breaker |
-| 4401 | Authentication required |
+| Code | Sent when | The clients |
+|------|-----------|-------------|
+| 1000 | The application called `disconnect()` | reconnect |
+| 1001 | The server stops | reconnect |
+| 1013 | The client reads too slowly: its outbound queue stayed over `max_outbound_queue_bytes` for two ping intervals. Also: the server filled up during the upgrade | reconnect |
+| 4300 | Graceful drain (the code passed to `drain()`, 4300 by default) | reconnect |
+| 4401 | Authentication failed | stop (a client with a token provider retries with a new token) |
+| 4408 | Nothing received from the client for `idle_timeout` seconds | reconnect |
+| 4429 | The client kept sending past the rate limit for 10 seconds | reconnect |
 
 ## Topics
 
@@ -549,7 +558,7 @@ The server sends periodic ping messages to detect stale connections and measure 
 
 **Ping interval**: every 25 seconds.
 
-**Zombie detection**: connections that have not sent any data (including PONG responses) within 60 seconds are considered zombies and closed by the server.
+**Idle timeout**: a connection that has sent no frame for `idle_timeout` seconds (60 by default) is closed with code 4408. Every frame counts: messages, PONG replies, and WebSocket protocol pings and pongs, so a plain WebSocket client can stay connected with protocol pings alone. The server answers protocol pings itself.
 
 ### Ping Message
 
@@ -565,7 +574,7 @@ The client must respond with a PONG containing both the original server timestam
 {"c":"WSE","t":"PONG","p":{"client_timestamp":1708441800050,"server_timestamp":1708441800000}}
 ```
 
-The server uses the round-trip time to track connection health metrics. Clients that fail to respond within the zombie detection window are disconnected with close code 1000.
+A client that answers nothing within the idle timeout is closed with code 4408.
 
 ## Rate Limit Feedback
 
@@ -611,4 +620,4 @@ When the bucket is empty, the server rejects messages with an error:
 | `message` | `string` | Human-readable description |
 | `retry_after` | `float` | Suggested backoff before retrying (seconds) |
 
-The connection is not closed on rate limit violation. The client should stop sending, wait for `retry_after` seconds, and resume at a lower rate. Persistent violations may trigger the circuit breaker, which closes the connection with code 1011.
+The limit applies to the messages a client sends (text and binary frames), per connection. A dropped message is not delivered to the application; the error is sent at most once a second. The client should stop sending, wait for `retry_after` seconds, and resume at a lower rate. A client that keeps sending into the empty bucket for 10 seconds is closed with code 4429.

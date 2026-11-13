@@ -1329,6 +1329,7 @@ fn test_cluster_queue_group_dispatch() {
             pending: Arc::new(AtomicUsize::new(0)),
             broadcast_buf: Arc::new(Mutex::new(BroadcastQueue::new())),
             broadcast_notify: Arc::new(tokio::sync::Notify::new()),
+            closer: crate::wse::server::Closer::new(),
         };
         members.push((format!("conn{i}"), h));
         _rxs.push(rx);
