@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::http::{StatusCode, header};
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use uuid::Uuid;
 
@@ -23,7 +24,7 @@ use super::e2e::{decrypt_inbound, derive_connection_key};
 use super::frames::{
     close_frame, encode_message, encode_ws_frame, write_all_frames, ws_frame_size,
 };
-use super::handshake::{HandshakeGuard, reject_ws_auth};
+use super::handshake::{HandshakeGuard, normalize_origin, reject_ws_auth};
 use super::messages::{build_server_hello, build_server_ready, normalize_json_keys};
 use super::py::{fire_on_connect, fire_on_disconnect, json_to_pyobj};
 use super::state::InboundEvent;
@@ -43,26 +44,30 @@ use crate::wse::compression::{decode_msgpack_guarded, rmpv_to_serde_json};
 /// callback mode. Bounds inbound flooding from exhausting the blocking pool.
 const MAX_INFLIGHT_CALLBACKS: usize = 256;
 
-/// Spawn an on_message callback as a bounded blocking task. If `MAX_INFLIGHT_
-/// CALLBACKS` are already running for this connection the inbound work is SHED
-/// (counted as rate-limited) rather than spawning an unbounded task -- a client
-/// flooding inbound messages otherwise exhausts the blocking pool and contends
-/// the GIL. The permit is released when the blocking task finishes.
-fn spawn_bounded_callback<F>(sem: &Arc<tokio::sync::Semaphore>, state: &Arc<SharedState>, work: F)
-where
+/// Run an on_message callback on the blocking pool. It needs one of the
+/// connection's `MAX_INFLIGHT_CALLBACKS` permits (a client flooding messages
+/// is shed, counted in `rate_limited_total`) and room for its `bytes` in the
+/// server's budget of messages waiting for the application, the same one
+/// drain mode uses (counted in `inbound_dropped` when there is none).
+fn spawn_bounded_callback<F>(
+    sem: &Arc<tokio::sync::Semaphore>,
+    state: &Arc<SharedState>,
+    bytes: usize,
+    work: F,
+) where
     F: FnOnce() + Send + 'static,
 {
-    match sem.clone().try_acquire_owned() {
-        Ok(permit) => {
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                work();
-            });
-        }
-        Err(_) => {
-            state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+    let Ok(permit) = sem.clone().try_acquire_owned() else {
+        state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let Some(room) = SharedState::callback_room(state, bytes) else {
+        return;
+    };
+    tokio::task::spawn_blocking(move || {
+        let _held = (permit, room);
+        work();
+    });
 }
 
 /// Clone a TcpStream by duplicating the file descriptor.
@@ -76,15 +81,21 @@ fn clone_tcp_stream(stream: TcpStream) -> std::io::Result<(TcpStream, TcpStream)
     ))
 }
 
-/// The answer to an upgrade the server cannot take now.
-fn service_unavailable() -> ErrorResponse {
-    use tokio_tungstenite::tungstenite::http::{StatusCode, header};
+/// Why the upgrade was refused, if it was.
+const ACCEPTED: u8 = 0;
+const REFUSED_FULL: u8 = 1;
+const REFUSED_ORIGIN: u8 = 2;
 
+/// The answer to an upgrade the server does not take: 503 (with
+/// Retry-After) when it is full or draining, 403 for a foreign origin.
+fn refusal(status: StatusCode) -> ErrorResponse {
     let mut response = ErrorResponse::new(None);
-    *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-    response
-        .headers_mut()
-        .insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
+    *response.status_mut() = status;
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
+    }
     response
 }
 
@@ -138,6 +149,37 @@ impl AsyncWrite for ServerSocket {
 }
 
 const RATE_LIMITED_ERROR: &str = "{\"c\":\"WSE\",\"t\":\"error\",\"p\":{\"code\":\"RATE_LIMITED\",\"message\":\"Rate limit exceeded\",\"retry_after\":1.0},\"v\":1}";
+
+/// A client's bad frames are logged at most once every 10 seconds per
+/// connection: a client sending garbage must not flood the log.
+#[derive(Default)]
+struct FrameErrorLog {
+    last: Option<Instant>,
+    suppressed: u64,
+}
+
+impl FrameErrorLog {
+    fn warn(&mut self, conn_id: &str, what: &str) {
+        let now = Instant::now();
+        if self
+            .last
+            .is_some_and(|t| now.duration_since(t) < Duration::from_secs(10))
+        {
+            self.suppressed += 1;
+            return;
+        }
+        if self.suppressed > 0 {
+            tracing::warn!(
+                "[WSE] {conn_id}: {what} ({} more since the last report)",
+                self.suppressed
+            );
+        } else {
+            tracing::warn!("[WSE] {conn_id}: {what}");
+        }
+        self.last = Some(now);
+        self.suppressed = 0;
+    }
+}
 
 /// Control frames the write task takes from the queue at a time, before it
 /// turns to the broadcast frames again.
@@ -333,8 +375,9 @@ pub(super) async fn handle_connection(
         Arc::new(std::sync::OnceLock::new());
     let hd_clone = handshake_data.clone();
     // A draining or full server answers the upgrade with 503 and Retry-After
-    // (the count is checked again when the connection registers).
-    let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // (the count is checked again when the connection registers); a browser
+    // page from an origin not in allowed_origins gets 403.
+    let refused = Arc::new(AtomicU8::new(ACCEPTED));
     let refused_in_upgrade = refused.clone();
     let gate = state.clone();
 
@@ -357,8 +400,21 @@ pub(super) async fn handle_connection(
                 if gate.draining.load(Ordering::Relaxed)
                     || gate.connection_count.load(Ordering::Relaxed) >= gate.max_connections
                 {
-                    refused_in_upgrade.store(true, Ordering::Relaxed);
-                    return Err(service_unavailable());
+                    refused_in_upgrade.store(REFUSED_FULL, Ordering::Relaxed);
+                    return Err(refusal(StatusCode::SERVICE_UNAVAILABLE));
+                }
+                // Only browsers send Origin, and only they carry a victim's
+                // cookies to another site's page.
+                if let Some(ref allowed) = gate.allowed_origins
+                    && let Some(origin) = req.headers().get("origin")
+                    && !origin
+                        .to_str()
+                        .ok()
+                        .and_then(|o| normalize_origin(o).ok())
+                        .is_some_and(|o| allowed.contains(&o))
+                {
+                    refused_in_upgrade.store(REFUSED_ORIGIN, Ordering::Relaxed);
+                    return Err(refusal(StatusCode::FORBIDDEN));
                 }
                 let cookies = req
                     .headers()
@@ -388,11 +444,13 @@ pub(super) async fn handle_connection(
     .await
     {
         Ok(Ok(ws)) => ws,
-        Ok(Err(_)) if refused.load(Ordering::Relaxed) => {
+        Ok(Err(_)) if refused.load(Ordering::Relaxed) != ACCEPTED => {
             state
                 .connections_rejected_total
                 .fetch_add(1, Ordering::Relaxed);
-            if !state.draining.load(Ordering::Relaxed) {
+            if refused.load(Ordering::Relaxed) == REFUSED_ORIGIN {
+                tracing::warn!("[WSE] Origin not allowed, refused {addr}");
+            } else if !state.draining.load(Ordering::Relaxed) {
                 tracing::warn!("[WSE] Max connections reached, refused {addr}");
             }
             return;
@@ -708,6 +766,7 @@ pub(super) async fn handle_connection(
     // One server_hello per connection: a client repeating client_hello would
     // otherwise get one back each time.
     let mut hello_answered = false;
+    let mut frame_errors = FrameErrorLog::default();
 
     // Read loop. It ends when the client closes or the socket fails, and when
     // the server closed the connection and the client did not answer in time.
@@ -780,15 +839,18 @@ pub(super) async fn handle_connection(
                 } else {
                     // Non-JSON text — drain or callback
                     if drain {
-                        state.push_inbound(InboundEvent::RawText {
-                            conn_id: (*conn_id).clone(),
-                            text: text.to_string(),
-                        });
+                        state.push_message(
+                            InboundEvent::RawText {
+                                conn_id: (*conn_id).clone(),
+                                text: text.to_string(),
+                            },
+                            text.len(),
+                        );
                     } else if let Some(ref cb) = cached_on_message {
                         let cb_arc = cb.clone();
                         let cid = Arc::clone(&conn_id);
                         let t = text.to_string();
-                        spawn_bounded_callback(&callback_sem, &state, move || {
+                        spawn_bounded_callback(&callback_sem, &state, t.len(), move || {
                             Python::try_attach(|py| {
                                 if let Err(e) = cb_arc.call1(py, (&**cid, &*t)) {
                                     tracing::warn!("[WSE] on_message error: {e}");
@@ -905,15 +967,18 @@ pub(super) async fn handle_connection(
 
                         // Drain mode: push serde_json::Value to queue (zero GIL)
                         if drain {
-                            state.push_inbound(InboundEvent::Message {
-                                conn_id: (*conn_id).clone(),
-                                value: val,
-                            });
+                            state.push_message(
+                                InboundEvent::Message {
+                                    conn_id: (*conn_id).clone(),
+                                    value: val,
+                                },
+                                text.len(),
+                            );
                         } else if let Some(ref cb) = cached_on_message {
                             // Callback mode: convert to PyDict + call Python
                             let cb_arc = cb.clone();
                             let cid = Arc::clone(&conn_id);
-                            spawn_bounded_callback(&callback_sem, &state, move || {
+                            spawn_bounded_callback(&callback_sem, &state, text.len(), move || {
                                 Python::try_attach(|py| {
                                     let py_obj = json_to_pyobj(py, &val);
                                     if let Err(e) = cb_arc.call1(py, (&**cid, py_obj)) {
@@ -926,15 +991,18 @@ pub(super) async fn handle_connection(
                     Err(_) => {
                         // JSON parse failed — pass raw string
                         if drain {
-                            state.push_inbound(InboundEvent::RawText {
-                                conn_id: (*conn_id).clone(),
-                                text: text.to_string(),
-                            });
+                            state.push_message(
+                                InboundEvent::RawText {
+                                    conn_id: (*conn_id).clone(),
+                                    text: text.to_string(),
+                                },
+                                text.len(),
+                            );
                         } else if let Some(ref cb) = cached_on_message {
                             let cb_arc = cb.clone();
                             let cid = Arc::clone(&conn_id);
                             let t = text.to_string();
-                            spawn_bounded_callback(&callback_sem, &state, move || {
+                            spawn_bounded_callback(&callback_sem, &state, t.len(), move || {
                                 Python::try_attach(|py| {
                                     if let Err(e) = cb_arc.call1(py, (&**cid, &*t)) {
                                         tracing::warn!("[WSE] on_message error: {e}");
@@ -968,10 +1036,13 @@ pub(super) async fn handle_connection(
                                         text
                                     } else {
                                         if drain {
-                                            state.push_inbound(InboundEvent::RawText {
-                                                conn_id: (*conn_id).clone(),
-                                                text: text.to_string(),
-                                            });
+                                            state.push_message(
+                                                InboundEvent::RawText {
+                                                    conn_id: (*conn_id).clone(),
+                                                    text: text.to_string(),
+                                                },
+                                                text.len(),
+                                            );
                                         }
                                         continue;
                                     };
@@ -980,16 +1051,20 @@ pub(super) async fn handle_connection(
                                     {
                                         let val = normalize_json_keys(val);
                                         if drain {
-                                            state.push_inbound(InboundEvent::Message {
-                                                conn_id: (*conn_id).clone(),
-                                                value: val,
-                                            });
+                                            state.push_message(
+                                                InboundEvent::Message {
+                                                    conn_id: (*conn_id).clone(),
+                                                    value: val,
+                                                },
+                                                text.len(),
+                                            );
                                         } else if let Some(ref cb) = cached_on_message {
                                             let cb_arc = cb.clone();
                                             let cid = Arc::clone(&conn_id);
                                             spawn_bounded_callback(
                                                 &callback_sem,
                                                 &state,
+                                                text.len(),
                                                 move || {
                                                     Python::try_attach(|py| {
                                                         let py_obj = json_to_pyobj(py, &val);
@@ -1007,15 +1082,10 @@ pub(super) async fn handle_connection(
                                     }
                                 }
                             }
-                            Err(e) => {
-                                tracing::error!("[WSE] Decryption failed for {}: {}", conn_id, e);
-                            }
+                            Err(e) => frame_errors.warn(&conn_id, &e),
                         }
                     } else {
-                        tracing::error!(
-                            "[WSE] Received E: frame but no encryption key for {}",
-                            conn_id
-                        );
+                        frame_errors.warn(&conn_id, "encrypted frame before the key exchange");
                     }
                     continue;
                 }
@@ -1034,24 +1104,33 @@ pub(super) async fn handle_connection(
                             Ok(rmpv_val) => {
                                 let json_val = rmpv_to_serde_json(&rmpv_val);
                                 let json_val = normalize_json_keys(json_val);
-                                state.push_inbound(InboundEvent::Message {
-                                    conn_id: (*conn_id).clone(),
-                                    value: json_val,
-                                });
+                                state.push_message(
+                                    InboundEvent::Message {
+                                        conn_id: (*conn_id).clone(),
+                                        value: json_val,
+                                    },
+                                    data.len(),
+                                );
                             }
                             Err(_) => {
                                 // Not valid msgpack — pass raw bytes
-                                state.push_inbound(InboundEvent::Binary {
-                                    conn_id: (*conn_id).clone(),
-                                    data: data.to_vec(),
-                                });
+                                state.push_message(
+                                    InboundEvent::Binary {
+                                        conn_id: (*conn_id).clone(),
+                                        data: data.to_vec(),
+                                    },
+                                    data.len(),
+                                );
                             }
                         }
                     } else {
-                        state.push_inbound(InboundEvent::Binary {
-                            conn_id: (*conn_id).clone(),
-                            data: data.to_vec(),
-                        });
+                        state.push_message(
+                            InboundEvent::Binary {
+                                conn_id: (*conn_id).clone(),
+                                data: data.to_vec(),
+                            },
+                            data.len(),
+                        );
                     }
                 } else if let Some(ref cb) = cached_on_message {
                     let cb_arc = cb.clone();
@@ -1059,7 +1138,7 @@ pub(super) async fn handle_connection(
                     let d = data.to_vec();
                     if is_msgpack {
                         // Parse msgpack and pass as dict to callback (same as JSON text)
-                        spawn_bounded_callback(&callback_sem, &state, move || {
+                        spawn_bounded_callback(&callback_sem, &state, d.len(), move || {
                             Python::try_attach(|py| match decode_msgpack_guarded(&d[..]) {
                                 Ok(rmpv_val) => {
                                     let json_val = rmpv_to_serde_json(&rmpv_val);
@@ -1078,7 +1157,7 @@ pub(super) async fn handle_connection(
                             });
                         });
                     } else {
-                        spawn_bounded_callback(&callback_sem, &state, move || {
+                        spawn_bounded_callback(&callback_sem, &state, d.len(), move || {
                             Python::try_attach(|py| {
                                 let py_bytes = PyBytes::new(py, &d);
                                 if let Err(e) = cb_arc.call1(py, (&**cid, py_bytes)) {

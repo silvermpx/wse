@@ -156,7 +156,25 @@ Always use `wss://` (WebSocket Secure) in production. WSE does not enforce TLS a
 
 ### Origin Validation
 
-WSE does not perform origin validation at the application layer. To prevent Cross-Site WebSocket Hijacking (CSWSH), configure origin checks in your reverse proxy:
+A page on another site, even a sibling subdomain that browsers treat as
+same-site, can open a WebSocket to your server with the victim's cookies
+(Cross-Site WebSocket Hijacking, CSWSH). Pass the origins your pages are
+served from, and the server answers an upgrade from any other origin with
+HTTP 403:
+
+```python
+server = RustWSEServer(
+    "0.0.0.0", 5007,
+    jwt_secret=secret,
+    allowed_origins=["https://app.example.com", "https://admin.example.com"],
+)
+```
+
+Origins are compared as `scheme://host[:port]`, case-insensitively, with the
+scheme's default port optional. Upgrades without an `Origin` header (clients
+other than browsers) are not affected. The default `None` checks nothing.
+
+The same check can live in your reverse proxy instead:
 
 ```nginx
 # nginx: reject WebSocket upgrades from unknown origins
@@ -173,7 +191,7 @@ server {
 }
 ```
 
-JWT authentication provides the primary access control. Origin validation at the proxy layer adds defense-in-depth against CSWSH.
+JWT authentication provides the primary access control. Origin validation adds defense-in-depth against CSWSH.
 
 ## Message Security
 
@@ -342,7 +360,9 @@ before the server parses them (`rate_limit_capacity`, `rate_limit_refill`):
 - **Abuse**: a client that keeps sending into the empty bucket for 10 seconds is closed with code 4429
 
 Callback mode additionally bounds the callbacks in flight per connection
-(256); drain mode bounds the shared inbound queue (`max_inbound_queue_size`).
+(256). In both modes the client messages waiting for the application are
+bounded by `max_inbound_queue_size` (count) and `max_inbound_queue_bytes`
+(size); connect, disconnect and presence events are never dropped.
 
 ### Client-Side
 
@@ -466,7 +486,7 @@ Frontend nonce cache:
 ## Best Practices
 
 1. **Always use TLS** (`wss://`) in production
-2. **Configure origin validation** in your reverse proxy to prevent CSWSH
+2. **Configure origin validation** (`allowed_origins`, or your reverse proxy) to prevent CSWSH
 3. **Use asymmetric algorithms (RS256/ES256)** when tokens are issued by an external auth service
 4. **Rotate JWT keys** periodically using `jwt_previous_secret`
 5. **Enable signing** for critical operations

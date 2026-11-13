@@ -583,7 +583,7 @@ Returns a dict with the current server state:
 |-------|-------------|
 | `connections` | Active WebSocket connections |
 | `inbound_queue_depth` | Events waiting to be drained |
-| `inbound_dropped` | Events dropped due to full queue (should be 0) |
+| `inbound_dropped` | Client messages dropped over `max_inbound_queue_size` / `max_inbound_queue_bytes` (should be 0); connect, disconnect and presence events are never dropped |
 | `uptime_secs` | Server uptime in seconds |
 | `recovery_enabled` | Whether message recovery is active |
 | `recovery_topic_count` | Topics with active recovery buffers |
@@ -774,7 +774,7 @@ Both clients handle reconnection with exponential backoff, automatic resubscript
 
 - Set `max_connections` based on available memory. Approximately 1 KB per idle connection, more under active message flow.
 - Use `drain_inbound(256, 50)` for optimal throughput. Batch size 256 amortizes GIL acquisition. Timeout 50ms balances latency and CPU usage.
-- Monitor `health_snapshot()` for queue depth and dropped events. A non-zero `inbound_dropped` indicates the drain loop is too slow.
+- Monitor `health_snapshot()` for queue depth and dropped events. A non-zero `inbound_dropped` indicates the drain loop is too slow; the lifecycle events (connect, disconnect, presence) still arrive, only client messages are dropped.
 
 ### TLS Termination
 

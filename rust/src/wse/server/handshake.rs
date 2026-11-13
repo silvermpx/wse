@@ -32,6 +32,29 @@ pub(super) async fn reject_ws_auth(sock: &mut TcpStream, code: &str, message: &s
     let _ = sock.shutdown().await;
 }
 
+/// An origin as browsers send it in the `Origin` header: `scheme://host` or
+/// `scheme://host:port`, in lower case, without a trailing slash and without
+/// the scheme's default port.
+pub(crate) fn normalize_origin(origin: &str) -> Result<String, String> {
+    let invalid = || format!("allowed_origins: {origin:?} is not scheme://host[:port]");
+    let lowered = origin.trim().trim_end_matches('/').to_ascii_lowercase();
+    let Some((scheme, host)) = lowered.split_once("://") else {
+        return Err(invalid());
+    };
+    if scheme.is_empty() || host.is_empty() || host.contains(['/', '?', '#', '@', ' ']) {
+        return Err(invalid());
+    }
+    let default_port = match scheme {
+        "http" | "ws" => Some(":80"),
+        "https" | "wss" => Some(":443"),
+        _ => None,
+    };
+    let host = default_port
+        .and_then(|port| host.strip_suffix(port))
+        .unwrap_or(host);
+    Ok(format!("{scheme}://{host}"))
+}
+
 /// Max connections allowed to sit in the pre-handshake / handshake phase at once.
 /// `max_connections` only counts REGISTERED connections (a connection registers
 /// after the WS upgrade + JWT complete), so without this a slowloris that opens

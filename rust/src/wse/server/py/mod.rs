@@ -80,6 +80,8 @@ impl std::ops::Deref for CommandTx {
 struct ServerParams {
     max_connections: usize,
     max_inbound_queue_size: usize,
+    max_inbound_queue_bytes: usize,
+    allowed_origins: Option<Vec<String>>,
     max_message_size: usize,
     ping_interval: u64,
     idle_timeout: u64,
@@ -126,6 +128,7 @@ impl RustWSEServer {
         let at_least_one = [
             ("max_connections", srv.max_connections),
             ("max_inbound_queue_size", srv.max_inbound_queue_size),
+            ("max_inbound_queue_bytes", srv.max_inbound_queue_bytes),
             ("max_message_size", srv.max_message_size),
         ];
         for (name, value) in at_least_one {
@@ -153,6 +156,16 @@ impl RustWSEServer {
                 srv.rate_limit_refill
             )));
         }
+        let allowed_origins = srv
+            .allowed_origins
+            .map(|origins| {
+                origins
+                    .iter()
+                    .map(|origin| crate::wse::server::normalize_origin(origin))
+                    .collect::<Result<AHashSet<String>, String>>()
+            })
+            .transpose()
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
         if srv.ping_interval >= srv.idle_timeout {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "ping_interval ({}s) must be less than idle_timeout ({}s)",
@@ -245,6 +258,8 @@ impl RustWSEServer {
                 max_connections: srv.max_connections,
                 jwt_config,
                 max_inbound_queue_size: srv.max_inbound_queue_size,
+                max_inbound_queue_bytes: srv.max_inbound_queue_bytes,
+                allowed_origins,
                 recovery,
                 presence_enabled: pres.presence_enabled,
                 presence_max_data_size: pres.presence_max_data_size,
@@ -300,10 +315,10 @@ impl RustWSEServer {
     /// compression, encryption, ping/pong). Python handles application logic
     /// via drain mode or callbacks.
     #[new]
-    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, jwt_previous_secret = None, jwt_key_id = None, jwt_algorithm = None, jwt_private_key = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_bytes = 16_777_216, max_subscriptions_per_connection = 0))]
+    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, jwt_previous_secret = None, jwt_key_id = None, jwt_algorithm = None, jwt_private_key = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_bytes = 16_777_216, max_subscriptions_per_connection = 0, max_inbound_queue_bytes = 67_108_864, allowed_origins = None))]
     #[expect(
         clippy::too_many_arguments,
-        reason = "PyO3 __init__: 27 Python kwargs with defaults"
+        reason = "PyO3 __init__: 29 Python kwargs with defaults"
     )]
     fn new(
         host: String,
@@ -333,6 +348,8 @@ impl RustWSEServer {
         idle_timeout: u64,
         max_outbound_queue_bytes: usize,
         max_subscriptions_per_connection: usize,
+        max_inbound_queue_bytes: usize,
+        allowed_origins: Option<Vec<String>>,
     ) -> PyResult<Self> {
         Self::build(
             host,
@@ -340,6 +357,8 @@ impl RustWSEServer {
             ServerParams {
                 max_connections,
                 max_inbound_queue_size,
+                max_inbound_queue_bytes,
+                allowed_origins,
                 max_message_size,
                 ping_interval,
                 idle_timeout,
@@ -525,7 +544,9 @@ impl RustWSEServer {
         self.drain_inbound_impl(py, max_count, timeout_ms)
     }
 
-    /// Number of inbound events dropped due to queue overflow.
+    /// Client messages dropped over `max_inbound_queue_size` or
+    /// `max_inbound_queue_bytes`. Connect, disconnect and presence events are
+    /// never dropped.
     fn inbound_dropped_count(&self) -> u64 {
         self.shared.inbound_dropped.load(Ordering::Relaxed)
     }

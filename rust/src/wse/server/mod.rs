@@ -90,6 +90,7 @@ pub(crate) use fanout::{fanout_topic_direct, glob_match, stamp_recovery_fields};
 pub(crate) use frames::{
     BroadcastQueue, WsFrame, encode_ws_frame, pre_frame_binary, pre_frame_text,
 };
+pub(crate) use handshake::normalize_origin;
 pub(crate) use messages::format_presence_msg;
 pub(crate) use state::{
     CLOSE_GOING_AWAY, CLOSE_GRACE, CLOSE_IDLE, CLOSE_NORMAL, CLOSE_RATE_LIMITED,

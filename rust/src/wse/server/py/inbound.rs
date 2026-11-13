@@ -26,14 +26,14 @@ impl RustWSEServer {
                 .inbound_rx
                 .recv_timeout(Duration::from_millis(timeout_ms))
             {
-                Ok(event) => events.push(event),
+                Ok(queued) => events.push(self.shared.taken(queued)),
                 Err(_) => return events, // Timeout or disconnected
             }
 
             // Drain remaining without blocking (batch read)
             while events.len() < max_count {
                 match self.shared.inbound_rx.try_recv() {
-                    Ok(event) => events.push(event),
+                    Ok(queued) => events.push(self.shared.taken(queued)),
                     Err(_) => break,
                 }
             }

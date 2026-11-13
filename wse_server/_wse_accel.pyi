@@ -329,6 +329,9 @@ class RustWSEServer:
         ping_interval: int = 25,
         idle_timeout: int = 60,
         max_outbound_queue_bytes: int = 16_777_216,
+        max_subscriptions_per_connection: int = 0,
+        max_inbound_queue_bytes: int = 67_108_864,
+        allowed_origins: list[str] | None = None,
     ) -> None: ...
 
     # -- Lifecycle ------------------------------------------------------------
@@ -385,7 +388,9 @@ class RustWSEServer:
         """
         ...
     def inbound_dropped_count(self) -> int:
-        """Number of inbound events dropped due to queue overflow."""
+        """Client messages dropped over max_inbound_queue_size or
+        max_inbound_queue_bytes. Connect, disconnect and presence events are
+        never dropped."""
         ...
     def inbound_queue_depth(self) -> int:
         """Current number of events in the inbound queue."""

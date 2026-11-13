@@ -453,4 +453,4 @@ async def health():
 
 ## Configuration
 
-All configuration is passed programmatically through the `RustWSEServer` constructor and `connect_cluster()` method. Origin validation should be configured in your reverse proxy (see [SECURITY.md](SECURITY.md#origin-validation)).
+All configuration is passed programmatically through the `RustWSEServer` constructor and `connect_cluster()` method. Origin validation: `allowed_origins`, or your reverse proxy (see [SECURITY.md](SECURITY.md#origin-validation)).

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use ahash::AHashSet;
-use crossbeam_channel::{Receiver as CBReceiver, Sender as CBSender, bounded};
+use crossbeam_channel::{Receiver as CBReceiver, Sender as CBSender, unbounded};
 use dashmap::{DashMap, DashSet};
 use pyo3::prelude::*;
 use tokio::sync::{RwLock, mpsc, oneshot};
@@ -171,6 +171,29 @@ pub(super) enum InboundEvent {
     },
 }
 
+/// An event in the inbound queue. Connect, disconnect and presence events
+/// always get in, so the application never misses a join or a leave; the
+/// clients' messages are dropped while `max_inbound_queue_size` of them, or
+/// `max_inbound_queue_bytes` of their size, are waiting.
+pub(super) struct Queued {
+    pub(super) event: InboundEvent,
+    /// What a client's message counts against the byte budget; `None` for
+    /// the lifecycle events.
+    bytes: Option<usize>,
+}
+
+/// A message's room in the inbound budget while its callback runs.
+pub(super) struct CallbackRoom {
+    state: Arc<SharedState>,
+    bytes: usize,
+}
+
+impl Drop for CallbackRoom {
+    fn drop(&mut self) {
+        self.state.release_message(self.bytes);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dedup state (accessed from send_event on the Python thread)
 // ---------------------------------------------------------------------------
@@ -228,6 +251,8 @@ pub(crate) struct SharedStateConfig {
     pub max_connections: usize,
     pub jwt_config: Option<JwtConfig>,
     pub max_inbound_queue_size: usize,
+    pub max_inbound_queue_bytes: usize,
+    pub allowed_origins: Option<AHashSet<String>>,
     pub recovery: Option<Arc<crate::wse::recovery::RecoveryManager>>,
     pub presence_enabled: bool,
     pub presence_max_data_size: usize,
@@ -244,19 +269,25 @@ pub(crate) struct SharedStateConfig {
 pub(crate) struct SharedState {
     pub(crate) connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     pub(super) max_connections: usize,
+    // Origins a browser may open a connection from (None: any)
+    pub(super) allowed_origins: Option<AHashSet<String>>,
     pub(super) on_connect: std::sync::RwLock<Option<Py<PyAny>>>,
     pub(super) on_message: std::sync::RwLock<Option<Py<PyAny>>>,
     pub(super) on_disconnect: std::sync::RwLock<Option<Py<PyAny>>>,
     // Drain mode: when active, inbound events go to channel instead of callbacks
     pub(super) drain_mode: AtomicBool,
-    // Lock-free bounded channel: Tokio tasks send (non-blocking), Python drains
-    inbound_tx: CBSender<InboundEvent>,
-    pub(super) inbound_rx: CBReceiver<InboundEvent>,
-    // Counter for dropped events (observability)
+    // Lock-free channel: Tokio tasks send (non-blocking), Python drains
+    inbound_tx: CBSender<Queued>,
+    pub(super) inbound_rx: CBReceiver<Queued>,
+    // The clients' messages in the channel, their size and the limits of both
+    inbound_messages: AtomicUsize,
+    inbound_bytes: AtomicUsize,
+    max_inbound_messages: usize,
+    max_inbound_bytes: usize,
+    // Client messages dropped over those limits (observability)
     pub(super) inbound_dropped: AtomicU64,
     // Per-connection format preference (lock-free sync access for send_event)
     pub(super) conn_formats: DashMap<String, bool>,
-    // Per-connection rate limiter state (cleaned up on disconnect)
     // Atomic connection count (lock-free read from Python without GIL blocking)
     pub(super) connection_count: AtomicUsize,
     // JWT config: when set, Rust validates JWT in handshake (zero GIL)
@@ -376,16 +407,21 @@ impl SharedState {
     }
 
     pub(super) fn new(cfg: SharedStateConfig) -> Self {
-        let (tx, rx) = bounded(cfg.max_inbound_queue_size);
+        let (tx, rx) = unbounded();
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             max_connections: cfg.max_connections,
+            allowed_origins: cfg.allowed_origins,
             on_connect: std::sync::RwLock::new(None),
             on_message: std::sync::RwLock::new(None),
             on_disconnect: std::sync::RwLock::new(None),
             drain_mode: AtomicBool::new(false),
             inbound_tx: tx,
             inbound_rx: rx,
+            inbound_messages: AtomicUsize::new(0),
+            inbound_bytes: AtomicUsize::new(0),
+            max_inbound_messages: cfg.max_inbound_queue_size,
+            max_inbound_bytes: cfg.max_inbound_queue_bytes,
             inbound_dropped: AtomicU64::new(0),
             conn_formats: DashMap::new(),
             connection_count: AtomicUsize::new(0),
@@ -437,11 +473,60 @@ impl SharedState {
         }
     }
 
-    /// Push an event to the drain channel (lock-free, non-blocking).
-    /// When channel is full, drops the event and increments counter.
+    /// Queue a connect, disconnect or presence event for the drain: never
+    /// dropped.
     pub(super) fn push_inbound(&self, event: InboundEvent) {
-        if self.inbound_tx.try_send(event).is_err() {
+        let _ = self.inbound_tx.send(Queued { event, bytes: None });
+    }
+
+    /// Room for a client's message of `bytes` bytes among the messages
+    /// waiting for the application: at most `max_inbound_queue_size` of them
+    /// and `max_inbound_queue_bytes` of their size. A message larger than the
+    /// whole byte budget still gets in when nothing else waits. Without room
+    /// the message is counted in `inbound_dropped`.
+    fn reserve_message(&self, bytes: usize) -> bool {
+        let queued = self.inbound_messages.fetch_add(1, Ordering::AcqRel);
+        let held = self.inbound_bytes.fetch_add(bytes, Ordering::AcqRel);
+        if queued >= self.max_inbound_messages
+            || (held > 0 && held.saturating_add(bytes) > self.max_inbound_bytes)
+        {
+            self.release_message(bytes);
             self.inbound_dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
         }
+        true
+    }
+
+    fn release_message(&self, bytes: usize) {
+        self.inbound_messages.fetch_sub(1, Ordering::AcqRel);
+        self.inbound_bytes.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    /// Queue a client's message of `bytes` bytes for the drain, or drop it
+    /// when there is no room (see `reserve_message`).
+    pub(super) fn push_message(&self, event: InboundEvent, bytes: usize) {
+        if self.reserve_message(bytes) {
+            let _ = self.inbound_tx.send(Queued {
+                event,
+                bytes: Some(bytes),
+            });
+        }
+    }
+
+    /// The drain took `queued` off the channel: its room is free again.
+    pub(super) fn taken(&self, queued: Queued) -> InboundEvent {
+        if let Some(bytes) = queued.bytes {
+            self.release_message(bytes);
+        }
+        queued.event
+    }
+
+    /// Room for a message handed to an on_message callback, given back when
+    /// the callback is done (see `reserve_message`).
+    pub(super) fn callback_room(state: &Arc<Self>, bytes: usize) -> Option<CallbackRoom> {
+        state.reserve_message(bytes).then(|| CallbackRoom {
+            state: Arc::clone(state),
+            bytes,
+        })
     }
 }

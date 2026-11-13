@@ -124,7 +124,7 @@ Full reference with usage examples: [RUST_UTILITIES.md](RUST_UTILITIES.md)
 
 **Drain mode** (recommended for production):
 
-Events are queued in a lock-free crossbeam bounded channel. Python polls with `drain_inbound(max_count, timeout_ms)`, which releases the GIL while waiting on the channel and acquires it once for the entire batch conversion.
+Events are queued in a lock-free crossbeam channel. Connect, disconnect and presence events always get in; client messages are dropped (counted in `inbound_dropped`) while `max_inbound_queue_size` of them or `max_inbound_queue_bytes` of their size are waiting. Callback mode uses the same budget for the messages its callbacks are handling. Python polls with `drain_inbound(max_count, timeout_ms)`, which releases the GIL while waiting on the channel and acquires it once for the entire batch conversion.
 
 ```python
 server.enable_drain_mode()

@@ -282,3 +282,115 @@ class TestOptionChecks:
 
     def test_an_unlimited_rate_is_allowed(self):
         RustWSEServer("127.0.0.1", 0, rate_limit_capacity=float("inf"))
+
+
+class TestInboundBudget:
+    def test_lifecycle_events_survive_a_full_queue(self, server_port):
+        srv = start_server(server_port, max_inbound_queue_size=4)
+        try:
+
+            async def run():
+                first = await connect(server_port, make_token("first"))
+                _, first_id, _ = drain_until(srv, "auth_connect")
+                for i in range(20):
+                    await first.send(json.dumps({"t": "chat", "p": {"i": i}}))
+                await asyncio.sleep(0.3)
+                second = await connect(server_port, make_token("second"))
+                await first.close()
+                await asyncio.sleep(0.3)
+                await second.close()
+                await asyncio.sleep(0.3)
+                return first_id
+
+            first_id = asyncio.run(run())
+            events = drain_all(srv, timeout_ms=300)
+            kinds = [ev[0] for ev in events]
+            assert kinds.count("msg") == 4
+            assert kinds.count("auth_connect") == 1
+            assert kinds.count("disconnect") == 2
+            assert ("disconnect", first_id, None) in [tuple(ev) for ev in events]
+            assert srv.inbound_dropped_count() == 16
+        finally:
+            srv.stop()
+
+    def test_messages_are_bounded_by_size(self, server_port):
+        srv = start_server(server_port, max_inbound_queue_bytes=1000)
+        try:
+
+            async def send(sizes):
+                async with await connect(server_port, make_token()) as ws:
+                    drain_until(srv, "auth_connect")
+                    for size in sizes:
+                        await ws.send(json.dumps({"t": "chat", "p": {"fill": "x" * size}}))
+                    await asyncio.sleep(0.3)
+
+            asyncio.run(send([270] * 10))
+            assert len([ev for ev in drain_all(srv, timeout_ms=300) if ev[0] == "msg"]) == 3
+            # A message larger than the whole budget still gets into an empty queue.
+            asyncio.run(send([5000]))
+            assert len([ev for ev in drain_all(srv, timeout_ms=300) if ev[0] == "msg"]) == 1
+        finally:
+            srv.stop()
+
+    def test_callbacks_share_the_budget(self, server_port):
+        srv = RustWSEServer(
+            "127.0.0.1",
+            server_port,
+            jwt_secret=JWT_SECRET,
+            jwt_issuer=JWT_ISSUER,
+            jwt_audience=JWT_AUDIENCE,
+            max_inbound_queue_size=2,
+        )
+        calls = []
+
+        def on_message(conn_id, data):
+            calls.append(data)
+            time.sleep(0.5)
+
+        srv.set_callbacks(lambda *a: None, on_message, lambda *a: None)
+        srv.start()
+        time.sleep(0.05)
+        try:
+
+            async def run():
+                async with await connect(server_port, make_token()) as ws:
+                    await asyncio.wait_for(ws.recv(), timeout=2)  # server_ready
+                    for i in range(10):
+                        await ws.send(json.dumps({"t": "chat", "p": {"i": i}}))
+                    await asyncio.sleep(1.5)
+
+            asyncio.run(run())
+            assert len(calls) == 2
+            assert srv.inbound_dropped_count() == 8
+        finally:
+            srv.stop()
+
+
+class TestAllowedOrigins:
+    @pytest.mark.asyncio
+    async def test_only_listed_origins_may_connect(self, server_port):
+        srv = start_server(server_port, allowed_origins=["https://App.example.com:443/"])
+        token = make_token()
+        try:
+            for origin in ("https://app.example.com", None):
+                async with await websockets.connect(
+                    ws_url(server_port),
+                    origin=origin,
+                    additional_headers={"Authorization": f"Bearer {token}"},
+                ):
+                    drain_until(srv, "auth_connect")
+            for origin in ("https://evil.example.com", "http://app.example.com", "null"):
+                with pytest.raises(websockets.InvalidStatus) as refused:
+                    await websockets.connect(
+                        ws_url(server_port),
+                        origin=origin,
+                        additional_headers={"Authorization": f"Bearer {token}"},
+                    )
+                assert refused.value.response.status_code == 403
+        finally:
+            srv.stop()
+
+    @pytest.mark.parametrize("origin", ["app.example.com", "https://", "https://a.com/path"])
+    def test_malformed_origins_are_refused(self, origin):
+        with pytest.raises(ValueError):
+            RustWSEServer("127.0.0.1", 0, allowed_origins=[origin])

@@ -104,7 +104,7 @@ High-performance WebSocket server built in Rust with native clustering, E2E encr
 
 | Feature | Details |
 |---------|---------|
-| **Origin validation** | Configure in reverse proxy (nginx/Caddy) to prevent CSWSH |
+| **Origin validation** | `allowed_origins` refuses browser upgrades from other origins (403), against CSWSH |
 | **Cookie auth** | `access_token` HTTP-only cookie with `Secure + SameSite=Lax` (OWASP recommended for browsers) |
 | **Frame protection** | 1 MB max frame size, serde_json parsing (no eval), escaped user IDs in server_ready; inbound msgpack rejected beyond 64 nesting levels |
 | **Cluster frame protection** | zstd decompression output capped at 1 MB (MAX_FRAME_SIZE), protocol version validation |
@@ -179,7 +179,7 @@ token = rust_jwt_encode(
 | `jwt_key_id` | None | Expected `kid` header claim. Rejects tokens with mismatched key ID |
 | `jwt_algorithm` | None | JWT algorithm the server expects: `"HS256"` (default), `"HS384"`, `"HS512"`, `"RS256"`, `"RS384"`, `"RS512"`, `"PS256"`, `"PS384"`, `"PS512"`, `"ES256"`, `"ES384"` or `"EdDSA"`. The token's own `alg` header never overrides it. |
 | `jwt_private_key` | None | PEM private key for RS256/ES256 token encoding. Not needed for HS256 |
-| `max_inbound_queue_size` | 131072 | Drain mode bounded queue capacity |
+| `max_inbound_queue_size` | 131072 | Client messages waiting for the application (drain queue or running callbacks) before new ones are dropped; connect, disconnect and presence events are never dropped |
 | `recovery_enabled` | False | Enable per-topic message recovery buffers |
 | `recovery_buffer_size` | 128 | Ring buffer slots per topic (rounded to power-of-2) |
 | `recovery_ttl` | 300 | Buffer TTL in seconds before eviction |
@@ -195,6 +195,8 @@ token = rust_jwt_encode(
 | `max_message_size` | 1048576 | Maximum WebSocket frame size in bytes (default 1 MB) |
 | `ping_interval` | 25 | Server-initiated ping interval in seconds (at least 1, below `idle_timeout`) |
 | `idle_timeout` | 60 | Close connections that sent nothing for this many seconds (code 4408) |
+| `max_inbound_queue_bytes` | 67108864 | The same budget in bytes (default 64 MB); a single larger message still gets into an empty queue |
+| `allowed_origins` | None | Origins (`scheme://host[:port]`) browsers may connect from; others get HTTP 403. `None` checks nothing |
 
 ---
 
@@ -401,7 +403,7 @@ server.get_connections()             # List all connection IDs (snapshot)
 server.disconnect(conn_id)           # Force-disconnect a connection
 server.drain(close_code=4300, close_reason="shutting down", timeout=10)  # Graceful drain
 server.inbound_queue_depth()         # Events waiting to be drained
-server.inbound_dropped_count()       # Events dropped due to full queue
+server.inbound_dropped_count()       # Client messages dropped over the inbound budget
 server.get_cluster_dlq_entries()     # Retrieve failed cluster messages from dead letter queue
 ```
 
