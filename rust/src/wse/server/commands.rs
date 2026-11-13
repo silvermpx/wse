@@ -8,7 +8,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-use super::fanout::{FANOUT_PART, PARALLEL_FANOUT_AT, deliver_in_parts, fanout_broadcast_direct};
+use super::fanout::fanout_broadcast_direct;
 use super::frames::ws_frame_size;
 use super::{
     CLOSE_GOING_AWAY, CLOSE_NORMAL, Outgoing, ServerCommand, SharedState, WsFrame,
@@ -19,38 +19,6 @@ use crate::wse::cluster::ClusterCommand;
 // ---------------------------------------------------------------------------
 // Command processor
 // ---------------------------------------------------------------------------
-
-/// Deliver `msg` to every connection. A large broadcast is split across the
-/// runtime's threads; the connections' read lock is held until every part
-/// is done, as it is for a small one, so no connection registers in the
-/// middle of a message.
-async fn broadcast_to_all(state: &Arc<SharedState>, msg: Outgoing) {
-    let max_pending = state.max_outbound_queue_bytes;
-    let guard = state.connections.read().await;
-    let threads = tokio::runtime::Handle::current().metrics().num_workers();
-    let parts = (guard.len() / FANOUT_PART).min(threads);
-    if guard.len() < PARALLEL_FANOUT_AT || parts < 2 {
-        fanout_broadcast_direct(&guard, &msg, max_pending, &state.slow_consumer_drops);
-        return;
-    }
-    let list = match state.conn_list.load_full() {
-        Some(list) => list,
-        None => {
-            let list = Arc::new(guard.values().cloned().collect::<Vec<_>>());
-            state.conn_list.store(Some(list.clone()));
-            list
-        }
-    };
-    deliver_in_parts(
-        list,
-        Arc::new(msg),
-        parts,
-        max_pending,
-        state.slow_consumer_drops.clone(),
-    )
-    .await;
-    drop(guard);
-}
 
 pub(super) async fn process_commands(
     mut cmd_rx: mpsc::UnboundedReceiver<ServerCommand>,
@@ -118,10 +86,24 @@ pub(super) async fn process_commands(
                 }
             }
             ServerCommand::BroadcastText { data } => {
-                broadcast_to_all(&state, Outgoing::text(Bytes::from(data))).await;
+                let msg = Outgoing::text(Bytes::from(data));
+                let guard = state.connections.read().await;
+                fanout_broadcast_direct(
+                    &guard,
+                    &msg,
+                    state.max_outbound_queue_bytes,
+                    &state.slow_consumer_drops,
+                );
             }
             ServerCommand::BroadcastBytes { data } => {
-                broadcast_to_all(&state, Outgoing::binary(Bytes::from(data))).await;
+                let msg = Outgoing::binary(Bytes::from(data));
+                let guard = state.connections.read().await;
+                fanout_broadcast_direct(
+                    &guard,
+                    &msg,
+                    state.max_outbound_queue_bytes,
+                    &state.slow_consumer_drops,
+                );
             }
             ServerCommand::BroadcastLocal {
                 topic,

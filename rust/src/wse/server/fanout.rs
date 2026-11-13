@@ -280,42 +280,6 @@ impl ConnectionHandle {
     }
 }
 
-/// Connections from which a broadcast is split across the runtime's threads.
-pub(super) const PARALLEL_FANOUT_AT: usize = 4096;
-/// Connections each part of a split broadcast delivers to, at least.
-pub(super) const FANOUT_PART: usize = 1024;
-
-/// Deliver `msg` to every connection of `list` in `parts` on the runtime's
-/// own threads (their wakes stay on the runtime's queues), the first part
-/// on this task; returns when every part is done, so a next message starts
-/// after it and each connection gets messages in order.
-pub(super) async fn deliver_in_parts(
-    list: Arc<Vec<ConnectionHandle>>,
-    msg: Arc<Outgoing>,
-    parts: usize,
-    max_pending: usize,
-    slow_drops: Arc<AtomicU64>,
-) {
-    let size = list.len().div_ceil(parts.max(1));
-    let mut others = Vec::with_capacity(parts.saturating_sub(1));
-    for part in 1..parts {
-        let (list, msg, slow_drops) = (list.clone(), msg.clone(), slow_drops.clone());
-        others.push(tokio::spawn(async move {
-            let start = (part * size).min(list.len());
-            let end = ((part + 1) * size).min(list.len());
-            for h in &list[start..end] {
-                h.deliver(&msg, max_pending, &slow_drops);
-            }
-        }));
-    }
-    for h in &list[..size.min(list.len())] {
-        h.deliver(&msg, max_pending, &slow_drops);
-    }
-    for part in others {
-        let _ = part.await;
-    }
-}
-
 /// Deliver `msg` to every connection.
 pub(super) fn fanout_broadcast_direct(
     conns: &HashMap<String, ConnectionHandle>,

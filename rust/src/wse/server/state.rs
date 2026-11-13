@@ -317,11 +317,6 @@ pub(crate) struct SharedStateConfig {
 
 pub(crate) struct SharedState {
     pub(crate) connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
-    /// The connections as one list, for broadcasts split across the
-    /// runtime's threads; None once a connection came or went. Changed under
-    /// the `connections` write lock and read under its read lock, so a list
-    /// in use never misses a connection of the map.
-    pub(crate) conn_list: arc_swap::ArcSwapOption<Vec<ConnectionHandle>>,
     pub(super) max_connections: usize,
     // Origins a browser may open a connection from (None: any)
     pub(super) allowed_origins: Option<AHashSet<String>>,
@@ -488,7 +483,6 @@ impl SharedState {
         let (tx, rx) = unbounded();
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
-            conn_list: arc_swap::ArcSwapOption::empty(),
             max_connections: cfg.max_connections,
             allowed_origins: cfg.allowed_origins,
             client_subscriptions: cfg.client_subscriptions,

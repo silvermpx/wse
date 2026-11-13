@@ -297,24 +297,6 @@ fn a_large_fanout_reaches_everyone_once_and_in_order() {
     assert!(handles.iter().all(|(h, _)| queued(h).concat() == frame));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_broadcast_in_parts_reaches_everyone_once_and_in_order() {
-    let handles: Vec<_> = (0..5000).map(|_| make_handle()).collect();
-    let list = Arc::new(handles.iter().map(|(h, _)| h.clone()).collect::<Vec<_>>());
-    let drops = Arc::new(AtomicU64::new(0));
-    for n in 0..3 {
-        let msg = Arc::new(Outgoing::text(bytes::Bytes::from(format!("{{\"n\":{n}}}"))));
-        super::fanout::deliver_in_parts(list.clone(), msg, 4, 0, drops.clone()).await;
-    }
-    let expected: Vec<u8> = (0..3)
-        .flat_map(|n| encode_ws_frame(0x01, format!("{{\"n\":{n}}}").as_bytes()).to_vec())
-        .collect();
-    for (h, _) in &handles {
-        assert_eq!(queued(h).concat(), expected);
-    }
-    assert_eq!(drops.load(Ordering::Relaxed), 0);
-}
-
 #[test]
 fn unstamped_removes_exactly_the_recovery_fields() {
     let original = r#"{"c":"U","t":"x","p":{"k":"a\"b"}}"#;
