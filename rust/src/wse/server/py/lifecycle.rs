@@ -238,11 +238,13 @@ impl RustWSEServer {
                                     let last_seen = ping_state
                                         .conn_last_activity
                                         .get(cid)
-                                        .map(|entry| *entry);
+                                        .map(|entry| entry.load(Ordering::Relaxed));
                                     let Some(last) = last_seen else {
                                         continue; // gone since the snapshot
                                     };
-                                    if now.duration_since(last) > idle_timeout {
+                                    let idle_ms =
+                                        ping_state.activity_ms(now).saturating_sub(last);
+                                    if u128::from(idle_ms) > idle_timeout.as_millis() {
                                         handle.close(CLOSE_IDLE, "idle timeout");
                                         continue;
                                     }

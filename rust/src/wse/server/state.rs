@@ -377,8 +377,11 @@ pub(crate) struct SharedState {
     pub(crate) cluster_tls_holder:
         std::sync::RwLock<Option<Arc<arc_swap::ArcSwap<crate::wse::cluster::ClusterTlsConfig>>>>,
     pub(crate) recovery: Option<Arc<crate::wse::recovery::RecoveryManager>>,
-    // Per-connection last activity tracking for zombie detection
-    pub(super) conn_last_activity: DashMap<String, std::time::Instant>,
+    /// Each connection's last frame, in milliseconds since `clock_base`, for
+    /// the idle check. The connection's read loop holds its own counter and
+    /// stores into it with every frame: no map lookup on the read path.
+    pub(super) conn_last_activity: DashMap<String, Arc<AtomicU64>>,
+    pub(super) clock_base: std::time::Instant,
     // Per-connection AES-256-GCM cipher for E2E encryption (optional, client-initiated)
     pub(super) conn_encryption: DashMap<String, Arc<crate::crypto::Aes256Gcm>>,
     // Presence tracking (None when disabled)
@@ -417,6 +420,11 @@ pub(crate) struct SharedState {
 }
 
 impl SharedState {
+    /// `at` in milliseconds since `clock_base`: what the activity counters hold.
+    pub(super) fn activity_ms(&self, at: std::time::Instant) -> u64 {
+        at.saturating_duration_since(self.clock_base).as_millis() as u64
+    }
+
     /// One more local subscriber for each of `topics`; a topic's first one is
     /// advertised to cluster peers. Counted with or without a cluster, so
     /// connect_cluster() advertises (by RESYNC) what was subscribed before it.
@@ -508,6 +516,7 @@ impl SharedState {
             cluster_tls_holder: std::sync::RwLock::new(None),
             recovery: cfg.recovery,
             conn_last_activity: DashMap::new(),
+            clock_base: std::time::Instant::now(),
             conn_encryption: DashMap::new(),
             presence: if cfg.presence_enabled {
                 Some(Arc::new(crate::wse::presence::PresenceManager::new(

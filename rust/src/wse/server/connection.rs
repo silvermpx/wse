@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -459,8 +459,7 @@ impl InboundLimit {
         }
     }
 
-    fn check(&mut self) -> Inbound {
-        let now = Instant::now();
+    fn check(&mut self, now: Instant) -> Inbound {
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
         self.tokens = (self.tokens + elapsed * self.refill).min(self.capacity);
         self.last_refill = now;
@@ -779,10 +778,11 @@ pub(super) async fn handle_connection(
     if refuses_compression {
         state.conn_compression.insert((*conn_id).clone(), 0);
     }
-    // Initialize last activity for zombie detection
+    // Its last activity, for the idle check: updated by the read loop.
+    let activity = Arc::new(AtomicU64::new(state.activity_ms(Instant::now())));
     state
         .conn_last_activity
-        .insert((*conn_id).clone(), std::time::Instant::now());
+        .insert((*conn_id).clone(), activity.clone());
 
     // The user the server validated is the connection's user for presence.
     if let (Some(pm), Some(user_id)) = (&state.presence, &rust_auth_user_id) {
@@ -954,9 +954,8 @@ pub(super) async fn handle_connection(
             }
             // Every frame counts as activity, protocol pings and pongs included:
             // a plain WebSocket client may keep the link alive with those alone.
-            if let Some(mut last) = state.conn_last_activity.get_mut(&*conn_id) {
-                *last = std::time::Instant::now();
-            }
+            let now = Instant::now();
+            activity.store(state.activity_ms(now), Ordering::Relaxed);
             // In an E2E session the client sends sealed frames only.
             if session.is_some()
                 && match &msg {
@@ -969,7 +968,7 @@ pub(super) async fn handle_connection(
                 continue;
             }
             if matches!(msg, Message::Text(_) | Message::Binary(_)) {
-                match inbound_limit.check() {
+                match inbound_limit.check(now) {
                     Inbound::Pass => {}
                     Inbound::Warn { used, left } => {
                         let warning = format!(
