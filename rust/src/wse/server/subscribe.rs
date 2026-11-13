@@ -372,9 +372,12 @@ impl SharedState {
     }
 
     /// Subscribe a connection the way a recovering client asks: admit the
-    /// topics, take each one's head, subscribe, then replay each from its
-    /// position in `anchors`. Returns the topics taken (in order) and what
-    /// recovery did for each.
+    /// topics, subscribe, take each one's head, then replay each from its
+    /// position in `anchors` up to that head. Every later message reaches the
+    /// connection live: it is stored after the head was read, so after the
+    /// subscription, and the lanes deliver it after it is stored. A message
+    /// may come both ways; the client drops the second copy by its offset.
+    /// Returns the topics taken (in order) and what recovery did for each.
     pub(crate) fn subscribe_and_recover(
         &self,
         conn_id: &str,
@@ -383,8 +386,8 @@ impl SharedState {
         anchors: &HashMap<String, (u32, u64)>,
     ) -> Result<(Vec<String>, HashMap<String, TopicRecovery>), usize> {
         let accepted = self.admit_topics(conn_id, requested)?;
-        let heads: Vec<Option<(u32, u64)>> = accepted.iter().map(|t| self.topic_head(t)).collect();
         self.subscribe_topics(conn_id, handle, &accepted, None);
+        let heads: Vec<Option<(u32, u64)>> = accepted.iter().map(|t| self.topic_head(t)).collect();
         let recovered = accepted
             .iter()
             .zip(heads)

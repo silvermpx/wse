@@ -22,7 +22,9 @@ use crate::wse::pylock::lock;
 use crate::wse::server::commands::process_commands;
 use crate::wse::server::connection::handle_connection;
 use crate::wse::server::handshake::{HandshakeGuard, MAX_PENDING_HANDSHAKES};
-use crate::wse::server::{CLOSE_IDLE, CLOSE_TRY_AGAIN_LATER, ConnectionHandle, ServerCommand};
+use crate::wse::server::{
+    CLOSE_IDLE, CLOSE_TRY_AGAIN_LATER, ConnectionHandle, Fanout, ServerCommand,
+};
 
 /// TCP keepalive of accepted connections: the first probe after a minute of
 /// silence, then every 10 seconds.
@@ -113,6 +115,16 @@ impl RustWSEServer {
         tracing::info!("[WSE] Listening on {}:{}", self.host, self.port);
         // A drain of the last run is over.
         self.shared.draining.store(false, Ordering::SeqCst);
+        // A delivery task for each lane, running before the first command.
+        let fanout = {
+            let _runtime = rt.enter();
+            Fanout::start(
+                self.shared.topics.clone(),
+                self.shared.max_outbound_queue_bytes,
+                Arc::clone(&self.shared.slow_consumer_drops),
+            )
+        };
+        *self.shared.fanout.write().unwrap() = Some(fanout.clone());
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ServerCommand>();
         self.cmd_tx.store(Some(Arc::new(cmd_tx.clone())));
         // Store a clone for presence broadcasts from disconnect cleanup paths
@@ -126,7 +138,7 @@ impl RustWSEServer {
             .name("wse-server".into())
             .spawn(move || {
                 rt.block_on(async move {
-                    let cmd_handle = tokio::spawn(process_commands(cmd_rx, shared.clone()));
+                    let cmd_handle = tokio::spawn(process_commands(cmd_rx, shared.clone(), fanout));
                     // Spawn periodic recovery cleanup if recovery is enabled
                     if let Some(ref recovery) = shared.recovery {
                         let rm = recovery.clone();
@@ -440,6 +452,7 @@ impl RustWSEServer {
         };
         self.cmd_tx.store(None);
         *self.shared.presence_broadcast_tx.write().unwrap() = None;
+        *self.shared.fanout.write().unwrap() = None;
         *self.shared.cluster_cmd_tx.write().unwrap() = None;
         *self.shared.cluster_main_port.write().unwrap() = None;
         *self.shared.cluster_instance_id.lock().unwrap() = None;

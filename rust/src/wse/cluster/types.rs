@@ -154,7 +154,7 @@ pub(crate) fn release_link(links: &Links, peer: &str, session: u64) {
 #[derive(Clone)]
 pub(crate) struct ClusterContext {
     pub interest_tx: mpsc::Sender<InterestUpdate>,
-    pub topics: crate::wse::server::TopicIndex,
+    pub fanout: crate::wse::server::Fanout,
     pub metrics: Arc<ClusterMetrics>,
     pub new_peer_tx: mpsc::UnboundedSender<String>,
     pub cmd_tx: mpsc::UnboundedSender<ClusterCommand>,
@@ -319,10 +319,10 @@ impl ClusterMetrics {
 }
 
 impl ClusterMetrics {
-    pub(super) fn add_delivered(&self, count: u64) {
+    pub(crate) fn add_delivered(&self, count: u64) {
         self.messages_delivered.fetch_add(count, Ordering::Relaxed);
     }
-    pub(super) fn add_dropped(&self, count: u64) {
+    pub(crate) fn add_dropped(&self, count: u64) {
         self.messages_dropped.fetch_add(count, Ordering::Relaxed);
     }
 }

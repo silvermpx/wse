@@ -90,6 +90,13 @@ impl RustWSEServer {
         let rt_handle = self
             .runtime()
             .ok_or_else(|| PyRuntimeError::new_err("Server not started"))?;
+        let fanout = self
+            .shared
+            .fanout
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("Server not started"))?;
 
         // Bound here, so a port in use is an error of this call.
         let (inbound_links, main_port_tx) = match cluster_port {
@@ -148,7 +155,7 @@ impl RustWSEServer {
 
         let ctx = crate::wse::cluster::ClusterContext {
             interest_tx,
-            topics: self.shared.topics.clone(),
+            fanout,
             metrics: self.shared.cluster_metrics.clone(),
             new_peer_tx: placeholder_new_peer_tx,
             cmd_tx: placeholder_cmd_tx,

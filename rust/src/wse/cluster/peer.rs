@@ -303,9 +303,9 @@ pub(super) async fn tell_disconnected(
 }
 
 // ---------------------------------------------------------------------------
-// Per-peer dispatch task: receives decoded (topic, payload) from reader,
-// pre-frames as WebSocket and fans out via NATS-style direct buffer.
-// Decouples TCP reads from RwLock acquisition on the connections map.
+// Per-peer dispatch task: receives decoded (topic, payload) from the reader,
+// stores it for recovery and hands it to the lanes that deliver it. Decouples
+// TCP reads from the delivery.
 // ---------------------------------------------------------------------------
 
 pub(super) async fn peer_dispatch_task(
@@ -333,7 +333,7 @@ pub(super) async fn peer_dispatch_task(
             }
         }
 
-        // No RwLock needed -- handles are stored directly in topic_subscribers
+        // Queue-group deliveries, counted here; the lanes count the rest.
         let mut total_delivered = 0u64;
         let mut total_dropped = 0u64;
 
@@ -344,12 +344,11 @@ pub(super) async fn peer_dispatch_task(
                 rm.push_foreign(&topic, payload.clone(), epoch, offset);
             }
 
-            let msg = crate::wse::server::Outgoing::text(payload.clone());
-            let (d, f) = ctx
-                .topics
-                .fanout(&topic, &msg, ctx.max_outbound, &ctx.slow_drops);
-            total_delivered += d;
-            total_dropped += f;
+            ctx.fanout.publish(
+                &topic,
+                || crate::wse::server::Outgoing::text(payload.clone()),
+                Some(&ctx.metrics),
+            );
 
             // Track per-topic message count for Prometheus top-N metrics
             ctx.topic_message_counts
@@ -359,20 +358,20 @@ pub(super) async fn peer_dispatch_task(
 
             // Queue groups: one member each, round-robin, without the
             // recovery stamp (a member sees only some of the offsets).
-            if ctx.queue_groups.contains_key(&topic) {
-                let (d, f) = crate::wse::server::fanout_queue_groups(
-                    &ctx.queue_groups,
-                    &topic,
-                    &crate::wse::server::Outgoing::text(crate::wse::server::unstamped(&payload)),
-                    ctx.max_outbound,
-                    &ctx.slow_drops,
-                );
-                total_delivered += d;
-                total_dropped += f;
-            }
+            let (d, f) = ctx.fanout.queue_groups(
+                &ctx.queue_groups,
+                &topic,
+                || crate::wse::server::Outgoing::text(crate::wse::server::unstamped(&payload)),
+                ctx.max_outbound,
+                &ctx.slow_drops,
+            );
+            total_delivered += d;
+            total_dropped += f;
         }
 
-        ctx.metrics.add_delivered(total_delivered);
+        if total_delivered > 0 {
+            ctx.metrics.add_delivered(total_delivered);
+        }
         if total_dropped > 0 {
             ctx.metrics.add_dropped(total_dropped);
         }

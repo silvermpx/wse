@@ -25,8 +25,8 @@
 //!   pre-handshake cap and its guard.
 //! - `e2e`: end-to-end encryption (ECDH P-256 key exchange, AES-GCM-256).
 //! - `connection`: one client connection, from the upgrade to the cleanup.
-//! - `fanout`: topic glob matching, broadcast and topic fan-out, recovery
-//!   stamping.
+//! - `fanout`: topic glob matching, the topic index, delivery on every core
+//!   (one lane per core, each with its own task), recovery stamping.
 //! - `commands`: the command processor that executes `ServerCommand`s.
 //!
 //! Python layer, PyO3:
@@ -89,8 +89,8 @@ pub use py::RustWSEServer;
 
 pub(crate) use e2e::E2E_KEY_INFO;
 pub(crate) use fanout::{
-    Outgoing, TopicAcl, TopicIndex, fanout_queue_groups, glob_match, is_pattern,
-    stamp_recovery_fields, unstamped,
+    Fanout, Outgoing, TopicAcl, TopicIndex, glob_match, is_pattern, stamp_recovery_fields,
+    unstamped,
 };
 pub(crate) use frames::{BroadcastQueue, WsFrame, pre_frame_text};
 pub(crate) use handshake::normalize_origin;

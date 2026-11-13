@@ -11,7 +11,7 @@ use pyo3::prelude::*;
 use tokio::sync::{RwLock, mpsc};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-use super::{BroadcastQueue, TopicIndex, WsFrame};
+use super::{BroadcastQueue, Fanout, TopicIndex, WsFrame};
 use crate::jwt::JwtConfig;
 use crate::wse::cluster::{ClusterCommand, ClusterDlq, ClusterMetrics};
 
@@ -145,6 +145,8 @@ pub(crate) struct ConnectionHandle {
     /// The client asked for msgpack (`?format=msgpack`): what goes to it as
     /// JSON text is sent as an `M:` msgpack frame instead.
     pub(crate) msgpack: bool,
+    /// The lane delivering to it (`Fanout`).
+    pub(crate) lane: u8,
 }
 
 /// A connection's end-to-end encryption.
@@ -361,6 +363,8 @@ pub(crate) struct SharedState {
     // Topic subscribers, the subscribed patterns and the connections' topic
     // ACLs (from the JWT wse_topics claim or set_topic_acl; none = allow all)
     pub(crate) topics: TopicIndex,
+    // Delivery on every core, while the server runs
+    pub(crate) fanout: std::sync::RwLock<Option<Fanout>>,
     pub(super) conn_topics: DashMap<String, DashSet<String>>,
     // Cluster protocol
     pub(super) cluster_cmd_tx: std::sync::RwLock<Option<mpsc::UnboundedSender<ClusterCommand>>>,
@@ -505,7 +509,8 @@ impl SharedState {
             connection_count: AtomicUsize::new(0),
             jwt_config: cfg.jwt_config.map(arc_swap::ArcSwap::from_pointee),
             draining: AtomicBool::new(false),
-            topics: TopicIndex::default(),
+            topics: TopicIndex::new(super::fanout::lane_count()),
+            fanout: std::sync::RwLock::new(None),
             conn_topics: DashMap::new(),
             cluster_cmd_tx: std::sync::RwLock::new(None),
             cluster_metrics: Arc::new(ClusterMetrics::new()),

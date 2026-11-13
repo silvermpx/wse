@@ -118,6 +118,7 @@ fn make_handle() -> (ConnectionHandle, mpsc::UnboundedReceiver<WsFrame>) {
         closer: super::Closer::new(),
         cipher: Arc::new(std::sync::OnceLock::new()),
         msgpack: false,
+        lane: 0,
     };
     (h, rx)
 }
@@ -130,7 +131,7 @@ fn queued(h: &ConnectionHandle) -> Vec<bytes::Bytes> {
 
 #[test]
 fn patterns_are_tracked_with_their_subscribers() {
-    let index = TopicIndex::default();
+    let index = TopicIndex::new(1);
     let (h, _rx) = make_handle();
     assert!(index.subscribe("news.*", "c1", &h));
     assert!(!index.subscribe("news.*", "c1", &h));
@@ -145,7 +146,7 @@ fn patterns_are_tracked_with_their_subscribers() {
 
 #[test]
 fn a_pattern_subscriber_gets_only_what_its_acl_allows() {
-    let index = TopicIndex::default();
+    let index = TopicIndex::new(1);
     let (h, _rx) = make_handle();
     index.subscribe("tenant:acme:*", "c1", &h);
     index.acls.insert(
@@ -167,7 +168,7 @@ fn a_pattern_subscriber_gets_only_what_its_acl_allows() {
 
 #[test]
 fn a_connection_subscribed_twice_gets_a_message_once() {
-    let index = TopicIndex::default();
+    let index = TopicIndex::new(1);
     let (h, _rx) = make_handle();
     index.subscribe("room.1", "c1", &h);
     index.subscribe("room.*", "c1", &h);
@@ -179,7 +180,7 @@ fn a_connection_subscribed_twice_gets_a_message_once() {
 
 #[test]
 fn an_encrypted_connection_gets_its_own_sealed_frame() {
-    let index = TopicIndex::default();
+    let index = TopicIndex::new(1);
     let (plain, _rx1) = make_handle();
     let (sealed, _rx2) = make_handle();
     let key = Arc::new(crate::crypto::Aes256Gcm::new(&[9u8; 32]).unwrap());
@@ -210,7 +211,7 @@ fn an_encrypted_connection_gets_its_own_sealed_frame() {
 fn a_msgpack_connection_gets_json_as_msgpack() {
     use tokio_tungstenite::tungstenite::protocol::Message;
 
-    let index = TopicIndex::default();
+    let index = TopicIndex::new(1);
     let (json, _rx1) = make_handle();
     let (mut packed, mut rx2) = make_handle();
     packed.msgpack = true;
@@ -259,42 +260,99 @@ fn a_msgpack_connection_gets_json_as_msgpack() {
     }
 }
 
-#[test]
-fn a_large_fanout_reaches_everyone_once_and_in_order() {
-    let index = TopicIndex::default();
+/// Wait until `h` has `len` bytes queued (its lane delivered them), then
+/// take them.
+async fn delivered(h: &ConnectionHandle, len: usize) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while h.pending.load(Ordering::Relaxed) < len && tokio::time::Instant::now() < deadline {
+        tokio::task::yield_now().await;
+    }
+    let bytes = queued(h).concat();
+    h.pending.fetch_sub(bytes.len(), Ordering::Relaxed);
+    bytes
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_large_fanout_reaches_everyone_once_and_in_order() {
+    let index = TopicIndex::new(4);
     let handles: Vec<_> = (0..3000)
         .map(|i| {
-            let (h, rx) = make_handle();
-            index.subscribe("big", &format!("c{i}"), &h);
+            let (mut h, rx) = make_handle();
+            h.lane = index.next_lane();
+            let id = format!("c{i}");
+            index.join(&id, &h);
+            index.subscribe("big", &id, &h);
             (h, rx)
         })
         .collect();
-    let drops = AtomicU64::new(0);
+    let drops = Arc::new(AtomicU64::new(0));
+    let fanout = Fanout::start(index.clone(), 0, Arc::clone(&drops));
     for n in 0..3 {
-        let msg = Outgoing::text(bytes::Bytes::from(format!("{{\"n\":{n}}}")));
-        assert_eq!(index.fanout("big", &msg, 0, &drops), (3000, 0));
+        let msg = || Outgoing::text(bytes::Bytes::from(format!("{{\"n\":{n}}}")));
+        fanout.publish("big", msg, None);
     }
     // Each connection's queue holds the three frames, in order.
     let expected: Vec<u8> = (0..3)
         .flat_map(|n| encode_ws_frame(0x01, format!("{{\"n\":{n}}}").as_bytes()).to_vec())
         .collect();
     for (h, _) in &handles {
-        assert_eq!(queued(h).concat(), expected);
+        assert_eq!(delivered(h, expected.len()).await, expected);
     }
 
-    let conns: std::collections::HashMap<String, ConnectionHandle> = handles
-        .iter()
-        .enumerate()
-        .map(|(i, (h, _))| (format!("c{i}"), h.clone()))
-        .collect();
-    super::fanout::fanout_broadcast_direct(
-        &conns,
-        &Outgoing::text(bytes::Bytes::from_static(b"{}")),
-        0,
-        &drops,
-    );
+    fanout.broadcast(Outgoing::text(bytes::Bytes::from_static(b"{}")));
     let frame = encode_ws_frame(0x01, b"{}");
-    assert!(handles.iter().all(|(h, _)| queued(h).concat() == frame));
+    for (h, _) in &handles {
+        assert_eq!(delivered(h, frame.len()).await, frame.to_vec());
+    }
+    // A connection that left its lane gets no more broadcasts.
+    index.leave("c0", handles[0].0.lane);
+    fanout.broadcast(Outgoing::text(bytes::Bytes::from_static(b"{}")));
+    assert_eq!(delivered(&handles[1].0, frame.len()).await, frame.to_vec());
+    assert!(queued(&handles[0].0).is_empty());
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn subscribers_are_kept_by_lane() {
+    let index = TopicIndex::new(8);
+    let mut handles = Vec::new();
+    for (i, lane) in [5u8, 1, 7, 1, 0].into_iter().enumerate() {
+        let (mut h, rx) = make_handle();
+        h.lane = lane;
+        assert!(index.subscribe("t", &format!("c{i}"), &h));
+        handles.push((h, rx));
+    }
+    let mask = |index: &TopicIndex| index.subscribers.get("t").map(|s| s.mask);
+    assert_eq!(mask(&index), Some(0b1010_0011));
+    assert_eq!(index.subscribers.get("t").unwrap().len(), 5);
+    // Each lane delivers to its own subscribers only.
+    let drops = AtomicU64::new(0);
+    let msg = Outgoing::text(bytes::Bytes::from_static(b"{}"));
+    assert_eq!(index.fanout("t", &msg, 0, &drops), (5, 0));
+    assert!(handles.iter().all(|(h, _)| queued(h).len() == 1));
+    // A lane's bit goes with its last subscriber.
+    assert!(!index.unsubscribe("t", "c1"));
+    assert_eq!(mask(&index), Some(0b1010_0011));
+    assert!(!index.unsubscribe("t", "c3"));
+    assert_eq!(mask(&index), Some(0b1010_0001));
+    assert!(!index.unsubscribe("t", "c0"));
+    assert_eq!(mask(&index), Some(0b1000_0001));
+    assert!(!index.unsubscribe("t", "c9"));
+    assert!(!index.unsubscribe("t", "c4"));
+    assert_eq!(mask(&index), Some(0b1000_0000));
+    assert_eq!(index.fanout("t", &msg, 0, &drops), (1, 0));
+    assert_eq!(queued(&handles[2].0).len(), 1);
+    assert!(index.unsubscribe("t", "c2"));
+    assert!(index.subscribers.get("t").is_none());
+}
+
+#[test]
+fn lanes_go_in_turn() {
+    let index = TopicIndex::new(3);
+    let lanes: Vec<u8> = (0..7).map(|_| index.next_lane()).collect();
+    assert_eq!(lanes, [0, 1, 2, 0, 1, 2, 0]);
+    assert_eq!(TopicIndex::new(1000).lanes(), 64);
+    assert_eq!(TopicIndex::new(0).lanes(), 1);
 }
 
 #[test]

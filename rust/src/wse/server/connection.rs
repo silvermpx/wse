@@ -723,6 +723,7 @@ pub(super) async fn handle_connection(
         closer: closer.clone(),
         cipher: cipher_slot.clone(),
         msgpack: use_msgpack,
+        lane: state.topics.next_lane(),
     };
 
     // Register connection
@@ -731,8 +732,8 @@ pub(super) async fn handle_connection(
         let room = conns.len() < state.max_connections;
         if room {
             // server_ready goes into the queue before the connection is in the
-            // map: while the write lock is held no broadcast can reach it, so
-            // server_ready is the first frame.
+            // maps: no broadcast can reach it before, so server_ready is the
+            // first frame.
             if let Some(ref user_id) = rust_auth_user_id {
                 let recovery_enabled = state.recovery.is_some();
                 let server_ready = build_server_ready(&conn_id, user_id, recovery_enabled);
@@ -746,6 +747,7 @@ pub(super) async fn handle_connection(
                 }
             }
             conns.insert((*conn_id).clone(), own_handle.clone());
+            state.topics.join(&conn_id, &own_handle);
             state.connection_count.store(conns.len(), Ordering::Relaxed);
         }
         room
@@ -1474,6 +1476,7 @@ pub(super) async fn handle_connection(
     {
         let mut conns = state.connections.write().await;
         conns.remove(&*conn_id);
+        state.topics.leave(&conn_id, own_handle.lane);
         state.connection_count.store(conns.len(), Ordering::Relaxed);
     }
     state.conn_formats.remove(&*conn_id);

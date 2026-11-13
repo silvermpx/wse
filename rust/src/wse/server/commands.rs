@@ -8,11 +8,10 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-use super::fanout::fanout_broadcast_direct;
 use super::frames::ws_frame_size;
 use super::{
-    CLOSE_GOING_AWAY, CLOSE_NORMAL, Outgoing, ServerCommand, SharedState, WsFrame,
-    fanout_queue_groups, stamp_recovery_fields,
+    CLOSE_GOING_AWAY, CLOSE_NORMAL, Fanout, Outgoing, ServerCommand, SharedState, WsFrame,
+    stamp_recovery_fields,
 };
 use crate::wse::cluster::ClusterCommand;
 
@@ -23,6 +22,7 @@ use crate::wse::cluster::ClusterCommand;
 pub(super) async fn process_commands(
     mut cmd_rx: mpsc::UnboundedReceiver<ServerCommand>,
     state: Arc<SharedState>,
+    fanout: Fanout,
 ) {
     // The queue's depth for the metrics: 0 whenever it runs empty, otherwise
     // measured once every DEPTH_EVERY commands. Measuring walks the queue's
@@ -86,24 +86,10 @@ pub(super) async fn process_commands(
                 }
             }
             ServerCommand::BroadcastText { data } => {
-                let msg = Outgoing::text(Bytes::from(data));
-                let guard = state.connections.read().await;
-                fanout_broadcast_direct(
-                    &guard,
-                    &msg,
-                    state.max_outbound_queue_bytes,
-                    &state.slow_consumer_drops,
-                );
+                fanout.broadcast(Outgoing::text(Bytes::from(data)));
             }
             ServerCommand::BroadcastBytes { data } => {
-                let msg = Outgoing::binary(Bytes::from(data));
-                let guard = state.connections.read().await;
-                fanout_broadcast_direct(
-                    &guard,
-                    &msg,
-                    state.max_outbound_queue_bytes,
-                    &state.slow_consumer_drops,
-                );
+                fanout.broadcast(Outgoing::binary(Bytes::from(data)));
             }
             ServerCommand::BroadcastLocal {
                 topic,
@@ -147,22 +133,16 @@ pub(super) async fn process_commands(
                     .entry(topic.clone())
                     .or_insert_with(|| AtomicU64::new(0))
                     .fetch_add(1, Ordering::Relaxed);
-                let max_pending = state.max_outbound_queue_bytes;
-                let slow_drops = &state.slow_consumer_drops;
-                state
-                    .topics
-                    .fanout(&topic, &Outgoing::text(stamped), max_pending, slow_drops);
+                fanout.publish(&topic, || Outgoing::text(stamped), None);
                 // A queue-group member sees only some offsets of the topic: it
                 // gets the message without the recovery stamp.
-                if state.queue_groups.contains_key(&topic) {
-                    fanout_queue_groups(
-                        &state.queue_groups,
-                        &topic,
-                        &Outgoing::text(original),
-                        max_pending,
-                        slow_drops,
-                    );
-                }
+                fanout.queue_groups(
+                    &state.queue_groups,
+                    &topic,
+                    || Outgoing::text(original),
+                    state.max_outbound_queue_bytes,
+                    &state.slow_consumer_drops,
+                );
             }
             ServerCommand::Disconnect { conn_id } => {
                 let guard = state.connections.read().await;

@@ -1313,8 +1313,8 @@ fn test_reload_cluster_tls() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn test_cluster_queue_group_dispatch() {
+#[tokio::test]
+async fn test_cluster_queue_group_dispatch() {
     use crate::wse::server::{BroadcastQueue, QueueGroup};
     use parking_lot::Mutex;
 
@@ -1333,6 +1333,7 @@ fn test_cluster_queue_group_dispatch() {
             closer: crate::wse::server::Closer::new(),
             cipher: Arc::new(std::sync::OnceLock::new()),
             msgpack: false,
+            lane: 0,
         };
         members.push((format!("conn{i}"), h));
         _rxs.push(rx);
@@ -1346,19 +1347,35 @@ fn test_cluster_queue_group_dispatch() {
     inner.insert("workers".to_string(), group);
     queue_groups.insert("tasks".to_string(), inner);
 
-    let msg = crate::wse::server::Outgoing::text(bytes::Bytes::from_static(b"test-payload"));
     let frame_len = b"test-payload".len() + 2;
-    let drops = AtomicU64::new(0);
+    let drops = Arc::new(AtomicU64::new(0));
+    let fanout = crate::wse::server::Fanout::start(
+        crate::wse::server::TopicIndex::new(1),
+        0,
+        Arc::clone(&drops),
+    );
     for _ in 0..6 {
-        let (delivered, dropped) =
-            crate::wse::server::fanout_queue_groups(&queue_groups, "tasks", &msg, 0, &drops);
+        let (delivered, dropped) = fanout.queue_groups(
+            &queue_groups,
+            "tasks",
+            || crate::wse::server::Outgoing::text(bytes::Bytes::from_static(b"test-payload")),
+            0,
+            &drops,
+        );
         assert_eq!((delivered, dropped), (1, 0));
     }
 
-    // Each member should have received 2 messages (6 / 3 round-robin)
+    // Each member should have received 2 messages (6 / 3 round-robin), once
+    // its lane delivered them.
     let tg = queue_groups.get("tasks").unwrap();
     let g = tg.get("workers").unwrap();
     for (id, h) in &g.members {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while h.pending.load(Ordering::Relaxed) < frame_len * 2
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
             h.pending.load(Ordering::Relaxed),
             frame_len * 2,

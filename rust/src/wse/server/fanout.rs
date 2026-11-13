@@ -2,19 +2,20 @@
 //! groups), topic patterns and recovery stamping.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use ahash::AHashSet;
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
-
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 use super::e2e::{e2e_frame, e2e_message};
 use super::frames::{encode_ws_frame, ws_frame_size};
 use super::state::Seal;
 use super::{ConnectionHandle, QueueGroup, WsFrame};
+use crate::wse::cluster::ClusterMetrics;
 use crate::wse::msgpack::serde_json_to_rmpv;
 
 // ---------------------------------------------------------------------------
@@ -180,11 +181,7 @@ impl ConnectionHandle {
         max_pending: usize,
         slow_drops: &AtomicU64,
     ) -> bool {
-        if self.tx.is_closed() {
-            return false;
-        }
-        if max_pending > 0 && self.pending.load(Ordering::Relaxed) >= max_pending {
-            slow_drops.fetch_add(1, Ordering::Relaxed);
+        if !self.has_room(max_pending, slow_drops) {
             return false;
         }
         let (payload, frame) = msg.for_handle(self);
@@ -195,6 +192,19 @@ impl ConnectionHandle {
                 None => return false,
             },
             Some(Seal::Session) => return self.queue(WsFrame::Seal(payload.clone())),
+        }
+        true
+    }
+
+    /// Whether a delivery to this connection would be queued: it is open and
+    /// within its outbound budget (over it, counted in `slow_drops`).
+    fn has_room(&self, max_pending: usize, slow_drops: &AtomicU64) -> bool {
+        if self.tx.is_closed() {
+            return false;
+        }
+        if max_pending > 0 && self.pending.load(Ordering::Relaxed) >= max_pending {
+            slow_drops.fetch_add(1, Ordering::Relaxed);
+            return false;
         }
         true
     }
@@ -280,30 +290,116 @@ impl ConnectionHandle {
     }
 }
 
-/// Deliver `msg` to every connection.
-pub(super) fn fanout_broadcast_direct(
-    conns: &HashMap<String, ConnectionHandle>,
-    msg: &Outgoing,
-    max_pending: usize,
-    slow_drops: &AtomicU64,
-) {
-    for h in conns.values() {
-        h.deliver(msg, max_pending, slow_drops);
+// ---------------------------------------------------------------------------
+// Lanes: delivery on every core
+// ---------------------------------------------------------------------------
+
+/// A lane's connections by id.
+type ConnMap = HashMap<String, ConnectionHandle, ahash::RandomState>;
+
+/// At most this many lanes: a topic's lanes are the bits of a `u64`.
+const MAX_LANES: usize = 64;
+
+/// How many jobs a lane's task takes off its queue at once.
+const LANE_BATCH: usize = 64;
+
+/// How many lanes the server delivers on: one per core, at most `MAX_LANES`.
+pub(crate) fn lane_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(MAX_LANES)
+}
+
+/// The lanes whose bits are set in `mask`, lowest first.
+fn lanes_of(mut mask: u64) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+        (mask != 0).then(|| {
+            let lane = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            lane
+        })
+    })
+}
+
+/// A topic's subscribers, by lane: each lane's task delivers to its own.
+#[derive(Default)]
+pub(crate) struct Subscribers {
+    /// One map for each lane that has subscribers, in lane order.
+    parts: Vec<ConnMap>,
+    /// Those lanes, one bit each: a lane's map is at the count of the set
+    /// bits below its own.
+    pub(super) mask: u64,
+    len: usize,
+}
+
+impl Subscribers {
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    fn slot(&self, lane: u8) -> usize {
+        (self.mask & ((1u64 << lane) - 1)).count_ones() as usize
+    }
+
+    fn part(&self, lane: u8) -> Option<&ConnMap> {
+        (self.mask & (1u64 << lane) != 0).then(|| &self.parts[self.slot(lane)])
+    }
+
+    /// Add a connection, on its lane; true when it was not there yet.
+    fn insert(&mut self, conn_id: &str, handle: &ConnectionHandle) -> bool {
+        let lane = handle.lane;
+        let slot = self.slot(lane);
+        if self.mask & (1u64 << lane) == 0 {
+            self.parts.insert(slot, ConnMap::default());
+            self.mask |= 1u64 << lane;
+        }
+        let added = self.parts[slot]
+            .insert(conn_id.to_owned(), handle.clone())
+            .is_none();
+        self.len += usize::from(added);
+        added
+    }
+
+    /// Remove a connection; true when it was there.
+    fn remove(&mut self, conn_id: &str) -> bool {
+        let Some(slot) = self
+            .parts
+            .iter_mut()
+            .position(|part| part.remove(conn_id).is_some())
+        else {
+            return false;
+        };
+        self.len -= 1;
+        if self.parts[slot].is_empty() {
+            self.parts.remove(slot);
+            // The slot-th set bit is that lane's.
+            let mut rest = self.mask;
+            for _ in 0..slot {
+                rest &= rest - 1;
+            }
+            self.mask &= !(rest & rest.wrapping_neg());
+        }
+        true
     }
 }
 
 /// Who gets a topic's messages: its subscribers, and the subscribers of the
-/// patterns (names with `*` or `?`) matching it. Shared by the server and
-/// the cluster's inbound links.
-#[derive(Clone, Default)]
+/// patterns (names with `*` or `?`) matching it; and who gets a broadcast:
+/// every connection. Kept by lane. Shared by the server and the cluster's
+/// inbound links.
+#[derive(Clone)]
 pub(crate) struct TopicIndex {
-    pub(crate) subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
+    pub(crate) subscribers: Arc<DashMap<String, Subscribers>>,
     /// The subscribed names that are patterns. Changed only under the shard
     /// lock of the pattern's `subscribers` entry, so the two never disagree.
     pub(crate) patterns: Arc<DashSet<String>>,
     /// Per-connection topic ACLs: a pattern subscription gets only the topics
     /// its connection's ACL allows.
     pub(crate) acls: Arc<DashMap<String, TopicAcl>>,
+    /// Every connection, by lane.
+    everyone: Arc<[parking_lot::RwLock<ConnMap>]>,
+    /// Counts the connections that joined, to give each the next lane.
+    joined: Arc<AtomicUsize>,
 }
 
 pub(crate) fn is_pattern(topic: &str) -> bool {
@@ -311,11 +407,45 @@ pub(crate) fn is_pattern(topic: &str) -> bool {
 }
 
 impl TopicIndex {
+    /// An index over `lanes` lanes (1 to `MAX_LANES`).
+    pub(crate) fn new(lanes: usize) -> Self {
+        Self {
+            subscribers: Arc::default(),
+            patterns: Arc::default(),
+            acls: Arc::default(),
+            everyone: (0..lanes.clamp(1, MAX_LANES))
+                .map(|_| parking_lot::RwLock::new(ConnMap::default()))
+                .collect(),
+            joined: Arc::default(),
+        }
+    }
+
+    pub(crate) fn lanes(&self) -> usize {
+        self.everyone.len()
+    }
+
+    /// The lane for a new connection: each in turn.
+    pub(crate) fn next_lane(&self) -> u8 {
+        (self.joined.fetch_add(1, Ordering::Relaxed) % self.lanes()) as u8
+    }
+
+    /// A connection joins its lane: broadcasts reach it from now on.
+    pub(crate) fn join(&self, conn_id: &str, handle: &ConnectionHandle) {
+        self.everyone[usize::from(handle.lane)]
+            .write()
+            .insert(conn_id.to_owned(), handle.clone());
+    }
+
+    /// A connection leaves its lane.
+    pub(crate) fn leave(&self, conn_id: &str, lane: u8) {
+        self.everyone[usize::from(lane)].write().remove(conn_id);
+    }
+
     /// Add `conn_id` to `topic`; true when it was not subscribed yet.
     pub(crate) fn subscribe(&self, topic: &str, conn_id: &str, handle: &ConnectionHandle) -> bool {
-        let subs = self.subscribers.entry(topic.to_owned()).or_default();
-        let added = subs.insert(conn_id.to_owned(), handle.clone()).is_none();
-        if added && subs.len() == 1 && is_pattern(topic) {
+        let mut subs = self.subscribers.entry(topic.to_owned()).or_default();
+        let added = subs.insert(conn_id, handle);
+        if added && subs.len == 1 && is_pattern(topic) {
             self.patterns.insert(topic.to_owned());
         }
         added
@@ -324,9 +454,9 @@ impl TopicIndex {
     /// Remove `conn_id` from `topic`; true when the topic has no subscriber
     /// left.
     pub(crate) fn unsubscribe(&self, topic: &str, conn_id: &str) -> bool {
-        if let dashmap::Entry::Occupied(subs) = self.subscribers.entry(topic.to_owned()) {
-            subs.get().remove(conn_id);
-            if subs.get().is_empty() {
+        if let dashmap::Entry::Occupied(mut subs) = self.subscribers.entry(topic.to_owned()) {
+            subs.get_mut().remove(conn_id);
+            if subs.get().len == 0 {
                 subs.remove();
                 if is_pattern(topic) {
                     self.patterns.remove(topic);
@@ -337,15 +467,48 @@ impl TopicIndex {
         false
     }
 
-    /// Deliver `msg` on `topic`. A connection subscribed several ways gets it
-    /// once; a pattern subscriber only when its ACL allows `topic`. Returns
-    /// (delivered, dropped).
-    pub(crate) fn fanout(
+    /// Where a message on `topic` goes: the subscribed patterns matching it,
+    /// and the lanes with a subscriber of the topic or of those patterns.
+    fn reach(&self, topic: &str) -> (Vec<String>, u64) {
+        let mut mask = self.subscribers.get(topic).map_or(0, |subs| subs.mask);
+        if self.patterns.is_empty() {
+            return (Vec::new(), mask);
+        }
+        // Collected first: no lock of `patterns` is held while `subscribers`
+        // is read (subscribe takes them the other way round).
+        let matching: Vec<String> = self
+            .patterns
+            .iter()
+            .filter(|pattern| pattern.as_str() != topic && glob_match(pattern, topic))
+            .map(|pattern| pattern.key().clone())
+            .collect();
+        for pattern in &matching {
+            mask |= self.subscribers.get(pattern).map_or(0, |subs| subs.mask);
+        }
+        (matching, mask)
+    }
+
+    /// Deliver `msg` to every connection on `lane`.
+    fn deliver_all(&self, lane: u8, msg: &Outgoing, max_pending: usize, slow_drops: &AtomicU64) {
+        for h in self.everyone[usize::from(lane)].read().values() {
+            h.deliver(msg, max_pending, slow_drops);
+        }
+    }
+
+    /// Deliver `msg` on `topic` to the subscribers on `lane`: the topic's,
+    /// and those of `patterns` (the patterns matching it) their ACL allows.
+    /// A connection subscribed several ways gets it once; `served` is scratch
+    /// space for that. Returns (delivered, dropped).
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_topic(
         &self,
+        lane: u8,
         topic: &str,
+        patterns: &[String],
         msg: &Outgoing,
         max_pending: usize,
         slow_drops: &AtomicU64,
+        served: &mut AHashSet<usize>,
     ) -> (u64, u64) {
         let mut delivered = 0u64;
         let mut dropped = 0u64;
@@ -356,41 +519,40 @@ impl TopicIndex {
                 dropped += 1;
             }
         };
-        if self.patterns.is_empty() {
+        if patterns.is_empty() {
             // Exact topics only: the common case, no bookkeeping.
-            if let Some(subs) = self.subscribers.get(topic) {
-                for entry in subs.iter() {
-                    count(entry.value().deliver(msg, max_pending, slow_drops));
+            if let Some(subs) = self.subscribers.get(topic)
+                && let Some(part) = subs.part(lane)
+            {
+                for h in part.values() {
+                    count(h.deliver(msg, max_pending, slow_drops));
                 }
             }
             return (delivered, dropped);
         }
         // Connections already served, by the identity of their queue.
-        let mut served: AHashSet<usize> = AHashSet::new();
+        served.clear();
         let id = |h: &ConnectionHandle| Arc::as_ptr(&h.pending) as usize;
-        if let Some(subs) = self.subscribers.get(topic) {
-            for entry in subs.iter() {
-                let h = entry.value();
+        if let Some(subs) = self.subscribers.get(topic)
+            && let Some(part) = subs.part(lane)
+        {
+            for h in part.values() {
                 if served.insert(id(h)) {
                     count(h.deliver(msg, max_pending, slow_drops));
                 }
             }
         }
-        let matching: Vec<String> = self
-            .patterns
-            .iter()
-            .filter(|pattern| pattern.as_str() != topic && glob_match(pattern, topic))
-            .map(|pattern| pattern.key().clone())
-            .collect();
-        for pattern in matching {
-            let Some(subs) = self.subscribers.get(&pattern) else {
+        for pattern in patterns {
+            let Some(subs) = self.subscribers.get(pattern) else {
                 continue;
             };
-            for entry in subs.iter() {
-                let h = entry.value();
+            let Some(part) = subs.part(lane) else {
+                continue;
+            };
+            for (conn_id, h) in part {
                 let allowed = self
                     .acls
-                    .get(entry.key())
+                    .get(conn_id)
                     .is_none_or(|acl| acl.is_allowed(topic));
                 if allowed && served.insert(id(h)) {
                     count(h.deliver(msg, max_pending, slow_drops));
@@ -399,41 +561,193 @@ impl TopicIndex {
         }
         (delivered, dropped)
     }
+
+    /// Deliver `msg` on `topic` here and now, every lane in turn: what the
+    /// lanes' tasks do between them. Returns (delivered, dropped).
+    #[cfg(test)]
+    pub(crate) fn fanout(
+        &self,
+        topic: &str,
+        msg: &Outgoing,
+        max_pending: usize,
+        slow_drops: &AtomicU64,
+    ) -> (u64, u64) {
+        let (patterns, mask) = self.reach(topic);
+        let mut served = AHashSet::new();
+        lanes_of(mask).fold((0, 0), |(delivered, dropped), lane| {
+            let (d, f) = self.deliver_topic(
+                lane as u8,
+                topic,
+                &patterns,
+                msg,
+                max_pending,
+                slow_drops,
+                &mut served,
+            );
+            (delivered + d, dropped + f)
+        })
+    }
 }
 
-/// Deliver `msg` to one member of each queue group of `topic`, round-robin;
-/// a member that is gone or over its budget is passed over. Returns
-/// (delivered, dropped).
-pub(crate) fn fanout_queue_groups(
-    queue_groups: &DashMap<String, DashMap<String, QueueGroup>>,
-    topic: &str,
-    msg: &Outgoing,
-    max_pending: usize,
-    slow_drops: &AtomicU64,
-) -> (u64, u64) {
-    let mut delivered = 0u64;
-    let mut dropped = 0u64;
-    let Some(topic_groups) = queue_groups.get(topic) else {
-        return (0, 0);
-    };
-    for group_entry in topic_groups.iter() {
-        let group = group_entry.value();
-        let len = group.members.len();
-        if len == 0 {
-            continue;
-        }
-        let base = group.next.fetch_add(1, Ordering::Relaxed);
-        let served = (0..len).any(|attempt| {
-            let (_, ref h) = group.members[(base + attempt) % len];
-            h.deliver(msg, max_pending, slow_drops)
-        });
-        if served {
-            delivered += 1;
-        } else {
-            dropped += 1;
+/// A delivery for one lane's task.
+enum Job {
+    /// To every connection on the lane.
+    All(Arc<Outgoing>),
+    /// To the lane's subscribers of a topic.
+    Topic(Arc<TopicMessage>),
+    /// To one connection on the lane: a queue group's member.
+    One(ConnectionHandle, Arc<Outgoing>),
+}
+
+/// A message on a topic, shared by the lanes it goes to.
+struct TopicMessage {
+    topic: String,
+    /// The subscribed patterns matching the topic.
+    patterns: Vec<String>,
+    msg: Outgoing,
+    /// Where its deliveries are counted, for a message from a cluster peer.
+    tally: Option<Arc<ClusterMetrics>>,
+}
+
+/// Delivery on every core. Each connection belongs to one lane, and each lane
+/// has a task of its own delivering to its connections. A message goes to
+/// the lanes that have someone to get it, in the order it is handed over
+/// here, so a connection gets the messages from one sender in order.
+#[derive(Clone)]
+pub(crate) struct Fanout {
+    index: TopicIndex,
+    lanes: Arc<[mpsc::UnboundedSender<Job>]>,
+}
+
+impl Fanout {
+    /// Start a task for each lane of `index` on the current runtime.
+    pub(crate) fn start(index: TopicIndex, max_pending: usize, slow_drops: Arc<AtomicU64>) -> Self {
+        let lanes = (0..index.lanes())
+            .map(|lane| {
+                let (tx, rx) = mpsc::unbounded_channel();
+                tokio::spawn(run_lane(
+                    lane as u8,
+                    rx,
+                    index.clone(),
+                    max_pending,
+                    Arc::clone(&slow_drops),
+                ));
+                tx
+            })
+            .collect();
+        Self { index, lanes }
+    }
+
+    /// Deliver `msg` to every connection.
+    pub(crate) fn broadcast(&self, msg: Outgoing) {
+        let msg = Arc::new(msg);
+        for lane in self.lanes.iter() {
+            let _ = lane.send(Job::All(Arc::clone(&msg)));
         }
     }
-    (delivered, dropped)
+
+    /// Deliver a message on `topic` to its subscribers and to those of the
+    /// patterns matching it (see `TopicIndex::deliver_topic`); `msg` makes
+    /// it, only when someone is subscribed. The deliveries are counted in
+    /// `tally` when given.
+    pub(crate) fn publish(
+        &self,
+        topic: &str,
+        msg: impl FnOnce() -> Outgoing,
+        tally: Option<&Arc<ClusterMetrics>>,
+    ) {
+        let (patterns, mask) = self.index.reach(topic);
+        if mask == 0 {
+            return;
+        }
+        let message = Arc::new(TopicMessage {
+            topic: topic.to_owned(),
+            patterns,
+            msg: msg(),
+            tally: tally.cloned(),
+        });
+        for lane in lanes_of(mask) {
+            let _ = self.lanes[lane].send(Job::Topic(Arc::clone(&message)));
+        }
+    }
+
+    /// Deliver a message on `topic` to one member of each of its queue
+    /// groups, round-robin; a member that is gone or over its outbound budget
+    /// is passed over. `msg` makes the message, only when there is a group.
+    /// Returns (delivered, dropped).
+    pub(crate) fn queue_groups(
+        &self,
+        queue_groups: &DashMap<String, DashMap<String, QueueGroup>>,
+        topic: &str,
+        msg: impl FnOnce() -> Outgoing,
+        max_pending: usize,
+        slow_drops: &AtomicU64,
+    ) -> (u64, u64) {
+        let Some(topic_groups) = queue_groups.get(topic) else {
+            return (0, 0);
+        };
+        let msg = Arc::new(msg());
+        let mut delivered = 0u64;
+        let mut dropped = 0u64;
+        for group in topic_groups.iter() {
+            let len = group.members.len();
+            if len == 0 {
+                continue;
+            }
+            let base = group.next.fetch_add(1, Ordering::Relaxed);
+            let member = (0..len)
+                .map(|attempt| &group.members[(base + attempt) % len].1)
+                .find(|h| h.has_room(max_pending, slow_drops));
+            match member {
+                Some(h) => {
+                    let _ =
+                        self.lanes[usize::from(h.lane)].send(Job::One(h.clone(), Arc::clone(&msg)));
+                    delivered += 1;
+                }
+                None => dropped += 1,
+            }
+        }
+        (delivered, dropped)
+    }
+}
+
+/// A lane's task: the deliveries handed to the lane, in order.
+async fn run_lane(
+    lane: u8,
+    mut jobs: mpsc::UnboundedReceiver<Job>,
+    index: TopicIndex,
+    max_pending: usize,
+    slow_drops: Arc<AtomicU64>,
+) {
+    let mut batch = Vec::with_capacity(LANE_BATCH);
+    let mut served = AHashSet::new();
+    while jobs.recv_many(&mut batch, LANE_BATCH).await > 0 {
+        for job in batch.drain(..) {
+            match job {
+                Job::All(msg) => index.deliver_all(lane, &msg, max_pending, &slow_drops),
+                Job::Topic(message) => {
+                    let (delivered, dropped) = index.deliver_topic(
+                        lane,
+                        &message.topic,
+                        &message.patterns,
+                        &message.msg,
+                        max_pending,
+                        &slow_drops,
+                        &mut served,
+                    );
+                    if let Some(metrics) = &message.tally {
+                        metrics.add_delivered(delivered);
+                        if dropped > 0 {
+                            metrics.add_dropped(dropped);
+                        }
+                    }
+                }
+                Job::One(h, msg) => {
+                    h.deliver(&msg, max_pending, &slow_drops);
+                }
+            }
+        }
+    }
 }
 
 /// A recovery-stamped message without its stamp: what queue-group members
