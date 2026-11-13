@@ -191,6 +191,18 @@ pub fn rmpv_to_serde_json(val: &rmpv::Value) -> serde_json::Value {
     }
 }
 
+/// A float as msgpack: 32-bit (5 bytes) when that holds it exactly, else
+/// 64-bit (9 bytes). Short decimals such as 64000.5 or 0.25 would otherwise
+/// take more room than their JSON text; readers widen it back unchanged.
+pub(crate) fn float_value(f: f64) -> rmpv::Value {
+    let narrow = f as f32;
+    if f64::from(narrow) == f {
+        rmpv::Value::F32(narrow)
+    } else {
+        rmpv::Value::F64(f)
+    }
+}
+
 /// Convert serde_json::Value to rmpv::Value for msgpack serialization: what
 /// goes to a connection that asked for msgpack.
 pub fn serde_json_to_rmpv(val: &serde_json::Value) -> rmpv::Value {
@@ -203,7 +215,7 @@ pub fn serde_json_to_rmpv(val: &serde_json::Value) -> rmpv::Value {
             } else if let Some(u) = n.as_u64() {
                 rmpv::Value::Integer(rmpv::Integer::from(u))
             } else if let Some(f) = n.as_f64() {
-                rmpv::Value::F64(f)
+                float_value(f)
             } else {
                 rmpv::Value::Nil
             }
@@ -278,6 +290,16 @@ mod tests {
         assert!(check_msgpack_depth(&[0xc1], MAX_MSGPACK_DEPTH).is_err());
         // Empty input.
         assert!(check_msgpack_depth(&[], MAX_MSGPACK_DEPTH).is_err());
+    }
+
+    #[test]
+    fn floats_take_32_bits_only_when_that_is_exact() {
+        for f in [64000.5, 0.25, -0.0, 1.0, 1e30_f32 as f64] {
+            assert_eq!(float_value(f), rmpv::Value::F32(f as f32), "{f}");
+        }
+        for f in [187.42, 0.1, 1e300, f64::from(f32::MAX) * 2.0] {
+            assert_eq!(float_value(f), rmpv::Value::F64(f), "{f}");
+        }
     }
 
     #[test]

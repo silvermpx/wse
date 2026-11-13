@@ -1,4 +1,4 @@
-use crate::wse::msgpack::{decode_msgpack_guarded, rmpv_to_serde_json};
+use crate::wse::msgpack::{decode_msgpack_guarded, float_value, rmpv_to_serde_json};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use pyo3::prelude::*;
@@ -179,7 +179,7 @@ fn py_to_rmpv_at(obj: &Bound<'_, PyAny>, path: &mut Vec<usize>) -> PyResult<rmpv
     // Float
     if obj.is_instance_of::<PyFloat>() {
         let v: f64 = obj.extract()?;
-        return Ok(rmpv::Value::F64(v));
+        return Ok(float_value(v));
     }
 
     // String
