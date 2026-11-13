@@ -66,6 +66,29 @@ export interface MessageProcessorOptions {
   sequencer?: EventSequencer;
   /** IndexedDB queue replayed when the connection becomes ready. */
   offlineQueue?: OfflineQueue | null;
+  /**
+   * Share of handled messages (0..1) whose handler run time is measured into
+   * the handlerTimeAvg / handlerTimeMax metrics. 0 (default) measures none.
+   */
+  handlerSampleRate?: number;
+}
+
+/** Estimated size of a queued message in bytes (its serialized length). */
+function estimateBytes(message: WSMessage): number {
+  try {
+    return JSON.stringify(message).length;
+  } catch {
+    return 0;
+  }
+}
+
+const monotonicNow: () => number =
+  typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? () => performance.now()
+    : () => Date.now();
+
+function isExpired(expiresAt: number | undefined, now: number): boolean {
+  return expiresAt !== undefined && now > expiresAt;
 }
 
 interface RecoveryWindow {
@@ -146,6 +169,7 @@ export class MessageProcessor {
   private maxMessageSize: number;
   private recoveryTimeoutMs: number;
   private eventThrottleMs: number;
+  private handlerSampleRate: number;
   private lastEventTime = new Map<string, number>();
   private recoveryWindows = new Map<string, RecoveryWindow>();
   private earlyEncryptedFrames: ArrayBuffer[] = [];
@@ -181,6 +205,8 @@ export class MessageProcessor {
     this.compression = new CompressionManager(1024, 6, this.maxMessageSize);
     this.recoveryTimeoutMs = options.recoveryTimeoutMs ?? DEFAULT_RECOVERY_TIMEOUT_MS;
     this.eventThrottleMs = options.eventThrottleMs ?? 0;
+    const rate = options.handlerSampleRate ?? 0;
+    this.handlerSampleRate = Number.isFinite(rate) ? Math.min(Math.max(rate, 0), 1) : 0;
     this.offlineQueue = options.offlineQueue ?? null;
     this.messageHandlers = new Map();
 
@@ -932,8 +958,11 @@ export class MessageProcessor {
 
     const handler = this.messageHandlers.get(type);
     if (handler) {
+      const sampled = this.handlerSampleRate > 0 && Math.random() < this.handlerSampleRate;
+      const started = sampled ? monotonicNow() : 0;
       try {
         const result: unknown = handler(message);
+        if (sampled) useWSEStore.getState().recordHandlerTime(monotonicNow() - started);
         if (result && typeof (result as Promise<unknown>).then === 'function') {
           (result as Promise<unknown>).catch((error) => {
             logger.error(`Error in handler for ${type}:`, error);
@@ -1292,9 +1321,12 @@ export class MessageProcessor {
   enqueueOutgoing(
     message: WSMessage,
     priority: number = MessagePriority.NORMAL,
-    options: { offline?: boolean } = {},
+    options: { offline?: boolean; ttl?: number } = {},
   ): SendStatus {
     if (this.destroyed) return 'dropped';
+    const expiresAt = options.ttl !== undefined && Number.isFinite(options.ttl) && options.ttl >= 0
+      ? Date.now() + options.ttl
+      : undefined;
 
     const cm = this.connectionManager;
     const queueEmpty = useMessageQueueStore.getState().size === 0;
@@ -1313,24 +1345,25 @@ export class MessageProcessor {
 
     if (options.offline && this.offlineQueue?.isAvailable() && !cm?.isTransportReady()) {
       const queue = this.offlineQueue;
-      queue.enqueue(message).then(
+      queue.enqueue(message, expiresAt).then(
         (stored) => {
-          if (!stored) this.enqueueInMemory(message, priority);
+          if (!stored) this.enqueueInMemory(message, priority, expiresAt);
           else this.scheduleFlush(0);
         },
         (error) => {
           logger.error('Failed to persist offline message, keeping it in memory:', error);
-          this.enqueueInMemory(message, priority);
+          this.enqueueInMemory(message, priority, expiresAt);
         },
       );
       return 'queued';
     }
 
-    return this.enqueueInMemory(message, priority) ? 'queued' : 'dropped';
+    return this.enqueueInMemory(message, priority, expiresAt) ? 'queued' : 'dropped';
   }
 
-  private enqueueInMemory(message: WSMessage, priority: number): boolean {
+  private enqueueInMemory(message: WSMessage, priority: number, expiresAt?: number): boolean {
     if (this.destroyed) return false;
+    const queueStore = useMessageQueueStore.getState();
     const queued: QueuedMessage = {
       id: message.id || generateId(),
       type: message.t,
@@ -1341,9 +1374,12 @@ export class MessageProcessor {
       encrypted: message.enc,
       correlation_id: message.cid,
       message,
+      // Sized only when a memory bound is set: serializing costs a full pass.
+      bytes: queueStore.memoryLimit > 0 ? estimateBytes(message) : undefined,
+      expiresAt,
     };
 
-    if (!useMessageQueueStore.getState().enqueue(queued)) {
+    if (!queueStore.enqueue(queued)) {
       this.countDropped(1);
       logger.warn(`Outgoing queue full; message ${message.t} dropped`);
       return false;
@@ -1458,7 +1494,13 @@ export class MessageProcessor {
       const batch = queueStore.dequeue(step);
       if (batch.length === 0) return false;
 
+      const nowMs = Date.now();
       for (let i = 0; i < batch.length; i++) {
+        if (isExpired(batch[i].expiresAt, nowMs)) {
+          this.countDropped(1);
+          logger.debug(`Dropping ${batch[i].type}: its ttl ran out while it was queued`);
+          continue;
+        }
         const result = cm.trySend(this.toWire(batch[i]));
         if (result === 'sent') continue;
         if (result === 'error') {
@@ -1491,8 +1533,14 @@ export class MessageProcessor {
 
     const done: string[] = [];
     try {
+      const nowMs = Date.now();
       for (const record of records) {
         if (this.destroyed || !cm.isTransportReady()) return true;
+        if (isExpired(record.expiresAt, nowMs)) {
+          this.countDropped(1);
+          done.push(record.id);
+          continue;
+        }
         const result = cm.trySend(record.message);
         if (result === 'sent') {
           done.push(record.id);

@@ -40,6 +40,8 @@ interface WSEStore extends WSEState {
   // Actions - Metrics
   updateMetrics: (updates: Partial<ConnectionMetrics>) => void;
   recordLatency: (latency: number) => void;
+  /** One sampled handler run time (ms), see diagnostics.sampleRate. */
+  recordHandlerTime: (ms: number) => void;
   incrementMetric: (key: keyof ConnectionMetrics, value?: number) => void;
 
   // Actions - Circuit Breaker
@@ -127,6 +129,8 @@ const initialMetrics: ConnectionMetrics = {
   packetLoss: 0,
   gapsDetected: 0,
   messagesMissed: 0,
+  handlerTimeAvg: null,
+  handlerTimeMax: null,
 };
 
 const initialCircuitBreaker: CircuitBreakerInfo = {
@@ -147,6 +151,8 @@ const initialQueueStats: QueueStats = {
   priorityDistribution: {},
   processingRate: 0,
   backpressure: false,
+  bytes: 0,
+  memoryLimit: 0,
 };
 
 const initialOfflineQueue: OfflineQueueStats = {
@@ -294,6 +300,18 @@ export const useWSEStore = create<WSEStore>()(
     updateMetrics: (updates) => set((state) => ({
       metrics: { ...state.metrics, ...updates },
     })),
+
+    recordHandlerTime: (ms) => set((state) => {
+      if (!Number.isFinite(ms) || ms < 0) return state;
+      const { handlerTimeAvg, handlerTimeMax } = state.metrics;
+      return {
+        metrics: {
+          ...state.metrics,
+          handlerTimeAvg: handlerTimeAvg === null ? ms : handlerTimeAvg * 0.9 + ms * 0.1,
+          handlerTimeMax: handlerTimeMax === null || ms > handlerTimeMax ? ms : handlerTimeMax,
+        },
+      };
+    }),
 
     recordLatency: (latency) => set((state) => {
       latencyHistory.push(latency);

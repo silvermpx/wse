@@ -125,6 +125,7 @@ const {
   getQueueSize,       // () => number (in-memory + IndexedDB)
   requestSnapshot,    // (topics?) => void - sends a sync_request
   debugHandlers,      // () => void
+  setCompression,     // (enabled) => void - ask the server to compress what it sends (or not)
 } = useWSE(token, topics, config);
 ```
 
@@ -160,6 +161,8 @@ useWSE('cookie', ['notifications'], {
     batchSize: 10,                            // messages per flush step of the outgoing queue
     batchTimeout: 500,                        // ms
     maxQueueSize: 10000,                      // capacity of the in-memory outgoing queue
+    memoryLimit: 50 * 1024 * 1024,            // bytes the outgoing queue may hold; 0 = no bound
+    compressionThreshold: 1024,               // ask the server to compress messages above this size; 0 = never
   },
 
   offline: {
@@ -172,7 +175,11 @@ useWSE('cookie', ['notifications'], {
   diagnostics: {
     enabled: false,                           // run the network monitor (no timer when false)
     metricsInterval: 60000,                   // ms between diagnostics updates
+    sampleRate: 0.1,                          // share of handled messages timed (stats.handlerTimeAvg/Max)
+    healthCheckInterval: 15000,               // heartbeat ping: round-trip time and dead-socket check
   },
+
+  queryClient,                                // TanStack QueryClient to steer (see Adaptive Quality)
 
   rateLimit: { capacity: 1000, refillRate: 100 }, // outbound token bucket (msg burst, msg/s); false = off
   maxMessageSize: 16 * 1024 * 1024,           // inbound limit in bytes, checked while inflating
@@ -180,6 +187,41 @@ useWSE('cookie', ['notifications'], {
   serverReadyTimeout: 10000,                  // proceed without server_ready (server without jwt_secret); 0 = wait
 });
 ```
+
+### Compression
+
+The client tells the server in `client_hello` whether it wants compressed messages, and from which size
+(`performance.compressionThreshold`). `setCompression(false)` asks the connected server to stop
+compressing for this client at once (`client_config` message) and every later connection to start
+without it; `setCompression(true)` turns it back on. A fast LAN client can skip the inflate work, a
+mobile client on a slow link can ask for more compression.
+
+### Adaptive Quality
+
+Pass your TanStack Query client and its query defaults follow the measured connection:
+
+```tsx
+const queryClient = useQueryClient();
+useWSE('cookie', topics, { queryClient });
+```
+
+| Quality | When | staleTime | refetchInterval | refetchOnWindowFocus |
+|---|---|---|---|---|
+| excellent | round trip under 75 ms, steady | Infinity | off | no |
+| good | under 150 ms | 60 s | off | no |
+| fair | under 300 ms, or 3+ reconnects in 5 minutes | 10 s | 30 s | yes |
+| poor | slower, very jittery, or disconnected longer than 5 s | 5 s | 10 s | yes |
+
+- The quality comes from the round trip of every heartbeat (`diagnostics.healthCheckInterval`), the
+  connection state and recent reconnects. Nothing changes until the first round trip is measured.
+- A worse quality applies at once (and refetches active queries when it drops to poor); a better one
+  must be measured twice in a row, so a single fast heartbeat after a bad patch changes nothing.
+- A short outage or a planned reconnect (`forceReconnect`, `changeEndpoint`) changes nothing.
+- Only `staleTime`, `refetchInterval` and `refetchOnWindowFocus` are set; your other defaults stay,
+  and your own values come back when the connection ends.
+- Every change is also dispatched as the `connectionQualityChanged` window event
+  (`detail: { quality, previous, strategy, connected, metrics }`), with or without a QueryClient when
+  `diagnostics.enabled` is set. `AdaptiveQualityManager` is exported for use outside React.
 
 ## Receiving Messages
 
@@ -206,6 +248,7 @@ Other window events the client dispatches:
 | `wseEncryptionFailed` | Encryption was required but could not be established; the connection was closed |
 | `wseTokenRefreshFailed` | A periodic `refreshAuthToken` call failed (connection kept, retried later) |
 | `wseReconnectFailed` | `reconnection.maxAttempts` consecutive attempts failed |
+| `connectionQualityChanged` | The measured connection quality changed (see Adaptive Quality) |
 | `presenceJoin` / `presenceLeave` / `presenceUpdate` | Presence events (`presence_join` / `presence_leave` / `presence_update`) |
 | `subscriptionUpdate` | The server answered a subscription request |
 | `serverError`, `rateLimitExceeded`, `clientRateLimitExceeded` | Server errors and rate limits |
@@ -220,12 +263,22 @@ sendMessage('chat_message', { text: 'Hello' });                          // 'sen
 sendMessage('alert', { msg: 'critical' }, { priority: MessagePriority.CRITICAL });
 sendMessage('query', { filter: 'active' }, { correlation_id: 'req-123' });
 sendMessage('draft', { text }, { offline: true });                       // survives reloads (IndexedDB)
+sendMessage('quote_request', { symbol }, { ttl: 5000 });                  // worthless after 5 s
 ```
 
 Nothing is lost because the connection was busy: a message that cannot go out at once (before
 `server_ready`, while reconnecting, before the encryption key exists, or over the rate limit) is kept
 and sent automatically, in priority then FIFO order, as soon as possible. `'dropped'` means the
 outgoing queue was full or the message cannot be sent safely (see encryption).
+
+- `priority`: when the outgoing queue is full (by `maxQueueSize` or by `memoryLimit`), a message can
+  push out only messages of lower priority; otherwise it is dropped.
+- `ttl`: milliseconds the message stays worth sending. One still queued after that (waiting for the
+  connection, in memory or in IndexedDB) is dropped instead of sent late, and counted in
+  `stats.messagesDropped`.
+- `offline`: persist to IndexedDB while disconnected and replay after reconnecting, also after a reload.
+- `encrypted`: refuse to send unless E2E encryption is on; never falls back to plaintext.
+- `correlation_id`: sent as `cid`.
 
 ## Reconnection and Close Codes
 
@@ -329,9 +382,11 @@ import { WSE_VERSION, WS_CLIENT_VERSION, WS_PROTOCOL_VERSION, clearWSEStorage } 
 - `sendMessage` returns `'sent' | 'queued' | 'dropped'`; queued messages are no longer lost.
 - Messages are no longer dropped for their timestamp age, and `heartbeat`/`health_check`/`metrics_response`
   events are no longer throttled by name (`eventThrottleMs` remains as an opt-in).
-- Removed: `AdaptiveQualityManager`, the `queryClient` option, `setCompression()`,
-  `performance.compressionThreshold`, `performance.memoryLimit`, `diagnostics.sampleRate`,
-  `diagnostics.healthCheckInterval` and `MessageOptions.ttl` - none of them had any effect.
+- Options that used to do nothing now work: `AdaptiveQualityManager` with the `queryClient` option
+  measures the connection and leaves your other query defaults alone (it used to set every query to
+  15 s polling); `setCompression()` and `performance.compressionThreshold` reach the server;
+  `performance.memoryLimit` bounds the outgoing queue; `MessageOptions.ttl` drops stale messages;
+  `diagnostics.sampleRate` times handlers; `diagnostics.healthCheckInterval` sets the heartbeat.
 - `wseRecoveryGap` became `wseGap` (with the missing range) and no longer triggers a resubscribe.
 - The periodic refresh failure event is `wseTokenRefreshFailed` (was `authTokenExpired`, which also
   closed the connection).

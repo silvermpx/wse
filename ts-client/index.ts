@@ -45,6 +45,13 @@ export { RateLimiter } from './services/RateLimiter.js';
 export { ConnectionPool } from './services/ConnectionPool.js';
 export type { ConnectionPoolConfig } from './services/ConnectionPool.js';
 export { NetworkMonitor } from './services/NetworkMonitor.js';
+export { AdaptiveQualityManager, QUALITY_STRATEGIES } from './services/AdaptiveQualityManager.js';
+export type {
+  AdaptiveQualityOptions,
+  QualityChangeDetail,
+  QualityStrategy,
+  QueryClientLike,
+} from './services/AdaptiveQualityManager.js';
 export { OfflineQueue } from './services/OfflineQueue.js';
 export type { OfflineQueueConfig, OfflineRecord } from './services/OfflineQueue.js';
 

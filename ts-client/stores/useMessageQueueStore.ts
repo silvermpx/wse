@@ -1,6 +1,12 @@
 // =============================================================================
 // WebSocket Engine - Message Queue Store (Zustand)
 // =============================================================================
+//
+// The in-memory outgoing queue. Two bounds apply: a message count (capacity)
+// and an estimated size in bytes (memoryLimit). When either is reached, a new
+// message may push out queued messages of strictly lower priority, lowest and
+// oldest first; otherwise it is rejected. A burst of low-priority messages can
+// therefore never displace more important ones.
 
 import { create } from 'zustand';
 import {
@@ -25,6 +31,8 @@ interface MessageQueueStore extends MessageQueueState {
   updateStats: () => void;
   setProcessing: (processing: boolean) => void;
   setCapacity: (capacity: number) => void;
+  /** Bound on the queued messages' estimated size in bytes; 0 means none. */
+  setMemoryLimit: (bytes: number) => void;
 
   // Priority management
   getByPriority: (priority: MessagePriority) => QueuedMessage[];
@@ -35,65 +43,107 @@ interface MessageQueueStore extends MessageQueueState {
   getOldestMessageAge: () => number | null;
 }
 
+const DEFAULT_CAPACITY = 10000;
+
+const initialStats: QueueStats = {
+  size: 0,
+  capacity: DEFAULT_CAPACITY,
+  utilizationPercent: 0,
+  oldestMessageAge: null,
+  priorityDistribution: {},
+  processingRate: 0,
+  backpressure: false,
+  bytes: 0,
+  memoryLimit: 0,
+};
+
 const initialState: MessageQueueState = {
   messages: [],
   size: 0,
-  capacity: 10000,
+  bytes: 0,
+  capacity: DEFAULT_CAPACITY,
+  memoryLimit: 0,
   processing: false,
-  stats: {
-    size: 0,
-    capacity: 10000,
-    utilizationPercent: 0,
-    oldestMessageAge: null,
-    priorityDistribution: {},
-    processingRate: 0,
-    backpressure: false,
-  },
+  stats: initialStats,
 };
 
 // Track message processing rate
 let processedCount = 0;
 let lastProcessedTime = Date.now();
 
+function bytesOf(messages: QueuedMessage[]): number {
+  let total = 0;
+  for (const m of messages) total += m.bytes ?? 0;
+  return total;
+}
+
+/**
+ * The fields that follow from the message list. Utilization is the fuller of
+ * the two bounds, so backpressure shows whichever limit is closer.
+ */
+function derive(
+  s: Pick<MessageQueueState, 'capacity' | 'memoryLimit' | 'stats'>,
+  messages: QueuedMessage[],
+): Pick<MessageQueueState, 'messages' | 'size' | 'bytes' | 'stats'> {
+  const size = messages.length;
+  const bytes = bytesOf(messages);
+  const byCount = s.capacity > 0 ? size / s.capacity : 0;
+  const byBytes = s.memoryLimit > 0 ? bytes / s.memoryLimit : 0;
+  const utilization = Math.max(byCount, byBytes);
+  return {
+    messages,
+    size,
+    bytes,
+    stats: {
+      ...s.stats,
+      size,
+      bytes,
+      capacity: s.capacity,
+      memoryLimit: s.memoryLimit,
+      utilizationPercent: utilization * 100,
+      backpressure: utilization > 0.8,
+    },
+  };
+}
+
+/**
+ * Messages to evict so `incoming` fits, or null when it cannot fit: only
+ * messages of strictly lower priority are candidates, lowest and oldest first.
+ */
+function evictionsFor(state: MessageQueueState, incoming: QueuedMessage): Set<string> | null {
+  const incomingBytes = incoming.bytes ?? 0;
+  if (state.memoryLimit > 0 && incomingBytes > state.memoryLimit) return null;
+
+  let size = state.size;
+  let bytes = state.bytes;
+  const fits = () =>
+    size < state.capacity && (state.memoryLimit <= 0 || bytes + incomingBytes <= state.memoryLimit);
+  if (fits()) return new Set();
+
+  const candidates = state.messages
+    .filter(m => m.priority < incoming.priority)
+    .sort((a, b) => (a.priority - b.priority) || (a.timestamp - b.timestamp));
+  const evicted = new Set<string>();
+  for (const m of candidates) {
+    evicted.add(m.id);
+    size -= 1;
+    bytes -= m.bytes ?? 0;
+    if (fits()) return evicted;
+  }
+  return null;
+}
+
 export const useMessageQueueStore = create<MessageQueueStore>((set, get) => ({
   ...initialState,
 
   enqueue: (message) => {
-    const state = get();
-
-    // Check capacity
-    if (state.size >= state.capacity) {
-      const sorted = [...state.messages].sort((a, b) => {
-        if (a.priority !== b.priority) return a.priority - b.priority;
-        return a.timestamp - b.timestamp;
-      });
-
-      if (sorted.length > 0 && sorted[0].priority < message.priority) {
-        set((s) => ({
-          messages: s.messages.filter(m => m.id !== sorted[0].id),
-          size: s.size - 1,
-        }));
-      } else {
-        return false;
-      }
-    }
+    const evicted = evictionsFor(get(), message);
+    if (evicted === null) return false;
 
     set((s) => {
-      const messages = [...s.messages, message];
-      const size = messages.length;
-
-      return {
-        messages,
-        size,
-        stats: {
-          ...s.stats,
-          size,
-          utilizationPercent: (size / s.capacity) * 100,
-          backpressure: size > s.capacity * 0.8,
-        },
-      };
+      const kept = evicted.size > 0 ? s.messages.filter(m => !evicted.has(m.id)) : s.messages;
+      return derive(s, [...kept, message]);
     });
-
     return true;
   },
 
@@ -123,19 +173,9 @@ export const useMessageQueueStore = create<MessageQueueStore>((set, get) => ({
       }
 
       set((s) => {
-        const size = remaining.length;
-
-        return {
-          messages: remaining,
-          size,
-          stats: {
-            ...s.stats,
-            size,
-            utilizationPercent: (size / s.capacity) * 100,
-            backpressure: size > s.capacity * 0.8,
-            processingRate: Math.round(processingRate * 100) / 100,
-          },
-        };
+        const next = derive(s, remaining);
+        next.stats.processingRate = Math.round(processingRate * 100) / 100;
+        return next;
       });
     }
 
@@ -147,37 +187,12 @@ export const useMessageQueueStore = create<MessageQueueStore>((set, get) => ({
     set((s) => {
       const known = new Set(s.messages.map(m => m.id));
       const back = messages.filter(m => !known.has(m.id));
-      const merged = [...back, ...s.messages];
-      const size = merged.length;
-      return {
-        messages: merged,
-        size,
-        stats: {
-          ...s.stats,
-          size,
-          utilizationPercent: (size / s.capacity) * 100,
-          backpressure: size > s.capacity * 0.8,
-        },
-      };
+      return derive(s, [...back, ...s.messages]);
     });
   },
 
   removeMessage: (id) => {
-    set((s) => {
-      const messages = s.messages.filter(m => m.id !== id);
-      const size = messages.length;
-
-      return {
-        messages,
-        size,
-        stats: {
-          ...s.stats,
-          size,
-          utilizationPercent: (size / s.capacity) * 100,
-          backpressure: size > s.capacity * 0.8,
-        },
-      };
-    });
+    set((s) => derive(s, s.messages.filter(m => m.id !== id)));
   },
 
   clearQueue: () => {
@@ -186,13 +201,16 @@ export const useMessageQueueStore = create<MessageQueueStore>((set, get) => ({
 
     if (get().size === 0 && get().messages.length === 0) return;
 
-    set({
+    set((s) => ({
       messages: [],
       size: 0,
+      bytes: 0,
       stats: {
-        ...initialState.stats,
+        ...initialStats,
+        capacity: s.capacity,
+        memoryLimit: s.memoryLimit,
       },
-    });
+    }));
   },
 
   updateStats: () => {
@@ -225,15 +243,12 @@ export const useMessageQueueStore = create<MessageQueueStore>((set, get) => ({
     set({ processing });
   },
 
-  setCapacity: (capacity) => set((s) => ({
-    capacity,
-    stats: {
-      ...s.stats,
-      capacity,
-      utilizationPercent: (s.size / capacity) * 100,
-      backpressure: s.size > capacity * 0.8,
-    },
-  })),
+  setCapacity: (capacity) => set((s) => derive({ ...s, capacity }, s.messages)),
+
+  setMemoryLimit: (bytes) => set((s) => {
+    const memoryLimit = Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
+    return { memoryLimit, ...derive({ ...s, memoryLimit }, s.messages) };
+  }),
 
   getByPriority: (priority) => {
     return get().messages.filter(m => m.priority === priority);
@@ -242,19 +257,7 @@ export const useMessageQueueStore = create<MessageQueueStore>((set, get) => ({
   removeOldest: (count) => {
     set((s) => {
       const sorted = [...s.messages].sort((a, b) => a.timestamp - b.timestamp);
-      const remaining = sorted.slice(count);
-      const size = remaining.length;
-
-      return {
-        messages: remaining,
-        size,
-        stats: {
-          ...s.stats,
-          size,
-          utilizationPercent: (size / s.capacity) * 100,
-          backpressure: size > s.capacity * 0.8,
-        },
-      };
+      return derive(s, sorted.slice(count));
     });
   },
 

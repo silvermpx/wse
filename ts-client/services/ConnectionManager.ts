@@ -96,6 +96,15 @@ export interface ConnectionManagerConfig {
 
   /** Called with a message accepted by trySend() whose socket vanished before it went out. */
   onUndeliverable?: (message: WSMessage) => void;
+
+  /** Heartbeat ping interval in ms (round-trip measurement, dead-socket check). */
+  heartbeatInterval?: number;
+
+  /**
+   * What client_hello asks of the server: compress what it sends us, and
+   * from which size on (bytes). Default: enabled, 1024.
+   */
+  compression?: { enabled: boolean; threshold: number };
 }
 
 type StopReason = 'none' | 'manual' | 'auth' | 'encryption' | 'max_attempts';
@@ -131,6 +140,8 @@ export class ConnectionManager {
   private serverReadyTimer: ReturnType<typeof setTimeout> | null = null;
   private encryptionTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+  private compressionEnabled: boolean;
+  private compressionThreshold: number;
   private tokenRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
   private reconnectAttempts = 0;
@@ -176,6 +187,8 @@ export class ConnectionManager {
   ) {
     this.config = config ?? {};
     this.encryptionRequired = !!this.config.encryptionRequired;
+    this.compressionEnabled = this.config.compression?.enabled ?? true;
+    this.compressionThreshold = this.config.compression?.threshold ?? 1024;
     this.rateLimiter = createRateLimiter(this.config.rateLimit);
 
     this.connectionPool = new ConnectionPool({
@@ -245,7 +258,7 @@ export class ConnectionManager {
     const url = new URL(endpoint);
     url.searchParams.set('client_version', WS_CLIENT_VERSION);
     url.searchParams.set('protocol_version', String(WS_PROTOCOL_VERSION));
-    url.searchParams.set('compression', String(FEATURES.COMPRESSION));
+    url.searchParams.set('compression', String(this.compressionEnabled && this.compressionThreshold > 0));
     url.searchParams.set('encryption', String(this.encryptionRequired));
     return url.toString();
   }
@@ -1099,7 +1112,7 @@ export class ConnectionManager {
       client_version: WS_CLIENT_VERSION,
       protocol_version: WS_PROTOCOL_VERSION,
       features: {
-        compression: FEATURES.COMPRESSION,
+        compression: this.compressionEnabled && this.compressionThreshold > 0,
         encryption: this.encryptionRequired && encryptionPublicKey !== null,
         batching: FEATURES.BATCHING,
         priority_queue: FEATURES.PRIORITY_QUEUE,
@@ -1111,6 +1124,7 @@ export class ConnectionManager {
         metrics: FEATURES.METRICS,
       },
       connection_id: this.connectionId,
+      compression_threshold: this.compressionThreshold,
     };
 
     if (encryptionPublicKey) {
@@ -1243,7 +1257,25 @@ export class ConnectionManager {
         p: { timestamp: Date.now() },
         v: WS_PROTOCOL_VERSION,
       }));
-    }, HEARTBEAT_INTERVAL);
+    }, this.heartbeatEvery());
+  }
+
+  private heartbeatEvery(): number {
+    const ms = this.config.heartbeatInterval;
+    return typeof ms === 'number' && Number.isFinite(ms) && ms >= 1000 ? ms : HEARTBEAT_INTERVAL;
+  }
+
+  /**
+   * Change what client_hello asks for compression; later connections use it.
+   * The caller tells the current server with a client_config message.
+   */
+  setCompression(enabled: boolean): void {
+    this.compressionEnabled = enabled;
+  }
+
+  /** The compression preference: whether the server should compress, and from which size. */
+  getCompression(): { enabled: boolean; threshold: number } {
+    return { enabled: this.compressionEnabled && this.compressionThreshold > 0, threshold: this.compressionThreshold };
   }
 
   // ---------------------------------------------------------------------------

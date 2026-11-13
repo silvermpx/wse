@@ -152,7 +152,13 @@ describe('options and versions', () => {
     expect(o.maxMessageSize).toBe(16 * 1024 * 1024);
     expect(o.rateLimit).toEqual({});
     expect(resolveOptions({ endpoints: ['ws://x/wse'], rateLimit: false }).rateLimit).toBe(false);
-    expect(o.diagnostics).toEqual({ enabled: false, metricsInterval: 60000 });
+    expect(o.diagnostics).toEqual({
+      enabled: false,
+      metricsInterval: 60000,
+      sampleRate: 0.1,
+      healthCheckInterval: 15000,
+    });
+    expect(o.performance).toMatchObject({ memoryLimit: 50 * 1024 * 1024, compressionThreshold: 1024 });
   });
 
   it('reports the package version everywhere', () => {
@@ -162,8 +168,9 @@ describe('options and versions', () => {
     expect(pkg.type).toBe('module');
   });
 
-  it('no longer exports the removed AdaptiveQualityManager', () => {
-    expect((api as Record<string, unknown>).AdaptiveQualityManager).toBeUndefined();
+  it('exports the adaptive quality manager', () => {
+    expect(typeof api.AdaptiveQualityManager).toBe('function');
+    expect(api.QUALITY_STRATEGIES.excellent.refetchInterval).toBe(false);
     expect(typeof api.useWSE).toBe('function');
   });
 });

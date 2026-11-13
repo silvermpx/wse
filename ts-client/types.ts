@@ -85,6 +85,19 @@ export interface PerformanceConfig {
   batchTimeout: number;
   /** Capacity of the in-memory outgoing queue. */
   maxQueueSize: number;
+  /**
+   * Bound on the in-memory outgoing queue's estimated size in bytes (the
+   * serialized messages). When it is reached, a new message pushes out
+   * queued messages of lower priority or is dropped. 0 disables the bound.
+   * Default 50 MiB.
+   */
+  memoryLimit: number;
+  /**
+   * Ask the server to compress messages larger than this many bytes (sent in
+   * client_hello). 0 asks for no compression. Default 1024. Compression can
+   * also be switched at runtime with setCompression().
+   */
+  compressionThreshold: number;
 }
 
 export interface OfflineConfig {
@@ -98,6 +111,18 @@ export interface DiagnosticsConfig {
   /** Run the network monitor and refresh `diagnostics` every metricsInterval ms. */
   enabled: boolean;
   metricsInterval: number;
+  /**
+   * With diagnostics enabled, the share of handled messages (0..1) whose
+   * handler run time is measured into `stats.handlerTimeAvg` / `handlerTimeMax`.
+   * Default 0.1.
+   */
+  sampleRate: number;
+  /**
+   * Interval (ms) of the heartbeat ping that measures the round-trip time and
+   * detects dead sockets; the adaptive quality strategy is re-evaluated with
+   * every answer. Default 15000.
+   */
+  healthCheckInterval: number;
 }
 
 /**
@@ -151,6 +176,10 @@ export interface ConnectionMetrics {
   gapsDetected: number;
   /** Messages known to be missing across all gaps (when the range is known). */
   messagesMissed: number;
+  /** Mean run time (ms) of sampled message handlers (diagnostics.sampleRate). */
+  handlerTimeAvg: number | null;
+  /** Longest sampled handler run time (ms). */
+  handlerTimeMax: number | null;
 }
 
 export interface ConnectionInfo {
@@ -226,6 +255,10 @@ export interface QueuedMessage {
   correlation_id?: string;
   /** The complete wire message (keeps cid/enc and the original id). */
   message?: WSMessage;
+  /** Estimated size in bytes (serialized length), counted against memoryLimit. */
+  bytes?: number;
+  /** Epoch ms after which the message is dropped instead of sent (MessageOptions.ttl). */
+  expiresAt?: number;
 }
 
 export interface MessageOptions {
@@ -238,6 +271,11 @@ export interface MessageOptions {
   /** Persist to IndexedDB while disconnected and replay after reconnecting. */
   offline?: boolean;
   correlation_id?: string;
+  /**
+   * Milliseconds the message stays worth sending. A message still queued
+   * (in memory or offline) after that is dropped instead of sent late.
+   */
+  ttl?: number;
 }
 
 /**
@@ -278,6 +316,10 @@ export interface QueueStats {
   priorityDistribution: Record<number, number>;
   processingRate: number;
   backpressure: boolean;
+  /** Estimated size of the queued messages in bytes. */
+  bytes: number;
+  /** Bound on `bytes`; 0 means none. */
+  memoryLimit: number;
 }
 
 export interface OfflineQueueStats {
@@ -403,7 +445,11 @@ export interface WSEState {
 export interface MessageQueueState {
   messages: QueuedMessage[];
   size: number;
+  /** Estimated size of the queued messages in bytes. */
+  bytes: number;
   capacity: number;
+  /** Bound on `bytes`; 0 means none. */
+  memoryLimit: number;
   processing: boolean;
   stats: QueueStats;
 }
@@ -486,6 +532,12 @@ export interface UseWSEReturn {
   getQueueSize: () => number;
   requestSnapshot: (topics?: string[]) => void;
   debugHandlers: () => void;
+  /**
+   * Ask the server to compress (true) or not compress (false) the messages it
+   * sends this client. Applies to the current connection at once and to
+   * every later one.
+   */
+  setCompression: (enabled: boolean) => void;
 }
 
 // ---------------------------------------------------------------------------

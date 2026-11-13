@@ -34,6 +34,7 @@ import {
   DEFAULT_MAX_INBOUND_MESSAGE_SIZE,
   DEFAULT_RECOVERY_TIMEOUT_MS,
   DEFAULT_TOPICS,
+  HEARTBEAT_INTERVAL,
   RECONNECT_MAX_ATTEMPTS,
   SERVER_READY_TIMEOUT,
   WS_PROTOCOL_VERSION,
@@ -47,6 +48,7 @@ import { useMessageQueueStore } from '../stores/useMessageQueueStore.js';
 import { ConnectionManager } from './ConnectionManager.js';
 import { MessageProcessor } from './MessageProcessor.js';
 import { NetworkMonitor } from './NetworkMonitor.js';
+import { AdaptiveQualityManager, QueryClientLike } from './AdaptiveQualityManager.js';
 import { OfflineQueue } from './OfflineQueue.js';
 import { EventSequencer } from './EventSequencer.js';
 import { EventHandlers } from '../handlers/EventHandlers.js';
@@ -115,6 +117,14 @@ export interface UseWSEConfig {
    * jwt_secret send none). Default 10000; 0 waits forever.
    */
   serverReadyTimeout?: number;
+
+  /**
+   * TanStack Query client whose query defaults (staleTime, refetchInterval,
+   * refetchOnWindowFocus) follow the measured connection quality: little
+   * polling while the socket is fast and steady, more when it is slow,
+   * unstable or down. The app's other defaults are kept.
+   */
+  queryClient?: QueryClientLike;
 }
 
 /** Fully resolved options of one session. */
@@ -133,6 +143,7 @@ export interface ResolvedWSEOptions {
   criticalHandlers: string[];
   refreshAuthToken?: () => Promise<void>;
   registerHandlers?: (messageProcessor: HandlerRegistry) => void;
+  queryClient?: QueryClientLike;
 }
 
 export const DEFAULT_RECONNECTION: ReconnectionStrategy = {
@@ -166,6 +177,8 @@ export function resolveOptions(config: UseWSEConfig | undefined): ResolvedWSEOpt
       batchSize: 10,
       batchTimeout: 500,
       maxQueueSize: 10000,
+      memoryLimit: 50 * 1024 * 1024,
+      compressionThreshold: 1024,
       ...config?.performance,
     },
     offline: {
@@ -178,6 +191,8 @@ export function resolveOptions(config: UseWSEConfig | undefined): ResolvedWSEOpt
     diagnostics: {
       enabled: false,
       metricsInterval: 60000,
+      sampleRate: 0.1,
+      healthCheckInterval: HEARTBEAT_INTERVAL,
       ...config?.diagnostics,
     },
     rateLimit: config?.rateLimit === false ? false : { ...config?.rateLimit },
@@ -190,6 +205,7 @@ export function resolveOptions(config: UseWSEConfig | undefined): ResolvedWSEOpt
     criticalHandlers: config?.criticalHandlers ? [...config.criticalHandlers] : [],
     refreshAuthToken: config?.refreshAuthToken,
     registerHandlers: config?.registerHandlers,
+    queryClient: config?.queryClient,
   };
 }
 
@@ -212,6 +228,15 @@ function buildMessage(type: string, payload: any, options: MessageOptions = {}):
   return message;
 }
 
+/** Epoch ms after which a message with `ttl` is no longer worth sending. */
+function expiryOf(options: MessageOptions): number | undefined {
+  const ttl = options.ttl;
+  return ttl !== undefined && Number.isFinite(ttl) && ttl >= 0 ? Date.now() + ttl : undefined;
+}
+
+// What setCompression() asked for; it outlives sessions (null: the option decides).
+let compressionOverride: boolean | null = null;
+
 export interface SessionParams {
   key: string;
   auth: string;
@@ -226,6 +251,7 @@ export class WSESession {
   readonly processor: MessageProcessor;
   connection: ConnectionManager | null = null;
   networkMonitor: NetworkMonitor | null = null;
+  quality: AdaptiveQualityManager | null = null;
   offlineQueue: OfflineQueue | null = null;
   refCount = 0;
   destroyed = false;
@@ -234,6 +260,7 @@ export class WSESession {
   private topicsResolved: boolean;
   private startPromise: Promise<void> | null = null;
   private windowListener: ((event: Event) => void) | null = null;
+  private stopWatchingState: (() => void) | null = null;
 
   constructor(params: SessionParams, sequencer: EventSequencer) {
     this.key = params.key;
@@ -248,6 +275,7 @@ export class WSESession {
         recoveryTimeoutMs: this.options.recoveryTimeoutMs,
         eventThrottleMs: this.options.eventThrottleMs,
         sequencer,
+        handlerSampleRate: this.options.diagnostics.enabled ? this.options.diagnostics.sampleRate : 0,
       },
     );
 
@@ -292,6 +320,7 @@ export class WSESession {
     const o = this.options;
     useWSEStore.getState().updateConfig({ maxReconnectAttempts: o.reconnection.maxAttempts });
     useMessageQueueStore.getState().setCapacity(o.performance.maxQueueSize);
+    useMessageQueueStore.getState().setMemoryLimit(o.performance.memoryLimit);
 
     if (o.criticalHandlers.length > 0) {
       const missing = o.criticalHandlers.filter(h => !this.processor.isHandlerRegistered(h));
@@ -341,7 +370,21 @@ export class WSESession {
     }
 
     this.networkMonitor = new NetworkMonitor(100, o.diagnostics.metricsInterval, o.diagnostics.enabled);
-    this.processor.setLatencyListener((latency) => this.networkMonitor?.recordLatency(latency));
+    // Quality tracking runs when something consumes it: a QueryClient to
+    // steer, or diagnostics (the connectionQualityChanged event).
+    if (o.queryClient || o.diagnostics.enabled) {
+      const quality = new AdaptiveQualityManager({ queryClient: o.queryClient ?? null });
+      this.quality = quality;
+      this.stopWatchingState = useWSEStore.subscribe((state, previous) => {
+        if (state.connectionState !== previous.connectionState) {
+          quality.setConnectionState(state.connectionState);
+        }
+      });
+    }
+    this.processor.setLatencyListener((latency) => {
+      this.networkMonitor?.recordLatency(latency);
+      this.quality?.recordLatency(latency);
+    });
 
     const connection = new ConnectionManager(
       o.endpoints,
@@ -363,6 +406,11 @@ export class WSESession {
         },
         onSocketClosed: () => this.processor.handleConnectionClosed(),
         onUndeliverable: (message) => this.processor.requeue(message),
+        heartbeatInterval: o.diagnostics.healthCheckInterval,
+        compression: {
+          enabled: compressionOverride ?? o.performance.compressionThreshold > 0,
+          threshold: o.performance.compressionThreshold,
+        },
       },
     );
     this.connection = connection;
@@ -470,6 +518,7 @@ export class WSESession {
     const priority = options.priority ?? MessagePriority.NORMAL;
     return this.processor.enqueueOutgoing(buildMessage(type, payload, options), priority, {
       offline: !!options.offline && this.options.offline.enabled,
+      ttl: options.ttl,
     });
   }
 
@@ -479,12 +528,27 @@ export class WSESession {
       logger.warn('forceReconnect: the connection is still initializing');
       return;
     }
+    this.quality?.expectReconnect();
     this.connection.forceReconnect();
   }
 
   changeEndpoint(endpoint: string): void {
     if (this.destroyed || !this.connection) return;
+    this.quality?.expectReconnect();
     this.connection.changeEndpoint(endpoint);
+  }
+
+  /**
+   * Ask the server to compress (or not) what it sends this client. The next
+   * client_hello carries it, and a connected server is told at once.
+   */
+  setCompression(enabled: boolean): void {
+    if (this.destroyed || !this.connection) return;
+    this.connection.setCompression(enabled);
+    if (this.connection.isReady()) {
+      const { enabled: on, threshold } = this.connection.getCompression();
+      this.sendSystem('client_config', { compression: on, compression_threshold: threshold });
+    }
   }
 
   requestSnapshot(topics?: string[]): void {
@@ -523,6 +587,16 @@ export class WSESession {
       window.removeEventListener('wseRequestSnapshot', this.windowListener);
       this.windowListener = null;
     }
+
+    this.stopWatchingState?.();
+    this.stopWatchingState = null;
+    try {
+      // Gives the app its own query defaults back.
+      this.quality?.destroy();
+    } catch (error) {
+      logger.error('Error destroying the adaptive quality manager:', error);
+    }
+    this.quality = null;
 
     try {
       this.connection?.destroy();
@@ -728,7 +802,8 @@ function sendMessageAction(type: string, payload: any, options: MessageOptions =
     return 'dropped';
   }
   const message = buildMessage(type, payload, options);
-  const ok = useMessageQueueStore.getState().enqueue({
+  const queueStore = useMessageQueueStore.getState();
+  const ok = queueStore.enqueue({
     id: message.id!,
     type,
     payload,
@@ -737,6 +812,8 @@ function sendMessageAction(type: string, payload: any, options: MessageOptions =
     retries: 0,
     correlation_id: message.cid,
     message,
+    bytes: queueStore.memoryLimit > 0 ? JSON.stringify(message).length : undefined,
+    expiresAt: expiryOf(options),
   });
   return ok ? 'queued' : 'dropped';
 }
@@ -778,6 +855,12 @@ async function clearOfflineQueueAction(): Promise<void> {
   }
 }
 
+function setCompressionAction(enabled: boolean): void {
+  compressionOverride = !!enabled;
+  useWSEStore.getState().updateConfig({ compressionEnabled: !!enabled });
+  getCurrentSession()?.setCompression(!!enabled);
+}
+
 function getQueueSizeAction(): number {
   const session = getCurrentSession();
   return session ? session.getQueueSize() : useMessageQueueStore.getState().size;
@@ -809,7 +892,12 @@ export function collectDiagnostics(): Record<string, unknown> {
     activeTopics: store.activeTopics,
     recoveryState: store.subscriptions.recoveryState,
     errorHistory: store.errorHistory,
-    config: session ? { ...session.options, refreshAuthToken: undefined, registerHandlers: undefined } : null,
+    config: session
+      ? { ...session.options, refreshAuthToken: undefined, registerHandlers: undefined, queryClient: undefined }
+      : null,
+    quality: session?.quality
+      ? { current: session.quality.getCurrentQuality(), strategy: session.quality.getCurrentStrategyName() }
+      : null,
     network: {
       monitor: session?.networkMonitor?.getLatencyStats() ?? null,
       lastDiagnostics: session?.networkMonitor?.getLastDiagnostics() ?? null,
@@ -863,6 +951,7 @@ export const wseActions = Object.freeze({
   getQueueSize: getQueueSizeAction,
   requestSnapshot: requestSnapshotAction,
   debugHandlers: debugHandlersAction,
+  setCompression: setCompressionAction,
 });
 
 // Close the socket cleanly on page unload -- HMR-safe (replaces the previous listener).

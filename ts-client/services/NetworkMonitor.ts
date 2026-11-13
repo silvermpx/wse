@@ -6,6 +6,21 @@ import { NetworkDiagnostics, ConnectionQuality } from '../types.js';
 import { useWSEStore } from '../stores/useWSEStore.js';
 import { logger } from '../utils/logger.js';
 
+/**
+ * Quality verdict for a round-trip time and its jitter (ms). Shared by the
+ * diagnostics and the adaptive quality strategy, so both always agree.
+ */
+export function classifyLatency(avgLatency: number, jitter: number): ConnectionQuality {
+  if (avgLatency > 300 || jitter > 100) {
+    return ConnectionQuality.POOR;
+  } else if (avgLatency > 150 || jitter > 50) {
+    return ConnectionQuality.FAIR;
+  } else if (avgLatency > 75 || jitter > 25) {
+    return ConnectionQuality.GOOD;
+  }
+  return ConnectionQuality.EXCELLENT;
+}
+
 export class NetworkMonitor {
   private latencyHistory: number[] = [];
   private lastDiagnostics: NetworkDiagnostics | null = null;
@@ -57,7 +72,7 @@ export class NetworkMonitor {
 
     const avgLatency = this.calculateAverage(this.latencyHistory);
     const jitter = this.calculateJitter();
-    const quality = this.determineQuality(avgLatency, jitter);
+    const quality = classifyLatency(avgLatency, jitter);
     const suggestions = this.generateSuggestions(quality, avgLatency, jitter);
 
     const diagnostics: NetworkDiagnostics = {
@@ -92,20 +107,6 @@ export class NetworkMonitor {
     }
 
     return sumDiff / (this.latencyHistory.length - 1);
-  }
-
-  private determineQuality(
-    avgLatency: number,
-    jitter: number
-  ): ConnectionQuality {
-    if (avgLatency > 300 || jitter > 100) {
-      return ConnectionQuality.POOR;
-    } else if (avgLatency > 150 || jitter > 50) {
-      return ConnectionQuality.FAIR;
-    } else if (avgLatency > 75 || jitter > 25) {
-      return ConnectionQuality.GOOD;
-    }
-    return ConnectionQuality.EXCELLENT;
   }
 
   private generateSuggestions(

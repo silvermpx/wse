@@ -18,6 +18,8 @@ export interface OfflineRecord {
   timestamp: number;
   retries: number;
   message: WSMessage;
+  /** Epoch ms after which the message is dropped instead of sent (MessageOptions.ttl). */
+  expiresAt?: number;
 }
 
 function requestToPromise<T>(request: IDBRequest<T>): Promise<T> {
@@ -44,6 +46,7 @@ function toRecord(raw: any): OfflineRecord | null {
       timestamp: typeof raw.timestamp === 'number' ? raw.timestamp : 0,
       retries: typeof raw.retries === 'number' ? raw.retries : 0,
       message: raw.message as WSMessage,
+      expiresAt: typeof raw.expiresAt === 'number' ? raw.expiresAt : undefined,
     };
   }
   if (typeof raw.t === 'string') {
@@ -108,7 +111,7 @@ export class OfflineQueue {
    * Persist one message. Resolves false when the queue is disabled,
    * unavailable or full; the message is not stored then.
    */
-  async enqueue(message: WSMessage): Promise<boolean> {
+  async enqueue(message: WSMessage, expiresAt?: number): Promise<boolean> {
     if (!this.isAvailable() || !this.db) return false;
 
     await this.cleanup();
@@ -122,6 +125,7 @@ export class OfflineQueue {
 
     this.lastTimestamp = Math.max(Date.now(), this.lastTimestamp + 0.001);
     const record: OfflineRecord = { id, timestamp: this.lastTimestamp, retries: 0, message };
+    if (expiresAt !== undefined) record.expiresAt = expiresAt;
     const tx = this.db.transaction([this.storeName], 'readwrite');
     tx.objectStore(this.storeName).put(record);
     await transactionDone(tx);
