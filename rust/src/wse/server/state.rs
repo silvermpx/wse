@@ -41,6 +41,10 @@ pub(crate) struct Closer {
     /// Set once the server queued a close frame: the client's further
     /// messages are no longer delivered.
     closing: Arc<AtomicBool>,
+    /// Stop the connection's read loop and write task when it must go now.
+    /// They poll these with every message: an `Abortable` costs an atomic
+    /// load where the token takes a lock.
+    stops: Arc<std::sync::Mutex<Vec<futures_util::future::AbortHandle>>>,
 }
 
 impl Closer {
@@ -48,6 +52,29 @@ impl Closer {
         Self {
             token: tokio_util::sync::CancellationToken::new(),
             closing: Arc::new(AtomicBool::new(false)),
+            stops: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// What one of the connection's loops is wrapped in (`Abortable`), so it
+    /// stops as soon as the connection must go.
+    pub(crate) fn stop_registration(&self) -> futures_util::future::AbortRegistration {
+        let (handle, registration) = futures_util::future::AbortHandle::new_pair();
+        let mut stops = self.stops.lock().unwrap_or_else(|e| e.into_inner());
+        if self.token.is_cancelled() {
+            handle.abort();
+        } else {
+            stops.push(handle);
+        }
+        registration
+    }
+
+    /// The connection goes now: its loops stop and the socket is closed.
+    fn cancel(&self) {
+        let mut stops = self.stops.lock().unwrap_or_else(|e| e.into_inner());
+        self.token.cancel();
+        for stop in stops.drain(..) {
+            stop.abort();
         }
     }
 
@@ -62,7 +89,7 @@ impl Closer {
     /// Drop the connection now, without a close handshake.
     pub(crate) fn abort(&self) {
         self.closing.store(true, Ordering::Release);
-        self.token.cancel();
+        self.cancel();
     }
 
     /// Close from the server: queue a close frame with `code` on the
@@ -91,11 +118,11 @@ impl Closer {
         if tx.send(WsFrame::Msg(frame)).is_err() {
             pending.fetch_sub(bytes, Ordering::Relaxed);
         }
-        let token = self.token.clone();
+        let closer = self.clone();
         tokio::spawn(async move {
             tokio::select! {
-                () = tokio::time::sleep(CLOSE_GRACE) => token.cancel(),
-                () = token.cancelled() => {}
+                () = tokio::time::sleep(CLOSE_GRACE) => closer.cancel(),
+                () = closer.token.cancelled() => {}
             }
         });
     }

@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -819,9 +819,10 @@ pub(super) async fn handle_connection(
     let broadcast_notify_write = broadcast_notify;
     // `finish`: the read side is done, send nothing more but the close reply.
     // The closer's token: the socket goes now, even in the middle of a frame.
-    let finish = tokio_util::sync::CancellationToken::new();
+    let finish = Arc::new(AtomicBool::new(false));
     let write_finish = finish.clone();
     let write_abort = closer.token().clone();
+    let write_stop = closer.stop_registration();
     let peer_close = Arc::new(AtomicU32::new(NO_PEER_CLOSE));
     let write_peer_close = peer_close.clone();
     let write_task = tokio::spawn(async move {
@@ -831,7 +832,7 @@ pub(super) async fn handle_connection(
         let mut close_sent = false;
         let work = async {
             loop {
-                if write_finish.is_cancelled() {
+                if write_finish.load(Ordering::Acquire) {
                     break;
                 }
                 // Control frames first, without waiting: server_ready goes out
@@ -882,7 +883,6 @@ pub(super) async fn handle_connection(
                 }
                 tokio::select! {
                     biased;
-                    () = write_finish.cancelled() => break,
                     n = rx.recv_many(&mut batch, CONTROL_BATCH) => {
                         if n == 0 {
                             break; // every sender is gone
@@ -892,11 +892,11 @@ pub(super) async fn handle_connection(
                 }
             }
         };
-        let finished = tokio::select! {
-            biased;
-            () = write_abort.cancelled() => false,
-            () = work => true,
-        };
+        // Stopped at once when the connection must go, even in the middle of
+        // a frame.
+        let finished = futures_util::future::Abortable::new(work, write_stop)
+            .await
+            .is_ok();
         // The client closed first: answer it.
         if finished
             && !close_sent
@@ -932,309 +932,89 @@ pub(super) async fn handle_connection(
 
     // Read loop. It ends when the client closes or the socket fails, and when
     // the server closed the connection and the client did not answer in time.
-    let read_cancel = closer.token().clone();
-    loop {
-        let msg = tokio::select! {
-            biased;
-            () = read_cancel.cancelled() => break,
-            () = async { if let Some(sleep) = expiry.as_mut() { sleep.await } }, if expiry.is_some() => {
-                expiry = None;
-                closer.close(&tx, &pending, CLOSE_TOKEN_EXPIRED, "token expired");
+    let read_stop = closer.stop_registration();
+    let read_loop = async {
+        loop {
+            let msg = tokio::select! {
+                biased;
+                () = async { if let Some(sleep) = expiry.as_mut() { sleep.await } }, if expiry.is_some() => {
+                    expiry = None;
+                    closer.close(&tx, &pending, CLOSE_TOKEN_EXPIRED, "token expired");
+                    continue;
+                }
+                next = read_half.next() => match next {
+                    Some(Ok(msg)) => msg,
+                    _ => break,
+                },
+            };
+            // After the server queued a close, the client's further messages are
+            // not delivered: only its close frame, or the grace period, ends this.
+            if closer.is_closing() && !matches!(msg, Message::Close(_)) {
                 continue;
             }
-            next = read_half.next() => match next {
-                Some(Ok(msg)) => msg,
-                _ => break,
-            },
-        };
-        // After the server queued a close, the client's further messages are
-        // not delivered: only its close frame, or the grace period, ends this.
-        if closer.is_closing() && !matches!(msg, Message::Close(_)) {
-            continue;
-        }
-        // Every frame counts as activity, protocol pings and pongs included:
-        // a plain WebSocket client may keep the link alive with those alone.
-        if let Some(mut last) = state.conn_last_activity.get_mut(&*conn_id) {
-            *last = std::time::Instant::now();
-        }
-        // In an E2E session the client sends sealed frames only.
-        if session.is_some()
-            && match &msg {
-                Message::Text(_) => true,
-                Message::Binary(data) => !data.starts_with(b"E:"),
-                _ => false,
+            // Every frame counts as activity, protocol pings and pongs included:
+            // a plain WebSocket client may keep the link alive with those alone.
+            if let Some(mut last) = state.conn_last_activity.get_mut(&*conn_id) {
+                *last = std::time::Instant::now();
             }
-        {
-            closer.close(&tx, &pending, CLOSE_E2E_BAD_FRAME, "e2e frame refused");
-            continue;
-        }
-        if matches!(msg, Message::Text(_) | Message::Binary(_)) {
-            match inbound_limit.check() {
-                Inbound::Pass => {}
-                Inbound::Warn { used, left } => {
-                    let warning = format!(
-                        "{{\"c\":\"WSE\",\"t\":\"rate_limit_warning\",\"p\":{{\"current_rate\":{},\"limit\":{},\"remaining\":{},\"retry_after\":1.0}},\"v\":1}}",
-                        used as u64, inbound_limit.capacity as u64, left as u64,
-                    );
-                    queue_reply(&own_handle, max_pending, Message::Text(warning.into()));
+            // In an E2E session the client sends sealed frames only.
+            if session.is_some()
+                && match &msg {
+                    Message::Text(_) => true,
+                    Message::Binary(data) => !data.starts_with(b"E:"),
+                    _ => false,
                 }
-                Inbound::Limited { notify } => {
-                    state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
-                    if notify {
-                        queue_reply(
-                            &own_handle,
-                            max_pending,
-                            Message::Text(RATE_LIMITED_ERROR.into()),
-                        );
-                    }
-                    continue;
-                }
-                Inbound::Close => {
-                    state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
-                    closer.close(&tx, &pending, CLOSE_RATE_LIMITED, "rate limit exceeded");
-                    continue;
-                }
+            {
+                closer.close(&tx, &pending, CLOSE_E2E_BAD_FRAME, "e2e frame refused");
+                continue;
             }
-        }
-        match msg {
-            Message::Text(text) => {
-                state
-                    .messages_received_total
-                    .fetch_add(1, Ordering::Relaxed);
-                state
-                    .bytes_received_total
-                    .fetch_add(text.len() as u64, Ordering::Relaxed);
-                let text_ref: &str = text.as_ref();
-
-                // Strip prefix for JSON parsing
-                let json_str = if text_ref.starts_with("WSE{") {
-                    &text_ref[3..]
-                } else if text_ref.starts_with("S{") || text_ref.starts_with("U{") {
-                    &text_ref[1..]
-                } else if text_ref.starts_with('{') {
-                    text_ref
-                } else {
-                    // Non-JSON text — drain or callback
-                    if drain {
-                        state.push_message(
-                            InboundEvent::RawText {
-                                conn_id: (*conn_id).clone(),
-                                text: text.to_string(),
-                            },
-                            text.len(),
+            if matches!(msg, Message::Text(_) | Message::Binary(_)) {
+                match inbound_limit.check() {
+                    Inbound::Pass => {}
+                    Inbound::Warn { used, left } => {
+                        let warning = format!(
+                            "{{\"c\":\"WSE\",\"t\":\"rate_limit_warning\",\"p\":{{\"current_rate\":{},\"limit\":{},\"remaining\":{},\"retry_after\":1.0}},\"v\":1}}",
+                            used as u64, inbound_limit.capacity as u64, left as u64,
                         );
-                    } else if let (Some(cb), Some(callback_lane)) = (&cached_on_message, &lane) {
-                        let cb_arc = cb.clone();
-                        let cid = Arc::clone(&conn_id);
-                        let t = text.to_string();
-                        spawn_bounded_callback(callback_lane, &state, t.len(), move || {
-                            Python::try_attach(|py| {
-                                if let Err(e) = cb_arc.call1(py, (&**cid, &*t)) {
-                                    tracing::warn!("[WSE] on_message error: {e}");
-                                }
-                            });
-                        });
+                        queue_reply(&own_handle, max_pending, Message::Text(warning.into()));
                     }
-                    continue;
-                };
-
-                // Try to parse JSON in Rust
-                match serde_json::from_str::<serde_json::Value>(json_str) {
-                    Ok(val) => {
-                        // Fast-path: protocol messages handled entirely in Rust
-                        if let Some(t_val) = val.get("t").and_then(|t| t.as_str()) {
-                            if t_val == "client_hello" {
-                                if hello_answered {
-                                    continue;
-                                }
-                                hello_answered = true;
-                                let p = val.get("p");
-                                if let Some(threshold) = requested_compression(
-                                    p.and_then(|p| p.get("features"))
-                                        .and_then(|f| f.get("compression")),
-                                    p.and_then(|p| p.get("compression_threshold")),
-                                ) {
-                                    state.conn_compression.insert((*conn_id).clone(), threshold);
-                                }
-                                let client_proto =
-                                    p.and_then(|p| p.get("protocol_version"))
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(1) as u32;
-
-                                // An E2E session with an authenticated server.
-                                if let Some(offer) = p.and_then(|p| p.get("e2e")) {
-                                    let accepted =
-                                        e2e_session::parse_offer(offer).and_then(|offer| {
-                                            e2e_session::accept(
-                                                &offer,
-                                                &conn_id,
-                                                state.e2e_identity.as_ref(),
-                                            )
-                                        });
-                                    match accepted {
-                                        Ok(accepted) => {
-                                            let hello = build_server_hello(
-                                                &conn_id,
-                                                client_proto,
-                                                &state,
-                                                None,
-                                                Some(accepted.hello),
-                                            );
-                                            queue_reply(
-                                                &own_handle,
-                                                max_pending,
-                                                Message::Text(hello.into()),
-                                            );
-                                            // From here on the write task seals every
-                                            // frame, and the client sends nothing else.
-                                            let _ = tx.send(WsFrame::InstallSeal(Box::new(
-                                                accepted.send,
-                                            )));
-                                            session = Some(accepted.recv);
-                                            state.conn_sealed.insert((*conn_id).clone());
-                                            let _ = cipher_slot.set(Seal::Session);
-                                        }
-                                        Err(_) => {
-                                            queue_reply(
-                                                &own_handle,
-                                                max_pending,
-                                                Message::Text(E2E_UNSUPPORTED_ERROR.into()),
-                                            );
-                                            closer.close(
-                                                &tx,
-                                                &pending,
-                                                CLOSE_E2E_UNSUPPORTED,
-                                                "e2e suite unsupported",
-                                            );
-                                        }
-                                    }
-                                    continue;
-                                }
-
-                                // Check if client requests E2E encryption (the first design)
-                                let wants_encryption = p
-                                    .and_then(|p| p.get("features"))
-                                    .and_then(|f| f.get("encryption"))
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false);
-                                if wants_encryption && !state.e2e_legacy {
-                                    queue_reply(
-                                        &own_handle,
-                                        max_pending,
-                                        Message::Text(E2E_UNSUPPORTED_ERROR.into()),
-                                    );
-                                    closer.close(
-                                        &tx,
-                                        &pending,
-                                        CLOSE_E2E_UNSUPPORTED,
-                                        "e2e suite unsupported",
-                                    );
-                                    continue;
-                                }
-
-                                // Once-only key exchange: never re-derive the cipher
-                                // if this connection already has one. A repeated
-                                // client_hello would otherwise overwrite the AES key
-                                // mid-session (making in-flight encrypted messages
-                                // undecryptable) and is a cheap ECDH-keygen DoS amplifier.
-                                let key = if wants_encryption {
-                                    p.and_then(|p| p.get("encryption_public_key"))
-                                        .and_then(|v| v.as_str())
-                                        .and_then(|b64| match derive_connection_key(b64) {
-                                            Ok(key) => Some(key),
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "[WSE] ECDH key exchange failed for {}: {}",
-                                                    conn_id, e
-                                                );
-                                                let err_msg = format!(
-                                                    "{{\"c\":\"WSE\",\"t\":\"error\",\"p\":{{\"code\":\"KEY_EXCHANGE_FAILED\",\"message\":\"ECDH key exchange failed: {}\",\"recoverable\":true}}}}",
-                                                    e.replace('\"', "\\\"")
-                                                );
-                                                queue_reply(
-                                                    &own_handle,
-                                                    max_pending,
-                                                    Message::Text(err_msg.into()),
-                                                );
-                                                None
-                                            }
-                                        })
-                                } else {
-                                    None
-                                };
-
-                                let hello = build_server_hello(
-                                    &conn_id,
-                                    client_proto,
-                                    &state,
-                                    key.as_ref()
-                                        .map(|(server_public, _)| server_public.as_str()),
-                                    None,
-                                );
-                                queue_reply(&own_handle, max_pending, Message::Text(hello.into()));
-                                // The key is in use only after server_hello is queued:
-                                // an encrypted frame never reaches the client before
-                                // the server's public key.
-                                if let Some((_, cipher)) = key {
-                                    state
-                                        .conn_encryption
-                                        .insert((*conn_id).clone(), cipher.clone());
-                                    let _ = cipher_slot.set(Seal::Legacy(cipher));
-                                }
-                                continue;
-                            }
-                            if t_val == "ping" {
-                                queue_reply(
-                                    &own_handle,
-                                    max_pending,
-                                    Message::Text(pong_for(&val).into()),
-                                );
-                                continue;
-                            }
-                            if t_val == "pong" || t_val == "PONG" {
-                                continue;
-                            }
-                            if t_val == "client_config" {
-                                apply_client_config(&state, &conn_id, val.get("p"));
-                                continue;
-                            }
-                            if t_val == "subscription_update" && state.client_subscriptions {
-                                if let Some(p) = val.get("p") {
-                                    answer_subscription_request(&state, &conn_id, &own_handle, p);
-                                }
-                                continue;
-                            }
-                        }
-
-                        // Normalize type→t, payload→p in serde_json (no GIL needed)
-                        let val = normalize_json_keys(val);
-
-                        // Drain mode: push serde_json::Value to queue (zero GIL)
-                        if drain {
-                            state.push_message(
-                                InboundEvent::Message {
-                                    conn_id: (*conn_id).clone(),
-                                    value: val,
-                                },
-                                text.len(),
+                    Inbound::Limited { notify } => {
+                        state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
+                        if notify {
+                            queue_reply(
+                                &own_handle,
+                                max_pending,
+                                Message::Text(RATE_LIMITED_ERROR.into()),
                             );
-                        } else if let (Some(cb), Some(callback_lane)) = (&cached_on_message, &lane)
-                        {
-                            // Callback mode: convert to PyDict + call Python
-                            let cb_arc = cb.clone();
-                            let cid = Arc::clone(&conn_id);
-                            spawn_bounded_callback(callback_lane, &state, text.len(), move || {
-                                Python::try_attach(|py| {
-                                    let py_obj = json_to_pyobj(py, &val);
-                                    if let Err(e) = cb_arc.call1(py, (&**cid, py_obj)) {
-                                        tracing::warn!("[WSE] on_message error: {e}");
-                                    }
-                                });
-                            });
                         }
+                        continue;
                     }
-                    Err(_) => {
-                        // JSON parse failed — pass raw string
+                    Inbound::Close => {
+                        state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
+                        closer.close(&tx, &pending, CLOSE_RATE_LIMITED, "rate limit exceeded");
+                        continue;
+                    }
+                }
+            }
+            match msg {
+                Message::Text(text) => {
+                    state
+                        .messages_received_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    state
+                        .bytes_received_total
+                        .fetch_add(text.len() as u64, Ordering::Relaxed);
+                    let text_ref: &str = text.as_ref();
+
+                    // Strip prefix for JSON parsing
+                    let json_str = if text_ref.starts_with("WSE{") {
+                        &text_ref[3..]
+                    } else if text_ref.starts_with("S{") || text_ref.starts_with("U{") {
+                        &text_ref[1..]
+                    } else if text_ref.starts_with('{') {
+                        text_ref
+                    } else {
+                        // Non-JSON text — drain or callback
                         if drain {
                             state.push_message(
                                 InboundEvent::RawText {
@@ -1256,195 +1036,440 @@ pub(super) async fn handle_connection(
                                 });
                             });
                         }
-                    }
-                }
-            }
-            Message::Binary(data) => {
-                state
-                    .messages_received_total
-                    .fetch_add(1, Ordering::Relaxed);
-                state
-                    .bytes_received_total
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
-
-                // E2E encryption: detect E: prefix and decrypt before processing
-                if data.len() >= 2 && data[0] == b'E' && data[1] == b':' {
-                    let opened = match (session.as_mut(), cipher_slot.get()) {
-                        (Some(session), _) => match session.open(&data) {
-                            Ok(Some(plaintext)) => Some(Ok(plaintext)),
-                            // The client's close_notify: it closes next.
-                            Ok(None) => continue,
-                            Err(_) => {
-                                closer.close(
-                                    &tx,
-                                    &pending,
-                                    CLOSE_E2E_BAD_FRAME,
-                                    "e2e frame refused",
-                                );
-                                continue;
-                            }
-                        },
-                        (None, Some(Seal::Legacy(cipher))) => {
-                            Some(decrypt_inbound(cipher, &data[2..]))
-                        }
-                        (None, _) => None,
+                        continue;
                     };
-                    if let Some(opened) = opened {
-                        match opened {
-                            Ok(plaintext) => {
-                                // Decrypted payload is UTF-8 text (JSON with optional prefix)
-                                if let Ok(text) = std::str::from_utf8(&plaintext) {
-                                    let json_str = if text.starts_with("WSE{") {
-                                        &text[3..]
-                                    } else if text.starts_with("S{") || text.starts_with("U{") {
-                                        &text[1..]
-                                    } else if text.starts_with('{') {
-                                        text
-                                    } else {
-                                        if drain {
-                                            state.push_message(
-                                                InboundEvent::RawText {
-                                                    conn_id: (*conn_id).clone(),
-                                                    text: text.to_string(),
-                                                },
-                                                text.len(),
-                                            );
+
+                    // Try to parse JSON in Rust
+                    match serde_json::from_str::<serde_json::Value>(json_str) {
+                        Ok(val) => {
+                            // Fast-path: protocol messages handled entirely in Rust
+                            if let Some(t_val) = val.get("t").and_then(|t| t.as_str()) {
+                                if t_val == "client_hello" {
+                                    if hello_answered {
+                                        continue;
+                                    }
+                                    hello_answered = true;
+                                    let p = val.get("p");
+                                    if let Some(threshold) = requested_compression(
+                                        p.and_then(|p| p.get("features"))
+                                            .and_then(|f| f.get("compression")),
+                                        p.and_then(|p| p.get("compression_threshold")),
+                                    ) {
+                                        state
+                                            .conn_compression
+                                            .insert((*conn_id).clone(), threshold);
+                                    }
+                                    let client_proto = p
+                                        .and_then(|p| p.get("protocol_version"))
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(1)
+                                        as u32;
+
+                                    // An E2E session with an authenticated server.
+                                    if let Some(offer) = p.and_then(|p| p.get("e2e")) {
+                                        let accepted =
+                                            e2e_session::parse_offer(offer).and_then(|offer| {
+                                                e2e_session::accept(
+                                                    &offer,
+                                                    &conn_id,
+                                                    state.e2e_identity.as_ref(),
+                                                )
+                                            });
+                                        match accepted {
+                                            Ok(accepted) => {
+                                                let hello = build_server_hello(
+                                                    &conn_id,
+                                                    client_proto,
+                                                    &state,
+                                                    None,
+                                                    Some(accepted.hello),
+                                                );
+                                                queue_reply(
+                                                    &own_handle,
+                                                    max_pending,
+                                                    Message::Text(hello.into()),
+                                                );
+                                                // From here on the write task seals every
+                                                // frame, and the client sends nothing else.
+                                                let _ = tx.send(WsFrame::InstallSeal(Box::new(
+                                                    accepted.send,
+                                                )));
+                                                session = Some(accepted.recv);
+                                                state.conn_sealed.insert((*conn_id).clone());
+                                                let _ = cipher_slot.set(Seal::Session);
+                                            }
+                                            Err(_) => {
+                                                queue_reply(
+                                                    &own_handle,
+                                                    max_pending,
+                                                    Message::Text(E2E_UNSUPPORTED_ERROR.into()),
+                                                );
+                                                closer.close(
+                                                    &tx,
+                                                    &pending,
+                                                    CLOSE_E2E_UNSUPPORTED,
+                                                    "e2e suite unsupported",
+                                                );
+                                            }
                                         }
                                         continue;
+                                    }
+
+                                    // Check if client requests E2E encryption (the first design)
+                                    let wants_encryption = p
+                                        .and_then(|p| p.get("features"))
+                                        .and_then(|f| f.get("encryption"))
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    if wants_encryption && !state.e2e_legacy {
+                                        queue_reply(
+                                            &own_handle,
+                                            max_pending,
+                                            Message::Text(E2E_UNSUPPORTED_ERROR.into()),
+                                        );
+                                        closer.close(
+                                            &tx,
+                                            &pending,
+                                            CLOSE_E2E_UNSUPPORTED,
+                                            "e2e suite unsupported",
+                                        );
+                                        continue;
+                                    }
+
+                                    // Once-only key exchange: never re-derive the cipher
+                                    // if this connection already has one. A repeated
+                                    // client_hello would otherwise overwrite the AES key
+                                    // mid-session (making in-flight encrypted messages
+                                    // undecryptable) and is a cheap ECDH-keygen DoS amplifier.
+                                    let key = if wants_encryption {
+                                        p.and_then(|p| p.get("encryption_public_key"))
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|b64| match derive_connection_key(b64) {
+                                            Ok(key) => Some(key),
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "[WSE] ECDH key exchange failed for {}: {}",
+                                                    conn_id, e
+                                                );
+                                                let err_msg = format!(
+                                                    "{{\"c\":\"WSE\",\"t\":\"error\",\"p\":{{\"code\":\"KEY_EXCHANGE_FAILED\",\"message\":\"ECDH key exchange failed: {}\",\"recoverable\":true}}}}",
+                                                    e.replace('\"', "\\\"")
+                                                );
+                                                queue_reply(
+                                                    &own_handle,
+                                                    max_pending,
+                                                    Message::Text(err_msg.into()),
+                                                );
+                                                None
+                                            }
+                                        })
+                                    } else {
+                                        None
                                     };
-                                    if let Ok(val) =
-                                        serde_json::from_str::<serde_json::Value>(json_str)
-                                    {
-                                        let val = normalize_json_keys(val);
-                                        // The clients encrypt their protocol
-                                        // messages too (all of them in a session).
-                                        if answer_protocol_message(
+
+                                    let hello = build_server_hello(
+                                        &conn_id,
+                                        client_proto,
+                                        &state,
+                                        key.as_ref()
+                                            .map(|(server_public, _)| server_public.as_str()),
+                                        None,
+                                    );
+                                    queue_reply(
+                                        &own_handle,
+                                        max_pending,
+                                        Message::Text(hello.into()),
+                                    );
+                                    // The key is in use only after server_hello is queued:
+                                    // an encrypted frame never reaches the client before
+                                    // the server's public key.
+                                    if let Some((_, cipher)) = key {
+                                        state
+                                            .conn_encryption
+                                            .insert((*conn_id).clone(), cipher.clone());
+                                        let _ = cipher_slot.set(Seal::Legacy(cipher));
+                                    }
+                                    continue;
+                                }
+                                if t_val == "ping" {
+                                    queue_reply(
+                                        &own_handle,
+                                        max_pending,
+                                        Message::Text(pong_for(&val).into()),
+                                    );
+                                    continue;
+                                }
+                                if t_val == "pong" || t_val == "PONG" {
+                                    continue;
+                                }
+                                if t_val == "client_config" {
+                                    apply_client_config(&state, &conn_id, val.get("p"));
+                                    continue;
+                                }
+                                if t_val == "subscription_update" && state.client_subscriptions {
+                                    if let Some(p) = val.get("p") {
+                                        answer_subscription_request(
                                             &state,
                                             &conn_id,
                                             &own_handle,
-                                            max_pending,
-                                            &val,
-                                        ) {
-                                            continue;
+                                            p,
+                                        );
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            // Normalize type→t, payload→p in serde_json (no GIL needed)
+                            let val = normalize_json_keys(val);
+
+                            // Drain mode: push serde_json::Value to queue (zero GIL)
+                            if drain {
+                                state.push_message(
+                                    InboundEvent::Message {
+                                        conn_id: (*conn_id).clone(),
+                                        value: val,
+                                    },
+                                    text.len(),
+                                );
+                            } else if let (Some(cb), Some(callback_lane)) =
+                                (&cached_on_message, &lane)
+                            {
+                                // Callback mode: convert to PyDict + call Python
+                                let cb_arc = cb.clone();
+                                let cid = Arc::clone(&conn_id);
+                                spawn_bounded_callback(
+                                    callback_lane,
+                                    &state,
+                                    text.len(),
+                                    move || {
+                                        Python::try_attach(|py| {
+                                            let py_obj = json_to_pyobj(py, &val);
+                                            if let Err(e) = cb_arc.call1(py, (&**cid, py_obj)) {
+                                                tracing::warn!("[WSE] on_message error: {e}");
+                                            }
+                                        });
+                                    },
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            // JSON parse failed — pass raw string
+                            if drain {
+                                state.push_message(
+                                    InboundEvent::RawText {
+                                        conn_id: (*conn_id).clone(),
+                                        text: text.to_string(),
+                                    },
+                                    text.len(),
+                                );
+                            } else if let (Some(cb), Some(callback_lane)) =
+                                (&cached_on_message, &lane)
+                            {
+                                let cb_arc = cb.clone();
+                                let cid = Arc::clone(&conn_id);
+                                let t = text.to_string();
+                                spawn_bounded_callback(callback_lane, &state, t.len(), move || {
+                                    Python::try_attach(|py| {
+                                        if let Err(e) = cb_arc.call1(py, (&**cid, &*t)) {
+                                            tracing::warn!("[WSE] on_message error: {e}");
                                         }
-                                        if drain {
-                                            state.push_message(
-                                                InboundEvent::Message {
-                                                    conn_id: (*conn_id).clone(),
-                                                    value: val,
-                                                },
-                                                text.len(),
-                                            );
-                                        } else if let (Some(cb), Some(callback_lane)) =
-                                            (&cached_on_message, &lane)
+                                    });
+                                });
+                            }
+                        }
+                    }
+                }
+                Message::Binary(data) => {
+                    state
+                        .messages_received_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    state
+                        .bytes_received_total
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+
+                    // E2E encryption: detect E: prefix and decrypt before processing
+                    if data.len() >= 2 && data[0] == b'E' && data[1] == b':' {
+                        let opened = match (session.as_mut(), cipher_slot.get()) {
+                            (Some(session), _) => match session.open(&data) {
+                                Ok(Some(plaintext)) => Some(Ok(plaintext)),
+                                // The client's close_notify: it closes next.
+                                Ok(None) => continue,
+                                Err(_) => {
+                                    closer.close(
+                                        &tx,
+                                        &pending,
+                                        CLOSE_E2E_BAD_FRAME,
+                                        "e2e frame refused",
+                                    );
+                                    continue;
+                                }
+                            },
+                            (None, Some(Seal::Legacy(cipher))) => {
+                                Some(decrypt_inbound(cipher, &data[2..]))
+                            }
+                            (None, _) => None,
+                        };
+                        if let Some(opened) = opened {
+                            match opened {
+                                Ok(plaintext) => {
+                                    // Decrypted payload is UTF-8 text (JSON with optional prefix)
+                                    if let Ok(text) = std::str::from_utf8(&plaintext) {
+                                        let json_str = if text.starts_with("WSE{") {
+                                            &text[3..]
+                                        } else if text.starts_with("S{") || text.starts_with("U{") {
+                                            &text[1..]
+                                        } else if text.starts_with('{') {
+                                            text
+                                        } else {
+                                            if drain {
+                                                state.push_message(
+                                                    InboundEvent::RawText {
+                                                        conn_id: (*conn_id).clone(),
+                                                        text: text.to_string(),
+                                                    },
+                                                    text.len(),
+                                                );
+                                            }
+                                            continue;
+                                        };
+                                        if let Ok(val) =
+                                            serde_json::from_str::<serde_json::Value>(json_str)
                                         {
-                                            let cb_arc = cb.clone();
-                                            let cid = Arc::clone(&conn_id);
-                                            spawn_bounded_callback(
-                                                callback_lane,
+                                            let val = normalize_json_keys(val);
+                                            // The clients encrypt their protocol
+                                            // messages too (all of them in a session).
+                                            if answer_protocol_message(
                                                 &state,
-                                                text.len(),
-                                                move || {
-                                                    Python::try_attach(|py| {
-                                                        let py_obj = json_to_pyobj(py, &val);
-                                                        if let Err(e) =
-                                                            cb_arc.call1(py, (&**cid, py_obj))
-                                                        {
-                                                            tracing::warn!(
-                                                                "[WSE] on_message (decrypted) error: {e}"
-                                                            );
-                                                        }
-                                                    });
-                                                },
-                                            );
+                                                &conn_id,
+                                                &own_handle,
+                                                max_pending,
+                                                &val,
+                                            ) {
+                                                continue;
+                                            }
+                                            if drain {
+                                                state.push_message(
+                                                    InboundEvent::Message {
+                                                        conn_id: (*conn_id).clone(),
+                                                        value: val,
+                                                    },
+                                                    text.len(),
+                                                );
+                                            } else if let (Some(cb), Some(callback_lane)) =
+                                                (&cached_on_message, &lane)
+                                            {
+                                                let cb_arc = cb.clone();
+                                                let cid = Arc::clone(&conn_id);
+                                                spawn_bounded_callback(
+                                                    callback_lane,
+                                                    &state,
+                                                    text.len(),
+                                                    move || {
+                                                        Python::try_attach(|py| {
+                                                            let py_obj = json_to_pyobj(py, &val);
+                                                            if let Err(e) =
+                                                                cb_arc.call1(py, (&**cid, py_obj))
+                                                            {
+                                                                tracing::warn!(
+                                                                    "[WSE] on_message (decrypted) error: {e}"
+                                                                );
+                                                            }
+                                                        });
+                                                    },
+                                                );
+                                            }
                                         }
                                     }
                                 }
+                                Err(e) => frame_errors.warn(&conn_id, &e),
                             }
-                            Err(e) => frame_errors.warn(&conn_id, &e),
+                        } else {
+                            frame_errors.warn(&conn_id, "encrypted frame before the key exchange");
                         }
-                    } else {
-                        frame_errors.warn(&conn_id, "encrypted frame before the key exchange");
+                        continue;
                     }
-                    continue;
-                }
 
-                // Check if this connection uses msgpack (lock-free DashMap read)
-                let is_msgpack = state
-                    .conn_formats
-                    .get(&*conn_id)
-                    .map(|v| *v)
-                    .unwrap_or(false);
+                    // Check if this connection uses msgpack (lock-free DashMap read)
+                    let is_msgpack = state
+                        .conn_formats
+                        .get(&*conn_id)
+                        .map(|v| *v)
+                        .unwrap_or(false);
 
-                // A msgpack client's message, decoded once here (the same
-                // dict the JSON text path makes); anything else stays bytes.
-                let decoded = if is_msgpack {
-                    inbound_msgpack(&data[..])
-                        .ok()
-                        .map(|value| normalize_json_keys(rmpv_to_serde_json(&value)))
-                } else {
-                    None
-                };
-                // Its protocol messages come in msgpack too: the server
-                // answers those itself.
-                if let Some(val) = &decoded
-                    && answer_protocol_message(&state, &conn_id, &own_handle, max_pending, val)
-                {
-                    continue;
-                }
-
-                if drain {
-                    let event = match decoded {
-                        Some(value) => InboundEvent::Message {
-                            conn_id: (*conn_id).clone(),
-                            value,
-                        },
-                        None => InboundEvent::Binary {
-                            conn_id: (*conn_id).clone(),
-                            data: data.to_vec(),
-                        },
-                    };
-                    state.push_message(event, data.len());
-                } else if let (Some(cb), Some(callback_lane)) = (&cached_on_message, &lane) {
-                    let cb_arc = cb.clone();
-                    let cid = Arc::clone(&conn_id);
-                    let size = data.len();
-                    let raw = if decoded.is_none() {
-                        data.to_vec()
+                    // A msgpack client's message, decoded once here (the same
+                    // dict the JSON text path makes); anything else stays bytes.
+                    let decoded = if is_msgpack {
+                        inbound_msgpack(&data[..])
+                            .ok()
+                            .map(|value| normalize_json_keys(rmpv_to_serde_json(&value)))
                     } else {
-                        Vec::new()
+                        None
                     };
-                    spawn_bounded_callback(callback_lane, &state, size, move || {
-                        Python::try_attach(|py| {
-                            let result = match &decoded {
-                                Some(val) => cb_arc.call1(py, (&**cid, json_to_pyobj(py, val))),
-                                None => cb_arc.call1(py, (&**cid, PyBytes::new(py, &raw))),
-                            };
-                            if let Err(e) = result {
-                                tracing::warn!("[WSE] on_message (binary) error: {e}");
-                            }
+                    // Its protocol messages come in msgpack too: the server
+                    // answers those itself.
+                    if let Some(val) = &decoded
+                        && answer_protocol_message(&state, &conn_id, &own_handle, max_pending, val)
+                    {
+                        continue;
+                    }
+
+                    if drain {
+                        let event = match decoded {
+                            Some(value) => InboundEvent::Message {
+                                conn_id: (*conn_id).clone(),
+                                value,
+                            },
+                            None => InboundEvent::Binary {
+                                conn_id: (*conn_id).clone(),
+                                data: data.to_vec(),
+                            },
+                        };
+                        state.push_message(event, data.len());
+                    } else if let (Some(cb), Some(callback_lane)) = (&cached_on_message, &lane) {
+                        let cb_arc = cb.clone();
+                        let cid = Arc::clone(&conn_id);
+                        let size = data.len();
+                        let raw = if decoded.is_none() {
+                            data.to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        spawn_bounded_callback(callback_lane, &state, size, move || {
+                            Python::try_attach(|py| {
+                                let result = match &decoded {
+                                    Some(val) => cb_arc.call1(py, (&**cid, json_to_pyobj(py, val))),
+                                    None => cb_arc.call1(py, (&**cid, PyBytes::new(py, &raw))),
+                                };
+                                if let Err(e) = result {
+                                    tracing::warn!("[WSE] on_message (binary) error: {e}");
+                                }
+                            });
                         });
-                    });
-                }
-            }
-            Message::Ping(payload) => {
-                queue_reply(&own_handle, max_pending, Message::Pong(payload));
-            }
-            Message::Close(frame) => {
-                let code = frame.map_or(PEER_CLOSE_WITHOUT_CODE, |f| {
-                    if f.code.is_allowed() {
-                        u32::from(u16::from(f.code))
-                    } else {
-                        1002 // protocol error
                     }
-                });
-                peer_close.store(code, Ordering::Release);
-                break;
+                }
+                Message::Ping(payload) => {
+                    queue_reply(&own_handle, max_pending, Message::Pong(payload));
+                }
+                Message::Close(frame) => {
+                    let code = frame.map_or(PEER_CLOSE_WITHOUT_CODE, |f| {
+                        if f.code.is_allowed() {
+                            u32::from(u16::from(f.code))
+                        } else {
+                            1002 // protocol error
+                        }
+                    });
+                    peer_close.store(code, Ordering::Release);
+                    break;
+                }
+                Message::Pong(_) | Message::Frame(_) => {}
             }
-            Message::Pong(_) | Message::Frame(_) => {}
         }
-    }
-    finish.cancel();
+    };
+    // Stopped at once when the connection must go (`Closer`).
+    let _ = futures_util::future::Abortable::new(read_loop, read_stop).await;
+    // The read side is done: the write task sends the close reply and ends.
+    finish.store(true, Ordering::Release);
+    own_handle.broadcast_notify.notify_one();
 
     // Cleanup
     {
