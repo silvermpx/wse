@@ -176,6 +176,24 @@ describe('E2E encryption, first design', () => {
     await vi.waitFor(() => expect(received).toEqual([1, 2, 3]));
   });
 
+  it('shows encryption only after a real handshake, whatever a message claims', async () => {
+    acquireSession({
+      key: makeSessionKey('cookie', [ENDPOINT]),
+      auth: 'cookie',
+      initialTopics: [],
+      config: { endpoints: [ENDPOINT], offline: { enabled: false } },
+    });
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const ws = FakeWebSocket.last();
+    ws.serverOpen();
+    ws.serverSend(serverReadyMessage());
+    ws.serverSend({ c: 'WSE', t: 'encryption_response', p: { enabled: true, algorithms: { encryption: 'AES-GCM' } }, v: 1 });
+    ws.serverSend({ c: 'WSE', t: 'key_rotation_response', p: { success: true }, v: 1 });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(useWSEStore.getState().security.encryptionEnabled).toBe(false);
+    expect(useWSEStore.getState().security.lastKeyRotation).toBeNull();
+  });
+
   it('refuses a message marked encrypted on a session without encryption', async () => {
     acquireSession({
       key: makeSessionKey('cookie', [ENDPOINT]),

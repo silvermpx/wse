@@ -1312,23 +1312,15 @@ export class MessageProcessor {
     useWSEStore.getState().updateMetrics({ lastHealthCheck: Date.now() });
   }
 
+  // An application's own messages: passed on as events. The store's security
+  // state follows the real handshake alone; a message claiming encryption
+  // must not make the client show it.
   private handleEncryptionResponse(message: WSMessage): void {
-    const payload = message.p || {};
-    if (payload.enabled !== undefined) {
-      useWSEStore.getState().updateSecurity({
-        encryptionEnabled: payload.enabled,
-        encryptionAlgorithm: payload.algorithms?.encryption || null
-      });
-    }
-    dispatchWSEEvent('encryptionResponse', payload);
+    dispatchWSEEvent('encryptionResponse', message.p || {});
   }
 
   private handleKeyRotationResponse(message: WSMessage): void {
-    const payload = message.p || {};
-    if (payload.success) {
-      useWSEStore.getState().updateSecurity({ lastKeyRotation: Date.now() });
-    }
-    dispatchWSEEvent('keyRotationResponse', payload);
+    dispatchWSEEvent('keyRotationResponse', message.p || {});
   }
 
   private handleConnectionStateResponse(message: WSMessage): void {
