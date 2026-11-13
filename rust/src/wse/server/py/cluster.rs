@@ -106,7 +106,7 @@ impl RustWSEServer {
             new_peer_tx: placeholder_new_peer_tx,
             cmd_tx: placeholder_cmd_tx,
             presence_tx: placeholder_presence_tx,
-            connected_instances: Arc::new(dashmap::DashMap::new()),
+            links: Arc::new(dashmap::DashMap::new()),
             known_peers: Arc::new(dashmap::DashSet::new()),
             local_topic_refcount: self.shared.local_topic_refcount.clone(),
             cluster_addr,

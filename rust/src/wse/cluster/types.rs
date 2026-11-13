@@ -8,8 +8,84 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::wse::server::ConnectionHandle;
+
+// ---------------------------------------------------------------------------
+// Live links, one per peer instance
+// ---------------------------------------------------------------------------
+
+/// The live link to one peer instance.
+pub(crate) struct Link {
+    /// Instance id of the node that dialed this link.
+    pub dialer: String,
+    /// Session number: a link's cleanup removes only its own entry, never the
+    /// link that replaced it.
+    pub session: u64,
+    /// Ends the link's tasks; a link that a better duplicate replaces is
+    /// closed through it.
+    pub cancel: CancellationToken,
+}
+
+/// Live links by peer instance id.
+pub(crate) type Links = DashMap<String, Link>;
+
+/// Why a new link is not kept.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LinkRefused {
+    /// The peer is this node itself (its own address in the peer list).
+    SelfLink,
+    /// Another link to the same instance exists and wins.
+    Duplicate,
+}
+
+/// Register a new link to the instance `peer`, dialed by `link.dialer`.
+///
+/// Any node may dial any other, so a newly started node can join through an
+/// older one. Two links to one instance appear when two nodes dial each other
+/// at the same moment, or when one node knows a peer under two addresses.
+/// Both nodes must then keep the same link, so the choice depends only on the
+/// two links: the one dialed by the lower instance id wins. A peer that dials
+/// again while we still hold its earlier link has given up on that one (a
+/// half-open connection), so the new link replaces it; a second link dialed by
+/// this node is surplus.
+pub(crate) fn claim_link(
+    links: &Links,
+    local: &str,
+    peer: &str,
+    link: Link,
+) -> Result<(), LinkRefused> {
+    use dashmap::mapref::entry::Entry;
+    if peer == local {
+        return Err(LinkRefused::SelfLink);
+    }
+    match links.entry(peer.to_string()) {
+        Entry::Vacant(e) => {
+            e.insert(link);
+            Ok(())
+        }
+        Entry::Occupied(mut e) => {
+            let existing = e.get();
+            let replace = if existing.dialer == link.dialer {
+                link.dialer == peer
+            } else {
+                link.dialer < existing.dialer
+            };
+            if !replace {
+                return Err(LinkRefused::Duplicate);
+            }
+            e.get().cancel.cancel();
+            e.insert(link);
+            Ok(())
+        }
+    }
+}
+
+/// Forget the link to `peer` if it is still the one from `session`.
+pub(crate) fn release_link(links: &Links, peer: &str, session: u64) {
+    links.remove_if(peer, |_, link| link.session == session);
+}
 
 // ---------------------------------------------------------------------------
 // ClusterContext: shared state passed to all cluster peer tasks
@@ -27,7 +103,7 @@ pub(crate) struct ClusterContext {
     pub new_peer_tx: mpsc::UnboundedSender<String>,
     pub cmd_tx: mpsc::UnboundedSender<ClusterCommand>,
     pub presence_tx: mpsc::UnboundedSender<PresencePeerFrame>,
-    pub connected_instances: Arc<DashMap<String, String>>,
+    pub links: Arc<Links>,
     pub known_peers: Arc<DashSet<String>>,
     pub local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     pub cluster_addr: Option<String>,
@@ -81,10 +157,6 @@ pub(crate) enum PeerRegistration {
     },
     Deregister {
         peer_addr: String,
-    },
-    UpdateCaps {
-        peer_addr: String,
-        negotiated_caps: u32,
     },
 }
 

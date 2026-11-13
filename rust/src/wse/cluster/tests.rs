@@ -1364,24 +1364,144 @@ async fn dispatch_channel_is_bounded_and_sheds_when_full() {
     );
 }
 
-// The duplicate-connection tiebreaker: for any pair exactly ONE direction
-// survives (the lower-id dialer), and a self-connection survives on neither.
+fn link(dialer: &str, session: u64) -> (Link, tokio_util::sync::CancellationToken) {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    (
+        Link {
+            dialer: dialer.to_string(),
+            session,
+            cancel: cancel.clone(),
+        },
+        cancel,
+    )
+}
+
+// Any node may open the first link to another, whichever of the two is newer.
 #[test]
-fn cluster_link_survives_keeps_exactly_one_direction() {
-    assert!(cluster_link_survives("a", "b")); // a dials b -> survives
-    assert!(!cluster_link_survives("b", "a")); // b dials a -> yields
-    assert!(cluster_link_survives("node-01", "node-02"));
-    assert!(!cluster_link_survives("node-02", "node-01"));
+fn the_first_link_to_an_instance_is_kept_whoever_dialed() {
+    let links = Links::new();
+    let (newer_dials, _) = link("02-newer", 1);
+    assert_eq!(
+        claim_link(&links, "01-older", "02-newer", newer_dials),
+        Ok(())
+    );
+    let links_b = Links::new();
+    let (older_dials, _) = link("01-older", 2);
+    assert_eq!(
+        claim_link(&links_b, "02-newer", "01-older", older_dials),
+        Ok(())
+    );
+}
 
-    // Self-connection (equal ids): neither side survives.
-    assert!(!cluster_link_survives("x", "x"));
+// Both nodes dial each other at once: each sees the same two links and keeps
+// the one dialed by the lower id, so they agree.
+#[test]
+fn simultaneous_links_settle_on_the_lower_dialer_on_both_nodes() {
+    // Node "a": the inbound from "b" registered first, then its own outbound.
+    let on_a = Links::new();
+    let (b_dialed, b_dialed_cancel) = link("b", 1);
+    assert_eq!(claim_link(&on_a, "a", "b", b_dialed), Ok(()));
+    let (a_dialed, _) = link("a", 2);
+    assert_eq!(claim_link(&on_a, "a", "b", a_dialed), Ok(()));
+    assert!(
+        b_dialed_cancel.is_cancelled(),
+        "the link dialed by b is closed on a"
+    );
+    assert_eq!(on_a.get("b").unwrap().dialer, "a");
 
-    // Mutual exclusion for any distinct pair -> never two links, never zero.
-    for (a, b) in [("alpha", "beta"), ("z", "a"), ("n1", "n2")] {
-        assert_ne!(
-            cluster_link_survives(a, b),
-            cluster_link_survives(b, a),
-            "exactly one of A->B / B->A must survive for {a},{b}"
-        );
+    // Node "b": its own outbound registered first, then the inbound from "a".
+    let on_b = Links::new();
+    let (b_out, b_out_cancel) = link("b", 3);
+    assert_eq!(claim_link(&on_b, "b", "a", b_out), Ok(()));
+    let (a_in, _) = link("a", 4);
+    assert_eq!(claim_link(&on_b, "b", "a", a_in), Ok(()));
+    assert!(b_out_cancel.is_cancelled());
+    assert_eq!(on_b.get("a").unwrap().dialer, "a");
+
+    // A later dial by "b" loses on both nodes.
+    let (late, late_cancel) = link("b", 5);
+    assert_eq!(
+        claim_link(&on_a, "a", "b", late),
+        Err(LinkRefused::Duplicate)
+    );
+    assert!(!late_cancel.is_cancelled());
+}
+
+#[test]
+fn a_redial_replaces_a_half_open_link_but_a_second_own_dial_is_surplus() {
+    let links = Links::new();
+    let (old, old_cancel) = link("peer", 1);
+    assert_eq!(claim_link(&links, "me", "peer", old), Ok(()));
+    let (redial, _) = link("peer", 2);
+    assert_eq!(claim_link(&links, "me", "peer", redial), Ok(()));
+    assert!(old_cancel.is_cancelled());
+
+    let other = Links::new();
+    let (mine, _) = link("me", 1);
+    assert_eq!(claim_link(&other, "me", "peer", mine), Ok(()));
+    let (mine_again, _) = link("me", 2);
+    assert_eq!(
+        claim_link(&other, "me", "peer", mine_again),
+        Err(LinkRefused::Duplicate)
+    );
+}
+
+#[test]
+fn self_links_are_refused_and_release_leaves_a_successor_alone() {
+    let links = Links::new();
+    let (to_self, _) = link("me", 1);
+    assert_eq!(
+        claim_link(&links, "me", "me", to_self),
+        Err(LinkRefused::SelfLink)
+    );
+
+    let (first, _) = link("peer", 1);
+    claim_link(&links, "me", "peer", first).unwrap();
+    let (second, _) = link("peer", 2);
+    claim_link(&links, "me", "peer", second).unwrap();
+    release_link(&links, "peer", 1); // the replaced session cleaning up late
+    assert_eq!(links.get("peer").unwrap().session, 2);
+    release_link(&links, "peer", 2);
+    assert!(links.get("peer").is_none());
+}
+
+#[test]
+fn gossip_addresses_may_be_ips_or_dns_names() {
+    for ok in [
+        "10.0.0.2:9999",
+        "[::1]:9999",
+        "wse-1.wse.default.svc:9999",
+        "node-2:7000",
+    ] {
+        assert!(super::manager::valid_peer_addr(ok), "{ok}");
     }
+    for bad in [
+        "10.0.0.2",
+        "host:0",
+        "http://x:1",
+        "a b:1",
+        "-bad:1",
+        ":1",
+        "x:99999",
+    ] {
+        assert!(!super::manager::valid_peer_addr(bad), "{bad}");
+    }
+}
+
+#[test]
+fn tls_server_names_handle_ipv6_and_dns_peers() {
+    use rustls::pki_types::ServerName;
+    assert!(matches!(
+        super::peer::server_name_for("[::1]:9000"),
+        Some(ServerName::IpAddress(_))
+    ));
+    assert!(matches!(
+        super::peer::server_name_for("10.1.2.3:9000"),
+        Some(ServerName::IpAddress(_))
+    ));
+    assert!(matches!(
+        super::peer::server_name_for("wse-0.wse:9000"),
+        Some(ServerName::DnsName(_))
+    ));
+    assert!(super::peer::server_name_for("no-port").is_none());
 }

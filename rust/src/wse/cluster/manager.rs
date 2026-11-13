@@ -17,8 +17,8 @@ use super::peer::PeerSpawnCtx;
 use super::{
     CAP_COMPRESSION, CAP_INTEREST_ROUTING, CAP_PRESENCE, CAP_RECOVERY, ClusterCommand,
     ClusterContext, ClusterDlq, ClusterDlqEntry, ClusterTlsConfig, InterestUpdate,
-    LOCAL_CAPABILITIES, MAX_CLUSTER_PEERS, MAX_REMOTE_INTEREST_PER_PEER, PeerRegistration,
-    PresencePeerFrame, encode_drain, encode_msg, encode_msg_compressed, encode_msg_with_recovery,
+    MAX_CLUSTER_PEERS, MAX_REMOTE_INTEREST_PER_PEER, PeerRegistration, PresencePeerFrame,
+    encode_drain, encode_msg, encode_msg_compressed, encode_msg_with_recovery,
     encode_peer_announce, encode_presence_update, encode_shutdown, encode_sub, encode_unsub,
 };
 
@@ -66,15 +66,18 @@ pub(crate) async fn cluster_manager(
         new_peer_tx,
         cmd_tx: gossip_cmd_tx,
         presence_tx: presence_peer_tx,
-        connected_instances: Arc::new(DashMap::new()),
+        links: Arc::new(DashMap::new()),
         known_peers: Arc::new(DashSet::new()),
         ..ctx
     };
 
-    // Per-peer channels: manager sends encoded BytesMut, peer task forwards to writer
-    // Each entry: (peer_addr, write_channel, negotiated_caps)
+    // Live links, outbound and inbound alike, as their sessions register
+    // them: (peer_addr, write channel, negotiated caps). Only these receive
+    // publishes, interest and presence, so nothing queues up for a peer that
+    // is not connected.
     let mut peer_txs: Vec<(String, mpsc::Sender<Bytes>, u32)> = Vec::new();
-    let mut peer_handles = Vec::new();
+    // Dial tasks by address, static and discovered.
+    let mut dialing: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
 
     let spawn_ctx = PeerSpawnCtx {
         instance_id: instance_id.clone(),
@@ -87,22 +90,10 @@ pub(crate) async fn cluster_manager(
 
     for peer_addr in &peers {
         ctx.known_peers.insert(peer_addr.clone());
-        let (tx, rx) = mpsc::channel::<Bytes>(10_000);
-        // Outbound peers: caps are negotiated in run_peer_session; default to full caps
-        // since all peers in current deployment run the same version.
-        peer_txs.push((peer_addr.clone(), tx, LOCAL_CAPABILITIES));
-        peer_handles.push(spawn_ctx.spawn(peer_addr.clone(), rx));
-    }
-
-    // Prune completed peer handles every 16 additions to prevent unbounded growth
-    let mut handles_since_prune = 0u32;
-    let mut prune_handles = |handles: &mut Vec<tokio::task::JoinHandle<()>>| {
-        handles_since_prune += 1;
-        if handles_since_prune >= 16 {
-            handles.retain(|h| !h.is_finished());
-            handles_since_prune = 0;
+        if !dialing.contains_key(peer_addr) {
+            dialing.insert(peer_addr.clone(), spawn_ctx.spawn(peer_addr.clone(), true));
         }
-    };
+    }
 
     // Start cluster listener for inbound peer connections (separate port)
     // Limit concurrent inbound connections to prevent resource exhaustion
@@ -366,29 +357,23 @@ pub(crate) async fn cluster_manager(
             }
             // Dynamic peer discovery: spawn connection tasks for newly discovered peers
             Some(new_addr) = new_peer_rx.recv() => {
-                // Validate address parses as a valid SocketAddr to prevent SSRF
-                if new_addr.parse::<std::net::SocketAddr>().is_err() {
+                if !valid_peer_addr(&new_addr) {
                     tracing::debug!("[WSE-Cluster] Ignoring invalid peer address from gossip: {new_addr}");
                     continue;
                 }
-                // Skip if we already know this peer or it's our own address
                 let is_self = ctx.cluster_addr.as_deref() == Some(&new_addr);
                 let already_known = !ctx.known_peers.insert(new_addr.clone());
                 if !is_self && !already_known {
-                    // Prune dead peer channels FIRST so closed entries don't block re-connection
-                    peer_txs.retain(|(_, tx, _)| !tx.is_closed());
-                    if !peer_txs.iter().any(|(a, _, _)| a == &new_addr) {
-                        if peer_txs.len() >= MAX_CLUSTER_PEERS {
-                            tracing::warn!(
-                                "[WSE-Cluster] Ignoring discovered peer {new_addr}: at capacity ({MAX_CLUSTER_PEERS} peers)"
-                            );
-                        } else {
-                            let (tx, rx) = mpsc::channel::<Bytes>(10_000);
-                            peer_txs.push((new_addr.clone(), tx, LOCAL_CAPABILITIES));
-                            peer_handles.push(spawn_ctx.spawn(new_addr.clone(), rx));
-                            prune_handles(&mut peer_handles);
-                            tracing::info!("[WSE-Cluster] Discovered new peer: {new_addr}");
-                        }
+                    dialing.retain(|_, task| !task.is_finished());
+                    if dialing.contains_key(&new_addr) {
+                        // Still being dialed.
+                    } else if dialing.len() >= MAX_CLUSTER_PEERS {
+                        tracing::warn!(
+                            "[WSE-Cluster] Ignoring discovered peer {new_addr}: at capacity ({MAX_CLUSTER_PEERS} peers)"
+                        );
+                    } else {
+                        dialing.insert(new_addr.clone(), spawn_ctx.spawn(new_addr.clone(), false));
+                        tracing::info!("[WSE-Cluster] Discovered new peer: {new_addr}");
                     }
                 }
             }
@@ -396,7 +381,7 @@ pub(crate) async fn cluster_manager(
             Some(gossip_cmd) = gossip_cmd_rx.recv() => {
                 if let ClusterCommand::GossipPeerAnnounce { addr, exclude_peer } = gossip_cmd {
                     // Validate address before processing
-                    if addr.parse::<std::net::SocketAddr>().is_err() {
+                    if !valid_peer_addr(&addr) {
                         tracing::debug!("[WSE-Cluster] Ignoring invalid gossip address: {addr}");
                         continue;
                     }
@@ -418,19 +403,16 @@ pub(crate) async fn cluster_manager(
                         }
                     }
                     // Only spawn connection to this peer if we don't already know it
-                    if ctx.known_peers.insert(addr.clone())
-                        && !peer_txs.iter().any(|(a, _, _)| a == &addr)
-                    {
-                        peer_txs.retain(|(_, tx, _)| !tx.is_closed());
-                        if peer_txs.len() >= MAX_CLUSTER_PEERS {
+                    if ctx.known_peers.insert(addr.clone()) {
+                        dialing.retain(|_, task| !task.is_finished());
+                        if dialing.contains_key(&addr) {
+                            // Still being dialed.
+                        } else if dialing.len() >= MAX_CLUSTER_PEERS {
                             tracing::warn!(
                                 "[WSE-Cluster] Ignoring gossip peer {addr}: at capacity ({MAX_CLUSTER_PEERS} peers)"
                             );
                         } else {
-                            let (tx, rx) = mpsc::channel::<Bytes>(10_000);
-                            peer_txs.push((addr.clone(), tx, LOCAL_CAPABILITIES));
-                            peer_handles.push(spawn_ctx.spawn(addr.clone(), rx));
-                            prune_handles(&mut peer_handles);
+                            dialing.insert(addr.clone(), spawn_ctx.spawn(addr.clone(), false));
                             tracing::info!("[WSE-Cluster] Discovered peer via gossip: {addr}");
                         }
                     }
@@ -500,24 +482,18 @@ pub(crate) async fn cluster_manager(
             Some(reg) = peer_reg_rx.recv() => {
                 match reg {
                     PeerRegistration::Register { peer_addr, write_tx, negotiated_caps } => {
-                        // Add inbound peer's write channel so it receives Publish/Sub/Unsub
-                        if !peer_txs.iter().any(|(a, _, _)| a == &peer_addr) {
-                            peer_txs.push((peer_addr.clone(), write_tx, negotiated_caps));
-                            tracing::info!("[WSE-Cluster] Registered inbound peer: {peer_addr} (caps=0x{negotiated_caps:08x})");
-                        }
+                        // A live session, outbound or inbound, with the caps its
+                        // handshake negotiated.
+                        peer_txs.retain(|(a, _, _)| a != &peer_addr);
+                        peer_txs.push((peer_addr.clone(), write_tx, negotiated_caps));
+                        tracing::debug!("[WSE-Cluster] Link up: {peer_addr} (caps=0x{negotiated_caps:08x})");
                     }
                     PeerRegistration::Deregister { peer_addr } => {
-                        // Remove disconnected inbound peer
                         peer_txs.retain(|(a, _, _)| a != &peer_addr);
-                        // Allow gossip-discovered peers to be re-discovered
-                        if !static_peers.contains(&peer_addr) {
+                        // A gossip-discovered peer that is no longer dialed can be
+                        // discovered again.
+                        if !static_peers.contains(&peer_addr) && !dialing.contains_key(&peer_addr) {
                             ctx.known_peers.remove(&peer_addr);
-                        }
-                    }
-                    PeerRegistration::UpdateCaps { peer_addr, negotiated_caps } => {
-                        // Update outbound peer caps after handshake negotiation
-                        if let Some((_, _, caps)) = peer_txs.iter_mut().find(|(a, _, _)| a == &peer_addr) {
-                            *caps = negotiated_caps;
                         }
                     }
                 }
@@ -588,9 +564,31 @@ pub(crate) async fn cluster_manager(
         });
     }
 
-    // Wait for all peer tasks to finish
-    for handle in peer_handles {
-        let _ = handle.await;
+    // Wait for all dial tasks to finish
+    for (_, task) in dialing {
+        let _ = task.await;
     }
     tracing::info!("[WSE-Cluster] Manager stopped");
+}
+
+/// Whether an address from gossip may be dialed: `ip:port`, `[ipv6]:port` or
+/// `dns-name:port`. Anything else (a path, a URL, a port of zero) is refused.
+pub(super) fn valid_peer_addr(addr: &str) -> bool {
+    if let Ok(sock) = addr.parse::<std::net::SocketAddr>() {
+        return sock.port() != 0;
+    }
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return false;
+    };
+    let port_ok = port.parse::<u16>().is_ok_and(|p| p != 0);
+    let host_ok = !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        });
+    port_ok && host_ok
 }

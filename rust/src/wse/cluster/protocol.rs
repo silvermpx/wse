@@ -701,15 +701,3 @@ pub(crate) fn negotiate_version(local_ver: u16, remote_ver: u16) -> Option<u16> 
 pub(crate) fn negotiate_capabilities(local: u32, remote: u32) -> u32 {
     local & remote
 }
-
-/// Deterministic duplicate-connection tiebreaker. When two nodes discover each
-/// other they BOTH dial, yielding two TCP links per pair; each node would then
-/// decide locally which to keep and, in ~half of races, keep opposite links so
-/// both get torn down and both reconnect (flapping). The surviving link is the
-/// one whose DIALER has the lexicographically-lower instance_id: the lower-id
-/// node keeps its outbound and the higher-id node rejects its own outbound and
-/// accepts the inbound. Equal ids (a self-connection) survive on neither side,
-/// so a node never connects to itself even if its own address is in its peer list.
-pub(crate) fn cluster_link_survives(dialer_id: &str, receiver_id: &str) -> bool {
-    dialer_id < receiver_id
-}

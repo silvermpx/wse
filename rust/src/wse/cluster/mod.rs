@@ -28,15 +28,16 @@ mod types;
 pub(crate) use inbound::handle_cluster_inbound;
 pub(crate) use manager::cluster_manager;
 pub(crate) use protocol::{
-    ClusterFrame, cluster_link_survives, decode_frame, encode_drain, encode_hello, encode_msg,
-    encode_msg_compressed, encode_msg_with_recovery, encode_peer_announce, encode_peer_list,
-    encode_ping, encode_pong, encode_presence_full, encode_presence_update, encode_resync,
-    encode_shutdown, encode_sub, encode_unsub, negotiate_capabilities, negotiate_version,
+    ClusterFrame, decode_frame, encode_drain, encode_hello, encode_msg, encode_msg_compressed,
+    encode_msg_with_recovery, encode_peer_announce, encode_peer_list, encode_ping, encode_pong,
+    encode_presence_full, encode_presence_update, encode_resync, encode_shutdown, encode_sub,
+    encode_unsub, negotiate_capabilities, negotiate_version,
 };
 pub(crate) use tls::{ClusterTlsConfig, build_cluster_tls};
 pub(crate) use types::{
     ClusterCommand, ClusterContext, ClusterDlq, ClusterDlqEntry, ClusterMetrics, InterestUpdate,
-    PeerInfo, PeerRegistration, PresencePeerFrame,
+    Link, LinkRefused, Links, PeerInfo, PeerRegistration, PresencePeerFrame, claim_link,
+    release_link,
 };
 
 use std::sync::atomic::AtomicU64;

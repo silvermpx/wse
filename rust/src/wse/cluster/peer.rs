@@ -18,11 +18,11 @@ use super::protocol::write_framed;
 use super::{
     CAP_PRESENCE, CLUSTER_RESYNC_INTERVAL_SECS, ClusterCommand, ClusterContext, ClusterFrame,
     ClusterMetrics, ClusterTlsConfig, DispatchItem, HEARTBEAT_INTERVAL_SECS,
-    HEARTBEAT_TIMEOUT_SECS, InterestUpdate, LOCAL_CAPABILITIES, MAX_BATCH_BYTES, MAX_FRAME_SIZE,
-    PEER_DISPATCH_QUEUE_CAP, PEER_SESSION_GENERATION, PROTOCOL_VERSION, PeerInfo, PeerRegistration,
-    PresencePeerFrame, cluster_link_survives, decode_frame, encode_hello, encode_peer_announce,
-    encode_peer_list, encode_ping, encode_pong, encode_presence_full, encode_resync, epoch_ms,
-    negotiate_capabilities, negotiate_version,
+    HEARTBEAT_TIMEOUT_SECS, InterestUpdate, LOCAL_CAPABILITIES, Link, LinkRefused, MAX_BATCH_BYTES,
+    MAX_FRAME_SIZE, PEER_DISPATCH_QUEUE_CAP, PEER_SESSION_GENERATION, PROTOCOL_VERSION, PeerInfo,
+    PeerRegistration, PresencePeerFrame, claim_link, decode_frame, encode_hello,
+    encode_peer_announce, encode_peer_list, encode_ping, encode_pong, encode_presence_full,
+    encode_resync, epoch_ms, negotiate_capabilities, negotiate_version, release_link,
 };
 use crate::wse::reliability::{CircuitBreaker, ExponentialBackoff};
 
@@ -36,6 +36,9 @@ pub(super) async fn peer_writer<W: AsyncWriteExt + Unpin>(
     cancel: CancellationToken,
     metrics: Arc<ClusterMetrics>,
 ) {
+    // Whichever of a link's tasks ends first ends the link: its cleanup then
+    // runs and the dialer reconnects.
+    let _end_link = cancel.clone().drop_guard();
     let mut buf = BytesMut::with_capacity(MAX_BATCH_BYTES);
 
     loop {
@@ -87,6 +90,7 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
     cancel: CancellationToken,
     session: (Arc<AtomicU64>, u64),
 ) {
+    let _end_link = cancel.clone().drop_guard();
     let (last_activity, generation) = session;
     // BufReader: bulk reads from TCP into 64KB buffer, serves read_exact from memory
     let mut reader = BufReader::with_capacity(65_536, reader);
@@ -257,6 +261,7 @@ pub(super) async fn peer_dispatch_task(
     ctx: ClusterContext,
     cancel: CancellationToken,
 ) {
+    let _end_link = cancel.clone().drop_guard();
     let mut batch: Vec<DispatchItem> = Vec::with_capacity(64);
 
     loop {
@@ -369,6 +374,7 @@ pub(super) async fn heartbeat_task(
     last_activity: Arc<AtomicU64>,
     local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
 ) {
+    let _end_link = cancel.clone().drop_guard();
     let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
     let mut resync_interval =
         tokio::time::interval(Duration::from_secs(CLUSTER_RESYNC_INTERVAL_SECS));
@@ -418,61 +424,101 @@ pub(super) async fn heartbeat_task(
 }
 
 // ---------------------------------------------------------------------------
-// Single peer connection task (connect + HELLO + spawn reader/writer/heartbeat)
+// Handshake helpers
 // ---------------------------------------------------------------------------
 
-/// Run HELLO exchange, RESYNC, then spawn reader/writer/heartbeat and forward data.
-/// Generic over AsyncRead/AsyncWrite to support both plaintext TCP and TLS streams.
-/// Returns when the peer disconnects or cancellation is triggered.
+/// Read one length-prefixed frame (the HELLO of a handshake). `Ok(None)` is a
+/// frame of an impossible size or one that does not decode.
+pub(super) async fn read_frame<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<ClusterFrame>> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf).await?;
+    let frame_len = u32::from_be_bytes(len_buf) as usize;
+    if frame_len == 0 || frame_len > MAX_FRAME_SIZE {
+        return Ok(None);
+    }
+    let mut frame_buf = BytesMut::zeroed(frame_len);
+    reader.read_exact(&mut frame_buf).await?;
+    Ok(decode_frame(frame_buf))
+}
+
+/// The TLS server name for a peer address: its IP address or DNS name without
+/// the port. IPv6 addresses come bracketed (`[::1]:9000`).
+pub(super) fn server_name_for(addr: &str) -> Option<ServerName<'static>> {
+    if let Ok(sock) = addr.parse::<std::net::SocketAddr>() {
+        return Some(ServerName::IpAddress(sock.ip().into()));
+    }
+    let (host, port) = addr.rsplit_once(':')?;
+    port.parse::<u16>().ok()?;
+    ServerName::try_from(host.to_owned()).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Outbound link: handshake, session and the dial loop
+// ---------------------------------------------------------------------------
+
+/// How an outbound attempt ended, and so what the dial loop does next.
+enum Outcome {
+    /// A session ran and the link closed: dial again.
+    Ended,
+    /// The handshake failed: back off, counting a failure.
+    Failed,
+    /// The peer is already linked to this node through a link that wins:
+    /// back off and try again later, in case that link goes away.
+    Duplicate,
+    /// The address is this node's own: stop dialing it.
+    SelfLink,
+    /// The cluster is shutting down.
+    Shutdown,
+}
+
+/// HELLO exchange, then the session until the link closes. Generic over
+/// AsyncRead/AsyncWrite for both plaintext TCP and TLS streams.
 async fn run_peer_session<R, W>(
     mut reader: R,
     mut writer: W,
     ids: (&str, &str),
-    data_rx: &mut mpsc::Receiver<Bytes>,
     ctx: &ClusterContext,
-    reliability: (&mut ExponentialBackoff, &mut CircuitBreaker),
+    peer_reg_tx: &mpsc::UnboundedSender<PeerRegistration>,
     session: (
         &Option<Arc<crate::wse::presence::PresenceManager>>,
         &CancellationToken,
     ),
-) -> (bool, u32)
+) -> Outcome
 where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
     let (peer_addr, instance_id) = ids;
-    let (backoff, breaker) = reliability;
     let (presence, global_cancel) = session;
-    // Send HELLO
+
     let mut hello_buf = BytesMut::new();
     encode_hello(&mut hello_buf, instance_id, LOCAL_CAPABILITIES);
     let mut frame = BytesMut::new();
     write_framed(&mut frame, &hello_buf);
     if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
-        breaker.record_failure();
         tracing::warn!("[WSE-Cluster] Failed to send HELLO to {peer_addr}");
-        return (false, 0);
+        return Outcome::Failed;
     }
 
-    // Read HELLO response
-    let peer_hello = match tokio::time::timeout(Duration::from_secs(5), async {
-        let mut len_buf = [0u8; 4];
-        reader.read_exact(&mut len_buf).await?;
-        let frame_len = u32::from_be_bytes(len_buf) as usize;
-        if frame_len == 0 || frame_len > MAX_FRAME_SIZE {
-            return Ok::<Option<ClusterFrame>, std::io::Error>(None);
-        }
-        let mut frame_buf = BytesMut::zeroed(frame_len);
-        reader.read_exact(&mut frame_buf).await?;
-        Ok(decode_frame(frame_buf))
-    })
-    .await
-    {
-        Ok(Ok(frame)) => frame,
-        _ => None,
-    };
+    let peer_hello =
+        match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut reader)).await {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(_)) => {
+                // A peer closes without answering when it keeps another link to
+                // this node, or when it is an older version that only accepts
+                // links from the lower instance id.
+                tracing::debug!("[WSE-Cluster] {peer_addr} closed the link during the handshake");
+                return Outcome::Failed;
+            }
+            Err(_) => {
+                tracing::warn!("[WSE-Cluster] No HELLO from {peer_addr} within 5s");
+                return Outcome::Failed;
+            }
+        };
 
-    let (peer_instance_id, _peer_version, peer_caps) = match peer_hello {
+    let (peer_instance_id, peer_version, peer_caps) = match peer_hello {
         Some(ClusterFrame::Hello {
             instance_id: peer_id,
             protocol_version,
@@ -487,57 +533,39 @@ where
                 tracing::warn!(
                     "[WSE-Cluster] Version mismatch with {peer_addr}: local={PROTOCOL_VERSION}, remote={protocol_version}"
                 );
-                breaker.record_failure();
-                return (false, 0);
+                return Outcome::Failed;
             }
         },
         _ => {
             tracing::warn!("[WSE-Cluster] Invalid HELLO from {peer_addr}");
-            breaker.record_failure();
-            return (false, 0);
+            return Outcome::Failed;
         }
     };
 
-    // Tiebreaker: we are the DIALER here. If our instance_id is not lower than the
-    // peer's, the peer is the designated dialer -- drop our outbound (it will dial
-    // us and we accept that inbound), so exactly one link survives per pair. Equal
-    // ids = a self-connection, also dropped. Do NOT touch connected_instances: the
-    // peer's inbound link may already hold its instance_id and removing it would
-    // clobber a valid link. Return success so peer_connection_task does not treat
-    // this as a failure and tight-loop; a later reconnect just yields again.
-    if !cluster_link_survives(instance_id, &peer_instance_id) {
-        tracing::debug!(
-            "[WSE-Cluster] Yielding outbound to {peer_addr}: instance {peer_instance_id} is the designated dialer"
-        );
-        return (true, peer_caps);
-    }
-
-    // Duplicate connection prevention: atomic check-and-insert via entry() API
-    // to avoid TOCTOU race between contains_key and insert
-    {
-        use dashmap::mapref::entry::Entry;
-        match ctx.connected_instances.entry(peer_instance_id.clone()) {
-            Entry::Occupied(_) => {
-                tracing::info!(
-                    "[WSE-Cluster] Already connected to instance {}, dropping duplicate from {peer_addr}",
-                    peer_instance_id
-                );
-                // Record failure so peer_connection_task backs off instead of spinning
-                breaker.record_failure();
-                return (false, peer_caps);
-            }
-            Entry::Vacant(e) => {
-                e.insert(peer_addr.to_string());
-            }
+    let peer_cancel = global_cancel.child_token();
+    let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
+    let link = Link {
+        dialer: instance_id.to_owned(),
+        session: session_gen,
+        cancel: peer_cancel.clone(),
+    };
+    match claim_link(&ctx.links, instance_id, &peer_instance_id, link) {
+        Ok(()) => {}
+        Err(LinkRefused::SelfLink) => {
+            tracing::info!("[WSE-Cluster] {peer_addr} is this node's own address; not dialing it");
+            return Outcome::SelfLink;
+        }
+        Err(LinkRefused::Duplicate) => {
+            tracing::debug!(
+                "[WSE-Cluster] Already linked to instance {peer_instance_id}; keeping that link instead of {peer_addr}"
+            );
+            return Outcome::Duplicate;
         }
     }
 
-    // Connected successfully
     tracing::info!(
-        "[WSE-Cluster] Connected to {peer_addr} (v{_peer_version}, caps=0x{peer_caps:08x})"
+        "[WSE-Cluster] Connected to {peer_addr} (v{peer_version}, caps=0x{peer_caps:08x})"
     );
-    breaker.record_success();
-    backoff.reset();
     ctx.metrics.connected_peers.fetch_add(1, Ordering::Relaxed);
     ctx.metrics.peer_info.insert(
         peer_addr.to_owned(),
@@ -549,32 +577,29 @@ where
         },
     );
 
-    // Send RESYNC with all current local topics (before spawning writer task)
-    {
-        let local_topics: Vec<String> = {
-            let refcounts = ctx
-                .local_topic_refcount
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            refcounts.keys().cloned().collect()
-        };
-        if !local_topics.is_empty() {
-            let resync_frames = encode_resync(&local_topics);
-            let mut wire_buf = BytesMut::new();
-            for frame in &resync_frames {
-                write_framed(&mut wire_buf, frame);
-            }
-            if writer.write_all(&wire_buf).await.is_err() || writer.flush().await.is_err() {
-                tracing::warn!("[WSE-Cluster] Failed to send RESYNC to {peer_addr}");
-                ctx.connected_instances.remove(&peer_instance_id);
-                ctx.metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
-                ctx.metrics.peer_info.remove(peer_addr);
-                return (false, peer_caps); // Will reconnect
-            }
+    // RESYNC with all current local topics, before the writer task starts.
+    let local_topics: Vec<String> = ctx
+        .local_topic_refcount
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    if !local_topics.is_empty() {
+        let mut wire_buf = BytesMut::new();
+        for frame in &encode_resync(&local_topics) {
+            write_framed(&mut wire_buf, frame);
+        }
+        if writer.write_all(&wire_buf).await.is_err() || writer.flush().await.is_err() {
+            tracing::warn!("[WSE-Cluster] Failed to send RESYNC to {peer_addr}");
+            release_link(&ctx.links, &peer_instance_id, session_gen);
+            ctx.metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
+            ctx.metrics.peer_info.remove(peer_addr);
+            return Outcome::Failed;
         }
     }
 
-    // Send PEER_ANNOUNCE with our cluster address (if in discovery mode)
+    // PEER_ANNOUNCE with our cluster address (discovery mode)
     if let Some(ref our_addr) = ctx.cluster_addr {
         let mut announce_buf = BytesMut::new();
         encode_peer_announce(&mut announce_buf, our_addr);
@@ -584,25 +609,21 @@ where
         let _ = writer.flush().await;
     }
 
-    // Send PEER_LIST with all known peers
-    {
-        let addrs: Vec<String> = ctx.known_peers.iter().map(|r| r.key().clone()).collect();
-        if !addrs.is_empty() {
-            let mut list_buf = BytesMut::new();
-            encode_peer_list(&mut list_buf, &addrs);
-            let mut list_frame = BytesMut::new();
-            write_framed(&mut list_frame, &list_buf);
-            let _ = writer.write_all(&list_frame).await;
-            let _ = writer.flush().await;
-        }
+    // PEER_LIST with all known peers
+    let addrs: Vec<String> = ctx.known_peers.iter().map(|r| r.key().clone()).collect();
+    if !addrs.is_empty() {
+        let mut list_buf = BytesMut::new();
+        encode_peer_list(&mut list_buf, &addrs);
+        let mut list_frame = BytesMut::new();
+        write_framed(&mut list_frame, &list_buf);
+        let _ = writer.write_all(&list_frame).await;
+        let _ = writer.flush().await;
     }
 
-    // Send full presence state to new peer (only if peer supports presence)
+    // Full presence state, chunked so a large state still arrives whole.
     if peer_caps & CAP_PRESENCE != 0
         && let Some(pm) = presence
     {
-        // Chunked so a node with >1 frame of presence still sends its full state
-        // (a single oversized frame was previously dropped, leaving the peer blind).
         for entries in pm.serialize_full_state_chunked(MAX_FRAME_SIZE - 1024) {
             let mut buf = BytesMut::new();
             if encode_presence_full(&mut buf, &entries) {
@@ -616,8 +637,6 @@ where
         }
     }
 
-    // Spawn reader, writer, heartbeat with child cancellation token
-    let peer_cancel = global_cancel.child_token();
     let (peer_write_tx, peer_write_rx) = mpsc::channel::<Bytes>(10_000);
     let last_activity = Arc::new(AtomicU64::new(epoch_ms()));
 
@@ -629,14 +648,12 @@ where
     ));
 
     let (dispatch_tx, dispatch_rx) = mpsc::channel::<DispatchItem>(PEER_DISPATCH_QUEUE_CAP);
-
     let dispatch_handle = tokio::spawn(peer_dispatch_task(
         dispatch_rx,
         ctx.clone(),
         peer_cancel.clone(),
     ));
 
-    let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
     let reader_handle = tokio::spawn(peer_reader(
         reader,
         peer_write_tx.clone(),
@@ -654,53 +671,50 @@ where
         ctx.local_topic_refcount.clone(),
     ));
 
-    // Forward data from cluster manager to this peer's writer
-    loop {
-        let data = tokio::select! {
-            data = data_rx.recv() => data,
-            () = peer_cancel.cancelled() => break,
-            () = global_cancel.cancelled() => {
-                peer_cancel.cancel();
-                break;
-            }
-        };
+    // From now on the manager routes publishes, interest and presence here,
+    // with the capabilities this handshake negotiated.
+    let _ = peer_reg_tx.send(PeerRegistration::Register {
+        peer_addr: peer_addr.to_owned(),
+        write_tx: peer_write_tx,
+        negotiated_caps: peer_caps,
+    });
 
-        match data {
-            Some(frame_data) => {
-                if peer_write_tx.try_send(frame_data).is_err() {
-                    ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            None => {
-                // Manager channel closed (shutdown)
-                peer_cancel.cancel();
-                break;
-            }
-        }
-    }
-
-    // Cleanup
-    peer_cancel.cancel();
+    // The link ends when any of its tasks ends, when a better duplicate
+    // replaces it, or on shutdown (the token is a child of the global one).
+    peer_cancel.cancelled().await;
     let _ = writer_handle.await;
     let _ = reader_handle.await;
     let _ = dispatch_handle.await;
     let _ = heartbeat_handle.await;
+
+    let _ = peer_reg_tx.send(PeerRegistration::Deregister {
+        peer_addr: peer_addr.to_owned(),
+    });
     ctx.metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
     ctx.metrics.peer_info.remove(peer_addr);
-    ctx.connected_instances.remove(&peer_instance_id);
+    release_link(&ctx.links, &peer_instance_id, session_gen);
     let _ = ctx.interest_tx.send(InterestUpdate::PeerDisconnected {
         peer_addr: peer_addr.to_owned(),
         generation: session_gen,
     });
     tracing::info!("[WSE-Cluster] Disconnected from {peer_addr}");
 
-    (global_cancel.is_cancelled(), peer_caps)
+    if global_cancel.is_cancelled() {
+        Outcome::Shutdown
+    } else {
+        Outcome::Ended
+    }
 }
+
+/// Consecutive failed connects after which a peer learned through gossip is
+/// given up: it has most likely left the cluster. Static peers are dialed for
+/// as long as the node runs.
+const MAX_UNREACHABLE_ATTEMPTS: u32 = 10;
 
 async fn peer_connection_task(
     peer_addr: String,
     instance_id: String,
-    mut data_rx: mpsc::Receiver<Bytes>,
+    is_static: bool,
     ctx: ClusterContext,
     tls_config: Option<Arc<arc_swap::ArcSwap<ClusterTlsConfig>>>,
     peer_reg_tx: mpsc::UnboundedSender<PeerRegistration>,
@@ -712,17 +726,20 @@ async fn peer_connection_task(
     let (presence, global_cancel) = session;
     let mut backoff = ExponentialBackoff::new();
     let mut breaker = CircuitBreaker::new();
+    let mut unreachable = 0u32;
 
     loop {
         if global_cancel.is_cancelled() {
             break;
         }
+        if !is_static && unreachable >= MAX_UNREACHABLE_ATTEMPTS {
+            tracing::info!(
+                "[WSE-Cluster] Giving up on {peer_addr}: unreachable for {unreachable} attempts"
+            );
+            ctx.known_peers.remove(&peer_addr);
+            break;
+        }
 
-        // Drain stale messages buffered during backoff/reconnect to prevent
-        // unbounded memory growth and replaying outdated data to the peer.
-        while data_rx.try_recv().is_ok() {}
-
-        // Circuit breaker check
         if !breaker.can_execute() {
             let delay = breaker.reset_timeout;
             tracing::warn!(
@@ -735,41 +752,32 @@ async fn peer_connection_task(
             }
         }
 
-        // TCP connect with timeout
-        let stream = match tokio::time::timeout(
-            Duration::from_secs(5),
-            TcpStream::connect(&peer_addr),
-        )
-        .await
-        {
+        let connected =
+            tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&peer_addr)).await;
+        let stream = match connected {
             Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => {
+            failed => {
+                unreachable += 1;
                 breaker.record_failure();
                 ctx.metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
                 let delay = backoff.next_delay();
-                tracing::warn!(
-                    "[WSE-Cluster] Connect failed {peer_addr}: {e}. Retry in {:.1}s",
-                    delay.as_secs_f64()
-                );
-                tokio::select! {
-                    () = tokio::time::sleep(delay) => continue,
-                    () = global_cancel.cancelled() => break,
+                match failed {
+                    Ok(Err(e)) => tracing::warn!(
+                        "[WSE-Cluster] Connect failed {peer_addr}: {e}. Retry in {:.1}s",
+                        delay.as_secs_f64()
+                    ),
+                    _ => tracing::warn!(
+                        "[WSE-Cluster] Connect timeout {peer_addr}. Retry in {:.1}s",
+                        delay.as_secs_f64()
+                    ),
                 }
-            }
-            Err(_) => {
-                breaker.record_failure();
-                ctx.metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
-                let delay = backoff.next_delay();
-                tracing::warn!(
-                    "[WSE-Cluster] Connect timeout {peer_addr}. Retry in {:.1}s",
-                    delay.as_secs_f64()
-                );
                 tokio::select! {
                     () = tokio::time::sleep(delay) => continue,
                     () = global_cancel.cancelled() => break,
                 }
             }
         };
+        unreachable = 0;
 
         // TCP_NODELAY + keepalive + larger buffers for throughput
         let _ = stream.set_nodelay(true);
@@ -781,30 +789,14 @@ async fn peer_connection_task(
         let _ = sock_ref.set_recv_buffer_size(262_144);
         let _ = sock_ref.set_send_buffer_size(262_144);
 
-        // TLS handshake or plaintext split, then run session.
-        // Load current TLS config snapshot -- safe even if a reload swaps the
-        // config mid-flight because TlsAcceptor/TlsConnector internally use Arc.
+        // The TLS config is read per attempt, so a reload applies to the next dial.
         let tls_snap = tls_config.as_ref().map(|holder| holder.load());
-        let result = if let Some(ref tls) = tls_snap {
-            // Extract hostname/IP from peer_addr for SNI
-            let host = peer_addr.split(':').next().unwrap_or(&peer_addr);
-            let server_name = match host.parse::<std::net::IpAddr>() {
-                Ok(ip) => ServerName::IpAddress(ip.into()),
-                Err(_) => match ServerName::try_from(host.to_owned()) {
-                    Ok(name) => name,
-                    Err(e) => {
-                        breaker.record_failure();
-                        let delay = backoff.next_delay();
-                        tracing::error!(
-                            "[WSE-Cluster] Invalid peer address for TLS SNI '{host}': {e}. Retry in {:.1}s",
-                            delay.as_secs_f64()
-                        );
-                        tokio::select! {
-                            () = tokio::time::sleep(delay) => continue,
-                            () = global_cancel.cancelled() => break,
-                        }
-                    }
-                },
+        let outcome = if let Some(ref tls) = tls_snap {
+            let Some(server_name) = server_name_for(&peer_addr) else {
+                tracing::error!(
+                    "[WSE-Cluster] {peer_addr} is not a host:port address usable for TLS; not dialing it"
+                );
+                break;
             };
             match tokio::time::timeout(
                 Duration::from_secs(5),
@@ -818,74 +810,52 @@ async fn peer_connection_task(
                         reader,
                         writer,
                         (&peer_addr, &instance_id),
-                        &mut data_rx,
                         &ctx,
-                        (&mut backoff, &mut breaker),
+                        &peer_reg_tx,
                         (&presence, &global_cancel),
                     )
                     .await
                 }
                 Ok(Err(e)) => {
-                    breaker.record_failure();
-                    ctx.metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
-                    let delay = backoff.next_delay();
-                    tracing::warn!(
-                        "[WSE-Cluster] TLS handshake failed {peer_addr}: {e}. Retry in {:.1}s",
-                        delay.as_secs_f64()
-                    );
-                    tokio::select! {
-                        () = tokio::time::sleep(delay) => continue,
-                        () = global_cancel.cancelled() => break,
-                    }
+                    tracing::warn!("[WSE-Cluster] TLS handshake failed {peer_addr}: {e}");
+                    Outcome::Failed
                 }
                 Err(_) => {
-                    breaker.record_failure();
-                    ctx.metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
-                    let delay = backoff.next_delay();
-                    tracing::warn!(
-                        "[WSE-Cluster] TLS handshake timeout {peer_addr}. Retry in {:.1}s",
-                        delay.as_secs_f64()
-                    );
-                    tokio::select! {
-                        () = tokio::time::sleep(delay) => continue,
-                        () = global_cancel.cancelled() => break,
-                    }
+                    tracing::warn!("[WSE-Cluster] TLS handshake timeout {peer_addr}");
+                    Outcome::Failed
                 }
             }
         } else {
-            // Plaintext: split into owned halves
             let (reader, writer) = stream.into_split();
             run_peer_session(
                 reader,
                 writer,
                 (&peer_addr, &instance_id),
-                &mut data_rx,
                 &ctx,
-                (&mut backoff, &mut breaker),
+                &peer_reg_tx,
                 (&presence, &global_cancel),
             )
             .await
         };
 
-        let (should_stop, negotiated_caps) = result;
-
-        // Update outbound peer caps after handshake negotiation
-        if negotiated_caps != 0 {
-            let _ = peer_reg_tx.send(PeerRegistration::UpdateCaps {
-                peer_addr: peer_addr.clone(),
-                negotiated_caps,
-            });
-        }
-
-        if should_stop {
-            break;
-        }
-
-        // Reconnect
-        ctx.metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
-        let delay = backoff.next_delay();
-        tracing::info!(
-            "[WSE-Cluster] Reconnecting to {peer_addr} in {:.1}s",
+        let delay = match outcome {
+            Outcome::Shutdown | Outcome::SelfLink => break,
+            Outcome::Ended => {
+                breaker.record_success();
+                backoff.reset();
+                ctx.metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
+                backoff.next_delay()
+            }
+            Outcome::Failed => {
+                breaker.record_failure();
+                ctx.metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
+                backoff.next_delay()
+            }
+            // The peer answered: no failure, but no need to redial soon.
+            Outcome::Duplicate => backoff.next_delay(),
+        };
+        tracing::debug!(
+            "[WSE-Cluster] Dialing {peer_addr} again in {:.1}s",
             delay.as_secs_f64()
         );
         tokio::select! {
@@ -906,15 +876,14 @@ pub(super) struct PeerSpawnCtx {
 }
 
 impl PeerSpawnCtx {
-    pub(super) fn spawn(
-        &self,
-        peer_addr: String,
-        data_rx: mpsc::Receiver<Bytes>,
-    ) -> tokio::task::JoinHandle<()> {
+    /// Start dialing `peer_addr`. A static peer (from the configuration) is
+    /// dialed for as long as the node runs; one learned through gossip is
+    /// given up after it stays unreachable.
+    pub(super) fn spawn(&self, peer_addr: String, is_static: bool) -> tokio::task::JoinHandle<()> {
         tokio::spawn(peer_connection_task(
             peer_addr,
             self.instance_id.clone(),
-            data_rx,
+            is_static,
             self.ctx.clone(),
             self.tls_config.clone(),
             self.peer_reg_tx.clone(),

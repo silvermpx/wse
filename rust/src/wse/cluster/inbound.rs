@@ -9,19 +9,19 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use dashmap::{DashMap, DashSet};
 use socket2::{SockRef, TcpKeepalive};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::peer::{heartbeat_task, peer_dispatch_task, peer_reader, peer_writer};
+use super::peer::{heartbeat_task, peer_dispatch_task, peer_reader, peer_writer, read_frame};
 use super::protocol::write_framed;
 use super::{
     CAP_PRESENCE, ClusterCommand, ClusterContext, ClusterFrame, DispatchItem, InterestUpdate,
-    LOCAL_CAPABILITIES, MAX_FRAME_SIZE, PEER_DISPATCH_QUEUE_CAP, PEER_SESSION_GENERATION,
-    PROTOCOL_VERSION, PeerInfo, PeerRegistration, PresencePeerFrame, cluster_link_survives,
-    decode_frame, encode_hello, encode_peer_announce, encode_peer_list, encode_presence_full,
-    encode_resync, epoch_ms, negotiate_capabilities, negotiate_version,
+    LOCAL_CAPABILITIES, Link, LinkRefused, Links, MAX_FRAME_SIZE, PEER_DISPATCH_QUEUE_CAP,
+    PEER_SESSION_GENERATION, PROTOCOL_VERSION, PeerInfo, PeerRegistration, PresencePeerFrame,
+    claim_link, encode_hello, encode_peer_announce, encode_peer_list, encode_presence_full,
+    encode_resync, epoch_ms, negotiate_capabilities, negotiate_version, release_link,
 };
 
 // ---------------------------------------------------------------------------
@@ -43,22 +43,11 @@ pub(super) async fn handle_cluster_inbound_generic<S>(
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     // Read peer's HELLO frame
-    let peer_hello = match tokio::time::timeout(Duration::from_secs(5), async {
-        let mut len_buf = [0u8; 4];
-        reader.read_exact(&mut len_buf).await?;
-        let frame_len = u32::from_be_bytes(len_buf) as usize;
-        if frame_len == 0 || frame_len > MAX_FRAME_SIZE {
-            return Ok::<Option<ClusterFrame>, std::io::Error>(None);
-        }
-        let mut frame_buf = BytesMut::zeroed(frame_len);
-        reader.read_exact(&mut frame_buf).await?;
-        Ok(decode_frame(frame_buf))
-    })
-    .await
-    {
-        Ok(Ok(frame)) => frame,
-        _ => None,
-    };
+    let peer_hello =
+        match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut reader)).await {
+            Ok(Ok(frame)) => frame,
+            _ => None,
+        };
 
     let (peer_instance_id, _peer_version, peer_caps) = match peer_hello {
         Some(ClusterFrame::Hello {
@@ -84,31 +73,26 @@ pub(super) async fn handle_cluster_inbound_generic<S>(
         }
     };
 
-    // Tiebreaker: the peer is the DIALER here, we are the receiver. If the peer's
-    // instance_id is not lower than ours, WE are the designated dialer -- reject
-    // this inbound (we keep our own outbound to the peer instead), so exactly one
-    // link survives per pair. Equal ids = a self-connection, also rejected.
-    if !cluster_link_survives(&peer_instance_id, instance_id) {
-        tracing::debug!(
-            "[WSE-Cluster] Rejecting inbound from {addr}: we (instance {instance_id}) are the designated dialer for {peer_instance_id}"
-        );
-        return;
-    }
-
-    // Duplicate connection prevention: atomic check-and-insert via entry() API
-    {
-        use dashmap::mapref::entry::Entry;
-        match ctx.connected_instances.entry(peer_instance_id.clone()) {
-            Entry::Occupied(_) => {
-                tracing::info!(
-                    "[WSE-Cluster] Already connected to instance {}, rejecting inbound from {addr}",
-                    peer_instance_id
-                );
-                return;
-            }
-            Entry::Vacant(e) => {
-                e.insert(addr.to_string());
-            }
+    // Claim the link. Refused, it closes before our HELLO: the dialer keeps
+    // retrying with backoff, in case the link that won goes away.
+    let cancel = global_cancel.child_token();
+    let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
+    let link = Link {
+        dialer: peer_instance_id.clone(),
+        session: session_gen,
+        cancel: cancel.clone(),
+    };
+    match claim_link(&ctx.links, instance_id, &peer_instance_id, link) {
+        Ok(()) => {}
+        Err(LinkRefused::SelfLink) => {
+            tracing::debug!("[WSE-Cluster] Closing inbound from {addr}: it is this node");
+            return;
+        }
+        Err(LinkRefused::Duplicate) => {
+            tracing::debug!(
+                "[WSE-Cluster] Closing inbound from {addr}: already linked to instance {peer_instance_id}"
+            );
+            return;
         }
     }
 
@@ -119,7 +103,7 @@ pub(super) async fn handle_cluster_inbound_generic<S>(
     write_framed(&mut frame, &hello_buf);
     if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
         tracing::error!("[WSE-Cluster] Failed to send HELLO to inbound {addr}");
-        ctx.connected_instances.remove(&peer_instance_id);
+        release_link(&ctx.links, &peer_instance_id, session_gen);
         return;
     }
 
@@ -140,7 +124,7 @@ pub(super) async fn handle_cluster_inbound_generic<S>(
             }
             if writer.write_all(&wire_buf).await.is_err() || writer.flush().await.is_err() {
                 tracing::warn!("[WSE-Cluster] Failed to send RESYNC to inbound {addr}");
-                ctx.connected_instances.remove(&peer_instance_id);
+                release_link(&ctx.links, &peer_instance_id, session_gen);
                 return;
             }
         }
@@ -205,7 +189,6 @@ pub(super) async fn handle_cluster_inbound_generic<S>(
         },
     );
 
-    let cancel = global_cancel.child_token();
     let (write_tx, write_rx) = mpsc::channel::<Bytes>(10_000);
     let last_activity = Arc::new(AtomicU64::new(epoch_ms()));
 
@@ -229,7 +212,6 @@ pub(super) async fn handle_cluster_inbound_generic<S>(
     let dispatch_handle =
         tokio::spawn(peer_dispatch_task(dispatch_rx, ctx.clone(), cancel.clone()));
 
-    let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
     let reader_handle = tokio::spawn(peer_reader(
         reader,
         write_tx.clone(),
@@ -247,20 +229,10 @@ pub(super) async fn handle_cluster_inbound_generic<S>(
         ctx.local_topic_refcount.clone(),
     ));
 
-    // Wait for any task to finish, then cancel + await all (prevents task leaks)
-    tokio::pin!(
-        reader_handle,
-        writer_handle,
-        heartbeat_handle,
-        dispatch_handle
-    );
-    tokio::select! {
-        _ = &mut reader_handle => {}
-        _ = &mut writer_handle => {}
-        _ = &mut heartbeat_handle => {}
-        _ = &mut dispatch_handle => {}
-    }
-    cancel.cancel();
+    // The link ends when any of its tasks ends (each cancels the token as it
+    // exits), when a better duplicate replaces it, or on shutdown. Only then
+    // are the tasks awaited, so none is polled again after it finished.
+    cancel.cancelled().await;
     let _ = reader_handle.await;
     let _ = writer_handle.await;
     let _ = dispatch_handle.await;
@@ -270,7 +242,7 @@ pub(super) async fn handle_cluster_inbound_generic<S>(
     let _ = peer_reg_tx.send(PeerRegistration::Deregister {
         peer_addr: peer_addr_str.clone(),
     });
-    ctx.connected_instances.remove(&peer_instance_id);
+    release_link(&ctx.links, &peer_instance_id, session_gen);
     ctx.metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
     ctx.metrics.peer_info.remove(&peer_addr_str);
     let _ = ctx.interest_tx.send(InterestUpdate::PeerDisconnected {
@@ -319,9 +291,8 @@ pub(crate) async fn handle_cluster_inbound(
     // Note: this static persists across server restarts within the same process, but entries
     // are always cleaned up in handle_cluster_inbound_generic on disconnect.
     // Legacy path is mutually exclusive with connect_cluster (which uses its own DashMap).
-    static LEGACY_CONNECTED: std::sync::OnceLock<Arc<DashMap<String, String>>> =
-        std::sync::OnceLock::new();
-    let connected_instances = LEGACY_CONNECTED
+    static LEGACY_LINKS: std::sync::OnceLock<Arc<Links>> = std::sync::OnceLock::new();
+    let links = LEGACY_LINKS
         .get_or_init(|| Arc::new(DashMap::new()))
         .clone();
     // Legacy path has no global_cancel -- create a standalone token.
@@ -339,7 +310,7 @@ pub(crate) async fn handle_cluster_inbound(
         new_peer_tx,
         cmd_tx,
         presence_tx,
-        connected_instances,
+        links,
         known_peers: legacy_known_peers,
         local_topic_refcount: shared.local_topic_refcount.clone(),
         cluster_addr: None,

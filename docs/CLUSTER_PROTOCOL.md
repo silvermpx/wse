@@ -12,7 +12,7 @@ WSE uses a custom binary protocol for communication between cluster nodes. All i
 
 If the HELLO handshake fails - wrong magic bytes, unsupported version, or malformed payload - the connection is closed immediately and the initiator retries with exponential backoff.
 
-**Duplicate-link tiebreaker.** When two nodes dial each other at the same time, both links complete and a deterministic rule keeps exactly one: the surviving link is the one whose **dialer** has the lexicographically lower `instance_id`. The node with the higher id drops its own outbound dial and keeps the inbound link; the other side does the reverse. This avoids flapping and guarantees a single link per pair without coordination.
+**One link per pair.** Any node may dial any other, so a node started later joins through an older seed like any other. A node keeps one live link per peer instance. When a second link to the same instance appears (both nodes dialed each other at the same moment, or a peer is known under two addresses), both nodes keep the one whose **dialer** has the lexicographically lower `instance_id` and close the other, so they always agree without coordination. A peer that dials again while the receiver still holds its earlier link has given up on that one (a half-open connection), so the new link replaces it. A node that finds its own address in the peer list stops dialing it. The losing dialer keeps retrying with backoff, so the pair reconnects at once if the winning link goes away.
 
 ## Frame Format
 
