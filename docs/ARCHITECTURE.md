@@ -485,7 +485,15 @@ The single largest optimization. For a broadcast to N connections, the WebSocket
 
 ### Lanes: fan-out on every core
 
-Each connection belongs to a lane: one lane per core (at most 64), given in turn as connections join. Each lane has a tokio task of its own that delivers to its connections, so a broadcast to 10,000 connections is delivered by every core at once, and each lane wakes its connections' write tasks from its own runtime thread. The sender (the command task, a cluster link) only hands the message over: one job per lane that has someone to get it, in the order it publishes, so a connection gets one sender's messages in order. No lock is held across an await: a lane holds its own maps' read locks while it appends frames, nothing longer. A lane gives way to the runtime after each batch of jobs, so the write tasks it woke run soon. A lane's queue holds 1024 jobs; a sender that finds it full waits for room, so a publisher faster than the delivery backs up in its own command queue, one entry per message, instead of one job per lane.
+Each connection belongs to a lane: one lane per core (at most 64), given in turn as connections join. Each lane has a tokio task of its own that delivers to its connections, so a broadcast to 10,000 connections is delivered by every core at once, and each lane wakes its connections' write tasks from its own runtime thread. The sender (the command task, a cluster link) only hands the message over: one job per lane that has someone to get it, in the order it publishes, so a connection gets one sender's messages in order. No lock is held across an await: a lane holds its own maps' read locks while it appends frames, nothing longer. A lane gives way to the runtime after serving about 512 connections, so the write tasks it woke run and the runtime reads the network: a lane on every thread under a steady stream must not keep new connections from completing their handshakes.
+
+### Flow control
+
+A publisher faster than the clients can read is held back step by step instead of filling memory:
+
+- **Sockets to lanes.** While a lane delivers, it counts the connections that still have 64 KiB or more to write. When most connections of a delivery to at least 32 of them are behind, the lane waits a millisecond before its next job. One slow client never holds back its lane: past its own budget (`max_outbound_queue_bytes`) it misses messages and the slow-consumer check closes it.
+- **Lanes to senders.** A lane's queue holds 1024 jobs; the command task or a cluster link that finds it full waits for room.
+- **Senders to the application.** The command queue counts what waits in it. `send()`, `send_event()` and the broadcasts wait, without the GIL, while 65,536 commands are queued, so a publisher loop runs at the speed the server delivers.
 
 The topic index keeps each topic's subscribers by lane, with a bit mask of the lanes that have some, so a topic with a few subscribers costs a job for each of their lanes only, and a topic nobody subscribes to costs a single lookup. Every connection is also kept by lane for broadcasts to all.
 

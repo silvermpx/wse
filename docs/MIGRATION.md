@@ -21,6 +21,7 @@
 - **Values that cannot be JSON raise `ValueError`**: a dict containing itself, or nesting deeper than 128 levels, in `send_event()`, presence data and `rust_jwt_encode()`.
 - **Applications that authenticate connections themselves** (no `jwt_secret`) call `accept_connection(conn_id, user_id)` to send `server_ready`.
 - **msgpack clients get msgpack everywhere** (topic messages, broadcasts, replays, replies), not only from `send_event()`.
+- **Sends wait when the server is saturated**: `send()`, `send_bytes()`, `send_event()` and the broadcasts wait (without holding the GIL) while 65,536 commands are queued for the server, instead of queueing without limit. A publisher faster than the clients can read now runs at the speed the server delivers rather than filling memory; normal traffic never waits.
 - **The `msgpack` extra is gone**: the server packs MessagePack in Rust and never imported the package. `pip install wse-server[msgpack]` still installs the server, with a warning about the unknown extra; drop the extra from your requirements.
 
 ### End-to-end encryption

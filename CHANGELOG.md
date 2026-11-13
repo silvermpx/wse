@@ -38,6 +38,9 @@ the steps to take are in [docs/MIGRATION.md](docs/MIGRATION.md#migrating-from-v2
   `ValueError`** instead of disabling features or crashing the process.
 - **The server's `msgpack` extra is gone**: MessagePack is packed in Rust
   and the package was never imported.
+- **Sends wait while the server is saturated**: with 65,536 commands
+  queued, `send()`, `send_event()` and the broadcasts wait (without the
+  GIL) instead of growing the queue without limit.
 
 ### Added
 
