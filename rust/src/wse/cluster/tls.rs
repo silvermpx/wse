@@ -52,16 +52,26 @@ pub(crate) fn build_cluster_tls(
     }
 
     // Server config: require client certs (mTLS)
-    let client_verifier = WebPkiClientVerifier::builder(Arc::new(root_store.clone()))
-        .build()
-        .map_err(|e| format!("Failed to build client verifier: {}", e))?;
-    let server_config = rustls::ServerConfig::builder()
+    let client_verifier = WebPkiClientVerifier::builder_with_provider(
+        Arc::new(root_store.clone()),
+        crate::crypto::tls_provider(),
+    )
+    .build()
+    .map_err(|e| format!("Failed to build client verifier: {}", e))?;
+    // The provider comes from the crate's crypto library, explicitly: nothing
+    // is installed as the process-wide rustls default.
+    let provider = crate::crypto::tls_provider();
+    let server_config = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("TLS protocol versions: {e}"))?
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(certs.clone(), key.clone_key())
         .map_err(|e| format!("Failed to build server TLS config: {}", e))?;
 
     // Client config: present our cert, verify server against CA
-    let client_config = rustls::ClientConfig::builder()
+    let client_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("TLS protocol versions: {e}"))?
         .with_root_certificates(root_store)
         .with_client_auth_cert(certs, key)
         .map_err(|e| format!("Failed to build client TLS config: {}", e))?;

@@ -302,6 +302,29 @@ openssl x509 -req -sha256 -in node.csr -CA ca.pem -CAkey ca.key -CAcreateserial 
 
 The same commands work with OpenSSL and with LibreSSL (the `openssl` on macOS). Keep `-sha256`: LibreSSL otherwise signs with SHA-1, which rustls rejects, and without `-extfile` it issues a version 1 certificate, which rustls rejects as well. A certificate without a matching subjectAltName fails every handshake with "certificate not valid for name".
 
+## Crypto Library
+
+One crypto library serves everything that encrypts or signs: cluster mTLS,
+JWT validation, end-to-end encryption and the `rust_*` crypto helpers. It is
+chosen when the extension is built:
+
+| Build feature | Library | Used by |
+|---|---|---|
+| `aws-lc` (default) | aws-lc-rs | the wheels on PyPI |
+| `fips` | aws-lc-rs on its FIPS 140-3 validated module | builds from source |
+
+A FIPS build needs CMake and Go, and is made from the source distribution:
+
+```bash
+MATURIN_PEP517_ARGS="--features fips" pip install wse-server --no-binary wse-server
+```
+
+`health_snapshot()["crypto"]` and the Prometheus metric
+`wse_build_info{crypto="..."}` report which library a running server uses.
+The cluster's TLS gets its provider from that library explicitly; WSE never
+installs a process-wide rustls provider, so the application's own TLS
+settings are left alone.
+
 ## Connection Security
 
 ### Rate Limiting

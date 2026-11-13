@@ -83,6 +83,8 @@ impl RustWSEServer {
                 .unwrap_or(0),
         )?;
         dict.set_item("uptime_secs", self.uptime_secs())?;
+        // The crypto library this build uses (cluster TLS, JWT, E2E).
+        dict.set_item("crypto", crate::crypto::LIBRARY)?;
         // Recovery metrics
         if let Some(ref recovery) = self.shared.recovery {
             dict.set_item("recovery_enabled", true)?;
@@ -122,6 +124,13 @@ impl RustWSEServer {
             self.shared.inbound_rx.len()
         ));
 
+        out.push_str("# HELP wse_build_info Build facts as labels, value 1\n");
+        out.push_str("# TYPE wse_build_info gauge\n");
+        out.push_str(&format!(
+            "wse_build_info{{version=\"{}\",crypto=\"{}\"}} 1\n",
+            env!("CARGO_PKG_VERSION"),
+            crate::crypto::LIBRARY
+        ));
         out.push_str("# HELP wse_uptime_seconds Server uptime in seconds\n");
         out.push_str("# TYPE wse_uptime_seconds gauge\n");
         out.push_str(&format!("wse_uptime_seconds {:.1}\n", self.uptime_secs()));

@@ -202,7 +202,7 @@ pub(crate) struct SharedState {
     // Per-connection last activity tracking for zombie detection
     pub(super) conn_last_activity: DashMap<String, std::time::Instant>,
     // Per-connection AES-256-GCM cipher for E2E encryption (optional, client-initiated)
-    pub(super) conn_encryption: DashMap<String, aes_gcm::Aes256Gcm>,
+    pub(super) conn_encryption: DashMap<String, Arc<crate::crypto::Aes256Gcm>>,
     // Presence tracking (None when disabled)
     pub(crate) presence: Option<Arc<crate::wse::presence::PresenceManager>>,
     // Queue groups: topic -> group_name -> QueueGroup (round-robin distribution)

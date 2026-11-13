@@ -28,6 +28,7 @@ use crate::lexer::{self, Lang};
 fn is_engine(path: &str) -> bool {
     let engine_dirs = ["rust/src/wse/cluster/", "rust/src/wse/server/"];
     let engine_files = [
+        "rust/src/crypto.rs",
         "rust/src/wse/presence.rs",
         "rust/src/wse/recovery.rs",
         "rust/src/wse/reliability.rs",

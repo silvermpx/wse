@@ -326,6 +326,40 @@ jobs:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
 
   # ---------------------------------------------------------------------------
+  # Rust: the `fips` build (aws-lc-rs from its FIPS 140-3 module), so the
+  # option keeps compiling and its tests keep passing. It needs CMake and Go,
+  # both on the runner image.
+  # ---------------------------------------------------------------------------
+  rust-fips:
+    name: Rust Tests (FIPS)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        id: python
+        with:
+          python-version: '3.12'
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: "rust -> target"
+          key: fips
+
+      - name: cargo test --features fips
+        run: cargo test --manifest-path rust/Cargo.toml --locked --features fips
+        env:
+          PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
+
+  # ---------------------------------------------------------------------------
   # Rust: the declared minimum version (rust-version in rust/Cargo.toml),
   # which is what an sdist install needs at least
   # ---------------------------------------------------------------------------
@@ -521,7 +555,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, checks, secrets, client, python-client, lint, rust-lint, rust-test, rust-msrv, test, benchmarks, security]
+    needs: [changes, checks, secrets, client, python-client, lint, rust-lint, rust-test, rust-fips, rust-msrv, test, benchmarks, security]
     runs-on: ubuntu-latest
     steps:
       - name: Every job passed or was skipped

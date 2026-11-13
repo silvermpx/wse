@@ -5,6 +5,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+mod crypto;
 mod jwt;
 mod wse;
 

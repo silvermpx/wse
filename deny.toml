@@ -29,6 +29,12 @@ allow = [
     "Zlib",
 ]
 
+# The FIPS 140-3 module carries the OpenSSL license; it is built only with the
+# `fips` feature, and only that crate may use the license.
+[[licenses.exceptions]]
+crate = "aws-lc-fips-sys"
+allow = ["OpenSSL"]
+
 [bans]
 # Two versions of one crate are reported, not refused: some come in through
 # upstream crates and resolve as those update.

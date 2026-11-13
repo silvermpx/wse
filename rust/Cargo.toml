@@ -20,21 +20,13 @@ serde_json = "1.0.154"
 flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs"] }
 rmp-serde = "1.3.1"
 rmpv = "1.3.1"
-hmac = "0.13"
-sha2 = "0.11"
 hex = "0.4"
 ahash = "0.8.12"
 dashmap = "6"
-# One crypto library for TLS, JWT and the Python crypto utilities.
-aws-lc-rs = "1.19"
-# zeroize: AES key schedules are wiped when a cipher is dropped.
-aes-gcm = { version = "0.11", features = ["getrandom", "zeroize"] }
-# Key generation uses p256's own getrandom-backed `Generate` (default `std` feature).
-p256 = { version = "0.14", features = ["ecdh"] }
-# aws_lc_rs: the same crypto library rustls already uses; the rust_crypto
-# backend pulled a second, older RustCrypto stack and the rsa crate.
-jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
-hkdf = "0.13"
+# The crypto library (see [features] and src/crypto.rs) is the only one in the
+# build: TLS, JWT, E2E and the Python helpers all use it.
+aws-lc-rs = { version = "1.19", optional = true }
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem"] }
 uuid = { version = "1.29.2", features = ["v7"] }
 base64 = "0.23"
 chrono = { version = "0.4.45", features = ["serde"] }
@@ -47,8 +39,9 @@ tokio-util = { version = "0.7", features = ["rt"] }
 socket2 = { version = "0.6", features = ["all"] }
 bytes = "1"
 mimalloc = "0.1"
-tokio-rustls = "0.26"
-rustls = { version = "0.23", default-features = true }
+# No default features: the crypto provider comes from the chosen library.
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
 rustls-pki-types = "1"
 zstd = "0.14"
 parking_lot = "0.13"
@@ -63,6 +56,14 @@ arc-swap = "1"
 # dynamic definition"): the module would not import.
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
+
+[features]
+default = ["aws-lc"]
+# The crypto library behind cluster TLS, JWT, E2E encryption and the Python
+# helpers. aws-lc: aws-lc-rs (the published wheels). fips: aws-lc-rs built from
+# its FIPS 140-3 validated module; building it needs CMake and Go.
+aws-lc = ["dep:aws-lc-rs", "rustls/aws_lc_rs", "rustls/prefer-post-quantum", "jsonwebtoken/aws_lc_rs"]
+fips = ["aws-lc", "aws-lc-rs/fips", "rustls/fips"]
 
 [dev-dependencies]
 rcgen = "0.14"
