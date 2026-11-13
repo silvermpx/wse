@@ -295,6 +295,9 @@ pub(crate) struct SharedState {
     pub(super) inbound_dropped: AtomicU64,
     // Per-connection format preference (lock-free sync access for send_event)
     pub(super) conn_formats: DashMap<String, bool>,
+    // What a client asked of compression: the threshold in bytes, 0 = never
+    // compress for it. Absent: the threshold send_event() is given.
+    pub(super) conn_compression: DashMap<String, usize>,
     // Atomic connection count (lock-free read from Python without GIL blocking)
     pub(super) connection_count: AtomicUsize,
     // JWT config: when set, Rust validates JWT in handshake (zero GIL)
@@ -435,6 +438,7 @@ impl SharedState {
             max_inbound_bytes: cfg.max_inbound_queue_bytes,
             inbound_dropped: AtomicU64::new(0),
             conn_formats: DashMap::new(),
+            conn_compression: DashMap::new(),
             connection_count: AtomicUsize::new(0),
             jwt_config: cfg.jwt_config.map(arc_swap::ArcSwap::from_pointee),
             draining: AtomicBool::new(false),

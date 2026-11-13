@@ -168,6 +168,8 @@ impl RustWSEServer {
 
         // Check if this connection has E2E encryption
         let conn_cipher = self.shared.conn_encryption.get(conn_id);
+        // The client's own compression wish, unless the call turns it off.
+        let client_threshold = self.shared.conn_compression.get(conn_id).map(|t| *t);
 
         let byte_count;
 
@@ -221,7 +223,10 @@ impl RustWSEServer {
                         message: Message::Binary(final_bytes.into()),
                     })
                     .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
-            } else if compression_threshold > 0 && payload_bytes.len() > compression_threshold {
+            } else if compression_threshold > 0
+                && payload_bytes.len() > client_threshold.unwrap_or(compression_threshold)
+                && client_threshold != Some(0)
+            {
                 // Compressed: C: prefix + zlib (binary frame)
                 let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
                 encoder

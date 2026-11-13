@@ -400,6 +400,25 @@ impl SharedState {
     }
 }
 
+/// The compression a client asks for, in `client_hello` (`features.compression`,
+/// `compression_threshold`) or `client_config` (`compression`,
+/// `compression_threshold`): the threshold, 0 for none; None when it says
+/// nothing.
+pub(crate) fn requested_compression(
+    compression: Option<&serde_json::Value>,
+    threshold: Option<&serde_json::Value>,
+) -> Option<usize> {
+    match compression.and_then(serde_json::Value::as_bool) {
+        Some(false) => Some(0),
+        Some(true) => Some(
+            threshold
+                .and_then(serde_json::Value::as_u64)
+                .map_or(1024, |t| usize::try_from(t).unwrap_or(usize::MAX)),
+        ),
+        None => None,
+    }
+}
+
 /// A client's position for a topic as it sends it: `{"epoch": "<8 hex>",
 /// "offset": <int>}`.
 pub(crate) fn parse_anchor(position: &serde_json::Value) -> Option<(u32, u64)> {

@@ -28,7 +28,7 @@ use super::handshake::{HandshakeGuard, normalize_origin, reject_ws_auth};
 use super::messages::{build_server_hello, build_server_ready, normalize_json_keys};
 use super::py::{fire_on_connect, fire_on_disconnect, json_to_pyobj};
 use super::state::InboundEvent;
-use super::subscribe::answer_subscription_request;
+use super::subscribe::{answer_subscription_request, requested_compression};
 use super::{
     BroadcastQueue, CLOSE_GRACE, CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED, CLOSE_TRY_AGAIN_LATER,
     Closer, ConnectionHandle, SharedState, WsFrame,
@@ -148,6 +148,16 @@ fn token_valid_until(exp: u64) -> tokio::time::Instant {
         .saturating_sub(now_unix);
     // Far-future values would overflow the timer; a year is never reached.
     tokio::time::Instant::now() + Duration::from_secs(left.min(365 * 24 * 3600))
+}
+
+/// A client's `client_config`: what it asks of compression from now on.
+fn apply_client_config(state: &SharedState, conn_id: &str, p: Option<&serde_json::Value>) {
+    if let Some(threshold) = requested_compression(
+        p.and_then(|p| p.get("compression")),
+        p.and_then(|p| p.get("compression_threshold")),
+    ) {
+        state.conn_compression.insert(conn_id.to_owned(), threshold);
+    }
 }
 
 /// Why the upgrade was refused, if it was.
@@ -433,6 +443,7 @@ pub(super) async fn handle_connection(
     struct HandshakeResult {
         cookies: String,
         wants_msgpack: bool,
+        refuses_compression: bool,
         authorization: Option<String>,
     }
     let handshake_data: Arc<std::sync::OnceLock<HandshakeResult>> =
@@ -486,10 +497,9 @@ pub(super) async fn handle_connection(
                     .and_then(|cv| cv.to_str().ok())
                     .map(|s| s.to_string())
                     .unwrap_or_default();
-                let wants_msgpack = req
-                    .uri()
-                    .query()
-                    .is_some_and(|q| q.contains("format=msgpack"));
+                let query = req.uri().query().unwrap_or("");
+                let wants_msgpack = query.contains("format=msgpack");
+                let refuses_compression = query.split('&').any(|kv| kv == "compression=false");
                 let authorization = req
                     .headers()
                     .get("authorization")
@@ -498,6 +508,7 @@ pub(super) async fn handle_connection(
                 let _ = hd_clone.set(HandshakeResult {
                     cookies,
                     wants_msgpack,
+                    refuses_compression,
                     authorization,
                 });
                 Ok(response)
@@ -533,12 +544,13 @@ pub(super) async fn handle_connection(
     let mut read_half = ws_stream;
     read_half.get_mut().silent = true;
 
-    let (cookie_str, use_msgpack, auth_header) = handshake_data
+    let (cookie_str, use_msgpack, refuses_compression, auth_header) = handshake_data
         .get()
         .map(|hd| {
             (
                 hd.cookies.clone(),
                 hd.wants_msgpack,
+                hd.refuses_compression,
                 hd.authorization.clone(),
             )
         })
@@ -692,6 +704,9 @@ pub(super) async fn handle_connection(
     // Store format preference for lock-free access from send_event()
     if use_msgpack {
         state.conn_formats.insert((*conn_id).clone(), true);
+    }
+    if refuses_compression {
+        state.conn_compression.insert((*conn_id).clone(), 0);
     }
     // Initialize last activity for zombie detection
     state
@@ -943,6 +958,13 @@ pub(super) async fn handle_connection(
                                 }
                                 hello_answered = true;
                                 let p = val.get("p");
+                                if let Some(threshold) = requested_compression(
+                                    p.and_then(|p| p.get("features"))
+                                        .and_then(|f| f.get("compression")),
+                                    p.and_then(|p| p.get("compression_threshold")),
+                                ) {
+                                    state.conn_compression.insert((*conn_id).clone(), threshold);
+                                }
                                 let client_proto =
                                     p.and_then(|p| p.get("protocol_version"))
                                         .and_then(|v| v.as_u64())
@@ -1032,6 +1054,10 @@ pub(super) async fn handle_connection(
                                 continue;
                             }
                             if t_val == "pong" || t_val == "PONG" {
+                                continue;
+                            }
+                            if t_val == "client_config" {
+                                apply_client_config(&state, &conn_id, val.get("p"));
                                 continue;
                             }
                             if t_val == "subscription_update" && state.client_subscriptions {
@@ -1132,8 +1158,14 @@ pub(super) async fn handle_connection(
                                         serde_json::from_str::<serde_json::Value>(json_str)
                                     {
                                         let val = normalize_json_keys(val);
-                                        // The clients encrypt their subscription
+                                        // The clients encrypt their protocol
                                         // requests too.
+                                        if val.get("t").and_then(|t| t.as_str())
+                                            == Some("client_config")
+                                        {
+                                            apply_client_config(&state, &conn_id, val.get("p"));
+                                            continue;
+                                        }
                                         if state.client_subscriptions
                                             && val.get("t").and_then(|t| t.as_str())
                                                 == Some("subscription_update")
@@ -1294,6 +1326,7 @@ pub(super) async fn handle_connection(
         state.connection_count.store(conns.len(), Ordering::Relaxed);
     }
     state.conn_formats.remove(&*conn_id);
+    state.conn_compression.remove(&*conn_id);
     state.conn_last_activity.remove(&*conn_id);
     state.conn_encryption.remove(&*conn_id);
     state.topics.acls.remove(&*conn_id);

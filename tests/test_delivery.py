@@ -8,7 +8,7 @@ import json
 import pytest
 
 from tests.conftest import JWT_AUDIENCE, JWT_ISSUER, JWT_SECRET, make_token
-from tests.test_integration import connect, drain_until
+from tests.test_integration import connect, drain_all, drain_until
 from wse_server._wse_accel import (
     RustWSEServer,
     rust_aes_gcm_decrypt,
@@ -177,5 +177,64 @@ class TestQueueGroups:
                         break
             assert "tp" not in msg and "o" not in msg and "e" not in msg
             await ws.close()
+        finally:
+            srv.stop()
+
+
+class TestClientCompression:
+    async def received(self, ws) -> bytes:
+        async with asyncio.timeout(5):
+            while True:
+                frame = await ws.recv()
+                if isinstance(frame, bytes):
+                    return frame
+
+    @pytest.mark.asyncio
+    async def test_the_client_decides_about_compression(self, server_port):
+        srv = start_server(server_port)
+        big = {"t": "big", "p": {"fill": "x" * 4000}}
+        try:
+            async with await connect(server_port, make_token()) as ws:
+                _, conn_id, _ = drain_until(srv, "auth_connect")
+                srv.send_event(conn_id, big)
+                assert (await self.received(ws)).startswith(b"C:")
+                await ws.send(
+                    json.dumps({"t": "client_hello", "p": {"features": {"compression": False}}})
+                )
+                await asyncio.sleep(0.2)
+                srv.send_event(conn_id, big)
+                assert not (await self.received(ws)).startswith(b"C:")
+                await ws.send(
+                    json.dumps(
+                        {
+                            "c": "WSE",
+                            "t": "client_config",
+                            "p": {"compression": True, "compression_threshold": 10},
+                        }
+                    )
+                )
+                await asyncio.sleep(0.2)
+                srv.send_event(conn_id, {"t": "small", "p": {"n": 12345}})
+                assert (await self.received(ws)).startswith(b"C:")
+                # The application's own 0 still turns compression off.
+                srv.send_event(conn_id, big, compression_threshold=0)
+                assert not (await self.received(ws)).startswith(b"C:")
+                assert not [e for e in drain_all(srv) if e[0] == "msg"]
+        finally:
+            srv.stop()
+
+    @pytest.mark.asyncio
+    async def test_compression_false_in_the_url(self, server_port):
+        import websockets
+
+        srv = start_server(server_port)
+        try:
+            async with websockets.connect(
+                f"ws://127.0.0.1:{server_port}/wse?compression=false",
+                additional_headers={"Authorization": f"Bearer {make_token()}"},
+            ) as ws:
+                _, conn_id, _ = drain_until(srv, "auth_connect")
+                srv.send_event(conn_id, {"t": "big", "p": {"fill": "x" * 4000}})
+                assert not (await self.received(ws)).startswith(b"C:")
         finally:
             srv.stop()

@@ -398,19 +398,18 @@ Protocol negotiation. When encryption is enabled, includes the client's ECDH pub
 
 Once the server receives `client_hello` with `encryption_public_key`, it derives the shared AES-256 key. All subsequent messages from both sides may be sent as `E:`-prefixed encrypted binary frames.
 
-### Config Update
+### Client Config
 
-Dynamic configuration:
+What the client asks of compression from now on (the TypeScript client sends it when its compression setting changes). The same wish can come with `client_hello` (`features.compression`, `compression_threshold`) or in the URL (`?compression=false`):
 
 ```json
-{"c":"WSE","t":"config_update","p":{
-  "compression_enabled": true,
-  "compression_threshold": 2048,
-  "batching_enabled": true,
-  "batch_size": 20,
-  "batch_timeout": 0.2
+{"c":"WSE","t":"client_config","p":{
+  "compression": true,
+  "compression_threshold": 2048
 },"v":1}
 ```
+
+The server then compresses `send_event()` messages to this connection above the client's threshold, or never with `"compression": false`; an application call with `compression_threshold=0` still turns compression off. The message does not reach the application.
 
 ### Health Check
 
