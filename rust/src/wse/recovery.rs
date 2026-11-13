@@ -414,6 +414,16 @@ impl RecoveryManager {
         // Key: "topic\0epoch" -- null byte separator is safe (never in topic names).
         let key = format!("{topic}\0{origin_epoch}");
 
+        // Over the memory budget no new buffer is made: each one allocates
+        // its slots up front, and a peer can name any number of fresh
+        // (topic, epoch) pairs between two cleanups. The message is still
+        // delivered live; only its recovery copy is skipped.
+        if !self.foreign_buffers.contains_key(&key)
+            && self.total_bytes.load(Ordering::Relaxed) >= self.config.global_memory_budget
+        {
+            return;
+        }
+
         let key_len = key.len();
         let mut created = false;
         let mut entry = self.foreign_buffers.entry(key).or_insert_with(|| {
@@ -941,6 +951,32 @@ mod tests {
 
         // After cleanup, should be at or under budget.
         assert!(mgr.total_bytes() <= 20);
+    }
+
+    #[test]
+    fn fresh_foreign_epochs_stop_at_the_budget() {
+        let config = RecoveryConfig {
+            global_memory_budget: 64 * 1024,
+            ..RecoveryConfig::default()
+        };
+        let mgr = RecoveryManager::new(config);
+        // A peer naming a new epoch with every message.
+        for epoch in 0..10_000u32 {
+            mgr.push_foreign("t", make_data("x"), epoch, 0);
+        }
+        let one_buffer = ForeignRecoveryBuffer::new(mgr.config.buffer_size_bits, 0, 8).footprint();
+        assert!(
+            mgr.total_bytes() <= 64 * 1024 + one_buffer,
+            "{}",
+            mgr.total_bytes()
+        );
+        assert!(mgr.foreign_buffers.len() < 10_000);
+        // An existing buffer still takes messages.
+        mgr.push_foreign("t", make_data("y"), 0, 1);
+        assert!(matches!(
+            mgr.recover("t", 0, 0),
+            RecoveryResult::Recovered { .. }
+        ));
     }
 
     #[test]
