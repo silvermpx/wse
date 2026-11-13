@@ -8,6 +8,7 @@ use std::sync::{Arc, OnceLock};
 use ahash::AHashSet;
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
+use rayon::prelude::*;
 
 use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -280,13 +281,45 @@ impl ConnectionHandle {
     }
 }
 
-/// Deliver `msg` to every connection.
+/// Connections from which a message is delivered on every core of the fan-out
+/// pool: below it splitting the work costs more than it saves.
+const PARALLEL_FANOUT_AT: usize = 1024;
+
+/// The pool that delivers large fan-outs: half the cores, the other half
+/// left to the connections' write tasks. None when it cannot start: the
+/// fan-out then runs on the calling task.
+fn fanout_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).max(2));
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("wse-fanout-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// Deliver `msg` to every connection. A large fan-out runs on every core of
+/// the pool and returns when it is done, so the next message starts after
+/// it: each connection still gets messages in order.
 pub(super) fn fanout_broadcast_direct(
     conns: &HashMap<String, ConnectionHandle>,
     msg: &Outgoing,
     max_pending: usize,
     slow_drops: &AtomicU64,
 ) {
+    if conns.len() >= PARALLEL_FANOUT_AT
+        && let Some(pool) = fanout_pool()
+    {
+        pool.install(|| {
+            conns.par_iter().for_each(|(_, h)| {
+                h.deliver(msg, max_pending, slow_drops);
+            });
+        });
+        return;
+    }
     for h in conns.values() {
         h.deliver(msg, max_pending, slow_drops);
     }
@@ -359,6 +392,21 @@ impl TopicIndex {
         if self.patterns.is_empty() {
             // Exact topics only: the common case, no bookkeeping.
             if let Some(subs) = self.subscribers.get(topic) {
+                // A large topic on every core of the pool, done before the
+                // next message: each subscriber still gets them in order.
+                if subs.len() >= PARALLEL_FANOUT_AT
+                    && let Some(pool) = fanout_pool()
+                {
+                    return pool.install(|| {
+                        subs.par_iter()
+                            .map(|entry| entry.value().deliver(msg, max_pending, slow_drops))
+                            .fold(
+                                || (0u64, 0u64),
+                                |(d, f), sent| if sent { (d + 1, f) } else { (d, f + 1) },
+                            )
+                            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+                    });
+                }
                 for entry in subs.iter() {
                     count(entry.value().deliver(msg, max_pending, slow_drops));
                 }

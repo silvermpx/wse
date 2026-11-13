@@ -260,6 +260,44 @@ fn a_msgpack_connection_gets_json_as_msgpack() {
 }
 
 #[test]
+fn a_large_fanout_reaches_everyone_once_and_in_order() {
+    let index = TopicIndex::default();
+    let handles: Vec<_> = (0..3000)
+        .map(|i| {
+            let (h, rx) = make_handle();
+            index.subscribe("big", &format!("c{i}"), &h);
+            (h, rx)
+        })
+        .collect();
+    let drops = AtomicU64::new(0);
+    for n in 0..3 {
+        let msg = Outgoing::text(bytes::Bytes::from(format!("{{\"n\":{n}}}")));
+        assert_eq!(index.fanout("big", &msg, 0, &drops), (3000, 0));
+    }
+    // Each connection's queue holds the three frames, in order.
+    let expected: Vec<u8> = (0..3)
+        .flat_map(|n| encode_ws_frame(0x01, format!("{{\"n\":{n}}}").as_bytes()).to_vec())
+        .collect();
+    for (h, _) in &handles {
+        assert_eq!(queued(h).concat(), expected);
+    }
+
+    let conns: std::collections::HashMap<String, ConnectionHandle> = handles
+        .iter()
+        .enumerate()
+        .map(|(i, (h, _))| (format!("c{i}"), h.clone()))
+        .collect();
+    super::fanout::fanout_broadcast_direct(
+        &conns,
+        &Outgoing::text(bytes::Bytes::from_static(b"{}")),
+        0,
+        &drops,
+    );
+    let frame = encode_ws_frame(0x01, b"{}");
+    assert!(handles.iter().all(|(h, _)| queued(h).concat() == frame));
+}
+
+#[test]
 fn unstamped_removes_exactly_the_recovery_fields() {
     let original = r#"{"c":"U","t":"x","p":{"k":"a\"b"}}"#;
     let stamped = stamp_recovery_fields(original, "ro\"om", 0xab, 42);
