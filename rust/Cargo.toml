@@ -22,7 +22,7 @@ rmp-serde = "1.3.1"
 rmpv = "1.3.1"
 hex = "0.4"
 ahash = "0.8.12"
-dashmap = { version = "6", features = ["rayon"] }
+dashmap = "6"
 # The crypto library (see [features] and src/crypto.rs) is the only one in the
 # build: TLS, JWT, E2E and the Python helpers all use it.
 aws-lc-rs = { version = "1.19", optional = true }
@@ -31,7 +31,6 @@ uuid = { version = "1.29.2", features = ["v7"] }
 base64 = "0.23"
 chrono = { version = "0.4.45", features = ["serde"] }
 regex = "1.13.1"
-rayon = "1.11"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "io-util"] }
 tokio-tungstenite = "0.30.0"
 futures-util = "0.3.34"
