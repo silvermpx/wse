@@ -372,3 +372,49 @@ def test_mutual_tls_refuses_certificate_without_address(nodes, tmp_path):
     a.join(b, **tls)
     b.join(a, **tls)
     assert not wait_for(lambda: a.peers or b.peers, timeout=3.0)
+
+
+def test_a_user_who_left_every_node_is_gone_from_all(nodes):
+    websockets = pytest.importorskip("websockets")
+    from tests.conftest import JWT_AUDIENCE, JWT_ISSUER, JWT_SECRET, make_token
+
+    options = {
+        "presence_enabled": True,
+        "jwt_secret": JWT_SECRET,
+        "jwt_issuer": JWT_ISSUER,
+        "jwt_audience": JWT_AUDIENCE,
+    }
+    a, b = nodes(**options), nodes(**options)
+    a.join(b)
+    b.join(a)
+    assert wait_for(lambda: a.peers == 1 and b.peers == 1)
+
+    async def tab(node):
+        ws = await websockets.connect(
+            f"ws://127.0.0.1:{node.port}/wse",
+            additional_headers={"Authorization": f"Bearer {make_token('alice')}"},
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            joined = [e for e in node.server.drain_inbound(16, 50) if e[0] == "auth_connect"]
+            if joined:
+                node.server.subscribe_connection(joined[0][1], ["room"], {"here": True})
+                return ws
+            await asyncio.sleep(0.05)
+        raise AssertionError("no auth_connect")
+
+    def listed(node):
+        return "alice" in node.server.presence("room")
+
+    async def scenario():
+        on_a = await tab(a)
+        on_b = await tab(b)
+        assert await asyncio.to_thread(wait_for, lambda: listed(a) and listed(b))
+        await on_a.close()
+        # Still on b: both nodes keep listing her.
+        await asyncio.sleep(0.5)
+        assert listed(a) and listed(b)
+        await on_b.close()
+        return await asyncio.to_thread(wait_for, lambda: not listed(a) and not listed(b))
+
+    assert asyncio.run(scenario())

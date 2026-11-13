@@ -22,10 +22,8 @@ use crate::wse::pylock::lock;
 use crate::wse::server::commands::process_commands;
 use crate::wse::server::connection::handle_connection;
 use crate::wse::server::handshake::{HandshakeGuard, MAX_PENDING_HANDSHAKES};
-use crate::wse::server::state::InboundEvent;
 use crate::wse::server::{
     CLOSE_IDLE, CLOSE_TRY_AGAIN_LATER, ConnectionHandle, ServerCommand, WsFrame,
-    format_presence_msg,
 };
 
 /// TCP keepalive of accepted connections: the first probe after a minute of
@@ -186,61 +184,8 @@ impl RustWSEServer {
                                 if removed.is_empty() {
                                     continue;
                                 }
-                                let drain = sweep_state
-                                    .drain_mode
-                                    .load(Ordering::Relaxed);
-                                let broadcast_tx = sweep_state
-                                    .presence_broadcast_tx
-                                    .read()
-                                    .unwrap()
-                                    .clone();
-                                let cluster_tx = sweep_state
-                                    .cluster_cmd_tx
-                                    .read()
-                                    .unwrap()
-                                    .clone();
                                 for (topic, user_id, data) in removed {
-                                    if drain {
-                                        sweep_state.push_inbound(
-                                            InboundEvent::PresenceLeave {
-                                                topic: topic.clone(),
-                                                user_id: user_id.clone(),
-                                                data: data.clone(),
-                                            },
-                                        );
-                                    }
-                                    let msg = format_presence_msg(
-                                        "presence_leave",
-                                        &user_id,
-                                        &data,
-                                    );
-                                    if let Some(ref tx) = broadcast_tx {
-                                        let _ = tx.send(
-                                            ServerCommand::BroadcastLocal {
-                                                topic: topic.clone(),
-                                                data: msg,
-                                                skip_recovery: true,
-                                                publish: false,
-                                            },
-                                        );
-                                    }
-                                    if let Some(ref ctx) = cluster_tx {
-                                        let data_str = serde_json::to_string(
-                                            &data,
-                                        )
-                                        .unwrap_or_default();
-                                        let now =
-                                            crate::wse::presence::epoch_ms();
-                                        let _ = ctx.send(
-                                            ClusterCommand::PresenceUpdate {
-                                                topic,
-                                                user_id,
-                                                action: 1,
-                                                data: data_str,
-                                                updated_at: now,
-                                            },
-                                        );
-                                    }
+                                    sweep_state.announce_presence_leave(topic, user_id, data, true);
                                 }
                             }
                         });

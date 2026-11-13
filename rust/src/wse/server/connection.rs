@@ -31,10 +31,9 @@ use super::state::InboundEvent;
 use super::subscribe::answer_subscription_request;
 use super::{
     BroadcastQueue, CLOSE_GRACE, CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED, CLOSE_TRY_AGAIN_LATER,
-    Closer, ConnectionHandle, ServerCommand, SharedState, WsFrame, format_presence_msg,
+    Closer, ConnectionHandle, SharedState, WsFrame,
 };
 use crate::jwt::{self, parse_cookie_value};
-use crate::wse::cluster::ClusterCommand;
 use crate::wse::compression::{decode_msgpack_guarded, rmpv_to_serde_json};
 
 // ---------------------------------------------------------------------------
@@ -1319,42 +1318,7 @@ pub(super) async fn handle_connection(
     }
     // Presence cleanup: untrack from all topics before disconnect event
     if let Some(ref pm) = state.presence {
-        let results = pm.remove_connection(&conn_id);
-        let cluster_tx = state.cluster_cmd_tx.read().unwrap().clone();
-        for (topic, result) in results {
-            if let crate::wse::presence::UntrackResult::LastLeave { user_id, data } = result {
-                if drain {
-                    state.push_inbound(InboundEvent::PresenceLeave {
-                        topic: topic.clone(),
-                        user_id: user_id.clone(),
-                        data: data.clone(),
-                    });
-                }
-                // Broadcast to topic subscribers via WebSocket
-                let tx = state.presence_broadcast_tx.read().unwrap().clone();
-                if let Some(tx) = tx {
-                    let msg = format_presence_msg("presence_leave", &user_id, &data);
-                    let _ = tx.send(ServerCommand::BroadcastLocal {
-                        topic: topic.clone(),
-                        data: msg,
-                        skip_recovery: true,
-                        publish: false,
-                    });
-                }
-                // Cluster sync: notify peers of presence leave
-                if let Some(ref ctx) = cluster_tx {
-                    let data_str = serde_json::to_string(&data).unwrap_or_default();
-                    let now = crate::wse::presence::epoch_ms();
-                    let _ = ctx.send(ClusterCommand::PresenceUpdate {
-                        topic,
-                        user_id,
-                        action: 1, // leave
-                        data: data_str,
-                        updated_at: now,
-                    });
-                }
-            }
-        }
+        state.announce_untracked(pm.remove_connection(&conn_id));
     }
     // Pub/Sub cleanup: remove connection from all subscribed topics
     if let Some((_, topics)) = state.conn_topics.remove(&*conn_id) {

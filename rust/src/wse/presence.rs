@@ -44,7 +44,9 @@ pub(crate) struct PresenceEntry {
 #[derive(Clone, Debug)]
 pub(crate) struct ConnMeta {
     pub conn_id: String,
-    pub _joined_at: u64,
+    /// When it joined; for a peer's sentinel, the time of that peer's latest
+    /// join, which its leaves are compared against.
+    pub joined_at: u64,
 }
 
 pub(crate) struct PresenceStats {
@@ -80,6 +82,13 @@ pub(crate) enum TrackResult {
 pub(crate) enum UntrackResult {
     /// Last connection removed, user is gone (emit leave event).
     LastLeave {
+        user_id: String,
+        data: serde_json::Value,
+    },
+    /// The user's last connection on this node left, but other nodes still
+    /// report the user: peers must hear the leave, local subscribers must
+    /// not (the user is still present).
+    LastLocalLeave {
         user_id: String,
         data: serde_json::Value,
     },
@@ -198,7 +207,7 @@ impl PresenceManager {
             let inserted = if !entry.connections.iter().any(|c| c.conn_id == conn_id) {
                 entry.connections.push(ConnMeta {
                     conn_id: conn_id.to_owned(),
-                    _joined_at: now,
+                    joined_at: now,
                 });
                 true
             } else {
@@ -297,6 +306,20 @@ impl PresenceManager {
                 return UntrackResult::LastLeave {
                     user_id,
                     data: removed_entry.data,
+                };
+            }
+            // Only other nodes' sentinels left: this node's leave must still
+            // reach them, or each keeps this node's sentinel for good.
+            if removed_conn
+                && let Some(entry) = topic_map.get(&user_id)
+                && entry
+                    .connections
+                    .iter()
+                    .all(|c| c.conn_id.starts_with(REMOTE_PREFIX))
+            {
+                return UntrackResult::LastLocalLeave {
+                    user_id,
+                    data: entry.data.clone(),
                 };
             }
         }
@@ -521,7 +544,8 @@ impl PresenceManager {
     /// Merge a remote join from a peer node. Does NOT emit events (caller handles broadcast).
     /// `origin` is the reporting peer's address; the sentinel is keyed by it so
     /// each peer contributes its own and a leave/disconnect from one peer cannot
-    /// erase a user still present on another.
+    /// erase a user still present on another. True when the user was not
+    /// present before: only then is it a join for local subscribers.
     pub fn merge_remote_join(
         &self,
         topic: &str,
@@ -529,7 +553,7 @@ impl PresenceManager {
         data: &serde_json::Value,
         updated_at: u64,
         origin: &str,
-    ) {
+    ) -> bool {
         // Validate remote data size (same limit as local track)
         let data_str = data.to_string();
         if data_str.len() > self.max_data_size {
@@ -538,7 +562,7 @@ impl PresenceManager {
                 data_str.len(),
                 self.max_data_size
             );
-            return;
+            return false;
         }
         let topic_map = self
             .topic_presence
@@ -554,7 +578,7 @@ impl PresenceManager {
                 "[WSE-Presence] Rejecting remote join for {user_id}: topic at capacity ({})",
                 self.max_members
             );
-            return;
+            return false;
         }
 
         let mut entry = topic_map
@@ -577,91 +601,86 @@ impl PresenceManager {
         // double-count; if another peer already reported the user, this adds a
         // second sentinel so the user survives the first peer leaving.
         let sentinel = remote_sentinel(origin, user_id);
-        let already_present = entry.connections.iter().any(|c| c.conn_id == sentinel);
-        if !already_present {
-            entry.connections.push(ConnMeta {
-                conn_id: sentinel,
-                _joined_at: updated_at,
-            });
-            let stats = self
-                .topic_presence_stats
-                .entry(topic.to_owned())
-                .or_insert_with(PresenceStats::new);
-            if user_was_new {
-                stats.num_users.fetch_add(1, Ordering::Relaxed);
+        match entry.connections.iter_mut().find(|c| c.conn_id == sentinel) {
+            Some(existing) => existing.joined_at = existing.joined_at.max(updated_at),
+            None => {
+                entry.connections.push(ConnMeta {
+                    conn_id: sentinel,
+                    joined_at: updated_at,
+                });
+                let stats = self
+                    .topic_presence_stats
+                    .entry(topic.to_owned())
+                    .or_insert_with(PresenceStats::new);
+                if user_was_new {
+                    stats.num_users.fetch_add(1, Ordering::Relaxed);
+                }
+                stats.num_connections.fetch_add(1, Ordering::Relaxed);
             }
-            stats.num_connections.fetch_add(1, Ordering::Relaxed);
         }
+        user_was_new
     }
 
-    /// Merge a remote leave from a peer node. `updated_at` + `origin` enable
-    /// last-write-wins (a stale/reordered leave is ignored) and per-origin
-    /// sentinel removal (only the leaving peer's sentinel is dropped).
-    pub fn merge_remote_leave(&self, topic: &str, user_id: &str, updated_at: u64, origin: &str) {
-        if let Some(topic_map) = self.topic_presence.get(topic) {
-            let mut should_remove_user = false;
-            let mut removed_sentinel = false;
-
-            if let Some(mut entry) = topic_map.get_mut(user_id) {
-                // Last-write-wins: ignore a leave that predates the current state
-                // (e.g. leave@t then re-join@t+1 reordered on the wire), which
-                // would otherwise wrongly remove a user that just re-joined.
-                if updated_at < entry.updated_at {
-                    return;
-                }
-                // Remove ONLY this origin's sentinel; other peers' sentinels and
-                // local connections remain, so the user stays present if still
-                // connected elsewhere.
-                let sentinel = remote_sentinel(origin, user_id);
-                let before = entry.connections.len();
-                entry.connections.retain(|c| c.conn_id != sentinel);
-                removed_sentinel = entry.connections.len() < before;
-                // If no connections remain, remove the user entirely.
-                should_remove_user = entry.connections.is_empty();
-                // Advance the tombstone so a later stale join cannot resurrect it.
-                if removed_sentinel && updated_at > entry.updated_at {
-                    entry.updated_at = updated_at;
-                }
+    /// Merge a remote leave from a peer node: drop that peer's sentinel, unless
+    /// the peer joined again after `updated_at` (the peer's own clock, so its
+    /// joins and leaves compare; a peer's frames arrive in order on its link).
+    /// Returns the user's data when the user is gone from the topic: only
+    /// then is it a leave for local subscribers.
+    pub fn merge_remote_leave(
+        &self,
+        topic: &str,
+        user_id: &str,
+        updated_at: u64,
+        origin: &str,
+    ) -> Option<serde_json::Value> {
+        let topic_map = self.topic_presence.get(topic)?;
+        let sentinel = remote_sentinel(origin, user_id);
+        let emptied = {
+            let mut entry = topic_map.get_mut(user_id)?;
+            let joined_at = entry
+                .connections
+                .iter()
+                .find(|c| c.conn_id == sentinel)?
+                .joined_at;
+            if updated_at < joined_at {
+                return None;
             }
-
-            if should_remove_user {
-                // Use remove_if to prevent TOCTOU: track() could add a local
-                // connection between get_mut release and this remove call.
-                let actually_removed =
-                    topic_map.remove_if(user_id, |_, entry| entry.connections.is_empty());
-                if actually_removed.is_some()
-                    && let Some(stats) = self.topic_presence_stats.get(topic)
-                {
-                    let _ = stats.num_users.try_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |current| Some(current.saturating_sub(1)),
-                    );
-                }
-            }
-            // Decrement connection count for each removed sentinel
-            if removed_sentinel && let Some(stats) = self.topic_presence_stats.get(topic) {
-                let _ = stats.num_connections.try_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |current| Some(current.saturating_sub(1)),
-                );
-            }
-            if should_remove_user {
-                drop(topic_map);
-                self.remove_topic_if_empty(topic);
-            }
+            entry.connections.retain(|c| c.conn_id != sentinel);
+            entry.connections.is_empty()
+        };
+        if let Some(stats) = self.topic_presence_stats.get(topic) {
+            let _ = stats
+                .num_connections
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                    Some(c.saturating_sub(1))
+                });
         }
+        if !emptied {
+            return None;
+        }
+        // remove_if: track() may have added a local connection meanwhile.
+        let (_, removed) = topic_map.remove_if(user_id, |_, entry| entry.connections.is_empty())?;
+        if let Some(stats) = self.topic_presence_stats.get(topic) {
+            let _ = stats
+                .num_users
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                    Some(c.saturating_sub(1))
+                });
+        }
+        drop(topic_map);
+        self.remove_topic_if_empty(topic);
+        Some(removed.data)
     }
 
     /// Merge a remote data update (last-write-wins).
+    /// True when the update was newer and applied.
     pub fn merge_remote_update(
         &self,
         topic: &str,
         user_id: &str,
         data: &serde_json::Value,
         updated_at: u64,
-    ) {
+    ) -> bool {
         // Validate remote data size (same limit as local track)
         let data_str = data.to_string();
         if data_str.len() > self.max_data_size {
@@ -670,7 +689,7 @@ impl PresenceManager {
                 data_str.len(),
                 self.max_data_size
             );
-            return;
+            return false;
         }
         if let Some(topic_map) = self.topic_presence.get(topic)
             && let Some(mut entry) = topic_map.get_mut(user_id)
@@ -678,27 +697,35 @@ impl PresenceManager {
         {
             entry.data = data.clone();
             entry.updated_at = updated_at;
+            return true;
         }
+        false
     }
 
     /// Merge full presence state from a peer (called on peer connect).
     /// Expected JSON format: {"topic": {"user_id": {"data": {...}, "updated_at": 123}}}
-    pub fn merge_full_state(&self, entries_json: &str, origin: &str) {
+    /// Returns (topic, user_id, data) of the users who were not present before.
+    pub fn merge_full_state(
+        &self,
+        entries_json: &str,
+        origin: &str,
+    ) -> Vec<(String, String, serde_json::Value)> {
+        let mut joined = Vec::new();
         // Cap incoming full state to 10MB to prevent OOM
         if entries_json.len() > 10_000_000 {
             tracing::error!(
                 "[Presence] Full state too large ({} bytes, max 10MB), rejecting",
                 entries_json.len()
             );
-            return;
+            return joined;
         }
         let parsed: serde_json::Value = match serde_json::from_str(entries_json) {
             Ok(v) => v,
-            Err(_) => return,
+            Err(_) => return joined,
         };
         let topics = match parsed.as_object() {
             Some(t) => t,
-            None => return,
+            None => return joined,
         };
         for (topic, users_val) in topics {
             let users = match users_val.as_object() {
@@ -714,18 +741,23 @@ impl PresenceManager {
                     .get("updated_at")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                self.merge_remote_join(topic, user_id, &data, updated_at, origin);
+                if self.merge_remote_join(topic, user_id, &data, updated_at, origin) {
+                    joined.push((topic.clone(), user_id.clone(), data));
+                }
             }
         }
+        joined
     }
 
     /// Remove every presence sentinel contributed by `origin` -- called when a
     /// cluster peer disconnects. Users left with no remaining connections are
     /// dropped, so a crashed peer (which sends no per-user leave) cannot leave
     /// "ghost" members present forever and drift membership counts upward.
-    pub fn purge_origin(&self, origin: &str) {
+    /// Returns (topic, user_id, data) of the users gone with it.
+    pub fn purge_origin(&self, origin: &str) -> Vec<(String, String, serde_json::Value)> {
         let prefix = remote_origin_prefix(origin);
         let mut thinned_topics: Vec<String> = Vec::new();
+        let mut gone = Vec::new();
         for topic_entry in self.topic_presence.iter() {
             let topic = topic_entry.key();
             let topic_map = topic_entry.value();
@@ -750,11 +782,10 @@ impl PresenceManager {
             for uid in emptied_users {
                 // remove_if guards against a concurrent local track() re-adding a
                 // connection between the iter_mut release and this removal.
-                if topic_map
-                    .remove_if(&uid, |_, e| e.connections.is_empty())
-                    .is_some()
+                if let Some((_, entry)) = topic_map.remove_if(&uid, |_, e| e.connections.is_empty())
                 {
                     users_removed += 1;
+                    gone.push((topic.clone(), uid, entry.data));
                 }
             }
 
@@ -782,6 +813,7 @@ impl PresenceManager {
         for topic in &thinned_topics {
             self.remove_topic_if_empty(topic);
         }
+        gone
     }
 
     /// Serialize local presence state into one or more JSON chunks, each whose
@@ -858,6 +890,77 @@ mod tests {
 
     fn data() -> serde_json::Value {
         serde_json::json!({"status": "online"})
+    }
+
+    fn members(mgr: &PresenceManager, topic: &str) -> Vec<String> {
+        let mut users: Vec<String> = mgr.query(topic).into_iter().map(|m| m.0).collect();
+        users.sort();
+        users
+    }
+
+    // The user's last tab on this node closes while another node still has
+    // one: peers must hear this node's leave, local subscribers must not.
+    #[test]
+    fn the_last_local_leave_is_told_to_peers_only() {
+        let mgr = PresenceManager::new(4096, 0);
+        mgr.register_connection("c1", "alice");
+        assert!(matches!(
+            mgr.track("c1", "room", &data()),
+            TrackResult::FirstJoin { .. }
+        ));
+        assert!(!mgr.merge_remote_join("room", "alice", &data(), 100, "peerB"));
+        let results = mgr.remove_connection("c1");
+        assert!(matches!(results[0].1, UntrackResult::LastLocalLeave { .. }));
+        assert_eq!(members(&mgr, "room"), ["alice"]);
+        // Then peerB's leave: now the user is gone, and that is the event.
+        assert_eq!(
+            mgr.merge_remote_leave("room", "alice", 200, "peerB"),
+            Some(data())
+        );
+        assert!(members(&mgr, "room").is_empty());
+    }
+
+    // A peer's leave is compared with that peer's own join, not with the
+    // newest write from anywhere (another node's clock, a local update).
+    #[test]
+    fn a_remote_leave_is_judged_by_its_own_peers_join() {
+        let mgr = PresenceManager::new(4096, 0);
+        mgr.merge_remote_join("room", "alice", &data(), 100, "peerB");
+        // A newer write from elsewhere moves the entry's own timestamp on.
+        mgr.merge_remote_join("room", "alice", &data(), 500, "peerC");
+        assert_eq!(mgr.merge_remote_leave("room", "alice", 150, "peerB"), None);
+        let entry_conns = mgr
+            .topic_presence
+            .get("room")
+            .unwrap()
+            .get("alice")
+            .unwrap()
+            .connections
+            .len();
+        assert_eq!(entry_conns, 1, "peerB's sentinel is gone, peerC's stays");
+        // A leave older than the peer's latest join is stale.
+        mgr.merge_remote_join("room", "bob", &data(), 300, "peerB");
+        assert_eq!(mgr.merge_remote_leave("room", "bob", 250, "peerB"), None);
+        assert_eq!(members(&mgr, "room"), ["alice", "bob"]);
+    }
+
+    #[test]
+    fn remote_merges_report_what_changed() {
+        let mgr = PresenceManager::new(4096, 0);
+        assert!(mgr.merge_remote_join("room", "alice", &data(), 100, "peerB"));
+        assert!(!mgr.merge_remote_join("room", "alice", &data(), 101, "peerC"));
+        assert!(mgr.merge_remote_update("room", "alice", &serde_json::json!({"s": 1}), 200));
+        assert!(!mgr.merge_remote_update("room", "alice", &serde_json::json!({"s": 0}), 150));
+        let full = r#"{"room": {"alice": {"data": {}, "updated_at": 1}, "carol": {"data": {}, "updated_at": 1}}}"#;
+        let joined = mgr.merge_full_state(full, "peerD");
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].1, "carol");
+        let gone = mgr.purge_origin("peerD");
+        assert_eq!(
+            gone.iter().map(|g| g.1.as_str()).collect::<Vec<_>>(),
+            ["carol"]
+        );
+        assert_eq!(members(&mgr, "room"), ["alice"]);
     }
 
     // Per-origin sentinels: a leave from one peer must not erase a user

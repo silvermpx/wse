@@ -14,6 +14,7 @@ use super::{
     ConnectionHandle, QueueGroup, ServerCommand, SharedState, format_presence_msg, is_pattern,
 };
 use crate::wse::cluster::ClusterCommand;
+use crate::wse::presence::UntrackResult;
 use crate::wse::recovery::RecoveryResult;
 
 /// Longest topic name accepted, in bytes.
@@ -220,39 +221,39 @@ impl SharedState {
         self.remove_local_interest(&left_groups);
 
         if let Some(ref pm) = self.presence {
-            for (topic, result) in pm.untrack_topics(conn_id, &removed) {
-                if let crate::wse::presence::UntrackResult::LastLeave { user_id, data } = result {
-                    self.announce_presence_leave(topic, user_id, data);
-                }
-            }
+            self.announce_untracked(pm.untrack_topics(conn_id, &removed));
         }
         self.remove_local_interest(&removed);
         removed
     }
 
-    /// A user's last connection left `topic`: tell the application (drain
-    /// mode), the topic's subscribers and the cluster.
+    /// Announce what removing a connection from presence changed.
+    pub(crate) fn announce_untracked(&self, results: Vec<(String, UntrackResult)>) {
+        for (topic, result) in results {
+            match result {
+                UntrackResult::LastLeave { user_id, data } => {
+                    self.announce_presence_leave(topic, user_id, data, true);
+                }
+                UntrackResult::LastLocalLeave { user_id, data } => {
+                    self.announce_presence_leave(topic, user_id, data, false);
+                }
+                UntrackResult::StillPresent | UntrackResult::NotTracked => {}
+            }
+        }
+    }
+
+    /// A user's last connection on this node left `topic`: the cluster is
+    /// told; with `local`, the user is gone everywhere and the application
+    /// (drain mode) and the topic's subscribers are told too.
     pub(crate) fn announce_presence_leave(
         &self,
         topic: String,
         user_id: String,
         data: serde_json::Value,
+        local: bool,
     ) {
-        if self.drain_mode.load(Ordering::Relaxed) {
-            self.push_inbound(InboundEvent::PresenceLeave {
-                topic: topic.clone(),
-                user_id: user_id.clone(),
-                data: data.clone(),
-            });
-        }
-        let presence_tx = self.presence_broadcast_tx.read().unwrap().clone();
-        if let Some(tx) = presence_tx {
-            let _ = tx.send(ServerCommand::BroadcastLocal {
-                topic: topic.clone(),
-                data: format_presence_msg("presence_leave", &user_id, &data),
-                skip_recovery: true,
-                publish: false,
-            });
+        if local {
+            self.tell_presence_leave(&topic, &user_id, &data);
         }
         let cluster_tx = self.cluster_cmd_tx.read().unwrap().clone();
         if let Some(tx) = cluster_tx {
@@ -262,6 +263,27 @@ impl SharedState {
                 action: 1, // leave
                 data: serde_json::to_string(&data).unwrap_or_default(),
                 updated_at: crate::wse::presence::epoch_ms(),
+            });
+        }
+    }
+
+    /// Tell the application (drain mode) and the topic's subscribers that a
+    /// user left `topic`.
+    pub(crate) fn tell_presence_leave(&self, topic: &str, user_id: &str, data: &serde_json::Value) {
+        if self.drain_mode.load(Ordering::Relaxed) {
+            self.push_inbound(InboundEvent::PresenceLeave {
+                topic: topic.to_owned(),
+                user_id: user_id.to_owned(),
+                data: data.clone(),
+            });
+        }
+        let presence_tx = self.presence_broadcast_tx.read().unwrap().clone();
+        if let Some(tx) = presence_tx {
+            let _ = tx.send(ServerCommand::BroadcastLocal {
+                topic: topic.to_owned(),
+                data: format_presence_msg("presence_leave", user_id, data),
+                skip_recovery: true,
+                publish: false,
             });
         }
     }

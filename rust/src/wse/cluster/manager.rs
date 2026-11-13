@@ -25,6 +25,25 @@ use super::{
 // Cluster manager: orchestrates all peer connections
 // ---------------------------------------------------------------------------
 
+/// Broadcast a presence event of a remote user to the topic's local
+/// subscribers.
+fn tell_presence(
+    server_cmd_tx: &Option<mpsc::UnboundedSender<crate::wse::server::ServerCommand>>,
+    kind: &str,
+    topic: String,
+    user_id: &str,
+    data: &serde_json::Value,
+) {
+    if let Some(tx) = server_cmd_tx {
+        let _ = tx.send(crate::wse::server::ServerCommand::BroadcastLocal {
+            topic,
+            data: crate::wse::server::format_presence_msg(kind, user_id, data),
+            skip_recovery: true,
+            publish: false,
+        });
+    }
+}
+
 pub(crate) async fn cluster_manager(
     peers: Vec<String>,
     instance_id: String,
@@ -423,7 +442,9 @@ pub(crate) async fn cluster_manager(
                             // Purge this peer's presence sentinels so a crashed peer
                             // (no per-user leave) leaves no ghost members behind.
                             if let Some(ref pm) = presence {
-                                pm.purge_origin(&peer_addr);
+                                for (topic, user_id, data) in pm.purge_origin(&peer_addr) {
+                                    tell_presence(&server_cmd_tx, "presence_leave", topic, &user_id, &data);
+                                }
                             }
                             remote_interest.remove(&peer_addr);
                             peer_generation.remove(&peer_addr);
@@ -469,51 +490,29 @@ pub(crate) async fn cluster_manager(
                     match pf {
                         PresencePeerFrame::Update { origin, topic, user_id, action, data, updated_at } => {
                             let data_val: serde_json::Value = serde_json::from_str(&data).unwrap_or(serde_json::Value::Null);
-                            match action {
-                                0 => {
-                                    // Remote join: merge into local presence
-                                    pm.merge_remote_join(&topic, &user_id, &data_val, updated_at, &origin);
-                                    if let Some(ref tx) = server_cmd_tx {
-                                        let msg = crate::wse::server::format_presence_msg("presence_join", &user_id, &data_val);
-                                        let _ = tx.send(crate::wse::server::ServerCommand::BroadcastLocal {
-                                            topic,
-                                            data: msg,
-                                            skip_recovery: true,
-                                            publish: false,
-                                        });
-                                    }
-                                }
-                                1 => {
-                                    // Remote leave
-                                    pm.merge_remote_leave(&topic, &user_id, updated_at, &origin);
-                                    if let Some(ref tx) = server_cmd_tx {
-                                        let msg = crate::wse::server::format_presence_msg("presence_leave", &user_id, &data_val);
-                                        let _ = tx.send(crate::wse::server::ServerCommand::BroadcastLocal {
-                                            topic,
-                                            data: msg,
-                                            skip_recovery: true,
-                                            publish: false,
-                                        });
-                                    }
-                                }
-                                2 => {
-                                    // Remote data update
-                                    pm.merge_remote_update(&topic, &user_id, &data_val, updated_at);
-                                    if let Some(ref tx) = server_cmd_tx {
-                                        let msg = crate::wse::server::format_presence_msg("presence_update", &user_id, &data_val);
-                                        let _ = tx.send(crate::wse::server::ServerCommand::BroadcastLocal {
-                                            topic,
-                                            data: msg,
-                                            skip_recovery: true,
-                                            publish: false,
-                                        });
-                                    }
-                                }
-                                _ => {} // Ignore unknown actions
+                            // Local subscribers hear of a change in membership
+                            // only: a join of a user already present (another
+                            // node) or a leave of one still present is none.
+                            let event = match action {
+                                0 => pm
+                                    .merge_remote_join(&topic, &user_id, &data_val, updated_at, &origin)
+                                    .then_some(("presence_join", data_val)),
+                                1 => pm
+                                    .merge_remote_leave(&topic, &user_id, updated_at, &origin)
+                                    .map(|left| ("presence_leave", left)),
+                                2 => pm
+                                    .merge_remote_update(&topic, &user_id, &data_val, updated_at)
+                                    .then_some(("presence_update", data_val)),
+                                _ => None, // Ignore unknown actions
+                            };
+                            if let Some((kind, data)) = event {
+                                tell_presence(&server_cmd_tx, kind, topic, &user_id, &data);
                             }
                         }
                         PresencePeerFrame::Full { origin, entries } => {
-                            pm.merge_full_state(&entries, &origin);
+                            for (topic, user_id, data) in pm.merge_full_state(&entries, &origin) {
+                                tell_presence(&server_cmd_tx, "presence_join", topic, &user_id, &data);
+                            }
                         }
                     }
                 }
