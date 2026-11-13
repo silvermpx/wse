@@ -57,6 +57,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 arc-swap = "1"
 
+# musl (Alpine) loads the extension with dlopen, where mimalloc's default
+# initial-exec TLS model fails to resolve ("initial-exec TLS resolves to
+# dynamic definition"): the module would not import.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
+
 [dev-dependencies]
 rcgen = "0.14"
 # Property tests: parsers and buffers fed thousands of random inputs per run.

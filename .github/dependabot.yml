@@ -1,14 +1,60 @@
 version: 2
+# cooldown: a new release is proposed only after it has been public for a
+# week, so a hijacked release is usually caught and yanked before it lands
+# here. Security updates are not delayed.
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+
   - package-ecosystem: "cargo"
     directory: "/rust"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+
+  # Benchmark tools behind the published numbers: one grouped PR each.
+  - package-ecosystem: "cargo"
+    directory: "/benchmarks/rust-bench"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      rust-bench:
+        patterns: ["*"]
+
+  - package-ecosystem: "npm"
+    directory: "/benchmarks/ts-bench"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      ts-bench:
+        patterns: ["*"]
+
+  # Python dependency ranges: wse-server (build backend, extras) and
+  # wse-client (runtime dependencies, extras).
+  - package-ecosystem: "pip"
+    directories:
+      - "/"
+      - "/python-client"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      python:
+        patterns: ["*"]

@@ -8,7 +8,10 @@ name = "wse-server"
 version = "2.5.1"
 description = "Rust-powered WebSocket engine for Python. Up to 5M fan-out del/s. Zero-GIL JWT."
 readme = "README.md"
-license = { text = "MIT" }
+# PEP 639: an SPDX expression (core metadata License-Expression). The table
+# form next to license-files is what PEP 639 tells build tools to reject, and
+# the License :: classifier is superseded by the expression.
+license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 authors = [
@@ -26,7 +29,6 @@ keywords = [
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",

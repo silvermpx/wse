@@ -1,16 +1,17 @@
-# Enable SIMD optimizations for local builds.
-# zlib-rs: AVX2/NEON adler32, crc32, deflate matching
-# httparse: AVX2/NEON header scanning (inside tungstenite)
-# ahash: AES-NI hardware hashing
+# No build flags are committed here on purpose.
 #
-# NOTE: Binaries are tied to the CPU they're compiled on.
-# CI release builds must NOT use target-cpu=native.
-
-[target.aarch64-apple-darwin]
-rustflags = ["-C", "target-cpu=native"]
-
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=native"]
-
-[target.x86_64-apple-darwin]
-rustflags = ["-C", "target-cpu=native"]
+# maturin applies this file to every wheel it builds and the sdist ships it,
+# so a `target-cpu=native` here would tie published wheels (and every sdist
+# install) to the CPU of the machine that built them: SIGILL on older CPUs,
+# and a failed build when cross-compiling (x86_64 macOS from an arm64 Mac).
+# The release preflight (.github/scripts/release_preflight.py cargo-config)
+# refuses target-cpu / target-feature in this file.
+#
+# CPU tuning stays a local opt-in for benchmarks on your own machine:
+#
+#   RUSTFLAGS="-C target-cpu=native" maturin develop --release
+#   RUSTFLAGS="-C target-cpu=native" cargo bench --manifest-path rust/Cargo.toml
+#
+# It turns CPU features on at compile time. ahash's AES-NI hashing on x86_64
+# needs that; zlib-rs (adler32/crc32, deflate matching) and httparse (header
+# scanning) also pick AVX2/NEON at run time in the portable build.

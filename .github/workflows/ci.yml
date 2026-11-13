@@ -14,25 +14,47 @@ permissions:
 
 env:
   CARGO_INCREMENTAL: 0
+  # The maturin that builds the extension here. Keep it equal to
+  # MATURIN_VERSION in release.yml and inside pyproject.toml's
+  # [build-system] requires.
+  MATURIN_VERSION: '1.16.0'
 
 jobs:
   # ---------------------------------------------------------------------------
-  # TS client: type-check + build
+  # TS client: type-check, unit tests, build, consumer check
   # ---------------------------------------------------------------------------
   client:
     name: Client (TS)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: '22'
           cache: 'npm'
 
-      - run: npm ci
-      - run: npx tsc --noEmit
-      - run: npm run build
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Unit tests (vitest)
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # The packed tarball, installed into a fresh project: bundled with
+      # esbuild and imported in Node, the two ways applications load it.
+      - name: Consumer check
+        run: |
+          mkdir -p npm-dist
+          npm pack --ignore-scripts --pack-destination npm-dist
+          bash .github/scripts/npm-consumer-check.sh npm-dist/wse-client-*.tgz
 
   # ---------------------------------------------------------------------------
   # Python client: lint + tests
@@ -47,6 +69,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
@@ -75,13 +99,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
           cache: 'pip'
 
-      - run: pip install 'ruff==0.17.5' mypy
+      # prometheus-client: wse_server.prometheus imports it (the prometheus extra).
+      - run: pip install 'ruff==0.17.5' 'mypy==2.4.1' prometheus-client
 
       - name: Ruff check
         run: ruff check wse_server/ tests/
@@ -89,17 +116,25 @@ jobs:
       - name: Ruff format
         run: ruff format --check wse_server/ tests/
 
+      # Strict mypy (pyproject.toml [tool.mypy]) over the package and the
+      # shipped stub of the extension.
+      - name: Mypy
+        run: mypy wse_server
+
   # ---------------------------------------------------------------------------
-  # Rust: clippy + fmt
+  # Rust: fmt + clippy
   # ---------------------------------------------------------------------------
   rust-lint:
     name: Rust Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      - uses: dtolnay/rust-toolchain@stable
         with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
@@ -110,7 +145,81 @@ jobs:
         run: cargo fmt --manifest-path rust/Cargo.toml -- --check
 
       - name: Clippy
-        run: cargo clippy --manifest-path rust/Cargo.toml -- -D warnings
+        run: cargo clippy --manifest-path rust/Cargo.toml --locked --all-targets -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # Rust: unit tests
+  # ---------------------------------------------------------------------------
+  rust-test:
+    name: Rust Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Without pyo3's extension-module feature the test binary links
+      # libpython. setup-python's CPython is a shared build and exports
+      # LD_LIBRARY_PATH to its lib directory, so the binary also runs.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        id: python
+        with:
+          python-version: '3.12'
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: "rust -> target"
+
+      - name: cargo test
+        run: cargo test --manifest-path rust/Cargo.toml --locked
+        env:
+          PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
+
+  # ---------------------------------------------------------------------------
+  # Rust: the declared minimum version (rust-version in rust/Cargo.toml),
+  # which is what an sdist install needs at least
+  # ---------------------------------------------------------------------------
+  rust-msrv:
+    name: Rust MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read rust-version
+        id: msrv
+        run: |
+          msrv="$(sed -n 's/^rust-version *= *"\([0-9.]*\)".*/\1/p' rust/Cargo.toml)"
+          if [ -z "$msrv" ]; then
+            echo "::error file=rust/Cargo.toml::no rust-version found"
+            exit 1
+          fi
+          echo "Declared MSRV: $msrv"
+          echo "version=$msrv" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        id: python
+        with:
+          python-version: '3.12'
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: "rust -> target"
+
+      - name: cargo check (MSRV)
+        run: cargo +"$MSRV" check --manifest-path rust/Cargo.toml --locked
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+          PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
 
   # ---------------------------------------------------------------------------
   # Python server: build Rust + run tests
@@ -126,28 +235,34 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ matrix.python }}
           cache: 'pip'
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: "rust -> target"
 
+      # cryptography plays the client side of the E2E key exchange test;
+      # prometheus-client runs the collector test (wse-server[prometheus]).
       - name: Create virtualenv + install deps
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin pytest pytest-asyncio pytest-cov httpx websockets cryptography
+          pip install "maturin==${MATURIN_VERSION}" pytest pytest-asyncio pytest-cov httpx websockets cryptography prometheus-client
 
       - name: Build Rust extension
         run: |
           source .venv/bin/activate
-          maturin develop --release
+          maturin develop --release --locked
 
       - name: Run tests
         run: |
@@ -155,28 +270,84 @@ jobs:
           pytest tests/ -v --tb=short
 
   # ---------------------------------------------------------------------------
-  # Security: dependency audit
+  # Benchmarks: the tools behind the published numbers must still build
+  # ---------------------------------------------------------------------------
+  benchmarks:
+    name: Benchmarks (build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: "benchmarks/rust-bench -> target"
+
+      - name: rust-bench (cargo check)
+        run: cargo check --manifest-path benchmarks/rust-bench/Cargo.toml --locked --all-targets
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: benchmarks/ts-bench/package-lock.json
+
+      - name: ts-bench (type check)
+        working-directory: benchmarks/ts-bench
+        run: |
+          npm ci --ignore-scripts
+          npx tsc --noEmit -p .
+
+      - name: Python benchmark scripts (syntax)
+        run: python3 -m compileall -q benchmarks/
+
+  # ---------------------------------------------------------------------------
+  # Security: dependency audit (every step can fail the job)
   # ---------------------------------------------------------------------------
   security:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
       - name: Rust dependency audit
-        run: cargo audit --file rust/Cargo.lock --ignore RUSTSEC-2023-0071
-        # RUSTSEC-2023-0071: rsa crate Marvin Attack (timing side-channel in RSA decryption).
-        # Not exploitable: WSE uses jsonwebtoken for JWT signature verification only,
-        # never RSA decryption. No fix available upstream.
+        run: cargo audit --file rust/Cargo.lock
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: '22'
 
-      - name: npm audit
-        run: npm audit --audit-level=high || true
+      # The npm package's runtime dependencies (what users install). Dev
+      # tooling advisories do not reach users and do not fail the build.
+      - name: npm audit (runtime dependencies)
+        run: npm audit --omit=dev --audit-level=high
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.12'
+
+      # wse-server has no Python runtime dependencies; wse-client[all] has
+      # websockets, cryptography, msgpack and orjson. Resolve them as a user
+      # would today and audit exactly that set.
+      - name: pip-audit (Python client dependencies)
+        run: |
+          python -m venv /tmp/client-env
+          /tmp/client-env/bin/pip install --quiet "./python-client[all]"
+          /tmp/client-env/bin/pip freeze --exclude wse-client > /tmp/client-requirements.txt
+          cat /tmp/client-requirements.txt
+          python -m pip install --quiet 'pip-audit==2.10.1'
+          python -m pip_audit --strict --no-deps --disable-pip --progress-spinner off -r /tmp/client-requirements.txt
