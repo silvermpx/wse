@@ -162,8 +162,8 @@ class TestSendPaths:
 
         limiter = TokenBucketRateLimiter(capacity=1, refill_rate=1)
         limiter.try_consume()  # empty
-        security = SecurityManager()
-        peer = SecurityManager()
+        security = SecurityManager(legacy=True)
+        peer = SecurityManager(legacy=True)
         security.generate_keypair()
         security.derive_shared_secret(peer.generate_keypair())
         security.stop_key_rotation()
@@ -186,7 +186,7 @@ class TestSendPaths:
         pytest.importorskip("cryptography")
         from wse_client.security import SecurityManager
 
-        conn = ConnectionManager("ws://x/wse", security=SecurityManager())
+        conn = ConnectionManager("ws://x/wse", security=SecurityManager(legacy=True))
         ws = FakeWS()
         conn._ws = ws
         conn._state = ConnectionState.CONNECTED

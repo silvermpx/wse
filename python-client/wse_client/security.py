@@ -9,9 +9,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import os
+from typing import Any
 
 from ._logging import logger
 
@@ -51,11 +53,38 @@ class SecurityManager:
     Requires ``cryptography`` package (``pip install wse-client[crypto]``).
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        server_keys: list[str] | None = None,
+        unauthenticated: bool = False,
+        legacy: bool = False,
+    ) -> None:
+        """End-to-end encryption of a connection.
+
+        By default a session with an authenticated server: ``server_keys``
+        are the server's identity public keys (``e2e_identity_public_key()``
+        on the server, base64), one of which must sign each handshake;
+        ``unauthenticated=True`` accepts an unsigned server instead, which
+        only protects against passive observers. ``legacy=True`` speaks the
+        first design, for servers before 3.0.
+        """
         if not _HAS_CRYPTO:
             raise WSEEncryptionError(
                 "cryptography package required: pip install wse-client[crypto]"
             )
+        if not legacy and not server_keys and not unauthenticated:
+            raise WSEEncryptionError(
+                "encryption needs the server's e2e identity key (e2e_server_keys), "
+                "or e2e_unauthenticated=True, or e2e_legacy=True for servers before 3.0"
+            )
+        self._legacy = legacy
+        self._server_keys = list(server_keys or [])
+        self._unauthenticated = unauthenticated
+        self._offer: Any = None
+        self._session: Any = None
+        #: The session's failure (a frame out of order or forged): the
+        #: connection must end.
+        self.broken: Exception | None = None
 
         self._private_key: EllipticCurvePrivateKey | None = None
         self._aes_key: bytes | None = None
@@ -70,7 +99,48 @@ class SecurityManager:
 
     @property
     def is_enabled(self) -> bool:
+        if not self._legacy:
+            return self._session is not None
         return self._enabled and self._aes_key is not None
+
+    @property
+    def session_mode(self) -> bool:
+        """A session (not the first design): every frame after the
+        handshake is sealed, control frames included."""
+        return not self._legacy
+
+    def hello_fields(self) -> dict[str, Any]:
+        """What ``client_hello.p`` carries for the key exchange, fresh for
+        each connection attempt."""
+        self.reset()
+        if not self._legacy:
+            from .e2e_session import Offer
+
+            self._offer = Offer()
+            return {"e2e": self._offer.message()}
+        public = self.generate_keypair()
+        return {"encryption_public_key": base64.b64encode(public).decode("ascii")}
+
+    def accept_server_hello(self, p: dict[str, Any]) -> None:
+        """Complete the key exchange from ``server_hello.p``; raises when
+        the server did not answer it, or its identity does not check."""
+        if not self._legacy:
+            e2e = p.get("e2e")
+            if self._offer is None or not isinstance(e2e, dict):
+                raise WSEEncryptionError("the server did not answer the E2E offer")
+            self._session = self._offer.accept(
+                e2e,
+                str(p.get("connection_id", "")),
+                self._server_keys,
+                self._unauthenticated,
+            )
+            self._offer = None
+            logger.debug("E2E session established")
+            return
+        server_key = p.get("encryption_public_key")
+        if not isinstance(server_key, str):
+            raise WSEEncryptionError("server_hello without encryption key")
+        self.derive_shared_secret(base64.b64decode(server_key))
 
     # -- Key exchange ---------------------------------------------------------
 
@@ -121,6 +191,8 @@ class SecurityManager:
 
     def encrypt(self, plaintext: str) -> bytes:
         """Encrypt plaintext -> bytes (without E: prefix)."""
+        if self._session is not None:
+            return bytes(self._session.seal(plaintext.encode("utf-8"))[2:])
         if self._aes_key is None:
             raise WSEEncryptionError("Encryption not initialised")
 
@@ -140,6 +212,15 @@ class SecurityManager:
         The plaintext is JSON text, or an ``M:``-prefixed msgpack payload on
         a connection that negotiated msgpack, so it is not decoded here.
         """
+        if self._session is not None:
+            try:
+                plaintext = self._session.open(b"E:" + data)
+            except Exception as exc:
+                self.broken = exc
+                raise
+            if plaintext is None:
+                raise WSEEncryptionError("the server ended the E2E session")
+            return bytes(plaintext)
         if self._aes_key is None:
             raise WSEEncryptionError("Encryption not initialised")
 
@@ -264,6 +345,9 @@ class SecurityManager:
 
     def reset(self) -> None:
         """Clear all keys, disable encryption, and cancel rotation."""
+        self._offer = None
+        self._session = None
+        self.broken = None
         self._private_key = None
         self._aes_key = None
         self._signing_key = None

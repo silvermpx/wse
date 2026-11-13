@@ -442,6 +442,8 @@ jobs:
           python -m venv .venv
           source .venv/bin/activate
           pip install "maturin==${MATURIN_VERSION}" pytest pytest-asyncio pytest-cov httpx websockets cryptography prometheus-client
+          # tests/test_clients.py runs the Python client against the server.
+          pip install -e python-client
 
       - name: Build Rust extension
         run: |

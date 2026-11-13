@@ -263,7 +263,7 @@ class FakeWSEServer:
         if self.encryption and p.get("features", {}).get("encryption") and client_key:
             from wse_client.security import SecurityManager
 
-            server = SecurityManager()
+            server = SecurityManager(legacy=True)
             server_pub = server.generate_keypair()
             server.derive_shared_secret(base64.b64decode(client_key))
             server.stop_key_rotation()

@@ -12,15 +12,15 @@ HAS_CRYPTO = importlib.util.find_spec("cryptography") is not None
 @pytest.mark.skipif(not HAS_CRYPTO, reason="cryptography not installed")
 class TestSecurityManager:
     def test_generate_keypair_returns_65_bytes(self):
-        sm = SecurityManager()
+        sm = SecurityManager(legacy=True)
         pub = sm.generate_keypair()
         assert len(pub) == 65
         assert pub[0] == 0x04  # Uncompressed point prefix
 
     def test_ecdh_derive_shared_secret(self):
         # Simulate client + server key exchange
-        client = SecurityManager()
-        server = SecurityManager()
+        client = SecurityManager(legacy=True)
+        server = SecurityManager(legacy=True)
 
         client_pub = client.generate_keypair()
         server_pub = server.generate_keypair()
@@ -32,8 +32,8 @@ class TestSecurityManager:
         assert server.is_enabled
 
     def test_encrypt_decrypt_roundtrip(self):
-        client = SecurityManager()
-        server = SecurityManager()
+        client = SecurityManager(legacy=True)
+        server = SecurityManager(legacy=True)
 
         client_pub = client.generate_keypair()
         server_pub = server.generate_keypair()
@@ -52,10 +52,10 @@ class TestSecurityManager:
 
     def test_sign_verify_roundtrip(self):
         # Signing keys are per-side (random), so sign+verify on same instance
-        mgr = SecurityManager()
+        mgr = SecurityManager(legacy=True)
         mgr.generate_keypair()
         # Manually set a signing key (derive_shared_secret sets one randomly)
-        peer = SecurityManager()
+        peer = SecurityManager(legacy=True)
         peer_pub = peer.generate_keypair()
         mgr.derive_shared_secret(peer_pub)
 
@@ -64,9 +64,9 @@ class TestSecurityManager:
         assert mgr.verify(payload, sig) is True
 
     def test_verify_rejects_tampered(self):
-        mgr = SecurityManager()
+        mgr = SecurityManager(legacy=True)
         mgr.generate_keypair()
-        peer = SecurityManager()
+        peer = SecurityManager(legacy=True)
         peer_pub = peer.generate_keypair()
         mgr.derive_shared_secret(peer_pub)
 
@@ -74,8 +74,8 @@ class TestSecurityManager:
         assert mgr.verify('{"tampered":true}', sig) is False
 
     def test_reset_disables(self):
-        sm = SecurityManager()
-        server = SecurityManager()
+        sm = SecurityManager(legacy=True)
+        server = SecurityManager(legacy=True)
 
         sm.generate_keypair()
         server_pub = server.generate_keypair()
@@ -87,9 +87,9 @@ class TestSecurityManager:
         assert not sm.is_enabled
 
     def test_decrypt_wrong_key_fails(self):
-        client = SecurityManager()
-        server = SecurityManager()
-        wrong = SecurityManager()
+        client = SecurityManager(legacy=True)
+        server = SecurityManager(legacy=True)
+        wrong = SecurityManager(legacy=True)
 
         client.generate_keypair()
         server_pub = server.generate_keypair()

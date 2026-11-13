@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import time
 
 from uuid import uuid4
@@ -183,6 +182,9 @@ class AsyncWSEClient:
         extra_headers: dict[str, str] | None = None,
         queue_size: int = 1000,
         encryption: bool = False,
+        e2e_server_keys: list[str] | None = None,
+        e2e_unauthenticated: bool = False,
+        e2e_legacy: bool = False,
         endpoints: list[str] | None = None,
         load_balancing: LoadBalancingStrategy = LoadBalancingStrategy.WEIGHTED_RANDOM,
         rate_limit: float | None = RATE_LIMIT_REFILL_RATE,
@@ -209,7 +211,11 @@ class AsyncWSEClient:
         if encryption:
             from .security import SecurityManager
 
-            self._security = SecurityManager()
+            self._security = SecurityManager(
+                server_keys=e2e_server_keys,
+                unauthenticated=e2e_unauthenticated,
+                legacy=e2e_legacy,
+            )
 
         # Services
         self._compression = CompressionHandler()
@@ -1292,6 +1298,13 @@ class AsyncWSEClient:
             self._stats.bytes_received += len(data.encode("utf-8"))
 
         result = self._codec.decode(data)
+        security = self._security
+        if security is not None and security.broken is not None:
+            # A frame out of order or forged: the session cannot go on.
+            self._start_encryption_failure(
+                WSEEncryptionError(f"E2E frame refused: {security.broken}")
+            )
+            return
         if result is None:
             return
 
@@ -1682,23 +1695,14 @@ class AsyncWSEClient:
         # Complete the ECDH key exchange -- or fail closed.
         security = self._security
         if security is not None and not security.is_enabled:
-            server_key = p.get("encryption_public_key")
-            if not (features.get("encryption") and isinstance(server_key, str)):
-                self._start_encryption_failure(
-                    WSEEncryptionError(
-                        "The server did not enable E2E encryption "
-                        "(server_hello without encryption key)"
-                    )
-                )
-                return
             try:
-                security.derive_shared_secret(base64.b64decode(server_key))
+                security.accept_server_hello(p)
             except Exception as exc:
                 self._start_encryption_failure(
                     WSEEncryptionError(f"E2E key exchange failed: {exc}")
                 )
                 return
-            logger.info("E2E encryption enabled (ECDH P-256 + AES-GCM-256)")
+            logger.info("E2E encryption enabled")
             _resolve(self._key_ready)
 
         server_version = p.get("server_version", "unknown")

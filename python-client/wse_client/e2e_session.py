@@ -78,11 +78,21 @@ def transcript(
         t += bytes([len(suite)]) + suite.encode()
     t += bytes([len(chosen)]) + chosen.encode()
     conn = connection_id.encode()[:255]
-    return t + client_random + client_public + server_public + bytes([len(conn)]) + conn + kid
+    return (
+        t
+        + client_random
+        + client_public
+        + server_public
+        + bytes([len(conn)])
+        + conn
+        + kid
+    )
 
 
 def _derive(th: bytes, ikm: bytes, label: bytes, length: int) -> bytes:
-    return HKDF(algorithm=hashes.SHA256(), length=length, salt=th, info=label).derive(ikm)
+    return HKDF(algorithm=hashes.SHA256(), length=length, salt=th, info=label).derive(
+        ikm
+    )
 
 
 class _Direction:
@@ -209,14 +219,24 @@ class Offer:
             server_public = base64.b64decode(hello["server_public_key"])
             kid = bytes.fromhex(hello["key_id"])
         except (KeyError, ValueError, TypeError):
-            raise E2eError("malformed server e2e answer", CLOSE_SERVER_REJECTED) from None
+            raise E2eError(
+                "malformed server e2e answer", CLOSE_SERVER_REJECTED
+            ) from None
         if len(server_public) != 65 or len(kid) != 8:
             raise E2eError("malformed server e2e answer", CLOSE_SERVER_REJECTED)
         t = transcript(
-            self.suites, SUITE, self.random, self.public_key, server_public, connection_id, kid
+            self.suites,
+            SUITE,
+            self.random,
+            self.public_key,
+            server_public,
+            connection_id,
+            kid,
         )
         if server_keys:
-            pinned = {key_id(base64.b64decode(k)): base64.b64decode(k) for k in server_keys}
+            pinned = {
+                key_id(base64.b64decode(k)): base64.b64decode(k) for k in server_keys
+            }
             signer = pinned.get(kid.hex())
             signature = hello.get("signature")
             if signer is None or hello.get("alg") != SIGNATURE_ALG or not signature:
@@ -225,17 +245,23 @@ class Offer:
             der = encode_dss_signature(
                 int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:], "big")
             )
-            public = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), signer)
+            public = ec.EllipticCurvePublicKey.from_encoded_point(
+                ec.SECP256R1(), signer
+            )
             try:
                 public.verify(der, t, ec.ECDSA(hashes.SHA256()))
             except InvalidSignature:
-                raise E2eError("server identity signature invalid", CLOSE_SERVER_REJECTED) from None
+                raise E2eError(
+                    "server identity signature invalid", CLOSE_SERVER_REJECTED
+                ) from None
         elif not unauthenticated:
             raise E2eError(
                 "pin the server's e2e identity key (server_keys) or allow unauthenticated",
                 CLOSE_SERVER_REJECTED,
             )
-        peer = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), server_public)
+        peer = ec.EllipticCurvePublicKey.from_encoded_point(
+            ec.SECP256R1(), server_public
+        )
         z = self._private.exchange(ec.ECDH(), peer)
         th = hashlib.sha256(t).digest()
         return Session(

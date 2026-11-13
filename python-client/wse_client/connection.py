@@ -29,7 +29,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import inspect
 import json as _json
 import math
@@ -497,12 +496,22 @@ class ConnectionManager:
     async def send_control(self, data: str) -> bool:
         """Send a protocol control frame (ping, PONG, client_hello).
 
-        Control frames are plaintext even with E2E on -- the server answers
-        pings only on its plaintext path -- and are never rate limited.
+        Never rate limited. In an E2E session they are sealed like every
+        other frame once the key exists (the server accepts nothing else);
+        with the first E2E design they stay plaintext.
         """
         ws = self._ws
         if ws is None or self._destroyed:
             return False
+        security = self._security
+        if security is not None and security.session_mode and security.is_enabled:
+            try:
+                return await self._ws_send(
+                    ws, PREFIX_ENCRYPTED + security.encrypt(data)
+                )
+            except Exception as exc:
+                logger.warning("Encryption failed, not sending: %s", exc)
+                return False
         return await self._ws_send(ws, data)
 
     @staticmethod
@@ -667,20 +676,18 @@ class ConnectionManager:
         the server's feature list -- also arrives when the application never
         sends server_ready.
         """
-        encryption_pubkey_b64: str | None = None
-        if self._security is not None:
-            # Fresh keypair per connection; no key of an older connection
-            # survives into this one.
-            self._security.reset()
-            pubkey_bytes = self._security.generate_keypair()
-            encryption_pubkey_b64 = base64.b64encode(pubkey_bytes).decode("ascii")
+        # A fresh offer per connection; no key of an older connection
+        # survives into this one.
+        key_exchange = (
+            self._security.hello_fields() if self._security is not None else {}
+        )
 
         p: dict[str, Any] = {
             "client_version": CLIENT_VERSION,
             "protocol_version": PROTOCOL_VERSION,
             "features": {
                 "compression": True,
-                "encryption": encryption_pubkey_b64 is not None,
+                "encryption": self._security is not None,
                 "batching": True,
                 "priority_queue": True,
                 "circuit_breaker": True,
@@ -692,8 +699,7 @@ class ConnectionManager:
             },
             "connection_id": self._connection_id,
         }
-        if encryption_pubkey_b64 is not None:
-            p["encryption_public_key"] = encryption_pubkey_b64
+        p.update(key_exchange)
 
         msg = {
             "c": "WSE",

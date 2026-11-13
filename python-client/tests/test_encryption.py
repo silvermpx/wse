@@ -28,7 +28,8 @@ FAST = ReconnectConfig(base_delay=0.05, max_delay=0.2, jitter=False)
 
 def make_client(url: str, **kwargs) -> AsyncWSEClient:
     kwargs.setdefault("reconnect", FAST)
-    client = AsyncWSEClient(url, encryption=True, **kwargs)
+    # The fake server speaks the first E2E design.
+    client = AsyncWSEClient(url, encryption=True, e2e_legacy=True, **kwargs)
     client._circuit_breaker._failure_threshold = 10_000
     return client
 
@@ -177,7 +178,7 @@ class TestEncryptedMsgpack:
         from wse_client.protocol import MessageCodec
         from wse_client.security import SecurityManager
 
-        client_sm, server_sm = SecurityManager(), SecurityManager()
+        client_sm, server_sm = SecurityManager(legacy=True), SecurityManager(legacy=True)
         client_pub = client_sm.generate_keypair()
         server_pub = server_sm.generate_keypair()
         client_sm.derive_shared_secret(server_pub)
