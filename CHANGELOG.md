@@ -112,19 +112,38 @@ the steps to take are in [docs/MIGRATION.md](docs/MIGRATION.md#migrating-from-v2
 
 ### Performance
 
-- Fan-out and the inbound path are back at 2.5.1's speed after two
-  slowdowns of this release were found by measurement: each connection's
+- **Fan-out on every core.** Each connection belongs to a lane, one per
+  core, and each lane has a task of its own delivering to its
+  connections; a topic's subscribers are kept by lane with a bit mask, so
+  a message goes only to the lanes that have someone to get it, in order
+  per sender. Before, one task delivered every message to every
+  connection.
+- **Flow control from the sockets back to the application.** A lane whose
+  connections are behind waits until one of them catches up; a lane's
+  queue holds 1024 jobs; the application's sends wait while 65,536
+  commands are queued. A publisher faster than the clients now runs at
+  their pace instead of filling memory: 2.5.1 kept every message in an
+  unbounded queue.
+- No allocation, lock or extra lookup per published message (the topic
+  counter, the recovery buffers and the cluster sender), a connection's
+  delivery state in one allocation, frame queues reused by the write
+  task, and no lock per delivery to check the connection is open.
+- Two slowdowns of this release were found by measurement and fixed: the
   read and write loops checked a cancellation token, which takes a lock,
   for every message (now `Abortable`, an atomic load), and the command
-  queue's depth gauge walked the queue for every command, so a burst of
-  broadcasts drained slower the longer it got (now measured once every
-  1024 commands). Measured against 2.5.1 built the same way, on a quiet
-  48-thread Xeon: broadcast to 1000, 5000 and 10000 subscribers 5.2, 6.1
-  and 7.4 million deliveries/s (2.5.1: 5.5, 6.0, 7.5), inbound 8.4 million
-  messages/s (8.3).
+  queue's depth gauge walked the queue for every command (now an exact
+  count kept by the senders).
 - A frame's activity is an atomic store instead of a map lookup, one clock
   read serves the activity and the rate limit, and writev gathers frames
   on the stack.
+- Measured against 2.5.1 on a 48-thread Xeon, server and benchmark client
+  each on 12 physical cores, three rounds: broadcast to 1000, 5000 and
+  10000 subscribers 9.4, 8.2 and 7.3 million deliveries/s (2.5.1: 5.4,
+  6.0, 7.4); a topic relayed by a cluster peer to 1000 and 10000
+  subscribers 6.8 and 8.4 million (5.9, 5.7); inbound 8.2 and 7.6 million
+  messages/s from 100 and 1000 connections (8.3, 7.7). Under the
+  benchmark's publisher, which never pauses, the server peaked at 19-21 GB
+  (2.5.1: 35-39 GB).
 
 ### Changed (build and checks)
 
