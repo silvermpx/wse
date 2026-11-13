@@ -432,8 +432,9 @@ class RustWSEServer:
         """Send an event through the full outbound pipeline.
 
         Returns the size of the frame handed to the connection, 0 for an
-        event id this connection already got. A connection whose outbound
-        queue is over max_outbound_queue_bytes drops it.
+        event id this connection already got or a connection that is gone. A
+        connection whose outbound queue is over max_outbound_queue_bytes
+        drops it.
         """
         ...
 
@@ -486,12 +487,28 @@ class RustWSEServer:
         conn_id: str,
         allow: list[str] | None = None,
         deny: list[str] | None = None,
-    ) -> None:
+    ) -> bool:
         """Set topic ACL for a connection programmatically.
 
         allow: glob patterns (empty = allow all).
         deny: glob patterns (deny takes precedence over allow).
         JWT `wse_topics` claim sets ACL automatically during auth.
+        Returns False (and stores nothing) when the connection is gone.
+        """
+        ...
+    def reload_jwt_keys(
+        self,
+        jwt_secret: bytes,
+        jwt_previous_secret: bytes | None = None,
+        jwt_key_id: str | None = None,
+    ) -> None:
+        """Replace the JWT verification keys without a restart.
+
+        jwt_secret is the HMAC secret, or the public key of the asymmetric
+        algorithms; jwt_previous_secret is accepted too while tokens signed
+        with it are out. Algorithm, issuer, audience and cookie name stay.
+        Raises RuntimeError on a server without jwt_secret and ValueError
+        for a key that does not fit the algorithm.
         """
         ...
 

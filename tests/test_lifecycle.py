@@ -257,3 +257,40 @@ srv.stop()
             env={"PATH": "/usr/bin:/bin"},
         )
         assert "JWT validation failed" in out.stdout + out.stderr, out.stderr
+
+
+class TestApi:
+    def test_sending_to_a_gone_connection_does_nothing(self, server):
+        assert server.send_event("no-such-connection", {"t": "x", "p": {}}) == 0
+        assert server.set_topic_acl("no-such-connection", ["a"]) is False
+        assert "command_queue_depth" in server.health_snapshot()
+
+    @pytest.mark.asyncio
+    async def test_jwt_keys_can_be_replaced(self, server, server_port):
+        from wse_server._wse_accel import rust_jwt_encode
+
+        new_secret = b"another-secret-for-the-rotation!"
+
+        def token(secret):
+            now = int(time.time())
+            claims = {"sub": "dave", "iss": JWT_ISSUER, "aud": JWT_AUDIENCE,
+                      "exp": now + 600, "iat": now}
+            return rust_jwt_encode(claims, secret)
+
+        async def accepted(tok) -> bool:
+            async with await connect(server_port, tok) as ws:
+                first = json.loads(await asyncio.wait_for(ws.recv(), timeout=2))
+                return first["t"] == "server_ready"
+
+        assert not await accepted(token(new_secret))
+        server.reload_jwt_keys(new_secret, jwt_previous_secret=JWT_SECRET)
+        assert await accepted(token(new_secret))
+        assert await accepted(token(JWT_SECRET))
+        server.reload_jwt_keys(new_secret)
+        assert not await accepted(token(JWT_SECRET))
+        with pytest.raises(ValueError):
+            server.reload_jwt_keys(b"short")
+
+    def test_reloading_keys_needs_a_jwt_server(self, server_no_auth):
+        with pytest.raises(RuntimeError):
+            server_no_auth.reload_jwt_keys(b"x" * 32)

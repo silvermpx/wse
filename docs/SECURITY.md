@@ -100,7 +100,7 @@ The Rust server extracts the JWT from cookies (configured via `jwt_cookie_name`)
 
 **Expiry of open connections:** a connection is closed with code 4403 when the token it opened with expires (its `exp` plus the 30-second skew). The clients reconnect with a fresh token from their token provider; without one they stop. Keep tokens short-lived: an open WebSocket is authorized exactly as long as its token.
 
-**Key rotation:** Set `jwt_previous_secret` to the old key when rotating. For HS256: old shared secret. For RS256/ES256: old public key PEM. Tokens signed with either key are accepted during the transition window. Remove `jwt_previous_secret` after all old tokens have expired.
+**Key rotation:** Set `jwt_previous_secret` to the old key when rotating. For HS256: old shared secret. For RS256/ES256: old public key PEM. Tokens signed with either key are accepted during the transition window. Remove `jwt_previous_secret` after all old tokens have expired. A running server takes new keys with `server.reload_jwt_keys(new_key, jwt_previous_secret=old_key)`, no restart needed; open connections keep running until their tokens expire.
 
 On success, the server sends `server_ready` directly from Rust and pushes an `AuthConnect` event to the drain queue with the validated `user_id`.
 

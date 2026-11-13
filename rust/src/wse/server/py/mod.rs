@@ -697,6 +697,46 @@ impl RustWSEServer {
             .load(Ordering::Relaxed)
     }
 
+    /// Replace the JWT verification keys without a restart, for a key
+    /// rotation: `jwt_secret` (the HMAC secret, or the public key of the
+    /// asymmetric algorithms) and optionally `jwt_previous_secret`, accepted
+    /// too while tokens signed with it are still out. The algorithm, issuer,
+    /// audience and cookie name stay. Open connections are not affected; new
+    /// ones are checked with the new keys. Raises RuntimeError on a server
+    /// without jwt_secret, ValueError for a key that does not fit.
+    #[pyo3(signature = (jwt_secret, jwt_previous_secret = None, jwt_key_id = None))]
+    fn reload_jwt_keys(
+        &self,
+        jwt_secret: Vec<u8>,
+        jwt_previous_secret: Option<Vec<u8>>,
+        jwt_key_id: Option<String>,
+    ) -> PyResult<()> {
+        let holder = self.shared.jwt_config.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err("this server does not validate tokens (no jwt_secret)")
+        })?;
+        let current = holder.load();
+        let alg = current.algorithm;
+        let key_error = |option: &str, e: jwt::JwtError| {
+            pyo3::exceptions::PyValueError::new_err(format!("{option} for {alg:?}: {e}"))
+        };
+        jwt::check_verification_key(alg, &jwt_secret).map_err(|e| key_error("jwt_secret", e))?;
+        if let Some(ref key) = jwt_previous_secret {
+            jwt::check_verification_key(alg, key)
+                .map_err(|e| key_error("jwt_previous_secret", e))?;
+        }
+        holder.store(Arc::new(JwtConfig {
+            algorithm: alg,
+            secret: Zeroizing::new(jwt_secret),
+            previous_secret: jwt_previous_secret.map(Zeroizing::new),
+            key_id: jwt_key_id.or_else(|| current.key_id.clone()),
+            issuer: current.issuer.clone(),
+            audience: current.audience.clone(),
+            cookie_name: current.cookie_name.clone(),
+        }));
+        tracing::info!("[WSE] JWT keys reloaded");
+        Ok(())
+    }
+
     /// Hot-reload cluster TLS certificates without restarting the server.
     /// New connections will use the updated certs; in-flight handshakes
     /// complete with the previous config (TlsAcceptor/TlsConnector use Arc internally).
@@ -722,8 +762,15 @@ impl RustWSEServer {
     ///
     /// - allow: list of glob patterns (empty = allow all)
     /// - deny: list of glob patterns (deny takes precedence over allow)
+    ///
+    /// Returns False (and stores nothing) when the connection is gone.
     #[pyo3(signature = (conn_id, allow = None, deny = None))]
-    fn set_topic_acl(&self, conn_id: &str, allow: Option<Vec<String>>, deny: Option<Vec<String>>) {
+    fn set_topic_acl(
+        &self,
+        conn_id: &str,
+        allow: Option<Vec<String>>,
+        deny: Option<Vec<String>>,
+    ) -> bool {
         self.set_topic_acl_impl(conn_id, allow, deny)
     }
 

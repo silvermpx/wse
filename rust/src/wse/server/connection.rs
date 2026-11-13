@@ -562,7 +562,8 @@ pub(super) async fn handle_connection(
     // When the token stops being valid (its exp, plus the clock skew the
     // validation allows).
     let mut token_deadline: Option<tokio::time::Instant> = None;
-    let rust_auth_user_id: Option<String> = if let Some(ref jwt_cfg) = state.jwt_config {
+    let rust_auth_user_id: Option<String> = if let Some(ref jwt_holder) = state.jwt_config {
+        let jwt_cfg = &*jwt_holder.load();
         let token = parse_cookie_value(&cookie_str, &jwt_cfg.cookie_name).or_else(|| {
             auth_header.as_deref().and_then(|h| {
                 // RFC 7235: auth-scheme is case-insensitive

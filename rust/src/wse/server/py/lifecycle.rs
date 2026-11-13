@@ -143,6 +143,24 @@ impl RustWSEServer {
                             }
                         });
                     }
+                    // Per-topic delivery counters of topics nobody subscribes
+                    // to any more: dropped once there are many (user- or
+                    // UUID-scoped topics), whether or not metrics are read.
+                    {
+                        let counts_state = shared.clone();
+                        tokio::spawn(async move {
+                            let mut interval = tokio::time::interval(Duration::from_secs(60));
+                            loop {
+                                interval.tick().await;
+                                let counts = &counts_state.topic_message_counts;
+                                if counts.len() > 10_000 {
+                                    counts.retain(|topic, _| {
+                                        counts_state.topic_subscribers.contains_key(topic)
+                                    });
+                                }
+                            }
+                        });
+                    }
                     // Presence TTL sweep (every 30 seconds)
                     if let Some(ref pm) = shared.presence {
                         let sweep_pm = pm.clone();

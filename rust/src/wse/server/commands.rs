@@ -27,6 +27,7 @@ pub(super) async fn process_commands(
     state: Arc<SharedState>,
 ) {
     while let Some(cmd) = cmd_rx.recv().await {
+        state.commands_queued.store(cmd_rx.len(), Ordering::Relaxed);
         match cmd {
             ServerCommand::SendText { conn_id, data } => {
                 let guard = state.connections.read().await;
@@ -72,6 +73,12 @@ pub(super) async fn process_commands(
                         h.pending.fetch_add(msg_bytes, Ordering::Relaxed);
                         if h.tx.send(WsFrame::Msg(message)).is_err() {
                             h.pending.fetch_sub(msg_bytes, Ordering::Relaxed);
+                        } else {
+                            // Counted once really queued.
+                            state.messages_sent_total.fetch_add(1, Ordering::Relaxed);
+                            state
+                                .bytes_sent_total
+                                .fetch_add(msg_bytes as u64, Ordering::Relaxed);
                         }
                     }
                 }

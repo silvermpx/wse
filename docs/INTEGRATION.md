@@ -611,6 +611,7 @@ Returns a dict with the current server state:
 |-------|-------------|
 | `connections` | Active WebSocket connections |
 | `inbound_queue_depth` | Events waiting to be drained |
+| `command_queue_depth` | Commands from Python (sends, broadcasts, subscriptions) waiting for the server; a growing value means Python publishes faster than the server delivers |
 | `inbound_dropped` | Client messages dropped over `max_inbound_queue_size` / `max_inbound_queue_bytes` (should be 0); connect, disconnect and presence events are never dropped |
 | `uptime_secs` | Server uptime in seconds |
 | `recovery_enabled` | Whether message recovery is active |

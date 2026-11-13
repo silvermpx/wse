@@ -20,12 +20,22 @@ impl RustWSEServer {
         conn_id: &str,
         allow: Option<Vec<String>>,
         deny: Option<Vec<String>>,
-    ) {
+    ) -> bool {
+        // Only for a registered connection: its cleanup removes the entry.
+        if !self.shared.conn_last_activity.contains_key(conn_id) {
+            return false;
+        }
         let acl = crate::jwt::TopicAcl {
             allow: allow.unwrap_or_default(),
             deny: deny.unwrap_or_default(),
         };
         self.shared.conn_topic_acl.insert(conn_id.to_owned(), acl);
+        // Gone meanwhile: its cleanup may have run before the insert.
+        if !self.shared.conn_last_activity.contains_key(conn_id) {
+            self.shared.conn_topic_acl.remove(conn_id);
+            return false;
+        }
+        true
     }
 
     pub(super) fn subscribe_connection_impl(

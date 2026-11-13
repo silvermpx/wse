@@ -436,6 +436,7 @@ async def health():
 | `wse_inbound_queue_depth` | gauge | Sustained growth (drain loop too slow) |
 | `wse_inbound_dropped_total` | counter | Any increase (events lost) |
 | `wse_auth_failures_total` | counter | Spike (brute force or misconfigured clients) |
+| `wse_command_queue_depth` | gauge | Growing: Python publishes faster than the server delivers |
 | `wse_rate_limited_total` | counter | Sustained growth (clients sending faster than `rate_limit_refill`) |
 | `wse_slow_consumer_drops_total` | counter | Any increase (slow clients, tune `max_outbound_queue_bytes`) |
 | `wse_cluster_peers` | gauge | Below expected count (peer down) |

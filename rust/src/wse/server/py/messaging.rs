@@ -76,6 +76,10 @@ impl RustWSEServer {
         compression_threshold: usize,
     ) -> PyResult<usize> {
         let cmd_tx = self.command_tx()?;
+        // A connection that is gone (or never was) gets nothing.
+        if !self.shared.conn_last_activity.contains_key(conn_id) {
+            return Ok(0);
+        }
 
         // Dedup: skip if this event ID was already sent
         if let Ok(Some(id_val)) = event.get_item("id")
@@ -248,12 +252,6 @@ impl RustWSEServer {
             }
         }
 
-        self.shared
-            .messages_sent_total
-            .fetch_add(1, Ordering::Relaxed);
-        self.shared
-            .bytes_sent_total
-            .fetch_add(byte_count as u64, Ordering::Relaxed);
         Ok(byte_count)
     }
 

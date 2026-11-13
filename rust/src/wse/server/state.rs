@@ -293,7 +293,9 @@ pub(crate) struct SharedState {
     // Atomic connection count (lock-free read from Python without GIL blocking)
     pub(super) connection_count: AtomicUsize,
     // JWT config: when set, Rust validates JWT in handshake (zero GIL)
-    pub(super) jwt_config: Option<JwtConfig>,
+    // Fixed for the server's life: whether tokens are validated, and how;
+    // the keys inside can be replaced (reload_jwt_keys).
+    pub(super) jwt_config: Option<arc_swap::ArcSwap<JwtConfig>>,
     // Graceful drain: when true, reject new connections
     pub(super) draining: AtomicBool,
     pub(crate) topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
@@ -344,6 +346,8 @@ pub(crate) struct SharedState {
     pub(crate) slow_consumer_drops: Arc<AtomicU64>,
     pub(super) messages_received_total: AtomicU64,
     pub(super) messages_sent_total: AtomicU64,
+    // Commands waiting for the command task, as it last saw them
+    pub(super) commands_queued: AtomicUsize,
     pub(super) connections_accepted_total: AtomicU64,
     pub(super) connections_rejected_total: AtomicU64,
     pub(super) bytes_received_total: AtomicU64,
@@ -428,7 +432,7 @@ impl SharedState {
             inbound_dropped: AtomicU64::new(0),
             conn_formats: DashMap::new(),
             connection_count: AtomicUsize::new(0),
-            jwt_config: cfg.jwt_config,
+            jwt_config: cfg.jwt_config.map(arc_swap::ArcSwap::from_pointee),
             draining: AtomicBool::new(false),
             topic_subscribers: Arc::new(DashMap::new()),
             conn_topics: DashMap::new(),
@@ -465,6 +469,7 @@ impl SharedState {
             slow_consumer_drops: Arc::new(AtomicU64::new(0)),
             messages_received_total: AtomicU64::new(0),
             messages_sent_total: AtomicU64::new(0),
+            commands_queued: AtomicUsize::new(0),
             connections_accepted_total: AtomicU64::new(0),
             connections_rejected_total: AtomicU64::new(0),
             bytes_received_total: AtomicU64::new(0),

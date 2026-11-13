@@ -36,6 +36,10 @@ impl RustWSEServer {
         )?;
         dict.set_item("inbound_queue_depth", self.shared.inbound_rx.len())?;
         dict.set_item(
+            "command_queue_depth",
+            self.shared.commands_queued.load(Ordering::Relaxed),
+        )?;
+        dict.set_item(
             "inbound_dropped",
             self.shared.inbound_dropped.load(Ordering::Relaxed),
         )?;
@@ -148,6 +152,15 @@ impl RustWSEServer {
         out.push_str(&format!(
             "wse_messages_received_total {}\n",
             self.shared.messages_received_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP wse_command_queue_depth Commands from Python waiting for the server\n",
+        );
+        out.push_str("# TYPE wse_command_queue_depth gauge\n");
+        out.push_str(&format!(
+            "wse_command_queue_depth {}\n",
+            self.shared.commands_queued.load(Ordering::Relaxed)
         ));
 
         out.push_str("# HELP wse_messages_sent_total Total messages sent to clients\n");
@@ -284,19 +297,8 @@ impl RustWSEServer {
         }
 
         // Per-topic message counts (top 50 by volume)
-        // Evict stale entries when map grows too large (prevents unbounded growth
-        // for servers using user-scoped or UUID-keyed topics)
         {
             let map = &self.shared.topic_message_counts;
-            if map.len() > 10_000 {
-                let active_topics: std::collections::HashSet<String> = self
-                    .shared
-                    .topic_subscribers
-                    .iter()
-                    .map(|e| e.key().clone())
-                    .collect();
-                map.retain(|k, _| active_topics.contains(k));
-            }
             if !map.is_empty() {
                 let mut entries: Vec<(String, u64)> = map
                     .iter()
