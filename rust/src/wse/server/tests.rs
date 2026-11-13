@@ -291,7 +291,7 @@ async fn a_large_fanout_reaches_everyone_once_and_in_order() {
     let fanout = Fanout::start(index.clone(), 0, Arc::clone(&drops));
     for n in 0..3 {
         let msg = || Outgoing::text(bytes::Bytes::from(format!("{{\"n\":{n}}}")));
-        fanout.publish("big", msg, None);
+        fanout.publish("big".to_owned(), msg, None);
     }
     // Each connection's queue holds the three frames, in order.
     let expected: Vec<u8> = (0..3)

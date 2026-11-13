@@ -255,7 +255,7 @@ impl SharedState {
         if local {
             self.tell_presence_leave(&topic, &user_id, &data);
         }
-        let cluster_tx = self.cluster_cmd_tx.read().unwrap().clone();
+        let cluster_tx = self.cluster_cmd_tx.load_full();
         if let Some(tx) = cluster_tx {
             let _ = tx.send(ClusterCommand::PresenceUpdate {
                 topic,

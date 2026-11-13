@@ -81,9 +81,7 @@ impl Drop for RustWSEServer {
     /// its thread ends by itself; nothing waits for it here.
     fn drop(&mut self) {
         if self.running.swap(false, Ordering::SeqCst) {
-            if let Ok(guard) = self.shared.cluster_cmd_tx.read()
-                && let Some(ref tx) = *guard
-            {
+            if let Some(tx) = self.shared.cluster_cmd_tx.load_full() {
                 let _ = tx.send(crate::wse::cluster::ClusterCommand::Shutdown);
             }
             if let Some(tx) = self.cmd_tx.load_full() {

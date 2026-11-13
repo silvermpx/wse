@@ -344,17 +344,8 @@ pub(super) async fn peer_dispatch_task(
                 rm.push_foreign(&topic, payload.clone(), epoch, offset);
             }
 
-            ctx.fanout.publish(
-                &topic,
-                || crate::wse::server::Outgoing::text(payload.clone()),
-                Some(&ctx.metrics),
-            );
-
-            // Track per-topic message count for Prometheus top-N metrics
-            ctx.topic_message_counts
-                .entry(topic.clone())
-                .or_insert_with(|| AtomicU64::new(0))
-                .fetch_add(1, Ordering::Relaxed);
+            // Per-topic message count for the Prometheus top-N metrics.
+            crate::wse::server::count_message(&ctx.topic_message_counts, &topic);
 
             // Queue groups: one member each, round-robin, without the
             // recovery stamp (a member sees only some of the offsets).
@@ -367,6 +358,12 @@ pub(super) async fn peer_dispatch_task(
             );
             total_delivered += d;
             total_dropped += f;
+
+            ctx.fanout.publish(
+                topic,
+                || crate::wse::server::Outgoing::text(payload),
+                Some(&ctx.metrics),
+            );
         }
 
         if total_delivered > 0 {

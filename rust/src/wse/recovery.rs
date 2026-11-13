@@ -363,10 +363,14 @@ impl RecoveryManager {
         F: FnOnce(u32, u64) -> Bytes,
     {
         let mut created = false;
-        let mut entry = self.buffers.entry(topic.to_owned()).or_insert_with(|| {
-            created = true;
-            TopicRecoveryBuffer::new(self.config.buffer_size_bits, topic.len())
-        });
+        // A topic that has a buffer is found without making a key.
+        let mut entry = match self.buffers.get_mut(topic) {
+            Some(entry) => entry,
+            None => self.buffers.entry(topic.to_owned()).or_insert_with(|| {
+                created = true;
+                TopicRecoveryBuffer::new(self.config.buffer_size_bits, topic.len())
+            }),
+        };
 
         let buf = entry.value_mut();
         let epoch = buf.epoch;
@@ -411,25 +415,45 @@ impl RecoveryManager {
         origin_epoch: u32,
         origin_offset: u64,
     ) {
-        // Key: "topic\0epoch" -- null byte separator is safe (never in topic names).
-        let key = format!("{topic}\0{origin_epoch}");
-
-        // Over the memory budget no new buffer is made: each one allocates
-        // its slots up front, and a peer can name any number of fresh
-        // (topic, epoch) pairs between two cleanups. The message is still
-        // delivered live; only its recovery copy is skipped.
-        if !self.foreign_buffers.contains_key(&key)
-            && self.total_bytes.load(Ordering::Relaxed) >= self.config.global_memory_budget
-        {
-            return;
+        // Key: "topic\0epoch" -- null byte separator is safe (never in topic
+        // names). Written into this thread's buffer: a buffer that exists is
+        // found without allocating a key.
+        thread_local! {
+            static KEY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
         }
-
-        let key_len = key.len();
-        let mut created = false;
-        let mut entry = self.foreign_buffers.entry(key).or_insert_with(|| {
-            created = true;
-            ForeignRecoveryBuffer::new(self.config.buffer_size_bits, origin_epoch, key_len)
+        KEY.with_borrow_mut(|key| {
+            use std::fmt::Write;
+            key.clear();
+            let _ = write!(key, "{topic}\0{origin_epoch}");
+            self.push_foreign_at(key, data, origin_epoch, origin_offset);
         });
+    }
+
+    fn push_foreign_at(&self, key: &str, data: Bytes, origin_epoch: u32, origin_offset: u64) {
+        let mut created = false;
+        let mut entry = match self.foreign_buffers.get_mut(key) {
+            Some(entry) => entry,
+            // Over the memory budget no new buffer is made: each one
+            // allocates its slots up front, and a peer can name any number of
+            // fresh (topic, epoch) pairs between two cleanups. The message is
+            // still delivered live; only its recovery copy is skipped.
+            None if self.total_bytes.load(Ordering::Relaxed)
+                >= self.config.global_memory_budget =>
+            {
+                return;
+            }
+            None => self
+                .foreign_buffers
+                .entry(key.to_owned())
+                .or_insert_with(|| {
+                    created = true;
+                    ForeignRecoveryBuffer::new(
+                        self.config.buffer_size_bits,
+                        origin_epoch,
+                        key.len(),
+                    )
+                }),
+        };
 
         let buf = entry.value_mut();
         let old_bytes = if created { 0 } else { buf.footprint() };

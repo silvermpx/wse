@@ -666,16 +666,16 @@ impl Fanout {
     /// `tally` when given.
     pub(crate) fn publish(
         &self,
-        topic: &str,
+        topic: String,
         msg: impl FnOnce() -> Outgoing,
         tally: Option<&Arc<ClusterMetrics>>,
     ) {
-        let (patterns, mask) = self.index.reach(topic);
+        let (patterns, mask) = self.index.reach(&topic);
         if mask == 0 {
             return;
         }
         let message = Arc::new(TopicMessage {
-            topic: topic.to_owned(),
+            topic,
             patterns,
             msg: msg(),
             tally: tally.cloned(),
@@ -767,6 +767,18 @@ async fn run_lane(
         // budget runs out, after thousands of deliveries.
         tokio::task::yield_now().await;
     }
+}
+
+/// Count a message on `topic` (the Prometheus top-N topics); a topic seen
+/// before is counted without making a key.
+pub(crate) fn count_message(counts: &DashMap<String, AtomicU64>, topic: &str) {
+    match counts.get(topic) {
+        Some(count) => count.fetch_add(1, Ordering::Relaxed),
+        None => counts
+            .entry(topic.to_owned())
+            .or_default()
+            .fetch_add(1, Ordering::Relaxed),
+    };
 }
 
 /// A recovery-stamped message without its stamp: what queue-group members

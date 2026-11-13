@@ -89,8 +89,8 @@ pub use py::RustWSEServer;
 
 pub(crate) use e2e::E2E_KEY_INFO;
 pub(crate) use fanout::{
-    Fanout, Outgoing, TopicAcl, TopicIndex, glob_match, is_pattern, stamp_recovery_fields,
-    unstamped,
+    Fanout, Outgoing, TopicAcl, TopicIndex, count_message, glob_match, is_pattern,
+    stamp_recovery_fields, unstamped,
 };
 pub(crate) use frames::{BroadcastQueue, WsFrame, pre_frame_text};
 pub(crate) use handshake::normalize_origin;

@@ -192,7 +192,7 @@ pub(super) fn build_server_hello(
 ) -> String {
     let proto = client_proto.min(2);
     let recovery_enabled = state.recovery.is_some();
-    let cluster_enabled = state.cluster_cmd_tx.read().unwrap().is_some();
+    let cluster_enabled = state.cluster_cmd_tx.load().is_some();
     let encryption_enabled = encryption_pubkey.is_some() || e2e.is_some();
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut val = serde_json::json!({

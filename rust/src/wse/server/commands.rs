@@ -1,7 +1,7 @@
 //! The command processor: executes the `ServerCommand`s sent to the running server.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use super::frames::ws_frame_size;
 use super::{
     CLOSE_GOING_AWAY, CLOSE_NORMAL, Fanout, Outgoing, ServerCommand, SharedState, WsFrame,
-    stamp_recovery_fields,
+    count_message, stamp_recovery_fields,
 };
 use crate::wse::cluster::ClusterCommand;
 
@@ -113,27 +113,15 @@ pub(super) async fn process_commands(
                 } else {
                     original.clone()
                 };
-                if publish {
-                    let cluster_tx = state
-                        .cluster_cmd_tx
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    if let Some(tx) = cluster_tx {
-                        let _ = tx.send(ClusterCommand::Publish {
-                            topic: topic.clone(),
-                            payload: String::from_utf8_lossy(&stamped).into_owned(),
-                            position,
-                        });
-                    }
+                if publish && let Some(tx) = &*state.cluster_cmd_tx.load() {
+                    let _ = tx.send(ClusterCommand::Publish {
+                        topic: topic.clone(),
+                        payload: String::from_utf8_lossy(&stamped).into_owned(),
+                        position,
+                    });
                 }
-                // Track per-topic message count for Prometheus top-N metrics
-                state
-                    .topic_message_counts
-                    .entry(topic.clone())
-                    .or_insert_with(|| AtomicU64::new(0))
-                    .fetch_add(1, Ordering::Relaxed);
-                fanout.publish(&topic, || Outgoing::text(stamped), None);
+                // Per-topic message count for the Prometheus top-N metrics.
+                count_message(&state.topic_message_counts, &topic);
                 // A queue-group member sees only some offsets of the topic: it
                 // gets the message without the recovery stamp.
                 fanout.queue_groups(
@@ -143,6 +131,7 @@ pub(super) async fn process_commands(
                     state.max_outbound_queue_bytes,
                     &state.slow_consumer_drops,
                 );
+                fanout.publish(topic, || Outgoing::text(stamped), None);
             }
             ServerCommand::Disconnect { conn_id } => {
                 let guard = state.connections.read().await;
@@ -159,7 +148,7 @@ pub(super) async fn process_commands(
                 tracing::info!("[WSE] Entering drain mode (lame duck)");
 
                 // Notify cluster peers
-                if let Some(tx) = state.cluster_cmd_tx.read().unwrap().as_ref() {
+                if let Some(tx) = state.cluster_cmd_tx.load().as_ref() {
                     let _ = tx.send(ClusterCommand::Drain);
                 }
 

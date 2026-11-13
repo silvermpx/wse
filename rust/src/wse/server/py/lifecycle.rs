@@ -429,9 +429,7 @@ impl RustWSEServer {
         };
         let on_own_runtime = self.on_own_runtime();
         // Shutdown cluster
-        if let Ok(guard) = self.shared.cluster_cmd_tx.read()
-            && let Some(ref tx) = *guard
-        {
+        if let Some(tx) = self.shared.cluster_cmd_tx.load_full() {
             let _ = tx.send(ClusterCommand::Shutdown);
         }
         if let Ok(tx) = self.command_tx() {
@@ -453,7 +451,7 @@ impl RustWSEServer {
         self.cmd_tx.store(None);
         *self.shared.presence_broadcast_tx.write().unwrap() = None;
         *self.shared.fanout.write().unwrap() = None;
-        *self.shared.cluster_cmd_tx.write().unwrap() = None;
+        self.shared.cluster_cmd_tx.store(None);
         *self.shared.cluster_main_port.write().unwrap() = None;
         *self.shared.cluster_instance_id.lock().unwrap() = None;
         *self.rt_handle.write() = None;

@@ -22,7 +22,7 @@ impl RustWSEServer {
         let (tls_cert, tls_key, tls_ca) = tls;
         let (cluster_port, cluster_host, single_port) = listen;
 
-        if self.shared.cluster_cmd_tx.read().unwrap().is_some() {
+        if self.shared.cluster_cmd_tx.load().is_some() {
             return Err(PyRuntimeError::new_err("Cluster already connected"));
         }
 
@@ -130,7 +130,7 @@ impl RustWSEServer {
         *self.shared.cluster_tls_holder.write().unwrap() = tls_holder.clone();
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
-        *self.shared.cluster_cmd_tx.write().unwrap() = Some(cmd_tx);
+        self.shared.cluster_cmd_tx.store(Some(Arc::new(cmd_tx)));
 
         let (interest_tx, interest_rx) = mpsc::channel::<crate::wse::cluster::InterestUpdate>(
             crate::wse::cluster::MANAGER_QUEUE_CAP,

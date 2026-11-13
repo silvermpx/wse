@@ -68,7 +68,7 @@ impl RustWSEServer {
         if let (Some(pm), Some(pd)) = (&self.shared.presence, &presence_data) {
             let data = pyobj_to_json(pd.as_any())?;
             let drain = self.shared.drain_mode.load(Ordering::Relaxed);
-            let cluster_tx = self.shared.cluster_cmd_tx.read().unwrap().clone();
+            let cluster_tx = self.shared.cluster_cmd_tx.load_full();
             for topic in &accepted {
                 if let crate::wse::presence::TrackResult::FirstJoin {
                     user_id,

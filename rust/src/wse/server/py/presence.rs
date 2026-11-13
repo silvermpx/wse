@@ -55,7 +55,7 @@ impl RustWSEServer {
                     // Broadcast presence_update to all topics where the user has presence
                     let data_str = serde_json::to_string(&new_data).unwrap_or_default();
                     let now = crate::wse::presence::epoch_ms();
-                    let cluster_tx = self.shared.cluster_cmd_tx.read().unwrap().clone();
+                    let cluster_tx = self.shared.cluster_cmd_tx.load_full();
                     if let Ok(tx) = self.command_tx() {
                         let msg = format_presence_msg("presence_update", &user_id, &new_data);
                         for topic in &topics {

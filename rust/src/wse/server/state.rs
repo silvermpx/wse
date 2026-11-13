@@ -387,7 +387,7 @@ pub(crate) struct SharedState {
     pub(crate) fanout: std::sync::RwLock<Option<Fanout>>,
     pub(super) conn_topics: DashMap<String, DashSet<String>>,
     // Cluster protocol
-    pub(super) cluster_cmd_tx: std::sync::RwLock<Option<mpsc::UnboundedSender<ClusterCommand>>>,
+    pub(super) cluster_cmd_tx: arc_swap::ArcSwapOption<mpsc::UnboundedSender<ClusterCommand>>,
     pub(crate) cluster_metrics: Arc<ClusterMetrics>,
     pub(super) cluster_dlq: Arc<std::sync::Mutex<ClusterDlq>>,
     pub(crate) cluster_instance_id: std::sync::Mutex<Option<String>>,
@@ -453,11 +453,7 @@ impl SharedState {
     /// advertised to cluster peers. Counted with or without a cluster, so
     /// connect_cluster() advertises (by RESYNC) what was subscribed before it.
     pub(crate) fn add_local_interest<'a>(&self, topics: impl IntoIterator<Item = &'a String>) {
-        let cluster_tx = self
-            .cluster_cmd_tx
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let cluster_tx = self.cluster_cmd_tx.load_full();
         let mut refcounts = self
             .local_topic_refcount
             .lock()
@@ -478,11 +474,7 @@ impl SharedState {
     /// One fewer local subscriber for each of `topics`; a topic's last one
     /// leaving withdraws it from cluster peers.
     pub(crate) fn remove_local_interest<'a>(&self, topics: impl IntoIterator<Item = &'a String>) {
-        let cluster_tx = self
-            .cluster_cmd_tx
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let cluster_tx = self.cluster_cmd_tx.load_full();
         let mut refcounts = self
             .local_topic_refcount
             .lock()
@@ -532,7 +524,7 @@ impl SharedState {
             topics: TopicIndex::new(super::fanout::lane_count()),
             fanout: std::sync::RwLock::new(None),
             conn_topics: DashMap::new(),
-            cluster_cmd_tx: std::sync::RwLock::new(None),
+            cluster_cmd_tx: arc_swap::ArcSwapOption::empty(),
             cluster_metrics: Arc::new(ClusterMetrics::new()),
             cluster_dlq: Arc::new(std::sync::Mutex::new(ClusterDlq::new(1000))),
             cluster_instance_id: std::sync::Mutex::new(None),
