@@ -92,17 +92,19 @@ pub(super) async fn write_all_frames<W: tokio::io::AsyncWrite + Unpin>(
     frames: &std::collections::VecDeque<Bytes>,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
-    const MAX_IOV: usize = 512;
+    // Frames per writev, gathered on the stack: no allocation per write.
+    const MAX_IOV: usize = 16;
     let mut index = 0; // first frame not fully written
     let mut offset = 0; // bytes of it already written
     while index < frames.len() {
-        let mut slices: Vec<std::io::IoSlice<'_>> =
-            Vec::with_capacity(MAX_IOV.min(frames.len() - index));
-        slices.push(std::io::IoSlice::new(&frames[index][offset..]));
+        let mut slices = [std::io::IoSlice::new(&[]); MAX_IOV];
+        slices[0] = std::io::IoSlice::new(&frames[index][offset..]);
+        let mut count = 1;
         for frame in frames.iter().skip(index + 1).take(MAX_IOV - 1) {
-            slices.push(std::io::IoSlice::new(frame));
+            slices[count] = std::io::IoSlice::new(frame);
+            count += 1;
         }
-        let mut written = w.write_vectored(&slices).await?;
+        let mut written = w.write_vectored(&slices[..count]).await?;
         if written == 0 {
             return Err(std::io::ErrorKind::WriteZero.into());
         }
