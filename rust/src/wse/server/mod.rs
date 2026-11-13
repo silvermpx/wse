@@ -98,7 +98,7 @@ pub(crate) use messages::format_presence_msg;
 pub(crate) use state::{
     CLOSE_E2E_BAD_FRAME, CLOSE_E2E_EXHAUSTED, CLOSE_E2E_UNSUPPORTED, CLOSE_GOING_AWAY, CLOSE_GRACE,
     CLOSE_IDLE, CLOSE_NORMAL, CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED, CLOSE_TRY_AGAIN_LATER,
-    Closer, ConnectionHandle, QueueGroup, ServerCommand, SharedState, SharedStateConfig,
+    Closer, Commands, ConnectionHandle, QueueGroup, ServerCommand, SharedState, SharedStateConfig,
 };
 
 // ---------------------------------------------------------------------------

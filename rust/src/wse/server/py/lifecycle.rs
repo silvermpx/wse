@@ -23,7 +23,7 @@ use crate::wse::server::commands::process_commands;
 use crate::wse::server::connection::handle_connection;
 use crate::wse::server::handshake::{HandshakeGuard, MAX_PENDING_HANDSHAKES};
 use crate::wse::server::{
-    CLOSE_IDLE, CLOSE_TRY_AGAIN_LATER, ConnectionHandle, Fanout, ServerCommand,
+    CLOSE_IDLE, CLOSE_TRY_AGAIN_LATER, Commands, ConnectionHandle, Fanout, ServerCommand,
 };
 
 /// TCP keepalive of accepted connections: the first probe after a minute of
@@ -126,9 +126,13 @@ impl RustWSEServer {
         };
         *self.shared.fanout.write().unwrap() = Some(fanout.clone());
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ServerCommand>();
+        self.shared.commands_queued.store(0, Ordering::Relaxed);
+        let cmd_tx = Commands::new(cmd_tx, Arc::clone(&self.shared.commands_queued));
         self.cmd_tx.store(Some(Arc::new(cmd_tx.clone())));
         // Store a clone for presence broadcasts from disconnect cleanup paths
-        *self.shared.presence_broadcast_tx.write().unwrap() = Some(cmd_tx.clone());
+        self.shared
+            .presence_broadcast_tx
+            .store(Some(Arc::new(cmd_tx.clone())));
         let running = self.running.clone();
         let shared = self.shared.clone();
         let rt_handle = rt.handle().clone();
@@ -449,7 +453,7 @@ impl RustWSEServer {
             py.detach(move || handle.join().is_err())
         };
         self.cmd_tx.store(None);
-        *self.shared.presence_broadcast_tx.write().unwrap() = None;
+        self.shared.presence_broadcast_tx.store(None);
         *self.shared.fanout.write().unwrap() = None;
         self.shared.cluster_cmd_tx.store(None);
         *self.shared.cluster_main_port.write().unwrap() = None;

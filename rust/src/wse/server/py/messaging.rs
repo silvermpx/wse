@@ -47,29 +47,40 @@ impl RustWSEServer {
         Ok(true)
     }
 
-    pub(super) fn send_impl(&self, conn_id: &str, data: &str) -> PyResult<()> {
+    pub(super) fn send_impl(&self, py: Python<'_>, conn_id: &str, data: &str) -> PyResult<()> {
         let tx = self.command_tx()?;
-        tx.send(ServerCommand::SendText {
-            conn_id: conn_id.to_owned(),
-            data: data.to_owned(),
-        })
+        tx.send_waiting(
+            py,
+            ServerCommand::SendText {
+                conn_id: conn_id.to_owned(),
+                data: data.to_owned(),
+            },
+        )
         .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         Ok(())
     }
 
-    pub(super) fn send_bytes_impl(&self, conn_id: &str, data: &[u8]) -> PyResult<()> {
+    pub(super) fn send_bytes_impl(
+        &self,
+        py: Python<'_>,
+        conn_id: &str,
+        data: &[u8],
+    ) -> PyResult<()> {
         let tx = self.command_tx()?;
-        tx.send(ServerCommand::SendBytes {
-            conn_id: conn_id.to_owned(),
-            data: data.to_vec(),
-        })
+        tx.send_waiting(
+            py,
+            ServerCommand::SendBytes {
+                conn_id: conn_id.to_owned(),
+                data: data.to_vec(),
+            },
+        )
         .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         Ok(())
     }
 
     pub(super) fn send_event_impl(
         &self,
-        _py: Python<'_>,
+        py: Python<'_>,
         conn_id: &str,
         event: &Bound<'_, PyDict>,
         compression_threshold: usize,
@@ -201,57 +212,74 @@ impl RustWSEServer {
         };
         let byte_count = body.len();
         cmd_tx
-            .send(ServerCommand::SendPrebuilt {
-                conn_id: conn_id.to_owned(),
-                message: Message::Binary(body.into()),
-            })
+            .send_waiting(
+                py,
+                ServerCommand::SendPrebuilt {
+                    conn_id: conn_id.to_owned(),
+                    message: Message::Binary(body.into()),
+                },
+            )
             .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         Ok(byte_count)
     }
 
-    pub(super) fn broadcast_all_impl(&self, data: &str) -> PyResult<()> {
+    pub(super) fn broadcast_all_impl(&self, py: Python<'_>, data: &str) -> PyResult<()> {
         let tx = self.command_tx()?;
         let data = inject_category(data);
-        tx.send(ServerCommand::BroadcastText { data })
+        tx.send_waiting(py, ServerCommand::BroadcastText { data })
             .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         Ok(())
     }
 
-    pub(super) fn broadcast_all_bytes_impl(&self, data: &[u8]) -> PyResult<()> {
+    pub(super) fn broadcast_all_bytes_impl(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
         let tx = self.command_tx()?;
-        tx.send(ServerCommand::BroadcastBytes {
-            data: data.to_vec(),
-        })
+        tx.send_waiting(
+            py,
+            ServerCommand::BroadcastBytes {
+                data: data.to_vec(),
+            },
+        )
         .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         Ok(())
     }
 
-    pub(super) fn broadcast_local_impl(&self, topic: &str, data: &str) -> PyResult<()> {
+    pub(super) fn broadcast_local_impl(
+        &self,
+        py: Python<'_>,
+        topic: &str,
+        data: &str,
+    ) -> PyResult<()> {
         let tx = self.command_tx()?;
         let data = inject_category(data);
-        tx.send(ServerCommand::BroadcastLocal {
-            topic: topic.to_owned(),
-            data,
-            skip_recovery: false,
-            publish: false,
-        })
+        tx.send_waiting(
+            py,
+            ServerCommand::BroadcastLocal {
+                topic: topic.to_owned(),
+                data,
+                skip_recovery: false,
+                publish: false,
+            },
+        )
         .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         Ok(())
     }
 
-    pub(super) fn broadcast_impl(&self, topic: &str, data: &str) -> PyResult<()> {
+    pub(super) fn broadcast_impl(&self, py: Python<'_>, topic: &str, data: &str) -> PyResult<()> {
         let data = inject_category(data);
 
         // The command task stamps the message (recovery position) and fans it
         // out locally, then publishes the same stamped bytes to cluster peers:
         // every node delivers one wire form per message, with one position.
         self.command_tx()?
-            .send(ServerCommand::BroadcastLocal {
-                topic: topic.to_owned(),
-                data,
-                skip_recovery: false,
-                publish: true,
-            })
+            .send_waiting(
+                py,
+                ServerCommand::BroadcastLocal {
+                    topic: topic.to_owned(),
+                    data,
+                    skip_recovery: false,
+                    publish: true,
+                },
+            )
             .map_err(|_| PyRuntimeError::new_err("Server command channel closed"))?;
         Ok(())
     }

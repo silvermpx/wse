@@ -311,6 +311,54 @@ const LANE_BATCH: usize = 64;
 /// handshakes timed out.
 const LANE_SLICE: usize = 512;
 
+/// A connection with this many bytes still to write is behind.
+const BEHIND_BYTES: usize = 64 * 1024;
+
+/// How long a lane waits when most connections a delivery reached were
+/// behind: it does not run further ahead of the sockets than they can write.
+/// Its queue fills meanwhile, and then the senders wait in turn. Only a
+/// delivery to at least `PACE_MIN` connections counts, so one slow client
+/// never holds back its lane: over its own budget it just misses messages.
+const LANE_PACE: std::time::Duration = std::time::Duration::from_millis(1);
+const PACE_MIN: usize = 32;
+
+/// What a lane's job did.
+#[derive(Default, Clone, Copy)]
+struct Served {
+    delivered: u64,
+    dropped: u64,
+    /// The connections that were behind before this delivery.
+    behind: usize,
+}
+
+impl Served {
+    fn deliver(
+        &mut self,
+        h: &ConnectionHandle,
+        msg: &Outgoing,
+        max_pending: usize,
+        slow_drops: &AtomicU64,
+    ) {
+        if h.out.pending.load(Ordering::Relaxed) >= BEHIND_BYTES {
+            self.behind += 1;
+        }
+        if h.deliver(msg, max_pending, slow_drops) {
+            self.delivered += 1;
+        } else {
+            self.dropped += 1;
+        }
+    }
+
+    fn connections(&self) -> usize {
+        (self.delivered + self.dropped) as usize
+    }
+
+    /// Most of the many connections served were behind.
+    fn lagging(&self) -> bool {
+        self.connections() >= PACE_MIN && self.behind * 2 > self.connections()
+    }
+}
+
 /// How many jobs wait for a lane at most. A sender that finds the queue full
 /// waits for room: a publisher faster than the delivery then backs up in its
 /// own queue, a message each, not in a job for every lane.
@@ -510,26 +558,25 @@ impl TopicIndex {
         (matching, mask)
     }
 
-    /// Deliver `msg` to every connection on `lane`. Returns how many
-    /// connections that was.
+    /// Deliver `msg` to every connection on `lane`.
     fn deliver_all(
         &self,
         lane: u8,
         msg: &Outgoing,
         max_pending: usize,
         slow_drops: &AtomicU64,
-    ) -> usize {
-        let conns = self.everyone[usize::from(lane)].read();
-        for h in conns.values() {
-            h.deliver(msg, max_pending, slow_drops);
+    ) -> Served {
+        let mut served = Served::default();
+        for h in self.everyone[usize::from(lane)].read().values() {
+            served.deliver(h, msg, max_pending, slow_drops);
         }
-        conns.len()
+        served
     }
 
     /// Deliver `msg` on `topic` to the subscribers on `lane`: the topic's,
     /// and those of `patterns` (the patterns matching it) their ACL allows.
-    /// A connection subscribed several ways gets it once; `served` is scratch
-    /// space for that. Returns (delivered, dropped).
+    /// A connection subscribed several ways gets it once; `seen` is scratch
+    /// space for that.
     #[allow(clippy::too_many_arguments)]
     fn deliver_topic(
         &self,
@@ -539,37 +586,29 @@ impl TopicIndex {
         msg: &Outgoing,
         max_pending: usize,
         slow_drops: &AtomicU64,
-        served: &mut AHashSet<usize>,
-    ) -> (u64, u64) {
-        let mut delivered = 0u64;
-        let mut dropped = 0u64;
-        let mut count = |sent: bool| {
-            if sent {
-                delivered += 1;
-            } else {
-                dropped += 1;
-            }
-        };
+        seen: &mut AHashSet<usize>,
+    ) -> Served {
+        let mut served = Served::default();
         if patterns.is_empty() {
             // Exact topics only: the common case, no bookkeeping.
             if let Some(subs) = self.subscribers.get(topic)
                 && let Some(part) = subs.part(lane)
             {
                 for h in part.values() {
-                    count(h.deliver(msg, max_pending, slow_drops));
+                    served.deliver(h, msg, max_pending, slow_drops);
                 }
             }
-            return (delivered, dropped);
+            return served;
         }
         // Connections already served, by the identity of their queue.
-        served.clear();
+        seen.clear();
         let id = |h: &ConnectionHandle| Arc::as_ptr(&h.out) as usize;
         if let Some(subs) = self.subscribers.get(topic)
             && let Some(part) = subs.part(lane)
         {
             for h in part.values() {
-                if served.insert(id(h)) {
-                    count(h.deliver(msg, max_pending, slow_drops));
+                if seen.insert(id(h)) {
+                    served.deliver(h, msg, max_pending, slow_drops);
                 }
             }
         }
@@ -585,12 +624,12 @@ impl TopicIndex {
                     .acls
                     .get(conn_id)
                     .is_none_or(|acl| acl.is_allowed(topic));
-                if allowed && served.insert(id(h)) {
-                    count(h.deliver(msg, max_pending, slow_drops));
+                if allowed && seen.insert(id(h)) {
+                    served.deliver(h, msg, max_pending, slow_drops);
                 }
             }
         }
-        (delivered, dropped)
+        served
     }
 
     /// Deliver `msg` on `topic` here and now, every lane in turn: what the
@@ -604,18 +643,18 @@ impl TopicIndex {
         slow_drops: &AtomicU64,
     ) -> (u64, u64) {
         let (patterns, mask) = self.reach(topic);
-        let mut served = AHashSet::new();
+        let mut seen = AHashSet::new();
         lanes_of(mask).fold((0, 0), |(delivered, dropped), lane| {
-            let (d, f) = self.deliver_topic(
+            let served = self.deliver_topic(
                 lane as u8,
                 topic,
                 &patterns,
                 msg,
                 max_pending,
                 slow_drops,
-                &mut served,
+                &mut seen,
             );
-            (delivered + d, dropped + f)
+            (delivered + served.delivered, dropped + served.dropped)
         })
     }
 }
@@ -777,46 +816,53 @@ async fn run_lane(
     slow_drops: Arc<AtomicU64>,
 ) {
     let mut batch = Vec::with_capacity(LANE_BATCH);
-    let mut served = AHashSet::new();
+    let mut seen = AHashSet::new();
     while jobs.recv_many(&mut batch, LANE_BATCH).await > 0 {
         // Connections served since the lane last gave way.
-        let mut served_since = 0;
+        let mut since = 0;
         for job in batch.drain(..) {
-            served_since += match job {
+            let served = match job {
                 Job::All(msg) => index.deliver_all(lane, &msg, max_pending, &slow_drops),
                 Job::Topic(message) => {
-                    let (delivered, dropped) = index.deliver_topic(
+                    let served = index.deliver_topic(
                         lane,
                         &message.topic,
                         &message.patterns,
                         &message.msg,
                         max_pending,
                         &slow_drops,
-                        &mut served,
+                        &mut seen,
                     );
                     if let Some(metrics) = &message.tally {
-                        metrics.add_delivered(delivered);
-                        if dropped > 0 {
-                            metrics.add_dropped(dropped);
+                        metrics.add_delivered(served.delivered);
+                        if served.dropped > 0 {
+                            metrics.add_dropped(served.dropped);
                         }
                     }
-                    (delivered + dropped) as usize
+                    served
                 }
                 Job::One(h, msg) => {
-                    h.deliver(&msg, max_pending, &slow_drops);
-                    1
+                    let mut served = Served::default();
+                    served.deliver(&h, &msg, max_pending, &slow_drops);
+                    served
                 }
             };
-            // The write tasks it woke wait in this thread's run queue: they
-            // run, and the runtime reads the network, before the lane goes
-            // on. A lane with work would not give way by itself until
-            // tokio's budget ran out, after thousands of deliveries.
-            if served_since >= LANE_SLICE {
+            since += served.connections();
+            if served.lagging() {
+                // The sockets are behind: they write before more is queued.
+                tokio::time::sleep(LANE_PACE).await;
+                since = 0;
+            } else if since >= LANE_SLICE {
+                // The write tasks it woke wait in this thread's run queue:
+                // they run, and the runtime reads the network, before the
+                // lane goes on. A lane with work would not give way by
+                // itself until tokio's budget ran out, after thousands of
+                // deliveries.
                 tokio::task::yield_now().await;
-                served_since = 0;
+                since = 0;
             }
         }
-        if served_since > 0 {
+        if since > 0 {
             tokio::task::yield_now().await;
         }
     }

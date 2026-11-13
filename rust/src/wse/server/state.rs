@@ -274,6 +274,54 @@ pub(super) struct DeduplicationState {
     pub(super) max_entries: usize,
 }
 
+/// How many commands wait for the command task before the application's
+/// sends wait for room (`Commands::send_waiting`).
+pub(crate) const COMMAND_QUEUE: usize = 65_536;
+
+/// The sending side of the command queue. It counts what waits in the queue,
+/// so the application can be held back while the queue is full: a publisher
+/// faster than the server then waits for it instead of filling memory.
+#[derive(Clone)]
+pub(crate) struct Commands {
+    tx: mpsc::UnboundedSender<ServerCommand>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl Commands {
+    pub(crate) fn new(tx: mpsc::UnboundedSender<ServerCommand>, queued: Arc<AtomicUsize>) -> Self {
+        Self { tx, queued }
+    }
+
+    /// Queue `cmd` now, full queue or not: the server's own messages and
+    /// the lifecycle commands.
+    pub(crate) fn send(
+        &self,
+        cmd: ServerCommand,
+    ) -> Result<(), mpsc::error::SendError<ServerCommand>> {
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        self.tx.send(cmd).inspect_err(|_| {
+            self.queued.fetch_sub(1, Ordering::Relaxed);
+        })
+    }
+
+    /// Queue `cmd` once fewer than `COMMAND_QUEUE` commands wait, waiting
+    /// without the GIL meanwhile: the application's sends and broadcasts.
+    pub(crate) fn send_waiting(
+        &self,
+        py: Python<'_>,
+        cmd: ServerCommand,
+    ) -> Result<(), mpsc::error::SendError<ServerCommand>> {
+        if self.queued.load(Ordering::Relaxed) >= COMMAND_QUEUE {
+            py.detach(|| {
+                while self.queued.load(Ordering::Relaxed) >= COMMAND_QUEUE && !self.tx.is_closed() {
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
+            });
+        }
+        self.send(cmd)
+    }
+}
+
 pub(crate) enum ServerCommand {
     SendText {
         conn_id: String,
@@ -416,8 +464,7 @@ pub(crate) struct SharedState {
     pub(super) conn_queue_groups: DashMap<String, Vec<(String, String)>>,
     // Sender for presence broadcasts from disconnect cleanup paths
     // (where self.cmd_tx is not available, only Arc<SharedState>)
-    pub(super) presence_broadcast_tx:
-        std::sync::RwLock<Option<mpsc::UnboundedSender<ServerCommand>>>,
+    pub(super) presence_broadcast_tx: arc_swap::ArcSwapOption<Commands>,
     // Configurable limits
     pub(super) rate_capacity: f64,
     pub(super) rate_refill: f64,
@@ -431,8 +478,8 @@ pub(crate) struct SharedState {
     pub(crate) slow_consumer_drops: Arc<AtomicU64>,
     pub(super) messages_received_total: AtomicU64,
     pub(super) messages_sent_total: AtomicU64,
-    // Commands waiting for the command task, as it last saw them
-    pub(super) commands_queued: AtomicUsize,
+    // Commands waiting for the command task
+    pub(super) commands_queued: Arc<AtomicUsize>,
     pub(super) connections_accepted_total: AtomicU64,
     pub(super) connections_rejected_total: AtomicU64,
     pub(super) bytes_received_total: AtomicU64,
@@ -545,7 +592,7 @@ impl SharedState {
             },
             queue_groups: Arc::new(DashMap::new()),
             conn_queue_groups: DashMap::new(),
-            presence_broadcast_tx: std::sync::RwLock::new(None),
+            presence_broadcast_tx: arc_swap::ArcSwapOption::empty(),
             rate_capacity: cfg.rate_capacity,
             rate_refill: cfg.rate_refill,
             max_message_size: cfg.max_message_size,
@@ -556,7 +603,7 @@ impl SharedState {
             slow_consumer_drops: Arc::new(AtomicU64::new(0)),
             messages_received_total: AtomicU64::new(0),
             messages_sent_total: AtomicU64::new(0),
-            commands_queued: AtomicUsize::new(0),
+            commands_queued: Arc::default(),
             connections_accepted_total: AtomicU64::new(0),
             connections_rejected_total: AtomicU64::new(0),
             bytes_received_total: AtomicU64::new(0),

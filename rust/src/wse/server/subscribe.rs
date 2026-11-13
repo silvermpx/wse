@@ -277,8 +277,7 @@ impl SharedState {
                 data: data.clone(),
             });
         }
-        let presence_tx = self.presence_broadcast_tx.read().unwrap().clone();
-        if let Some(tx) = presence_tx {
+        if let Some(tx) = &*self.presence_broadcast_tx.load() {
             let _ = tx.send(ServerCommand::BroadcastLocal {
                 topic: topic.to_owned(),
                 data: format_presence_msg("presence_leave", user_id, data),

@@ -90,7 +90,7 @@ pub(super) fn presence_round(pm: &PresenceManager) -> Vec<Bytes> {
 /// Broadcast a presence event of a remote user to the topic's local
 /// subscribers.
 fn tell_presence(
-    server_cmd_tx: &Option<mpsc::UnboundedSender<crate::wse::server::ServerCommand>>,
+    server_cmd_tx: &Option<crate::wse::server::Commands>,
     kind: &str,
     topic: String,
     user_id: &str,
@@ -119,7 +119,7 @@ pub(crate) async fn cluster_manager(
     cluster_opts: (
         InboundLinks,
         Option<Arc<crate::wse::presence::PresenceManager>>,
-        Option<mpsc::UnboundedSender<crate::wse::server::ServerCommand>>,
+        Option<crate::wse::server::Commands>,
     ),
 ) {
     let (mut cmd_rx, mut interest_rx) = channels;

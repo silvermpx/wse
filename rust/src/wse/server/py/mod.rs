@@ -27,12 +27,11 @@ use ahash::AHashSet;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
 use crate::jwt::{self, JwtConfig};
 use crate::wse::server::state::DeduplicationState;
-use crate::wse::server::{ServerCommand, SharedState, SharedStateConfig};
+use crate::wse::server::{Commands, ServerCommand, SharedState, SharedStateConfig};
 
 // ---------------------------------------------------------------------------
 // PyO3 class
@@ -52,7 +51,7 @@ pub struct RustWSEServer {
     shared: Arc<SharedState>,
     /// Command channel into the running server, `None` while stopped. Loaded on
     /// every send and broadcast, replaced only by `start()` and `stop()`.
-    cmd_tx: arc_swap::ArcSwapOption<mpsc::UnboundedSender<ServerCommand>>,
+    cmd_tx: arc_swap::ArcSwapOption<Commands>,
     /// The server thread while one exists. Its lock also serializes `start()`
     /// and `stop()` against each other.
     lifecycle: std::sync::Mutex<Option<thread::JoinHandle<()>>>,
@@ -64,10 +63,10 @@ pub struct RustWSEServer {
 
 /// The command sender of the running server, loaded from `RustWSEServer::cmd_tx`
 /// without touching its reference count.
-struct CommandTx(arc_swap::Guard<Option<Arc<mpsc::UnboundedSender<ServerCommand>>>>);
+struct CommandTx(arc_swap::Guard<Option<Arc<Commands>>>);
 
 impl std::ops::Deref for CommandTx {
-    type Target = mpsc::UnboundedSender<ServerCommand>;
+    type Target = Commands;
 
     fn deref(&self) -> &Self::Target {
         self.0
@@ -537,13 +536,13 @@ impl RustWSEServer {
     // -- send methods -------------------------------------------------------
 
     /// Send a raw text frame to a single connection.
-    fn send(&self, conn_id: &str, data: &str) -> PyResult<()> {
-        self.send_impl(conn_id, data)
+    fn send(&self, py: Python<'_>, conn_id: &str, data: &str) -> PyResult<()> {
+        self.send_impl(py, conn_id, data)
     }
 
     /// Send a raw binary frame to a single connection.
-    fn send_bytes(&self, conn_id: &str, data: &[u8]) -> PyResult<()> {
-        self.send_bytes_impl(conn_id, data)
+    fn send_bytes(&self, py: Python<'_>, conn_id: &str, data: &[u8]) -> PyResult<()> {
+        self.send_bytes_impl(py, conn_id, data)
     }
 
     /// Full outbound pipeline in Rust: PyDict -> envelope -> JSON -> compress -> send.
@@ -553,22 +552,22 @@ impl RustWSEServer {
     #[pyo3(signature = (conn_id, event, compression_threshold = 1024))]
     fn send_event(
         &self,
-        _py: Python<'_>,
+        py: Python<'_>,
         conn_id: &str,
         event: &Bound<'_, PyDict>,
         compression_threshold: usize,
     ) -> PyResult<usize> {
-        self.send_event_impl(_py, conn_id, event, compression_threshold)
+        self.send_event_impl(py, conn_id, event, compression_threshold)
     }
 
     /// Send a text frame to all connected clients (no topic filtering).
-    fn broadcast_all(&self, data: &str) -> PyResult<()> {
-        self.broadcast_all_impl(data)
+    fn broadcast_all(&self, py: Python<'_>, data: &str) -> PyResult<()> {
+        self.broadcast_all_impl(py, data)
     }
 
     /// Send a binary frame to all connected clients.
-    fn broadcast_all_bytes(&self, data: &[u8]) -> PyResult<()> {
-        self.broadcast_all_bytes_impl(data)
+    fn broadcast_all_bytes(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
+        self.broadcast_all_bytes_impl(py, data)
     }
 
     // -- query / management -------------------------------------------------
@@ -930,13 +929,13 @@ impl RustWSEServer {
     }
 
     /// Fan-out to topic subscribers locally.
-    fn broadcast_local(&self, topic: &str, data: &str) -> PyResult<()> {
-        self.broadcast_local_impl(topic, data)
+    fn broadcast_local(&self, py: Python<'_>, topic: &str, data: &str) -> PyResult<()> {
+        self.broadcast_local_impl(py, topic, data)
     }
 
     /// Fan-out locally + cluster PUBLISH for multi-instance coordination.
-    fn broadcast(&self, topic: &str, data: &str) -> PyResult<()> {
-        self.broadcast_impl(topic, data)
+    fn broadcast(&self, py: Python<'_>, topic: &str, data: &str) -> PyResult<()> {
+        self.broadcast_impl(py, topic, data)
     }
 
     /// Number of fan-out subscribers on a topic (excludes queue group members).
