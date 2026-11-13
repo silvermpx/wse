@@ -101,6 +101,22 @@ the steps to take are in [docs/MIGRATION.md](docs/MIGRATION.md#migrating-from-v2
 - TypeScript: one session per page shared by every `useWSE()`; adaptive
   quality, the compression preference and the idle options work.
 
+### Performance
+
+- Fan-out and the inbound path are back at 2.5.1's speed after two
+  slowdowns of this release were found by measurement: each connection's
+  read and write loops checked a cancellation token, which takes a lock,
+  for every message (now `Abortable`, an atomic load), and the command
+  queue's depth gauge walked the queue for every command, so a burst of
+  broadcasts drained slower the longer it got (now measured once every
+  1024 commands). Measured against 2.5.1 built the same way, on a quiet
+  48-thread Xeon: broadcast to 1000, 5000 and 10000 subscribers 5.2, 6.1
+  and 7.4 million deliveries/s (2.5.1: 5.5, 6.0, 7.5), inbound 8.4 million
+  messages/s (8.3).
+- A frame's activity is an atomic store instead of a map lookup, one clock
+  read serves the activity and the rate limit, and writev gathers frames
+  on the stack.
+
 ### Changed (build and checks)
 
 - PyO3 0.30 and current crates; JWT and the Python crypto helpers on
