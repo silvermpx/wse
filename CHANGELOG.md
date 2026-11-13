@@ -1,6 +1,6 @@
 # Changelog
 
-## v3.0.0 (unreleased)
+## v3.0.0 (2026-11-13)
 
 Security, correctness and speed. Upgrading from 2.x: see
 [docs/MIGRATION.md](docs/MIGRATION.md#migrating-from-v2x-to-v30).
