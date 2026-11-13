@@ -2,157 +2,92 @@
 
 ## v3.0.0 (unreleased)
 
-A security and correctness release: end-to-end encryption with an
-authenticated server, every delivery path through one per-connection
-route, closes the server enforces, a cluster whose links, interest and
-presence stay consistent, msgpack on every path, and fan-out on every
-core with flow control back to the application. Breaking changes and
-the steps to take are in [docs/MIGRATION.md](docs/MIGRATION.md#migrating-from-v2x-to-v30).
+Security, correctness and speed. Upgrading from 2.x: see
+[docs/MIGRATION.md](docs/MIGRATION.md#migrating-from-v2x-to-v30).
 
 ### Breaking changes
 
-- **E2E encryption authenticates the server.** A new session protocol: the
-  server signs each handshake with its identity key (`e2e_identity_key`,
-  ECDSA P-256), clients pin its public key; keys per direction, bound to
-  the handshake; every frame carries an epoch and sequence number, and a
-  replayed, reordered, dropped or forged frame closes the connection. With
-  encryption on, both clients need a pinned key, an explicitly
-  unauthenticated server, or the first design (`e2e_legacy`, kept for 2.x
-  peers on both sides).
-- **Message signing is gone.** It signed nothing (a random key the server
-  never knew, functions without callers, a signature nobody read).
-  `security.messageSignature`, `WSEEvent.signature` and the clients'
-  signing-key rotation are removed.
-- **`connect_cluster()` needs `cluster_port`**, or `single_port=True`;
-  cluster links are no longer taken on the WebSocket port otherwise.
-- **`start()` and `connect_cluster()` raise `OSError`** when they cannot
-  bind; **`drain()` blocks** and returns how many clients it dropped.
-- **JWT options are validated at startup**, missing `iss`/`aud` claims are
-  refused when configured, a malformed `wse_topics` claim denies every
-  topic, and `jwt_*` options without `jwt_secret` are an error.
-- **The rate limit applies to what clients send** (`RATE_LIMITED`, then
-  close 4429); `send_event()` is not throttled.
-- **New close codes** 1013, 4403, 4408, 4429, 4800, 4802, 4803.
-- **`subscribe_connection()` returns the topics it took**; topic names are
-  checked and a connection holds at most 16 patterns.
-- **Out-of-range options and values that cannot be JSON raise
-  `ValueError`** instead of disabling features or crashing the process.
-- **The server's `msgpack` extra is gone**: MessagePack is packed in Rust
-  and the package was never imported.
-- **Sends wait while the server is saturated**: with 65,536 commands
-  queued, `send()`, `send_event()` and the broadcasts wait (without the
-  GIL) instead of growing the queue without limit.
+- E2E encryption now authenticates the server: clients pin the server's
+  public key (`e2e_identity_key` on the server). 2.x clients keep working
+  while `e2e_legacy=True`, the default.
+- Message signing is removed. It never worked: the server never checked a
+  signature.
+- `connect_cluster()` needs `cluster_port`, or `single_port=True` to take
+  peers on the WebSocket port.
+- `start()` and `connect_cluster()` raise `OSError` when the port is taken.
+  `drain()` waits for the clients to leave and returns how many it dropped.
+- JWT settings are checked at startup. A token without the configured
+  `iss`/`aud` is rejected; a malformed `wse_topics` claim denies every topic.
+- The rate limit applies to what clients send, as documented (close code
+  4429). `send_event()` is no longer throttled.
+- New close codes: 1013, 4403, 4408, 4429, 4800, 4802, 4803.
+- `subscribe_connection()` returns the topics it accepted. Topic names are
+  validated, and a connection holds at most 16 patterns.
+- Invalid options, and values that cannot be JSON, raise `ValueError`.
+- Sends and broadcasts wait, without holding the GIL, while 65,536 commands
+  are queued, instead of using memory without limit.
+- The server's `msgpack` extra is removed; nothing used it.
+- TypeScript `ConnectionPool`: the health check that wrote `PING:` to the
+  socket every 30 s is removed; `healthCheckInterval` is now
+  `scoreDecayInterval`.
 
-### Added
+### New
 
-- **Free-threaded Python**: cp314t and cp315t wheels; every Python class is
-  thread safe.
-- **JWT**: every standard algorithm (HS, RS, PS 256/384/512, ES256/384,
-  EdDSA); `issue_token()` signs with the server's own configuration;
-  `reload_jwt_keys()` swaps keys on a running server.
-- **One crypto library, chosen when building**: aws-lc-rs, or its FIPS
-  140-3 module with the `fips` feature.
+- Free-threaded Python wheels (3.14t, 3.15t).
+- Every standard JWT algorithm, `issue_token()`, and `reload_jwt_keys()`
+  on a running server.
+- A FIPS 140-3 build (`fips` feature).
 - `accept_connection()` for applications that authenticate connections
-  themselves; connections close (4403) when their token expires.
-- `client_subscriptions=True`: the server answers the clients' own
-  subscribe and recovery requests, within each connection's topic ACL.
-- `allowed_origins` against cross-site WebSocket hijacking;
-  `max_inbound_queue_bytes`; with-statement support; `is_draining()`.
-- Each client decides whether its messages are compressed (`client_hello`,
-  `client_config`, `?compression=false`).
-- msgpack everywhere a client asks for it: topic messages, broadcasts,
-  replays and replies, read back in msgpack too; the TS client's
-  `wireFormat: 'msgpack'`; floats in 32 bits when exact. 24-41% fewer
-  bytes than JSON on typical messages.
-- `wse_server.prometheus.WSECollector` for a prometheus_client registry.
-- Cluster presence sync rounds: a full round on every link, and again for a
-  peer that missed an update, so a lost leave leaves no ghost.
+  themselves; connections close when their token expires.
+- `client_subscriptions=True`: clients subscribe and recover by themselves,
+  within their topic ACL.
+- `allowed_origins`, `max_inbound_queue_bytes`, `is_draining()` and `with`.
+- Each client chooses whether its messages are compressed.
+- msgpack on every message path, and `wireFormat: 'msgpack'` in the
+  TypeScript client: 24-41% fewer bytes than JSON.
+- `wse_server.prometheus.WSECollector`.
 
-### Fixed (server)
+### Fixed
 
-- One delivery path per connection: relayed, queue-group and direct
-  messages no longer reach E2E connections in plaintext, and pattern
-  subscriptions respect the connection's ACL.
-- Closes are enforced (5 s grace), one task writes each socket, the
-  control queue is never held behind broadcasts, and every frame counts
-  as activity.
-- Lifecycle events are never dropped; client messages are bounded by count
-  and by size.
-- `start()`, `drain()`, `stop()` and callback mode keep their promises;
-  a dropped server is stopped; callbacks run in order per connection.
-- Recovery memory stays within its budget, also against a peer naming new
-  epochs; TTL cleanup no longer panics.
-- Presence: no deadlock between updates and tracking; leaves reach every
-  node; remote events report only real changes.
-- Utilities: filters, msgpack, transformer and queues behave as documented;
-  cyclic or deep values raise `ValueError`.
-
-### Fixed (cluster)
-
-- Any node can link to any other, one link per pair; links that end are
-  noticed and redialed; a node no longer dials itself.
-- Interest routing matches what peers subscribed (patterns included);
-  subscriptions made before `connect_cluster()` are advertised; a draining
-  peer gets nothing new.
-- A new link gets the node's interest and presence in order with every
-  change after them; RESYNC is queued whole or not at all; the queues to
-  the manager are bounded.
-- Relayed messages keep the recovery position they got at origin.
-
-### Fixed (clients)
-
-- Python and TypeScript: reconnects that never give up except on an auth
-  rejection or a refused E2E design, fail-closed encryption, gap recovery
-  from the last delivered offset, inbound size limits.
-- TypeScript: one session per page shared by every `useWSE()`; adaptive
-  quality, the compression preference and the idle options work.
-- TypeScript: `ConnectionPool` no longer writes `PING:` text to the
-  application's socket every 30 seconds, a check that counted a success
-  without an answer; its health-check options are gone and
-  `healthCheckInterval` is `scoreDecayInterval`.
+- Server: E2E connections never get plaintext; pattern subscriptions
+  respect the ACL; closes are enforced; connect and disconnect events are
+  never dropped; `start()`, `drain()`, `stop()` and callbacks do what the
+  docs say; recovery stays within its memory budget; presence no longer
+  deadlocks.
+- Cluster: any node can link to any other and redials a lost link;
+  interest routing understands patterns; a new peer gets the full interest
+  and presence state; no ghost members after a lost leave; relayed messages
+  keep their recovery position.
+- Clients: reconnect until the server rejects the token; encryption fails
+  closed; gaps are recovered from the last delivered message; the
+  TypeScript client keeps one session per page.
+- The Rust utilities (filters, queues, transformer, msgpack) behave as
+  documented.
 
 ### Performance
 
-- **Fan-out on every core.** Each connection belongs to a lane, one per
-  core, and each lane has a task of its own delivering to its
-  connections; a topic's subscribers are kept by lane with a bit mask, so
-  a message goes only to the lanes that have someone to get it, in order
-  per sender. Before, one task delivered every message to every
-  connection.
-- **Flow control from the sockets back to the application.** A lane whose
-  connections are behind waits until one of them catches up; a lane's
-  queue holds 1024 jobs; the application's sends wait while 65,536
-  commands are queued. A publisher faster than the clients now runs at
-  their pace instead of filling memory: 2.5.1 kept every message in an
-  unbounded queue.
-- No allocation, lock or extra lookup per published message (the topic
-  counter, the recovery buffers and the cluster sender), a connection's
-  delivery state in one allocation, frame queues reused by the write
-  task, and no lock per delivery to check the connection is open.
-- Two slowdowns of this release were found by measurement and fixed: the
-  read and write loops checked a cancellation token, which takes a lock,
-  for every message (now `Abortable`, an atomic load), and the command
-  queue's depth gauge walked the queue for every command (now an exact
-  count kept by the senders).
-- A frame's activity is an atomic store instead of a map lookup, one clock
-  read serves the activity and the rate limit, and writev gathers frames
-  on the stack.
-- Measured against 2.5.1 on a 48-thread Xeon, server and benchmark client
-  each on 12 physical cores, three rounds: broadcast to 1000, 5000 and
-  10000 subscribers 9.4, 8.2 and 7.3 million deliveries/s (2.5.1: 5.4,
-  6.0, 7.4); a topic relayed by a cluster peer to 1000 and 10000
-  subscribers 6.8 and 8.4 million (5.9, 5.7); inbound 8.2 and 7.6 million
-  messages/s from 100 and 1000 connections (8.3, 7.7). Under the
-  benchmark's publisher, which never pauses, the server peaked at 19-21 GB
-  (2.5.1: 35-39 GB).
+- Fan-out uses every core: one delivery lane per core instead of a single
+  task.
+- Flow control: when clients read slower than the application publishes,
+  the publisher waits instead of the server buffering without limit.
+- No allocation or lock per published message.
 
-### Changed (build and checks)
+Against 2.5.1 on the same 48-thread Xeon, server and benchmark client on
+separate cores ([details](docs/BENCHMARKS_FANOUT.md)):
 
-- PyO3 0.30 and current crates; JWT and the Python crypto helpers on
-  aws-lc-rs; the RustCrypto crates and `rsa` leave the build.
-- CI tests every package, the stub against the compiled module, the FIPS
-  build, and repository rules (`cargo xtask`); cargo-deny, gitleaks.
-- Releases publish only what was built, installed and tested; musllinux and
+| | 2.5.1 | 3.0.0 |
+|---|---|---|
+| Broadcast, 1,000 / 5,000 / 10,000 subscribers | 5.4 / 6.0 / 7.4M deliveries/s | 9.4 / 8.2 / 7.3M |
+| A topic through a cluster peer, 1,000 / 10,000 | 5.9 / 5.7M | 6.8 / 8.4M |
+| Inbound, 100 / 1,000 connections | 8.3 / 7.7M messages/s | 8.2 / 7.6M |
+| Peak memory under a publisher that never pauses | 35-39 GB | 19-21 GB |
+
+### Build and CI
+
+- PyO3 0.30; one crypto library, aws-lc-rs.
+- CI tests every package, the type stub, the FIPS build and the
+  repository rules, with cargo-deny and gitleaks.
+- Releases publish only what was built and tested; new musllinux and
   Windows arm64 wheels.
 
 ## v2.5.1 (2026-10-15)

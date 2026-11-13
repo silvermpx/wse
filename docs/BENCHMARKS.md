@@ -8,7 +8,7 @@ Each client has its own detailed results page.
 | Client | Language | Max Connections Tested | Peak Throughput | Details |
 |--------|----------|----------------------|-----------------|---------|
 | **wse-bench** | Rust (tokio) | **500,000** | **30M msg/s** | [Rust Client Results](BENCHMARKS_RUST_CLIENT.md) |
-| **wse-bench** (fan-out) | Rust (tokio) | **500,000** | **5.0M del/s** | [Fan-out Results](BENCHMARKS_FANOUT.md) |
+| **wse-bench** (fan-out) | Rust (tokio) | **500,000** | **9.4M del/s** (3.0) | [Fan-out Results](BENCHMARKS_FANOUT.md) |
 | **bench_brutal.py** | Python (sync) | 1,000 | 6.9M msg/s | [Python Client Results](BENCHMARKS_PYTHON_CLIENT.md) |
 | **bench_wse_multiprocess.py** | Python (multi-proc) | 128 | 2.1M msg/s | [Python Client Results](BENCHMARKS_PYTHON_CLIENT.md) |
 
@@ -21,6 +21,8 @@ than Python could measure.
 ## Server Hardware
 
 Primary test environment: AMD EPYC 7502P (32 cores, 64 threads), 128 GB RAM, Ubuntu 24.04.
+The 3.0 fan-out comparison with 2.5.1 ran on an Intel Xeon Gold 5412U (24 cores, 48 threads),
+server and client on separate cores; see [Fan-out Results](BENCHMARKS_FANOUT.md#v300-results-november-2026).
 Client and server on the same machine (loopback, zero network noise). M2 MacBook used
 for development benchmarks.
 
@@ -35,6 +37,8 @@ full Python wrapper with drain_mode, JWT auth, the whole stack.
 |--------|-------|--------|
 | Peak throughput (JSON) | **14.7M msg/s** (2.6 GB/s) | Rust client, 500 conns |
 | Peak throughput (binary) | **30M msg/s** | Rust client, 100 conns |
+| Fan-out broadcast (v3.0) | **9.4M del/s** | 1,000 subs, Xeon 5412U, server on 12 cores (2.5.1: 5.4M) |
+| Fan-out through a cluster peer (v3.0) | **8.4M del/s** | 10,000 subs, same machine (2.5.1: 5.7M) |
 | Fan-out broadcast (v2.2) | **4.7M del/s** | 32 cores pinned, 100 subs, 0 gaps, 0 drops |
 | Fan-out cluster 50/50 (v2.2) | **6.6M del/s** | 2 nodes, 500 subs, 0 gaps, 0 drops |
 | Peak message rate | **20.7M msg/s** | Rust client, 64B payload |

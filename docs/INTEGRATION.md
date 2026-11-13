@@ -308,6 +308,8 @@ server.broadcast("prices", '{"t":"price","p":{"symbol":"AAPL","price":187.42}}')
 
 `broadcast_all` and `broadcast_local` never touch the network - they fan out directly to local connections. `broadcast` additionally forwards to cluster peers via the native TCP mesh protocol.
 
+All of these queue the message and return. Only when the server is saturated, with 65,536 commands waiting because the clients read slower than the application publishes, does a call wait (without holding the GIL) until there is room. A publisher loop then runs at the speed the server delivers instead of filling memory.
+
 ---
 
 ## 6. Topic Subscriptions

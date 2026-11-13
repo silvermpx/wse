@@ -7,7 +7,42 @@ Two modes tested:
 - **Single-Instance Broadcast** (Test 8) -- `server.broadcast_all()` directly to all connections
 - **Multi-Instance Cluster** (Test 11) -- publish on Server A -> custom TCP protocol -> Server B -> N subscribers
 
-## Hardware
+## v3.0.0 Results (November 2026)
+
+3.0 delivers fan-out on every core (one delivery lane per core) and slows
+the publisher down when the clients cannot keep up. Measured against 2.5.1
+on the same machine.
+
+**Hardware:** Intel Xeon Gold 5412U (24 cores, 48 threads), 125 GB RAM,
+Linux. The server and `wse-bench` each run on 12 physical cores with their
+hyperthreads (`taskset`), so neither takes CPU from the other. Same message
+and publisher as below; the publisher never pauses. 8 seconds per tier,
+averages of three rounds.
+
+| Test | 2.5.1 | 3.0.0 | Change |
+|------|-------|-------|--------|
+| Broadcast, 1,000 subscribers | 5.4M del/s | **9.4M del/s** | +75% |
+| Broadcast, 5,000 subscribers | 6.0M del/s | **8.2M del/s** | +36% |
+| Broadcast, 10,000 subscribers | 7.4M del/s | 7.3M del/s | same |
+| Topic through a cluster peer, 1,000 subscribers | 5.9M del/s | **6.8M del/s** | +15% |
+| Topic through a cluster peer, 10,000 subscribers | 5.7M del/s | **8.4M del/s** | +46% |
+| Inbound, 100 / 1,000 connections | 8.3M / 7.7M msg/s | 8.2M / 7.6M msg/s | same |
+| Server peak memory | 35-39 GB | **19-21 GB** | about half |
+
+Results vary by about 10% between rounds on this machine, which runs other
+work too. The memory peak comes from the publisher that never pauses: 2.5.1
+keeps every message it has not delivered yet in an unbounded queue; 3.0
+makes the publisher wait once 65,536 commands are queued, and delivers at
+the pace the sockets write.
+
+With server and client sharing all cores, as in the older results below
+(one round): 8.5M and 7.9M del/s at 1,000 and 5,000 subscribers (2.5.1:
+5.5M, 5.8M). At 10,000, 6.4M against 9.6M for 2.5.1, which reached it with
+a queue of 40 GB before the run's memory limit stopped it.
+
+---
+
+## Hardware (v2.x results below)
 
 AMD EPYC 7502P (32 cores, 64 threads), 128 GB RAM, Ubuntu 24.04.
 Client and server on the same machine (loopback).
@@ -183,6 +218,14 @@ and the scaling advantage narrows.
 ---
 
 ## Reproducing
+
+### v3.0.0, server and client on separate cores
+
+```bash
+# List the CPUs of each physical core: lscpu -p=CPU,CORE
+taskset -c <server cpus> python benchmarks/bench_fanout_server.py --mode broadcast --max-connections 100000
+taskset -c <client cpus> wse-bench --test fanout-broadcast --tiers 1000,5000,10000 --duration 8
+```
 
 ### Test 8: Single-Instance Broadcast
 

@@ -750,7 +750,7 @@ When `broadcast(topic, data)` is called:
 | connections       | Arc<RwLock<HashMap>>        | Read-heavy, write on connect/disconnect |
 | topic index       | Arc<DashMap<String, Subscribers>> | Per topic: subscribers by lane, lane bit mask |
 | lane connections  | parking_lot::RwLock per lane | Read by the lane's task, write on connect/disconnect |
-| lane jobs         | tokio mpsc::unbounded per lane | Senders hand messages over in order |
+| lane jobs         | tokio mpsc, 1024 per lane    | Senders hand messages over in order, wait when full |
 | conn_topics       | DashMap<String, DashSet>    | Concurrent read/write     |
 | queue_groups      | Arc<DashMap<String, DashMap<String, QueueGroup>>>| Per-topic per-group       |
 | conn_formats      | DashMap<String, bool>       | Per-connection read/write  |
@@ -760,6 +760,7 @@ When `broadcast(topic, data)` is called:
 | connection channel| tokio mpsc::unbounded       | SPSC per connection       |
 | cluster peer data | tokio mpsc::bounded(10K)    | Per-peer backpressure     |
 | cluster command   | tokio mpsc::unbounded       | MPSC                      |
+| server command    | tokio mpsc, counted         | Application sends wait at 65,536 queued |
 | recovery buffers  | DashMap<TopicRecoveryBuffer>| Per-topic write lock      |
 | presence state    | DashMap<DashMap<PresenceEntry>>| Per-topic per-user write |
 | presence stats    | DashMap<AtomicUsize counters>| Lock-free                |

@@ -567,7 +567,16 @@ See [ts-client/](ts-client/) for full source and examples.
 
 ## Performance
 
-Benchmarked on AMD EPYC 7502P (32 cores / 64 threads, 128 GB RAM), Ubuntu 24.04.
+3.0 against 2.5.1 on the same machine (Intel Xeon Gold 5412U, 48 threads), server and benchmark client on separate cores:
+
+| Test | 2.5.1 | 3.0 |
+|------|-------|-----|
+| Broadcast, 1,000 / 5,000 / 10,000 subscribers | 5.4 / 6.0 / 7.4M deliveries/s | **9.4 / 8.2 / 7.3M** |
+| Topic through a cluster peer, 1,000 / 10,000 subscribers | 5.9 / 5.7M deliveries/s | **6.8 / 8.4M** |
+| Inbound, 100 / 1,000 connections | 8.3 / 7.7M msg/s | 8.2 / 7.6M |
+| Peak memory under a publisher that never pauses | 35-39 GB | **19-21 GB** |
+
+Peak numbers measured with 2.x on AMD EPYC 7502P (32 cores / 64 threads, 128 GB RAM), Ubuntu 24.04:
 
 | Mode | Peak Throughput | Connections | Message Loss |
 |------|----------------|-------------|--------------|
