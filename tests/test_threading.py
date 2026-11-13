@@ -132,11 +132,13 @@ class TestServerAcrossThreads:
         """Drain loops, broadcasts and health reads overlap without errors."""
         srv = drain_server(server_port)
         srv.start()
-        stop_at = time.monotonic() + 0.5
 
         def work(index):
+            # Each thread runs half a second from its own release, and makes at
+            # least one call: on a busy runner a thread can start late.
+            stop_at = time.monotonic() + 0.5
             calls = 0
-            while time.monotonic() < stop_at:
+            while True:
                 if index % 4 == 0:
                     srv.drain_inbound(64, 5)
                 elif index % 4 == 1:
@@ -147,7 +149,8 @@ class TestServerAcrossThreads:
                     assert srv.health_snapshot()["connections"] == 0
                     srv.prometheus_metrics()
                 calls += 1
-            return calls
+                if time.monotonic() >= stop_at:
+                    return calls
 
         try:
             assert all(calls > 0 for calls in run_in_threads(work))
