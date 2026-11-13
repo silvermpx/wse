@@ -31,7 +31,8 @@ Security, correctness and speed. Upgrading from 2.x: see
 
 ### New
 
-- Free-threaded Python wheels (3.14t, 3.15t).
+- Free-threaded Python wheels (3.14t, 3.15t), and wheels for Alpine Linux
+  (musllinux) and Windows on ARM.
 - Every standard JWT algorithm, `issue_token()`, and `reload_jwt_keys()`
   on a running server.
 - A FIPS 140-3 build (`fips` feature).
@@ -80,14 +81,6 @@ separate cores ([details](docs/BENCHMARKS_FANOUT.md)):
 | A topic through a cluster peer, 1,000 / 10,000 | 5.9 / 5.7M | 6.8 / 8.4M |
 | Inbound, 100 / 1,000 connections | 8.3 / 7.7M messages/s | 8.3 / 7.7M |
 | Peak memory under a publisher that never pauses | 35-39 GB | 19-21 GB |
-
-### Build and CI
-
-- PyO3 0.30; one crypto library, aws-lc-rs.
-- CI tests every package, the type stub, the FIPS build and the
-  repository rules, with cargo-deny and gitleaks.
-- Releases publish only what was built and tested; new musllinux and
-  Windows arm64 wheels.
 
 ## v2.5.1 (2026-10-15)
 
