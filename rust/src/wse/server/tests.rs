@@ -324,6 +324,32 @@ async fn a_large_fanout_reaches_everyone_once_and_in_order() {
     assert_eq!(index.occupied.load(Ordering::Relaxed), 0b1101);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn a_full_lane_makes_the_sender_wait_and_loses_nothing() {
+    use super::fanout::LANE_QUEUE;
+
+    let index = TopicIndex::new(1);
+    let (h, _rx) = make_handle();
+    index.subscribe("t", "c", &h);
+    let fanout = Fanout::start(index, 0, Arc::new(AtomicU64::new(0)));
+    let frame = |n: usize| encode_ws_frame(0x01, format!("{{\"n\":{n}}}").as_bytes());
+    let msg = |n: usize| move || Outgoing::text(bytes::Bytes::from(format!("{{\"n\":{n}}}")));
+    // On this one thread the lane runs only when the sender waits: the
+    // queue fills up without it.
+    for n in 0..LANE_QUEUE {
+        fanout.publish("t".to_owned(), msg(n), None).await;
+    }
+    assert_eq!(fanout.room(0), 0);
+    assert!(queued(&h).is_empty());
+    // The next message waits for room, the lane makes it.
+    let total = LANE_QUEUE + 10;
+    for n in LANE_QUEUE..total {
+        fanout.publish("t".to_owned(), msg(n), None).await;
+    }
+    let expected: Vec<u8> = (0..total).flat_map(|n| frame(n).to_vec()).collect();
+    assert_eq!(delivered(&h, expected.len()).await, expected);
+}
+
 #[test]
 fn subscribers_are_kept_by_lane() {
     let index = TopicIndex::new(8);

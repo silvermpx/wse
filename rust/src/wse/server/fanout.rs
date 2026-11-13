@@ -307,7 +307,7 @@ const LANE_BATCH: usize = 64;
 /// How many jobs wait for a lane at most. A sender that finds the queue full
 /// waits for room: a publisher faster than the delivery then backs up in its
 /// own queue, a message each, not in a job for every lane.
-const LANE_QUEUE: usize = 1024;
+pub(super) const LANE_QUEUE: usize = 1024;
 
 /// How many lanes the server delivers on: one per core, at most `MAX_LANES`.
 pub(crate) fn lane_count() -> usize {
@@ -658,6 +658,12 @@ impl Fanout {
             })
             .collect();
         Self { index, lanes }
+    }
+
+    /// How many more jobs `lane`'s queue takes.
+    #[cfg(test)]
+    pub(super) fn room(&self, lane: usize) -> usize {
+        self.lanes[lane].capacity()
     }
 
     /// Deliver `msg` to every connection.
