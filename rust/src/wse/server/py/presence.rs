@@ -44,7 +44,7 @@ impl RustWSEServer {
         data: &Bound<'_, PyDict>,
     ) -> PyResult<()> {
         if let Some(ref pm) = self.shared.presence {
-            let new_data = pyobj_to_json(data.as_any());
+            let new_data = pyobj_to_json(data.as_any())?;
             match pm.update_data(conn_id, &new_data) {
                 None => {
                     return Err(PyRuntimeError::new_err(

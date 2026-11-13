@@ -131,7 +131,7 @@ impl RustWSEServer {
             if key == "t" || key == "v" || key == "c" {
                 continue;
             }
-            map.insert(key, pyobj_to_json(&v));
+            map.insert(key, pyobj_to_json(&v)?);
         }
 
         // Envelope: id, seq, ts

@@ -298,3 +298,22 @@ class TestApi:
     def test_reloading_keys_needs_a_jwt_server(self, server_no_auth):
         with pytest.raises(RuntimeError):
             server_no_auth.reload_jwt_keys(b"x" * 32)
+
+
+class TestConversion:
+    @pytest.mark.asyncio
+    async def test_cyclic_or_too_deep_data_raises_value_error(self, server, server_port):
+        async with await connect(server_port, make_token()):
+            _, conn_id, _ = drain_until(server, "auth_connect")
+            cyclic: dict = {"t": "x"}
+            cyclic["p"] = cyclic
+            with pytest.raises(ValueError, match="Circular"):
+                server.send_event(conn_id, cyclic)
+            deep: list = []
+            for _ in range(200):
+                deep = [deep]
+            with pytest.raises(ValueError, match="deeper"):
+                server.send_event(conn_id, {"t": "x", "p": deep})
+            # Shared, not cyclic: fine.
+            shared = {"k": 1}
+            assert server.send_event(conn_id, {"t": "x", "p": {"a": shared, "b": shared}}) > 0

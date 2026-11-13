@@ -7,80 +7,101 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyT
 // PyObject <-> serde_json::Value conversion
 // ---------------------------------------------------------------------------
 
-/// Convert a Python object to serde_json::Value.
-pub(super) fn pyobj_to_json(obj: &Bound<'_, PyAny>) -> serde_json::Value {
+/// Deepest nesting of dicts, lists and tuples converted.
+const MAX_DEPTH: usize = 128;
+
+/// Convert a Python object to JSON. A container inside itself, or nesting
+/// deeper than `MAX_DEPTH`, raises ValueError (as `json.dumps` does) instead
+/// of recursing until the stack overflows.
+pub(super) fn pyobj_to_json(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+    let mut path = Vec::new();
+    to_json(obj, &mut path)
+}
+
+/// `path`: the containers being converted, outermost first.
+fn to_json(obj: &Bound<'_, PyAny>, path: &mut Vec<usize>) -> PyResult<serde_json::Value> {
     if obj.is_none() {
-        return serde_json::Value::Null;
+        return Ok(serde_json::Value::Null);
     }
     // Bool before int (bool is subclass of int in Python)
     if obj.is_instance_of::<PyBool>()
         && let Ok(b) = obj.extract::<bool>()
     {
-        return serde_json::Value::Bool(b);
+        return Ok(serde_json::Value::Bool(b));
     }
     if obj.is_instance_of::<PyInt>()
         && let Ok(i) = obj.extract::<i64>()
     {
-        return serde_json::Value::Number(i.into());
+        return Ok(serde_json::Value::Number(i.into()));
     }
     if obj.is_instance_of::<PyFloat>()
         && let Ok(f) = obj.extract::<f64>()
     {
-        if let Some(n) = serde_json::Number::from_f64(f) {
-            return serde_json::Value::Number(n);
-        }
-        return serde_json::Value::Null;
+        return Ok(serde_json::Number::from_f64(f).map_or(serde_json::Value::Null, Into::into));
     }
     if obj.is_instance_of::<PyString>()
         && let Ok(s) = obj.extract::<String>()
     {
-        return serde_json::Value::String(s);
+        return Ok(serde_json::Value::String(s));
     }
-    if obj.is_instance_of::<PyDict>()
-        && let Ok(dict) = obj.cast::<PyDict>()
-    {
-        let mut map = serde_json::Map::new();
-        for (k, v) in dict.iter() {
-            let key = k.extract::<String>().unwrap_or_else(|_| format!("{}", k));
-            map.insert(key, pyobj_to_json(&v));
+    let is_container = obj.is_instance_of::<PyDict>()
+        || obj.is_instance_of::<PyList>()
+        || obj.is_instance_of::<PyTuple>();
+    if is_container {
+        let id = obj.as_ptr() as usize;
+        if path.contains(&id) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Circular reference detected",
+            ));
         }
-        return serde_json::Value::Object(map);
-    }
-    if obj.is_instance_of::<PyList>()
-        && let Ok(list) = obj.cast::<PyList>()
-    {
-        let arr: Vec<serde_json::Value> = list.iter().map(|item| pyobj_to_json(&item)).collect();
-        return serde_json::Value::Array(arr);
-    }
-    if obj.is_instance_of::<PyTuple>()
-        && let Ok(tup) = obj.cast::<PyTuple>()
-    {
-        let arr: Vec<serde_json::Value> = tup.iter().map(|item| pyobj_to_json(&item)).collect();
-        return serde_json::Value::Array(arr);
+        if path.len() >= MAX_DEPTH {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "nested deeper than {MAX_DEPTH} levels"
+            )));
+        }
+        path.push(id);
+        let value = if let Ok(dict) = obj.cast::<PyDict>() {
+            let mut map = serde_json::Map::new();
+            for (k, v) in dict.iter() {
+                let key = k.extract::<String>().unwrap_or_else(|_| format!("{}", k));
+                map.insert(key, to_json(&v, path)?);
+            }
+            serde_json::Value::Object(map)
+        } else if let Ok(list) = obj.cast::<PyList>() {
+            serde_json::Value::Array(
+                list.iter()
+                    .map(|item| to_json(&item, path))
+                    .collect::<PyResult<_>>()?,
+            )
+        } else {
+            let tup = obj.cast::<PyTuple>()?;
+            serde_json::Value::Array(
+                tup.iter()
+                    .map(|item| to_json(&item, path))
+                    .collect::<PyResult<_>>()?,
+            )
+        };
+        path.pop();
+        return Ok(value);
     }
     if obj.is_instance_of::<PyBytes>()
         && let Ok(b) = obj.extract::<Vec<u8>>()
     {
-        use std::fmt::Write as FmtWrite;
-        let mut hex = String::with_capacity(b.len() * 2);
-        for byte in &b {
-            let _ = write!(hex, "{:02x}", byte);
-        }
-        return serde_json::Value::String(hex);
+        return Ok(serde_json::Value::String(hex::encode(b)));
     }
     // Try isoformat() for datetime objects
     if let Ok(iso) = obj.call_method0("isoformat")
         && let Ok(s) = iso.extract::<String>()
     {
-        return serde_json::Value::String(s);
+        return Ok(serde_json::Value::String(s));
     }
     // Fallback: str(obj)
     if let Ok(s) = obj.str()
         && let Ok(s) = s.extract::<String>()
     {
-        return serde_json::Value::String(s);
+        return Ok(serde_json::Value::String(s));
     }
-    serde_json::Value::Null
+    Ok(serde_json::Value::Null)
 }
 
 /// Convert serde_json::Value to a Python object.

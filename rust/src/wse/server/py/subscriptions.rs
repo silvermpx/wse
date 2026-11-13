@@ -66,7 +66,7 @@ impl RustWSEServer {
 
         // Presence tracking
         if let (Some(pm), Some(pd)) = (&self.shared.presence, &presence_data) {
-            let data = pyobj_to_json(pd.as_any());
+            let data = pyobj_to_json(pd.as_any())?;
             let drain = self.shared.drain_mode.load(Ordering::Relaxed);
             let cluster_tx = self.shared.cluster_cmd_tx.read().unwrap().clone();
             for topic in &accepted {
@@ -133,7 +133,7 @@ impl RustWSEServer {
             if let Some(positions) = positions {
                 for (topic, position) in positions.iter() {
                     let topic: String = topic.extract()?;
-                    let anchor = parse_anchor(&pyobj_to_json(&position)).ok_or_else(|| {
+                    let anchor = parse_anchor(&pyobj_to_json(&position)?).ok_or_else(|| {
                         PyValueError::new_err(format!(
                             "positions[{topic:?}] must be {{\"epoch\": \"<8 hex digits>\", \"offset\": <int>}}"
                         ))
