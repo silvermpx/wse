@@ -55,7 +55,7 @@ RUSTFLAGS="-C target-cpu=native" maturin develop --release
 
 ```bash
 cargo xtask fast      # rustfmt, clippy, then the checks below
-cargo xtask lint      # comments and the engine boundary only
+cargo xtask lint      # comments, version-free names and the engine boundary
 cargo xtask commits   # commit messages of your branch (origin/main..HEAD)
 ```
 
@@ -63,6 +63,9 @@ cargo xtask commits   # commit messages of your branch (origin/main..HEAD)
   next reader. Issue, ticket and audit numbers, plan or wave numbers and the
   dates of a change belong in the commit message, not in the code. Python
   docstrings count as comments.
+- **Names** carry no version number: a function, type, module or file is
+  named by what it does, not `..._v2`. A wire protocol's version is data
+  (`protocol_version`), not part of a name.
 - **Engine boundary**: the WebSocket and cluster engine (`cluster/`,
   `server/` outside `server/py/`, presence, recovery, reliability) does not
   use PyO3; the Python bindings live in `server/py/`. The places that still

@@ -4,7 +4,8 @@
 //!   comments        comments are English prose: no audit ids, issue, task or
 //!                   phase numbers, no dates of our own changes
 //!   arch            the engine stays free of the Python layer (see arch.rs)
-//!   lint            comments + arch
+//!   names           no version numbers (v2, v3) in names of code or files
+//!   lint            comments + arch + names
 //!   commits [RANGE] commit messages carry no AI co-author or
 //!                   "generated with" lines (default: origin/main..HEAD)
 //!   fast            the quick local gate: cargo fmt --check, clippy with
@@ -15,6 +16,7 @@
 mod arch;
 mod comments;
 mod lexer;
+mod names;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -27,11 +29,14 @@ fn main() -> ExitCode {
     let ok = match args.first().map(String::as_str) {
         Some("comments") => run_comments(&root),
         Some("arch") => run_arch(&root),
-        Some("lint") => run_comments(&root) & run_arch(&root),
+        Some("names") => run_names(&root),
+        Some("lint") => run_comments(&root) & run_arch(&root) & run_names(&root),
         Some("commits") => run_commits(&root, args.get(1).map(String::as_str)),
         Some("fast") => run_fast(&root),
         _ => {
-            eprintln!("usage: cargo xtask <comments | arch | lint | commits [RANGE] | fast>");
+            eprintln!(
+                "usage: cargo xtask <comments | arch | names | lint | commits [RANGE] | fast>"
+            );
             return ExitCode::from(2);
         }
     };
@@ -103,6 +108,42 @@ fn run_comments(root: &Path) -> bool {
              would write it to a colleague: drop audit ids, issue, task and phase numbers and the \
              dates of our own changes (the commit log has them). A standard's name the term list \
              misses can be marked `comment-kitchen:allow` on its line.",
+            findings.len()
+        );
+        false
+    }
+}
+
+fn run_names(root: &Path) -> bool {
+    let mut findings: Vec<String> = Vec::new();
+    for path in repo_files(root) {
+        if names::versioned_file(&path) {
+            findings.push(format!("{path}: the file name carries a version number"));
+        }
+        let Some(lang) = lexer::Lang::of(&path) else {
+            continue;
+        };
+        if lang == lexer::Lang::Hash {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(root.join(&path)) else {
+            continue;
+        };
+        for f in names::check_code(&path, &src, lang) {
+            findings.push(format!("{}:{}: {}", f.path, f.line, f.name));
+        }
+    }
+    for f in &findings {
+        eprintln!("{f}");
+    }
+    if findings.is_empty() {
+        println!("names: ok");
+        true
+    } else {
+        eprintln!(
+            "\nnames: {} name(s) carry a version number. Name a function, type, module or \
+             file by what it does, not by its version (a protocol version is data, not a \
+             name). A library's own name can be marked `names:allow` on its line.",
             findings.len()
         );
         false
@@ -241,7 +282,7 @@ fn run_fast(root: &Path) -> bool {
         }
     }
     println!("== lint");
-    run_comments(root) & run_arch(root)
+    run_comments(root) & run_arch(root) & run_names(root)
 }
 
 #[cfg(test)]
