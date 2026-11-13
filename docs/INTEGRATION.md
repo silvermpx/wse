@@ -252,6 +252,8 @@ If you prefer a callback-driven model instead of polling:
 
 ```python
 def on_connect(conn_id, user_id):
+    # With jwt_secret: the user id from the token. Without: the Cookie
+    # header, for the application to check (then accept_connection()).
     print(f"Connected: {user_id}")
 
 def on_message(conn_id, data):
@@ -264,7 +266,9 @@ server.set_callbacks(on_connect, on_message, on_disconnect)
 server.start()
 ```
 
-Drain mode is recommended for production workloads - it batches events efficiently and gives you explicit control over backpressure. Callbacks use `spawn_blocking` per invocation, which acquires the GIL more frequently; in-flight callbacks are bounded at 256 per connection, and excess inbound messages are shed (counted in `wse_rate_limited_total`) rather than spawning unbounded blocking tasks.
+The callbacks of one connection run one after another in the order of its events: `on_connect` first, its messages in order, `on_disconnect` last. Different connections run in parallel on the server's worker threads (truly in parallel on free-threaded Python), so state shared between connections needs a lock.
+
+Drain mode is recommended for production workloads - it batches events efficiently and gives you explicit control over backpressure. Callbacks acquire the GIL per call; up to 256 callbacks may wait per connection, and further messages are shed (counted in `wse_rate_limited_total`). A callback may call any server method, `stop()` included.
 
 ---
 
@@ -637,7 +641,7 @@ conn_ids = server.get_connections()
 # Get count (lock-free, AtomicUsize)
 count = server.get_connection_count()
 
-# Disconnect a specific connection
+# Close a specific connection (code 1000; dropped if it does not answer within 5 s)
 server.disconnect(conn_id)
 
 # Check queue stats
@@ -648,14 +652,15 @@ dropped = server.inbound_dropped_count()
 dlq = server.get_cluster_dlq_entries()
 ```
 
-`get_connection_count()` is lock-free and safe to call at high frequency (e.g., in health check endpoints). `get_connections()` takes a snapshot of all connection IDs and is slightly more expensive.
+`get_connection_count()` is lock-free and safe to call at high frequency (e.g., in health check endpoints). `get_connections()` takes a snapshot of all connection IDs without waiting for the server; it costs one string per connection.
 
 ### Graceful Drain
 
-Shut down the server without dropping in-flight messages. The `drain()` method sends a WebSocket Close frame to all connected clients and stops accepting new connections.
+Shut down the server without dropping in-flight messages. The `drain()` method sends a WebSocket Close frame to all connected clients, stops accepting new connections (upgrades get HTTP 503), and waits for the clients to go.
 
 ```python
-server.drain(close_code=4300, close_reason="", timeout=30)
+forced = server.drain(close_code=4300, close_reason="", timeout=30)
+server.stop()
 ```
 
 | Parameter | Default | Description |
@@ -664,7 +669,7 @@ server.drain(close_code=4300, close_reason="", timeout=30)
 | `close_reason` | `""` | Close reason string |
 | `timeout` | 30 | Seconds to wait for clients to disconnect before force-closing |
 
-The drain wait runs as a separate tokio task. The command processor stays responsive during the timeout window, so health checks and cluster protocol messages continue to work.
+`drain()` returns when the last client is gone, or at the timeout after force-closing the rest; it returns how many had to be forced. A client that does not answer the close frame is dropped after 5 seconds anyway. Other threads keep running while it waits, and the server keeps serving health checks and cluster traffic. `is_draining()` is True from then until the next `start()`.
 
 Clients can detect a server-initiated drain by checking for close code 4300 and reconnecting to another instance. In cluster mode, the draining node notifies peers via `ClusterCommand::Drain` so they can update routing tables.
 

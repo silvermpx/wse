@@ -8,7 +8,7 @@ use ahash::AHashSet;
 use crossbeam_channel::{Receiver as CBReceiver, Sender as CBSender, unbounded};
 use dashmap::{DashMap, DashSet};
 use pyo3::prelude::*;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 use super::{BroadcastQueue, WsFrame};
@@ -236,16 +236,14 @@ pub(crate) enum ServerCommand {
     Disconnect {
         conn_id: String,
     },
-    GetConnections {
-        reply: oneshot::Sender<Vec<String>>,
-    },
     Shutdown,
     /// Graceful drain: stop accepting, close all clients with custom code, wait.
     Drain {
         close_code: u16,
         close_reason: String,
-        timeout_secs: u64,
     },
+    /// Drop every connection now, without waiting for its close handshake.
+    AbortAll,
 }
 
 /// Configuration for SharedState construction.
@@ -273,9 +271,11 @@ pub(crate) struct SharedState {
     pub(super) max_connections: usize,
     // Origins a browser may open a connection from (None: any)
     pub(super) allowed_origins: Option<AHashSet<String>>,
-    pub(super) on_connect: std::sync::RwLock<Option<Py<PyAny>>>,
-    pub(super) on_message: std::sync::RwLock<Option<Py<PyAny>>>,
-    pub(super) on_disconnect: std::sync::RwLock<Option<Py<PyAny>>>,
+    // Callback mode. Shared, so a runtime thread takes one without attaching
+    // to Python.
+    pub(super) on_connect: std::sync::RwLock<Option<Arc<Py<PyAny>>>>,
+    pub(super) on_message: std::sync::RwLock<Option<Arc<Py<PyAny>>>>,
+    pub(super) on_disconnect: std::sync::RwLock<Option<Arc<Py<PyAny>>>>,
     // Drain mode: when active, inbound events go to channel instead of callbacks
     pub(super) drain_mode: AtomicBool,
     // Lock-free channel: Tokio tasks send (non-blocking), Python drains

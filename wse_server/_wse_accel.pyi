@@ -337,7 +337,11 @@ class RustWSEServer:
     # -- Lifecycle ------------------------------------------------------------
 
     def start(self) -> None:
-        """Start the WebSocket server."""
+        """Bind host:port and start the server.
+
+        Raises RuntimeError if it runs already and OSError if the address
+        cannot be bound.
+        """
         ...
     def stop(self) -> None:
         """Stop the server and close all connections (close code 1001)."""
@@ -347,15 +351,25 @@ class RustWSEServer:
         close_code: int = 4300,
         close_reason: str = "",
         timeout: int = 30,
-    ) -> None:
+    ) -> int:
         """Enter graceful drain mode (lame duck).
 
         Stops accepting new connections (upgrades get HTTP 503), closes every
         client with close_code (a client that does not answer within 5
         seconds is disconnected), notifies cluster peers, and waits up to
-        timeout seconds for clients to disconnect. Call stop() after drain()
-        to fully shut down.
+        timeout seconds for clients to disconnect; the rest are dropped then.
+        Returns how many had to be dropped. Call stop() after drain() to
+        fully shut down.
         """
+        ...
+    def is_draining(self) -> bool:
+        """True between drain() and the next start()."""
+        ...
+    def __enter__(self) -> RustWSEServer:
+        """Start the server (unless it runs already)."""
+        ...
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        """Stop the server."""
         ...
     def is_running(self) -> bool:
         """Return True if the server is running."""
@@ -369,7 +383,12 @@ class RustWSEServer:
         on_message: Callable[[str, dict[str, Any]], Any],
         on_disconnect: Callable[[str], Any],
     ) -> None:
-        """Set callback functions for connect, message, and disconnect events."""
+        """Set callback functions for connect, message, and disconnect events.
+
+        on_connect(conn_id, user_id) gets the user id the server validated, or
+        without jwt_secret the Cookie header. The callbacks of one connection
+        run one after another in the order of its events.
+        """
         ...
 
     # -- Drain Mode -----------------------------------------------------------
@@ -439,7 +458,7 @@ class RustWSEServer:
         """Number of active connections (lock-free AtomicUsize read)."""
         ...
     def get_connections(self) -> list[str]:
-        """List of active connection IDs."""
+        """List of active connection IDs, read without waiting for the server."""
         ...
     def accept_connection(self, conn_id: str, user_id: str) -> bool:
         """Accept a connection the application authenticated itself.

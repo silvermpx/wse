@@ -205,10 +205,17 @@ token = rust_jwt_encode(
 ### Lifecycle
 
 ```python
-server.start()                          # Start the server
-server.stop()                           # Graceful shutdown
+server.start()                          # Bind and start (OSError if the port is taken)
+server.stop()                           # Close every connection (1001) and stop
+server.drain(4300, "", timeout=30)      # Close clients, wait, return how many were forced
 server.is_running()                     # Check server status (bool)
+server.is_draining()                    # True between drain() and the next start()
+
+with RustWSEServer("0.0.0.0", 5007) as server:   # start() ... stop()
+    ...
 ```
+
+Rust-side logs go to standard output at level `info`; set `RUST_LOG` (for example `RUST_LOG=_wse_accel=debug`) to change it.
 
 ### Event Handling
 
@@ -232,7 +239,7 @@ Each event is a tuple: `(event_type, conn_id, payload)`
 | `"presence_join"` | User's first connection joined a topic | dict with user_id, topic, data |
 | `"presence_leave"` | User's last connection left a topic | dict with user_id, topic, data |
 
-**Callback mode** - alternative to drain mode. Callbacks are invoked via `spawn_blocking` per event.
+**Callback mode** - alternative to drain mode. The callbacks of one connection run in the order of its events (`on_connect` first, `on_disconnect` last) on the server's worker threads; `on_connect(conn_id, user_id)` gets the validated user id, or the Cookie header without `jwt_secret`.
 
 ```python
 server.set_callbacks(on_connect, on_message, on_disconnect)

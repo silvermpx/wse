@@ -44,30 +44,85 @@ use crate::wse::compression::{decode_msgpack_guarded, rmpv_to_serde_json};
 /// callback mode. Bounds inbound flooding from exhausting the blocking pool.
 const MAX_INFLIGHT_CALLBACKS: usize = 256;
 
-/// Run an on_message callback on the blocking pool. It needs one of the
-/// connection's `MAX_INFLIGHT_CALLBACKS` permits (a client flooding messages
-/// is shed, counted in `rate_limited_total`) and room for its `bytes` in the
+/// A callback job of callback mode; it attaches to Python itself.
+type CallbackJob = Box<dyn FnOnce() + Send>;
+
+/// The callbacks of one connection, run one after another on the blocking
+/// pool in the order of its events: on_connect first, its messages in order,
+/// on_disconnect last. A drainer runs only while jobs wait, so an idle
+/// connection holds no thread.
+struct CallbackLane {
+    queue: parking_lot::Mutex<LaneQueue>,
+}
+
+#[derive(Default)]
+struct LaneQueue {
+    jobs: VecDeque<CallbackJob>,
+    draining: bool,
+}
+
+impl CallbackLane {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            queue: parking_lot::Mutex::new(LaneQueue::default()),
+        })
+    }
+
+    /// Queue `job`; false (and nothing queued) when `limit` jobs wait already.
+    fn push(self: &Arc<Self>, job: CallbackJob, limit: Option<usize>) -> bool {
+        let mut queue = self.queue.lock();
+        if limit.is_some_and(|limit| queue.jobs.len() >= limit) {
+            return false;
+        }
+        queue.jobs.push_back(job);
+        if !queue.draining {
+            queue.draining = true;
+            let lane = Arc::clone(self);
+            tokio::task::spawn_blocking(move || lane.drain());
+        }
+        true
+    }
+
+    fn drain(&self) {
+        loop {
+            let job = {
+                let mut queue = self.queue.lock();
+                match queue.jobs.pop_front() {
+                    Some(job) => job,
+                    None => {
+                        queue.draining = false;
+                        return;
+                    }
+                }
+            };
+            job();
+        }
+    }
+}
+
+/// Queue an on_message callback. It needs a place among the connection's
+/// `MAX_INFLIGHT_CALLBACKS` waiting callbacks (a client flooding messages is
+/// shed, counted in `rate_limited_total`) and room for its `bytes` in the
 /// server's budget of messages waiting for the application, the same one
 /// drain mode uses (counted in `inbound_dropped` when there is none).
 fn spawn_bounded_callback<F>(
-    sem: &Arc<tokio::sync::Semaphore>,
+    lane: &Arc<CallbackLane>,
     state: &Arc<SharedState>,
     bytes: usize,
     work: F,
 ) where
     F: FnOnce() + Send + 'static,
 {
-    let Ok(permit) = sem.clone().try_acquire_owned() else {
-        state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
-        return;
-    };
     let Some(room) = SharedState::callback_room(state, bytes) else {
         return;
     };
-    tokio::task::spawn_blocking(move || {
-        let _held = (permit, room);
+    let job: CallbackJob = Box::new(move || {
+        let _room = room;
         work();
     });
+    if !lane.push(job, Some(MAX_INFLIGHT_CALLBACKS)) {
+        state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Clone a TcpStream by duplicating the file descriptor.
@@ -642,38 +697,31 @@ pub(super) async fn handle_connection(
         .conn_last_activity
         .insert((*conn_id).clone(), std::time::Instant::now());
 
-    // Fire on_connect (drain mode: push to queue; callback mode: background task)
+    // The user the server validated is the connection's user for presence.
+    if let (Some(pm), Some(user_id)) = (&state.presence, &rust_auth_user_id) {
+        pm.register_connection(&conn_id, user_id);
+    }
+    // Callback mode: this connection's callbacks, in the order of its events.
+    let lane = (!drain).then(CallbackLane::new);
+    // The connect event: the validated user id, or without jwt_secret the
+    // cookies for the application to check.
     if drain {
-        if let Some(user_id) = rust_auth_user_id {
-            // Register user_id for presence lookups
-            if let Some(ref pm) = state.presence {
-                pm.register_connection(&conn_id, &user_id);
-            }
-            // Rust validated JWT — send AuthConnect (Python skips JWT decode)
-            state.push_inbound(InboundEvent::AuthConnect {
+        state.push_inbound(match rust_auth_user_id {
+            Some(user_id) => InboundEvent::AuthConnect {
                 conn_id: (*conn_id).clone(),
                 user_id,
-            });
-        } else {
-            // No JWT config — send cookies for Python to validate
-            state.push_inbound(InboundEvent::Connect {
+            },
+            None => InboundEvent::Connect {
                 conn_id: (*conn_id).clone(),
                 cookies: cookie_str.clone(),
-            });
-        }
-    } else {
-        let cb_guard = state.on_connect.read().unwrap();
-        if let Some(ref cb) = *cb_guard
-            && let Some(cb_clone) = Python::try_attach(|py| cb.clone_ref(py))
-        {
-            let cid = (*conn_id).clone();
-            let ck = cookie_str.clone();
-            drop(cb_guard);
-            // Fire in background — don't block connection setup on GIL
-            tokio::task::spawn_blocking(move || {
-                fire_on_connect(&cb_clone, &cid, &ck);
-            });
-        }
+            },
+        });
+    } else if let Some(ref lane) = lane
+        && let Some(cb) = state.on_connect.read().unwrap().clone()
+    {
+        let cid = (*conn_id).clone();
+        let who = rust_auth_user_id.unwrap_or_else(|| cookie_str.clone());
+        lane.push(Box::new(move || fire_on_connect(&cb, &cid, &who)), None);
     }
 
     // Write task: the only writer to the socket. Two sources: the control
@@ -767,20 +815,12 @@ pub(super) async fn handle_connection(
         }
     });
 
-    // Cache on_message callback (only needed in callback mode)
-    let cached_on_message: Option<Arc<Py<PyAny>>> = if !drain {
-        let cb_guard = state.on_message.read().unwrap();
-        cb_guard
-            .as_ref()
-            .and_then(|cb| Python::try_attach(|py| cb.clone_ref(py)).map(Arc::new))
-    } else {
+    // on_message of callback mode, read once per connection.
+    let cached_on_message: Option<Arc<Py<PyAny>>> = if drain {
         None
+    } else {
+        state.on_message.read().unwrap().clone()
     };
-    // Bounds concurrent on_message callbacks in CALLBACK mode. Each inbound
-    // message spawns a blocking task; without a cap a flood exhausts the blocking
-    // thread pool and contends the GIL. When saturated the inbound is shed
-    // (counted as rate-limited). Drain mode uses the bounded inbound_tx instead.
-    let callback_sem = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_CALLBACKS));
 
     let max_pending = state.max_outbound_queue_bytes;
     let mut inbound_limit = InboundLimit::new(state.rate_capacity, state.rate_refill);
@@ -876,11 +916,11 @@ pub(super) async fn handle_connection(
                             },
                             text.len(),
                         );
-                    } else if let Some(ref cb) = cached_on_message {
+                    } else if let (Some(cb), Some(callback_lane)) = (&cached_on_message, &lane) {
                         let cb_arc = cb.clone();
                         let cid = Arc::clone(&conn_id);
                         let t = text.to_string();
-                        spawn_bounded_callback(&callback_sem, &state, t.len(), move || {
+                        spawn_bounded_callback(callback_lane, &state, t.len(), move || {
                             Python::try_attach(|py| {
                                 if let Err(e) = cb_arc.call1(py, (&**cid, &*t)) {
                                     tracing::warn!("[WSE] on_message error: {e}");
@@ -1004,11 +1044,12 @@ pub(super) async fn handle_connection(
                                 },
                                 text.len(),
                             );
-                        } else if let Some(ref cb) = cached_on_message {
+                        } else if let (Some(cb), Some(callback_lane)) = (&cached_on_message, &lane)
+                        {
                             // Callback mode: convert to PyDict + call Python
                             let cb_arc = cb.clone();
                             let cid = Arc::clone(&conn_id);
-                            spawn_bounded_callback(&callback_sem, &state, text.len(), move || {
+                            spawn_bounded_callback(callback_lane, &state, text.len(), move || {
                                 Python::try_attach(|py| {
                                     let py_obj = json_to_pyobj(py, &val);
                                     if let Err(e) = cb_arc.call1(py, (&**cid, py_obj)) {
@@ -1028,11 +1069,12 @@ pub(super) async fn handle_connection(
                                 },
                                 text.len(),
                             );
-                        } else if let Some(ref cb) = cached_on_message {
+                        } else if let (Some(cb), Some(callback_lane)) = (&cached_on_message, &lane)
+                        {
                             let cb_arc = cb.clone();
                             let cid = Arc::clone(&conn_id);
                             let t = text.to_string();
-                            spawn_bounded_callback(&callback_sem, &state, t.len(), move || {
+                            spawn_bounded_callback(callback_lane, &state, t.len(), move || {
                                 Python::try_attach(|py| {
                                     if let Err(e) = cb_arc.call1(py, (&**cid, &*t)) {
                                         tracing::warn!("[WSE] on_message error: {e}");
@@ -1088,11 +1130,13 @@ pub(super) async fn handle_connection(
                                                 },
                                                 text.len(),
                                             );
-                                        } else if let Some(ref cb) = cached_on_message {
+                                        } else if let (Some(cb), Some(callback_lane)) =
+                                            (&cached_on_message, &lane)
+                                        {
                                             let cb_arc = cb.clone();
                                             let cid = Arc::clone(&conn_id);
                                             spawn_bounded_callback(
-                                                &callback_sem,
+                                                callback_lane,
                                                 &state,
                                                 text.len(),
                                                 move || {
@@ -1162,13 +1206,13 @@ pub(super) async fn handle_connection(
                             data.len(),
                         );
                     }
-                } else if let Some(ref cb) = cached_on_message {
+                } else if let (Some(cb), Some(callback_lane)) = (&cached_on_message, &lane) {
                     let cb_arc = cb.clone();
                     let cid = Arc::clone(&conn_id);
                     let d = data.to_vec();
                     if is_msgpack {
                         // Parse msgpack and pass as dict to callback (same as JSON text)
-                        spawn_bounded_callback(&callback_sem, &state, d.len(), move || {
+                        spawn_bounded_callback(callback_lane, &state, d.len(), move || {
                             Python::try_attach(|py| match decode_msgpack_guarded(&d[..]) {
                                 Ok(rmpv_val) => {
                                     let json_val = rmpv_to_serde_json(&rmpv_val);
@@ -1187,7 +1231,7 @@ pub(super) async fn handle_connection(
                             });
                         });
                     } else {
-                        spawn_bounded_callback(&callback_sem, &state, d.len(), move || {
+                        spawn_bounded_callback(callback_lane, &state, d.len(), move || {
                             Python::try_attach(|py| {
                                 let py_bytes = PyBytes::new(py, &d);
                                 if let Err(e) = cb_arc.call1(py, (&**cid, py_bytes)) {
@@ -1307,18 +1351,12 @@ pub(super) async fn handle_connection(
         state.push_inbound(InboundEvent::Disconnect {
             conn_id: (*conn_id).clone(),
         });
-    } else {
-        let cb_guard = state.on_disconnect.read().unwrap();
-        if let Some(ref cb) = *cb_guard
-            && let Some(cb_clone) = Python::try_attach(|py| cb.clone_ref(py))
-        {
-            let cid = (*conn_id).clone();
-            drop(cb_guard);
-            // Fire in background — don't block cleanup on GIL
-            tokio::task::spawn_blocking(move || {
-                fire_on_disconnect(&cb_clone, &cid);
-            });
-        }
+    } else if let Some(ref lane) = lane
+        && let Some(cb) = state.on_disconnect.read().unwrap().clone()
+    {
+        // After every callback of this connection's messages.
+        let cid = (*conn_id).clone();
+        lane.push(Box::new(move || fire_on_disconnect(&cb, &cid)), None);
     }
     drop(tx);
     // A client that reads nothing more is not waited for past the grace.

@@ -13,7 +13,6 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::sync::RwLockExt;
 use tokio::net::TcpListener;
-use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -52,28 +51,25 @@ impl RustWSEServer {
         {
             return Err(PyRuntimeError::new_err("All callbacks must be callable"));
         }
-        // Server threads read these slots and then attach to Python while still
-        // holding the read guard (to clone the callback). Waiting for the write
-        // lock attached would block that attach - the GIL, or a stop-the-world
-        // pause of the free-threaded build - and neither side could go on, so
-        // the wait happens detached (`write_py_attached`). The callbacks being
-        // replaced are dropped after the guards: that may run Python code.
+        // Waited for detached (`write_py_attached`), so a reader on another
+        // thread is never kept from its attach. The callbacks being replaced
+        // are dropped after the guards: that may run Python code.
         let shared = self.shared.clone();
         let old_connect = shared
             .on_connect
             .write_py_attached(py)
             .unwrap()
-            .replace(on_connect);
+            .replace(Arc::new(on_connect));
         let old_message = shared
             .on_message
             .write_py_attached(py)
             .unwrap()
-            .replace(on_message);
+            .replace(Arc::new(on_message));
         let old_disconnect = shared
             .on_disconnect
             .write_py_attached(py)
             .unwrap()
-            .replace(on_disconnect);
+            .replace(Arc::new(on_disconnect));
         drop((old_connect, old_message, old_disconnect));
         Ok(())
     }
@@ -91,54 +87,49 @@ impl RustWSEServer {
         if let Some(handle) = server_thread.take() {
             let _ = handle.join();
         }
+        // The crate's log targets start with its library name, `_wse_accel`.
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("wse_accel=info")),
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("_wse_accel=info")),
             )
             .with_target(false)
             .try_init();
+        // The runtime and the listener are made here, so that a port in use
+        // or a runtime that cannot start is an error of start().
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("wse-runtime")
+            .build()
+            .map_err(|e| PyRuntimeError::new_err(format!("cannot start the runtime: {e}")))?;
+        let listener = std::net::TcpListener::bind((self.host.as_str(), self.port))
+            .and_then(|listener| {
+                listener.set_nonblocking(true)?;
+                let _runtime = rt.enter();
+                TcpListener::from_std(listener)
+            })
+            .map_err(|e| {
+                pyo3::exceptions::PyOSError::new_err(format!(
+                    "cannot listen on {}:{}: {e}",
+                    self.host, self.port
+                ))
+            })?;
+        tracing::info!("[WSE] Listening on {}:{}", self.host, self.port);
+        // A drain of the last run is over.
+        self.shared.draining.store(false, Ordering::SeqCst);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ServerCommand>();
         self.cmd_tx.store(Some(Arc::new(cmd_tx.clone())));
         // Store a clone for presence broadcasts from disconnect cleanup paths
         *self.shared.presence_broadcast_tx.write().unwrap() = Some(cmd_tx.clone());
-        let host = self.host.clone();
-        let port = self.port;
         let running = self.running.clone();
         let shared = self.shared.clone();
-        let (rt_handle_tx, rt_handle_rx) =
-            std::sync::mpsc::sync_channel::<tokio::runtime::Handle>(1);
+        let rt_handle = rt.handle().clone();
 
-        // Running from here on, before the listener is bound: a drain loop
-        // started right after start() (`while server.is_running(): ...`) must
-        // not see a stale `false` and quit. The server thread clears the flag
-        // again if it cannot create its runtime or bind the address.
         self.running.store(true, Ordering::SeqCst);
         let handle = thread::Builder::new()
-            .name("wse-tokio-rt".into())
+            .name("wse-server".into())
             .spawn(move || {
-                let rt = match Runtime::new() {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        tracing::error!("[WSE] Failed to create runtime: {e}");
-                        running.store(false, Ordering::SeqCst);
-                        return;
-                    }
-                };
-                let _ = rt_handle_tx.send(rt.handle().clone());
                 rt.block_on(async move {
-                    let bind_addr = format!("{host}:{port}");
-                    let listener = match TcpListener::bind(&bind_addr).await {
-                        Ok(l) => {
-                            tracing::info!("[WSE] Listening on {bind_addr}");
-                            l
-                        }
-                        Err(e) => {
-                            tracing::error!("[WSE] Failed to bind {bind_addr}: {e}");
-                            running.store(false, Ordering::SeqCst);
-                            return;
-                        }
-                    };
                     let cmd_handle = tokio::spawn(process_commands(cmd_rx, shared.clone()));
                     // Spawn periodic recovery cleanup if recovery is enabled
                     if let Some(ref recovery) = shared.recovery {
@@ -406,16 +397,16 @@ impl RustWSEServer {
                     running.store(false, Ordering::SeqCst);
                     tracing::info!("[WSE] Shut down");
                 });
+                // Callbacks still running get five seconds; a callback stuck
+                // in slow I/O does not hold the shutdown forever.
+                rt.shutdown_timeout(Duration::from_secs(5));
             })
             .map_err(|e| {
                 self.running.store(false, Ordering::SeqCst);
                 self.cmd_tx.store(None);
                 PyRuntimeError::new_err(format!("Spawn error: {e}"))
             })?;
-        // The runtime hands its handle over as soon as it exists; wait for it
-        // detached, so other Python threads keep running meanwhile.
-        let rt_handle = py.detach(move || rt_handle_rx.recv().ok());
-        *self.rt_handle.write() = rt_handle;
+        *self.rt_handle.write() = Some(rt_handle);
         *self.started_at.lock() = Some(std::time::Instant::now());
         *server_thread = Some(handle);
         Ok(())
@@ -423,18 +414,44 @@ impl RustWSEServer {
 
     pub(super) fn drain_impl(
         &self,
+        py: Python<'_>,
         close_code: u16,
         close_reason: &str,
         timeout: u64,
-    ) -> PyResult<()> {
+    ) -> PyResult<usize> {
         let tx = self.command_tx()?;
         tx.send(ServerCommand::Drain {
             close_code,
             close_reason: close_reason.to_owned(),
-            timeout_secs: timeout,
         })
         .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
-        Ok(())
+        // Wait detached for the clients to go; the rest are closed at the
+        // deadline.
+        let shared = self.shared.clone();
+        let remaining = py.detach(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(timeout);
+            loop {
+                let left = shared.connection_count.load(Ordering::Relaxed);
+                if left == 0 || std::time::Instant::now() >= deadline {
+                    return left;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        if remaining > 0 {
+            tracing::warn!("[WSE] Drain timeout: closing the {remaining} remaining connections");
+            let _ = tx.send(ServerCommand::AbortAll);
+        } else {
+            tracing::info!("[WSE] Drain complete: all connections closed");
+        }
+        Ok(remaining)
+    }
+
+    /// Whether the server runs on the current thread: a callback, or code a
+    /// callback runs.
+    fn on_own_runtime(&self) -> bool {
+        let own = self.runtime().map(|handle| handle.id());
+        own.is_some() && tokio::runtime::Handle::try_current().ok().map(|h| h.id()) == own
     }
 
     pub(super) fn stop_impl(&self, py: Python<'_>) -> PyResult<()> {
@@ -442,6 +459,7 @@ impl RustWSEServer {
         let Some(handle) = server_thread.take() else {
             return Ok(());
         };
+        let on_own_runtime = self.on_own_runtime();
         // Shutdown cluster
         if let Ok(guard) = self.shared.cluster_cmd_tx.read()
             && let Some(ref tx) = *guard
@@ -452,14 +470,25 @@ impl RustWSEServer {
             let _ = tx.send(ServerCommand::Shutdown);
         }
         self.running.store(false, Ordering::SeqCst);
-        // Detached while the server drains (about two seconds): other Python
-        // threads keep running, and a start() from another thread waits for
-        // the `lifecycle` lock without holding up the interpreter.
-        let panicked = py.detach(move || handle.join().is_err());
+        // From a callback the server thread is not joined: it waits for its
+        // callbacks, this one included. It stops by itself.
+        let panicked = if on_own_runtime {
+            drop(handle);
+            false
+        } else {
+            // Detached while the server closes its connections (up to three
+            // seconds): other Python threads keep running, and a start() from
+            // another thread waits for the `lifecycle` lock without holding
+            // up the interpreter.
+            py.detach(move || handle.join().is_err())
+        };
         self.cmd_tx.store(None);
+        *self.shared.presence_broadcast_tx.write().unwrap() = None;
         *self.shared.cluster_cmd_tx.write().unwrap() = None;
         *self.shared.cluster_main_port.write().unwrap() = None;
         *self.shared.cluster_instance_id.lock().unwrap() = None;
+        *self.rt_handle.write() = None;
+        *self.started_at.lock() = None;
         drop(server_thread);
         if panicked {
             return Err(PyRuntimeError::new_err("Server thread panicked"));

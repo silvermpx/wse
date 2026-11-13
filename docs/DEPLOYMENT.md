@@ -315,7 +315,7 @@ The `drain()` method enables zero-downtime deployments by sending a WebSocket Cl
 server.drain(close_code=4300, close_reason="shutting down", timeout=10)
 ```
 
-Clients receive close code 4300, which signals a server-initiated drain. Well-behaved clients reconnect to another instance. After `timeout` seconds, any remaining connections are force-closed.
+Clients receive close code 4300, which signals a server-initiated drain. Well-behaved clients reconnect to another instance. `drain()` returns once every client is gone; after `timeout` seconds it force-closes the rest and returns how many that were.
 
 ### Kubernetes preStop Hook
 
@@ -454,3 +454,12 @@ async def health():
 ## Configuration
 
 All configuration is passed programmatically through the `RustWSEServer` constructor and `connect_cluster()` method. Origin validation: `allowed_origins`, or your reverse proxy (see [SECURITY.md](SECURITY.md#origin-validation)).
+
+### Logging
+
+The server logs to standard output at level `info` (`[WSE] ...` lines: listening, refused connections, drain progress, cluster links, callback errors). The `RUST_LOG` environment variable, read at the first `start()`, overrides it with the usual filter syntax; the crate's log target is `_wse_accel`:
+
+```bash
+RUST_LOG=_wse_accel=debug python app.py    # more detail
+RUST_LOG=_wse_accel=warn python app.py     # problems only
+```

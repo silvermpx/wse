@@ -30,6 +30,7 @@ impl RustWSEServer {
 
     pub(super) fn subscribe_connection_impl(
         &self,
+        py: Python<'_>,
         conn_id: &str,
         topics: Vec<String>,
         presence_data: Option<&Bound<'_, PyDict>>,
@@ -93,11 +94,8 @@ impl RustWSEServer {
             }
         }
 
-        // Get the ConnectionHandle (may block_on tokio) before taking any lock.
-        let handle = self.runtime().and_then(|rt| {
-            let guard = rt.block_on(self.shared.connections.read());
-            guard.get(conn_id).cloned()
-        });
+        // The ConnectionHandle, before taking any lock.
+        let handle = self.connection_handle(py, conn_id);
 
         // Topics this connection newly subscribed: counted for cluster interest
         // once the loop is done.
@@ -235,7 +233,7 @@ impl RustWSEServer {
         offset: Option<u64>,
     ) -> PyResult<Py<PyDict>> {
         // Step 1: Subscribe using existing logic (no presence tracking for recovery)
-        self.subscribe_connection(conn_id, topics.clone(), None, None)?;
+        self.subscribe_connection_impl(py, conn_id, topics.clone(), None, None)?;
 
         // Fail-closed authorization for the recovery path: subscribe_connection
         // above filters the LIVE subscription through the connection's topic ACL,
@@ -258,12 +256,11 @@ impl RustWSEServer {
 
         // Step 2: Get connection tx + pending counter (clone them, drop the lock)
         let (tx, tx_pending) = if recover {
-            let rt = self
-                .runtime()
-                .ok_or_else(|| PyRuntimeError::new_err("Not running"))?;
-            let guard = rt.block_on(self.shared.connections.read());
-            match guard.get(conn_id) {
-                Some(h) => (Some(h.tx.clone()), Some(h.pending.clone())),
+            if self.runtime().is_none() {
+                return Err(PyRuntimeError::new_err("Not running"));
+            }
+            match self.connection_handle(py, conn_id) {
+                Some(h) => (Some(h.tx), Some(h.pending)),
                 None => (None, None),
             }
         } else {

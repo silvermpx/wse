@@ -403,14 +403,9 @@ pub(super) async fn process_commands(
                     h.close(CLOSE_NORMAL, "");
                 }
             }
-            ServerCommand::GetConnections { reply } => {
-                let guard = state.connections.read().await;
-                let _ = reply.send(guard.keys().cloned().collect());
-            }
             ServerCommand::Drain {
                 close_code,
                 close_reason,
-                timeout_secs,
             } => {
                 // Set draining flag to reject new connections
                 state.draining.store(true, Ordering::Relaxed);
@@ -429,29 +424,12 @@ pub(super) async fn process_commands(
                     h.close(close_code, &close_reason);
                 }
                 drop(guard);
-                tracing::info!(
-                    "[WSE] Drain: sent close to {n} connections, waiting up to {timeout_secs}s"
-                );
-
-                // Spawn drain wait as separate task so command processor stays responsive
-                let drain_state = state.clone();
-                tokio::spawn(async move {
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-                    loop {
-                        if drain_state.connection_count.load(Ordering::Relaxed) == 0 {
-                            tracing::info!("[WSE] Drain complete: all connections closed");
-                            break;
-                        }
-                        if tokio::time::Instant::now() >= deadline {
-                            let remaining = drain_state.connection_count.load(Ordering::Relaxed);
-                            tracing::warn!(
-                                "[WSE] Drain timeout: {remaining} connections remaining"
-                            );
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                });
+                tracing::info!("[WSE] Drain: sent close to {n} connections");
+            }
+            ServerCommand::AbortAll => {
+                for h in state.connections.read().await.values() {
+                    h.closer.abort();
+                }
             }
             ServerCommand::Shutdown => {
                 let guard = state.connections.read().await;
@@ -459,10 +437,26 @@ pub(super) async fn process_commands(
                     h.close(CLOSE_GOING_AWAY, "server shutting down");
                 }
                 drop(guard);
-                // Drain period: allow in-flight messages to flush before exiting
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                // Up to two seconds for the clients to answer, then the rest
+                // are dropped. Either way every connection's cleanup runs
+                // (disconnect events, presence, maps) before the runtime goes,
+                // so a later start() begins with none left over.
+                wait_for_no_connections(&state, Duration::from_secs(2)).await;
+                for h in state.connections.read().await.values() {
+                    h.closer.abort();
+                }
+                wait_for_no_connections(&state, Duration::from_secs(1)).await;
                 break;
             }
         }
+    }
+}
+
+async fn wait_for_no_connections(state: &SharedState, limit: Duration) {
+    let deadline = tokio::time::Instant::now() + limit;
+    while state.connection_count.load(Ordering::Relaxed) > 0
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }

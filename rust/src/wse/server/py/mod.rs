@@ -27,7 +27,7 @@ use ahash::AHashSet;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
 use crate::jwt::{self, JwtConfig};
@@ -73,6 +73,23 @@ impl std::ops::Deref for CommandTx {
         self.0
             .as_deref()
             .expect("CommandTx is only built while a sender is stored")
+    }
+}
+
+impl Drop for RustWSEServer {
+    /// Dropped while running, without stop(): the server is told to stop and
+    /// its thread ends by itself; nothing waits for it here.
+    fn drop(&mut self) {
+        if self.running.swap(false, Ordering::SeqCst) {
+            if let Ok(guard) = self.shared.cluster_cmd_tx.read()
+                && let Some(ref tx) = *guard
+            {
+                let _ = tx.send(crate::wse::cluster::ClusterCommand::Shutdown);
+            }
+            if let Some(tx) = self.cmd_tx.load_full() {
+                let _ = tx.send(ServerCommand::Shutdown);
+            }
+        }
     }
 }
 
@@ -299,6 +316,21 @@ impl RustWSEServer {
         self.rt_handle.read().clone()
     }
 
+    /// The handle of a registered connection. Looked up detached: the lookup
+    /// waits on the runtime, whose threads may need this thread's interpreter
+    /// meanwhile (a callback being handed over, a stop-the-world pause).
+    fn connection_handle(
+        &self,
+        py: Python<'_>,
+        conn_id: &str,
+    ) -> Option<crate::wse::server::ConnectionHandle> {
+        let rt = self.runtime()?;
+        let shared = self.shared.clone();
+        py.detach(move || {
+            rt.block_on(async { shared.connections.read().await.get(conn_id).cloned() })
+        })
+    }
+
     /// Seconds since the last `start()`, 0.0 before the first one.
     fn uptime_secs(&self) -> f64 {
         self.started_at
@@ -394,11 +426,14 @@ impl RustWSEServer {
 
     /// Register Python callbacks for connection events.
     ///
-    /// - on_connect(conn_id, cookies) -- called when a client connects
+    /// - on_connect(conn_id, user_id) -- called when a client connects; the
+    ///   user id the server validated, or without jwt_secret the Cookie header
     /// - on_message(conn_id, data) -- called when a message is received
     /// - on_disconnect(conn_id) -- called when a client disconnects
     ///
-    /// Alternative to drain mode. Cannot be used together with enable_drain_mode().
+    /// The callbacks of one connection run one after another in the order of
+    /// its events. Alternative to drain mode. Cannot be used together with
+    /// enable_drain_mode().
     fn set_callbacks(
         &self,
         py: Python<'_>,
@@ -411,8 +446,9 @@ impl RustWSEServer {
 
     /// Start the WebSocket server on a background thread.
     ///
-    /// Spawns a dedicated tokio runtime, binds to host:port, and begins
-    /// accepting connections. Raises RuntimeError if already running.
+    /// Binds to host:port, spawns a dedicated tokio runtime and begins
+    /// accepting connections. Raises RuntimeError if already running and
+    /// OSError if host:port cannot be bound.
     fn start(&self, py: Python<'_>) -> PyResult<()> {
         self.start_impl(py)
     }
@@ -423,12 +459,46 @@ impl RustWSEServer {
     /// 2. Notifies cluster peers via DRAIN frame
     /// 3. Closes every client with `close_code`; a client that does not
     ///    answer within 5 seconds is disconnected
-    /// 4. Waits up to `timeout` seconds for clients to disconnect
+    /// 4. Waits up to `timeout` seconds for clients to disconnect, then
+    ///    drops the rest
     ///
-    /// Call `stop()` after `drain()` to fully shut down.
+    /// Returns how many connections had to be dropped at the timeout. Call
+    /// `stop()` after `drain()` to fully shut down.
     #[pyo3(signature = (close_code = 4300, close_reason = "", timeout = 30))]
-    fn drain(&self, close_code: u16, close_reason: &str, timeout: u64) -> PyResult<()> {
-        self.drain_impl(close_code, close_reason, timeout)
+    fn drain(
+        &self,
+        py: Python<'_>,
+        close_code: u16,
+        close_reason: &str,
+        timeout: u64,
+    ) -> PyResult<usize> {
+        self.drain_impl(py, close_code, close_reason, timeout)
+    }
+
+    /// True between drain() and the next start().
+    fn is_draining(&self) -> bool {
+        self.shared.draining.load(Ordering::Relaxed)
+    }
+
+    /// `with RustWSEServer(...) as server:` starts the server (unless it
+    /// runs already) and stops it at the end of the block.
+    fn __enter__<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<PyRef<'py, Self>> {
+        if !slf.running.load(Ordering::SeqCst) {
+            slf.start_impl(py)?;
+        }
+        Ok(slf)
+    }
+
+    #[pyo3(signature = (_exc_type = None, _exc = None, _traceback = None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc: Option<&Bound<'_, PyAny>>,
+        _traceback: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        self.stop_impl(py)?;
+        Ok(false)
     }
 
     /// Stop the server and close all connections (close code 1001).
@@ -486,15 +556,15 @@ impl RustWSEServer {
         self.shared.connection_count.load(Ordering::Relaxed)
     }
 
-    /// List all active connection IDs.
-    fn get_connections(&self) -> PyResult<Vec<String>> {
-        let tx = self.command_tx()?;
-        let (reply_tx, reply_rx) = oneshot::channel();
-        tx.send(ServerCommand::GetConnections { reply: reply_tx })
-            .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
-        reply_rx
-            .blocking_recv()
-            .map_err(|_| PyRuntimeError::new_err("Reply dropped"))
+    /// List all active connection IDs, read without waiting for the server.
+    fn get_connections(&self) -> Vec<String> {
+        // An activity entry lives from a connection's registration to its
+        // cleanup.
+        self.shared
+            .conn_last_activity
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 
     /// Close a connection with code 1000. Its messages after that are not
@@ -667,12 +737,13 @@ impl RustWSEServer {
     #[pyo3(signature = (conn_id, topics, presence_data = None, queue_group = None))]
     fn subscribe_connection(
         &self,
+        py: Python<'_>,
         conn_id: &str,
         topics: Vec<String>,
         presence_data: Option<&Bound<'_, PyDict>>,
         queue_group: Option<String>,
     ) -> PyResult<()> {
-        self.subscribe_connection_impl(conn_id, topics, presence_data, queue_group)
+        self.subscribe_connection_impl(py, conn_id, topics, presence_data, queue_group)
     }
 
     /// Subscribe with message recovery support.
