@@ -3,6 +3,7 @@ pattern subscriptions, queue groups with recovery, msgpack clients."""
 
 import asyncio
 import base64
+import importlib.util
 import json
 
 import pytest
@@ -346,6 +347,11 @@ class SessionClient:
                     return msg
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("wse_client") is None
+    or importlib.util.find_spec("cryptography") is None,
+    reason="needs the Python client and cryptography",
+)
 class TestE2eSessions:
     @pytest.mark.asyncio
     async def test_a_pinned_session_carries_everything_sealed(self, server_port):

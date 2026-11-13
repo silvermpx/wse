@@ -331,9 +331,10 @@ jobs:
           path: dist/
 
       # dist/ holds the abi3 wheel and the free-threaded ones; pip picks the
-      # one this interpreter can load. cryptography plays the client side of
-      # the E2E key exchange test; it has no wheel for Intel macOS or Windows
-      # on Arm, and there that one test is skipped rather than built from source.
+      # one this interpreter can load. The Python client and cryptography play
+      # the client side of the E2E tests; cryptography has no wheel for Intel
+      # macOS or Windows on Arm, and there those tests are skipped rather than
+      # built from source.
       - name: Install wheel + test deps
         shell: bash
         env:
@@ -341,7 +342,7 @@ jobs:
           PYTHON: ${{ matrix.python }}
         run: |
           python -m pip install --no-index --find-links dist wse-server
-          python -m pip install pytest pytest-asyncio httpx websockets prometheus-client
+          python -m pip install pytest pytest-asyncio httpx websockets prometheus-client ./python-client
           if ! python -m pip install --only-binary=:all: cryptography; then
             echo "::notice::No cryptography wheel for ${TARGET} / Python ${PYTHON}: the encrypted delivery test is skipped."
           fi
@@ -381,10 +382,10 @@ jobs:
       - name: Install the wheel in python:3.12-alpine and run the tests
         run: |
           docker run --rm -v "$PWD:/src:ro" python:3.12-alpine sh -euc '
-            cp -r /src/tests /src/pyproject.toml /tmp/
+            cp -r /src/tests /src/pyproject.toml /src/python-client /tmp/
             cd /tmp
             python -m pip install --no-index --find-links /src/dist wse-server
-            python -m pip install pytest pytest-asyncio httpx websockets cryptography prometheus-client
+            python -m pip install pytest pytest-asyncio httpx websockets cryptography prometheus-client ./python-client
             python -c "import sys, wse_server; print(wse_server.__file__, wse_server.__version__, sys.version)"
             python -m pytest tests/ -v --tb=short -p no:cacheprovider
           '
@@ -422,7 +423,7 @@ jobs:
 
       - name: Run tests
         run: |
-          python -m pip install pytest pytest-asyncio httpx websockets cryptography prometheus-client
+          python -m pip install pytest pytest-asyncio httpx websockets cryptography prometheus-client ./python-client
           rm -rf wse_server/
           python -c "import sys, wse_server; print(wse_server.__file__, wse_server.__version__, sys.version)"
           python -m pytest tests/ -v --tb=short
