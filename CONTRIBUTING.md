@@ -109,8 +109,10 @@ Speed is a requirement from the first line, not something to win back later.
   done once per message, not once per subscriber; shared payloads are `Bytes`.
 - Know what a primitive costs before it goes into a loop that runs per
   message: `CancellationToken::is_cancelled()` locks a mutex, a `Notify` wait
-  registers under one. Atomics, `Abortable` and the stack (arrays, `SmallVec`)
-  are the defaults.
+  registers under one, `UnboundedReceiver::len()` walks the queue, and a
+  tokio task woken from a thread outside the runtime goes through a shared
+  queue under a lock. Atomics, `Abortable` and the stack (arrays,
+  `SmallVec`) are the defaults.
 - Use every core where ordering allows it.
 - A change that touches a hot path is measured against the previous release
   on the same machine and with the same build flags, and the numbers go in the
