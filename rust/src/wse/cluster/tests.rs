@@ -1315,8 +1315,7 @@ fn test_reload_cluster_tls() {
 
 #[tokio::test]
 async fn test_cluster_queue_group_dispatch() {
-    use crate::wse::server::{BroadcastQueue, QueueGroup};
-    use parking_lot::Mutex;
+    use crate::wse::server::QueueGroup;
 
     // Create queue groups with 3 members
     let queue_groups: Arc<DashMap<String, DashMap<String, QueueGroup>>> = Arc::new(DashMap::new());
@@ -1327,11 +1326,8 @@ async fn test_cluster_queue_group_dispatch() {
         let (tx, rx) = mpsc::unbounded_channel();
         let h = crate::wse::server::ConnectionHandle {
             tx,
-            pending: Arc::new(AtomicUsize::new(0)),
-            broadcast_buf: Arc::new(Mutex::new(BroadcastQueue::new())),
-            broadcast_notify: Arc::new(tokio::sync::Notify::new()),
+            out: Arc::default(),
             closer: crate::wse::server::Closer::new(),
-            cipher: Arc::new(std::sync::OnceLock::new()),
             msgpack: false,
             lane: 0,
         };
@@ -1371,13 +1367,13 @@ async fn test_cluster_queue_group_dispatch() {
     let g = tg.get("workers").unwrap();
     for (id, h) in &g.members {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while h.pending.load(Ordering::Relaxed) < frame_len * 2
+        while h.out.pending.load(Ordering::Relaxed) < frame_len * 2
             && tokio::time::Instant::now() < deadline
         {
             tokio::task::yield_now().await;
         }
         assert_eq!(
-            h.pending.load(Ordering::Relaxed),
+            h.out.pending.load(Ordering::Relaxed),
             frame_len * 2,
             "{id} should have 2 messages"
         );

@@ -29,11 +29,10 @@ use super::frames::{
 use super::handshake::{HandshakeGuard, normalize_origin, reject_ws_auth};
 use super::messages::{build_server_hello, build_server_ready, normalize_json_keys};
 use super::py::{fire_on_connect, fire_on_disconnect, json_to_pyobj};
-use super::state::InboundEvent;
-use super::state::Seal;
+use super::state::{CloseOutbox, InboundEvent, Outbox, Seal};
 use super::subscribe::{answer_subscription_request, requested_compression};
 use super::{
-    BroadcastQueue, CLOSE_E2E_BAD_FRAME, CLOSE_E2E_EXHAUSTED, CLOSE_E2E_UNSUPPORTED, CLOSE_GRACE,
+    CLOSE_E2E_BAD_FRAME, CLOSE_E2E_EXHAUSTED, CLOSE_E2E_UNSUPPORTED, CLOSE_GRACE,
     CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED, CLOSE_TRY_AGAIN_LATER, Closer, ConnectionHandle,
     SharedState, WsFrame,
 };
@@ -406,7 +405,7 @@ fn close_reply(peer: u32) -> Option<Bytes> {
 /// over `max_outbound_queue_bytes` the frame is dropped.
 fn queue_reply(handle: &ConnectionHandle, max_pending: usize, msg: Message) {
     let bytes = ws_frame_size(&WsFrame::Msg(msg.clone()));
-    if max_pending > 0 && handle.pending.load(Ordering::Relaxed) + bytes > max_pending {
+    if max_pending > 0 && handle.out.pending.load(Ordering::Relaxed) + bytes > max_pending {
         return;
     }
     handle.send_control(msg);
@@ -627,9 +626,7 @@ pub(super) async fn handle_connection(
         .unwrap_or_default();
     let conn_id: Arc<String> = Arc::new(Uuid::now_v7().to_string());
     let (tx, mut rx) = mpsc::unbounded_channel::<WsFrame>();
-    let pending = Arc::new(AtomicUsize::new(0));
-    let broadcast_buf = Arc::new(parking_lot::Mutex::new(BroadcastQueue::new()));
-    let broadcast_notify = Arc::new(tokio::sync::Notify::new());
+    let out = Arc::new(Outbox::default());
     let drain = state.drain_mode.load(Ordering::Relaxed);
 
     // ── JWT validation in Rust (zero GIL) ──────────────────────────────────
@@ -710,18 +707,12 @@ pub(super) async fn handle_connection(
 
     // Lets the server end this connection: a close frame, then the socket.
     let closer = Closer::new();
-    // Its E2E key, once the client asked for one: every delivery path reads
-    // it from the handle.
-    let cipher_slot: Arc<std::sync::OnceLock<Seal>> = Arc::new(std::sync::OnceLock::new());
 
     // This connection as the rest of the server sees it.
     let own_handle = ConnectionHandle {
         tx: tx.clone(),
-        pending: pending.clone(),
-        broadcast_buf: broadcast_buf.clone(),
-        broadcast_notify: broadcast_notify.clone(),
+        out: Arc::clone(&out),
         closer: closer.clone(),
-        cipher: cipher_slot.clone(),
         msgpack: use_msgpack,
         lane: state.topics.next_lane(),
     };
@@ -738,12 +729,12 @@ pub(super) async fn handle_connection(
                 let recovery_enabled = state.recovery.is_some();
                 let server_ready = build_server_ready(&conn_id, user_id, recovery_enabled);
                 let sr_bytes = server_ready.len() + 4;
-                pending.fetch_add(sr_bytes, Ordering::Relaxed);
+                out.pending.fetch_add(sr_bytes, Ordering::Relaxed);
                 if tx
                     .send(WsFrame::Msg(Message::Text(server_ready.into())))
                     .is_err()
                 {
-                    pending.fetch_sub(sr_bytes, Ordering::Relaxed);
+                    out.pending.fetch_sub(sr_bytes, Ordering::Relaxed);
                 }
             }
             conns.insert((*conn_id).clone(), own_handle.clone());
@@ -816,9 +807,7 @@ pub(super) async fn handle_connection(
     // Write task: the only writer to the socket. Two sources: the control
     // queue (server_ready, replies, send_event, close) and the broadcast buffer
     // (fan-out frames shared with every subscriber, not copied).
-    let pending_write = pending.clone();
-    let broadcast_buf_write = broadcast_buf;
-    let broadcast_notify_write = broadcast_notify;
+    let out_write = Arc::clone(&out);
     // `finish`: the read side is done, send nothing more but the close reply.
     // The closer's token: the socket goes now, even in the middle of a frame.
     let finish = Arc::new(AtomicBool::new(false));
@@ -828,8 +817,13 @@ pub(super) async fn handle_connection(
     let peer_close = Arc::new(AtomicU32::new(NO_PEER_CLOSE));
     let write_peer_close = peer_close.clone();
     let write_task = tokio::spawn(async move {
+        // Deliveries stop when this task ends, however it ends.
+        let _closed = CloseOutbox(Arc::clone(&out_write));
         let mut batch: Vec<WsFrame> = Vec::with_capacity(CONTROL_BATCH);
         let mut wire: VecDeque<Bytes> = VecDeque::with_capacity(CONTROL_BATCH);
+        // The broadcast frames being written; swapped with the queue's, so
+        // both keep their room and no write allocates.
+        let mut shared: VecDeque<Bytes> = VecDeque::new();
         let mut seal: Option<SendState> = None;
         let mut close_sent = false;
         let work = async {
@@ -853,7 +847,7 @@ pub(super) async fn handle_connection(
                         &mut raw_write,
                         &mut batch,
                         &mut wire,
-                        &pending_write,
+                        &out_write.pending,
                         &mut seal,
                     )
                     .await
@@ -867,15 +861,18 @@ pub(super) async fn handle_connection(
                     }
                 }
                 // Then the broadcast frames queued so far.
-                let shared = {
-                    let mut buf = broadcast_buf_write.lock();
-                    (!buf.is_empty()).then(|| buf.take())
-                };
-                if let Some(frames) = shared {
+                {
+                    let mut queue = out_write.frames.lock();
+                    if !queue.is_empty() {
+                        queue.swap_into(&mut shared);
+                    }
+                }
+                if !shared.is_empty() {
                     wrote = true;
-                    let len: usize = frames.iter().map(Bytes::len).sum();
-                    let result = write_all_frames(&mut raw_write, &frames).await;
-                    release(&pending_write, len);
+                    let len: usize = shared.iter().map(Bytes::len).sum();
+                    let result = write_all_frames(&mut raw_write, &shared).await;
+                    shared.clear();
+                    release(&out_write.pending, len);
                     if result.is_err() {
                         break;
                     }
@@ -890,7 +887,7 @@ pub(super) async fn handle_connection(
                             break; // every sender is gone
                         }
                     }
-                    () = broadcast_notify_write.notified() => {}
+                    () = out_write.notify.notified() => {}
                 }
             }
         };
@@ -941,7 +938,7 @@ pub(super) async fn handle_connection(
                 biased;
                 () = async { if let Some(sleep) = expiry.as_mut() { sleep.await } }, if expiry.is_some() => {
                     expiry = None;
-                    closer.close(&tx, &pending, CLOSE_TOKEN_EXPIRED, "token expired");
+                    closer.close(&tx, &out.pending, CLOSE_TOKEN_EXPIRED, "token expired");
                     continue;
                 }
                 next = read_half.next() => match next {
@@ -966,7 +963,7 @@ pub(super) async fn handle_connection(
                     _ => false,
                 }
             {
-                closer.close(&tx, &pending, CLOSE_E2E_BAD_FRAME, "e2e frame refused");
+                closer.close(&tx, &out.pending, CLOSE_E2E_BAD_FRAME, "e2e frame refused");
                 continue;
             }
             if matches!(msg, Message::Text(_) | Message::Binary(_)) {
@@ -992,7 +989,7 @@ pub(super) async fn handle_connection(
                     }
                     Inbound::Close => {
                         state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
-                        closer.close(&tx, &pending, CLOSE_RATE_LIMITED, "rate limit exceeded");
+                        closer.close(&tx, &out.pending, CLOSE_RATE_LIMITED, "rate limit exceeded");
                         continue;
                     }
                 }
@@ -1097,7 +1094,7 @@ pub(super) async fn handle_connection(
                                                 )));
                                                 session = Some(accepted.recv);
                                                 state.conn_sealed.insert((*conn_id).clone());
-                                                let _ = cipher_slot.set(Seal::Session);
+                                                let _ = out.cipher.set(Seal::Session);
                                             }
                                             Err(_) => {
                                                 queue_reply(
@@ -1107,7 +1104,7 @@ pub(super) async fn handle_connection(
                                                 );
                                                 closer.close(
                                                     &tx,
-                                                    &pending,
+                                                    &out.pending,
                                                     CLOSE_E2E_UNSUPPORTED,
                                                     "e2e suite unsupported",
                                                 );
@@ -1130,7 +1127,7 @@ pub(super) async fn handle_connection(
                                         );
                                         closer.close(
                                             &tx,
-                                            &pending,
+                                            &out.pending,
                                             CLOSE_E2E_UNSUPPORTED,
                                             "e2e suite unsupported",
                                         );
@@ -1188,7 +1185,7 @@ pub(super) async fn handle_connection(
                                         state
                                             .conn_encryption
                                             .insert((*conn_id).clone(), cipher.clone());
-                                        let _ = cipher_slot.set(Seal::Legacy(cipher));
+                                        let _ = out.cipher.set(Seal::Legacy(cipher));
                                     }
                                     continue;
                                 }
@@ -1290,7 +1287,7 @@ pub(super) async fn handle_connection(
 
                     // E2E encryption: detect E: prefix and decrypt before processing
                     if data.len() >= 2 && data[0] == b'E' && data[1] == b':' {
-                        let opened = match (session.as_mut(), cipher_slot.get()) {
+                        let opened = match (session.as_mut(), out.cipher.get()) {
                             (Some(session), _) => match session.open(&data) {
                                 Ok(Some(plaintext)) => Some(Ok(plaintext)),
                                 // The client's close_notify: it closes next.
@@ -1298,7 +1295,7 @@ pub(super) async fn handle_connection(
                                 Err(_) => {
                                     closer.close(
                                         &tx,
-                                        &pending,
+                                        &out.pending,
                                         CLOSE_E2E_BAD_FRAME,
                                         "e2e frame refused",
                                     );
@@ -1470,7 +1467,7 @@ pub(super) async fn handle_connection(
     let _ = futures_util::future::Abortable::new(read_loop, read_stop).await;
     // The read side is done: the write task sends the close reply and ends.
     finish.store(true, Ordering::Release);
-    own_handle.broadcast_notify.notify_one();
+    own_handle.out.notify.notify_one();
 
     // Cleanup
     {

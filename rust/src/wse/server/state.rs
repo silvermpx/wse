@@ -130,23 +130,43 @@ impl Closer {
 
 #[derive(Clone)]
 pub(crate) struct ConnectionHandle {
+    /// The control queue: server_ready, replies, direct sends, closes.
     pub(crate) tx: mpsc::UnboundedSender<WsFrame>,
-    /// Pending outbound bytes (not messages) for backpressure accounting.
-    pub(crate) pending: Arc<AtomicUsize>,
-    /// NATS-style direct buffer for broadcasts (bypasses mpsc channel): the frames
-    /// themselves, shared with every other connection they go to, not copies.
-    pub(crate) broadcast_buf: Arc<parking_lot::Mutex<BroadcastQueue>>,
-    /// Wakes write task when broadcast data is appended to broadcast_buf.
-    pub(crate) broadcast_notify: Arc<tokio::sync::Notify>,
+    /// What a delivery touches, in one allocation.
+    pub(crate) out: Arc<Outbox>,
     pub(crate) closer: Closer,
-    /// How the connection's frames are encrypted, set once by its key
-    /// exchange.
-    pub(crate) cipher: Arc<std::sync::OnceLock<Seal>>,
     /// The client asked for msgpack (`?format=msgpack`): what goes to it as
     /// JSON text is sent as an `M:` msgpack frame instead.
     pub(crate) msgpack: bool,
     /// The lane delivering to it (`Fanout`).
     pub(crate) lane: u8,
+}
+
+/// A connection's outbound state that every delivery reads or changes, kept
+/// together so a delivery reaches one allocation instead of one per field.
+#[derive(Default)]
+pub(crate) struct Outbox {
+    /// Pending outbound bytes (not messages), for the outbound budget.
+    pub(crate) pending: AtomicUsize,
+    /// Set when the write task is gone: deliveries stop.
+    pub(crate) closed: AtomicBool,
+    /// How the connection's frames are encrypted, set once by its key
+    /// exchange.
+    pub(crate) cipher: std::sync::OnceLock<Seal>,
+    /// Broadcast frames for the write task, apart from the control queue:
+    /// shared with every other connection they go to, not copies.
+    pub(crate) frames: parking_lot::Mutex<BroadcastQueue>,
+    /// Wakes the write task when frames are queued on an empty queue.
+    pub(crate) notify: tokio::sync::Notify,
+}
+
+/// Marks the outbox closed when the write task ends, however it ends.
+pub(crate) struct CloseOutbox(pub(crate) Arc<Outbox>);
+
+impl Drop for CloseOutbox {
+    fn drop(&mut self) {
+        self.0.closed.store(true, Ordering::Release);
+    }
 }
 
 /// A connection's end-to-end encryption.
@@ -162,7 +182,7 @@ pub(crate) enum Seal {
 impl ConnectionHandle {
     /// See `Closer::close`.
     pub(crate) fn close(&self, code: u16, reason: &str) {
-        self.closer.close(&self.tx, &self.pending, code, reason);
+        self.closer.close(&self.tx, &self.out.pending, code, reason);
     }
 }
 

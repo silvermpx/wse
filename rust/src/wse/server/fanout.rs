@@ -185,7 +185,7 @@ impl ConnectionHandle {
             return false;
         }
         let (payload, frame) = msg.for_handle(self);
-        match self.cipher.get() {
+        match self.out.cipher.get() {
             None => self.push_frame(frame),
             Some(Seal::Legacy(cipher)) => match e2e_frame(cipher, payload) {
                 Some(frame) => self.push_frame(&frame),
@@ -199,10 +199,10 @@ impl ConnectionHandle {
     /// Whether a delivery to this connection would be queued: it is open and
     /// within its outbound budget (over it, counted in `slow_drops`).
     fn has_room(&self, max_pending: usize, slow_drops: &AtomicU64) -> bool {
-        if self.tx.is_closed() {
+        if self.out.closed.load(Ordering::Relaxed) {
             return false;
         }
-        if max_pending > 0 && self.pending.load(Ordering::Relaxed) >= max_pending {
+        if max_pending > 0 && self.out.pending.load(Ordering::Relaxed) >= max_pending {
             slow_drops.fetch_add(1, Ordering::Relaxed);
             return false;
         }
@@ -212,9 +212,9 @@ impl ConnectionHandle {
     /// Queue a frame on the control queue, counted in the outbound budget.
     fn queue(&self, frame: WsFrame) -> bool {
         let bytes = ws_frame_size(&frame);
-        self.pending.fetch_add(bytes, Ordering::Relaxed);
+        self.out.pending.fetch_add(bytes, Ordering::Relaxed);
         if self.tx.send(frame).is_err() {
-            self.pending.fetch_sub(bytes, Ordering::Relaxed);
+            self.out.pending.fetch_sub(bytes, Ordering::Relaxed);
             return false;
         }
         true
@@ -224,7 +224,7 @@ impl ConnectionHandle {
     /// error): sealed in an E2E session, where the client accepts nothing
     /// else, as is otherwise (older E2E clients take these in plaintext).
     pub(crate) fn send_control(&self, msg: Message) -> bool {
-        match (self.cipher.get(), msg) {
+        match (self.out.cipher.get(), msg) {
             (Some(Seal::Session), Message::Text(text)) => {
                 self.queue(WsFrame::Seal(Bytes::from(text)))
             }
@@ -243,7 +243,7 @@ impl ConnectionHandle {
         max_pending: usize,
         slow_drops: &AtomicU64,
     ) -> bool {
-        if max_pending > 0 && self.pending.load(Ordering::Relaxed) >= max_pending {
+        if max_pending > 0 && self.out.pending.load(Ordering::Relaxed) >= max_pending {
             slow_drops.fetch_add(1, Ordering::Relaxed);
             return false;
         }
@@ -255,7 +255,7 @@ impl ConnectionHandle {
             },
             msg => msg,
         };
-        let frame = match (self.cipher.get(), msg) {
+        let frame = match (self.out.cipher.get(), msg) {
             (Some(Seal::Legacy(cipher)), Message::Text(text)) => {
                 match e2e_message(cipher, text.as_bytes()) {
                     Some(sealed) => WsFrame::Msg(sealed),
@@ -277,15 +277,16 @@ impl ConnectionHandle {
     /// Append a frame to the broadcast buffer; the write task is woken when
     /// the buffer was empty.
     fn push_frame(&self, frame: &Bytes) {
-        self.pending.fetch_add(frame.len(), Ordering::Relaxed);
+        let out = &*self.out;
+        out.pending.fetch_add(frame.len(), Ordering::Relaxed);
         let was_empty = {
-            let mut buf = self.broadcast_buf.lock();
-            let empty = buf.is_empty();
-            buf.push(frame);
+            let mut queue = out.frames.lock();
+            let empty = queue.is_empty();
+            queue.push(frame);
             empty
         };
         if was_empty {
-            self.broadcast_notify.notify_one();
+            out.notify.notify_one();
         }
     }
 }
@@ -541,7 +542,7 @@ impl TopicIndex {
         }
         // Connections already served, by the identity of their queue.
         served.clear();
-        let id = |h: &ConnectionHandle| Arc::as_ptr(&h.pending) as usize;
+        let id = |h: &ConnectionHandle| Arc::as_ptr(&h.out) as usize;
         if let Some(subs) = self.subscribers.get(topic)
             && let Some(part) = subs.part(lane)
         {

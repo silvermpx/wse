@@ -112,11 +112,8 @@ fn make_handle() -> (ConnectionHandle, mpsc::UnboundedReceiver<WsFrame>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let h = ConnectionHandle {
         tx,
-        pending: Arc::new(AtomicUsize::new(0)),
-        broadcast_buf: Arc::new(parking_lot::Mutex::new(BroadcastQueue::new())),
-        broadcast_notify: Arc::new(tokio::sync::Notify::new()),
+        out: Arc::default(),
         closer: super::Closer::new(),
-        cipher: Arc::new(std::sync::OnceLock::new()),
         msgpack: false,
         lane: 0,
     };
@@ -124,7 +121,11 @@ fn make_handle() -> (ConnectionHandle, mpsc::UnboundedReceiver<WsFrame>) {
 }
 
 fn queued(h: &ConnectionHandle) -> Vec<bytes::Bytes> {
-    h.broadcast_buf.lock().take().into_iter().collect()
+    {
+        let mut frames = std::collections::VecDeque::new();
+        h.out.frames.lock().swap_into(&mut frames);
+        frames.into_iter().collect()
+    }
 }
 
 // -- Topic index ------------------------------------------------------------
@@ -185,6 +186,7 @@ fn an_encrypted_connection_gets_its_own_sealed_frame() {
     let (sealed, _rx2) = make_handle();
     let key = Arc::new(crate::crypto::Aes256Gcm::new(&[9u8; 32]).unwrap());
     sealed
+        .out
         .cipher
         .set(super::state::Seal::Legacy(key.clone()))
         .ok()
@@ -264,11 +266,11 @@ fn a_msgpack_connection_gets_json_as_msgpack() {
 /// take them.
 async fn delivered(h: &ConnectionHandle, len: usize) -> Vec<u8> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while h.pending.load(Ordering::Relaxed) < len && tokio::time::Instant::now() < deadline {
+    while h.out.pending.load(Ordering::Relaxed) < len && tokio::time::Instant::now() < deadline {
         tokio::task::yield_now().await;
     }
     let bytes = queued(h).concat();
-    h.pending.fetch_sub(bytes.len(), Ordering::Relaxed);
+    h.out.pending.fetch_sub(bytes.len(), Ordering::Relaxed);
     bytes
 }
 
@@ -408,8 +410,8 @@ fn test_queue_group_round_robin() {
                 let g = entry.value_mut();
                 let idx = g.next.fetch_add(1, Ordering::Relaxed) % g.members.len();
                 let (_, ref h) = g.members[idx];
-                h.pending.fetch_add(data.len(), Ordering::Relaxed);
-                let mut buf = h.broadcast_buf.lock();
+                h.out.pending.fetch_add(data.len(), Ordering::Relaxed);
+                let mut buf = h.out.frames.lock();
                 buf.push(&data);
             }
         }
@@ -420,7 +422,7 @@ fn test_queue_group_round_robin() {
     let g = tg.get("workers").unwrap();
     for (_, h) in &g.members {
         assert_eq!(
-            h.pending.load(Ordering::Relaxed),
+            h.out.pending.load(Ordering::Relaxed),
             data.len() * 3,
             "Each member should receive 3 messages"
         );

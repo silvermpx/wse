@@ -233,7 +233,7 @@ impl RustWSEServer {
                                     // second tick. It gets a close frame; if it does
                                     // not read that either, the close grace drops it.
                                     if max_pending > 0
-                                        && handle.pending.load(Ordering::Relaxed) >= max_pending
+                                        && handle.out.pending.load(Ordering::Relaxed) >= max_pending
                                     {
                                         if suspected_slow.remove(cid) {
                                             handle.close(CLOSE_TRY_AGAIN_LATER, "too slow to read");

@@ -55,10 +55,6 @@ pub(crate) struct BroadcastQueue {
 }
 
 impl BroadcastQueue {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.frames.is_empty() && self.small.is_empty()
     }
@@ -72,10 +68,13 @@ impl BroadcastQueue {
         }
     }
 
-    /// Take every queued frame, for one vectored write.
-    pub(crate) fn take(&mut self) -> std::collections::VecDeque<Bytes> {
+    /// Move every queued frame into `out`, which must be empty, for one
+    /// vectored write; the queue keeps `out`'s room for the next frames, so
+    /// a write task that clears `out` after each write allocates nothing.
+    pub(crate) fn swap_into(&mut self, out: &mut std::collections::VecDeque<Bytes>) {
+        debug_assert!(out.is_empty());
         self.seal_small();
-        std::mem::take(&mut self.frames)
+        std::mem::swap(&mut self.frames, out);
     }
 
     /// Close the segment of small frames, so what comes next goes after it.
