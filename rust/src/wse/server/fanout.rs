@@ -304,6 +304,13 @@ const MAX_LANES: usize = 64;
 /// How many jobs a lane's task takes off its queue at once.
 const LANE_BATCH: usize = 64;
 
+/// How many connections a lane serves before it gives way to the runtime:
+/// some tens of microseconds. tokio looks at the network only between task
+/// polls, so a lane that kept its thread longer, with every thread running a
+/// lane under a steady stream, left new connections waiting until their
+/// handshakes timed out.
+const LANE_SLICE: usize = 512;
+
 /// How many jobs wait for a lane at most. A sender that finds the queue full
 /// waits for room: a publisher faster than the delivery then backs up in its
 /// own queue, a message each, not in a job for every lane.
@@ -503,11 +510,20 @@ impl TopicIndex {
         (matching, mask)
     }
 
-    /// Deliver `msg` to every connection on `lane`.
-    fn deliver_all(&self, lane: u8, msg: &Outgoing, max_pending: usize, slow_drops: &AtomicU64) {
-        for h in self.everyone[usize::from(lane)].read().values() {
+    /// Deliver `msg` to every connection on `lane`. Returns how many
+    /// connections that was.
+    fn deliver_all(
+        &self,
+        lane: u8,
+        msg: &Outgoing,
+        max_pending: usize,
+        slow_drops: &AtomicU64,
+    ) -> usize {
+        let conns = self.everyone[usize::from(lane)].read();
+        for h in conns.values() {
             h.deliver(msg, max_pending, slow_drops);
         }
+        conns.len()
     }
 
     /// Deliver `msg` on `topic` to the subscribers on `lane`: the topic's,
@@ -763,8 +779,10 @@ async fn run_lane(
     let mut batch = Vec::with_capacity(LANE_BATCH);
     let mut served = AHashSet::new();
     while jobs.recv_many(&mut batch, LANE_BATCH).await > 0 {
+        // Connections served since the lane last gave way.
+        let mut served_since = 0;
         for job in batch.drain(..) {
-            match job {
+            served_since += match job {
                 Job::All(msg) => index.deliver_all(lane, &msg, max_pending, &slow_drops),
                 Job::Topic(message) => {
                     let (delivered, dropped) = index.deliver_topic(
@@ -782,17 +800,25 @@ async fn run_lane(
                             metrics.add_dropped(dropped);
                         }
                     }
+                    (delivered + dropped) as usize
                 }
                 Job::One(h, msg) => {
                     h.deliver(&msg, max_pending, &slow_drops);
+                    1
                 }
+            };
+            // The write tasks it woke wait in this thread's run queue: they
+            // run, and the runtime reads the network, before the lane goes
+            // on. A lane with work would not give way by itself until
+            // tokio's budget ran out, after thousands of deliveries.
+            if served_since >= LANE_SLICE {
+                tokio::task::yield_now().await;
+                served_since = 0;
             }
         }
-        // The write tasks this batch woke wait in this thread's run queue:
-        // they run, and so does the rest of the runtime, before the next
-        // batch. A lane with work does not give way by itself until tokio's
-        // budget runs out, after thousands of deliveries.
-        tokio::task::yield_now().await;
+        if served_since > 0 {
+            tokio::task::yield_now().await;
+        }
     }
 }
 
