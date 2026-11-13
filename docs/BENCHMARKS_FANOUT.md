@@ -23,10 +23,10 @@ averages of three rounds.
 |------|-------|-------|--------|
 | Broadcast, 1,000 subscribers | 5.4M del/s | **9.4M del/s** | +75% |
 | Broadcast, 5,000 subscribers | 6.0M del/s | **8.2M del/s** | +36% |
-| Broadcast, 10,000 subscribers | 7.4M del/s | 7.3M del/s | same |
+| Broadcast, 10,000 subscribers | 7.4M del/s | same | within noise |
 | Topic through a cluster peer, 1,000 subscribers | 5.9M del/s | **6.8M del/s** | +15% |
 | Topic through a cluster peer, 10,000 subscribers | 5.7M del/s | **8.4M del/s** | +46% |
-| Inbound, 100 / 1,000 connections | 8.3M / 7.7M msg/s | 8.2M / 7.6M msg/s | same |
+| Inbound, 100 / 1,000 connections | 8.3M / 7.7M msg/s | same | within noise |
 | Server peak memory | 35-39 GB | **19-21 GB** | about half |
 
 Results vary by about 10% between rounds on this machine, which runs other

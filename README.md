@@ -571,10 +571,12 @@ See [ts-client/](ts-client/) for full source and examples.
 
 | Test | 2.5.1 | 3.0 |
 |------|-------|-----|
-| Broadcast, 1,000 / 5,000 / 10,000 subscribers | 5.4 / 6.0 / 7.4M deliveries/s | **9.4 / 8.2 / 7.3M** |
+| Broadcast, 1,000 / 5,000 / 10,000 subscribers | 5.4 / 6.0 / 7.4M deliveries/s | **9.4 / 8.2M** / same |
 | Topic through a cluster peer, 1,000 / 10,000 subscribers | 5.9 / 5.7M deliveries/s | **6.8 / 8.4M** |
-| Inbound, 100 / 1,000 connections | 8.3 / 7.7M msg/s | 8.2 / 7.6M |
+| Inbound, 100 / 1,000 connections | 8.3 / 7.7M msg/s | same |
 | Peak memory under a publisher that never pauses | 35-39 GB | **19-21 GB** |
+
+"Same": within the run-to-run noise of the machine (about 10%).
 
 Peak numbers measured with 2.x on AMD EPYC 7502P (32 cores / 64 threads, 128 GB RAM), Ubuntu 24.04:
 
