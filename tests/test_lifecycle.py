@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -253,7 +254,8 @@ srv.stop()
             capture_output=True,
             text=True,
             timeout=60,
-            env={"PATH": "/usr/bin:/bin"},
+            # Without RUST_LOG; the rest stays (Windows needs SYSTEMROOT).
+            env={k: v for k, v in os.environ.items() if k != "RUST_LOG"},
         )
         assert "JWT validation failed" in out.stdout + out.stderr, out.stderr
 

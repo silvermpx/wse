@@ -278,7 +278,12 @@ class TestMsgpack:
                 # The client's msgpack, behind the M: prefix or without it.
                 await ws.send(b"M:" + cm.pack_msgpack({"t": "chat", "p": {"x": 1}}))
                 await ws.send(cm.pack_msgpack({"t": "chat", "p": {"x": 2}}))
-                got = [drain_until(srv, "msg")[2]["p"]["x"] for _ in range(2)]
+                # Waited for off the event loop: on Windows the loop itself
+                # writes the frames out, so it must keep running.
+                got = [
+                    (await asyncio.to_thread(drain_until, srv, "msg"))[2]["p"]["x"]
+                    for _ in range(2)
+                ]
                 assert got == [1, 2]
 
             srv.broadcast_local("news", json.dumps({"t": "tick", "p": {"n": 2}}))
