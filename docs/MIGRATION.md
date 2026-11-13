@@ -55,6 +55,7 @@ It signed nothing: the Python client signed with a random key the server never k
 - `security.encryptionEnabled` needs `serverKeys`, `unauthenticated` or `legacyE2e` (above).
 - One connection per page, shared by every `useWSE()` call; `maxAttempts: -1` (the default) never gives up.
 - `wireFormat: 'msgpack'` is new.
+- `ConnectionPool` no longer sends `PING:` text on the open socket every 30 seconds (it counted a success without waiting for an answer): `enableHealthCheck`, `healthCheckTimeout` and `setHealthCheckEnabled()` are gone, and `healthCheckInterval` is now `scoreDecayInterval`, the period after which an endpoint's score decays. The session's heartbeat (`diagnostics.healthCheckInterval`) is unchanged.
 
 ---
 

@@ -344,12 +344,6 @@ export interface OfflineQueueStats {
 // Connection Pool
 // ---------------------------------------------------------------------------
 
-export interface ConnectionPoolConfig {
-  endpoints: string[];
-  maxPerEndpoint: number;
-  healthCheckInterval: number;
-}
-
 export interface ConnectionPoolStats {
   endpoints: EndpointStats[];
   activeEndpoint: string | null;

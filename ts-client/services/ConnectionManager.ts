@@ -231,7 +231,7 @@ export class ConnectionManager {
     this.connectionPool = new ConnectionPool({
       endpoints: this.endpoints,
       maxPerEndpoint: 1,
-      healthCheckInterval: 30000,
+      scoreDecayInterval: 30000,
       loadBalancingStrategy: 'weighted-random',
     });
 

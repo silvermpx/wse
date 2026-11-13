@@ -20,13 +20,12 @@ interface EndpointHealth {
 
 export interface ConnectionPoolConfig {
   maxPerEndpoint?: number;
-  healthCheckInterval?: number;
+  /** An endpoint's score decays once this long (ms) passed without a success or failure. */
+  scoreDecayInterval?: number;
   latencyHistorySize?: number;
   scoreDecayRate?: number;
   minHealthScore?: number;
   loadBalancingStrategy?: 'weighted-random' | 'least-connections' | 'round-robin';
-  healthCheckTimeout?: number;
-  enableHealthCheck?: boolean;
   endpoints?: string[];
 }
 
@@ -40,19 +39,14 @@ export class ConnectionPool {
 
   private config = {
     maxPerEndpoint: 3,
-    healthCheckInterval: 30000,
+    scoreDecayInterval: 30000,
     latencyHistorySize: 100,
     scoreDecayRate: 0.1,
     minHealthScore: 10,
     loadBalancingStrategy: 'weighted-random' as 'weighted-random' | 'least-connections' | 'round-robin',
-    healthCheckTimeout: 5000,
-    enableHealthCheck: true,
   };
 
-  private healthCheckTimer: NodeJS.Timeout | null = null;
-  private initialHealthCheckTimer: NodeJS.Timeout | null = null;
   private roundRobinIndex = 0;
-  private healthCheckInProgress = false;
 
   constructor(config?: ConnectionPoolConfig) {
     Object.assign(this.config, config);
@@ -67,10 +61,6 @@ export class ConnectionPool {
     uniqueEndpoints.forEach((endpoint) => {
       this.addEndpoint(endpoint);
     });
-
-    if (this.config.enableHealthCheck && this.config.healthCheckInterval > 0 && uniqueEndpoints.length > 0) {
-      this.startHealthMonitoring();
-    }
   }
 
   getBestEndpoint(): string {
@@ -233,10 +223,6 @@ export class ConnectionPool {
       this.connections.set(endpoint, []);
 
       logger.info(`Added endpoint: ${endpoint}`);
-
-      if (this.config.enableHealthCheck && !this.healthCheckTimer && this.endpoints.size > 0) {
-        this.startHealthMonitoring();
-      }
     }
   }
 
@@ -298,15 +284,6 @@ export class ConnectionPool {
 
   destroy(): void {
     this.isDestroyed = true;
-
-    if (this.initialHealthCheckTimer) {
-      clearTimeout(this.initialHealthCheckTimer);
-      this.initialHealthCheckTimer = null;
-    }
-    if (this.healthCheckTimer) {
-      clearInterval(this.healthCheckTimer);
-      this.healthCheckTimer = null;
-    }
 
     this.closeAll();
     this.endpoints.clear();
@@ -380,8 +357,8 @@ export class ConnectionPool {
     }
 
     const timeSinceLastCheck = Date.now() - health.lastChecked;
-    if (timeSinceLastCheck > this.config.healthCheckInterval) {
-      const decayFactor = 1 - (this.config.scoreDecayRate * timeSinceLastCheck / this.config.healthCheckInterval);
+    if (timeSinceLastCheck > this.config.scoreDecayInterval) {
+      const decayFactor = 1 - (this.config.scoreDecayRate * timeSinceLastCheck / this.config.scoreDecayInterval);
       score = Math.max(this.config.minHealthScore, score * decayFactor);
     }
 
@@ -416,68 +393,6 @@ export class ConnectionPool {
     return Array.from(this.endpoints.entries())
       .filter(([_, health]) => health.score > this.config.minHealthScore)
       .sort((a, b) => b[1].score - a[1].score);
-  }
-
-  private startHealthMonitoring(): void {
-    if (this.healthCheckTimer || this.isDestroyed || this.config.healthCheckInterval <= 0) return;
-
-    this.initialHealthCheckTimer = setTimeout(() => {
-      this.initialHealthCheckTimer = null;
-      if (!this.isDestroyed) {
-        this.performHealthCheck().catch(error => {
-          logger.error('Initial health check failed:', error);
-        });
-      }
-    }, 5000);
-
-    this.healthCheckTimer = setInterval(() => {
-      if (!this.isDestroyed && !this.healthCheckInProgress) {
-        this.performHealthCheck().catch(error => {
-          logger.error('Periodic health check failed:', error);
-        });
-      }
-    }, this.config.healthCheckInterval);
-  }
-
-  private async performHealthCheck(): Promise<void> {
-    if (this.isDestroyed || this.healthCheckInProgress) return;
-
-    this.healthCheckInProgress = true;
-
-    try {
-      const promises = [];
-
-      for (const [endpoint, health] of this.endpoints) {
-        if (Date.now() - health.lastChecked < this.config.healthCheckInterval / 2) {
-          continue;
-        }
-        promises.push(this.checkEndpointHealth(endpoint));
-      }
-
-      await Promise.allSettled(promises);
-    } finally {
-      this.healthCheckInProgress = false;
-    }
-  }
-
-  private async checkEndpointHealth(endpoint: string): Promise<void> {
-    try {
-      const existingConnection = this.connections.get(endpoint)?.find(
-        ws => ws.readyState === WebSocket.OPEN
-      );
-
-      if (existingConnection) {
-        try {
-          const start = Date.now();
-          existingConnection.send(`PING:${start}`);
-          this.recordSuccess(endpoint);
-        } catch (error) {
-          this.recordFailure(endpoint);
-        }
-      }
-    } catch (error) {
-      logger.debug(`Health check for ${endpoint} encountered an error:`, error);
-    }
   }
 
   getDetailedStats(): {
@@ -523,19 +438,6 @@ export class ConnectionPool {
       this.config.loadBalancingStrategy = strategy;
       this.roundRobinIndex = 0;
       logger.info(`Load balancing strategy changed to: ${strategy}`);
-    }
-  }
-
-  setHealthCheckEnabled(enabled: boolean): void {
-    if (this.isDestroyed) return;
-
-    this.config.enableHealthCheck = enabled;
-
-    if (enabled && !this.healthCheckTimer && this.config.healthCheckInterval > 0 && this.endpoints.size > 0) {
-      this.startHealthMonitoring();
-    } else if (!enabled && this.healthCheckTimer) {
-      clearInterval(this.healthCheckTimer);
-      this.healthCheckTimer = null;
     }
   }
 }

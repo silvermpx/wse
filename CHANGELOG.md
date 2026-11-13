@@ -102,6 +102,10 @@ the steps to take are in [docs/MIGRATION.md](docs/MIGRATION.md#migrating-from-v2
   from the last delivered offset, inbound size limits.
 - TypeScript: one session per page shared by every `useWSE()`; adaptive
   quality, the compression preference and the idle options work.
+- TypeScript: `ConnectionPool` no longer writes `PING:` text to the
+  application's socket every 30 seconds, a check that counted a success
+  without an answer; its health-check options are gone and
+  `healthCheckInterval` is `scoreDecayInterval`.
 
 ### Performance
 
