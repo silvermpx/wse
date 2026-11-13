@@ -35,6 +35,17 @@ updates:
       rust-bench:
         patterns: ["*"]
 
+  # Repository checks (cargo xtask): one grouped PR.
+  - package-ecosystem: "cargo"
+    directory: "/xtask"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      xtask:
+        patterns: ["*"]
+
   - package-ecosystem: "npm"
     directory: "/benchmarks/ts-bench"
     schedule:

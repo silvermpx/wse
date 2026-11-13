@@ -1,0 +1,79 @@
+name: Weekly
+
+# Advisories are published on their own schedule, and a secret that slipped
+# in before the per-push scan existed would never surface again: once a week
+# the current main is checked against today's advisory databases, and its
+# whole history is scanned for secrets.
+on:
+  schedule:
+    - cron: '17 5 * * 1'  # Mondays 05:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dependencies:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust (extension)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # v2.1.1
+        with:
+          manifest-path: rust/Cargo.toml
+          command: check
+
+      - name: Rust (xtask)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # v2.1.1
+        with:
+          manifest-path: xtask/Cargo.toml
+          command: check
+
+      - name: Rust (benchmarks)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # v2.1.1
+        with:
+          manifest-path: benchmarks/rust-bench/Cargo.toml
+          command: check
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: npm (runtime dependencies)
+        run: npm audit --omit=dev --audit-level=high
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Python client dependencies
+        run: |
+          python -m venv /tmp/client-env
+          /tmp/client-env/bin/pip install --quiet "./python-client[all]"
+          /tmp/client-env/bin/pip freeze --exclude wse-client > /tmp/client-requirements.txt
+          python -m pip install --quiet 'pip-audit==2.10.1'
+          python -m pip_audit --strict --no-deps --disable-pip --progress-spinner off -r /tmp/client-requirements.txt
+
+  secrets:
+    name: Secret scan (full history)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o gitleaks.tgz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tgz" | sha256sum -c -
+          tar -xzf gitleaks.tgz gitleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Scan every commit
+        run: gitleaks git --config .gitleaks.toml --redact --no-banner --exit-code 1 .

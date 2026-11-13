@@ -6,20 +6,20 @@ Thank you for your interest in contributing to WSE. This guide covers the develo
 
 ### Prerequisites
 
-- Python 3.12+
-- Rust 1.75+ (stable)
-- Node.js 18+ (for TS client)
-- maturin (`pip install maturin`)
+- Python 3.12+ for the server (the Python client supports 3.11+)
+- Rust 1.95+ (stable; the minimum is `rust-version` in `rust/Cargo.toml`)
+- Node.js 22 for the TS client's tests and build (the published package runs on Node 18+)
+- maturin 1.16+ (`pip install maturin`)
 
 ### Building from Source
 
 ```bash
 # Clone the repository
-git clone https://github.com/niceguy135/wse.git
+git clone https://github.com/silvermpx/wse.git
 cd wse
 
-# Build the Rust extension (development mode)
-maturin develop --manifest-path rust/Cargo.toml
+# Build the Rust extension into the active virtualenv
+maturin develop --release
 
 # Install Python dependencies
 pip install -e ".[dev]"
@@ -44,14 +44,43 @@ cd python-client && pytest tests/
 npm test
 ```
 
+Builds are portable by default: no CPU-specific flags are committed. To
+benchmark on your own machine with its CPU features turned on:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" maturin develop --release
+```
+
+### Repository Checks
+
+```bash
+cargo xtask fast      # rustfmt, clippy, then the checks below
+cargo xtask lint      # comments and the engine boundary only
+cargo xtask commits   # commit messages of your branch (origin/main..HEAD)
+```
+
+- **Comments** say why the code is the way it is, in plain English, for the
+  next reader. Issue, ticket and audit numbers, plan or wave numbers and the
+  dates of a change belong in the commit message, not in the code. Python
+  docstrings count as comments.
+- **Engine boundary**: the WebSocket and cluster engine (`cluster/`,
+  `server/` outside `server/py/`, presence, recovery, reliability) does not
+  use PyO3; the Python bindings live in `server/py/`. The places that still
+  cross are listed with their reasons in `xtask/arch_allow.toml`.
+
+CI runs the same commands, plus cargo-deny (`deny.toml`) for the Rust
+dependencies and gitleaks (`.gitleaks.toml`) for secrets. The `ci-ok` job is
+the one result a pull request needs.
+
 ## Project Structure
 
 ```
 wse/
-  rust/                  # Rust core (PyO3 bindings, server, cluster, presence, recovery)
+  rust/                  # Rust core (server, cluster, presence, recovery, PyO3 bindings)
   wse_server/            # Python server package (thin wrapper over Rust)
   python-client/         # Python client SDK (wse-client on PyPI)
-  client/                # TypeScript/React client SDK (wse-client on npm)
+  ts-client/             # TypeScript/React client SDK (wse-client on npm)
+  xtask/                 # Repository checks (cargo xtask)
   examples/              # Working example scripts
   tests/                 # Integration tests
   benchmarks/            # Performance benchmarks (Rust, Python, TypeScript)
@@ -76,9 +105,8 @@ wse/
 
 ### TypeScript
 
-- Format with Prettier.
-- Lint with ESLint.
-- Strict TypeScript mode (`strict: true`).
+- Strict TypeScript mode (`strict: true`); `npx tsc --noEmit` must pass.
+- Tests with vitest (`npm test`).
 
 ## Commit Messages
 
@@ -106,7 +134,7 @@ Receiver now correctly validates total wire frame size.
 1. Create a feature branch from `main`.
 2. Make your changes with clear, focused commits.
 3. Ensure all tests pass locally.
-4. Run `cargo fmt` and `cargo clippy` for Rust changes.
+4. Run `cargo xtask fast`.
 5. Run `ruff format` and `ruff check` for Python changes.
 6. Open a PR against `main` with a clear description.
 

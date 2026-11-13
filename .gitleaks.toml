@@ -1,0 +1,17 @@
+# gitleaks: secret scan of every pushed commit range (ci.yml) and of the
+# whole history once a week (weekly.yml). The default rules apply; the
+# exceptions below are narrow, so a real secret anywhere else still fails.
+
+title = "WSE"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Key pairs that exist only for the JWT tests"
+paths = ['''^tests/keys/[a-z0-9]+_private\.pem$''']
+
+[[allowlists]]
+description = "Example JWT claims in the documentation"
+regexTarget = "line"
+regexes = ['''jwt_(?:issuer|audience)="[a-z-]+"''']

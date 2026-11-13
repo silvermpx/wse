@@ -21,10 +21,148 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # What changed: a docs-only change skips the builds. ci-ok below is the one
+  # result to require; it counts a skipped job as passed.
+  # ---------------------------------------------------------------------------
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      server: ${{ steps.filter.outputs.server }}
+      python_client: ${{ steps.filter.outputs.python_client }}
+      ts_client: ${{ steps.filter.outputs.ts_client }}
+      benchmarks: ${{ steps.filter.outputs.benchmarks }}
+    steps:
+      # Credentials stay: on a push the filter fetches the previous commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'rust/**'
+              - 'deny.toml'
+              - '.github/workflows/ci.yml'
+            server:
+              - 'rust/**'
+              - 'wse_server/**'
+              - 'tests/**'
+              - 'pyproject.toml'
+              - '.github/workflows/ci.yml'
+            python_client:
+              - 'python-client/**'
+              - '.github/workflows/ci.yml'
+            ts_client:
+              - 'ts-client/**'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'tsconfig.json'
+              - 'vitest.config.ts'
+              - '.github/scripts/npm-consumer-check.sh'
+              - '.github/workflows/ci.yml'
+            benchmarks:
+              - 'benchmarks/**'
+              - '.github/workflows/ci.yml'
+
+  # ---------------------------------------------------------------------------
+  # Repository checks (cargo xtask): comments, engine boundary, commit messages
+  # ---------------------------------------------------------------------------
+  checks:
+    name: Repository checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0  # the commit message check reads the pushed range
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: "xtask -> target"
+
+      - name: xtask (fmt, clippy, tests)
+        working-directory: xtask
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+
+      - name: Comments and engine boundary
+        run: cargo xtask lint
+
+      - name: Commit messages
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            range="$PR_BASE..$PR_HEAD"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ] \
+               && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            range="$BEFORE..$AFTER"
+          else
+            range="$AFTER~1..$AFTER"
+          fi
+          cargo xtask commits "$range"
+
+  # ---------------------------------------------------------------------------
+  # Secrets: gitleaks over the pushed commits (the full history weekly)
+  # ---------------------------------------------------------------------------
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o gitleaks.tgz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tgz" | sha256sum -c -
+          tar -xzf gitleaks.tgz gitleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Scan the pushed commits
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            range="$PR_BASE..$PR_HEAD"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ] \
+               && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            range="$BEFORE..$AFTER"
+          else
+            range=""  # a new branch or a rewritten one: the whole history
+          fi
+          gitleaks git --config .gitleaks.toml --redact --no-banner --exit-code 1 \
+            ${range:+--log-opts="$range"} .
+
+  # ---------------------------------------------------------------------------
   # TS client: type-check, unit tests, build, consumer check
   # ---------------------------------------------------------------------------
   client:
     name: Client (TS)
+    needs: changes
+    if: needs.changes.outputs.ts_client == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -61,6 +199,8 @@ jobs:
   # ---------------------------------------------------------------------------
   python-client:
     name: Python Client (Python ${{ matrix.python }})
+    needs: changes
+    if: needs.changes.outputs.python_client == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -96,6 +236,8 @@ jobs:
   # ---------------------------------------------------------------------------
   lint:
     name: Lint
+    needs: changes
+    if: needs.changes.outputs.server == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -126,6 +268,8 @@ jobs:
   # ---------------------------------------------------------------------------
   rust-lint:
     name: Rust Lint
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -152,6 +296,8 @@ jobs:
   # ---------------------------------------------------------------------------
   rust-test:
     name: Rust Tests
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -185,6 +331,8 @@ jobs:
   # ---------------------------------------------------------------------------
   rust-msrv:
     name: Rust MSRV
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -226,6 +374,8 @@ jobs:
   # ---------------------------------------------------------------------------
   test:
     name: Test (Python ${{ matrix.python }})
+    needs: changes
+    if: needs.changes.outputs.server == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -274,6 +424,8 @@ jobs:
   # ---------------------------------------------------------------------------
   benchmarks:
     name: Benchmarks (build)
+    needs: changes
+    if: needs.changes.outputs.benchmarks == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -317,15 +469,25 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+      # cargo-deny (deny.toml): advisories, yanked crates, licenses, sources
+      # and wildcard versions, for the extension, xtask and the benchmarks.
+      - name: Rust dependencies (extension)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # v2.1.1
         with:
-          toolchain: stable
+          manifest-path: rust/Cargo.toml
+          command: check
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+      - name: Rust dependencies (xtask)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # v2.1.1
+        with:
+          manifest-path: xtask/Cargo.toml
+          command: check
 
-      - name: Rust dependency audit
-        run: cargo audit --file rust/Cargo.lock
+      - name: Rust dependencies (benchmarks)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # v2.1.1
+        with:
+          manifest-path: benchmarks/rust-bench/Cargo.toml
+          command: check
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
@@ -351,3 +513,25 @@ jobs:
           cat /tmp/client-requirements.txt
           python -m pip install --quiet 'pip-audit==2.10.1'
           python -m pip_audit --strict --no-deps --disable-pip --progress-spinner off -r /tmp/client-requirements.txt
+
+  # ---------------------------------------------------------------------------
+  # The one result to require for merging: every job passed or was skipped
+  # because nothing it covers changed.
+  # ---------------------------------------------------------------------------
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [changes, checks, secrets, client, python-client, lint, rust-lint, rust-test, rust-msrv, test, benchmarks, security]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job passed or was skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | python3 -c '
+          import json, sys
+          results = {name: job["result"] for name, job in json.load(sys.stdin).items()}
+          print(json.dumps(results, indent=2))
+          bad = [name for name, result in results.items() if result not in ("success", "skipped")]
+          if bad:
+              sys.exit("failed or cancelled: " + ", ".join(bad))'
