@@ -71,8 +71,10 @@ TCP accept
 
 Each connection has one write task, the only writer to its socket. It has two sources:
 
-- **The control queue** (unbounded mpsc of `WsFrame`): server_ready, replies, `send_event`, close frames. `WsFrame::Msg(Message)` is encoded by the write task; `WsFrame::PreFramed(Bytes)` is already wire bytes.
+- **The control queue** (unbounded mpsc of `WsFrame`): server_ready, replies, `send_event`, close frames. `WsFrame::Msg(Message)` is encoded by the write task.
 - **The broadcast buffer**: fan-out frames built once and shared by every subscriber (`Bytes`, reference counted), not copied per connection.
+
+On an E2E session the write task seals every frame itself, in the order of the wire: it alone holds the session's sending keys, which arrive as `WsFrame::InstallSeal` right behind server_hello, and every producer queues plaintext as `WsFrame::Seal(Bytes)` on the control queue, fan-out included.
 
 tungstenite only reads. After the upgrade its writes are discarded, so its automatic pongs and close replies can never land inside a frame the write task is in the middle of; the read loop queues pongs and the write task answers a client's close frame.
 
@@ -100,9 +102,11 @@ Server-to-client WebSocket frames do not require masking (per RFC 6455). This me
 broadcast_all("hello")
   -> encode_ws_frame(0x01, "hello")   // opcode=text, build header+payload
   -> Bytes (Arc-shared, single allocation)
-  -> WsFrame::PreFramed(bytes.clone()) sent to every connection's channel
+  -> appended to every connection's broadcast buffer (a clone of the Arc)
   -> Write task: raw TCP write (bypasses tungstenite)
 ```
+
+A connection that asked for msgpack gets a second shared frame, encoded once on first use for all such connections; an E2E connection gets the payload sealed for it (see Dual Write Path).
 
 The frame encoding handles all three WebSocket payload length formats (7-bit, 16-bit, 64-bit) and sets FIN=1 on every frame.
 
@@ -562,7 +566,8 @@ ts-client/
 +-- utils/
     +-- logger.ts                  Structured logging with levels
     +-- circuitBreaker.ts          Client-side circuit breaker
-    +-- security.ts                AES-GCM encryption, HMAC signing, ECDH key exchange
+    +-- security.ts                E2E encryption: session mode and the first design
+    +-- e2eSession.ts              E2E session: handshake check, key schedule, frames
 ```
 
 ### useWSE Hook
@@ -593,14 +598,17 @@ interface WSEConfig {
     mode?: string;                  // default: 'adaptive'
     baseDelay?: number;             // default: 1000
     maxDelay?: number;              // default: 30000
-    maxAttempts?: number;           // default: 10
+    maxAttempts?: number;           // default: -1 (forever)
     factor?: number;                // default: 1.5
     jitter?: boolean;               // default: true
   };
   security?: {
     encryptionEnabled?: boolean;    // default: false
-    messageSignature?: boolean;     // default: false
+    serverKeys?: string[];          // the server identity keys to pin
+    unauthenticated?: boolean;      // accept any server instead
+    legacyE2e?: boolean;            // the first design, for servers before 3.0
   };
+  wireFormat?: 'json' | 'msgpack';  // default: 'json'
   performance?: {
     compressionThreshold?: number;  // default: 1024
     batchSize?: number;             // default: 10
@@ -646,7 +654,8 @@ python-client/wse_client/
 +-- protocol.py            MessageCodec (prefix strip, JSON parse, envelope)
 +-- compression.py         zlib compress/decompress
 +-- msgpack_handler.py     msgpack encode/decode (optional dependency)
-+-- security.py            ECDH P-256, AES-GCM-256, HMAC-SHA256
++-- security.py            E2E encryption: session mode and the first design
++-- e2e_session.py         E2E session: handshake check, key schedule, frames
 +-- circuit_breaker.py     CLOSED/OPEN/HALF_OPEN state machine
 +-- rate_limiter.py        Token bucket
 +-- event_sequencer.py     Id dedup + per-topic (epoch, offset) gap detection

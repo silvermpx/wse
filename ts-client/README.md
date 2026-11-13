@@ -154,7 +154,12 @@ useWSE('cookie', ['notifications'], {
 
   security: {
     encryptionEnabled: false,                 // require E2E encryption (fails closed, see below)
+    serverKeys: [SERVER_KEY],                 // with encryption: the server's identity key(s) to pin
+    // unauthenticated: true,                 //   or accept any server (passive listeners only)
+    // legacyE2e: true,                       //   or the first design, for servers before 3.0
   },
+
+  wireFormat: 'json',                         // 'msgpack': msgpack both ways (not inside E2E frames)
 
   performance: {
     batchSize: 10,                            // messages per flush step of the outgoing queue
@@ -305,15 +310,22 @@ When the server runs with `recovery_enabled`, topic publications carry `tp`/`e`/
 
 ## Encryption
 
-With `security.encryptionEnabled: true` the client **fails closed**:
+With `security.encryptionEnabled: true` every frame is sealed for the server alone, and the server
+proves who it is: pin its identity key, what its `e2e_identity_public_key()` returns, in
+`security.serverKeys` (two during a key rotation). `security.unauthenticated: true` accepts any
+server instead (safe only from passive listeners), `security.legacyE2e: true` speaks the first design
+to servers before 3.0; with none of the three the session does not start. Setup, guarantees and the
+wire format: [SECURITY.md](../docs/SECURITY.md#end-to-end-encryption).
 
-- Only the control frames `client_hello` (which carries the client's public key), heartbeat `ping`
-  and `PONG` are ever sent in plaintext. Every application message, including the resubscribe, waits
-  until the ECDH key exchange completes and is then sent AES-GCM encrypted.
-- Encrypted frames that arrive while the key is being derived are kept and decrypted once it exists.
-- If the server does not confirm encryption in `server_hello`, reports `KEY_EXCHANGE_FAILED`, or no
-  key arrives in time, the connection is closed, the state becomes `ERROR` and `wseEncryptionFailed`
-  is dispatched. Nothing is sent in plaintext instead.
+The client **fails closed**:
+
+- Only `client_hello` (which carries the offer) goes in plaintext. After the handshake every frame
+  is sealed, both ways, heartbeats included; application messages, the resubscribe among them, wait
+  for the handshake, and a heartbeat due meanwhile is skipped.
+- If the server's identity does not check, a frame does not open (replayed, reordered, forged), or
+  the server refuses (`KEY_EXCHANGE_FAILED`, `E2E_UNSUPPORTED`, no key in time), the connection is
+  closed, the state becomes `ERROR` and `wseEncryptionFailed` is dispatched. Nothing is sent in
+  plaintext instead.
 - Web Crypto needs a secure context (https:// or localhost); without it an encrypted session does not
   connect at all.
 - A message sent with `{ encrypted: true }` on a session without encryption is refused (`'dropped'`).
@@ -345,9 +357,9 @@ The logger defaults to `WARN` in production and `INFO` in development (`WSE_LOG_
 |---------|-------------|
 | **Auto-reconnection** | Exponential, linear, fibonacci or adaptive backoff with jitter, infinite by default |
 | **Offline queue** | `{ offline: true }` messages persist in IndexedDB and replay after reconnecting |
-| **E2E encryption** | ECDH P-256 + AES-GCM-256, per-connection keys via Web Crypto; fails closed |
+| **E2E encryption** | Sessions with a pinned server identity via Web Crypto; fails closed |
 | **Compression** | Inflates `C:` (zlib) frames from the server with a size limit |
-| **MessagePack** | Decodes `M:` binary frames via `@msgpack/msgpack` |
+| **MessagePack** | `wireFormat: 'msgpack'`: msgpack both ways via `@msgpack/msgpack` (24-41% fewer bytes than JSON) |
 | **Rate limiting** | Configurable client-side token bucket (default 1000 burst, 100 msg/s); control frames exempt |
 | **Circuit breaker** | Pauses reconnects after 5 consecutive failures (60 s), reset by `forceReconnect` |
 | **Idempotent delivery** | Per-topic `(epoch, offset)` dedup, gap reporting, recovery from the last delivered offset |
@@ -397,7 +409,7 @@ import { WSE_VERSION, WS_CLIENT_VERSION, WS_PROTOCOL_VERSION, clearWSEStorage } 
 Speaks WSE wire protocol v1, identical to the Python client:
 
 - **Text frames:** JSON with `c` field for category (`WSE`, `S`, `U`)
-- **Binary frames:** Codec prefix (`C:` zlib, `M:` msgpack, `E:` AES-GCM) + payload
+- **Binary frames:** Codec prefix (`C:` zlib, `M:` msgpack, `E:` E2E sealed) + payload
 - **Recovery stamp:** topic publications carry `tp` (topic), `e` (epoch, 8-hex), `o` (offset)
 - **Heartbeat:** JSON PING/PONG with latency tracking
 - **Protocol negotiation:** `client_hello`/`server_hello` handshake with feature discovery

@@ -16,18 +16,18 @@ If the HELLO handshake fails - wrong magic bytes, unsupported version, or malfor
 
 ## Frame Format
 
-All frames share a common 8-byte header:
+On the wire every frame follows a 4-byte big-endian length (u32), the length of the frame after it. A frame starts with an 8-byte header:
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 1 | type | Message type (0x01 - 0x0D) |
-| 1 | 1 | flags | Bit 0: compressed (zstd); bit 1: has recovery trailer; bits 2-7: reserved |
+| 1 | 1 | flags | Per type: MSG bit 0 compressed (zstd), bit 1 recovery trailer; RESYNC bit 0 continuation; PresenceFull bits 0-2 sync round; otherwise 0 |
 | 2 | 2 | topic_len | Topic field length (little-endian u16) |
 | 4 | 4 | payload_len | Payload field length (little-endian u32) |
 | 8 | N | topic | Topic string (UTF-8, N = topic_len) |
 | 8+N | M | payload | Payload data (M = payload_len) |
 
-Maximum frame size: 1,048,576 bytes (1 MB). Frames exceeding this limit are rejected and the connection is reset.
+Maximum frame size: 1,048,576 bytes (1 MB). A frame over this limit ends the link; a node never sends one (a publish too large for it reaches local subscribers only).
 
 ## Message Types
 
@@ -38,12 +38,12 @@ Carries a topic-addressed message from one node to subscribers on another.
 ```
 [header: type=0x01, flags, topic_len=N, payload_len=M]
 [N bytes: topic string]
-[M bytes: message payload (pre-framed WebSocket data)]
+[M bytes: message payload]
 ```
 
 If FLAG_COMPRESSED (0x01) is set in the flags byte, the payload is zstd-compressed. The receiver decompresses before dispatching to local subscribers.
 
-The payload contains pre-framed WebSocket data. This means the sending node has already formatted the message for WebSocket delivery, so the receiving node can forward it directly to connected clients without re-serialization.
+The payload is the message as the sending node's own subscribers got it: JSON text, with its recovery stamp when recovery is on. The receiving node builds the WebSocket frame once for all of its subscribers (and msgpack or sealed frames for those that need them).
 
 If FLAG_HAS_RECOVERY (0x02) is set, a 12-byte **recovery trailer** is appended *after* the payload (and is **not** counted in `payload_len`): a little-endian `u32` origin epoch followed by a little-endian `u64` origin offset. The receiving node stores the payload in a foreign recovery buffer keyed by `(topic, origin_epoch)`, so a client that reconnects to a different node can still recover with its original `(epoch, offset)` — provided that node had interest in (and therefore received) the topic's messages.
 
@@ -75,6 +75,7 @@ The magic bytes `WSE\x00` prevent accidental connections from non-WSE services. 
 | 0 | CAP_INTEREST_ROUTING | SUB/UNSUB/RESYNC support |
 | 1 | CAP_COMPRESSION | zstd compression support |
 | 2 | CAP_PRESENCE | Presence sync support |
+| 3 | CAP_RECOVERY | MSG frames carry the origin's recovery position |
 
 Negotiated capabilities are the bitwise AND of both peers. A feature is only active when both sides advertise support for it.
 
@@ -84,7 +85,7 @@ Negotiated capabilities are the bitwise AND of both peers. A feature is only act
 [header: type=0x05, all other fields zero]
 ```
 
-Sent when a node is shutting down cleanly. The receiving peer removes the sender from its peer table without triggering reconnection logic. After sending SHUTDOWN to all peers, the node cancels all peer tasks immediately.
+Sent when a node is shutting down cleanly. The receiver ends the link at once instead of waiting for the heartbeat timeout, and drops the sender's interest and presence. A peer that dials the node keeps dialing it with backoff, so it is back as soon as the node restarts (a peer learned through gossip is given up after 10 failed attempts). After sending SHUTDOWN to all peers, the node cancels all peer tasks immediately.
 
 ### SUB (0x06) - Topic Subscribe
 
@@ -95,7 +96,7 @@ Sent when a node is shutting down cleanly. The receiving peer removes the sender
 
 Sent when the first local client on a node subscribes to a topic. The receiving peer records this interest so it can route matching MSG frames to the sender.
 
-Topics are matched by exact string comparison.
+A topic with `*` or `?` is a pattern: the peer forwards every topic it matches. A peer holds at most 1,000,000 topics of each node, names of at most 256 bytes (the longest a node subscribes); anything past that is ignored.
 
 ### UNSUB (0x07) - Topic Unsubscribe
 
@@ -113,9 +114,9 @@ Sent when the last local client on a node unsubscribes from a topic. The receivi
 [N bytes: newline-separated topic list]
 ```
 
-Sent after a peer reconnects to re-establish the full interest table. The receiver replaces any stale interest state for the sender with the topics in this message. This prevents interest drift caused by missed SUB/UNSUB messages during disconnection.
+The sender's whole interest. The receiver replaces what it held for the sender with these topics. A list over the frame limit is split: the first frame (flags 0) replaces, the following ones (flags 0x01) extend, and only within the same link.
 
-RESYNC is also re-sent periodically on every peer link — every 60 seconds (`CLUSTER_RESYNC_INTERVAL_SECS`) — as a drift safety-net, so a lost SUB/UNSUB on a live link is self-healing and not only corrected on reconnect.
+The cluster manager sends it when a link comes up, queued in the same order as every SUB and UNSUB after it, so a subscription made while the link came up reaches the peer after the snapshot, never before it. It sends it again on every link every 60 seconds (`CLUSTER_RESYNC_INTERVAL_SECS`), whole or not at all, so a SUB or UNSUB dropped on a full link heals.
 
 ### PeerAnnounce (0x09) - Address Gossip
 
@@ -134,7 +135,7 @@ Sent by a node to announce its own cluster address to peers. Used during dynamic
 [For each peer: 2 bytes addr_len (little-endian u16) + addr_len bytes address string]
 ```
 
-Response to a PeerAnnounce or sent periodically during discovery. Contains the full list of known peer addresses, allowing a newly joined node to connect to all existing members of the mesh.
+Sent by both sides when a link comes up. Contains the known peer addresses, so a newly joined node connects to every member of the mesh.
 
 ### PresenceUpdate (0x0B) - Presence Delta
 
@@ -161,11 +162,13 @@ Action values:
 ### PresenceFull (0x0C) - Full Presence Sync
 
 ```
-[header: type=0x0C, topic_len=0, payload_len=M]
+[header: type=0x0C, flags, topic_len=0, payload_len=M]
 [M bytes: JSON state]
 ```
 
-Sent when a new peer connects and completes the HELLO handshake. The payload is the full local presence state serialized as JSON:
+The sender's whole local presence, as a sync round: one frame or several, flags `0x04` on each, `0x01` on the first and `0x02` on the last. The receiver merges every frame as it comes, and at the end of the round drops whatever it held for the sender that the round did not hold, so a leave lost on the way leaves no ghost. The cluster manager sends a round when a link comes up, in order with every PresenceUpdate after it, and again, on the next 60-second tick, to a peer whose link was too full for a presence update. Frames without the flags (from older nodes) are merged as they come.
+
+The payload is presence state as JSON:
 
 ```json
 {
@@ -176,7 +179,7 @@ Sent when a new peer connects and completes the HELLO handshake. The payload is 
 }
 ```
 
-The receiver merges this state into its own presence tables, creating **per-origin** sentinel entries (`__remote__<origin>\x1F<user_id>`, one per origin+user) for remote users, so one peer's leave or disconnect can't erase a user still present via another peer. A large state may be split across multiple PresenceFull frames (chunked under the frame-size budget) and merged additively. Only entries with local connections (not re-synced remote entries) are included in the outgoing full sync to prevent infinite amplification.
+The receiver merges this state into its own presence tables, creating **per-origin** sentinel entries (`__remote__<origin>\x1F<user_id>`, one per origin+user) for remote users, so one peer's leave or disconnect can't erase a user still present via another peer. Only entries with local connections (not remote ones) are sent, so state never echoes around the mesh.
 
 ### DRAIN (0x0D) - Lame Duck
 
@@ -203,7 +206,7 @@ With CAP_INTEREST_ROUTING negotiated, nodes only forward messages to peers that 
 
 Subscription tracking uses reference counting. The first local subscriber for a topic triggers a SUB to peers; the last unsubscribe triggers an UNSUB. This prevents duplicate SUB/UNSUB messages when multiple local clients share the same topic.
 
-**Reconnection behavior**: after a peer reconnects and completes the HELLO handshake, it sends a RESYNC containing its full topic list. The receiving node replaces any stale interest state for that peer. Before RESYNC is received, the safe default is to forward all MSG frames to that peer (preventing message loss during the resync window).
+**When a link comes up**, each side sends a RESYNC with its full topic list, and the receiving node replaces any stale interest for that peer. Until the first RESYNC arrives, the safe default is to forward every MSG to that peer (no message is lost meanwhile).
 
 **Known trade-off**: a SUB message may arrive at a peer after a MSG for that topic has already been sent. This is an accepted at-most-once delivery semantic - the alternative (buffering all messages until SUB confirmation) adds latency and complexity without meaningful benefit for real-time workloads.
 
@@ -238,7 +241,7 @@ WSE supports two modes of cluster formation:
 
 **Dynamic**: nodes discover each other through address gossip. A node joining the cluster connects to one or more seed nodes, sends a PeerAnnounce with its own address, and receives a PeerList of known members. The node then connects to any peers it does not already have connections to.
 
-Gossip is lightweight - PeerAnnounce and PeerList are only exchanged during join and on periodic intervals, not on every message.
+Gossip is lightweight: PeerAnnounce and PeerList go out when links come up, and a node relays a PeerAnnounce to its other peers only for an address it did not know yet.
 
 ## Reliability
 
@@ -250,7 +253,7 @@ Gossip is lightweight - PeerAnnounce and PeerList are only exchanged during join
 | Graceful shutdown | SHUTDOWN frame sent to all peers, then immediate cancel |
 | Dead letter queue | 1,000 entries, FIFO eviction |
 | Write batching | 64 KB batch limit per flush |
-| Backpressure | Bounded per-peer outbound channel (10,000 capacity), messages dropped on overflow. The inbound MSG dispatch queue per peer is likewise bounded (10,000); overflow is shed (counted in `messages_dropped`) so the reader stays responsive to heartbeats, and shed messages remain recoverable via recovery buffers |
+| Backpressure | Bounded per-peer outbound channel (10,000 frames), messages dropped on overflow. The inbound MSG dispatch queue per peer is likewise bounded (10,000); overflow is shed (counted in `messages_dropped`) so the reader stays responsive to heartbeats, and shed messages remain recoverable via recovery buffers. Interest and presence updates reach the manager through bounded queues (65,536); a peer that sends them faster than the manager keeps up waits, slowed down at its socket |
 
 ### Circuit Breaker
 
@@ -258,7 +261,7 @@ Each peer connection has an independent circuit breaker. After 10 consecutive fa
 
 ### Dead Letter Queue
 
-Messages that cannot be delivered to any peer (all connections down, all channels full) are placed in a per-node dead letter queue. The DLQ holds up to 1,000 entries with FIFO eviction - oldest entries are discarded when the queue is full. DLQ contents are exposed through the health snapshot API for monitoring and debugging.
+Publishes and presence updates for a peer whose link has just closed (its channel is gone) go to a per-node dead letter queue; ones dropped on a full channel are only counted (`messages_dropped`). The DLQ holds up to 1,000 entries with FIFO eviction - oldest entries are discarded when the queue is full. `get_cluster_dlq_entries()` takes them, and `health_snapshot()` reports `cluster_dlq_size`.
 
 ### Write Batching
 
@@ -277,18 +280,19 @@ The `cluster_info()` method exposes the current cluster topology from the perspe
 ```python
 peers = server.cluster_info()
 # [
-#     {"address": "10.0.0.2:9999", "instance_id": "a1b2c3...", "connected": True},
-#     {"address": "10.0.0.3:9999", "instance_id": "d4e5f6...", "connected": True},
+#     {"address": "10.0.0.2:9999", "instance_id": "a1b2c3...", "capabilities": 15, "connected_at": 1731470000123},
+#     {"address": "10.0.0.3:41822", "instance_id": "d4e5f6...", "capabilities": 15, "connected_at": 1731470000456},
 # ]
 ```
 
-Each entry contains:
+One entry per live link:
 
 | Field | Description |
 |-------|-------------|
-| `address` | Peer's cluster address (host:port) |
+| `address` | The address this node dialed, or, for a link the peer dialed, the socket address it came from |
 | `instance_id` | Unique identifier assigned at peer startup (UUID) |
-| `connected` | Whether the TCP connection to this peer is currently active |
+| `capabilities` | The capabilities negotiated with this peer (bitmask) |
+| `connected_at` | When the link came up (milliseconds since the epoch) |
 
 Use `cluster_info()` for monitoring dashboards, verifying that gossip discovery has converged, and debugging connectivity issues between nodes.
 

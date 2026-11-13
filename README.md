@@ -27,8 +27,7 @@ High-performance WebSocket server built in Rust with native clustering, E2E encr
 | **Idle detection** | Server pings every 25s, closes connections that sent nothing for 60s; every server close is enforced 5s later |
 | **Drain mode** | Lock-free crossbeam bounded channel, Python acquires GIL once per batch (not per event) |
 | **Compression** | zlib for client-facing messages above threshold (default 1024 bytes) |
-| **MessagePack** | Opt-in binary transport via `?format=msgpack`, roughly 2x faster serialization, 30% smaller |
-| **Message signing** | Selective HMAC-SHA256 signing for critical operations, nonce-based replay prevention |
+| **MessagePack** | Opt-in binary transport via `?format=msgpack`: everything the server sends such a client goes in msgpack (topics, broadcasts, replays, direct sends), and it may send in msgpack too; 24-41% fewer bytes than JSON on typical messages |
 | **Queue groups** | Round-robin dispatch within named groups for load-balanced worker pools |
 | **Topic ACL** | Per-connection allow/deny glob patterns for topic access control |
 | **Graceful drain** | `drain()` sends Close frame to all clients, rejects new connections, notifies cluster peers |
@@ -37,19 +36,22 @@ High-performance WebSocket server built in Rust with native clustering, E2E encr
 
 | Feature | Details |
 |---------|---------|
-| **Key exchange** | ECDH P-256 (per-connection keypair, automatic during handshake) |
-| **Encryption** | AES-GCM-256 with unique 12-byte IV per message |
-| **Key derivation** | HKDF-SHA256 (no salt, info: `wse-encryption/aes-gcm-key`) |
-| **Wire format** | `E:` prefix + 12-byte IV + AES-GCM ciphertext + 16-byte auth tag |
-| **Key rotation** | Configurable rotation interval (default 1 hour), automatic renegotiation |
-| **Replay prevention** | Nonce cache (10K entries, 5-minute TTL) on the client side |
+| **Server identity** | The server signs every handshake with its identity key (ECDSA P-256, `e2e_identity_key`); clients pin the public key (`e2e_identity_public_key()`), so nothing in between, such as a TLS-terminating proxy, can answer for the server |
+| **Key exchange** | Ephemeral ECDH P-256 on both sides, per connection |
+| **Keys** | HKDF-SHA256 bound to the handshake transcript, one key schedule per direction |
+| **Frames** | AES-256-GCM; the nonce is the frame's sequence number, and only the next frame opens: a replayed, reordered, dropped or foreign frame ends the connection |
+| **Rekeying** | Each direction moves to a new key after 2^20 frames or 10 minutes |
+| **Everything sealed** | After the handshake every frame is sealed, pings and protocol messages included |
+| **Older clients** | `e2e_legacy=True` (the default) still serves 2.x clients with the first design: one key, random nonces, no server identity |
+
+See [SECURITY.md](docs/SECURITY.md#end-to-end-encryption) for setup and the threat model.
 
 ### Cluster Protocol
 
 | Feature | Details |
 |---------|---------|
 | **Topology** | Full TCP mesh, direct peer-to-peer connections |
-| **Wire format** | Custom binary frames: 8-byte header + topic + payload, 12 message types |
+| **Wire format** | Length-prefixed binary frames: 8-byte header + topic + payload, 13 message types |
 | **Interest routing** | SUB/UNSUB/RESYNC frames, messages forwarded only to peers with matching subscribers |
 | **Gossip discovery** | PeerAnnounce/PeerList frames, new nodes need one seed address to join |
 | **mTLS** | rustls + tokio-rustls, P-256 certificates, WebPkiClientVerifier for both sides |
@@ -57,8 +59,8 @@ High-performance WebSocket server built in Rust with native clustering, E2E encr
 | **Heartbeat** | 5s ping interval, 15s timeout, dead peer detection |
 | **Circuit breaker** | 10 failures to open, 60s reset, 3 half-open probe calls |
 | **Dead letter queue** | 1000-entry ring buffer for failed cluster sends |
-| **Presence sync** | PresenceUpdate/PresenceFull frames, CRDT last-write-wins conflict resolution |
-| **Topology API** | `cluster_info()` returns connected peer list with address, instance_id, status |
+| **Presence sync** | PresenceUpdate frames, last-write-wins; a full sync round on connect, and again for a peer that missed an update, drops what the round does not hold |
+| **Topology API** | `cluster_info()` returns the linked peers: address, instance_id, capabilities, connected_at |
 
 ### Presence Tracking
 
@@ -91,14 +93,13 @@ High-performance WebSocket server built in Rust with native clustering, E2E encr
 | **Connection pool** | Multi-endpoint with health scoring, 3 load balancing strategies, automatic failover |
 | **Circuit breaker** | CLOSED/OPEN/HALF_OPEN state machine, prevents connection storms |
 | **Rate limiting** | Client-side token bucket, coordinates with server feedback |
-| **E2E encryption** | Wire-compatible AES-GCM-256 + ECDH P-256 (both clients speak the same protocol) |
+| **E2E encryption** | Sessions with a pinned server identity (both clients speak the same protocol), the first design for 2.x servers |
 | **Event sequencing** | Duplicate detection (sliding window) + per-topic `(epoch, offset)` idempotent dedup with automatic gap recovery |
 | **Network monitor** | Real-time latency, jitter, and connection-quality scoring (Python client also estimates packet loss) |
 | **Priority queues** | 5 levels from CRITICAL to BACKGROUND |
 | **Offline queue** | IndexedDB persistence (TypeScript), replayed on reconnect |
 | **Compression** | Automatic zlib for messages above threshold |
-| **MessagePack** | Binary encoding for smaller payloads and faster serialization |
-| **Message signing** | HMAC-SHA256 integrity verification |
+| **MessagePack** | `wire_format="msgpack"` / `wireFormat: 'msgpack'`: msgpack both ways |
 
 ### Transport Security
 
@@ -198,6 +199,8 @@ token = rust_jwt_encode(
 | `max_inbound_queue_bytes` | 67108864 | The same budget in bytes (default 64 MB); a single larger message still gets into an empty queue |
 | `allowed_origins` | None | Origins (`scheme://host[:port]`) browsers may connect from; others get HTTP 403. `None` checks nothing |
 | `client_subscriptions` | False | Answer the clients' own subscribe, unsubscribe and recovery requests in the server, within each connection's topic ACL; otherwise they reach the application as messages |
+| `e2e_identity_key` | None | PEM or DER (PKCS#8) ECDSA P-256 private key the server signs E2E handshakes with; clients pin its public key, `e2e_identity_public_key()`. Without it, E2E clients must accept an unauthenticated server |
+| `e2e_legacy` | True | Also serve the first E2E design (2.x clients); `False` refuses it with close code 4800 |
 
 ---
 
@@ -263,15 +266,17 @@ server.broadcast(topic, text)                    # Fan-out to topic subscribers 
 |--------|-------|-------|
 | `send` | Single connection | Raw text frame |
 | `send_bytes` | Single connection | Raw binary frame |
-| `send_event` | Single connection | JSON-serialized, compressed if above threshold, deduplication via 50K-entry FIFO window |
+| `send_event` | Single connection | JSON-serialized (msgpack for msgpack clients), compressed if above threshold, deduplication via 50K-entry FIFO window |
 | `broadcast_all` | All connections | Pre-framed, single frame build shared via Arc |
 | `broadcast_local` | Topic (local) | Pre-framed, DashMap subscriber lookup, stored in recovery buffer if enabled |
 | `broadcast` | Topic (all nodes) | Local fan-out + forwarded to cluster peers with matching interest |
 
+A client that asked for msgpack (`?format=msgpack`) gets in msgpack whatever would go to it as JSON text: topic messages, broadcasts, recovery replays, `send` and `send_event`. Bytes sent with `send_bytes` or `broadcast_all_bytes` go as they are.
+
 ### Topic Subscriptions
 
 ```python
-server.subscribe_connection(conn_id, ["prices", "news"])              # Subscribe to topics
+server.subscribe_connection(conn_id, ["prices", "news"])              # Subscribe; returns the topics it took (ACL, limits)
 server.subscribe_connection(conn_id, ["chat"], {"status": "online"})  # Subscribe with presence data
 server.subscribe_connection(conn_id, ["tasks"], queue_group="workers") # Subscribe with queue group (round-robin)
 server.unsubscribe_connection(conn_id, ["news"])                      # Unsubscribe from specific topics
@@ -364,7 +369,7 @@ server.connect_cluster(peers=["10.0.0.2:5007"], single_port=True)
 
 server.cluster_connected()       # True if connected to at least one peer
 server.cluster_peers_count()     # Number of active peer connections
-server.cluster_info()            # List of connected peers (address, instance_id, connected)
+server.cluster_info()            # Linked peers (address, instance_id, capabilities, connected_at)
 ```
 
 Nodes form a full TCP mesh automatically. The cluster protocol uses a custom binary frame format with an 8-byte header, 12 message types, and capability negotiation during handshake. Features:
@@ -435,13 +440,22 @@ Token delivery:
 
 Required claims: `sub` (user ID), `exp` (expiration). Recommended: `iat` (issued at). Optional: `iss`, `aud` (validated if configured).
 
+`server.issue_token(sub, ttl=900, claims=None)` signs a token with the server's own configuration, for a login endpoint in the same process; `server.reload_jwt_keys(...)` swaps keys on a running server.
+
 ### End-to-End Encryption
 
-Per-connection session keys via ECDH P-256 key exchange, AES-GCM-256 encryption, HKDF-SHA256 key derivation.
+On top of TLS, a client can seal every frame for the server alone. The server proves who it is with an identity key:
 
-Wire format: `E:` prefix + 12-byte IV + AES-GCM ciphertext + 16-byte auth tag.
+```bash
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out e2e-identity.pem
+```
 
-Enable on the client side - the server handles key exchange automatically during the handshake.
+```python
+server = RustWSEServer("0.0.0.0", 5007, jwt_secret=..., e2e_identity_key=open("e2e-identity.pem", "rb").read())
+print(server.e2e_identity_public_key())   # the key clients pin (base64)
+```
+
+Clients pin that key: `AsyncWSEClient(url, encryption=True, e2e_server_keys=[key])` in Python, `security: { encryptionEnabled: true, serverKeys: [key] }` in TypeScript. After the handshake every frame is sealed with a key per direction (AES-256-GCM, sequence numbers, rekeying); a replayed or forged frame ends the connection. Setup, key rotation and the threat model: [docs/SECURITY.md](docs/SECURITY.md#end-to-end-encryption).
 
 ### Rate Limiting
 
@@ -465,9 +479,9 @@ WSE uses a custom wire protocol with categorized JSON messages:
 
 **Text frames:** JSON with `c` field for category: `"WSE"` (system), `"S"` (snapshot), `"U"` (update)
 
-**Binary frames:** `C:` (zlib compressed), `M:` (MessagePack), `E:` (AES-GCM encrypted), raw zlib (0x78 magic byte)
+**Binary frames:** `C:` (zlib compressed), `M:` (MessagePack), `E:` (E2E sealed), raw zlib (0x78 magic byte)
 
-**MessagePack transport:** opt-in per connection via `?format=msgpack` query parameter. Roughly 2x faster serialization and 30% smaller payloads.
+**MessagePack transport:** opt-in per connection via the `?format=msgpack` query parameter (`wire_format="msgpack"` in the Python client, `wireFormat: 'msgpack'` in the TypeScript one). The server then sends that connection msgpack instead of JSON text, and reads msgpack from it; on typical messages that is 24-41% fewer bytes. E2E sealed frames carry it too.
 
 **Protocol negotiation:** `client_hello`/`server_hello` handshake with feature discovery, capability advertisement, and version agreement.
 

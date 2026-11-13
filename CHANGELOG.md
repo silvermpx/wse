@@ -1,5 +1,115 @@
 # Changelog
 
+## v3.0.0 (unreleased)
+
+A security and correctness release: end-to-end encryption with an
+authenticated server, every delivery path through one per-connection
+route, closes the server enforces, a cluster whose links, interest and
+presence stay consistent, and msgpack on every path. Breaking changes and
+the steps to take are in [docs/MIGRATION.md](docs/MIGRATION.md#migrating-from-v2x-to-v30).
+
+### Breaking changes
+
+- **E2E encryption authenticates the server.** A new session protocol: the
+  server signs each handshake with its identity key (`e2e_identity_key`,
+  ECDSA P-256), clients pin its public key; keys per direction, bound to
+  the handshake; every frame carries an epoch and sequence number, and a
+  replayed, reordered, dropped or forged frame closes the connection. With
+  encryption on, both clients need a pinned key, an explicitly
+  unauthenticated server, or the first design (`e2e_legacy`, kept for 2.x
+  peers on both sides).
+- **Message signing is gone.** It signed nothing (a random key the server
+  never knew, functions without callers, a signature nobody read).
+  `security.messageSignature`, `WSEEvent.signature` and the clients'
+  signing-key rotation are removed.
+- **`connect_cluster()` needs `cluster_port`**, or `single_port=True`;
+  cluster links are no longer taken on the WebSocket port otherwise.
+- **`start()` and `connect_cluster()` raise `OSError`** when they cannot
+  bind; **`drain()` blocks** and returns how many clients it dropped.
+- **JWT options are validated at startup**, missing `iss`/`aud` claims are
+  refused when configured, a malformed `wse_topics` claim denies every
+  topic, and `jwt_*` options without `jwt_secret` are an error.
+- **The rate limit applies to what clients send** (`RATE_LIMITED`, then
+  close 4429); `send_event()` is not throttled.
+- **New close codes** 1013, 4403, 4408, 4429, 4800, 4802, 4803.
+- **`subscribe_connection()` returns the topics it took**; topic names are
+  checked and a connection holds at most 16 patterns.
+- **Out-of-range options and values that cannot be JSON raise
+  `ValueError`** instead of disabling features or crashing the process.
+
+### Added
+
+- **Free-threaded Python**: cp314t and cp315t wheels; every Python class is
+  thread safe.
+- **JWT**: every standard algorithm (HS, RS, PS 256/384/512, ES256/384,
+  EdDSA); `issue_token()` signs with the server's own configuration;
+  `reload_jwt_keys()` swaps keys on a running server.
+- **One crypto library, chosen when building**: aws-lc-rs, or its FIPS
+  140-3 module with the `fips` feature.
+- `accept_connection()` for applications that authenticate connections
+  themselves; connections close (4403) when their token expires.
+- `client_subscriptions=True`: the server answers the clients' own
+  subscribe and recovery requests, within each connection's topic ACL.
+- `allowed_origins` against cross-site WebSocket hijacking;
+  `max_inbound_queue_bytes`; with-statement support; `is_draining()`.
+- Each client decides whether its messages are compressed (`client_hello`,
+  `client_config`, `?compression=false`).
+- msgpack everywhere a client asks for it: topic messages, broadcasts,
+  replays and replies, read back in msgpack too; the TS client's
+  `wireFormat: 'msgpack'`; floats in 32 bits when exact. 24-41% fewer
+  bytes than JSON on typical messages.
+- `wse_server.prometheus.WSECollector` for a prometheus_client registry.
+- Cluster presence sync rounds: a full round on every link, and again for a
+  peer that missed an update, so a lost leave leaves no ghost.
+
+### Fixed (server)
+
+- One delivery path per connection: relayed, queue-group and direct
+  messages no longer reach E2E connections in plaintext, and pattern
+  subscriptions respect the connection's ACL.
+- Closes are enforced (5 s grace), one task writes each socket, the
+  control queue is never held behind broadcasts, and every frame counts
+  as activity.
+- Lifecycle events are never dropped; client messages are bounded by count
+  and by size.
+- `start()`, `drain()`, `stop()` and callback mode keep their promises;
+  a dropped server is stopped; callbacks run in order per connection.
+- Recovery memory stays within its budget, also against a peer naming new
+  epochs; TTL cleanup no longer panics.
+- Presence: no deadlock between updates and tracking; leaves reach every
+  node; remote events report only real changes.
+- Utilities: filters, msgpack, transformer and queues behave as documented;
+  cyclic or deep values raise `ValueError`.
+
+### Fixed (cluster)
+
+- Any node can link to any other, one link per pair; links that end are
+  noticed and redialed; a node no longer dials itself.
+- Interest routing matches what peers subscribed (patterns included);
+  subscriptions made before `connect_cluster()` are advertised; a draining
+  peer gets nothing new.
+- A new link gets the node's interest and presence in order with every
+  change after them; RESYNC is queued whole or not at all; the queues to
+  the manager are bounded.
+- Relayed messages keep the recovery position they got at origin.
+
+### Fixed (clients)
+
+- Python and TypeScript: reconnects that never give up except on an auth
+  rejection or a refused E2E design, fail-closed encryption, gap recovery
+  from the last delivered offset, inbound size limits.
+- TypeScript: one session per page shared by every `useWSE()`; adaptive
+  quality, the compression preference and the idle options work.
+
+### Changed (build and checks)
+
+- PyO3 0.30 and current crates; JWT and the Python crypto helpers on
+  aws-lc-rs; the RustCrypto crates and `rsa` leave the build.
+- CI tests every package, the stub against the compiled module, the FIPS
+  build, and repository rules (`cargo xtask`); cargo-deny, gitleaks.
+- Releases publish only what was built, installed and tested; musllinux and
+  Windows arm64 wheels.
+
 ## v2.5.1 (2026-10-15)
 
 2.5.0 reached PyPI only as wse-server: the publish steps of the Python

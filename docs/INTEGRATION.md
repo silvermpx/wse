@@ -573,12 +573,12 @@ server.cluster_peers_count()    # int - number of active peer connections
 ```python
 peers = server.cluster_info()
 # [
-#     {"address": "10.0.0.2:9999", "instance_id": "a1b2c3...", "connected": True},
-#     {"address": "10.0.0.3:9999", "instance_id": "d4e5f6...", "connected": True},
+#     {"address": "10.0.0.2:9999", "instance_id": "a1b2c3...", "capabilities": 15, "connected_at": 1731470000123},
+#     {"address": "10.0.0.3:41822", "instance_id": "d4e5f6...", "capabilities": 15, "connected_at": 1731470000456},
 # ]
 ```
 
-`cluster_info()` returns a list of connected peer entries. Each entry includes the peer's cluster address, its unique instance ID (assigned at startup), and connection status. Useful for monitoring dashboards and verifying that dynamic peer discovery is working correctly.
+`cluster_info()` returns one entry per live link: the address this node dialed (or, for a link the peer dialed, the socket address it came from), the peer's instance ID (assigned at startup), the negotiated capabilities and when the link came up. Useful for monitoring dashboards and verifying that dynamic peer discovery is working correctly.
 
 ---
 
@@ -825,7 +825,7 @@ Both clients handle reconnection with exponential backoff, automatic resubscript
 - Enable recovery for topics where missed messages matter (chat, order updates, notifications).
 - Set `recovery_memory_budget` to cap total memory across all topic buffers. Default 256 MB is suitable for most workloads.
 - Choose `recovery_buffer_size` as a power of 2 based on message rate and expected reconnect window. For example: 1000 msg/s with 30s reconnect window needs at least 32768 slots.
-- Recovery is local to each node. For cluster deployments, use sticky sessions (HAProxy `stick-table`, consistent hashing) to route clients back to the same node.
+- Recovery works on any node that has subscribers for the topic: nodes keep each other's messages for it under their original positions (see [Cluster Recovery](ARCHITECTURE.md#cluster-recovery)). A node that never had interest in the topic has no history for it, so sticky sessions are what guarantees recovery after a reconnect (HAProxy `stick-table`, consistent hashing by user ID).
 
 ### Cluster Scaling
 

@@ -17,7 +17,7 @@ pip install wse-client
 Optional extras:
 
 ```bash
-pip install wse-client[crypto]   # E2E encryption (ECDH + AES-GCM)
+pip install wse-client[crypto]   # E2E encryption
 pip install wse-client[msgpack]  # MessagePack wire format (wire_format="msgpack")
 pip install wse-client[orjson]   # Faster JSON (de)serialization
 pip install wse-client[all]      # Everything
@@ -84,7 +84,10 @@ client.run_forever()
 | `reconnect` | ReconnectConfig | default config | Reconnection strategy |
 | `extra_headers` | dict[str, str] | None | Additional HTTP headers for the handshake |
 | `queue_size` | int | 1000 | Max events buffered for the iterator / `recv()`; the oldest is dropped when full |
-| `encryption` | bool | False | Require E2E encryption (ECDH P-256 + AES-GCM-256; needs the `[crypto]` extra) |
+| `encryption` | bool | False | Require E2E encryption (needs the `[crypto]` extra and one of the three below) |
+| `e2e_server_keys` | list[str] | None | The server's identity public keys (`e2e_identity_public_key()`, base64) one of which must sign the handshake |
+| `e2e_unauthenticated` | bool | False | Accept a server without an identity key: safe only from passive listeners |
+| `e2e_legacy` | bool | False | Speak the first E2E design, for servers before 3.0 |
 | `endpoints` | list[str] | None | Additional endpoints for the built-in connection pool / failover |
 | `load_balancing` | LoadBalancingStrategy | WEIGHTED_RANDOM | Endpoint selection strategy when `endpoints` is set |
 | `rate_limit` | float \| None | 100 | Outbound limit for `send()` / `send_with_retry()` / `send_batch()` in messages per second; `None` disables it |
@@ -92,7 +95,7 @@ client.run_forever()
 | `offline_queue` | bool | False | Hold messages sent while disconnected and send them once after the next reconnect |
 | `max_message_size` | int \| None | 16 MiB | Largest inbound message, checked on the frame and while inflating compressed frames; `None` disables it |
 | `recovery_timeout` | float | 3.0 | Seconds a topic waits for a recovery replay after an offset gap (`0` never waits) |
-| `wire_format` | str | `"json"` | `"msgpack"` asks the server to send this connection's messages as MessagePack |
+| `wire_format` | str | `"json"` | `"msgpack"`: the server sends this connection MessagePack and the client sends in it too, except inside E2E frames (needs the `[msgpack]` extra) |
 
 The `connect(url, **kwargs)` factory returns an `AsyncWSEClient` (not connected yet) to use as an async context manager.
 
@@ -254,20 +257,23 @@ The client inflates compressed frames from the server (`C:` prefix or raw zlib),
 
 ### E2E Encryption
 
-ECDH P-256 key exchange with AES-GCM-256 encryption. Requires the `cryptography` package:
+Each frame sealed for the server alone, with the server's identity checked. Requires the `cryptography` package:
 
 ```bash
 pip install wse-client[crypto]
 ```
 
-Enable it with `AsyncWSEClient(url, encryption=True)` (it is off by default). The client sends its public key in `client_hello` as the first frame of every connection and derives the session key from the server's key in `server_hello` (HKDF-SHA256). Wire format is the `E:` prefix + 12-byte IV + ciphertext + 16-byte auth tag, compatible with the TS client and Rust server.
+```python
+client = AsyncWSEClient(url, token=token, encryption=True, e2e_server_keys=[SERVER_KEY])
+```
+
+`SERVER_KEY` is what the server's `e2e_identity_public_key()` returns; list two during a key rotation. Instead of pinning, `e2e_unauthenticated=True` accepts any server (safe only from passive listeners), and `e2e_legacy=True` speaks the first design to servers before 3.0. With `encryption=True` and none of the three, the client refuses to start. Setup, guarantees and the wire format: [SECURITY.md](../docs/SECURITY.md#end-to-end-encryption).
 
 Encryption fails closed:
 
-- Every application message (sends, subscriptions, recovery requests, replies) is encrypted. Messages sent before the key exchange completed wait for it; nothing goes out in plaintext.
-- Each connection gets a fresh key; no message is sent with the key of an earlier connection.
-- If the server does not complete the exchange (no encryption support, `KEY_EXCHANGE_FAILED`, no `server_hello` within 10 s), the client closes the connection and ends with `WSEEncryptionError`; it never falls back to plaintext.
-- `client_hello` and the heartbeat `ping` / `PONG` stay plaintext control frames: they carry no application data, and the server answers pings only on its plaintext path.
+- After the handshake every frame is sealed, both ways: application messages, subscriptions, recovery requests, pings and PONGs. Messages sent before the handshake completed wait for it; nothing goes out in plaintext, and a heartbeat due meanwhile is skipped.
+- Each connection runs a fresh session; no frame is sealed with the keys of an earlier one.
+- If the server's identity does not check, a frame does not open (replayed, reordered, forged), or the server refuses (`KEY_EXCHANGE_FAILED`, `E2E_UNSUPPORTED`, no `server_hello` within 10 s), the client closes the connection and ends with `WSEEncryptionError`; it never falls back to plaintext.
 
 ### Circuit Breaker
 
@@ -372,7 +378,7 @@ from wse_client.errors import (
 The client speaks WSE wire protocol v1:
 
 - **Text frames:** JSON with `c` field for category (`WSE`, `S`, `U`)
-- **Binary frames:** Codec prefix (`C:` zlib, `M:` msgpack, `E:` AES-GCM) + payload; with `wire_format="msgpack"` the client asks for `?format=msgpack` and decodes `M:` frames, encrypted ones included
+- **Binary frames:** Codec prefix (`C:` zlib, `M:` msgpack, `E:` E2E sealed) + payload; with `wire_format="msgpack"` the client asks for `?format=msgpack`, decodes `M:` frames (sealed ones included) and sends its messages as `M:` frames
 - **Handshake:** `client_hello` is the first frame of every connection; the connection is ready at the first `server_ready` or `server_hello` (with encryption: once the key exchange completed)
 - **Heartbeat:** JSON PING/PONG with latency tracking (plaintext control frames)
 

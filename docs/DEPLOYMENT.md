@@ -125,7 +125,7 @@ New nodes only need one reachable seed address. The gossip protocol (PeerAnnounc
 
 ### Load Balancer Configuration
 
-For message recovery to work, clients must reconnect to the same node (recovery buffers are local). Use sticky sessions:
+Recovery works on any node that has subscribers for the topic: nodes keep each other's messages for it under their original positions (see [Cluster Recovery](ARCHITECTURE.md#cluster-recovery)). A node that never had interest in the topic has no history for it, so sticky sessions are what guarantees recovery after a reconnect:
 
 **HAProxy:**
 
@@ -192,6 +192,37 @@ COPY app.py .
 
 EXPOSE 5007 9999
 CMD ["python", "app.py"]
+```
+
+WSE itself reads no `WSE_PORT`, `WSE_PEERS` or `WSE_SEEDS`: the compose and Kubernetes files below pass them to this `app.py`, which hands them to the server. (The server reads `WSE_CLUSTER_TLS_CERT`, `WSE_CLUSTER_TLS_KEY` and `WSE_CLUSTER_TLS_CA` itself, when `connect_cluster()` gets no TLS paths, and `RUST_LOG`.)
+
+```python
+# app.py
+import os
+
+from wse_server import RustWSEServer
+
+server = RustWSEServer(
+    "0.0.0.0",
+    int(os.environ.get("WSE_PORT", "5007")),
+    jwt_secret=open("/etc/wse/jwt-secret", "rb").read(),
+)
+server.enable_drain_mode()
+server.start()
+
+def addresses(name):
+    return [a for a in os.environ.get(name, "").split(",") if a]
+
+server.connect_cluster(
+    peers=addresses("WSE_PEERS"),
+    seeds=addresses("WSE_SEEDS") or None,
+    cluster_addr=os.environ.get("WSE_CLUSTER_ADDR"),
+    cluster_port=int(os.environ.get("WSE_CLUSTER_PORT", "9999")),
+    tls_ca="/etc/wse/ca.pem",
+    tls_cert="/etc/wse/node.pem",
+    tls_key="/etc/wse/node.key",
+)
+# ... the application's drain_inbound() loop
 ```
 
 ### Docker Compose (3-node cluster)
@@ -265,6 +296,12 @@ spec:
           env:
             - name: WSE_SEEDS
               value: "wse-0.wse.default.svc.cluster.local:9999"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: WSE_CLUSTER_ADDR
+              value: "$(POD_NAME).wse.default.svc.cluster.local:9999"
           volumeMounts:
             - name: tls
               mountPath: /etc/wse
@@ -454,7 +491,7 @@ async def health():
 
 ## Configuration
 
-All configuration is passed programmatically through the `RustWSEServer` constructor and `connect_cluster()` method. Origin validation: `allowed_origins`, or your reverse proxy (see [SECURITY.md](SECURITY.md#origin-validation)).
+All configuration is passed programmatically through the `RustWSEServer` constructor and `connect_cluster()` method; the server reads only `RUST_LOG` and, as a fallback for `connect_cluster()`'s TLS paths, `WSE_CLUSTER_TLS_CERT`, `WSE_CLUSTER_TLS_KEY` and `WSE_CLUSTER_TLS_CA` from the environment. Origin validation: `allowed_origins`, or your reverse proxy (see [SECURITY.md](SECURITY.md#origin-validation)).
 
 ### Logging
 

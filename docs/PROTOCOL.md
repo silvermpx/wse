@@ -42,7 +42,6 @@ Fields are ordered for readability in DevTools: `c` first, `t` second, `v` last.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `sig` | `string` | JWT signature for signed messages |
 | `pri` | `int` | Priority (1=BACKGROUND, 3=LOW, 5=NORMAL, 8=HIGH, 10=CRITICAL) |
 | `cid` | `string` | Correlation ID for request/response pairing |
 | `wse_processing_ms` | `int` | Server-side processing time in milliseconds |
@@ -113,37 +112,7 @@ The client detects the `C:` prefix, strips it, decompresses with zlib, and parse
 
 ### Binary Mode: Encryption
 
-When encryption is enabled, messages are sent as binary frames with `E:` prefix:
-
-```
-E:<IV (12 bytes)><AES-GCM ciphertext + 16-byte auth tag>
-```
-
-Encryption spec:
-
-| Parameter | Value |
-|-----------|-------|
-| Algorithm | AES-GCM-256 |
-| IV | 12 bytes (96 bits), random per message |
-| Auth tag | 16 bytes (128 bits), appended to ciphertext |
-| Key exchange | ECDH P-256 with HKDF-SHA256 |
-| HKDF salt | none (no salt; HKDF-Extract uses a zero salt) |
-| HKDF info | `wse-encryption/aes-gcm-key` (UTF-8 bytes) |
-| HKDF hash | SHA-256 |
-| Derived key | 32 bytes (256 bits) |
-
-**Key exchange flow:**
-
-1. Server generates ECDH P-256 keypair during connection setup
-2. Server sends its public key (65 bytes, uncompressed SEC1) in `server_ready`
-3. Client generates its own ECDH keypair
-4. Client derives shared secret from server's public key
-5. Client sends its public key in `client_hello`
-6. Server derives the same shared secret from client's public key
-7. Both sides run HKDF to get the AES-256 key
-8. All subsequent `E:`-prefixed messages use this key
-
-The plaintext inside the encrypted envelope is the full JSON message (e.g. `{"c":"U","t":"...","p":{...},"v":1}`).
+On an E2E connection every frame after the handshake is a binary frame that starts with `E:`. See [End-to-End Encryption](#end-to-end-encryption).
 
 ### Binary Mode: JSON (default since v1.1)
 
@@ -153,23 +122,23 @@ Clients should handle both text and binary frames containing JSON for backward c
 
 ### Binary Mode: MessagePack
 
-For compact serialization, `M:` prefix indicates msgpack-encoded data:
-
-```
-M:<msgpack-encoded-data>
-```
-
-To opt in, connect with `?format=msgpack` query parameter:
+A client opts in with the `?format=msgpack` query parameter:
 
 ```
 ws://host:port/wse?format=msgpack
 ```
 
-When enabled, per-connection `send()` serializes that connection's messages with MessagePack instead of JSON (same fields: `c`, `t`, `p`, `id`, `ts`, `seq`, `v`). Topic broadcasts are delivered to every subscriber as pre-framed JSON binary frames regardless of per-connection format (the broadcast frame is built once and shared).
+The server then sends that connection msgpack wherever it would send JSON text: topic messages, broadcasts, recovery replays, replies, `send()` text and `send_event()`. Each is a binary frame with the `M:` prefix:
 
-Inbound msgpack frames nested deeper than 64 levels are rejected before decoding, so a crafted deeply-nested payload can't stack-overflow the decoder.
+```
+M:<msgpack-encoded message>
+```
 
-Requires `@msgpack/msgpack` (JS) or `msgpack` (Python) on the client side.
+The message is the same map as in JSON (`c`, `t`, `p`, `id`, `ts`, `seq`, `v`, `tp`/`e`/`o`), encoded once per message and shared by every msgpack connection that gets it. A float takes 32 bits when that holds it exactly, else 64. Bytes the application sends as bytes (`send_bytes()`, `broadcast_all_bytes()`) go as they are, and the server's own pings and errors stay JSON.
+
+Such a client may send msgpack too: binary frames holding one msgpack value, with or without the `M:` prefix. The server reads its protocol messages (`ping`, `client_config`, `subscription_update`) in msgpack like their JSON form, and hands the rest to the application as the same dict a JSON message gives. Values nested deeper than 64 levels are refused before decoding, so a crafted payload can't overflow the decoder's stack. Inside E2E frames the clients send JSON.
+
+On typical messages msgpack takes 24-41% fewer bytes than JSON. Clients need `@msgpack/msgpack` (TypeScript, a dependency) or `msgpack` (Python, the `wse-client[msgpack]` extra).
 
 ## Connection Lifecycle
 
@@ -380,23 +349,7 @@ Request initial data snapshots:
 
 ### Client Hello
 
-Protocol negotiation. When encryption is enabled, includes the client's ECDH public key:
-
-```json
-{"c":"WSE","t":"client_hello","p":{
-  "client_version": "2.1.0",
-  "protocol_version": 1,
-  "features": {
-    "compression": true,
-    "batch_messages": true,
-    "encryption": true
-  },
-  "capabilities": ["compression", "encryption", "batching"],
-  "encryption_public_key": "<base64-encoded 65-byte ECDH P-256 public key>"
-},"v":1}
-```
-
-Once the server receives `client_hello` with `encryption_public_key`, it derives the shared AES-256 key. All subsequent messages from both sides may be sent as `E:`-prefixed encrypted binary frames.
+Protocol negotiation, and with encryption the client's half of the key exchange: see [Protocol Negotiation](#protocol-negotiation).
 
 ### Client Config
 
@@ -411,21 +364,9 @@ What the client asks of compression from now on (the TypeScript client sends it 
 
 The server then compresses `send_event()` messages to this connection above the client's threshold, or never with `"compression": false`; an application call with `compression_threshold=0` still turns compression off. The message does not reach the application.
 
-### Health Check
+## Batches
 
-```json
-{"c":"WSE","t":"health_check","p":{},"v":1}
-```
-
-### Metrics Request
-
-```json
-{"c":"WSE","t":"metrics_request","p":{},"v":1}
-```
-
-## Batching
-
-When the client supports batching (`batch_messages: true` in features), the server may send multiple messages in a single frame:
+An application may send several messages in one frame as a `batch` message; both SDKs unpack it and handle each message in order:
 
 ```json
 {"c":"WSE","t":"batch","p":{
@@ -437,40 +378,19 @@ When the client supports batching (`batch_messages: true` in features), the serv
 },"v":1}
 ```
 
-## Message Signing
-
-Messages matching a configurable set of types are signed for integrity verification. The set is empty by default - configure via `signed_message_types` in the connection constructor. When `message_signing_enabled` is `True`, all messages are signed.
-
-```json
-{"c":"U","t":"my_critical_event","p":{"action":"transfer","amount":500},"sig":"<hash>:<timestamp>:<nonce>:<hmac>","v":1}
-```
-
-The `sig` field contains an HMAC-SHA256 signature (or JWT when a TokenProvider is configured):
-- `hash`: SHA-256 hash of the JSON-serialized payload
-- `signed_at`: Unix timestamp
-- `nonce`: Random 16-byte hex string
-- `signature`: HMAC-SHA256 of `hash:signed_at:nonce`
-
-Example signed types (domain-specific, not built into WSE):
-
-```
-payment_completed, account_transfer, config_change, ...
-```
-
 ## Error Codes
 
-| Code | Meaning |
-|------|---------|
-| `AUTH_FAILED` | JWT authentication failed |
-| `RATE_LIMITED` | Client sending too fast |
-| `MESSAGE_TOO_LARGE` | Message exceeds 1 MB limit |
-| `INVALID_SUBSCRIPTION` | No topics specified |
-| `INVALID_ACTION` | Unknown subscription action |
-| `HANDLER_ERROR` | Server-side handler error (recoverable) |
-| `CIRCUIT_BREAKER_OPEN` | Too many errors, connection closing |
-| `ENCRYPTION_REQUIRED` | Operation requires encryption |
-| `SERVER_ERROR` | Internal server error |
-| `INIT_ERROR` | Connection initialization failed |
+The server's own `error` messages (`{"c":"WSE","t":"error","p":{"code":...,"message":...}}`):
+
+| Code | Sent when |
+|------|-----------|
+| `AUTH_FAILED` | The token was refused at the upgrade; the close (4401) follows |
+| `AUTH_REQUIRED` | No token, on a server with `jwt_secret`; the close (4401) follows |
+| `RATE_LIMITED` | A message was dropped over the client's rate limit (at most once a second) |
+| `KEY_EXCHANGE_FAILED` | The first design's key exchange failed |
+| `E2E_UNSUPPORTED` | No E2E suite in common, or the first design refused; the close (4800) follows |
+
+Applications send their own codes in the same shape.
 
 ## WebSocket Close Codes
 
@@ -484,6 +404,9 @@ payment_completed, account_transfer, config_change, ...
 | 4403 | The token the connection opened with expired | stop (a client with a token provider retries with a new token) |
 | 4408 | Nothing received from the client for `idle_timeout` seconds | reconnect |
 | 4429 | The client kept sending past the rate limit for 10 seconds | reconnect |
+| 4800 | No E2E suite in common, or a first-design client on a server with `e2e_legacy=False` (after an `E2E_UNSUPPORTED` error) | stop, with an encryption error |
+| 4802 | An E2E frame from the client out of order, forged, or plaintext inside a session | reconnect (a new session) |
+| 4803 | The E2E frame counter is used up | reconnect (a new session) |
 
 ## Topics
 
@@ -504,30 +427,41 @@ After the WebSocket connection is established and the server sends `server_ready
 
 ### Client Hello
 
-Sent by the client immediately after receiving `server_ready`:
+Sent by the client right after the connection opens (the TypeScript client waits for `server_ready`):
 
 ```json
 {"c":"WSE","t":"client_hello","p":{
-  "client_version": "2.1.0",
+  "client_version": "3.0.0",
   "protocol_version": 1,
   "features": {
     "compression": true,
-    "batch_messages": true,
     "encryption": true,
-    "msgpack": false
+    "batching": true,
+    "priority_queue": true,
+    "circuit_breaker": true,
+    "offline_queue": true,
+    "rate_limiting": true,
+    "health_check": true,
+    "metrics": true
   },
-  "capabilities": ["compression", "encryption", "batching"],
-  "encryption_public_key": "<base64-encoded 65-byte ECDH P-256 public key>"
+  "connection_id": "rs_f186cd9d_019c53c4",
+  "compression_threshold": 1024,
+  "e2e": {
+    "suites": ["p256-aes256gcm"],
+    "client_public_key": "<base64>",
+    "client_random": "<base64>"
+  }
 },"v":1}
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `client_version` | `string` | Semantic version of the client library |
+| `client_version` | `string` | Version of the client library |
 | `protocol_version` | `int` | Highest protocol version the client supports |
-| `features` | `object` | Feature flags the client wants to enable |
-| `capabilities` | `string[]` | List of supported capability names |
-| `encryption_public_key` | `string` | Client ECDH public key for key exchange (only when encryption is enabled) |
+| `features` | `object` | What the client does; the server reads `compression` (and `encryption` to know an E2E client) |
+| `compression_threshold` | `int` | From which size the client wants messages compressed |
+| `e2e` | `object` | The E2E offer, see [End-to-End Encryption](#end-to-end-encryption) |
+| `encryption_public_key` | `string` | Instead of `e2e`: the first design's ECDH public key |
 
 ### Server Hello
 
@@ -535,7 +469,7 @@ Sent by the server in response to `client_hello`:
 
 ```json
 {"c":"WSE","t":"server_hello","p":{
-  "server_version": "2.1.0",
+  "server_version": "3.0.0",
   "protocol_version": 1,
   "features": {
     "compression": true,
@@ -543,7 +477,8 @@ Sent by the server in response to `client_hello`:
     "cluster": false,
     "batching": true,
     "priority_queue": true,
-    "msgpack": true
+    "msgpack": true,
+    "encryption": true
   },
   "limits": {
     "max_message_size": 1048576,
@@ -551,8 +486,15 @@ Sent by the server in response to `client_hello`:
     "rate_limit_refill": 10000
   },
   "ping_interval": 25000,
-  "connection_id": "conn-abc-123",
-  "server_time": "2026-02-28T12:00:00.000Z"
+  "connection_id": "rs_f186cd9d_019c53c4",
+  "server_time": "2026-02-28T12:00:00.000Z",
+  "e2e": {
+    "suite": "p256-aes256gcm",
+    "server_public_key": "<base64>",
+    "key_id": "3f6c0a1b2c3d4e5f",
+    "alg": "ES256",
+    "signature": "<base64>"
+  }
 },"v":1}
 ```
 
@@ -560,13 +502,61 @@ Sent by the server in response to `client_hello`:
 |-------|------|-------------|
 | `server_version` | `string` | WSE server version |
 | `protocol_version` | `int` | Negotiated protocol version (minimum of client and server) |
-| `features` | `object` | Server feature flags (compression, recovery, cluster, batching, priority_queue, msgpack) |
+| `features` | `object` | `compression`, `recovery`, `cluster`, `msgpack` and `encryption` describe this server; `batching` and `priority_queue` are always `true`, kept for older clients |
 | `limits` | `object` | Server-enforced limits for this connection |
 | `ping_interval` | `int` | Server ping interval in milliseconds |
 | `connection_id` | `string` | Unique connection identifier |
 | `server_time` | `string` | Server wall clock (ISO 8601) |
+| `e2e` | `object` | The answer to the client's E2E offer |
+| `encryption_public_key` | `string` | Instead of `e2e`: the first design's ECDH public key |
 
 The negotiated protocol version is the minimum of both sides.
+
+## End-to-End Encryption
+
+One suite, `p256-aes256gcm`: ECDH P-256, HKDF-SHA256 and AES-256-GCM, with the server's identity signing in ECDSA P-256/SHA-256 (`ES256`). [SECURITY.md](SECURITY.md#end-to-end-encryption) explains setup and guarantees; `tests/vectors/e2e.json` holds test vectors for everything below.
+
+### Handshake
+
+The client offers, in `client_hello.p.e2e`, the suites it speaks, a fresh ECDH public key (65-byte uncompressed point, base64) and 32 random bytes (base64). The server answers in `server_hello.p.e2e` with the suite it chose, its own fresh ECDH public key, `key_id` (the first 8 bytes of SHA-256 over its identity public key, hex) and the signature over the transcript `T` (64 bytes `r || s`, base64). A server without an identity key sends `alg` and `signature` as `null` and `key_id` as `0000000000000000`; only a client that allows unauthenticated servers goes on.
+
+The transcript, each length one byte:
+
+```
+"WSE-E2E server_hello\0" | n | n × (len | suite) | len | chosen suite
+  | client_random (32) | client_public_key (65) | server_public_key (65)
+  | len | connection_id | key_id (8)
+```
+
+`connection_id` is the one in `server_hello`. A client pinning keys takes the one whose id is `key_id` and checks the signature; no match, or a wrong signature, ends the connection on the client side.
+
+### Keys
+
+`TH` = SHA-256(T); `H(ikm, label, n)` = HKDF-SHA256 with salt `TH` and info `label`, n bytes; `Z` = the ECDH shared secret.
+
+| | |
+|-|-|
+| Client-to-server secret, epoch 0 | `H(Z, "wse/e2e c2s", 32)` |
+| Server-to-client secret, epoch 0 | `H(Z, "wse/e2e s2c", 32)` |
+| An epoch's key, from its secret `S` | `H(S, "wse/e2e key", 32)` |
+| An epoch's IV | `H(S, "wse/e2e iv", 4)` |
+| The next epoch's secret | `H(S, "wse/e2e next", 32)` |
+
+### Frames
+
+Binary frames:
+
+```
+"E:" | format 0x01 | type (0 data, 1 close) | epoch (u32 BE) | seq (u64 BE) | ciphertext | tag (16)
+```
+
+The nonce is the epoch's IV followed by `seq` (u64 BE); the additional data is the direction (`0x01` client to server, `0x02` server to client), `TH` and the 14-byte header. Each direction counts `seq` from 0, one per frame, across epochs. A receiver opens only the frame with the next `seq`, in the current epoch or the next one (whose key it derives on trial and keeps only when the tag holds), and at most 2^24 frames per epoch; anything else closes the connection with 4802. A sender moves to the next epoch after 2^20 frames or 600 seconds, and past `seq` 2^53 - 1 closes with 4803. The plaintext is the message as it would go unsealed: JSON, or `M:` msgpack on a msgpack connection.
+
+`server_hello` is the last plaintext frame the server sends: its sending keys are installed right behind it. Once it has answered `client_hello` the server takes only sealed frames (WebSocket control frames apart), and a client sends nothing but `client_hello` until it holds the keys.
+
+### The first design
+
+For 2.x clients and servers. The client sends `encryption_public_key` (a 65-byte ECDH point, base64) in `client_hello`, the server answers with its own in `server_hello`. Both derive one key with HKDF-SHA256 (no salt, info `wse-encryption/aes-gcm-key`, 32 bytes) and seal every message with AES-256-GCM under a random 12-byte IV: `E:` | IV | ciphertext | tag. Refused with 4800 by a server with `e2e_legacy=False`.
 
 ## Server-Initiated Ping
 

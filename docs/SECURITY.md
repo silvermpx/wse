@@ -197,92 +197,69 @@ server {
 
 JWT authentication provides the primary access control. Origin validation adds defense-in-depth against CSWSH.
 
-## Message Security
+## End-to-End Encryption
 
-### Message Signing (Integrity)
+TLS protects a connection up to whatever terminates it: a load balancer, a reverse proxy or a CDN in front of the server sees every message in clear. E2E encryption seals each frame for the server process itself.
 
-WSE uses selective message signing: only critical operations are signed, not data updates or status messages.
+### Setting it up
 
-**Signing process (server):**
-1. Serialize payload to JSON with sorted keys
-2. Compute SHA-256 hash of serialized payload
-3. Create JWT with `hash`, `signed_at`, and random `nonce`
-4. Attach as `sig` field on the message
+1. Give the server an identity key, an ECDSA P-256 private key in PEM or DER (PKCS#8):
 
-```json
-{
-  "c": "U",
-  "t": "action_completed",
-  "p": {"item_id": "abc123", "status": "done"},
-  "sig": "eyJhbGciOiJIUzI1NiJ9.eyJoYXNoIjoiYWJjZGVmLi4uIiwic2lnbmVkX2F0IjoxNzA4NDQxODAwfQ.xxxxx",
-  "v": 1
-}
-```
+   ```bash
+   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out e2e-identity.pem
+   ```
 
-**Verification (client):**
-1. Decode JWT signature
-2. Recompute SHA-256 hash of received payload
-3. Compare hashes
-4. Check nonce hasn't been seen before (replay prevention)
+   ```python
+   server = RustWSEServer(
+       "0.0.0.0", 5007,
+       jwt_secret=...,
+       e2e_identity_key=open("e2e-identity.pem", "rb").read(),
+   )
+   server.e2e_identity_public_key()  # base64: what the clients pin
+   ```
 
-Configure which event types require signing based on your application's security requirements. Typical candidates include state-changing operations, financial transactions, and configuration changes.
+2. Pin its public key in the clients:
 
-### End-to-End Encryption
+   ```python
+   client = AsyncWSEClient(url, token=token, encryption=True, e2e_server_keys=[SERVER_KEY])
+   ```
 
-WSE supports optional E2E encryption using Web Crypto API:
+   ```typescript
+   useWSE(token, topics, { security: { encryptionEnabled: true, serverKeys: [SERVER_KEY] } });
+   ```
 
-**Algorithms:**
-| Purpose | Algorithm |
-|---------|-----------|
-| Encryption | AES-GCM-256 |
-| Key Exchange | ECDH P-256 |
-| Key Derivation | HKDF-SHA256 |
-| Signing | HMAC-SHA256 |
+   A client that cannot pin a key, during development for instance, may accept any server with `e2e_unauthenticated=True` (Python) or `security.unauthenticated: true` (TypeScript). The session is then safe from anyone who only listens, not from anyone who can answer in the server's place. With encryption on, a client refuses to start without one of the two.
 
-**Key exchange flow:**
-1. Client generates ECDH P-256 key pair
-2. Server generates ECDH P-256 key pair
-3. Public keys exchanged via `encryption_request`/`encryption_response`
-4. Both derive shared secret via ECDH
-5. Shared secret -> HKDF -> AES-GCM-256 encryption key
+**Rotating the identity key:** clients pin a list. Ship clients that pin the old and the new key, switch the server to the new one, then drop the old key from the clients.
 
-**Wire format (encrypted):**
-```
-E:<IV (12 bytes)><AES-GCM ciphertext>
-```
+### What a session guarantees
 
-**Server-side encryption (Rust):**
-- ECDH P-256 with a fresh server key per connection, HKDF-SHA256 (no salt, info: `wse-encryption/aes-gcm-key`) and AES-GCM-256, all from the crypto library of the build (see [Crypto Library](#crypto-library))
-- Per-connection key lifecycle: derived on the client's key exchange, dropped with the connection
-- Every delivery to an E2E connection is encrypted for it: topic broadcasts, `broadcast_all`, queue-group deliveries, messages relayed from other cluster nodes, presence events, `send()`/`send_bytes()`, `send_event()` and recovery replay. Connections without a key share one plaintext frame, so one encrypted client does not slow the others down
-- The key is used only once `server_hello` (with the server's public key) is queued, so no encrypted frame reaches a client before it can derive the key
+| | |
+|-|-|
+| Server authenticity | The server signs the handshake (ES256 over the whole exchange: the suites offered, both sides' ephemeral keys, the client's random, the connection id and the key id); the client checks the signature against the keys it pins |
+| Forward secrecy | Every connection uses fresh ECDH P-256 keys on both sides; the identity key only signs, so losing it later exposes no recorded session |
+| Confidentiality and integrity | AES-256-GCM, with keys from HKDF-SHA256 over the ECDH secret salted with the transcript hash: one key schedule per direction |
+| Order | Each frame carries its direction's epoch and sequence number, authenticated with it, and only the next frame opens: a replayed, reordered, dropped, reflected or forged frame closes the connection (4802) |
+| Key lifetime | Each direction moves to a new key after 2^20 frames or 10 minutes; past 2^53 frames the connection closes (4803) |
+| Coverage | After `server_hello` every frame is sealed, both ways: application messages, pings and PONGs, subscription requests and replies, presence events, recovery replays, messages relayed from other cluster nodes. A plaintext data frame inside a session closes the connection (4802) |
 
-**Client-side encryption (`security.ts`):**
-- AES-GCM-256 with a fresh random IV per message; the recent-IV set is checked **before** each encryption (redraw on collision, and refuse to encrypt rather than reuse an IV)
-- Nonce cache for replay attack prevention (5-minute window, 10K max)
-- Automatic key rotation (configurable interval, default: 1 hour)
-- Constant-time string comparison for security checks
-- Cleanup on destroy (keys, timers, caches cleared from memory)
+It does not hide the size and timing of frames (the server does not compress for E2E connections, so sizes say nothing about content), and the server process sees the plaintext: E2E protects the path between client and server, not the server.
 
-**Enable encryption:**
+[PROTOCOL.md](PROTOCOL.md#end-to-end-encryption) specifies the handshake, the transcript and the frames. `tests/vectors/e2e.json`, made with an independent implementation, holds test vectors the server and both clients check.
 
-```typescript
-// TypeScript/React client
-const { } = useWSE({
-  security: { encryptionEnabled: true },
-});
-```
+### Close codes
 
-```python
-# Python client
-from wse_client import AsyncWSEClient
+| Code | Meaning |
+|------|---------|
+| 4800 | No E2E suite in common, or a first-design client on a server with `e2e_legacy=False` |
+| 4802 | A frame out of order, forged, or in plaintext inside a session |
+| 4803 | The frame counter is used up |
 
-# Encryption is negotiated during the handshake when crypto extras are installed
-async with AsyncWSEClient("ws://localhost:5006/wse", token="<jwt>") as client:
-    await client.subscribe(["secure-topic"])
-```
+A client that refuses the server's identity or one of its frames ends the connection itself, stops reconnecting and reports an encryption error. Nothing is sent in plaintext instead.
 
-The key exchange happens automatically during the `client_hello`/`server_hello` handshake. The `SecurityManager` handles ECDH key exchange, AES-GCM encryption/decryption, and key rotation. Incoming `E:`-prefixed binary frames are decrypted transparently by the message processor.
+### The first design (2.x clients)
+
+`e2e_legacy=True`, the default, keeps serving 2.x clients, and 3.x clients reach 2.x servers with `e2e_legacy=True` (Python) or `security.legacyE2e: true` (TypeScript). That design is ECDH P-256 per connection, HKDF-SHA256 (no salt, info `wse-encryption/aes-gcm-key`) and one AES-256-GCM key for both directions with a random 12-byte nonce per message (`E:` + nonce + ciphertext + tag). It has no server identity, no sequence numbers and no rekeying: whoever can answer the handshake can read and change the session, and frames can be replayed. Set `e2e_legacy=False` once every client is on 3.x.
 
 ## Cluster Security
 
@@ -480,24 +457,14 @@ When circuit breaker opens:
 3. After reset timeout, transitions to `HALF_OPEN`
 4. On success, closes; on failure, reopens
 
-## Replay Attack Prevention
-
-Frontend nonce cache:
-- **Max size**: 10,000 entries
-- **TTL**: 5 minutes
-- **Cleanup**: Every 60 seconds
-- Signed messages include timestamp + nonce
-- Messages older than TTL are rejected
-
 ## Best Practices
 
 1. **Always use TLS** (`wss://`) in production
 2. **Configure origin validation** (`allowed_origins`, or your reverse proxy) to prevent CSWSH
 3. **Use asymmetric algorithms (RS256/ES256)** when tokens are issued by an external auth service
 4. **Rotate JWT keys** periodically using `jwt_previous_secret`
-5. **Enable signing** for critical operations
-6. **Enable encryption** for sensitive data (PII, credentials)
-7. **Enable mTLS** for cluster peer connections in production
-8. **Monitor circuit breaker** state for connection health
-9. **Use HTTP-only cookies** for web clients (prevents XSS token theft)
-10. **Use separate CA** for cluster certificates (isolate trust domains)
+5. **Enable E2E encryption with a pinned server identity** when something between clients and the server (a TLS-terminating proxy, a CDN) must not read the messages
+6. **Enable mTLS** for cluster peer connections in production
+7. **Monitor circuit breaker** state for connection health
+8. **Use HTTP-only cookies** for web clients (prevents XSS token theft)
+9. **Use separate CA** for cluster certificates (isolate trust domains)
