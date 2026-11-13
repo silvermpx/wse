@@ -178,7 +178,10 @@ class TestEncryptedMsgpack:
         from wse_client.protocol import MessageCodec
         from wse_client.security import SecurityManager
 
-        client_sm, server_sm = SecurityManager(legacy=True), SecurityManager(legacy=True)
+        client_sm, server_sm = (
+            SecurityManager(legacy=True),
+            SecurityManager(legacy=True),
+        )
         client_pub = client_sm.generate_keypair()
         server_pub = server_sm.generate_keypair()
         client_sm.derive_shared_secret(server_pub)

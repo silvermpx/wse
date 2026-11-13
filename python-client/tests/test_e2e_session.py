@@ -46,12 +46,16 @@ def test_transcript_key_id_and_signature(v):
     )
     assert t.hex() == v["transcript"]
     sig = b(v["signature"])
-    der = encode_dss_signature(int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:], "big"))
+    der = encode_dss_signature(
+        int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:], "big")
+    )
     public = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), identity)
     public.verify(der, t, ec.ECDSA(hashes.SHA256()))
 
 
-@pytest.mark.parametrize("name,direction", [("client_to_server", 1), ("server_to_client", 2)])
+@pytest.mark.parametrize(
+    "name,direction", [("client_to_server", 1), ("server_to_client", 2)]
+)
 def test_frames_of_both_directions(v, name, direction):
     from wse_client.e2e_session import _REKEY_FRAMES, _Receiver, _Sender
 
