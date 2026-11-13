@@ -46,10 +46,7 @@ class Node:
         return self.server.cluster_peers_count()
 
     def join(self, *peers, **tls):
-        if self.single_port:
-            listen = {"single_port": True}
-        else:
-            listen = {"cluster_port": self.cluster_port}
+        listen = {"single_port": True} if self.single_port else {"cluster_port": self.cluster_port}
         self.server.connect_cluster(peers=[p.addr for p in peers], **listen, **tls)
 
     def stop(self):

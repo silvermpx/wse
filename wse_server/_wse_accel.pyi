@@ -1,7 +1,31 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Self, final
+
+__all__ = [
+    "rust_transform_event",
+    "rust_compress",
+    "rust_decompress",
+    "rust_should_compress",
+    "RustCompressionManager",
+    "RustTokenBucket",
+    "RustSequencer",
+    "RustEventSequencer",
+    "RustPriorityQueue",
+    "RustPriorityMessageQueue",
+    "rust_match_event",
+    "rust_hmac_sha256",
+    "rust_sha256",
+    "rust_sign_message",
+    "rust_aes_gcm_encrypt",
+    "rust_aes_gcm_decrypt",
+    "rust_ecdh_generate_keypair",
+    "rust_ecdh_derive_shared_secret",
+    "rust_jwt_decode",
+    "rust_jwt_encode",
+    "RustWSEServer",
+]
 
 # =============================================================================
 # Compression
@@ -118,10 +142,11 @@ def rust_jwt_decode(
 # RustCompressionManager
 # =============================================================================
 
+@final
 class RustCompressionManager:
     """Zlib compression manager with optional msgpack support."""
 
-    def __init__(self, threshold: int = 1024, compression_level: int = 6) -> None: ...
+    def __new__(cls, threshold: int = 1024, compression_level: int = 6) -> Self: ...
     def should_compress(self, data: bytes) -> bool:
         """Return True if data exceeds the compression threshold."""
         ...
@@ -160,15 +185,16 @@ class RustCompressionManager:
 # RustTokenBucket
 # =============================================================================
 
+@final
 class RustTokenBucket:
     """Token bucket rate limiter."""
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         capacity: float,
         refill_rate: float,
         initial_tokens: float | None = None,
-    ) -> None: ...
+    ) -> Self: ...
     def acquire(self, tokens: float = 1.0) -> bool:
         """Try to acquire tokens. Returns True if successful."""
         ...
@@ -184,10 +210,11 @@ class RustTokenBucket:
 # RustSequencer
 # =============================================================================
 
+@final
 class RustSequencer:
     """Monotonic sequence counter with duplicate detection."""
 
-    def __init__(self, window_size: int) -> None: ...
+    def __new__(cls, window_size: int) -> Self: ...
     def next_seq(self) -> int:
         """Increment and return the next sequence number."""
         ...
@@ -208,10 +235,11 @@ class RustSequencer:
 # RustEventSequencer
 # =============================================================================
 
+@final
 class RustEventSequencer:
     """Event sequencer with dedup and out-of-order buffering."""
 
-    def __init__(self, window_size: int = 10000, max_out_of_order: int = 100) -> None: ...
+    def __new__(cls, window_size: int = 10000, max_out_of_order: int = 100) -> Self: ...
     def next_seq(self) -> int:
         """Increment and return the next sequence number."""
         ...
@@ -241,10 +269,11 @@ class RustEventSequencer:
 # RustPriorityQueue
 # =============================================================================
 
+@final
 class RustPriorityQueue:
     """Bounded priority queue (binary heap)."""
 
-    def __init__(self, max_size: int) -> None: ...
+    def __new__(cls, max_size: int) -> Self: ...
     def push(self, priority: int, message: Any) -> bool:
         """Push a message. Returns False if queue is full."""
         ...
@@ -262,10 +291,11 @@ class RustPriorityQueue:
 # RustPriorityMessageQueue
 # =============================================================================
 
+@final
 class RustPriorityMessageQueue:
     """Priority message queue with stats and batch dequeue."""
 
-    def __init__(self, max_size: int = 1000, batch_size: int = 10) -> None: ...
+    def __new__(cls, max_size: int = 1000, batch_size: int = 10) -> Self: ...
     def enqueue(self, message: Any, priority: int = 5) -> bool:
         """Enqueue a message. Priorities: BACKGROUND=1, LOW=3, NORMAL=5, HIGH=8, CRITICAL=10."""
         ...
@@ -293,6 +323,7 @@ class RustPriorityMessageQueue:
 # RustWSEServer
 # =============================================================================
 
+@final
 class RustWSEServer:
     """Standalone Rust WebSocket server controlled from Python.
 
@@ -301,8 +332,8 @@ class RustWSEServer:
     or callbacks.
     """
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         host: str,
         port: int,
         max_connections: int = 1000,
@@ -333,7 +364,7 @@ class RustWSEServer:
         max_inbound_queue_bytes: int = 67_108_864,
         allowed_origins: list[str] | None = None,
         client_subscriptions: bool = False,
-    ) -> None: ...
+    ) -> Self: ...
 
     # -- Lifecycle ------------------------------------------------------------
 
@@ -369,7 +400,9 @@ class RustWSEServer:
     def __enter__(self) -> RustWSEServer:
         """Start the server (unless it runs already)."""
         ...
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+    def __exit__(
+        self, exc_type: object = None, exc: object = None, traceback: object = None
+    ) -> bool:
         """Stop the server."""
         ...
     def is_running(self) -> bool:

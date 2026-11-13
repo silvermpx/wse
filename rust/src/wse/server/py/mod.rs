@@ -493,14 +493,16 @@ impl RustWSEServer {
         Ok(slf)
     }
 
-    #[pyo3(signature = (_exc_type = None, _exc = None, _traceback = None))]
+    /// Stops the server; an exception in the block is not swallowed.
+    #[pyo3(signature = (exc_type = None, exc = None, traceback = None))]
     fn __exit__(
         &self,
         py: Python<'_>,
-        _exc_type: Option<&Bound<'_, PyAny>>,
-        _exc: Option<&Bound<'_, PyAny>>,
-        _traceback: Option<&Bound<'_, PyAny>>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc: Option<&Bound<'_, PyAny>>,
+        traceback: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<bool> {
+        let _ = (exc_type, exc, traceback);
         self.stop_impl(py)?;
         Ok(false)
     }

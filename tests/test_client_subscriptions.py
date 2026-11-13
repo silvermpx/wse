@@ -175,7 +175,9 @@ class TestRecovery:
                 publish(srv, "a", n)
             async with await connect(server_port, make_token()) as ws:
                 drain_until(srv, "auth_connect")
-                await ws.send(request("subscribe", ["a"], {"a": {"epoch": "00000000", "offset": 1}}))
+                await ws.send(
+                    request("subscribe", ["a"], {"a": {"epoch": "00000000", "offset": 1}})
+                )
                 replayed, reply = await messages_until_reply(ws)
             assert replayed == []
             rec = reply["p"]["recovery"]["a"]
@@ -191,8 +193,14 @@ class TestRecovery:
         try:
             client = await EncryptedClient.open(server_port)
             drain_until(srv, "auth_connect")
-            await client.send({"c": "WSE", "t": "subscription_update",
-                               "p": {"action": "subscribe", "topics": ["a"]}, "v": 1})
+            await client.send(
+                {
+                    "c": "WSE",
+                    "t": "subscription_update",
+                    "p": {"action": "subscribe", "topics": ["a"]},
+                    "v": 1,
+                }
+            )
             async with asyncio.timeout(5):
                 while True:
                     msg, encrypted = await client.recv()
@@ -208,12 +216,14 @@ class TestRecovery:
 class TestSubscribeWithRecovery:
     @pytest.mark.asyncio
     async def test_positions_per_topic_and_the_topics_taken(self, server_port):
-        srv = start_server(server_port, client_subscriptions=False, max_subscriptions_per_connection=2)
+        srv = start_server(
+            server_port, client_subscriptions=False, max_subscriptions_per_connection=2
+        )
         try:
             for n in range(4):
                 publish(srv, "a", n)
                 publish(srv, "b", n)
-            async with await connect(server_port, make_token()) as ws:
+            async with await connect(server_port, make_token()):
                 _, conn_id, _ = drain_until(srv, "auth_connect")
                 a_epoch = srv.subscribe_with_recovery(conn_id, ["a"])["topics"]["a"]["epoch"]
                 srv.unsubscribe_connection(conn_id, ["a"])
@@ -223,8 +233,10 @@ class TestSubscribeWithRecovery:
                     conn_id,
                     ["a", "b", "c"],
                     recover=True,
-                    positions={"a": {"epoch": a_epoch, "offset": 1},
-                               "b": {"epoch": b_epoch, "offset": 2}},
+                    positions={
+                        "a": {"epoch": a_epoch, "offset": 1},
+                        "b": {"epoch": b_epoch, "offset": 2},
+                    },
                 )
                 topics = result["topics"]
                 assert topics["a"]["recovered"] and topics["a"]["count"] == 2
@@ -232,7 +244,8 @@ class TestSubscribeWithRecovery:
                 assert topics["c"]["subscribed"] is False
                 assert result["recovered"] is False  # c was not taken
                 with pytest.raises(ValueError):
-                    srv.subscribe_with_recovery(conn_id, ["a"], recover=True,
-                                                positions={"a": {"epoch": "zz", "offset": 1}})
+                    srv.subscribe_with_recovery(
+                        conn_id, ["a"], recover=True, positions={"a": {"epoch": "zz", "offset": 1}}
+                    )
         finally:
             srv.stop()

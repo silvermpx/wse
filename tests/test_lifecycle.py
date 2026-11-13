@@ -1,6 +1,7 @@
 """Server lifecycle: start and stop, drain, restarts, callback mode and logs."""
 
 import asyncio
+import contextlib
 import json
 import socket
 import subprocess
@@ -158,10 +159,8 @@ class TestStop:
                 await ws.send(json.dumps({"t": "stop"}))
                 await asyncio.sleep(0.5)
 
-        try:
+        with contextlib.suppress(websockets.ConnectionClosed):
             asyncio.run(run())
-        except websockets.ConnectionClosed:
-            pass
         assert stopped.wait(5)
         assert wait_for(lambda: not srv.is_running())
         # A new start() is possible once the old thread has ended.
@@ -273,8 +272,13 @@ class TestApi:
 
         def token(secret):
             now = int(time.time())
-            claims = {"sub": "dave", "iss": JWT_ISSUER, "aud": JWT_AUDIENCE,
-                      "exp": now + 600, "iat": now}
+            claims = {
+                "sub": "dave",
+                "iss": JWT_ISSUER,
+                "aud": JWT_AUDIENCE,
+                "exp": now + 600,
+                "iat": now,
+            }
             return rust_jwt_encode(claims, secret)
 
         async def accepted(tok) -> bool:

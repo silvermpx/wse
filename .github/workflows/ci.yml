@@ -453,6 +453,14 @@ jobs:
           source .venv/bin/activate
           pytest tests/ -v --tb=short
 
+      # The shipped stub must say what the compiled module does.
+      - name: Stub matches the extension
+        if: matrix.python == '3.12'
+        run: |
+          source .venv/bin/activate
+          pip install 'mypy==2.4.1'
+          python -m mypy.stubtest wse_server._wse_accel
+
   # ---------------------------------------------------------------------------
   # Benchmarks: the tools behind the published numbers must still build
   # ---------------------------------------------------------------------------
