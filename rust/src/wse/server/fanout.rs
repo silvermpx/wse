@@ -304,13 +304,6 @@ const MAX_LANES: usize = 64;
 /// How many jobs a lane's task takes off its queue at once.
 const LANE_BATCH: usize = 64;
 
-/// How many connections a lane serves before it gives way to the runtime:
-/// some tens of microseconds. tokio looks at the network only between task
-/// polls, so a lane that kept its thread longer, with every thread running a
-/// lane under a steady stream, left new connections waiting until their
-/// handshakes timed out.
-const LANE_SLICE: usize = 512;
-
 /// A connection with this many bytes still to write is behind.
 pub(crate) const BEHIND_BYTES: usize = 64 * 1024;
 
@@ -833,8 +826,8 @@ async fn run_lane(
     let mut seen = AHashSet::new();
     let drained = index.drained(lane);
     while jobs.recv_many(&mut batch, LANE_BATCH).await > 0 {
-        // Connections served since the lane last gave way.
-        let mut since = 0;
+        // Whether the lane served anyone since it last waited.
+        let mut served_any = false;
         for job in batch.drain(..) {
             let served = match job {
                 Job::All(msg) => index.deliver_all(lane, &msg, max_pending, &slow_drops),
@@ -862,25 +855,22 @@ async fn run_lane(
                     served
                 }
             };
-            since += served.connections();
+            served_any = true;
             if served.lagging() {
                 // The sockets are behind: they write before more is queued.
                 tokio::select! {
                     () = drained.notified() => {}
                     () = tokio::time::sleep(LANE_PACE) => {}
                 }
-                since = 0;
-            } else if since >= LANE_SLICE {
-                // The write tasks it woke wait in this thread's run queue:
-                // they run, and the runtime reads the network, before the
-                // lane goes on. A lane with work would not give way by
-                // itself until tokio's budget ran out, after thousands of
-                // deliveries.
-                tokio::task::yield_now().await;
-                since = 0;
+                served_any = false;
             }
         }
-        if since > 0 {
+        // The write tasks the batch woke wait in this thread's run queue:
+        // they run, and the runtime reads the network, before the next
+        // batch. Giving way more often, every few hundred connections, cost
+        // a sixth of the throughput at 10000 subscribers: after a yield the
+        // lane waits for its thread's whole run queue.
+        if served_any {
             tokio::task::yield_now().await;
         }
     }
