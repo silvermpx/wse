@@ -1,4 +1,5 @@
-// JWT encode/decode — HS256, RS256, ES256 — powered by jsonwebtoken crate.
+// JWT encode/decode with every standard algorithm (HS*, RS*, PS*, ES256/384,
+// EdDSA), powered by the jsonwebtoken crate.
 //
 // Used in two ways:
 //   1. Internally by server.rs during WebSocket handshake (zero GIL)
@@ -12,28 +13,99 @@ use zeroize::Zeroizing;
 // Algorithm
 // ---------------------------------------------------------------------------
 
+/// The signature algorithm tokens are checked with. The server is configured
+/// with exactly one; the token's own `alg` header never chooses it, which is
+/// what algorithm-confusion attacks rely on. Every standard one is accepted,
+/// so tokens from any auth service can be validated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JwtAlgorithm {
     HS256,
+    HS384,
+    HS512,
     RS256,
+    RS384,
+    RS512,
+    PS256,
+    PS384,
+    PS512,
     ES256,
+    ES384,
+    EdDSA,
 }
+
+/// The kind of key an algorithm takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyKind {
+    /// A shared secret of at least `min_len` bytes (RFC 7518: the hash size).
+    Secret {
+        min_len: usize,
+    },
+    Rsa,
+    Ec,
+    Ed,
+}
+
+const ALGORITHMS: [(&str, JwtAlgorithm); 12] = [
+    ("HS256", JwtAlgorithm::HS256),
+    ("HS384", JwtAlgorithm::HS384),
+    ("HS512", JwtAlgorithm::HS512),
+    ("RS256", JwtAlgorithm::RS256),
+    ("RS384", JwtAlgorithm::RS384),
+    ("RS512", JwtAlgorithm::RS512),
+    ("PS256", JwtAlgorithm::PS256),
+    ("PS384", JwtAlgorithm::PS384),
+    ("PS512", JwtAlgorithm::PS512),
+    ("ES256", JwtAlgorithm::ES256),
+    ("ES384", JwtAlgorithm::ES384),
+    ("EdDSA", JwtAlgorithm::EdDSA),
+];
 
 impl JwtAlgorithm {
     pub fn from_str(s: &str) -> Result<Self, JwtError> {
-        match s {
-            "HS256" => Ok(Self::HS256),
-            "RS256" => Ok(Self::RS256),
-            "ES256" => Ok(Self::ES256),
-            _ => Err(JwtError::UnsupportedAlgorithm),
+        ALGORITHMS
+            .iter()
+            .find(|(name, _)| *name == s)
+            .map(|(_, alg)| *alg)
+            .ok_or(JwtError::UnsupportedAlgorithm)
+    }
+
+    /// The accepted names, for error messages.
+    pub fn supported() -> String {
+        ALGORITHMS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    pub(crate) fn key_kind(self) -> KeyKind {
+        match self {
+            Self::HS256 => KeyKind::Secret { min_len: 32 },
+            Self::HS384 => KeyKind::Secret { min_len: 48 },
+            Self::HS512 => KeyKind::Secret { min_len: 64 },
+            Self::RS256 | Self::RS384 | Self::RS512 | Self::PS256 | Self::PS384 | Self::PS512 => {
+                KeyKind::Rsa
+            }
+            Self::ES256 | Self::ES384 => KeyKind::Ec,
+            Self::EdDSA => KeyKind::Ed,
         }
     }
 
     fn to_jw(self) -> jsonwebtoken::Algorithm {
+        use jsonwebtoken::Algorithm as A;
         match self {
-            Self::HS256 => jsonwebtoken::Algorithm::HS256,
-            Self::RS256 => jsonwebtoken::Algorithm::RS256,
-            Self::ES256 => jsonwebtoken::Algorithm::ES256,
+            Self::HS256 => A::HS256,
+            Self::HS384 => A::HS384,
+            Self::HS512 => A::HS512,
+            Self::RS256 => A::RS256,
+            Self::RS384 => A::RS384,
+            Self::RS512 => A::RS512,
+            Self::PS256 => A::PS256,
+            Self::PS384 => A::PS384,
+            Self::PS512 => A::PS512,
+            Self::ES256 => A::ES256,
+            Self::ES384 => A::ES384,
+            Self::EdDSA => A::EdDSA,
         }
     }
 }
@@ -52,7 +124,8 @@ pub(crate) enum JwtError {
     TokenNotYetValid,
     InvalidIssuer,
     InvalidAudience,
-    KeyTooShort,
+    /// The shared secret is shorter than the algorithm requires (bytes).
+    KeyTooShort(usize),
     TokenTooLarge,
     InvalidKeyId,
     InvalidKey(String),
@@ -63,7 +136,11 @@ impl std::fmt::Display for JwtError {
         match self {
             Self::MalformedToken => write!(f, "Malformed JWT token"),
             Self::UnsupportedAlgorithm => {
-                write!(f, "Unsupported algorithm (supported: HS256, RS256, ES256)")
+                write!(
+                    f,
+                    "Unsupported algorithm (supported: {})",
+                    JwtAlgorithm::supported()
+                )
             }
             Self::InvalidSignature => write!(f, "Invalid JWT signature"),
             Self::InvalidPayload => write!(f, "Invalid JWT payload"),
@@ -71,8 +148,11 @@ impl std::fmt::Display for JwtError {
             Self::TokenNotYetValid => write!(f, "Token not yet valid (nbf)"),
             Self::InvalidIssuer => write!(f, "Invalid issuer"),
             Self::InvalidAudience => write!(f, "Invalid audience"),
-            Self::KeyTooShort => {
-                write!(f, "Secret key too short (minimum 32 bytes for HS256)")
+            Self::KeyTooShort(min) => {
+                write!(
+                    f,
+                    "Secret key too short: this algorithm needs at least {min} bytes"
+                )
             }
             Self::TokenTooLarge => write!(f, "Token exceeds maximum size"),
             Self::InvalidKeyId => write!(f, "Invalid or mismatched key ID (kid)"),
@@ -139,55 +219,70 @@ pub struct JwtConfig {
 // Internal API (used by server.rs directly — no GIL)
 // ---------------------------------------------------------------------------
 
-// RFC 7518: HS256 key MUST be >= 256 bits (32 bytes)
-const MIN_HS256_KEY_LEN: usize = 32;
 // Reject tokens larger than 8KB to prevent DoS
 const MAX_TOKEN_LEN: usize = 8192;
 // Clock skew tolerance for exp/nbf (seconds) -- RFC 8725 recommendation
 const CLOCK_SKEW_SECS: u64 = 30;
 
-/// Build a DecodingKey for the given algorithm and key material.
+/// A shared secret for an HS* algorithm: long enough, and not a PEM key
+/// (an asymmetric key used as an HMAC secret lets anyone holding the public
+/// half mint tokens).
+fn check_secret(key: &[u8], min_len: usize) -> Result<(), JwtError> {
+    if key.len() < min_len {
+        return Err(JwtError::KeyTooShort(min_len));
+    }
+    if key.starts_with(b"-----BEGIN") {
+        return Err(JwtError::InvalidKey(
+            "the secret is a PEM key; set jwt_algorithm to the key's algorithm (RS*, PS*, ES*, EdDSA)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Build a DecodingKey (a public key, or the shared secret) for `algorithm`.
 fn make_decoding_key(
     algorithm: JwtAlgorithm,
     key: &[u8],
 ) -> Result<jsonwebtoken::DecodingKey, JwtError> {
-    match algorithm {
-        JwtAlgorithm::HS256 => {
-            if key.len() < MIN_HS256_KEY_LEN {
-                return Err(JwtError::KeyTooShort);
-            }
-            if key.starts_with(b"-----BEGIN") {
-                return Err(JwtError::InvalidKey(
-                    "HS256 secret is a PEM key; set the algorithm to RS256 or ES256".into(),
-                ));
-            }
-            Ok(jsonwebtoken::DecodingKey::from_secret(key))
+    use jsonwebtoken::DecodingKey;
+    Ok(match algorithm.key_kind() {
+        KeyKind::Secret { min_len } => {
+            check_secret(key, min_len)?;
+            DecodingKey::from_secret(key)
         }
-        JwtAlgorithm::RS256 => Ok(jsonwebtoken::DecodingKey::from_rsa_pem(key)?),
-        JwtAlgorithm::ES256 => Ok(jsonwebtoken::DecodingKey::from_ec_pem(key)?),
-    }
+        KeyKind::Rsa => DecodingKey::from_rsa_pem(key)?,
+        KeyKind::Ec => DecodingKey::from_ec_pem(key)?,
+        KeyKind::Ed => DecodingKey::from_ed_pem(key)?,
+    })
 }
 
-/// Build an EncodingKey for the given algorithm and key material.
+/// Build an EncodingKey (a private key, or the shared secret) for `algorithm`.
 fn make_encoding_key(
     algorithm: JwtAlgorithm,
     key: &[u8],
 ) -> Result<jsonwebtoken::EncodingKey, JwtError> {
-    match algorithm {
-        JwtAlgorithm::HS256 => {
-            if key.len() < MIN_HS256_KEY_LEN {
-                return Err(JwtError::KeyTooShort);
-            }
-            if key.starts_with(b"-----BEGIN") {
-                return Err(JwtError::InvalidKey(
-                    "HS256 secret is a PEM key; set the algorithm to RS256 or ES256".into(),
-                ));
-            }
-            Ok(jsonwebtoken::EncodingKey::from_secret(key))
+    use jsonwebtoken::EncodingKey;
+    Ok(match algorithm.key_kind() {
+        KeyKind::Secret { min_len } => {
+            check_secret(key, min_len)?;
+            EncodingKey::from_secret(key)
         }
-        JwtAlgorithm::RS256 => Ok(jsonwebtoken::EncodingKey::from_rsa_pem(key)?),
-        JwtAlgorithm::ES256 => Ok(jsonwebtoken::EncodingKey::from_ec_pem(key)?),
-    }
+        KeyKind::Rsa => EncodingKey::from_rsa_pem(key)?,
+        KeyKind::Ec => EncodingKey::from_ec_pem(key)?,
+        KeyKind::Ed => EncodingKey::from_ed_pem(key)?,
+    })
+}
+
+/// Whether `key` can verify tokens of `algorithm` (checked at server start for
+/// jwt_secret and jwt_previous_secret).
+pub(crate) fn check_verification_key(algorithm: JwtAlgorithm, key: &[u8]) -> Result<(), JwtError> {
+    make_decoding_key(algorithm, key).map(|_| ())
+}
+
+/// Whether `key` can sign tokens of `algorithm` (jwt_private_key).
+pub(crate) fn check_signing_key(algorithm: JwtAlgorithm, key: &[u8]) -> Result<(), JwtError> {
+    make_encoding_key(algorithm, key).map(|_| ())
 }
 
 /// Build a Validation config for the given algorithm and claims requirements.
@@ -351,7 +446,10 @@ fn jwt_decode_with_rotation(
     key_id: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let alg = JwtAlgorithm::from_str(algorithm).map_err(|_| {
-        format!("Unsupported algorithm: {algorithm}. Supported: HS256, RS256, ES256")
+        format!(
+            "Unsupported algorithm: {algorithm}. Supported: {}",
+            JwtAlgorithm::supported()
+        )
     })?;
 
     let result = match jwt_decode_inner(token, secret, alg, issuer, audience, key_id) {
@@ -424,7 +522,8 @@ pub fn rust_jwt_encode(
 ) -> PyResult<String> {
     let alg = JwtAlgorithm::from_str(algorithm).map_err(|_| {
         pyo3::exceptions::PyValueError::new_err(format!(
-            "Unsupported algorithm: {algorithm}. Supported: HS256, RS256, ES256"
+            "Unsupported algorithm: {algorithm}. Supported: {}",
+            JwtAlgorithm::supported()
         ))
     })?;
 
@@ -915,7 +1014,7 @@ mod tests {
         let short_secret = b"too-short".to_vec();
         let claims = serde_json::json!({"sub": "x", "exp": future_exp()});
         let result = jwt_encode(&claims, &short_secret, JwtAlgorithm::HS256, None);
-        assert!(matches!(result, Err(JwtError::KeyTooShort)));
+        assert!(matches!(result, Err(JwtError::KeyTooShort(32))));
     }
 
     #[test]

@@ -50,6 +50,10 @@ server = RustWSEServer(
     jwt_key_id=None,                 # optional: expected kid header claim
 )
 
+# Any standard algorithm: HS256/384/512, RS256/384/512, PS256/384/512,
+# ES256/384 and EdDSA (Ed25519). The server checks tokens with exactly the
+# configured one; a token's own "alg" header never chooses it.
+
 # RS256 (asymmetric -- external auth service signs with RSA private key)
 server = RustWSEServer(
     host="0.0.0.0",

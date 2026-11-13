@@ -24,7 +24,7 @@ server = RustWSEServer(
     jwt_cookie_name="access_token",    # optional, default: "access_token"
     jwt_previous_secret=None,          # optional: old secret for zero-downtime rotation
     jwt_key_id=None,                   # optional: expected kid header claim
-    # jwt_algorithm="RS256",           # optional: use RS256 or ES256 instead of HS256
+    # jwt_algorithm="RS256",           # optional: any of HS256/384/512, RS*, PS*, ES256/384, EdDSA
     # jwt_private_key=open("key.pem", "rb").read(),  # optional: private key for token encoding
 )
 server.enable_drain_mode()
@@ -91,7 +91,7 @@ server = RustWSEServer(
     jwt_cookie_name="access_token",    # optional, default: "access_token"
     jwt_previous_secret=None,          # optional: old secret for zero-downtime rotation
     jwt_key_id=None,                   # optional: expected kid header claim
-    # jwt_algorithm="RS256",           # optional: RS256 or ES256
+    # jwt_algorithm="RS256",           # optional: any of HS256/384/512, RS*, PS*, ES256/384, EdDSA
     # jwt_private_key=open("key.pem", "rb").read(),
     recovery_enabled=True,
     presence_enabled=True,

@@ -15,6 +15,7 @@ from wse_server import (
     RustPriorityQueue,
     RustSequencer,
     RustTokenBucket,
+    RustWSEServer,
     rust_aes_gcm_decrypt,
     rust_aes_gcm_encrypt,
     rust_compress,
@@ -339,3 +340,94 @@ class TestBoundary:
         with pytest.raises(ValueError):
             bucket.acquire(tokens)
         assert bucket.tokens == 10.0
+
+
+# ---------------------------------------------------------------------------
+# JWT algorithms: tokens from any auth service
+# ---------------------------------------------------------------------------
+
+ALGORITHMS = [
+    "HS256",
+    "HS384",
+    "HS512",
+    "RS256",
+    "RS384",
+    "RS512",
+    "PS256",
+    "PS384",
+    "PS512",
+    "ES256",
+    "ES384",
+    "EdDSA",
+]
+
+
+@pytest.fixture(scope="module")
+def key_pairs():
+    """PEM key pairs made by the `cryptography` package, one per key kind."""
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
+
+    def pem(private):
+        return (
+            private.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            ),
+            private.public_key().public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+            ),
+        )
+
+    return {
+        "RSA": pem(rsa.generate_private_key(public_exponent=65537, key_size=2048)),
+        "P-256": pem(ec.generate_private_key(ec.SECP256R1())),
+        "P-384": pem(ec.generate_private_key(ec.SECP384R1())),
+        "Ed25519": pem(ed25519.Ed25519PrivateKey.generate()),
+    }
+
+
+def keys_for(alg, key_pairs):
+    """(signing key, verification key) for `alg`."""
+    if alg.startswith("HS"):
+        secret = bytes(range(64))[: {"HS256": 32, "HS384": 48, "HS512": 64}[alg]]
+        return secret, secret
+    kind = {"RS": "RSA", "PS": "RSA", "ES256": "P-256", "ES384": "P-384", "EdDSA": "Ed25519"}
+    pair = key_pairs[kind.get(alg, kind.get(alg[:2]))]
+    return pair
+
+
+class TestJwtAlgorithms:
+    @pytest.mark.parametrize("alg", ALGORITHMS)
+    def test_every_standard_algorithm_round_trips(self, alg, key_pairs):
+        signing, verifying = keys_for(alg, key_pairs)
+        token = rust_jwt_encode({"sub": "u1", "exp": 4_000_000_000}, signing, algorithm=alg)
+        claims = rust_jwt_decode(token, verifying, algorithm=alg)
+        assert claims is not None and claims["sub"] == "u1"
+
+    @pytest.mark.parametrize("alg", ["RS256", "ES256", "EdDSA"])
+    def test_the_configured_algorithm_decides_not_the_token(self, alg, key_pairs):
+        signing, verifying = keys_for(alg, key_pairs)
+        token = rust_jwt_encode({"sub": "u1", "exp": 4_000_000_000}, signing, algorithm=alg)
+        # The same public key used as an HMAC secret must not verify anything.
+        assert rust_jwt_decode(token, verifying, algorithm="HS256") is None
+        other = {"RS256": "PS256", "ES256": "ES384", "EdDSA": "ES256"}[alg]
+        assert rust_jwt_decode(token, verifying, algorithm=other) is None
+
+    def test_hmac_secrets_must_match_the_hash_size(self):
+        with pytest.raises(RuntimeError):
+            rust_jwt_encode({"sub": "u", "exp": 4_000_000_000}, b"x" * 47, algorithm="HS384")
+
+    def test_server_accepts_any_standard_algorithm_and_checks_its_keys(self, key_pairs):
+        _, ed_public = key_pairs["Ed25519"]
+        RustWSEServer("127.0.0.1", 1, jwt_secret=ed_public, jwt_algorithm="EdDSA")
+        with pytest.raises(ValueError, match="jwt_secret"):
+            RustWSEServer("127.0.0.1", 1, jwt_secret=b"not a key", jwt_algorithm="EdDSA")
+        with pytest.raises(ValueError, match="Supported"):
+            RustWSEServer("127.0.0.1", 1, jwt_secret=ed_public, jwt_algorithm="none")
+
+    def test_jwt_options_without_a_secret_are_refused(self):
+        with pytest.raises(ValueError, match="jwt_issuer, jwt_audience"):
+            RustWSEServer("127.0.0.1", 1, jwt_issuer="auth", jwt_audience="api")

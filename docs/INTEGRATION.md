@@ -133,7 +133,7 @@ For production, put both behind the same reverse proxy (nginx, Caddy) and route 
 
 ## 3. JWT Authentication
 
-Configure `jwt_secret`, `jwt_issuer`, `jwt_audience`, and optionally `jwt_cookie_name` and `jwt_algorithm` in the constructor. The server validates JWT tokens during the WebSocket handshake in Rust (zero-GIL, sub-millisecond). Supported algorithms: HS256 (default), RS256, ES256.
+Configure `jwt_secret`, `jwt_issuer`, `jwt_audience`, and optionally `jwt_cookie_name` and `jwt_algorithm` in the constructor. The server validates JWT tokens during the WebSocket handshake in Rust (zero-GIL, sub-millisecond). Supported algorithms: HS256 (default), HS384, HS512, RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384 and EdDSA (Ed25519), so tokens from any standard auth service can be validated. The server expects exactly the configured one; a token's `alg` header never chooses it. Every `jwt_*` option needs `jwt_secret` (the HMAC secret, or the public key for the asymmetric algorithms); setting one without it is an error rather than a server that accepts everyone.
 
 **Token claims:**
 

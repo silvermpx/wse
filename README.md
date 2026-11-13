@@ -177,7 +177,7 @@ token = rust_jwt_encode(
 | `jwt_cookie_name` | "access_token" | Cookie name for JWT token extraction |
 | `jwt_previous_secret` | None | Previous key for zero-downtime rotation. HS256: previous secret. RS256/ES256: previous public key PEM |
 | `jwt_key_id` | None | Expected `kid` header claim. Rejects tokens with mismatched key ID |
-| `jwt_algorithm` | None | JWT algorithm: `"HS256"` (default), `"RS256"`, or `"ES256"` |
+| `jwt_algorithm` | None | JWT algorithm the server expects: `"HS256"` (default), `"HS384"`, `"HS512"`, `"RS256"`, `"RS384"`, `"RS512"`, `"PS256"`, `"PS384"`, `"PS512"`, `"ES256"`, `"ES384"` or `"EdDSA"`. The token's own `alg` header never overrides it. |
 | `jwt_private_key` | None | PEM private key for RS256/ES256 token encoding. Not needed for HS256 |
 | `max_inbound_queue_size` | 131072 | Drain mode bounded queue capacity |
 | `recovery_enabled` | False | Enable per-topic message recovery buffers |

@@ -129,82 +129,54 @@ impl RustWSEServer {
                 srv.ping_interval, srv.idle_timeout
             )));
         }
-        let jwt_alg = match jwt.jwt_algorithm.as_deref() {
-            None | Some("HS256") => jwt::JwtAlgorithm::HS256,
-            Some("RS256") => jwt::JwtAlgorithm::RS256,
-            Some("ES256") => jwt::JwtAlgorithm::ES256,
-            Some(other) => {
+        // Every jwt_* option needs jwt_secret: without it the server runs with
+        // no authentication, and an issuer or audience set alone would only
+        // look like protection.
+        if jwt.jwt_secret.is_none() {
+            let set: Vec<&str> = [
+                ("jwt_issuer", jwt.jwt_issuer.is_some()),
+                ("jwt_audience", jwt.jwt_audience.is_some()),
+                ("jwt_previous_secret", jwt.jwt_previous_secret.is_some()),
+                ("jwt_key_id", jwt.jwt_key_id.is_some()),
+                ("jwt_algorithm", jwt.jwt_algorithm.is_some()),
+                ("jwt_private_key", jwt.jwt_private_key.is_some()),
+                ("jwt_cookie_name", jwt.jwt_cookie_name.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(name, is_set)| is_set.then_some(name))
+            .collect();
+            if !set.is_empty() {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Unsupported jwt_algorithm: {other}. Supported: HS256, RS256, ES256"
+                    "{} set without jwt_secret: the server would accept every connection \
+                     unauthenticated. Pass jwt_secret (the HMAC secret, or the public key \
+                     for the asymmetric algorithms) or drop these options.",
+                    set.join(", ")
                 )));
             }
+        }
+        let jwt_alg = match jwt.jwt_algorithm.as_deref() {
+            None => jwt::JwtAlgorithm::HS256,
+            Some(name) => jwt::JwtAlgorithm::from_str(name).map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unsupported jwt_algorithm: {name}. Supported: {}",
+                    jwt::JwtAlgorithm::supported()
+                ))
+            })?,
         };
-        // Algorithm-specific key validation at startup
-        if jwt.jwt_secret.is_some() {
-            match jwt_alg {
-                jwt::JwtAlgorithm::HS256 => {
-                    if let Some(ref s) = jwt.jwt_secret
-                        && s.len() < 32
-                    {
-                        return Err(pyo3::exceptions::PyValueError::new_err(
-                            "jwt_secret must be at least 32 bytes (RFC 7518 HS256 minimum)",
-                        ));
-                    }
-                    if let Some(ref s) = jwt.jwt_previous_secret
-                        && s.len() < 32
-                    {
-                        return Err(pyo3::exceptions::PyValueError::new_err(
-                            "jwt_previous_secret must be at least 32 bytes",
-                        ));
-                    }
-                }
-                jwt::JwtAlgorithm::RS256 => {
-                    if let Some(ref s) = jwt.jwt_secret {
-                        jsonwebtoken::DecodingKey::from_rsa_pem(s).map_err(|e| {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "Invalid RS256 public key PEM: {e}"
-                            ))
-                        })?;
-                    }
-                    if let Some(ref s) = jwt.jwt_previous_secret {
-                        jsonwebtoken::DecodingKey::from_rsa_pem(s).map_err(|e| {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "Invalid RS256 jwt_previous_secret PEM: {e}"
-                            ))
-                        })?;
-                    }
-                    if let Some(ref s) = jwt.jwt_private_key {
-                        jsonwebtoken::EncodingKey::from_rsa_pem(s).map_err(|e| {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "Invalid RS256 jwt_private_key PEM: {e}"
-                            ))
-                        })?;
-                    }
-                }
-                jwt::JwtAlgorithm::ES256 => {
-                    if let Some(ref s) = jwt.jwt_secret {
-                        jsonwebtoken::DecodingKey::from_ec_pem(s).map_err(|e| {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "Invalid ES256 public key PEM: {e}"
-                            ))
-                        })?;
-                    }
-                    if let Some(ref s) = jwt.jwt_previous_secret {
-                        jsonwebtoken::DecodingKey::from_ec_pem(s).map_err(|e| {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "Invalid ES256 jwt_previous_secret PEM: {e}"
-                            ))
-                        })?;
-                    }
-                    if let Some(ref s) = jwt.jwt_private_key {
-                        jsonwebtoken::EncodingKey::from_ec_pem(s).map_err(|e| {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "Invalid ES256 jwt_private_key PEM: {e}"
-                            ))
-                        })?;
-                    }
-                }
-            }
+        // Keys are checked against the algorithm at startup, not at the first
+        // connection.
+        let key_error = |option: &str, e: jwt::JwtError| {
+            pyo3::exceptions::PyValueError::new_err(format!("{option} for {jwt_alg:?}: {e}"))
+        };
+        if let Some(ref key) = jwt.jwt_secret {
+            jwt::check_verification_key(jwt_alg, key).map_err(|e| key_error("jwt_secret", e))?;
+        }
+        if let Some(ref key) = jwt.jwt_previous_secret {
+            jwt::check_verification_key(jwt_alg, key)
+                .map_err(|e| key_error("jwt_previous_secret", e))?;
+        }
+        if let Some(ref key) = jwt.jwt_private_key {
+            jwt::check_signing_key(jwt_alg, key).map_err(|e| key_error("jwt_private_key", e))?;
         }
         drop(jwt.jwt_private_key);
         let jwt_config = jwt.jwt_secret.map(|secret| JwtConfig {
