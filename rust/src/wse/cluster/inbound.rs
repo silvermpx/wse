@@ -1,45 +1,230 @@
-//! Inbound peer links: the handshake and session of a peer that dialed us, on
-//! the cluster port or (legacy) on the main port.
+//! Inbound peer links: their admission, and the handshake and session of a
+//! peer that dialed us, on the cluster port or, in single-port mode, on the
+//! WebSocket port.
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use dashmap::{DashMap, DashSet};
-use socket2::{SockRef, TcpKeepalive};
+use socket2::SockRef;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::peer::{heartbeat_task, peer_dispatch_task, peer_reader, peer_writer, read_frame};
 use super::protocol::write_framed;
 use super::{
-    CAP_PRESENCE, ClusterCommand, ClusterContext, ClusterFrame, DispatchItem, InterestUpdate,
-    LOCAL_CAPABILITIES, Link, LinkRefused, Links, MAX_FRAME_SIZE, PEER_DISPATCH_QUEUE_CAP,
-    PEER_SESSION_GENERATION, PROTOCOL_VERSION, PeerInfo, PeerRegistration, PresencePeerFrame,
+    CAP_PRESENCE, ClusterContext, ClusterFrame, ClusterTlsConfig, DispatchItem, InterestUpdate,
+    LOCAL_CAPABILITIES, Link, LinkRefused, MAX_CLUSTER_PEERS, MAX_FRAME_SIZE,
+    PEER_DISPATCH_QUEUE_CAP, PEER_SESSION_GENERATION, PROTOCOL_VERSION, PeerInfo, PeerRegistration,
     claim_link, encode_hello, encode_peer_announce, encode_peer_list, encode_presence_full,
     encode_resync, epoch_ms, negotiate_capabilities, negotiate_version, release_link,
 };
+
+// ---------------------------------------------------------------------------
+// Inbound links
+// ---------------------------------------------------------------------------
+
+/// Where this node takes links from its peers.
+pub(crate) enum InboundLinks {
+    /// Its own cluster port, bound by connect_cluster().
+    Listener(tokio::net::TcpListener),
+    /// The WebSocket port (single-port mode): it hands over every connection
+    /// that starts like a cluster frame.
+    MainPort(mpsc::UnboundedReceiver<(tokio::net::TcpStream, SocketAddr)>),
+}
+
+/// Admission of inbound links. Between accept and HELLO a link holds one of
+/// `MAX_PENDING_HELLOS` slots, and one address no more than
+/// `MAX_PENDING_HELLOS_PER_IP` of them, so junk connections from one host
+/// cannot keep the real peers out; past HELLO it holds one of
+/// `MAX_CLUSTER_PEERS` sessions.
+#[derive(Default)]
+pub(super) struct InboundGate {
+    pending: std::sync::Mutex<HashMap<IpAddr, usize>>,
+    pending_total: std::sync::atomic::AtomicUsize,
+    sessions: std::sync::atomic::AtomicUsize,
+}
+
+const MAX_PENDING_HELLOS: usize = 64;
+const MAX_PENDING_HELLOS_PER_IP: usize = 4;
+
+/// A link's place in the gate until HELLO; `session()` trades it for a
+/// session slot.
+pub(super) struct Admitted {
+    gate: Arc<InboundGate>,
+    ip: IpAddr,
+    pending: bool,
+    session: bool,
+}
+
+impl InboundGate {
+    pub(super) fn admit(self: &Arc<Self>, addr: SocketAddr) -> Option<Admitted> {
+        let ip = addr.ip();
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let from_ip = pending.entry(ip).or_insert(0);
+        if *from_ip >= MAX_PENDING_HELLOS_PER_IP
+            || self.pending_total.load(Ordering::Relaxed) >= MAX_PENDING_HELLOS
+        {
+            if *from_ip == 0 {
+                pending.remove(&ip);
+            }
+            tracing::warn!("[WSE-Cluster] Too many links waiting for HELLO, refusing {addr}");
+            return None;
+        }
+        *from_ip += 1;
+        self.pending_total.fetch_add(1, Ordering::Relaxed);
+        Some(Admitted {
+            gate: Arc::clone(self),
+            ip,
+            pending: true,
+            session: false,
+        })
+    }
+}
+
+impl Admitted {
+    fn leave_pending(&mut self) {
+        if std::mem::take(&mut self.pending) {
+            let mut pending = self.gate.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(from_ip) = pending.get_mut(&self.ip) {
+                *from_ip -= 1;
+                if *from_ip == 0 {
+                    pending.remove(&self.ip);
+                }
+            }
+            self.gate.pending_total.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// HELLO arrived: a session slot, or false when all are taken.
+    fn session(&mut self) -> bool {
+        self.leave_pending();
+        let taken = self
+            .gate
+            .sessions
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_CLUSTER_PEERS).then_some(n + 1)
+            })
+            .is_ok();
+        self.session = taken;
+        taken
+    }
+}
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        self.leave_pending();
+        if self.session {
+            self.gate.sessions.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// What an inbound session needs from the manager.
+#[derive(Clone)]
+pub(super) struct InboundSessionCtx {
+    pub(super) instance_id: String,
+    pub(super) ctx: ClusterContext,
+    pub(super) peer_reg_tx: mpsc::UnboundedSender<PeerRegistration>,
+    pub(super) global_cancel: CancellationToken,
+    pub(super) presence: Option<Arc<crate::wse::presence::PresenceManager>>,
+}
+
+impl InboundSessionCtx {
+    pub(super) async fn run<S>(self, stream: S, addr: SocketAddr, admitted: Admitted)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        handle_cluster_inbound_generic(stream, addr, self, admitted).await;
+    }
+}
+
+/// Accept links on the cluster port until the cluster shuts down. An accept
+/// error (out of file descriptors, say) is retried after a pause that grows
+/// from 10 ms to a second, and logged once per pause.
+pub(super) async fn accept_cluster_links(
+    listener: tokio::net::TcpListener,
+    tls: Option<Arc<arc_swap::ArcSwap<ClusterTlsConfig>>>,
+    gate: Arc<InboundGate>,
+    inbound: InboundSessionCtx,
+) {
+    let cancel = inbound.global_cancel.clone();
+    let mut pause = Duration::ZERO;
+    loop {
+        let accepted = tokio::select! {
+            res = listener.accept() => res,
+            () = cancel.cancelled() => break,
+        };
+        let (stream, addr) = match accepted {
+            Ok(link) => {
+                pause = Duration::ZERO;
+                link
+            }
+            Err(e) => {
+                pause = (pause * 2).clamp(Duration::from_millis(10), Duration::from_secs(1));
+                tracing::error!("[WSE-Cluster] Cluster accept error: {e} (retrying in {pause:?})");
+                tokio::select! {
+                    () = tokio::time::sleep(pause) => continue,
+                    () = cancel.cancelled() => break,
+                }
+            }
+        };
+        let Some(admitted) = gate.admit(addr) else {
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        let sock = SockRef::from(&stream);
+        let _ = sock.set_send_buffer_size(262_144);
+        let _ = sock.set_recv_buffer_size(262_144);
+        let tls_snap = tls.as_ref().map(|holder| holder.load_full());
+        let inbound = inbound.clone();
+        tokio::spawn(async move {
+            match tls_snap {
+                Some(tls_cfg) => {
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        tls_cfg.acceptor.accept(stream),
+                    )
+                    .await
+                    {
+                        Ok(Ok(tls_stream)) => inbound.run(tls_stream, addr, admitted).await,
+                        Ok(Err(e)) => {
+                            tracing::warn!("[WSE-Cluster] TLS accept failed from {addr}: {e}");
+                        }
+                        Err(_) => tracing::warn!("[WSE-Cluster] TLS accept timeout from {addr}"),
+                    }
+                }
+                None => inbound.run(stream, addr, admitted).await,
+            }
+        });
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Inbound cluster connection handler (generic over transport)
 // ---------------------------------------------------------------------------
 
 /// Handle inbound cluster peer connection. Generic over stream type (TLS or plaintext).
-pub(super) async fn handle_cluster_inbound_generic<S>(
+async fn handle_cluster_inbound_generic<S>(
     stream: S,
     addr: SocketAddr,
-    instance_id: &str,
-    ctx: ClusterContext,
-    peer_reg_tx: mpsc::UnboundedSender<PeerRegistration>,
-    global_cancel: CancellationToken,
-    presence: Option<Arc<crate::wse::presence::PresenceManager>>,
+    session: InboundSessionCtx,
+    mut admitted: Admitted,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let InboundSessionCtx {
+        instance_id,
+        ctx,
+        peer_reg_tx,
+        global_cancel,
+        presence,
+    } = session;
+    let instance_id: &str = &instance_id;
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     // Read peer's HELLO frame
@@ -72,6 +257,13 @@ pub(super) async fn handle_cluster_inbound_generic<S>(
             return;
         }
     };
+
+    if !admitted.session() {
+        tracing::warn!(
+            "[WSE-Cluster] Refusing inbound {addr}: {MAX_CLUSTER_PEERS} peer sessions already"
+        );
+        return;
+    }
 
     // Claim the link. Refused, it closes before our HELLO: the dialer keeps
     // retrying with backoff, in case the link that won goes away.
@@ -252,85 +444,4 @@ pub(super) async fn handle_cluster_inbound_generic<S>(
         generation: session_gen,
     });
     tracing::info!("[WSE-Cluster] Inbound peer {addr} disconnected");
-}
-
-/// Legacy inbound handler: used when cluster connections arrive on the main port (no separate cluster listener).
-/// Kept for backwards compatibility when cluster_port is not configured.
-pub(crate) async fn handle_cluster_inbound(
-    stream: TcpStream,
-    addr: SocketAddr,
-    shared: &crate::wse::server::SharedState,
-    interest_tx: mpsc::UnboundedSender<InterestUpdate>,
-) {
-    let instance_id = match shared
-        .cluster_instance_id
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-    {
-        Some(id) => id,
-        None => {
-            tracing::warn!("[WSE-Cluster] Rejected inbound from {addr}: cluster not configured");
-            return;
-        }
-    };
-
-    let keepalive = TcpKeepalive::new()
-        .with_time(Duration::from_secs(10))
-        .with_interval(Duration::from_secs(5));
-    let sock_ref = SockRef::from(&stream);
-    let _ = sock_ref.set_tcp_keepalive(&keepalive);
-    let _ = sock_ref.set_recv_buffer_size(262_144);
-    let _ = sock_ref.set_send_buffer_size(262_144);
-
-    // Legacy path: no cluster_manager, so create dummy channels for discovery and registration
-    // (messages sent here are just dropped -- discovery/registration only works with cluster_port)
-    let (new_peer_tx, _new_peer_rx) = mpsc::unbounded_channel::<String>();
-    let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
-    let (peer_reg_tx, _peer_reg_rx) = mpsc::unbounded_channel::<PeerRegistration>();
-    let (presence_tx, _presence_rx) = mpsc::unbounded_channel::<PresencePeerFrame>();
-    // Shared across all legacy inbound calls so duplicate detection actually works.
-    // Note: this static persists across server restarts within the same process, but entries
-    // are always cleaned up in handle_cluster_inbound_generic on disconnect.
-    // Legacy path is mutually exclusive with connect_cluster (which uses its own DashMap).
-    static LEGACY_LINKS: std::sync::OnceLock<Arc<Links>> = std::sync::OnceLock::new();
-    let links = LEGACY_LINKS
-        .get_or_init(|| Arc::new(DashMap::new()))
-        .clone();
-    // Legacy path has no global_cancel -- create a standalone token.
-    // Cleanup happens via tokio runtime drop on server stop.
-    let legacy_cancel = CancellationToken::new();
-
-    // Legacy path has no gossip discovery
-    let legacy_known_peers: Arc<DashSet<String>> = Arc::new(DashSet::new());
-
-    let ctx = ClusterContext {
-        interest_tx,
-        topic_subscribers: shared.topic_subscribers.clone(),
-        glob_topic_count: shared.glob_topic_count.clone(),
-        metrics: shared.cluster_metrics.clone(),
-        new_peer_tx,
-        cmd_tx,
-        presence_tx,
-        links,
-        known_peers: legacy_known_peers,
-        local_topic_refcount: shared.local_topic_refcount.clone(),
-        cluster_addr: None,
-        max_outbound: shared.max_outbound_queue_bytes,
-        slow_drops: Arc::clone(&shared.slow_consumer_drops),
-        recovery: shared.recovery.clone(),
-        topic_message_counts: shared.topic_message_counts.clone(),
-        queue_groups: shared.queue_groups.clone(),
-    };
-
-    handle_cluster_inbound_generic(
-        stream,
-        addr,
-        &instance_id,
-        ctx,
-        peer_reg_tx,
-        legacy_cancel,
-        shared.presence.clone(),
-    )
-    .await;
 }

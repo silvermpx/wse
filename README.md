@@ -351,6 +351,9 @@ server.connect_cluster(
     cluster_port=9999,
 )
 
+# One host or a closed network: links share the WebSocket port (plaintext)
+server.connect_cluster(peers=["10.0.0.2:5007"], single_port=True)
+
 server.cluster_connected()       # True if connected to at least one peer
 server.cluster_peers_count()     # Number of active peer connections
 server.cluster_info()            # List of connected peers (address, instance_id, connected)

@@ -420,9 +420,10 @@ Deny always takes precedence over allow. Patterns support `*` (match any charact
 
 ### Cluster Authentication
 
-- **With TLS**: mutual TLS (mTLS) provides both encryption and authentication. Cluster connections are only accepted on the dedicated `cluster_port`
-- **Without TLS**: cluster connections on the main WebSocket port log a security warning. For production, always enable cluster TLS or use a dedicated cluster port on a private network
-- Plaintext cluster connections are accepted only when cluster is initialized and TLS is not configured
+- **With TLS**: mutual TLS (mTLS) provides both encryption and authentication on the dedicated `cluster_port`
+- **Without TLS**: links are plaintext and unauthenticated: anyone who reaches the cluster port can join as a peer, read every topic and publish to any. Keep `cluster_port` on a private network (`cluster_host` binds it to one interface)
+- The WebSocket port takes cluster links only with `connect_cluster(..., single_port=True)`, which shares that port with clients: use it only where the WebSocket port, too, is reachable from the cluster's own network alone. Otherwise cluster frames arriving there are refused
+- At most 64 inbound links may wait for their HELLO at once, 4 from one address, and at most 256 peer sessions are open
 
 ### Cluster Frame Protection
 

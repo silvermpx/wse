@@ -497,8 +497,18 @@ Clustering connects multiple WSE instances into a broadcast mesh. Messages sent 
 **Basic cluster (no TLS):**
 
 ```python
-server.connect_cluster(peers=["10.0.0.2:9999", "10.0.0.3:9999"])
+server.connect_cluster(peers=["10.0.0.2:9999", "10.0.0.3:9999"], cluster_port=9999)
 ```
+
+Peers' links come in on `cluster_port` (on all interfaces; `cluster_host="10.0.0.1"` binds one). Without TLS they are unauthenticated, so keep that port on a private network.
+
+**Single port:** where the WebSocket port itself is reachable only from the cluster's network (a test setup, one host), the links can share it:
+
+```python
+server.connect_cluster(peers=["10.0.0.2:5007", "10.0.0.3:5007"], single_port=True)
+```
+
+Without `cluster_port` or `single_port=True`, `connect_cluster()` raises `ValueError`; a port that cannot be bound raises `OSError`.
 
 **Cluster with mTLS:**
 

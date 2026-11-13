@@ -25,7 +25,7 @@ mod protocol;
 mod tls;
 mod types;
 
-pub(crate) use inbound::handle_cluster_inbound;
+pub(crate) use inbound::InboundLinks;
 pub(crate) use manager::cluster_manager;
 pub(crate) use protocol::{
     ClusterFrame, decode_frame, encode_drain, encode_hello, encode_msg, encode_msg_compressed,
@@ -34,10 +34,12 @@ pub(crate) use protocol::{
     encode_unsub, negotiate_capabilities, negotiate_version,
 };
 pub(crate) use tls::{ClusterTlsConfig, build_cluster_tls};
+#[cfg(test)]
+use types::Links;
 pub(crate) use types::{
     ClusterCommand, ClusterContext, ClusterDlq, ClusterDlqEntry, ClusterMetrics, InterestUpdate,
-    Link, LinkRefused, Links, PeerInfo, PeerInterest, PeerRegistration, PresencePeerFrame,
-    claim_link, release_link,
+    Link, LinkRefused, PeerInfo, PeerInterest, PeerRegistration, PresencePeerFrame, claim_link,
+    release_link,
 };
 
 use std::sync::atomic::AtomicU64;

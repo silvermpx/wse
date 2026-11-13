@@ -4,15 +4,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::{DashMap, DashSet};
-use socket2::SockRef;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::inbound::handle_cluster_inbound_generic;
+use super::inbound::{InboundGate, InboundLinks, InboundSessionCtx, accept_cluster_links};
 use super::peer::PeerSpawnCtx;
 use super::{
     CAP_COMPRESSION, CAP_INTEREST_ROUTING, CAP_PRESENCE, CAP_RECOVERY, ClusterCommand,
@@ -38,13 +36,13 @@ pub(crate) async fn cluster_manager(
     dlq: Arc<std::sync::Mutex<ClusterDlq>>,
     tls_config: Option<Arc<arc_swap::ArcSwap<ClusterTlsConfig>>>,
     cluster_opts: (
-        Option<u16>,
+        InboundLinks,
         Option<Arc<crate::wse::presence::PresenceManager>>,
         Option<mpsc::UnboundedSender<crate::wse::server::ServerCommand>>,
     ),
 ) {
     let (mut cmd_rx, mut interest_rx) = channels;
-    let (cluster_port, presence, server_cmd_tx) = cluster_opts;
+    let (inbound_links, presence, server_cmd_tx) = cluster_opts;
     let global_cancel = CancellationToken::new();
 
     // Remote interest: the topics each peer has subscribers for. A peer with
@@ -99,91 +97,43 @@ pub(crate) async fn cluster_manager(
         }
     }
 
-    // Start cluster listener for inbound peer connections (separate port)
-    // Limit concurrent inbound connections to prevent resource exhaustion
-    const MAX_INBOUND_CLUSTER_CONNS: usize = 128;
-    if let Some(port) = cluster_port {
-        let bind_addr = format!("0.0.0.0:{}", port);
-        match tokio::net::TcpListener::bind(&bind_addr).await {
-            Ok(cluster_listener) => {
-                tracing::info!("[WSE-Cluster] Cluster listener on {bind_addr}");
-                let tls_cfg = tls_config.clone();
-                let inst_id = instance_id.clone();
-                let cancel = global_cancel.clone();
-                let prt = peer_reg_tx.clone();
-                let inbound_ctx = ctx.clone();
-                let ppres = presence.clone();
-                let conn_semaphore =
-                    Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_CLUSTER_CONNS));
-                tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            res = cluster_listener.accept() => {
-                                match res {
-                                    Ok((stream, addr)) => {
-                                        let permit = match conn_semaphore.clone().try_acquire_owned() {
-                                            Ok(permit) => permit,
-                                            Err(_) => {
-                                                tracing::warn!("[WSE-Cluster] Max inbound connections reached, rejecting {addr}");
-                                                drop(stream);
-                                                continue;
-                                            }
-                                        };
-                                        let _ = stream.set_nodelay(true);
-                                        let sock = SockRef::from(&stream);
-                                        let _ = sock.set_send_buffer_size(262_144);
-                                        let _ = sock.set_recv_buffer_size(262_144);
-                                        let tls = tls_cfg.clone();
-                                        let inst2 = inst_id.clone();
-                                        let prt2 = prt.clone();
-                                        let gc2 = cancel.clone();
-                                        let ctx2 = inbound_ctx.clone();
-                                        let ppres2 = ppres.clone();
-                                        tokio::spawn(async move {
-                                            let _permit = permit; // held until task completes
-                                            // Load current TLS config snapshot for this handshake
-                                            let tls_snap = tls.as_ref().map(|holder| holder.load());
-                                            if let Some(ref tls_cfg) = tls_snap {
-                                                match tokio::time::timeout(
-                                                    Duration::from_secs(5),
-                                                    tls_cfg.acceptor.accept(stream),
-                                                ).await {
-                                                    Ok(Ok(tls_stream)) => {
-                                                        handle_cluster_inbound_generic(
-                                                            tls_stream, addr, &inst2,
-                                                            ctx2, prt2, gc2, ppres2,
-                                                        ).await;
-                                                    }
-                                                    Ok(Err(e)) => {
-                                                        tracing::warn!("[WSE-Cluster] TLS accept failed from {addr}: {e}");
-                                                    }
-                                                    Err(_) => {
-                                                        tracing::warn!("[WSE-Cluster] TLS accept timeout from {addr}");
-                                                    }
-                                                }
-                                            } else {
-                                                handle_cluster_inbound_generic(
-                                                    stream, addr, &inst2,
-                                                    ctx2, prt2, gc2, ppres2,
-                                                ).await;
-                                            }
-                                        });
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("[WSE-Cluster] Cluster accept error: {e}");
-                                    }
-                                }
+    // Inbound links: from the cluster listener, or handed over by the
+    // WebSocket port in single-port mode.
+    let gate = Arc::new(InboundGate::default());
+    let inbound = InboundSessionCtx {
+        instance_id: instance_id.clone(),
+        ctx: ctx.clone(),
+        peer_reg_tx: peer_reg_tx.clone(),
+        global_cancel: global_cancel.clone(),
+        presence: presence.clone(),
+    };
+    match inbound_links {
+        InboundLinks::Listener(listener) => {
+            tokio::spawn(accept_cluster_links(
+                listener,
+                tls_config.clone(),
+                gate,
+                inbound,
+            ));
+        }
+        InboundLinks::MainPort(mut handed_over) => {
+            let cancel = global_cancel.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        link = handed_over.recv() => {
+                            let Some((stream, addr)) = link else { break };
+                            if let Some(admitted) = gate.admit(addr) {
+                                let inbound = inbound.clone();
+                                tokio::spawn(async move {
+                                    inbound.run(stream, addr, admitted).await;
+                                });
                             }
-                            () = cancel.cancelled() => break,
                         }
+                        () = cancel.cancelled() => break,
                     }
-                });
-            }
-            Err(e) => {
-                tracing::error!(
-                    "[WSE-Cluster] Failed to bind cluster listener on {bind_addr}: {e}"
-                );
-            }
+                }
+            });
         }
     }
 

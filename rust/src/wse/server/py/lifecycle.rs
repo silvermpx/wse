@@ -318,11 +318,13 @@ impl RustWSEServer {
                     // Bounds the number of connections in the pre-handshake phase
                     // (slowloris): max_connections only counts registered ones.
                     let handshakes_in_flight = Arc::new(AtomicUsize::new(0));
+                    let mut accept_pause = Duration::ZERO;
                     loop {
                         tokio::select! {
                             res = listener.accept() => {
                                 match res {
                                     Ok((stream, addr)) => {
+                                        accept_pause = Duration::ZERO;
                                         if handshakes_in_flight.load(Ordering::Relaxed)
                                             >= MAX_PENDING_HANDSHAKES
                                         {
@@ -362,47 +364,21 @@ impl RustWSEServer {
                                                 _ => false,
                                             };
                                             if is_cluster {
-                                                // Reject cluster connections on main port:
-                                                // - always when mTLS is configured (use dedicated cluster_port)
-                                                // - always when TLS is NOT configured (unauthenticated injection risk)
-                                                // - when cluster is not yet initialized
-                                                let cluster_ready = shared2
-                                                    .cluster_interest_tx
-                                                    .read()
-                                                    .unwrap()
-                                                    .is_some();
-                                                let tls_enabled = shared2.cluster_tls_enabled.load(Ordering::Relaxed);
-                                                if tls_enabled || !cluster_ready {
-                                                    if tls_enabled {
-                                                        tracing::warn!(
-                                                            "[WSE] Rejecting cluster connection on main port \
-                                                             (mTLS required, use dedicated cluster_port): {addr}"
-                                                        );
-                                                    }
-                                                    drop(stream);
-                                                    return;
-                                                }
-                                                // Non-TLS cluster on main port: reject unless cluster_port
-                                                // is explicitly not set (backward compat for single-port
-                                                // deployments). Log a warning for security awareness.
-                                                tracing::warn!(
-                                                    "[WSE] Accepting plaintext cluster connection on main port \
-                                                     from {addr} -- configure cluster TLS for production use"
-                                                );
-                                                let interest_tx = shared2
-                                                    .cluster_interest_tx
+                                                // Only in single-port mode, and then the
+                                                // cluster manager takes the link over.
+                                                drop(hs_guard);
+                                                let main_port = shared2
+                                                    .cluster_main_port
                                                     .read()
                                                     .unwrap()
                                                     .clone();
-                                                if let Some(interest_tx) = interest_tx {
-                                                    crate::wse::cluster::handle_cluster_inbound(
-                                                        stream, addr, &shared2, interest_tx,
-                                                    )
-                                                    .await;
-                                                } else {
-                                                    tracing::warn!(
-                                                        "[WSE-Cluster] No interest channel for inbound {addr}"
-                                                    );
+                                                match main_port {
+                                                    Some(manager) => {
+                                                        let _ = manager.send((stream, addr));
+                                                    }
+                                                    None => tracing::debug!(
+                                                        "[WSE] Refused a cluster link on the WebSocket port from {addr}"
+                                                    ),
                                                 }
                                             } else {
                                                 handle_connection(stream, addr, shared2, hs_guard).await;
@@ -411,7 +387,13 @@ impl RustWSEServer {
                                     }
                                     Err(e) => {
                                         if !running.load(Ordering::SeqCst) { break; }
-                                        tracing::error!("[WSE] Accept error: {e}");
+                                        // Out of file descriptors, say: retrying at
+                                        // once would spin.
+                                        accept_pause = (accept_pause * 2)
+                                            .clamp(Duration::from_millis(10), Duration::from_secs(1));
+                                        tracing::error!("[WSE] Accept error: {e} (retrying in {accept_pause:?})");
+                                        tokio::time::sleep(accept_pause).await;
+                                        continue;
                                     }
                                 }
                             }
@@ -476,6 +458,8 @@ impl RustWSEServer {
         let panicked = py.detach(move || handle.join().is_err());
         self.cmd_tx.store(None);
         *self.shared.cluster_cmd_tx.write().unwrap() = None;
+        *self.shared.cluster_main_port.write().unwrap() = None;
+        *self.shared.cluster_instance_id.lock().unwrap() = None;
         drop(server_thread);
         if panicked {
             return Err(PyRuntimeError::new_err("Server thread panicked"));

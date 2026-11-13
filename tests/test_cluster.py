@@ -26,28 +26,31 @@ def wait_for(predicate, timeout=10.0):
 
 
 class Node:
-    def __init__(self, recovery=False):
+    def __init__(self, recovery=False, single_port=False, **options):
         self.port = _next_port()
         self.server = RustWSEServer(
-            "127.0.0.1", self.port, max_connections=10, recovery_enabled=recovery
+            "127.0.0.1", self.port, max_connections=10, recovery_enabled=recovery, **options
         )
         self.server.enable_drain_mode()
         self.server.start()
-        self.cluster_port = _next_port()
+        self.single_port = single_port
+        self.cluster_port = None if single_port else _next_port()
         self.running = True
 
     @property
     def addr(self):
-        return f"127.0.0.1:{self.cluster_port}"
+        return f"127.0.0.1:{self.port if self.single_port else self.cluster_port}"
 
     @property
     def peers(self):
         return self.server.cluster_peers_count()
 
     def join(self, *peers, **tls):
-        self.server.connect_cluster(
-            peers=[p.addr for p in peers], cluster_port=self.cluster_port, **tls
-        )
+        if self.single_port:
+            listen = {"single_port": True}
+        else:
+            listen = {"cluster_port": self.cluster_port}
+        self.server.connect_cluster(peers=[p.addr for p in peers], **listen, **tls)
 
     def stop(self):
         if self.running:
@@ -191,6 +194,81 @@ def test_subscriptions_made_before_joining_reach_peers(nodes):
 
     message = asyncio.run(scenario())
     assert message["p"] == {"n": 1}
+
+
+# ---------------------------------------------------------------------------
+# Where links come in
+# ---------------------------------------------------------------------------
+
+
+def test_a_listening_option_is_required(nodes):
+    node = nodes()
+    with pytest.raises(ValueError, match="cluster_port"):
+        node.server.connect_cluster(peers=[])
+    with pytest.raises(ValueError, match="exclude"):
+        node.server.connect_cluster(peers=[], cluster_port=_next_port(), single_port=True)
+    with pytest.raises(ValueError, match="cluster_host needs cluster_port"):
+        node.server.connect_cluster(peers=[], single_port=True, cluster_host="127.0.0.1")
+
+
+def test_a_cluster_port_in_use_is_an_error_of_the_call(nodes):
+    a, b = nodes(), nodes()
+    a.join()
+    with pytest.raises(OSError, match="cannot listen"):
+        b.server.connect_cluster(peers=[], cluster_port=a.cluster_port)
+
+
+def test_the_websocket_port_refuses_cluster_links_without_single_port(nodes):
+    import socket
+    import struct
+
+    node = nodes()
+    node.join()
+    # A HELLO-shaped frame: a 4-byte length, then the header. Refused, the
+    # connection is closed without a HELLO back.
+    body = b"\x00" * 24
+    with socket.create_connection(("127.0.0.1", node.port), timeout=5) as sock:
+        sock.sendall(struct.pack(">I", len(body)) + body)
+        sock.settimeout(5)
+        try:
+            answer = sock.recv(64)
+        except ConnectionResetError:
+            answer = b""
+        assert answer == b""
+    assert node.peers == 0
+
+
+def test_single_port_cluster_forms_and_shares_presence(nodes):
+    websockets = pytest.importorskip("websockets")
+    from tests.conftest import JWT_AUDIENCE, JWT_ISSUER, JWT_SECRET, make_token
+
+    options = {
+        "single_port": True,
+        "presence_enabled": True,
+        "jwt_secret": JWT_SECRET,
+        "jwt_issuer": JWT_ISSUER,
+        "jwt_audience": JWT_AUDIENCE,
+    }
+    a, b = nodes(**options), nodes(**options)
+    a.join(b)
+    b.join(a)
+    assert wait_for(lambda: a.peers == 1 and b.peers == 1)
+
+    async def scenario():
+        async with websockets.connect(
+            f"ws://127.0.0.1:{a.port}/wse",
+            additional_headers={"Authorization": f"Bearer {make_token('alice')}"},
+        ):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                joined = [e for e in a.server.drain_inbound(16, 50) if e[0] == "auth_connect"]
+                if joined:
+                    a.server.subscribe_connection(joined[0][1], ["room"], {"status": "here"})
+                    break
+                await asyncio.sleep(0.05)
+            return await asyncio.to_thread(wait_for, lambda: "alice" in b.server.presence("room"))
+
+    assert asyncio.run(scenario())
 
 
 # ---------------------------------------------------------------------------

@@ -305,11 +305,12 @@ pub(crate) struct SharedState {
     pub(crate) cluster_metrics: Arc<ClusterMetrics>,
     pub(super) cluster_dlq: Arc<std::sync::Mutex<ClusterDlq>>,
     pub(crate) cluster_instance_id: std::sync::Mutex<Option<String>>,
-    pub(crate) cluster_interest_tx:
-        std::sync::RwLock<Option<mpsc::UnboundedSender<crate::wse::cluster::InterestUpdate>>>,
     pub(crate) local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    // True when cluster TLS is configured (reject cluster connections on main port)
-    pub(super) cluster_tls_enabled: AtomicBool,
+    // Single-port mode only: the WebSocket port hands cluster links to the
+    // cluster manager through this. None: cluster frames are refused there.
+    pub(super) cluster_main_port: std::sync::RwLock<
+        Option<mpsc::UnboundedSender<(tokio::net::TcpStream, std::net::SocketAddr)>>,
+    >,
     // ArcSwap holder for hot-reloading cluster TLS certificates at runtime
     pub(crate) cluster_tls_holder:
         std::sync::RwLock<Option<Arc<arc_swap::ArcSwap<crate::wse::cluster::ClusterTlsConfig>>>>,
@@ -435,9 +436,8 @@ impl SharedState {
             cluster_metrics: Arc::new(ClusterMetrics::new()),
             cluster_dlq: Arc::new(std::sync::Mutex::new(ClusterDlq::new(1000))),
             cluster_instance_id: std::sync::Mutex::new(None),
-            cluster_interest_tx: std::sync::RwLock::new(None),
             local_topic_refcount: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            cluster_tls_enabled: AtomicBool::new(false),
+            cluster_main_port: std::sync::RwLock::new(None),
             cluster_tls_holder: std::sync::RwLock::new(None),
             recovery: cfg.recovery,
             conn_last_activity: DashMap::new(),

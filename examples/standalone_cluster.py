@@ -89,7 +89,9 @@ def main():
     server.start()
 
     try:
-        server.connect_cluster(args.peers)
+        # Peers' links share the WebSocket port: fine on one host, never on a
+        # port reachable from outside (use cluster_port there).
+        server.connect_cluster(args.peers, single_port=True)
         print(f"Cluster peers: {args.peers}")
     except Exception as e:
         print(f"Cluster connect failed: {e}")

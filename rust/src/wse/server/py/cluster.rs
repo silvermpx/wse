@@ -1,7 +1,6 @@
 //! Joining the cluster mesh, cluster TLS reload and the peer list.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -16,11 +15,12 @@ impl RustWSEServer {
         &self,
         peers: Vec<String>,
         tls: (Option<String>, Option<String>, Option<String>),
-        cluster_port: Option<u16>,
+        listen: (Option<u16>, Option<String>, bool),
         seeds: Option<Vec<String>>,
         cluster_addr: Option<String>,
     ) -> PyResult<()> {
         let (tls_cert, tls_key, tls_ca) = tls;
+        let (cluster_port, cluster_host, single_port) = listen;
 
         if self.shared.cluster_cmd_tx.read().unwrap().is_some() {
             return Err(PyRuntimeError::new_err("Cluster already connected"));
@@ -64,23 +64,70 @@ impl RustWSEServer {
             }
         };
 
-        self.shared
-            .cluster_tls_enabled
-            .store(tls_config.is_some(), Ordering::Relaxed);
-
-        let tls_holder = tls_config.map(|cfg| Arc::new(arc_swap::ArcSwap::from_pointee(cfg)));
-        *self.shared.cluster_tls_holder.write().unwrap() = tls_holder.clone();
+        // Where peers' links come in. The WebSocket port takes them only when
+        // asked to: there anyone who reaches the port could join as a peer.
+        let invalid = |msg: &str| Err(pyo3::exceptions::PyValueError::new_err(msg.to_owned()));
+        match (cluster_port, single_port) {
+            (Some(_), true) => {
+                return invalid("cluster_port and single_port=True exclude each other");
+            }
+            (None, false) => {
+                return invalid(
+                    "connect_cluster needs cluster_port, the port peers' links come in on; \
+                     or single_port=True to take them on the WebSocket port, unauthenticated, \
+                     where that port is reachable only from the cluster's own network",
+                );
+            }
+            _ => {}
+        }
+        if single_port && tls_config.is_some() {
+            return invalid("cluster TLS needs cluster_port: single_port links are plaintext");
+        }
+        if cluster_host.is_some() && cluster_port.is_none() {
+            return invalid("cluster_host needs cluster_port");
+        }
 
         let rt_handle = self
             .runtime()
             .ok_or_else(|| PyRuntimeError::new_err("Server not started"))?;
+
+        // Bound here, so a port in use is an error of this call.
+        let (inbound_links, main_port_tx) = match cluster_port {
+            Some(port) => {
+                let host = cluster_host.as_deref().unwrap_or("0.0.0.0");
+                let listener = std::net::TcpListener::bind((host, port))
+                    .and_then(|listener| {
+                        listener.set_nonblocking(true)?;
+                        let _runtime = rt_handle.enter();
+                        tokio::net::TcpListener::from_std(listener)
+                    })
+                    .map_err(|e| {
+                        pyo3::exceptions::PyOSError::new_err(format!(
+                            "cannot listen for cluster links on {host}:{port}: {e}"
+                        ))
+                    })?;
+                tracing::info!("[WSE-Cluster] Cluster listener on {host}:{port}");
+                (crate::wse::cluster::InboundLinks::Listener(listener), None)
+            }
+            None => {
+                tracing::warn!(
+                    "[WSE-Cluster] single_port: cluster links are taken on the WebSocket port, \
+                     unauthenticated"
+                );
+                let (tx, rx) = mpsc::unbounded_channel();
+                (crate::wse::cluster::InboundLinks::MainPort(rx), Some(tx))
+            }
+        };
+
+        let tls_holder = tls_config.map(|cfg| Arc::new(arc_swap::ArcSwap::from_pointee(cfg)));
+        *self.shared.cluster_tls_holder.write().unwrap() = tls_holder.clone();
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
         *self.shared.cluster_cmd_tx.write().unwrap() = Some(cmd_tx);
 
         let (interest_tx, interest_rx) =
             mpsc::unbounded_channel::<crate::wse::cluster::InterestUpdate>();
-        *self.shared.cluster_interest_tx.write().unwrap() = Some(interest_tx.clone());
+        *self.shared.cluster_main_port.write().unwrap() = main_port_tx;
 
         let instance_id = uuid::Uuid::now_v7().to_string();
         *self.shared.cluster_instance_id.lock().unwrap() = Some(instance_id.clone());
@@ -125,7 +172,7 @@ impl RustWSEServer {
             dlq,
             tls_holder,
             (
-                cluster_port,
+                inbound_links,
                 self.shared.presence.clone(),
                 self.cmd_tx.load_full().map(|tx| (*tx).clone()),
             ),

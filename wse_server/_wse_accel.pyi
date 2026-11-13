@@ -524,8 +524,17 @@ class RustWSEServer:
         cluster_port: int | None = None,
         seeds: list[str] | None = None,
         cluster_addr: str | None = None,
+        cluster_host: str | None = None,
+        single_port: bool = False,
     ) -> None:
-        """Connect to cluster peers via TCP mesh protocol."""
+        """Connect to cluster peers via TCP mesh protocol.
+
+        Peers' links come in on cluster_port (bound on cluster_host, 0.0.0.0
+        by default), or with single_port=True on the WebSocket port:
+        plaintext and unauthenticated, for a port only the cluster's own
+        network reaches. One of the two is required (ValueError otherwise);
+        a cluster_port that cannot be bound raises OSError.
+        """
         ...
     def cluster_connected(self) -> bool:
         """Return True if at least one cluster peer is connected."""
