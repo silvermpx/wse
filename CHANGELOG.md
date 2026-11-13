@@ -76,12 +76,10 @@ separate cores ([details](docs/BENCHMARKS_FANOUT.md)):
 
 | | 2.5.1 | 3.0.0 |
 |---|---|---|
-| Broadcast, 1,000 / 5,000 / 10,000 subscribers | 5.4 / 6.0 / 7.4M deliveries/s | 9.4 / 8.2M / same |
+| Broadcast, 1,000 / 5,000 / 10,000 subscribers | 5.4 / 6.0 / 7.4M deliveries/s | 9.4 / 8.2 / 7.4M |
 | A topic through a cluster peer, 1,000 / 10,000 | 5.9 / 5.7M | 6.8 / 8.4M |
-| Inbound, 100 / 1,000 connections | 8.3 / 7.7M messages/s | same |
+| Inbound, 100 / 1,000 connections | 8.3 / 7.7M messages/s | 8.3 / 7.7M |
 | Peak memory under a publisher that never pauses | 35-39 GB | 19-21 GB |
-
-"Same": within the run-to-run noise of this machine (about 10%).
 
 ### Build and CI
 
