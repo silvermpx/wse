@@ -121,13 +121,13 @@ def test_restarted_peer_is_connected_again(nodes):
     assert wait_for(lambda: a.peers == 1 and c.peers == 1, timeout=20.0)
 
 
-async def subscribe_next_client(node, topics):
+async def subscribe_next_client(node, topics, queue_group=None):
     """Wait for the next client's connect event on `node` and subscribe it."""
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         for event in node.server.drain_inbound(16, 50):
             if event[0] == "connect":
-                node.server.subscribe_connection(event[1], topics)
+                node.server.subscribe_connection(event[1], topics, queue_group=queue_group)
                 return
         await asyncio.sleep(0.05)
     raise AssertionError("no client connected")
@@ -164,6 +164,27 @@ def test_relayed_messages_carry_the_position_they_got_at_their_origin(nodes):
     assert len({m["e"] for m in messages}) == 1
     offsets = [m["o"] for m in messages]
     assert offsets == list(range(offsets[0], offsets[0] + 5)), offsets
+
+
+def test_a_queue_group_on_another_node_gets_the_topic(nodes):
+    websockets = pytest.importorskip("websockets")
+    origin, worker = nodes(recovery=True), nodes(recovery=True)
+    origin.join(worker)
+    worker.join(origin)
+    assert wait_for(lambda: origin.peers == 1 and worker.peers == 1)
+
+    async def scenario():
+        async with websockets.connect(f"ws://127.0.0.1:{worker.port}/wse") as ws:
+            await subscribe_next_client(worker, ["tasks"], queue_group="workers")
+            await asyncio.sleep(0.5)  # the membership's SUB reaches the origin
+            for n in range(3):
+                origin.server.broadcast("tasks", json.dumps({"t": "task", "p": {"n": n}}))
+            return await messages_of_type(ws, "task", 3)
+
+    tasks = asyncio.run(scenario())
+    assert [t["p"]["n"] for t in tasks] == [0, 1, 2]
+    # A member sees only some offsets of a topic: no recovery stamp.
+    assert all("o" not in t for t in tasks)
 
 
 def test_subscriptions_made_before_joining_reach_peers(nodes):

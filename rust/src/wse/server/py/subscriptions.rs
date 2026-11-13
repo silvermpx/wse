@@ -12,7 +12,14 @@ use super::convert::pyobj_to_json;
 use crate::wse::cluster::ClusterCommand;
 use crate::wse::server::e2e::encrypt_outbound;
 use crate::wse::server::state::InboundEvent;
-use crate::wse::server::{QueueGroup, ServerCommand, WsFrame, format_presence_msg, pre_frame_text};
+use crate::wse::server::{
+    QueueGroup, ServerCommand, WsFrame, format_presence_msg, is_pattern, pre_frame_text,
+};
+
+/// Longest topic name accepted, in bytes.
+const MAX_TOPIC_LEN: usize = 256;
+/// Pattern subscriptions (names with `*` or `?`) one connection may hold.
+const MAX_PATTERNS_PER_CONNECTION: usize = 16;
 
 impl RustWSEServer {
     pub(super) fn set_topic_acl_impl(
@@ -25,14 +32,14 @@ impl RustWSEServer {
         if !self.shared.conn_last_activity.contains_key(conn_id) {
             return false;
         }
-        let acl = crate::jwt::TopicAcl {
+        let acl = crate::wse::server::TopicAcl {
             allow: allow.unwrap_or_default(),
             deny: deny.unwrap_or_default(),
         };
-        self.shared.conn_topic_acl.insert(conn_id.to_owned(), acl);
+        self.shared.topics.acls.insert(conn_id.to_owned(), acl);
         // Gone meanwhile: its cleanup may have run before the insert.
         if !self.shared.conn_last_activity.contains_key(conn_id) {
-            self.shared.conn_topic_acl.remove(conn_id);
+            self.shared.topics.acls.remove(conn_id);
             return false;
         }
         true
@@ -45,10 +52,10 @@ impl RustWSEServer {
         topics: Vec<String>,
         presence_data: Option<&Bound<'_, PyDict>>,
         queue_group: Option<String>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Vec<String>> {
         // Filter topics through ACL if one exists for this connection.
         // No ACL = allow all (backward compatible).
-        let mut topics = if let Some(acl) = self.shared.conn_topic_acl.get(conn_id) {
+        let mut topics = if let Some(acl) = self.shared.topics.acls.get(conn_id) {
             topics
                 .into_iter()
                 .filter(|t| acl.is_allowed(t))
@@ -57,21 +64,36 @@ impl RustWSEServer {
             topics
         };
 
-        // Reject topics containing ASCII control characters. The cluster RESYNC
-        // wire format newline-delimits topics, so a '\n' in a topic name would be
-        // decoded by a peer as two separate interest entries -- corrupting that
-        // peer's routing table (a topic-injection vector). Drop them at this
-        // single chokepoint where topics enter local interest / RESYNC. Non-ASCII
-        // UTF-8 topics are unaffected (only ASCII control bytes are rejected).
+        // Topic names: not empty, at most MAX_TOPIC_LEN bytes, no ASCII control
+        // characters. The cluster RESYNC wire format newline-delimits topics,
+        // so a '\n' in a name would reach a peer as two interest entries.
         topics.retain(|t| {
-            if t.bytes().any(|b| b.is_ascii_control()) {
-                tracing::warn!(
-                    "[WSE] Rejecting subscribe to topic with control characters (conn {conn_id})"
-                );
-                false
-            } else {
-                true
+            let valid = !t.is_empty()
+                && t.len() <= MAX_TOPIC_LEN
+                && !t.bytes().any(|b| b.is_ascii_control());
+            if !valid {
+                tracing::warn!("[WSE] Refusing an invalid topic name (conn {conn_id})");
             }
+            valid
+        });
+        // Patterns cost every publish a match: a few per connection.
+        let mut patterns = self
+            .shared
+            .conn_topics
+            .get(conn_id)
+            .map_or(0, |held| held.iter().filter(|t| is_pattern(t)).count());
+        topics.retain(|t| {
+            if !is_pattern(t) {
+                return true;
+            }
+            patterns += 1;
+            if patterns > MAX_PATTERNS_PER_CONNECTION {
+                tracing::warn!(
+                    "[WSE] Refusing pattern {t:?}: {MAX_PATTERNS_PER_CONNECTION} per connection (conn {conn_id})"
+                );
+                return false;
+            }
+            true
         });
 
         // Enforce per-connection subscription limit (0 = unlimited).
@@ -140,25 +162,13 @@ impl RustWSEServer {
                         let pair = (topic.clone(), qg_name.clone());
                         if !memberships.contains(&pair) {
                             memberships.push(pair);
+                            // A group member is an interest in the topic too:
+                            // peers send this node the topic's messages.
+                            newly_subscribed.push(topic.clone());
                         }
                     }
                 } else {
-                    // Normal fan-out mode: add to topic_subscribers
-                    // Use single entry() call to detect fresh topic creation atomically
-                    // (avoids TOCTOU race between contains_key and entry)
-                    let outer = self
-                        .shared
-                        .topic_subscribers
-                        .entry(topic.clone())
-                        .or_default();
-                    let is_new_entry = outer.insert(conn_id.to_owned(), h.clone()).is_none();
-                    let is_first = is_new_entry && outer.len() == 1;
-                    // fetch_add while holding shard lock to prevent race with concurrent
-                    // unsubscribe (which also needs the shard lock for remove_if)
-                    if is_first && (topic.contains('*') || topic.contains('?')) {
-                        self.shared.glob_topic_count.fetch_add(1, Ordering::Relaxed);
-                    }
-                    drop(outer);
+                    self.shared.topics.subscribe(topic, conn_id, h);
                 }
             } else {
                 // Connection already disconnected -- skip topic tracking and cluster sub
@@ -230,7 +240,7 @@ impl RustWSEServer {
             }
         }
 
-        Ok(())
+        Ok(topics)
     }
 
     pub(super) fn subscribe_with_recovery_impl(
@@ -254,7 +264,7 @@ impl RustWSEServer {
         // configured the connection is unrestricted (the fail-open default is a
         // separate finding); here we only mirror whatever subscribe_connection did.
         let allowed: std::collections::HashSet<String> =
-            if let Some(acl) = self.shared.conn_topic_acl.get(conn_id) {
+            if let Some(acl) = self.shared.topics.acls.get(conn_id) {
                 topics
                     .iter()
                     .filter(|t| acl.is_allowed(t.as_str()))
@@ -456,18 +466,7 @@ impl RustWSEServer {
                             false
                         };
                     if was_subscribed {
-                        if let Some(subscribers) = self.shared.topic_subscribers.get(topic) {
-                            subscribers.remove(conn_id);
-                        }
-                        if self
-                            .shared
-                            .topic_subscribers
-                            .remove_if(topic, |_, subs| subs.is_empty())
-                            .is_some()
-                            && (topic.contains('*') || topic.contains('?'))
-                        {
-                            self.shared.glob_topic_count.fetch_sub(1, Ordering::Relaxed);
-                        }
+                        self.shared.topics.unsubscribe(topic, conn_id);
                         actually_removed.push(topic.clone());
                     }
                 }
@@ -482,18 +481,7 @@ impl RustWSEServer {
                 if let Some((_, topics)) = self.shared.conn_topics.remove(conn_id) {
                     for topic_ref in topics.iter() {
                         let topic = topic_ref.clone();
-                        if let Some(subscribers) = self.shared.topic_subscribers.get(&topic) {
-                            subscribers.remove(conn_id);
-                        }
-                        if self
-                            .shared
-                            .topic_subscribers
-                            .remove_if(&topic, |_, subs| subs.is_empty())
-                            .is_some()
-                            && (topic.contains('*') || topic.contains('?'))
-                        {
-                            self.shared.glob_topic_count.fetch_sub(1, Ordering::Relaxed);
-                        }
+                        self.shared.topics.unsubscribe(&topic, conn_id);
                         removed.push(topic);
                     }
                 }
@@ -503,6 +491,7 @@ impl RustWSEServer {
 
         // Queue group cleanup: when unsubscribing specific topics, only remove those;
         // when unsubscribing all (topics=None), remove all queue group memberships.
+        let mut left_groups: Vec<String> = Vec::new();
         if let Some(mut memberships) = self.shared.conn_queue_groups.get_mut(conn_id) {
             memberships.retain(|(topic, group_name)| {
                 if !unsubscribe_all
@@ -511,6 +500,7 @@ impl RustWSEServer {
                 {
                     return true; // keep: topic was not in unsubscribe request
                 }
+                left_groups.push(topic.clone());
                 if let Some(tg) = self.shared.queue_groups.get(topic) {
                     if let Some(mut g) = tg.get_mut(group_name) {
                         g.members.retain(|(id, _)| id != conn_id);
@@ -527,6 +517,7 @@ impl RustWSEServer {
         self.shared
             .conn_queue_groups
             .remove_if(conn_id, |_, v| v.is_empty());
+        self.shared.remove_local_interest(&left_groups);
 
         // Presence cleanup for removed topics
         if let Some(ref pm) = self.shared.presence {

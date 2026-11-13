@@ -11,7 +11,7 @@ use pyo3::prelude::*;
 use tokio::sync::{RwLock, mpsc};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-use super::{BroadcastQueue, WsFrame};
+use super::{BroadcastQueue, TopicIndex, WsFrame};
 use crate::jwt::JwtConfig;
 use crate::wse::cluster::{ClusterCommand, ClusterDlq, ClusterMetrics};
 
@@ -109,6 +109,8 @@ pub(crate) struct ConnectionHandle {
     /// Wakes write task when broadcast data is appended to broadcast_buf.
     pub(crate) broadcast_notify: Arc<tokio::sync::Notify>,
     pub(crate) closer: Closer,
+    /// The connection's E2E key, set once by its key exchange.
+    pub(crate) cipher: Arc<std::sync::OnceLock<Arc<crate::crypto::Aes256Gcm>>>,
 }
 
 impl ConnectionHandle {
@@ -298,12 +300,10 @@ pub(crate) struct SharedState {
     pub(super) jwt_config: Option<arc_swap::ArcSwap<JwtConfig>>,
     // Graceful drain: when true, reject new connections
     pub(super) draining: AtomicBool,
-    pub(crate) topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
+    // Topic subscribers, the subscribed patterns and the connections' topic
+    // ACLs (from the JWT wse_topics claim or set_topic_acl; none = allow all)
+    pub(crate) topics: TopicIndex,
     pub(super) conn_topics: DashMap<String, DashSet<String>>,
-    // Per-connection topic ACL from JWT wse_topics claim (None entry = allow all)
-    pub(super) conn_topic_acl: DashMap<String, crate::jwt::TopicAcl>,
-    // Count of glob-pattern topics (contains * or ?) -- avoids O(T) scan in fanout_topic_direct
-    pub(crate) glob_topic_count: Arc<AtomicUsize>,
     // Cluster protocol
     pub(super) cluster_cmd_tx: std::sync::RwLock<Option<mpsc::UnboundedSender<ClusterCommand>>>,
     pub(crate) cluster_metrics: Arc<ClusterMetrics>,
@@ -434,10 +434,8 @@ impl SharedState {
             connection_count: AtomicUsize::new(0),
             jwt_config: cfg.jwt_config.map(arc_swap::ArcSwap::from_pointee),
             draining: AtomicBool::new(false),
-            topic_subscribers: Arc::new(DashMap::new()),
+            topics: TopicIndex::default(),
             conn_topics: DashMap::new(),
-            conn_topic_acl: DashMap::new(),
-            glob_topic_count: Arc::new(AtomicUsize::new(0)),
             cluster_cmd_tx: std::sync::RwLock::new(None),
             cluster_metrics: Arc::new(ClusterMetrics::new()),
             cluster_dlq: Arc::new(std::sync::Mutex::new(ClusterDlq::new(1000))),

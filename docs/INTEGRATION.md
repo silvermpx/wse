@@ -349,6 +349,8 @@ server.broadcast("tasks", '{"t":"task","p":{"id":"abc"}}')
 
 Use queue groups when you need to distribute work across a pool of consumers. Each topic tracks its own set of queue groups independently, so the same connection can be in different groups for different topics.
 
+Queue groups are per node: in a cluster, each node with members of a group delivers every message of the topic to one of its own members, wherever the message was published. Members get messages without the recovery fields (`tp`, `e`, `o`): each member sees only some offsets of the topic, so recovery does not apply to them.
+
 ### Topic ACL
 
 Per-connection topic access control with glob pattern matching. Call `set_topic_acl` before `subscribe_connection` to enforce the rules.
@@ -376,6 +378,8 @@ server.subscribe_connection(conn_id, ["admin:settings"])       # denied (not in 
 | Allow + Deny | Must match allow AND not match deny |
 
 Patterns support `*` (any characters) and `?` (single character) wildcards. Deny always takes precedence over allow.
+
+A subscription to a pattern itself (`tenant:acme:*`) is checked as a name at subscribe time and again for each topic it delivers: it gets only the topics the ACL allows. `subscribe_connection` returns the topics it took.
 
 ---
 

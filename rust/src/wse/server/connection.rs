@@ -586,7 +586,7 @@ pub(super) async fn handle_connection(
                     {
                         // Extract optional topic ACL from wse_topics claim
                         if let Some(acl) = jwt::extract_topic_acl(&claims) {
-                            state.conn_topic_acl.insert(conn_id.to_string(), acl);
+                            state.topics.acls.insert(conn_id.to_string(), acl);
                         }
                         token_deadline = claims
                             .get("exp")
@@ -633,6 +633,10 @@ pub(super) async fn handle_connection(
 
     // Lets the server end this connection: a close frame, then the socket.
     let closer = Closer::new();
+    // Its E2E key, once the client asked for one: every delivery path reads
+    // it from the handle.
+    let cipher_slot: Arc<std::sync::OnceLock<Arc<crate::crypto::Aes256Gcm>>> =
+        Arc::new(std::sync::OnceLock::new());
 
     // Register connection
     let registered = {
@@ -662,6 +666,7 @@ pub(super) async fn handle_connection(
                     broadcast_buf: broadcast_buf.clone(),
                     broadcast_notify: broadcast_notify.clone(),
                     closer: closer.clone(),
+                    cipher: cipher_slot.clone(),
                 },
             );
             state.connection_count.store(conns.len(), Ordering::Relaxed);
@@ -674,7 +679,7 @@ pub(super) async fn handle_connection(
             .fetch_add(1, Ordering::Relaxed);
         tracing::warn!("[WSE] Max connections reached, rejecting {addr}");
         // The ACL was stored before the check.
-        state.conn_topic_acl.remove(&*conn_id);
+        state.topics.acls.remove(&*conn_id);
         let frames = VecDeque::from([close_frame(CLOSE_TRY_AGAIN_LATER, "server full")]);
         let _ = tokio::time::timeout(
             Duration::from_secs(1),
@@ -1004,7 +1009,10 @@ pub(super) async fn handle_connection(
                                 // an encrypted frame never reaches the client before
                                 // the server's public key.
                                 if let Some((_, cipher)) = key {
-                                    state.conn_encryption.insert((*conn_id).clone(), cipher);
+                                    state
+                                        .conn_encryption
+                                        .insert((*conn_id).clone(), cipher.clone());
+                                    let _ = cipher_slot.set(cipher);
                                 }
                                 continue;
                             }
@@ -1096,8 +1104,8 @@ pub(super) async fn handle_connection(
 
                 // E2E encryption: detect E: prefix and decrypt before processing
                 if data.len() >= 2 && data[0] == b'E' && data[1] == b':' {
-                    if let Some(cipher_ref) = state.conn_encryption.get(&*conn_id) {
-                        match decrypt_inbound(&cipher_ref, &data[2..]) {
+                    if let Some(cipher_ref) = cipher_slot.get() {
+                        match decrypt_inbound(cipher_ref, &data[2..]) {
                             Ok(plaintext) => {
                                 // Decrypted payload is UTF-8 text (JSON with optional prefix)
                                 if let Ok(text) = std::str::from_utf8(&plaintext) {
@@ -1271,9 +1279,10 @@ pub(super) async fn handle_connection(
     state.conn_formats.remove(&*conn_id);
     state.conn_last_activity.remove(&*conn_id);
     state.conn_encryption.remove(&*conn_id);
-    state.conn_topic_acl.remove(&*conn_id);
+    state.topics.acls.remove(&*conn_id);
     // Queue group cleanup: remove this connection from all queue groups
     if let Some((_, memberships)) = state.conn_queue_groups.remove(&*conn_id) {
+        let mut left_groups = Vec::with_capacity(memberships.len());
         for (topic, group_name) in memberships {
             if let Some(topic_groups) = state.queue_groups.get(&topic) {
                 if let Some(mut group) = topic_groups.get_mut(&group_name) {
@@ -1286,7 +1295,9 @@ pub(super) async fn handle_connection(
             state
                 .queue_groups
                 .remove_if(&topic, |_, groups| groups.is_empty());
+            left_groups.push(topic);
         }
+        state.remove_local_interest(&left_groups);
     }
     // Presence cleanup: untrack from all topics before disconnect event
     if let Some(ref pm) = state.presence {
@@ -1332,17 +1343,7 @@ pub(super) async fn handle_connection(
         let mut disconnected_topics = Vec::new();
         for topic_ref in topics.iter() {
             let topic = topic_ref.clone();
-            if let Some(subscribers) = state.topic_subscribers.get(&topic) {
-                subscribers.remove(&*conn_id);
-            }
-            if state
-                .topic_subscribers
-                .remove_if(&topic, |_, subs| subs.is_empty())
-                .is_some()
-                && (topic.contains('*') || topic.contains('?'))
-            {
-                state.glob_topic_count.fetch_sub(1, Ordering::Relaxed);
-            }
+            state.topics.unsubscribe(&topic, &conn_id);
             disconnected_topics.push(topic);
         }
 

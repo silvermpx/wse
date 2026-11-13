@@ -52,3 +52,29 @@ pub(super) fn decrypt_inbound(cipher: &Aes256Gcm, data: &[u8]) -> Result<Vec<u8>
         .open_nonce_prefixed(data)
         .map_err(|_| "AES-GCM decrypt failed".to_string())
 }
+
+/// `payload` sealed for one connection: `E:` followed by nonce, ciphertext
+/// and tag, the body of a binary frame. None if the encryption failed.
+fn e2e_body(cipher: &Aes256Gcm, payload: &[u8]) -> Option<Vec<u8>> {
+    let sealed = encrypt_outbound(cipher, payload)
+        .inspect_err(|e| tracing::error!("[WSE] {e}"))
+        .ok()?;
+    let mut body = Vec::with_capacity(2 + sealed.len());
+    body.extend_from_slice(b"E:");
+    body.extend_from_slice(&sealed);
+    Some(body)
+}
+
+/// `payload` sealed for one connection, as a frame.
+pub(super) fn e2e_frame(cipher: &Aes256Gcm, payload: &[u8]) -> Option<bytes::Bytes> {
+    e2e_body(cipher, payload).map(|body| super::frames::encode_ws_frame(0x02, &body))
+}
+
+/// `payload` sealed for one connection, as a message.
+pub(super) fn e2e_message(
+    cipher: &Aes256Gcm,
+    payload: &[u8],
+) -> Option<tokio_tungstenite::tungstenite::protocol::Message> {
+    e2e_body(cipher, payload)
+        .map(|body| tokio_tungstenite::tungstenite::protocol::Message::Binary(body.into()))
+}

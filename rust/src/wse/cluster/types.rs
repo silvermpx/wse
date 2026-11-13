@@ -3,14 +3,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-
-use crate::wse::server::ConnectionHandle;
 
 // ---------------------------------------------------------------------------
 // Live links, one per peer instance
@@ -156,8 +154,7 @@ pub(crate) fn release_link(links: &Links, peer: &str, session: u64) {
 #[derive(Clone)]
 pub(crate) struct ClusterContext {
     pub interest_tx: mpsc::UnboundedSender<InterestUpdate>,
-    pub topic_subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
-    pub glob_topic_count: Arc<AtomicUsize>,
+    pub topics: crate::wse::server::TopicIndex,
     pub metrics: Arc<ClusterMetrics>,
     pub new_peer_tx: mpsc::UnboundedSender<String>,
     pub cmd_tx: mpsc::UnboundedSender<ClusterCommand>,

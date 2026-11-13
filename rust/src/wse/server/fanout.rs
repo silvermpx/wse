@@ -1,13 +1,19 @@
-//! Topic glob matching, broadcast and topic fan-out, recovery stamping.
+//! Delivery of one message to many connections (broadcast, topics, queue
+//! groups), topic patterns and recovery stamping.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::AHashSet;
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 
-use super::ConnectionHandle;
+use tokio_tungstenite::tungstenite::protocol::Message;
+
+use super::e2e::{e2e_frame, e2e_message};
+use super::frames::{encode_ws_frame, ws_frame_size};
+use super::{ConnectionHandle, QueueGroup, WsFrame};
 
 // ---------------------------------------------------------------------------
 // Glob matching
@@ -42,155 +48,371 @@ pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Parallel fan-out helpers
+// Topic ACL
 // ---------------------------------------------------------------------------
 
-/// NATS-style direct buffer fan-out for broadcast_all (BroadcastText/BroadcastBytes).
-/// Appends pre-framed bytes to each connection's broadcast_buf under parking_lot::Mutex,
-/// bypassing the mpsc channel entirely. Per-connection cost: ~15-20ns vs ~80-130ns for mpsc.
-/// Only calls notify_one() when buffer transitions from empty to non-empty (skip when
-/// write task is already awake draining data).
-#[inline]
-pub(super) fn fanout_broadcast_direct(
-    conns: &HashMap<String, ConnectionHandle>,
-    data: &Bytes,
-    max_pending: usize,
-    slow_drops: &AtomicU64,
-) {
-    let data_len = data.len();
-    for h in conns.values() {
-        // Skip dead connections (write task exited but cleanup hasn't run yet)
-        if h.tx.is_closed() {
-            continue;
+/// A connection's topic access control list, from the JWT `wse_topics`
+/// claim or `set_topic_acl()`.
+///
+/// Format in JWT: `{"wse_topics": {"allow": ["chat.*"], "deny": ["admin.*"]}}`
+///
+/// Rules:
+/// - Deny takes precedence over allow
+/// - Empty allow list = allow all (backward compatible)
+/// - Patterns use glob matching (*, ?)
+#[derive(Debug, Clone)]
+pub(crate) struct TopicAcl {
+    pub(crate) allow: Vec<String>,
+    pub(crate) deny: Vec<String>,
+}
+
+impl TopicAcl {
+    /// An ACL that allows no topic at all.
+    pub(crate) fn deny_all() -> Self {
+        Self {
+            allow: Vec::new(),
+            deny: vec!["*".to_string()],
         }
-        if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
+    }
+
+    /// Check if a topic is allowed by this ACL.
+    ///
+    /// Deny rules take precedence. Empty allow = allow all.
+    pub(crate) fn is_allowed(&self, topic: &str) -> bool {
+        // Check deny first (deny takes precedence)
+        for pattern in &self.deny {
+            if glob_match(pattern, topic) {
+                return false;
+            }
+        }
+
+        // Empty allow = allow all
+        if self.allow.is_empty() {
+            return true;
+        }
+
+        // Check allow patterns
+        for pattern in &self.allow {
+            if glob_match(pattern, topic) {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Delivery
+// ---------------------------------------------------------------------------
+
+/// A message going to many connections: what the application wrote, and its
+/// frame, built once and shared by every connection that gets it as is.
+pub(crate) struct Outgoing {
+    payload: Bytes,
+    frame: Bytes,
+}
+
+impl Outgoing {
+    pub(crate) fn text(payload: Bytes) -> Self {
+        let frame = encode_ws_frame(0x01, &payload);
+        Self { payload, frame }
+    }
+
+    pub(crate) fn binary(payload: Bytes) -> Self {
+        let frame = encode_ws_frame(0x02, &payload);
+        Self { payload, frame }
+    }
+}
+
+impl ConnectionHandle {
+    /// Deliver `msg` to this connection: sealed with its E2E key when it has
+    /// one (an `E:` frame of its own), else the shared frame. Every path that
+    /// sends one message to many connections comes through here, so none
+    /// skips a connection's encryption. A connection over its outbound budget
+    /// drops it (counted in `slow_drops`). True when queued.
+    pub(crate) fn deliver(
+        &self,
+        msg: &Outgoing,
+        max_pending: usize,
+        slow_drops: &AtomicU64,
+    ) -> bool {
+        if self.tx.is_closed() {
+            return false;
+        }
+        if max_pending > 0 && self.pending.load(Ordering::Relaxed) >= max_pending {
             slow_drops.fetch_add(1, Ordering::Relaxed);
-            continue;
+            return false;
         }
-        h.pending.fetch_add(data_len, Ordering::Relaxed);
+        match self.cipher.get() {
+            None => self.push_frame(&msg.frame),
+            Some(cipher) => match e2e_frame(cipher, &msg.payload) {
+                Some(frame) => self.push_frame(&frame),
+                None => return false,
+            },
+        }
+        true
+    }
+
+    /// Send one message to this connection alone, in order with its other
+    /// direct sends: sealed with its E2E key when it has one. A connection
+    /// over its outbound budget drops it (counted in `slow_drops`). True
+    /// when queued.
+    pub(crate) fn send_one(
+        &self,
+        msg: Message,
+        max_pending: usize,
+        slow_drops: &AtomicU64,
+    ) -> bool {
+        if max_pending > 0 && self.pending.load(Ordering::Relaxed) >= max_pending {
+            slow_drops.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let msg = match (self.cipher.get(), msg) {
+            (Some(cipher), Message::Text(text)) => match e2e_message(cipher, text.as_bytes()) {
+                Some(sealed) => sealed,
+                None => return false,
+            },
+            (Some(cipher), Message::Binary(data)) => match e2e_message(cipher, &data) {
+                Some(sealed) => sealed,
+                None => return false,
+            },
+            (_, msg) => msg,
+        };
+        let frame = WsFrame::Msg(msg);
+        let bytes = ws_frame_size(&frame);
+        self.pending.fetch_add(bytes, Ordering::Relaxed);
+        if self.tx.send(frame).is_err() {
+            self.pending.fetch_sub(bytes, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// Append a frame to the broadcast buffer; the write task is woken when
+    /// the buffer was empty.
+    fn push_frame(&self, frame: &Bytes) {
+        self.pending.fetch_add(frame.len(), Ordering::Relaxed);
         let was_empty = {
-            let mut buf = h.broadcast_buf.lock();
+            let mut buf = self.broadcast_buf.lock();
             let empty = buf.is_empty();
-            buf.push(data);
+            buf.push(frame);
             empty
         };
         if was_empty {
-            h.broadcast_notify.notify_one();
+            self.broadcast_notify.notify_one();
         }
     }
 }
 
-/// NATS-style direct buffer fan-out for topic-filtered connections (BroadcastLocal + cluster).
-/// Iterates ConnectionHandle values stored directly in topic_subscribers DashMap,
-/// eliminating the per-connection HashMap lookup that was the main bottleneck.
-/// Returns (delivered, dropped) counts for metrics tracking.
-#[inline]
-pub(crate) fn fanout_topic_direct(
-    topic_subscribers: &DashMap<String, DashMap<String, ConnectionHandle>>,
-    topic: &str,
-    data: &Bytes,
+/// Deliver `msg` to every connection.
+pub(super) fn fanout_broadcast_direct(
+    conns: &HashMap<String, ConnectionHandle>,
+    msg: &Outgoing,
     max_pending: usize,
     slow_drops: &AtomicU64,
-    glob_count: usize,
-) -> (u64, u64) {
-    let data_len = data.len();
-    let mut delivered = 0u64;
-    let mut dropped = 0u64;
+) {
+    for h in conns.values() {
+        h.deliver(msg, max_pending, slow_drops);
+    }
+}
 
-    // Check if any glob patterns exist (rare -- most deployments use exact topics)
-    let has_globs = glob_count > 0;
+/// Who gets a topic's messages: its subscribers, and the subscribers of the
+/// patterns (names with `*` or `?`) matching it. Shared by the server and
+/// the cluster's inbound links.
+#[derive(Clone, Default)]
+pub(crate) struct TopicIndex {
+    pub(crate) subscribers: Arc<DashMap<String, DashMap<String, ConnectionHandle>>>,
+    /// The subscribed names that are patterns. Changed only under the shard
+    /// lock of the pattern's `subscribers` entry, so the two never disagree.
+    pub(crate) patterns: Arc<DashSet<String>>,
+    /// Per-connection topic ACLs: a pattern subscription gets only the topics
+    /// its connection's ACL allows.
+    pub(crate) acls: Arc<DashMap<String, TopicAcl>>,
+}
 
-    if !has_globs {
-        // Fast path: exact match only, iterate handles directly (no HashMap lookup)
-        if let Some(subs) = topic_subscribers.get(topic) {
-            for entry in subs.iter() {
-                let h = entry.value();
-                if h.tx.is_closed() {
-                    continue;
-                }
-                if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
-                    slow_drops.fetch_add(1, Ordering::Relaxed);
-                    dropped += 1;
-                    continue;
-                }
-                h.pending.fetch_add(data_len, Ordering::Relaxed);
-                let was_empty = {
-                    let mut buf = h.broadcast_buf.lock();
-                    let empty = buf.is_empty();
-                    buf.push(data);
-                    empty
-                };
-                if was_empty {
-                    h.broadcast_notify.notify_one();
-                }
-                delivered += 1;
-            }
+pub(crate) fn is_pattern(topic: &str) -> bool {
+    topic.contains(['*', '?'])
+}
+
+impl TopicIndex {
+    /// Add `conn_id` to `topic`; true when it was not subscribed yet.
+    pub(crate) fn subscribe(&self, topic: &str, conn_id: &str, handle: &ConnectionHandle) -> bool {
+        let subs = self.subscribers.entry(topic.to_owned()).or_default();
+        let added = subs.insert(conn_id.to_owned(), handle.clone()).is_none();
+        if added && subs.len() == 1 && is_pattern(topic) {
+            self.patterns.insert(topic.to_owned());
         }
-    } else {
-        // Slow path: glob patterns exist, need AHashSet for dedup
-        let mut seen = AHashSet::new();
-
-        // Exact topic match
-        if let Some(subs) = topic_subscribers.get(topic) {
-            for entry in subs.iter() {
-                if seen.insert(entry.key().clone()) {
-                    let h = entry.value();
-                    if h.tx.is_closed() {
-                        continue;
-                    }
-                    if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
-                        slow_drops.fetch_add(1, Ordering::Relaxed);
-                        dropped += 1;
-                        continue;
-                    }
-                    h.pending.fetch_add(data_len, Ordering::Relaxed);
-                    let was_empty = {
-                        let mut buf = h.broadcast_buf.lock();
-                        let empty = buf.is_empty();
-                        buf.push(data);
-                        empty
-                    };
-                    if was_empty {
-                        h.broadcast_notify.notify_one();
-                    }
-                    delivered += 1;
-                }
-            }
-        }
-
-        // Glob pattern match
-        for topic_entry in topic_subscribers.iter() {
-            let pattern = topic_entry.key();
-            if (pattern.contains('*') || pattern.contains('?')) && glob_match(pattern, topic) {
-                for entry in topic_entry.value().iter() {
-                    if seen.insert(entry.key().clone()) {
-                        let h = entry.value();
-                        if h.tx.is_closed() {
-                            continue;
-                        }
-                        if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
-                            slow_drops.fetch_add(1, Ordering::Relaxed);
-                            dropped += 1;
-                            continue;
-                        }
-                        h.pending.fetch_add(data_len, Ordering::Relaxed);
-                        let was_empty = {
-                            let mut buf = h.broadcast_buf.lock();
-                            let empty = buf.is_empty();
-                            buf.push(data);
-                            empty
-                        };
-                        if was_empty {
-                            h.broadcast_notify.notify_one();
-                        }
-                        delivered += 1;
-                    }
-                }
-            }
-        }
+        added
     }
 
+    /// Remove `conn_id` from `topic`; true when the topic has no subscriber
+    /// left.
+    pub(crate) fn unsubscribe(&self, topic: &str, conn_id: &str) -> bool {
+        if let dashmap::Entry::Occupied(subs) = self.subscribers.entry(topic.to_owned()) {
+            subs.get().remove(conn_id);
+            if subs.get().is_empty() {
+                subs.remove();
+                if is_pattern(topic) {
+                    self.patterns.remove(topic);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Deliver `msg` on `topic`. A connection subscribed several ways gets it
+    /// once; a pattern subscriber only when its ACL allows `topic`. Returns
+    /// (delivered, dropped).
+    pub(crate) fn fanout(
+        &self,
+        topic: &str,
+        msg: &Outgoing,
+        max_pending: usize,
+        slow_drops: &AtomicU64,
+    ) -> (u64, u64) {
+        let mut delivered = 0u64;
+        let mut dropped = 0u64;
+        let mut count = |sent: bool| {
+            if sent {
+                delivered += 1;
+            } else {
+                dropped += 1;
+            }
+        };
+        if self.patterns.is_empty() {
+            // Exact topics only: the common case, no bookkeeping.
+            if let Some(subs) = self.subscribers.get(topic) {
+                for entry in subs.iter() {
+                    count(entry.value().deliver(msg, max_pending, slow_drops));
+                }
+            }
+            return (delivered, dropped);
+        }
+        // Connections already served, by the identity of their queue.
+        let mut served: AHashSet<usize> = AHashSet::new();
+        let id = |h: &ConnectionHandle| Arc::as_ptr(&h.pending) as usize;
+        if let Some(subs) = self.subscribers.get(topic) {
+            for entry in subs.iter() {
+                let h = entry.value();
+                if served.insert(id(h)) {
+                    count(h.deliver(msg, max_pending, slow_drops));
+                }
+            }
+        }
+        let matching: Vec<String> = self
+            .patterns
+            .iter()
+            .filter(|pattern| pattern.as_str() != topic && glob_match(pattern, topic))
+            .map(|pattern| pattern.key().clone())
+            .collect();
+        for pattern in matching {
+            let Some(subs) = self.subscribers.get(&pattern) else {
+                continue;
+            };
+            for entry in subs.iter() {
+                let h = entry.value();
+                let allowed = self
+                    .acls
+                    .get(entry.key())
+                    .is_none_or(|acl| acl.is_allowed(topic));
+                if allowed && served.insert(id(h)) {
+                    count(h.deliver(msg, max_pending, slow_drops));
+                }
+            }
+        }
+        (delivered, dropped)
+    }
+}
+
+/// Deliver `msg` to one member of each queue group of `topic`, round-robin;
+/// a member that is gone or over its budget is passed over. Returns
+/// (delivered, dropped).
+pub(crate) fn fanout_queue_groups(
+    queue_groups: &DashMap<String, DashMap<String, QueueGroup>>,
+    topic: &str,
+    msg: &Outgoing,
+    max_pending: usize,
+    slow_drops: &AtomicU64,
+) -> (u64, u64) {
+    let mut delivered = 0u64;
+    let mut dropped = 0u64;
+    let Some(topic_groups) = queue_groups.get(topic) else {
+        return (0, 0);
+    };
+    for group_entry in topic_groups.iter() {
+        let group = group_entry.value();
+        let len = group.members.len();
+        if len == 0 {
+            continue;
+        }
+        let base = group.next.fetch_add(1, Ordering::Relaxed);
+        let served = (0..len).any(|attempt| {
+            let (_, ref h) = group.members[(base + attempt) % len];
+            h.deliver(msg, max_pending, slow_drops)
+        });
+        if served {
+            delivered += 1;
+        } else {
+            dropped += 1;
+        }
+    }
     (delivered, dropped)
+}
+
+/// A recovery-stamped message without its stamp: what queue-group members
+/// get, since each sees only some of the topic's offsets and would take the
+/// rest for gaps. Messages without a stamp come back unchanged.
+pub(crate) fn unstamped(payload: &Bytes) -> Bytes {
+    let Ok(text) = std::str::from_utf8(payload) else {
+        return payload.clone();
+    };
+    let Some(rest) = text.strip_prefix("{\"tp\":") else {
+        return payload.clone();
+    };
+    // The topic is a JSON string: skip it, escapes included.
+    let mut chars = rest.char_indices();
+    if !matches!(chars.next(), Some((_, '"'))) {
+        return payload.clone();
+    }
+    let mut after_topic = None;
+    let mut escaped = false;
+    for (i, c) in chars {
+        match (escaped, c) {
+            (true, _) => escaped = false,
+            (false, '\\') => escaped = true,
+            (false, '"') => {
+                after_topic = Some(i + 1);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some(after_topic) = after_topic else {
+        return payload.clone();
+    };
+    // ,"e":"xxxxxxxx","o":<digits> then `,` or `}`
+    let rest = &rest[after_topic..];
+    let Some(rest) = rest.strip_prefix(",\"e\":\"") else {
+        return payload.clone();
+    };
+    if rest.len() < 8 || !rest.as_bytes()[..8].iter().all(u8::is_ascii_hexdigit) {
+        return payload.clone();
+    }
+    let Some(rest) = rest[8..].strip_prefix("\",\"o\":") else {
+        return payload.clone();
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return payload.clone();
+    }
+    let rest = &rest[digits..];
+    let body = rest.strip_prefix(',').unwrap_or(rest);
+    let mut out = String::with_capacity(1 + body.len());
+    out.push('{');
+    out.push_str(body);
+    Bytes::from(out)
 }
 
 /// Weave this message's recovery coordinates -- topic (`tp`), epoch (`e`, as an

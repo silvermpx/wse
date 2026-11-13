@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 
+use super::frames::{encode_ws_frame, pre_frame_binary};
 use super::handshake::HandshakeGuard;
 
 #[test]
@@ -115,8 +116,106 @@ fn make_handle() -> (ConnectionHandle, mpsc::UnboundedReceiver<WsFrame>) {
         broadcast_buf: Arc::new(parking_lot::Mutex::new(BroadcastQueue::new())),
         broadcast_notify: Arc::new(tokio::sync::Notify::new()),
         closer: super::Closer::new(),
+        cipher: Arc::new(std::sync::OnceLock::new()),
     };
     (h, rx)
+}
+
+fn queued(h: &ConnectionHandle) -> Vec<bytes::Bytes> {
+    h.broadcast_buf.lock().take().into_iter().collect()
+}
+
+// -- Topic index ------------------------------------------------------------
+
+#[test]
+fn patterns_are_tracked_with_their_subscribers() {
+    let index = TopicIndex::default();
+    let (h, _rx) = make_handle();
+    assert!(index.subscribe("news.*", "c1", &h));
+    assert!(!index.subscribe("news.*", "c1", &h));
+    index.subscribe("news.*", "c2", &h);
+    index.subscribe("exact", "c1", &h);
+    assert_eq!(index.patterns.len(), 1);
+    assert!(!index.unsubscribe("news.*", "c1"));
+    assert!(index.unsubscribe("news.*", "c2"));
+    assert!(index.patterns.is_empty());
+    assert!(index.subscribers.get("news.*").is_none());
+}
+
+#[test]
+fn a_pattern_subscriber_gets_only_what_its_acl_allows() {
+    let index = TopicIndex::default();
+    let (h, _rx) = make_handle();
+    index.subscribe("tenant:acme:*", "c1", &h);
+    index.acls.insert(
+        "c1".into(),
+        crate::wse::server::TopicAcl {
+            allow: vec!["tenant:acme:*".into()],
+            deny: vec!["tenant:acme:internal:*".into()],
+        },
+    );
+    let drops = AtomicU64::new(0);
+    let msg = Outgoing::text(bytes::Bytes::from_static(b"{}"));
+    assert_eq!(index.fanout("tenant:acme:orders", &msg, 0, &drops), (1, 0));
+    assert_eq!(
+        index.fanout("tenant:acme:internal:logs", &msg, 0, &drops),
+        (0, 0)
+    );
+    assert_eq!(queued(&h).len(), 1);
+}
+
+#[test]
+fn a_connection_subscribed_twice_gets_a_message_once() {
+    let index = TopicIndex::default();
+    let (h, _rx) = make_handle();
+    index.subscribe("room.1", "c1", &h);
+    index.subscribe("room.*", "c1", &h);
+    let drops = AtomicU64::new(0);
+    let msg = Outgoing::text(bytes::Bytes::from_static(b"{}"));
+    assert_eq!(index.fanout("room.1", &msg, 0, &drops), (1, 0));
+    assert_eq!(queued(&h).iter().map(|b| b.len()).sum::<usize>(), 4);
+}
+
+#[test]
+fn an_encrypted_connection_gets_its_own_sealed_frame() {
+    let index = TopicIndex::default();
+    let (plain, _rx1) = make_handle();
+    let (sealed, _rx2) = make_handle();
+    let key = Arc::new(crate::crypto::Aes256Gcm::new(&[9u8; 32]).unwrap());
+    sealed.cipher.set(key.clone()).ok().unwrap();
+    index.subscribe("t", "plain", &plain);
+    index.subscribe("t", "sealed", &sealed);
+    let drops = AtomicU64::new(0);
+    index.fanout(
+        "t",
+        &Outgoing::text(bytes::Bytes::from_static(b"{\"x\":1}")),
+        0,
+        &drops,
+    );
+    let plain_frame = queued(&plain).concat();
+    assert_eq!(&plain_frame[2..], b"{\"x\":1}");
+    let sealed_frame = queued(&sealed).concat();
+    assert_eq!(sealed_frame[0], 0x82); // binary
+    let body = &sealed_frame[2..];
+    assert_eq!(&body[..2], b"E:");
+    assert_eq!(key.open_nonce_prefixed(&body[2..]).unwrap(), b"{\"x\":1}");
+}
+
+#[test]
+fn unstamped_removes_exactly_the_recovery_fields() {
+    let original = r#"{"c":"U","t":"x","p":{"k":"a\"b"}}"#;
+    let stamped = stamp_recovery_fields(original, "ro\"om", 0xab, 42);
+    assert_eq!(
+        unstamped(&bytes::Bytes::from(stamped)),
+        bytes::Bytes::from(original)
+    );
+    let empty = stamp_recovery_fields("{}", "t", 1, 2);
+    assert_eq!(
+        unstamped(&bytes::Bytes::from(empty)),
+        bytes::Bytes::from("{}")
+    );
+    let plain = bytes::Bytes::from_static(br#"{"tp":"look-alike"}"#);
+    assert_eq!(unstamped(&plain), plain);
 }
 
 #[test]

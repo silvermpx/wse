@@ -286,24 +286,16 @@ pub(super) async fn peer_dispatch_task(
         let mut total_dropped = 0u64;
 
         for (topic, payload, rec) in batch.drain(..) {
-            let preframed = crate::wse::server::encode_ws_frame(0x01, &payload);
-
-            // Store the UNFRAMED payload in the foreign recovery buffer (cross-node
-            // recovery), matching the local buffer's stored form so subscribe_with_
-            // recovery frames/encrypts replayed bytes per connection. Live fan-out
-            // below still uses the shared pre-framed bytes.
+            // Store the unframed payload in the foreign recovery buffer
+            // (cross-node recovery), the form the local buffer stores too.
             if let (Some(rm), Some((epoch, offset))) = (&ctx.recovery, rec) {
                 rm.push_foreign(&topic, payload.clone(), epoch, offset);
             }
 
-            let (d, f) = crate::wse::server::fanout_topic_direct(
-                &ctx.topic_subscribers,
-                &topic,
-                &preframed,
-                ctx.max_outbound,
-                &ctx.slow_drops,
-                ctx.glob_topic_count.load(Ordering::Relaxed),
-            );
+            let msg = crate::wse::server::Outgoing::text(payload.clone());
+            let (d, f) = ctx
+                .topics
+                .fanout(&topic, &msg, ctx.max_outbound, &ctx.slow_drops);
             total_delivered += d;
             total_dropped += f;
 
@@ -313,47 +305,18 @@ pub(super) async fn peer_dispatch_task(
                 .or_insert_with(|| AtomicU64::new(0))
                 .fetch_add(1, Ordering::Relaxed);
 
-            // Cross-cluster queue group dispatch: round-robin to one member per group
-            if let Some(topic_groups) = ctx.queue_groups.get(&topic) {
-                for mut group_entry in topic_groups.iter_mut() {
-                    let group = group_entry.value_mut();
-                    let len = group.members.len();
-                    if len == 0 {
-                        continue;
-                    }
-                    let base = group.next.fetch_add(1, Ordering::Relaxed);
-                    let data_len = preframed.len();
-                    let mut delivered = false;
-                    for attempt in 0..len {
-                        let idx = (base + attempt) % len;
-                        let (_, ref h) = group.members[idx];
-                        if h.tx.is_closed() {
-                            continue;
-                        }
-                        if ctx.max_outbound > 0
-                            && h.pending.load(Ordering::Relaxed) >= ctx.max_outbound
-                        {
-                            ctx.slow_drops.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                        h.pending.fetch_add(data_len, Ordering::Relaxed);
-                        let was_empty = {
-                            let mut buf = h.broadcast_buf.lock();
-                            let empty = buf.is_empty();
-                            buf.push(&preframed);
-                            empty
-                        };
-                        if was_empty {
-                            h.broadcast_notify.notify_one();
-                        }
-                        delivered = true;
-                        total_delivered += 1;
-                        break;
-                    }
-                    if !delivered {
-                        total_dropped += 1;
-                    }
-                }
+            // Queue groups: one member each, round-robin, without the
+            // recovery stamp (a member sees only some of the offsets).
+            if ctx.queue_groups.contains_key(&topic) {
+                let (d, f) = crate::wse::server::fanout_queue_groups(
+                    &ctx.queue_groups,
+                    &topic,
+                    &crate::wse::server::Outgoing::text(crate::wse::server::unstamped(&payload)),
+                    ctx.max_outbound,
+                    &ctx.slow_drops,
+                );
+                total_delivered += d;
+                total_dropped += f;
             }
         }
 

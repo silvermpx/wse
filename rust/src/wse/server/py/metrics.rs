@@ -143,7 +143,7 @@ impl RustWSEServer {
         out.push_str("# TYPE wse_topics gauge\n");
         out.push_str(&format!(
             "wse_topics {}\n",
-            self.shared.topic_subscribers.len()
+            self.shared.topics.subscribers.len()
         ));
 
         // Counters

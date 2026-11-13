@@ -86,10 +86,11 @@ mod state;
 pub use py::RustWSEServer;
 
 pub(crate) use e2e::E2E_KEY_INFO;
-pub(crate) use fanout::{fanout_topic_direct, glob_match, stamp_recovery_fields};
-pub(crate) use frames::{
-    BroadcastQueue, WsFrame, encode_ws_frame, pre_frame_binary, pre_frame_text,
+pub(crate) use fanout::{
+    Outgoing, TopicAcl, TopicIndex, fanout_queue_groups, glob_match, is_pattern,
+    stamp_recovery_fields, unstamped,
 };
+pub(crate) use frames::{BroadcastQueue, WsFrame, pre_frame_text};
 pub(crate) use handshake::normalize_origin;
 pub(crate) use messages::format_presence_msg;
 pub(crate) use state::{

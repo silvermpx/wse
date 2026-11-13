@@ -1330,6 +1330,7 @@ fn test_cluster_queue_group_dispatch() {
             broadcast_buf: Arc::new(Mutex::new(BroadcastQueue::new())),
             broadcast_notify: Arc::new(tokio::sync::Notify::new()),
             closer: crate::wse::server::Closer::new(),
+            cipher: Arc::new(std::sync::OnceLock::new()),
         };
         members.push((format!("conn{i}"), h));
         _rxs.push(rx);
@@ -1343,32 +1344,13 @@ fn test_cluster_queue_group_dispatch() {
     inner.insert("workers".to_string(), group);
     queue_groups.insert("tasks".to_string(), inner);
 
-    let preframed = crate::wse::server::encode_ws_frame(0x01, b"test-payload");
-
-    // Dispatch 6 messages using the same logic as peer_dispatch_task
+    let msg = crate::wse::server::Outgoing::text(bytes::Bytes::from_static(b"test-payload"));
+    let frame_len = b"test-payload".len() + 2;
+    let drops = AtomicU64::new(0);
     for _ in 0..6 {
-        if let Some(topic_groups) = queue_groups.get("tasks") {
-            for mut group_entry in topic_groups.iter_mut() {
-                let group = group_entry.value_mut();
-                let len = group.members.len();
-                let base = group.next.fetch_add(1, Ordering::Relaxed);
-                let data_len = preframed.len();
-                for attempt in 0..len {
-                    let idx = (base + attempt) % len;
-                    let (_, ref h) = group.members[idx];
-                    if h.tx.is_closed() {
-                        continue;
-                    }
-                    h.pending.fetch_add(data_len, Ordering::Relaxed);
-                    {
-                        let mut buf = h.broadcast_buf.lock();
-                        buf.push(&preframed);
-                    }
-                    h.broadcast_notify.notify_one();
-                    break;
-                }
-            }
-        }
+        let (delivered, dropped) =
+            crate::wse::server::fanout_queue_groups(&queue_groups, "tasks", &msg, 0, &drops);
+        assert_eq!((delivered, dropped), (1, 0));
     }
 
     // Each member should have received 2 messages (6 / 3 round-robin)
@@ -1377,7 +1359,7 @@ fn test_cluster_queue_group_dispatch() {
     for (id, h) in &g.members {
         assert_eq!(
             h.pending.load(Ordering::Relaxed),
-            preframed.len() * 2,
+            frame_len * 2,
             "{id} should have 2 messages"
         );
     }

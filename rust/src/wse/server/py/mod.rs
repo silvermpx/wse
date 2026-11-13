@@ -781,6 +781,10 @@ impl RustWSEServer {
     /// Optionally set initial presence data (requires presence_enabled=True).
     /// If queue_group is set, the connection joins a named group for
     /// round-robin dispatch instead of standard fan-out.
+    ///
+    /// Returns the topics it took: not those its topic ACL denies, invalid
+    /// names (empty, over 256 bytes, control characters), patterns past 16
+    /// per connection, or what exceeds max_subscriptions_per_connection.
     #[pyo3(signature = (conn_id, topics, presence_data = None, queue_group = None))]
     fn subscribe_connection(
         &self,
@@ -789,7 +793,7 @@ impl RustWSEServer {
         topics: Vec<String>,
         presence_data: Option<&Bound<'_, PyDict>>,
         queue_group: Option<String>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Vec<String>> {
         self.subscribe_connection_impl(py, conn_id, topics, presence_data, queue_group)
     }
 
@@ -833,7 +837,8 @@ impl RustWSEServer {
     /// Number of fan-out subscribers on a topic (excludes queue group members).
     fn get_topic_subscriber_count(&self, topic: &str) -> usize {
         self.shared
-            .topic_subscribers
+            .topics
+            .subscribers
             .get(topic)
             .map(|s| s.len())
             .unwrap_or(0)

@@ -178,6 +178,7 @@ pub(crate) fn pre_frame_text(data: &str) -> Bytes {
     encode_ws_frame(0x01, data.as_bytes())
 }
 
+#[cfg(test)]
 pub(crate) fn pre_frame_binary(data: &[u8]) -> Bytes {
     encode_ws_frame(0x02, data)
 }

@@ -520,12 +520,17 @@ class RustWSEServer:
         topics: list[str],
         presence_data: dict[str, Any] | None = None,
         queue_group: str | None = None,
-    ) -> None:
+    ) -> list[str]:
         """Subscribe a connection to topics. Optionally set initial presence data.
 
         If queue_group is set, the connection joins a queue group instead of
         receiving fan-out. Messages are round-robin distributed to one member
         per group.
+
+        Returns the topics it took: not those its topic ACL denies, invalid
+        names (empty, over 256 bytes, control characters), patterns past 16
+        per connection, or what exceeds max_subscriptions_per_connection. A
+        pattern subscription gets only the topics the ACL allows.
         """
         ...
     def subscribe_with_recovery(

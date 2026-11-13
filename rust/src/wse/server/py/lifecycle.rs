@@ -155,7 +155,7 @@ impl RustWSEServer {
                                 let counts = &counts_state.topic_message_counts;
                                 if counts.len() > 10_000 {
                                     counts.retain(|topic, _| {
-                                        counts_state.topic_subscribers.contains_key(topic)
+                                        counts_state.topics.subscribers.contains_key(topic)
                                     });
                                 }
                             }

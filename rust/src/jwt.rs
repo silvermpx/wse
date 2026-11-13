@@ -650,58 +650,10 @@ fn json_value_to_py(py: Python<'_>, val: &serde_json::Value) -> Py<PyAny> {
 }
 
 // ---------------------------------------------------------------------------
-// TopicAcl -- per-connection topic authorization from JWT claims
+// Topic ACL from the JWT wse_topics claim
 // ---------------------------------------------------------------------------
 
-/// Topic-level access control list extracted from JWT `wse_topics` claim.
-///
-/// Format in JWT: `{"wse_topics": {"allow": ["chat.*"], "deny": ["admin.*"]}}`
-///
-/// Rules:
-/// - Deny takes precedence over allow
-/// - Empty allow list = allow all (backward compatible)
-/// - Patterns use glob matching (*, ?)
-#[derive(Debug, Clone)]
-pub struct TopicAcl {
-    pub allow: Vec<String>,
-    pub deny: Vec<String>,
-}
-
-impl TopicAcl {
-    /// An ACL that allows no topic at all.
-    pub fn deny_all() -> Self {
-        Self {
-            allow: Vec::new(),
-            deny: vec!["*".to_string()],
-        }
-    }
-
-    /// Check if a topic is allowed by this ACL.
-    ///
-    /// Deny rules take precedence. Empty allow = allow all.
-    pub fn is_allowed(&self, topic: &str) -> bool {
-        // Check deny first (deny takes precedence)
-        for pattern in &self.deny {
-            if crate::wse::server::glob_match(pattern, topic) {
-                return false;
-            }
-        }
-
-        // Empty allow = allow all
-        if self.allow.is_empty() {
-            return true;
-        }
-
-        // Check allow patterns
-        for pattern in &self.allow {
-            if crate::wse::server::glob_match(pattern, topic) {
-                return true;
-            }
-        }
-
-        false
-    }
-}
+use crate::wse::server::TopicAcl;
 
 /// Extract optional topic ACL from JWT claims.
 ///

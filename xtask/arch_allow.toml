@@ -21,4 +21,4 @@ reason = "Callback mode calls the Python layer's fire_on_connect, fire_on_discon
 [[allow]]
 rule = "engine-imports"
 file = "rust/src/wse/server/state.rs"
-reason = "JwtConfig and TopicAcl come from crate::jwt, which also holds the rust_jwt_* Python functions; they move to the engine half of that split."
+reason = "JwtConfig comes from crate::jwt, which also holds the rust_jwt_* Python functions; it moves to the engine half of that split."

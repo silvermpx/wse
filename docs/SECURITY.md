@@ -250,11 +250,10 @@ E:<IV (12 bytes)><AES-GCM ciphertext>
 ```
 
 **Server-side encryption (Rust):**
-- ECDH P-256 key pair generated per connection via `p256` crate
-- Session key derivation via HKDF-SHA256 (no salt, info: `wse-encryption/aes-gcm-key`)
-- AES-GCM-256 encrypt/decrypt via `aes-gcm` crate
-- Per-connection key lifecycle: generate on handshake, derive on client key exchange, clear on disconnect
-- Recovery replay: buffered messages are stored **unframed**; each is framed — or encrypted then framed — per connection at replay time, so a plaintext frame is never replayed to an E2E-encrypted connection
+- ECDH P-256 with a fresh server key per connection, HKDF-SHA256 (no salt, info: `wse-encryption/aes-gcm-key`) and AES-GCM-256, all from the crypto library of the build (see [Crypto Library](#crypto-library))
+- Per-connection key lifecycle: derived on the client's key exchange, dropped with the connection
+- Every delivery to an E2E connection is encrypted for it: topic broadcasts, `broadcast_all`, queue-group deliveries, messages relayed from other cluster nodes, presence events, `send()`/`send_bytes()`, `send_event()` and recovery replay. Connections without a key share one plaintext frame, so one encrypted client does not slow the others down
+- The key is used only once `server_hello` (with the server's public key) is queued, so no encrypted frame reaches a client before it can derive the key
 
 **Client-side encryption (`security.ts`):**
 - AES-GCM-256 with a fresh random IV per message; the recent-IV set is checked **before** each encryption (redraw on collision, and refuse to encrypt rather than reuse an IV)
@@ -411,9 +410,11 @@ server.subscribe_connection(conn_id, ["tenant:other:prices"])  # denied (not in 
 
 Deny always takes precedence over allow. Patterns support `*` (match any characters) and `?` (match single character).
 
+**Pattern subscriptions:** a subscription to a name with `*` or `?` receives the matching topics, and for a connection with an ACL only those the ACL allows: with the ACL above, a subscription to `tenant:acme:*` gets `tenant:acme:prices` but never `tenant:acme:internal:logs`. A connection holds at most 16 pattern subscriptions; every publish is matched against the patterns, never against all topics. Topic names are at most 256 bytes, without control characters; `subscribe_connection` returns the topics it took.
+
 **Security considerations:**
 
-- ACLs are enforced at subscribe time **and on recovery replay**: `subscribe_with_recovery` filters replayed topics through the same ACL, fail-closed — an unauthorized topic is never replayed and its position is never probed (no existence/count leak). Call `set_topic_acl` before `subscribe_connection`.
+- ACLs are enforced at subscribe time, **on every delivery to a pattern subscription** and **on recovery replay**: `subscribe_with_recovery` filters replayed topics through the same ACL, fail-closed — an unauthorized topic is never replayed and its position is never probed (no existence/count leak). Call `set_topic_acl` before `subscribe_connection`.
 - ACLs are per-connection, not per-user. Different connections from the same user can have different ACLs.
 - Without ACLs, all topics are accessible (backward compatible).
 - Combine with JWT `sub` claim for user-level authorization: read the user's role from the JWT payload in your drain loop, then set appropriate ACLs.

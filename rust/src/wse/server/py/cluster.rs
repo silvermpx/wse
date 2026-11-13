@@ -147,8 +147,7 @@ impl RustWSEServer {
 
         let ctx = crate::wse::cluster::ClusterContext {
             interest_tx,
-            topic_subscribers: self.shared.topic_subscribers.clone(),
-            glob_topic_count: self.shared.glob_topic_count.clone(),
+            topics: self.shared.topics.clone(),
             metrics: self.shared.cluster_metrics.clone(),
             new_peer_tx: placeholder_new_peer_tx,
             cmd_tx: placeholder_cmd_tx,
