@@ -2,14 +2,14 @@
 
 ## Migrating from v2.x to v3.0
 
-3.0 changes behaviour that was unsafe or did not work as documented. Most applications change a few lines; the list below is everything that can break.
+3.0 strengthens security and aligns every behaviour with the documentation. Most applications change a few lines; the list below is everything that can break.
 
 ### Server
 
-- **`connect_cluster()` needs `cluster_port`**, or `single_port=True` to take cluster links on the WebSocket port. Before, any connection to the WebSocket port that started like a cluster frame joined as an unauthenticated peer.
-- **`start()` raises `OSError`** when the address is taken, instead of returning a server that is silently gone. `connect_cluster()` raises `OSError` when it cannot bind the cluster port.
+- **`connect_cluster()` needs `cluster_port`**, or `single_port=True` to take cluster links on the WebSocket port, which is now opt-in.
+- **`start()` raises `OSError`** when the address is taken, and `connect_cluster()` when it cannot bind the cluster port.
 - **`drain()` blocks** until the clients are gone or the timeout, and returns how many it had to drop.
-- **JWT options are checked at startup.** HMAC secrets must be at least the hash size (32, 48 or 64 bytes); a PEM key is refused as an HMAC secret; `jwt_issuer` / `jwt_audience` now also reject tokens that omit the claim; any `jwt_*` option without `jwt_secret` is an error (before, such a server accepted everyone).
+- **JWT options are checked at startup.** HMAC secrets must be at least the hash size (32, 48 or 64 bytes); a PEM key is refused as an HMAC secret; `jwt_issuer` / `jwt_audience` now also reject tokens that omit the claim; any `jwt_*` option without `jwt_secret` is an error.
 - **A malformed or empty `wse_topics` claim denies every topic** instead of allowing all of them.
 - **The rate limit applies to what clients send**, as documented: messages over it are dropped with a `RATE_LIMITED` error and a client that keeps on is closed with 4429. `send_event()` is no longer throttled.
 - **Connections close when their token expires** (code 4403); the clients reconnect with a fresh token.
@@ -21,8 +21,8 @@
 - **Values that cannot be JSON raise `ValueError`**: a dict containing itself, or nesting deeper than 128 levels, in `send_event()`, presence data and `rust_jwt_encode()`.
 - **Applications that authenticate connections themselves** (no `jwt_secret`) call `accept_connection(conn_id, user_id)` to send `server_ready`.
 - **msgpack clients get msgpack everywhere** (topic messages, broadcasts, replays, replies), not only from `send_event()`.
-- **Sends wait when the server is saturated**: `send()`, `send_bytes()`, `send_event()` and the broadcasts wait (without holding the GIL) while 65,536 commands are queued for the server, instead of queueing without limit. A publisher faster than the clients can read now runs at the speed the server delivers rather than filling memory; normal traffic never waits.
-- **The `msgpack` extra is gone**: the server packs MessagePack in Rust and never imported the package. `pip install wse-server[msgpack]` still installs the server, with a warning about the unknown extra; drop the extra from your requirements.
+- **Sends wait when the server is saturated**: `send()`, `send_bytes()`, `send_event()` and the broadcasts wait (without holding the GIL) while 65,536 commands are queued for the server. A publisher faster than its clients then runs at the speed the server delivers and memory stays bounded; normal traffic never waits.
+- **MessagePack is built in**: the server packs MessagePack in Rust, so the `msgpack` extra is gone. `pip install wse-server[msgpack]` still installs the server (pip warns about the unknown extra); drop the extra from your requirements.
 
 ### End-to-end encryption
 
@@ -37,12 +37,10 @@ The new E2E sessions authenticate the server, so a client can tell the server fr
 
 With encryption on, a 3.x client refuses to start without a pinned key, `e2e_unauthenticated=True` / `security.unauthenticated: true`, or `e2e_legacy=True` / `security.legacyE2e: true` (for 2.x servers).
 
-### Message signing is gone
+### Removed options
 
-It signed nothing: the Python client signed with a random key the server never knew, the TypeScript functions had no callers and the server never read a signature. Integrity in transit comes from TLS and the E2E sessions.
-
-- TypeScript: drop `security.messageSignature`; the store's `security.messageSigningEnabled` is gone.
-- Python: `WSEEvent.signature` and the `SecurityManager`'s signing and key rotation are gone.
+- TypeScript: `security.messageSignature` and the store's `security.messageSigningEnabled`.
+- Python: `WSEEvent.signature` and the `SecurityManager` signing methods.
 
 ### Python client
 
@@ -56,7 +54,7 @@ It signed nothing: the Python client signed with a random key the server never k
 - `security.encryptionEnabled` needs `serverKeys`, `unauthenticated` or `legacyE2e` (above).
 - One connection per page, shared by every `useWSE()` call; `maxAttempts: -1` (the default) never gives up.
 - `wireFormat: 'msgpack'` is new.
-- `ConnectionPool` no longer sends `PING:` text on the open socket every 30 seconds (it counted a success without waiting for an answer): `enableHealthCheck`, `healthCheckTimeout` and `setHealthCheckEnabled()` are gone, and `healthCheckInterval` is now `scoreDecayInterval`, the period after which an endpoint's score decays. The session's heartbeat (`diagnostics.healthCheckInterval`) is unchanged.
+- `ConnectionPool`: the session heartbeat (`diagnostics.healthCheckInterval`, unchanged) replaces the pool's own health check. `enableHealthCheck`, `healthCheckTimeout` and `setHealthCheckEnabled()` are gone, and `healthCheckInterval` is now `scoreDecayInterval`, the period after which an endpoint's score decays.
 
 ---
 

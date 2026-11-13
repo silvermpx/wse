@@ -10,26 +10,24 @@ Security, correctness and speed. Upgrading from 2.x: see
 - E2E encryption now authenticates the server: clients pin the server's
   public key (`e2e_identity_key` on the server). 2.x clients keep working
   while `e2e_legacy=True`, the default.
-- Message signing is removed. It never worked: the server never checked a
-  signature.
 - `connect_cluster()` needs `cluster_port`, or `single_port=True` to take
   peers on the WebSocket port.
 - `start()` and `connect_cluster()` raise `OSError` when the port is taken.
   `drain()` waits for the clients to leave and returns how many it dropped.
 - JWT settings are checked at startup. A token without the configured
   `iss`/`aud` is rejected; a malformed `wse_topics` claim denies every topic.
-- The rate limit applies to what clients send, as documented (close code
-  4429). `send_event()` is no longer throttled.
+- The rate limit applies to what clients send (close code 4429);
+  `send_event()` is not throttled.
 - New close codes: 1013, 4403, 4408, 4429, 4800, 4802, 4803.
 - `subscribe_connection()` returns the topics it accepted. Topic names are
   validated, and a connection holds at most 16 patterns.
 - Invalid options, and values that cannot be JSON, raise `ValueError`.
 - Sends and broadcasts wait, without holding the GIL, while 65,536 commands
-  are queued, instead of using memory without limit.
-- The server's `msgpack` extra is removed; nothing used it.
-- TypeScript `ConnectionPool`: the health check that wrote `PING:` to the
-  socket every 30 s is removed; `healthCheckInterval` is now
-  `scoreDecayInterval`.
+  are queued, so memory stays bounded under any load.
+- MessagePack is built into the server, so the `wse-server[msgpack]` extra
+  is no longer needed.
+- TypeScript `ConnectionPool`: the session heartbeat replaces the pool's
+  own health check; `healthCheckInterval` is now `scoreDecayInterval`.
 
 ### New
 
@@ -49,27 +47,28 @@ Security, correctness and speed. Upgrading from 2.x: see
 
 ### Fixed
 
-- Server: E2E connections never get plaintext; pattern subscriptions
-  respect the ACL; closes are enforced; connect and disconnect events are
-  never dropped; `start()`, `drain()`, `stop()` and callbacks do what the
-  docs say; recovery stays within its memory budget; presence no longer
-  deadlocks.
+- Server: every delivery path encrypts for E2E connections; pattern
+  subscriptions follow the connection's ACL; server closes complete within
+  a grace period; connect and disconnect events are always delivered;
+  `start()`, `drain()`, `stop()` and callbacks follow their documented
+  contract; recovery stays within its memory budget; presence updates and
+  tracking run concurrently.
 - Cluster: any node can link to any other and redials a lost link;
-  interest routing understands patterns; a new peer gets the full interest
-  and presence state; no ghost members after a lost leave; relayed messages
-  keep their recovery position.
+  interest routing covers patterns; a new peer receives the full interest
+  and presence state; presence stays consistent after a lost leave;
+  relayed messages keep their recovery position.
 - Clients: reconnect until the server rejects the token; encryption fails
   closed; gaps are recovered from the last delivered message; the
   TypeScript client keeps one session per page.
-- The Rust utilities (filters, queues, transformer, msgpack) behave as
-  documented.
+- The Rust utilities (filters, queues, transformer, msgpack) follow their
+  documentation.
 
 ### Performance
 
 - Fan-out uses every core: one delivery lane per core instead of a single
   task.
 - Flow control: when clients read slower than the application publishes,
-  the publisher waits instead of the server buffering without limit.
+  the publisher is paced to them, so memory stays bounded.
 - No allocation or lock per published message.
 
 Against 2.5.1 on the same 48-thread Xeon, server and benchmark client on
