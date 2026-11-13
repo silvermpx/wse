@@ -399,6 +399,11 @@ export class WSESession {
       {
         refreshAuthToken: o.refreshAuthToken,
         encryptionRequired: o.security.encryptionEnabled,
+        e2e: {
+          serverKeys: o.security.serverKeys,
+          unauthenticated: o.security.unauthenticated,
+          legacy: o.security.legacyE2e,
+        },
         rateLimit: o.rateLimit,
         serverReadyTimeout: o.serverReadyTimeout,
         onTransportReady: () => {

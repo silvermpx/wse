@@ -15,6 +15,7 @@
 // flushed when the connection becomes ready; nothing is dropped because the
 // socket was busy, reconnecting or rate limited.
 
+import { E2eError } from '../utils/e2eSession.js';
 import {
   WSMessage,
   QueuedMessage,
@@ -342,6 +343,7 @@ export class MessageProcessor {
       if (size > this.maxMessageSize) {
         logger.warn(`Inbound message of ${size} bytes exceeds maxMessageSize (${this.maxMessageSize}); dropped`);
         this.countDropped(1);
+        await this.skipSealedFrame(buffer);
         return;
       }
       message = await this.processBinaryMessage(buffer);
@@ -643,15 +645,41 @@ export class MessageProcessor {
     }
 
     try {
-      const decrypted = await securityManager.decryptFromTransport(data);
-      if (!decrypted) {
+      const plaintext = await securityManager.decryptBytesFromTransport(data);
+      if (!plaintext) {
         logger.warn('Decryption returned nothing for an encrypted message');
         return null;
       }
-      return this.processTextMessage(decrypted);
+      // Msgpack inside (M:): the binary path; JSON otherwise.
+      if (plaintext.length >= 2 && plaintext[0] === 0x4d && plaintext[1] === 0x3a) {
+        return this.processBinaryMessage(plaintext.slice().buffer);
+      }
+      return this.processTextMessage(new TextDecoder().decode(plaintext));
     } catch (error) {
+      if (error instanceof E2eError) {
+        // A session frame out of order or forged: the session cannot go on.
+        cm?.failEncryption(`E2E frame refused (${error.message})`);
+        return null;
+      }
       logger.error('Failed to decrypt message:', error);
       return null;
+    }
+  }
+
+  /**
+   * A dropped E2E session frame is still opened: each frame is checked
+   * against the one before it, so skipping one would end the session.
+   */
+  private async skipSealedFrame(buffer: ArrayBuffer): Promise<void> {
+    const view = new Uint8Array(buffer);
+    if (view.length < 2 || view[0] !== 69 || view[1] !== 58) return;
+    if (!securityManager.isSessionMode() || !securityManager.isTransportEncryptionReady()) return;
+    try {
+      await securityManager.decryptBytesFromTransport(buffer);
+    } catch (error) {
+      if (error instanceof E2eError) {
+        this.connectionManager?.failEncryption(`E2E frame refused (${error.message})`);
+      }
     }
   }
 

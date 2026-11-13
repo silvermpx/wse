@@ -2,6 +2,7 @@
 // WebSocket Engine - Security Manager
 // =============================================================================
 
+import { E2eOffer, type E2eSession, type E2eTrust } from './e2eSession.js';
 import { logger } from './logger.js';
 
 // Check for Web Crypto API availability
@@ -46,6 +47,12 @@ export class SecurityManager {
   private keyGeneration = 0;
 
   private usedIVs = new Set<string>();
+
+  // E2E sessions (with encryption, unless the first design is asked for): a
+  // fresh offer per connection, and the session it becomes.
+  private e2eTrust: E2eTrust | null = null;
+  private e2eOffer: E2eOffer | null = null;
+  private e2eSession: E2eSession | null = null;
 
   private backendCompatibilityMode = false;
   private readonly supportedAlgorithms = {
@@ -342,7 +349,66 @@ export class SecurityManager {
     }
   }
 
+  /** Use E2E sessions with this trust; null for the first design. */
+  configureE2e(trust: E2eTrust | null): void {
+    this.e2eTrust = trust;
+  }
+
+  isSessionMode(): boolean {
+    return this.e2eTrust !== null;
+  }
+
+  /** client_hello.p.e2e: a fresh offer for this connection. */
+  async createOffer(): Promise<Record<string, unknown>> {
+    this.e2eSession = null;
+    const generation = this.keyGeneration;
+    const offer = await E2eOffer.create();
+    if (generation === this.keyGeneration) this.e2eOffer = offer;
+    return offer.message();
+  }
+
+  /** Complete the handshake from server_hello.p; rejects when it does not check. */
+  async acceptServerHello(payload: any): Promise<void> {
+    const offer = this.e2eOffer;
+    if (!offer || !this.e2eTrust || typeof payload?.e2e !== 'object' || payload.e2e === null) {
+      throw new SecurityError('the server did not answer the E2E offer', 'KEY_EXCHANGE_FAILED');
+    }
+    const generation = this.keyGeneration;
+    const session = await offer.accept(payload.e2e, String(payload.connection_id ?? ''), this.e2eTrust);
+    if (generation !== this.keyGeneration) return; // reset meanwhile: another connection
+    this.e2eSession = session;
+    this.e2eOffer = null;
+  }
+
+  /**
+   * The plaintext of an E:-prefixed frame as bytes (JSON, or M: msgpack).
+   * In a session a frame that is not the next one rejects with an E2eError:
+   * the connection must end.
+   */
+  async decryptBytesFromTransport(data: ArrayBuffer): Promise<Uint8Array | null> {
+    const view = new Uint8Array(data);
+    if (view.length < 2 || view[0] !== 69 || view[1] !== 58) return null;
+    if (this.e2eSession) {
+      return this.e2eSession.open(new Uint8Array(view));
+    }
+    if (!this.encryptionEnabled || !this.encryptionKey) return null;
+    try {
+      const decrypted = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: view.slice(2, 14) },
+        this.encryptionKey,
+        view.slice(14),
+      );
+      return new Uint8Array(decrypted);
+    } catch (error) {
+      throw new SecurityError('Decryption failed', 'DECRYPTION_FAILED', error);
+    }
+  }
+
   async encryptForTransport(data: string): Promise<ArrayBuffer> {
+    if (this.e2eSession) {
+      const frame = await this.e2eSession.seal(new TextEncoder().encode(data));
+      return frame.buffer;
+    }
     const encrypted = await this.encryptMessage(data);
     if (!encrypted) {
       throw new SecurityError('Cannot send: encryption key not ready', 'ENCRYPTION_FAILED');
@@ -506,6 +572,7 @@ export class SecurityManager {
    * server does not yet have -- which would deadlock the handshake.
    */
   isTransportEncryptionReady(): boolean {
+    if (this.e2eTrust) return this.e2eSession !== null;
     return this.encryptionEnabled && this.sharedSecret !== null;
   }
 
@@ -538,6 +605,8 @@ export class SecurityManager {
   resetEncryption(): void {
     this.keyGeneration++;
     this.keyDerivation = null;
+    this.e2eOffer = null;
+    this.e2eSession = null;
     this.encryptionKey = null;
     this.sharedSecret = null;
     this.serverPublicKey = null;

@@ -76,6 +76,12 @@ export interface ConnectionManagerConfig {
    */
   encryptionRequired?: boolean;
 
+  /**
+   * Who may answer the E2E handshake: `serverKeys` (pinned identity keys) or
+   * `unauthenticated`; `legacy` speaks the first design instead.
+   */
+  e2e?: { serverKeys?: string[]; unauthenticated?: boolean; legacy?: boolean };
+
   /** Outbound rate limit; false disables it. Default 1000 burst, 100/s. */
   rateLimit?: RateLimitConfig | false;
 
@@ -187,6 +193,18 @@ export class ConnectionManager {
   ) {
     this.config = config ?? {};
     this.encryptionRequired = !!this.config.encryptionRequired;
+    const e2e = this.config.e2e ?? {};
+    if (this.encryptionRequired && !e2e.legacy && !(e2e.serverKeys?.length) && !e2e.unauthenticated) {
+      throw new Error(
+        "E2E encryption needs the server's identity key (security.serverKeys), " +
+          'or security.unauthenticated, or security.legacyE2e for servers before 3.0',
+      );
+    }
+    securityManager.configureE2e(
+      this.encryptionRequired && !e2e.legacy
+        ? { serverKeys: e2e.serverKeys, unauthenticated: e2e.unauthenticated }
+        : null,
+    );
     this.compressionEnabled = this.config.compression?.enabled ?? true;
     this.compressionThreshold = this.config.compression?.threshold ?? 1024;
     this.rateLimiter = createRateLimiter(this.config.rateLimit);
@@ -979,15 +997,41 @@ export class ConnectionManager {
   }
 
   /**
-   * Send a protocol control frame (heartbeat ping, PONG, client_hello):
-   * plaintext and never rate limited. RFC 6455 wants PONGs "as soon as is
-   * practical", and the server answers only plaintext pings.
+   * Send a protocol control frame (heartbeat ping, PONG, client_hello), never
+   * rate limited: RFC 6455 wants PONGs "as soon as is practical". Plaintext,
+   * except in an E2E session: once the server has answered client_hello it
+   * takes sealed frames only, so they are sealed when the session exists and
+   * skipped (the next heartbeat follows) while the handshake is in flight.
    */
   sendControl(data: string | ArrayBuffer): boolean {
     if (!this.ws || this.ws.readyState !== WS_OPEN || this.isDestroyed) {
       return false;
     }
+    if (this.encryptionRequired && securityManager.isSessionMode()) {
+      if (this.encryptionState === 'ready' && typeof data === 'string') return this.sendSealed(data);
+      if (this.clientHelloSent) {
+        logger.debug('[ConnectionManager] Control frame skipped: the E2E session is not ready');
+        return false;
+      }
+    }
     return this.sendDirect(data);
+  }
+
+  /** Seal through the queue the application's frames take: one sequence, in wire order. */
+  private sendSealed(data: string): boolean {
+    const ws = this.ws;
+    if (!ws) return false;
+    const socketId = this.socketId;
+    this.encryptedSendQueue = this.encryptedSendQueue.then(async () => {
+      if (socketId !== this.socketId || this.ws !== ws || ws.readyState !== WS_OPEN) return;
+      try {
+        const frame = await securityManager.encryptForTransport(data);
+        if (socketId === this.socketId && this.ws === ws && ws.readyState === WS_OPEN) ws.send(frame);
+      } catch (error) {
+        logger.error('[ConnectionManager] Encryption failed, control frame dropped:', errorMessage(error));
+      }
+    });
+    return true;
   }
 
   private sendDirect(data: string | ArrayBuffer): boolean {
@@ -1090,7 +1134,15 @@ export class ConnectionManager {
 
     const socketId = this.socketId;
     let encryptionPublicKey: string | null = null;
-    if (this.encryptionRequired) {
+    let e2eOffer: Record<string, unknown> | null = null;
+    if (this.encryptionRequired && securityManager.isSessionMode()) {
+      try {
+        e2eOffer = await securityManager.createOffer();
+      } catch (error) {
+        if (socketId === this.socketId) this.failEncryption(`cannot make the E2E offer (${errorMessage(error)})`);
+        return;
+      }
+    } else if (this.encryptionRequired) {
       try {
         await securityManager.generateKeyPair();
         encryptionPublicKey = await securityManager.getPublicKeyRaw();
@@ -1113,7 +1165,7 @@ export class ConnectionManager {
       protocol_version: WS_PROTOCOL_VERSION,
       features: {
         compression: this.compressionEnabled && this.compressionThreshold > 0,
-        encryption: this.encryptionRequired && encryptionPublicKey !== null,
+        encryption: this.encryptionRequired && (encryptionPublicKey !== null || e2eOffer !== null),
         batching: FEATURES.BATCHING,
         priority_queue: FEATURES.PRIORITY_QUEUE,
         circuit_breaker: FEATURES.CIRCUIT_BREAKER,
@@ -1129,6 +1181,9 @@ export class ConnectionManager {
 
     if (encryptionPublicKey) {
       payload.encryption_public_key = encryptionPublicKey;
+    }
+    if (e2eOffer) {
+      payload.e2e = e2eOffer;
     }
 
     const message: WSMessage = {
@@ -1161,14 +1216,17 @@ export class ConnectionManager {
     if (!this.encryptionRequired || this.encryptionState !== 'pending' || this.isDestroyed) return;
 
     const socketId = this.socketId;
-    const key = payload?.encryption_public_key;
-    if (!payload?.features?.encryption || typeof key !== 'string' || key.length === 0) {
-      this.failEncryption('the server did not confirm encryption in server_hello');
-      return;
-    }
-
     try {
-      await securityManager.setServerPublicKeyRaw(key);
+      if (securityManager.isSessionMode()) {
+        await securityManager.acceptServerHello(payload);
+      } else {
+        const key = payload?.encryption_public_key;
+        if (!payload?.features?.encryption || typeof key !== 'string' || key.length === 0) {
+          this.failEncryption('the server did not confirm encryption in server_hello');
+          return;
+        }
+        await securityManager.setServerPublicKeyRaw(key);
+      }
     } catch (error) {
       if (socketId === this.socketId) {
         this.failEncryption(`key exchange failed (${errorMessage(error)})`);

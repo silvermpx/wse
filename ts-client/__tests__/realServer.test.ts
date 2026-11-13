@@ -5,10 +5,11 @@
 //
 //   WSE_E2E_PYTHON=.venv/bin/python npx vitest run ts-client/__tests__/realServer.test.ts
 //
-// Covers what fakes cannot prove: JWT cookie auth, the ECDH/AES-GCM key
-// exchange with the server's own implementation, stamped fan-out, a server
-// kick (close 1005) followed by a recovery replay, a server stop (1001)
-// without ever entering ERROR, a restart (new epoch) and sign-out.
+// Covers what fakes cannot prove: JWT cookie auth, an E2E session with the
+// server's own implementation (its identity key pinned), stamped fan-out, a
+// server kick (close 1005) followed by a recovery replay, a server stop (1001)
+// without ever entering ERROR, a restart (new epoch) and sign-out; and the
+// first E2E design, which the server still speaks to older clients.
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
@@ -33,6 +34,7 @@ describe.skipIf(!PYTHON || typeof WebSocket === 'undefined')('real RustWSEServer
   const events: any[] = [];
   let server: ChildProcessWithoutNullStreams;
   let token = '';
+  let identity = '';
 
   const send = (command: string) => server.stdin.write(`${command}\n`);
   const transportReady = () => !!getCurrentSession()?.connection?.isTransportReady();
@@ -44,6 +46,7 @@ describe.skipIf(!PYTHON || typeof WebSocket === 'undefined')('real RustWSEServer
       try {
         const ev = JSON.parse(line);
         if (ev.event === 'token') token = ev.token;
+        else if (ev.event === 'identity') identity = ev.key;
         else events.push(ev);
       } catch {
         // not an event line
@@ -51,6 +54,7 @@ describe.skipIf(!PYTHON || typeof WebSocket === 'undefined')('real RustWSEServer
     });
     await vi.waitFor(() => {
       expect(token).not.toBe('');
+      expect(identity).not.toBe('');
       expect(events.some((e) => e.event === 'started')).toBe(true);
     }, { timeout: 15_000 });
 
@@ -87,7 +91,7 @@ describe.skipIf(!PYTHON || typeof WebSocket === 'undefined')('real RustWSEServer
       config: {
         endpoints: [endpoint],
         offline: { enabled: false },
-        security: { encryptionEnabled: true },
+        security: { encryptionEnabled: true, serverKeys: [identity] },
         reconnection: { baseDelay: 200, maxDelay: 500 },
         registerHandlers: (p) => {
           p.registerHandler('price_update', (m) => {
@@ -100,7 +104,7 @@ describe.skipIf(!PYTHON || typeof WebSocket === 'undefined')('real RustWSEServer
     });
     session.processor.setGapListener((g) => gaps.push(g));
 
-    // JWT cookie auth, server_ready, key exchange with the server's ECDH.
+    // JWT cookie auth, server_ready, the E2E handshake signed by the pinned key.
     await vi.waitFor(() => expect(transportReady()).toBe(true), { timeout: 10_000 });
     await vi.waitFor(() => expect(events.some((e) => e.event === 'subscribe')).toBe(true), { timeout: 5_000 });
     expect(useWSEStore.getState().security.encryptionEnabled).toBe(true);
@@ -146,4 +150,26 @@ describe.skipIf(!PYTHON || typeof WebSocket === 'undefined')('real RustWSEServer
 
     unsubscribe();
   }, 60_000);
+
+  it('speaks the first E2E design to a server that still offers it', async () => {
+    destroyCurrentSession({ clearUserData: true });
+    const echoes: any[] = [];
+    acquireSession({
+      key: makeSessionKey('cookie', [endpoint]),
+      auth: 'cookie',
+      initialTopics: [],
+      config: {
+        endpoints: [endpoint],
+        offline: { enabled: false },
+        security: { encryptionEnabled: true, legacyE2e: true },
+        registerHandlers: (p) => {
+          p.registerHandler('echo_reply', (m) => echoes.push(m.p));
+        },
+      },
+    });
+
+    await vi.waitFor(() => expect(transportReady()).toBe(true), { timeout: 10_000 });
+    expect(wseActions.sendMessage('echo', { n: 7 })).toBe('sent');
+    await vi.waitFor(() => expect(echoes.some((p) => p.n === 7)).toBe(true), { timeout: 5_000 });
+  }, 30_000);
 });

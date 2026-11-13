@@ -73,6 +73,17 @@ export interface SecurityConfig {
    * the server does not confirm encryption.
    */
   encryptionEnabled: boolean;
+  /**
+   * The server's E2E identity public keys (base64, its
+   * e2e_identity_public_key()): one of them must sign each handshake, so
+   * nothing in between (a TLS-terminating proxy) can answer for the server.
+   * Two during a key rotation.
+   */
+  serverKeys?: string[];
+  /** Accept a server without an identity key: protects only against passive observers. */
+  unauthenticated?: boolean;
+  /** Speak the first E2E design, for servers before 3.0 (no server identity). */
+  legacyE2e?: boolean;
   publicKey?: string;
   sessionKey?: CryptoKey;
   messageSignature: boolean;

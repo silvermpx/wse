@@ -504,7 +504,13 @@ class ConnectionManager:
         if ws is None or self._destroyed:
             return False
         security = self._security
-        if security is not None and security.session_mode and security.is_enabled:
+        if security is not None and security.session_mode:
+            if not security.is_enabled:
+                # The server takes nothing but sealed frames once it has
+                # answered client_hello: until the session exists here, a
+                # heartbeat or PONG waits for the next one.
+                logger.debug("Control frame skipped: the E2E session is not ready")
+                return False
             try:
                 return await self._ws_send(
                     ws, PREFIX_ENCRYPTED + security.encrypt(data)

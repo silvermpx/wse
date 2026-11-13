@@ -6,6 +6,7 @@ import { vi } from 'vitest';
 import { destroyCurrentSession } from '../services/WSESession.js';
 import { useWSEStore } from '../stores/useWSEStore.js';
 import { useMessageQueueStore } from '../stores/useMessageQueueStore.js';
+import { E2E_SUITE, E2eReceiver, E2eSender, keyId, transcript } from '../utils/e2eSession.js';
 
 export const ENDPOINT = 'ws://wse.test/wse';
 
@@ -264,6 +265,86 @@ export async function serverKeyExchange(clientPublicKeyB64: string): Promise<Ser
       if (view[0] !== 69 || view[1] !== 58) throw new Error('not an E: frame');
       const pt = await subtle.decrypt({ name: 'AES-GCM', iv: view.slice(2, 14) }, aes, view.slice(14));
       return new TextDecoder().decode(pt);
+    },
+  };
+}
+
+// ---- the server side of an E2E session (mirrors e2e_session.rs) ------------
+
+function raw(text: string): Uint8Array<ArrayBuffer> {
+  const bin = atob(text);
+  const out = new Uint8Array(new ArrayBuffer(bin.length));
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function hkdf(th: Uint8Array<ArrayBuffer>, ikm: Uint8Array<ArrayBuffer>, label: string): Promise<Uint8Array<ArrayBuffer>> {
+  const subtle = globalThis.crypto.subtle;
+  const key = await subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+  const bits = await subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: th, info: new TextEncoder().encode(label) }, key, 256);
+  return new Uint8Array(bits);
+}
+
+/** A server identity key pair: what e2e_identity_key holds on the server. */
+export interface SessionIdentity {
+  publicKeyB64: string;
+  publicKey: Uint8Array<ArrayBuffer>;
+  sign(data: Uint8Array<ArrayBuffer>): Promise<Uint8Array<ArrayBuffer>>;
+}
+
+export async function sessionIdentity(): Promise<SessionIdentity> {
+  const subtle = globalThis.crypto.subtle;
+  const pair = await subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const publicKey = new Uint8Array(await subtle.exportKey('raw', pair.publicKey));
+  return {
+    publicKeyB64: b64(publicKey.buffer),
+    publicKey,
+    // WebCrypto signs ECDSA as raw r||s: the wire format.
+    sign: async (data) => new Uint8Array(await subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, pair.privateKey, data)),
+  };
+}
+
+export interface SessionServer {
+  /** server_hello.p.e2e */
+  hello: Record<string, unknown>;
+  sender: E2eSender;
+  /** A sealed binary frame carrying `data` (JSON text, or raw bytes). */
+  seal(data: string | Uint8Array<ArrayBuffer>): Promise<ArrayBuffer>;
+  /** The client's next sealed frame, opened (null: its close notice). */
+  open(frame: ArrayBuffer): Promise<string | null>;
+}
+
+/** Answer the client's offer (client_hello.p.e2e) like the server; `identity` null: unauthenticated. */
+export async function sessionServer(offer: any, connectionId: string, identity: SessionIdentity | null): Promise<SessionServer> {
+  const subtle = globalThis.crypto.subtle;
+  const pair = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const serverPublic = new Uint8Array(await subtle.exportKey('raw', pair.publicKey));
+  const clientPublic = raw(offer.client_public_key);
+  const kidHex = identity ? await keyId(identity.publicKey) : '0000000000000000';
+  const kid = new Uint8Array(new ArrayBuffer(8));
+  for (let i = 0; i < 8; i++) kid[i] = parseInt(kidHex.slice(2 * i, 2 * i + 2), 16);
+  const t = transcript(offer.suites, E2E_SUITE, raw(offer.client_random), clientPublic, serverPublic, connectionId, kid);
+  const peer = await subtle.importKey('raw', clientPublic, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const z = new Uint8Array(await subtle.deriveBits({ name: 'ECDH', public: peer }, pair.privateKey, 256));
+  const th = new Uint8Array(await subtle.digest('SHA-256', t));
+  const sender = await new E2eSender(th, 0x02, await hkdf(th, z, 'wse/e2e s2c')).init();
+  const receiver = await new E2eReceiver(th, 0x01, await hkdf(th, z, 'wse/e2e c2s')).init();
+  return {
+    hello: {
+      suite: E2E_SUITE,
+      server_public_key: b64(serverPublic.buffer),
+      key_id: kidHex,
+      alg: identity ? 'ES256' : null,
+      signature: identity ? b64((await identity.sign(t)).buffer) : null,
+    },
+    sender,
+    async seal(data) {
+      const body = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+      return (await sender.seal(body as Uint8Array<ArrayBuffer>)).buffer;
+    },
+    async open(frame) {
+      const plaintext = await receiver.open(new Uint8Array(frame));
+      return plaintext === null ? null : new TextDecoder().decode(plaintext);
     },
   };
 }

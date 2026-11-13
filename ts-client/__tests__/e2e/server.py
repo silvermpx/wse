@@ -3,7 +3,9 @@
 Driven over stdin ("publish N", "kick", "stop", "start", "quit"); reports
 events as JSON lines on stdout. Handles client subscription_update with
 subscribe_with_recovery() and replies like examples/standalone_recovery.py.
-Uses an installed wse-server, or the prebuilt module of this repository.
+Signs E2E sessions with an identity key made for the run (the same one
+across a restart), which the client pins. Uses an installed wse-server, or
+the prebuilt module of this repository; needs cryptography for the key.
 """
 
 import json
@@ -13,10 +15,18 @@ import time
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[3]))
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
+
 from wse_server._wse_accel import RustWSEServer, rust_jwt_encode  # noqa: E402
 
 PORT = int(sys.argv[1])
 SECRET = b"e2e-secret-key-32-bytes-long!!!!"
+IDENTITY = ec.generate_private_key(ec.SECP256R1()).private_bytes(
+    serialization.Encoding.PEM,
+    serialization.PrivateFormat.PKCS8,
+    serialization.NoEncryption(),
+)
 
 
 def emit(obj):
@@ -37,7 +47,12 @@ class Runner:
 
     def start(self):
         s = RustWSEServer(
-            "127.0.0.1", PORT, jwt_secret=SECRET, recovery_enabled=True, recovery_buffer_size=1024
+            "127.0.0.1",
+            PORT,
+            jwt_secret=SECRET,
+            recovery_enabled=True,
+            recovery_buffer_size=1024,
+            e2e_identity_key=IDENTITY,
         )
         s.enable_drain_mode()
         s.start()
@@ -131,6 +146,7 @@ class Runner:
 
 r = Runner()
 r.start()
+emit({"event": "identity", "key": r.server.e2e_identity_public_key()})
 emit({"event": "token", "token": make_token()})
 for line in sys.stdin:
     cmd = line.strip().split()

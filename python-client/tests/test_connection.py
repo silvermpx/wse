@@ -181,6 +181,23 @@ class TestSendPaths:
         assert ws.sent[1] == "PONG:123"
         assert json.loads(ws.sent[2])["t"] == "PONG"
 
+    async def test_session_control_frames_wait_for_the_handshake(self) -> None:
+        """Once the server answered client_hello it takes sealed frames only:
+        a heartbeat or PONG while the handshake is in flight is skipped, not
+        sent in plaintext."""
+        pytest.importorskip("cryptography")
+        from wse_client.security import SecurityManager
+
+        security = SecurityManager(unauthenticated=True)
+        security.hello_fields()
+        conn = ConnectionManager("ws://x/wse", security=security)
+        ws = FakeWS()
+        conn._ws = ws
+        conn._state = ConnectionState.CONNECTED
+        await conn._send_ping()
+        await conn._respond_ping_json('{"c":"WSE","t":"ping","p":{"server_time":"t"}}')
+        assert ws.sent == []
+
     async def test_app_frame_is_never_sent_in_plaintext(self) -> None:
         """Before the key exchange the transport fails closed."""
         pytest.importorskip("cryptography")
