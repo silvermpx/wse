@@ -10,9 +10,13 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 
 /// What goes through a connection's control queue; the write task encodes
 /// it (`encode_message`). Broadcast frames go through the broadcast buffer.
-#[derive(Clone)]
 pub(crate) enum WsFrame {
     Msg(Message),
+    /// A message for an E2E session: sealed by the write task, which alone
+    /// holds the session's sending state.
+    Seal(Bytes),
+    /// The sending state of an E2E session, queued right after server_hello.
+    InstallSeal(Box<super::e2e_session::SendState>),
 }
 
 /// Byte size of a WsFrame for backpressure accounting.
@@ -20,6 +24,9 @@ pub(crate) enum WsFrame {
 #[inline]
 pub(super) fn ws_frame_size(frame: &WsFrame) -> usize {
     match frame {
+        // Header, tag and frame overhead of a sealed frame.
+        WsFrame::Seal(plaintext) => plaintext.len() + 36,
+        WsFrame::InstallSeal(_) => 0,
         WsFrame::Msg(msg) => match msg {
             Message::Text(s) => s.len() + 4,
             Message::Binary(b) => b.len() + 4,

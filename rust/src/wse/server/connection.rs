@@ -17,10 +17,12 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::{StatusCode, header};
-use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketConfig};
 use uuid::Uuid;
 
 use super::e2e::{decrypt_inbound, derive_connection_key};
+use super::e2e_session::{self, RecvState, SendState};
 use super::frames::{
     close_frame, encode_message, encode_ws_frame, write_all_frames, ws_frame_size,
 };
@@ -28,10 +30,12 @@ use super::handshake::{HandshakeGuard, normalize_origin, reject_ws_auth};
 use super::messages::{build_server_hello, build_server_ready, normalize_json_keys};
 use super::py::{fire_on_connect, fire_on_disconnect, json_to_pyobj};
 use super::state::InboundEvent;
+use super::state::Seal;
 use super::subscribe::{answer_subscription_request, requested_compression};
 use super::{
-    BroadcastQueue, CLOSE_GRACE, CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED, CLOSE_TRY_AGAIN_LATER,
-    Closer, ConnectionHandle, SharedState, WsFrame,
+    BroadcastQueue, CLOSE_E2E_BAD_FRAME, CLOSE_E2E_EXHAUSTED, CLOSE_E2E_UNSUPPORTED, CLOSE_GRACE,
+    CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED, CLOSE_TRY_AGAIN_LATER, Closer, ConnectionHandle,
+    SharedState, WsFrame,
 };
 use crate::jwt::{self, parse_cookie_value};
 use crate::wse::compression::{decode_msgpack_guarded, rmpv_to_serde_json};
@@ -227,6 +231,27 @@ impl AsyncWrite for ServerSocket {
     }
 }
 
+const E2E_UNSUPPORTED_ERROR: &str = "{\"c\":\"WSE\",\"t\":\"error\",\"p\":{\"code\":\"E2E_UNSUPPORTED\",\"message\":\"No end-to-end encryption in common with the server\",\"recoverable\":false},\"v\":1}";
+
+/// The PONG answering a client's JSON `ping`.
+fn pong_for(ping: &serde_json::Value) -> String {
+    let timestamp = ping
+        .get("p")
+        .and_then(|p| p.get("timestamp"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let server_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    format!(
+        "{{\"c\":\"WSE\",\"t\":\"PONG\",\"p\":{{\"client_timestamp\":{},\"server_timestamp\":{},\"latency\":{}}},\"v\":1}}",
+        timestamp,
+        server_ts,
+        server_ts.saturating_sub(timestamp).max(0)
+    )
+}
+
 const RATE_LIMITED_ERROR: &str = "{\"c\":\"WSE\",\"t\":\"error\",\"p\":{\"code\":\"RATE_LIMITED\",\"message\":\"Rate limit exceeded\",\"retry_after\":1.0},\"v\":1}";
 
 /// A client's bad frames are logged at most once every 10 seconds per
@@ -279,16 +304,35 @@ enum Sent {
 }
 
 /// Write the queued control frames in order, up to the server's close frame;
-/// whatever was queued after the close is dropped.
+/// whatever was queued after the close is dropped. `seal` is the connection's
+/// E2E session sending state, once installed: sealing here, in queue order,
+/// keeps its sequence numbers in the order of the wire.
 async fn write_control(
     sock: &mut TcpStream,
     batch: &mut Vec<WsFrame>,
     wire: &mut VecDeque<Bytes>,
     pending: &AtomicUsize,
+    seal: &mut Option<SendState>,
 ) -> Sent {
     let queued: usize = batch.iter().map(ws_frame_size).sum();
     let mut close = false;
-    for WsFrame::Msg(msg) in batch.drain(..) {
+    for frame in batch.drain(..) {
+        let msg = match frame {
+            WsFrame::Msg(msg) => msg,
+            WsFrame::InstallSeal(state) => {
+                *seal = Some(*state);
+                continue;
+            }
+            WsFrame::Seal(plaintext) => match seal.as_mut().map(|s| s.seal(&plaintext)) {
+                Some(Ok(body)) => Message::Binary(body.into()),
+                // The session's counters are used up: the client reconnects.
+                Some(Err(_)) => Message::Close(Some(CloseFrame {
+                    code: CloseCode::from(CLOSE_E2E_EXHAUSTED),
+                    reason: "e2e limit reached".into(),
+                })),
+                None => continue,
+            },
+        };
         close = matches!(msg, Message::Close(_));
         if let Some(bytes) = encode_message(&msg) {
             wire.push_back(bytes);
@@ -324,21 +368,12 @@ fn close_reply(peer: u32) -> Option<Bytes> {
 /// Queue a frame the server makes on its own (server_hello, PONG, an error).
 /// A client that sends but does not read must not grow its queue with them:
 /// over `max_outbound_queue_bytes` the frame is dropped.
-fn queue_reply(
-    tx: &mpsc::UnboundedSender<WsFrame>,
-    pending: &AtomicUsize,
-    max_pending: usize,
-    msg: Message,
-) {
-    let frame = WsFrame::Msg(msg);
-    let bytes = ws_frame_size(&frame);
-    if max_pending > 0 && pending.load(Ordering::Relaxed) + bytes > max_pending {
+fn queue_reply(handle: &ConnectionHandle, max_pending: usize, msg: Message) {
+    let bytes = ws_frame_size(&WsFrame::Msg(msg.clone()));
+    if max_pending > 0 && handle.pending.load(Ordering::Relaxed) + bytes > max_pending {
         return;
     }
-    pending.fetch_add(bytes, Ordering::Relaxed);
-    if tx.send(frame).is_err() {
-        release(pending, bytes);
-    }
+    handle.send_control(msg);
 }
 
 /// The client's messages per connection: a token bucket of
@@ -642,8 +677,7 @@ pub(super) async fn handle_connection(
     let closer = Closer::new();
     // Its E2E key, once the client asked for one: every delivery path reads
     // it from the handle.
-    let cipher_slot: Arc<std::sync::OnceLock<Arc<crate::crypto::Aes256Gcm>>> =
-        Arc::new(std::sync::OnceLock::new());
+    let cipher_slot: Arc<std::sync::OnceLock<Seal>> = Arc::new(std::sync::OnceLock::new());
 
     // This connection as the rest of the server sees it.
     let own_handle = ConnectionHandle {
@@ -756,6 +790,7 @@ pub(super) async fn handle_connection(
     let write_task = tokio::spawn(async move {
         let mut batch: Vec<WsFrame> = Vec::with_capacity(CONTROL_BATCH);
         let mut wire: VecDeque<Bytes> = VecDeque::with_capacity(CONTROL_BATCH);
+        let mut seal: Option<SendState> = None;
         let mut close_sent = false;
         let work = async {
             loop {
@@ -774,7 +809,14 @@ pub(super) async fn handle_connection(
                 let mut wrote = false;
                 if !batch.is_empty() {
                     wrote = true;
-                    match write_control(&mut raw_write, &mut batch, &mut wire, &pending_write).await
+                    match write_control(
+                        &mut raw_write,
+                        &mut batch,
+                        &mut wire,
+                        &pending_write,
+                        &mut seal,
+                    )
+                    .await
                     {
                         Sent::Frames => {}
                         Sent::Close => {
@@ -843,6 +885,8 @@ pub(super) async fn handle_connection(
     // One server_hello per connection: a client repeating client_hello would
     // otherwise get one back each time.
     let mut hello_answered = false;
+    // The client's sending state of an E2E session: frames open in order only.
+    let mut session: Option<RecvState> = None;
     let mut frame_errors = FrameErrorLog::default();
 
     // A connection whose token expires is closed (4403): the clients come
@@ -876,6 +920,17 @@ pub(super) async fn handle_connection(
         if let Some(mut last) = state.conn_last_activity.get_mut(&*conn_id) {
             *last = std::time::Instant::now();
         }
+        // In an E2E session the client sends sealed frames only.
+        if session.is_some()
+            && match &msg {
+                Message::Text(_) => true,
+                Message::Binary(data) => !data.starts_with(b"E:"),
+                _ => false,
+            }
+        {
+            closer.close(&tx, &pending, CLOSE_E2E_BAD_FRAME, "e2e frame refused");
+            continue;
+        }
         if matches!(msg, Message::Text(_) | Message::Binary(_)) {
             match inbound_limit.check() {
                 Inbound::Pass => {}
@@ -884,14 +939,13 @@ pub(super) async fn handle_connection(
                         "{{\"c\":\"WSE\",\"t\":\"rate_limit_warning\",\"p\":{{\"current_rate\":{},\"limit\":{},\"remaining\":{},\"retry_after\":1.0}},\"v\":1}}",
                         used as u64, inbound_limit.capacity as u64, left as u64,
                     );
-                    queue_reply(&tx, &pending, max_pending, Message::Text(warning.into()));
+                    queue_reply(&own_handle, max_pending, Message::Text(warning.into()));
                 }
                 Inbound::Limited { notify } => {
                     state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
                     if notify {
                         queue_reply(
-                            &tx,
-                            &pending,
+                            &own_handle,
                             max_pending,
                             Message::Text(RATE_LIMITED_ERROR.into()),
                         );
@@ -970,12 +1024,76 @@ pub(super) async fn handle_connection(
                                         .and_then(|v| v.as_u64())
                                         .unwrap_or(1) as u32;
 
-                                // Check if client requests E2E encryption
+                                // An E2E session with an authenticated server.
+                                if let Some(offer) = p.and_then(|p| p.get("e2e")) {
+                                    let accepted =
+                                        e2e_session::parse_offer(offer).and_then(|offer| {
+                                            e2e_session::accept(
+                                                &offer,
+                                                &conn_id,
+                                                state.e2e_identity.as_ref(),
+                                            )
+                                        });
+                                    match accepted {
+                                        Ok(accepted) => {
+                                            let hello = build_server_hello(
+                                                &conn_id,
+                                                client_proto,
+                                                &state,
+                                                None,
+                                                Some(accepted.hello),
+                                            );
+                                            queue_reply(
+                                                &own_handle,
+                                                max_pending,
+                                                Message::Text(hello.into()),
+                                            );
+                                            // From here on the write task seals every
+                                            // frame, and the client sends nothing else.
+                                            let _ = tx.send(WsFrame::InstallSeal(Box::new(
+                                                accepted.send,
+                                            )));
+                                            session = Some(accepted.recv);
+                                            state.conn_sealed.insert((*conn_id).clone());
+                                            let _ = cipher_slot.set(Seal::Session);
+                                        }
+                                        Err(_) => {
+                                            queue_reply(
+                                                &own_handle,
+                                                max_pending,
+                                                Message::Text(E2E_UNSUPPORTED_ERROR.into()),
+                                            );
+                                            closer.close(
+                                                &tx,
+                                                &pending,
+                                                CLOSE_E2E_UNSUPPORTED,
+                                                "e2e suite unsupported",
+                                            );
+                                        }
+                                    }
+                                    continue;
+                                }
+
+                                // Check if client requests E2E encryption (the first design)
                                 let wants_encryption = p
                                     .and_then(|p| p.get("features"))
                                     .and_then(|f| f.get("encryption"))
                                     .and_then(|v| v.as_bool())
                                     .unwrap_or(false);
+                                if wants_encryption && !state.e2e_legacy {
+                                    queue_reply(
+                                        &own_handle,
+                                        max_pending,
+                                        Message::Text(E2E_UNSUPPORTED_ERROR.into()),
+                                    );
+                                    closer.close(
+                                        &tx,
+                                        &pending,
+                                        CLOSE_E2E_UNSUPPORTED,
+                                        "e2e suite unsupported",
+                                    );
+                                    continue;
+                                }
 
                                 // Once-only key exchange: never re-derive the cipher
                                 // if this connection already has one. A repeated
@@ -997,8 +1115,7 @@ pub(super) async fn handle_connection(
                                                     e.replace('\"', "\\\"")
                                                 );
                                                 queue_reply(
-                                                    &tx,
-                                                    &pending,
+                                                    &own_handle,
                                                     max_pending,
                                                     Message::Text(err_msg.into()),
                                                 );
@@ -1015,13 +1132,9 @@ pub(super) async fn handle_connection(
                                     &state,
                                     key.as_ref()
                                         .map(|(server_public, _)| server_public.as_str()),
+                                    None,
                                 );
-                                queue_reply(
-                                    &tx,
-                                    &pending,
-                                    max_pending,
-                                    Message::Text(hello.into()),
-                                );
+                                queue_reply(&own_handle, max_pending, Message::Text(hello.into()));
                                 // The key is in use only after server_hello is queued:
                                 // an encrypted frame never reaches the client before
                                 // the server's public key.
@@ -1029,28 +1142,16 @@ pub(super) async fn handle_connection(
                                     state
                                         .conn_encryption
                                         .insert((*conn_id).clone(), cipher.clone());
-                                    let _ = cipher_slot.set(cipher);
+                                    let _ = cipher_slot.set(Seal::Legacy(cipher));
                                 }
                                 continue;
                             }
                             if t_val == "ping" {
-                                let timestamp = val
-                                    .get("p")
-                                    .and_then(|p| p.get("timestamp"))
-                                    .and_then(|ts| ts.as_i64())
-                                    .unwrap_or(0);
-                                let server_ts = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis()
-                                    as i64;
-                                let pong = format!(
-                                    "{{\"c\":\"WSE\",\"t\":\"PONG\",\"p\":{{\"client_timestamp\":{},\"server_timestamp\":{},\"latency\":{}}},\"v\":1}}",
-                                    timestamp,
-                                    server_ts,
-                                    server_ts.saturating_sub(timestamp).max(0)
+                                queue_reply(
+                                    &own_handle,
+                                    max_pending,
+                                    Message::Text(pong_for(&val).into()),
                                 );
-                                queue_reply(&tx, &pending, max_pending, Message::Text(pong.into()));
                                 continue;
                             }
                             if t_val == "pong" || t_val == "PONG" {
@@ -1131,8 +1232,28 @@ pub(super) async fn handle_connection(
 
                 // E2E encryption: detect E: prefix and decrypt before processing
                 if data.len() >= 2 && data[0] == b'E' && data[1] == b':' {
-                    if let Some(cipher_ref) = cipher_slot.get() {
-                        match decrypt_inbound(cipher_ref, &data[2..]) {
+                    let opened = match (session.as_mut(), cipher_slot.get()) {
+                        (Some(session), _) => match session.open(&data) {
+                            Ok(Some(plaintext)) => Some(Ok(plaintext)),
+                            // The client's close_notify: it closes next.
+                            Ok(None) => continue,
+                            Err(_) => {
+                                closer.close(
+                                    &tx,
+                                    &pending,
+                                    CLOSE_E2E_BAD_FRAME,
+                                    "e2e frame refused",
+                                );
+                                continue;
+                            }
+                        },
+                        (None, Some(Seal::Legacy(cipher))) => {
+                            Some(decrypt_inbound(cipher, &data[2..]))
+                        }
+                        (None, _) => None,
+                    };
+                    if let Some(opened) = opened {
+                        match opened {
                             Ok(plaintext) => {
                                 // Decrypted payload is UTF-8 text (JSON with optional prefix)
                                 if let Ok(text) = std::str::from_utf8(&plaintext) {
@@ -1159,7 +1280,19 @@ pub(super) async fn handle_connection(
                                     {
                                         let val = normalize_json_keys(val);
                                         // The clients encrypt their protocol
-                                        // requests too.
+                                        // messages too (all of them in a session).
+                                        match val.get("t").and_then(|t| t.as_str()) {
+                                            Some("ping") => {
+                                                queue_reply(
+                                                    &own_handle,
+                                                    max_pending,
+                                                    Message::Text(pong_for(&val).into()),
+                                                );
+                                                continue;
+                                            }
+                                            Some("pong" | "PONG" | "client_hello") => continue,
+                                            _ => {}
+                                        }
                                         if val.get("t").and_then(|t| t.as_str())
                                             == Some("client_config")
                                         {
@@ -1301,7 +1434,7 @@ pub(super) async fn handle_connection(
                 }
             }
             Message::Ping(payload) => {
-                queue_reply(&tx, &pending, max_pending, Message::Pong(payload));
+                queue_reply(&own_handle, max_pending, Message::Pong(payload));
             }
             Message::Close(frame) => {
                 let code = frame.map_or(PEER_CLOSE_WITHOUT_CODE, |f| {
@@ -1327,6 +1460,7 @@ pub(super) async fn handle_connection(
     }
     state.conn_formats.remove(&*conn_id);
     state.conn_compression.remove(&*conn_id);
+    state.conn_sealed.remove(&*conn_id);
     state.conn_last_activity.remove(&*conn_id);
     state.conn_encryption.remove(&*conn_id);
     state.topics.acls.remove(&*conn_id);

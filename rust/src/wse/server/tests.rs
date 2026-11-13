@@ -182,7 +182,11 @@ fn an_encrypted_connection_gets_its_own_sealed_frame() {
     let (plain, _rx1) = make_handle();
     let (sealed, _rx2) = make_handle();
     let key = Arc::new(crate::crypto::Aes256Gcm::new(&[9u8; 32]).unwrap());
-    sealed.cipher.set(key.clone()).ok().unwrap();
+    sealed
+        .cipher
+        .set(super::state::Seal::Legacy(key.clone()))
+        .ok()
+        .unwrap();
     index.subscribe("t", "plain", &plain);
     index.subscribe("t", "sealed", &sealed);
     let drops = AtomicU64::new(0);

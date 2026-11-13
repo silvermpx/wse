@@ -215,6 +215,63 @@ pub(crate) fn ecdh_ephemeral<R>(
     Ok((public, derived))
 }
 
+/// The server's identity for end-to-end encryption: an ECDSA P-256 key that
+/// signs each handshake, so a client pinning its public key knows it talks
+/// to this server and not to whatever terminates TLS in between.
+pub(crate) struct IdentityKey(aws_lc_rs::signature::EcdsaKeyPair);
+
+impl IdentityKey {
+    /// From a PKCS#8 private key, PEM (`-----BEGIN PRIVATE KEY-----`) or DER.
+    pub(crate) fn from_pkcs8(key: &[u8]) -> Result<Self, Error> {
+        let der = pem_body(key).unwrap_or_else(|| key.to_vec());
+        aws_lc_rs::signature::EcdsaKeyPair::from_pkcs8(
+            &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &der,
+        )
+        .map(Self)
+        .map_err(|_| Error)
+    }
+
+    /// The public key: uncompressed SEC1, `0x04 || X || Y`.
+    pub(crate) fn public_key(&self) -> &[u8] {
+        use aws_lc_rs::signature::KeyPair;
+        self.0.public_key().as_ref()
+    }
+
+    /// An ECDSA P-256 / SHA-256 signature of `message`, `r || s` (64 bytes).
+    pub(crate) fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
+        let rng = rand::SystemRandom::new();
+        Ok(self.0.sign(&rng, message)?.as_ref().to_vec())
+    }
+}
+
+/// Check an ECDSA P-256 / SHA-256 signature (`r || s`) by an uncompressed
+/// SEC1 public key.
+#[cfg(test)]
+pub(crate) fn verify_p256(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    aws_lc_rs::signature::UnparsedPublicKey::new(
+        &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED,
+        public_key,
+    )
+    .verify(message, signature)
+    .is_ok()
+}
+
+/// The DER inside a PEM block, if `text` is one.
+fn pem_body(text: &[u8]) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let text = std::str::from_utf8(text).ok()?;
+    if !text.trim_start().starts_with("-----BEGIN") {
+        return None;
+    }
+    let body: String = text
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .flat_map(|line| line.trim().chars())
+        .collect();
+    base64::engine::general_purpose::STANDARD.decode(body).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +331,23 @@ mod tests {
             hex::encode(sha256(b"abc")),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn identity_signatures_verify_and_bind_the_message() {
+        let rng = rand::SystemRandom::new();
+        let pkcs8 = aws_lc_rs::signature::EcdsaKeyPair::generate_pkcs8(
+            &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &rng,
+        )
+        .unwrap();
+        let key = IdentityKey::from_pkcs8(pkcs8.as_ref()).unwrap();
+        assert_eq!(key.public_key().len(), P256_PUBLIC_LEN);
+        let sig = key.sign(b"transcript").unwrap();
+        assert_eq!(sig.len(), 64);
+        assert!(verify_p256(key.public_key(), b"transcript", &sig));
+        assert!(!verify_p256(key.public_key(), b"transcripT", &sig));
+        assert!(IdentityKey::from_pkcs8(b"not a key").is_err());
     }
 
     #[test]

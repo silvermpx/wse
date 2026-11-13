@@ -100,6 +100,8 @@ struct ServerParams {
     max_inbound_queue_bytes: usize,
     allowed_origins: Option<Vec<String>>,
     client_subscriptions: bool,
+    e2e_identity_key: Option<Vec<u8>>,
+    e2e_legacy: bool,
     max_message_size: usize,
     ping_interval: u64,
     idle_timeout: u64,
@@ -184,6 +186,16 @@ impl RustWSEServer {
             })
             .transpose()
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        let e2e_identity = srv
+            .e2e_identity_key
+            .as_deref()
+            .map(crate::crypto::IdentityKey::from_pkcs8)
+            .transpose()
+            .map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "e2e_identity_key must be an ECDSA P-256 private key in PKCS#8 (PEM or DER)",
+                )
+            })?;
         if srv.ping_interval >= srv.idle_timeout {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "ping_interval ({}s) must be less than idle_timeout ({}s)",
@@ -279,6 +291,8 @@ impl RustWSEServer {
                 max_inbound_queue_bytes: srv.max_inbound_queue_bytes,
                 allowed_origins,
                 client_subscriptions: srv.client_subscriptions,
+                e2e_identity,
+                e2e_legacy: srv.e2e_legacy,
                 recovery,
                 presence_enabled: pres.presence_enabled,
                 presence_max_data_size: pres.presence_max_data_size,
@@ -349,10 +363,10 @@ impl RustWSEServer {
     /// compression, encryption, ping/pong). Python handles application logic
     /// via drain mode or callbacks.
     #[new]
-    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, jwt_previous_secret = None, jwt_key_id = None, jwt_algorithm = None, jwt_private_key = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_bytes = 16_777_216, max_subscriptions_per_connection = 0, max_inbound_queue_bytes = 67_108_864, allowed_origins = None, client_subscriptions = false))]
+    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, jwt_previous_secret = None, jwt_key_id = None, jwt_algorithm = None, jwt_private_key = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_bytes = 16_777_216, max_subscriptions_per_connection = 0, max_inbound_queue_bytes = 67_108_864, allowed_origins = None, client_subscriptions = false, e2e_identity_key = None, e2e_legacy = true))]
     #[expect(
         clippy::too_many_arguments,
-        reason = "PyO3 __init__: 30 Python kwargs with defaults"
+        reason = "PyO3 __init__: 32 Python kwargs with defaults"
     )]
     fn new(
         host: String,
@@ -385,6 +399,8 @@ impl RustWSEServer {
         max_inbound_queue_bytes: usize,
         allowed_origins: Option<Vec<String>>,
         client_subscriptions: bool,
+        e2e_identity_key: Option<Vec<u8>>,
+        e2e_legacy: bool,
     ) -> PyResult<Self> {
         Self::build(
             host,
@@ -395,6 +411,8 @@ impl RustWSEServer {
                 max_inbound_queue_bytes,
                 allowed_origins,
                 client_subscriptions,
+                e2e_identity_key,
+                e2e_legacy,
                 max_message_size,
                 ping_interval,
                 idle_timeout,
@@ -755,6 +773,16 @@ impl RustWSEServer {
             cfg.key_id.as_deref(),
         )
         .map_err(|e| PyRuntimeError::new_err(format!("JWT encode error: {e}")))
+    }
+
+    /// The public key clients pin for end-to-end encryption: base64 of the
+    /// uncompressed P-256 point of `e2e_identity_key`, None without one.
+    fn e2e_identity_public_key(&self) -> Option<String> {
+        use base64::Engine;
+        self.shared
+            .e2e_identity
+            .as_ref()
+            .map(|k| base64::engine::general_purpose::STANDARD.encode(k.public_key()))
     }
 
     /// Replace the JWT verification keys without a restart, for a key

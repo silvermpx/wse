@@ -22,9 +22,7 @@ use crate::wse::pylock::lock;
 use crate::wse::server::commands::process_commands;
 use crate::wse::server::connection::handle_connection;
 use crate::wse::server::handshake::{HandshakeGuard, MAX_PENDING_HANDSHAKES};
-use crate::wse::server::{
-    CLOSE_IDLE, CLOSE_TRY_AGAIN_LATER, ConnectionHandle, ServerCommand, WsFrame,
-};
+use crate::wse::server::{CLOSE_IDLE, CLOSE_TRY_AGAIN_LATER, ConnectionHandle, ServerCommand};
 
 /// TCP keepalive of accepted connections: the first probe after a minute of
 /// silence, then every 10 seconds.
@@ -256,15 +254,8 @@ impl RustWSEServer {
                                     let ping_msg = format!(
                                         "{{\"c\":\"WSE\",\"t\":\"ping\",\"p\":{{\"server_time\":\"{ts}\"}}}}"
                                     );
-                                    let pm_bytes = ping_msg.len() + 4;
-                                    handle.pending.fetch_add(pm_bytes, Ordering::Relaxed);
-                                    if handle
-                                        .tx
-                                        .send(WsFrame::Msg(Message::Text(ping_msg.into())))
-                                        .is_err()
-                                    {
-                                        handle.pending.fetch_sub(pm_bytes, Ordering::Relaxed);
-                                    }
+                                    // Sealed in an E2E session.
+                                    handle.send_control(Message::Text(ping_msg.into()));
                                 }
                             }
                         });

@@ -50,21 +50,16 @@ pub(super) async fn process_commands(
             ServerCommand::SendPrebuilt { conn_id, message } => {
                 let guard = state.connections.read().await;
                 if let Some(h) = guard.get(&conn_id) {
-                    let max_pending = state.max_outbound_queue_bytes;
-                    if max_pending > 0 && h.pending.load(Ordering::Relaxed) >= max_pending {
-                        state.slow_consumer_drops.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        let msg_bytes = ws_frame_size(&WsFrame::Msg(message.clone()));
-                        h.pending.fetch_add(msg_bytes, Ordering::Relaxed);
-                        if h.tx.send(WsFrame::Msg(message)).is_err() {
-                            h.pending.fetch_sub(msg_bytes, Ordering::Relaxed);
-                        } else {
-                            // Counted once really queued.
-                            state.messages_sent_total.fetch_add(1, Ordering::Relaxed);
-                            state
-                                .bytes_sent_total
-                                .fetch_add(msg_bytes as u64, Ordering::Relaxed);
-                        }
+                    let bytes = ws_frame_size(&WsFrame::Msg(message.clone())) as u64;
+                    // Sealed for the connection's E2E key, if it has one.
+                    if h.send_one(
+                        message,
+                        state.max_outbound_queue_bytes,
+                        &state.slow_consumer_drops,
+                    ) {
+                        // Counted once really queued.
+                        state.messages_sent_total.fetch_add(1, Ordering::Relaxed);
+                        state.bytes_sent_total.fetch_add(bytes, Ordering::Relaxed);
                     }
                 }
             }

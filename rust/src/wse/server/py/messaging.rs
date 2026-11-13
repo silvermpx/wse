@@ -15,7 +15,6 @@ use super::RustWSEServer;
 use super::convert::pyobj_to_json;
 use crate::wse::compression::serde_json_to_rmpv;
 use crate::wse::server::ServerCommand;
-use crate::wse::server::e2e::encrypt_outbound;
 use crate::wse::server::messages::{build_server_ready, inject_category, message_category};
 
 impl RustWSEServer {
@@ -167,96 +166,46 @@ impl RustWSEServer {
             .unwrap_or(false);
 
         // Check if this connection has E2E encryption
-        let conn_cipher = self.shared.conn_encryption.get(conn_id);
+        // Encrypted connections are sealed by the server on the way out, and
+        // never compressed: compression would leak through the length.
+        let e2e = self.shared.conn_encryption.contains_key(conn_id)
+            || self.shared.conn_sealed.contains(conn_id);
         // The client's own compression wish, unless the call turns it off.
         let client_threshold = self.shared.conn_compression.get(conn_id).map(|t| *t);
 
-        let byte_count;
-
-        if use_msgpack {
-            // Msgpack path: M: prefix + rmpv serialize (binary frame)
+        let body: Vec<u8> = if use_msgpack {
+            // Msgpack: M: prefix + rmpv serialize (binary frame)
             let rmpv_val = serde_json_to_rmpv(&serde_json::Value::Object(map));
-            let mut buf = Vec::new();
+            let mut buf = Vec::with_capacity(256);
+            buf.extend_from_slice(b"M:");
             rmpv::encode::write_value(&mut buf, &rmpv_val)
                 .map_err(|e| PyRuntimeError::new_err(format!("Msgpack error: {e}")))?;
-            let mut final_bytes = Vec::with_capacity(buf.len() + 2);
-            final_bytes.extend_from_slice(b"M:");
-            final_bytes.extend_from_slice(&buf);
-
-            // Encrypt if E2E enabled for this connection
-            let final_bytes = if let Some(ref cipher) = conn_cipher {
-                let encrypted = encrypt_outbound(cipher, &final_bytes)
-                    .map_err(|e| PyRuntimeError::new_err(format!("Encrypt error: {e}")))?;
-                let mut enc_buf = Vec::with_capacity(2 + encrypted.len());
-                enc_buf.extend_from_slice(b"E:");
-                enc_buf.extend_from_slice(&encrypted);
-                enc_buf
-            } else {
-                final_bytes
-            };
-
-            byte_count = final_bytes.len();
-            cmd_tx
-                .send(ServerCommand::SendPrebuilt {
-                    conn_id: conn_id.to_owned(),
-                    message: Message::Binary(final_bytes.into()),
-                })
-                .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
+            buf
         } else {
-            // JSON path: serialize (no wire prefix, c is inside JSON)
-            let json_str = serde_json::to_string(&serde_json::Value::Object(map))
+            let json = serde_json::to_vec(&serde_json::Value::Object(map))
                 .map_err(|e| PyRuntimeError::new_err(format!("JSON error: {e}")))?;
-
-            let payload_bytes = json_str.as_bytes();
-
-            if let Some(ref cipher) = conn_cipher {
-                // E2E encrypted: encrypt plaintext payload, send as E: prefix binary
-                let encrypted = encrypt_outbound(cipher, payload_bytes)
-                    .map_err(|e| PyRuntimeError::new_err(format!("Encrypt error: {e}")))?;
-                let mut final_bytes = Vec::with_capacity(2 + encrypted.len());
-                final_bytes.extend_from_slice(b"E:");
-                final_bytes.extend_from_slice(&encrypted);
-                byte_count = final_bytes.len();
-                cmd_tx
-                    .send(ServerCommand::SendPrebuilt {
-                        conn_id: conn_id.to_owned(),
-                        message: Message::Binary(final_bytes.into()),
-                    })
-                    .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
-            } else if compression_threshold > 0
-                && payload_bytes.len() > client_threshold.unwrap_or(compression_threshold)
-                && client_threshold != Some(0)
-            {
+            let threshold = client_threshold.unwrap_or(compression_threshold);
+            if !e2e && compression_threshold > 0 && threshold > 0 && json.len() > threshold {
                 // Compressed: C: prefix + zlib (binary frame)
-                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+                let mut encoder = ZlibEncoder::new(Vec::from(&b"C:"[..]), Compression::fast());
                 encoder
-                    .write_all(payload_bytes)
+                    .write_all(&json)
                     .map_err(|e| PyRuntimeError::new_err(format!("Compress error: {e}")))?;
-                let compressed = encoder
+                encoder
                     .finish()
-                    .map_err(|e| PyRuntimeError::new_err(format!("Compress finish: {e}")))?;
-                let mut final_bytes = Vec::with_capacity(compressed.len() + 2);
-                final_bytes.extend_from_slice(b"C:");
-                final_bytes.extend_from_slice(&compressed);
-                byte_count = final_bytes.len();
-                cmd_tx
-                    .send(ServerCommand::SendPrebuilt {
-                        conn_id: conn_id.to_owned(),
-                        message: Message::Binary(final_bytes.into()),
-                    })
-                    .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
+                    .map_err(|e| PyRuntimeError::new_err(format!("Compress finish: {e}")))?
             } else {
-                // Uncompressed JSON: binary frame (skips UTF-8 validation overhead)
-                byte_count = json_str.len();
-                cmd_tx
-                    .send(ServerCommand::SendPrebuilt {
-                        conn_id: conn_id.to_owned(),
-                        message: Message::Binary(json_str.into_bytes().into()),
-                    })
-                    .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
+                // JSON as a binary frame (skips UTF-8 validation overhead)
+                json
             }
-        }
-
+        };
+        let byte_count = body.len();
+        cmd_tx
+            .send(ServerCommand::SendPrebuilt {
+                conn_id: conn_id.to_owned(),
+                message: Message::Binary(body.into()),
+            })
+            .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         Ok(byte_count)
     }
 

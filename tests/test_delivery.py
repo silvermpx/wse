@@ -238,3 +238,161 @@ class TestClientCompression:
                 assert not (await self.received(ws)).startswith(b"C:")
         finally:
             srv.stop()
+
+
+def identity_key() -> bytes:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    return ec.generate_private_key(ec.SECP256R1()).private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+
+
+class SessionClient:
+    """The client side of an E2E session, by hand on a plain socket."""
+
+    def __init__(self, ws, session):
+        self.ws = ws
+        self.session = session
+
+    @classmethod
+    async def open(cls, port: int, server_keys=None, unauthenticated=False):
+        from wse_client.e2e_session import Offer
+
+        ws = await connect(port, make_token())
+        offer = Offer()
+        await ws.send(
+            json.dumps({"t": "client_hello", "p": {"protocol_version": 1, "e2e": offer.message()}})
+        )
+        async with asyncio.timeout(5):
+            while True:
+                msg = json.loads(await ws.recv())
+                if msg["t"] == "server_hello":
+                    p = msg["p"]
+                    session = offer.accept(
+                        p["e2e"], p["connection_id"], server_keys, unauthenticated
+                    )
+                    return cls(ws, session)
+
+    async def send(self, message: dict):
+        await self.ws.send(self.session.seal(json.dumps(message).encode()))
+
+    async def recv(self) -> dict:
+        frame = await asyncio.wait_for(self.ws.recv(), timeout=5)
+        assert isinstance(frame, bytes) and frame.startswith(b"E:"), frame
+        return json.loads(self.session.open(frame))
+
+    async def next_of_type(self, kind: str) -> dict:
+        async with asyncio.timeout(5):
+            while True:
+                msg = await self.recv()
+                if msg.get("t") == kind:
+                    return msg
+
+
+class TestE2eSessions:
+    @pytest.mark.asyncio
+    async def test_a_pinned_session_carries_everything_sealed(self, server_port):
+        srv = start_server(server_port, e2e_identity_key=identity_key())
+        try:
+            pin = srv.e2e_identity_public_key()
+            client = await SessionClient.open(server_port, server_keys=[pin])
+            _, conn_id, _ = drain_until(srv, "auth_connect")
+            srv.subscribe_connection(conn_id, ["room"])
+            await asyncio.sleep(0.1)
+            srv.broadcast_local("room", json.dumps({"t": "topic", "p": {"n": 1}}))
+            assert (await client.next_of_type("topic"))["p"] == {"n": 1}
+            srv.send_event(conn_id, {"t": "direct", "p": {"fill": "x" * 3000}})
+            assert (await client.next_of_type("direct"))["p"]["fill"] == "x" * 3000
+            await client.send({"t": "ping", "p": {"timestamp": 1}})
+            assert (await client.next_of_type("PONG"))["p"]["client_timestamp"] == 1
+            await client.send({"t": "chat", "p": {"text": "hi"}})
+            assert drain_until(srv, "msg")[2]["p"] == {"text": "hi"}
+            await client.ws.close()
+        finally:
+            srv.stop()
+
+    @pytest.mark.asyncio
+    async def test_plaintext_or_replayed_frames_end_the_session(self, server_port):
+        import websockets
+
+        srv = start_server(server_port, e2e_identity_key=identity_key())
+        try:
+            pin = srv.e2e_identity_public_key()
+            client = await SessionClient.open(server_port, server_keys=[pin])
+            await client.ws.send(json.dumps({"t": "chat", "p": {}}))
+            with pytest.raises(websockets.ConnectionClosed):
+                while True:
+                    await asyncio.wait_for(client.ws.recv(), timeout=5)
+            assert client.ws.close_code == 4802
+
+            client = await SessionClient.open(server_port, server_keys=[pin])
+            frame = client.session.seal(b'{"t":"chat","p":{}}')
+            await client.ws.send(frame)
+            await client.ws.send(frame)  # the same frame again
+            with pytest.raises(websockets.ConnectionClosed):
+                while True:
+                    await asyncio.wait_for(client.ws.recv(), timeout=5)
+            assert client.ws.close_code == 4802
+        finally:
+            srv.stop()
+
+    @pytest.mark.asyncio
+    async def test_the_client_refuses_an_unpinned_or_unsigned_server(self, server_port):
+        from wse_client.e2e_session import E2eError
+
+        srv = start_server(server_port, e2e_identity_key=identity_key())
+        try:
+            other = RustWSEServer("127.0.0.1", 0, e2e_identity_key=identity_key())
+            with pytest.raises(E2eError) as wrong:
+                await SessionClient.open(server_port, server_keys=[other.e2e_identity_public_key()])
+            assert wrong.value.close_code == 4801
+        finally:
+            srv.stop()
+        plain = start_server(server_port)
+        try:
+            assert plain.e2e_identity_public_key() is None
+            with pytest.raises(E2eError):
+                await SessionClient.open(server_port, server_keys=["BAAAAA=="])
+            client = await SessionClient.open(server_port, unauthenticated=True)
+            await client.send({"t": "ping", "p": {"timestamp": 2}})
+            assert (await client.next_of_type("PONG"))["p"]["client_timestamp"] == 2
+            await client.ws.close()
+        finally:
+            plain.stop()
+
+    @pytest.mark.asyncio
+    async def test_the_first_design_can_be_turned_off(self, server_port):
+        srv = start_server(server_port, e2e_legacy=False)
+        try:
+            ws = await connect(server_port, make_token())
+            _, public = rust_ecdh_generate_keypair()
+            await ws.send(
+                json.dumps(
+                    {
+                        "t": "client_hello",
+                        "p": {
+                            "features": {"encryption": True},
+                            "encryption_public_key": base64.b64encode(public).decode(),
+                        },
+                    }
+                )
+            )
+            codes = []
+            async with asyncio.timeout(5):
+                try:
+                    async for frame in ws:
+                        codes.append(json.loads(frame).get("p", {}).get("code"))
+                except Exception:
+                    pass
+            assert "E2E_UNSUPPORTED" in codes
+            assert ws.close_code == 4800
+        finally:
+            srv.stop()
+
+    def test_a_malformed_identity_key_is_refused(self):
+        with pytest.raises(ValueError, match="e2e_identity_key"):
+            RustWSEServer("127.0.0.1", 0, e2e_identity_key=b"not a key")

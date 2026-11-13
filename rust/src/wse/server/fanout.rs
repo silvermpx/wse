@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 
 use super::e2e::{e2e_frame, e2e_message};
 use super::frames::{encode_ws_frame, ws_frame_size};
+use super::state::Seal;
 use super::{ConnectionHandle, QueueGroup, WsFrame};
 
 // ---------------------------------------------------------------------------
@@ -146,12 +147,37 @@ impl ConnectionHandle {
         }
         match self.cipher.get() {
             None => self.push_frame(&msg.frame),
-            Some(cipher) => match e2e_frame(cipher, &msg.payload) {
+            Some(Seal::Legacy(cipher)) => match e2e_frame(cipher, &msg.payload) {
                 Some(frame) => self.push_frame(&frame),
                 None => return false,
             },
+            Some(Seal::Session) => return self.queue(WsFrame::Seal(msg.payload.clone())),
         }
         true
+    }
+
+    /// Queue a frame on the control queue, counted in the outbound budget.
+    fn queue(&self, frame: WsFrame) -> bool {
+        let bytes = ws_frame_size(&frame);
+        self.pending.fetch_add(bytes, Ordering::Relaxed);
+        if self.tx.send(frame).is_err() {
+            self.pending.fetch_sub(bytes, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// Queue a message the server makes on its own (a ping, a reply, an
+    /// error): sealed in an E2E session, where the client accepts nothing
+    /// else, as is otherwise (older E2E clients take these in plaintext).
+    pub(crate) fn send_control(&self, msg: Message) -> bool {
+        match (self.cipher.get(), msg) {
+            (Some(Seal::Session), Message::Text(text)) => {
+                self.queue(WsFrame::Seal(Bytes::from(text)))
+            }
+            (Some(Seal::Session), Message::Binary(data)) => self.queue(WsFrame::Seal(data)),
+            (_, msg) => self.queue(WsFrame::Msg(msg)),
+        }
     }
 
     /// Send one message to this connection alone, in order with its other
@@ -168,25 +194,23 @@ impl ConnectionHandle {
             slow_drops.fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        let msg = match (self.cipher.get(), msg) {
-            (Some(cipher), Message::Text(text)) => match e2e_message(cipher, text.as_bytes()) {
-                Some(sealed) => sealed,
+        let frame = match (self.cipher.get(), msg) {
+            (Some(Seal::Legacy(cipher)), Message::Text(text)) => {
+                match e2e_message(cipher, text.as_bytes()) {
+                    Some(sealed) => WsFrame::Msg(sealed),
+                    None => return false,
+                }
+            }
+            (Some(Seal::Legacy(cipher)), Message::Binary(data)) => match e2e_message(cipher, &data)
+            {
+                Some(sealed) => WsFrame::Msg(sealed),
                 None => return false,
             },
-            (Some(cipher), Message::Binary(data)) => match e2e_message(cipher, &data) {
-                Some(sealed) => sealed,
-                None => return false,
-            },
-            (_, msg) => msg,
+            (Some(Seal::Session), Message::Text(text)) => WsFrame::Seal(Bytes::from(text)),
+            (Some(Seal::Session), Message::Binary(data)) => WsFrame::Seal(data),
+            (_, msg) => WsFrame::Msg(msg),
         };
-        let frame = WsFrame::Msg(msg);
-        let bytes = ws_frame_size(&frame);
-        self.pending.fetch_add(bytes, Ordering::Relaxed);
-        if self.tx.send(frame).is_err() {
-            self.pending.fetch_sub(bytes, Ordering::Relaxed);
-            return false;
-        }
-        true
+        self.queue(frame)
     }
 
     /// Append a frame to the broadcast buffer; the write task is woken when

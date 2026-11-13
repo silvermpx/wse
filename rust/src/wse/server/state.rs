@@ -24,6 +24,9 @@ pub(crate) const CLOSE_TRY_AGAIN_LATER: u16 = 1013; // too slow to read, or the 
 pub(crate) const CLOSE_TOKEN_EXPIRED: u16 = 4403; // the JWT the connection opened with expired
 pub(crate) const CLOSE_IDLE: u16 = 4408; // nothing received within idle_timeout
 pub(crate) const CLOSE_RATE_LIMITED: u16 = 4429; // kept sending past the rate limit
+pub(crate) const CLOSE_E2E_UNSUPPORTED: u16 = 4800; // no end-to-end encryption in common
+pub(crate) const CLOSE_E2E_BAD_FRAME: u16 = 4802; // an E2E frame out of order, forged, or in plaintext
+pub(crate) const CLOSE_E2E_EXHAUSTED: u16 = 4803; // the E2E session's counters are used up
 
 /// How long a client gets to answer the server's close frame before its
 /// socket is closed for it.
@@ -109,8 +112,19 @@ pub(crate) struct ConnectionHandle {
     /// Wakes write task when broadcast data is appended to broadcast_buf.
     pub(crate) broadcast_notify: Arc<tokio::sync::Notify>,
     pub(crate) closer: Closer,
-    /// The connection's E2E key, set once by its key exchange.
-    pub(crate) cipher: Arc<std::sync::OnceLock<Arc<crate::crypto::Aes256Gcm>>>,
+    /// How the connection's frames are encrypted, set once by its key
+    /// exchange.
+    pub(crate) cipher: Arc<std::sync::OnceLock<Seal>>,
+}
+
+/// A connection's end-to-end encryption.
+pub(crate) enum Seal {
+    /// The first design, for older clients: one key, a random nonce; every
+    /// producer seals for itself.
+    Legacy(Arc<crate::crypto::Aes256Gcm>),
+    /// A session with an authenticated server: the write task seals every
+    /// frame, in the order of the wire (`WsFrame::Seal`).
+    Session,
 }
 
 impl ConnectionHandle {
@@ -256,6 +270,8 @@ pub(crate) struct SharedStateConfig {
     pub max_inbound_queue_bytes: usize,
     pub allowed_origins: Option<AHashSet<String>>,
     pub client_subscriptions: bool,
+    pub e2e_identity: Option<crate::crypto::IdentityKey>,
+    pub e2e_legacy: bool,
     pub recovery: Option<Arc<crate::wse::recovery::RecoveryManager>>,
     pub presence_enabled: bool,
     pub presence_max_data_size: usize,
@@ -276,6 +292,12 @@ pub(crate) struct SharedState {
     pub(super) allowed_origins: Option<AHashSet<String>>,
     // The server answers the clients' own subscribe/unsubscribe requests
     pub(super) client_subscriptions: bool,
+    // E2E: the identity key signing each session handshake, and whether
+    // older clients may still use the first design
+    pub(super) e2e_identity: Option<crate::crypto::IdentityKey>,
+    pub(super) e2e_legacy: bool,
+    // Connections in an E2E session (send_event does not compress for them)
+    pub(super) conn_sealed: DashSet<String>,
     // Callback mode. Shared, so a runtime thread takes one without attaching
     // to Python.
     pub(super) on_connect: std::sync::RwLock<Option<Arc<Py<PyAny>>>>,
@@ -426,6 +448,9 @@ impl SharedState {
             max_connections: cfg.max_connections,
             allowed_origins: cfg.allowed_origins,
             client_subscriptions: cfg.client_subscriptions,
+            e2e_identity: cfg.e2e_identity,
+            e2e_legacy: cfg.e2e_legacy,
+            conn_sealed: DashSet::new(),
             on_connect: std::sync::RwLock::new(None),
             on_message: std::sync::RwLock::new(None),
             on_disconnect: std::sync::RwLock::new(None),

@@ -188,11 +188,12 @@ pub(super) fn build_server_hello(
     client_proto: u32,
     state: &SharedState,
     encryption_pubkey: Option<&str>,
+    e2e: Option<serde_json::Value>,
 ) -> String {
     let proto = client_proto.min(2);
     let recovery_enabled = state.recovery.is_some();
     let cluster_enabled = state.cluster_cmd_tx.read().unwrap().is_some();
-    let encryption_enabled = encryption_pubkey.is_some();
+    let encryption_enabled = encryption_pubkey.is_some() || e2e.is_some();
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut val = serde_json::json!({
         "c": "WSE",
@@ -222,6 +223,9 @@ pub(super) fn build_server_hello(
     });
     if let Some(pubkey) = encryption_pubkey {
         val["p"]["encryption_public_key"] = serde_json::Value::String(pubkey.to_string());
+    }
+    if let Some(e2e) = e2e {
+        val["p"]["e2e"] = e2e;
     }
     val.to_string()
 }

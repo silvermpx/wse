@@ -364,6 +364,8 @@ class RustWSEServer:
         max_inbound_queue_bytes: int = 67_108_864,
         allowed_origins: list[str] | None = None,
         client_subscriptions: bool = False,
+        e2e_identity_key: bytes | None = None,
+        e2e_legacy: bool = True,
     ) -> Self: ...
 
     # -- Lifecycle ------------------------------------------------------------
@@ -539,6 +541,10 @@ class RustWSEServer:
         RuntimeError on a server without jwt_secret, or with an asymmetric
         algorithm but no jwt_private_key.
         """
+        ...
+    def e2e_identity_public_key(self) -> str | None:
+        """The key clients pin for end-to-end encryption: base64 of the
+        uncompressed P-256 point of e2e_identity_key, None without one."""
         ...
     def reload_jwt_keys(
         self,
