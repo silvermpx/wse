@@ -5,6 +5,7 @@ joins first holds the lower id. Each scenario names which node dials.
 """
 
 import asyncio
+import base64
 import datetime
 import ipaddress
 import json
@@ -161,6 +162,42 @@ def test_relayed_messages_carry_the_position_they_got_at_their_origin(nodes):
     assert len({m["e"] for m in messages}) == 1
     offsets = [m["o"] for m in messages]
     assert offsets == list(range(offsets[0], offsets[0] + 5)), offsets
+
+
+def test_a_signed_message_crosses_the_cluster_unchanged(nodes):
+    websockets = pytest.importorskip("websockets")
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+
+    key = ec.generate_private_key(ec.SECP256R1()).private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    origin, relay = nodes(recovery=True, signing_key=key), nodes(recovery=True)
+    origin.join(relay)
+    relay.join(origin)
+    assert wait_for(lambda: origin.peers == 1 and relay.peers == 1)
+
+    async def scenario():
+        async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as ws:
+            await subscribe_next_client(relay, ["orders"])
+            await asyncio.sleep(0.5)  # the SUB reaches the origin
+            origin.server.broadcast("orders", origin.server.sign("fill", {"qty": "2"}, "orders"))
+            return (await messages_of_type(ws, "signed", 1))[0]
+
+    envelope = asyncio.run(scenario())
+    # Stamped by the origin around the signed text, which arrives as signed.
+    assert envelope["tp"] == "orders" and "o" in envelope
+    public = base64.b64decode(origin.server.signing_public_key())
+    raw = base64.b64decode(envelope["sig"])
+    der = encode_dss_signature(int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:], "big"))
+    ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), public).verify(
+        der, b"WSE-SIG server\0" + envelope["sb"].encode(), ec.ECDSA(hashes.SHA256())
+    )
+    assert json.loads(envelope["sb"])["p"] == {"qty": "2"}
 
 
 def test_a_queue_group_on_another_node_gets_the_topic(nodes):
