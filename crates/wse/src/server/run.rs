@@ -41,6 +41,7 @@ pub(crate) struct Started {
 pub(crate) fn start<H: Handler>(shared: &Arc<SharedState>, handler: &Arc<H>) -> Started {
     // A drain of the last run is over.
     shared.draining.store(false, Ordering::SeqCst);
+    *shared.started_at.lock() = Some(std::time::Instant::now());
     let fanout = Fanout::start(
         shared.topics.clone(),
         shared.max_outbound_queue_bytes,
@@ -332,6 +333,7 @@ pub(crate) async fn serve<H: Handler>(
 
 /// What a stopped server leaves: no lanes, no command queue, no cluster.
 pub(crate) fn stopped(shared: &SharedState) {
+    *shared.started_at.lock() = None;
     shared.commands.store(None);
     shared.presence_events.store(None);
     *shared.fanout.write().unwrap() = None;

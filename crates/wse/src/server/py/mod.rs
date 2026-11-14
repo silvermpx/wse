@@ -54,7 +54,6 @@ pub struct RustWSEServer {
     lifecycle: std::sync::Mutex<Option<thread::JoinHandle<()>>>,
     running: Arc<AtomicBool>,
     rt_handle: parking_lot::RwLock<Option<tokio::runtime::Handle>>,
-    started_at: parking_lot::Mutex<Option<std::time::Instant>>,
     /// Callback mode's callbacks (`set_callbacks()`), shared with the handler.
     callbacks: Arc<handler::PyCallbacks>,
 }
@@ -222,7 +221,6 @@ impl RustWSEServer {
             lifecycle: std::sync::Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
             rt_handle: parking_lot::RwLock::new(None),
-            started_at: parking_lot::Mutex::new(None),
             callbacks: Arc::default(),
         })
     }
@@ -244,13 +242,6 @@ impl RustWSEServer {
     /// The tokio runtime of the server, once it has been started.
     fn runtime(&self) -> Option<tokio::runtime::Handle> {
         self.rt_handle.read().clone()
-    }
-
-    /// Seconds since the last `start()`, 0.0 before the first one.
-    fn uptime_secs(&self) -> f64 {
-        self.started_at
-            .lock()
-            .map_or(0.0, |s| s.elapsed().as_secs_f64())
     }
 }
 

@@ -40,6 +40,12 @@ pub enum Error {
     Jwt(String),
     /// A key does not fit the configured algorithm.
     BadJwtKey(String),
+    /// The cluster could not be joined, or its TLS reloaded.
+    Cluster(String),
+    /// Cluster settings that exclude each other.
+    ClusterConfig(String),
+    /// A port could not be bound.
+    Io(String),
 }
 
 impl std::fmt::Display for Error {
@@ -55,7 +61,12 @@ impl std::fmt::Display for Error {
             Self::BadKey => {
                 f.write_str("public_key must be base64 of an uncompressed P-256 point (65 bytes)")
             }
-            Self::Encode(what) | Self::Jwt(what) | Self::BadJwtKey(what) => f.write_str(what),
+            Self::Encode(what)
+            | Self::Jwt(what)
+            | Self::BadJwtKey(what)
+            | Self::Cluster(what)
+            | Self::ClusterConfig(what)
+            | Self::Io(what) => f.write_str(what),
             Self::TooManyTopics(conn_id, max) => {
                 write!(f, "Connection {conn_id} reached max subscriptions ({max})")
             }

@@ -133,7 +133,6 @@ impl RustWSEServer {
                 PyRuntimeError::new_err(format!("Spawn error: {e}"))
             })?;
         *self.rt_handle.write() = Some(rt_handle);
-        *self.started_at.lock() = Some(std::time::Instant::now());
         *server_thread = Some(handle);
         Ok(())
     }
@@ -209,7 +208,6 @@ impl RustWSEServer {
         self.cmd_tx.store(None);
         run::stopped(&self.shared);
         *self.rt_handle.write() = None;
-        *self.started_at.lock() = None;
         drop(server_thread);
         if panicked {
             return Err(PyRuntimeError::new_err("Server thread panicked"));

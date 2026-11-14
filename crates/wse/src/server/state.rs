@@ -624,6 +624,8 @@ pub(crate) struct SharedState {
     pub(super) bytes_sent_total: AtomicU64,
     pub(super) auth_failures_total: AtomicU64,
     pub(super) rate_limited_total: AtomicU64,
+    // When the running server started: None while stopped.
+    pub(crate) started_at: parking_lot::Mutex<Option<std::time::Instant>>,
     // send_event: the (connection, id) pairs sent lately, each sent once.
     pub(crate) dedup: std::sync::Mutex<DeduplicationState>,
     // Per-topic message delivery counts (for top-N Prometheus metrics)
@@ -818,6 +820,7 @@ impl SharedState {
             bytes_sent_total: AtomicU64::new(0),
             auth_failures_total: AtomicU64::new(0),
             rate_limited_total: AtomicU64::new(0),
+            started_at: parking_lot::Mutex::new(None),
             dedup: std::sync::Mutex::new(DeduplicationState {
                 seen: AHashSet::with_capacity(50_000),
                 queue: std::collections::VecDeque::with_capacity(50_000),
