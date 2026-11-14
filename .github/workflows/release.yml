@@ -512,6 +512,10 @@ jobs:
       - name: Consumer check (esbuild bundle, Node import)
         run: bash .github/scripts/npm-consumer-check.sh npm-dist/wse-client-*.tgz
 
+      # The publish job's command, without uploading.
+      - name: Publish dry run
+        run: npm publish --dry-run --ignore-scripts --access public ./npm-dist/wse-client-*.tgz
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: npm-package
@@ -580,14 +584,16 @@ jobs:
       name: release
       url: https://www.npmjs.com/package/wse-client
     permissions:
-      # npm trusted publishing (OIDC) and provenance; no long-lived token.
+      # Provenance, and npm trusted publishing (OIDC) once it is set up for
+      # the package.
       id-token: write
     steps:
-      # npm >= 11.5.1 for trusted publishing: Node 24 ships 11.x. No
-      # registry-url: that would write an .npmrc expecting NODE_AUTH_TOKEN.
+      # npm >= 11.5.1 tries trusted publishing first and falls back to the
+      # NPM_TOKEN in the .npmrc that registry-url writes.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
@@ -598,6 +604,7 @@ jobs:
         env:
           NPM_VERSION: ${{ needs.preflight.outputs.npm-version }}
           PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           npm --version
           code="$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 "https://registry.npmjs.org/wse-client/${NPM_VERSION}" || true)"
@@ -607,7 +614,8 @@ jobs:
           fi
           tag=latest
           if [ "$PRERELEASE" = true ]; then tag=next; fi
-          npm publish "npm-dist/wse-client-${NPM_VERSION}.tgz" \
+          # "./": without it npm reads "npm-dist/<file>" as a GitHub repository.
+          npm publish "./npm-dist/wse-client-${NPM_VERSION}.tgz" \
             --provenance --access public --tag "$tag" --ignore-scripts
 
   publish-pypi:
