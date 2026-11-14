@@ -83,7 +83,7 @@ impl Drop for RustWSEServer {
                 let _ = tx.send(crate::cluster::ClusterCommand::Shutdown);
             }
             if let Some(tx) = self.cmd_tx.load_full() {
-                let _ = tx.commands.send(ServerCommand::Shutdown);
+                let _ = tx.command(ServerCommand::Shutdown);
             }
         }
     }
@@ -545,11 +545,10 @@ impl RustWSEServer {
     /// disconnected.
     fn disconnect(&self, conn_id: &str) -> PyResult<()> {
         let tx = self.command_tx()?;
-        tx.commands
-            .send(ServerCommand::Disconnect {
-                conn_id: conn_id.to_owned(),
-            })
-            .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
+        tx.command(ServerCommand::Disconnect {
+            conn_id: conn_id.to_owned(),
+        })
+        .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         Ok(())
     }
 

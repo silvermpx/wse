@@ -599,9 +599,8 @@ pub(crate) struct SharedState {
     pub(crate) queue_groups: Arc<DashMap<String, DashMap<String, QueueGroup>>>,
     // Reverse index: conn_id -> set of (topic, group_name) for cleanup on disconnect
     pub(super) conn_queue_groups: DashMap<String, Vec<(String, String)>>,
-    // Sender for presence broadcasts from disconnect cleanup paths
-    // (where self.cmd_tx is not available, only Arc<SharedState>)
-    pub(super) presence_broadcast_tx: arc_swap::ArcSwapOption<Commands>,
+    // The running server's command queue: None while stopped.
+    pub(crate) commands: arc_swap::ArcSwapOption<Commands>,
     // The running server's handler, for presence events.
     pub(crate) presence_events: arc_swap::ArcSwapOption<PresenceEvents>,
     // Configurable limits
@@ -800,7 +799,7 @@ impl SharedState {
             },
             queue_groups: Arc::new(DashMap::new()),
             conn_queue_groups: DashMap::new(),
-            presence_broadcast_tx: arc_swap::ArcSwapOption::empty(),
+            commands: arc_swap::ArcSwapOption::empty(),
             presence_events: arc_swap::ArcSwapOption::empty(),
             rate_capacity: cfg.rate_capacity,
             rate_refill: cfg.rate_refill,

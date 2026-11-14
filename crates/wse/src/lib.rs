@@ -22,7 +22,7 @@ mod server;
 
 pub use server::{
     Config, ConfigError, Connect, Error, Handler, Inbound, JwtSettings, Presence, PresenceSettings,
-    Publisher, RecoverySettings,
+    Publisher, RecoverySettings, Server,
 };
 
 // The Python module and its helpers: built into the `wse-server` package.

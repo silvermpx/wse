@@ -311,7 +311,7 @@ impl SharedState {
                 user_id: user_id.clone(),
                 data: join_data.clone(),
             });
-            if let Some(tx) = &*self.presence_broadcast_tx.load() {
+            if let Some(tx) = &*self.commands.load() {
                 let _ = tx.send(ServerCommand::BroadcastLocal {
                     topic: topic.clone(),
                     data: format_presence_msg("presence_join", &user_id, &join_data),
@@ -341,7 +341,7 @@ impl SharedState {
         let Some((user_id, topics)) = pm.update_data(conn_id, data) else {
             return false;
         };
-        if let Some(tx) = &*self.presence_broadcast_tx.load() {
+        if let Some(tx) = &*self.commands.load() {
             let msg = format_presence_msg("presence_update", &user_id, data);
             for topic in &topics {
                 let _ = tx.send(ServerCommand::BroadcastLocal {
@@ -376,7 +376,7 @@ impl SharedState {
             user_id: user_id.to_owned(),
             data: data.clone(),
         });
-        if let Some(tx) = &*self.presence_broadcast_tx.load() {
+        if let Some(tx) = &*self.commands.load() {
             let _ = tx.send(ServerCommand::BroadcastLocal {
                 topic: topic.to_owned(),
                 data: format_presence_msg("presence_leave", user_id, data),

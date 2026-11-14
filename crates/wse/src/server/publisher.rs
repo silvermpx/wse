@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::messages::{build_server_ready, inject_category, message_category};
 use super::signing;
-use super::state::{Commands, ServerCommand, SharedState};
+use super::state::{ServerCommand, SharedState};
 use crate::msgpack::serde_json_to_rmpv;
 
 /// Why the server did not take a message or a request.
@@ -21,6 +21,8 @@ use crate::msgpack::serde_json_to_rmpv;
 pub enum Error {
     /// The server stopped: it takes nothing more.
     Stopped,
+    /// The server is running already.
+    Running,
     /// The server validates tokens itself and accepts its connections on
     /// its own.
     AcceptsByToken,
@@ -36,6 +38,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Stopped => f.write_str("the server stopped"),
+            Self::Running => f.write_str("the server is running already"),
             Self::AcceptsByToken => f.write_str(
                 "this server validates tokens itself (jwt_secret) and accepts connections on \
                  its own; accept_connection() is for applications that authenticate them",
@@ -51,34 +54,62 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// A running server's sending side. Cheap to clone; every clone reaches the
-/// same server. Sends and broadcasts go through the server's command queue
-/// in the order they are made: when the queue is full, a fast publisher
-/// waits for room (`ready`, `wait_ready`) instead of filling memory.
+/// What the application reaches its server with: send, publish, subscribe,
+/// close. Cheap to clone; every clone reaches the same server, across
+/// restarts. While the server is stopped, sends fail with `Error::Stopped`.
+/// Sends and broadcasts go through the server's command queue in the order
+/// they are made: when the queue is full, a fast publisher waits for room
+/// (`ready`, `wait_ready`) instead of filling memory.
 #[derive(Clone)]
 pub struct Publisher {
     pub(crate) shared: Arc<SharedState>,
-    pub(crate) commands: Commands,
 }
 
 impl Publisher {
-    pub(crate) fn new(shared: Arc<SharedState>, commands: Commands) -> Self {
-        Self { shared, commands }
+    pub(crate) fn new(shared: Arc<SharedState>) -> Self {
+        Self { shared }
+    }
+
+    /// Queue a command for the running server.
+    pub(crate) fn command(&self, cmd: ServerCommand) -> Result<(), Error> {
+        match &*self.shared.commands.load() {
+            Some(commands) => commands.send(cmd).map_err(|_| Error::Stopped),
+            None => Err(Error::Stopped),
+        }
     }
 
     fn queue(&self, cmd: ServerCommand) -> Result<(), Error> {
-        self.commands.send(cmd).map_err(|_| Error::Stopped)
+        self.command(cmd)
+    }
+
+    /// Whether the server is running: it takes sends and broadcasts.
+    pub fn is_running(&self) -> bool {
+        self.shared
+            .commands
+            .load()
+            .as_ref()
+            .is_some_and(|commands| !commands.is_closed())
     }
 
     /// Whether the command queue is full: sends and broadcasts wait for room
     /// before theirs.
     pub fn is_full(&self) -> bool {
-        self.commands.is_full()
+        self.shared
+            .commands
+            .load()
+            .as_ref()
+            .is_some_and(|commands| commands.is_full())
     }
 
     /// Wait for room in the command queue.
     pub async fn ready(&self) {
-        while self.commands.is_full() && !self.commands.is_closed() {
+        while self
+            .shared
+            .commands
+            .load()
+            .as_ref()
+            .is_some_and(|commands| commands.is_full() && !commands.is_closed())
+        {
             tokio::time::sleep(std::time::Duration::from_micros(50)).await;
         }
     }
@@ -86,7 +117,9 @@ impl Publisher {
     /// Block the calling thread until the command queue has room: for a
     /// caller outside the runtime.
     pub fn wait_ready(&self) {
-        self.commands.wait_for_room();
+        if let Some(commands) = self.shared.commands.load_full() {
+            commands.wait_for_room();
+        }
     }
 
     /// Accept a connection the application authenticated itself (a server
@@ -147,7 +180,7 @@ impl Publisher {
         compression_threshold: usize,
     ) -> Result<usize, Error> {
         let shared = &self.shared;
-        if self.commands.is_closed() {
+        if !self.is_running() {
             return Err(Error::Stopped);
         }
         // A connection that is gone (or never was) gets nothing.

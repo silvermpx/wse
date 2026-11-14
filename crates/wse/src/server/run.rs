@@ -58,11 +58,9 @@ pub(crate) fn start<H: Handler>(shared: &Arc<SharedState>, handler: &Arc<H>) -> 
             presence_handler.presence(event)
         }))));
     // For presence broadcasts from the disconnect cleanup paths.
-    shared
-        .presence_broadcast_tx
-        .store(Some(Arc::new(commands.clone())));
+    shared.commands.store(Some(Arc::new(commands)));
     Started {
-        publisher: super::Publisher::new(Arc::clone(shared), commands),
+        publisher: super::Publisher::new(Arc::clone(shared)),
         commands_rx,
         fanout,
     }
@@ -334,7 +332,7 @@ pub(crate) async fn serve<H: Handler>(
 
 /// What a stopped server leaves: no lanes, no command queue, no cluster.
 pub(crate) fn stopped(shared: &SharedState) {
-    shared.presence_broadcast_tx.store(None);
+    shared.commands.store(None);
     shared.presence_events.store(None);
     *shared.fanout.write().unwrap() = None;
     shared.cluster_cmd_tx.store(None);

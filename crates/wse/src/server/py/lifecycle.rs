@@ -146,12 +146,11 @@ impl RustWSEServer {
         timeout: u64,
     ) -> PyResult<usize> {
         let tx = self.command_tx()?;
-        tx.commands
-            .send(ServerCommand::Drain {
-                close_code,
-                close_reason: close_reason.to_owned(),
-            })
-            .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
+        tx.command(ServerCommand::Drain {
+            close_code,
+            close_reason: close_reason.to_owned(),
+        })
+        .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         // Wait detached for the clients to go; the rest are closed at the
         // deadline.
         let shared = self.shared.clone();
@@ -167,7 +166,7 @@ impl RustWSEServer {
         });
         if remaining > 0 {
             tracing::warn!("[WSE] Drain timeout: closing the {remaining} remaining connections");
-            let _ = tx.commands.send(ServerCommand::AbortAll);
+            let _ = tx.command(ServerCommand::AbortAll);
         } else {
             tracing::info!("[WSE] Drain complete: all connections closed");
         }
@@ -192,7 +191,7 @@ impl RustWSEServer {
             let _ = tx.send(ClusterCommand::Shutdown);
         }
         if let Ok(tx) = self.command_tx() {
-            let _ = tx.commands.send(ServerCommand::Shutdown);
+            let _ = tx.command(ServerCommand::Shutdown);
         }
         self.running.store(false, Ordering::SeqCst);
         // From a callback the server thread is not joined: it waits for its

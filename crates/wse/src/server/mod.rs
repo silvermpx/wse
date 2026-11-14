@@ -77,6 +77,7 @@ mod e2e;
 pub(crate) mod e2e_session;
 mod fanout;
 mod frames;
+pub(crate) mod handle;
 pub(crate) mod handler;
 mod handshake;
 mod messages;
@@ -98,6 +99,7 @@ pub(crate) use fanout::{
     stamp_recovery_fields, unstamped,
 };
 pub(crate) use frames::{BroadcastQueue, WsFrame, pre_frame_text};
+pub use handle::Server;
 pub use handler::{Connect, Handler, Inbound, Presence};
 pub(crate) use handshake::normalize_origin;
 pub(crate) use messages::format_presence_msg;
