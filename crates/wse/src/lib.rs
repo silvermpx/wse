@@ -1,11 +1,4 @@
-//! WSE: a WebSocket engine for applications that publish to many clients at
-//! once. Fan-out on every CPU core, topics with recovery for clients that come
-//! back, presence, a native cluster protocol, JWT, end-to-end encryption and
-//! signed messages.
-//!
-//! A server is a `Config`, a `Handler` (what the application hears of its
-//! clients) and a `Publisher` (what it sends them). The Python package
-//! `wse-server` runs this same engine.
+#![doc = include_str!("../README.md")]
 
 mod cluster;
 mod crypto;

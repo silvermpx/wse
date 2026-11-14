@@ -7,6 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
 keywords = ["websocket", "pubsub", "realtime", "tokio", "server"]
 categories = ["network-programming", "web-programming::websocket", "asynchronous"]
 
@@ -62,5 +63,7 @@ fips = ["aws-lc", "aws-lc-rs/fips", "rustls/fips"]
 
 [dev-dependencies]
 rcgen = "0.14"
+# The examples wait for Ctrl+C.
+tokio = { version = "1.54.1", features = ["signal"] }
 # Property tests: parsers and buffers fed thousands of random inputs per run.
 proptest = "1.12"
