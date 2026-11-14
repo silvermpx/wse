@@ -1,6 +1,6 @@
 # WSE Integration Guide
 
-Complete reference for integrating `wse-server` into your application. Covers server setup, authentication, messaging, subscriptions, clustering, and client SDKs.
+Complete reference for integrating `wse-server` into your application. Covers server setup, authentication, messaging, subscriptions, clustering, and client SDKs; Rust applications use the `wse` crate (section 16).
 
 ---
 
@@ -1111,4 +1111,67 @@ scrape_configs:
     static_configs:
       - targets: ["localhost:8000"]
     metrics_path: /metrics
+```
+
+---
+
+## 16. Rust Applications
+
+The engine is a Rust crate of its own, [`wse`](https://crates.io/crates/wse):
+a Rust application runs the server on its own tokio runtime, with the same
+protocol, clients and cluster as the Python package. Its README has a full
+example; `examples/chat.rs` in the crate is a chat room.
+
+```bash
+cargo add wse serde_json tokio --features tokio/full
+```
+
+What the application hears comes to its `Handler`: `connect` (return the
+connection's own state, or `None` to refuse it; subscribe it to its topics
+there with `Connect::subscribe`), `message`, `signed`, `disconnect` and
+`presence`. What it sends goes through a `Publisher` (`server.publisher()`,
+cheap to clone):
+
+| Python (`RustWSEServer`) | Rust (`wse`) |
+|---|---|
+| `RustWSEServer(...)` | `Server::new(Config)`: the same settings, checked as a whole |
+| `start()` | `server.start(listener, handler)` |
+| `drain_inbound()` / callbacks | the `Handler` |
+| `accept_connection(conn_id, user_id)` | `Publisher::accept` |
+| `send_event(conn_id, event)` | `Publisher::send_event` |
+| `broadcast_all(text)` | `Publisher::broadcast` |
+| `broadcast_local(topic, text)` | `Publisher::publish_local` |
+| `broadcast(topic, text)` | `Publisher::publish`: this node and the cluster |
+| `subscribe_connection(conn_id, topics)` | `Publisher::subscribe`, or `Connect::subscribe` in `connect` |
+| `subscribe_with_recovery(...)` | `Publisher::subscribe_with_recovery` |
+| `disconnect(conn_id)` | `Publisher::disconnect` |
+| - | `Publisher::send_to_user`, `disconnect_user`: every connection of a user |
+| `connect_cluster(...)` | `Server::connect_cluster(ClusterSettings)` |
+| `health_snapshot()` | `Publisher::health` |
+| `prometheus_metrics()` | `Publisher::prometheus_metrics` |
+| `drain(code, reason, timeout)` | `Server::drain` |
+| `stop()` | `Server::stop` |
+
+A full queue holds a fast publisher back: `Publisher::is_full()`, or wait
+with `Publisher::ready().await`. The application sets up its own tracing
+subscriber; the server's log target is `wse`.
+
+The Rust client is [`wse-client`](https://crates.io/crates/wse-client): a
+`Handler` that reads each message in place from its frame, or a stream of
+owned messages; topics with recovery, reconnects, msgpack, E2E encryption
+and signed messages.
+
+```bash
+cargo add wse-client tokio --features tokio/full
+```
+
+```rust
+let mut config = wse_client::Config::new("ws://localhost:5006/wse");
+config.token = Some(token);
+config.topics = vec!["updates".into()];
+let (client, mut events) = wse_client::connect(config).await?;
+client.send("hello", &serde_json::json!({"n": 1})).await?;
+while let Some(incoming) = events.next().await {
+    println!("{incoming:?}");
+}
 ```

@@ -31,9 +31,13 @@ npm install
 ### Running Tests
 
 ```bash
-# Rust tests: the engine alone, then with its Python module
+# Rust tests: the engine alone, then with its Python module; the shared
+# protocol crate; the Rust client, with its crypto and without
 cargo test -p wse
 cargo test -p wse --features python
+cargo test -p wse-protocol
+cargo test -p wse-client
+cargo test -p wse-client --no-default-features
 
 # Python server tests
 pytest tests/
@@ -81,6 +85,8 @@ the one result a pull request needs.
 ```
 wse/
   crates/wse/            # The engine (server, cluster, presence, recovery); its Python module behind `python`
+  crates/wse-client/     # The Rust client (wse-client on crates.io)
+  crates/wse-protocol/   # Crypto, E2E sessions and signed messages, shared by the engine and the Rust client
   crates/wse-py/         # The Python extension built from it (wse-server on PyPI)
   wse_server/            # Python server package (thin wrapper over Rust)
   python-client/         # Python client SDK (wse-client on PyPI)
@@ -97,7 +103,7 @@ wse/
 ### Rust
 
 - Format with `cargo fmt` before every commit.
-- Pass `cargo clippy --workspace --all-targets -- -D warnings` and `cargo clippy -p wse --all-targets -- -D warnings` with zero warnings.
+- Pass `cargo clippy --workspace --all-targets -- -D warnings`, `cargo clippy -p wse --all-targets -- -D warnings` and `cargo clippy -p wse-client --no-default-features --all-targets -- -D warnings` with zero warnings.
 - Use `DashMap` for concurrent state, `crossbeam` for channels.
 - Prefer `Arc<Bytes>` for shared message payloads (zero-copy broadcast).
 

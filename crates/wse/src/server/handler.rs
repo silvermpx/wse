@@ -18,6 +18,7 @@ pub struct Connect<'a> {
 }
 
 /// A client's message, as the server read it.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Inbound {
     /// JSON text, or the message of a msgpack client, decoded; `type` and
     /// `payload` read as `t` and `p`.
@@ -60,6 +61,7 @@ pub trait Handler: Send + Sync + 'static {
 }
 
 /// A user's presence on a topic changed.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Presence {
     Join {
         topic: String,

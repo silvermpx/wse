@@ -2,7 +2,8 @@
 
 ## v3.0.0 (2026-11-14)
 
-Security, correctness and speed. Upgrading from 2.x: see
+Security, correctness and speed, and the engine for Rust applications.
+Upgrading from 2.x: see
 [docs/MIGRATION.md](docs/MIGRATION.md#migrating-from-v2x-to-v30).
 
 ### Breaking changes
@@ -39,6 +40,18 @@ Security, correctness and speed. Upgrading from 2.x: see
 
 ### New
 
+- Rust crates on crates.io, released with the Python and npm packages:
+  - `wse`: the engine for Rust applications. A server runs on the
+    application's tokio runtime with its own `Handler` (connect, messages,
+    signed messages, disconnect, presence) and sends through a `Publisher`:
+    topics with recovery, `send_to_user()` and `disconnect_user()` for
+    every connection of a user, the cluster, drain, health and Prometheus
+    metrics. The Python package runs the same engine.
+  - `wse-client`: the Rust client. Messages read in place from their frames
+    by a `Handler`, or a stream of owned ones; topics with recovery,
+    reconnects, msgpack, end-to-end encryption and signed messages.
+  - `wse-protocol`: the crypto, end-to-end sessions and signed messages the
+    server and the Rust client share.
 - Free-threaded Python wheels (3.14t, 3.15t), and wheels for Alpine Linux
   (musllinux) and Windows on ARM.
 - Every standard JWT algorithm, `issue_token()`, and `reload_jwt_keys()`

@@ -6,7 +6,16 @@ Technical reference for WSE internals. Covers the Rust server, PyO3 bridge, clus
 
 ## System Overview
 
-WSE is a WebSocket server written in Rust, exposed to Python via PyO3. The entire transport layer - WebSocket accept, framing, ping/pong, JWT validation, rate limiting, topic fan-out, and cluster coordination - runs inside a tokio multi-threaded runtime. Python interacts with the server through a thin PyO3 interface, either polling for events (drain mode) or receiving callbacks.
+WSE is a WebSocket server written in Rust. The entire transport layer - WebSocket accept, framing, ping/pong, JWT validation, rate limiting, topic fan-out, and cluster coordination - runs inside a tokio multi-threaded runtime. A Rust application runs it on its own runtime (the `wse` crate) and hears its clients through a `Handler`; Python interacts with it through a thin PyO3 interface, either polling for events (drain mode) or receiving callbacks.
+
+The crates:
+
+| Crate | What it is |
+|---|---|
+| `crates/wse` | The engine: server, cluster, presence, recovery; the Python module behind the `python` feature |
+| `crates/wse-py` | The Python extension built from it (`wse-server` on PyPI) |
+| `crates/wse-protocol` | The crypto (aws-lc-rs), E2E sessions and signed messages, shared by the engine and the Rust client |
+| `crates/wse-client` | The Rust client |
 
 ```
 Python Application
