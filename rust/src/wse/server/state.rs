@@ -288,6 +288,9 @@ pub(crate) struct DeduplicationState {
 /// sends wait for room (`Commands::send_waiting`).
 pub(crate) const COMMAND_QUEUE: usize = 65_536;
 
+/// Where a running server's presence events go: its handler.
+pub(crate) type PresenceEvents = Box<dyn Fn(super::handler::Presence) + Send + Sync>;
+
 /// The sending side of the command queue. It counts what waits in the queue,
 /// so the application can be held back while the queue is full: a publisher
 /// faster than the server then waits for it instead of filling memory.
@@ -599,6 +602,8 @@ pub(crate) struct SharedState {
     // Sender for presence broadcasts from disconnect cleanup paths
     // (where self.cmd_tx is not available, only Arc<SharedState>)
     pub(super) presence_broadcast_tx: arc_swap::ArcSwapOption<Commands>,
+    // The running server's handler, for presence events.
+    pub(crate) presence_events: arc_swap::ArcSwapOption<PresenceEvents>,
     // Configurable limits
     pub(super) rate_capacity: f64,
     pub(super) rate_refill: f64,
@@ -796,6 +801,7 @@ impl SharedState {
             queue_groups: Arc::new(DashMap::new()),
             conn_queue_groups: DashMap::new(),
             presence_broadcast_tx: arc_swap::ArcSwapOption::empty(),
+            presence_events: arc_swap::ArcSwapOption::empty(),
             rate_capacity: cfg.rate_capacity,
             rate_refill: cfg.rate_refill,
             max_message_size: cfg.max_message_size,

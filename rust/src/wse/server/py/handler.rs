@@ -11,7 +11,7 @@ use pyo3::types::PyBytes;
 
 use super::callbacks::{fire_on_connect, fire_on_disconnect};
 use super::convert::json_to_pyobj;
-use crate::wse::server::handler::{Connect, Handler, Inbound};
+use crate::wse::server::handler::{Connect, Handler, Inbound, Presence};
 use crate::wse::server::state::{InboundEvent, SharedState, inbound_cost};
 
 /// The callbacks of callback mode, set by `set_callbacks()`.
@@ -258,6 +258,33 @@ impl Handler for PyHandler {
                 })
             }
         }
+    }
+
+    /// Drain mode: presence_join and presence_leave events.
+    fn presence(&self, event: Presence) {
+        if !self.state.drain_mode.load(Ordering::Relaxed) {
+            return;
+        }
+        self.state.push_inbound(match event {
+            Presence::Join {
+                topic,
+                user_id,
+                data,
+            } => InboundEvent::PresenceJoin {
+                topic,
+                user_id,
+                data,
+            },
+            Presence::Leave {
+                topic,
+                user_id,
+                data,
+            } => InboundEvent::PresenceLeave {
+                topic,
+                user_id,
+                data,
+            },
+        });
     }
 
     fn disconnect(&self, conn: PyConnection) {

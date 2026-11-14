@@ -6,8 +6,6 @@ use pyo3::types::PyDict;
 
 use super::RustWSEServer;
 use super::convert::{json_to_pyobj, pyobj_to_json};
-use crate::wse::cluster::ClusterCommand;
-use crate::wse::server::{ServerCommand, format_presence_msg};
 
 impl RustWSEServer {
     pub(super) fn presence_impl(&self, py: Python<'_>, topic: &str) -> PyResult<Py<PyDict>> {
@@ -43,43 +41,12 @@ impl RustWSEServer {
         conn_id: &str,
         data: &Bound<'_, PyDict>,
     ) -> PyResult<()> {
-        if let Some(ref pm) = self.shared.presence {
+        if self.shared.presence.is_some() {
             let new_data = pyobj_to_json(data.as_any())?;
-            match pm.update_data(conn_id, &new_data) {
-                None => {
-                    return Err(PyRuntimeError::new_err(
-                        "Failed to update presence data (size limit or unknown connection)",
-                    ));
-                }
-                Some((user_id, topics)) => {
-                    // Broadcast presence_update to all topics where the user has presence
-                    let data_str = serde_json::to_string(&new_data).unwrap_or_default();
-                    let now = crate::wse::presence::epoch_ms();
-                    let cluster_tx = self.shared.cluster_cmd_tx.load_full();
-                    if let Ok(tx) = self.command_tx() {
-                        let msg = format_presence_msg("presence_update", &user_id, &new_data);
-                        for topic in &topics {
-                            let _ = tx.commands.send(ServerCommand::BroadcastLocal {
-                                topic: topic.clone(),
-                                data: msg.clone(),
-                                skip_recovery: true,
-                                publish: false,
-                            });
-                        }
-                    }
-                    // Cluster sync: notify peers of presence update
-                    if let Some(ref ctx) = cluster_tx {
-                        for topic in topics {
-                            let _ = ctx.send(ClusterCommand::PresenceUpdate {
-                                topic,
-                                user_id: user_id.clone(),
-                                action: 2, // update
-                                data: data_str.clone(),
-                                updated_at: now,
-                            });
-                        }
-                    }
-                }
+            if !self.shared.update_presence(conn_id, &new_data) {
+                return Err(PyRuntimeError::new_err(
+                    "Failed to update presence data (size limit or unknown connection)",
+                ));
             }
         }
         Ok(())

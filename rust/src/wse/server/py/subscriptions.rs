@@ -2,7 +2,6 @@
 //! unsubscribe: the Python side of the engine's subscription module.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -10,10 +9,7 @@ use pyo3::types::PyDict;
 
 use super::RustWSEServer;
 use super::convert::pyobj_to_json;
-use crate::wse::cluster::ClusterCommand;
-use crate::wse::server::state::InboundEvent;
 use crate::wse::server::subscribe::{TopicRecovery, parse_anchor};
-use crate::wse::server::{ServerCommand, format_presence_msg};
 
 fn limit_error(conn_id: &str, max: usize) -> PyErr {
     PyRuntimeError::new_err(format!(
@@ -75,47 +71,11 @@ impl RustWSEServer {
         }
 
         // Presence tracking
-        if let (Some(pm), Some(pd)) = (&self.shared.presence, &presence_data) {
-            let data = pyobj_to_json(pd.as_any())?;
-            let drain = self.shared.drain_mode.load(Ordering::Relaxed);
-            let cluster_tx = self.shared.cluster_cmd_tx.load_full();
-            for topic in &accepted {
-                if let crate::wse::presence::TrackResult::FirstJoin {
-                    user_id,
-                    data: join_data,
-                } = pm.track(conn_id, topic, &data)
-                {
-                    if drain {
-                        self.shared.push_inbound(InboundEvent::PresenceJoin {
-                            topic: topic.clone(),
-                            user_id: user_id.clone(),
-                            data: join_data.clone(),
-                        });
-                    }
-                    // Broadcast to topic subscribers via WebSocket
-                    if let Ok(tx) = self.command_tx() {
-                        let msg = format_presence_msg("presence_join", &user_id, &join_data);
-                        let _ = tx.commands.send(ServerCommand::BroadcastLocal {
-                            topic: topic.clone(),
-                            data: msg,
-                            skip_recovery: true,
-                            publish: false,
-                        });
-                    }
-                    // Cluster sync: notify peers of presence join
-                    if let Some(ref ctx) = cluster_tx {
-                        let data_str = serde_json::to_string(&join_data).unwrap_or_default();
-                        let now = crate::wse::presence::epoch_ms();
-                        let _ = ctx.send(ClusterCommand::PresenceUpdate {
-                            topic: topic.clone(),
-                            user_id: user_id.clone(),
-                            action: 0, // join
-                            data: data_str,
-                            updated_at: now,
-                        });
-                    }
-                }
-            }
+        if let Some(presence_data) = presence_data
+            && self.shared.presence.is_some()
+        {
+            let data = pyobj_to_json(presence_data.as_any())?;
+            self.shared.track_presence(conn_id, &accepted, &data);
         }
 
         Ok(accepted)

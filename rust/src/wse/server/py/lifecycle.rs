@@ -103,19 +103,19 @@ impl RustWSEServer {
                 ))
             })?;
         tracing::info!("[WSE] Listening on {}:{}", self.host, self.port);
-        // The lanes run from here on, on the server's runtime.
-        let started = {
-            let _runtime = rt.enter();
-            run::start(&self.shared)
-        };
-        self.cmd_tx.store(Some(Arc::new(started.publisher.clone())));
-        let running = self.running.clone();
-        let shared = self.shared.clone();
         // What the application hears of its connections: drain or callbacks.
         let handler = Arc::new(super::handler::PyHandler {
             state: self.shared.clone(),
             callbacks: self.callbacks.clone(),
         });
+        // The lanes run from here on, on the server's runtime.
+        let started = {
+            let _runtime = rt.enter();
+            run::start(&self.shared, &handler)
+        };
+        self.cmd_tx.store(Some(Arc::new(started.publisher.clone())));
+        let running = self.running.clone();
+        let shared = self.shared.clone();
         let rt_handle = rt.handle().clone();
 
         self.running.store(true, Ordering::SeqCst);

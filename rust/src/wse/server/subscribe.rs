@@ -9,12 +9,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-use super::state::InboundEvent;
+use super::handler::Presence;
 use super::{
     ConnectionHandle, QueueGroup, ServerCommand, SharedState, format_presence_msg, is_pattern,
 };
 use crate::wse::cluster::ClusterCommand;
-use crate::wse::presence::UntrackResult;
+use crate::wse::presence::{TrackResult, UntrackResult};
 use crate::wse::recovery::RecoveryResult;
 
 /// Longest topic name accepted, in bytes.
@@ -278,16 +278,104 @@ impl SharedState {
         }
     }
 
-    /// Tell the application (drain mode) and the topic's subscribers that a
-    /// user left `topic`.
-    pub(crate) fn tell_presence_leave(&self, topic: &str, user_id: &str, data: &serde_json::Value) {
-        if self.drain_mode.load(Ordering::Relaxed) {
-            self.push_inbound(InboundEvent::PresenceLeave {
-                topic: topic.to_owned(),
-                user_id: user_id.to_owned(),
-                data: data.clone(),
-            });
+    /// Tell the running server's handler of a presence change.
+    pub(crate) fn tell_presence(&self, event: Presence) {
+        if let Some(events) = &*self.presence_events.load() {
+            events(event);
         }
+    }
+
+    /// Track `conn_id`'s presence on `topics` with `data`: a user's first
+    /// connection on a topic is told to the application, to the topic's
+    /// subscribers (`presence_join`) and to the cluster.
+    pub(crate) fn track_presence(
+        &self,
+        conn_id: &str,
+        topics: &[String],
+        data: &serde_json::Value,
+    ) {
+        let Some(pm) = &self.presence else {
+            return;
+        };
+        let cluster_tx = self.cluster_cmd_tx.load_full();
+        for topic in topics {
+            let TrackResult::FirstJoin {
+                user_id,
+                data: join_data,
+            } = pm.track(conn_id, topic, data)
+            else {
+                continue;
+            };
+            self.tell_presence(Presence::Join {
+                topic: topic.clone(),
+                user_id: user_id.clone(),
+                data: join_data.clone(),
+            });
+            if let Some(tx) = &*self.presence_broadcast_tx.load() {
+                let _ = tx.send(ServerCommand::BroadcastLocal {
+                    topic: topic.clone(),
+                    data: format_presence_msg("presence_join", &user_id, &join_data),
+                    skip_recovery: true,
+                    publish: false,
+                });
+            }
+            if let Some(ref ctx) = cluster_tx {
+                let _ = ctx.send(ClusterCommand::PresenceUpdate {
+                    topic: topic.clone(),
+                    user_id: user_id.clone(),
+                    action: 0, // join
+                    data: serde_json::to_string(&join_data).unwrap_or_default(),
+                    updated_at: crate::wse::presence::epoch_ms(),
+                });
+            }
+        }
+    }
+
+    /// New presence data for `conn_id`'s user: every topic it is present on
+    /// hears `presence_update`, and so does the cluster. False over the size
+    /// limit, or for a connection without presence.
+    pub(crate) fn update_presence(&self, conn_id: &str, data: &serde_json::Value) -> bool {
+        let Some(pm) = &self.presence else {
+            return true;
+        };
+        let Some((user_id, topics)) = pm.update_data(conn_id, data) else {
+            return false;
+        };
+        if let Some(tx) = &*self.presence_broadcast_tx.load() {
+            let msg = format_presence_msg("presence_update", &user_id, data);
+            for topic in &topics {
+                let _ = tx.send(ServerCommand::BroadcastLocal {
+                    topic: topic.clone(),
+                    data: msg.clone(),
+                    skip_recovery: true,
+                    publish: false,
+                });
+            }
+        }
+        if let Some(ctx) = self.cluster_cmd_tx.load_full() {
+            let data = serde_json::to_string(data).unwrap_or_default();
+            let now = crate::wse::presence::epoch_ms();
+            for topic in topics {
+                let _ = ctx.send(ClusterCommand::PresenceUpdate {
+                    topic,
+                    user_id: user_id.clone(),
+                    action: 2, // update
+                    data: data.clone(),
+                    updated_at: now,
+                });
+            }
+        }
+        true
+    }
+
+    /// Tell the application and the topic's subscribers that a user left
+    /// `topic`.
+    pub(crate) fn tell_presence_leave(&self, topic: &str, user_id: &str, data: &serde_json::Value) {
+        self.tell_presence(Presence::Leave {
+            topic: topic.to_owned(),
+            user_id: user_id.to_owned(),
+            data: data.clone(),
+        });
         if let Some(tx) = &*self.presence_broadcast_tx.load() {
             let _ = tx.send(ServerCommand::BroadcastLocal {
                 topic: topic.to_owned(),

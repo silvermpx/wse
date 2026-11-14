@@ -38,7 +38,7 @@ pub(crate) struct Started {
 
 /// Start `shared`'s server on the current runtime: its lanes run from here
 /// on, its commands queue until `serve` takes them.
-pub(crate) fn start(shared: &Arc<SharedState>) -> Started {
+pub(crate) fn start<H: Handler>(shared: &Arc<SharedState>, handler: &Arc<H>) -> Started {
     // A drain of the last run is over.
     shared.draining.store(false, Ordering::SeqCst);
     let fanout = Fanout::start(
@@ -50,6 +50,13 @@ pub(crate) fn start(shared: &Arc<SharedState>) -> Started {
     let (tx, commands_rx) = mpsc::unbounded_channel::<ServerCommand>();
     shared.commands_queued.store(0, Ordering::Relaxed);
     let commands = Commands::new(tx, Arc::clone(&shared.commands_queued));
+    // The handler hears of presence changes.
+    let presence_handler = Arc::clone(handler);
+    shared
+        .presence_events
+        .store(Some(Arc::new(Box::new(move |event| {
+            presence_handler.presence(event)
+        }))));
     // For presence broadcasts from the disconnect cleanup paths.
     shared
         .presence_broadcast_tx
@@ -328,6 +335,7 @@ pub(crate) async fn serve<H: Handler>(
 /// What a stopped server leaves: no lanes, no command queue, no cluster.
 pub(crate) fn stopped(shared: &SharedState) {
     shared.presence_broadcast_tx.store(None);
+    shared.presence_events.store(None);
     *shared.fanout.write().unwrap() = None;
     shared.cluster_cmd_tx.store(None);
     *shared.cluster_main_port.write().unwrap() = None;

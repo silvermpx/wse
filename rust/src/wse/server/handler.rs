@@ -48,4 +48,24 @@ pub trait Handler: Send + Sync + 'static {
 
     /// The connection ended. Only a connection `connect` took gets here.
     fn disconnect(&self, conn: Self::Connection);
+
+    /// A user's first connection joined a topic with presence, or its last
+    /// one left. Called from whichever task saw it, not a connection's own.
+    fn presence(&self, event: Presence) {
+        let _ = event;
+    }
+}
+
+/// A user's presence on a topic changed.
+pub enum Presence {
+    Join {
+        topic: String,
+        user_id: String,
+        data: serde_json::Value,
+    },
+    Leave {
+        topic: String,
+        user_id: String,
+        data: serde_json::Value,
+    },
 }
