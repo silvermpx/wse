@@ -16,6 +16,7 @@
 // socket was busy, reconnecting or rate limited.
 
 import { E2eError } from '../utils/e2eSession.js';
+import { ServerSigningKeys } from '../utils/signing.js';
 import {
   WSMessage,
   QueuedMessage,
@@ -167,6 +168,11 @@ export class MessageProcessor {
 
   // Inbound
   private inboundChain: Promise<void> = Promise.resolve();
+  // Signed messages: the server keys they are checked against, and the
+  // server's signing key id from server_ready / server_hello (the audience
+  // of what this client signs).
+  private serverSigningKeys: Promise<ServerSigningKeys> = ServerSigningKeys.create(undefined);
+  private serverSigningKid: string | null = null;
   private maxMessageSize: number;
   private recoveryTimeoutMs: number;
   private eventThrottleMs: number;
@@ -229,6 +235,18 @@ export class MessageProcessor {
 
   setOfflineQueue(queue: OfflineQueue | null): void {
     this.offlineQueue = queue;
+  }
+
+  /** The server signing keys (base64) signed messages are checked against. */
+  setServerSigningKeys(keys: string[] | undefined): void {
+    this.serverSigningKeys = ServerSigningKeys.create(keys);
+    // A bad key is reported when the first signed message is opened.
+    this.serverSigningKeys.catch(() => undefined);
+  }
+
+  /** The server's signing key id, once server_ready or server_hello named it. */
+  getServerSigningKid(): string | null {
+    return this.serverSigningKid;
   }
 
   setReady(ready: boolean): void {
@@ -364,6 +382,16 @@ export class MessageProcessor {
       return;
     }
 
+    if (message.t === 'signed') {
+      const opened = await this.openSigned(message);
+      if (!opened) {
+        this.recordInbound(size);
+        this.countDropped(1);
+        return;
+      }
+      message = opened;
+    }
+
     logger.debug(`Received message type: ${message.t}`);
     this.handleEventVersion(message);
     this.logPerformanceMetrics(message);
@@ -385,6 +413,40 @@ export class MessageProcessor {
 
     this.recordInbound(size);
     await this.deliver(message);
+  }
+
+  /**
+   * A message the server signed: checked against the pinned keys, then the
+   * message its signed text says, with the proof; the recovery stamp stays
+   * the server's. Null when the check fails or the text names another topic
+   * than the one it came on.
+   */
+  private async openSigned(envelope: WSMessage): Promise<WSMessage | null> {
+    let opened;
+    try {
+      opened = await (await this.serverSigningKeys).open(envelope as unknown as Record<string, unknown>);
+    } catch (error) {
+      logger.warn('Dropping a signed message:', error instanceof Error ? error.message : error);
+      return null;
+    }
+    const { message, proof } = opened;
+    if (envelope.tp !== undefined && message.tp !== undefined && message.tp !== envelope.tp) {
+      logger.warn(`Dropping a message signed for topic ${message.tp} that came on ${envelope.tp}`);
+      return null;
+    }
+    const delivered: WSMessage = {
+      t: message.t,
+      p: message.p ?? {},
+      signature: proof,
+    };
+    if (typeof message.n === 'string') delivered.id = message.n;
+    if (typeof message.ts === 'number') delivered.ts = new Date(message.ts).toISOString();
+    if (envelope.c) delivered.c = envelope.c;
+    const topic = envelope.tp ?? (typeof message.tp === 'string' ? message.tp : undefined);
+    if (topic !== undefined) delivered.tp = topic;
+    if (envelope.e !== undefined) delivered.e = envelope.e;
+    if (envelope.o !== undefined) delivered.o = envelope.o;
+    return delivered;
   }
 
   private async deliver(message: WSMessage): Promise<void> {
@@ -457,12 +519,14 @@ export class MessageProcessor {
     if (typeof features.recovery === 'boolean') {
       useWSEStore.getState().setServerRecoveryEnabled(features.recovery);
     }
+    if (typeof details.signing?.kid === 'string') this.serverSigningKid = details.signing.kid;
     this.connectionManager?.handleServerReady(details);
   }
 
   private async processServerHello(message: WSMessage): Promise<void> {
     const payload = message.p || {};
     const store = useWSEStore.getState();
+    if (typeof payload.signing?.kid === 'string') this.serverSigningKid = payload.signing.kid;
 
     if (payload.features) {
       // server_ready only exists on the Rust-JWT path; server_hello always

@@ -29,6 +29,14 @@ export { useMessageQueueStore } from './stores/useMessageQueueStore.js';
 export { logger, Logger, LogLevel } from './utils/logger.js';
 export { CircuitBreaker, createCircuitBreaker } from './utils/circuitBreaker.js';
 export { generateId } from './utils/id.js';
+export {
+  generateSigningKey,
+  signingKeyFrom,
+  signMessage,
+  ServerSigningKeys,
+  SignatureError,
+} from './utils/signing.js';
+export type { SignatureProof, SigningKey } from './utils/signing.js';
 export { EventSequencer } from './services/EventSequencer.js';
 export { compressionManager, CompressionManager, DecompressedSizeLimitError } from './protocols/compression.js';
 export { eventTransformer } from './protocols/transformer.js';

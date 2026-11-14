@@ -2,6 +2,8 @@
 // WebSocket Engine - Type Definitions
 // =============================================================================
 
+import type { SignatureProof } from './utils/signing.js';
+
 // ---------------------------------------------------------------------------
 // Enums
 // ---------------------------------------------------------------------------
@@ -84,6 +86,20 @@ export interface SecurityConfig {
   unauthenticated?: boolean;
   /** Speak the first E2E design, for servers before 3.0 (no server identity). */
   legacyE2e?: boolean;
+  /**
+   * This client's P-256 ECDSA key pair for sendSigned() (generateSigningKey()
+   * makes one; keep the CryptoKeyPair, IndexedDB stores it as is). The server
+   * learns its public key from the token's `cnf` claim or from the
+   * application (set_client_key).
+   */
+  signingKey?: CryptoKeyPair;
+  /**
+   * The server's signing public keys (base64, its signing_public_key()) the
+   * messages it signs are checked against; one no pinned key verifies is
+   * dropped. Without them signed messages are delivered unchecked
+   * (`message.signature.verified` is false).
+   */
+  serverSigningKeys?: string[];
   publicKey?: string;
   sessionKey?: CryptoKey;
 }
@@ -241,7 +257,12 @@ export interface WSMessage {
   pri?: number;
   cmp?: boolean;
   enc?: boolean;
+  /** A signed message on the wire (`t: "signed"`): the signed text, signature and key id. */
+  sb?: string;
   sig?: string;
+  kid?: string;
+  /** On a delivered message the server signed: what to keep as the proof. */
+  signature?: SignatureProof;
   event_version?: number;
   latency_ms?: number;
   wse_processing_ms?: number;
@@ -286,6 +307,12 @@ export interface MessageOptions {
    * (in memory or offline) after that is dropped instead of sent late.
    */
   ttl?: number;
+}
+
+export interface SignedMessageOptions {
+  priority?: MessagePriority;
+  /** Unique per signed message; the server takes each once. */
+  nonce?: string;
 }
 
 /**
@@ -524,6 +551,14 @@ export interface UseWSEReturn {
   changeEndpoint: (endpoint: string) => void;
   sendMessage: (type: string, payload: any, options?: MessageOptions) => SendStatus;
   sendBatch: (messages: Array<{ type: string; payload: any; options?: MessageOptions }>) => SendStatus[];
+  /**
+   * Send a message signed with security.signingKey: the server checks it,
+   * answers with a signed `receipt` message and hands the application the
+   * proof. `nonce` is its unique id (an order id, say; random by default);
+   * the receipt and a SIGNATURE_REFUSED error carry it as `n`. Signing is
+   * asynchronous: await it before sending what must follow it.
+   */
+  sendSigned: (type: string, payload: any, options?: SignedMessageOptions) => Promise<SendStatus>;
   /** Connection metrics, refreshed at most once per second. */
   stats: ConnectionMetrics;
   activeTopics: string[];

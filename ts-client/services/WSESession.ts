@@ -29,6 +29,7 @@ import {
   SecurityConfig,
   SendStatus,
   WSMessage,
+  SignedMessageOptions,
 } from '../types.js';
 import {
   DEFAULT_MAX_INBOUND_MESSAGE_SIZE,
@@ -55,6 +56,7 @@ import { EventHandlers } from '../handlers/EventHandlers.js';
 import { securityManager } from '../utils/security.js';
 import { logger } from '../utils/logger.js';
 import { generateId } from '../utils/id.js';
+import { signingKeyFrom, signMessage, type SigningKey } from '../utils/signing.js';
 import { dispatchWSEEvent } from '../utils/events.js';
 
 /** Handler registration surface handed to `registerHandlers`. */
@@ -268,6 +270,8 @@ export class WSESession {
   private startPromise: Promise<void> | null = null;
   private windowListener: ((event: Event) => void) | null = null;
   private stopWatchingState: (() => void) | null = null;
+  // This client's signing key, derived once from security.signingKey.
+  private signingKey: Promise<SigningKey> | null = null;
 
   constructor(params: SessionParams, sequencer: EventSequencer) {
     this.key = params.key;
@@ -285,6 +289,8 @@ export class WSESession {
         handlerSampleRate: this.options.diagnostics.enabled ? this.options.diagnostics.sampleRate : 0,
       },
     );
+
+    this.processor.setServerSigningKeys(this.options.security.serverSigningKeys);
 
     EventHandlers.registerAll(this.processor);
     this.options.registerHandlers?.(this.processor);
@@ -527,6 +533,32 @@ export class WSESession {
       offline: !!options.offline && this.options.offline.enabled,
       ttl: options.ttl,
     });
+  }
+
+  /** See UseWSEReturn.sendSigned. */
+  async sendSigned(type: string, payload: any, options: SignedMessageOptions = {}): Promise<SendStatus> {
+    if (this.destroyed) return 'dropped';
+    const keyPair = this.options.security.signingKey;
+    if (!keyPair) {
+      logger.error(`Refusing to sign ${type}: no security.signingKey`);
+      return 'dropped';
+    }
+    const audience = this.processor.getServerSigningKid();
+    if (!audience) {
+      logger.error(`Refusing to sign ${type}: the server has not named a signing key`);
+      return 'dropped';
+    }
+    this.signingKey ??= signingKeyFrom(keyPair);
+    let envelope;
+    try {
+      envelope = await signMessage(await this.signingKey, type, payload, audience, options.nonce ?? generateId());
+    } catch (error) {
+      logger.error(`Could not sign ${type}:`, error);
+      return 'dropped';
+    }
+    if (this.destroyed) return 'dropped';
+    const message: WSMessage = { ...envelope, p: undefined, id: generateId() };
+    return this.processor.enqueueOutgoing(message, options.priority ?? MessagePriority.NORMAL);
   }
 
   forceReconnect(): void {
@@ -825,6 +857,15 @@ function sendMessageAction(type: string, payload: any, options: MessageOptions =
   return ok ? 'queued' : 'dropped';
 }
 
+function sendSignedAction(type: string, payload: any, options?: SignedMessageOptions): Promise<SendStatus> {
+  const session = getCurrentSession();
+  if (!session) {
+    logger.warn(`sendSigned(${type}): no active WSE connection`);
+    return Promise.resolve('dropped');
+  }
+  return session.sendSigned(type, payload, options);
+}
+
 function sendBatchAction(messages: Array<{ type: string; payload: any; options?: MessageOptions }>): SendStatus[] {
   return messages.map(({ type, payload, options }) => sendMessageAction(type, payload, options));
 }
@@ -953,6 +994,7 @@ export const wseActions = Object.freeze({
   changeEndpoint: changeEndpointAction,
   sendMessage: sendMessageAction,
   sendBatch: sendBatchAction,
+  sendSigned: sendSignedAction,
   downloadDiagnostics: downloadDiagnosticsAction,
   clearOfflineQueue: clearOfflineQueueAction,
   getQueueSize: getQueueSizeAction,

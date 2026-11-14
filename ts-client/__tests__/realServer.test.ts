@@ -24,6 +24,7 @@ import {
 } from '../services/WSESession.js';
 import { useWSEStore } from '../stores/useWSEStore.js';
 import { logger, LogLevel } from '../utils/logger.js';
+import { generateSigningKey } from '../utils/signing.js';
 import type { WSEGapEvent } from '../types.js';
 
 const PYTHON = process.env.WSE_E2E_PYTHON;
@@ -35,6 +36,7 @@ describe.skipIf(!PYTHON || typeof WebSocket === 'undefined')('real RustWSEServer
   let server: ChildProcessWithoutNullStreams;
   let token = '';
   let identity = '';
+  let signing = '';
 
   const send = (command: string) => server.stdin.write(`${command}\n`);
   const transportReady = () => !!getCurrentSession()?.connection?.isTransportReady();
@@ -47,6 +49,7 @@ describe.skipIf(!PYTHON || typeof WebSocket === 'undefined')('real RustWSEServer
         const ev = JSON.parse(line);
         if (ev.event === 'token') token = ev.token;
         else if (ev.event === 'identity') identity = ev.key;
+        else if (ev.event === 'signing') signing = ev.key;
         else events.push(ev);
       } catch {
         // not an event line
@@ -150,6 +153,54 @@ describe.skipIf(!PYTHON || typeof WebSocket === 'undefined')('real RustWSEServer
 
     unsubscribe();
   }, 60_000);
+
+  it('signs both ways with the server, inside an E2E session', async () => {
+    destroyCurrentSession({ clearUserData: true });
+    const key = await generateSigningKey();
+    const fills: any[] = [];
+    const receipts: any[] = [];
+    let registered = false;
+    acquireSession({
+      key: makeSessionKey('cookie', [endpoint]),
+      auth: 'cookie',
+      initialTopics: [],
+      config: {
+        endpoints: [endpoint],
+        offline: { enabled: false },
+        security: {
+          encryptionEnabled: true,
+          serverKeys: [identity],
+          signingKey: key.keyPair,
+          serverSigningKeys: [signing],
+        },
+        registerHandlers: (p) => {
+          p.registerHandler('key_registered', () => {
+            registered = true;
+          });
+          p.registerHandler('receipt', (m) => receipts.push(m));
+          p.registerHandler('fill', (m) => fills.push(m));
+        },
+      },
+    });
+
+    await vi.waitFor(() => expect(transportReady()).toBe(true), { timeout: 10_000 });
+    expect(wseActions.sendMessage('register_key', { public_key: key.publicKey })).toBe('sent');
+    await vi.waitFor(() => expect(registered).toBe(true), { timeout: 5_000 });
+
+    expect(await wseActions.sendSigned('order', { qty: '2' }, { nonce: 'ts-1' })).toBe('sent');
+    await vi.waitFor(
+      () => expect(events.some((e) => e.event === 'signed' && e.n === 'ts-1' && e.kid === key.kid)).toBe(true),
+      { timeout: 5_000 },
+    );
+    await vi.waitFor(() => {
+      expect(receipts).toHaveLength(1);
+      expect(fills).toHaveLength(1);
+    }, { timeout: 5_000 });
+    expect(receipts[0].p.n).toBe('ts-1');
+    expect(receipts[0].signature.verified).toBe(true);
+    expect(fills[0].p).toEqual({ n: 'ts-1' });
+    expect(fills[0].signature.verified).toBe(true);
+  }, 30_000);
 
   it('speaks the first E2E design to a server that still offers it', async () => {
     destroyCurrentSession({ clearUserData: true });

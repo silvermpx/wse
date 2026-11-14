@@ -4,7 +4,10 @@ Driven over stdin ("publish N", "kick", "stop", "start", "quit"); reports
 events as JSON lines on stdout. Handles client subscription_update with
 subscribe_with_recovery() and replies like examples/standalone_recovery.py.
 Signs E2E sessions with an identity key made for the run (the same one
-across a restart), which the client pins. Uses an installed wse-server, or
+across a restart), which the client pins, and its own messages with a signing
+key made for the run; binds a client's signing key when it sends
+"register_key" and answers each signed message with a signed "fill". Uses an
+installed wse-server, or
 the prebuilt module of this repository; needs cryptography for the key.
 """
 
@@ -22,11 +25,16 @@ from wse_server._wse_accel import RustWSEServer, rust_jwt_encode  # noqa: E402
 
 PORT = int(sys.argv[1])
 SECRET = b"e2e-secret-key-32-bytes-long!!!!"
-IDENTITY = ec.generate_private_key(ec.SECP256R1()).private_bytes(
-    serialization.Encoding.PEM,
-    serialization.PrivateFormat.PKCS8,
-    serialization.NoEncryption(),
-)
+def new_key() -> bytes:
+    return ec.generate_private_key(ec.SECP256R1()).private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+
+
+IDENTITY = new_key()
+SIGNING = new_key()
 
 
 def emit(obj):
@@ -53,6 +61,7 @@ class Runner:
             recovery_enabled=True,
             recovery_buffer_size=1024,
             e2e_identity_key=IDENTITY,
+            signing_key=SIGNING,
         )
         s.enable_drain_mode()
         s.start()
@@ -127,11 +136,25 @@ class Runner:
                                 "recovered": res.get("recovered"),
                             }
                         )
+                    elif t == "register_key":
+                        s.set_client_key(cid, p.get("public_key"))
+                        s.send(cid, json.dumps({"c": "U", "t": "key_registered", "p": {}, "v": 1}))
+                        emit({"event": "key_registered"})
                     elif t == "echo":
                         s.send(cid, json.dumps({"c": "U", "t": "echo_reply", "p": p, "v": 1}))
                         emit({"event": "echo", "payload": p})
                     else:
                         emit({"event": "msg", "t": t})
+                elif kind == "signed" and isinstance(data, dict):
+                    emit(
+                        {
+                            "event": "signed",
+                            "t": data.get("t"),
+                            "n": data.get("n"),
+                            "kid": data["signature"]["kid"],
+                        }
+                    )
+                    s.send(cid, s.sign("fill", {"n": data.get("n")}))
                 elif kind == "disconnect":
                     emit({"event": "disconnect"})
 
@@ -147,6 +170,7 @@ class Runner:
 r = Runner()
 r.start()
 emit({"event": "identity", "key": r.server.e2e_identity_public_key()})
+emit({"event": "signing", "key": r.server.signing_public_key()})
 emit({"event": "token", "token": make_token()})
 for line in sys.stdin:
     cmd = line.strip().split()
