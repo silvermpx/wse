@@ -71,6 +71,25 @@ def test_frames_of_both_directions(v, name, direction):
         assert receiver.open(sealed) == text
 
 
+def test_the_shared_vectors_are_refused(v):
+    from wse_client.e2e_session import E2eError, _Receiver
+
+    th = bytes.fromhex(v["th"])
+    assert len(v["refused"]) >= 20
+    for case in v["refused"]:
+        name = case["direction"]
+        direction = 2 if name == "server_to_client" else 1
+        receiver = _Receiver(th, direction, bytes.fromhex(v[f"{name}_secret"]))
+        for frame in v[name][: case["after"]]:
+            receiver.open(bytes.fromhex(frame["frame"]))
+        try:
+            receiver.open(bytes.fromhex(case["frame"]))
+        except E2eError as refused:
+            assert refused.close_code == 4802, case["case"]
+        else:
+            pytest.fail(f"{name}: opened what it must refuse ({case['case']})")
+
+
 def test_a_replayed_or_tampered_frame_is_refused(v):
     from wse_client.e2e_session import E2eError, _Receiver, _Sender
 

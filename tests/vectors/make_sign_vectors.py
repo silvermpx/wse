@@ -41,7 +41,13 @@ def b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-def side(k: ec.EllipticCurvePrivateKey, label: bytes, body: str) -> dict:
+def flipped(sig: str) -> str:
+    raw = bytearray(base64.b64decode(sig))
+    raw[-1] ^= 1
+    return base64.b64encode(bytes(raw)).decode()
+
+
+def side(k: ec.EllipticCurvePrivateKey, label: bytes, other_label: bytes, body: str) -> dict:
     public = point(k)
     sig = sign(k, label, body)
     return {
@@ -53,6 +59,10 @@ def side(k: ec.EllipticCurvePrivateKey, label: bytes, body: str) -> dict:
         "envelope": json.dumps({"t": "signed", "sb": body, "sig": sig, "kid": kid(public)}),
         # The same signature over a body one character off: must not verify.
         "tampered_body": body.replace("1.25", "9.25"),
+        # Neither must the signature with one bit changed, nor the same key's
+        # signature of the same body under the other side's label.
+        "flipped_sig": flipped(sig),
+        "other_label_sig": sign(k, other_label, body),
     }
 
 
@@ -72,8 +82,8 @@ def main() -> None:
     out = {
         "client_label": CLIENT_LABEL.decode(),
         "server_label": SERVER_LABEL.decode(),
-        "client": side(client, CLIENT_LABEL, order),
-        "server": side(server, SERVER_LABEL, fill),
+        "client": side(client, CLIENT_LABEL, SERVER_LABEL, order),
+        "server": side(server, SERVER_LABEL, CLIENT_LABEL, fill),
     }
     print(json.dumps(out, indent=2, ensure_ascii=False))
 

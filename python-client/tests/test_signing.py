@@ -65,6 +65,9 @@ def test_a_signed_message_that_does_not_check_is_dropped(v):
     pinned = codec([server["public_key"]])
     tampered = dict(envelope, sb=server["tampered_body"])
     assert pinned.decode(json.dumps(tampered)) is None
+    # A signature one bit off, or made under the client's label.
+    for bad in ("flipped_sig", "other_label_sig"):
+        assert pinned.decode(json.dumps(dict(envelope, sig=server[bad]))) is None, bad
     # Signed for another topic than the one it came on.
     assert pinned.decode(json.dumps(dict(envelope, tp="orders.u2"))) is None
     # A key the client does not pin.

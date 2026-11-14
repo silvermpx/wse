@@ -627,16 +627,30 @@ mod tests {
             check(&tampered, Some(&key), audience, 1_794_600_000_000, WINDOW).err(),
             Some(Refused::BadSignature)
         );
+        // A signature one bit off, or made under the server's label.
+        for bad in ["flipped_sig", "other_label_sig"] {
+            let mut forged = envelope.clone();
+            forged["sig"] = client[bad].clone();
+            assert_eq!(
+                check(&forged, Some(&key), audience, 1_794_600_000_000, WINDOW).err(),
+                Some(Refused::BadSignature),
+                "{bad}"
+            );
+        }
 
         let server = &v["server"];
         let key = ClientKey::from_base64(server["public_key"].as_str().unwrap()).unwrap();
-        let sig = b64().decode(server["sig"].as_str().unwrap()).unwrap();
-        assert!(key.verifies(SERVER_LABEL, server["body"].as_str().unwrap(), &sig));
+        let body = server["body"].as_str().unwrap();
+        let sig = |name: &str| b64().decode(server[name].as_str().unwrap()).unwrap();
+        assert!(key.verifies(SERVER_LABEL, body, &sig("sig")));
         assert!(!key.verifies(
             SERVER_LABEL,
             server["tampered_body"].as_str().unwrap(),
-            &sig
+            &sig("sig")
         ));
+        assert!(!key.verifies(SERVER_LABEL, body, &sig("flipped_sig")));
+        assert!(!key.verifies(SERVER_LABEL, body, &sig("other_label_sig")));
+        assert!(key.verifies(CLIENT_LABEL, body, &sig("other_label_sig")));
     }
 
     #[test]

@@ -47,6 +47,17 @@ describe('E2E session vectors', () => {
     });
   }
 
+  // What the vectors say a receiver must refuse: a forgery, a replay or a
+  // skip, an epoch out of turn, a frame it cannot read.
+  for (const c of v.refused as { case: string; direction: string; after: number; frame: string }[]) {
+    it(`refuses ${c.direction}: ${c.case}`, async () => {
+      const direction = c.direction === 'server_to_client' ? 2 : 1;
+      const receiver = await new E2eReceiver(unhex(v.th), direction, unhex(v[`${c.direction}_secret`])).init();
+      for (const f of (v[c.direction] as { frame: string }[]).slice(0, c.after)) await receiver.open(unhex(f.frame));
+      await expect(receiver.open(unhex(c.frame))).rejects.toMatchObject({ closeCode: 4802 });
+    });
+  }
+
   it('refuses a replayed or tampered frame', async () => {
     const th = unhex(v.th);
     const secret = unhex(v.server_to_client_secret);

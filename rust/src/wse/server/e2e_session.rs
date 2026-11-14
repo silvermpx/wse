@@ -463,6 +463,37 @@ mod tests {
         }
     }
 
+    /// What the shared vectors say a receiver must refuse: a forgery, a
+    /// replay or a skip, an epoch out of turn, a frame it cannot read.
+    #[test]
+    fn the_shared_vectors_are_refused() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../tests/vectors/e2e.json")).unwrap();
+        let hexed = |s: &serde_json::Value| hex::decode(s.as_str().unwrap()).unwrap();
+        let th: [u8; 32] = hexed(&v["th"]).try_into().unwrap();
+        let cases = v["refused"].as_array().unwrap();
+        assert!(cases.len() >= 20);
+        for case in cases {
+            let name = case["direction"].as_str().unwrap();
+            let direction = match name {
+                "server_to_client" => SERVER_TO_CLIENT,
+                _ => CLIENT_TO_SERVER,
+            };
+            let secret: [u8; 32] = hexed(&v[format!("{name}_secret")]).try_into().unwrap();
+            let mut recv = RecvState::new(th, direction, Zeroizing::new(secret));
+            let after = case["after"].as_u64().unwrap() as usize;
+            for frame in v[name].as_array().unwrap().iter().take(after) {
+                recv.open(&hexed(&frame["frame"])).unwrap();
+            }
+            assert_eq!(
+                recv.open(&hexed(&case["frame"])),
+                Err(E2eError::BadFrame),
+                "{name}: {}",
+                case["case"]
+            );
+        }
+    }
+
     #[test]
     fn frames_open_in_order_only() {
         let (mut send, mut recv) = pair([7; 32], [9; 32]);

@@ -67,5 +67,163 @@
       "key": "b5bdd624c918669c4c2ac6e2c1b3e35682cedcae814101fcf35df2a151c368e3",
       "iv": "ad4d3053"
     }
+  ],
+  "refused": [
+    {
+      "case": "tampered tag",
+      "direction": "server_to_client",
+      "after": 0,
+      "frame": "453a010000000000000000000000000037ed01cda22493001e50e6dba39f2e1a41c5f4ff3a2fe3f60b8060"
+    },
+    {
+      "case": "tampered ciphertext",
+      "direction": "server_to_client",
+      "after": 0,
+      "frame": "453a010000000000000000000000000036ed01cda22493001e50e6dba39f2e1a41c5f4ff3a2fe3f60b8061"
+    },
+    {
+      "case": "header changed after sealing",
+      "direction": "server_to_client",
+      "after": 0,
+      "frame": "453a010100000000000000000000000037ed01cda22493001e50e6dba39f2e1a41c5f4ff3a2fe3f60b8061"
+    },
+    {
+      "case": "replayed",
+      "direction": "server_to_client",
+      "after": 1,
+      "frame": "453a010000000000000000000000000037ed01cda22493001e50e6dba39f2e1a41c5f4ff3a2fe3f60b8061"
+    },
+    {
+      "case": "skipped ahead",
+      "direction": "server_to_client",
+      "after": 0,
+      "frame": "453a0100000000000000000000000001e1a95b118ccf98d0877c13fba87799abed051148e9cb6c4fe9b51d"
+    },
+    {
+      "case": "sealed for the other direction",
+      "direction": "server_to_client",
+      "after": 0,
+      "frame": "453a010000000000000000000000000037ed01cda22493001e50e632fe8627c4ec3b9ad82a6ad0816e4a15"
+    },
+    {
+      "case": "next epoch sealed with the old key",
+      "direction": "server_to_client",
+      "after": 0,
+      "frame": "453a010000000001000000000000000037ed01cda22493001e50e6c7f27ecaee6e8d38934abf2ef288075c"
+    },
+    {
+      "case": "an epoch skipped",
+      "direction": "server_to_client",
+      "after": 0,
+      "frame": "453a0100000000020000000000000000130a8337bbfca437a2ac23198df5e80cbcf43593f1e0a363f473ad"
+    },
+    {
+      "case": "earlier epoch after a rekey",
+      "direction": "server_to_client",
+      "after": 3,
+      "frame": "453a01000000000000000000000000031605c1571fbcf813aa3ef025518ac7bc901f4c94d046f0d8392d93"
+    },
+    {
+      "case": "unknown frame format",
+      "direction": "server_to_client",
+      "after": 0,
+      "frame": "453a020000000000000000000000000037ed01cda22493001e50e6f67acb9a8bf092f97bb368d334388f0f"
+    },
+    {
+      "case": "unknown frame type",
+      "direction": "server_to_client",
+      "after": 0,
+      "frame": "453a010700000000000000000000000037ed01cda22493001e50e6df6f654b1f123797e0b0ba5087ce0885"
+    },
+    {
+      "case": "shorter than a tag",
+      "direction": "server_to_client",
+      "after": 0,
+      "frame": "453a010000000000000000000000000037ed01cda22493001e50e6dba39f2e"
+    },
+    {
+      "case": "no frame prefix",
+      "direction": "server_to_client",
+      "after": 0,
+      "frame": "583a010000000000000000000000000037ed01cda22493001e50e6dba39f2e1a41c5f4ff3a2fe3f60b8061"
+    },
+    {
+      "case": "tampered tag",
+      "direction": "client_to_server",
+      "after": 0,
+      "frame": "453a010000000000000000000000000089b557effad1363aa1d697227ed599bfb9f8baa23110b69441fc8e"
+    },
+    {
+      "case": "tampered ciphertext",
+      "direction": "client_to_server",
+      "after": 0,
+      "frame": "453a010000000000000000000000000088b557effad1363aa1d697227ed599bfb9f8baa23110b69441fc8f"
+    },
+    {
+      "case": "header changed after sealing",
+      "direction": "client_to_server",
+      "after": 0,
+      "frame": "453a010100000000000000000000000089b557effad1363aa1d697227ed599bfb9f8baa23110b69441fc8f"
+    },
+    {
+      "case": "replayed",
+      "direction": "client_to_server",
+      "after": 1,
+      "frame": "453a010000000000000000000000000089b557effad1363aa1d697227ed599bfb9f8baa23110b69441fc8f"
+    },
+    {
+      "case": "skipped ahead",
+      "direction": "client_to_server",
+      "after": 0,
+      "frame": "453a0100000000000000000000000001d4db8cb949649decad8ddc3135231b086c353638530d7962f5ec9d"
+    },
+    {
+      "case": "sealed for the other direction",
+      "direction": "client_to_server",
+      "after": 0,
+      "frame": "453a010000000000000000000000000089b557effad1363aa1d697ce595b27d0d368daf3b5c7ca3c9572fd"
+    },
+    {
+      "case": "next epoch sealed with the old key",
+      "direction": "client_to_server",
+      "after": 0,
+      "frame": "453a010000000001000000000000000089b557effad1363aa1d697ad5bd7d65462b0baaaf7c4b5a598623e"
+    },
+    {
+      "case": "an epoch skipped",
+      "direction": "client_to_server",
+      "after": 0,
+      "frame": "453a01000000000200000000000000003a20f7aa833b27c8319b0b8ad696509245448c03acc0aeeb300b5f"
+    },
+    {
+      "case": "earlier epoch after a rekey",
+      "direction": "client_to_server",
+      "after": 3,
+      "frame": "453a01000000000000000000000000039346f62dc96f0542a04ca53496d6a9a48f3d891d839f915aaa849d"
+    },
+    {
+      "case": "unknown frame format",
+      "direction": "client_to_server",
+      "after": 0,
+      "frame": "453a020000000000000000000000000089b557effad1363aa1d69787a6d580f4c5fde8c892c2c24a62556b"
+    },
+    {
+      "case": "unknown frame type",
+      "direction": "client_to_server",
+      "after": 0,
+      "frame": "453a010700000000000000000000000089b557effad1363aa1d697d97e2d9985e9d4b3373dc9a3ae485abb"
+    },
+    {
+      "case": "shorter than a tag",
+      "direction": "client_to_server",
+      "after": 0,
+      "frame": "453a010000000000000000000000000089b557effad1363aa1d697227ed599"
+    },
+    {
+      "case": "no frame prefix",
+      "direction": "client_to_server",
+      "after": 0,
+      "frame": "583a010000000000000000000000000089b557effad1363aa1d697227ed599bfb9f8baa23110b69441fc8f"
+    }
   ]
 }

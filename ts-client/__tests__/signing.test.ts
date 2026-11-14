@@ -47,6 +47,9 @@ describe('signed message vectors', () => {
     const key = await importPoint(v.client.public_key);
     expect(await verifies(key, CLIENT_LABEL, v.client.body, v.client.sig)).toBe(true);
     expect(await verifies(key, CLIENT_LABEL, v.client.tampered_body, v.client.sig)).toBe(false);
+    // A signature one bit off, or made under the server's label.
+    expect(await verifies(key, CLIENT_LABEL, v.client.body, v.client.flipped_sig)).toBe(false);
+    expect(await verifies(key, CLIENT_LABEL, v.client.body, v.client.other_label_sig)).toBe(false);
   });
 
   it('opens the server vector with its proof', async () => {
@@ -61,6 +64,8 @@ describe('signed message vectors', () => {
     const envelope = JSON.parse(v.server.envelope);
     const pinned = await ServerSigningKeys.create([v.server.public_key]);
     await expect(pinned.open({ ...envelope, sb: v.server.tampered_body })).rejects.toBeInstanceOf(SignatureError);
+    await expect(pinned.open({ ...envelope, sig: v.server.flipped_sig })).rejects.toBeInstanceOf(SignatureError);
+    await expect(pinned.open({ ...envelope, sig: v.server.other_label_sig })).rejects.toBeInstanceOf(SignatureError);
     const other = await ServerSigningKeys.create([v.client.public_key]);
     await expect(other.open(envelope)).rejects.toBeInstanceOf(SignatureError);
     await expect(ServerSigningKeys.create(['AAAA'])).rejects.toBeInstanceOf(SignatureError);

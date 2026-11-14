@@ -44,6 +44,16 @@ def transcript(suites, chosen, client_random, client_pub, server_pub, conn_id, k
     return t
 
 
+def seal(th, secret, direction, epoch, seq, text, fmt=1, frame_type=0) -> bytes:
+    """A frame sealed with the keys of `secret`, whatever its header says."""
+    k = h(th, secret, b"wse/e2e key", 32)
+    iv = h(th, secret, b"wse/e2e iv", 4)
+    hdr = struct.pack(">BBIQ", fmt, frame_type, epoch, seq)
+    nonce = iv + struct.pack(">Q", seq)
+    aad = bytes([direction]) + th + hdr
+    return b"E:" + hdr + AESGCM(k).encrypt(nonce, text, aad)
+
+
 def frames(th: bytes, secret: bytes, direction: int, texts: list[bytes], rekey_after: int):
     out = []
     epoch = 0
@@ -51,22 +61,54 @@ def frames(th: bytes, secret: bytes, direction: int, texts: list[bytes], rekey_a
         if seq == rekey_after:
             secret = h(th, secret, b"wse/e2e next", 32)
             epoch += 1
-        k = h(th, secret, b"wse/e2e key", 32)
-        iv = h(th, secret, b"wse/e2e iv", 4)
-        hdr = struct.pack(">BBIQ", 1, 0, epoch, seq)
-        nonce = iv + struct.pack(">Q", seq)
-        aad = bytes([direction]) + th + hdr
-        sealed = AESGCM(k).encrypt(nonce, text, aad)
         out.append(
             {
                 "epoch": epoch,
                 "seq": seq,
                 "plaintext": text.decode(),
-                "frame": (b"E:" + hdr + sealed).hex(),
-                "key": k.hex(),
-                "iv": iv.hex(),
+                "frame": seal(th, secret, direction, epoch, seq, text).hex(),
+                "key": h(th, secret, b"wse/e2e key", 32).hex(),
+                "iv": h(th, secret, b"wse/e2e iv", 4).hex(),
             }
         )
+    return out
+
+
+def changed(frame: bytes, at: int, value: int | None = None) -> bytes:
+    out = bytearray(frame)
+    out[at] = out[at] ^ 1 if value is None else value
+    return bytes(out)
+
+
+def refused(th: bytes, secrets: dict[str, bytes]) -> list[dict]:
+    """Frames a receiver must refuse after opening the first `after` frames of
+    its direction: each must end the session."""
+    out = []
+    for name, d in (("server_to_client", 2), ("client_to_server", 1)):
+        e0 = secrets[name]
+        e2 = h(th, h(th, e0, b"wse/e2e next", 32), b"wse/e2e next", 32)
+        one = b'{"t":"one"}'
+        first = seal(th, e0, d, 0, 0, one)
+        tag_at, body_at, type_at = len(first) - 1, 2 + 14, 3
+        cases = [
+            ("tampered tag", 0, changed(first, tag_at)),
+            ("tampered ciphertext", 0, changed(first, body_at)),
+            ("header changed after sealing", 0, changed(first, type_at, 1)),
+            ("replayed", 1, first),
+            ("skipped ahead", 0, seal(th, e0, d, 0, 1, b'{"t":"two"}')),
+            ("sealed for the other direction", 0, seal(th, e0, 3 - d, 0, 0, one)),
+            ("next epoch sealed with the old key", 0, seal(th, e0, d, 1, 0, one)),
+            ("an epoch skipped", 0, seal(th, e2, d, 2, 0, one)),
+            ("earlier epoch after a rekey", 3, seal(th, e0, d, 0, 3, one)),
+            ("unknown frame format", 0, seal(th, e0, d, 0, 0, one, fmt=2)),
+            ("unknown frame type", 0, seal(th, e0, d, 0, 0, one, frame_type=7)),
+            ("shorter than a tag", 0, first[: 2 + 14 + 15]),
+            ("no frame prefix", 0, b"X:" + first[2:]),
+        ]
+        out += [
+            {"case": case, "direction": name, "after": after, "frame": frame.hex()}
+            for case, after, frame in cases
+        ]
     return out
 
 
@@ -105,6 +147,7 @@ def main() -> None:
         # Epoch 1 starts at the third frame of each direction.
         "server_to_client": frames(th, s2c, 2, texts, rekey_after=2),
         "client_to_server": frames(th, c2s, 1, texts, rekey_after=2),
+        "refused": refused(th, {"server_to_client": s2c, "client_to_server": c2s}),
     }
     print(json.dumps(vectors, indent=2))
 
