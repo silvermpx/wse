@@ -57,9 +57,10 @@ client.close()
 ```python
 from wse_client import SyncWSEClient
 
-client = SyncWSEClient("ws://localhost:5007/wse", token="<jwt>")
+client = SyncWSEClient("ws://localhost:5007/wse", token="<jwt>", topics=["notifications"])
 
-@client.on("notifications")
+# By event type (the "t" of a message), whatever topic it comes on.
+@client.on("notification")
 def handle(event):
     print(event.payload)
 
@@ -404,7 +405,7 @@ The client speaks WSE wire protocol v1:
 - **Text frames:** JSON with `c` field for category (`WSE`, `S`, `U`)
 - **Binary frames:** Codec prefix (`C:` zlib, `M:` msgpack, `E:` E2E sealed) + payload; with `wire_format="msgpack"` the client asks for `?format=msgpack`, decodes `M:` frames (sealed ones included) and sends its messages as `M:` frames
 - **Handshake:** `client_hello` is the first frame of every connection; the connection is ready at the first `server_ready` or `server_hello` (with encryption: once the key exchange completed)
-- **Heartbeat:** JSON PING/PONG with latency tracking (plaintext control frames)
+- **Heartbeat:** JSON PING/PONG with latency tracking (sealed like every other frame inside an E2E session)
 
 Full protocol specification: [PROTOCOL.md](../docs/PROTOCOL.md)
 

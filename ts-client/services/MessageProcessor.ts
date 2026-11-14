@@ -37,6 +37,7 @@ import {
   WS_PROTOCOL_VERSION,
   DEFAULT_MAX_INBOUND_MESSAGE_SIZE,
   DEFAULT_RECOVERY_TIMEOUT_MS,
+  OFFLINE_OWNER_STORAGE_KEY,
 } from '../constants.js';
 import { securityManager } from '../utils/security.js';
 import { generateId } from '../utils/id.js';
@@ -126,6 +127,23 @@ const MAX_EARLY_ENCRYPTED_FRAMES = 1000;
 const MAX_LOGGED_UNHANDLED_TYPES = 1000;
 const PARKED = Symbol('parked');
 
+/** The user of this browser's last connection, kept across page loads. */
+function storedOwner(): string | undefined {
+  try {
+    return localStorage.getItem(OFFLINE_OWNER_STORAGE_KEY) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function storeOwner(user: string): void {
+  try {
+    localStorage.setItem(OFFLINE_OWNER_STORAGE_KEY, user);
+  } catch {
+    // no storage: owners come from this page's connections only
+  }
+}
+
 function isSystemType(type: string): boolean {
   return SYSTEM_TYPES.has(type) || type.includes('snapshot');
 }
@@ -148,6 +166,40 @@ function asArrayBuffer(data: unknown): ArrayBuffer | null {
     return data as ArrayBuffer;
   }
   return null;
+}
+
+const HANDSHAKE_TYPES = new Set(['server_hello', 'error', 'ping', 'PING', 'pong', 'PONG']);
+
+/** A frame that may come unsealed before an E2E session: the answer to the offer, an error, a heartbeat. */
+function isHandshakeFrame(data: unknown): boolean {
+  let text: string;
+  if (typeof data === 'string') {
+    text = data;
+  } else {
+    const buffer = asArrayBuffer(data);
+    if (!buffer) return false;
+    try {
+      text = new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+    } catch {
+      return false;
+    }
+  }
+  if (/^(WSE:)?(PING|PONG):/.test(text)) return true;
+  try {
+    const parsed = JSON.parse(text.startsWith('WSE{') ? text.slice(3) : text);
+    return typeof parsed === 'object' && parsed !== null && HANDSHAKE_TYPES.has(parsed.t);
+  } catch {
+    return false;
+  }
+}
+
+/** A binary frame sealed for an E2E session or the first design: `E:` first. */
+function isSealed(data: unknown): boolean {
+  if (typeof data === 'string') return false;
+  const buffer = asArrayBuffer(data);
+  if (!buffer || buffer.byteLength < 2) return false;
+  const head = new Uint8Array(buffer, 0, 2);
+  return head[0] === 0x45 && head[1] === 0x3a;
 }
 
 export class MessageProcessor {
@@ -173,12 +225,16 @@ export class MessageProcessor {
   // of what this client signs).
   private serverSigningKeys: Promise<ServerSigningKeys> = ServerSigningKeys.create(undefined);
   private serverSigningKid: string | null = null;
+  /** The user server_ready named for this connection. */
+  private userId: string | null = null;
   private maxMessageSize: number;
   private recoveryTimeoutMs: number;
   private eventThrottleMs: number;
   private handlerSampleRate: number;
   private lastEventTime = new Map<string, number>();
   private recoveryWindows = new Map<string, RecoveryWindow>();
+  /** Topics the server could not recover, until their next message shows what was missed. */
+  private unrecovered = new Map<string, { epoch: string; reported: boolean }>();
   private earlyEncryptedFrames: ArrayBuffer[] = [];
   private loggedEventVersions = new Set<string>();
   private unhandledTypesLogged = new Set<string>();
@@ -342,6 +398,21 @@ export class MessageProcessor {
   private async processFrame(data: string | ArrayBuffer): Promise<void> {
     let message: WSMessage | null | typeof PARKED;
     let size: number;
+
+    if (securityManager.isSessionMode() && !isSealed(data)) {
+      // An E2E session is opened first and then every frame is sealed:
+      // unsealed come only the server's answer to the offer, an error and
+      // heartbeats before it. Anything else was put in by whatever sits
+      // between client and server.
+      if (securityManager.isTransportEncryptionReady()) {
+        this.connectionManager?.failEncryption('E2E frame refused (a plaintext frame inside the session)');
+        return;
+      }
+      if (!isHandshakeFrame(data)) {
+        this.connectionManager?.failEncryption('E2E frame refused (a plaintext frame before the session)');
+        return;
+      }
+    }
 
     if (typeof data === 'string') {
       size = data.length;
@@ -512,6 +583,37 @@ export class MessageProcessor {
     }
   }
 
+  /**
+   * The server's signing key id, the audience of what this client signs. In
+   * an E2E session only the sealed server_ready names it; with pinned server
+   * signing keys it must be one of them.
+   */
+  private takeSigningKid(signing: any, sealed: boolean): void {
+    if (typeof signing?.kid !== 'string') return;
+    if (!sealed && securityManager.isSessionMode()) return;
+    this.serverSigningKid = signing.kid;
+  }
+
+  /**
+   * The audience of what this client signs: the server's signing key id,
+   * which must be one of the pinned server signing keys when there are any.
+   */
+  async signingAudience(): Promise<string | null> {
+    const kid = this.serverSigningKid;
+    if (kid === null) return null;
+    let keys: ServerSigningKeys;
+    try {
+      keys = await this.serverSigningKeys;
+    } catch {
+      return null;
+    }
+    if (keys.pinned && !keys.has(kid)) {
+      logger.warn(`The server names signing key ${kid}, which is not pinned; not signing`);
+      return null;
+    }
+    return kid;
+  }
+
   private processServerReady(message: WSMessage): void {
     const payload = message.p || {};
     const details = payload.details || payload;
@@ -519,14 +621,18 @@ export class MessageProcessor {
     if (typeof features.recovery === 'boolean') {
       useWSEStore.getState().setServerRecoveryEnabled(features.recovery);
     }
-    if (typeof details.signing?.kid === 'string') this.serverSigningKid = details.signing.kid;
+    this.takeSigningKid(details.signing, true);
+    if (typeof details.user_id === 'string' && details.user_id) {
+      this.userId = details.user_id;
+      storeOwner(details.user_id);
+    }
     this.connectionManager?.handleServerReady(details);
   }
 
   private async processServerHello(message: WSMessage): Promise<void> {
     const payload = message.p || {};
     const store = useWSEStore.getState();
-    if (typeof payload.signing?.kid === 'string') this.serverSigningKid = payload.signing.kid;
+    this.takeSigningKid(payload.signing, false);
 
     if (payload.features) {
       // server_ready only exists on the Rust-JWT path; server_hello always
@@ -811,23 +917,32 @@ export class MessageProcessor {
       // No replay pending: deliver now and report what is missing.
       const last = previous!.offset;
       this.sequencer.setTopicPosition(topic, epoch, offset);
+      const unrecovered = this.takeUnrecovered(topic, epoch);
       this.reportGap({
         topic,
         epoch,
         fromOffset: last + 1,
         toOffset: offset - 1,
         missed: offset - last - 1,
-        reason: 'offset_gap',
+        reason: unrecovered ? 'not_recovered' : 'offset_gap',
       });
     } else if (previous && previous.epoch !== epoch) {
-      this.reportGap({
-        topic,
-        epoch,
-        fromOffset: null,
-        toOffset: null,
-        missed: null,
-        reason: 'epoch_changed',
-      });
+      // Reported already when the server said it could not recover.
+      const mark = this.unrecovered.get(topic);
+      if (!mark || !mark.reported || mark.epoch !== epoch) {
+        this.reportGap({
+          topic,
+          epoch,
+          fromOffset: null,
+          toOffset: null,
+          missed: null,
+          reason: 'epoch_changed',
+        });
+      }
+      this.unrecovered.delete(topic);
+    } else if (verdict === 'deliver') {
+      // In order after an unrecovered reply: nothing was missed after all.
+      this.unrecovered.delete(topic);
     }
 
     // The recovery anchor is the last DELIVERED position.
@@ -837,6 +952,13 @@ export class MessageProcessor {
     if (this.recoveryWindows.has(topic)) {
       await this.drainRecoveryBuffer(topic);
     }
+  }
+
+  /** True (once) when the server said it could not recover this topic's epoch. */
+  private takeUnrecovered(topic: string, epoch: string): boolean {
+    const mark = this.unrecovered.get(topic);
+    this.unrecovered.delete(topic);
+    return mark !== undefined && mark.epoch === epoch && !mark.reported;
   }
 
   /** Deliver held messages that are now in order. */
@@ -962,15 +1084,19 @@ export class MessageProcessor {
       const window = this.recoveryWindows.get(topic);
 
       if (info.recovered === false) {
-        // The server cannot replay (history evicted, epoch changed, no
-        // recovery requested): release what is held, then move the anchor
-        // forward to the server's position -- never backwards -- and report
-        // what was lost. The post-subscribe snapshot covers the state.
-        if (window) await this.flushRecoveryWindow(topic);
+        // Only the answer to this client's own recovery request says
+        // anything about its stream. A plain subscribe's reply (of a topic
+        // another component subscribed too) carries the server head, which
+        // runs ahead of the broadcasts still on their way: it never moves
+        // the anchor.
+        if (!window) continue;
+        // The server cannot replay (history evicted, epoch changed): release
+        // what is held. The anchor stays where delivery is, so nothing on its
+        // way is dropped as a duplicate; the next message shows what was
+        // missed, reported as not recovered.
+        await this.flushRecoveryWindow(topic);
         const position = this.sequencer.getTopicPosition(topic);
-        if (!position) {
-          this.setBaseline(topic, serverEpoch, serverOffset);
-        } else if (position.epoch !== serverEpoch) {
+        if (position && position.epoch !== serverEpoch) {
           this.reportGap({
             topic,
             epoch: serverEpoch,
@@ -979,17 +1105,9 @@ export class MessageProcessor {
             missed: null,
             reason: 'not_recovered',
           });
-          this.setBaseline(topic, serverEpoch, serverOffset);
-        } else if (serverOffset > position.offset) {
-          this.reportGap({
-            topic,
-            epoch: serverEpoch,
-            fromOffset: position.offset + 1,
-            toOffset: serverOffset,
-            missed: serverOffset - position.offset,
-            reason: 'not_recovered',
-          });
-          this.setBaseline(topic, serverEpoch, serverOffset);
+          this.unrecovered.set(topic, { epoch: serverEpoch, reported: true });
+        } else if (position) {
+          this.unrecovered.set(topic, { epoch: serverEpoch, reported: false });
         }
         continue;
       }
@@ -1018,6 +1136,7 @@ export class MessageProcessor {
   forgetTopics(topics: string[]): void {
     for (const topic of topics) {
       this.closeRecoveryWindow(topic);
+      this.unrecovered.delete(topic);
     }
     this.sequencer.clearTopics(topics);
     useWSEStore.getState().removeRecoveryTopics(topics);
@@ -1026,6 +1145,8 @@ export class MessageProcessor {
   /** The socket is gone: release held messages and drop undecryptable early frames. */
   handleConnectionClosed(): void {
     if (this.destroyed) return;
+    // The next connection's server names its own signing key.
+    this.serverSigningKid = null;
     void this.enqueueTask(async () => {
       this.earlyEncryptedFrames = [];
       for (const topic of [...this.recoveryWindows.keys()]) {
@@ -1432,7 +1553,9 @@ export class MessageProcessor {
 
     if (options.offline && this.offlineQueue?.isAvailable() && !cm?.isTransportReady()) {
       const queue = this.offlineQueue;
-      queue.enqueue(message, expiresAt).then(
+      // Written for the user of this page's last connection (or, before any,
+      // of this browser's): only that user's connection replays it.
+      queue.enqueue(message, expiresAt, this.userId ?? storedOwner()).then(
         (stored) => {
           if (!stored) this.enqueueInMemory(message, priority, expiresAt);
           else this.scheduleFlush(0);
@@ -1621,9 +1744,20 @@ export class MessageProcessor {
     const done: string[] = [];
     try {
       const nowMs = Date.now();
+      const user = this.userId;
+      let foreign = 0;
       for (const record of records) {
         if (this.destroyed || !cm.isTransportReady()) return true;
         if (isExpired(record.expiresAt, nowMs)) {
+          this.countDropped(1);
+          done.push(record.id);
+          continue;
+        }
+        // Written for another user: never sent on this user's connection.
+        // (A record without an owner was written before this browser ever
+        // connected, or by 2.x.)
+        if (user !== null && record.owner !== undefined && record.owner !== user) {
+          foreign++;
           this.countDropped(1);
           done.push(record.id);
           continue;
@@ -1643,8 +1777,11 @@ export class MessageProcessor {
         }
         return true;
       }
-      if (records.length > 0) {
-        logger.info(`Replayed ${records.length} offline message(s)`);
+      if (foreign > 0) {
+        logger.warn(`Dropped ${foreign} offline message(s) written for another user`);
+      }
+      if (records.length > foreign) {
+        logger.info(`Replayed ${records.length - foreign} offline message(s)`);
       }
       return false;
     } finally {
@@ -1753,6 +1890,7 @@ export class MessageProcessor {
       if (window.timer) clearTimeout(window.timer);
     }
     this.recoveryWindows.clear();
+    this.unrecovered.clear();
     this.earlyEncryptedFrames = [];
     this.clearHandlers();
     this.connectionManager = null;

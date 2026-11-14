@@ -122,6 +122,11 @@ class MessageCodec:
         self._server_keys = server_keys or ServerKeys(None)
         self._sequence = 0
 
+    @property
+    def server_keys(self) -> ServerKeys:
+        """The server signing keys signed messages are checked against."""
+        return self._server_keys
+
     def decode(self, data: str | bytes) -> WSEEvent | list[WSEEvent] | None:
         """Decode an incoming message from any wire format.
 

@@ -13,7 +13,15 @@ import {
   serverReadyMessage,
 } from './helpers.js';
 import { OfflineQueue } from '../services/OfflineQueue.js';
-import { acquireSession, getCurrentSession, makeSessionKey, wseActions } from '../services/WSESession.js';
+import {
+  acquireSession,
+  destroyCurrentSession,
+  getCurrentSession,
+  makeSessionKey,
+  wseActions,
+} from '../services/WSESession.js';
+import { useWSEStore } from '../stores/useWSEStore.js';
+import { ConnectionState } from '../types.js';
 
 const CONFIG = { enabled: true, maxSize: 100, maxAge: 3_600_000, persistToStorage: true };
 
@@ -120,5 +128,44 @@ describe('offline replay through the session', () => {
     });
     await vi.waitFor(() => expect(getCurrentSession()!.offlineQueue!.getStats().size).toBe(0));
     expect(await getCurrentSession()!.offlineQueue!.getAll()).toEqual([]);
+  });
+});
+
+describe('offline messages belong to their user', () => {
+  function start() {
+    acquireSession({
+      key: makeSessionKey('cookie', [ENDPOINT]),
+      auth: 'cookie',
+      initialTopics: [],
+      config: { endpoints: [ENDPOINT] },
+    });
+  }
+
+  it("never replays one user's messages on another user's connection", async () => {
+    // Alice connects once, then goes offline and sends.
+    start();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    await vi.waitFor(() => expect(getCurrentSession()!.offlineQueue?.isAvailable()).toBe(true));
+    const first = FakeWebSocket.last();
+    first.serverOpen();
+    first.serverSend(serverReadyMessage({ user_id: 'alice' }));
+    await vi.waitFor(() => expect(useWSEStore.getState().connectionState).toBe(ConnectionState.CONNECTED));
+    first.serverClose(1006);
+    await vi.waitFor(() => expect(useWSEStore.getState().connectionState).not.toBe(ConnectionState.CONNECTED));
+    expect(wseActions.sendMessage('transfer', { to: 'mallory' }, { offline: true })).toBe('queued');
+    await vi.waitFor(() => expect(getCurrentSession()!.getQueueSize()).toBe(1));
+
+    // A page reload: the module state is gone, IndexedDB and storage stay.
+    destroyCurrentSession({ clearUserData: false });
+    FakeWebSocket.reset();
+
+    // Bob's connection on the same browser does not send it.
+    start();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const bob = FakeWebSocket.last();
+    bob.serverOpen();
+    bob.serverSend(serverReadyMessage({ user_id: 'bob' }));
+    await vi.waitFor(() => expect(getCurrentSession()!.offlineQueue!.getStats().size).toBe(0));
+    expect(bob.appTextMessages().filter((m) => m.t === 'transfer')).toEqual([]);
   });
 });

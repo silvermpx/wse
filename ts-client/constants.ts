@@ -100,6 +100,8 @@ export const SUBSCRIPTION_STORAGE_KEY = `${STORAGE_KEY_PREFIX}subscriptions`;
 export const ENDPOINTS_STORAGE_KEY = `${STORAGE_KEY_PREFIX}endpoints`;
 export const METRICS_STORAGE_KEY = `${STORAGE_KEY_PREFIX}metrics`;
 export const DIAGNOSTICS_STORAGE_KEY = `${STORAGE_KEY_PREFIX}diagnostics`;
+/** The user the last connection of this browser belonged to (owner of offline messages). */
+export const OFFLINE_OWNER_STORAGE_KEY = `${STORAGE_KEY_PREFIX}offline_owner`;
 
 // ---------------------------------------------------------------------------
 // Default Topics

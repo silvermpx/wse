@@ -367,7 +367,8 @@ class SyncWSEClient:
     def on(
         self, event_type: str
     ) -> Callable[[Callable[[WSEEvent], Any]], Callable[[WSEEvent], Any]]:
-        """Decorator for event handlers (sync callbacks)."""
+        """Decorator to register a handler (a sync callback) for one event
+        type (the ``t`` of the messages, whatever topic they come on)."""
 
         def decorator(fn: Callable[[WSEEvent], Any]) -> Callable[[WSEEvent], Any]:
             self._handlers.setdefault(event_type, []).append(fn)

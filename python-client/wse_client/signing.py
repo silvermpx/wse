@@ -208,6 +208,10 @@ class ServerKeys:
     def __bool__(self) -> bool:
         return bool(self._keys)
 
+    def __contains__(self, kid: object) -> bool:
+        """Whether a pinned key has this id."""
+        return kid in self._keys
+
     def open(self, envelope: dict[str, Any]) -> tuple[dict[str, Any], SignatureProof]:
         """The body of a server-signed message and its proof.
 

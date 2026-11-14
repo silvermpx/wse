@@ -123,6 +123,15 @@ async def test_bad_frame_does_not_end_the_receive_loop() -> None:
     assert handled == ['{"t":"ok"}']
 
 
+def test_a_sealed_frame_keeps_the_connection_alive() -> None:
+    """Inside an E2E session the server's pings and PONGs come sealed, as
+    binary frames: they count for the idle watchdog like any other frame."""
+    conn = ConnectionManager("ws://localhost:5006/wse", on_message=lambda data: None)
+    conn._last_pong = 0.0
+    conn._handle_raw_message(b"E:" + b"\x00" * 40)
+    assert conn._last_pong > 0.0
+
+
 class TestBackoff:
     def test_exponential_never_overflows(self) -> None:
         """1.5 ** attempt overflowed after ~15 h of outage and killed

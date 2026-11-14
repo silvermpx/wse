@@ -543,9 +543,9 @@ export class WSESession {
       logger.error(`Refusing to sign ${type}: no security.signingKey`);
       return 'dropped';
     }
-    const audience = this.processor.getServerSigningKid();
+    const audience = await this.processor.signingAudience();
     if (!audience) {
-      logger.error(`Refusing to sign ${type}: the server has not named a signing key`);
+      logger.error(`Refusing to sign ${type}: the server has not named a signing key it may sign for`);
       return 'dropped';
     }
     this.signingKey ??= signingKeyFrom(keyPair);
@@ -557,8 +557,17 @@ export class WSESession {
       return 'dropped';
     }
     if (this.destroyed) return 'dropped';
+    // Signed for this server and valid for its signature window: it goes out
+    // on the live connection or not at all, never from a queue after a
+    // reconnect.
+    if (!this.connection?.isTransportReady()) {
+      logger.warn(`Signed ${type} not sent: no live connection`);
+      return 'dropped';
+    }
     const message: WSMessage = { ...envelope, p: undefined, id: generateId() };
-    return this.processor.enqueueOutgoing(message, options.priority ?? MessagePriority.NORMAL);
+    return this.processor.enqueueOutgoing(message, options.priority ?? MessagePriority.NORMAL, {
+      ttl: SIGNED_MESSAGE_TTL_MS,
+    });
   }
 
   forceReconnect(): void {
@@ -679,6 +688,8 @@ export class WSESession {
 // =============================================================================
 
 const OFFLINE_DB_NAME = 'wse_offline_queue';
+/** How long a signed message may wait behind older ones before it is stale. */
+const SIGNED_MESSAGE_TTL_MS = 10_000;
 
 let currentSession: WSESession | null = null;
 let pendingDestroy: ReturnType<typeof setTimeout> | null = null;

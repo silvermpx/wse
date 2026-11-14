@@ -371,3 +371,17 @@ class TestDisconnect:
             await asyncio.wait_for(done.wait(), timeout=3.0)
             await asyncio.wait_for(srv.connections[0].closed.wait(), timeout=2.0)
             assert client.state == ConnectionState.DISCONNECTED
+
+
+class TestReuse:
+    async def test_a_client_connects_again_after_disconnect(self):
+        async def on_connect(conn):
+            await push_event(conn, "hello")
+
+        async with FakeWSEServer(on_connect=on_connect) as srv:
+            client = make_client(srv.url)
+            for _ in range(2):
+                await client.connect()
+                assert (await client.recv(timeout=2.0)).type == "hello"
+                await client.disconnect()
+            assert len(srv.connections) == 2

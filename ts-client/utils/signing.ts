@@ -140,6 +140,11 @@ export class ServerSigningKeys {
     return this.keys.size > 0;
   }
 
+  /** Whether a pinned key has this id. */
+  has(kid: string): boolean {
+    return this.keys.has(kid);
+  }
+
   /**
    * The body of a server-signed message and its proof. Throws SignatureError
    * when it is malformed or, with pinned keys, when no pinned key has its id

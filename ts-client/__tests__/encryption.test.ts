@@ -299,7 +299,20 @@ describe('E2E sessions', () => {
     identity = await sessionIdentity();
   });
 
-  /** Answer client_hello like the server: server_hello with the signed e2e answer. */
+  /** A session opens first: the offer goes out at once, announced in the URL, before any server_ready. */
+  async function openSession(count = 1): Promise<{ ws: FakeWebSocket; hello: any }> {
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(count));
+    const ws = FakeWebSocket.last();
+    expect(new URL(ws.url).searchParams.get('e2e')).toBe('1');
+    ws.serverOpen();
+    await vi.waitFor(() => expect(ws.messagesOfType('client_hello')).toHaveLength(1));
+    return { ws, hello: ws.messagesOfType('client_hello')[0] };
+  }
+
+  /**
+   * Answer client_hello like the server: server_hello with the signed e2e
+   * answer, then server_ready sealed in the session.
+   */
   async function answer(ws: FakeWebSocket, hello: any, signer: SessionIdentity | null = identity, connectionId = 'conn-1') {
     const server = await sessionServer(hello.p.e2e, connectionId, signer);
     ws.serverSend(serverHelloMessage({
@@ -307,6 +320,7 @@ describe('E2E sessions', () => {
       connection_id: connectionId,
       e2e: server.hello,
     }));
+    ws.serverSend(await server.seal(JSON.stringify(serverReadyMessage({ connection_id: connectionId }))));
     return server;
   }
 
@@ -318,7 +332,7 @@ describe('E2E sessions', () => {
     }, ['prices']);
     expect(wseActions.sendMessage('order', { id: 1 })).toBe('queued');
 
-    const { ws, hello } = await openAndHello();
+    const { ws, hello } = await openSession();
     expect(hello.p.features.encryption).toBe(true);
     expect(hello.p.encryption_public_key).toBeUndefined();
     expect(hello.p.e2e.suites).toEqual(['p256-aes256gcm']);
@@ -346,7 +360,7 @@ describe('E2E sessions', () => {
 
   it('skips heartbeats while the handshake is in flight, then seals them', async () => {
     start({ security: pinned(), diagnostics: { healthCheckInterval: 1_000 } } as UseWSEConfig);
-    const { ws, hello } = await openAndHello();
+    const { ws, hello } = await openSession();
 
     // The server takes only sealed frames once it has answered client_hello.
     await new Promise((r) => setTimeout(r, 1_300));
@@ -363,7 +377,7 @@ describe('E2E sessions', () => {
     start({ security: pinned() });
     wseActions.sendMessage('order', { id: 1 });
 
-    const { ws, hello } = await openAndHello();
+    const { ws, hello } = await openSession();
     await answer(ws, hello, await sessionIdentity());
 
     await vi.waitFor(() => expect(useWSEStore.getState().connectionState).toBe(ConnectionState.ERROR));
@@ -379,7 +393,7 @@ describe('E2E sessions', () => {
   it('refuses an unsigned server when it pins a key', async () => {
     const failures = recordEvents('wseEncryptionFailed');
     start({ security: pinned() });
-    const { ws, hello } = await openAndHello();
+    const { ws, hello } = await openSession();
     await answer(ws, hello, null);
 
     await vi.waitFor(() => expect(failures).toHaveLength(1));
@@ -388,7 +402,7 @@ describe('E2E sessions', () => {
 
   it('takes an unsigned server only when told to', async () => {
     start({ security: { encryptionEnabled: true, unauthenticated: true } });
-    const { ws, hello } = await openAndHello();
+    const { ws, hello } = await openSession();
     const server = await answer(ws, hello, null);
 
     await vi.waitFor(() => expect(transportReady()).toBe(true));
@@ -411,7 +425,7 @@ describe('E2E sessions', () => {
       security: pinned(),
       registerHandlers: (p) => p.registerHandler('price_update', (m) => prices.push(m.o)),
     }, ['prices']);
-    const { ws, hello } = await openAndHello();
+    const { ws, hello } = await openSession();
     const server = await answer(ws, hello);
     await vi.waitFor(() => expect(transportReady()).toBe(true));
 
@@ -424,13 +438,57 @@ describe('E2E sessions', () => {
     expect(useWSEStore.getState().connectionState).toBe(ConnectionState.ERROR);
   });
 
+  it('ends the session on a plaintext frame, text or binary', async () => {
+    for (const forged of [
+      (m: object) => JSON.stringify(m),
+      (m: object) => new TextEncoder().encode(JSON.stringify(m)).buffer,
+    ]) {
+      resetClientState();
+      installFakeWebSocket();
+      const failures = recordEvents('wseEncryptionFailed');
+      const prices: number[] = [];
+      start({
+        security: pinned(),
+        registerHandlers: (p) => p.registerHandler('price_update', (m) => prices.push(m.o)),
+      }, ['prices']);
+      const { ws, hello } = await openSession();
+      const server = await answer(ws, hello);
+      await vi.waitFor(() => expect(transportReady()).toBe(true));
+
+      ws.serverSend(await server.seal(JSON.stringify(stamped('prices', 1))));
+      // Put in by whatever sits between client and server.
+      ws.serverSend(forged(stamped('prices', 2)) as any);
+
+      await vi.waitFor(() => expect(failures).toHaveLength(1));
+      expect(prices).toEqual([1]);
+      expect(useWSEStore.getState().connectionState).toBe(ConnectionState.ERROR);
+    }
+  });
+
+  it('ends the connection on plaintext data before the session', async () => {
+    const failures = recordEvents('wseEncryptionFailed');
+    const prices: number[] = [];
+    start({
+      security: pinned(),
+      registerHandlers: (p) => p.registerHandler('price_update', (m) => prices.push(m.o)),
+    }, ['prices']);
+    const { ws } = await openSession();
+    // A heartbeat and an error may come before; data may not.
+    ws.serverSend({ c: 'WSE', t: 'ping', p: { server_time: 1 }, v: 1 });
+    ws.serverSend(stamped('prices', 1));
+
+    await vi.waitFor(() => expect(failures).toHaveLength(1));
+    expect(prices).toEqual([]);
+    expect(useWSEStore.getState().connectionState).toBe(ConnectionState.ERROR);
+  });
+
   it('reads msgpack sealed in a frame', async () => {
     const ticks: number[] = [];
     start({
       security: pinned(),
       registerHandlers: (p) => p.registerHandler('tick', (m) => ticks.push(m.p.n)),
     });
-    const { ws, hello } = await openAndHello();
+    const { ws, hello } = await openSession();
     const server = await answer(ws, hello);
     await vi.waitFor(() => expect(transportReady()).toBe(true));
 
@@ -451,7 +509,7 @@ describe('E2E sessions', () => {
       maxMessageSize: 4_096,
       registerHandlers: (p) => p.registerHandler('tick', (m) => ticks.push(m.p.n)),
     });
-    const { ws, hello } = await openAndHello();
+    const { ws, hello } = await openSession();
     const server = await answer(ws, hello);
     await vi.waitFor(() => expect(transportReady()).toBe(true));
 
@@ -465,7 +523,7 @@ describe('E2E sessions', () => {
 
   it('starts a fresh session on every connection', async () => {
     start({ security: pinned(), reconnection: { baseDelay: 10, maxDelay: 20 } });
-    const first = await openAndHello();
+    const first = await openSession();
     const server1 = await answer(first.ws, first.hello);
     await vi.waitFor(() => expect(transportReady()).toBe(true));
     expect(wseActions.sendMessage('order', { id: 1 })).toBe('sent');
@@ -473,15 +531,10 @@ describe('E2E sessions', () => {
     await vi.waitFor(async () => expect((await sent1()).filter((m) => m.t === 'order').map((m) => m.p.id)).toEqual([1]));
 
     first.ws.serverClose(1001);
-    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
-    const ws2 = FakeWebSocket.last();
-    ws2.serverOpen();
-    ws2.serverSend(serverReadyMessage({ connection_id: 'conn-2' }));
+    const { ws: ws2, hello: hello2 } = await openSession(2);
     expect(wseActions.sendMessage('order', { id: 2 })).toBe('queued');
-    await vi.waitFor(() => expect(ws2.messagesOfType('client_hello')).toHaveLength(1));
     expect(ws2.binaryFrames()).toEqual([]);
 
-    const hello2 = ws2.messagesOfType('client_hello')[0];
     expect(hello2.p.e2e.client_public_key).not.toBe(first.hello.p.e2e.client_public_key);
     const server2 = await answer(ws2, hello2, identity, 'conn-2');
     const sent2 = sealedReader(ws2, server2);

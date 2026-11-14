@@ -556,7 +556,9 @@ export interface UseWSEReturn {
    * answers with a signed `receipt` message and hands the application the
    * proof. `nonce` is its unique id (an order id, say; random by default);
    * the receipt and a SIGNATURE_REFUSED error carry it as `n`. Signing is
-   * asynchronous: await it before sending what must follow it.
+   * asynchronous: await it before sending what must follow it. It is signed
+   * for this server and valid for its signature window, so it is never
+   * queued for a later connection: 'dropped' without a live connection.
    */
   sendSigned: (type: string, payload: any, options?: SignedMessageOptions) => Promise<SendStatus>;
   /** Connection metrics, refreshed at most once per second. */

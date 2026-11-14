@@ -221,3 +221,45 @@ class TestEncryptedMsgpack:
         event = codec.decode(frame)
         assert event is not None and event.type == "tick"
         assert event.payload == {"px": 1.5}
+
+
+class TestPlaintextInsideASession:
+    async def test_a_plaintext_frame_ends_the_session(self):
+        """After server_hello every frame is sealed: a plaintext one, text or
+        binary, was put in on the way and ends the connection."""
+        for frame in (
+            '{"c":"U","t":"tick","p":{"n":1}}',
+            b'{"c":"U","t":"tick","p":{"n":1}}',
+        ):
+            client = AsyncWSEClient(
+                "ws://127.0.0.1:9/wse", encryption=True, e2e_unauthenticated=True
+            )
+            client._security._session = object()  # a live session
+            client._on_raw_message(frame)
+            assert isinstance(client._encryption_error, WSEEncryptionError)
+            await client.disconnect()
+
+    async def test_only_the_handshake_comes_unsealed_before_the_session(self):
+        client = AsyncWSEClient(
+            "ws://127.0.0.1:9/wse", encryption=True, e2e_unauthenticated=True
+        )
+        assert client._connection._query_params == {"e2e": "1"}
+        client._on_raw_message('{"c":"WSE","t":"ping","p":{"server_time":1}}')
+        assert client._encryption_error is None
+        client._on_raw_message('{"c":"U","t":"balance","p":{"iban":"DE89"}}')
+        assert isinstance(client._encryption_error, WSEEncryptionError)
+        assert "before the session" in str(client._encryption_error)
+        await client.disconnect()
+
+    async def test_an_unsealed_heartbeat_is_no_sign_of_life(self):
+        """An injected PONG must not hide a session that stopped delivering."""
+        client = AsyncWSEClient(
+            "ws://127.0.0.1:9/wse", encryption=True, e2e_unauthenticated=True
+        )
+        client._security._session = object()  # a live session
+        conn = client._connection
+        conn._last_pong = 0.0
+        conn._handle_raw_message("PONG:123")
+        assert conn._last_pong == 0.0
+        assert isinstance(client._encryption_error, WSEEncryptionError)
+        await client.disconnect()

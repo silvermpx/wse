@@ -576,14 +576,26 @@ class ConnectionManager:
 
     def _handle_raw_message(self, data: str | bytes) -> None:
         """Quick-check for PONG / PING at transport level, then forward."""
+        security = self._security
+        if (
+            security is not None
+            and security.session_mode
+            and not (isinstance(data, bytes) and data[:2] == PREFIX_ENCRYPTED)
+        ):
+            # E2E: the client judges what comes unsealed, and it is no sign
+            # of life (an injected heartbeat must not hide a stalled session).
+            if self._on_message:
+                self._on_message(data)
+            return
+        # Any frame shows the connection is alive: inside an E2E session the
+        # server's pings and PONGs come sealed, as binary frames.
+        self._last_pong = time.monotonic()
         if isinstance(data, str):
             # PONG handling (response to our PING)
             if data.startswith("WSE:PONG:"):
-                self._last_pong = time.monotonic()
                 self._record_pong_latency(data[9:])
                 return
             if data.startswith("PONG:"):
-                self._last_pong = time.monotonic()
                 self._record_pong_latency(data[5:])
                 return
 
@@ -591,12 +603,10 @@ class ConnectionManager:
             if data.startswith("WSE:PING:"):
                 ts = data[9:]  # skip "WSE:PING:"
                 self._fire_task(self._send_pong(ts))
-                self._last_pong = time.monotonic()
                 return
             if data.startswith("PING:"):
                 ts = data[5:]  # skip "PING:"
                 self._fire_task(self._send_pong(ts))
-                self._last_pong = time.monotonic()
                 return
 
             # PONG message (JSON with c field from Rust server)
@@ -604,7 +614,6 @@ class ConnectionManager:
             # Only match top-level "t" field (first ~20 chars), not nested payloads
             data_start = data[:25]
             if '"t":"PONG"' in data_start or '"t": "PONG"' in data_start:
-                self._last_pong = time.monotonic()
                 if self._on_message:
                     self._on_message(data)
                 return
@@ -617,7 +626,6 @@ class ConnectionManager:
                 or '"t": "ping"' in data_start
             ):
                 self._fire_task(self._respond_ping_json(data))
-                self._last_pong = time.monotonic()
                 return
 
         # Forward to client

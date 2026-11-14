@@ -167,7 +167,7 @@ class TestNoBlackout:
 
     async def test_disconnect_delivers_held_messages(self):
         c = make_client(timeout=5.0)
-        c._connection.destroy = AsyncMock()
+        c._connection.disconnect = AsyncMock()
         c._on_raw_message(stamped(1))
         c._on_raw_message(stamped(4))
         await c.disconnect()

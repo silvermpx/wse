@@ -403,6 +403,7 @@ def _mock_client(**kwargs):
     c._connection.state = ConnectionState.CONNECTED
     c._connection.send = AsyncMock(return_value=True)
     c._connection.destroy = AsyncMock()
+    c._connection.disconnect = AsyncMock()
     c._connection._pool = None
     return c
 
@@ -557,7 +558,7 @@ class TestDisconnectFromHandler:
 
         c._dispatch_event(WSEEvent(type="shutdown", payload={}))
         await asyncio.wait_for(finished.wait(), timeout=2.0)
-        c._connection.destroy.assert_awaited_once()
+        c._connection.disconnect.assert_awaited_once()
 
 
 class TestIterationEnd:

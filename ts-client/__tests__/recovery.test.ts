@@ -237,7 +237,7 @@ describe('recovery after a reconnect', () => {
     expect(ws3.messagesOfType('subscription_update')[0].p.recovery).toEqual({ prices: { epoch: EPOCH, offset: 3 } });
   });
 
-  it('a recovered:false reply releases held messages and re-baselines forward with a gap event', async () => {
+  it('a recovered:false reply keeps the anchor; the next message reports what was not recovered', async () => {
     start();
     await tick();
     const ws1 = FakeWebSocket.last();
@@ -246,13 +246,44 @@ describe('recovery after a reconnect', () => {
 
     const ws2 = await reconnect(ws1);
     await send(ws2, recoveryReply('prices', 10, false));
-    expect(gaps).toEqual([{
-      topic: 'prices', epoch: EPOCH, fromOffset: 4, toOffset: 10, missed: 7, reason: 'not_recovered',
-    }]);
+    expect(gaps).toEqual([]);
 
     await send(ws2, stamped('prices', 11));
     expect(offsets()).toEqual([1, 2, 3, 11]);
-    expect(gaps).toHaveLength(1);
+    expect(gaps).toEqual([{
+      topic: 'prices', epoch: EPOCH, fromOffset: 4, toOffset: 10, missed: 7, reason: 'not_recovered',
+    }]);
+  });
+
+  it('a recovered:false reply to another epoch reports it once', async () => {
+    start();
+    await tick();
+    const ws1 = FakeWebSocket.last();
+    await connectServer(ws1);
+    await send(ws1, stamped('prices', 1));
+
+    const ws2 = await reconnect(ws1);
+    await send(ws2, recoveryReply('prices', 5, false, '0000000b'));
+    await send(ws2, { ...stamped('prices', 6), e: '0000000b' });
+    expect(offsets()).toEqual([1, 6]);
+    expect(gaps).toEqual([{
+      topic: 'prices', epoch: '0000000b', fromOffset: null, toOffset: null, missed: null, reason: 'not_recovered',
+    }]);
+  });
+
+  it("a plain subscribe's reply never drops what is still on its way", async () => {
+    start();
+    await tick();
+    const ws = FakeWebSocket.last();
+    await connectServer(ws);
+    await send(ws, stamped('prices', 1), stamped('prices', 2));
+
+    // Another component subscribes to the same topic: the reply carries the
+    // server head and overtakes broadcasts queued before it.
+    await send(ws, recoveryReply('prices', 9, false));
+    await send(ws, stamped('prices', 3), stamped('prices', 4));
+    expect(offsets()).toEqual([1, 2, 3, 4]);
+    expect(gaps).toEqual([]);
   });
 });
 

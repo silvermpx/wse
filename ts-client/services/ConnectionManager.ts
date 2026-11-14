@@ -298,6 +298,8 @@ export class ConnectionManager {
     url.searchParams.set('compression', String(this.compressionEnabled && this.compressionThreshold > 0));
     url.searchParams.set('encryption', String(this.encryptionRequired));
     if (this.msgpack) url.searchParams.set('format', 'msgpack');
+    // An E2E session is opened first: the server holds everything back until then.
+    if (this.encryptionRequired && securityManager.isSessionMode()) url.searchParams.set('e2e', '1');
     return url.toString();
   }
 
@@ -415,6 +417,14 @@ export class ConnectionManager {
     this.startServerReadyTimer();
 
     logger.info(`[ConnectionManager] Connected to ${endpoint} in ${connectMs}ms`);
+
+    // An E2E session comes first: the offer goes out now, server_ready
+    // follows the session, sealed.
+    if (this.encryptionRequired && securityManager.isSessionMode()) {
+      this.encryptionState = 'pending';
+      this.startEncryptionTimer();
+      void this.sendClientHello();
+    }
   }
 
   /** The current socket is gone (close event, timeout, idle watchdog). */
@@ -1113,7 +1123,9 @@ export class ConnectionManager {
 
     logger.info('[ConnectionManager] Server ready');
 
-    if (this.encryptionRequired) {
+    // The first design exchanges keys after server_ready; a session was
+    // opened before it (handleOpen).
+    if (this.encryptionRequired && !securityManager.isSessionMode()) {
       this.encryptionState = 'pending';
       this.startEncryptionTimer();
     }
@@ -1127,7 +1139,7 @@ export class ConnectionManager {
       }
     }
 
-    if (!this.encryptionRequired) {
+    if (!this.encryptionRequired || this.encryptionState === 'ready') {
       this.notifyTransportReady();
     }
   }
@@ -1272,7 +1284,8 @@ export class ConnectionManager {
       encryptionAlgorithm: 'AES-GCM-256',
     });
     logger.info('[ConnectionManager] E2E encryption established');
-    this.notifyTransportReady();
+    // In a session server_ready follows, sealed: ready then.
+    if (this.serverReady) this.notifyTransportReady();
   }
 
   /**

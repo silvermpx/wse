@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 from uuid import uuid4
@@ -106,6 +107,35 @@ class _GapState:
     in_flight: bool = False  # a recovery request is out, no reply yet
     requested_from: int | None = None  # anchor offset of the last request
     answered: bool = False  # some reply for this topic arrived
+
+
+_HANDSHAKE_TYPES = frozenset({"server_hello", "error", "ping", "PING", "pong", "PONG"})
+
+
+def _handshake_frame(data: str | bytes) -> bool:
+    """A frame that may come unsealed before an E2E session: the answer to
+    the offer, an error, a heartbeat."""
+    if isinstance(data, bytes):
+        try:
+            data = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+    if data.startswith(("PING:", "PONG:", "WSE:PING:", "WSE:PONG:")):
+        return True
+    text = data[3:] if data.startswith("WSE{") else data
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return False
+    return isinstance(parsed, dict) and parsed.get("t") in _HANDSHAKE_TYPES
+
+
+def _sends_server_ready(version: object) -> bool:
+    """A server of 3.0 or later: it always sends server_ready."""
+    if not isinstance(version, str):
+        return False
+    major = version.split(".", 1)[0]
+    return major.isdigit() and int(major) >= 3
 
 
 def _resolve(fut: asyncio.Future[None] | None) -> None:
@@ -327,6 +357,14 @@ class AsyncWSEClient:
         # Reconnect config for later use
         self._reconnect_cfg = reconnect
 
+        # The upgrade asks for msgpack, and announces an E2E session: the
+        # server then holds everything back until the session exists.
+        query: dict[str, str] = {}
+        if wire_format == "msgpack":
+            query["format"] = "msgpack"
+        if self._security is not None and self._security.session_mode:
+            query["e2e"] = "1"
+
         # Connection manager
         self._connection = ConnectionManager(
             url,
@@ -342,7 +380,7 @@ class AsyncWSEClient:
             endpoints=endpoints,
             load_balancing=load_balancing,
             max_message_size=max_message_size,
-            query_params={"format": "msgpack"} if wire_format == "msgpack" else None,
+            query_params=query or None,
         )
 
         self._connection._on_pong = self._on_transport_pong
@@ -420,11 +458,11 @@ class AsyncWSEClient:
         """Connect and complete the handshake.
 
         Returns once the server confirmed the connection with
-        ``server_ready`` or ``server_hello`` (with ``encryption=True``: once
-        the key exchange completed), then subscribes the initial *topics*.
-        If neither arrives within 10 s the client proceeds anyway (for
-        servers whose application never sends ``server_ready``) -- except
-        with encryption, which then fails closed.
+        ``server_ready`` (from a server before 3.0, ``server_hello`` will do;
+        with ``encryption=True``: once the key exchange completed too), then
+        subscribes the initial *topics*. If neither arrives within 10 s the
+        client proceeds anyway (for servers whose application never sends
+        ``server_ready``) -- except with encryption, which then fails closed.
 
         Raises:
             WSEAuthError: The server rejected the credentials (close
@@ -451,7 +489,8 @@ class AsyncWSEClient:
             self._subscribed_topics.update(self._initial_topics)
 
     async def disconnect(self) -> None:
-        """Disconnect gracefully. Iteration ends after the queued events."""
+        """Disconnect gracefully. Iteration ends after the queued events;
+        nothing reconnects until :meth:`connect` is called again."""
         # Never cancel the calling task: an async handler (a background task)
         # may await disconnect() itself, and cancelling it would abort the
         # teardown half way and leave the socket open.
@@ -470,7 +509,8 @@ class AsyncWSEClient:
 
         # Signal iterator to stop (drop oldest if queue is full)
         self._push_stream_end(_StreamEnd(None))
-        await self._connection.destroy()
+        # Closed, not destroyed: connect() may open the client again.
+        await self._connection.disconnect()
 
     async def close(self) -> None:
         """Alias for disconnect."""
@@ -570,7 +610,9 @@ class AsyncWSEClient:
             ``SendResult.SENT`` when it went out; ``SendResult.QUEUED`` when
             it is held by the offline queue (``offline_queue=True``) for the
             next reconnect; ``SendResult.FAILED`` (falsy) when it was neither
-            sent nor queued (not connected, rate limited).
+            sent nor queued (not connected, rate limited). A signed message is
+            never queued: it is signed for this server and valid for its
+            signature window, so without a connection it fails.
 
         Raises:
             WSEEncryptionError: ``encryption=True`` and the key exchange of
@@ -596,7 +638,7 @@ class AsyncWSEClient:
                 correlation_id=correlation_id,
             )
         return await self._send_app_frame(
-            encoded, priority=priority, msg_type=type, allow_queue=True
+            encoded, priority=priority, msg_type=type, allow_queue=not signed
         )
 
     async def send_with_retry(
@@ -890,17 +932,18 @@ class AsyncWSEClient:
     def on(
         self, event_type: str
     ) -> Callable[[EventHandler | AsyncEventHandler], EventHandler | AsyncEventHandler]:
-        """Decorator to register an event handler for a specific topic.
+        """Decorator to register a handler for one event type (the ``t``
+        of the messages, whatever topic they come on).
 
         Args:
-            event_type: Event type to listen for, e.g. ``"notifications"``.
+            event_type: Event type to listen for, e.g. ``"notification"``.
 
         Returns:
             Decorator that registers the function.
 
         Example::
 
-            @client.on("notifications")
+            @client.on("notification")
             async def handle(event: WSEEvent):
                 print(event.payload)
         """
@@ -1038,6 +1081,8 @@ class AsyncWSEClient:
         self._server_ready_event.clear()
         self._server_hello_seen = False
         self._server_recovery_enabled = False
+        # The server of this connection names its own signing key.
+        self._server_signing_kid = None
         self._encryption_error = None
         self._recovery_requests.clear()
         self._unrecoverable.clear()
@@ -1343,8 +1388,28 @@ class AsyncWSEClient:
         else:
             self._stats.bytes_received += len(data.encode("utf-8"))
 
-        result = self._codec.decode(data)
         security = self._security
+        if (
+            security is not None
+            and security.session_mode
+            and not (isinstance(data, bytes) and data[:2] == b"E:")
+        ):
+            # An E2E session is opened first and then every frame is sealed:
+            # unsealed come only the server's answer to the offer, an error
+            # and heartbeats before it. Anything else was put in by whatever
+            # sits between client and server.
+            if security.is_enabled:
+                reason = "a plaintext frame inside the session"
+            elif _handshake_frame(data):
+                reason = None
+            else:
+                reason = "a plaintext frame before the session"
+            if reason is not None:
+                self._start_encryption_failure(
+                    WSEEncryptionError(f"E2E frame refused: {reason}")
+                )
+                return
+        result = self._codec.decode(data)
         if security is not None and security.broken is not None:
             # A frame out of order or forged: the session cannot go on.
             self._start_encryption_failure(
@@ -1689,9 +1754,7 @@ class AsyncWSEClient:
         if not isinstance(details, dict):
             details = {}
         conn_id = payload.get("connection_id") or details.get("connection_id")
-        signing = details.get("signing")
-        if isinstance(signing, dict) and isinstance(signing.get("kid"), str):
-            self._server_signing_kid = signing["kid"]
+        self._take_signing_kid(details.get("signing"), sealed=True)
         self._connection.handle_server_ready(
             conn_id if isinstance(conn_id, str) else None
         )
@@ -1739,10 +1802,11 @@ class AsyncWSEClient:
 
         if features.get("recovery"):
             self._server_recovery_enabled = True
-        signing = p.get("signing")
-        if isinstance(signing, dict) and isinstance(signing.get("kid"), str):
-            self._server_signing_kid = signing["kid"]
-        self._server_hello_seen = True
+        self._take_signing_kid(p.get("signing"), sealed=False)
+        # A 3.x server always sends server_ready (at once with jwt_secret,
+        # from accept_connection() without), and takes nothing before it:
+        # only an older server's server_hello completes the handshake.
+        self._server_hello_seen = not _sends_server_ready(p.get("server_version"))
 
         # Complete the ECDH key exchange -- or fail closed.
         security = self._security
@@ -1764,6 +1828,25 @@ class AsyncWSEClient:
             list(self._server_features.keys()),
         )
         self._maybe_complete_handshake()
+
+    def _take_signing_kid(self, signing: Any, *, sealed: bool) -> None:
+        """The server's signing key id, the audience of what this client
+        signs. In an E2E session only the sealed server_ready names it; with
+        pinned server signing keys it must be one of them."""
+        if not isinstance(signing, dict) or not isinstance(signing.get("kid"), str):
+            return
+        security = self._security
+        if not sealed and security is not None and security.session_mode:
+            return  # server_hello is not sealed: server_ready says it
+        kid = signing["kid"]
+        pinned = self._codec.server_keys
+        if pinned and kid not in pinned:
+            logger.warning(
+                "The server names signing key %s, which is not pinned; not signing", kid
+            )
+            self._server_signing_kid = None
+            return
+        self._server_signing_kid = kid
 
     def _start_encryption_failure(self, err: WSEEncryptionError) -> None:
         """Fail closed: never fall back to plaintext, end the client."""
