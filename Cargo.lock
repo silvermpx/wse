@@ -2066,6 +2066,7 @@ dependencies = [
  "fastrand",
  "flate2",
  "futures-util",
+ "memchr",
  "rmp",
  "rmp-serde",
  "rustls",

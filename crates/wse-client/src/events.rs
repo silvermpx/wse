@@ -98,10 +98,15 @@ impl Handler for Queue {
     }
 
     async fn ready(&mut self) {
-        while let Some(item) = self.waiting.pop_front() {
-            if self.tx.send(item).await.is_err() {
+        // Room first, then the item: dropped while it waits, nothing is
+        // lost.
+        while !self.waiting.is_empty() {
+            let Ok(permit) = self.tx.reserve().await else {
                 self.waiting.clear();
                 return;
+            };
+            if let Some(item) = self.waiting.pop_front() {
+                permit.send(item);
             }
         }
     }

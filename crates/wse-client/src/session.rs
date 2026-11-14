@@ -1194,4 +1194,66 @@ mod tests {
         assert_eq!(hello["t"], "client_hello");
         assert_eq!(hello["p"]["features"]["compression"], true);
     }
+
+    /// What reading a topic message costs, frames apart: run with
+    /// `cargo test --release -p wse-client --lib -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn the_cost_of_a_message() {
+        #[derive(serde::Deserialize)]
+        struct Tick<'a> {
+            #[serde(borrow)]
+            symbol: &'a str,
+            price: f64,
+        }
+        struct Decode(f64);
+        impl Handler for Decode {
+            fn message(&mut self, message: &Message<'_>) {
+                if message.kind() == "tick" {
+                    let tick: Tick<'_> = message.payload().unwrap();
+                    self.0 += tick.price + tick.symbol.len() as f64;
+                }
+            }
+        }
+        let n = 1_000_000u64;
+        let frames: Vec<String> = (1..=n)
+            .map(|o| {
+                format!(
+                    r#"{{"tp":"bench","e":"0000abcd","o":{o},"t":"tick","p":{{"symbol":"BTCUSDT","price":67012.5,"qty":0.0125,"side":"buy","ts":1794600000000}}}}"#
+                )
+            })
+            .collect();
+        let shared = Arc::new(Shared {
+            ready: AtomicBool::new(false),
+            connection: Mutex::new(None),
+            token: Mutex::new(None),
+            server_kid: Mutex::new(None),
+        });
+        let keys = Arc::new(Keys::from_config(&crate::Config::new("ws://x")).unwrap());
+        let mut s = Session::new(Decode(0.0), shared, keys, &[], Duration::from_secs(3));
+        s.open(None);
+        let started = std::time::Instant::now();
+        for frame in &frames {
+            s.on_json(frame, None);
+        }
+        let all = started.elapsed().as_nanos() as f64 / n as f64;
+        // The envelope alone.
+        let started = std::time::Instant::now();
+        let mut kinds = 0usize;
+        for frame in &frames {
+            kinds += decode::json_envelope(frame).unwrap().t.unwrap().len();
+        }
+        let envelope = started.elapsed().as_nanos() as f64 / n as f64;
+        // A whole serde_json::Value, as a typical client reads it.
+        let started = std::time::Instant::now();
+        for frame in &frames {
+            let value: serde_json::Value = serde_json::from_str(frame).unwrap();
+            kinds += value["t"].as_str().unwrap().len();
+        }
+        let value = started.elapsed().as_nanos() as f64 / n as f64;
+        println!(
+            "per message: session {all:.0} ns (envelope {envelope:.0} ns); a serde_json::Value {value:.0} ns [{kinds} {}]",
+            s.handler.0
+        );
+    }
 }

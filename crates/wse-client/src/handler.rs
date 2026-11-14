@@ -32,7 +32,8 @@ pub trait Handler: Send + 'static {
 
     /// Called before each frame is read. Waiting here holds the server back
     /// while the application catches up; the heartbeat and sends go on
-    /// meanwhile.
+    /// meanwhile, and the wait may be dropped for them and begun again: it
+    /// must lose nothing when dropped.
     fn ready(&mut self) -> impl Future<Output = ()> + Send {
         std::future::ready(())
     }

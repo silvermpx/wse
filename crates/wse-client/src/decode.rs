@@ -193,6 +193,14 @@ pub(crate) fn json_envelope(text: &str) -> Result<Envelope<'_>, Dropped> {
         .or_else(|| text.strip_prefix('U'))
         .filter(|rest| rest.starts_with('{'))
         .unwrap_or(text);
+    match crate::scan::envelope(text) {
+        Some(envelope) => Ok(envelope),
+        None => json_envelope_full(text),
+    }
+}
+
+/// A JSON message's fields, read by the full parser.
+pub(crate) fn json_envelope_full(text: &str) -> Result<Envelope<'_>, Dropped> {
     let mut de = serde_json::Deserializer::from_str(text);
     let envelope = de.deserialize_map(EnvelopeVisitor).map_err(Dropped::Json)?;
     de.end().map_err(Dropped::Json)?;
@@ -211,7 +219,7 @@ pub(crate) fn json_batch(payload: &str) -> Option<Vec<&str>> {
         .map(|batch| batch.messages.into_iter().map(RawValue::get).collect())
 }
 
-enum Field {
+pub(crate) enum Field {
     T,
     P,
     C,
@@ -230,7 +238,7 @@ enum Field {
 }
 
 impl Field {
-    fn of(name: &str) -> Self {
+    pub(crate) fn of(name: &str) -> Self {
         match name {
             "t" | "type" => Self::T,
             "p" | "payload" => Self::P,

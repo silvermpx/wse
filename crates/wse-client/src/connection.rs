@@ -33,6 +33,8 @@ const CLOSE_E2E_UNSUPPORTED: u16 = 4800;
 const AUTH_ATTEMPTS: u32 = 3;
 /// Messages the application queued that go out in one write.
 const SEND_BATCH: usize = 256;
+/// Frames read in one go when they came together.
+const READ_BATCH: usize = 64;
 
 /// How a connection ended.
 enum Lost {
@@ -94,9 +96,27 @@ impl<H: Handler> Driver<H> {
     pub(crate) async fn run(mut self, first: oneshot::Sender<Result<(), Error>>) {
         let mut first = Some(first);
         let end = loop {
-            let lost = match self.connect().await {
-                Ok(ws) => self.serve(ws, &mut first).await,
-                Err(error) => Lost::Failed(error),
+            // The attempt goes on while the application asks for things; a
+            // close ends it at once.
+            let attempt = {
+                let opening = open_socket(&self.config, &self.shared, &self.keys);
+                tokio::pin!(opening);
+                loop {
+                    tokio::select! {
+                        result = &mut opening => break Some(result),
+                        control = self.control.recv() => match control {
+                            None | Some(Control::Close) => break None,
+                            Some(Control::Reconnect) => {}
+                            Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
+                            Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
+                        },
+                    }
+                }
+            };
+            let lost = match attempt {
+                None => Lost::Shutdown,
+                Some(Ok(ws)) => self.serve(ws, &mut first).await,
+                Some(Err(error)) => Lost::Failed(error),
             };
             self.session.close();
             // Messages queued for the lost connection go with it.
@@ -187,62 +207,6 @@ impl<H: Handler> Driver<H> {
         }
     }
 
-    /// Opens the socket and upgrades it.
-    async fn connect(&mut self) -> Result<Ws, Error> {
-        let token = match &self.config.token_provider {
-            Some(provider) => {
-                let token = provider
-                    .token()
-                    .await
-                    .map_err(|e| Error::Connect(format!("token provider: {e}")))?;
-                Some(token)
-            }
-            None => self.shared.token.lock().ok().and_then(|t| t.clone()),
-        };
-        let request = self.config.request(token.as_deref(), self.keys.e2e)?;
-        let mut ws_config = WebSocketConfig::default();
-        ws_config.max_message_size = Some(self.config.max_message_size + 16);
-        ws_config.max_frame_size = Some(self.config.max_message_size + 16);
-        #[cfg(feature = "aws-lc")]
-        let open = tokio_tungstenite::connect_async_tls_with_config(
-            request,
-            Some(ws_config),
-            true,
-            self.tls(),
-        );
-        #[cfg(not(feature = "aws-lc"))]
-        let open = tokio_tungstenite::connect_async_with_config(request, Some(ws_config), true);
-        match tokio::time::timeout(self.config.connect_timeout, open).await {
-            Err(_) => Err(Error::Timeout(format!(
-                "no upgrade within {:?}",
-                self.config.connect_timeout
-            ))),
-            Ok(Err(tungstenite::Error::Http(response))) => {
-                let status = response.status().as_u16();
-                if status == 401 || status == 403 {
-                    Err(Error::Auth(format!(
-                        "the upgrade was refused with HTTP {status}"
-                    )))
-                } else {
-                    Err(Error::Connect(format!(
-                        "the upgrade was refused with HTTP {status}"
-                    )))
-                }
-            }
-            Ok(Err(e)) => Err(Error::Connect(e.to_string())),
-            Ok(Ok((ws, _))) => Ok(ws),
-        }
-    }
-
-    #[cfg(feature = "aws-lc")]
-    fn tls(&self) -> Option<tokio_tungstenite::Connector> {
-        if !self.config.url.starts_with("wss://") {
-            return None;
-        }
-        let config = self.config.tls.clone().unwrap_or_else(default_tls);
-        Some(tokio_tungstenite::Connector::Rustls(config))
-    }
-
     /// One connection, until it ends.
     async fn serve(
         &mut self,
@@ -292,15 +256,13 @@ impl<H: Handler> Driver<H> {
             };
 
             tokio::select! {
-                frame = read(&mut self.session.handler, &mut ws) => match frame {
-                    Some(Ok(frame)) => {
-                        // In an end-to-end session only sealed frames show
-                        // the server is alive.
-                        if self.session.sealing.is_none() {
-                            last_seen = Instant::now();
-                        }
+                frame = read(&mut self.session.handler, &mut ws) => {
+                    // What already came is read in one go, up to a batch.
+                    let mut frame = frame;
+                    let mut alive = false;
+                    for _ in 0..READ_BATCH {
                         match frame {
-                            Frame::Close(close) => {
+                            Some(Ok(Frame::Close(close))) => {
                                 // tungstenite queued the answer: send it.
                                 let _ = ws.flush().await;
                                 let (code, reason) = close.map_or((None, String::new()), |c| {
@@ -308,17 +270,39 @@ impl<H: Handler> Driver<H> {
                                 });
                                 return Lost::Closed { code, reason };
                             }
-                            Frame::Ping(_) => flush = true,
-                            frame => {
-                                if self.on_frame(frame) {
-                                    last_seen = Instant::now();
-                                }
+                            Some(Ok(Frame::Ping(_))) => {
+                                flush = true;
+                                // In an end-to-end session only sealed
+                                // frames show the server is alive.
+                                alive |= self.session.sealing.is_none();
+                            }
+                            Some(Ok(frame)) => alive |= self.on_frame(frame),
+                            Some(Err(e)) => {
+                                return Lost::Closed { code: None, reason: e.to_string() };
+                            }
+                            None => {
+                                return Lost::Closed {
+                                    code: None,
+                                    reason: "connection closed".to_owned(),
+                                };
                             }
                         }
+                        // What the frame asked for goes out first.
+                        if !self.session.outbox.is_empty()
+                            || self.session.fatal.is_some()
+                            || self.session.became_ready
+                        {
+                            break;
+                        }
+                        match poll_once(read(&mut self.session.handler, &mut ws)).await {
+                            Some(next) => frame = next,
+                            None => break,
+                        }
                     }
-                    Some(Err(e)) => return Lost::Closed { code: None, reason: e.to_string() },
-                    None => return Lost::Closed { code: None, reason: "connection closed".to_owned() },
-                },
+                    if alive {
+                        last_seen = Instant::now();
+                    }
+                }
                 Some(text) = self.frames.recv(), if self.session.ready => {
                     self.session.outbox.push(Outgoing::Text(text));
                     for _ in 1..SEND_BATCH {
@@ -478,6 +462,62 @@ impl<H: Handler> Driver<H> {
     }
 }
 
+/// Opens the socket and upgrades it.
+async fn open_socket(config: &Config, shared: &Shared, keys: &Keys) -> Result<Ws, Error> {
+    let token = match &config.token_provider {
+        Some(provider) => {
+            let token = provider
+                .token()
+                .await
+                .map_err(|e| Error::Connect(format!("token provider: {e}")))?;
+            Some(token)
+        }
+        None => shared.token.lock().ok().and_then(|t| t.clone()),
+    };
+    let request = config.request(token.as_deref(), keys.e2e)?;
+    let mut ws_config = WebSocketConfig::default();
+    ws_config.max_message_size = Some(config.max_message_size + 16);
+    ws_config.max_frame_size = Some(config.max_message_size + 16);
+    #[cfg(feature = "aws-lc")]
+    let open = tokio_tungstenite::connect_async_tls_with_config(
+        request,
+        Some(ws_config),
+        true,
+        tls(config),
+    );
+    #[cfg(not(feature = "aws-lc"))]
+    let open = tokio_tungstenite::connect_async_with_config(request, Some(ws_config), true);
+    match tokio::time::timeout(config.connect_timeout, open).await {
+        Err(_) => Err(Error::Timeout(format!(
+            "no upgrade within {:?}",
+            config.connect_timeout
+        ))),
+        Ok(Err(tungstenite::Error::Http(response))) => {
+            let status = response.status().as_u16();
+            if status == 401 || status == 403 {
+                Err(Error::Auth(format!(
+                    "the upgrade was refused with HTTP {status}"
+                )))
+            } else {
+                Err(Error::Connect(format!(
+                    "the upgrade was refused with HTTP {status}"
+                )))
+            }
+        }
+        Ok(Err(e)) => Err(Error::Connect(e.to_string())),
+        Ok(Ok((ws, _))) => Ok(ws),
+    }
+}
+
+#[cfg(feature = "aws-lc")]
+fn tls(config: &Config) -> Option<tokio_tungstenite::Connector> {
+    if !config.url.starts_with("wss://") {
+        return None;
+    }
+    let tls = config.tls.clone().unwrap_or_else(default_tls);
+    Some(tokio_tungstenite::Connector::Rustls(tls))
+}
+
 /// The next frame, once the handler is ready for it.
 async fn read<H: Handler>(
     handler: &mut H,
@@ -485,6 +525,17 @@ async fn read<H: Handler>(
 ) -> Option<Result<Frame, tungstenite::Error>> {
     handler.ready().await;
     ws.next().await
+}
+
+/// `future` polled once: its output, or `None` (and it dropped) when it is
+/// not ready.
+async fn poll_once<F: std::future::Future>(future: F) -> Option<F::Output> {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| match future.as_mut().poll(cx) {
+        std::task::Poll::Ready(output) => std::task::Poll::Ready(Some(output)),
+        std::task::Poll::Pending => std::task::Poll::Ready(None),
+    })
+    .await
 }
 
 async fn sleep_until(deadline: Option<Instant>) {
@@ -517,6 +568,9 @@ fn default_tls() -> Arc<rustls::ClientConfig> {
         let roots = rustls::RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         };
+        #[cfg(feature = "fips")]
+        let provider = Arc::new(rustls::crypto::default_fips_provider());
+        #[cfg(not(feature = "fips"))]
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let config = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()

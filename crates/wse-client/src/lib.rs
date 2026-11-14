@@ -8,6 +8,7 @@ mod error;
 mod events;
 mod handler;
 mod message;
+mod scan;
 mod security;
 mod sequencer;
 mod session;
