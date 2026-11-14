@@ -96,6 +96,8 @@ client.run_forever()
 | `max_message_size` | int \| None | 16 MiB | Largest inbound message, checked on the frame and while inflating compressed frames; `None` disables it |
 | `recovery_timeout` | float | 3.0 | Seconds a topic waits for a recovery replay after an offset gap (`0` never waits) |
 | `wire_format` | str | `"json"` | `"msgpack"`: the server sends this connection MessagePack and the client sends in it too, except inside E2E frames (needs the `[msgpack]` extra) |
+| `signing_key` | EC key or PEM/DER bytes | None | This client's ECDSA P-256 key for `send(..., signed=True)` (needs the `[crypto]` extra) |
+| `server_signing_keys` | list[str] | None | The server's signing public keys (`signing_public_key()`, base64) its signed messages are checked against |
 
 The `connect(url, **kwargs)` factory returns an `AsyncWSEClient` (not connected yet) to use as an async context manager.
 
@@ -184,6 +186,7 @@ class WSEEvent:
     topic: str | None = None         # Recovery stamp: topic ("tp" field)
     epoch: str | None = None         # Recovery stamp: buffer epoch, 8-hex ("e")
     offset: int | None = None        # Recovery stamp: per-topic offset ("o")
+    signature: SignatureProof | None = None  # A server-signed message: body, sig, kid, verified
 ```
 
 ## Features
@@ -274,6 +277,27 @@ Encryption fails closed:
 - After the handshake every frame is sealed, both ways: application messages, subscriptions, recovery requests, pings and PONGs. Messages sent before the handshake completed wait for it; nothing goes out in plaintext, and a heartbeat due meanwhile is skipped.
 - Each connection runs a fresh session; no frame is sealed with the keys of an earlier one.
 - If the server's identity does not check, a frame does not open (replayed, reordered, forged), or the server refuses (`KEY_EXCHANGE_FAILED`, `E2E_UNSUPPORTED`, no `server_hello` within 10 s), the client closes the connection and ends with `WSEEncryptionError`; it never falls back to plaintext.
+
+### Signed Messages
+
+A message that may be disputed (an order) can go signed with this client's own key, and the server's signed messages arrive with their proof. Requires the `cryptography` package (`[crypto]` extra).
+
+```python
+from wse_client import AsyncWSEClient, generate_signing_key, public_key_jwk
+
+key = generate_signing_key()          # keep it on this device
+# Register the public key with your backend: public_key_jwk(key) goes into the
+# token's "cnf" claim, or the backend calls server.set_client_key().
+
+client = AsyncWSEClient(url, token=token, signing_key=key, server_signing_keys=[SERVER_SIGNING_KEY])
+await client.send("order", {"side": "buy", "qty": "1.5"}, signed=True, nonce="o-17")
+
+async for event in client:
+    if event.type == "receipt":       # the server's signed receipt: event.payload["n"] == "o-17"
+        keep(event.signature)         # body, sig, kid: the proof
+```
+
+The server takes a signed message once (`nonce`, random by default), within its time window, and refuses anything else with a `SIGNATURE_REFUSED` error carrying `n`. A server-signed message no pinned key verifies, or one signed for another topic than the one it came on, is dropped; without `server_signing_keys` they arrive unchecked (`event.signature.verified` is False). Setup and guarantees: [SECURITY.md](../docs/SECURITY.md#signed-messages).
 
 ### Circuit Breaker
 

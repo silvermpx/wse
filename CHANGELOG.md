@@ -44,6 +44,13 @@ Security, correctness and speed. Upgrading from 2.x: see
 - Each client chooses whether its messages are compressed.
 - msgpack on every message path, and `wireFormat: 'msgpack'` in the
   TypeScript client: 24-41% fewer bytes than JSON.
+- Signed messages: a message that may be disputed (an order, a fill)
+  travels as the exact text its sender signed with its own ECDSA P-256
+  key. The server takes a client's signed message once, within a time
+  window, and answers with a signed receipt; it signs its own with
+  `signing_key`. Client keys are bound in the token (`cnf`) or with
+  `set_client_key()`; both clients sign and check (`signed=True`,
+  `sendSigned()`).
 - `wse_server.prometheus.WSECollector`.
 
 ### Fixed

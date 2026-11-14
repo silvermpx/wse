@@ -261,6 +261,52 @@ A client that refuses the server's identity or one of its frames ends the connec
 
 `e2e_legacy=True`, the default, keeps serving 2.x clients, and 3.x clients reach 2.x servers with `e2e_legacy=True` (Python) or `security.legacyE2e: true` (TypeScript). That design is ECDH P-256 per connection, HKDF-SHA256 (no salt, info `wse-encryption/aes-gcm-key`) and one AES-256-GCM key for both directions with a random 12-byte nonce per message (`E:` + nonce + ciphertext + tag). It has no server identity, no sequence numbers and no rekeying: whoever can answer the handshake can read and change the session, and frames can be replayed. Set `e2e_legacy=False` once every client is on 3.x.
 
+## Signed Messages
+
+TLS and the E2E sessions protect a message on its way, but they leave no proof: afterwards nobody can show a third party that a client sent a given order. A signed message carries that proof. It is signed with the sender's own private key, which only the sender holds, over the exact text that travels, and whoever keeps the text, the signature and the key id can verify later who sent what.
+
+Use it for the messages that may be disputed: orders, cancellations, fills, balance changes. Every message signed costs a few tens of microseconds on each side (ECDSA P-256: about 11 µs to sign, 37 µs to verify), so it is not for every tick of a price feed.
+
+### Setting it up
+
+1. Give the server a signing key, an ECDSA P-256 private key in PEM or DER (PKCS#8), apart from its E2E identity key:
+
+   ```bash
+   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out signing.pem
+   ```
+
+   ```python
+   server = RustWSEServer("0.0.0.0", 5007, jwt_secret=..., signing_key=open("signing.pem", "rb").read())
+   server.signing_public_key()  # base64: what the clients pin
+   ```
+
+2. Each client makes its own key pair and keeps the private key on the device: `generate_signing_key()` (Python) or `generateSigningKey()` (TypeScript, a WebCrypto key that cannot be exported; IndexedDB stores it as is).
+
+3. Bind the client's public key to the user, one of two ways:
+
+   - **In the token.** The application's backend puts the public key in the JWT the client connects with, as RFC 7800's confirmation claim: `"cnf": {"jwk": {"kty": "EC", "crv": "P-256", "x": ..., "y": ...}}` (`public_key_jwk()` / `SigningKey.jwk` give it).
+   - **By the application.** `server.set_client_key(conn_id, public_key)` binds a key to a connection whatever way the application checked it: its own key registry, an admin, or a passkey (WebAuthn) assertion over the new key, verified with a standard WebAuthn library. That last one proves a person approved the key.
+
+   Non-repudiation is only as strong as this binding: whoever can bind a key to the user can sign as the user.
+
+4. The clients pin the server's signing key (`server_signing_keys` / `security.serverSigningKeys`) and send with `send(..., signed=True)` / `sendSigned()`.
+
+### What it guarantees
+
+| | |
+|-|-|
+| Origin | Only the holder of the private key can produce the signature; the server checks it against the key bound to the connection |
+| Integrity | The signature covers the body byte for byte; one changed byte fails it |
+| One server, one time, once | The body names the server's key (`aud`), carries a time the server accepts only within `signature_window`, and an `n` the server takes once per key within that window |
+| Proof for later | The application gets the body, signature and key id with every signed message; keeping them, with the key binding, is what lets anyone verify the message years later |
+| Receipt | The server answers every signed message it takes with a signed receipt: the client can show what the server received and when |
+
+The server remembers `n` within the window on its own node only. A message replayed to another node of a cluster within the window is taken there too: the application deduplicates by `n` where it executes the order (an order id it already has is a no-op).
+
+The recovery stamp (`tp` / `e` / `o`) is outside the signature: it is the server's delivery position, protected by TLS and E2E. A topic message's signed body names its topic, and clients drop one that comes on another.
+
+**Rotating the server's key:** clients pin a list. Pin the old and the new key, switch the server, then drop the old one; keep old public keys wherever signatures must still be verified.
+
 ## Cluster Security
 
 ### Mutual TLS (mTLS)

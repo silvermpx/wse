@@ -228,6 +228,24 @@ server.broadcast(topic, data)
   -> ClusterCommand::Publish{topic, data}  - forward to cluster peers
 ```
 
+### Signed Messages
+
+```
+Client {"t": "signed", "sb", "sig", "kid"}
+  -> recognised by its type in the match every message already goes through
+     (unsigned messages pay nothing more)
+  -> the connection's key (token cnf claim or set_client_key), parsed once
+  -> ECDSA P-256 verify over "WSE-SIG client\0" + body, on the connection's task
+  -> aud = server signing key id, ts within signature_window, (kid, n) not taken
+     (a map swept every 5 s of what fell out of the window)
+  -> signed receipt to the client; "signed" drain event / on_signed_message
+
+server.sign(type, payload, topic)
+  -> signed once on the caller's thread with signing_key
+  -> send / broadcast like any text: the body travels as a string, so
+     msgpack, recovery stamps and cluster relays leave it as it was
+```
+
 ---
 
 ## Cluster Architecture

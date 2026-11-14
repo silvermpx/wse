@@ -389,6 +389,7 @@ The server's own `error` messages (`{"c":"WSE","t":"error","p":{"code":...,"mess
 | `RATE_LIMITED` | A message was dropped over the client's rate limit (at most once a second) |
 | `KEY_EXCHANGE_FAILED` | The first design's key exchange failed |
 | `E2E_UNSUPPORTED` | No E2E suite in common, or the first design refused; the close (4800) follows |
+| `SIGNATURE_REFUSED` | A signed message failed a check; `p.reason` says which and `p.n` names the message (see [Signed Messages](#signed-messages)) |
 
 Applications send their own codes in the same shape.
 
@@ -557,6 +558,51 @@ The nonce is the epoch's IV followed by `seq` (u64 BE); the additional data is t
 ### The first design
 
 For 2.x clients and servers. The client sends `encryption_public_key` (a 65-byte ECDH point, base64) in `client_hello`, the server answers with its own in `server_hello`. Both derive one key with HKDF-SHA256 (no salt, info `wse-encryption/aes-gcm-key`, 32 bytes) and seal every message with AES-256-GCM under a random 12-byte IV: `E:` | IV | ciphertext | tag. Refused with 4800 by a server with `e2e_legacy=False`.
+
+## Signed Messages
+
+A message whose sender must be provable later (an order, a fill) travels as the exact text its sender signed, next to the signature and the signing key's id. [SECURITY.md](SECURITY.md#signed-messages) explains what it proves and how keys are bound; `tests/vectors/sign.json` holds test vectors for everything below.
+
+### Wire format
+
+```json
+{"t": "signed", "sb": "<body>", "sig": "<signature>", "kid": "<key id>"}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `sb` | The body: a JSON object as text, signed byte for byte. It is never re-encoded: the server's own fields (`c`, the recovery stamp `tp` / `e` / `o`) and msgpack conversion touch only the outer object, so the signature survives delivery, recovery replays and cluster relays |
+| `sig` | ECDSA P-256 / SHA-256 over the label and the body, 64 bytes `r \|\| s`, base64 |
+| `kid` | The signing key's id: the first 8 bytes of SHA-256 over its public key (65-byte uncompressed point), hex |
+
+The signed bytes are a label naming the signer's side, then the body as UTF-8:
+
+| Signer | Label |
+|--------|-------|
+| Client | `WSE-SIG client\0` |
+| Server | `WSE-SIG server\0` |
+
+### Client to server
+
+The body carries `t` (the message type), `p` (its payload, optional), `aud` (the server's signing key id, from `server_ready` or `server_hello`), `ts` (milliseconds since the epoch) and `n` (unique per message, at most 128 characters: an order id, say).
+
+The server takes the message only when the connection holds a key with id `kid` (from its token's `cnf` claim, or bound by the application), the signature verifies, `aud` is the id of the server's own signing key, `ts` is within `signature_window` seconds (30) of the server's clock, and no message with the same `kid` and `n` came within that window. It then sends the client a signed `receipt` and hands the application the body's fields with `signature` (`body`, `sig`, `kid`) added. Otherwise the client gets an `error` with code `SIGNATURE_REFUSED`, `n` when the body reads, and a `reason`:
+
+| `reason` | Why |
+|----------|-----|
+| `malformed` | Not a signed message the server can read: a field missing, the body not a JSON object, no `t`, `ts` or `n` |
+| `unknown_key` | The connection holds no key with this id |
+| `bad_signature` | The signature does not verify |
+| `wrong_audience` | Signed for another server's key |
+| `stale` | `ts` outside the window |
+| `replayed` | This `kid` and `n` came already |
+| `not_enabled` | The server has no signing key |
+
+### Server to client
+
+The server signs with its own key (`signing_key`, apart from the E2E identity key). The body carries `t`, `p`, `ts`, `n` and, for a topic message, `tp`: a client drops a message whose signed `tp` is not the topic it came on. `server_ready` (`p.details.signing`) and `server_hello` (`p.signing`) name the key: `{"kid": ..., "public_key": ...}`. Clients check signatures against the keys they pin, not against these.
+
+The receipt for a client's signed message is a server-signed message of type `receipt`: `p` holds the client's `kid` and `n`, `sha256` (SHA-256 of the body it got, base64) and `received` (the server's time, milliseconds).
 
 ## Server-Initiated Ping
 

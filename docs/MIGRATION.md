@@ -39,8 +39,8 @@ With encryption on, a 3.x client refuses to start without a pinned key, `e2e_una
 
 ### Removed options
 
-- TypeScript: `security.messageSignature` and the store's `security.messageSigningEnabled`.
-- Python: `WSEEvent.signature` and the `SecurityManager` signing methods.
+- TypeScript: `security.messageSignature` and the store's `security.messageSigningEnabled`. Signed messages now use `security.signingKey` and `sendSigned()` ([SECURITY.md](SECURITY.md#signed-messages)).
+- Python: the `SecurityManager` signing methods. Signed messages now use `signing_key` and `send(..., signed=True)`; `WSEEvent.signature` holds the proof of a message the server signed.
 
 ### Python client
 

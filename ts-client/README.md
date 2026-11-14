@@ -114,6 +114,7 @@ const {
 
   sendMessage,        // (type, payload, options?: MessageOptions) => 'sent' | 'queued' | 'dropped'
   sendBatch,          // (Array<{ type, payload, options? }>) => SendStatus[]
+  sendSigned,         // (type, payload, { nonce?, priority? }) => Promise<SendStatus>
 
   stats,              // ConnectionMetrics, refreshed at most once per second
   activeTopics,       // string[]
@@ -157,6 +158,8 @@ useWSE('cookie', ['notifications'], {
     serverKeys: [SERVER_KEY],                 // with encryption: the server's identity key(s) to pin
     // unauthenticated: true,                 //   or accept any server (passive listeners only)
     // legacyE2e: true,                       //   or the first design, for servers before 3.0
+    signingKey: keyPair,                      // this client's P-256 key pair for sendSigned()
+    serverSigningKeys: [SERVER_SIGNING_KEY],  // the server's signing key(s) its signed messages are checked against
   },
 
   wireFormat: 'json',                         // 'msgpack': msgpack both ways (not inside E2E frames)
@@ -329,6 +332,30 @@ The client **fails closed**:
 - Web Crypto needs a secure context (https:// or localhost); without it an encrypted session does not
   connect at all.
 - A message sent with `{ encrypted: true }` on a session without encryption is refused (`'dropped'`).
+
+## Signed Messages
+
+A message that may be disputed (an order) can go signed with this client's own key, and the
+server's signed messages arrive with their proof:
+
+```tsx
+import { generateSigningKey } from 'wse-client';
+
+const key = await generateSigningKey();   // the private key cannot be exported
+// Keep key.keyPair (IndexedDB stores CryptoKeyPair as is); register the public key with your
+// backend: key.jwk goes into the token's "cnf" claim, or the backend calls set_client_key().
+
+const { sendSigned } = useWSE(token, topics, {
+  security: { encryptionEnabled: false, signingKey: key.keyPair, serverSigningKeys: [SERVER_SIGNING_KEY] },
+});
+await sendSigned('order', { side: 'buy', qty: '1.5' }, { nonce: 'o-17' });
+```
+
+The server answers with a signed `receipt` message (`p.n` is the nonce); a message the server
+signed arrives with `message.signature` (`body`, `sig`, `kid`, `verified`), the proof to keep. One no
+pinned key verifies, or signed for another topic than the one it came on, is dropped. Signing is
+asynchronous: await `sendSigned` before sending what must follow it. Setup and guarantees:
+[SECURITY.md](../docs/SECURITY.md#signed-messages).
 
 ## Stores (Zustand)
 

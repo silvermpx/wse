@@ -5,7 +5,7 @@
 [![npm](https://img.shields.io/npm/v/wse-client)](https://www.npmjs.com/package/wse-client)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-High-performance WebSocket server built in Rust with native clustering, E2E encryption, message recovery, presence tracking, and real-time fan-out. Exposed to Python via PyO3 with zero GIL overhead on the data path. Ships with Rust-accelerated utilities for application code: priority queues, rate limiters, event sequencing, compression, cryptography, and JWT.
+High-performance WebSocket server built in Rust with native clustering, E2E encryption, signed messages, message recovery, presence tracking, and real-time fan-out. Exposed to Python via PyO3 with zero GIL overhead on the data path. Ships with Rust-accelerated utilities for application code: priority queues, rate limiters, event sequencing, compression, cryptography, and JWT.
 
 ## Features
 
@@ -45,6 +45,18 @@ High-performance WebSocket server built in Rust with native clustering, E2E encr
 | **Older clients** | `e2e_legacy=True` (the default) still serves 2.x clients with the first design: one key, random nonces, no server identity |
 
 See [SECURITY.md](docs/SECURITY.md#end-to-end-encryption) for setup and the threat model.
+
+### Signed Messages
+
+| Feature | Details |
+|---------|---------|
+| **Proof of origin** | A message that may be disputed (an order, a fill) travels as the exact text its sender signed with its own ECDSA P-256 key; whoever keeps the text, signature and key id can verify later who sent it |
+| **Client keys** | Made on the device (the browser's private key cannot be exported); bound to the user in the token (`cnf` claim) or by the application (`set_client_key`) |
+| **Checks** | The server takes a client's signed message only for its own key, within a time window, once per message id, and answers with a signed receipt |
+| **Server signatures** | `sign()` once with `signing_key`, then send or broadcast to anyone; clients check against the keys they pin |
+| **Survives the path** | msgpack, recovery replays and cluster relays leave the signed text as it was |
+
+See [SECURITY.md](docs/SECURITY.md#signed-messages) for setup and guarantees.
 
 ### Cluster Protocol
 
@@ -94,6 +106,7 @@ See [SECURITY.md](docs/SECURITY.md#end-to-end-encryption) for setup and the thre
 | **Circuit breaker** | CLOSED/OPEN/HALF_OPEN state machine, prevents connection storms |
 | **Rate limiting** | Client-side token bucket, coordinates with server feedback |
 | **E2E encryption** | Sessions with a pinned server identity (both clients speak the same protocol), the first design for 2.x servers |
+| **Signed messages** | `send(..., signed=True)` / `sendSigned()` with the client's own key; the server's signed messages checked against pinned keys |
 | **Event sequencing** | Duplicate detection (sliding window) + per-topic `(epoch, offset)` idempotent dedup with automatic gap recovery |
 | **Network monitor** | Real-time latency, jitter, and connection-quality scoring (Python client also estimates packet loss) |
 | **Priority queues** | 5 levels from CRITICAL to BACKGROUND |
@@ -201,6 +214,8 @@ token = rust_jwt_encode(
 | `client_subscriptions` | False | Answer the clients' own subscribe, unsubscribe and recovery requests in the server, within each connection's topic ACL; otherwise they reach the application as messages |
 | `e2e_identity_key` | None | PEM or DER (PKCS#8) ECDSA P-256 private key the server signs E2E handshakes with; clients pin its public key, `e2e_identity_public_key()`. Without it, E2E clients must accept an unauthenticated server |
 | `e2e_legacy` | True | Also serve the first E2E design (2.x clients); `False` refuses it with close code 4800 |
+| `signing_key` | None | PEM or DER (PKCS#8) ECDSA P-256 private key for signed messages, apart from `e2e_identity_key`: the server signs with it (`sign()`) and clients' signed messages must name it; clients pin `signing_public_key()` |
+| `signature_window` | 30 | Seconds a client's signed message may be off the server's clock |
 
 ---
 
@@ -237,6 +252,7 @@ Each event is a tuple: `(event_type, conn_id, payload)`
 | `"auth_connect"` | JWT-validated connection | user_id (string) |
 | `"connect"` | Connection without JWT | cookies (string) |
 | `"msg"` | Client sent WSE-prefixed JSON | parsed dict |
+| `"signed"` | Client's signed message that passed every check | the signed body's fields, and `signature` (`body`, `sig`, `kid`): the proof to keep |
 | `"raw"` | Client sent plain text | raw string |
 | `"bin"` | Client sent binary frame | bytes |
 | `"disconnect"` | Connection closed | None |
@@ -246,8 +262,10 @@ Each event is a tuple: `(event_type, conn_id, payload)`
 **Callback mode** - alternative to drain mode. The callbacks of one connection run in the order of its events (`on_connect` first, `on_disconnect` last) on the server's worker threads; `on_connect(conn_id, user_id)` gets the validated user id, or the Cookie header without `jwt_secret`.
 
 ```python
-server.set_callbacks(on_connect, on_message, on_disconnect)
+server.set_callbacks(on_connect, on_message, on_disconnect, on_signed_message=None)
 ```
+
+`on_signed_message(conn_id, data)` gets a client's signed message with its proof; without it such messages go to `on_message` without the proof.
 
 ### Sending Messages
 
@@ -272,6 +290,15 @@ server.broadcast(topic, text)                    # Fan-out to topic subscribers 
 | `broadcast` | Topic (all nodes) | Local fan-out + forwarded to cluster peers with matching interest |
 
 A client that asked for msgpack (`?format=msgpack`) gets in msgpack whatever would go to it as JSON text: topic messages, broadcasts, recovery replays, `send` and `send_event`. Bytes sent with `send_bytes` or `broadcast_all_bytes` go as they are.
+
+**Signed messages** (with `signing_key`): sign once, send to anyone.
+
+```python
+fill = server.sign("fill", {"order": "o-17", "qty": "2"}, topic="orders.u1")
+server.broadcast("orders.u1", fill)             # or send(conn_id, fill)
+server.set_client_key(conn_id, public_key)      # bind a client's key (or the token's cnf claim does)
+server.signing_public_key()                     # what clients pin (base64)
+```
 
 ### Topic Subscriptions
 
@@ -456,6 +483,17 @@ print(server.e2e_identity_public_key())   # the key clients pin (base64)
 ```
 
 Clients pin that key: `AsyncWSEClient(url, encryption=True, e2e_server_keys=[key])` in Python, `security: { encryptionEnabled: true, serverKeys: [key] }` in TypeScript. After the handshake every frame is sealed with a key per direction (AES-256-GCM, sequence numbers, rekeying); a replayed or forged frame ends the connection. Setup, key rotation and the threat model: [docs/SECURITY.md](docs/SECURITY.md#end-to-end-encryption).
+
+### Signed Messages
+
+E2E protects a message on its way; a signature proves later who sent it. Each client signs with its own key, kept on its device; the server signs with `signing_key`:
+
+```python
+client = AsyncWSEClient(url, token=token, signing_key=key, server_signing_keys=[server_key])
+await client.send("order", {"side": "buy", "qty": "1.5"}, signed=True, nonce="o-17")
+```
+
+The server takes it once, within `signature_window`, and only for its own key; the application gets the order with its proof, the client a signed receipt. Key binding and guarantees: [docs/SECURITY.md](docs/SECURITY.md#signed-messages).
 
 ### Rate Limiting
 
