@@ -472,9 +472,15 @@ pub(crate) fn answer_subscription_request(
     } else {
         HashMap::new()
     };
-    let (accepted, recovered) = state
-        .subscribe_and_recover(conn_id, handle, topics.clone(), &anchors)
-        .unwrap_or_default();
+    // Not accepted yet (no token, and the application has not called
+    // accept_connection): every topic is refused.
+    let (accepted, recovered) = if handle.out.admitted.load(Ordering::Acquire) {
+        state
+            .subscribe_and_recover(conn_id, handle, topics.clone(), &anchors)
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
     let failed: Vec<&String> = topics.iter().filter(|t| !accepted.contains(t)).collect();
     let recovery: serde_json::Map<String, serde_json::Value> = recovered
         .iter()

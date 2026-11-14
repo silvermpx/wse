@@ -875,7 +875,12 @@ pub(super) async fn handle_connection(
                 }
             }
             conns.insert((*conn_id).clone(), own_handle.clone());
-            state.topics.join(&conn_id, &own_handle);
+            // Accepted by its token. Without one, the application accepts it
+            // (ServerCommand::Accept) before broadcasts reach it.
+            if rust_auth_user_id.is_some() {
+                out.admitted.store(true, Ordering::Release);
+                state.topics.join(&conn_id, &own_handle);
+            }
             state.connection_count.store(conns.len(), Ordering::Relaxed);
         }
         room

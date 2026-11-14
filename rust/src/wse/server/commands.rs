@@ -58,6 +58,23 @@ pub(super) async fn process_commands(
                     );
                 }
             }
+            ServerCommand::Accept { conn_id, ready } => {
+                // Under the read lock: its cleanup (write lock) cannot run
+                // between the join and here, so a gone connection never stays
+                // in the broadcast set.
+                let guard = state.connections.read().await;
+                if let Some(h) = guard.get(&conn_id)
+                    && !h.out.admitted.swap(true, Ordering::AcqRel)
+                {
+                    // server_ready first, then broadcasts.
+                    h.send_one(
+                        Message::Text(ready.into()),
+                        state.max_outbound_queue_bytes,
+                        &state.slow_consumer_drops,
+                    );
+                    state.topics.join(&conn_id, h);
+                }
+            }
             ServerCommand::SendBytes { conn_id, data } => {
                 let guard = state.connections.read().await;
                 if let Some(h) = guard.get(&conn_id) {

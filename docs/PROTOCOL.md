@@ -166,7 +166,9 @@ Two paths depending on server configuration:
 **Python fallback (when `jwt_secret` is not configured):**
 1. Rust pushes raw `Connect{conn_id, cookies}` to drain queue
 2. Python extracts and validates JWT from cookies
-3. Python calls `accept_connection(conn_id, user_id)`, which sends `server_ready`
+3. Python calls `accept_connection(conn_id, user_id)`, which sends `server_ready`.
+   Until then the connection gets no broadcasts, and with `client_subscriptions`
+   the server refuses every topic it asks for.
 
 The Rust JWT path eliminates GIL acquisition from the connection critical path, reducing median connection latency from ~23ms to 0.53ms.
 

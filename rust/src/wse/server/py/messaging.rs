@@ -41,9 +41,9 @@ impl RustWSEServer {
             }
         }
         let ready = build_server_ready(conn_id, user_id, &self.shared);
-        tx.send(ServerCommand::SendText {
+        tx.send(ServerCommand::Accept {
             conn_id: conn_id.to_owned(),
-            data: ready,
+            ready,
         })
         .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         Ok(true)

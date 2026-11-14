@@ -151,6 +151,9 @@ pub(crate) struct Outbox {
     pub(crate) pending: AtomicUsize,
     /// Set when the write task is gone: deliveries stop.
     pub(crate) closed: AtomicBool,
+    /// Accepted: by its token, or by the application (`accept_connection`).
+    /// Until then it gets no broadcasts and may not subscribe on its own.
+    pub(crate) admitted: AtomicBool,
     /// How the connection's frames are encrypted, set once by its key
     /// exchange.
     pub(crate) cipher: std::sync::OnceLock<Seal>,
@@ -355,6 +358,12 @@ pub(crate) enum ServerCommand {
         /// Also publish to cluster peers, after stamping, with the exact
         /// recovery position the message got here.
         publish: bool,
+    },
+    /// The application accepts a connection: `ready` (its server_ready) is
+    /// sent, then broadcasts reach it and it may subscribe on its own.
+    Accept {
+        conn_id: String,
+        ready: String,
     },
     Disconnect {
         conn_id: String,

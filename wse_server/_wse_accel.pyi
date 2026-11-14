@@ -510,7 +510,9 @@ class RustWSEServer:
 
         For a server without jwt_secret: the connection gets server_ready, the
         message the clients wait for before they send anything, and user_id
-        becomes its user for presence. Call it once per connection, after
+        becomes its user for presence. Until then the connection gets no
+        broadcasts and the server refuses its own subscription requests
+        (client_subscriptions). Call it once per connection, after
         checking the cookies of its "connect" event. Returns False when the
         connection is gone; raises RuntimeError on a server that validates
         tokens itself.

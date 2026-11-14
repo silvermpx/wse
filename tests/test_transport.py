@@ -417,6 +417,46 @@ class TestApplicationAuth:
         finally:
             srv.stop()
 
+    @pytest.mark.asyncio
+    async def test_nothing_reaches_a_connection_before_it_is_accepted(self, server_port):
+        srv = RustWSEServer(
+            "127.0.0.1", server_port, client_subscriptions=True, recovery_enabled=True
+        )
+        srv.enable_drain_mode()
+        srv.start()
+        time.sleep(0.05)
+
+        def subscribe(topic: str) -> str:
+            p = {"action": "subscribe", "topics": [topic]}
+            return json.dumps({"c": "WSE", "t": "subscription_update", "p": p, "v": 1})
+
+        async def next_message(ws) -> dict:
+            return json.loads(await asyncio.wait_for(ws.recv(), timeout=2))
+
+        try:
+            srv.broadcast_local("orders", json.dumps({"t": "fill", "p": {"n": 1}}))
+            async with websockets.connect(ws_url(server_port)) as ws:
+                _, conn_id, _ = drain_until(srv, "connect")
+                srv.broadcast_all(json.dumps({"t": "news", "p": {"n": 1}}))
+                # Not accepted yet: the topic is refused and nothing is replayed.
+                await ws.send(subscribe("orders"))
+                refused = await next_message(ws)
+                assert refused["t"] == "subscription_update"
+                assert refused["p"]["success_topics"] == []
+                assert refused["p"]["failed_topics"] == ["orders"]
+                await asyncio.sleep(0.2)
+
+                assert srv.accept_connection(conn_id, "bob")
+                assert (await next_message(ws))["t"] == "server_ready"
+                srv.broadcast_all(json.dumps({"t": "news", "p": {"n": 2}}))
+                news = await next_message(ws)
+                assert news["t"] == "news" and news["p"]["n"] == 2
+                await ws.send(subscribe("orders"))
+                taken = await next_message(ws)
+                assert taken["p"]["success_topics"] == ["orders"]
+        finally:
+            srv.stop()
+
     def test_a_jwt_server_accepts_on_its_own(self, server):
         with pytest.raises(RuntimeError, match="jwt_secret"):
             server.accept_connection("any", "bob")
