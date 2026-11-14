@@ -10,8 +10,6 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::StreamExt;
-use pyo3::prelude::*;
-use pyo3::types::PyBytes;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -27,11 +25,11 @@ use super::fanout::BEHIND_BYTES;
 use super::frames::{
     close_frame, encode_message, encode_ws_frame, write_all_frames, ws_frame_size,
 };
+use super::handler::{Connect, Handler, Inbound};
 use super::handshake::{HANDSHAKE_TIMEOUT, HandshakeGuard, normalize_origin, reject_ws_auth};
 use super::messages::{build_server_hello, build_server_ready, normalize_json_keys};
-use super::py::{fire_on_connect, fire_on_disconnect, json_to_pyobj};
 use super::signing::{self, ClientKey, Refused};
-use super::state::{Activity, CloseOutbox, InboundEvent, Outbox, Seal, inbound_cost};
+use super::state::{Activity, CloseOutbox, Outbox, Seal};
 use super::subscribe::{answer_subscription_request, requested_compression};
 use super::{
     CLOSE_E2E_BAD_FRAME, CLOSE_E2E_EXHAUSTED, CLOSE_E2E_UNSUPPORTED, CLOSE_GRACE,
@@ -44,66 +42,6 @@ use crate::wse::msgpack::{decode_msgpack_guarded, rmpv_to_serde_json};
 // ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
-
-/// Max concurrent on_message callbacks (blocking tasks) per connection in
-/// callback mode. Bounds inbound flooding from exhausting the blocking pool.
-const MAX_INFLIGHT_CALLBACKS: usize = 256;
-
-/// A callback job of callback mode; it attaches to Python itself.
-type CallbackJob = Box<dyn FnOnce() + Send>;
-
-/// The callbacks of one connection, run one after another on the blocking
-/// pool in the order of its events: on_connect first, its messages in order,
-/// on_disconnect last. A drainer runs only while jobs wait, so an idle
-/// connection holds no thread.
-struct CallbackLane {
-    queue: parking_lot::Mutex<LaneQueue>,
-}
-
-#[derive(Default)]
-struct LaneQueue {
-    jobs: VecDeque<CallbackJob>,
-    draining: bool,
-}
-
-impl CallbackLane {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            queue: parking_lot::Mutex::new(LaneQueue::default()),
-        })
-    }
-
-    /// Queue `job`; false (and nothing queued) when `limit` jobs wait already.
-    fn push(self: &Arc<Self>, job: CallbackJob, limit: Option<usize>) -> bool {
-        let mut queue = self.queue.lock();
-        if limit.is_some_and(|limit| queue.jobs.len() >= limit) {
-            return false;
-        }
-        queue.jobs.push_back(job);
-        if !queue.draining {
-            queue.draining = true;
-            let lane = Arc::clone(self);
-            tokio::task::spawn_blocking(move || lane.drain());
-        }
-        true
-    }
-
-    fn drain(&self) {
-        loop {
-            let job = {
-                let mut queue = self.queue.lock();
-                match queue.jobs.pop_front() {
-                    Some(job) => job,
-                    None => {
-                        queue.draining = false;
-                        return;
-                    }
-                }
-            };
-            job();
-        }
-    }
-}
 
 /// Answer a protocol message the server handles itself (a ping, a client's
 /// compression wish, a subscription request when the server takes them),
@@ -146,52 +84,26 @@ enum Protocol {
     Application,
 }
 
-/// Where a connection's messages go: the drain, or its callbacks.
-struct Callbacks<'a> {
-    drain: bool,
-    lane: Option<&'a Arc<CallbackLane>>,
-    on_message: Option<&'a Arc<Py<PyAny>>>,
-    on_signed_message: Option<&'a Arc<Py<PyAny>>>,
-}
-
 /// The application learns of a connection: the validated user id (its user
-/// for presence), or without jwt_secret the cookies for it to check. False
-/// when a stalled drain holds too many connect and disconnect events already
-/// (the connection is then refused).
+/// for presence), or without jwt_secret the cookies for it to check. None
+/// when it has no room for the connection now (it is then refused).
 #[must_use]
-fn tell_application(
+fn tell_application<H: Handler>(
     state: &Arc<SharedState>,
     conn_id: &Arc<String>,
-    user_id: Option<String>,
+    user_id: Option<&str>,
     cookies: &str,
-    drain: bool,
-    lane: Option<&Arc<CallbackLane>>,
-) -> bool {
-    if drain {
-        let event = match user_id.clone() {
-            Some(user_id) => InboundEvent::AuthConnect {
-                conn_id: (**conn_id).clone(),
-                user_id,
-            },
-            None => InboundEvent::Connect {
-                conn_id: (**conn_id).clone(),
-                cookies: cookies.to_owned(),
-            },
-        };
-        if !state.push_connect(event) {
-            return false;
-        }
-    } else if let Some(lane) = lane
-        && let Some(cb) = state.on_connect.read().unwrap().clone()
-    {
-        let cid = (**conn_id).clone();
-        let who = user_id.clone().unwrap_or_else(|| cookies.to_owned());
-        lane.push(Box::new(move || fire_on_connect(&cb, &cid, &who)), None);
-    }
-    if let (Some(pm), Some(user_id)) = (&state.presence, &user_id) {
+    handler: &H,
+) -> Option<H::Connection> {
+    let app = handler.connect(&Connect {
+        conn_id,
+        user_id,
+        cookies,
+    })?;
+    if let (Some(pm), Some(user_id)) = (&state.presence, user_id) {
         pm.register_connection(conn_id, user_id);
     }
-    true
+    Some(app)
 }
 
 /// A client that announced E2E now has its session: accepted by its token,
@@ -203,22 +115,21 @@ fn tell_application(
 /// them here and the join needs no lock. The read loop waits on nothing but
 /// the socket.
 #[must_use]
-fn admit_after_session(
+fn admit_after_session<H: Handler>(
     state: &Arc<SharedState>,
     conn_id: &Arc<String>,
     handle: &ConnectionHandle,
-    user_id: Option<String>,
+    user_id: Option<&str>,
     cookies: &str,
-    drain: bool,
-    lane: Option<&Arc<CallbackLane>>,
-) -> bool {
-    if let Some(ref user) = user_id {
+    handler: &H,
+) -> Option<H::Connection> {
+    if let Some(user) = user_id {
         let ready = build_server_ready(conn_id, user, state);
         handle.send_control(Message::Text(ready.into()));
         handle.out.admitted.store(true, Ordering::Release);
         state.topics.join(conn_id, handle);
     }
-    tell_application(state, conn_id, user_id, cookies, drain, lane)
+    tell_application(state, conn_id, user_id, cookies, handler)
 }
 
 /// What the read loop's paths need of their connection.
@@ -243,15 +154,15 @@ impl Conn<'_> {
 
 /// The read loop's state a client_hello may change, and what admitting the
 /// connection after its E2E session takes.
-struct Admission<'a> {
+struct Admission<'a, H: Handler> {
     announced_e2e: bool,
     session: &'a mut Option<RecvState>,
     awaiting_session: &'a mut bool,
-    known: &'a mut bool,
-    user_id: &'a Option<String>,
+    /// The application's side of the connection, once it heard of it.
+    app: &'a mut Option<H::Connection>,
+    handler: &'a H,
+    user_id: Option<&'a str>,
     cookies: &'a str,
-    drain: bool,
-    lane: Option<&'a Arc<CallbackLane>>,
 }
 
 /// The client's hello, once a connection: compression, then an E2E session
@@ -260,7 +171,11 @@ struct Admission<'a> {
 /// messages, and this code sat in the middle of it.
 #[cold]
 #[inline(never)]
-fn answer_client_hello(conn: &Conn<'_>, val: &serde_json::Value, admission: Admission<'_>) {
+fn answer_client_hello<H: Handler>(
+    conn: &Conn<'_>,
+    val: &serde_json::Value,
+    admission: Admission<'_, H>,
+) {
     let (state, conn_id) = (conn.state, conn.conn_id);
     let p = val.get("p");
     if let Some(threshold) = requested_compression(
@@ -304,16 +219,15 @@ fn answer_client_hello(conn: &Conn<'_>, val: &serde_json::Value, admission: Admi
                 state.conn_sealed.insert((**conn_id).clone());
                 let _ = conn.handle.out.cipher.set(Seal::Session);
                 *admission.awaiting_session = false;
-                *admission.known = admit_after_session(
+                *admission.app = admit_after_session(
                     state,
                     conn_id,
                     conn.handle,
-                    admission.user_id.clone(),
+                    admission.user_id,
                     admission.cookies,
-                    admission.drain,
-                    admission.lane,
+                    admission.handler,
                 );
-                if !*admission.known {
+                if admission.app.is_none() {
                     conn.closer.close(
                         conn.tx,
                         &conn.handle.out.pending,
@@ -415,15 +329,20 @@ fn handshake_message(text: &str) -> bool {
 /// `SIGNATURE_REFUSED` error otherwise, `busy` when the application cannot
 /// take it now: then it was not received and its `n` stays free.
 #[inline(never)]
-fn take_signed(
-    state: &Arc<SharedState>,
-    conn_id: &Arc<String>,
-    handle: &ConnectionHandle,
-    max_pending: usize,
+fn take_signed<H: Handler>(
+    conn: &Conn<'_>,
     envelope: &serde_json::Value,
     size: usize,
-    callbacks: &Callbacks<'_>,
+    handler: &H,
+    app: &mut Option<H::Connection>,
 ) {
+    let Conn {
+        state,
+        conn_id,
+        handle,
+        max_pending,
+        ..
+    } = *conn;
     let now = signing::now_ms();
     let window = state.signature_window_ms;
     let checked = match &state.signer {
@@ -471,7 +390,11 @@ fn take_signed(
         .as_ref()
         .and_then(|signer| signer.receipt(&verified, now).ok());
     let n = verified.n.clone();
-    if deliver_signed(state, conn_id, verified.into_value(), size, callbacks) {
+    let value = verified.into_value();
+    if app
+        .as_mut()
+        .is_some_and(|app| handler.signed(app, value, size))
+    {
         if let Some(receipt) = receipt {
             queue_reply(handle, max_pending, Message::Text(receipt.into()));
         }
@@ -503,82 +426,10 @@ fn refuse_signed(
     queue_reply(handle, max_pending, Message::Text(error.to_string().into()));
 }
 
-/// Hand a verified signed message to the application; false when it has no
-/// room for it now (or no callback takes it).
-fn deliver_signed(
-    state: &Arc<SharedState>,
-    conn_id: &Arc<String>,
-    mut value: serde_json::Value,
-    size: usize,
-    callbacks: &Callbacks<'_>,
-) -> bool {
-    if callbacks.drain {
-        return state.push_message(
-            InboundEvent::Signed {
-                conn_id: (**conn_id).clone(),
-                value,
-            },
-            size,
-        );
-    }
-    let Some(lane) = callbacks.lane else {
-        return false;
-    };
-    let callback = match (callbacks.on_signed_message, callbacks.on_message) {
-        (Some(callback), _) => Arc::clone(callback),
-        (None, Some(callback)) => {
-            if let serde_json::Value::Object(message) = &mut value {
-                message.remove("signature");
-            }
-            Arc::clone(callback)
-        }
-        (None, None) => return false,
-    };
-    let cid = Arc::clone(conn_id);
-    let size = inbound_cost(size, &value);
-    spawn_bounded_callback(lane, state, size, move || {
-        Python::try_attach(|py| {
-            let message = json_to_pyobj(py, &value);
-            if let Err(e) = callback.call1(py, (&**cid, message)) {
-                tracing::warn!("[WSE] signed message callback error: {e}");
-            }
-        });
-    })
-}
-
 /// A msgpack frame from a client that asked for msgpack: one value, as is or
 /// behind the `M:` prefix the server's own msgpack frames carry.
 fn inbound_msgpack(data: &[u8]) -> Result<rmpv::Value, ()> {
     decode_msgpack_guarded(data.strip_prefix(b"M:").unwrap_or(data))
-}
-
-/// Queue an on_message callback. It needs a place among the connection's
-/// `MAX_INFLIGHT_CALLBACKS` waiting callbacks (a client flooding messages is
-/// shed, counted in `rate_limited_total`) and room for its `bytes` in the
-/// server's budget of messages waiting for the application, the same one
-/// drain mode uses (counted in `inbound_dropped` when there is none). False
-/// when it was shed.
-fn spawn_bounded_callback<F>(
-    lane: &Arc<CallbackLane>,
-    state: &Arc<SharedState>,
-    bytes: usize,
-    work: F,
-) -> bool
-where
-    F: FnOnce() + Send + 'static,
-{
-    let Some(room) = SharedState::callback_room(state, bytes) else {
-        return false;
-    };
-    let job: CallbackJob = Box::new(move || {
-        let _room = room;
-        work();
-    });
-    if lane.push(job, Some(MAX_INFLIGHT_CALLBACKS)) {
-        return true;
-    }
-    state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
-    false
 }
 
 /// Clone a TcpStream by duplicating the file descriptor.
@@ -859,7 +710,7 @@ struct InboundLimit {
     drops_since: Option<Instant>,
 }
 
-enum Inbound {
+enum Rate {
     Pass,
     /// Passed; tell the client how close it is to the limit.
     Warn {
@@ -889,7 +740,7 @@ impl InboundLimit {
         }
     }
 
-    fn check(&mut self, now: Instant) -> Inbound {
+    fn check(&mut self, now: Instant) -> Rate {
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
         self.tokens = (self.tokens + elapsed * self.refill).min(self.capacity);
         self.last_refill = now;
@@ -904,23 +755,23 @@ impl InboundLimit {
             self.drops_since = Some(since);
             self.last_drop = Some(now);
             if now.duration_since(since) >= Self::ABUSE_AFTER {
-                return Inbound::Close;
+                return Rate::Close;
             }
             let notify = a_second_since(self.last_notice);
             if notify {
                 self.last_notice = Some(now);
             }
-            return Inbound::Limited { notify };
+            return Rate::Limited { notify };
         }
         self.tokens -= 1.0;
         if self.tokens < self.capacity * 0.2 && a_second_since(self.last_warning) {
             self.last_warning = Some(now);
-            return Inbound::Warn {
+            return Rate::Warn {
                 used: self.capacity - self.tokens,
                 left: self.tokens,
             };
         }
-        Inbound::Pass
+        Rate::Pass
     }
 }
 
@@ -934,14 +785,14 @@ enum Flow {
 /// loop only waits for the socket; each frame goes through `on_frame`, a
 /// plain function the compiler optimizes on its own, not as a branch of the
 /// connection's whole state machine.
-struct Reader<'a> {
+struct Reader<'a, H: Handler> {
     conn: Conn<'a>,
     activity: &'a Activity,
     /// The code of the client's close frame, for the write task's reply.
     peer_close: &'a AtomicU32,
-    callbacks: Callbacks<'a>,
+    handler: &'a H,
     announced_e2e: bool,
-    user_id: &'a Option<String>,
+    user_id: Option<&'a str>,
     cookies: &'a str,
     inbound_limit: InboundLimit,
     frame_errors: FrameErrorLog,
@@ -951,11 +802,24 @@ struct Reader<'a> {
     awaiting_session: bool,
     /// The client's sending state of an E2E session: frames open in order only.
     session: Option<RecvState>,
-    /// Whether the application heard of the connection.
-    known: bool,
+    /// The application's side of the connection, once it heard of it.
+    app: Option<H::Connection>,
 }
 
-impl Reader<'_> {
+/// Hand a client's message to the application; false when it has no room
+/// for it (or has not heard of the connection).
+#[inline]
+fn deliver<H: Handler>(
+    handler: &H,
+    app: &mut Option<H::Connection>,
+    message: Inbound,
+    size: usize,
+) -> bool {
+    app.as_mut()
+        .is_some_and(|app| handler.message(app, message, size))
+}
+
+impl<H: Handler> Reader<'_, H> {
     /// One frame from the client.
     fn on_frame(&mut self, msg: Message) -> Flow {
         let conn = self.conn;
@@ -973,13 +837,11 @@ impl Reader<'_> {
         let announced_e2e = self.announced_e2e;
         let rust_auth_user_id = self.user_id;
         let cookie_str = self.cookies;
-        let callbacks = &self.callbacks;
-        let (drain, lane, cached_on_message) =
-            (callbacks.drain, callbacks.lane, callbacks.on_message);
+        let handler = self.handler;
         let session = &mut self.session;
         let awaiting_session = &mut self.awaiting_session;
         let hello_answered = &mut self.hello_answered;
-        let known = &mut self.known;
+        let app = &mut self.app;
         let inbound_limit = &mut self.inbound_limit;
         let frame_errors = &mut self.frame_errors;
         // After the server queued a close, the client's further messages are
@@ -1016,15 +878,15 @@ impl Reader<'_> {
         }
         if matches!(msg, Message::Text(_) | Message::Binary(_)) {
             match inbound_limit.check(now) {
-                Inbound::Pass => {}
-                Inbound::Warn { used, left } => {
+                Rate::Pass => {}
+                Rate::Warn { used, left } => {
                     let warning = format!(
                         "{{\"c\":\"WSE\",\"t\":\"rate_limit_warning\",\"p\":{{\"current_rate\":{},\"limit\":{},\"remaining\":{},\"retry_after\":1.0}},\"v\":1}}",
                         used as u64, inbound_limit.capacity as u64, left as u64,
                     );
                     queue_reply(own_handle, max_pending, Message::Text(warning.into()));
                 }
-                Inbound::Limited { notify } => {
+                Rate::Limited { notify } => {
                     state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
                     if notify {
                         queue_reply(
@@ -1035,7 +897,7 @@ impl Reader<'_> {
                     }
                     return Flow::Next;
                 }
-                Inbound::Close => {
+                Rate::Close => {
                     state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
                     closer.close(tx, &out.pending, CLOSE_RATE_LIMITED, "rate limit exceeded");
                     return Flow::Next;
@@ -1058,26 +920,7 @@ impl Reader<'_> {
                     text_ref
                 } else {
                     // Non-JSON text — drain or callback
-                    if drain {
-                        state.push_message(
-                            InboundEvent::RawText {
-                                conn_id: (**conn_id).clone(),
-                                text: text.to_string(),
-                            },
-                            text.len(),
-                        );
-                    } else if let (Some(cb), Some(callback_lane)) = (&cached_on_message, &lane) {
-                        let cb_arc = Arc::clone(cb);
-                        let cid = Arc::clone(conn_id);
-                        let t = text.to_string();
-                        spawn_bounded_callback(callback_lane, state, t.len(), move || {
-                            Python::try_attach(|py| {
-                                if let Err(e) = cb_arc.call1(py, (&**cid, &*t)) {
-                                    tracing::warn!("[WSE] on_message error: {e}");
-                                }
-                            });
-                        });
-                    }
+                    deliver(handler, app, Inbound::Text(text.to_string()), text.len());
                     return Flow::Next;
                 };
 
@@ -1096,26 +939,17 @@ impl Reader<'_> {
                                             announced_e2e,
                                             session,
                                             awaiting_session,
-                                            known,
+                                            app,
+                                            handler,
                                             user_id: rust_auth_user_id,
                                             cookies: cookie_str,
-                                            drain,
-                                            lane,
                                         },
                                     );
                                 }
                                 return Flow::Next;
                             }
                             if t_val == "signed" {
-                                take_signed(
-                                    state,
-                                    conn_id,
-                                    own_handle,
-                                    max_pending,
-                                    &val,
-                                    text.len(),
-                                    callbacks,
-                                );
+                                take_signed(&conn, &val, text.len(), handler, app);
                                 return Flow::Next;
                             }
                             if t_val == "ping" {
@@ -1145,57 +979,11 @@ impl Reader<'_> {
                         let val = normalize_json_keys(val);
 
                         // Drain mode: push serde_json::Value to queue (zero GIL)
-                        if drain {
-                            state.push_message(
-                                InboundEvent::Message {
-                                    conn_id: (**conn_id).clone(),
-                                    value: val,
-                                },
-                                text.len(),
-                            );
-                        } else if let (Some(cb), Some(callback_lane)) = (&cached_on_message, &lane)
-                        {
-                            // Callback mode: convert to PyDict + call Python
-                            let cb_arc = Arc::clone(cb);
-                            let cid = Arc::clone(conn_id);
-                            spawn_bounded_callback(
-                                callback_lane,
-                                state,
-                                inbound_cost(text.len(), &val),
-                                move || {
-                                    Python::try_attach(|py| {
-                                        let py_obj = json_to_pyobj(py, &val);
-                                        if let Err(e) = cb_arc.call1(py, (&**cid, py_obj)) {
-                                            tracing::warn!("[WSE] on_message error: {e}");
-                                        }
-                                    });
-                                },
-                            );
-                        }
+                        deliver(handler, app, Inbound::Json(val), text.len());
                     }
                     Err(_) => {
                         // JSON parse failed — pass raw string
-                        if drain {
-                            state.push_message(
-                                InboundEvent::RawText {
-                                    conn_id: (**conn_id).clone(),
-                                    text: text.to_string(),
-                                },
-                                text.len(),
-                            );
-                        } else if let (Some(cb), Some(callback_lane)) = (&cached_on_message, &lane)
-                        {
-                            let cb_arc = Arc::clone(cb);
-                            let cid = Arc::clone(conn_id);
-                            let t = text.to_string();
-                            spawn_bounded_callback(callback_lane, state, t.len(), move || {
-                                Python::try_attach(|py| {
-                                    if let Err(e) = cb_arc.call1(py, (&**cid, &*t)) {
-                                        tracing::warn!("[WSE] on_message error: {e}");
-                                    }
-                                });
-                            });
-                        }
+                        deliver(handler, app, Inbound::Text(text.to_string()), text.len());
                     }
                 }
             }
@@ -1238,15 +1026,12 @@ impl Reader<'_> {
                                     } else if text.starts_with('{') {
                                         text
                                     } else {
-                                        if drain {
-                                            state.push_message(
-                                                InboundEvent::RawText {
-                                                    conn_id: (**conn_id).clone(),
-                                                    text: text.to_string(),
-                                                },
-                                                text.len(),
-                                            );
-                                        }
+                                        deliver(
+                                            handler,
+                                            app,
+                                            Inbound::Text(text.to_string()),
+                                            text.len(),
+                                        );
                                         return Flow::Next;
                                     };
                                     if let Ok(val) =
@@ -1264,50 +1049,12 @@ impl Reader<'_> {
                                         ) {
                                             Protocol::Answered => return Flow::Next,
                                             Protocol::Signed => {
-                                                take_signed(
-                                                    state,
-                                                    conn_id,
-                                                    own_handle,
-                                                    max_pending,
-                                                    &val,
-                                                    text.len(),
-                                                    callbacks,
-                                                );
+                                                take_signed(&conn, &val, text.len(), handler, app);
                                                 return Flow::Next;
                                             }
                                             Protocol::Application => {}
                                         }
-                                        if drain {
-                                            state.push_message(
-                                                InboundEvent::Message {
-                                                    conn_id: (**conn_id).clone(),
-                                                    value: val,
-                                                },
-                                                text.len(),
-                                            );
-                                        } else if let (Some(cb), Some(callback_lane)) =
-                                            (&cached_on_message, &lane)
-                                        {
-                                            let cb_arc = Arc::clone(cb);
-                                            let cid = Arc::clone(conn_id);
-                                            spawn_bounded_callback(
-                                                callback_lane,
-                                                state,
-                                                inbound_cost(text.len(), &val),
-                                                move || {
-                                                    Python::try_attach(|py| {
-                                                        let py_obj = json_to_pyobj(py, &val);
-                                                        if let Err(e) =
-                                                            cb_arc.call1(py, (&**cid, py_obj))
-                                                        {
-                                                            tracing::warn!(
-                                                                "[WSE] on_message (decrypted) error: {e}"
-                                                            );
-                                                        }
-                                                    });
-                                                },
-                                            );
-                                        }
+                                        deliver(handler, app, Inbound::Json(val), text.len());
                                     }
                                 }
                             }
@@ -1341,56 +1088,18 @@ impl Reader<'_> {
                     match answer_protocol_message(state, conn_id, own_handle, max_pending, val) {
                         Protocol::Answered => return Flow::Next,
                         Protocol::Signed => {
-                            take_signed(
-                                state,
-                                conn_id,
-                                own_handle,
-                                max_pending,
-                                val,
-                                data.len(),
-                                callbacks,
-                            );
+                            take_signed(&conn, val, data.len(), handler, app);
                             return Flow::Next;
                         }
                         Protocol::Application => {}
                     }
                 }
 
-                if drain {
-                    let event = match decoded {
-                        Some(value) => InboundEvent::Message {
-                            conn_id: (**conn_id).clone(),
-                            value,
-                        },
-                        None => InboundEvent::Binary {
-                            conn_id: (**conn_id).clone(),
-                            data: data.to_vec(),
-                        },
-                    };
-                    state.push_message(event, data.len());
-                } else if let (Some(cb), Some(callback_lane)) = (&cached_on_message, &lane) {
-                    let cb_arc = Arc::clone(cb);
-                    let cid = Arc::clone(conn_id);
-                    let size = decoded
-                        .as_ref()
-                        .map_or(data.len(), |value| inbound_cost(data.len(), value));
-                    let raw = if decoded.is_none() {
-                        data.to_vec()
-                    } else {
-                        Vec::new()
-                    };
-                    spawn_bounded_callback(callback_lane, state, size, move || {
-                        Python::try_attach(|py| {
-                            let result = match &decoded {
-                                Some(val) => cb_arc.call1(py, (&**cid, json_to_pyobj(py, val))),
-                                None => cb_arc.call1(py, (&**cid, PyBytes::new(py, &raw))),
-                            };
-                            if let Err(e) = result {
-                                tracing::warn!("[WSE] on_message (binary) error: {e}");
-                            }
-                        });
-                    });
-                }
+                let message = match decoded {
+                    Some(value) => Inbound::Json(value),
+                    None => Inbound::Binary(data.to_vec()),
+                };
+                deliver(handler, app, message, data.len());
             }
             Message::Ping(payload) => {
                 queue_reply(own_handle, max_pending, Message::Pong(payload));
@@ -1412,11 +1121,12 @@ impl Reader<'_> {
     }
 }
 
-pub(super) async fn handle_connection(
+pub(crate) async fn handle_connection<H: Handler>(
     stream: TcpStream,
     addr: SocketAddr,
     state: Arc<SharedState>,
     hs_guard: HandshakeGuard,
+    handler: Arc<H>,
 ) {
     // Clone the TCP stream FD for pre-framed raw writes (bypasses tungstenite).
     let (stream, mut raw_write) = match clone_tcp_stream(stream) {
@@ -1551,11 +1261,10 @@ pub(super) async fn handle_connection(
     let conn_id: Arc<String> = Arc::new(Uuid::now_v7().to_string());
     let (tx, mut rx) = mpsc::unbounded_channel::<WsFrame>();
     let out = Arc::new(Outbox::default());
-    let drain = state.drain_mode.load(Ordering::Relaxed);
 
     // ── JWT validation in Rust (zero GIL) ──────────────────────────────────
     // When jwt_config is set, validate JWT from cookie or Authorization header.
-    // On success: send server_ready immediately, push AuthConnect to drain queue.
+    // On success: send server_ready immediately, then the application hears of it.
     // On failure: send error + close — connection never registered.
     // When the token stops being valid (its exp, plus the clock skew the
     // validation allows).
@@ -1720,23 +1429,23 @@ pub(super) async fn handle_connection(
         .conn_last_activity
         .insert((*conn_id).clone(), activity.clone());
 
-    // Callback mode: this connection's callbacks, in the order of its events.
-    let lane = (!drain).then(CallbackLane::new);
     // A client that announced E2E is unknown to the application until its
     // session exists: then all it gets is sealed.
     let awaiting_session = announced_e2e;
-    // Whether the application heard of the connection (and so hears of its
-    // end). No room for it to hear: refused, to come back.
-    let known = !announced_e2e
-        && tell_application(
+    // The application's side of the connection, once it heard of it (and so
+    // hears of its end). No room for it: refused, to come back.
+    let app = if announced_e2e {
+        None
+    } else {
+        tell_application(
             &state,
             &conn_id,
-            rust_auth_user_id.clone(),
+            rust_auth_user_id.as_deref(),
             &cookie_str,
-            drain,
-            lane.as_ref(),
-        );
-    if !announced_e2e && !known {
+            &*handler,
+        )
+    };
+    if !announced_e2e && app.is_none() {
         closer.close(&tx, &out.pending, CLOSE_TRY_AGAIN_LATER, "server busy");
     }
 
@@ -1854,24 +1563,6 @@ pub(super) async fn handle_connection(
         }
     });
 
-    // on_message of callback mode, read once per connection.
-    let cached_on_message: Option<Arc<Py<PyAny>>> = if drain {
-        None
-    } else {
-        state.on_message.read().unwrap().clone()
-    };
-    let cached_on_signed: Option<Arc<Py<PyAny>>> = if drain {
-        None
-    } else {
-        state.on_signed_message.read().unwrap().clone()
-    };
-    let callbacks = Callbacks {
-        drain,
-        lane: lane.as_ref(),
-        on_message: cached_on_message.as_ref(),
-        on_signed_message: cached_on_signed.as_ref(),
-    };
-
     let mut reader = Reader {
         conn: Conn {
             state: &state,
@@ -1883,16 +1574,16 @@ pub(super) async fn handle_connection(
         },
         activity: &activity,
         peer_close: &peer_close,
-        callbacks,
+        handler: &*handler,
         announced_e2e,
-        user_id: &rust_auth_user_id,
+        user_id: rust_auth_user_id.as_deref(),
         cookies: &cookie_str,
         inbound_limit: InboundLimit::new(state.rate_capacity, state.rate_refill),
         frame_errors: FrameErrorLog::default(),
         hello_answered: false,
         awaiting_session,
         session: None,
-        known,
+        app,
     };
 
     // A connection whose token expires is closed (4403): the clients come
@@ -1924,7 +1615,7 @@ pub(super) async fn handle_connection(
     };
     // Stopped at once when the connection must go (`Closer`).
     let _ = futures_util::future::Abortable::new(read_loop, read_stop).await;
-    let known = reader.known;
+    let app = reader.app.take();
     // The read side is done: the write task sends the close reply and ends.
     finish.store(true, Ordering::Release);
     own_handle.out.notify.notify_one();
@@ -1980,17 +1671,8 @@ pub(super) async fn handle_connection(
     // A connection the application never heard of (an announced client that
     // never opened its session, or one refused for want of room) gets no
     // disconnect event either.
-    if known && drain {
-        state.push_inbound(InboundEvent::Disconnect {
-            conn_id: (*conn_id).clone(),
-        });
-    } else if known
-        && let Some(ref lane) = lane
-        && let Some(cb) = state.on_disconnect.read().unwrap().clone()
-    {
-        // After every callback of this connection's messages.
-        let cid = (*conn_id).clone();
-        lane.push(Box::new(move || fire_on_disconnect(&cb, &cid)), None);
+    if let Some(app) = app {
+        handler.disconnect(app);
     }
     drop(tx);
     // A client that reads nothing more is not waited for past the grace.

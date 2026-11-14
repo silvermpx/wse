@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use ahash::AHashSet;
 use crossbeam_channel::{Receiver as CBReceiver, Sender as CBSender, unbounded};
 use dashmap::{DashMap, DashSet};
-use pyo3::prelude::*;
+
 use tokio::sync::{RwLock, mpsc};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -314,21 +314,18 @@ impl Commands {
         })
     }
 
-    /// Queue `cmd` once fewer than `COMMAND_QUEUE` commands wait, waiting
-    /// without the GIL meanwhile: the application's sends and broadcasts.
-    pub(crate) fn send_waiting(
-        &self,
-        py: Python<'_>,
-        cmd: ServerCommand,
-    ) -> Result<(), mpsc::error::SendError<ServerCommand>> {
-        if self.queued.load(Ordering::Relaxed) >= COMMAND_QUEUE {
-            py.detach(|| {
-                while self.queued.load(Ordering::Relaxed) >= COMMAND_QUEUE && !self.tx.is_closed() {
-                    std::thread::sleep(std::time::Duration::from_micros(50));
-                }
-            });
+    /// Whether `COMMAND_QUEUE` commands wait already: the application's
+    /// sends and broadcasts wait for room (`wait_for_room`) before theirs.
+    pub(crate) fn is_full(&self) -> bool {
+        self.queued.load(Ordering::Relaxed) >= COMMAND_QUEUE
+    }
+
+    /// Block the calling thread until fewer than `COMMAND_QUEUE` commands
+    /// wait, or the server is gone.
+    pub(crate) fn wait_for_room(&self) {
+        while self.is_full() && !self.tx.is_closed() {
+            std::thread::sleep(std::time::Duration::from_micros(50));
         }
-        self.send(cmd)
     }
 }
 
@@ -519,12 +516,6 @@ pub(crate) struct SharedState {
     pub(super) e2e_legacy: bool,
     // Connections in an E2E session (send_event does not compress for them)
     pub(super) conn_sealed: DashSet<String>,
-    // Callback mode. Shared, so a runtime thread takes one without attaching
-    // to Python.
-    pub(super) on_connect: std::sync::RwLock<Option<Arc<Py<PyAny>>>>,
-    pub(super) on_message: std::sync::RwLock<Option<Arc<Py<PyAny>>>>,
-    pub(super) on_disconnect: std::sync::RwLock<Option<Arc<Py<PyAny>>>>,
-    pub(super) on_signed_message: std::sync::RwLock<Option<Arc<Py<PyAny>>>>,
     // Signed messages: the server's key, how far a message's time may be
     // from the server's, each connection's key, and the (kid, n) taken
     // within the window, each until it is too old to come again.
@@ -750,10 +741,6 @@ impl SharedState {
             e2e_identity: cfg.e2e_identity,
             e2e_legacy: cfg.e2e_legacy,
             conn_sealed: DashSet::new(),
-            on_connect: std::sync::RwLock::new(None),
-            on_message: std::sync::RwLock::new(None),
-            on_disconnect: std::sync::RwLock::new(None),
-            on_signed_message: std::sync::RwLock::new(None),
             signer: cfg.signer,
             signature_window_ms: cfg.signature_window_secs.saturating_mul(1000),
             client_keys: DashMap::new(),

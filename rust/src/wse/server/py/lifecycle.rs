@@ -56,7 +56,7 @@ impl RustWSEServer {
         // Waited for detached (`write_py_attached`), so a reader on another
         // thread is never kept from its attach. The callbacks being replaced
         // are dropped after the guards: that may run Python code.
-        let shared = self.shared.clone();
+        let shared = self.callbacks.clone();
         let old_connect = shared
             .on_connect
             .write_py_attached(py)
@@ -143,6 +143,11 @@ impl RustWSEServer {
             .store(Some(Arc::new(cmd_tx.clone())));
         let running = self.running.clone();
         let shared = self.shared.clone();
+        // What the application hears of its connections: drain or callbacks.
+        let handler = Arc::new(super::handler::PyHandler {
+            state: self.shared.clone(),
+            callbacks: self.callbacks.clone(),
+        });
         let rt_handle = rt.handle().clone();
 
         self.running.store(true, Ordering::SeqCst);
@@ -338,6 +343,7 @@ impl RustWSEServer {
                                         // by the kernel too, not only by idle_timeout.
                                         let _ = sock.set_tcp_keepalive(&tcp_keepalive());
                                         let shared2 = shared.clone();
+                                        let handler = Arc::clone(&handler);
                                         // Cluster links come on this port only in
                                         // single-port mode: the peek is for that.
                                         let single_port =
@@ -380,7 +386,7 @@ impl RustWSEServer {
                                                     ),
                                                 }
                                             } else {
-                                                handle_connection(stream, addr, shared2, hs_guard).await;
+                                                handle_connection(stream, addr, shared2, hs_guard, handler).await;
                                             }
                                         });
                                     }

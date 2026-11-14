@@ -12,8 +12,8 @@ use pyo3::types::PyDict;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use uuid::Uuid;
 
-use super::RustWSEServer;
 use super::convert::pyobj_to_json;
+use super::{RustWSEServer, SendWaiting};
 use crate::wse::msgpack::serde_json_to_rmpv;
 use crate::wse::server::ServerCommand;
 use crate::wse::server::messages::{build_server_ready, inject_category, message_category};
@@ -107,7 +107,7 @@ impl RustWSEServer {
 
     pub(super) fn send_impl(&self, py: Python<'_>, conn_id: &str, data: &str) -> PyResult<()> {
         let tx = self.command_tx()?;
-        tx.send_waiting(
+        tx.send_waiting_detached(
             py,
             ServerCommand::SendText {
                 conn_id: conn_id.to_owned(),
@@ -125,7 +125,7 @@ impl RustWSEServer {
         data: &[u8],
     ) -> PyResult<()> {
         let tx = self.command_tx()?;
-        tx.send_waiting(
+        tx.send_waiting_detached(
             py,
             ServerCommand::SendBytes {
                 conn_id: conn_id.to_owned(),
@@ -270,7 +270,7 @@ impl RustWSEServer {
         };
         let byte_count = body.len();
         cmd_tx
-            .send_waiting(
+            .send_waiting_detached(
                 py,
                 ServerCommand::SendPrebuilt {
                     conn_id: conn_id.to_owned(),
@@ -284,14 +284,14 @@ impl RustWSEServer {
     pub(super) fn broadcast_all_impl(&self, py: Python<'_>, data: &str) -> PyResult<()> {
         let tx = self.command_tx()?;
         let data = inject_category(data);
-        tx.send_waiting(py, ServerCommand::BroadcastText { data })
+        tx.send_waiting_detached(py, ServerCommand::BroadcastText { data })
             .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         Ok(())
     }
 
     pub(super) fn broadcast_all_bytes_impl(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
         let tx = self.command_tx()?;
-        tx.send_waiting(
+        tx.send_waiting_detached(
             py,
             ServerCommand::BroadcastBytes {
                 data: data.to_vec(),
@@ -309,7 +309,7 @@ impl RustWSEServer {
     ) -> PyResult<()> {
         let tx = self.command_tx()?;
         let data = inject_category(data);
-        tx.send_waiting(
+        tx.send_waiting_detached(
             py,
             ServerCommand::BroadcastLocal {
                 topic: topic.to_owned(),
@@ -329,7 +329,7 @@ impl RustWSEServer {
         // out locally, then publishes the same stamped bytes to cluster peers:
         // every node delivers one wire form per message, with one position.
         self.command_tx()?
-            .send_waiting(
+            .send_waiting_detached(
                 py,
                 ServerCommand::BroadcastLocal {
                     topic: topic.to_owned(),

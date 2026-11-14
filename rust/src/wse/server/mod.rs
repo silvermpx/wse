@@ -30,6 +30,7 @@
 //! - `signing`: signed messages: client keys, the server's signing key, the
 //!   checks a client's signed message passes.
 //! - `commands`: the command processor that executes `ServerCommand`s.
+//! - `handler`: what the application hears of its clients (`Handler`).
 //!
 //! Python layer, PyO3:
 //!
@@ -40,7 +41,8 @@
 //!   `*_impl` helper in a topic file: `py/lifecycle.rs`, `messaging.rs`,
 //!   `inbound.rs`, `subscriptions.rs`, `presence.rs`, `cluster.rs` and
 //!   `metrics.rs`; `convert.rs` converts between Python objects and JSON,
-//!   `callbacks.rs` fires the callback-mode callbacks.
+//!   `callbacks.rs` fires the callback-mode callbacks, `handler.rs` is the
+//!   `Handler` the Python server runs its connections with.
 //!
 //! The crate-visible items are re-exported below, so `server::X` paths stay as
 //! they were. Sibling modules import them through these re-exports and import
@@ -48,26 +50,19 @@
 //!
 //! # Engine vs Python layer
 //!
-//! PyO3 is still used inside the engine here, to untangle before the engine can
-//! stand alone:
-//!
-//! - `state`: `SharedState::{on_connect, on_message, on_disconnect}` hold the
-//!   callback-mode Python callbacks as `Py<PyAny>`.
-//! - `connection`: `handle_connection` runs callback mode itself. It clones the
-//!   callbacks under `Python::try_attach`, calls `on_message` with
-//!   `py::json_to_pyobj` / `PyBytes` arguments through `spawn_bounded_callback`,
-//!   and fires `py::fire_on_connect` / `py::fire_on_disconnect`.
-//! - Modules outside `server` that the engine calls also define PyO3 functions:
-//!   `crate::jwt` (JWT validation, topic ACLs) and `crate::wse::compression`
-//!   (msgpack helpers). `crate::wse::cluster` has no PyO3.
+//! The engine has no PyO3: what the application hears of its connections
+//! goes through `handler::Handler`, called on each connection's task in
+//! order (connect, messages, signed messages, disconnect). `py::handler`
+//! implements it for Python: drain mode queues the events for
+//! `drain_inbound()`, callback mode runs the callbacks one after another for
+//! each connection on the blocking pool.
 //!
 //! Engine code that still lives in the Python layer:
 //!
 //! - `py::lifecycle::start_impl` builds the runtime: the accept loop with
 //!   cluster protocol detection, the recovery cleanup, the presence TTL sweep
-//!   and the ping / zombie / slow-consumer task, which also fires
-//!   `fire_on_disconnect`. `start_impl` and `stop_impl` take the lifecycle
-//!   lock through the Python-aware `crate::wse::pylock::lock`.
+//!   and the ping / zombie / slow-consumer task. `start_impl` and `stop_impl`
+//!   take the lifecycle lock through the Python-aware `crate::wse::pylock::lock`.
 //! - `py::messaging::send_event_impl` holds the outbound pipeline (dedup, rate
 //!   limit, envelope, msgpack / zlib / E2E) next to the `PyDict` conversion.
 //! - `py::subscriptions` and `py::presence` hold subscribe / unsubscribe, queue
@@ -81,6 +76,7 @@ mod e2e;
 pub(crate) mod e2e_session;
 mod fanout;
 mod frames;
+pub(crate) mod handler;
 mod handshake;
 mod messages;
 mod py;

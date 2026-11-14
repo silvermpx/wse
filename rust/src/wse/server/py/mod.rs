@@ -9,15 +9,13 @@
 mod callbacks;
 mod cluster;
 mod convert;
+mod handler;
 mod inbound;
 mod lifecycle;
 mod messaging;
 mod metrics;
 mod presence;
 mod subscriptions;
-
-pub(super) use callbacks::{fire_on_connect, fire_on_disconnect};
-pub(super) use convert::json_to_pyobj;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +57,31 @@ pub struct RustWSEServer {
     dedup: Arc<std::sync::Mutex<DeduplicationState>>,
     rt_handle: parking_lot::RwLock<Option<tokio::runtime::Handle>>,
     started_at: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Callback mode's callbacks (`set_callbacks()`), shared with the handler.
+    callbacks: Arc<handler::PyCallbacks>,
+}
+
+/// Queue a command once there is room for it in the command queue, waiting
+/// without the GIL meanwhile: the application's sends and broadcasts.
+pub(super) trait SendWaiting {
+    fn send_waiting_detached(
+        &self,
+        py: Python<'_>,
+        cmd: ServerCommand,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<ServerCommand>>;
+}
+
+impl SendWaiting for Commands {
+    fn send_waiting_detached(
+        &self,
+        py: Python<'_>,
+        cmd: ServerCommand,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<ServerCommand>> {
+        if self.is_full() {
+            py.detach(|| self.wait_for_room());
+        }
+        self.send(cmd)
+    }
 }
 
 /// The command sender of the running server, loaded from `RustWSEServer::cmd_tx`
@@ -331,6 +354,7 @@ impl RustWSEServer {
             })),
             rt_handle: parking_lot::RwLock::new(None),
             started_at: parking_lot::Mutex::new(None),
+            callbacks: Arc::default(),
         })
     }
 
