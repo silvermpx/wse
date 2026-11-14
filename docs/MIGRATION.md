@@ -12,6 +12,9 @@
 - **JWT options are checked at startup.** HMAC secrets must be at least the hash size (32, 48 or 64 bytes); a PEM key is refused as an HMAC secret; `jwt_issuer` / `jwt_audience` now also reject tokens that omit the claim; any `jwt_*` option without `jwt_secret` is an error.
 - **A `wse_topics` claim that is malformed, empty (`{}`), has a key other than `allow` and `deny`, or an empty `allow` list denies every topic** instead of allowing all of them.
 - **`set_topic_acl(conn_id, allow=[])` allows no topic**, as an empty `allow` list in the claim; leave `allow` out to allow every topic that is not denied.
+- **`reload_jwt_keys()` with a new public key needs the matching `jwt_private_key`** on a server that issues tokens (`issue_token()`).
+- **A client's own subscription requests** (`client_subscriptions=True`) take at most 1024 topics each, and a client holds at most 1024 topics that way unless `max_subscriptions_per_connection` is set.
+- **An E2E session is opened first.** A client that wants one announces it (`e2e=1` in the upgrade URL) and sends `client_hello` at once; the server tells the application of the connection, and sends `server_ready` sealed, only after the session exists. The 3.0 clients do this; a client of your own follows [PROTOCOL.md](PROTOCOL.md#end-to-end-encryption).
 - **The rate limit applies to what clients send**, as documented: messages over it are dropped with a `RATE_LIMITED` error and a client that keeps on is closed with 4429. `send_event()` is no longer throttled.
 - **Connections close when their token expires** (code 4403); the clients reconnect with a fresh token.
 - **New close codes**: 1013 (slow consumer), 4403, 4408 (idle), 4429, 4800, 4802, 4803. See [PROTOCOL.md](PROTOCOL.md#websocket-close-codes).

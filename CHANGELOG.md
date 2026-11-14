@@ -8,19 +8,27 @@ Security, correctness and speed. Upgrading from 2.x: see
 ### Breaking changes
 
 - E2E encryption now authenticates the server: clients pin the server's
-  public key (`e2e_identity_key` on the server). 2.x clients keep working
-  while `e2e_legacy=True`, the default.
+  public key (`e2e_identity_key` on the server). The session comes first:
+  announced when the client connects, it is opened before the application
+  hears of the connection, and every frame after it is sealed. 2.x clients
+  keep working while `e2e_legacy=True`, the default.
 - `connect_cluster()` needs `cluster_port`, or `single_port=True` to take
   peers on the WebSocket port.
 - `start()` and `connect_cluster()` raise `OSError` when the port is taken.
   `drain()` waits for the clients to leave and returns how many it dropped.
 - JWT settings are checked at startup. A token without the configured
-  `iss`/`aud` is rejected; a malformed `wse_topics` claim denies every topic.
+  `iss`/`aud` is rejected; a `wse_topics` claim that is malformed, empty or
+  has a key besides `allow`/`deny` denies every topic, and so does
+  `set_topic_acl(conn_id, allow=[])`.
+- `reload_jwt_keys()` with a new public key needs the new `jwt_private_key`
+  on a server that issues tokens.
 - The rate limit applies to what clients send (close code 4429);
   `send_event()` is not throttled.
 - New close codes: 1013, 4403, 4408, 4429, 4800, 4802, 4803.
 - `subscribe_connection()` returns the topics it accepted. Topic names are
-  validated, and a connection holds at most 16 patterns.
+  validated, and a connection holds at most 16 patterns. A client's own
+  requests take at most 1024 topics, and hold at most 1024 unless
+  `max_subscriptions_per_connection` is set.
 - Invalid options, and values that cannot be JSON, raise `ValueError`.
 - Sends and broadcasts wait, without holding the GIL, while 65,536 commands
   are queued, so memory stays bounded under any load.
@@ -61,15 +69,23 @@ Security, correctness and speed. Upgrading from 2.x: see
   `start()`, `drain()`, `stop()` and callbacks follow their documented
   contract; recovery stays within its memory budget; presence updates and
   tracking run concurrently.
-- Cluster: any node can link to any other and redials a lost link;
-  interest routing covers patterns; a new peer receives the full interest
-  and presence state; presence stays consistent after a lost leave;
-  relayed messages keep their recovery position.
+- Cluster: any node can link to any other and redials a lost link, and a
+  node known under two addresses keeps one steady link; interest routing
+  covers patterns; a new peer receives the full interest and presence
+  state; presence stays consistent after a lost leave or link; relayed
+  messages keep their recovery position, and a topic published on several
+  nodes recovers from all of them.
 - Clients: reconnect until the server rejects the token; encryption fails
-  closed; gaps are recovered from the last delivered message; the
-  TypeScript client keeps one session per page.
+  closed, on a plaintext frame too; gaps are recovered from the last
+  delivered message; offline messages go out only for the user they were
+  written for, and signed ones are never queued; the TypeScript client
+  keeps one session per page.
 - The Rust utilities (filters, queues, transformer, msgpack) follow their
   documentation.
+
+- Limits: sockets that send nothing, subscribers that read nothing,
+  oversized subscription requests and messages that grow when decoded are
+  bounded, and cost the server neither speed nor memory.
 
 ### Performance
 

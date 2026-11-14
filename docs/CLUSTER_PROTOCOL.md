@@ -45,7 +45,7 @@ If FLAG_COMPRESSED (0x01) is set in the flags byte, the payload is zstd-compress
 
 The payload is the message as the sending node's own subscribers got it: JSON text, with its recovery stamp when recovery is on. The receiving node builds the WebSocket frame once for all of its subscribers (and msgpack or sealed frames for those that need them).
 
-If FLAG_HAS_RECOVERY (0x02) is set, a 12-byte **recovery trailer** is appended *after* the payload (and is **not** counted in `payload_len`): a little-endian `u32` origin epoch followed by a little-endian `u64` origin offset. The receiving node stores the payload in a foreign recovery buffer keyed by `(topic, origin_epoch)`, so a client that reconnects to a different node can still recover with its original `(epoch, offset)` — provided that node had interest in (and therefore received) the topic's messages.
+If FLAG_HAS_RECOVERY (0x02) is set, a 12-byte **recovery trailer** is appended *after* the payload (and is **not** counted in `payload_len`): a little-endian `u32` origin epoch followed by a little-endian `u64` origin offset. The receiving node stores the payload in a foreign recovery buffer keyed by `(topic, origin_epoch)`, so a client that reconnects to a different node can still recover with its original `(epoch, offset)` — provided that node had interest in (and therefore received) the topic's messages. With recovery on, a node keeps its interest in a topic for the history's lifetime (`recovery_ttl`) after the topic's last local subscriber leaves, so what other nodes publish meanwhile still reaches it. A topic published on several nodes has one stream per origin (one epoch each): a recovery replays, from every stream, what reached this node after the client's last message, in the order it arrived, and reports `recovered: false` when a stream no longer holds all of that or when this node's interest was interrupted since.
 
 ### PING (0x02) / PONG (0x03) - Heartbeat
 
@@ -253,7 +253,7 @@ Gossip is lightweight: PeerAnnounce and PeerList go out when links come up, and 
 | Graceful shutdown | SHUTDOWN frame sent to all peers, then immediate cancel |
 | Dead letter queue | 1,000 entries, FIFO eviction |
 | Write batching | 64 KB batch limit per flush |
-| Backpressure | Bounded per-peer outbound channel (10,000 frames), messages dropped on overflow. The inbound MSG dispatch queue per peer is likewise bounded (10,000); overflow is shed (counted in `messages_dropped`) so the reader stays responsive to heartbeats, and shed messages remain recoverable via recovery buffers. Interest and presence updates reach the manager through bounded queues (65,536); a peer that sends them faster than the manager keeps up waits, slowed down at its socket |
+| Backpressure | Bounded per-peer outbound channel (10,000 frames), messages dropped on overflow. The inbound MSG dispatch queue per peer is likewise bounded (10,000); overflow is shed (counted in `messages_dropped`) so the reader stays responsive to heartbeats. A shed message is not stored for recovery on the receiving node: a client recovering there across it gets `recovered: false`. Interest and presence updates reach the manager through bounded queues (65,536); a peer that sends them faster than the manager keeps up waits, slowed down at its socket |
 
 ### Circuit Breaker
 

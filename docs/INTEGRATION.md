@@ -491,7 +491,7 @@ server = RustWSEServer(
 
 **Recovery on reconnect.** After every reconnect both client SDKs re-subscribe their topics in one `subscription_update` request carrying, per topic, the epoch and offset of the last message they delivered. Two ways to answer it:
 
-- Let the server do it: `RustWSEServer(..., client_subscriptions=True)`. It subscribes the topics the connection's topic ACL allows (set one with `set_topic_acl` or the JWT `wse_topics` claim: without an ACL a client may subscribe to any topic), replays what each one missed, then replies. No application code.
+- Let the server do it: `RustWSEServer(..., client_subscriptions=True)`. It subscribes the topics the connection's topic ACL allows (set one with `set_topic_acl` or the JWT `wse_topics` claim: without an ACL a client may subscribe to any topic), replays what each one missed, then replies. No application code. A request takes at most 1024 topics, and a client holds at most 1024 that way unless `max_subscriptions_per_connection` is set.
 - Or handle the request in your drain loop (`t == "subscription_update"`):
 
 ```python
