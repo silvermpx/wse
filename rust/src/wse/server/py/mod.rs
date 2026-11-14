@@ -21,14 +21,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use ahash::AHashSet;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use zeroize::Zeroizing;
 
 use crate::jwt::{self, JwtConfig};
-use crate::wse::server::{Publisher, ServerCommand, SharedState, SharedStateConfig};
+use crate::wse::server::{
+    Config, JwtSettings, PresenceSettings, Publisher, RecoverySettings, ServerCommand, SharedState,
+};
 
 // ---------------------------------------------------------------------------
 // PyO3 class
@@ -134,6 +135,8 @@ struct PresenceParams {
 }
 
 impl RustWSEServer {
+    // Config's fields are set one by one, as from another crate.
+    #[allow(clippy::field_reassign_with_default)]
     fn build(
         host: String,
         port: u16,
@@ -142,78 +145,6 @@ impl RustWSEServer {
         rec: RecoveryParams,
         pres: PresenceParams,
     ) -> PyResult<Self> {
-        let at_least_one = [
-            ("max_connections", srv.max_connections),
-            ("max_inbound_queue_size", srv.max_inbound_queue_size),
-            ("max_inbound_queue_bytes", srv.max_inbound_queue_bytes),
-            ("max_message_size", srv.max_message_size),
-        ];
-        for (name, value) in at_least_one {
-            if value == 0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "{name} must be at least 1"
-                )));
-            }
-        }
-        if srv.ping_interval == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "ping_interval must be at least 1 second",
-            ));
-        }
-        // NaN is refused; infinity means no limit.
-        if srv.rate_limit_capacity.is_nan() || srv.rate_limit_capacity < 1.0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "rate_limit_capacity must be at least 1, got {}",
-                srv.rate_limit_capacity
-            )));
-        }
-        if srv.rate_limit_refill.is_nan() || srv.rate_limit_refill <= 0.0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "rate_limit_refill must be above 0, got {}",
-                srv.rate_limit_refill
-            )));
-        }
-        let allowed_origins = srv
-            .allowed_origins
-            .map(|origins| {
-                origins
-                    .iter()
-                    .map(|origin| crate::wse::server::normalize_origin(origin))
-                    .collect::<Result<AHashSet<String>, String>>()
-            })
-            .transpose()
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        let e2e_identity = srv
-            .e2e_identity_key
-            .as_deref()
-            .map(crate::crypto::IdentityKey::from_pkcs8)
-            .transpose()
-            .map_err(|_| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "e2e_identity_key must be an ECDSA P-256 private key in PKCS#8 (PEM or DER)",
-                )
-            })?;
-        let signer = srv
-            .signing_key
-            .as_deref()
-            .map(crate::wse::server::signing::ServerSigner::from_pkcs8)
-            .transpose()
-            .map_err(|_| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "signing_key must be an ECDSA P-256 private key in PKCS#8 (PEM or DER)",
-                )
-            })?;
-        if srv.signature_window == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "signature_window must be at least 1 second",
-            ));
-        }
-        if srv.ping_interval >= srv.idle_timeout {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "ping_interval ({}s) must be less than idle_timeout ({}s)",
-                srv.ping_interval, srv.idle_timeout
-            )));
-        }
         // Every jwt_* option needs jwt_secret: without it the server runs with
         // no authentication, and an issuer or audience set alone would only
         // look like protection.
@@ -239,86 +170,55 @@ impl RustWSEServer {
                 )));
             }
         }
-        let jwt_alg = match jwt.jwt_algorithm.as_deref() {
-            None => jwt::JwtAlgorithm::HS256,
-            Some(name) => jwt::JwtAlgorithm::from_str(name).map_err(|_| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "Unsupported jwt_algorithm: {name}. Supported: {}",
-                    jwt::JwtAlgorithm::supported()
-                ))
-            })?,
-        };
-        // Keys are checked against the algorithm at startup, not at the first
-        // connection.
-        let key_error = |option: &str, e: jwt::JwtError| {
-            pyo3::exceptions::PyValueError::new_err(format!("{option} for {jwt_alg:?}: {e}"))
-        };
-        if let Some(ref key) = jwt.jwt_secret {
-            jwt::check_verification_key(jwt_alg, key).map_err(|e| key_error("jwt_secret", e))?;
-        }
-        if let Some(ref key) = jwt.jwt_previous_secret {
-            jwt::check_verification_key(jwt_alg, key)
-                .map_err(|e| key_error("jwt_previous_secret", e))?;
-        }
-        if let Some(ref key) = jwt.jwt_private_key {
-            jwt::check_signing_key(jwt_alg, key).map_err(|e| key_error("jwt_private_key", e))?;
-        }
-        let jwt_config = jwt.jwt_secret.map(|secret| JwtConfig {
-            algorithm: jwt_alg,
-            secret: Zeroizing::new(secret),
-            previous_secret: jwt.jwt_previous_secret.map(Zeroizing::new),
-            signing_key: jwt.jwt_private_key.map(Zeroizing::new),
-            key_id: jwt.jwt_key_id,
-            issuer: jwt.jwt_issuer.unwrap_or_default(),
-            audience: jwt.jwt_audience.unwrap_or_default(),
-            cookie_name: jwt
-                .jwt_cookie_name
-                .unwrap_or_else(|| "access_token".to_string()),
+        let mut config = Config::default();
+        config.max_connections = srv.max_connections;
+        config.max_inbound_queue_size = srv.max_inbound_queue_size;
+        config.max_inbound_queue_bytes = srv.max_inbound_queue_bytes;
+        config.allowed_origins = srv.allowed_origins;
+        config.client_subscriptions = srv.client_subscriptions;
+        config.e2e_identity_key = srv.e2e_identity_key;
+        config.e2e_legacy = srv.e2e_legacy;
+        config.signing_key = srv.signing_key;
+        config.signature_window = srv.signature_window;
+        config.max_message_size = srv.max_message_size;
+        config.ping_interval = srv.ping_interval;
+        config.idle_timeout = srv.idle_timeout;
+        config.max_outbound_queue_bytes = srv.max_outbound_queue_bytes;
+        config.max_subscriptions_per_connection = srv.max_subscriptions_per_connection;
+        config.rate_limit_capacity = srv.rate_limit_capacity;
+        config.rate_limit_refill = srv.rate_limit_refill;
+        config.jwt = jwt.jwt_secret.map(|secret| {
+            let mut settings = JwtSettings::new(secret);
+            settings.algorithm = jwt.jwt_algorithm;
+            settings.issuer = jwt.jwt_issuer;
+            settings.audience = jwt.jwt_audience;
+            settings.cookie_name = jwt.jwt_cookie_name;
+            settings.previous_secret = jwt.jwt_previous_secret;
+            settings.key_id = jwt.jwt_key_id;
+            settings.private_key = jwt.jwt_private_key;
+            settings
         });
-        let recovery = if rec.recovery_enabled {
-            let clamped = rec.recovery_buffer_size.max(16);
-            let bits = if clamped.is_power_of_two() {
-                clamped.trailing_zeros()
-            } else {
-                clamped.next_power_of_two().trailing_zeros()
-            };
-            Some(Arc::new(crate::wse::recovery::RecoveryManager::new(
-                crate::wse::recovery::RecoveryConfig {
-                    buffer_size_bits: bits,
-                    history_ttl_secs: rec.recovery_ttl,
-                    max_recovery_messages: rec.recovery_max_messages,
-                    global_memory_budget: rec.recovery_memory_budget,
-                },
-            )))
-        } else {
-            None
-        };
+        config.recovery = rec.recovery_enabled.then(|| {
+            let mut settings = RecoverySettings::default();
+            settings.buffer_size = rec.recovery_buffer_size;
+            settings.ttl = rec.recovery_ttl;
+            settings.max_messages = rec.recovery_max_messages;
+            settings.memory_budget = rec.recovery_memory_budget;
+            settings
+        });
+        config.presence = pres.presence_enabled.then(|| {
+            let mut settings = PresenceSettings::default();
+            settings.max_data_size = pres.presence_max_data_size;
+            settings.max_members = pres.presence_max_members;
+            settings
+        });
+        let shared = config
+            .into_state()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.0))?;
         Ok(Self {
             host,
             port,
-            shared: Arc::new(SharedState::new(SharedStateConfig {
-                max_connections: srv.max_connections,
-                jwt_config,
-                max_inbound_queue_size: srv.max_inbound_queue_size,
-                max_inbound_queue_bytes: srv.max_inbound_queue_bytes,
-                allowed_origins,
-                client_subscriptions: srv.client_subscriptions,
-                e2e_identity,
-                e2e_legacy: srv.e2e_legacy,
-                recovery,
-                presence_enabled: pres.presence_enabled,
-                presence_max_data_size: pres.presence_max_data_size,
-                presence_max_members: pres.presence_max_members,
-                rate_capacity: srv.rate_limit_capacity,
-                rate_refill: srv.rate_limit_refill,
-                max_message_size: srv.max_message_size,
-                ping_interval_secs: srv.ping_interval,
-                idle_timeout_secs: srv.idle_timeout,
-                max_outbound_queue_bytes: srv.max_outbound_queue_bytes,
-                max_subscriptions_per_connection: srv.max_subscriptions_per_connection,
-                signer,
-                signature_window_secs: srv.signature_window,
-            })),
+            shared: Arc::new(shared),
             cmd_tx: arc_swap::ArcSwapOption::empty(),
             lifecycle: std::sync::Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),

@@ -71,6 +71,7 @@
 //!   `SharedState` configuration, reporting errors as Python exceptions.
 
 mod commands;
+pub(crate) mod config;
 mod connection;
 mod e2e;
 pub(crate) mod e2e_session;
@@ -88,6 +89,9 @@ pub(crate) mod subscribe;
 
 pub use py::RustWSEServer;
 
+// The engine's Rust API: the Python layer uses part of it.
+#[allow(unused_imports)]
+pub use config::{Config, ConfigError, JwtSettings, PresenceSettings, RecoverySettings};
 pub(crate) use e2e::E2E_KEY_INFO;
 pub(crate) use fanout::{
     Fanout, Outgoing, TopicAcl, TopicIndex, count_message, glob_match, is_pattern,
@@ -100,8 +104,7 @@ pub use publisher::{Error, Publisher};
 pub(crate) use state::{
     CLOSE_E2E_BAD_FRAME, CLOSE_E2E_EXHAUSTED, CLOSE_E2E_UNSUPPORTED, CLOSE_GOING_AWAY, CLOSE_GRACE,
     CLOSE_IDLE, CLOSE_NORMAL, CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED, CLOSE_TRY_AGAIN_LATER,
-    Closer, Commands, ConnectionHandle, QueueGroup, ServerCommand, SharedState, SharedStateConfig,
-    Tally,
+    Closer, Commands, ConnectionHandle, QueueGroup, ServerCommand, SharedState, Tally,
 };
 
 // ---------------------------------------------------------------------------
