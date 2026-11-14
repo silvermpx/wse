@@ -289,3 +289,36 @@ ulimit -n 500000
 ---
 
 *Tested February 28, 2026. WSE v2.0.0, wse-bench v0.1.0.*
+
+---
+
+## The `wse-client` crate: what a message costs
+
+The Rust client of 3.0 (`crates/wse-client`) against two clients built on
+tokio-tungstenite directly: one that only counts frames (the floor: what the
+WebSocket layer and the runtime cost), and a typical one that parses every
+frame into a `serde_json::Value`. Each `wse-client` connection decodes the
+payload into a struct (`{symbol: &str, price: f64}`), and drops duplicates
+and orders the topic by its recovery stamps as it always does.
+
+The server publishes a topic message (138 bytes with its recovery stamp) at
+a fixed rate, 2 million deliveries a second across the client's
+connections, so every client gets the same load. The figure is the CPU
+time of the client process over 8 seconds divided by the messages it got;
+two rounds each.
+
+Intel Xeon Gold 5412U (24 cores, 48 threads), server and client pinned to
+separate halves; WSE 3.0.0, November 2026.
+
+| Client | 100 connections | 1,000 connections |
+|--------|-----------------|-------------------|
+| tokio-tungstenite, frames counted only | 1.24-1.29 µs | 4.59-4.71 µs |
+| tokio-tungstenite + `serde_json::Value` | 3.18-3.23 µs | 5.21-5.41 µs |
+| `wse-client`, a `Handler` | **1.66-1.99 µs** | **4.84-4.86 µs** |
+| `wse-client`, the `Events` stream | 1.93-2.33 µs | 4.55-4.95 µs |
+
+At 1,000 connections each gets 2,000 messages a second and the cost is
+mostly the wake-ups of the runtime, the same for every client. At 100
+connections, 20,000 a second each, the client reads its messages in batches
+and the difference shows: everything the client does on top of the
+WebSocket layer costs less than parsing the message into a `Value`.
