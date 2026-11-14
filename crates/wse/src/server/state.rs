@@ -207,6 +207,7 @@ pub(crate) struct QueueGroup {
 
 /// Inbound event types pushed to drain queue.
 /// All events go through one FIFO queue to preserve ordering.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub(super) enum InboundEvent {
     Connect {
         conn_id: String,
@@ -255,6 +256,7 @@ pub(super) enum InboundEvent {
 /// always get in, so the application never misses a join or a leave; the
 /// clients' messages are dropped while `max_inbound_queue_size` of them, or
 /// `max_inbound_queue_bytes` of their size, are waiting.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub(super) struct Queued {
     pub(super) event: InboundEvent,
     /// What a client's message counts against the byte budget; `None` for
@@ -263,6 +265,7 @@ pub(super) struct Queued {
 }
 
 /// A message's room in the inbound budget while its callback runs.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub(super) struct CallbackRoom {
     state: Arc<SharedState>,
     bytes: usize,
@@ -341,6 +344,7 @@ impl Commands {
 /// wire, as the budget is set; or what its decoded value holds in memory when
 /// that is many times more (a frame of many tiny elements holds tens of times
 /// its own size).
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub(crate) fn inbound_cost(wire: usize, value: &serde_json::Value) -> usize {
     let decoded = decoded_size(value);
     if decoded > wire.saturating_mul(DECODED_SIZE_RATIO) {
@@ -352,8 +356,10 @@ pub(crate) fn inbound_cost(wire: usize, value: &serde_json::Value) -> usize {
 
 /// How many times its wire size a decoded message may hold before it is
 /// charged what it holds: ordinary JSON stays well under it.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
 const DECODED_SIZE_RATIO: usize = 4;
 
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
 fn decoded_size(value: &serde_json::Value) -> usize {
     use serde_json::Value;
     const NODE: usize = std::mem::size_of::<Value>();
@@ -432,6 +438,7 @@ const MIN_LIFECYCLE_EVENTS: usize = 64;
 
 impl InboundEvent {
     /// A connection's connect or disconnect event.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     fn is_lifecycle(&self) -> bool {
         matches!(
             self,
@@ -532,19 +539,27 @@ pub(crate) struct SharedState {
     pub(super) client_keys: DashMap<String, Arc<ClientKey>>,
     pub(super) signed_seen: DashMap<String, u64>,
     // Drain mode: when active, inbound events go to channel instead of callbacks
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub(super) drain_mode: AtomicBool,
     // Lock-free channel: Tokio tasks send (non-blocking), Python drains
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     inbound_tx: CBSender<Queued>,
     pub(super) inbound_rx: CBReceiver<Queued>,
     // The clients' messages in the channel, their size and the limits of both
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     inbound_messages: AtomicUsize,
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     inbound_bytes: AtomicUsize,
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     max_inbound_messages: usize,
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     max_inbound_bytes: usize,
     // Connect and disconnect events in the channel: no message limit applies
     // to them (the application's view of its connections stays whole), but
     // past this many a server whose drain stalls takes no new connection.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     inbound_lifecycle: AtomicUsize,
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     max_lifecycle_events: usize,
     // Client messages dropped over those limits (observability)
     pub(super) inbound_dropped: AtomicU64,
@@ -832,6 +847,7 @@ impl SharedState {
 
     /// Queue a connect, disconnect or presence event for the drain: never
     /// dropped.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub(super) fn push_inbound(&self, event: InboundEvent) {
         if event.is_lifecycle() {
             self.inbound_lifecycle.fetch_add(1, Ordering::AcqRel);
@@ -842,6 +858,7 @@ impl SharedState {
     /// Queue a connection's connect event, unless `max_lifecycle_events`
     /// wait already (the drain stalls while connections come and go): then
     /// false, and the connection is refused.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub(super) fn push_connect(&self, event: InboundEvent) -> bool {
         if self.inbound_lifecycle.load(Ordering::Acquire) >= self.max_lifecycle_events {
             return false;
@@ -855,6 +872,7 @@ impl SharedState {
     /// and `max_inbound_queue_bytes` of their size. A message larger than the
     /// whole byte budget still gets in when nothing else waits. Without room
     /// the message is counted in `inbound_dropped`.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     fn reserve_message(&self, bytes: usize) -> bool {
         let queued = self.inbound_messages.fetch_add(1, Ordering::AcqRel);
         let held = self.inbound_bytes.fetch_add(bytes, Ordering::AcqRel);
@@ -868,6 +886,7 @@ impl SharedState {
         true
     }
 
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     fn release_message(&self, bytes: usize) {
         self.inbound_messages.fetch_sub(1, Ordering::AcqRel);
         self.inbound_bytes.fetch_sub(bytes, Ordering::AcqRel);
@@ -876,6 +895,7 @@ impl SharedState {
     /// Queue a client's message of `bytes` bytes for the drain, or drop it
     /// when there is no room (see `reserve_message`). A decoded message is
     /// charged what it holds in memory when that is more. False when dropped.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub(super) fn push_message(&self, event: InboundEvent, bytes: usize) -> bool {
         let bytes = match &event {
             InboundEvent::Message { value, .. } | InboundEvent::Signed { value, .. } => {
@@ -900,6 +920,7 @@ impl SharedState {
     }
 
     /// The drain took `queued` off the channel: its room is free again.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub(super) fn taken(&self, queued: Queued) -> InboundEvent {
         if let Some(bytes) = queued.bytes {
             self.release_message(bytes);
@@ -911,6 +932,7 @@ impl SharedState {
 
     /// Room for a message handed to an on_message callback, given back when
     /// the callback is done (see `reserve_message`).
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub(super) fn callback_room(state: &Arc<Self>, bytes: usize) -> Option<CallbackRoom> {
         state.reserve_message(bytes).then(|| CallbackRoom {
             state: Arc::clone(state),

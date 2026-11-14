@@ -68,6 +68,7 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data).as_ref());
@@ -168,6 +169,7 @@ pub(crate) const P256_PUBLIC_LEN: usize = 65;
 
 /// A new P-256 key pair for ECDH: the private scalar (wiped when dropped)
 /// and the uncompressed public key.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub(crate) fn ecdh_generate() -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), Error> {
     let private = agreement::PrivateKey::generate(&agreement::ECDH_P256)?;
     let public = private.compute_public_key()?;
@@ -180,6 +182,7 @@ pub(crate) fn ecdh_generate() -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), Error> {
 
 /// ECDH with a stored private scalar: `derive` gets the shared secret, which
 /// never leaves the library otherwise.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub(crate) fn ecdh_agree<R>(
     private_scalar: &[u8],
     peer_public: &[u8],

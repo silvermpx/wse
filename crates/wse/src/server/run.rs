@@ -31,7 +31,6 @@ fn tcp_keepalive() -> socket2::TcpKeepalive {
 /// What a server's start makes before it serves: the command queue, and a
 /// delivery task for each lane, running before the first command.
 pub(crate) struct Started {
-    pub(crate) publisher: super::Publisher,
     commands_rx: mpsc::UnboundedReceiver<ServerCommand>,
     fanout: Fanout,
 }
@@ -61,7 +60,6 @@ pub(crate) fn start<H: Handler>(shared: &Arc<SharedState>, handler: &Arc<H>) -> 
     // For presence broadcasts from the disconnect cleanup paths.
     shared.commands.store(Some(Arc::new(commands)));
     Started {
-        publisher: super::Publisher::new(Arc::clone(shared)),
         commands_rx,
         fanout,
     }

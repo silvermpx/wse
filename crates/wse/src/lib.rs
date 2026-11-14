@@ -7,10 +7,6 @@
 //! clients) and a `Publisher` (what it sends them). The Python package
 //! `wse-server` runs this same engine.
 
-// Until the Rust API reaches every part of the engine, some of it is called
-// by the Python layer alone.
-#![cfg_attr(not(feature = "python"), allow(dead_code, unused_imports))]
-
 mod cluster;
 mod crypto;
 mod jwt;

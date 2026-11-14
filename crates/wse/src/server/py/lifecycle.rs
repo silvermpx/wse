@@ -14,8 +14,8 @@ use tokio::net::TcpListener;
 use super::RustWSEServer;
 use crate::cluster::ClusterCommand;
 use crate::pylock::lock;
-use crate::server::ServerCommand;
 use crate::server::run;
+use crate::server::{Publisher, ServerCommand};
 
 impl RustWSEServer {
     pub(super) fn set_callbacks_impl(
@@ -113,7 +113,8 @@ impl RustWSEServer {
             let _runtime = rt.enter();
             run::start(&self.shared, &handler)
         };
-        self.cmd_tx.store(Some(Arc::new(started.publisher.clone())));
+        self.cmd_tx
+            .store(Some(Arc::new(Publisher::new(Arc::clone(&self.shared)))));
         let running = self.running.clone();
         let shared = self.shared.clone();
         let rt_handle = rt.handle().clone();

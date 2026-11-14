@@ -442,6 +442,7 @@ pub fn parse_cookie_value<'a>(cookies: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// Decode a JWT, returning claims as serde_json::Value or error.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub(crate) fn jwt_decode_with_rotation(
     token: &str,
     secret: &[u8],

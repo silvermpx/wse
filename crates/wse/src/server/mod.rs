@@ -98,6 +98,7 @@ pub use py::RustWSEServer;
 pub use cluster_link::{ClusterPeer, ClusterSettings, ClusterTls, DeadLetter};
 pub use config::{Config, ConfigError, JwtSettings, PresenceSettings, RecoverySettings};
 pub use control::{JwtKeys, Member, Recovered, Subscribe};
+#[cfg(feature = "python")]
 pub(crate) use e2e::E2E_KEY_INFO;
 pub(crate) use fanout::{
     Fanout, Outgoing, TopicAcl, TopicIndex, count_message, glob_match, is_pattern,
