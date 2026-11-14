@@ -93,7 +93,8 @@ pub(crate) const MAX_KNOWN_PEERS: usize = MAX_CLUSTER_PEERS * 4;
 // local fan-out can drain, the bounded dispatch queue fills and excess messages are
 // shed (try_send) with metrics.messages_dropped incremented, rather than growing an
 // unbounded backlog. Shedding keeps the single reader loop responsive to control and
-// heartbeat frames, and shed messages remain recoverable via the recovery buffer.
+// heartbeat frames. A shed message is not stored for recovery here: a recovery
+// across it reports recovered: false.
 pub(crate) const PEER_DISPATCH_QUEUE_CAP: usize = 10_000;
 /// Max distinct topics tracked in one peer's remote-interest set. Bounds memory
 /// so a buggy or compromised (but authenticated) peer streaming distinct SUB

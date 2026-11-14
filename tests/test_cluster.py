@@ -482,3 +482,51 @@ def test_a_user_who_left_every_node_is_gone_from_all(nodes):
         return await asyncio.to_thread(wait_for, lambda: not listed(a) and not listed(b))
 
     assert asyncio.run(scenario())
+
+
+def test_a_topic_published_on_two_nodes_recovers_both(nodes):
+    """Each node stamps its own stream of the topic: a client back from a gap
+    gets what it missed of both, in the order it came to its node."""
+    websockets = pytest.importorskip("websockets")
+    a, b = nodes(recovery=True), nodes(recovery=True)
+    a.join(b)
+    b.join(a)
+    assert wait_for(lambda: a.peers == 1 and b.peers == 1)
+
+    def publish(node, text):
+        node.server.broadcast("room", json.dumps({"t": "chat", "p": {"text": text}}))
+        time.sleep(0.1)  # in this order on b, relayed or not
+
+    async def scenario():
+        async with websockets.connect(f"ws://127.0.0.1:{b.port}/wse") as ws:
+            await subscribe_next_client(b, ["room"])
+            await asyncio.sleep(0.5)  # the SUB reaches a
+            for node, text in [(a, "a1"), (b, "b1"), (a, "a2"), (b, "b2")]:
+                publish(node, text)
+            seen = await messages_of_type(ws, "chat", 4)
+        assert [m["p"]["text"] for m in seen] == ["a1", "b1", "a2", "b2"]
+        last = seen[-1]
+
+        for node, text in [(a, "a3"), (b, "b3"), (a, "a4"), (b, "b4")]:
+            publish(node, text)
+
+        async with websockets.connect(f"ws://127.0.0.1:{b.port}/wse") as ws:
+            deadline = time.monotonic() + 5
+            conn_id = None
+            while conn_id is None and time.monotonic() < deadline:
+                for event in b.server.drain_inbound(16, 50):
+                    if event[0] == "connect":
+                        conn_id = event[1]
+                await asyncio.sleep(0.05)
+            result = b.server.subscribe_with_recovery(
+                conn_id,
+                ["room"],
+                recover=True,
+                positions={"room": {"epoch": last["e"], "offset": last["o"]}},
+            )
+            replayed = await messages_of_type(ws, "chat", 4)
+        return result, replayed
+
+    result, replayed = asyncio.run(scenario())
+    assert result["topics"]["room"]["recovered"] is True
+    assert [m["p"]["text"] for m in replayed] == ["a3", "b3", "a4", "b4"]

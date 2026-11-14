@@ -521,6 +521,10 @@ pub(crate) struct SharedState {
     pub(super) cluster_dlq: Arc<std::sync::Mutex<ClusterDlq>>,
     pub(crate) cluster_instance_id: std::sync::Mutex<Option<String>>,
     pub(crate) local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    /// Topics whose last local subscriber left, kept of interest (count 0 in
+    /// `local_topic_refcount`) until this time, with recovery on: see
+    /// `RecoveryManager::interest_linger`.
+    interest_linger: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     // Single-port mode only: the WebSocket port hands cluster links to the
     // cluster manager through this. None: cluster frames are refused there.
     pub(super) cluster_main_port: std::sync::RwLock<
@@ -589,9 +593,23 @@ impl SharedState {
         for topic in topics {
             let count = refcounts.entry(topic.clone()).or_insert(0);
             *count += 1;
-            if *count == 1
-                && let Some(tx) = &cluster_tx
-            {
+            if *count != 1 {
+                continue;
+            }
+            // Lingering: still advertised and relayed, the interest unbroken.
+            let lingered = self
+                .interest_linger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(topic)
+                .is_some();
+            if lingered {
+                continue;
+            }
+            if let Some(recovery) = &self.recovery {
+                recovery.interest_began(topic);
+            }
+            if let Some(tx) = &cluster_tx {
                 let _ = tx.send(ClusterCommand::Sub {
                     topic: topic.clone(),
                 });
@@ -612,15 +630,61 @@ impl SharedState {
                 continue;
             };
             *count = count.saturating_sub(1);
-            if *count == 0 {
+            if *count != 0 {
+                continue;
+            }
+            // With recovery, the topic stays of interest for the history's
+            // lifetime: a client coming back finds here what other nodes
+            // published meanwhile.
+            if let Some(recovery) = &self.recovery {
+                self.interest_linger
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        topic.clone(),
+                        std::time::Instant::now() + recovery.interest_linger(),
+                    );
+                continue;
+            }
+            refcounts.remove(topic);
+            if let Some(tx) = &cluster_tx {
+                let _ = tx.send(ClusterCommand::Unsub {
+                    topic: topic.clone(),
+                });
+            }
+        }
+    }
+
+    /// End the interest in topics that lingered their time without a local
+    /// subscriber coming back.
+    pub(crate) fn sweep_interest_linger(&self) {
+        let now = std::time::Instant::now();
+        let cluster_tx = self.cluster_cmd_tx.load_full();
+        let mut refcounts = self
+            .local_topic_refcount
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut linger = self
+            .interest_linger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        linger.retain(|topic, until| {
+            if *until > now {
+                return true;
+            }
+            if refcounts.get(topic) == Some(&0) {
                 refcounts.remove(topic);
+                if let Some(recovery) = &self.recovery {
+                    recovery.interest_ended(topic);
+                }
                 if let Some(tx) = &cluster_tx {
                     let _ = tx.send(ClusterCommand::Unsub {
                         topic: topic.clone(),
                     });
                 }
             }
-        }
+            false
+        });
     }
 
     pub(super) fn new(cfg: SharedStateConfig) -> Self {
@@ -667,6 +731,7 @@ impl SharedState {
             cluster_dlq: Arc::new(std::sync::Mutex::new(ClusterDlq::new(1000))),
             cluster_instance_id: std::sync::Mutex::new(None),
             local_topic_refcount: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            interest_linger: std::sync::Mutex::new(HashMap::new()),
             cluster_main_port: std::sync::RwLock::new(None),
             cluster_tls_holder: std::sync::RwLock::new(None),
             recovery: cfg.recovery,

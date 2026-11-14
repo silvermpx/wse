@@ -2,7 +2,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::VecDeque;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Global counter to guarantee unique epochs even for rapid buffer re-creation.
@@ -68,7 +68,12 @@ struct RecoveryEntry {
     data: Bytes,
     /// Monotonic offset within this topic buffer.
     offset: u64,
+    /// Its place in this node's arrival order (`RecoveryManager::arrival`).
+    seq: u64,
 }
+
+/// A stored message and its place in this node's arrival order.
+type Arrived = (u64, Bytes);
 
 // ---------------------------------------------------------------------------
 // TopicRecoveryBuffer -- per-topic ring buffer
@@ -78,9 +83,12 @@ struct TopicRecoveryBuffer {
     /// Stored messages in offset order; the front holds `tail_offset()`. The
     /// queue grows as messages arrive, so a topic that has seen a handful of
     /// messages does not pay for `capacity` slots.
-    entries: VecDeque<Bytes>,
+    entries: VecDeque<(Bytes, u64)>,
     /// Maximum number of messages kept; the oldest is evicted beyond it.
     capacity: usize,
+    /// The latest arrival number evicted (0: none): every message that
+    /// arrived after it is still here.
+    evicted_through: u64,
     /// Next offset to be written (one past the newest entry).
     head_offset: u64,
     /// Random epoch generated on creation -- changes on server restart.
@@ -108,6 +116,7 @@ impl TopicRecoveryBuffer {
         Self {
             entries: VecDeque::new(),
             capacity: 1usize << capacity_bits.min(MAX_BUFFER_SIZE_BITS),
+            evicted_through: 0,
             head_offset: 0,
             epoch,
             total_bytes: 0,
@@ -126,7 +135,7 @@ impl TopicRecoveryBuffer {
     /// budget is checked against.
     fn footprint(&self) -> usize {
         self.total_bytes
-            + self.entries.capacity() * size_of::<Bytes>()
+            + self.entries.capacity() * size_of::<(Bytes, u64)>()
             + self.key_len
             + BUFFER_OVERHEAD
     }
@@ -134,16 +143,17 @@ impl TopicRecoveryBuffer {
     /// Push a message into the buffer. Returns the assigned offset.
     ///
     /// When the buffer is full, the oldest entry is evicted.
-    fn push(&mut self, data: Bytes) -> u64 {
+    fn push(&mut self, data: Bytes, seq: u64) -> u64 {
         if self.entries.len() >= self.capacity
-            && let Some(old) = self.entries.pop_front()
+            && let Some((old, old_seq)) = self.entries.pop_front()
         {
             self.total_bytes -= old.len();
+            self.evicted_through = self.evicted_through.max(old_seq);
         }
 
         let offset = self.head_offset;
         self.total_bytes += data.len();
-        self.entries.push_back(data);
+        self.entries.push_back((data, seq));
         self.head_offset += 1;
         self.last_write = Instant::now();
 
@@ -154,7 +164,7 @@ impl TopicRecoveryBuffer {
     ///
     /// Returns `None` if `after_offset` is older than the tail (gap too large).
     /// Results are capped at `max_messages`.
-    fn recover_since(&self, after_offset: u64, max_messages: usize) -> Option<Vec<Bytes>> {
+    fn recover_since(&self, after_offset: u64, max_messages: usize) -> Option<Vec<Arrived>> {
         // If the first message we need (after_offset + 1) is before the tail,
         // those messages have been evicted -- gap too large.
         let start = match after_offset.checked_add(1) {
@@ -178,7 +188,45 @@ impl TopicRecoveryBuffer {
                 .iter()
                 .skip(first)
                 .take(count)
-                .cloned()
+                .map(|(data, seq)| (*seq, data.clone()))
+                .collect(),
+        )
+    }
+
+    /// The arrival number of the message at `offset`, if it is still here.
+    fn seq_at(&self, offset: u64) -> Option<u64> {
+        let tail = self.tail_offset();
+        (offset >= tail && offset < self.head_offset)
+            .then(|| self.entries[(offset - tail) as usize].1)
+    }
+
+    /// Where the client's last message (`offset`) stands in this node's
+    /// arrival order: its own number, the last evicted one's when it was
+    /// that, or the newest's when the client has everything here.
+    fn anchor_seq(&self, offset: u64) -> Option<u64> {
+        self.seq_at(offset)
+            .or_else(|| {
+                (offset.checked_add(1) == Some(self.tail_offset()) && self.evicted_through > 0)
+                    .then_some(self.evicted_through)
+            })
+            .or_else(|| {
+                (offset.saturating_add(1) >= self.head_offset)
+                    .then(|| self.entries.back().map(|(_, seq)| *seq))
+                    .flatten()
+            })
+    }
+
+    /// The messages that arrived after `seq`; None when one of them was
+    /// evicted already.
+    fn arrived_after(&self, seq: u64) -> Option<Vec<Arrived>> {
+        if self.evicted_through > seq {
+            return None;
+        }
+        Some(
+            self.entries
+                .iter()
+                .filter(|(_, s)| *s > seq)
+                .map(|(data, s)| (*s, data.clone()))
                 .collect(),
         )
     }
@@ -205,6 +253,8 @@ struct ForeignRecoveryBuffer {
     key_len: usize,
     last_write: Instant,
     initialized: bool,
+    /// The latest arrival number evicted (0: none).
+    evicted_through: u64,
 }
 
 impl ForeignRecoveryBuffer {
@@ -222,6 +272,7 @@ impl ForeignRecoveryBuffer {
             key_len,
             last_write: Instant::now(),
             initialized: false,
+            evicted_through: 0,
         }
     }
 
@@ -235,7 +286,7 @@ impl ForeignRecoveryBuffer {
     }
 
     /// Insert at the origin node's offset. Handles gaps and out-of-order arrival.
-    fn push_at(&mut self, data: Bytes, origin_offset: u64) {
+    fn push_at(&mut self, data: Bytes, origin_offset: u64, seq: u64) {
         let capacity = self.mask + 1;
 
         // First message sets the baseline (handles origin_offset = 0 correctly).
@@ -260,6 +311,7 @@ impl ForeignRecoveryBuffer {
                 for slot in self.entries.iter_mut() {
                     if let Some(old) = slot.take() {
                         self.total_bytes -= old.data.len();
+                        self.evicted_through = self.evicted_through.max(old.seq);
                     }
                 }
                 self.tail_offset = new_tail;
@@ -268,6 +320,7 @@ impl ForeignRecoveryBuffer {
                     let evict_idx = (self.tail_offset & self.mask) as usize;
                     if let Some(old) = self.entries[evict_idx].take() {
                         self.total_bytes -= old.data.len();
+                        self.evicted_through = self.evicted_through.max(old.seq);
                     }
                     self.tail_offset += 1;
                 }
@@ -281,18 +334,20 @@ impl ForeignRecoveryBuffer {
         // Evict any existing entry at this slot (shouldn't happen, but defensive).
         if let Some(old) = self.entries[idx].take() {
             self.total_bytes -= old.data.len();
+            self.evicted_through = self.evicted_through.max(old.seq);
         }
 
         self.entries[idx] = Some(RecoveryEntry {
             data,
             offset: origin_offset,
+            seq,
         });
         self.total_bytes += data_len;
         self.last_write = Instant::now();
     }
 
     /// Recover messages after `after_offset`, same logic as TopicRecoveryBuffer.
-    fn recover_since(&self, after_offset: u64, max_messages: usize) -> Option<Vec<Bytes>> {
+    fn recover_since(&self, after_offset: u64, max_messages: usize) -> Option<Vec<Arrived>> {
         let start = match after_offset.checked_add(1) {
             Some(s) => s,
             None => return Some(Vec::new()),
@@ -313,7 +368,7 @@ impl ForeignRecoveryBuffer {
             let idx = (offset & self.mask) as usize;
             if let Some(entry) = &self.entries[idx] {
                 if entry.offset == offset {
-                    result.push(entry.data.clone());
+                    result.push((entry.seq, entry.data.clone()));
                 } else {
                     // Gap in foreign buffer (missed cluster message) -- can't recover.
                     return None;
@@ -325,6 +380,70 @@ impl ForeignRecoveryBuffer {
 
         Some(result)
     }
+
+    /// The arrival number of the message at `offset`, if it is here.
+    fn seq_at(&self, offset: u64) -> Option<u64> {
+        self.entries[(offset & self.mask) as usize]
+            .as_ref()
+            .filter(|entry| entry.offset == offset)
+            .map(|entry| entry.seq)
+    }
+
+    /// Where the client's last message (`offset`) stands in this node's
+    /// arrival order: its own number; the last evicted one's when it was
+    /// that; just before the next one here when it never came here; the
+    /// newest's when the client has everything here.
+    fn anchor_seq(&self, offset: u64) -> Option<u64> {
+        if let Some(seq) = self.seq_at(offset) {
+            return Some(seq);
+        }
+        let next = offset.saturating_add(1);
+        if next == self.tail_offset && self.evicted_through > 0 {
+            return Some(self.evicted_through);
+        }
+        if next >= self.head_offset {
+            return self.entries.iter().flatten().map(|entry| entry.seq).max();
+        }
+        self.entries
+            .iter()
+            .flatten()
+            .filter(|entry| entry.offset > offset)
+            .min_by_key(|entry| entry.offset)
+            .map(|entry| entry.seq.saturating_sub(1))
+    }
+
+    /// The messages that arrived after `seq`; None when one of them was
+    /// evicted already, or one never came (shed on the way, or relayed while
+    /// this node had no interest): a hole among them.
+    fn arrived_after(&self, seq: u64) -> Option<Vec<Arrived>> {
+        if self.evicted_through > seq {
+            return None;
+        }
+        let mut after: Vec<&RecoveryEntry> = self
+            .entries
+            .iter()
+            .flatten()
+            .filter(|entry| entry.seq > seq)
+            .collect();
+        after.sort_unstable_by_key(|entry| entry.offset);
+        if let Some(first) = after.first() {
+            // What came before them is here (or evicted, or the stream's
+            // start): nothing is missing in between.
+            let before = first.offset.checked_sub(1);
+            let held = before
+                .is_none_or(|before| before < self.tail_offset || self.seq_at(before).is_some());
+            let contiguous = after.windows(2).all(|w| w[1].offset == w[0].offset + 1);
+            if !held || !contiguous {
+                return None;
+            }
+        }
+        Some(
+            after
+                .into_iter()
+                .map(|entry| (entry.seq, entry.data.clone()))
+                .collect(),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +454,17 @@ pub(crate) struct RecoveryManager {
     buffers: DashMap<String, TopicRecoveryBuffer>,
     /// Foreign buffers: keyed by "topic:epoch" to support multiple origin epochs.
     foreign_buffers: DashMap<String, ForeignRecoveryBuffer>,
+    /// The origin epochs each topic has a foreign buffer for: a topic
+    /// published on several nodes recovers from all of them.
+    foreign_epochs: DashMap<String, Vec<u32>>,
+    /// The order messages arrive in on this node, whatever node published
+    /// them: a recovery replays every stream of a topic after the client's
+    /// last message, in this order.
+    arrival: AtomicU64,
+    /// Where in that order this node's current, unbroken interest in each
+    /// topic began: other nodes relay a topic only while this node has it,
+    /// so the relayed streams are whole from there on only.
+    interest_since: DashMap<String, u64>,
     config: RecoveryConfig,
     total_bytes: AtomicUsize,
 }
@@ -344,6 +474,9 @@ impl RecoveryManager {
         Self {
             buffers: DashMap::new(),
             foreign_buffers: DashMap::new(),
+            foreign_epochs: DashMap::new(),
+            arrival: AtomicU64::new(1),
+            interest_since: DashMap::new(),
             config,
             total_bytes: AtomicUsize::new(0),
         }
@@ -388,7 +521,7 @@ impl RecoveryManager {
         let data = build(epoch, offset);
 
         let old_bytes = if created { 0 } else { buf.footprint() };
-        buf.push(data.clone());
+        buf.push(data.clone(), self.arrival.fetch_add(1, Ordering::Relaxed));
         let new_bytes = buf.footprint();
 
         // Update global byte counter with the delta (accounts for evictions).
@@ -465,9 +598,19 @@ impl RecoveryManager {
                 }),
         };
 
+        if created && let Some((topic, _)) = key.split_once('\0') {
+            let mut epochs = self.foreign_epochs.entry(topic.to_owned()).or_default();
+            if !epochs.contains(&origin_epoch) {
+                epochs.push(origin_epoch);
+            }
+        }
         let buf = entry.value_mut();
         let old_bytes = if created { 0 } else { buf.footprint() };
-        buf.push_at(data, origin_offset);
+        buf.push_at(
+            data,
+            origin_offset,
+            self.arrival.fetch_add(1, Ordering::Relaxed),
+        );
         let new_bytes = buf.footprint();
 
         if new_bytes > old_bytes {
@@ -489,84 +632,127 @@ impl RecoveryManager {
     /// This allows clients to recover from any node, even after reconnecting to a
     /// different node than the one that originally published the messages.
     pub(crate) fn recover(&self, topic: &str, epoch: u32, after_offset: u64) -> RecoveryResult {
-        // Try local buffer first.
-        if let Some(buf) = self.buffers.get(topic)
+        let max = self.config.max_recovery_messages;
+        // The stream of the client's last message: the local one, or one
+        // relayed from another node, by its epoch. What it missed there, and
+        // where that last message stands in this node's arrival order.
+        let anchored = if let Some(buf) = self.buffers.get(topic)
             && buf.epoch == epoch
         {
-            return self.recover_from_local(&buf, after_offset);
-        }
-
-        // Epoch doesn't match local -- check foreign buffers.
-        let foreign_key = format!("{topic}\0{epoch}");
-        if let Some(fbuf) = self.foreign_buffers.get(&foreign_key)
+            let missed = buf
+                .head_offset
+                .saturating_sub(after_offset.saturating_add(1)) as usize;
+            Some((
+                if missed <= max {
+                    buf.recover_since(after_offset, max)
+                } else {
+                    None
+                },
+                buf.anchor_seq(after_offset),
+                buf.head_offset,
+            ))
+        } else if let Some(fbuf) = self.foreign_buffers.get(&format!("{topic}\0{epoch}"))
             && fbuf.epoch == epoch
         {
-            // Early backlog check before recover_since to avoid wasted allocation
-            let available =
-                fbuf.head_offset
-                    .saturating_sub(after_offset.saturating_add(1)) as usize;
-            if available > self.config.max_recovery_messages {
-                return RecoveryResult::NotRecovered {
-                    epoch: fbuf.epoch,
-                    offset: fbuf.head_offset,
-                };
-            }
-            match fbuf.recover_since(after_offset, self.config.max_recovery_messages) {
-                Some(publications) => {
-                    let offset = fbuf.head_offset.saturating_sub(1);
-                    return RecoveryResult::Recovered {
-                        publications,
-                        epoch: fbuf.epoch,
-                        offset,
-                    };
-                }
-                None => {
-                    return RecoveryResult::NotRecovered {
-                        epoch: fbuf.epoch,
-                        offset: fbuf.head_offset,
-                    };
-                }
-            }
-        }
-
-        // No matching buffer found at all.
-        if let Some(buf) = self.buffers.get(topic) {
-            // Local buffer exists but with different epoch -- tell client to re-subscribe.
-            RecoveryResult::NotRecovered {
-                epoch: buf.epoch,
-                offset: buf.head_offset,
-            }
+            let missed = fbuf
+                .head_offset
+                .saturating_sub(after_offset.saturating_add(1)) as usize;
+            Some((
+                if missed <= max {
+                    fbuf.recover_since(after_offset, max)
+                } else {
+                    None
+                },
+                fbuf.anchor_seq(after_offset),
+                fbuf.head_offset,
+            ))
         } else {
-            RecoveryResult::NoHistory
-        }
-    }
-
-    /// Internal: recover from a local TopicRecoveryBuffer (epoch already verified).
-    fn recover_from_local(&self, buf: &TopicRecoveryBuffer, after_offset: u64) -> RecoveryResult {
-        // Check backlog size BEFORE doing recovery work to avoid wasted computation
-        let available = buf
-            .head_offset
-            .saturating_sub(after_offset.saturating_add(1)) as usize;
-        if available > self.config.max_recovery_messages {
-            return RecoveryResult::NotRecovered {
-                epoch: buf.epoch,
-                offset: buf.head_offset,
-            };
-        }
-
-        match buf.recover_since(after_offset, self.config.max_recovery_messages) {
-            Some(publications) => {
-                let offset = buf.head_offset.saturating_sub(1);
-                RecoveryResult::Recovered {
-                    publications,
+            None
+        };
+        let Some((own, anchor_seq, head)) = anchored else {
+            // No matching buffer found at all.
+            return match self.buffers.get(topic) {
+                // Local buffer exists but with different epoch -- tell client to re-subscribe.
+                Some(buf) => RecoveryResult::NotRecovered {
                     epoch: buf.epoch,
-                    offset,
-                }
+                    offset: buf.head_offset,
+                },
+                None => RecoveryResult::NoHistory,
+            };
+        };
+        let not_recovered = RecoveryResult::NotRecovered {
+            epoch,
+            offset: head,
+        };
+        let Some(mut publications) = own else {
+            return not_recovered;
+        };
+        // Relayed streams are whole only within this node's unbroken
+        // interest in the topic: one that began after the client's last
+        // message may have missed what other nodes published in between.
+        let relayed_whole = |seq: Option<u64>| {
+            let since = self
+                .interest_since
+                .get(topic)
+                .map_or(u64::MAX, |since| *since);
+            seq.is_some_and(|seq| seq >= since)
+        };
+        let anchored_relayed = !self
+            .buffers
+            .get(topic)
+            .is_some_and(|buf| buf.epoch == epoch);
+        let relays = self
+            .foreign_epochs
+            .get(topic)
+            .is_some_and(|epochs| !epochs.is_empty());
+        if (anchored_relayed || relays) && !relayed_whole(anchor_seq) {
+            return not_recovered;
+        }
+        // The topic's other streams (published here, or on other nodes):
+        // what arrived after the client's last message, which each of them
+        // must still hold whole. Without that message here, nothing places
+        // them: a stream with anything in it then cannot be recovered.
+        let mut streams: Vec<Option<Vec<Arrived>>> = Vec::new();
+        if let Some(buf) = self.buffers.get(topic)
+            && buf.epoch != epoch
+        {
+            streams.push(match anchor_seq {
+                Some(seq) => buf.arrived_after(seq),
+                None => buf.entries.is_empty().then(Vec::new),
+            });
+        }
+        let others: Vec<u32> = self
+            .foreign_epochs
+            .get(topic)
+            .map(|epochs| epochs.iter().copied().filter(|e| *e != epoch).collect())
+            .unwrap_or_default();
+        for other in others {
+            if let Some(fbuf) = self.foreign_buffers.get(&format!("{topic}\0{other}")) {
+                streams.push(match anchor_seq {
+                    Some(seq) => fbuf.arrived_after(seq),
+                    None => fbuf.arrived_after(u64::MAX),
+                });
             }
-            None => RecoveryResult::NotRecovered {
-                epoch: buf.epoch,
-                offset: buf.head_offset,
-            },
+        }
+        let mut merged = false;
+        for stream in streams {
+            let Some(mut more) = stream else {
+                return not_recovered;
+            };
+            merged |= !more.is_empty();
+            publications.append(&mut more);
+        }
+        if publications.len() > max {
+            return not_recovered;
+        }
+        if merged {
+            // In the order they arrived here.
+            publications.sort_unstable_by_key(|(seq, _)| *seq);
+        }
+        RecoveryResult::Recovered {
+            publications: publications.into_iter().map(|(_, data)| data).collect(),
+            epoch,
+            offset: head.saturating_sub(1),
         }
     }
 
@@ -615,6 +801,7 @@ impl RecoveryManager {
         }
         for key in &foreign_to_remove {
             if let Some((_, removed)) = self.foreign_buffers.remove(key) {
+                self.forget_foreign(key, removed.epoch);
                 let _ = self
                     .total_bytes
                     .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
@@ -661,6 +848,7 @@ impl RecoveryManager {
                         );
                     }
                 } else if let Some((_, removed)) = self.foreign_buffers.remove(&key) {
+                    self.forget_foreign(&key, removed.epoch);
                     let _ =
                         self.total_bytes
                             .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
@@ -668,6 +856,37 @@ impl RecoveryManager {
                             });
                 }
             }
+        }
+    }
+
+    /// This node took an interest in `topic` (its first local subscriber,
+    /// none lingering): other nodes relay it from now on.
+    pub(crate) fn interest_began(&self, topic: &str) {
+        self.interest_since
+            .insert(topic.to_owned(), self.arrival.load(Ordering::Relaxed));
+    }
+
+    /// This node no longer has `topic`: its relayed streams stop.
+    pub(crate) fn interest_ended(&self, topic: &str) {
+        self.interest_since.remove(topic);
+    }
+
+    /// How long a topic stays of interest after its last local subscriber
+    /// left: what other nodes publish meanwhile is still relayed here, for
+    /// the client that comes back within the history's lifetime.
+    pub(crate) fn interest_linger(&self) -> Duration {
+        Duration::from_secs(self.config.history_ttl_secs)
+    }
+
+    /// A foreign buffer (`topic\0epoch`) is gone: its topic no longer
+    /// recovers from that epoch.
+    fn forget_foreign(&self, key: &str, epoch: u32) {
+        if let Some((topic, _)) = key.split_once('\0') {
+            if let Some(mut epochs) = self.foreign_epochs.get_mut(topic) {
+                epochs.retain(|e| *e != epoch);
+            }
+            self.foreign_epochs
+                .remove_if(topic, |_, epochs| epochs.is_empty());
         }
     }
 
@@ -708,21 +927,21 @@ mod tests {
     fn test_push_recover_roundtrip() {
         let mut buf = TopicRecoveryBuffer::new(4, 0); // 16 slots
         for i in 0..5 {
-            buf.push(make_data(&format!("msg{i}")));
+            buf.push(make_data(&format!("msg{i}")), i + 1);
         }
 
         // Recover from offset 2 (should get messages at offsets 3 and 4).
         let recovered = buf.recover_since(2, 500).unwrap();
         assert_eq!(recovered.len(), 2);
-        assert_eq!(&recovered[0][..], b"msg3");
-        assert_eq!(&recovered[1][..], b"msg4");
+        assert_eq!(&recovered[0].1[..], b"msg3");
+        assert_eq!(&recovered[1].1[..], b"msg4");
     }
 
     #[test]
     fn test_buffer_overflow() {
         let mut buf = TopicRecoveryBuffer::new(2, 0); // 4 slots
         for i in 0..10 {
-            buf.push(make_data(&format!("msg{i}")));
+            buf.push(make_data(&format!("msg{i}")), i + 1);
         }
 
         // Tail should have advanced. head=10, tail=6.
@@ -735,13 +954,13 @@ mod tests {
         // Boundary: after_offset=5, start=6 which IS the tail -- should succeed.
         let boundary = buf.recover_since(5, 500).unwrap();
         assert_eq!(boundary.len(), 4); // offsets 6, 7, 8, 9
-        assert_eq!(&boundary[0][..], b"msg6");
+        assert_eq!(&boundary[0].1[..], b"msg6");
 
         // Recover from offset 7 should return msgs 8 and 9.
         let recovered = buf.recover_since(7, 500).unwrap();
         assert_eq!(recovered.len(), 2);
-        assert_eq!(&recovered[0][..], b"msg8");
-        assert_eq!(&recovered[1][..], b"msg9");
+        assert_eq!(&recovered[0].1[..], b"msg8");
+        assert_eq!(&recovered[1].1[..], b"msg9");
     }
 
     #[test]
@@ -926,6 +1145,8 @@ mod tests {
     fn test_foreign_push_recover() {
         let config = RecoveryConfig::default();
         let mgr = RecoveryManager::new(config);
+        // This node has the topic: other nodes relay it here.
+        mgr.interest_began("topic1");
 
         let foreign_epoch: u32 = 42;
 
@@ -1009,6 +1230,8 @@ mod tests {
             ..RecoveryConfig::default()
         };
         let mgr = RecoveryManager::new(config);
+        // This node has the topic: other nodes relay it here.
+        mgr.interest_began("t");
         // A peer naming a new epoch with every message.
         for epoch in 0..10_000u32 {
             mgr.push_foreign("t", make_data("x"), epoch, 0);
@@ -1049,6 +1272,8 @@ mod tests {
     fn test_foreign_and_local_coexist() {
         let config = RecoveryConfig::default();
         let mgr = RecoveryManager::new(config);
+        // This node has the topic: other nodes relay it here.
+        mgr.interest_began("topic1");
 
         // Local messages on topic1.
         mgr.push("topic1", make_data("local0"));
@@ -1060,16 +1285,17 @@ mod tests {
         mgr.push_foreign("topic1", make_data("foreign0"), foreign_epoch, 0);
         mgr.push_foreign("topic1", make_data("foreign1"), foreign_epoch, 1);
 
-        // Recover using local epoch.
+        // The client last had local0: everything after it, from both
+        // streams, in the order it arrived here.
         match mgr.recover("topic1", local_epoch, 0) {
             RecoveryResult::Recovered { publications, .. } => {
-                assert_eq!(publications.len(), 1);
-                assert_eq!(&publications[0][..], b"local1");
+                let got: Vec<&[u8]> = publications.iter().map(|p| &p[..]).collect();
+                assert_eq!(got, [&b"local1"[..], b"foreign0", b"foreign1"]);
             }
-            _ => panic!("expected Recovered from local buffer"),
+            _ => panic!("expected Recovered from both streams"),
         }
 
-        // Recover using foreign epoch.
+        // The client last had foreign0: only foreign1 came after it.
         match mgr.recover("topic1", foreign_epoch, 0) {
             RecoveryResult::Recovered { publications, .. } => {
                 assert_eq!(publications.len(), 1);
@@ -1080,12 +1306,73 @@ mod tests {
     }
 
     #[test]
+    fn two_nodes_interleaved_recover_in_arrival_order() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        // This node has the topic: other nodes relay it here.
+        mgr.interest_began("room");
+        let other: u32 = 0xa;
+        mgr.push_foreign("room", make_data("a1"), other, 0);
+        mgr.push("room", make_data("b1"));
+        mgr.push_foreign("room", make_data("a2"), other, 1);
+        mgr.push("room", make_data("b2"));
+        let (epoch, _) = mgr.get_position("room").unwrap();
+        mgr.push_foreign("room", make_data("a3"), other, 2);
+        mgr.push("room", make_data("b3"));
+        mgr.push_foreign("room", make_data("a4"), other, 3);
+        mgr.push("room", make_data("b4"));
+        match mgr.recover("room", epoch, 1) {
+            RecoveryResult::Recovered { publications, .. } => {
+                let got: Vec<&[u8]> = publications.iter().map(|p| &p[..]).collect();
+                assert_eq!(got, [&b"a3"[..], b"b3", b"a4", b"b4"]);
+            }
+            _ => panic!("expected Recovered from both streams"),
+        }
+    }
+
+    #[test]
+    fn a_relayed_stream_with_a_hole_after_the_anchor_is_not_recovered() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.interest_began("room");
+        mgr.push_foreign("room", make_data("b0"), 7, 0);
+        mgr.push("room", make_data("a0"));
+        let (epoch, _) = mgr.get_position("room").unwrap();
+        mgr.push_foreign("room", make_data("b1"), 7, 1);
+        // b2 was shed on the way here.
+        mgr.push_foreign("room", make_data("b3"), 7, 3);
+        assert!(matches!(
+            mgr.recover("room", epoch, 0),
+            RecoveryResult::NotRecovered { .. }
+        ));
+    }
+
+    #[test]
+    fn a_stream_that_lost_what_came_after_the_anchor_is_not_recovered() {
+        let mgr = RecoveryManager::new(RecoveryConfig {
+            buffer_size_bits: 1, // 2 slots
+            ..RecoveryConfig::default()
+        });
+        mgr.push_foreign("room", make_data("b0"), 7, 0);
+        mgr.push("room", make_data("a0"));
+        let (epoch, _) = mgr.get_position("room").unwrap();
+        // Three more from the other node: one of them is evicted already.
+        for (i, text) in ["b1", "b2", "b3"].iter().enumerate() {
+            mgr.push_foreign("room", make_data(text), 7, i as u64 + 1);
+        }
+        assert!(matches!(
+            mgr.recover("room", epoch, 0),
+            RecoveryResult::NotRecovered { .. }
+        ));
+    }
+
+    #[test]
     fn test_foreign_buffer_overflow() {
         let config = RecoveryConfig {
             buffer_size_bits: 2, // 4 slots
             ..RecoveryConfig::default()
         };
         let mgr = RecoveryManager::new(config);
+        // This node has the topic: other nodes relay it here.
+        mgr.interest_began("topic1");
 
         let epoch: u32 = 50;
         // Push 10 messages -- only last 4 should survive (offsets 6-9).
@@ -1122,6 +1409,8 @@ mod tests {
     #[test]
     fn foreign_offset_jump_is_bounded() {
         let mgr = RecoveryManager::new(RecoveryConfig::default());
+        // This node has the topic: other nodes relay it here.
+        mgr.interest_began("t");
         mgr.push_foreign("t", make_data("a"), 7, 0);
         let started = Instant::now();
         mgr.push_foreign("t", make_data("b"), 7, 1u64 << 62);

@@ -154,12 +154,14 @@ impl RustWSEServer {
                     // Spawn periodic recovery cleanup if recovery is enabled
                     if let Some(ref recovery) = shared.recovery {
                         let rm = recovery.clone();
+                        let cleanup_state = shared.clone();
                         tokio::spawn(async move {
                             let mut interval =
                                 tokio::time::interval(Duration::from_secs(30));
                             loop {
                                 interval.tick().await;
                                 rm.cleanup();
+                                cleanup_state.sweep_interest_linger();
                             }
                         });
                     }
