@@ -182,8 +182,18 @@ def collect() -> list[Source]:
             semver=True,
         )
     )
+    protocol = _toml("Cargo.toml")["workspace"]["dependencies"]["wse-protocol"]["version"]
+    sources.append(
+        Source(
+            "wse-protocol, as the crates require it (=version)",
+            "Cargo.toml",
+            str(protocol).removeprefix("="),
+            line_of(ROOT / "Cargo.toml", r"^wse-protocol\s*="),
+            semver=True,
+        )
+    )
     lock = _toml("Cargo.lock").get("package", [])
-    for crate in ("wse", "wse-py"):
+    for crate in ("wse", "wse-client", "wse-protocol", "wse-py"):
         locked = [p for p in lock if p.get("name") == crate]
         if len(locked) != 1:
             raise CheckError(

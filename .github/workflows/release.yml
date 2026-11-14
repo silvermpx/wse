@@ -1,10 +1,12 @@
 name: Release
 
-# A v* tag push builds every artifact of the three packages (wse-server and
-# wse-client on PyPI, wse-client on npm), checks the tag against every version
-# in the repo, installs and tests every wheel, the sdist, the Python client
-# and the npm package, and only then publishes: npm first, then PyPI, then
-# the GitHub release. Nothing is uploaded until everything has passed.
+# A v* tag push builds every artifact of the packages (wse-server and
+# wse-client on PyPI, wse-client on npm, the wse, wse-client and wse-protocol
+# crates), checks the tag against every version in the repo, installs and
+# tests every wheel, the sdist, the Python client, the npm package and the
+# crates as crates.io builds them, and only then publishes: npm first, then
+# PyPI, then crates.io, then the GitHub release. Nothing is uploaded until
+# everything has passed.
 #
 # Pull requests and pushes to main that touch packaging run the same build
 # and test jobs as a dry run, and workflow_dispatch runs that dry run by hand
@@ -120,6 +122,17 @@ jobs:
             200) echo "::error::wse-client ${NPM_VERSION} is already on npm: bump the version"; failed=1 ;;
             *) echo "::error::npm answered HTTP ${code} for wse-client ${NPM_VERSION}"; failed=1 ;;
           esac
+          # crates.io asks API clients to name themselves.
+          for crate in wse-protocol wse wse-client; do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 \
+              -A 'wse-release (github.com/silvermpx/wse)' \
+              "https://crates.io/api/v1/crates/${crate}/${NPM_VERSION}" || true)"
+            case "$code" in
+              404) echo "crates.io ${crate} ${NPM_VERSION}: not published yet" ;;
+              200) echo "::error::${crate} ${NPM_VERSION} is already on crates.io: bump the version"; failed=1 ;;
+              *) echo "::error::crates.io answered HTTP ${code} for ${crate} ${NPM_VERSION}"; failed=1 ;;
+            esac
+          done
           exit "$failed"
 
   # ---------------------------------------------------------------------------
@@ -530,9 +543,43 @@ jobs:
   # for it. (Not a required check: path filters keep this workflow off most
   # pull requests, and a required check that never runs blocks the merge.)
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # The Rust crates: packaged, and each built from its package as crates.io
+  # builds it, the ones it depends on taken from the packages beside it.
+  # ---------------------------------------------------------------------------
+  crates:
+    name: Rust crates (package, build)
+    needs: preflight
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: ". -> target"
+          key: crates
+
+      - name: cargo publish --dry-run
+        run: cargo publish --locked --dry-run -p wse-protocol -p wse -p wse-client
+
+      - name: What each package holds
+        run: |
+          for crate in wse-protocol wse wse-client; do
+            echo "== ${crate}"
+            cargo package --locked --list -p "$crate"
+          done
+
   release-gate:
     name: Release gate
-    needs: [preflight, build, sdist, test, test-musllinux, sdist-install, python-client, npm-package]
+    needs: [preflight, build, sdist, test, test-musllinux, sdist-install, python-client, npm-package, crates]
     # Runs (and fails) when a job above failed: a gate skipped because of a
     # failed dependency would report success to branch protection.
     if: always()
@@ -662,9 +709,53 @@ jobs:
           packages-dir: dist/
           skip-existing: ${{ github.run_attempt != '1' }}
 
+  # The first publish of a crate needs a crates.io API token (repository
+  # secret CARGO_REGISTRY_TOKEN, scope publish-new and publish-update); once
+  # the crates exist, crates.io trusted publishing can take its place.
+  publish-crates:
+    name: Publish the Rust crates to crates.io
+    needs: [preflight, release-gate, publish-pypi]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment:
+      name: release
+      url: https://crates.io/crates/wse
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+
+      - name: Publish what is not on crates.io yet
+        env:
+          VERSION: ${{ needs.preflight.outputs.npm-version }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          packages=()
+          for crate in wse-protocol wse wse-client; do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 \
+              -A 'wse-release (github.com/silvermpx/wse)' \
+              "https://crates.io/api/v1/crates/${crate}/${VERSION}" || true)"
+            if [ "$code" = 200 ]; then
+              echo "${crate} ${VERSION} is on crates.io already (an earlier attempt)."
+            else
+              packages+=(-p "$crate")
+            fi
+          done
+          if [ "${#packages[@]}" -eq 0 ]; then
+            exit 0
+          fi
+          # In dependency order, each built from its package before upload.
+          cargo publish --locked "${packages[@]}"
+
   github-release:
     name: GitHub release
-    needs: [preflight, publish-pypi]
+    needs: [preflight, publish-pypi, publish-crates]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:

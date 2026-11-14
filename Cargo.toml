@@ -15,6 +15,10 @@ rust-version = "1.95"
 repository = "https://github.com/silvermpx/wse"
 homepage = "https://github.com/silvermpx/wse"
 
+# The crates depend on one another at exactly the release's version.
+[workspace.dependencies]
+wse-protocol = { version = "=3.0.0", path = "crates/wse-protocol" }
+
 [profile.release]
 lto = true
 codegen-units = 1

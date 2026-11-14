@@ -28,7 +28,7 @@ dashmap = "6"
 # build: TLS, JWT, E2E and the Python helpers all use it.
 aws-lc-rs = { version = "1.19", optional = true }
 # The crypto, E2E sessions and signed messages, shared with the Rust client.
-wse-protocol = { version = "=3.0.0", path = "../wse-protocol" }
+wse-protocol.workspace = true
 jsonwebtoken = { version = "11", default-features = false, features = ["use_pem"] }
 uuid = { version = "1.29.2", features = ["v7"] }
 base64 = "0.23"
