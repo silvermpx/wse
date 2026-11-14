@@ -241,7 +241,7 @@ TLS protects a connection up to whatever terminates it: a load balancer, a rever
 | Confidentiality and integrity | AES-256-GCM, with keys from HKDF-SHA256 over the ECDH secret salted with the transcript hash: one key schedule per direction |
 | Order | Each frame carries its direction's epoch and sequence number, authenticated with it, and only the next frame opens: a replayed, reordered, dropped, reflected or forged frame closes the connection (4802) |
 | Key lifetime | Each direction moves to a new key after 2^20 frames or 10 minutes; past 2^53 frames the connection closes (4803) |
-| Coverage | After `server_hello` every frame is sealed, both ways: application messages, pings and PONGs, subscription requests and replies, presence events, recovery replays, messages relayed from other cluster nodes. A plaintext data frame inside a session closes the connection (4802) |
+| Coverage | The session comes first: the client announces it when it connects, and until it exists the server sends that connection nothing of the application's and the application does not learn of it. After `server_hello` every frame is sealed, both ways: `server_ready`, application messages, pings and PONGs, subscription requests and replies, presence events, recovery replays, messages relayed from other cluster nodes. A plaintext data frame inside a session closes the connection (4802); a client takes no unsealed data before the session either |
 
 It does not hide the size and timing of frames (the server does not compress for E2E connections, so sizes say nothing about content), and the server process sees the plaintext: E2E protects the path between client and server, not the server.
 
@@ -367,6 +367,8 @@ A FIPS build needs CMake and Go, and is made from the source distribution:
 MATURIN_PEP517_ARGS="--features fips" pip install wse-server --no-binary wse-server
 ```
 
+In a FIPS build AES-GCM seals only through the module's approved constructions: a nonce the module draws itself for the first E2E design and the `rust_*` helpers, and the TLS 1.2 record construction, which refuses a counter that does not grow, for E2E sessions.
+
 `health_snapshot()["crypto"]` and the Prometheus metric
 `wse_build_info{crypto="..."}` report which library a running server uses.
 The cluster's TLS gets its provider from that library explicitly; WSE never
@@ -430,7 +432,7 @@ server.subscribe_connection(conn_id, ["tenant:other:prices"])  # denied (not in 
 **Evaluation order:**
 
 1. If deny list is set and the topic matches any deny pattern, subscription is rejected
-2. If allow list is set and the topic does not match any allow pattern, subscription is rejected
+2. If allow list is set and the topic does not match any allow pattern, subscription is rejected (an empty allow list rejects every topic)
 3. Otherwise, subscription is permitted
 
 Deny always takes precedence over allow. Patterns support `*` (match any characters) and `?` (match single character).
@@ -441,7 +443,8 @@ Deny always takes precedence over allow. Patterns support `*` (match any charact
 
 - ACLs are enforced at subscribe time, **on every delivery to a pattern subscription** and **on recovery replay**: `subscribe_with_recovery` filters replayed topics through the same ACL, fail-closed — an unauthorized topic is never replayed and its position is never probed (no existence/count leak). Call `set_topic_acl` before `subscribe_connection`.
 - ACLs are per-connection, not per-user. Different connections from the same user can have different ACLs.
-- Without ACLs, all topics are accessible (backward compatible).
+- Without ACLs, all topics are accessible (backward compatible). Set the ACL before `accept_connection` when the application accepts connections itself.
+- In the JWT `wse_topics` claim, `{"allow": [...], "deny": [...]}`: a claim that is not such an object, an empty object, one with any other key, or an empty `allow` list denies every topic; a claim with only `deny` allows every topic it does not deny.
 - Combine with JWT `sub` claim for user-level authorization: read the user's role from the JWT payload in your drain loop, then set appropriate ACLs.
 
 ## Wire-Level Security

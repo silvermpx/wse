@@ -151,7 +151,7 @@ Configure `jwt_secret`, `jwt_issuer`, `jwt_audience`, and optionally `jwt_cookie
 - With JWT configured: `auth_connect` event fires with the validated `user_id`
 - Without JWT configured: `connect` event fires with the raw cookies string
 
-**Authenticating in Python:** without `jwt_secret`, check the cookies of the `connect` event yourself, then call `server.accept_connection(conn_id, user_id)`. It sends the client `server_ready`, the message both clients wait for before they send anything, and makes `user_id` the connection's user for presence. Until then the connection gets no broadcasts and, with `client_subscriptions=True`, the server refuses every topic it asks for. Reject with `server.disconnect(conn_id)`.
+**Authenticating in Python:** without `jwt_secret`, check the cookies of the `connect` event yourself, then call `server.accept_connection(conn_id, user_id)`. It sends the client `server_ready`, the message both clients wait for before they send anything, and makes `user_id` the connection's user for presence. Until then the connection gets no broadcasts and, with `client_subscriptions=True`, the server refuses every topic it asks for. Set its topic ACL (`set_topic_acl`) before accepting it: from then on the client may subscribe. Reject with `server.disconnect(conn_id)`.
 
 ```python
 for kind, conn_id, data in server.drain_inbound(256, 50):
@@ -355,7 +355,7 @@ Queue groups are per node: in a cluster, each node with members of a group deliv
 
 ### Topic ACL
 
-Per-connection topic access control with glob pattern matching. Call `set_topic_acl` before `subscribe_connection` to enforce the rules.
+Per-connection topic access control with glob pattern matching. Call `set_topic_acl` before `subscribe_connection` (and, without `jwt_secret`, before `accept_connection`) to enforce the rules. Leaving `allow` out allows every topic that is not denied; an empty `allow` list allows none.
 
 ```python
 # Tenant isolation: connection can only access its own namespace

@@ -430,7 +430,7 @@ After the WebSocket connection is established and the server sends `server_ready
 
 ### Client Hello
 
-Sent by the client right after the connection opens (the TypeScript client waits for `server_ready`):
+Sent by the client right after the connection opens (without E2E the TypeScript client waits for `server_ready`; with an E2E session both send it at once, see [End-to-End Encryption](#end-to-end-encryption)):
 
 ```json
 {"c":"WSE","t":"client_hello","p":{
@@ -521,6 +521,10 @@ One suite, `p256-aes256gcm`: ECDH P-256, HKDF-SHA256 and AES-256-GCM, with the s
 
 ### Handshake
 
+The session comes first. The client announces it in the upgrade request (`e2e=1` in the query) and sends `client_hello` as soon as the socket opens, without waiting for `server_ready`. Until the session exists the server holds everything back: the connection joins no broadcast, the application does not learn of it (no `auth_connect` or `connect` event) and it gets no `server_ready`; it answers heartbeats only and ignores whatever else the client sends. Once it has answered with `server_hello`, it sends `server_ready` sealed, and only then does the application learn of the connection, so nothing the application sends ever goes in plaintext. A session offer without the announcement, or an announced connection whose `client_hello` carries no offer, gets `E2E_UNSUPPORTED` and close 4800.
+
+Before the session the client takes unsealed only `server_hello`, an `error` and heartbeats; any other unsealed frame, then or inside the session, ends the connection on the client side.
+
 The client offers, in `client_hello.p.e2e`, the suites it speaks, a fresh ECDH public key (65-byte uncompressed point, base64) and 32 random bytes (base64). The server answers in `server_hello.p.e2e` with the suite it chose, its own fresh ECDH public key, `key_id` (the first 8 bytes of SHA-256 over its identity public key, hex) and the signature over the transcript `T` (64 bytes `r || s`, base64). A server without an identity key sends `alg` and `signature` as `null` and `key_id` as `0000000000000000`; only a client that allows unauthenticated servers goes on.
 
 The transcript, each length one byte:
@@ -555,7 +559,7 @@ Binary frames:
 
 The nonce is the epoch's IV followed by `seq` (u64 BE); the additional data is the direction (`0x01` client to server, `0x02` server to client), `TH` and the 14-byte header. Each direction counts `seq` from 0, one per frame, across epochs. A receiver opens only the frame with the next `seq`, in the current epoch or the next one (whose key it derives on trial and keeps only when the tag holds), and at most 2^24 frames per epoch; anything else closes the connection with 4802. A sender moves to the next epoch after 2^20 frames or 600 seconds, and past `seq` 2^53 - 1 closes with 4803. The plaintext is the message as it would go unsealed: JSON, or `M:` msgpack on a msgpack connection.
 
-`server_hello` is the last plaintext frame the server sends: its sending keys are installed right behind it. Once it has answered `client_hello` the server takes only sealed frames (WebSocket control frames apart), and a client sends nothing but `client_hello` until it holds the keys.
+`server_hello` is the last plaintext frame the server sends: its sending keys are installed right behind it, and every data frame queued after them is sealed. Once it has answered `client_hello` the server takes only sealed frames (WebSocket control frames apart), and a client sends nothing but `client_hello` until it holds the keys. The server seals with the counter nonce above through the library's TLS 1.2 record construction, which refuses a nonce that does not grow: in a `fips` build that is the approved way to use AES-GCM.
 
 ### The first design
 
@@ -586,19 +590,20 @@ The signed bytes are a label naming the signer's side, then the body as UTF-8:
 
 ### Client to server
 
-The body carries `t` (the message type), `p` (its payload, optional), `aud` (the server's signing key id, from `server_ready` or `server_hello`), `ts` (milliseconds since the epoch) and `n` (unique per message, at most 128 characters: an order id, say).
+The body carries `t` (the message type), `p` (its payload, optional), `aud` (the server's signing key id, from `server_ready` or `server_hello`; in an E2E session from the sealed `server_ready` only, and one of the pinned server signing keys when the client pins any), `ts` (milliseconds since the epoch) and `n` (unique per message, at most 128 characters: an order id, say).
 
-The server takes the message only when the connection holds a key with id `kid` (from its token's `cnf` claim, or bound by the application), the signature verifies, `aud` is the id of the server's own signing key, `ts` is within `signature_window` seconds (30) of the server's clock, and no message with the same `kid` and `n` came within that window. It then sends the client a signed `receipt` and hands the application the body's fields with `signature` (`body`, `sig`, `kid`) added. Otherwise the client gets an `error` with code `SIGNATURE_REFUSED`, `n` when the body reads, and a `reason`:
+The server takes the message only when the connection holds a key with id `kid` (from its token's `cnf` claim, or bound by the application), the signature verifies, `aud` is the id of the server's own signing key, `ts` is within `signature_window` seconds (30) of the server's clock, and no message with the same `kid` and `n` came within that window. It hands the application the body's fields with `signature` (`body`, `sig`, `kid`) added, then sends the client a signed `receipt`: a receipt means the application has the message. Otherwise the client gets an `error` with code `SIGNATURE_REFUSED`, `n` when the body reads, and a `reason`:
 
 | `reason` | Why |
 |----------|-----|
-| `malformed` | Not a signed message the server can read: a field missing, the body not a JSON object, no `t`, `ts` or `n` |
+| `malformed` | Not a signed message the server can read: a field missing, the body not a JSON object, no `t`, `ts` or `n`, `n` longer than 128 characters, a key twice in one object, or an integer beyond 64 bits (readers would not agree on what such a body says) |
 | `unknown_key` | The connection holds no key with this id |
 | `bad_signature` | The signature does not verify |
 | `wrong_audience` | Signed for another server's key |
 | `stale` | `ts` outside the window |
 | `replayed` | This `kid` and `n` came already |
 | `not_enabled` | The server has no signing key |
+| `busy` | Verified, but the application cannot take it now (its queue is full). Not received: send it again, with the same `n` |
 
 ### Server to client
 

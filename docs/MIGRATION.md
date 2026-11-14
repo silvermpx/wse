@@ -10,7 +10,8 @@
 - **`start()` raises `OSError`** when the address is taken, and `connect_cluster()` when it cannot bind the cluster port.
 - **`drain()` blocks** until the clients are gone or the timeout, and returns how many it had to drop.
 - **JWT options are checked at startup.** HMAC secrets must be at least the hash size (32, 48 or 64 bytes); a PEM key is refused as an HMAC secret; `jwt_issuer` / `jwt_audience` now also reject tokens that omit the claim; any `jwt_*` option without `jwt_secret` is an error.
-- **A malformed or empty `wse_topics` claim denies every topic** instead of allowing all of them.
+- **A `wse_topics` claim that is malformed, empty (`{}`), has a key other than `allow` and `deny`, or an empty `allow` list denies every topic** instead of allowing all of them.
+- **`set_topic_acl(conn_id, allow=[])` allows no topic**, as an empty `allow` list in the claim; leave `allow` out to allow every topic that is not denied.
 - **The rate limit applies to what clients send**, as documented: messages over it are dropped with a `RATE_LIMITED` error and a client that keeps on is closed with 4429. `send_event()` is no longer throttled.
 - **Connections close when their token expires** (code 4403); the clients reconnect with a fresh token.
 - **New close codes**: 1013 (slow consumer), 4403, 4408 (idle), 4429, 4800, 4802, 4803. See [PROTOCOL.md](PROTOCOL.md#websocket-close-codes).
@@ -19,7 +20,7 @@
 - **A pattern subscription gets only the topics its connection's ACL allows.**
 - **Out-of-range options raise `ValueError`** (ping_interval 0, rate limits below 1 or NaN, zero sizes).
 - **Values that cannot be JSON raise `ValueError`**: a dict containing itself, or nesting deeper than 128 levels, in `send_event()`, presence data and `rust_jwt_encode()`.
-- **Applications that authenticate connections themselves** (no `jwt_secret`) call `accept_connection(conn_id, user_id)` to send `server_ready`. Until then the connection gets no broadcasts and the server refuses its own subscription requests.
+- **Applications that authenticate connections themselves** (no `jwt_secret`) call `accept_connection(conn_id, user_id)` to send `server_ready`. Until then the connection gets no broadcasts and the server refuses its own subscription requests. Set its topic ACL before accepting it.
 - **msgpack clients get msgpack everywhere** (topic messages, broadcasts, replays, replies), not only from `send_event()`.
 - **Sends wait when the server is saturated**: `send()`, `send_bytes()`, `send_event()` and the broadcasts wait (without holding the GIL) while 65,536 commands are queued for the server. A publisher faster than its clients then runs at the speed the server delivers and memory stays bounded; normal traffic never waits.
 - **MessagePack is built in**: the server packs MessagePack in Rust, so the `msgpack` extra is gone. `pip install wse-server[msgpack]` still installs the server (pip warns about the unknown extra); drop the extra from your requirements.
