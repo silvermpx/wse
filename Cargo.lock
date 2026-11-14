@@ -1586,7 +1586,10 @@ checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite",
 ]
 
@@ -1720,6 +1723,8 @@ dependencies = [
  "httparse",
  "log",
  "rand",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror",
 ]
@@ -1843,6 +1848,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b1f9c3798725016c6ee5f2f57869ec0831e8bbc0ab0310a86e787e97f41389e"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7265c9301c16a8711c992c2d8da90ee77ef54b1ed51482d6dfeb00dc756b1297"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
@@ -2040,6 +2054,29 @@ dependencies = [
  "wse-protocol",
  "zeroize",
  "zstd",
+]
+
+[[package]]
+name = "wse-client"
+version = "3.0.0"
+dependencies = [
+ "ahash",
+ "base64 0.23.1",
+ "bytes",
+ "fastrand",
+ "flate2",
+ "futures-util",
+ "rmp",
+ "rmp-serde",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "webpki-roots",
+ "wse",
+ "wse-protocol",
 ]
 
 [[package]]

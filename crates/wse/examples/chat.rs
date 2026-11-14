@@ -5,7 +5,8 @@
 //!
 //! Clients connect to ws://127.0.0.1:5006/wse with their token in the
 //! `access_token` cookie or an `Authorization: Bearer` header, and send
-//! `{"t": "say", "p": {"text": "..."}}`.
+//! `{"t": "say", "p": {"text": "..."}}`. The server prints a token to try it
+//! with; the `wse-client` crate's `chat_client` example is such a client.
 
 use std::time::Duration;
 
@@ -65,7 +66,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         publisher: server.publisher(),
     };
     server.start(TcpListener::bind("127.0.0.1:5006").await?, chat)?;
-    println!("chat on ws://127.0.0.1:5006/wse");
+    let token = server.publisher().issue_token(
+        "guest",
+        Duration::from_secs(3600),
+        serde_json::Map::new(),
+    )?;
+    println!("chat on ws://127.0.0.1:5006/wse\na token for an hour: {token}");
 
     tokio::signal::ctrl_c().await?;
     // Clients are told the server restarts and come back to another one.

@@ -1,7 +1,7 @@
 # The WSE workspace: the engine (crates/wse, on crates.io as `wse`) and the
 # Python extension built from it (crates/wse-py, the `wse-server` package).
 [workspace]
-members = ["crates/wse", "crates/wse-protocol", "crates/wse-py"]
+members = ["crates/wse", "crates/wse-client", "crates/wse-protocol", "crates/wse-py"]
 # Their own lock files and tools: run on their own.
 exclude = ["benchmarks/rust-bench", "xtask"]
 resolver = "3"

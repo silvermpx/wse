@@ -295,11 +295,13 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
-      # The engine alone (what crates.io has) and with the Python module.
+      # The engine alone (what crates.io has), with the Python module, and
+      # the client without its crypto (ws:// only).
       - name: Clippy
         run: |
           cargo clippy -p wse --locked --all-targets -- -D warnings
           cargo clippy --workspace --locked --all-targets -- -D warnings
+          cargo clippy -p wse-client --locked --no-default-features --all-targets -- -D warnings
 
   # ---------------------------------------------------------------------------
   # Rust: unit tests
@@ -334,6 +336,9 @@ jobs:
         run: |
           cargo test -p wse --locked
           cargo test -p wse --locked --features python
+          cargo test -p wse-protocol --locked
+          cargo test -p wse-client --locked
+          cargo test -p wse-client --locked --no-default-features
         env:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
 
@@ -367,7 +372,9 @@ jobs:
           key: fips
 
       - name: cargo test --features fips
-        run: cargo test -p wse --locked --features fips,python
+        run: |
+          cargo test -p wse --locked --features fips,python
+          cargo test -p wse-client --locked --features fips
         env:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
 

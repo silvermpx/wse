@@ -35,6 +35,12 @@ allow = [
 crate = "aws-lc-fips-sys"
 allow = ["OpenSSL"]
 
+# The Mozilla root certificates the Rust client trusts for wss:// by default:
+# data under the Community Data License Agreement, permissive.
+[[licenses.exceptions]]
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 # Two versions of one crate are reported, not refused: some come in through
 # upstream crates and resolve as those update.
