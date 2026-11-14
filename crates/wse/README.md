@@ -5,6 +5,7 @@ fan-out on every CPU core, topics with recovery for clients that come back,
 presence, a native cluster protocol, JWT validation, end-to-end encryption
 and signed messages. The same engine runs the Python package
 [`wse-server`](https://pypi.org/project/wse-server/); the clients are
+[`wse-client`](https://crates.io/crates/wse-client) for Rust,
 [`wse-client`](https://www.npmjs.com/package/wse-client) for TypeScript and
 React, and [`wse-client`](https://pypi.org/project/wse-client/) for Python.
 
@@ -66,7 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`examples/chat.rs` is a complete chat room.
+`examples/chat.rs` is a complete chat room; it prints a token to try it
+with, and the `wse-client` crate's `chat_client` example talks to it.
 
 ## What a server does
 
