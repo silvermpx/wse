@@ -44,6 +44,7 @@ from .network_monitor import NetworkMonitor
 from .offline_queue import OfflineQueue
 from .protocol import MessageCodec, _json_loads
 from .rate_limiter import TokenBucketRateLimiter
+from .signing import ClientSigner, ServerKeys
 from .types import (
     ConnectionQuality,
     ConnectionState,
@@ -163,6 +164,16 @@ class AsyncWSEClient:
             to send this connection's messages as MessagePack, and sends
             the client's in it too, except frames sealed for E2E; needs the
             ``[msgpack]`` extra).
+        signing_key: This client's ECDSA P-256 private key (a key object or
+            PKCS#8 PEM/DER) for ``send(..., signed=True)``. The server learns
+            its public key from the token's ``cnf`` claim or from the
+            application (``set_client_key``); see :mod:`wse_client.signing`.
+            Needs the ``[crypto]`` extra.
+        server_signing_keys: The server's signing public keys (base64, from
+            ``server.signing_public_key()``) that the messages it signs are
+            checked against; a signed message no pinned key verifies is
+            dropped. Without them signed messages are delivered unchecked
+            (``event.signature.verified`` is False).
 
     Example::
 
@@ -194,6 +205,8 @@ class AsyncWSEClient:
         max_message_size: int | None = DEFAULT_MAX_MESSAGE_SIZE,
         recovery_timeout: float = RECOVERY_TIMEOUT,
         wire_format: str = "json",
+        signing_key: Any = None,
+        server_signing_keys: list[str] | None = None,
     ) -> None:
         if wire_format not in _WIRE_FORMATS:
             raise ValueError(f"wire_format must be one of {_WIRE_FORMATS}")
@@ -235,7 +248,12 @@ class AsyncWSEClient:
             security=self._security,
             msgpack=msgpack_handler,
             max_message_size=max_message_size,
+            server_keys=ServerKeys(server_signing_keys),
         )
+        # Signed messages: this client's key, and the server's signing key id
+        # from its server_hello (the audience of what the client signs).
+        self._signer = ClientSigner(signing_key) if signing_key is not None else None
+        self._server_signing_kid: str | None = None
         # Messages go out in msgpack too, except frames sealed for E2E.
         self._send_packed = (
             msgpack_handler
@@ -530,6 +548,8 @@ class AsyncWSEClient:
         *,
         priority: int = MessagePriority.NORMAL,
         correlation_id: str | None = None,
+        signed: bool = False,
+        nonce: str | None = None,
     ) -> SendResult:
         """Send a message to the server.
 
@@ -538,6 +558,13 @@ class AsyncWSEClient:
             payload: Message data dict (default: empty).
             priority: See :class:`~wse_client.types.MessagePriority`.
             correlation_id: Optional ID to correlate request/response.
+            signed: Sign the message with ``signing_key``: the server checks
+                it, answers with a signed ``receipt`` event and hands the
+                application the proof. Needs a server with a signing key
+                (its id comes in ``server_hello``).
+            nonce: For a signed message, its unique id (an order id, say);
+                the server takes each once. Random by default. The receipt
+                and a ``SIGNATURE_REFUSED`` error carry it as ``n``.
 
         Returns:
             ``SendResult.SENT`` when it went out; ``SendResult.QUEUED`` when
@@ -548,13 +575,26 @@ class AsyncWSEClient:
         Raises:
             WSEEncryptionError: ``encryption=True`` and the key exchange of
                 the current connection failed; nothing was sent.
+            WSEError: ``signed=True`` without ``signing_key``, or before the
+                server's ``server_hello`` named its signing key.
         """
-        encoded = self._codec.encode(
-            type,
-            payload or {},
-            priority=priority,
-            correlation_id=correlation_id,
-        )
+        if signed:
+            if self._signer is None:
+                raise WSEError("signed=True needs AsyncWSEClient(signing_key=...)")
+            if self._server_signing_kid is None:
+                raise WSEError(
+                    "the server has no signing key (none in its server_hello)"
+                )
+            encoded = self._signer.envelope(
+                type, payload or {}, self._server_signing_kid, nonce=nonce
+            )
+        else:
+            encoded = self._codec.encode(
+                type,
+                payload or {},
+                priority=priority,
+                correlation_id=correlation_id,
+            )
         return await self._send_app_frame(
             encoded, priority=priority, msg_type=type, allow_queue=True
         )
@@ -1649,6 +1689,9 @@ class AsyncWSEClient:
         if not isinstance(details, dict):
             details = {}
         conn_id = payload.get("connection_id") or details.get("connection_id")
+        signing = details.get("signing")
+        if isinstance(signing, dict) and isinstance(signing.get("kid"), str):
+            self._server_signing_kid = signing["kid"]
         self._connection.handle_server_ready(
             conn_id if isinstance(conn_id, str) else None
         )
@@ -1696,6 +1739,9 @@ class AsyncWSEClient:
 
         if features.get("recovery"):
             self._server_recovery_enabled = True
+        signing = p.get("signing")
+        if isinstance(signing, dict) and isinstance(signing.get("kid"), str):
+            self._server_signing_kid = signing["kid"]
         self._server_hello_seen = True
 
         # Complete the ECDH key exchange -- or fail closed.

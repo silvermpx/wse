@@ -34,6 +34,7 @@ from .constants import (
     ZLIB_MAGIC,
     ZLIB_METHODS,
 )
+from .signing import ServerKeys, SignatureError
 from .types import MessageCategory, WSEEvent
 
 if TYPE_CHECKING:
@@ -101,6 +102,8 @@ class MessageCodec:
         max_message_size: Largest accepted message in bytes, checked on the
             frame and -- for compressed frames -- while inflating. ``None``
             disables the check.
+        server_keys: The server signing keys to check signed messages
+            against; without any, signed messages are delivered unchecked.
     """
 
     def __init__(
@@ -110,11 +113,13 @@ class MessageCodec:
         msgpack: MsgPackHandler | None = None,
         *,
         max_message_size: int | None = DEFAULT_MAX_MESSAGE_SIZE,
+        server_keys: ServerKeys | None = None,
     ) -> None:
         self._compression = compression
         self._security = security
         self._msgpack = msgpack
         self._max_size = max_message_size
+        self._server_keys = server_keys or ServerKeys(None)
         self._sequence = 0
 
     def decode(self, data: str | bytes) -> WSEEvent | list[WSEEvent] | None:
@@ -290,6 +295,8 @@ class MessageCodec:
 
         # Normalize keys: "type" -> "t", "payload" -> "p"
         t = parsed.get("t") or parsed.get("type", "unknown")
+        if t == "signed":
+            return self._signed_to_event(parsed, category)
         p = parsed.get("p") or parsed.get("payload") or {}
 
         # Handle batch messages
@@ -325,4 +332,51 @@ class MessageCodec:
             topic=topic if isinstance(topic, str) else None,
             epoch=str(epoch) if epoch is not None else None,
             offset=int(offset) if isinstance(offset, int) else None,
+        )
+
+    def _signed_to_event(
+        self, envelope: dict[str, Any], category: MessageCategory | None
+    ) -> WSEEvent | None:
+        """A message the server signed: checked against the pinned keys, then
+        delivered as the signed text says, with the proof. Dropped when the
+        check fails, or when the text names another topic than the one it
+        came on."""
+        try:
+            message, proof = self._server_keys.open(envelope)
+        except SignatureError as exc:
+            logger.warning("Dropping a signed message: %s", exc)
+            return None
+        topic = envelope.get("tp")
+        signed_topic = message.get("tp")
+        if (
+            isinstance(topic, str)
+            and signed_topic is not None
+            and signed_topic != topic
+        ):
+            logger.warning(
+                "Dropping a message signed for topic %r that came on %r",
+                signed_topic,
+                topic,
+            )
+            return None
+        epoch = envelope.get("e")
+        offset = envelope.get("o")
+        ts = message.get("ts")
+        p = message.get("p", {})
+        return WSEEvent(
+            type=message["t"],
+            payload=p if isinstance(p, dict) else {"data": p},
+            id=message.get("n") if isinstance(message.get("n"), str) else None,
+            timestamp=(
+                datetime.fromtimestamp(ts / 1000, UTC).isoformat()
+                if isinstance(ts, int)
+                else None
+            ),
+            category=category.value if category else envelope.get("c"),
+            topic=topic
+            if isinstance(topic, str)
+            else (signed_topic if isinstance(signed_topic, str) else None),
+            epoch=str(epoch) if epoch is not None else None,
+            offset=int(offset) if isinstance(offset, int) else None,
+            signature=proof,
         )

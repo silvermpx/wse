@@ -28,6 +28,12 @@ from ._version import __version__
 from .client import AsyncWSEClient
 from .connection_pool import ConnectionPool
 from .offline_queue import OfflineQueue
+from .signing import (
+    SignatureProof,
+    generate_signing_key,
+    public_key_base64,
+    public_key_jwk,
+)
 from .errors import (
     WSEAuthError,
     WSECircuitBreakerError,
@@ -92,6 +98,10 @@ __all__ = [
     "ConnectionPool",
     "OfflineQueue",
     "WSEEvent",
+    "SignatureProof",
+    "generate_signing_key",
+    "public_key_base64",
+    "public_key_jwk",
     "ConnectionState",
     "ConnectionQuality",
     "ConnectionStats",

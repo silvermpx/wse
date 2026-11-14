@@ -108,6 +108,9 @@ class SyncWSEClient:
         extra_headers: dict[str, str] | None = None,
         queue_size: int = 1000,
         encryption: bool = False,
+        e2e_server_keys: list[str] | None = None,
+        e2e_unauthenticated: bool = False,
+        e2e_legacy: bool = False,
         endpoints: list[str] | None = None,
         load_balancing: LoadBalancingStrategy = LoadBalancingStrategy.WEIGHTED_RANDOM,
         rate_limit: float | None = RATE_LIMIT_REFILL_RATE,
@@ -116,6 +119,8 @@ class SyncWSEClient:
         max_message_size: int | None = DEFAULT_MAX_MESSAGE_SIZE,
         recovery_timeout: float = RECOVERY_TIMEOUT,
         wire_format: str = "json",
+        signing_key: Any = None,
+        server_signing_keys: list[str] | None = None,
     ) -> None:
         self._url = url
         self._token = token
@@ -128,6 +133,9 @@ class SyncWSEClient:
             "extra_headers": extra_headers,
             "queue_size": queue_size,
             "encryption": encryption,
+            "e2e_server_keys": e2e_server_keys,
+            "e2e_unauthenticated": e2e_unauthenticated,
+            "e2e_legacy": e2e_legacy,
             "endpoints": endpoints,
             "load_balancing": load_balancing,
             "rate_limit": rate_limit,
@@ -136,6 +144,8 @@ class SyncWSEClient:
             "max_message_size": max_message_size,
             "recovery_timeout": recovery_timeout,
             "wire_format": wire_format,
+            "signing_key": signing_key,
+            "server_signing_keys": server_signing_keys,
         }
         self._queue_size = queue_size
 
@@ -235,10 +245,14 @@ class SyncWSEClient:
         payload: dict[str, Any] | None = None,
         *,
         priority: int = 5,
+        signed: bool = False,
+        nonce: str | None = None,
     ) -> SendResult:
         """Send a message (blocks until sent). See :meth:`AsyncWSEClient.send`."""
         result = self._run(
-            lambda c: c.send(type, payload, priority=priority),
+            lambda c: c.send(
+                type, payload, priority=priority, signed=signed, nonce=nonce
+            ),
             timeout=15.0,
             default=SendResult.FAILED,
         )

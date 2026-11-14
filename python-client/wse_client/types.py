@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import Any, Awaitable, Callable, Optional, Union
 
+from .signing import SignatureProof
+
 # A callable returning the token to authenticate with (or None), sync or async.
 # The client calls it before every connect and reconnect attempt.
 TokenProvider = Callable[[], Union[Optional[str], Awaitable[Optional[str]]]]
@@ -145,6 +147,10 @@ class WSEEvent:
             with ``epoch`` this drives idempotent dedup, gap detection, and
             recovery from the last-seen position. Present only on stamped topic
             publications (absent on control/system messages).
+        signature: For a message the server signed: the signed text, the
+            signature and the key id, what to keep as the proof (see
+            :class:`~wse_client.signing.SignatureProof`). ``type`` and
+            ``payload`` come from the signed text.
     """
 
     type: str
@@ -159,6 +165,7 @@ class WSEEvent:
     topic: str | None = None
     epoch: str | None = None
     offset: int | None = None
+    signature: SignatureProof | None = None
 
 
 @dataclass
