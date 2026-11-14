@@ -25,6 +25,8 @@ from wse_server._wse_accel import RustWSEServer, rust_jwt_encode  # noqa: E402
 
 PORT = int(sys.argv[1])
 SECRET = b"e2e-secret-key-32-bytes-long!!!!"
+
+
 def new_key() -> bytes:
     return ec.generate_private_key(ec.SECP256R1()).private_bytes(
         serialization.Encoding.PEM,
