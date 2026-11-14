@@ -144,15 +144,28 @@ describe('offset gaps', () => {
     expect(gaps).toEqual([]);
   });
 
-  it('reports an epoch change (server restart) and continues on the new epoch', async () => {
+  it('keeps the streams of a topic published on several nodes apart', async () => {
     start();
     await tick();
     const ws = FakeWebSocket.last();
     await connectServer(ws);
-    await send(ws, stamped('prices', 7), stamped('prices', 0, '0000000b'), stamped('prices', 1, '0000000b'));
+    // Two nodes publish on the topic: each stream is in order on its own.
+    await send(
+      ws,
+      stamped('prices', 7),
+      stamped('prices', 0, '0000000b'),
+      stamped('prices', 8),
+      stamped('prices', 1, '0000000b'),
+      stamped('prices', 8), // a duplicate in its own stream
+    );
+    expect(offsets()).toEqual([7, 0, 8, 1]);
+    expect(gaps).toEqual([]);
 
-    expect(offsets()).toEqual([7, 0, 1]);
-    expect(gaps.map((g) => g.reason)).toEqual(['epoch_changed']);
+    // A hole in one stream is reported for that stream alone.
+    await send(ws, stamped('prices', 3, '0000000b'));
+    expect(gaps).toEqual([{
+      topic: 'prices', epoch: '0000000b', fromOffset: 2, toOffset: 2, missed: 1, reason: 'offset_gap',
+    }]);
   });
 
   it('learns that the server supports recovery from server_hello', async () => {
@@ -267,7 +280,7 @@ describe('recovery after a reconnect', () => {
     await send(ws2, { ...stamped('prices', 6), e: '0000000b' });
     expect(offsets()).toEqual([1, 6]);
     expect(gaps).toEqual([{
-      topic: 'prices', epoch: '0000000b', fromOffset: null, toOffset: null, missed: null, reason: 'not_recovered',
+      topic: 'prices', epoch: '0000000b', fromOffset: null, toOffset: null, missed: null, reason: 'epoch_changed',
     }]);
   });
 

@@ -4,6 +4,9 @@
 
 import { logger } from '../utils/logger.js';
 
+/** Streams (origin epochs) remembered per topic: a cluster's nodes, plus restarts. */
+const MAX_STREAMS_PER_TOPIC = 32;
+
 export class EventSequencer {
   private sequence = 0;
   private seenIds: Map<string, number>;
@@ -11,6 +14,12 @@ export class EventSequencer {
   // stamped messages; survives reconnects within an epoch. Replaces the old
   // seq-based reorder buffer, which the server's global `seq` made unsound.
   private topicPositions = new Map<string, { epoch: string; offset: number }>();
+  /**
+   * Per topic, the last offset of each stream (origin epoch): a topic
+   * published on several cluster nodes interleaves their streams, each in
+   * order on its own. Most recently delivered last.
+   */
+  private streams = new Map<string, Map<string, number>>();
   private readonly windowSize: number;
 
   private cleanupCounter = 0;
@@ -79,35 +88,56 @@ export class EventSequencer {
   }
 
   /**
-   * Idempotent dedup + gap detection by per-topic (epoch, offset). Mirrors the
-   * Python client's check_topic_stamp.
-   *   'duplicate' -- already delivered (offset <= last on same epoch); drop.
-   *   'gap'       -- offset jumped ahead. This does NOT advance the position:
-   *                  the caller decides (MessageProcessor holds the message
-   *                  while a requested replay may still fill the hole, then
-   *                  delivers it, advances with setTopicPosition() and emits a
-   *                  gap event -- a gap never blacks the topic out).
-   *   'deliver'   -- next in order, or first message on a new/changed epoch.
+   * Idempotent dedup + gap detection by (epoch, offset) within the topic's
+   * stream of that epoch. Mirrors the Python client's check_topic_stamp.
+   *   'duplicate' -- already delivered (offset <= last in its stream); drop.
+   *   'gap'       -- offset jumped ahead in its stream. This does NOT advance
+   *                  the position: the caller decides (MessageProcessor holds
+   *                  the message while a requested replay may still fill the
+   *                  hole, then delivers it, advances with setTopicPosition()
+   *                  and emits a gap event -- a gap never blacks the topic out).
+   *   'deliver'   -- next in order, or the first message of a stream not seen
+   *                  yet (another node publishing on the topic, or a restart).
    */
   checkTopicStamp(topic: string, epoch: string, offset: number): 'duplicate' | 'gap' | 'deliver' {
-    const prev = this.topicPositions.get(topic);
-    if (!prev || prev.epoch !== epoch) {
-      this.topicPositions.set(topic, { epoch, offset });
+    const last = this.streams.get(topic)?.get(epoch);
+    if (last === undefined) {
+      this.advance(topic, epoch, offset);
       return 'deliver';
     }
-    const last = prev.offset;
     if (offset <= last) {
       return 'duplicate';
     }
     if (offset === last + 1) {
-      this.topicPositions.set(topic, { epoch, offset });
+      this.advance(topic, epoch, offset);
       return 'deliver';
     }
     return 'gap';
   }
 
+  private advance(topic: string, epoch: string, offset: number): void {
+    let streams = this.streams.get(topic);
+    if (!streams) {
+      streams = new Map();
+      this.streams.set(topic, streams);
+    }
+    streams.delete(epoch); // most recent last
+    streams.set(epoch, offset);
+    if (streams.size > MAX_STREAMS_PER_TOPIC) {
+      streams.delete(streams.keys().next().value!);
+    }
+    this.topicPositions.set(topic, { epoch, offset });
+  }
+
+  /** Last delivered (epoch, offset) of a topic: the recovery anchor. */
   getTopicPosition(topic: string): { epoch: string; offset: number } | undefined {
     return this.topicPositions.get(topic);
+  }
+
+  /** Last delivered (epoch, offset) of the topic's stream of `epoch`. */
+  getStreamPosition(topic: string, epoch: string): { epoch: string; offset: number } | undefined {
+    const offset = this.streams.get(topic)?.get(epoch);
+    return offset === undefined ? undefined : { epoch, offset };
   }
 
   /**
@@ -133,6 +163,7 @@ export class EventSequencer {
   clearTopics(topics: string[]): void {
     for (const topic of topics) {
       this.topicPositions.delete(topic);
+      this.streams.delete(topic);
     }
   }
 
@@ -147,7 +178,7 @@ export class EventSequencer {
    * the skipped window's state.
    */
   setTopicPosition(topic: string, epoch: string, offset: number): void {
-    this.topicPositions.set(topic, { epoch, offset });
+    this.advance(topic, epoch, offset);
   }
 
   getStats(): {
@@ -175,6 +206,7 @@ export class EventSequencer {
   destroy(): void {
     this.seenIds.clear();
     this.topicPositions.clear();
+    this.streams.clear();
     this.sequence = 0;
     this.cleanupCounter = 0;
 
@@ -187,6 +219,7 @@ export class EventSequencer {
     this.sequence = 0;
     this.seenIds.clear();
     this.topicPositions.clear();
+    this.streams.clear();
     this.cleanupCounter = 0;
 
     logger.debug('EventSequencer reset');

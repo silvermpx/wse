@@ -157,13 +157,31 @@ class TestNoBlackout:
             c._on_raw_message(stamped(o))
         assert offsets(drain(c)) == [1, ("gap", 2, 2), 3, 4, 5, 6]
 
-    async def test_epoch_change_while_waiting(self):
+    async def test_another_stream_goes_through_while_a_gap_waits(self):
+        """A topic published on two cluster nodes interleaves two streams
+        (epochs): each is in order on its own, so a message of the other
+        one is no gap and does not end this one's."""
         c = make_client(timeout=5.0)
         c._on_raw_message(stamped(1))
         c._on_raw_message(stamped(4))
-        c._on_raw_message(stamped(0, epoch="0000000b"))  # server restarted
-        assert offsets(drain(c)) == [1, ("gap", 2, 3), 4, 0]
-        assert c.recovery_state["prices"] == ("0000000b", 0)
+        c._on_raw_message(stamped(0, epoch="0000000b"))
+        c._on_raw_message(stamped(1, epoch="0000000b"))
+        assert offsets(drain(c)) == [1, 0, 1]
+        assert "prices" in c._gaps
+        assert c.recovery_state["prices"] == ("0000000b", 1)
+
+    async def test_streams_alternating_are_no_gaps(self):
+        c = make_client(timeout=5.0)
+        for epoch, offset in [
+            ("0000000a", 1),
+            ("0000000b", 7),
+            ("0000000a", 2),
+            ("0000000b", 8),
+        ]:
+            c._on_raw_message(stamped(offset, epoch=epoch))
+        c._on_raw_message(stamped(2))  # a duplicate in its own stream
+        assert offsets(drain(c)) == [1, 7, 2, 8]
+        assert c._gaps == {}
 
     async def test_disconnect_delivers_held_messages(self):
         c = make_client(timeout=5.0)

@@ -12,6 +12,10 @@ import time
 
 from .constants import DUPLICATE_MAX_AGE, SEQUENCE_WINDOW_SIZE
 
+#: Streams (origin epochs) remembered per topic: a cluster's nodes, plus the
+#: epochs a restart leaves behind.
+MAX_STREAMS_PER_TOPIC = 32
+
 
 class EventSequencer:
     """Idempotent delivery: id dedup + per-topic (epoch, offset) dedup/gap detection.
@@ -37,11 +41,14 @@ class EventSequencer:
         self._sequence = 0
         self._cleanup_counter = 0
         self._duplicates_detected = 0
-        # Per-topic last-seen recovery position: topic -> (epoch, offset). The
-        # AUTHORITATIVE dedup/ordering for stamped messages; survives reconnects
-        # within an epoch (not cleared on reconnect). Replaces the old seq-based
-        # reorder buffer, which the server's global seq made unsound.
+        # Per-topic last delivered position: topic -> (epoch, offset), the
+        # anchor a recovery asks from. Survives reconnects.
         self._topic_positions: dict[str, tuple[str, int]] = {}
+        # Per-topic, per-stream last offset: topic -> {epoch: offset}. A topic
+        # published on several cluster nodes interleaves their streams (one
+        # epoch each), each in order on its own: the authoritative dedup and
+        # gap detection for stamped messages.
+        self._streams: dict[str, dict[str, int]] = {}
 
     def get_next_sequence(self) -> int:
         self._sequence += 1
@@ -73,38 +80,52 @@ class EventSequencer:
         return False
 
     def check_topic_stamp(self, topic: str, epoch: str, offset: int) -> str:
-        """Idempotent dedup + gap detection by per-topic ``(epoch, offset)``.
+        """Idempotent dedup + gap detection by ``(epoch, offset)`` within the
+        topic's stream of that epoch.
 
         Returns one of:
-            ``"duplicate"`` -- already delivered (offset <= last seen on the same
-                epoch); the caller should drop it. This is what makes replay /
+            ``"duplicate"`` -- already delivered (offset <= last seen in its
+                stream); the caller should drop it. This is what makes replay /
                 reconnect overlap safe independently of the id window.
-            ``"gap"`` -- the offset jumped ahead of the expected next. The
-                position does not move; the caller holds the message while it
-                recovers the hole, or re-baselines with
+            ``"gap"`` -- the offset jumped ahead of the expected next in its
+                stream. The position does not move; the caller holds the
+                message while it recovers the hole, or re-baselines with
                 :meth:`set_topic_position` when it gives up.
-            ``"deliver"`` -- the next in order, or the first message on a new or
-                changed epoch (server restart -- old offsets are meaningless).
+            ``"deliver"`` -- the next in order, or the first message of a stream
+                not seen yet (another node publishing on the topic, or one that
+                restarted).
         """
-        prev = self._topic_positions.get(topic)
-        if prev is None or prev[0] != epoch:
-            # New topic, or epoch change (server restart): accept and (re)baseline.
-            self._topic_positions[topic] = (epoch, offset)
+        streams = self._streams.setdefault(topic, {})
+        last = streams.get(epoch)
+        if last is None:
+            self._advance(topic, epoch, offset)
             return "deliver"
-        last = prev[1]
         if offset <= last:
             return "duplicate"
         if offset == last + 1:
-            self._topic_positions[topic] = (epoch, offset)
+            self._advance(topic, epoch, offset)
             return "deliver"
         # Gap: do NOT advance. The caller recovers from `last`, which replays the
         # whole missed range (last+1 .. head) in order; advancing here would make
         # those replayed messages look like duplicates and they'd be dropped.
         return "gap"
 
+    def _advance(self, topic: str, epoch: str, offset: int) -> None:
+        streams = self._streams.setdefault(topic, {})
+        streams.pop(epoch, None)  # most recent last
+        streams[epoch] = offset
+        if len(streams) > MAX_STREAMS_PER_TOPIC:
+            del streams[next(iter(streams))]
+        self._topic_positions[topic] = (epoch, offset)
+
     def topic_position(self, topic: str) -> tuple[str, int] | None:
-        """Last-seen ``(epoch, offset)`` for a topic, for recovery requests."""
+        """Last delivered ``(epoch, offset)`` of a topic, for recovery requests."""
         return self._topic_positions.get(topic)
+
+    def stream_position(self, topic: str, epoch: str) -> tuple[str, int] | None:
+        """Last delivered ``(epoch, offset)`` of a topic's stream of *epoch*."""
+        offset = self._streams.get(topic, {}).get(epoch)
+        return None if offset is None else (epoch, offset)
 
     def topic_positions(self) -> dict[str, tuple[str, int]]:
         """Copy of every topic's last-seen ``(epoch, offset)``."""
@@ -112,12 +133,13 @@ class EventSequencer:
 
     def set_topic_position(self, topic: str, epoch: str, offset: int) -> None:
         """Set a topic's position (re-baseline after an unrecoverable gap)."""
-        self._topic_positions[topic] = (epoch, offset)
+        self._advance(topic, epoch, offset)
 
     def clear_topic(self, topic: str) -> None:
         """Forget a topic's position (on unsubscribe), so a later subscribe
         re-baselines on its first message instead of seeing a gap."""
         self._topic_positions.pop(topic, None)
+        self._streams.pop(topic, None)
 
     def _cleanup_old_entries(self) -> None:
         # Age order == insertion order: drop the expired prefix only.
@@ -146,3 +168,4 @@ class EventSequencer:
         self._duplicates_detected = 0
         self._cleanup_counter = 0
         self._topic_positions.clear()
+        self._streams.clear()

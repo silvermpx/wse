@@ -1461,9 +1461,8 @@ class AsyncWSEClient:
         assert topic is not None and epoch is not None and offset is not None
         gap = self._gaps.get(topic)
         if gap is not None and gap.epoch != epoch:
-            # New epoch (server restart) while a hole was open: it can never
-            # be filled any more.
-            self._give_up_gap(topic, "epoch_changed")
+            # Another stream of the topic (a topic published on several
+            # nodes): in order on its own, apart from the hole in this one.
             gap = None
 
         verdict = self._sequencer.check_topic_stamp(topic, epoch, offset)
@@ -1504,7 +1503,7 @@ class AsyncWSEClient:
         assert topic is not None and epoch is not None and offset is not None
         if not self._recovery_available():
             return False
-        if self._sequencer.topic_position(topic) is None:
+        if self._sequencer.stream_position(topic, epoch) is None:
             return False
         try:
             loop = asyncio.get_running_loop()
@@ -1526,8 +1525,10 @@ class AsyncWSEClient:
         topics; this sends the recovery subscription_update directly."""
         if self._gaps.get(topic) is not gap or gap.in_flight:
             return
-        pos = self._sequencer.topic_position(topic)
-        if pos is None or pos[0] != gap.epoch:
+        # From the last message of the stream with the hole: the server
+        # replays it and every other stream of the topic after that point.
+        pos = self._sequencer.stream_position(topic, gap.epoch)
+        if pos is None:
             return
         payload = {
             "action": "subscribe",
@@ -1556,8 +1557,8 @@ class AsyncWSEClient:
         if gap is None:
             return
         while True:
-            pos = self._sequencer.topic_position(topic)
-            if pos is None or pos[0] != gap.epoch:
+            pos = self._sequencer.stream_position(topic, gap.epoch)
+            if pos is None:
                 break
             for off in [o for o in gap.buffer if o <= pos[1]]:
                 del gap.buffer[off]
@@ -1584,8 +1585,8 @@ class AsyncWSEClient:
         if gap is None:
             return
         self._close_gap(topic, gap)
-        pos = self._sequencer.topic_position(topic)
-        last = pos[1] if pos is not None and pos[0] == gap.epoch else None
+        pos = self._sequencer.stream_position(topic, gap.epoch)
+        last = pos[1] if pos is not None else None
         for off in sorted(gap.buffer):
             if last is not None and off <= last:
                 continue
@@ -1599,8 +1600,8 @@ class AsyncWSEClient:
         """Accept a gap at once: report it, re-baseline, deliver *event*."""
         topic, epoch, offset = event.topic, event.epoch, event.offset
         assert topic is not None and epoch is not None and offset is not None
-        pos = self._sequencer.topic_position(topic)
-        if pos is not None and pos[0] == epoch and offset > pos[1] + 1:
+        pos = self._sequencer.stream_position(topic, epoch)
+        if pos is not None and offset > pos[1] + 1:
             self._report_gap(topic, epoch, pos[1] + 1, offset - 1, reason)
         self._sequencer.set_topic_position(topic, epoch, offset)
         self._dispatch_event(event)
@@ -1668,11 +1669,10 @@ class AsyncWSEClient:
             self._drain_gap(topic)  # the replay arrived before this reply
             if self._gaps.get(topic) is not gap:
                 return  # filled
-            pos = self._sequencer.topic_position(topic)
+            pos = self._sequencer.stream_position(topic, gap.epoch)
             progressed = (
                 pos is not None
                 and gap.requested_from is not None
-                and pos[0] == gap.epoch
                 and pos[1] > gap.requested_from
             )
             if recovered and progressed:
@@ -1696,7 +1696,12 @@ class AsyncWSEClient:
         epoch = info.get("epoch")
         if pos is None:
             return
-        if epoch is not None and str(epoch) != pos[0]:
+        if epoch is None:
+            # The server has no history of the topic any more (it
+            # restarted): the stream this client was on is gone.
+            self._report_gap(topic, pos[0], None, None, "epoch_changed")
+            return
+        if str(epoch) != pos[0]:
             self._report_gap(topic, str(epoch), None, None, "epoch_changed")
             return
         offset = info.get("offset")

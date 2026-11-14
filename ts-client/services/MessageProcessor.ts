@@ -884,13 +884,10 @@ export class MessageProcessor {
       return;
     }
 
-    const window = this.recoveryWindows.get(topic);
-    if (window && window.epoch !== epoch) {
-      // New epoch (server restarted): release what the old epoch's window held first.
-      await this.flushRecoveryWindow(topic);
-    }
-
-    const previous = this.sequencer.getTopicPosition(topic);
+    // A topic published on several cluster nodes interleaves their streams
+    // (one epoch each): every one is in order on its own, and a message of
+    // another stream neither is a gap nor ends a recovery window.
+    const previous = this.sequencer.getStreamPosition(topic, epoch);
     const verdict = this.sequencer.checkTopicStamp(topic, epoch, offset);
 
     if (verdict === 'duplicate') {
@@ -926,22 +923,9 @@ export class MessageProcessor {
         missed: offset - last - 1,
         reason: unrecovered ? 'not_recovered' : 'offset_gap',
       });
-    } else if (previous && previous.epoch !== epoch) {
-      // Reported already when the server said it could not recover.
-      const mark = this.unrecovered.get(topic);
-      if (!mark || !mark.reported || mark.epoch !== epoch) {
-        this.reportGap({
-          topic,
-          epoch,
-          fromOffset: null,
-          toOffset: null,
-          missed: null,
-          reason: 'epoch_changed',
-        });
-      }
-      this.unrecovered.delete(topic);
-    } else if (verdict === 'deliver') {
-      // In order after an unrecovered reply: nothing was missed after all.
+    } else if (this.unrecovered.get(topic)?.epoch === epoch) {
+      // In order after an unrecovered reply (or the first message of the
+      // stream it named): nothing more to report.
       this.unrecovered.delete(topic);
     }
 
@@ -966,8 +950,8 @@ export class MessageProcessor {
     const window = this.recoveryWindows.get(topic);
     if (!window) return;
 
-    let position = this.sequencer.getTopicPosition(topic);
-    while (position && position.epoch === window.epoch) {
+    let position = this.sequencer.getStreamPosition(topic, window.epoch);
+    while (position) {
       for (const held of [...window.buffer.keys()]) {
         if (held <= position.offset) window.buffer.delete(held);
       }
@@ -975,7 +959,7 @@ export class MessageProcessor {
       if (!next) break;
       window.buffer.delete(position.offset + 1);
       await this.deliverHeld(topic, window.epoch, position.offset + 1, next);
-      position = this.sequencer.getTopicPosition(topic);
+      position = this.sequencer.getStreamPosition(topic, window.epoch);
     }
 
     if (window.confirmed && window.buffer.size === 0) {
@@ -998,8 +982,8 @@ export class MessageProcessor {
     const offsets = [...window.buffer.keys()].sort((a, b) => a - b);
     for (const offset of offsets) {
       const message = window.buffer.get(offset)!;
-      const position = this.sequencer.getTopicPosition(topic);
-      if (position && position.epoch === window.epoch) {
+      const position = this.sequencer.getStreamPosition(topic, window.epoch);
+      if (position) {
         if (offset <= position.offset) continue;
         if (offset > position.offset + 1) {
           this.reportGap({
@@ -1077,6 +1061,23 @@ export class MessageProcessor {
     if (!recovery || typeof recovery !== 'object') return;
 
     for (const [topic, info] of Object.entries(recovery as Record<string, any>)) {
+      if (info && info.recovered === false && info.epoch == null && this.recoveryWindows.has(topic)) {
+        // The server has no history of the topic any more (it restarted):
+        // the stream this client was on is gone.
+        await this.flushRecoveryWindow(topic);
+        const position = this.sequencer.getTopicPosition(topic);
+        if (position) {
+          this.reportGap({
+            topic,
+            epoch: position.epoch,
+            fromOffset: null,
+            toOffset: null,
+            missed: null,
+            reason: 'epoch_changed',
+          });
+        }
+        continue;
+      }
       if (!info || info.epoch == null || info.offset == null) continue;
       const serverOffset = Number(info.offset);
       if (!Number.isFinite(serverOffset)) continue;
@@ -1097,13 +1098,14 @@ export class MessageProcessor {
         await this.flushRecoveryWindow(topic);
         const position = this.sequencer.getTopicPosition(topic);
         if (position && position.epoch !== serverEpoch) {
+          // The stream restarted (as the Python client reports it).
           this.reportGap({
             topic,
             epoch: serverEpoch,
             fromOffset: null,
             toOffset: null,
             missed: null,
-            reason: 'not_recovered',
+            reason: 'epoch_changed',
           });
           this.unrecovered.set(topic, { epoch: serverEpoch, reported: true });
         } else if (position) {
