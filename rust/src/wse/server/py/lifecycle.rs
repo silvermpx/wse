@@ -21,7 +21,7 @@ use crate::wse::cluster::ClusterCommand;
 use crate::wse::pylock::lock;
 use crate::wse::server::commands::process_commands;
 use crate::wse::server::connection::handle_connection;
-use crate::wse::server::handshake::{HandshakeGuard, MAX_PENDING_HANDSHAKES};
+use crate::wse::server::handshake::{HANDSHAKE_TIMEOUT, HandshakeGuard, MAX_PENDING_HANDSHAKES};
 use crate::wse::server::{
     CLOSE_IDLE, CLOSE_TRY_AGAIN_LATER, Commands, ConnectionHandle, Fanout, ServerCommand,
 };
@@ -302,6 +302,8 @@ impl RustWSEServer {
                     // Bounds the number of connections in the pre-handshake phase
                     // (slowloris): max_connections only counts registered ones.
                     let handshakes_in_flight = Arc::new(AtomicUsize::new(0));
+                    let mut refused_handshakes: u64 = 0;
+                    let mut last_refused_log = tokio::time::Instant::now() - Duration::from_secs(1);
                     let mut accept_pause = Duration::ZERO;
                     loop {
                         tokio::select! {
@@ -312,9 +314,16 @@ impl RustWSEServer {
                                         if handshakes_in_flight.load(Ordering::Relaxed)
                                             >= MAX_PENDING_HANDSHAKES
                                         {
-                                            tracing::warn!(
-                                                "[WSE] Pre-handshake cap reached ({MAX_PENDING_HANDSHAKES}), dropping {addr}"
-                                            );
+                                            // Logged once a second at most: a flood
+                                            // of sockets is not a flood of lines.
+                                            refused_handshakes += 1;
+                                            if last_refused_log.elapsed() >= Duration::from_secs(1) {
+                                                tracing::warn!(
+                                                    "[WSE] Pre-handshake cap reached ({MAX_PENDING_HANDSHAKES}), dropped {refused_handshakes} socket(s), the last from {addr}"
+                                                );
+                                                refused_handshakes = 0;
+                                                last_refused_log = tokio::time::Instant::now();
+                                            }
                                             continue; // drop the stream
                                         }
                                         let hs_guard =
@@ -327,6 +336,10 @@ impl RustWSEServer {
                                         // by the kernel too, not only by idle_timeout.
                                         let _ = sock.set_tcp_keepalive(&tcp_keepalive());
                                         let shared2 = shared.clone();
+                                        // Cluster links come on this port only in
+                                        // single-port mode: the peek is for that.
+                                        let single_port =
+                                            shared.cluster_main_port.read().unwrap().is_some();
                                         tokio::spawn(async move {
                                             // Protocol detection: peek first 4 bytes to distinguish
                                             // cluster binary frames (4-byte big-endian length prefix:
@@ -334,8 +347,8 @@ impl RustWSEServer {
                                             // (first byte is ASCII letter like 'G' for GET) or TLS
                                             // (first byte 0x16 for ClientHello).
                                             let mut peek = [0u8; 4];
-                                            let is_cluster = match tokio::time::timeout(
-                                                Duration::from_secs(5),
+                                            let is_cluster = single_port && match tokio::time::timeout(
+                                                HANDSHAKE_TIMEOUT,
                                                 stream.peek(&mut peek),
                                             ).await {
                                                 Ok(Ok(n)) if n >= 4 => {

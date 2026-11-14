@@ -3,7 +3,7 @@
 //! server's own answer to the clients' subscription requests. The Python API
 //! and the connection task both come through here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio_tungstenite::tungstenite::Utf8Bytes;
@@ -21,6 +21,12 @@ use crate::wse::recovery::RecoveryResult;
 pub(crate) const MAX_TOPIC_LEN: usize = 256;
 /// Pattern subscriptions (names with `*` or `?`) one connection may hold.
 pub(crate) const MAX_PATTERNS_PER_CONNECTION: usize = 16;
+/// Topics one `subscription_update` of a client may ask for; the rest fail.
+pub(crate) const MAX_TOPICS_PER_REQUEST: usize = 1024;
+/// Topics a client may hold through its own requests when the server sets no
+/// `max_subscriptions_per_connection`: the application may subscribe it to
+/// more, a client alone not.
+pub(crate) const CLIENT_SUBSCRIPTION_LIMIT: usize = 1024;
 
 /// What a recovery did for one topic, in the terms the clients read: the
 /// topic's epoch and an offset (inclusive: the last one the client has, or
@@ -68,33 +74,38 @@ impl SharedState {
                 .collect(),
             None => requested,
         };
+        let asked = topics.len();
         topics.retain(|t| {
-            let valid = !t.is_empty()
-                && t.len() <= MAX_TOPIC_LEN
-                && !t.bytes().any(|b| b.is_ascii_control());
-            if !valid {
-                tracing::warn!("[WSE] Refusing an invalid topic name (conn {conn_id})");
-            }
-            valid
+            !t.is_empty() && t.len() <= MAX_TOPIC_LEN && !t.bytes().any(|b| b.is_ascii_control())
         });
+        if topics.len() < asked {
+            tracing::warn!(
+                "[WSE] Refusing {} invalid topic name(s) (conn {conn_id})",
+                asked - topics.len()
+            );
+        }
         // Patterns cost every publish a match: a few per connection.
         let held = self.conn_topics.get(conn_id);
         let mut patterns = held
             .as_ref()
             .map_or(0, |held| held.iter().filter(|t| is_pattern(t)).count());
+        let mut over = 0usize;
         topics.retain(|t| {
             if !is_pattern(t) || held.as_ref().is_some_and(|held| held.contains(t)) {
                 return true;
             }
             patterns += 1;
             if patterns > MAX_PATTERNS_PER_CONNECTION {
-                tracing::warn!(
-                    "[WSE] Refusing pattern {t:?}: {MAX_PATTERNS_PER_CONNECTION} per connection (conn {conn_id})"
-                );
+                over += 1;
                 return false;
             }
             true
         });
+        if over > 0 {
+            tracing::warn!(
+                "[WSE] Refusing {over} pattern(s): {MAX_PATTERNS_PER_CONNECTION} per connection (conn {conn_id})"
+            );
+        }
         drop(held);
         let max_subs = self.max_subscriptions_per_connection;
         if max_subs > 0 {
@@ -472,16 +483,37 @@ pub(crate) fn answer_subscription_request(
     } else {
         HashMap::new()
     };
+    // Each topic once, a bounded number per request, and on its own a client
+    // holds at most CLIENT_SUBSCRIPTION_LIMIT unless the server sets a limit.
+    let mut asked: Vec<String> = Vec::with_capacity(topics.len().min(MAX_TOPICS_PER_REQUEST));
+    let mut seen: HashSet<&str> = HashSet::with_capacity(asked.capacity());
+    for topic in &topics {
+        if asked.len() == MAX_TOPICS_PER_REQUEST {
+            break;
+        }
+        if seen.insert(topic) {
+            asked.push(topic.clone());
+        }
+    }
+    if state.max_subscriptions_per_connection == 0 {
+        let held = state.conn_topics.get(conn_id).map_or(0, |held| held.len());
+        asked.truncate(CLIENT_SUBSCRIPTION_LIMIT.saturating_sub(held));
+    }
     // Not accepted yet (no token, and the application has not called
     // accept_connection): every topic is refused.
-    let (accepted, recovered) = if handle.out.admitted.load(Ordering::Acquire) {
+    let (accepted, recovered) = if handle.out.admitted.load(Ordering::Acquire) && !asked.is_empty()
+    {
         state
-            .subscribe_and_recover(conn_id, handle, topics.clone(), &anchors)
+            .subscribe_and_recover(conn_id, handle, asked, &anchors)
             .unwrap_or_default()
     } else {
         Default::default()
     };
-    let failed: Vec<&String> = topics.iter().filter(|t| !accepted.contains(t)).collect();
+    let taken: HashSet<&str> = accepted.iter().map(String::as_str).collect();
+    let failed: Vec<&String> = topics
+        .iter()
+        .filter(|t| !taken.contains(t.as_str()))
+        .collect();
     let recovery: serde_json::Map<String, serde_json::Value> = recovered
         .iter()
         .map(|(topic, r)| {

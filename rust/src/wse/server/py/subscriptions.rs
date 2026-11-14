@@ -67,6 +67,12 @@ impl RustWSEServer {
         };
         self.shared
             .subscribe_topics(conn_id, &handle, &accepted, queue_group.as_deref());
+        // Gone meanwhile: its cleanup (it removes the activity entry first)
+        // may have run before the subscribe, which would outlive it.
+        if !self.shared.conn_last_activity.contains_key(conn_id) {
+            self.shared.unsubscribe_topics(conn_id, None);
+            return Ok(Vec::new());
+        }
 
         // Presence tracking
         if let (Some(pm), Some(pd)) = (&self.shared.presence, &presence_data) {
@@ -158,6 +164,13 @@ impl RustWSEServer {
                 .subscribe_and_recover(conn_id, &handle, topics.clone(), &anchors)
                 .map_err(|max| limit_error(conn_id, max))?,
             None => (Vec::new(), HashMap::new()),
+        };
+        // Gone meanwhile: what it subscribed would outlive it.
+        let (accepted, recovered) = if self.shared.conn_last_activity.contains_key(conn_id) {
+            (accepted, recovered)
+        } else {
+            self.shared.unsubscribe_topics(conn_id, None);
+            (Vec::new(), HashMap::new())
         };
 
         let topics_dict = PyDict::new(py);

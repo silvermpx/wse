@@ -358,7 +358,12 @@ impl RecoveryManager {
     /// the caller weave the recovery coordinates INTO the payload before it is
     /// framed/encrypted, so the live copy and any replayed copy are byte-identical
     /// and the client can dedup / detect gaps from the message itself.
-    pub(crate) fn push_stamped<F>(&self, topic: &str, build: F) -> Bytes
+    ///
+    /// None when the topic has no buffer and the memory budget is used up: a
+    /// new buffer allocates its slots up front, and an application may
+    /// publish to any number of new topics between two cleanups. The message
+    /// then goes unstamped; its topic is recoverable once there is room.
+    pub(crate) fn push_stamped<F>(&self, topic: &str, build: F) -> Option<Bytes>
     where
         F: FnOnce(u32, u64) -> Bytes,
     {
@@ -366,6 +371,11 @@ impl RecoveryManager {
         // A topic that has a buffer is found without making a key.
         let mut entry = match self.buffers.get_mut(topic) {
             Some(entry) => entry,
+            None if self.total_bytes.load(Ordering::Relaxed)
+                >= self.config.global_memory_budget =>
+            {
+                return None;
+            }
             None => self.buffers.entry(topic.to_owned()).or_insert_with(|| {
                 created = true;
                 TopicRecoveryBuffer::new(self.config.buffer_size_bits, topic.len())
@@ -394,7 +404,7 @@ impl RecoveryManager {
                     Some(cur.saturating_sub(old_bytes - new_bytes))
                 });
         }
-        data
+        Some(data)
     }
 
     /// Push a pre-built message (recovery coordinates already woven in, or none).
@@ -825,14 +835,29 @@ mod tests {
     }
 
     #[test]
+    fn over_the_budget_a_new_topic_goes_unstamped() {
+        let mgr = RecoveryManager::new(RecoveryConfig {
+            global_memory_budget: 1,
+            ..RecoveryConfig::default()
+        });
+        assert!(mgr.push_stamped("first", |_, _| make_data("a")).is_some());
+        // The budget is used up: a topic with a buffer keeps it, a new one
+        // gets none.
+        assert!(mgr.push_stamped("first", |_, _| make_data("b")).is_some());
+        assert!(mgr.push_stamped("second", |_, _| make_data("c")).is_none());
+    }
+
+    #[test]
     fn push_stamped_offset_matches_storage_and_recover() {
         let mgr = RecoveryManager::new(RecoveryConfig::default());
         let mut reserved = Vec::new();
         for _ in 0..3 {
-            let stored = mgr.push_stamped("topic1", |epoch, offset| {
-                reserved.push((epoch, offset));
-                make_data(&format!("o={offset}"))
-            });
+            let stored = mgr
+                .push_stamped("topic1", |epoch, offset| {
+                    reserved.push((epoch, offset));
+                    make_data(&format!("o={offset}"))
+                })
+                .unwrap();
             // The returned bytes are exactly what was built for the reserved offset.
             let (_, off) = *reserved.last().unwrap();
             assert_eq!(&stored[..], format!("o={off}").as_bytes());

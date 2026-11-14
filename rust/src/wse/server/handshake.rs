@@ -58,9 +58,15 @@ pub(crate) fn normalize_origin(origin: &str) -> Result<String, String> {
 /// Max connections allowed to sit in the pre-handshake / handshake phase at once.
 /// `max_connections` only counts REGISTERED connections (a connection registers
 /// after the WS upgrade + JWT complete), so without this a slowloris that opens
-/// sockets but never completes the upgrade -- each held up to the 10s handshake
-/// timeout -- exhausts tasks and file descriptors well before any limit fires.
-pub(super) const MAX_PENDING_HANDSHAKES: usize = 512;
+/// sockets but never completes the upgrade exhausts tasks and file descriptors
+/// well before any limit fires. A socket that sends nothing holds its place
+/// `HANDSHAKE_TIMEOUT` at most: keeping them all taken costs a sender this
+/// many new sockets every few seconds, where a real client takes its place for
+/// milliseconds.
+pub(super) const MAX_PENDING_HANDSHAKES: usize = 4096;
+
+/// How long a new socket may take to complete the WebSocket upgrade.
+pub(super) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// RAII counter for in-flight (pre-registration) handshakes: increments on
 /// construction, decrements when the handshake task ends (success or failure).

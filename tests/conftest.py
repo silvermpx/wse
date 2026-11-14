@@ -1,6 +1,7 @@
 """Shared fixtures for WSE integration tests."""
 
 import os
+import socket
 import time
 
 import pytest
@@ -18,9 +19,17 @@ JWT_AUDIENCE = "wse-test-api"
 
 
 def _next_port():
-    """Thread-safe port allocator."""
-    _next_port.counter += 1
-    return BASE_PORT + _next_port.counter
+    """The next port of the range that is free: one another program listens
+    on is skipped."""
+    while True:
+        _next_port.counter += 1
+        port = BASE_PORT + _next_port.counter
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        return port
 
 
 _next_port.counter = 0

@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 
 use ahash::AHashSet;
 use bytes::Bytes;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -317,16 +317,34 @@ pub(crate) const BEHIND_BYTES: usize = 64 * 1024;
 const LANE_PACE: std::time::Duration = std::time::Duration::from_millis(1);
 const PACE_MIN: usize = 32;
 
+/// A connection whose write task wrote nothing for this long while it is
+/// behind is stalled, not slow: it reads nothing, and the lane does not wait
+/// for it (its messages pile up to its budget and are dropped, then it is
+/// closed as a slow consumer).
+const STALLED_MS: u64 = 500;
+
 /// What a lane's job did.
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct Served {
     delivered: u64,
     dropped: u64,
-    /// The connections that were behind before this delivery.
+    /// The connections the message was queued for that were behind, and
+    /// still writing, before this delivery.
     behind: usize,
+    /// When the job started, on `clock_ms`.
+    now_ms: u64,
 }
 
 impl Served {
+    fn starting_now() -> Self {
+        Self {
+            delivered: 0,
+            dropped: 0,
+            behind: 0,
+            now_ms: clock_ms(),
+        }
+    }
+
     fn deliver(
         &mut self,
         h: &ConnectionHandle,
@@ -334,24 +352,69 @@ impl Served {
         max_pending: usize,
         slow_drops: &AtomicU64,
     ) {
-        if h.out.pending.load(Ordering::Relaxed) >= BEHIND_BYTES {
-            self.behind += 1;
-        }
+        let behind = h.out.pending.load(Ordering::Relaxed) >= BEHIND_BYTES
+            && self
+                .now_ms
+                .saturating_sub(h.out.written_ms.load(Ordering::Relaxed))
+                < STALLED_MS;
         if h.deliver(msg, max_pending, slow_drops) {
             self.delivered += 1;
+            if behind {
+                self.behind += 1;
+            }
         } else {
             self.dropped += 1;
         }
     }
 
-    fn connections(&self) -> usize {
-        (self.delivered + self.dropped) as usize
-    }
-
-    /// Most of the many connections served were behind.
+    /// Most of the many connections the message was queued for were behind
+    /// and still writing: the lane waits for them a moment. Connections that
+    /// are closed, over their budget or stalled never hold it back.
     fn lagging(&self) -> bool {
-        self.connections() >= PACE_MIN && self.behind * 2 > self.connections()
+        let queued = self.delivered as usize;
+        queued >= PACE_MIN && self.behind * 2 > queued
     }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+
+    #[test]
+    fn a_stalled_or_full_connection_never_holds_the_lane_back() {
+        let drops = AtomicU64::new(0);
+        let msg = Outgoing::text(bytes::Bytes::from_static(b"{}"));
+        let behind = |written_ago: u64, max_pending: usize| {
+            let mut served = Served::starting_now();
+            // Far enough from the clock's start for any age.
+            served.now_ms = 1_000_000;
+            for _ in 0..PACE_MIN {
+                let (h, _rx) = super::super::tests::test_handle();
+                h.out.pending.store(BEHIND_BYTES, Ordering::Relaxed);
+                h.out
+                    .written_ms
+                    .store(served.now_ms.saturating_sub(written_ago), Ordering::Relaxed);
+                served.deliver(&h, &msg, max_pending, &drops);
+            }
+            served.lagging()
+        };
+        // Behind and still writing: the lane waits for them.
+        assert!(behind(10, 0));
+        // Writing nothing for long: stalled, not waited for.
+        assert!(!behind(STALLED_MS * 4, 0));
+        // Over their budget: the message is dropped for them, nothing to wait for.
+        assert!(!behind(10, BEHIND_BYTES));
+    }
+}
+
+/// Milliseconds on a clock of this process, for the write tasks and the
+/// lanes to compare.
+pub(crate) fn clock_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 /// How many jobs wait for a lane at most. A sender that finds the queue full
@@ -446,9 +509,13 @@ impl Subscribers {
 #[derive(Clone)]
 pub(crate) struct TopicIndex {
     pub(crate) subscribers: Arc<DashMap<String, Subscribers>>,
-    /// The subscribed names that are patterns. Changed only under the shard
-    /// lock of the pattern's `subscribers` entry, so the two never disagree.
-    pub(crate) patterns: Arc<DashSet<String>>,
+    /// The subscribed names that are patterns, by bucket (`pattern_bucket`):
+    /// a message looks only into the buckets its topic can match. Changed
+    /// only under the shard lock of the pattern's `subscribers` entry, so the
+    /// two never disagree.
+    patterns: Arc<DashMap<String, Vec<String>>>,
+    /// How many patterns the buckets hold: none, no lookup.
+    pattern_count: Arc<AtomicUsize>,
     /// Per-connection topic ACLs: a pattern subscription gets only the topics
     /// its connection's ACL allows.
     pub(crate) acls: Arc<DashMap<String, TopicAcl>>,
@@ -468,12 +535,30 @@ pub(crate) fn is_pattern(topic: &str) -> bool {
     topic.contains(['*', '?'])
 }
 
+/// The characters that part a topic name (`user:42:orders`, `prices.btc`).
+fn is_separator(b: u8) -> bool {
+    matches!(b, b':' | b'.' | b'/')
+}
+
+/// A pattern's bucket: its literal start (up to the first `*` or `?`), cut
+/// after its last separator. A topic it matches starts with that literal, so
+/// the bucket is the topic's start up to one of its separators, or empty:
+/// a message looks into those buckets only, not at every pattern.
+fn pattern_bucket(pattern: &str) -> &str {
+    let literal = &pattern[..pattern.find(['*', '?']).unwrap_or(pattern.len())];
+    match literal.bytes().rposition(is_separator) {
+        Some(i) => &literal[..=i],
+        None => "",
+    }
+}
+
 impl TopicIndex {
     /// An index over `lanes` lanes (1 to `MAX_LANES`).
     pub(crate) fn new(lanes: usize) -> Self {
         Self {
             subscribers: Arc::default(),
             patterns: Arc::default(),
+            pattern_count: Arc::default(),
             acls: Arc::default(),
             everyone: (0..lanes.clamp(1, MAX_LANES))
                 .map(|_| parking_lot::RwLock::new(ConnMap::default()))
@@ -488,6 +573,12 @@ impl TopicIndex {
 
     pub(crate) fn lanes(&self) -> usize {
         self.everyone.len()
+    }
+
+    /// How many distinct patterns are subscribed.
+    #[cfg(test)]
+    pub(crate) fn pattern_count(&self) -> usize {
+        self.pattern_count.load(Ordering::Relaxed)
     }
 
     /// What a connection's write task wakes when it has written down to
@@ -523,7 +614,11 @@ impl TopicIndex {
         let mut subs = self.subscribers.entry(topic.to_owned()).or_default();
         let added = subs.insert(conn_id, handle);
         if added && subs.len == 1 && is_pattern(topic) {
-            self.patterns.insert(topic.to_owned());
+            self.patterns
+                .entry(pattern_bucket(topic).to_owned())
+                .or_default()
+                .push(topic.to_owned());
+            self.pattern_count.fetch_add(1, Ordering::Relaxed);
         }
         added
     }
@@ -536,7 +631,13 @@ impl TopicIndex {
             if subs.get().len == 0 {
                 subs.remove();
                 if is_pattern(topic) {
-                    self.patterns.remove(topic);
+                    let bucket = pattern_bucket(topic);
+                    if let Some(mut patterns) = self.patterns.get_mut(bucket) {
+                        patterns.retain(|p| p != topic);
+                    }
+                    self.patterns
+                        .remove_if(bucket, |_, patterns| patterns.is_empty());
+                    self.pattern_count.fetch_sub(1, Ordering::Relaxed);
                 }
                 return true;
             }
@@ -548,17 +649,28 @@ impl TopicIndex {
     /// and the lanes with a subscriber of the topic or of those patterns.
     fn reach(&self, topic: &str) -> (Vec<String>, u64) {
         let mut mask = self.subscribers.get(topic).map_or(0, |subs| subs.mask);
-        if self.patterns.is_empty() {
+        if self.pattern_count.load(Ordering::Relaxed) == 0 {
             return (Vec::new(), mask);
         }
         // Collected first: no lock of `patterns` is held while `subscribers`
         // is read (subscribe takes them the other way round).
-        let matching: Vec<String> = self
-            .patterns
-            .iter()
-            .filter(|pattern| pattern.as_str() != topic && glob_match(pattern, topic))
-            .map(|pattern| pattern.key().clone())
-            .collect();
+        let mut matching: Vec<String> = Vec::new();
+        let mut look = |bucket: &str| {
+            if let Some(patterns) = self.patterns.get(bucket) {
+                matching.extend(
+                    patterns
+                        .iter()
+                        .filter(|pattern| pattern.as_str() != topic && glob_match(pattern, topic))
+                        .cloned(),
+                );
+            }
+        };
+        look("");
+        for (i, b) in topic.bytes().enumerate() {
+            if is_separator(b) {
+                look(&topic[..=i]);
+            }
+        }
         for pattern in &matching {
             mask |= self.subscribers.get(pattern).map_or(0, |subs| subs.mask);
         }
@@ -573,7 +685,7 @@ impl TopicIndex {
         max_pending: usize,
         slow_drops: &AtomicU64,
     ) -> Served {
-        let mut served = Served::default();
+        let mut served = Served::starting_now();
         for h in self.everyone[usize::from(lane)].read().values() {
             served.deliver(h, msg, max_pending, slow_drops);
         }
@@ -595,7 +707,7 @@ impl TopicIndex {
         slow_drops: &AtomicU64,
         seen: &mut AHashSet<usize>,
     ) -> Served {
-        let mut served = Served::default();
+        let mut served = Served::starting_now();
         if patterns.is_empty() {
             // Exact topics only: the common case, no bookkeeping.
             if let Some(subs) = self.subscribers.get(topic)
@@ -850,7 +962,7 @@ async fn run_lane(
                     served
                 }
                 Job::One(h, msg) => {
-                    let mut served = Served::default();
+                    let mut served = Served::starting_now();
                     served.deliver(&h, &msg, max_pending, &slow_drops);
                     served
                 }

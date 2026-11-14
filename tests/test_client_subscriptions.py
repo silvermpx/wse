@@ -249,3 +249,25 @@ class TestSubscribeWithRecovery:
                     )
         finally:
             srv.stop()
+
+
+class TestLimits:
+    @pytest.mark.asyncio
+    async def test_a_huge_request_is_bounded_and_quick(self, server_port):
+        srv = start_server(server_port)
+        try:
+            async with await connect(server_port, make_token()) as ws:
+                drain_until(srv, "auth_connect")
+                topics = [f"t{i}" for i in range(3000)] + ["t1", "t1"]
+                await ws.send(request("subscribe", topics))
+                async with asyncio.timeout(2):
+                    _, reply = await messages_until_reply(ws)
+                taken = reply["p"]["success_topics"]
+                assert len(taken) == 1024 and taken[:2] == ["t0", "t1"]
+                assert len(reply["p"]["failed_topics"]) == len(topics) - 1024 - 2
+                # A client alone holds no more than that.
+                await ws.send(request("subscribe", ["more"]))
+                _, reply = await messages_until_reply(ws)
+                assert reply["p"]["success_topics"] == []
+        finally:
+            srv.stop()

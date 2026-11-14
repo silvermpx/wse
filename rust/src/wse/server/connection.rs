@@ -23,15 +23,15 @@ use uuid::Uuid;
 
 use super::e2e::{decrypt_inbound, derive_connection_key};
 use super::e2e_session::{self, RecvState, SendState};
-use super::fanout::BEHIND_BYTES;
+use super::fanout::{BEHIND_BYTES, clock_ms};
 use super::frames::{
     close_frame, encode_message, encode_ws_frame, write_all_frames, ws_frame_size,
 };
-use super::handshake::{HandshakeGuard, normalize_origin, reject_ws_auth};
+use super::handshake::{HANDSHAKE_TIMEOUT, HandshakeGuard, normalize_origin, reject_ws_auth};
 use super::messages::{build_server_hello, build_server_ready, normalize_json_keys};
 use super::py::{fire_on_connect, fire_on_disconnect, json_to_pyobj};
 use super::signing::{self, ClientKey, Refused};
-use super::state::{CloseOutbox, InboundEvent, Outbox, Seal};
+use super::state::{CloseOutbox, InboundEvent, Outbox, Seal, inbound_cost};
 use super::subscribe::{answer_subscription_request, requested_compression};
 use super::{
     CLOSE_E2E_BAD_FRAME, CLOSE_E2E_EXHAUSTED, CLOSE_E2E_UNSUPPORTED, CLOSE_GRACE,
@@ -155,7 +155,10 @@ struct Callbacks<'a> {
 }
 
 /// The application learns of a connection: the validated user id (its user
-/// for presence), or without jwt_secret the cookies for it to check.
+/// for presence), or without jwt_secret the cookies for it to check. False
+/// when a stalled drain holds too many connect and disconnect events already
+/// (the connection is then refused).
+#[must_use]
 fn tell_application(
     state: &Arc<SharedState>,
     conn_id: &Arc<String>,
@@ -163,12 +166,9 @@ fn tell_application(
     cookies: &str,
     drain: bool,
     lane: Option<&Arc<CallbackLane>>,
-) {
-    if let (Some(pm), Some(user_id)) = (&state.presence, &user_id) {
-        pm.register_connection(conn_id, user_id);
-    }
+) -> bool {
     if drain {
-        state.push_inbound(match user_id {
+        let event = match user_id.clone() {
             Some(user_id) => InboundEvent::AuthConnect {
                 conn_id: (**conn_id).clone(),
                 user_id,
@@ -177,19 +177,28 @@ fn tell_application(
                 conn_id: (**conn_id).clone(),
                 cookies: cookies.to_owned(),
             },
-        });
+        };
+        if !state.push_connect(event) {
+            return false;
+        }
     } else if let Some(lane) = lane
         && let Some(cb) = state.on_connect.read().unwrap().clone()
     {
         let cid = (**conn_id).clone();
-        let who = user_id.unwrap_or_else(|| cookies.to_owned());
+        let who = user_id.clone().unwrap_or_else(|| cookies.to_owned());
         lane.push(Box::new(move || fire_on_connect(&cb, &cid, &who)), None);
     }
+    if let (Some(pm), Some(user_id)) = (&state.presence, &user_id) {
+        pm.register_connection(conn_id, user_id);
+    }
+    true
 }
+
 
 /// A client that announced E2E now has its session: accepted by its token,
 /// it gets server_ready (sealed) and joins the broadcasts; then the
-/// application learns of it.
+/// application learns of it. False when the application has no room for it.
+#[must_use]
 async fn admit_after_session(
     state: &Arc<SharedState>,
     conn_id: &Arc<String>,
@@ -198,7 +207,7 @@ async fn admit_after_session(
     cookies: &str,
     drain: bool,
     lane: Option<&Arc<CallbackLane>>,
-) {
+) -> bool {
     if let Some(ref user) = user_id {
         let ready = build_server_ready(conn_id, user, state);
         handle.send_control(Message::Text(ready.into()));
@@ -209,7 +218,7 @@ async fn admit_after_session(
             state.topics.join(conn_id, handle);
         }
     }
-    tell_application(state, conn_id, user_id, cookies, drain, lane);
+    tell_application(state, conn_id, user_id, cookies, drain, lane)
 }
 
 /// Before its session, a client that announced E2E sends client_hello and
@@ -356,6 +365,7 @@ fn deliver_signed(
         (None, None) => return false,
     };
     let cid = Arc::clone(conn_id);
+    let size = inbound_cost(size, &value);
     spawn_bounded_callback(lane, state, size, move || {
         Python::try_attach(|py| {
             let message = json_to_pyobj(py, &value);
@@ -777,9 +787,9 @@ pub(super) async fn handle_connection(
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_message_size = Some(state.max_message_size);
     ws_config.max_frame_size = Some(state.max_message_size);
-    // 10-second timeout prevents slow loris attacks on the handshake
+    // A socket that sends nothing does not hold its place for long.
     let ws_stream = match tokio::time::timeout(
-        Duration::from_secs(10),
+        HANDSHAKE_TIMEOUT,
         tokio_tungstenite::accept_hdr_async_with_config(
             ServerSocket {
                 inner: stream,
@@ -879,6 +889,7 @@ pub(super) async fn handle_connection(
     let conn_id: Arc<String> = Arc::new(Uuid::now_v7().to_string());
     let (tx, mut rx) = mpsc::unbounded_channel::<WsFrame>();
     let out = Arc::new(Outbox::default());
+    out.written_ms.store(clock_ms(), Ordering::Relaxed);
     let drain = state.drain_mode.load(Ordering::Relaxed);
 
     // ── JWT validation in Rust (zero GIL) ──────────────────────────────────
@@ -974,7 +985,9 @@ pub(super) async fn handle_connection(
     // Register connection
     let registered = {
         let mut conns = state.connections.write().await;
-        let room = conns.len() < state.max_connections;
+        // A draining or stopping server takes no one: the client comes back
+        // to another server or later.
+        let room = conns.len() < state.max_connections && !state.draining.load(Ordering::SeqCst);
         if room {
             // server_ready goes into the queue before the connection is in the
             // maps: no broadcast can reach it before, so server_ready is the
@@ -1008,11 +1021,17 @@ pub(super) async fn handle_connection(
         state
             .connections_rejected_total
             .fetch_add(1, Ordering::Relaxed);
-        tracing::warn!("[WSE] Max connections reached, rejecting {addr}");
+        let reason = if state.draining.load(Ordering::SeqCst) {
+            tracing::debug!("[WSE] Draining, refusing {addr}");
+            "server draining"
+        } else {
+            tracing::warn!("[WSE] Max connections reached, rejecting {addr}");
+            "server full"
+        };
         // The ACL and the client key were stored before the check.
         state.topics.acls.remove(&*conn_id);
         state.client_keys.remove(&*conn_id);
-        let frames = VecDeque::from([close_frame(CLOSE_TRY_AGAIN_LATER, "server full")]);
+        let frames = VecDeque::from([close_frame(CLOSE_TRY_AGAIN_LATER, reason)]);
         let _ = tokio::time::timeout(
             Duration::from_secs(1),
             write_all_frames(&mut raw_write, &frames),
@@ -1044,8 +1063,10 @@ pub(super) async fn handle_connection(
     // A client that announced E2E is unknown to the application until its
     // session exists: then all it gets is sealed.
     let mut awaiting_session = announced_e2e;
-    if !announced_e2e {
-        tell_application(
+    // Whether the application heard of the connection (and so hears of its
+    // end). No room for it to hear: refused, to come back.
+    let mut known = !announced_e2e
+        && tell_application(
             &state,
             &conn_id,
             rust_auth_user_id.clone(),
@@ -1053,6 +1074,8 @@ pub(super) async fn handle_connection(
             drain,
             lane.as_ref(),
         );
+    if !announced_e2e && !known {
+        closer.close(&tx, &out.pending, CLOSE_TRY_AGAIN_LATER, "server busy");
     }
 
     // Write task: the only writer to the socket. Two sources: the control
@@ -1138,6 +1161,7 @@ pub(super) async fn handle_connection(
                     }
                 }
                 if wrote {
+                    out_write.written_ms.store(clock_ms(), Ordering::Relaxed);
                     continue;
                 }
                 tokio::select! {
@@ -1397,7 +1421,7 @@ pub(super) async fn handle_connection(
                                                 state.conn_sealed.insert((*conn_id).clone());
                                                 let _ = out.cipher.set(Seal::Session);
                                                 awaiting_session = false;
-                                                admit_after_session(
+                                                known = admit_after_session(
                                                     &state,
                                                     &conn_id,
                                                     &own_handle,
@@ -1407,6 +1431,14 @@ pub(super) async fn handle_connection(
                                                     lane.as_ref(),
                                                 )
                                                 .await;
+                                                if !known {
+                                                    closer.close(
+                                                        &tx,
+                                                        &out.pending,
+                                                        CLOSE_TRY_AGAIN_LATER,
+                                                        "server busy",
+                                                    );
+                                                }
                                             }
                                             Err(_) => {
                                                 queue_reply(
@@ -1562,7 +1594,7 @@ pub(super) async fn handle_connection(
                                 spawn_bounded_callback(
                                     callback_lane,
                                     &state,
-                                    text.len(),
+                                    inbound_cost(text.len(), &val),
                                     move || {
                                         Python::try_attach(|py| {
                                             let py_obj = json_to_pyobj(py, &val);
@@ -1698,7 +1730,7 @@ pub(super) async fn handle_connection(
                                                 spawn_bounded_callback(
                                                     callback_lane,
                                                     &state,
-                                                    text.len(),
+                                                    inbound_cost(text.len(), &val),
                                                     move || {
                                                         Python::try_attach(|py| {
                                                             let py_obj = json_to_pyobj(py, &val);
@@ -1782,7 +1814,9 @@ pub(super) async fn handle_connection(
                     } else if let (Some(cb), Some(callback_lane)) = (&cached_on_message, &lane) {
                         let cb_arc = cb.clone();
                         let cid = Arc::clone(&conn_id);
-                        let size = data.len();
+                        let size = decoded
+                            .as_ref()
+                            .map_or(data.len(), |value| inbound_cost(data.len(), value));
                         let raw = if decoded.is_none() {
                             data.to_vec()
                         } else {
@@ -1873,9 +1907,9 @@ pub(super) async fn handle_connection(
 
         state.remove_local_interest(&disconnected_topics);
     }
-    // A client that announced E2E and never opened its session was never
-    // known to the application: no disconnect event either.
-    let known = !awaiting_session;
+    // A connection the application never heard of (an announced client that
+    // never opened its session, or one refused for want of room) gets no
+    // disconnect event either.
     if known && drain {
         state.push_inbound(InboundEvent::Disconnect {
             conn_id: (*conn_id).clone(),

@@ -122,10 +122,12 @@ pub(super) async fn process_commands(
                 let mut position = None;
                 let stamped: Bytes = if !skip_recovery && let Some(ref recovery) = state.recovery {
                     let text = std::str::from_utf8(&original).unwrap_or("");
-                    recovery.push_stamped(&topic, |epoch, offset| {
-                        position = Some((epoch, offset));
-                        Bytes::from(stamp_recovery_fields(text, &topic, epoch, offset))
-                    })
+                    recovery
+                        .push_stamped(&topic, |epoch, offset| {
+                            position = Some((epoch, offset));
+                            Bytes::from(stamp_recovery_fields(text, &topic, epoch, offset))
+                        })
+                        .unwrap_or_else(|| original.clone())
                 } else {
                     original.clone()
                 };
@@ -188,6 +190,10 @@ pub(super) async fn process_commands(
                 }
             }
             ServerCommand::Shutdown => {
+                // No connection registers from now on: one whose handshake
+                // is still in flight would come in after the close below and
+                // outlive the runtime.
+                state.draining.store(true, Ordering::SeqCst);
                 let guard = state.connections.read().await;
                 for h in guard.values() {
                     h.close(CLOSE_GOING_AWAY, "server shutting down");

@@ -120,6 +120,10 @@ fn make_handle() -> (ConnectionHandle, mpsc::UnboundedReceiver<WsFrame>) {
     (h, rx)
 }
 
+pub(super) fn test_handle() -> (ConnectionHandle, mpsc::UnboundedReceiver<WsFrame>) {
+    make_handle()
+}
+
 fn queued(h: &ConnectionHandle) -> Vec<bytes::Bytes> {
     {
         let mut frames = std::collections::VecDeque::new();
@@ -138,11 +142,57 @@ fn patterns_are_tracked_with_their_subscribers() {
     assert!(!index.subscribe("news.*", "c1", &h));
     index.subscribe("news.*", "c2", &h);
     index.subscribe("exact", "c1", &h);
-    assert_eq!(index.patterns.len(), 1);
+    assert_eq!(index.pattern_count(), 1);
     assert!(!index.unsubscribe("news.*", "c1"));
     assert!(index.unsubscribe("news.*", "c2"));
-    assert!(index.patterns.is_empty());
+    assert_eq!(index.pattern_count(), 0);
     assert!(index.subscribers.get("news.*").is_none());
+}
+
+#[test]
+fn a_message_reaches_every_matching_pattern_wherever_it_is_kept() {
+    let index = TopicIndex::new(1);
+    let patterns = [
+        "user:1:*",
+        "user:*",
+        "*",
+        "*.btc",
+        "pri?es.btc",
+        "prices.b*",
+        "user:2:*",
+        "news.*",
+    ];
+    let handles: Vec<_> = patterns
+        .iter()
+        .enumerate()
+        .map(|(i, pattern)| {
+            let (h, rx) = make_handle();
+            index.subscribe(pattern, &format!("c{i}"), &h);
+            (h, rx)
+        })
+        .collect();
+    let drops = AtomicU64::new(0);
+    // queued() takes the frames: each topic is checked on empty queues.
+    let reached = |topic: &str| -> Vec<&str> {
+        index.fanout(
+            topic,
+            &Outgoing::text(bytes::Bytes::from_static(b"{}")),
+            0,
+            &drops,
+        );
+        patterns
+            .iter()
+            .zip(&handles)
+            .filter(|(_, (h, _))| !queued(h).is_empty())
+            .map(|(pattern, _)| *pattern)
+            .collect()
+    };
+    assert_eq!(reached("user:1:orders"), ["user:1:*", "user:*", "*"]);
+    assert_eq!(
+        reached("prices.btc"),
+        ["*", "*.btc", "pri?es.btc", "prices.b*"]
+    );
+    assert_eq!(reached("news"), ["*"]);
 }
 
 #[test]

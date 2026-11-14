@@ -462,6 +462,39 @@ class TestApplicationAuth:
             server.accept_connection("any", "bob")
 
 
+class TestConnectEvents:
+    @pytest.mark.asyncio
+    async def test_a_stalled_drain_takes_no_new_connection_past_its_bound(self, server_port):
+        """Connect and disconnect events are never dropped, so while nothing
+        drains, connections coming and going would grow the queue without
+        end: past twice max_connections (at least 64) a new one is refused."""
+        srv = RustWSEServer(
+            "127.0.0.1",
+            server_port,
+            max_connections=4,
+            jwt_secret=JWT_SECRET,
+            jwt_issuer=JWT_ISSUER,
+            jwt_audience=JWT_AUDIENCE,
+        )
+        srv.enable_drain_mode()
+        srv.start()
+        time.sleep(0.05)
+        try:
+            for i in range(32):
+                ws = await connect(server_port, make_token(f"u{i}"))
+                await ws.close()
+            await asyncio.sleep(0.3)
+            refused = await connect(server_port, make_token("late"))
+            assert await close_code(refused, timeout=5) == 1013
+            events = drain_all(srv, timeout_ms=300)
+            assert [e[0] for e in events].count("auth_connect") == 32
+            assert "late" not in [e[2] for e in events if e[0] == "auth_connect"]
+            async with await connect(server_port, make_token("after")):
+                assert drain_until(srv, "auth_connect")[2] == "after"
+        finally:
+            srv.stop()
+
+
 class TestTokenExpiry:
     @pytest.mark.asyncio
     async def test_a_connection_is_closed_when_its_token_expires(self, server, server_port):

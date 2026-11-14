@@ -154,6 +154,9 @@ pub(crate) struct Outbox {
     /// Accepted: by its token, or by the application (`accept_connection`).
     /// Until then it gets no broadcasts and may not subscribe on its own.
     pub(crate) admitted: AtomicBool,
+    /// When its write task last wrote, on `fanout::clock_ms`: a connection
+    /// behind that does not write is stalled, and no lane waits for it.
+    pub(crate) written_ms: AtomicU64,
     /// How the connection's frames are encrypted, set once by its key
     /// exchange.
     pub(crate) cipher: std::sync::OnceLock<Seal>,
@@ -332,6 +335,53 @@ impl Commands {
     }
 }
 
+/// What a client's decoded message costs the inbound budget: its size on the
+/// wire, as the budget is set; or what its decoded value holds in memory when
+/// that is many times more (a frame of many tiny elements holds tens of times
+/// its own size).
+pub(crate) fn inbound_cost(wire: usize, value: &serde_json::Value) -> usize {
+    let decoded = decoded_size(value);
+    if decoded > wire.saturating_mul(DECODED_SIZE_RATIO) {
+        decoded
+    } else {
+        wire
+    }
+}
+
+/// How many times its wire size a decoded message may hold before it is
+/// charged what it holds: ordinary JSON stays well under it.
+const DECODED_SIZE_RATIO: usize = 4;
+
+fn decoded_size(value: &serde_json::Value) -> usize {
+    use serde_json::Value;
+    const NODE: usize = std::mem::size_of::<Value>();
+    match value {
+        Value::String(s) => NODE + s.len(),
+        Value::Array(items) => NODE + items.iter().map(decoded_size).sum::<usize>(),
+        Value::Object(map) => {
+            NODE + map
+                .iter()
+                .map(|(k, v)| NODE + k.len() + decoded_size(v))
+                .sum::<usize>()
+        }
+        _ => NODE,
+    }
+}
+
+/// Connect and disconnect events the drain may hold whatever the server's
+/// size (twice `max_connections`, at least this).
+const MIN_LIFECYCLE_EVENTS: usize = 64;
+
+impl InboundEvent {
+    /// A connection's connect or disconnect event.
+    fn is_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Self::Connect { .. } | Self::AuthConnect { .. } | Self::Disconnect { .. }
+        )
+    }
+}
+
 pub(crate) enum ServerCommand {
     SendText {
         conn_id: String,
@@ -439,6 +489,11 @@ pub(crate) struct SharedState {
     inbound_bytes: AtomicUsize,
     max_inbound_messages: usize,
     max_inbound_bytes: usize,
+    // Connect and disconnect events in the channel: no message limit applies
+    // to them (the application's view of its connections stays whole), but
+    // past this many a server whose drain stalls takes no new connection.
+    inbound_lifecycle: AtomicUsize,
+    max_lifecycle_events: usize,
     // Client messages dropped over those limits (observability)
     pub(super) inbound_dropped: AtomicU64,
     // Per-connection format preference (lock-free sync access for send_event)
@@ -593,6 +648,8 @@ impl SharedState {
             inbound_bytes: AtomicUsize::new(0),
             max_inbound_messages: cfg.max_inbound_queue_size,
             max_inbound_bytes: cfg.max_inbound_queue_bytes,
+            inbound_lifecycle: AtomicUsize::new(0),
+            max_lifecycle_events: cfg.max_connections.saturating_mul(2).max(MIN_LIFECYCLE_EVENTS),
             inbound_dropped: AtomicU64::new(0),
             conn_formats: DashMap::new(),
             conn_compression: DashMap::new(),
@@ -648,7 +705,21 @@ impl SharedState {
     /// Queue a connect, disconnect or presence event for the drain: never
     /// dropped.
     pub(super) fn push_inbound(&self, event: InboundEvent) {
+        if event.is_lifecycle() {
+            self.inbound_lifecycle.fetch_add(1, Ordering::AcqRel);
+        }
         let _ = self.inbound_tx.send(Queued { event, bytes: None });
+    }
+
+    /// Queue a connection's connect event, unless `max_lifecycle_events`
+    /// wait already (the drain stalls while connections come and go): then
+    /// false, and the connection is refused.
+    pub(super) fn push_connect(&self, event: InboundEvent) -> bool {
+        if self.inbound_lifecycle.load(Ordering::Acquire) >= self.max_lifecycle_events {
+            return false;
+        }
+        self.push_inbound(event);
+        true
     }
 
     /// Room for a client's message of `bytes` bytes among the messages
@@ -675,8 +746,15 @@ impl SharedState {
     }
 
     /// Queue a client's message of `bytes` bytes for the drain, or drop it
-    /// when there is no room (see `reserve_message`). False when dropped.
+    /// when there is no room (see `reserve_message`). A decoded message is
+    /// charged what it holds in memory when that is more. False when dropped.
     pub(super) fn push_message(&self, event: InboundEvent, bytes: usize) -> bool {
+        let bytes = match &event {
+            InboundEvent::Message { value, .. } | InboundEvent::Signed { value, .. } => {
+                inbound_cost(bytes, value)
+            }
+            _ => bytes,
+        };
         if !self.reserve_message(bytes) {
             return false;
         }
@@ -697,6 +775,8 @@ impl SharedState {
     pub(super) fn taken(&self, queued: Queued) -> InboundEvent {
         if let Some(bytes) = queued.bytes {
             self.release_message(bytes);
+        } else if queued.event.is_lifecycle() {
+            self.inbound_lifecycle.fetch_sub(1, Ordering::AcqRel);
         }
         queued.event
     }
