@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Release checks for wse-server (PyPI), wse-client (PyPI) and wse-client (npm).
+"""Release checks for wse-server (PyPI), wse-client (PyPI), wse-client (npm) and
+the wse crate (crates.io).
 
 Subcommands:
 
@@ -11,7 +12,7 @@ Subcommands:
 
   cargo-config
       No committed cargo config may tune the build to one CPU (target-cpu or
-      target-feature in rustflags): the sdist ships rust/.cargo/config.toml and
+      target-feature in rustflags): the sdist ships .cargo/config.toml and
       maturin applies it to every wheel it builds.
 
   artifacts --version V --npm-version NV DIR [DIR ...]
@@ -167,35 +168,36 @@ def collect() -> list[Source]:
         _project_version(
             "pyproject.toml",
             "wse-server version",
-            "dynamic: maturin takes it from rust/Cargo.toml",
+            "dynamic: maturin takes it from the workspace's Cargo.toml",
         )
     )
 
-    cargo = _toml("rust/Cargo.toml")["package"]
-    crate = cargo["name"]
+    workspace = _toml("Cargo.toml")["workspace"]["package"]
     sources.append(
         Source(
-            "Rust crate version",
-            "rust/Cargo.toml",
-            str(cargo["version"]),
-            line_of(ROOT / "rust/Cargo.toml", r"^version\s*="),
+            "Rust workspace version (the wse crate and the extension)",
+            "Cargo.toml",
+            str(workspace["version"]),
+            line_of(ROOT / "Cargo.toml", r"^version\s*="),
             semver=True,
         )
     )
-    locked = [p for p in _toml("rust/Cargo.lock").get("package", []) if p.get("name") == crate]
-    if len(locked) != 1:
-        raise CheckError(
-            f"rust/Cargo.lock: expected one [[package]] named {crate}, found {len(locked)}"
+    lock = _toml("Cargo.lock").get("package", [])
+    for crate in ("wse", "wse-py"):
+        locked = [p for p in lock if p.get("name") == crate]
+        if len(locked) != 1:
+            raise CheckError(
+                f"Cargo.lock: expected one [[package]] named {crate}, found {len(locked)}"
+            )
+        sources.append(
+            Source(
+                f"{crate} version in Cargo.lock",
+                "Cargo.lock",
+                str(locked[0]["version"]),
+                line_of(ROOT / "Cargo.lock", rf'^name = "{re.escape(crate)}"'),
+                semver=True,
+            )
         )
-    sources.append(
-        Source(
-            "Rust crate version in Cargo.lock",
-            "rust/Cargo.lock",
-            str(locked[0]["version"]),
-            line_of(ROOT / "rust/Cargo.lock", rf'^name = "{re.escape(crate)}"'),
-            semver=True,
-        )
-    )
 
     sources.append(
         _project_version(
@@ -348,8 +350,8 @@ def cmd_cargo_config(_args: argparse.Namespace) -> int:
     for rel in (
         ".cargo/config.toml",
         ".cargo/config",
-        "rust/.cargo/config.toml",
-        "rust/.cargo/config",
+        "crates/wse/.cargo/config.toml",
+        "crates/wse-py/.cargo/config.toml",
     ):
         path = ROOT / rel
         if not path.exists():

@@ -495,9 +495,9 @@ All configuration is passed programmatically through the `RustWSEServer` constru
 
 ### Logging
 
-The server logs to standard output at level `info` (`[WSE] ...` lines: listening, refused connections, drain progress, cluster links, callback errors). The `RUST_LOG` environment variable, read at the first `start()`, overrides it with the usual filter syntax; the crate's log target is `_wse_accel`:
+The server logs to standard output at level `info` (`[WSE] ...` lines: listening, refused connections, drain progress, cluster links, callback errors). The `RUST_LOG` environment variable, read at the first `start()`, overrides it with the usual filter syntax; the engine's log target is `wse`:
 
 ```bash
-RUST_LOG=_wse_accel=debug python app.py    # more detail
-RUST_LOG=_wse_accel=warn python app.py     # problems only
+RUST_LOG=wse=debug python app.py    # more detail
+RUST_LOG=wse=warn python app.py     # problems only
 ```

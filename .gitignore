@@ -11,10 +11,10 @@ build/
 .eggs/
 
 # Rust
-rust/target/
+/target/
 benchmarks/rust-bench/target/
 xtask/target/
-# rust/Cargo.lock is committed for reproducible builds
+# Cargo.lock is committed for reproducible builds
 
 # Virtual environments
 .venv/
@@ -47,3 +47,6 @@ node_modules/
 # Internal docs (not for release)
 docs/internal/
 /docs/plans/
+
+# The extension built before the workspace (rust/)
+rust/target/

@@ -1,0 +1,30 @@
+[package]
+name = "wse-py"
+description = "The Python extension of the wse-server package: the WSE engine for Python."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+# Published to PyPI as part of wse-server, not to crates.io.
+publish = false
+
+[lib]
+name = "_wse_accel"
+crate-type = ["cdylib"]
+
+[features]
+default = ["aws-lc"]
+aws-lc = ["wse/aws-lc"]
+fips = ["wse/fips"]
+
+[dependencies]
+wse = { path = "../wse", default-features = false, features = ["python"] }
+pyo3 = { version = "0.30", features = ["abi3-py312"] }
+mimalloc = "0.1"
+
+# musl (Alpine) loads the extension with dlopen, where mimalloc's default
+# initial-exec TLS model fails to resolve ("initial-exec TLS resolves to
+# dynamic definition"): the module would not import.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }

@@ -1,0 +1,1500 @@
+// JWT encode/decode with every standard algorithm (HS*, RS*, PS*, ES256/384,
+// EdDSA), powered by the jsonwebtoken crate.
+//
+// The server validates the clients' tokens with it during the WebSocket
+// handshake; the Python module's rust_jwt_* functions (jwt_py.rs) wrap it
+// for an application's HTTP routes.
+
+use zeroize::Zeroizing;
+
+// ---------------------------------------------------------------------------
+// Algorithm
+// ---------------------------------------------------------------------------
+
+/// The signature algorithm tokens are checked with. The server is configured
+/// with exactly one; the token's own `alg` header never chooses it, which is
+/// what algorithm-confusion attacks rely on. Every standard one is accepted,
+/// so tokens from any auth service can be validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JwtAlgorithm {
+    HS256,
+    HS384,
+    HS512,
+    RS256,
+    RS384,
+    RS512,
+    PS256,
+    PS384,
+    PS512,
+    ES256,
+    ES384,
+    EdDSA,
+}
+
+/// The kind of key an algorithm takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyKind {
+    /// A shared secret of at least `min_len` bytes (RFC 7518: the hash size).
+    Secret {
+        min_len: usize,
+    },
+    Rsa,
+    Ec,
+    Ed,
+}
+
+const ALGORITHMS: [(&str, JwtAlgorithm); 12] = [
+    ("HS256", JwtAlgorithm::HS256),
+    ("HS384", JwtAlgorithm::HS384),
+    ("HS512", JwtAlgorithm::HS512),
+    ("RS256", JwtAlgorithm::RS256),
+    ("RS384", JwtAlgorithm::RS384),
+    ("RS512", JwtAlgorithm::RS512),
+    ("PS256", JwtAlgorithm::PS256),
+    ("PS384", JwtAlgorithm::PS384),
+    ("PS512", JwtAlgorithm::PS512),
+    ("ES256", JwtAlgorithm::ES256),
+    ("ES384", JwtAlgorithm::ES384),
+    ("EdDSA", JwtAlgorithm::EdDSA),
+];
+
+impl JwtAlgorithm {
+    pub fn from_str(s: &str) -> Result<Self, JwtError> {
+        ALGORITHMS
+            .iter()
+            .find(|(name, _)| *name == s)
+            .map(|(_, alg)| *alg)
+            .ok_or(JwtError::UnsupportedAlgorithm)
+    }
+
+    /// The accepted names, for error messages.
+    pub fn supported() -> String {
+        ALGORITHMS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    pub(crate) fn key_kind(self) -> KeyKind {
+        match self {
+            Self::HS256 => KeyKind::Secret { min_len: 32 },
+            Self::HS384 => KeyKind::Secret { min_len: 48 },
+            Self::HS512 => KeyKind::Secret { min_len: 64 },
+            Self::RS256 | Self::RS384 | Self::RS512 | Self::PS256 | Self::PS384 | Self::PS512 => {
+                KeyKind::Rsa
+            }
+            Self::ES256 | Self::ES384 => KeyKind::Ec,
+            Self::EdDSA => KeyKind::Ed,
+        }
+    }
+
+    fn to_jw(self) -> jsonwebtoken::Algorithm {
+        use jsonwebtoken::Algorithm as A;
+        match self {
+            Self::HS256 => A::HS256,
+            Self::HS384 => A::HS384,
+            Self::HS512 => A::HS512,
+            Self::RS256 => A::RS256,
+            Self::RS384 => A::RS384,
+            Self::RS512 => A::RS512,
+            Self::PS256 => A::PS256,
+            Self::PS384 => A::PS384,
+            Self::PS512 => A::PS512,
+            Self::ES256 => A::ES256,
+            Self::ES384 => A::ES384,
+            Self::EdDSA => A::EdDSA,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub(crate) enum JwtError {
+    MalformedToken,
+    UnsupportedAlgorithm,
+    InvalidSignature,
+    InvalidPayload,
+    TokenExpired,
+    TokenNotYetValid,
+    InvalidIssuer,
+    InvalidAudience,
+    /// The shared secret is shorter than the algorithm requires (bytes).
+    KeyTooShort(usize),
+    TokenTooLarge,
+    InvalidKeyId,
+    InvalidKey(String),
+}
+
+impl std::fmt::Display for JwtError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MalformedToken => write!(f, "Malformed JWT token"),
+            Self::UnsupportedAlgorithm => {
+                write!(
+                    f,
+                    "Unsupported algorithm (supported: {})",
+                    JwtAlgorithm::supported()
+                )
+            }
+            Self::InvalidSignature => write!(f, "Invalid JWT signature"),
+            Self::InvalidPayload => write!(f, "Invalid JWT payload"),
+            Self::TokenExpired => write!(f, "Token expired"),
+            Self::TokenNotYetValid => write!(f, "Token not yet valid (nbf)"),
+            Self::InvalidIssuer => write!(f, "Invalid issuer"),
+            Self::InvalidAudience => write!(f, "Invalid audience"),
+            Self::KeyTooShort(min) => {
+                write!(
+                    f,
+                    "Secret key too short: this algorithm needs at least {min} bytes"
+                )
+            }
+            Self::TokenTooLarge => write!(f, "Token exceeds maximum size"),
+            Self::InvalidKeyId => write!(f, "Invalid or mismatched key ID (kid)"),
+            Self::InvalidKey(detail) => write!(f, "Invalid key: {detail}"),
+        }
+    }
+}
+
+impl From<jsonwebtoken::errors::Error> for JwtError {
+    fn from(e: jsonwebtoken::errors::Error) -> Self {
+        use jsonwebtoken::errors::ErrorKind;
+        match e.into_kind() {
+            ErrorKind::InvalidToken | ErrorKind::Base64(_) | ErrorKind::Utf8(_) => {
+                Self::MalformedToken
+            }
+            ErrorKind::InvalidSignature => Self::InvalidSignature,
+            ErrorKind::InvalidAlgorithm
+            | ErrorKind::InvalidAlgorithmName
+            | ErrorKind::MissingAlgorithm => Self::UnsupportedAlgorithm,
+            ErrorKind::ExpiredSignature => Self::TokenExpired,
+            ErrorKind::ImmatureSignature => Self::TokenNotYetValid,
+            ErrorKind::InvalidIssuer => Self::InvalidIssuer,
+            ErrorKind::InvalidAudience => Self::InvalidAudience,
+            ErrorKind::InvalidEcdsaKey => Self::InvalidKey("Invalid ECDSA key".into()),
+            ErrorKind::InvalidEddsaKey => Self::InvalidKey("Invalid EdDSA key".into()),
+            ErrorKind::InvalidRsaKey(msg) => Self::InvalidKey(format!("Invalid RSA key: {msg}")),
+            ErrorKind::InvalidKeyFormat => Self::InvalidKey("Invalid key format".into()),
+            ErrorKind::MissingRequiredClaim(_) | ErrorKind::InvalidClaimFormat(_) => {
+                Self::InvalidPayload
+            }
+            ErrorKind::Json(_) => Self::InvalidPayload,
+            ErrorKind::InvalidSubject => Self::InvalidPayload,
+            ErrorKind::RsaFailedSigning => Self::InvalidKey("RSA signing failed".into()),
+            ErrorKind::Signing(msg) => Self::InvalidKey(format!("Signing failed: {msg}")),
+            ErrorKind::Provider(msg) => Self::InvalidKey(format!("Provider error: {msg}")),
+            _ => Self::InvalidSignature,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+pub struct JwtConfig {
+    pub algorithm: JwtAlgorithm,
+    /// For HS256: shared secret (>= 32 bytes).
+    /// For RS256/ES256: public key in PEM format (for verification).
+    /// Wrapped in Zeroizing to clear key material from memory on drop.
+    pub secret: Zeroizing<Vec<u8>>,
+    /// For HS256: previous shared secret for key rotation.
+    /// For RS256/ES256: previous public key in PEM format.
+    pub previous_secret: Option<Zeroizing<Vec<u8>>>,
+    /// For the asymmetric algorithms: the private key `issue_token()` signs
+    /// with (PEM). The HMAC algorithms sign with `secret`.
+    pub signing_key: Option<Zeroizing<Vec<u8>>>,
+    pub key_id: Option<String>,
+    pub issuer: String,
+    pub audience: String,
+    pub cookie_name: String,
+}
+
+// ---------------------------------------------------------------------------
+// Internal API (used by server.rs directly — no GIL)
+// ---------------------------------------------------------------------------
+
+// Reject tokens larger than 8KB to prevent DoS
+const MAX_TOKEN_LEN: usize = 8192;
+// Clock skew tolerance for exp/nbf (seconds) -- RFC 8725 recommendation
+pub(crate) const CLOCK_SKEW_SECS: u64 = 30;
+
+/// A validated token's `exp` in seconds, read as the validation reads it: an
+/// integer, or a number with a fraction rounded to the nearest second (what
+/// `time.time() + 900` gives).
+pub(crate) fn exp_seconds(claims: &serde_json::Value) -> Option<u64> {
+    let exp = claims.get("exp")?;
+    exp.as_u64().or_else(|| {
+        exp.as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0 && *f < u64::MAX as f64)
+            .map(|f| f.round() as u64)
+    })
+}
+
+/// A shared secret for an HS* algorithm: long enough, and not a PEM key
+/// (an asymmetric key used as an HMAC secret lets anyone holding the public
+/// half mint tokens).
+fn check_secret(key: &[u8], min_len: usize) -> Result<(), JwtError> {
+    if key.len() < min_len {
+        return Err(JwtError::KeyTooShort(min_len));
+    }
+    if key.starts_with(b"-----BEGIN") {
+        return Err(JwtError::InvalidKey(
+            "the secret is a PEM key; set jwt_algorithm to the key's algorithm (RS*, PS*, ES*, EdDSA)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Build a DecodingKey (a public key, or the shared secret) for `algorithm`.
+fn make_decoding_key(
+    algorithm: JwtAlgorithm,
+    key: &[u8],
+) -> Result<jsonwebtoken::DecodingKey, JwtError> {
+    use jsonwebtoken::DecodingKey;
+    Ok(match algorithm.key_kind() {
+        KeyKind::Secret { min_len } => {
+            check_secret(key, min_len)?;
+            DecodingKey::from_secret(key)
+        }
+        KeyKind::Rsa => DecodingKey::from_rsa_pem(key)?,
+        KeyKind::Ec => DecodingKey::from_ec_pem(key)?,
+        KeyKind::Ed => DecodingKey::from_ed_pem(key)?,
+    })
+}
+
+/// Build an EncodingKey (a private key, or the shared secret) for `algorithm`.
+fn make_encoding_key(
+    algorithm: JwtAlgorithm,
+    key: &[u8],
+) -> Result<jsonwebtoken::EncodingKey, JwtError> {
+    use jsonwebtoken::EncodingKey;
+    Ok(match algorithm.key_kind() {
+        KeyKind::Secret { min_len } => {
+            check_secret(key, min_len)?;
+            EncodingKey::from_secret(key)
+        }
+        KeyKind::Rsa => EncodingKey::from_rsa_pem(key)?,
+        KeyKind::Ec => EncodingKey::from_ec_pem(key)?,
+        KeyKind::Ed => EncodingKey::from_ed_pem(key)?,
+    })
+}
+
+/// Whether `key` can verify tokens of `algorithm` (checked at server start for
+/// jwt_secret and jwt_previous_secret).
+pub(crate) fn check_verification_key(algorithm: JwtAlgorithm, key: &[u8]) -> Result<(), JwtError> {
+    make_decoding_key(algorithm, key).map(|_| ())
+}
+
+/// Whether `key` can sign tokens of `algorithm` (jwt_private_key).
+pub(crate) fn check_signing_key(algorithm: JwtAlgorithm, key: &[u8]) -> Result<(), JwtError> {
+    make_encoding_key(algorithm, key).map(|_| ())
+}
+
+/// Build a Validation config for the given algorithm and claims requirements.
+fn make_validation(
+    algorithm: JwtAlgorithm,
+    issuer: Option<&str>,
+    audience: Option<&str>,
+) -> jsonwebtoken::Validation {
+    let mut v = jsonwebtoken::Validation::new(algorithm.to_jw());
+    v.leeway = CLOCK_SKEW_SECS;
+    v.validate_exp = true;
+    v.validate_nbf = true;
+
+    // A configured issuer or audience is also a required claim: otherwise a
+    // token that simply omits it (or carries an unparseable value) passes.
+    let mut required = vec!["exp"];
+    if let Some(iss) = issuer {
+        v.set_issuer(&[iss]);
+        required.push("iss");
+    }
+    if let Some(aud) = audience {
+        v.set_audience(&[aud]);
+        required.push("aud");
+    } else {
+        v.validate_aud = false;
+    }
+    v.set_required_spec_claims(&required);
+
+    v
+}
+
+/// Decode and validate a JWT token.
+///
+/// Returns the payload as a serde_json::Value on success.
+/// Validates: signature, algorithm, expiration, issuer, audience, kid.
+/// Supports key rotation: if the primary key fails, retries with previous_secret.
+pub fn jwt_decode(token: &str, config: &JwtConfig) -> Result<serde_json::Value, JwtError> {
+    let issuer = if config.issuer.is_empty() {
+        None
+    } else {
+        Some(config.issuer.as_str())
+    };
+    let audience = if config.audience.is_empty() {
+        None
+    } else {
+        Some(config.audience.as_str())
+    };
+    let kid = config.key_id.as_deref();
+
+    match jwt_decode_inner(
+        token,
+        &config.secret,
+        config.algorithm,
+        issuer,
+        audience,
+        kid,
+    ) {
+        Err(JwtError::InvalidSignature | JwtError::InvalidKeyId)
+            if config.previous_secret.is_some() =>
+        {
+            // Verify the token's alg header matches before trying the previous key.
+            // This avoids double-verification on tokens with a completely wrong algorithm.
+            if let Ok(hdr) = jsonwebtoken::decode_header(token)
+                && hdr.alg != config.algorithm.to_jw()
+            {
+                return Err(JwtError::UnsupportedAlgorithm);
+            }
+            let prev = config.previous_secret.as_ref().unwrap();
+            // kid not enforced on previous-key path: old key may have had a different kid
+            jwt_decode_inner(token, prev, config.algorithm, issuer, audience, None)
+        }
+        other => other,
+    }
+}
+
+/// Core decode logic, shared between internal and PyO3 paths.
+fn jwt_decode_inner(
+    token: &str,
+    key: &[u8],
+    algorithm: JwtAlgorithm,
+    issuer: Option<&str>,
+    audience: Option<&str>,
+    expected_kid: Option<&str>,
+) -> Result<serde_json::Value, JwtError> {
+    // 0. Reject oversized tokens (DoS prevention)
+    if token.len() > MAX_TOKEN_LEN {
+        return Err(JwtError::TokenTooLarge);
+    }
+
+    // 1. Validate kid before full decode (cheap header-only parse, no signature check)
+    if let Some(expected) = expected_kid {
+        let header = jsonwebtoken::decode_header(token)?;
+        if header.kid.as_deref() != Some(expected) {
+            return Err(JwtError::InvalidKeyId);
+        }
+    }
+
+    // 2. Build key and validation
+    let decoding_key = make_decoding_key(algorithm, key)?;
+    let validation = make_validation(algorithm, issuer, audience);
+
+    // 3. Decode, verify signature, validate claims
+    let token_data = jsonwebtoken::decode::<serde_json::Value>(token, &decoding_key, &validation)?;
+
+    Ok(token_data.claims)
+}
+
+/// Encode claims into a JWT token.
+///
+/// For HS256: key is the shared secret (>= 32 bytes).
+/// For RS256/ES256: key is the private key in PEM format.
+/// The caller is responsible for including exp, iat, iss, aud, sub, etc.
+pub fn jwt_encode(
+    claims: &serde_json::Value,
+    key: &[u8],
+    algorithm: JwtAlgorithm,
+    kid: Option<&str>,
+) -> Result<String, JwtError> {
+    let encoding_key = make_encoding_key(algorithm, key)?;
+
+    let mut header = jsonwebtoken::Header::new(algorithm.to_jw());
+    if let Some(kid) = kid {
+        header.kid = Some(kid.to_string());
+    }
+
+    Ok(jsonwebtoken::encode(&header, claims, &encoding_key)?)
+}
+
+// ---------------------------------------------------------------------------
+// Cookie parsing helper (used by server.rs)
+// ---------------------------------------------------------------------------
+
+/// Extract a named cookie value from a raw Cookie header string.
+/// Returns None if the cookie is not found or is empty/"undefined"/"null".
+pub fn parse_cookie_value<'a>(cookies: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{}=", name);
+    for cookie in cookies.split(';') {
+        let cookie = cookie.trim();
+        if let Some(value) = cookie.strip_prefix(&prefix) {
+            let value = value.trim();
+            if !value.is_empty() && value != "undefined" && value != "null" {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+/// Decode a JWT, returning claims as serde_json::Value or error.
+pub(crate) fn jwt_decode_with_rotation(
+    token: &str,
+    secret: &[u8],
+    algorithm: &str,
+    issuer: Option<&str>,
+    audience: Option<&str>,
+    previous_secret: Option<&[u8]>,
+    key_id: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let alg = JwtAlgorithm::from_str(algorithm).map_err(|_| {
+        format!(
+            "Unsupported algorithm: {algorithm}. Supported: {}",
+            JwtAlgorithm::supported()
+        )
+    })?;
+
+    let result = match jwt_decode_inner(token, secret, alg, issuer, audience, key_id) {
+        Err(JwtError::InvalidSignature | JwtError::InvalidKeyId) if previous_secret.is_some() => {
+            if let Ok(hdr) = jsonwebtoken::decode_header(token)
+                && hdr.alg != alg.to_jw()
+            {
+                return Err("algorithm mismatch".to_string());
+            }
+            jwt_decode_inner(token, previous_secret.unwrap(), alg, issuer, audience, None)
+        }
+        other => other,
+    };
+
+    result.map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Topic ACL from the JWT wse_topics claim
+// ---------------------------------------------------------------------------
+
+use crate::server::TopicAcl;
+
+/// Extract optional topic ACL from JWT claims.
+///
+/// No `wse_topics` claim means no restriction (`None`). Inside the claim, an
+/// absent `allow` key allows every topic not denied, and an `allow` list
+/// allows only what it matches - so an explicit empty list allows nothing. A
+/// claim that is not an object of string lists, an empty object, or one with
+/// any key besides `allow` and `deny` (a typo) denies everything: a
+/// restriction the issuer meant to set must never turn into "allow all".
+pub fn extract_topic_acl(claims: &serde_json::Value) -> Option<TopicAcl> {
+    let topics = claims.get("wse_topics")?;
+    let Some(obj) = topics.as_object() else {
+        tracing::warn!("[WSE] wse_topics claim is not an object; denying all topics");
+        return Some(TopicAcl::deny_all());
+    };
+    if obj.is_empty() || obj.keys().any(|k| k != "allow" && k != "deny") {
+        tracing::warn!(
+            "[WSE] wse_topics claim is empty or has a key besides allow/deny; denying all topics"
+        );
+        return Some(TopicAcl::deny_all());
+    }
+
+    let mut lists = [Vec::new(), Vec::new()];
+    for (slot, key) in lists.iter_mut().zip(["allow", "deny"]) {
+        if let Some(value) = obj.get(key) {
+            match string_list(value) {
+                Some(list) => *slot = list,
+                None => {
+                    tracing::warn!(
+                        "[WSE] wse_topics.{key} is not a list of strings; denying all topics"
+                    );
+                    return Some(TopicAcl::deny_all());
+                }
+            }
+        }
+    }
+    let [allow, deny] = lists;
+    if obj.contains_key("allow") && allow.is_empty() {
+        return Some(TopicAcl::deny_all());
+    }
+
+    Some(TopicAcl { allow, deny })
+}
+
+/// A JSON array of strings, or `None` if the value is anything else.
+fn string_list(value: &serde_json::Value) -> Option<Vec<String>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|v| v.as_str().map(String::from))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Rust-level unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_secret() -> Vec<u8> {
+        b"test-secret-key-for-jwt-testing-32bytes!".to_vec()
+    }
+
+    fn hs256_config() -> JwtConfig {
+        JwtConfig {
+            algorithm: JwtAlgorithm::HS256,
+            secret: Zeroizing::new(test_secret()),
+            previous_secret: None,
+            signing_key: None,
+            key_id: None,
+            issuer: "wse-test".to_string(),
+            audience: "wse-test-api".to_string(),
+            cookie_name: "access_token".to_string(),
+        }
+    }
+
+    fn future_exp() -> i64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        now + 3600 // 1 hour from now
+    }
+
+    // --- HS256 tests ---
+
+    #[test]
+    fn hs256_encode_decode_roundtrip() {
+        let config = hs256_config();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+            "iat": 1700000000,
+            "iss": "wse-test",
+            "aud": "wse-test-api",
+            "type": "access",
+            "jti": "test-jti-001",
+        });
+
+        let token =
+            jwt_encode(&claims, &config.secret, JwtAlgorithm::HS256, None).expect("encode ok");
+        assert!(token.contains('.'));
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3);
+
+        let decoded = jwt_decode(&token, &config).expect("decode ok");
+        assert_eq!(decoded["sub"], "user-123");
+        assert_eq!(decoded["iss"], "wse-test");
+        assert_eq!(decoded["aud"], "wse-test-api");
+        assert_eq!(decoded["type"], "access");
+    }
+
+    #[test]
+    fn hs256_rejects_expired_token() {
+        let config = hs256_config();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": 1000000000, // far in the past
+            "iss": "wse-test",
+            "aud": "wse-test-api",
+        });
+
+        let token = jwt_encode(&claims, &config.secret, JwtAlgorithm::HS256, None).unwrap();
+        let result = jwt_decode(&token, &config);
+        assert!(matches!(result, Err(JwtError::TokenExpired)));
+    }
+
+    #[test]
+    fn hs256_rejects_wrong_secret() {
+        let config = hs256_config();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+            "iss": "wse-test",
+            "aud": "wse-test-api",
+        });
+
+        let token = jwt_encode(&claims, &config.secret, JwtAlgorithm::HS256, None).unwrap();
+
+        let bad_config = JwtConfig {
+            secret: Zeroizing::new(b"wrong-secret-key-at-least-32bytes!".to_vec()),
+            ..hs256_config()
+        };
+        let result = jwt_decode(&token, &bad_config);
+        assert!(matches!(result, Err(JwtError::InvalidSignature)));
+    }
+
+    #[test]
+    fn hs256_rejects_wrong_issuer() {
+        let config = hs256_config();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+            "iss": "other-service",
+            "aud": "wse-test-api",
+        });
+
+        let token = jwt_encode(&claims, &config.secret, JwtAlgorithm::HS256, None).unwrap();
+        let result = jwt_decode(&token, &config);
+        assert!(matches!(result, Err(JwtError::InvalidIssuer)));
+    }
+
+    #[test]
+    fn hs256_rejects_wrong_audience() {
+        let config = hs256_config();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+            "iss": "wse-test",
+            "aud": "other-api",
+        });
+
+        let token = jwt_encode(&claims, &config.secret, JwtAlgorithm::HS256, None).unwrap();
+        let result = jwt_decode(&token, &config);
+        assert!(matches!(result, Err(JwtError::InvalidAudience)));
+    }
+
+    #[test]
+    fn hs256_rejects_malformed_token() {
+        let config = hs256_config();
+        assert!(jwt_decode("not.a.jwt.token", &config).is_err());
+        assert!(matches!(
+            jwt_decode("just-a-string", &config),
+            Err(JwtError::MalformedToken)
+        ));
+        assert!(matches!(
+            jwt_decode("two.parts", &config),
+            Err(JwtError::MalformedToken)
+        ));
+        assert!(matches!(
+            jwt_decode("", &config),
+            Err(JwtError::MalformedToken)
+        ));
+    }
+
+    #[test]
+    fn hs256_rejects_tampered_payload() {
+        let config = hs256_config();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+            "iss": "wse-test",
+            "aud": "wse-test-api",
+        });
+
+        let token = jwt_encode(&claims, &config.secret, JwtAlgorithm::HS256, None).unwrap();
+
+        let parts: Vec<&str> = token.split('.').collect();
+        let tampered_payload = format!("{}x", parts[1]);
+        let tampered_token = format!("{}.{}.{}", parts[0], tampered_payload, parts[2]);
+
+        let result = jwt_decode(&tampered_token, &config);
+        assert!(matches!(result, Err(JwtError::InvalidSignature)));
+    }
+
+    #[test]
+    fn parse_cookie_value_works() {
+        assert_eq!(
+            parse_cookie_value("access_token=abc123; refresh_token=xyz", "access_token"),
+            Some("abc123")
+        );
+        assert_eq!(
+            parse_cookie_value("access_token=abc123; refresh_token=xyz", "refresh_token"),
+            Some("xyz")
+        );
+        assert_eq!(parse_cookie_value("access_token=abc123", "missing"), None);
+        assert_eq!(
+            parse_cookie_value("access_token=undefined", "access_token"),
+            None
+        );
+        assert_eq!(
+            parse_cookie_value("access_token=null", "access_token"),
+            None
+        );
+        assert_eq!(parse_cookie_value("access_token=", "access_token"), None);
+    }
+
+    #[test]
+    fn hs256_decode_with_optional_issuer_audience() {
+        let secret = test_secret();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+        });
+
+        let token = jwt_encode(&claims, &secret, JwtAlgorithm::HS256, None).unwrap();
+
+        let result = jwt_decode_inner(&token, &secret, JwtAlgorithm::HS256, None, None, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn hs256_rejects_missing_exp() {
+        let config = hs256_config();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "iss": "wse-test",
+            "aud": "wse-test-api",
+        });
+
+        let token = jwt_encode(&claims, &config.secret, JwtAlgorithm::HS256, None).unwrap();
+        let result = jwt_decode(&token, &config);
+        // jsonwebtoken returns MissingRequiredClaim which maps to InvalidPayload
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn hs256_skips_validation_when_issuer_audience_empty() {
+        let secret = test_secret();
+        let config = JwtConfig {
+            algorithm: JwtAlgorithm::HS256,
+            secret: Zeroizing::new(secret.clone()),
+            previous_secret: None,
+            signing_key: None,
+            key_id: None,
+            issuer: String::new(),
+            audience: String::new(),
+            cookie_name: "access_token".to_string(),
+        };
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+            "iss": "any-issuer",
+            "aud": "any-audience",
+        });
+
+        let token = jwt_encode(&claims, &secret, JwtAlgorithm::HS256, None).unwrap();
+        let result = jwt_decode(&token, &config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn hs256_preserves_all_claim_types() {
+        let secret = test_secret();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+            "iat": 1700000000,
+            "roles": ["admin", "user"],
+            "custom": {"nested": true},
+            "count": 42,
+            "active": true,
+        });
+
+        let token = jwt_encode(&claims, &secret, JwtAlgorithm::HS256, None).unwrap();
+        let decoded =
+            jwt_decode_inner(&token, &secret, JwtAlgorithm::HS256, None, None, None).unwrap();
+        assert_eq!(decoded["sub"], "user-123");
+        assert_eq!(decoded["roles"][0], "admin");
+        assert_eq!(decoded["custom"]["nested"], true);
+        assert_eq!(decoded["count"], 42);
+        assert_eq!(decoded["active"], true);
+    }
+
+    #[test]
+    fn hs256_rejects_short_secret() {
+        let short_secret = b"too-short".to_vec();
+        let claims = serde_json::json!({"sub": "x", "exp": future_exp()});
+        let result = jwt_encode(&claims, &short_secret, JwtAlgorithm::HS256, None);
+        assert!(matches!(result, Err(JwtError::KeyTooShort(32))));
+    }
+
+    #[test]
+    fn hs256_rejects_oversized_token() {
+        let config = hs256_config();
+        let huge_token = format!("a.{}.b", "x".repeat(9000));
+        let result = jwt_decode(&huge_token, &config);
+        assert!(matches!(result, Err(JwtError::TokenTooLarge)));
+    }
+
+    #[test]
+    fn hs256_exp_allows_clock_skew() {
+        let config = hs256_config();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Token expired 10 seconds ago -- within 30s skew, should pass
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": now - 10,
+            "iss": "wse-test",
+            "aud": "wse-test-api",
+        });
+        let token = jwt_encode(&claims, &config.secret, JwtAlgorithm::HS256, None).unwrap();
+        let result = jwt_decode(&token, &config);
+        assert!(result.is_ok());
+
+        // Token expired 60 seconds ago -- beyond skew, should fail
+        let claims_old = serde_json::json!({
+            "sub": "user-123",
+            "exp": now - 60,
+            "iss": "wse-test",
+            "aud": "wse-test-api",
+        });
+        let token_old = jwt_encode(&claims_old, &config.secret, JwtAlgorithm::HS256, None).unwrap();
+        let result_old = jwt_decode(&token_old, &config);
+        assert!(matches!(result_old, Err(JwtError::TokenExpired)));
+    }
+
+    // --- HS256 key rotation tests ---
+
+    #[test]
+    fn hs256_key_rotation_accepts_old_secret() {
+        let old_secret = b"old-secret-key-for-rotation-32b!!".to_vec();
+        let new_secret = b"new-secret-key-for-rotation-32b!!".to_vec();
+
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+            "iss": "wse-test",
+            "aud": "wse-test-api",
+        });
+        let token = jwt_encode(&claims, &old_secret, JwtAlgorithm::HS256, None).unwrap();
+
+        let config = JwtConfig {
+            algorithm: JwtAlgorithm::HS256,
+            secret: Zeroizing::new(new_secret),
+            previous_secret: Some(Zeroizing::new(old_secret)),
+            signing_key: None,
+            key_id: None,
+            issuer: "wse-test".to_string(),
+            audience: "wse-test-api".to_string(),
+            cookie_name: "access_token".to_string(),
+        };
+        let result = jwt_decode(&token, &config);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap()["sub"], "user-123");
+    }
+
+    #[test]
+    fn hs256_key_rotation_rejects_unknown_secret() {
+        let unknown = b"unknown-secret-not-configured-32!".to_vec();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+            "iss": "wse-test",
+            "aud": "wse-test-api",
+        });
+        let token = jwt_encode(&claims, &unknown, JwtAlgorithm::HS256, None).unwrap();
+
+        let config = JwtConfig {
+            algorithm: JwtAlgorithm::HS256,
+            secret: Zeroizing::new(b"current-secret-key-32-bytes-ok!!".to_vec()),
+            previous_secret: Some(Zeroizing::new(b"previous-secret-key-32bytes-ok!!".to_vec())),
+            signing_key: None,
+            key_id: None,
+            issuer: "wse-test".to_string(),
+            audience: "wse-test-api".to_string(),
+            cookie_name: "access_token".to_string(),
+        };
+        let result = jwt_decode(&token, &config);
+        assert!(matches!(result, Err(JwtError::InvalidSignature)));
+    }
+
+    // --- HS256 kid tests ---
+
+    #[test]
+    fn hs256_kid_in_header_roundtrip() {
+        let secret = test_secret();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+        });
+
+        let token = jwt_encode(&claims, &secret, JwtAlgorithm::HS256, Some("key-2024-03")).unwrap();
+
+        // Verify kid is in the header
+        let header = jsonwebtoken::decode_header(&token).unwrap();
+        assert_eq!(header.kid.as_deref(), Some("key-2024-03"));
+
+        // Decode with matching kid
+        let config = JwtConfig {
+            algorithm: JwtAlgorithm::HS256,
+            secret: Zeroizing::new(secret),
+            previous_secret: None,
+            signing_key: None,
+            key_id: Some("key-2024-03".to_string()),
+            issuer: String::new(),
+            audience: String::new(),
+            cookie_name: "access_token".to_string(),
+        };
+        let result = jwt_decode(&token, &config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn hs256_kid_mismatch_rejected() {
+        let secret = test_secret();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+        });
+
+        let token = jwt_encode(&claims, &secret, JwtAlgorithm::HS256, Some("key-old")).unwrap();
+
+        let config = JwtConfig {
+            algorithm: JwtAlgorithm::HS256,
+            secret: Zeroizing::new(secret),
+            previous_secret: None,
+            signing_key: None,
+            key_id: Some("key-new".to_string()),
+            issuer: String::new(),
+            audience: String::new(),
+            cookie_name: "access_token".to_string(),
+        };
+        let result = jwt_decode(&token, &config);
+        assert!(matches!(result, Err(JwtError::InvalidKeyId)));
+    }
+
+    #[test]
+    fn hs256_kid_missing_from_token_rejected() {
+        let secret = test_secret();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+        });
+
+        let token = jwt_encode(&claims, &secret, JwtAlgorithm::HS256, None).unwrap();
+
+        let config = JwtConfig {
+            algorithm: JwtAlgorithm::HS256,
+            secret: Zeroizing::new(secret),
+            previous_secret: None,
+            signing_key: None,
+            key_id: Some("expected-kid".to_string()),
+            issuer: String::new(),
+            audience: String::new(),
+            cookie_name: "access_token".to_string(),
+        };
+        let result = jwt_decode(&token, &config);
+        assert!(matches!(result, Err(JwtError::InvalidKeyId)));
+    }
+
+    #[test]
+    fn hs256_kid_not_required_when_unconfigured() {
+        let secret = test_secret();
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+        });
+
+        let token = jwt_encode(&claims, &secret, JwtAlgorithm::HS256, Some("some-kid")).unwrap();
+        let config = JwtConfig {
+            algorithm: JwtAlgorithm::HS256,
+            secret: Zeroizing::new(secret),
+            previous_secret: None,
+            signing_key: None,
+            key_id: None,
+            issuer: String::new(),
+            audience: String::new(),
+            cookie_name: "access_token".to_string(),
+        };
+        let result = jwt_decode(&token, &config);
+        assert!(result.is_ok());
+    }
+
+    // --- RS256 tests ---
+
+    const RSA_PRIVATE_KEY: &[u8] = include_bytes!("../../../tests/keys/rsa_private.pem");
+    const RSA_PUBLIC_KEY: &[u8] = include_bytes!("../../../tests/keys/rsa_public.pem");
+    const RSA2_PUBLIC_KEY: &[u8] = include_bytes!("../../../tests/keys/rsa2_public.pem");
+
+    #[test]
+    fn rs256_encode_decode_roundtrip() {
+        let claims = serde_json::json!({
+            "sub": "user-rs256",
+            "exp": future_exp(),
+            "iss": "test",
+            "aud": "test-api",
+        });
+
+        let token = jwt_encode(&claims, RSA_PRIVATE_KEY, JwtAlgorithm::RS256, None).unwrap();
+
+        let config = JwtConfig {
+            algorithm: JwtAlgorithm::RS256,
+            secret: Zeroizing::new(RSA_PUBLIC_KEY.to_vec()),
+            previous_secret: None,
+            signing_key: None,
+            key_id: None,
+            issuer: "test".to_string(),
+            audience: "test-api".to_string(),
+            cookie_name: "access_token".to_string(),
+        };
+        let decoded = jwt_decode(&token, &config).unwrap();
+        assert_eq!(decoded["sub"], "user-rs256");
+    }
+
+    #[test]
+    fn rs256_wrong_key_rejected() {
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+        });
+
+        // Sign with key 1
+        let token = jwt_encode(&claims, RSA_PRIVATE_KEY, JwtAlgorithm::RS256, None).unwrap();
+
+        // Verify with key 2 (different keypair)
+        let config = JwtConfig {
+            algorithm: JwtAlgorithm::RS256,
+            secret: Zeroizing::new(RSA2_PUBLIC_KEY.to_vec()),
+            previous_secret: None,
+            signing_key: None,
+            key_id: None,
+            issuer: String::new(),
+            audience: String::new(),
+            cookie_name: "access_token".to_string(),
+        };
+        let result = jwt_decode(&token, &config);
+        assert!(matches!(result, Err(JwtError::InvalidSignature)));
+    }
+
+    #[test]
+    fn rs256_key_rotation() {
+        let claims = serde_json::json!({
+            "sub": "user-rotation",
+            "exp": future_exp(),
+        });
+
+        // Sign with old RSA key
+        let token = jwt_encode(&claims, RSA_PRIVATE_KEY, JwtAlgorithm::RS256, None).unwrap();
+
+        // Config: new key is primary, old key is previous
+        let config = JwtConfig {
+            algorithm: JwtAlgorithm::RS256,
+            secret: Zeroizing::new(RSA2_PUBLIC_KEY.to_vec()),
+            previous_secret: Some(Zeroizing::new(RSA_PUBLIC_KEY.to_vec())),
+            signing_key: None,
+            key_id: None,
+            issuer: String::new(),
+            audience: String::new(),
+            cookie_name: "access_token".to_string(),
+        };
+        let result = jwt_decode(&token, &config);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap()["sub"], "user-rotation");
+    }
+
+    #[test]
+    fn rs256_kid_support() {
+        let claims = serde_json::json!({
+            "sub": "user-kid",
+            "exp": future_exp(),
+        });
+
+        let token = jwt_encode(
+            &claims,
+            RSA_PRIVATE_KEY,
+            JwtAlgorithm::RS256,
+            Some("rsa-key-1"),
+        )
+        .unwrap();
+
+        let header = jsonwebtoken::decode_header(&token).unwrap();
+        assert_eq!(header.kid.as_deref(), Some("rsa-key-1"));
+
+        let config = JwtConfig {
+            algorithm: JwtAlgorithm::RS256,
+            secret: Zeroizing::new(RSA_PUBLIC_KEY.to_vec()),
+            previous_secret: None,
+            signing_key: None,
+            key_id: Some("rsa-key-1".to_string()),
+            issuer: String::new(),
+            audience: String::new(),
+            cookie_name: "access_token".to_string(),
+        };
+        assert!(jwt_decode(&token, &config).is_ok());
+    }
+
+    // --- ES256 tests ---
+
+    const EC_PRIVATE_KEY: &[u8] = include_bytes!("../../../tests/keys/ec_private.pem");
+    const EC_PUBLIC_KEY: &[u8] = include_bytes!("../../../tests/keys/ec_public.pem");
+    const EC2_PUBLIC_KEY: &[u8] = include_bytes!("../../../tests/keys/ec2_public.pem");
+
+    #[test]
+    fn es256_encode_decode_roundtrip() {
+        let claims = serde_json::json!({
+            "sub": "user-es256",
+            "exp": future_exp(),
+            "iss": "test",
+            "aud": "test-api",
+        });
+
+        let token = jwt_encode(&claims, EC_PRIVATE_KEY, JwtAlgorithm::ES256, None).unwrap();
+
+        let config = JwtConfig {
+            algorithm: JwtAlgorithm::ES256,
+            secret: Zeroizing::new(EC_PUBLIC_KEY.to_vec()),
+            previous_secret: None,
+            signing_key: None,
+            key_id: None,
+            issuer: "test".to_string(),
+            audience: "test-api".to_string(),
+            cookie_name: "access_token".to_string(),
+        };
+        let decoded = jwt_decode(&token, &config).unwrap();
+        assert_eq!(decoded["sub"], "user-es256");
+    }
+
+    #[test]
+    fn es256_wrong_key_rejected() {
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+        });
+
+        let token = jwt_encode(&claims, EC_PRIVATE_KEY, JwtAlgorithm::ES256, None).unwrap();
+
+        let config = JwtConfig {
+            algorithm: JwtAlgorithm::ES256,
+            secret: Zeroizing::new(EC2_PUBLIC_KEY.to_vec()),
+            previous_secret: None,
+            signing_key: None,
+            key_id: None,
+            issuer: String::new(),
+            audience: String::new(),
+            cookie_name: "access_token".to_string(),
+        };
+        let result = jwt_decode(&token, &config);
+        assert!(matches!(result, Err(JwtError::InvalidSignature)));
+    }
+
+    #[test]
+    fn es256_key_rotation() {
+        let claims = serde_json::json!({
+            "sub": "user-ec-rotation",
+            "exp": future_exp(),
+        });
+
+        let token = jwt_encode(&claims, EC_PRIVATE_KEY, JwtAlgorithm::ES256, None).unwrap();
+
+        let config = JwtConfig {
+            algorithm: JwtAlgorithm::ES256,
+            secret: Zeroizing::new(EC2_PUBLIC_KEY.to_vec()),
+            previous_secret: Some(Zeroizing::new(EC_PUBLIC_KEY.to_vec())),
+            signing_key: None,
+            key_id: None,
+            issuer: String::new(),
+            audience: String::new(),
+            cookie_name: "access_token".to_string(),
+        };
+        let result = jwt_decode(&token, &config);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap()["sub"], "user-ec-rotation");
+    }
+
+    #[test]
+    fn es256_kid_support() {
+        let claims = serde_json::json!({
+            "sub": "user-kid",
+            "exp": future_exp(),
+        });
+
+        let token = jwt_encode(
+            &claims,
+            EC_PRIVATE_KEY,
+            JwtAlgorithm::ES256,
+            Some("ec-key-1"),
+        )
+        .unwrap();
+
+        let header = jsonwebtoken::decode_header(&token).unwrap();
+        assert_eq!(header.kid.as_deref(), Some("ec-key-1"));
+
+        let config = JwtConfig {
+            algorithm: JwtAlgorithm::ES256,
+            secret: Zeroizing::new(EC_PUBLIC_KEY.to_vec()),
+            previous_secret: None,
+            signing_key: None,
+            key_id: Some("ec-key-1".to_string()),
+            issuer: String::new(),
+            audience: String::new(),
+            cookie_name: "access_token".to_string(),
+        };
+        assert!(jwt_decode(&token, &config).is_ok());
+    }
+
+    // --- Cross-algorithm security tests ---
+
+    #[test]
+    fn cross_algorithm_hs256_token_rejected_by_rs256() {
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+        });
+
+        // Encode with HS256
+        let token = jwt_encode(&claims, &test_secret(), JwtAlgorithm::HS256, None).unwrap();
+
+        // Try to decode with RS256 config
+        let config = JwtConfig {
+            algorithm: JwtAlgorithm::RS256,
+            secret: Zeroizing::new(RSA_PUBLIC_KEY.to_vec()),
+            previous_secret: None,
+            signing_key: None,
+            key_id: None,
+            issuer: String::new(),
+            audience: String::new(),
+            cookie_name: "access_token".to_string(),
+        };
+        let result = jwt_decode(&token, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cross_algorithm_rs256_token_rejected_by_es256() {
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "exp": future_exp(),
+        });
+
+        let token = jwt_encode(&claims, RSA_PRIVATE_KEY, JwtAlgorithm::RS256, None).unwrap();
+
+        let config = JwtConfig {
+            algorithm: JwtAlgorithm::ES256,
+            secret: Zeroizing::new(EC_PUBLIC_KEY.to_vec()),
+            previous_secret: None,
+            signing_key: None,
+            key_id: None,
+            issuer: String::new(),
+            audience: String::new(),
+            cookie_name: "access_token".to_string(),
+        };
+        let result = jwt_decode(&token, &config);
+        assert!(result.is_err());
+    }
+
+    // --- TopicAcl tests ---
+
+    #[test]
+    fn test_topic_acl_allow_only() {
+        let acl = TopicAcl {
+            allow: vec!["chat.*".to_string(), "events".to_string()],
+            deny: vec![],
+        };
+        assert!(acl.is_allowed("chat.general"));
+        assert!(acl.is_allowed("chat.private"));
+        assert!(acl.is_allowed("events"));
+        assert!(!acl.is_allowed("admin.settings"));
+        assert!(!acl.is_allowed("other.topic"));
+    }
+
+    #[test]
+    fn test_topic_acl_deny_precedence() {
+        let acl = TopicAcl {
+            allow: vec!["chat.*".to_string()],
+            deny: vec!["chat.secret".to_string()],
+        };
+        assert!(acl.is_allowed("chat.general"));
+        assert!(!acl.is_allowed("chat.secret"));
+    }
+
+    #[test]
+    fn test_topic_acl_empty_allow() {
+        // Empty allow = allow all (only deny filters)
+        let acl = TopicAcl {
+            allow: vec![],
+            deny: vec!["admin.*".to_string()],
+        };
+        assert!(acl.is_allowed("chat.general"));
+        assert!(acl.is_allowed("events"));
+        assert!(!acl.is_allowed("admin.settings"));
+    }
+
+    #[test]
+    fn test_topic_acl_glob_matching() {
+        let acl = TopicAcl {
+            allow: vec!["user.*.messages".to_string(), "broadcast".to_string()],
+            deny: vec![],
+        };
+        assert!(acl.is_allowed("user.123.messages"));
+        assert!(acl.is_allowed("user.abc.messages"));
+        assert!(acl.is_allowed("broadcast"));
+        assert!(!acl.is_allowed("user.123.settings"));
+    }
+
+    #[test]
+    fn test_extract_topic_acl_present() {
+        let claims = serde_json::json!({
+            "sub": "user1",
+            "wse_topics": {
+                "allow": ["chat.*", "events"],
+                "deny": ["admin.*"]
+            }
+        });
+        let acl = extract_topic_acl(&claims).unwrap();
+        assert_eq!(acl.allow, vec!["chat.*", "events"]);
+        assert_eq!(acl.deny, vec!["admin.*"]);
+    }
+
+    #[test]
+    fn test_extract_topic_acl_missing() {
+        let claims = serde_json::json!({"sub": "user1"});
+        assert!(extract_topic_acl(&claims).is_none());
+    }
+
+    #[test]
+    fn test_extract_topic_acl_partial() {
+        // Only allow, no deny
+        let claims = serde_json::json!({
+            "sub": "user1",
+            "wse_topics": {"allow": ["chat.*"]}
+        });
+        let acl = extract_topic_acl(&claims).unwrap();
+        assert_eq!(acl.allow, vec!["chat.*"]);
+        assert!(acl.deny.is_empty());
+    }
+
+    #[test]
+    fn test_no_acl_backward_compat() {
+        // No wse_topics claim = no ACL = extract returns None
+        let claims = serde_json::json!({"sub": "user1", "iss": "myapp"});
+        assert!(extract_topic_acl(&claims).is_none());
+    }
+
+    #[test]
+    fn configured_issuer_and_audience_are_required() {
+        let config = hs256_config();
+        let claims_no_iss = serde_json::json!({
+            "sub": "u", "exp": future_exp(), "aud": config.audience.clone(),
+        });
+        let token = jwt_encode(&claims_no_iss, &test_secret(), JwtAlgorithm::HS256, None).unwrap();
+        assert!(
+            jwt_decode(&token, &config).is_err(),
+            "token without iss accepted"
+        );
+
+        let claims_no_aud = serde_json::json!({
+            "sub": "u", "exp": future_exp(), "iss": config.issuer.clone(),
+        });
+        let token = jwt_encode(&claims_no_aud, &test_secret(), JwtAlgorithm::HS256, None).unwrap();
+        assert!(
+            jwt_decode(&token, &config).is_err(),
+            "token without aud accepted"
+        );
+
+        let claims_bad_aud = serde_json::json!({
+            "sub": "u", "exp": future_exp(), "iss": config.issuer.clone(), "aud": 1,
+        });
+        let token = jwt_encode(&claims_bad_aud, &test_secret(), JwtAlgorithm::HS256, None).unwrap();
+        assert!(
+            jwt_decode(&token, &config).is_err(),
+            "token with aud=1 accepted"
+        );
+    }
+
+    #[test]
+    fn pem_key_is_not_an_hs256_secret() {
+        let pem = b"-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE\n-----END PUBLIC KEY-----\n";
+        let claims = serde_json::json!({"sub": "u", "exp": future_exp()});
+        assert!(jwt_encode(&claims, pem, JwtAlgorithm::HS256, None).is_err());
+    }
+
+    #[test]
+    fn malformed_topic_acl_denies_everything() {
+        for claim in [
+            serde_json::json!(["chat.*"]),
+            serde_json::json!({"allow": "chat.*"}),
+            serde_json::json!({"allow": [1, 2]}),
+            serde_json::json!({"deny": "admin.*"}),
+            serde_json::json!({"allow": []}),
+            serde_json::json!({}),
+            serde_json::json!({"allowed": ["chat.*"]}),
+            serde_json::json!({"allow": ["chat.*"], "denied": ["chat.secret"]}),
+        ] {
+            let acl = extract_topic_acl(&serde_json::json!({"wse_topics": claim.clone()}))
+                .expect("an ACL must be installed");
+            assert!(!acl.is_allowed("chat.room"), "{claim} allowed chat.room");
+            assert!(!acl.is_allowed("a.b:c"), "{claim} allowed a.b:c");
+        }
+    }
+
+    #[test]
+    fn exp_is_read_as_the_validation_reads_it() {
+        assert_eq!(
+            exp_seconds(&serde_json::json!({"exp": 1_900_000_000})),
+            Some(1_900_000_000)
+        );
+        // time.time() + 900, rounded as the validation rounds it.
+        assert_eq!(
+            exp_seconds(&serde_json::json!({"exp": 1_900_000_000.6})),
+            Some(1_900_000_001)
+        );
+        assert_eq!(
+            exp_seconds(&serde_json::json!({"exp": 1_900_000_000.4})),
+            Some(1_900_000_000)
+        );
+        assert_eq!(exp_seconds(&serde_json::json!({"exp": -5.0})), None);
+        assert_eq!(exp_seconds(&serde_json::json!({"exp": "1900000000"})), None);
+        assert_eq!(exp_seconds(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn a_token_with_a_fractional_exp_validates() {
+        let config = hs256_config();
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+            + 900.25;
+        let claims = serde_json::json!({
+            "sub": "user", "exp": exp, "iss": config.issuer, "aud": config.audience,
+        });
+        let token = jwt_encode(&claims, &test_secret(), JwtAlgorithm::HS256, None).unwrap();
+        let decoded = jwt_decode(&token, &config).unwrap();
+        assert_eq!(exp_seconds(&decoded), Some(exp.round() as u64));
+    }
+
+    #[test]
+    fn topic_acl_without_allow_key_allows_what_is_not_denied() {
+        let acl =
+            extract_topic_acl(&serde_json::json!({"wse_topics": {"deny": ["admin.*"]}})).unwrap();
+        assert!(acl.is_allowed("chat.room"));
+        assert!(!acl.is_allowed("admin.users"));
+    }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn valid_token() -> String {
+            let config = hs256_config();
+            let claims = serde_json::json!({
+                "sub": "user", "exp": future_exp(),
+                "iss": config.issuer, "aud": config.audience,
+            });
+            jwt_encode(&claims, &test_secret(), JwtAlgorithm::HS256, None).unwrap()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(2000))]
+
+            #[test]
+            fn garbage_tokens_are_rejected(token in ".{0,600}") {
+                prop_assert!(jwt_decode(&token, &hs256_config()).is_err());
+            }
+
+            #[test]
+            fn any_changed_character_is_rejected(pos in any::<prop::sample::Index>(), alt in "[A-Za-z0-9_-]") {
+                let token = valid_token();
+                let i = pos.index(token.len());
+                let original = &token[i..=i];
+                prop_assume!(original != "." && original != alt.as_str());
+                let mut mutated = token.clone();
+                mutated.replace_range(i..=i, &alt);
+                prop_assert!(jwt_decode(&mutated, &hs256_config()).is_err());
+            }
+        }
+
+        #[test]
+        fn the_unchanged_token_is_accepted() {
+            assert!(jwt_decode(&valid_token(), &hs256_config()).is_ok());
+        }
+    }
+}

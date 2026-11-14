@@ -1,5 +1,21 @@
 # `cargo xtask <command>` runs the repository checks (xtask/src/main.rs).
-# Only an alias lives here: build flags for the extension do not belong in a
-# committed cargo config (see rust/.cargo/config.toml).
 [alias]
 xtask = "run --quiet --locked --manifest-path xtask/Cargo.toml --"
+
+# No build flags are committed here on purpose.
+#
+# maturin applies this file to every wheel it builds and the sdist ships it,
+# so a `target-cpu=native` here would tie published wheels (and every sdist
+# install) to the CPU of the machine that built them: SIGILL on older CPUs,
+# and a failed build when cross-compiling (x86_64 macOS from an arm64 Mac).
+# The release preflight (.github/scripts/release_preflight.py cargo-config)
+# refuses target-cpu / target-feature in this file.
+#
+# CPU tuning stays a local opt-in for benchmarks on your own machine:
+#
+#   RUSTFLAGS="-C target-cpu=native" maturin develop --release
+#   RUSTFLAGS="-C target-cpu=native" cargo bench -p wse
+#
+# It turns CPU features on at compile time. ahash's AES-NI hashing on x86_64
+# needs that; zlib-rs (adler32/crc32, deflate matching) and httparse (header
+# scanning) also pick AVX2/NEON at run time in the portable build.

@@ -153,7 +153,7 @@ fn run_names(root: &Path) -> bool {
 fn run_arch(root: &Path) -> bool {
     let sources: Vec<(String, String)> = repo_files(root)
         .into_iter()
-        .filter(|p| p.starts_with("rust/src/") && p.ends_with(".rs"))
+        .filter(|p| p.starts_with("crates/") && p.ends_with(".rs"))
         .filter_map(|p| std::fs::read_to_string(root.join(&p)).ok().map(|s| (p, s)))
         .collect();
     let allow = std::fs::read_to_string(root.join("xtask/arch_allow.toml")).unwrap_or_default();

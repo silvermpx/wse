@@ -7,7 +7,7 @@ Thank you for your interest in contributing to WSE. This guide covers the develo
 ### Prerequisites
 
 - Python 3.12+ for the server (the Python client supports 3.11+)
-- Rust 1.95+ (stable; the minimum is `rust-version` in `rust/Cargo.toml`)
+- Rust 1.95+ (stable; the minimum is `rust-version` in `Cargo.toml`)
 - Node.js 22 for the TS client's tests and build (the published package runs on Node 18+)
 - maturin 1.16+ (`pip install maturin`)
 
@@ -31,8 +31,9 @@ npm install
 ### Running Tests
 
 ```bash
-# Rust tests
-cargo test --manifest-path rust/Cargo.toml
+# Rust tests: the engine alone, then with its Python module
+cargo test -p wse
+cargo test -p wse --features python
 
 # Python server tests
 pytest tests/
@@ -79,7 +80,8 @@ the one result a pull request needs.
 
 ```
 wse/
-  rust/                  # Rust core (server, cluster, presence, recovery, PyO3 bindings)
+  crates/wse/            # The engine (server, cluster, presence, recovery); its Python module behind `python`
+  crates/wse-py/         # The Python extension built from it (wse-server on PyPI)
   wse_server/            # Python server package (thin wrapper over Rust)
   python-client/         # Python client SDK (wse-client on PyPI)
   ts-client/             # TypeScript/React client SDK (wse-client on npm)
@@ -95,7 +97,7 @@ wse/
 ### Rust
 
 - Format with `cargo fmt` before every commit.
-- Pass `cargo clippy -- -D warnings` with zero warnings.
+- Pass `cargo clippy --workspace --all-targets -- -D warnings` and `cargo clippy -p wse --all-targets -- -D warnings` with zero warnings.
 - Use `DashMap` for concurrent state, `crossbeam` for channels.
 - Prefer `Arc<Bytes>` for shared message payloads (zero-copy broadcast).
 

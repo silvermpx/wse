@@ -234,7 +234,7 @@ with RustWSEServer("0.0.0.0", 5007) as server:   # start() ... stop()
     ...
 ```
 
-Rust-side logs go to standard output at level `info`; set `RUST_LOG` (for example `RUST_LOG=_wse_accel=debug`) to change it.
+Rust-side logs go to standard output at level `info`; set `RUST_LOG` (for example `RUST_LOG=wse=debug`) to change it.
 
 ### Event Handling
 

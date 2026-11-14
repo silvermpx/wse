@@ -26,16 +26,16 @@ use crate::lexer::{self, Lang};
 
 /// Engine sources: what a native wse-rs keeps.
 fn is_engine(path: &str) -> bool {
-    let engine_dirs = ["rust/src/wse/cluster/", "rust/src/wse/server/"];
+    let engine_dirs = ["crates/wse/src/cluster/", "crates/wse/src/server/"];
     let engine_files = [
-        "rust/src/crypto.rs",
-        "rust/src/jwt.rs",
-        "rust/src/wse/msgpack.rs",
-        "rust/src/wse/presence.rs",
-        "rust/src/wse/recovery.rs",
-        "rust/src/wse/reliability.rs",
+        "crates/wse/src/crypto.rs",
+        "crates/wse/src/jwt.rs",
+        "crates/wse/src/msgpack.rs",
+        "crates/wse/src/presence.rs",
+        "crates/wse/src/recovery.rs",
+        "crates/wse/src/reliability.rs",
     ];
-    if path.starts_with("rust/src/wse/server/py/") || path == "rust/src/wse/server/mod.rs" {
+    if path.starts_with("crates/wse/src/server/py/") || path == "crates/wse/src/server/mod.rs" {
         // The Python layer, and the module root that wires it in.
         return false;
     }
@@ -56,7 +56,7 @@ fn python_layer_pattern() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"\bpylock\b|\bserver::py\b|\bsuper::py\b|\bcrate::jwt_py\b|\bcrate::wse::(?:compression|filters|queue|rate_limiter|security|sequencer|transformer)\b",
+            r"\bpylock\b|\bserver::py\b|\bsuper::py\b|\bcrate::jwt_py\b|\bcrate::(?:compression|filters|queue|rate_limiter|security|sequencer|transformer|python)\b",
         )
         .expect("a fixed pattern")
     })
@@ -81,7 +81,7 @@ pub struct Report {
     pub allowed: usize,
 }
 
-/// `sources`: (repository path, contents) of every Rust file under rust/src.
+/// `sources`: (repository path, contents) of every Rust file under crates/.
 pub fn check(sources: &[(String, String)], allow_toml: &str) -> Result<Report, String> {
     let allow: AllowFile =
         toml::from_str(allow_toml).map_err(|e| format!("xtask/arch_allow.toml: {e}"))?;
@@ -102,7 +102,7 @@ pub fn check(sources: &[(String, String)], allow_toml: &str) -> Result<Report, S
         let lines = lexer::split(src, Lang::Rust);
         let in_tests = path.ends_with("/tests.rs");
         for line in &lines {
-            if path.starts_with("rust/src/wse/server/py/") && line.code.contains("#[pymethods]") {
+            if path.starts_with("crates/wse/src/server/py/") && line.code.contains("#[pymethods]") {
                 pymethods.push(format!("{path}:{}", line.number));
             }
             if !is_engine(path) || in_tests {
@@ -150,7 +150,7 @@ pub fn check(sources: &[(String, String)], allow_toml: &str) -> Result<Report, S
         }
     }
 
-    let expected = "rust/src/wse/server/py/mod.rs";
+    let expected = "crates/wse/src/server/py/mod.rs";
     let elsewhere: Vec<&String> = pymethods
         .iter()
         .filter(|p| !p.starts_with(expected))
@@ -175,7 +175,7 @@ mod tests {
 
     fn one_pymethods() -> (String, String) {
         src(
-            "rust/src/wse/server/py/mod.rs",
+            "crates/wse/src/server/py/mod.rs",
             "#[pymethods]\nimpl RustWSEServer {}\n",
         )
     }
@@ -185,11 +185,11 @@ mod tests {
         let sources = vec![
             one_pymethods(),
             src(
-                "rust/src/wse/cluster/peer.rs",
+                "crates/wse/src/cluster/peer.rs",
                 "use pyo3::prelude::*;\n// pyo3 in a comment is fine\nlet s = \"crate::jwt_py\";\nuse crate::jwt_py::rust_jwt_decode;\nuse crate::jwt::JwtConfig;\n",
             ),
             src(
-                "rust/src/wse/server/py/messaging.rs",
+                "crates/wse/src/server/py/messaging.rs",
                 "use pyo3::prelude::*;\n",
             ),
         ];
@@ -203,17 +203,17 @@ mod tests {
     fn allowances_need_a_reason_and_go_stale() {
         let sources = vec![
             one_pymethods(),
-            src("rust/src/wse/server/state.rs", "use pyo3::Py;\n"),
+            src("crates/wse/src/server/state.rs", "use pyo3::Py;\n"),
         ];
         let allow = r#"
 [[allow]]
 rule = "engine-pyo3"
-file = "rust/src/wse/server/state.rs"
+file = "crates/wse/src/server/state.rs"
 reason = "callbacks"
 
 [[allow]]
 rule = "engine-pyo3"
-file = "rust/src/wse/server/connection.rs"
+file = "crates/wse/src/server/connection.rs"
 reason = "gone already"
 "#;
         let report = check(&sources, allow).unwrap();
@@ -230,7 +230,7 @@ reason = "gone already"
         let sources = vec![
             one_pymethods(),
             src(
-                "rust/src/wse/server/py/extra.rs",
+                "crates/wse/src/server/py/extra.rs",
                 "#[pymethods]\nimpl RustWSEServer {}\n",
             ),
         ];

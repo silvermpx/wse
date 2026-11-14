@@ -1,0 +1,116 @@
+// =============================================================================
+// WSE Rust WebSocket server: tokio + tungstenite + PyO3.
+//
+// Key optimizations:
+//   - send_event(): full outbound pipeline in Rust (envelope+serialize+compress+send)
+//   - Drain mode: Python polls Rust for batched inbound events (1 GIL per batch)
+//   - Ping/pong handled entirely in Rust (zero Python round-trips)
+//   - Write coalescing: feed() + batch try_recv() + single flush()
+//   - TCP_NODELAY on accept
+// =============================================================================
+
+//! The WebSocket server.
+//!
+//! # Module map
+//!
+//! Engine, plain Rust (the part a native `wse-rs` library would keep):
+//!
+//! - `frames`: WebSocket frame types, pre-framed encoding, the per-connection
+//!   broadcast queue and its vectored writer.
+//! - `state`: what every task shares: connection handles, queue groups, inbound
+//!   events, server commands and `SharedState`.
+//! - `messages`: protocol messages the server builds itself (server_hello,
+//!   server_ready, errors, presence events) and the category helpers.
+//! - `handshake`: WebSocket upgrade helpers: the auth rejection, the
+//!   pre-handshake cap and its guard.
+//! - `e2e`: end-to-end encryption (ECDH P-256 key exchange, AES-GCM-256).
+//! - `connection`: one client connection, from the upgrade to the cleanup.
+//! - `fanout`: topic glob matching, the topic index, delivery on every core
+//!   (one lane per core, each with its own task), recovery stamping.
+//! - `signing`: signed messages: client keys, the server's signing key, the
+//!   checks a client's signed message passes.
+//! - `commands`: the command processor that executes `ServerCommand`s.
+//! - `handler`: what the application hears of its clients (`Handler`).
+//!
+//! Python layer, PyO3:
+//!
+//! - `py`: the `RustWSEServer` class. `py/mod.rs` holds the class, its
+//!   constructor parameters and the single `#[pymethods]` block, so every
+//!   Python-visible signature, default and docstring is in one place. Apart
+//!   from the constructor and the short accessors, each method body is an
+//!   `*_impl` helper in a topic file: `py/lifecycle.rs`, `messaging.rs`,
+//!   `inbound.rs`, `subscriptions.rs`, `presence.rs`, `cluster.rs` and
+//!   `metrics.rs`; `convert.rs` converts between Python objects and JSON,
+//!   `callbacks.rs` fires the callback-mode callbacks, `handler.rs` is the
+//!   `Handler` the Python server runs its connections with.
+//!
+//! The crate-visible items are re-exported below, so `server::X` paths stay as
+//! they were. Sibling modules import them through these re-exports and import
+//! module-internal helpers (`pub(super)`) from their own module.
+//!
+//! # Engine vs Python layer
+//!
+//! The engine has no PyO3: what the application hears of its connections
+//! goes through `handler::Handler`, called on each connection's task in
+//! order (connect, messages, signed messages, disconnect). `py::handler`
+//! implements it for Python: drain mode queues the events for
+//! `drain_inbound()`, callback mode runs the callbacks one after another for
+//! each connection on the blocking pool.
+//!
+//! Engine code that still lives in the Python layer:
+//!
+//! - `py::lifecycle::start_impl` builds the runtime: the accept loop with
+//!   cluster protocol detection, the recovery cleanup, the presence TTL sweep
+//!   and the ping / zombie / slow-consumer task. `start_impl` and `stop_impl`
+//!   take the lifecycle lock through the Python-aware `crate::pylock::lock`.
+//! - `py::messaging::send_event_impl` holds the outbound pipeline (dedup, rate
+//!   limit, envelope, msgpack / zlib / E2E) next to the `PyDict` conversion.
+//! - `py::subscriptions` and `py::presence` hold subscribe / unsubscribe, queue
+//!   groups, cluster interest refcounts, recovery replay and presence tracking.
+//! - `RustWSEServer::build` (`py/mod.rs`) validates the JWT keys and builds the
+//!   `SharedState` configuration, reporting errors as Python exceptions.
+
+mod commands;
+pub(crate) mod config;
+mod connection;
+mod e2e;
+pub(crate) mod e2e_session;
+mod fanout;
+mod frames;
+pub(crate) mod handler;
+mod handshake;
+mod messages;
+pub(crate) mod publisher;
+#[cfg(feature = "python")]
+mod py;
+mod run;
+mod signing;
+mod state;
+pub(crate) mod subscribe;
+
+#[cfg(feature = "python")]
+pub use py::RustWSEServer;
+
+pub use config::{Config, ConfigError, JwtSettings, PresenceSettings, RecoverySettings};
+pub(crate) use e2e::E2E_KEY_INFO;
+pub(crate) use fanout::{
+    Fanout, Outgoing, TopicAcl, TopicIndex, count_message, glob_match, is_pattern,
+    stamp_recovery_fields, unstamped,
+};
+pub(crate) use frames::{BroadcastQueue, WsFrame, pre_frame_text};
+pub use handler::{Connect, Handler, Inbound, Presence};
+pub(crate) use handshake::normalize_origin;
+pub(crate) use messages::format_presence_msg;
+pub use publisher::{Error, Publisher};
+pub(crate) use state::{
+    CLOSE_E2E_BAD_FRAME, CLOSE_E2E_EXHAUSTED, CLOSE_E2E_UNSUPPORTED, CLOSE_GOING_AWAY, CLOSE_GRACE,
+    CLOSE_IDLE, CLOSE_NORMAL, CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED, CLOSE_TRY_AGAIN_LATER,
+    Closer, Commands, ConnectionHandle, QueueGroup, ServerCommand, SharedState, Tally,
+};
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests;

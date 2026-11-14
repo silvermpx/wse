@@ -69,7 +69,7 @@ Changelog = "https://github.com/silvermpx/wse/releases"
 [tool.maturin]
 features = ["pyo3/abi3-py312"]
 module-name = "wse_server._wse_accel"
-manifest-path = "rust/Cargo.toml"
+manifest-path = "crates/wse-py/Cargo.toml"
 
 [tool.ruff]
 target-version = "py312"

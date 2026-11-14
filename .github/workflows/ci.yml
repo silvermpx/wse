@@ -44,11 +44,18 @@ jobs:
         with:
           filters: |
             rust:
-              - 'rust/**'
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'tests/vectors/**'
+              - 'tests/keys/**'
               - 'deny.toml'
               - '.github/workflows/ci.yml'
             server:
-              - 'rust/**'
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
               - 'wse_server/**'
               - 'tests/**'
               - 'pyproject.toml'
@@ -283,13 +290,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
-          workspaces: "rust -> target"
+          workspaces: ". -> target"
 
       - name: Format check
-        run: cargo fmt --manifest-path rust/Cargo.toml -- --check
+        run: cargo fmt --all -- --check
 
+      # The engine alone (what crates.io has) and with the Python module.
       - name: Clippy
-        run: cargo clippy --manifest-path rust/Cargo.toml --locked --all-targets -- -D warnings
+        run: |
+          cargo clippy -p wse --locked --all-targets -- -D warnings
+          cargo clippy --workspace --locked --all-targets -- -D warnings
 
   # ---------------------------------------------------------------------------
   # Rust: unit tests
@@ -318,10 +328,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
-          workspaces: "rust -> target"
+          workspaces: ". -> target"
 
       - name: cargo test
-        run: cargo test --manifest-path rust/Cargo.toml --locked
+        run: |
+          cargo test -p wse --locked
+          cargo test -p wse --locked --features python
         env:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
 
@@ -351,16 +363,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
-          workspaces: "rust -> target"
+          workspaces: ". -> target"
           key: fips
 
       - name: cargo test --features fips
-        run: cargo test --manifest-path rust/Cargo.toml --locked --features fips
+        run: cargo test -p wse --locked --features fips,python
         env:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
 
   # ---------------------------------------------------------------------------
-  # Rust: the declared minimum version (rust-version in rust/Cargo.toml),
+  # Rust: the declared minimum version (rust-version in Cargo.toml),
   # which is what an sdist install needs at least
   # ---------------------------------------------------------------------------
   rust-msrv:
@@ -376,9 +388,9 @@ jobs:
       - name: Read rust-version
         id: msrv
         run: |
-          msrv="$(sed -n 's/^rust-version *= *"\([0-9.]*\)".*/\1/p' rust/Cargo.toml)"
+          msrv="$(sed -n 's/^rust-version *= *"\([0-9.]*\)".*/\1/p' Cargo.toml)"
           if [ -z "$msrv" ]; then
-            echo "::error file=rust/Cargo.toml::no rust-version found"
+            echo "::error file=Cargo.toml::no rust-version found"
             exit 1
           fi
           echo "Declared MSRV: $msrv"
@@ -395,10 +407,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
-          workspaces: "rust -> target"
+          workspaces: ". -> target"
 
       - name: cargo check (MSRV)
-        run: cargo +"$MSRV" check --manifest-path rust/Cargo.toml --locked
+        run: cargo +"$MSRV" check --workspace --locked
         env:
           MSRV: ${{ steps.msrv.outputs.version }}
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
@@ -433,7 +445,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
-          workspaces: "rust -> target"
+          workspaces: ". -> target"
 
       # cryptography plays the client side of the E2E key exchange test;
       # prometheus-client runs the collector test (wse-server[prometheus]).
@@ -515,10 +527,10 @@ jobs:
 
       # cargo-deny (deny.toml): advisories, yanked crates, licenses, sources
       # and wildcard versions, for the extension, xtask and the benchmarks.
-      - name: Rust dependencies (extension)
+      - name: Rust dependencies (workspace)
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # v2.1.1
         with:
-          manifest-path: rust/Cargo.toml
+          manifest-path: Cargo.toml
           command: check
 
       - name: Rust dependencies (xtask)

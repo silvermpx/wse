@@ -17,6 +17,7 @@
 - **An E2E session is opened first.** A client that wants one announces it (`e2e=1` in the upgrade URL) and sends `client_hello` at once; the server tells the application of the connection, and sends `server_ready` sealed, only after the session exists. The 3.0 clients do this; a client of your own follows [PROTOCOL.md](PROTOCOL.md#end-to-end-encryption).
 - **The rate limit applies to what clients send**, as documented: messages over it are dropped with a `RATE_LIMITED` error and a client that keeps on is closed with 4429. `send_event()` is no longer throttled.
 - **Connections close when their token expires** (code 4403); the clients reconnect with a fresh token.
+- **The log target is `wse`**: `RUST_LOG=wse=debug` instead of `RUST_LOG=_wse_accel=debug`.
 - **New close codes**: 1013 (slow consumer), 4403, 4408 (idle), 4429, 4800, 4802, 4803. See [PROTOCOL.md](PROTOCOL.md#websocket-close-codes).
 - **`on_connect(conn_id, user_id)`** in callback mode gets the validated user id (the Cookie header only without `jwt_secret`), and a connection's callbacks run in order on worker threads.
 - **`subscribe_connection()` returns the topics it took.** Topic names are checked (not empty, at most 256 bytes, no control characters) and a connection holds at most 16 patterns.

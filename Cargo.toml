@@ -1,0 +1,21 @@
+# The WSE workspace: the engine (crates/wse, on crates.io as `wse`) and the
+# Python extension built from it (crates/wse-py, the `wse-server` package).
+[workspace]
+members = ["crates/wse", "crates/wse-py"]
+# Their own lock files and tools: run on their own.
+exclude = ["benchmarks/rust-bench", "xtask"]
+resolver = "3"
+
+[workspace.package]
+version = "3.0.0"
+edition = "2024"
+license = "MIT"
+# try_update on the atomics is stable since 1.95.
+rust-version = "1.95"
+repository = "https://github.com/silvermpx/wse"
+homepage = "https://github.com/silvermpx/wse"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
