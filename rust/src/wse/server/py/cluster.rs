@@ -181,7 +181,7 @@ impl RustWSEServer {
             (
                 inbound_links,
                 self.shared.presence.clone(),
-                self.cmd_tx.load_full().map(|tx| (*tx).clone()),
+                self.cmd_tx.load_full().map(|tx| tx.commands.clone()),
             ),
         ));
 

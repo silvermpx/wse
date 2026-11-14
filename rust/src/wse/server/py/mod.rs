@@ -28,8 +28,7 @@ use pyo3::types::{PyDict, PyList};
 use zeroize::Zeroizing;
 
 use crate::jwt::{self, JwtConfig};
-use crate::wse::server::state::DeduplicationState;
-use crate::wse::server::{Commands, ServerCommand, SharedState, SharedStateConfig};
+use crate::wse::server::{Publisher, ServerCommand, SharedState, SharedStateConfig};
 
 // ---------------------------------------------------------------------------
 // PyO3 class
@@ -49,47 +48,23 @@ pub struct RustWSEServer {
     shared: Arc<SharedState>,
     /// Command channel into the running server, `None` while stopped. Loaded on
     /// every send and broadcast, replaced only by `start()` and `stop()`.
-    cmd_tx: arc_swap::ArcSwapOption<Commands>,
+    cmd_tx: arc_swap::ArcSwapOption<Publisher>,
     /// The server thread while one exists. Its lock also serializes `start()`
     /// and `stop()` against each other.
     lifecycle: std::sync::Mutex<Option<thread::JoinHandle<()>>>,
     running: Arc<AtomicBool>,
-    dedup: Arc<std::sync::Mutex<DeduplicationState>>,
     rt_handle: parking_lot::RwLock<Option<tokio::runtime::Handle>>,
     started_at: parking_lot::Mutex<Option<std::time::Instant>>,
     /// Callback mode's callbacks (`set_callbacks()`), shared with the handler.
     callbacks: Arc<handler::PyCallbacks>,
 }
 
-/// Queue a command once there is room for it in the command queue, waiting
-/// without the GIL meanwhile: the application's sends and broadcasts.
-pub(super) trait SendWaiting {
-    fn send_waiting_detached(
-        &self,
-        py: Python<'_>,
-        cmd: ServerCommand,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<ServerCommand>>;
-}
-
-impl SendWaiting for Commands {
-    fn send_waiting_detached(
-        &self,
-        py: Python<'_>,
-        cmd: ServerCommand,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<ServerCommand>> {
-        if self.is_full() {
-            py.detach(|| self.wait_for_room());
-        }
-        self.send(cmd)
-    }
-}
-
 /// The command sender of the running server, loaded from `RustWSEServer::cmd_tx`
 /// without touching its reference count.
-struct CommandTx(arc_swap::Guard<Option<Arc<Commands>>>);
+struct CommandTx(arc_swap::Guard<Option<Arc<Publisher>>>);
 
 impl std::ops::Deref for CommandTx {
-    type Target = Commands;
+    type Target = Publisher;
 
     fn deref(&self) -> &Self::Target {
         self.0
@@ -107,7 +82,7 @@ impl Drop for RustWSEServer {
                 let _ = tx.send(crate::wse::cluster::ClusterCommand::Shutdown);
             }
             if let Some(tx) = self.cmd_tx.load_full() {
-                let _ = tx.send(ServerCommand::Shutdown);
+                let _ = tx.commands.send(ServerCommand::Shutdown);
             }
         }
     }
@@ -347,11 +322,6 @@ impl RustWSEServer {
             cmd_tx: arc_swap::ArcSwapOption::empty(),
             lifecycle: std::sync::Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
-            dedup: Arc::new(std::sync::Mutex::new(DeduplicationState {
-                seen: AHashSet::with_capacity(50_000),
-                queue: std::collections::VecDeque::with_capacity(50_000),
-                max_entries: 50_000,
-            })),
             rt_handle: parking_lot::RwLock::new(None),
             started_at: parking_lot::Mutex::new(None),
             callbacks: Arc::default(),
@@ -675,10 +645,11 @@ impl RustWSEServer {
     /// disconnected.
     fn disconnect(&self, conn_id: &str) -> PyResult<()> {
         let tx = self.command_tx()?;
-        tx.send(ServerCommand::Disconnect {
-            conn_id: conn_id.to_owned(),
-        })
-        .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
+        tx.commands
+            .send(ServerCommand::Disconnect {
+                conn_id: conn_id.to_owned(),
+            })
+            .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
         Ok(())
     }
 

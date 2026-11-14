@@ -1,52 +1,40 @@
-//! Sending to one connection and broadcasting to all, to a topic or to the cluster.
+//! Sending to one connection and broadcasting to all, to a topic or to the
+//! cluster: the engine's `Publisher`, with Python's arguments and errors.
 
-use std::io::Write;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use flate2::Compression;
-use flate2::write::ZlibEncoder;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use tokio_tungstenite::tungstenite::protocol::Message;
-use uuid::Uuid;
 
+use super::RustWSEServer;
 use super::convert::pyobj_to_json;
-use super::{RustWSEServer, SendWaiting};
-use crate::wse::msgpack::serde_json_to_rmpv;
-use crate::wse::server::ServerCommand;
-use crate::wse::server::messages::{build_server_ready, inject_category, message_category};
-use crate::wse::server::signing;
+use crate::wse::server::{Error, Publisher};
+
+/// An engine error as Python sees it.
+pub(super) fn py_error(error: Error) -> PyErr {
+    match error {
+        Error::Stopped => PyRuntimeError::new_err("Channel closed"),
+        Error::NoSigningKey => PyRuntimeError::new_err("sign() needs the server's signing_key"),
+        Error::BadKey => PyValueError::new_err(error.to_string()),
+        error => PyRuntimeError::new_err(error.to_string()),
+    }
+}
+
+/// Wait without the GIL while the server's command queue is full: a
+/// publisher faster than the server is held back here.
+fn wait_for_room(py: Python<'_>, publisher: &Publisher) {
+    if publisher.is_full() {
+        py.detach(|| publisher.wait_ready());
+    }
+}
 
 impl RustWSEServer {
     pub(super) fn accept_connection_impl(&self, conn_id: &str, user_id: &str) -> PyResult<bool> {
         if self.shared.jwt_config.is_some() {
-            return Err(PyRuntimeError::new_err(
-                "this server validates tokens itself (jwt_secret) and accepts connections on \
-                 its own; accept_connection() is for applications that authenticate them",
-            ));
+            return Err(py_error(Error::AcceptsByToken));
         }
-        let tx = self.command_tx()?;
-        // Its activity entry lives from registration to cleanup.
-        if !self.shared.conn_last_activity.contains_key(conn_id) {
-            return Ok(false);
-        }
-        if let Some(ref pm) = self.shared.presence {
-            pm.register_connection(conn_id, user_id);
-            // Gone meanwhile: its cleanup may have run before the register.
-            if !self.shared.conn_last_activity.contains_key(conn_id) {
-                pm.remove_connection(conn_id);
-                return Ok(false);
-            }
-        }
-        let ready = build_server_ready(conn_id, user_id, &self.shared);
-        tx.send(ServerCommand::Accept {
-            conn_id: conn_id.to_owned(),
-            ready,
-        })
-        .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
-        Ok(true)
+        self.command_tx()?
+            .accept(conn_id, user_id)
+            .map_err(py_error)
     }
 
     pub(super) fn sign_impl(
@@ -55,18 +43,16 @@ impl RustWSEServer {
         payload: Option<&Bound<'_, PyAny>>,
         topic: Option<&str>,
     ) -> PyResult<String> {
-        let signer = self
-            .shared
-            .signer
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("sign() needs the server's signing_key"))?;
+        if self.shared.signer.is_none() {
+            return Err(py_error(Error::NoSigningKey));
+        }
         let payload = match payload {
             Some(p) if !p.is_none() => pyobj_to_json(p)?,
             _ => serde_json::Value::Null,
         };
-        signer
-            .sign_event(event_type, payload, topic, signing::now_ms())
-            .map_err(|_| PyRuntimeError::new_err("signing failed"))
+        self.shared
+            .sign(event_type, payload, topic)
+            .map_err(py_error)
     }
 
     pub(super) fn set_client_key_impl(
@@ -74,48 +60,15 @@ impl RustWSEServer {
         conn_id: &str,
         public_key: Option<&str>,
     ) -> PyResult<bool> {
-        let key = public_key
-            .map(|public_key| {
-                signing::ClientKey::from_base64(public_key).ok_or_else(|| {
-                    pyo3::exceptions::PyValueError::new_err(
-                        "public_key must be base64 of an uncompressed P-256 point (65 bytes)",
-                    )
-                })
-            })
-            .transpose()?;
-        // Its activity entry lives from registration to cleanup.
-        if !self.shared.conn_last_activity.contains_key(conn_id) {
-            return Ok(false);
-        }
-        match key {
-            None => {
-                self.shared.client_keys.remove(conn_id);
-            }
-            Some(key) => {
-                self.shared
-                    .client_keys
-                    .insert(conn_id.to_owned(), Arc::new(key));
-            }
-        }
-        // Gone meanwhile: its cleanup may have run before the insert.
-        if !self.shared.conn_last_activity.contains_key(conn_id) {
-            self.shared.client_keys.remove(conn_id);
-            return Ok(false);
-        }
-        Ok(true)
+        self.shared
+            .set_client_key(conn_id, public_key)
+            .map_err(py_error)
     }
 
     pub(super) fn send_impl(&self, py: Python<'_>, conn_id: &str, data: &str) -> PyResult<()> {
-        let tx = self.command_tx()?;
-        tx.send_waiting_detached(
-            py,
-            ServerCommand::SendText {
-                conn_id: conn_id.to_owned(),
-                data: data.to_owned(),
-            },
-        )
-        .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
-        Ok(())
+        let publisher = self.command_tx()?;
+        wait_for_room(py, &publisher);
+        publisher.send(conn_id, data).map_err(py_error)
     }
 
     pub(super) fn send_bytes_impl(
@@ -124,16 +77,9 @@ impl RustWSEServer {
         conn_id: &str,
         data: &[u8],
     ) -> PyResult<()> {
-        let tx = self.command_tx()?;
-        tx.send_waiting_detached(
-            py,
-            ServerCommand::SendBytes {
-                conn_id: conn_id.to_owned(),
-                data: data.to_vec(),
-            },
-        )
-        .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
-        Ok(())
+        let publisher = self.command_tx()?;
+        wait_for_room(py, &publisher);
+        publisher.send_bytes(conn_id, data).map_err(py_error)
     }
 
     pub(super) fn send_event_impl(
@@ -143,162 +89,46 @@ impl RustWSEServer {
         event: &Bound<'_, PyDict>,
         compression_threshold: usize,
     ) -> PyResult<usize> {
-        let cmd_tx = self.command_tx()?;
+        let publisher = self.command_tx()?;
         // A connection that is gone (or never was) gets nothing.
         if !self.shared.conn_last_activity.contains_key(conn_id) {
             return Ok(0);
         }
-
-        // Dedup: skip if this event ID was already sent
-        if let Ok(Some(id_val)) = event.get_item("id")
-            && let Ok(id_str) = id_val.extract::<String>()
-        {
-            // Dedup is per (connection, id): the SAME event id delivered to a
-            // DIFFERENT connection is a legitimate distinct send and must not be
-            // dropped (the set was previously keyed by id alone, so send_event to
-            // conn B silently returned 0 if conn A had already received that id).
-            let key = format!("{conn_id}\0{id_str}");
-            let mut dedup = self.dedup.lock().unwrap();
-            if !dedup.seen.insert(key.clone()) {
-                return Ok(0); // duplicate to THIS connection, skip serialize+send
-            }
-            dedup.queue.push_back(key);
-            while dedup.queue.len() > dedup.max_entries {
-                if let Some(old) = dedup.queue.pop_front() {
-                    dedup.seen.remove(&old);
+        let mut fields = serde_json::Map::new();
+        for (key, value) in event.iter() {
+            let Ok(key) = key.extract::<String>() else {
+                continue;
+            };
+            // The envelope's own: `c` and `v` are the server's, `t` counts
+            // only as text.
+            match key.as_str() {
+                "c" | "v" => {}
+                "t" => {
+                    if let Ok(t) = value.extract::<String>() {
+                        fields.insert(key, serde_json::Value::String(t));
+                    }
+                }
+                _ => {
+                    fields.insert(key, pyobj_to_json(&value)?);
                 }
             }
         }
-
-        // Build serde_json map from PyDict: c first, t second, v last
-        let mut map = serde_json::Map::new();
-        let mut msg_type = String::new();
-
-        // Extract 't' value (need it to determine category)
-        if let Ok(Some(t_val)) = event.get_item("t")
-            && let Ok(s) = t_val.extract::<String>()
-        {
-            msg_type = s;
-        }
-
-        // c first (category)
-        let cat = message_category(&msg_type);
-        map.insert("c".to_string(), serde_json::Value::String(cat.to_string()));
-
-        // t second
-        if !msg_type.is_empty() {
-            map.insert("t".to_string(), serde_json::Value::String(msg_type.clone()));
-        }
-
-        // All other keys (skip t, v, c)
-        for (k, v) in event.iter() {
-            let key = match k.extract::<String>() {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            if key == "t" || key == "v" || key == "c" {
-                continue;
-            }
-            map.insert(key, pyobj_to_json(&v)?);
-        }
-
-        // Envelope: id, seq, ts
-        if !map.contains_key("id") {
-            map.insert(
-                "id".to_string(),
-                serde_json::Value::String(Uuid::now_v7().to_string()),
-            );
-        }
-
-        static GLOBAL_SEQ: AtomicU64 = AtomicU64::new(0);
-        if !map.contains_key("seq") {
-            map.insert(
-                "seq".to_string(),
-                serde_json::Value::Number(GLOBAL_SEQ.fetch_add(1, Ordering::Relaxed).into()),
-            );
-        }
-
-        if !map.contains_key("ts") {
-            let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-            map.insert("ts".to_string(), serde_json::Value::String(ts));
-        }
-
-        // v goes last
-        map.insert("v".to_string(), serde_json::Value::Number(1.into()));
-
-        // Check if this connection wants msgpack (lock-free DashMap read)
-        let use_msgpack = self
-            .shared
-            .conn_formats
-            .get(conn_id)
-            .map(|v| *v)
-            .unwrap_or(false);
-
-        // Check if this connection has E2E encryption
-        // Encrypted connections are sealed by the server on the way out, and
-        // never compressed: compression would leak through the length.
-        let e2e = self.shared.conn_encryption.contains_key(conn_id)
-            || self.shared.conn_sealed.contains(conn_id);
-        // The client's own compression wish, unless the call turns it off.
-        let client_threshold = self.shared.conn_compression.get(conn_id).map(|t| *t);
-
-        let body: Vec<u8> = if use_msgpack {
-            // Msgpack: M: prefix + rmpv serialize (binary frame)
-            let rmpv_val = serde_json_to_rmpv(&serde_json::Value::Object(map));
-            let mut buf = Vec::with_capacity(256);
-            buf.extend_from_slice(b"M:");
-            rmpv::encode::write_value(&mut buf, &rmpv_val)
-                .map_err(|e| PyRuntimeError::new_err(format!("Msgpack error: {e}")))?;
-            buf
-        } else {
-            let json = serde_json::to_vec(&serde_json::Value::Object(map))
-                .map_err(|e| PyRuntimeError::new_err(format!("JSON error: {e}")))?;
-            let threshold = client_threshold.unwrap_or(compression_threshold);
-            if !e2e && compression_threshold > 0 && threshold > 0 && json.len() > threshold {
-                // Compressed: C: prefix + zlib (binary frame)
-                let mut encoder = ZlibEncoder::new(Vec::from(&b"C:"[..]), Compression::fast());
-                encoder
-                    .write_all(&json)
-                    .map_err(|e| PyRuntimeError::new_err(format!("Compress error: {e}")))?;
-                encoder
-                    .finish()
-                    .map_err(|e| PyRuntimeError::new_err(format!("Compress finish: {e}")))?
-            } else {
-                // JSON as a binary frame (skips UTF-8 validation overhead)
-                json
-            }
-        };
-        let byte_count = body.len();
-        cmd_tx
-            .send_waiting_detached(
-                py,
-                ServerCommand::SendPrebuilt {
-                    conn_id: conn_id.to_owned(),
-                    message: Message::Binary(body.into()),
-                },
-            )
-            .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
-        Ok(byte_count)
+        wait_for_room(py, &publisher);
+        publisher
+            .send_event(conn_id, fields, compression_threshold)
+            .map_err(py_error)
     }
 
     pub(super) fn broadcast_all_impl(&self, py: Python<'_>, data: &str) -> PyResult<()> {
-        let tx = self.command_tx()?;
-        let data = inject_category(data);
-        tx.send_waiting_detached(py, ServerCommand::BroadcastText { data })
-            .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
-        Ok(())
+        let publisher = self.command_tx()?;
+        wait_for_room(py, &publisher);
+        publisher.broadcast(data).map_err(py_error)
     }
 
     pub(super) fn broadcast_all_bytes_impl(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
-        let tx = self.command_tx()?;
-        tx.send_waiting_detached(
-            py,
-            ServerCommand::BroadcastBytes {
-                data: data.to_vec(),
-            },
-        )
-        .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
-        Ok(())
+        let publisher = self.command_tx()?;
+        wait_for_room(py, &publisher);
+        publisher.broadcast_bytes(data).map_err(py_error)
     }
 
     pub(super) fn broadcast_local_impl(
@@ -307,38 +137,16 @@ impl RustWSEServer {
         topic: &str,
         data: &str,
     ) -> PyResult<()> {
-        let tx = self.command_tx()?;
-        let data = inject_category(data);
-        tx.send_waiting_detached(
-            py,
-            ServerCommand::BroadcastLocal {
-                topic: topic.to_owned(),
-                data,
-                skip_recovery: false,
-                publish: false,
-            },
-        )
-        .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
-        Ok(())
+        let publisher = self.command_tx()?;
+        wait_for_room(py, &publisher);
+        publisher.publish_local(topic, data).map_err(py_error)
     }
 
     pub(super) fn broadcast_impl(&self, py: Python<'_>, topic: &str, data: &str) -> PyResult<()> {
-        let data = inject_category(data);
-
-        // The command task stamps the message (recovery position) and fans it
-        // out locally, then publishes the same stamped bytes to cluster peers:
-        // every node delivers one wire form per message, with one position.
-        self.command_tx()?
-            .send_waiting_detached(
-                py,
-                ServerCommand::BroadcastLocal {
-                    topic: topic.to_owned(),
-                    data,
-                    skip_recovery: false,
-                    publish: true,
-                },
-            )
-            .map_err(|_| PyRuntimeError::new_err("Server command channel closed"))?;
-        Ok(())
+        let publisher = self.command_tx()?;
+        wait_for_room(py, &publisher);
+        publisher
+            .publish(topic, data)
+            .map_err(|_| PyRuntimeError::new_err("Server command channel closed"))
     }
 }

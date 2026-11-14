@@ -95,7 +95,7 @@ impl RustWSEServer {
                     // Broadcast to topic subscribers via WebSocket
                     if let Ok(tx) = self.command_tx() {
                         let msg = format_presence_msg("presence_join", &user_id, &join_data);
-                        let _ = tx.send(ServerCommand::BroadcastLocal {
+                        let _ = tx.commands.send(ServerCommand::BroadcastLocal {
                             topic: topic.clone(),
                             data: msg,
                             skip_recovery: true,

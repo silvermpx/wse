@@ -59,7 +59,7 @@ impl RustWSEServer {
                     if let Ok(tx) = self.command_tx() {
                         let msg = format_presence_msg("presence_update", &user_id, &new_data);
                         for topic in &topics {
-                            let _ = tx.send(ServerCommand::BroadcastLocal {
+                            let _ = tx.commands.send(ServerCommand::BroadcastLocal {
                                 topic: topic.clone(),
                                 data: msg.clone(),
                                 skip_recovery: true,
