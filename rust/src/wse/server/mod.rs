@@ -80,6 +80,7 @@ pub(crate) mod handler;
 mod handshake;
 mod messages;
 mod py;
+mod run;
 mod signing;
 mod state;
 pub(crate) mod subscribe;
