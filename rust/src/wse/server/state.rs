@@ -11,6 +11,7 @@ use pyo3::prelude::*;
 use tokio::sync::{RwLock, mpsc};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
+use super::signing::{ClientKey, ServerSigner};
 use super::{BroadcastQueue, Fanout, TopicIndex, WsFrame};
 use crate::jwt::JwtConfig;
 use crate::wse::cluster::{ClusterCommand, ClusterDlq, ClusterMetrics};
@@ -218,6 +219,12 @@ pub(super) enum InboundEvent {
         conn_id: String,
         value: serde_json::Value,
     },
+    /// A client's signed message that passed every check: its body's fields
+    /// and `signature`, the proof.
+    Signed {
+        conn_id: String,
+        value: serde_json::Value,
+    },
     RawText {
         conn_id: String,
         text: String,
@@ -383,6 +390,8 @@ pub(crate) struct SharedStateConfig {
     pub idle_timeout_secs: u64,
     pub max_outbound_queue_bytes: usize,
     pub max_subscriptions_per_connection: usize,
+    pub signer: Option<ServerSigner>,
+    pub signature_window_secs: u64,
 }
 
 pub(crate) struct SharedState {
@@ -403,6 +412,14 @@ pub(crate) struct SharedState {
     pub(super) on_connect: std::sync::RwLock<Option<Arc<Py<PyAny>>>>,
     pub(super) on_message: std::sync::RwLock<Option<Arc<Py<PyAny>>>>,
     pub(super) on_disconnect: std::sync::RwLock<Option<Arc<Py<PyAny>>>>,
+    pub(super) on_signed_message: std::sync::RwLock<Option<Arc<Py<PyAny>>>>,
+    // Signed messages: the server's key, how far a message's time may be
+    // from the server's, each connection's key, and the (kid, n) taken
+    // within the window, each until it is too old to come again.
+    pub(crate) signer: Option<ServerSigner>,
+    pub(super) signature_window_ms: u64,
+    pub(super) client_keys: DashMap<String, Arc<ClientKey>>,
+    pub(super) signed_seen: DashMap<String, u64>,
     // Drain mode: when active, inbound events go to channel instead of callbacks
     pub(super) drain_mode: AtomicBool,
     // Lock-free channel: Tokio tasks send (non-blocking), Python drains
@@ -555,6 +572,11 @@ impl SharedState {
             on_connect: std::sync::RwLock::new(None),
             on_message: std::sync::RwLock::new(None),
             on_disconnect: std::sync::RwLock::new(None),
+            on_signed_message: std::sync::RwLock::new(None),
+            signer: cfg.signer,
+            signature_window_ms: cfg.signature_window_secs.saturating_mul(1000),
+            client_keys: DashMap::new(),
+            signed_seen: DashMap::new(),
             drain_mode: AtomicBool::new(false),
             inbound_tx: tx,
             inbound_rx: rx,

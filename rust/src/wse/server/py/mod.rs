@@ -99,6 +99,8 @@ struct ServerParams {
     client_subscriptions: bool,
     e2e_identity_key: Option<Vec<u8>>,
     e2e_legacy: bool,
+    signing_key: Option<Vec<u8>>,
+    signature_window: u64,
     max_message_size: usize,
     ping_interval: u64,
     idle_timeout: u64,
@@ -193,6 +195,21 @@ impl RustWSEServer {
                     "e2e_identity_key must be an ECDSA P-256 private key in PKCS#8 (PEM or DER)",
                 )
             })?;
+        let signer = srv
+            .signing_key
+            .as_deref()
+            .map(crate::wse::server::signing::ServerSigner::from_pkcs8)
+            .transpose()
+            .map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "signing_key must be an ECDSA P-256 private key in PKCS#8 (PEM or DER)",
+                )
+            })?;
+        if srv.signature_window == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "signature_window must be at least 1 second",
+            ));
+        }
         if srv.ping_interval >= srv.idle_timeout {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "ping_interval ({}s) must be less than idle_timeout ({}s)",
@@ -301,6 +318,8 @@ impl RustWSEServer {
                 idle_timeout_secs: srv.idle_timeout,
                 max_outbound_queue_bytes: srv.max_outbound_queue_bytes,
                 max_subscriptions_per_connection: srv.max_subscriptions_per_connection,
+                signer,
+                signature_window_secs: srv.signature_window,
             })),
             cmd_tx: arc_swap::ArcSwapOption::empty(),
             lifecycle: std::sync::Mutex::new(None),
@@ -360,10 +379,10 @@ impl RustWSEServer {
     /// compression, encryption, ping/pong). Python handles application logic
     /// via drain mode or callbacks.
     #[new]
-    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, jwt_previous_secret = None, jwt_key_id = None, jwt_algorithm = None, jwt_private_key = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_bytes = 16_777_216, max_subscriptions_per_connection = 0, max_inbound_queue_bytes = 67_108_864, allowed_origins = None, client_subscriptions = false, e2e_identity_key = None, e2e_legacy = true))]
+    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, jwt_previous_secret = None, jwt_key_id = None, jwt_algorithm = None, jwt_private_key = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_bytes = 16_777_216, max_subscriptions_per_connection = 0, max_inbound_queue_bytes = 67_108_864, allowed_origins = None, client_subscriptions = false, e2e_identity_key = None, e2e_legacy = true, signing_key = None, signature_window = 30))]
     #[expect(
         clippy::too_many_arguments,
-        reason = "PyO3 __init__: 32 Python kwargs with defaults"
+        reason = "PyO3 __init__: 34 Python kwargs with defaults"
     )]
     fn new(
         host: String,
@@ -398,6 +417,8 @@ impl RustWSEServer {
         client_subscriptions: bool,
         e2e_identity_key: Option<Vec<u8>>,
         e2e_legacy: bool,
+        signing_key: Option<Vec<u8>>,
+        signature_window: u64,
     ) -> PyResult<Self> {
         Self::build(
             host,
@@ -410,6 +431,8 @@ impl RustWSEServer {
                 client_subscriptions,
                 e2e_identity_key,
                 e2e_legacy,
+                signing_key,
+                signature_window,
                 max_message_size,
                 ping_interval,
                 idle_timeout,
@@ -449,18 +472,53 @@ impl RustWSEServer {
     ///   user id the server validated, or without jwt_secret the Cookie header
     /// - on_message(conn_id, data) -- called when a message is received
     /// - on_disconnect(conn_id) -- called when a client disconnects
+    /// - on_signed_message(conn_id, data) -- optional: a client's signed
+    ///   message that passed every check, with its proof in
+    ///   data["signature"]. Without it such messages go to on_message,
+    ///   without the proof.
     ///
     /// The callbacks of one connection run one after another in the order of
     /// its events. Alternative to drain mode. Cannot be used together with
     /// enable_drain_mode().
+    #[pyo3(signature = (on_connect, on_message, on_disconnect, on_signed_message = None))]
     fn set_callbacks(
         &self,
         py: Python<'_>,
         on_connect: Py<PyAny>,
         on_message: Py<PyAny>,
         on_disconnect: Py<PyAny>,
+        on_signed_message: Option<Py<PyAny>>,
     ) -> PyResult<()> {
-        self.set_callbacks_impl(py, on_connect, on_message, on_disconnect)
+        self.set_callbacks_impl(py, on_connect, on_message, on_disconnect, on_signed_message)
+    }
+
+    /// The server's public key for the messages it signs: base64 of the
+    /// uncompressed P-256 point, what clients pin to check them. None without
+    /// signing_key.
+    fn signing_public_key(&self) -> Option<String> {
+        self.shared.signer.as_ref().map(|s| s.public_key.clone())
+    }
+
+    /// A message signed with the server's signing_key, ready for send(),
+    /// broadcast() and the rest: its type, payload and, for a topic message,
+    /// the topic, which the signature covers. Sign once, send to any number
+    /// of connections.
+    #[pyo3(signature = (event_type, payload = None, topic = None))]
+    fn sign(
+        &self,
+        event_type: &str,
+        payload: Option<&Bound<'_, PyAny>>,
+        topic: Option<&str>,
+    ) -> PyResult<String> {
+        self.sign_impl(event_type, payload, topic)
+    }
+
+    /// Bind the public key a connection signs its messages with (base64 of
+    /// the uncompressed P-256 point), or remove it (None). A key from the
+    /// connection's token (`cnf` claim) is replaced. False when there is no
+    /// such connection.
+    fn set_client_key(&self, conn_id: &str, public_key: Option<&str>) -> PyResult<bool> {
+        self.set_client_key_impl(conn_id, public_key)
     }
 
     /// Start the WebSocket server on a background thread.

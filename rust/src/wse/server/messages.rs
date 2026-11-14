@@ -208,7 +208,8 @@ pub(super) fn build_server_hello(
                 "batching": true,
                 "priority_queue": true,
                 "msgpack": true,
-                "encryption": encryption_enabled
+                "encryption": encryption_enabled,
+                "signing": state.signer.is_some()
             },
             "limits": {
                 "max_message_size": state.max_message_size,
@@ -227,14 +228,24 @@ pub(super) fn build_server_hello(
     if let Some(e2e) = e2e {
         val["p"]["e2e"] = e2e;
     }
+    // The server's signing key: its id is the audience of the client's
+    // signed messages. Clients check the server's signatures against the
+    // keys they pin, not against this.
+    if let Some(signer) = &state.signer {
+        val["p"]["signing"] = serde_json::json!({
+            "kid": signer.kid,
+            "public_key": signer.public_key,
+        });
+    }
     val.to_string()
 }
 
 /// Build server_ready JSON message (sent immediately from Rust after JWT validation).
-pub(super) fn build_server_ready(conn_id: &str, user_id: &str, recovery_enabled: bool) -> String {
+pub(super) fn build_server_ready(conn_id: &str, user_id: &str, state: &SharedState) -> String {
+    let recovery_enabled = state.recovery.is_some();
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let msg_id = Uuid::now_v7().to_string();
-    let val = serde_json::json!({
+    let mut val = serde_json::json!({
         "c": "WSE",
         "t": "server_ready",
         "id": msg_id,
@@ -261,5 +272,13 @@ pub(super) fn build_server_ready(conn_id: &str, user_id: &str, recovery_enabled:
         },
         "v": 1
     });
+    // The server's signing key, as in server_hello: a client may sign as
+    // soon as it is ready.
+    if let Some(signer) = &state.signer {
+        val["p"]["details"]["signing"] = serde_json::json!({
+            "kid": signer.kid,
+            "public_key": signer.public_key,
+        });
+    }
     val.to_string()
 }

@@ -366,6 +366,8 @@ class RustWSEServer:
         client_subscriptions: bool = False,
         e2e_identity_key: bytes | None = None,
         e2e_legacy: bool = True,
+        signing_key: bytes | None = None,
+        signature_window: int = 30,
     ) -> Self: ...
 
     # -- Lifecycle ------------------------------------------------------------
@@ -418,12 +420,16 @@ class RustWSEServer:
         on_connect: Callable[[str, str], Any],
         on_message: Callable[[str, dict[str, Any]], Any],
         on_disconnect: Callable[[str], Any],
+        on_signed_message: Callable[[str, dict[str, Any]], Any] | None = None,
     ) -> None:
         """Set callback functions for connect, message, and disconnect events.
 
         on_connect(conn_id, user_id) gets the user id the server validated, or
-        without jwt_secret the Cookie header. The callbacks of one connection
-        run one after another in the order of its events.
+        without jwt_secret the Cookie header. on_signed_message(conn_id, data)
+        gets a client's signed message that passed every check, its proof in
+        data["signature"]; without it such messages go to on_message without
+        the proof. The callbacks of one connection run one after another in
+        the order of its events.
         """
         ...
 
@@ -438,8 +444,10 @@ class RustWSEServer:
         """Drain queued inbound events.
 
         Returns list of (event_type, conn_id, data) tuples.
-        Event types: "connect", "auth_connect", "msg", "raw", "bin",
-        "disconnect", "presence_join", "presence_leave".
+        Event types: "connect", "auth_connect", "msg", "signed", "raw", "bin",
+        "disconnect", "presence_join", "presence_leave". A "signed" event is a
+        client's signed message that passed every check: the signed body's
+        fields, and data["signature"] ({"body", "sig", "kid"}), the proof.
         """
         ...
     def inbound_dropped_count(self) -> int:
@@ -545,6 +553,22 @@ class RustWSEServer:
     def e2e_identity_public_key(self) -> str | None:
         """The key clients pin for end-to-end encryption: base64 of the
         uncompressed P-256 point of e2e_identity_key, None without one."""
+        ...
+    def signing_public_key(self) -> str | None:
+        """The key clients pin to check the messages the server signs: base64
+        of the uncompressed P-256 point of signing_key, None without one."""
+        ...
+    def sign(self, event_type: str, payload: Any = None, topic: str | None = None) -> str:
+        """A message signed with signing_key, ready for send() and the
+        broadcasts: its type, payload and, for a topic message, the topic the
+        signature covers. Sign once, send to any number of connections.
+        Raises RuntimeError without signing_key."""
+        ...
+    def set_client_key(self, conn_id: str, public_key: str | None) -> bool:
+        """Bind the public key a connection signs its messages with (base64
+        of the uncompressed P-256 point), or remove it (None); it replaces a
+        key from the connection's token (cnf claim). False when there is no
+        such connection; ValueError for a key that is not a P-256 point."""
         ...
     def reload_jwt_keys(
         self,

@@ -27,6 +27,8 @@
 //! - `connection`: one client connection, from the upgrade to the cleanup.
 //! - `fanout`: topic glob matching, the topic index, delivery on every core
 //!   (one lane per core, each with its own task), recovery stamping.
+//! - `signing`: signed messages: client keys, the server's signing key, the
+//!   checks a client's signed message passes.
 //! - `commands`: the command processor that executes `ServerCommand`s.
 //!
 //! Python layer, PyO3:
@@ -82,6 +84,7 @@ mod frames;
 mod handshake;
 mod messages;
 mod py;
+mod signing;
 mod state;
 pub(crate) mod subscribe;
 

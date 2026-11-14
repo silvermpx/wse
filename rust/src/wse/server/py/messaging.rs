@@ -1,6 +1,7 @@
 //! Sending to one connection and broadcasting to all, to a topic or to the cluster.
 
 use std::io::Write;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use flate2::Compression;
@@ -16,6 +17,7 @@ use super::convert::pyobj_to_json;
 use crate::wse::msgpack::serde_json_to_rmpv;
 use crate::wse::server::ServerCommand;
 use crate::wse::server::messages::{build_server_ready, inject_category, message_category};
+use crate::wse::server::signing;
 
 impl RustWSEServer {
     pub(super) fn accept_connection_impl(&self, conn_id: &str, user_id: &str) -> PyResult<bool> {
@@ -38,12 +40,68 @@ impl RustWSEServer {
                 return Ok(false);
             }
         }
-        let ready = build_server_ready(conn_id, user_id, self.shared.recovery.is_some());
+        let ready = build_server_ready(conn_id, user_id, &self.shared);
         tx.send(ServerCommand::SendText {
             conn_id: conn_id.to_owned(),
             data: ready,
         })
         .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
+        Ok(true)
+    }
+
+    pub(super) fn sign_impl(
+        &self,
+        event_type: &str,
+        payload: Option<&Bound<'_, PyAny>>,
+        topic: Option<&str>,
+    ) -> PyResult<String> {
+        let signer = self
+            .shared
+            .signer
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("sign() needs the server's signing_key"))?;
+        let payload = match payload {
+            Some(p) if !p.is_none() => pyobj_to_json(p)?,
+            _ => serde_json::Value::Null,
+        };
+        signer
+            .sign_event(event_type, payload, topic, signing::now_ms())
+            .map_err(|_| PyRuntimeError::new_err("signing failed"))
+    }
+
+    pub(super) fn set_client_key_impl(
+        &self,
+        conn_id: &str,
+        public_key: Option<&str>,
+    ) -> PyResult<bool> {
+        let key = public_key
+            .map(|public_key| {
+                signing::ClientKey::from_base64(public_key).ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "public_key must be base64 of an uncompressed P-256 point (65 bytes)",
+                    )
+                })
+            })
+            .transpose()?;
+        // Its activity entry lives from registration to cleanup.
+        if !self.shared.conn_last_activity.contains_key(conn_id) {
+            return Ok(false);
+        }
+        match key {
+            None => {
+                self.shared.client_keys.remove(conn_id);
+            }
+            Some(key) => {
+                self.shared
+                    .client_keys
+                    .insert(conn_id.to_owned(), Arc::new(key));
+            }
+        }
+        // Gone meanwhile: its cleanup may have run before the insert.
+        if !self.shared.conn_last_activity.contains_key(conn_id) {
+            self.shared.client_keys.remove(conn_id);
+            return Ok(false);
+        }
         Ok(true)
     }
 

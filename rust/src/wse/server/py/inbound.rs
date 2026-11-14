@@ -79,6 +79,18 @@ impl RustWSEServer {
                     )?;
                     list.append(tuple)?;
                 }
+                InboundEvent::Signed { conn_id, value } => {
+                    let py_data = json_to_pyobj(py, value);
+                    let tuple = PyTuple::new(
+                        py,
+                        &[
+                            "signed".into_pyobject(py).unwrap().into_any(),
+                            conn_id.as_str().into_pyobject(py).unwrap().into_any(),
+                            py_data.clone_ref(py).into_bound(py).into_any(),
+                        ],
+                    )?;
+                    list.append(tuple)?;
+                }
                 InboundEvent::RawText { conn_id, text } => {
                     let tuple = PyTuple::new(
                         py,

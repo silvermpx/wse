@@ -1,0 +1,32 @@
+{
+  "client_label": "WSE-SIG client\u0000",
+  "server_label": "WSE-SIG server\u0000",
+  "client": {
+    "public_key": "BNAYdzxdaOzwknz0cfvmrgRhe+HVU7kQl9ZMyfEpbQof4IqJT5kE/EGx/CE5+vuwvySTafB50paGZPtIUnb0LgE=",
+    "jwk": {
+      "kty": "EC",
+      "crv": "P-256",
+      "x": "0Bh3PF1o7PCSfPRx--auBGF74dVTuRCX1kzJ8SltCh8",
+      "y": "4IqJT5kE_EGx_CE5-vuwvySTafB50paGZPtIUnb0LgE"
+    },
+    "kid": "dc14d6c9beb5d0a7",
+    "body": "{\"t\":\"order\",\"p\":{\"side\":\"buy\",\"qty\":\"1.25\",\"note\":\"caf\\u00e9 \\\"q\\\" ü\"},\"aud\":\"ed94c7318b47fe94\",\"ts\":1794600000000,\"n\":\"order-7\"}",
+    "sig": "J7oq8Cn8ByTOMBlfHagmjbSOihOJTc+/rQG3OlRcyErizP6yToRXPPi6v+HbmYdPJjQrPF6oesdASZAP1sqEsw==",
+    "envelope": "{\"t\": \"signed\", \"sb\": \"{\\\"t\\\":\\\"order\\\",\\\"p\\\":{\\\"side\\\":\\\"buy\\\",\\\"qty\\\":\\\"1.25\\\",\\\"note\\\":\\\"caf\\\\u00e9 \\\\\\\"q\\\\\\\" \\u00fc\\\"},\\\"aud\\\":\\\"ed94c7318b47fe94\\\",\\\"ts\\\":1794600000000,\\\"n\\\":\\\"order-7\\\"}\", \"sig\": \"J7oq8Cn8ByTOMBlfHagmjbSOihOJTc+/rQG3OlRcyErizP6yToRXPPi6v+HbmYdPJjQrPF6oesdASZAP1sqEsw==\", \"kid\": \"dc14d6c9beb5d0a7\"}",
+    "tampered_body": "{\"t\":\"order\",\"p\":{\"side\":\"buy\",\"qty\":\"9.25\",\"note\":\"caf\\u00e9 \\\"q\\\" ü\"},\"aud\":\"ed94c7318b47fe94\",\"ts\":1794600000000,\"n\":\"order-7\"}"
+  },
+  "server": {
+    "public_key": "BOEmkubsZVJiuagEzigTFSpkKdgU+anZWWxgndYPm4b75ZbXHYrTAd21fWvpHb45OgjEmW9LtpHtAyDngHwDmtc=",
+    "jwk": {
+      "kty": "EC",
+      "crv": "P-256",
+      "x": "4SaS5uxlUmK5qATOKBMVKmQp2BT5qdlZbGCd1g-bhvs",
+      "y": "5ZbXHYrTAd21fWvpHb45OgjEmW9LtpHtAyDngHwDmtc"
+    },
+    "kid": "ed94c7318b47fe94",
+    "body": "{\"t\":\"fill\",\"p\":{\"px\":\"1.25\",\"qty\":\"3\"},\"ts\":1794600000123,\"n\":\"0192b0a0c0de7000a000000000000001\",\"tp\":\"orders.u1\"}",
+    "sig": "RF19uD29wCIRQSI35xDav1j5/KCRJp1is8g4ciNsPSYVhJcSHcP1pVghinIWeQKjksbJW6+7IW0X4iF0v3rjhQ==",
+    "envelope": "{\"t\": \"signed\", \"sb\": \"{\\\"t\\\":\\\"fill\\\",\\\"p\\\":{\\\"px\\\":\\\"1.25\\\",\\\"qty\\\":\\\"3\\\"},\\\"ts\\\":1794600000123,\\\"n\\\":\\\"0192b0a0c0de7000a000000000000001\\\",\\\"tp\\\":\\\"orders.u1\\\"}\", \"sig\": \"RF19uD29wCIRQSI35xDav1j5/KCRJp1is8g4ciNsPSYVhJcSHcP1pVghinIWeQKjksbJW6+7IW0X4iF0v3rjhQ==\", \"kid\": \"ed94c7318b47fe94\"}",
+    "tampered_body": "{\"t\":\"fill\",\"p\":{\"px\":\"9.25\",\"qty\":\"3\"},\"ts\":1794600000123,\"n\":\"0192b0a0c0de7000a000000000000001\",\"tp\":\"orders.u1\"}"
+  }
+}

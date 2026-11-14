@@ -42,10 +42,14 @@ impl RustWSEServer {
         on_connect: Py<PyAny>,
         on_message: Py<PyAny>,
         on_disconnect: Py<PyAny>,
+        on_signed_message: Option<Py<PyAny>>,
     ) -> PyResult<()> {
         if !on_connect.bind(py).is_callable()
             || !on_message.bind(py).is_callable()
             || !on_disconnect.bind(py).is_callable()
+            || on_signed_message
+                .as_ref()
+                .is_some_and(|cb| !cb.bind(py).is_callable())
         {
             return Err(PyRuntimeError::new_err("All callbacks must be callable"));
         }
@@ -68,7 +72,11 @@ impl RustWSEServer {
             .write_py_attached(py)
             .unwrap()
             .replace(Arc::new(on_disconnect));
-        drop((old_connect, old_message, old_disconnect));
+        let old_signed = std::mem::replace(
+            &mut *shared.on_signed_message.write_py_attached(py).unwrap(),
+            on_signed_message.map(Arc::new),
+        );
+        drop((old_connect, old_message, old_disconnect, old_signed));
         Ok(())
     }
 
@@ -170,6 +178,19 @@ impl RustWSEServer {
                                         counts_state.topics.subscribers.contains_key(topic)
                                     });
                                 }
+                            }
+                        });
+                    }
+                    // Signed messages: a (kid, n) is forgotten once its time
+                    // is out of the window, as it could not be taken again.
+                    if shared.signer.is_some() {
+                        let seen_state = shared.clone();
+                        tokio::spawn(async move {
+                            let mut interval = tokio::time::interval(Duration::from_secs(5));
+                            loop {
+                                interval.tick().await;
+                                let now = crate::wse::server::signing::now_ms();
+                                seen_state.signed_seen.retain(|_, until| *until > now);
                             }
                         });
                     }

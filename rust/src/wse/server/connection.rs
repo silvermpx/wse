@@ -30,6 +30,7 @@ use super::frames::{
 use super::handshake::{HandshakeGuard, normalize_origin, reject_ws_auth};
 use super::messages::{build_server_hello, build_server_ready, normalize_json_keys};
 use super::py::{fire_on_connect, fire_on_disconnect, json_to_pyobj};
+use super::signing::{self, ClientKey, Refused};
 use super::state::{CloseOutbox, InboundEvent, Outbox, Seal};
 use super::subscribe::{answer_subscription_request, requested_compression};
 use super::{
@@ -113,25 +114,153 @@ fn answer_protocol_message(
     handle: &ConnectionHandle,
     max_pending: usize,
     val: &serde_json::Value,
-) -> bool {
+) -> Protocol {
     match val.get("t").and_then(|t| t.as_str()) {
         Some("ping") => {
             queue_reply(handle, max_pending, Message::Text(pong_for(val).into()));
-            true
+            Protocol::Answered
         }
-        Some("pong" | "PONG" | "client_hello") => true,
+        Some("pong" | "PONG" | "client_hello") => Protocol::Answered,
         Some("client_config") => {
             apply_client_config(state, conn_id, val.get("p"));
-            true
+            Protocol::Answered
         }
         Some("subscription_update") if state.client_subscriptions => {
             if let Some(p) = val.get("p") {
                 answer_subscription_request(state, conn_id, handle, p);
             }
-            true
+            Protocol::Answered
         }
-        _ => false,
+        Some("signed") => Protocol::Signed,
+        _ => Protocol::Application,
     }
+}
+
+/// What a client's message is to the server.
+enum Protocol {
+    /// A protocol message, answered.
+    Answered,
+    /// A signed message (`take_signed`).
+    Signed,
+    /// The application's.
+    Application,
+}
+
+/// Where a connection's messages go: the drain, or its callbacks.
+struct Callbacks<'a> {
+    drain: bool,
+    lane: Option<&'a Arc<CallbackLane>>,
+    on_message: Option<&'a Arc<Py<PyAny>>>,
+    on_signed_message: Option<&'a Arc<Py<PyAny>>>,
+}
+
+/// A client's signed message: checked against the connection's key and the
+/// server's (`signing::check`), taken once per key and `n`, answered with the
+/// server's signed receipt and handed to the application with its proof
+/// (drain kind `signed`, or `on_signed_message`; `on_message` without the
+/// proof when there is no such callback). Refused with a `SIGNATURE_REFUSED`
+/// error otherwise.
+fn take_signed(
+    state: &Arc<SharedState>,
+    conn_id: &Arc<String>,
+    handle: &ConnectionHandle,
+    max_pending: usize,
+    envelope: &serde_json::Value,
+    size: usize,
+    callbacks: &Callbacks<'_>,
+) {
+    let now = signing::now_ms();
+    let window = state.signature_window_ms;
+    let checked = match &state.signer {
+        None => Err(Refused::NotEnabled),
+        Some(signer) => {
+            let key = state
+                .client_keys
+                .get(conn_id.as_str())
+                .map(|key| Arc::clone(key.value()));
+            signing::check(envelope, key.as_deref(), &signer.kid, now, window)
+        }
+    }
+    .and_then(|verified| {
+        // Remembered until its time is out of the window: it could not come
+        // again after that.
+        let ts = verified
+            .message
+            .get("ts")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(now);
+        match state
+            .signed_seen
+            .entry(format!("{}:{}", verified.kid, verified.n))
+        {
+            dashmap::Entry::Occupied(_) => Err(Refused::Replayed),
+            dashmap::Entry::Vacant(slot) => {
+                slot.insert(ts.saturating_add(window));
+                Ok(verified)
+            }
+        }
+    });
+    let verified = match checked {
+        Ok(verified) => verified,
+        Err(refused) => {
+            // The message's n, when its body reads, so the client knows which.
+            let n = envelope
+                .get("sb")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+                .and_then(|body| body.get("n").and_then(|n| n.as_str()).map(str::to_owned));
+            let mut p = serde_json::json!({
+                "code": "SIGNATURE_REFUSED",
+                "reason": refused.reason(),
+                "message": refused.message(),
+                "recoverable": true,
+            });
+            if let Some(n) = n {
+                p["n"] = serde_json::Value::String(n);
+            }
+            let error = serde_json::json!({"c": "WSE", "t": "error", "p": p, "v": 1});
+            queue_reply(handle, max_pending, Message::Text(error.to_string().into()));
+            return;
+        }
+    };
+    if let Some(signer) = &state.signer
+        && let Ok(receipt) = signer.receipt(&verified, now)
+    {
+        queue_reply(handle, max_pending, Message::Text(receipt.into()));
+    }
+    let mut value = verified.into_value();
+    if callbacks.drain {
+        state.push_message(
+            InboundEvent::Signed {
+                conn_id: (**conn_id).clone(),
+                value,
+            },
+            size,
+        );
+        return;
+    }
+    let Some(lane) = callbacks.lane else {
+        return;
+    };
+    let callback = match (callbacks.on_signed_message, callbacks.on_message) {
+        (Some(callback), _) => Arc::clone(callback),
+        (None, Some(callback)) => {
+            if let serde_json::Value::Object(message) = &mut value {
+                message.remove("signature");
+            }
+            Arc::clone(callback)
+        }
+        (None, None) => return,
+    };
+    let cid = Arc::clone(conn_id);
+    spawn_bounded_callback(lane, state, size, move || {
+        Python::try_attach(|py| {
+            let message = json_to_pyobj(py, &value);
+            if let Err(e) = callback.call1(py, (&**cid, message)) {
+                tracing::warn!("[WSE] signed message callback error: {e}");
+            }
+        });
+    });
 }
 
 /// A msgpack frame from a client that asked for msgpack: one value, as is or
@@ -666,6 +795,11 @@ pub(super) async fn handle_connection(
                         if let Some(acl) = jwt::extract_topic_acl(&claims) {
                             state.topics.acls.insert(conn_id.to_string(), acl);
                         }
+                        // The key the token binds to its holder (`cnf`), for
+                        // the client's signed messages.
+                        if let Some(key) = ClientKey::from_claims(&claims) {
+                            state.client_keys.insert(conn_id.to_string(), Arc::new(key));
+                        }
                         token_deadline = claims
                             .get("exp")
                             .and_then(serde_json::Value::as_u64)
@@ -730,8 +864,7 @@ pub(super) async fn handle_connection(
             // maps: no broadcast can reach it before, so server_ready is the
             // first frame.
             if let Some(ref user_id) = rust_auth_user_id {
-                let recovery_enabled = state.recovery.is_some();
-                let server_ready = build_server_ready(&conn_id, user_id, recovery_enabled);
+                let server_ready = build_server_ready(&conn_id, user_id, &state);
                 let sr_bytes = server_ready.len() + 4;
                 out.pending.fetch_add(sr_bytes, Ordering::Relaxed);
                 if tx
@@ -752,8 +885,9 @@ pub(super) async fn handle_connection(
             .connections_rejected_total
             .fetch_add(1, Ordering::Relaxed);
         tracing::warn!("[WSE] Max connections reached, rejecting {addr}");
-        // The ACL was stored before the check.
+        // The ACL and the client key were stored before the check.
         state.topics.acls.remove(&*conn_id);
+        state.client_keys.remove(&*conn_id);
         let frames = VecDeque::from([close_frame(CLOSE_TRY_AGAIN_LATER, "server full")]);
         let _ = tokio::time::timeout(
             Duration::from_secs(1),
@@ -923,6 +1057,17 @@ pub(super) async fn handle_connection(
         None
     } else {
         state.on_message.read().unwrap().clone()
+    };
+    let cached_on_signed: Option<Arc<Py<PyAny>>> = if drain {
+        None
+    } else {
+        state.on_signed_message.read().unwrap().clone()
+    };
+    let callbacks = Callbacks {
+        drain,
+        lane: lane.as_ref(),
+        on_message: cached_on_message.as_ref(),
+        on_signed_message: cached_on_signed.as_ref(),
     };
 
     let max_pending = state.max_outbound_queue_bytes;
@@ -1198,6 +1343,18 @@ pub(super) async fn handle_connection(
                                     }
                                     continue;
                                 }
+                                if t_val == "signed" {
+                                    take_signed(
+                                        &state,
+                                        &conn_id,
+                                        &own_handle,
+                                        max_pending,
+                                        &val,
+                                        text.len(),
+                                        &callbacks,
+                                    );
+                                    continue;
+                                }
                                 if t_val == "ping" {
                                     queue_reply(
                                         &own_handle,
@@ -1345,14 +1502,27 @@ pub(super) async fn handle_connection(
                                             let val = normalize_json_keys(val);
                                             // The clients encrypt their protocol
                                             // messages too (all of them in a session).
-                                            if answer_protocol_message(
+                                            match answer_protocol_message(
                                                 &state,
                                                 &conn_id,
                                                 &own_handle,
                                                 max_pending,
                                                 &val,
                                             ) {
-                                                continue;
+                                                Protocol::Answered => continue,
+                                                Protocol::Signed => {
+                                                    take_signed(
+                                                        &state,
+                                                        &conn_id,
+                                                        &own_handle,
+                                                        max_pending,
+                                                        &val,
+                                                        text.len(),
+                                                        &callbacks,
+                                                    );
+                                                    continue;
+                                                }
+                                                Protocol::Application => {}
                                             }
                                             if drain {
                                                 state.push_message(
@@ -1414,10 +1584,29 @@ pub(super) async fn handle_connection(
                     };
                     // Its protocol messages come in msgpack too: the server
                     // answers those itself.
-                    if let Some(val) = &decoded
-                        && answer_protocol_message(&state, &conn_id, &own_handle, max_pending, val)
-                    {
-                        continue;
+                    if let Some(val) = &decoded {
+                        match answer_protocol_message(
+                            &state,
+                            &conn_id,
+                            &own_handle,
+                            max_pending,
+                            val,
+                        ) {
+                            Protocol::Answered => continue,
+                            Protocol::Signed => {
+                                take_signed(
+                                    &state,
+                                    &conn_id,
+                                    &own_handle,
+                                    max_pending,
+                                    val,
+                                    data.len(),
+                                    &callbacks,
+                                );
+                                continue;
+                            }
+                            Protocol::Application => {}
+                        }
                     }
 
                     if drain {
@@ -1491,6 +1680,7 @@ pub(super) async fn handle_connection(
     state.conn_last_activity.remove(&*conn_id);
     state.conn_encryption.remove(&*conn_id);
     state.topics.acls.remove(&*conn_id);
+    state.client_keys.remove(&*conn_id);
     // Queue group cleanup: remove this connection from all queue groups
     if let Some((_, memberships)) = state.conn_queue_groups.remove(&*conn_id) {
         let mut left_groups = Vec::with_capacity(memberships.len());
