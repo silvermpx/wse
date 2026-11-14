@@ -711,7 +711,7 @@ impl RustWSEServer {
             token.insert("aud".into(), cfg.audience.clone().into());
         }
         if let Some(claims) = claims
-            && let serde_json::Value::Object(extra) = jwt::pydict_to_json(claims)?
+            && let serde_json::Value::Object(extra) = crate::jwt_py::pydict_to_json(claims)?
         {
             token.extend(extra);
         }

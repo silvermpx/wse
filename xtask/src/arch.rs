@@ -7,8 +7,8 @@
 //! - `engine-pyo3`: engine code uses no PyO3 (no `pyo3`, `Python`, `Py<..>`,
 //!   `PyResult`, `Bound<'..>`, no `#[py...]` attributes).
 //! - `engine-imports`: engine code does not reach into the Python layer: the
-//!   `server::py` module, `pylock`, or the utility modules that define Python
-//!   functions (`jwt`, `compression`, ...).
+//!   `server::py` module, `pylock`, `jwt_py`, or the utility modules that
+//!   define Python functions (`compression`, ...).
 //! - `one-pymethods`: `RustWSEServer` has one `#[pymethods]` block, in
 //!   `server/py/mod.rs`, so every Python-visible signature is in one place.
 //!
@@ -29,6 +29,7 @@ fn is_engine(path: &str) -> bool {
     let engine_dirs = ["rust/src/wse/cluster/", "rust/src/wse/server/"];
     let engine_files = [
         "rust/src/crypto.rs",
+        "rust/src/jwt.rs",
         "rust/src/wse/msgpack.rs",
         "rust/src/wse/presence.rs",
         "rust/src/wse/recovery.rs",
@@ -55,7 +56,7 @@ fn python_layer_pattern() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"\bpylock\b|\bserver::py\b|\bsuper::py\b|\bcrate::jwt\b|\bcrate::wse::(?:compression|filters|queue|rate_limiter|security|sequencer|transformer)\b",
+            r"\bpylock\b|\bserver::py\b|\bsuper::py\b|\bcrate::jwt_py\b|\bcrate::wse::(?:compression|filters|queue|rate_limiter|security|sequencer|transformer)\b",
         )
         .expect("a fixed pattern")
     })
@@ -185,7 +186,7 @@ mod tests {
             one_pymethods(),
             src(
                 "rust/src/wse/cluster/peer.rs",
-                "use pyo3::prelude::*;\n// pyo3 in a comment is fine\nlet s = \"crate::jwt\";\nuse crate::jwt::decode;\n",
+                "use pyo3::prelude::*;\n// pyo3 in a comment is fine\nlet s = \"crate::jwt_py\";\nuse crate::jwt_py::rust_jwt_decode;\nuse crate::jwt::JwtConfig;\n",
             ),
             src(
                 "rust/src/wse/server/py/messaging.rs",

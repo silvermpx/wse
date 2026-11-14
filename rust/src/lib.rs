@@ -7,6 +7,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 mod crypto;
 mod jwt;
+mod jwt_py;
 mod wse;
 
 /// WSE Rust acceleration module.
@@ -57,8 +58,8 @@ fn _wse_accel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
 
     // JWT encode/decode
-    m.add_function(wrap_pyfunction!(jwt::rust_jwt_decode, m)?)?;
-    m.add_function(wrap_pyfunction!(jwt::rust_jwt_encode, m)?)?;
+    m.add_function(wrap_pyfunction!(jwt_py::rust_jwt_decode, m)?)?;
+    m.add_function(wrap_pyfunction!(jwt_py::rust_jwt_encode, m)?)?;
 
     // WebSocket server
     m.add_class::<wse::server::RustWSEServer>()?;
