@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use super::e2e::{decrypt_inbound, derive_connection_key};
 use super::e2e_session::{self, RecvState, SendState};
-use super::fanout::{BEHIND_BYTES, clock_ms};
+use super::fanout::BEHIND_BYTES;
 use super::frames::{
     close_frame, encode_message, encode_ws_frame, write_all_frames, ws_frame_size,
 };
@@ -888,7 +888,6 @@ pub(super) async fn handle_connection(
     let conn_id: Arc<String> = Arc::new(Uuid::now_v7().to_string());
     let (tx, mut rx) = mpsc::unbounded_channel::<WsFrame>();
     let out = Arc::new(Outbox::default());
-    out.written_ms.store(clock_ms(), Ordering::Relaxed);
     let drain = state.drain_mode.load(Ordering::Relaxed);
 
     // ── JWT validation in Rust (zero GIL) ──────────────────────────────────
@@ -1160,7 +1159,6 @@ pub(super) async fn handle_connection(
                     }
                 }
                 if wrote {
-                    out_write.written_ms.store(clock_ms(), Ordering::Relaxed);
                     continue;
                 }
                 tokio::select! {

@@ -154,9 +154,6 @@ pub(crate) struct Outbox {
     /// Accepted: by its token, or by the application (`accept_connection`).
     /// Until then it gets no broadcasts and may not subscribe on its own.
     pub(crate) admitted: AtomicBool,
-    /// When its write task last wrote, on `fanout::clock_ms`: a connection
-    /// behind that does not write is stalled, and no lane waits for it.
-    pub(crate) written_ms: AtomicU64,
     /// How the connection's frames are encrypted, set once by its key
     /// exchange.
     pub(crate) cipher: std::sync::OnceLock<Seal>,

@@ -312,39 +312,22 @@ pub(crate) const BEHIND_BYTES: usize = 64 * 1024;
 /// write task wakes the lane), at most `LANE_PACE`: the lane goes on at the
 /// pace the sockets write, not further ahead. Its queue fills meanwhile, and
 /// then the senders wait in turn. Only a delivery to at least `PACE_MIN`
-/// connections counts, so one slow client never holds back its lane: over
-/// its own budget it just misses messages.
+/// connections counts, so one slow client never holds back its lane; and only
+/// the connections the message was queued for: one that is closed or over
+/// its own budget misses the message and holds nothing back.
 const LANE_PACE: std::time::Duration = std::time::Duration::from_millis(1);
 const PACE_MIN: usize = 32;
 
-/// A connection whose write task wrote nothing for this long while it is
-/// behind is stalled, not slow: it reads nothing, and the lane does not wait
-/// for it (its messages pile up to its budget and are dropped, then it is
-/// closed as a slow consumer).
-const STALLED_MS: u64 = 500;
-
 /// What a lane's job did.
-#[derive(Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 struct Served {
     delivered: u64,
     dropped: u64,
-    /// The connections the message was queued for that were behind, and
-    /// still writing, before this delivery.
+    /// The connections the message was queued for that were behind before.
     behind: usize,
-    /// When the job started, on `clock_ms`.
-    now_ms: u64,
 }
 
 impl Served {
-    fn starting_now() -> Self {
-        Self {
-            delivered: 0,
-            dropped: 0,
-            behind: 0,
-            now_ms: clock_ms(),
-        }
-    }
-
     fn deliver(
         &mut self,
         h: &ConnectionHandle,
@@ -352,24 +335,16 @@ impl Served {
         max_pending: usize,
         slow_drops: &AtomicU64,
     ) {
-        let behind = h.out.pending.load(Ordering::Relaxed) >= BEHIND_BYTES
-            && self
-                .now_ms
-                .saturating_sub(h.out.written_ms.load(Ordering::Relaxed))
-                < STALLED_MS;
+        let behind = h.out.pending.load(Ordering::Relaxed) >= BEHIND_BYTES;
         if h.deliver(msg, max_pending, slow_drops) {
             self.delivered += 1;
-            if behind {
-                self.behind += 1;
-            }
+            self.behind += usize::from(behind);
         } else {
             self.dropped += 1;
         }
     }
 
-    /// Most of the many connections the message was queued for were behind
-    /// and still writing: the lane waits for them a moment. Connections that
-    /// are closed, over their budget or stalled never hold it back.
+    /// Most of the many connections the message was queued for were behind.
     fn lagging(&self) -> bool {
         let queued = self.delivered as usize;
         queued >= PACE_MIN && self.behind * 2 > queued
@@ -381,40 +356,26 @@ mod pacing_tests {
     use super::*;
 
     #[test]
-    fn a_stalled_or_full_connection_never_holds_the_lane_back() {
+    fn a_closed_or_full_connection_never_holds_the_lane_back() {
         let drops = AtomicU64::new(0);
         let msg = Outgoing::text(bytes::Bytes::from_static(b"{}"));
-        let behind = |written_ago: u64, max_pending: usize| {
-            let mut served = Served::starting_now();
-            // Far enough from the clock's start for any age.
-            served.now_ms = 1_000_000;
+        let lagging = |max_pending: usize, closed: bool| {
+            let mut served = Served::default();
             for _ in 0..PACE_MIN {
                 let (h, _rx) = super::super::tests::test_handle();
                 h.out.pending.store(BEHIND_BYTES, Ordering::Relaxed);
-                h.out
-                    .written_ms
-                    .store(served.now_ms.saturating_sub(written_ago), Ordering::Relaxed);
+                h.out.closed.store(closed, Ordering::Relaxed);
                 served.deliver(&h, &msg, max_pending, &drops);
             }
             served.lagging()
         };
-        // Behind and still writing: the lane waits for them.
-        assert!(behind(10, 0));
-        // Writing nothing for long: stalled, not waited for.
-        assert!(!behind(STALLED_MS * 4, 0));
+        // Behind and still taking messages: the lane waits for them.
+        assert!(lagging(0, false));
         // Over their budget: the message is dropped for them, nothing to wait for.
-        assert!(!behind(10, BEHIND_BYTES));
+        assert!(!lagging(BEHIND_BYTES, false));
+        // Gone: nothing to wait for either.
+        assert!(!lagging(0, true));
     }
-}
-
-/// Milliseconds on a clock of this process, for the write tasks and the
-/// lanes to compare.
-pub(crate) fn clock_ms() -> u64 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_millis() as u64
 }
 
 /// How many jobs wait for a lane at most. A sender that finds the queue full
@@ -685,7 +646,7 @@ impl TopicIndex {
         max_pending: usize,
         slow_drops: &AtomicU64,
     ) -> Served {
-        let mut served = Served::starting_now();
+        let mut served = Served::default();
         for h in self.everyone[usize::from(lane)].read().values() {
             served.deliver(h, msg, max_pending, slow_drops);
         }
@@ -707,7 +668,7 @@ impl TopicIndex {
         slow_drops: &AtomicU64,
         seen: &mut AHashSet<usize>,
     ) -> Served {
-        let mut served = Served::starting_now();
+        let mut served = Served::default();
         if patterns.is_empty() {
             // Exact topics only: the common case, no bookkeeping.
             if let Some(subs) = self.subscribers.get(topic)
@@ -962,7 +923,7 @@ async fn run_lane(
                     served
                 }
                 Job::One(h, msg) => {
-                    let mut served = Served::starting_now();
+                    let mut served = Served::default();
                     served.deliver(&h, &msg, max_pending, &slow_drops);
                     served
                 }

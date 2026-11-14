@@ -85,7 +85,8 @@ Security, correctness and speed. Upgrading from 2.x: see
 
 - Limits: sockets that send nothing, subscribers that read nothing,
   oversized subscription requests and messages that grow when decoded are
-  bounded, and cost the server neither speed nor memory.
+  bounded. A subscriber that reads nothing slows its delivery lane only
+  until its own outbound budget is full, then misses messages and is closed.
 
 ### Performance
 
