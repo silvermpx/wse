@@ -91,6 +91,7 @@ enum Protocol {
 fn tell_application<H: Handler>(
     state: &Arc<SharedState>,
     conn_id: &Arc<String>,
+    handle: &ConnectionHandle,
     user_id: Option<&str>,
     cookies: &str,
     handler: &H,
@@ -99,6 +100,8 @@ fn tell_application<H: Handler>(
         conn_id,
         user_id,
         cookies,
+        state,
+        handle,
     })?;
     if let (Some(pm), Some(user_id)) = (&state.presence, user_id) {
         pm.register_connection(conn_id, user_id);
@@ -129,7 +132,7 @@ fn admit_after_session<H: Handler>(
         handle.out.admitted.store(true, Ordering::Release);
         state.topics.join(conn_id, handle);
     }
-    tell_application(state, conn_id, user_id, cookies, handler)
+    tell_application(state, conn_id, handle, user_id, cookies, handler)
 }
 
 /// What the read loop's paths need of their connection.
@@ -1440,6 +1443,7 @@ pub(crate) async fn handle_connection<H: Handler>(
         tell_application(
             &state,
             &conn_id,
+            &own_handle,
             rust_auth_user_id.as_deref(),
             &cookie_str,
             &*handler,

@@ -24,11 +24,10 @@ use std::thread;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use zeroize::Zeroizing;
 
-use crate::jwt::{self, JwtConfig};
 use crate::server::{
-    Config, JwtSettings, PresenceSettings, Publisher, RecoverySettings, ServerCommand, SharedState,
+    Config, JwtKeys, JwtSettings, PresenceSettings, Publisher, RecoverySettings, ServerCommand,
+    SharedState,
 };
 
 // ---------------------------------------------------------------------------
@@ -237,24 +236,14 @@ impl RustWSEServer {
         Ok(CommandTx(guard))
     }
 
+    /// The engine's API for this server, running or not.
+    fn engine(&self) -> Publisher {
+        Publisher::new(Arc::clone(&self.shared))
+    }
+
     /// The tokio runtime of the server, once it has been started.
     fn runtime(&self) -> Option<tokio::runtime::Handle> {
         self.rt_handle.read().clone()
-    }
-
-    /// The handle of a registered connection. Looked up detached: the lookup
-    /// waits on the runtime, whose threads may need this thread's interpreter
-    /// meanwhile (a callback being handed over, a stop-the-world pause).
-    fn connection_handle(
-        &self,
-        py: Python<'_>,
-        conn_id: &str,
-    ) -> Option<crate::server::ConnectionHandle> {
-        let rt = self.runtime()?;
-        let shared = self.shared.clone();
-        py.detach(move || {
-            rt.block_on(async { shared.connections.read().await.get(conn_id).cloned() })
-        })
     }
 
     /// Seconds since the last `start()`, 0.0 before the first one.
@@ -390,7 +379,7 @@ impl RustWSEServer {
     /// uncompressed P-256 point, what clients pin to check them. None without
     /// signing_key.
     fn signing_public_key(&self) -> Option<String> {
-        self.shared.signer.as_ref().map(|s| s.public_key.clone())
+        self.engine().signing_public_key()
     }
 
     /// A message signed with the server's signing_key, ready for send(),
@@ -448,7 +437,7 @@ impl RustWSEServer {
 
     /// True between drain() and the next start().
     fn is_draining(&self) -> bool {
-        self.shared.draining.load(Ordering::Relaxed)
+        self.engine().is_draining()
     }
 
     /// `with RustWSEServer(...) as server:` starts the server (unless it
@@ -526,30 +515,21 @@ impl RustWSEServer {
 
     /// Number of active connections (lock-free AtomicUsize read).
     fn get_connection_count(&self) -> usize {
-        self.shared.connection_count.load(Ordering::Relaxed)
+        self.engine().connection_count()
     }
 
     /// List all active connection IDs, read without waiting for the server.
     fn get_connections(&self) -> Vec<String> {
-        // An activity entry lives from a connection's registration to its
-        // cleanup.
-        self.shared
-            .conn_last_activity
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect()
+        self.engine().connections()
     }
 
     /// Close a connection with code 1000. Its messages after that are not
     /// delivered, and a client that does not answer within 5 seconds is
     /// disconnected.
     fn disconnect(&self, conn_id: &str) -> PyResult<()> {
-        let tx = self.command_tx()?;
-        tx.command(ServerCommand::Disconnect {
-            conn_id: conn_id.to_owned(),
-        })
-        .map_err(|_| PyRuntimeError::new_err("Channel closed"))?;
-        Ok(())
+        self.command_tx()?
+            .disconnect(conn_id)
+            .map_err(messaging::py_error)
     }
 
     /// Accept a connection the application authenticated itself (a server
@@ -683,45 +663,16 @@ impl RustWSEServer {
         ttl: u64,
         claims: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<String> {
-        let holder = self.shared.jwt_config.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("this server does not validate tokens (no jwt_secret)")
-        })?;
-        let cfg = holder.load();
-        let key: &[u8] = match cfg.algorithm.key_kind() {
-            jwt::KeyKind::Secret { .. } => &cfg.secret,
-            _ => cfg.signing_key.as_deref().ok_or_else(|| {
-                PyRuntimeError::new_err(format!(
-                    "{:?} signs with jwt_private_key, which this server was not given",
-                    cfg.algorithm
-                ))
-            })?,
+        let claims = match claims {
+            Some(claims) => match crate::jwt_py::pydict_to_json(claims)? {
+                serde_json::Value::Object(claims) => claims,
+                _ => serde_json::Map::new(),
+            },
+            None => serde_json::Map::new(),
         };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let mut token = serde_json::Map::new();
-        token.insert("iat".into(), now.into());
-        token.insert("exp".into(), now.saturating_add(ttl).into());
-        if !cfg.issuer.is_empty() {
-            token.insert("iss".into(), cfg.issuer.clone().into());
-        }
-        if !cfg.audience.is_empty() {
-            token.insert("aud".into(), cfg.audience.clone().into());
-        }
-        if let Some(claims) = claims
-            && let serde_json::Value::Object(extra) = crate::jwt_py::pydict_to_json(claims)?
-        {
-            token.extend(extra);
-        }
-        token.insert("sub".into(), sub.into());
-        jwt::jwt_encode(
-            &serde_json::Value::Object(token),
-            key,
-            cfg.algorithm,
-            cfg.key_id.as_deref(),
-        )
-        .map_err(|e| PyRuntimeError::new_err(format!("JWT encode error: {e}")))
+        self.engine()
+            .issue_token(sub, std::time::Duration::from_secs(ttl), claims)
+            .map_err(messaging::py_error)
     }
 
     /// The public key clients pin for end-to-end encryption: base64 of the
@@ -751,46 +702,13 @@ impl RustWSEServer {
         jwt_key_id: Option<String>,
         jwt_private_key: Option<Vec<u8>>,
     ) -> PyResult<()> {
-        let holder = self.shared.jwt_config.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("this server does not validate tokens (no jwt_secret)")
-        })?;
-        let current = holder.load();
-        let alg = current.algorithm;
-        let key_error = |option: &str, e: jwt::JwtError| {
-            pyo3::exceptions::PyValueError::new_err(format!("{option} for {alg:?}: {e}"))
-        };
-        jwt::check_verification_key(alg, &jwt_secret).map_err(|e| key_error("jwt_secret", e))?;
-        if let Some(ref key) = jwt_previous_secret {
-            jwt::check_verification_key(alg, key)
-                .map_err(|e| key_error("jwt_previous_secret", e))?;
-        }
-        if let Some(ref key) = jwt_private_key {
-            jwt::check_signing_key(alg, key).map_err(|e| key_error("jwt_private_key", e))?;
-        } else if current.signing_key.is_some()
-            && !matches!(alg.key_kind(), jwt::KeyKind::Secret { .. })
-            && jwt_secret.as_slice() != current.secret.as_slice()
-        {
-            // The private key it has belongs to the old public key: tokens
-            // issued with it would not verify any more.
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "jwt_private_key: a new jwt_secret needs the private key that goes with it, \
-                 for issue_token()",
-            ));
-        }
-        holder.store(Arc::new(JwtConfig {
-            algorithm: alg,
-            secret: Zeroizing::new(jwt_secret),
-            previous_secret: jwt_previous_secret.map(Zeroizing::new),
-            signing_key: jwt_private_key
-                .map(Zeroizing::new)
-                .or_else(|| current.signing_key.clone()),
-            key_id: jwt_key_id.or_else(|| current.key_id.clone()),
-            issuer: current.issuer.clone(),
-            audience: current.audience.clone(),
-            cookie_name: current.cookie_name.clone(),
-        }));
-        tracing::info!("[WSE] JWT keys reloaded");
-        Ok(())
+        let mut keys = JwtKeys::new(jwt_secret);
+        keys.previous_secret = jwt_previous_secret;
+        keys.key_id = jwt_key_id;
+        keys.private_key = jwt_private_key;
+        self.engine()
+            .reload_jwt_keys(keys)
+            .map_err(messaging::py_error)
     }
 
     /// Hot-reload cluster TLS certificates without restarting the server.
@@ -905,12 +823,7 @@ impl RustWSEServer {
 
     /// Number of fan-out subscribers on a topic (excludes queue group members).
     fn get_topic_subscriber_count(&self, topic: &str) -> usize {
-        self.shared
-            .topics
-            .subscribers
-            .get(topic)
-            .map(|s| s.len())
-            .unwrap_or(0)
+        self.engine().topic_subscriber_count(topic)
     }
 
     /// Get queue group info for a topic. Returns dict of group_name -> member_count.

@@ -164,3 +164,73 @@ fn a_configuration_is_checked_as_a_whole() {
         "ping_interval (60s) must be less than idle_timeout (30s)"
     );
 }
+
+/// Subscribes each connection to its user's topic as it comes in.
+struct UserTopics;
+
+impl wse::Handler for UserTopics {
+    type Connection = ();
+
+    fn connect(&self, connect: &wse::Connect<'_>) -> Option<()> {
+        let topics = vec![format!("user:{}", connect.user_id.unwrap_or("anonymous"))];
+        let taken = connect.subscribe(topics, &wse::Subscribe::default()).ok()?;
+        assert_eq!(taken.len(), 1);
+        Some(())
+    }
+
+    fn message(&self, _conn: &mut (), _message: wse::Inbound, _size: usize) -> bool {
+        true
+    }
+
+    fn signed(&self, _conn: &mut (), _message: serde_json::Value, _size: usize) -> bool {
+        false
+    }
+
+    fn disconnect(&self, _conn: ()) {}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handler_subscribes_its_connections_as_they_come() {
+    let server = wse::Server::new(wse::Config::default()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    server.start(listener, UserTopics).unwrap();
+    let publisher = server.publisher();
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/wse"))
+        .await
+        .unwrap();
+    let conn_id = loop {
+        if let Some(conn_id) = publisher.connections().pop() {
+            break conn_id;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(publisher.accept(&conn_id, "anonymous").unwrap());
+    assert!(next_text(&mut ws).await.contains("server_ready"));
+    assert_eq!(publisher.topic_subscriber_count("user:anonymous"), 1);
+
+    // Its own topic reaches it, another one does not.
+    publisher
+        .publish_local("user:someone-else", r#"{"t":"not-yours"}"#)
+        .unwrap();
+    publisher
+        .publish_local("user:anonymous", r#"{"t":"yours"}"#)
+        .unwrap();
+    assert!(next_text(&mut ws).await.contains("yours"));
+
+    // Subscribed later from the application's own code.
+    let taken = publisher
+        .subscribe(&conn_id, vec!["prices".into()], &wse::Subscribe::default())
+        .await
+        .unwrap();
+    assert_eq!(taken, vec!["prices".to_string()]);
+    publisher
+        .publish_local("prices", r#"{"t":"tick"}"#)
+        .unwrap();
+    assert!(next_text(&mut ws).await.contains("tick"));
+
+    publisher.unsubscribe(&conn_id, None);
+    assert_eq!(publisher.topic_subscriber_count("prices"), 0);
+    server.stop().await;
+}

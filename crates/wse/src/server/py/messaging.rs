@@ -14,7 +14,7 @@ pub(super) fn py_error(error: Error) -> PyErr {
     match error {
         Error::Stopped => PyRuntimeError::new_err("Channel closed"),
         Error::NoSigningKey => PyRuntimeError::new_err("sign() needs the server's signing_key"),
-        Error::BadKey => PyValueError::new_err(error.to_string()),
+        Error::BadKey | Error::BadJwtKey(_) => PyValueError::new_err(error.to_string()),
         error => PyRuntimeError::new_err(error.to_string()),
     }
 }

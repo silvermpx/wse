@@ -32,6 +32,14 @@ pub enum Error {
     BadKey,
     /// The message could not be encoded or signed.
     Encode(String),
+    /// A connection over its subscription limit (its id, the limit).
+    TooManyTopics(String, usize),
+    /// The server validates no tokens (no JWT configuration).
+    NoJwt,
+    /// A token could not be issued.
+    Jwt(String),
+    /// A key does not fit the configured algorithm.
+    BadJwtKey(String),
 }
 
 impl std::fmt::Display for Error {
@@ -47,7 +55,11 @@ impl std::fmt::Display for Error {
             Self::BadKey => {
                 f.write_str("public_key must be base64 of an uncompressed P-256 point (65 bytes)")
             }
-            Self::Encode(what) => f.write_str(what),
+            Self::Encode(what) | Self::Jwt(what) | Self::BadJwtKey(what) => f.write_str(what),
+            Self::TooManyTopics(conn_id, max) => {
+                write!(f, "Connection {conn_id} reached max subscriptions ({max})")
+            }
+            Self::NoJwt => f.write_str("this server does not validate tokens (no jwt_secret)"),
         }
     }
 }

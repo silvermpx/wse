@@ -21,8 +21,8 @@ mod reliability;
 mod server;
 
 pub use server::{
-    Config, ConfigError, Connect, Error, Handler, Inbound, JwtSettings, Presence, PresenceSettings,
-    Publisher, RecoverySettings, Server,
+    Config, ConfigError, Connect, Error, Handler, Inbound, JwtKeys, JwtSettings, Member, Presence,
+    PresenceSettings, Publisher, Recovered, RecoverySettings, Server, Subscribe,
 };
 
 // The Python module and its helpers: built into the `wse-server` package.

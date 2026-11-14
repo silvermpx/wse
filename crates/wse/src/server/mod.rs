@@ -73,6 +73,7 @@
 mod commands;
 pub(crate) mod config;
 mod connection;
+pub(crate) mod control;
 mod e2e;
 pub(crate) mod e2e_session;
 mod fanout;
@@ -93,6 +94,7 @@ pub(crate) mod subscribe;
 pub use py::RustWSEServer;
 
 pub use config::{Config, ConfigError, JwtSettings, PresenceSettings, RecoverySettings};
+pub use control::{JwtKeys, Member, Recovered, Subscribe};
 pub(crate) use e2e::E2E_KEY_INFO;
 pub(crate) use fanout::{
     Fanout, Outgoing, TopicAcl, TopicIndex, count_message, glob_match, is_pattern,

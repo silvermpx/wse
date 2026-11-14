@@ -2,7 +2,8 @@
 
 use std::sync::Arc;
 
-/// A connection, as the application first hears of it.
+/// A connection, as the application first hears of it. It may subscribe the
+/// connection right away (`subscribe`, `set_topic_acl`).
 pub struct Connect<'a> {
     /// The server's id for the connection.
     pub conn_id: &'a Arc<String>,
@@ -12,6 +13,8 @@ pub struct Connect<'a> {
     pub user_id: Option<&'a str>,
     /// The cookies of the upgrade request.
     pub cookies: &'a str,
+    pub(crate) state: &'a super::state::SharedState,
+    pub(crate) handle: &'a super::state::ConnectionHandle,
 }
 
 /// A client's message, as the server read it.

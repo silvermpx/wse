@@ -13,14 +13,7 @@ impl RustWSEServer {
         py: Python<'_>,
         topic: &str,
     ) -> PyResult<Py<PyDict>> {
-        // Copy first, build the dict after (see `cluster_info`).
-        let groups: Vec<(String, usize)> = match self.shared.queue_groups.get(topic) {
-            Some(topic_groups) => topic_groups
-                .iter()
-                .map(|entry| (entry.key().clone(), entry.value().members.len()))
-                .collect(),
-            None => Vec::new(),
-        };
+        let groups = self.engine().queue_groups(topic);
         let dict = PyDict::new(py);
         for (group, members) in &groups {
             dict.set_item(group.as_str(), *members)?;
