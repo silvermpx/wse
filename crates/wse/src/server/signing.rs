@@ -17,130 +17,38 @@
 use base64::Engine;
 use serde_json::{Map, Value};
 
-use crate::crypto::{self, IdentityKey};
-
-/// What a client's signature covers before the body.
-pub(crate) const CLIENT_LABEL: &[u8] = b"WSE-SIG client\0";
-/// What the server's signature covers before the body.
-pub(crate) const SERVER_LABEL: &[u8] = b"WSE-SIG server\0";
-
-/// The longest `n` the server takes.
-const MAX_NONCE_LEN: usize = 128;
+use crate::crypto;
+#[cfg(test)]
+use wse_protocol::signing::signed_input;
+pub(crate) use wse_protocol::signing::{
+    CLIENT_LABEL, MAX_NONCE_LEN, PublicKey as ClientKey, SERVER_LABEL, Signer, now_ms, parse_exact,
+};
 
 fn b64() -> base64::engine::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
 }
 
-/// A key id: the first 8 bytes of SHA-256 of an uncompressed public key, hex.
-pub(crate) fn key_id(public_key: &[u8]) -> String {
-    hex::encode(&crypto::sha256(public_key)[..8])
-}
-
-/// Now, in milliseconds since the Unix epoch: the clock of `ts`.
-pub(crate) fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
-
-fn signed_input(label: &[u8], body: &str) -> Vec<u8> {
-    let mut input = Vec::with_capacity(label.len() + body.len());
-    input.extend_from_slice(label);
-    input.extend_from_slice(body.as_bytes());
-    input
-}
-
-/// A client's public key for its signed messages, parsed once.
-pub(crate) struct ClientKey {
-    pub(crate) kid: String,
-    key: aws_lc_rs::signature::ParsedPublicKey,
-}
-
-impl ClientKey {
-    /// From an uncompressed SEC1 point, `0x04 || X || Y`.
-    pub(crate) fn from_sec1(public_key: &[u8]) -> Option<Self> {
-        if public_key.len() != crypto::P256_PUBLIC_LEN || public_key[0] != 0x04 {
-            return None;
-        }
-        let key = aws_lc_rs::signature::ParsedPublicKey::new(
-            &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED,
-            public_key,
-        )
-        .ok()?;
-        Some(Self {
-            kid: key_id(public_key),
-            key,
-        })
-    }
-
-    /// From the base64 of an uncompressed SEC1 point.
-    pub(crate) fn from_base64(public_key: &str) -> Option<Self> {
-        Self::from_sec1(&b64().decode(public_key.trim()).ok()?)
-    }
-
-    /// From a JWK (`{"kty": "EC", "crv": "P-256", "x": ..., "y": ...}`), the
-    /// form a token's `cnf` claim carries (RFC 7800).
-    pub(crate) fn from_jwk(jwk: &Value) -> Option<Self> {
-        if jwk.get("kty")?.as_str()? != "EC" || jwk.get("crv")?.as_str()? != "P-256" {
-            return None;
-        }
-        let coordinate = |name: &str| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(jwk.get(name)?.as_str()?)
-                .ok()
-                .filter(|bytes| bytes.len() == 32)
-        };
-        let mut point = Vec::with_capacity(crypto::P256_PUBLIC_LEN);
-        point.push(0x04);
-        point.extend_from_slice(&coordinate("x")?);
-        point.extend_from_slice(&coordinate("y")?);
-        Self::from_sec1(&point)
-    }
-
-    /// The key a token binds to its holder: `cnf.jwk`. None when the claim is
-    /// missing or not a P-256 key.
-    pub(crate) fn from_claims(claims: &Value) -> Option<Self> {
-        Self::from_jwk(claims.get("cnf")?.get("jwk")?)
-    }
-
-    fn verifies(&self, label: &[u8], body: &str, signature: &[u8]) -> bool {
-        self.key
-            .verify_sig(&signed_input(label, body), signature)
-            .is_ok()
-    }
-}
-
 /// The server's key for the messages it signs: its own key, apart from the
 /// E2E identity key.
-pub(crate) struct ServerSigner {
-    key: IdentityKey,
-    pub(crate) kid: String,
-    /// The public key, base64 of the uncompressed point.
-    pub(crate) public_key: String,
+pub(crate) struct ServerSigner(Signer);
+
+impl std::ops::Deref for ServerSigner {
+    type Target = Signer;
+
+    fn deref(&self) -> &Signer {
+        &self.0
+    }
 }
 
 impl ServerSigner {
     /// From a PKCS#8 ECDSA P-256 private key, PEM or DER.
     pub(crate) fn from_pkcs8(key: &[u8]) -> Result<Self, crypto::Error> {
-        let key = IdentityKey::from_pkcs8(key)?;
-        let public = key.public_key();
-        Ok(Self {
-            kid: key_id(public),
-            public_key: b64().encode(public),
-            key,
-        })
+        Signer::from_pkcs8(key).map(Self)
     }
 
     /// The signed message around `body`, a JSON object as text.
     pub(crate) fn envelope(&self, body: &str) -> Result<String, crypto::Error> {
-        let signature = self.key.sign(&signed_input(SERVER_LABEL, body))?;
-        Ok(serde_json::json!({
-            "t": "signed",
-            "sb": body,
-            "sig": b64().encode(signature),
-            "kid": self.kid,
-        })
-        .to_string())
+        self.0.sign_envelope(SERVER_LABEL, body)
     }
 
     /// A signed message of type `t` with payload `p`, stamped now with a new
@@ -309,122 +217,6 @@ pub(crate) fn check(
         kid: kid.to_owned(),
         n,
     })
-}
-
-/// A signed body as the application gets it, read so that it cannot say
-/// anything but its text: no key twice in an object (readers differ on which
-/// one counts) and every integer exact (past 64 bits it would come out
-/// rounded here and exact elsewhere). None when it is not such JSON.
-fn parse_exact(body: &str) -> Option<Value> {
-    if !integers_exact(body) {
-        return None;
-    }
-    let mut de = serde_json::Deserializer::from_str(body);
-    let Exact(value) = serde::Deserialize::deserialize(&mut de).ok()?;
-    de.end().ok()?;
-    Some(value)
-}
-
-/// Every integer literal of a JSON text (outside its strings) fits 64 bits.
-fn integers_exact(body: &str) -> bool {
-    let bytes = body.as_bytes();
-    let mut i = 0;
-    let mut in_string = false;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_string {
-            match b {
-                b'\\' => i += 1,
-                b'"' => in_string = false,
-                _ => {}
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'"' => {
-                in_string = true;
-                i += 1;
-            }
-            b'-' | b'0'..=b'9' => {
-                let start = i;
-                while i < bytes.len()
-                    && matches!(bytes[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
-                {
-                    i += 1;
-                }
-                let literal = &body[start..i];
-                if !literal.contains(['.', 'e', 'E'])
-                    && literal.parse::<i64>().is_err()
-                    && literal.parse::<u64>().is_err()
-                {
-                    return false;
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    true
-}
-
-/// JSON read into a `Value`, refusing an object with a key twice.
-struct Exact(Value);
-
-impl<'de> serde::Deserialize<'de> for Exact {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        de.deserialize_any(ExactVisitor).map(Exact)
-    }
-}
-
-struct ExactVisitor;
-
-impl<'de> serde::de::Visitor<'de> for ExactVisitor {
-    type Value = Value;
-
-    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("JSON")
-    }
-    fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
-        Ok(Value::Bool(v))
-    }
-    fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
-        Ok(v.into())
-    }
-    fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
-        Ok(v.into())
-    }
-    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Value, E> {
-        serde_json::Number::from_f64(v)
-            .map(Value::Number)
-            .ok_or_else(|| E::custom("not a finite number"))
-    }
-    fn visit_str<E>(self, v: &str) -> Result<Value, E> {
-        Ok(Value::String(v.to_owned()))
-    }
-    fn visit_string<E>(self, v: String) -> Result<Value, E> {
-        Ok(Value::String(v))
-    }
-    fn visit_unit<E>(self) -> Result<Value, E> {
-        Ok(Value::Null)
-    }
-    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
-        let mut items = Vec::new();
-        while let Some(Exact(item)) = seq.next_element()? {
-            items.push(item);
-        }
-        Ok(Value::Array(items))
-    }
-    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
-        let mut object = serde_json::Map::new();
-        while let Some(key) = map.next_key::<String>()? {
-            if object.contains_key(&key) {
-                return Err(serde::de::Error::custom("a key twice"));
-            }
-            let Exact(value) = map.next_value()?;
-            object.insert(key, value);
-        }
-        Ok(Value::Object(object))
-    }
 }
 
 #[cfg(test)]
@@ -651,27 +443,5 @@ mod tests {
         assert!(!key.verifies(SERVER_LABEL, body, &sig("flipped_sig")));
         assert!(!key.verifies(SERVER_LABEL, body, &sig("other_label_sig")));
         assert!(key.verifies(CLIENT_LABEL, body, &sig("other_label_sig")));
-    }
-
-    #[test]
-    fn a_jwk_names_the_same_key_as_its_point() {
-        let (_, key) = client_pair();
-        let (pair, _) = client_pair();
-        use aws_lc_rs::signature::KeyPair;
-        let point = pair.public_key().as_ref();
-        let url = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let jwk = serde_json::json!({
-            "kty": "EC", "crv": "P-256",
-            "x": url.encode(&point[1..33]), "y": url.encode(&point[33..]),
-        });
-        let from_jwk = ClientKey::from_jwk(&jwk).unwrap();
-        assert_eq!(from_jwk.kid, key_id(point));
-        assert_ne!(from_jwk.kid, key.kid);
-        let claims = serde_json::json!({"sub": "u", "cnf": {"jwk": jwk}});
-        assert_eq!(ClientKey::from_claims(&claims).unwrap().kid, from_jwk.kid);
-        assert!(
-            ClientKey::from_jwk(&serde_json::json!({"kty": "OKP", "crv": "Ed25519"})).is_none()
-        );
-        assert!(ClientKey::from_base64("not base64!").is_none());
     }
 }

@@ -155,7 +155,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex",
- "syn 2.0.119",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -2037,8 +2037,21 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wse-protocol",
  "zeroize",
  "zstd",
+]
+
+[[package]]
+name = "wse-protocol"
+version = "3.0.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "hex",
+ "serde",
+ "serde_json",
+ "zeroize",
 ]
 
 [[package]]

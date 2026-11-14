@@ -27,6 +27,8 @@ dashmap = "6"
 # The crypto library (see [features] and src/crypto.rs) is the only one in the
 # build: TLS, JWT, E2E and the Python helpers all use it.
 aws-lc-rs = { version = "1.19", optional = true }
+# The crypto, E2E sessions and signed messages, shared with the Rust client.
+wse-protocol = { version = "=3.0.0", path = "../wse-protocol" }
 jsonwebtoken = { version = "11", default-features = false, features = ["use_pem"] }
 uuid = { version = "1.29.2", features = ["v7"] }
 base64 = "0.23"
@@ -59,7 +61,7 @@ python = ["dep:pyo3", "dep:tracing-subscriber"]
 # helpers. aws-lc: aws-lc-rs (the published wheels). fips: aws-lc-rs built from
 # its FIPS 140-3 validated module; building it needs CMake and Go.
 aws-lc = ["dep:aws-lc-rs", "rustls/aws_lc_rs", "rustls/prefer-post-quantum", "jsonwebtoken/aws_lc_rs"]
-fips = ["aws-lc", "aws-lc-rs/fips", "rustls/fips"]
+fips = ["aws-lc", "aws-lc-rs/fips", "rustls/fips", "wse-protocol/fips"]
 
 [dev-dependencies]
 rcgen = "0.14"

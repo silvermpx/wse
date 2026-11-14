@@ -422,6 +422,16 @@ impl Publisher {
         self.shared.signer.as_ref().map(|s| s.public_key.clone())
     }
 
+    /// The public key clients pin for end-to-end encryption: base64 of the
+    /// uncompressed P-256 point of `e2e_identity_key`, None without one.
+    pub fn e2e_identity_public_key(&self) -> Option<String> {
+        use base64::Engine;
+        self.shared
+            .e2e_identity
+            .as_ref()
+            .map(|k| base64::engine::general_purpose::STANDARD.encode(k.public_key()))
+    }
+
     /// A connection's public key for its signed messages, or none. False
     /// when the connection is gone.
     pub fn set_client_key(&self, conn_id: &str, public_key: Option<&str>) -> Result<bool, Error> {
