@@ -158,13 +158,17 @@ impl Publisher {
         if !shared.conn_last_activity.contains_key(conn_id) {
             return Ok(false);
         }
+        shared.register_user(conn_id, user_id);
         if let Some(ref pm) = shared.presence {
             pm.register_connection(conn_id, user_id);
-            // Gone meanwhile: its cleanup may have run before the register.
-            if !shared.conn_last_activity.contains_key(conn_id) {
+        }
+        // Gone meanwhile: its cleanup may have run before the register.
+        if !shared.conn_last_activity.contains_key(conn_id) {
+            shared.unregister_user(conn_id);
+            if let Some(ref pm) = shared.presence {
                 pm.remove_connection(conn_id);
-                return Ok(false);
             }
+            return Ok(false);
         }
         let ready = build_server_ready(conn_id, user_id, shared);
         self.queue(ServerCommand::Accept {

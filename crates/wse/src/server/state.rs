@@ -537,6 +537,10 @@ pub(crate) struct SharedState {
     pub(crate) signer: Option<ServerSigner>,
     pub(super) signature_window_ms: u64,
     pub(super) client_keys: DashMap<String, Arc<ClientKey>>,
+    // Each user's connections, and each connection's user: what a send to a
+    // user reaches.
+    pub(crate) user_conns: DashMap<String, AHashSet<String>>,
+    pub(crate) conn_user: DashMap<String, String>,
     pub(super) signed_seen: DashMap<String, u64>,
     // Drain mode: when active, inbound events go to channel instead of callbacks
     #[cfg_attr(not(feature = "python"), allow(dead_code))]
@@ -648,6 +652,35 @@ pub(crate) struct SharedState {
 }
 
 impl SharedState {
+    /// `conn_id` is `user_id`'s from now on: sends to the user reach it.
+    pub(crate) fn register_user(&self, conn_id: &str, user_id: &str) {
+        if let Some(previous) = self
+            .conn_user
+            .insert(conn_id.to_owned(), user_id.to_owned())
+        {
+            self.forget_user_conn(&previous, conn_id);
+        }
+        self.user_conns
+            .entry(user_id.to_owned())
+            .or_default()
+            .insert(conn_id.to_owned());
+    }
+
+    /// `conn_id` is gone: its user no longer counts it.
+    pub(crate) fn unregister_user(&self, conn_id: &str) {
+        if let Some((_, user_id)) = self.conn_user.remove(conn_id) {
+            self.forget_user_conn(&user_id, conn_id);
+        }
+    }
+
+    fn forget_user_conn(&self, user_id: &str, conn_id: &str) {
+        if let Some(mut conns) = self.user_conns.get_mut(user_id) {
+            conns.remove(conn_id);
+        }
+        self.user_conns
+            .remove_if(user_id, |_, conns| conns.is_empty());
+    }
+
     /// `at` in milliseconds since `clock_base`: what the activity counters hold.
     pub(super) fn activity_ms(&self, at: std::time::Instant) -> u64 {
         at.saturating_duration_since(self.clock_base).as_millis() as u64
@@ -772,6 +805,8 @@ impl SharedState {
             signer: cfg.signer,
             signature_window_ms: cfg.signature_window_secs.saturating_mul(1000),
             client_keys: DashMap::new(),
+            user_conns: DashMap::new(),
+            conn_user: DashMap::new(),
             signed_seen: DashMap::new(),
             drain_mode: AtomicBool::new(false),
             inbound_tx: tx,

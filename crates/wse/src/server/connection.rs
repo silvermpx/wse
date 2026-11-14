@@ -103,8 +103,11 @@ fn tell_application<H: Handler>(
         state,
         handle,
     })?;
-    if let (Some(pm), Some(user_id)) = (&state.presence, user_id) {
-        pm.register_connection(conn_id, user_id);
+    if let Some(user_id) = user_id {
+        state.register_user(conn_id, user_id);
+        if let Some(pm) = &state.presence {
+            pm.register_connection(conn_id, user_id);
+        }
     }
     Some(app)
 }
@@ -1638,6 +1641,7 @@ pub(crate) async fn handle_connection<H: Handler>(
     state.conn_encryption.remove(&*conn_id);
     state.topics.acls.remove(&*conn_id);
     state.client_keys.remove(&*conn_id);
+    state.unregister_user(&conn_id);
     // Queue group cleanup: remove this connection from all queue groups
     if let Some((_, memberships)) = state.conn_queue_groups.remove(&*conn_id) {
         let mut left_groups = Vec::with_capacity(memberships.len());

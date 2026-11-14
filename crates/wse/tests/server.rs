@@ -234,3 +234,63 @@ async fn a_handler_subscribes_its_connections_as_they_come() {
     assert_eq!(publisher.topic_subscriber_count("prices"), 0);
     server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_user_is_reached_on_every_connection_it_has() {
+    let server = wse::Server::new(wse::Config::default()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut events) = mpsc::unbounded_channel();
+    server.start(listener, Recorder { events: tx }).unwrap();
+    let publisher = server.publisher();
+
+    // Two tabs of alice, one of bob.
+    let mut tabs = Vec::new();
+    for user in ["alice", "alice", "bob"] {
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/wse"))
+            .await
+            .unwrap();
+        let Event::Connect(conn_id) = next_event(&mut events).await else {
+            panic!("a connect event");
+        };
+        assert!(publisher.accept(&conn_id, user).unwrap());
+        assert!(next_text(&mut ws).await.contains("server_ready"));
+        tabs.push(ws);
+    }
+    assert_eq!(publisher.user_connections("alice").len(), 2);
+
+    assert_eq!(
+        publisher
+            .send_to_user("alice", r#"{"t":"for-alice"}"#)
+            .unwrap(),
+        2
+    );
+    assert!(next_text(&mut tabs[0]).await.contains("for-alice"));
+    assert!(next_text(&mut tabs[1]).await.contains("for-alice"));
+    publisher.send_to_user("bob", r#"{"t":"for-bob"}"#).unwrap();
+    assert!(next_text(&mut tabs[2]).await.contains("for-bob"));
+
+    // Logged out: both of alice's tabs close, bob's stays.
+    assert_eq!(publisher.disconnect_user("alice").unwrap(), 2);
+    for ws in &mut tabs[..2] {
+        let mut code = None;
+        while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            if let Ok(Message::Close(Some(frame))) = frame {
+                code = Some(u16::from(frame.code));
+                break;
+            }
+        }
+        assert_eq!(code, Some(1000));
+        // Read on: the client answers the close, and the server lets go.
+        while let Ok(Some(_)) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await {}
+    }
+    for _ in 0..2 {
+        assert!(matches!(
+            next_event(&mut events).await,
+            Event::Disconnect(_)
+        ));
+    }
+    assert!(publisher.user_connections("alice").is_empty());
+    assert_eq!(publisher.user_connections("bob").len(), 1);
+    server.stop().await;
+}

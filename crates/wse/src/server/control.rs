@@ -210,6 +210,51 @@ impl Publisher {
         })
     }
 
+    /// The connections of a user: every tab and device it has open here.
+    pub fn user_connections(&self, user_id: &str) -> Vec<String> {
+        self.shared
+            .user_conns
+            .get(user_id)
+            .map_or_else(Vec::new, |conns| conns.iter().cloned().collect())
+    }
+
+    /// Send `text` to every connection of a user. Returns how many it went to.
+    pub fn send_to_user(&self, user_id: &str, text: &str) -> Result<usize, Error> {
+        let conns = self.user_connections(user_id);
+        for conn_id in &conns {
+            self.send(conn_id, text)?;
+        }
+        Ok(conns.len())
+    }
+
+    /// Send an event (`send_event`) to every connection of a user, each in
+    /// its own format. Returns how many it went to.
+    pub fn send_event_to_user(
+        &self,
+        user_id: &str,
+        event: &serde_json::Map<String, serde_json::Value>,
+        compression_threshold: usize,
+    ) -> Result<usize, Error> {
+        let conns = self.user_connections(user_id);
+        let mut sent = 0;
+        for conn_id in &conns {
+            if self.send_event(conn_id, event.clone(), compression_threshold)? > 0 {
+                sent += 1;
+            }
+        }
+        Ok(sent)
+    }
+
+    /// Close every connection of a user (1000): a logout, a revoked
+    /// session, a banned account. Returns how many it closed.
+    pub fn disconnect_user(&self, user_id: &str) -> Result<usize, Error> {
+        let conns = self.user_connections(user_id);
+        for conn_id in &conns {
+            self.disconnect(conn_id)?;
+        }
+        Ok(conns.len())
+    }
+
     /// Subscribe a connection to `topics`: the ones its ACL allows, within
     /// its limit. Returns the topics it took; none when it is gone.
     pub async fn subscribe(
