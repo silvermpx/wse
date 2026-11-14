@@ -311,10 +311,12 @@ pub(crate) const BEHIND_BYTES: usize = 64 * 1024;
 /// until one of its connections has written down to `BEHIND_BYTES` (its
 /// write task wakes the lane), at most `LANE_PACE`: the lane goes on at the
 /// pace the sockets write, not further ahead. Its queue fills meanwhile, and
-/// then the senders wait in turn. Only a delivery to at least `PACE_MIN`
-/// connections counts, so one slow client never holds back its lane; and only
-/// the connections the message was queued for: one that is closed or over
-/// its own budget misses the message and holds nothing back.
+/// then the senders wait in turn. Only a delivery that reaches at least
+/// `PACE_MIN` connections counts, so a slow client or two never hold back
+/// their lane. A connection that is closed or over its own budget misses the
+/// message: it counts among those reached, never among those behind, so
+/// clients that read nothing hold their lane back only until their budget is
+/// full.
 const LANE_PACE: std::time::Duration = std::time::Duration::from_millis(1);
 const PACE_MIN: usize = 32;
 
@@ -344,10 +346,11 @@ impl Served {
         }
     }
 
-    /// Most of the many connections the message was queued for were behind.
+    /// The message reached many connections, and most of those it was
+    /// queued for were behind.
     fn lagging(&self) -> bool {
-        let queued = self.delivered as usize;
-        queued >= PACE_MIN && self.behind * 2 > queued
+        let reached = (self.delivered + self.dropped) as usize;
+        reached >= PACE_MIN && self.behind * 2 > self.delivered as usize
     }
 }
 
@@ -375,6 +378,26 @@ mod pacing_tests {
         assert!(!lagging(BEHIND_BYTES, false));
         // Gone: nothing to wait for either.
         assert!(!lagging(0, true));
+    }
+
+    #[test]
+    fn many_reached_and_most_takers_behind_hold_the_lane_back() {
+        let drops = AtomicU64::new(0);
+        let msg = Outgoing::text(bytes::Bytes::from_static(b"{}"));
+        let mut served = Served::default();
+        // Most of the lane's clients are over their budget, the rest behind:
+        // too few take the message to count alone, all of them reached do.
+        for i in 0..PACE_MIN {
+            let (h, _rx) = super::super::tests::test_handle();
+            let full = i % 3 != 0;
+            h.out.pending.store(
+                if full { 2 * BEHIND_BYTES } else { BEHIND_BYTES },
+                Ordering::Relaxed,
+            );
+            served.deliver(&h, &msg, 2 * BEHIND_BYTES, &drops);
+        }
+        assert!((served.delivered as usize) < PACE_MIN);
+        assert!(served.lagging());
     }
 }
 
