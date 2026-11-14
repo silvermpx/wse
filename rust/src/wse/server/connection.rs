@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -31,7 +31,7 @@ use super::handshake::{HANDSHAKE_TIMEOUT, HandshakeGuard, normalize_origin, reje
 use super::messages::{build_server_hello, build_server_ready, normalize_json_keys};
 use super::py::{fire_on_connect, fire_on_disconnect, json_to_pyobj};
 use super::signing::{self, ClientKey, Refused};
-use super::state::{CloseOutbox, InboundEvent, Outbox, Seal, inbound_cost};
+use super::state::{Activity, CloseOutbox, InboundEvent, Outbox, Seal, inbound_cost};
 use super::subscribe::{answer_subscription_request, requested_compression};
 use super::{
     CLOSE_E2E_BAD_FRAME, CLOSE_E2E_EXHAUSTED, CLOSE_E2E_UNSUPPORTED, CLOSE_GRACE,
@@ -197,8 +197,13 @@ fn tell_application(
 /// A client that announced E2E now has its session: accepted by its token,
 /// it gets server_ready (sealed) and joins the broadcasts; then the
 /// application learns of it. False when the application has no room for it.
+///
+/// Called from the connection's read loop: only the connection's own
+/// cleanup, after that loop, takes it out of the maps, so it is still in
+/// them here and the join needs no lock. The read loop waits on nothing but
+/// the socket.
 #[must_use]
-async fn admit_after_session(
+fn admit_after_session(
     state: &Arc<SharedState>,
     conn_id: &Arc<String>,
     handle: &ConnectionHandle,
@@ -210,18 +215,182 @@ async fn admit_after_session(
     if let Some(ref user) = user_id {
         let ready = build_server_ready(conn_id, user, state);
         handle.send_control(Message::Text(ready.into()));
-        // Under the read lock: its cleanup (write lock) cannot run in between.
-        let conns = state.connections.read().await;
-        if conns.contains_key(conn_id.as_str()) {
-            handle.out.admitted.store(true, Ordering::Release);
-            state.topics.join(conn_id, handle);
-        }
+        handle.out.admitted.store(true, Ordering::Release);
+        state.topics.join(conn_id, handle);
     }
     tell_application(state, conn_id, user_id, cookies, drain, lane)
 }
 
+/// What the read loop's rare paths need of their connection.
+struct Conn<'a> {
+    state: &'a Arc<SharedState>,
+    conn_id: &'a Arc<String>,
+    handle: &'a ConnectionHandle,
+    tx: &'a mpsc::UnboundedSender<WsFrame>,
+    closer: &'a Closer,
+    max_pending: usize,
+}
+
+impl Conn<'_> {
+    /// Tell the client why in `reply`, then close with `code`.
+    fn refuse(&self, reply: &'static str, code: u16, reason: &str) {
+        queue_reply(self.handle, self.max_pending, Message::Text(reply.into()));
+        self.closer
+            .close(self.tx, &self.handle.out.pending, code, reason);
+    }
+}
+
+/// The read loop's state a client_hello may change, and what admitting the
+/// connection after its E2E session takes.
+struct Admission<'a> {
+    announced_e2e: bool,
+    session: &'a mut Option<RecvState>,
+    awaiting_session: &'a mut bool,
+    known: &'a mut bool,
+    user_id: &'a Option<String>,
+    cookies: &'a str,
+    drain: bool,
+    lane: Option<&'a Arc<CallbackLane>>,
+}
+
+/// The client's hello, once a connection: compression, then an E2E session
+/// (announced at the upgrade) or the first design's key exchange, then
+/// server_hello. Out of line: the read loop's hot path is the client's
+/// messages, and this code sat in the middle of it.
+#[cold]
+#[inline(never)]
+fn answer_client_hello(conn: &Conn<'_>, val: &serde_json::Value, admission: Admission<'_>) {
+    let (state, conn_id) = (conn.state, conn.conn_id);
+    let p = val.get("p");
+    if let Some(threshold) = requested_compression(
+        p.and_then(|p| p.get("features"))
+            .and_then(|f| f.get("compression")),
+        p.and_then(|p| p.get("compression_threshold")),
+    ) {
+        state
+            .conn_compression
+            .insert((**conn_id).clone(), threshold);
+    }
+    let client_proto = p
+        .and_then(|p| p.get("protocol_version"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as u32;
+
+    // An E2E session with an authenticated server. It is opened first,
+    // announced at the upgrade (`e2e=1`): the server holds everything else
+    // back until then, so nothing goes in plaintext.
+    let offer = p.and_then(|p| p.get("e2e"));
+    if offer.is_some() != admission.announced_e2e {
+        conn.refuse(
+            E2E_UNSUPPORTED_ERROR,
+            CLOSE_E2E_UNSUPPORTED,
+            "e2e session not announced",
+        );
+        return;
+    }
+    if let Some(offer) = offer {
+        let accepted = e2e_session::parse_offer(offer)
+            .and_then(|offer| e2e_session::accept(&offer, conn_id, state.e2e_identity.as_ref()));
+        match accepted {
+            Ok(accepted) => {
+                let hello =
+                    build_server_hello(conn_id, client_proto, state, None, Some(accepted.hello));
+                queue_reply(conn.handle, conn.max_pending, Message::Text(hello.into()));
+                // From here on the write task seals every frame, and the
+                // client sends nothing else.
+                let _ = conn.tx.send(WsFrame::InstallSeal(Box::new(accepted.send)));
+                *admission.session = Some(accepted.recv);
+                state.conn_sealed.insert((**conn_id).clone());
+                let _ = conn.handle.out.cipher.set(Seal::Session);
+                *admission.awaiting_session = false;
+                *admission.known = admit_after_session(
+                    state,
+                    conn_id,
+                    conn.handle,
+                    admission.user_id.clone(),
+                    admission.cookies,
+                    admission.drain,
+                    admission.lane,
+                );
+                if !*admission.known {
+                    conn.closer.close(
+                        conn.tx,
+                        &conn.handle.out.pending,
+                        CLOSE_TRY_AGAIN_LATER,
+                        "server busy",
+                    );
+                }
+            }
+            Err(_) => conn.refuse(
+                E2E_UNSUPPORTED_ERROR,
+                CLOSE_E2E_UNSUPPORTED,
+                "e2e suite unsupported",
+            ),
+        }
+        return;
+    }
+
+    // Check if client requests E2E encryption (the first design)
+    let wants_encryption = p
+        .and_then(|p| p.get("features"))
+        .and_then(|f| f.get("encryption"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if wants_encryption && !state.e2e_legacy {
+        conn.refuse(
+            E2E_UNSUPPORTED_ERROR,
+            CLOSE_E2E_UNSUPPORTED,
+            "e2e suite unsupported",
+        );
+        return;
+    }
+
+    // Once-only key exchange: never re-derive the cipher if this connection
+    // already has one. A repeated client_hello would otherwise overwrite the
+    // AES key mid-session (making in-flight encrypted messages
+    // undecryptable) and is a cheap ECDH-keygen DoS amplifier.
+    let key = if wants_encryption {
+        p.and_then(|p| p.get("encryption_public_key"))
+            .and_then(|v| v.as_str())
+            .and_then(|b64| match derive_connection_key(b64) {
+                Ok(key) => Some(key),
+                Err(e) => {
+                    tracing::warn!("[WSE] ECDH key exchange failed for {}: {}", conn_id, e);
+                    let err_msg = format!(
+                        "{{\"c\":\"WSE\",\"t\":\"error\",\"p\":{{\"code\":\"KEY_EXCHANGE_FAILED\",\"message\":\"ECDH key exchange failed: {}\",\"recoverable\":true}}}}",
+                        e.replace('\"', "\\\"")
+                    );
+                    queue_reply(conn.handle, conn.max_pending, Message::Text(err_msg.into()));
+                    None
+                }
+            })
+    } else {
+        None
+    };
+
+    let hello = build_server_hello(
+        conn_id,
+        client_proto,
+        state,
+        key.as_ref()
+            .map(|(server_public, _)| server_public.as_str()),
+        None,
+    );
+    queue_reply(conn.handle, conn.max_pending, Message::Text(hello.into()));
+    // The key is in use only after server_hello is queued: an encrypted frame
+    // never reaches the client before the server's public key.
+    if let Some((_, cipher)) = key {
+        state
+            .conn_encryption
+            .insert((**conn_id).clone(), cipher.clone());
+        let _ = conn.handle.out.cipher.set(Seal::Legacy(cipher));
+    }
+}
+
 /// Before its session, a client that announced E2E sends client_hello and
 /// heartbeats only.
+#[cold]
+#[inline(never)]
 fn handshake_message(text: &str) -> bool {
     let json = text
         .strip_prefix("WSE")
@@ -244,6 +413,7 @@ fn handshake_message(text: &str) -> bool {
 /// answered with the server's signed receipt. Refused with a
 /// `SIGNATURE_REFUSED` error otherwise, `busy` when the application cannot
 /// take it now: then it was not received and its `n` stays free.
+#[inline(never)]
 fn take_signed(
     state: &Arc<SharedState>,
     conn_id: &Arc<String>,
@@ -436,6 +606,8 @@ fn token_valid_until(exp: u64) -> tokio::time::Instant {
 }
 
 /// A client's `client_config`: what it asks of compression from now on.
+#[cold]
+#[inline(never)]
 fn apply_client_config(state: &SharedState, conn_id: &str, p: Option<&serde_json::Value>) {
     if let Some(threshold) = requested_compression(
         p.and_then(|p| p.get("compression")),
@@ -515,6 +687,8 @@ impl AsyncWrite for ServerSocket {
 const E2E_UNSUPPORTED_ERROR: &str = "{\"c\":\"WSE\",\"t\":\"error\",\"p\":{\"code\":\"E2E_UNSUPPORTED\",\"message\":\"No end-to-end encryption in common with the server\",\"recoverable\":false},\"v\":1}";
 
 /// The PONG answering a client's JSON `ping`.
+#[cold]
+#[inline(never)]
 fn pong_for(ping: &serde_json::Value) -> String {
     let timestamp = ping
         .get("p")
@@ -1051,7 +1225,8 @@ pub(super) async fn handle_connection(
         state.conn_compression.insert((*conn_id).clone(), 0);
     }
     // Its last activity, for the idle check: updated by the read loop.
-    let activity = Arc::new(AtomicU64::new(state.activity_ms(Instant::now())));
+    let activity = Arc::new(Activity::default());
+    activity.store(state.activity_ms(Instant::now()), Ordering::Relaxed);
     state
         .conn_last_activity
         .insert((*conn_id).clone(), activity.clone());
@@ -1300,12 +1475,9 @@ pub(super) async fn handle_connection(
             }
             match msg {
                 Message::Text(text) => {
-                    state
-                        .messages_received_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    state
-                        .bytes_received_total
-                        .fetch_add(text.len() as u64, Ordering::Relaxed);
+                    let shard = usize::from(own_handle.lane);
+                    state.messages_received_total.add(shard, 1);
+                    state.bytes_received_total.add(shard, text.len() as u64);
                     let text_ref: &str = text.as_ref();
 
                     // Strip prefix for JSON parsing
@@ -1347,186 +1519,29 @@ pub(super) async fn handle_connection(
                             // Fast-path: protocol messages handled entirely in Rust
                             if let Some(t_val) = val.get("t").and_then(|t| t.as_str()) {
                                 if t_val == "client_hello" {
-                                    if hello_answered {
-                                        continue;
-                                    }
-                                    hello_answered = true;
-                                    let p = val.get("p");
-                                    if let Some(threshold) = requested_compression(
-                                        p.and_then(|p| p.get("features"))
-                                            .and_then(|f| f.get("compression")),
-                                        p.and_then(|p| p.get("compression_threshold")),
-                                    ) {
-                                        state
-                                            .conn_compression
-                                            .insert((*conn_id).clone(), threshold);
-                                    }
-                                    let client_proto = p
-                                        .and_then(|p| p.get("protocol_version"))
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(1)
-                                        as u32;
-
-                                    // An E2E session with an authenticated server. It
-                                    // is opened first, announced at the upgrade
-                                    // (`e2e=1`): the server holds everything else
-                                    // back until then, so nothing goes in plaintext.
-                                    let offer = p.and_then(|p| p.get("e2e"));
-                                    if offer.is_some() != announced_e2e {
-                                        queue_reply(
-                                            &own_handle,
-                                            max_pending,
-                                            Message::Text(E2E_UNSUPPORTED_ERROR.into()),
+                                    if !hello_answered {
+                                        hello_answered = true;
+                                        answer_client_hello(
+                                            &Conn {
+                                                state: &state,
+                                                conn_id: &conn_id,
+                                                handle: &own_handle,
+                                                tx: &tx,
+                                                closer: &closer,
+                                                max_pending,
+                                            },
+                                            &val,
+                                            Admission {
+                                                announced_e2e,
+                                                session: &mut session,
+                                                awaiting_session: &mut awaiting_session,
+                                                known: &mut known,
+                                                user_id: &rust_auth_user_id,
+                                                cookies: &cookie_str,
+                                                drain,
+                                                lane: lane.as_ref(),
+                                            },
                                         );
-                                        closer.close(
-                                            &tx,
-                                            &out.pending,
-                                            CLOSE_E2E_UNSUPPORTED,
-                                            "e2e session not announced",
-                                        );
-                                        continue;
-                                    }
-                                    if let Some(offer) = offer {
-                                        let accepted =
-                                            e2e_session::parse_offer(offer).and_then(|offer| {
-                                                e2e_session::accept(
-                                                    &offer,
-                                                    &conn_id,
-                                                    state.e2e_identity.as_ref(),
-                                                )
-                                            });
-                                        match accepted {
-                                            Ok(accepted) => {
-                                                let hello = build_server_hello(
-                                                    &conn_id,
-                                                    client_proto,
-                                                    &state,
-                                                    None,
-                                                    Some(accepted.hello),
-                                                );
-                                                queue_reply(
-                                                    &own_handle,
-                                                    max_pending,
-                                                    Message::Text(hello.into()),
-                                                );
-                                                // From here on the write task seals every
-                                                // frame, and the client sends nothing else.
-                                                let _ = tx.send(WsFrame::InstallSeal(Box::new(
-                                                    accepted.send,
-                                                )));
-                                                session = Some(accepted.recv);
-                                                state.conn_sealed.insert((*conn_id).clone());
-                                                let _ = out.cipher.set(Seal::Session);
-                                                awaiting_session = false;
-                                                known = admit_after_session(
-                                                    &state,
-                                                    &conn_id,
-                                                    &own_handle,
-                                                    rust_auth_user_id.clone(),
-                                                    &cookie_str,
-                                                    drain,
-                                                    lane.as_ref(),
-                                                )
-                                                .await;
-                                                if !known {
-                                                    closer.close(
-                                                        &tx,
-                                                        &out.pending,
-                                                        CLOSE_TRY_AGAIN_LATER,
-                                                        "server busy",
-                                                    );
-                                                }
-                                            }
-                                            Err(_) => {
-                                                queue_reply(
-                                                    &own_handle,
-                                                    max_pending,
-                                                    Message::Text(E2E_UNSUPPORTED_ERROR.into()),
-                                                );
-                                                closer.close(
-                                                    &tx,
-                                                    &out.pending,
-                                                    CLOSE_E2E_UNSUPPORTED,
-                                                    "e2e suite unsupported",
-                                                );
-                                            }
-                                        }
-                                        continue;
-                                    }
-
-                                    // Check if client requests E2E encryption (the first design)
-                                    let wants_encryption = p
-                                        .and_then(|p| p.get("features"))
-                                        .and_then(|f| f.get("encryption"))
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(false);
-                                    if wants_encryption && !state.e2e_legacy {
-                                        queue_reply(
-                                            &own_handle,
-                                            max_pending,
-                                            Message::Text(E2E_UNSUPPORTED_ERROR.into()),
-                                        );
-                                        closer.close(
-                                            &tx,
-                                            &out.pending,
-                                            CLOSE_E2E_UNSUPPORTED,
-                                            "e2e suite unsupported",
-                                        );
-                                        continue;
-                                    }
-
-                                    // Once-only key exchange: never re-derive the cipher
-                                    // if this connection already has one. A repeated
-                                    // client_hello would otherwise overwrite the AES key
-                                    // mid-session (making in-flight encrypted messages
-                                    // undecryptable) and is a cheap ECDH-keygen DoS amplifier.
-                                    let key = if wants_encryption {
-                                        p.and_then(|p| p.get("encryption_public_key"))
-                                        .and_then(|v| v.as_str())
-                                        .and_then(|b64| match derive_connection_key(b64) {
-                                            Ok(key) => Some(key),
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "[WSE] ECDH key exchange failed for {}: {}",
-                                                    conn_id, e
-                                                );
-                                                let err_msg = format!(
-                                                    "{{\"c\":\"WSE\",\"t\":\"error\",\"p\":{{\"code\":\"KEY_EXCHANGE_FAILED\",\"message\":\"ECDH key exchange failed: {}\",\"recoverable\":true}}}}",
-                                                    e.replace('\"', "\\\"")
-                                                );
-                                                queue_reply(
-                                                    &own_handle,
-                                                    max_pending,
-                                                    Message::Text(err_msg.into()),
-                                                );
-                                                None
-                                            }
-                                        })
-                                    } else {
-                                        None
-                                    };
-
-                                    let hello = build_server_hello(
-                                        &conn_id,
-                                        client_proto,
-                                        &state,
-                                        key.as_ref()
-                                            .map(|(server_public, _)| server_public.as_str()),
-                                        None,
-                                    );
-                                    queue_reply(
-                                        &own_handle,
-                                        max_pending,
-                                        Message::Text(hello.into()),
-                                    );
-                                    // The key is in use only after server_hello is queued:
-                                    // an encrypted frame never reaches the client before
-                                    // the server's public key.
-                                    if let Some((_, cipher)) = key {
-                                        state
-                                            .conn_encryption
-                                            .insert((*conn_id).clone(), cipher.clone());
-                                        let _ = out.cipher.set(Seal::Legacy(cipher));
                                     }
                                     continue;
                                 }
@@ -1631,12 +1646,9 @@ pub(super) async fn handle_connection(
                     }
                 }
                 Message::Binary(data) => {
-                    state
-                        .messages_received_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    state
-                        .bytes_received_total
-                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                    let shard = usize::from(own_handle.lane);
+                    state.messages_received_total.add(shard, 1);
+                    state.bytes_received_total.add(shard, data.len() as u64);
 
                     // E2E encryption: detect E: prefix and decrypt before processing
                     if data.len() >= 2 && data[0] == b'E' && data[1] == b':' {

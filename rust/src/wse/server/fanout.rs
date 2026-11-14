@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use super::e2e::{e2e_frame, e2e_message};
 use super::frames::{encode_ws_frame, ws_frame_size};
 use super::state::Seal;
-use super::{ConnectionHandle, QueueGroup, WsFrame};
+use super::{ConnectionHandle, QueueGroup, Tally, WsFrame};
 use crate::wse::cluster::ClusterMetrics;
 use crate::wse::msgpack::serde_json_to_rmpv;
 
@@ -801,7 +801,7 @@ async fn hand(lane: &mpsc::Sender<Job>, job: Job) {
 
 impl Fanout {
     /// Start a task for each lane of `index` on the current runtime.
-    pub(crate) fn start(index: TopicIndex, max_pending: usize, slow_drops: Arc<AtomicU64>) -> Self {
+    pub(crate) fn start(index: TopicIndex, max_pending: usize, slow_drops: Arc<Tally>) -> Self {
         let lanes = (0..index.lanes())
             .map(|lane| {
                 let (tx, rx) = mpsc::channel(LANE_QUEUE);
@@ -916,17 +916,19 @@ async fn run_lane(
     mut jobs: mpsc::Receiver<Job>,
     index: TopicIndex,
     max_pending: usize,
-    slow_drops: Arc<AtomicU64>,
+    slow_drops: Arc<Tally>,
 ) {
     let mut batch = Vec::with_capacity(LANE_BATCH);
     let mut seen = AHashSet::new();
     let drained = index.drained(lane);
+    // The lane's own count of what it dropped: no other lane writes it.
+    let slow_drops = slow_drops.shard(usize::from(lane));
     while jobs.recv_many(&mut batch, LANE_BATCH).await > 0 {
         // Whether the lane served anyone since it last waited.
         let mut served_any = false;
         for job in batch.drain(..) {
             let served = match job {
-                Job::All(msg) => index.deliver_all(lane, &msg, max_pending, &slow_drops),
+                Job::All(msg) => index.deliver_all(lane, &msg, max_pending, slow_drops),
                 Job::Topic(message) => {
                     let served = index.deliver_topic(
                         lane,
@@ -934,7 +936,7 @@ async fn run_lane(
                         &message.patterns,
                         &message.msg,
                         max_pending,
-                        &slow_drops,
+                        slow_drops,
                         &mut seen,
                     );
                     if let Some(metrics) = &message.tally {
@@ -947,7 +949,7 @@ async fn run_lane(
                 }
                 Job::One(h, msg) => {
                     let mut served = Served::default();
-                    served.deliver(&h, &msg, max_pending, &slow_drops);
+                    served.deliver(&h, &msg, max_pending, slow_drops);
                     served
                 }
             };

@@ -173,7 +173,7 @@ pub(crate) struct ClusterContext {
     pub local_topic_refcount: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     pub cluster_addr: Option<String>,
     pub max_outbound: usize,
-    pub slow_drops: Arc<AtomicU64>,
+    pub slow_drops: Arc<crate::wse::server::Tally>,
     pub recovery: Option<Arc<crate::wse::recovery::RecoveryManager>>,
     pub topic_message_counts: Arc<DashMap<String, AtomicU64>>,
     pub queue_groups: Arc<DashMap<String, DashMap<String, crate::wse::server::QueueGroup>>>,

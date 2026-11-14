@@ -151,7 +151,7 @@ impl RustWSEServer {
         out.push_str("# TYPE wse_messages_received_total counter\n");
         out.push_str(&format!(
             "wse_messages_received_total {}\n",
-            self.shared.messages_received_total.load(Ordering::Relaxed)
+            self.shared.messages_received_total.sum()
         ));
 
         out.push_str(
@@ -192,7 +192,7 @@ impl RustWSEServer {
         out.push_str("# TYPE wse_bytes_received_total counter\n");
         out.push_str(&format!(
             "wse_bytes_received_total {}\n",
-            self.shared.bytes_received_total.load(Ordering::Relaxed)
+            self.shared.bytes_received_total.sum()
         ));
 
         out.push_str("# HELP wse_bytes_sent_total Total bytes sent to clients\n");
@@ -229,7 +229,7 @@ impl RustWSEServer {
         out.push_str("# TYPE wse_slow_consumer_drops_total counter\n");
         out.push_str(&format!(
             "wse_slow_consumer_drops_total {}\n",
-            self.shared.slow_consumer_drops.load(Ordering::Relaxed)
+            self.shared.slow_consumer_drops.sum()
         ));
 
         // Cluster metrics

@@ -1350,7 +1350,7 @@ async fn test_cluster_queue_group_dispatch() {
     queue_groups.insert("tasks".to_string(), inner);
 
     let frame_len = b"test-payload".len() + 2;
-    let drops = Arc::new(AtomicU64::new(0));
+    let drops = Arc::new(crate::wse::server::Tally::new(1));
     let fanout = crate::wse::server::Fanout::start(
         crate::wse::server::TopicIndex::new(1),
         0,
@@ -1363,7 +1363,7 @@ async fn test_cluster_queue_group_dispatch() {
                 "tasks",
                 || crate::wse::server::Outgoing::text(bytes::Bytes::from_static(b"test-payload")),
                 0,
-                &drops,
+                drops.shard(0),
             )
             .await;
         assert_eq!((delivered, dropped), (1, 0));

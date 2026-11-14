@@ -359,7 +359,7 @@ pub(super) async fn peer_dispatch_task(
                     &topic,
                     || crate::wse::server::Outgoing::text(crate::wse::server::unstamped(&payload)),
                     ctx.max_outbound,
-                    &ctx.slow_drops,
+                    ctx.slow_drops.shard(0),
                 )
                 .await;
             total_delivered += d;

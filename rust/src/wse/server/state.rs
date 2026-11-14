@@ -365,6 +365,62 @@ fn decoded_size(value: &serde_json::Value) -> usize {
     }
 }
 
+/// A counter every core adds to at once: one cache line for each shard, so
+/// the cores never take a line from each other (nor from the fields around
+/// it), and a reader sums the shards. A lane counts on its own shard, a
+/// connection on its lane's.
+pub(crate) struct Tally {
+    shards: Box<[Shard]>,
+}
+
+/// Two lines: Intel fetches lines in pairs, Apple's are 128 bytes.
+#[repr(align(128))]
+#[derive(Default)]
+struct Shard(AtomicU64);
+
+impl Tally {
+    pub(crate) fn new(shards: usize) -> Self {
+        Self {
+            shards: (0..shards.max(1)).map(|_| Shard::default()).collect(),
+        }
+    }
+
+    /// The counter of shard `i` (any `i`: past the last, the first).
+    #[inline]
+    pub(crate) fn shard(&self, i: usize) -> &AtomicU64 {
+        &self.shards.get(i).unwrap_or(&self.shards[0]).0
+    }
+
+    #[inline]
+    pub(crate) fn add(&self, i: usize, n: u64) {
+        self.shard(i).fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub(crate) fn sum(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| shard.0.load(Ordering::Relaxed))
+            .sum()
+    }
+}
+
+/// A connection's last activity (`SharedState::activity_ms`), written by its
+/// read loop on every frame. On a line of its own: cells made one after the
+/// other for different connections would otherwise share a line, and the
+/// cores reading those connections would take it from each other on every
+/// message.
+#[repr(align(128))]
+#[derive(Default)]
+pub(crate) struct Activity(AtomicU64);
+
+impl std::ops::Deref for Activity {
+    type Target = AtomicU64;
+
+    fn deref(&self) -> &AtomicU64 {
+        &self.0
+    }
+}
+
 /// Connect and disconnect events the drain may hold whatever the server's
 /// size (twice `max_connections`, at least this).
 const MIN_LIFECYCLE_EVENTS: usize = 64;
@@ -534,7 +590,7 @@ pub(crate) struct SharedState {
     /// Each connection's last frame, in milliseconds since `clock_base`, for
     /// the idle check. The connection's read loop holds its own counter and
     /// stores into it with every frame: no map lookup on the read path.
-    pub(super) conn_last_activity: DashMap<String, Arc<AtomicU64>>,
+    pub(super) conn_last_activity: DashMap<String, Arc<Activity>>,
     pub(super) clock_base: std::time::Instant,
     // Per-connection AES-256-GCM cipher for E2E encryption (optional, client-initiated)
     pub(super) conn_encryption: DashMap<String, Arc<crate::crypto::Aes256Gcm>>,
@@ -557,14 +613,14 @@ pub(crate) struct SharedState {
     // Per-connection subscription limit (0 = unlimited)
     pub(super) max_subscriptions_per_connection: usize,
     // Prometheus counters
-    pub(crate) slow_consumer_drops: Arc<AtomicU64>,
-    pub(super) messages_received_total: AtomicU64,
+    pub(crate) slow_consumer_drops: Arc<Tally>,
+    pub(super) messages_received_total: Tally,
     pub(super) messages_sent_total: AtomicU64,
     // Commands waiting for the command task
     pub(super) commands_queued: Arc<AtomicUsize>,
     pub(super) connections_accepted_total: AtomicU64,
     pub(super) connections_rejected_total: AtomicU64,
-    pub(super) bytes_received_total: AtomicU64,
+    pub(super) bytes_received_total: Tally,
     pub(super) bytes_sent_total: AtomicU64,
     pub(super) auth_failures_total: AtomicU64,
     pub(super) rate_limited_total: AtomicU64,
@@ -753,13 +809,13 @@ impl SharedState {
             idle_timeout_secs: cfg.idle_timeout_secs,
             max_outbound_queue_bytes: cfg.max_outbound_queue_bytes,
             max_subscriptions_per_connection: cfg.max_subscriptions_per_connection,
-            slow_consumer_drops: Arc::new(AtomicU64::new(0)),
-            messages_received_total: AtomicU64::new(0),
+            slow_consumer_drops: Arc::new(Tally::new(super::fanout::lane_count())),
+            messages_received_total: Tally::new(super::fanout::lane_count()),
             messages_sent_total: AtomicU64::new(0),
             commands_queued: Arc::default(),
             connections_accepted_total: AtomicU64::new(0),
             connections_rejected_total: AtomicU64::new(0),
-            bytes_received_total: AtomicU64::new(0),
+            bytes_received_total: Tally::new(super::fanout::lane_count()),
             bytes_sent_total: AtomicU64::new(0),
             auth_failures_total: AtomicU64::new(0),
             rate_limited_total: AtomicU64::new(0),

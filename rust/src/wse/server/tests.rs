@@ -337,7 +337,7 @@ async fn a_large_fanout_reaches_everyone_once_and_in_order() {
             (h, rx)
         })
         .collect();
-    let drops = Arc::new(AtomicU64::new(0));
+    let drops = Arc::new(Tally::new(index.lanes()));
     let fanout = Fanout::start(index.clone(), 0, Arc::clone(&drops));
     for n in 0..3 {
         let msg = || Outgoing::text(bytes::Bytes::from(format!("{{\"n\":{n}}}")));
@@ -367,7 +367,7 @@ async fn a_large_fanout_reaches_everyone_once_and_in_order() {
         .await;
     assert_eq!(delivered(&handles[1].0, frame.len()).await, frame.to_vec());
     assert!(queued(&handles[0].0).is_empty());
-    assert_eq!(drops.load(Ordering::Relaxed), 0);
+    assert_eq!(drops.sum(), 0);
     for (i, (h, _)) in handles.iter().enumerate().filter(|(_, (h, _))| h.lane == 1) {
         index.leave(&format!("c{i}"), h.lane);
     }
@@ -381,7 +381,7 @@ async fn a_full_lane_makes_the_sender_wait_and_loses_nothing() {
     let index = TopicIndex::new(1);
     let (h, _rx) = make_handle();
     index.subscribe("t", "c", &h);
-    let fanout = Fanout::start(index, 0, Arc::new(AtomicU64::new(0)));
+    let fanout = Fanout::start(index, 0, Arc::new(Tally::new(1)));
     let frame = |n: usize| encode_ws_frame(0x01, format!("{{\"n\":{n}}}").as_bytes());
     let msg = |n: usize| move || Outgoing::text(bytes::Bytes::from(format!("{{\"n\":{n}}}")));
     // On this one thread the lane runs only when the sender waits: the
@@ -657,4 +657,20 @@ fn test_topic_metrics_top_n_limit() {
     assert_eq!(entries[0].1, 59);
     // 50th should be 10 (topics 0-9 excluded)
     assert_eq!(entries[49].1, 10);
+}
+
+#[test]
+fn a_tally_counts_on_shards_and_reads_their_sum() {
+    let tally = Tally::new(4);
+    // Lanes 4 to 7 are past the last shard: they count on the first.
+    for lane in 0..8 {
+        tally.add(lane, 1);
+    }
+    assert_eq!(tally.sum(), 8);
+    assert_eq!(tally.shard(0).load(Ordering::Relaxed), 5);
+    assert_eq!(tally.shard(3).load(Ordering::Relaxed), 1);
+    // Shards never share a cache line.
+    let (a, b) = (tally.shard(0), tally.shard(1));
+    let gap = (b as *const AtomicU64 as usize).abs_diff(a as *const AtomicU64 as usize);
+    assert!(gap >= 128);
 }

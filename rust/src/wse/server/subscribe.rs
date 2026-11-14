@@ -353,7 +353,7 @@ impl SharedState {
                     if !handle.send_one(
                         Message::Text(text),
                         self.max_outbound_queue_bytes,
-                        &self.slow_consumer_drops,
+                        self.slow_consumer_drops.shard(usize::from(handle.lane)),
                     ) {
                         break;
                     }
@@ -445,6 +445,8 @@ pub(crate) fn parse_anchor(position: &serde_json::Value) -> Option<(u32, u64)> {
 /// allow, replays what it missed from the positions it sent, then replies
 /// with the outcome; the replay is queued before the reply. `unsubscribe`
 /// gets no reply: the clients expect none.
+#[cold]
+#[inline(never)]
 pub(crate) fn answer_subscription_request(
     state: &SharedState,
     conn_id: &str,
@@ -543,6 +545,6 @@ pub(crate) fn answer_subscription_request(
     handle.send_one(
         Message::Text(reply.to_string().into()),
         state.max_outbound_queue_bytes,
-        &state.slow_consumer_drops,
+        state.slow_consumer_drops.shard(usize::from(handle.lane)),
     );
 }

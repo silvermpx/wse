@@ -54,7 +54,7 @@ pub(super) async fn process_commands(
                     h.send_one(
                         Message::Text(data.into()),
                         state.max_outbound_queue_bytes,
-                        &state.slow_consumer_drops,
+                        state.slow_consumer_drops.shard(usize::from(h.lane)),
                     );
                 }
             }
@@ -70,7 +70,7 @@ pub(super) async fn process_commands(
                     h.send_one(
                         Message::Text(ready.into()),
                         state.max_outbound_queue_bytes,
-                        &state.slow_consumer_drops,
+                        state.slow_consumer_drops.shard(usize::from(h.lane)),
                     );
                     state.topics.join(&conn_id, h);
                 }
@@ -81,7 +81,7 @@ pub(super) async fn process_commands(
                     h.send_one(
                         Message::Binary(data.into()),
                         state.max_outbound_queue_bytes,
-                        &state.slow_consumer_drops,
+                        state.slow_consumer_drops.shard(usize::from(h.lane)),
                     );
                 }
             }
@@ -93,7 +93,7 @@ pub(super) async fn process_commands(
                     if h.send_one(
                         message,
                         state.max_outbound_queue_bytes,
-                        &state.slow_consumer_drops,
+                        state.slow_consumer_drops.shard(usize::from(h.lane)),
                     ) {
                         // Counted once really queued.
                         state.messages_sent_total.fetch_add(1, Ordering::Relaxed);
@@ -148,7 +148,7 @@ pub(super) async fn process_commands(
                         &topic,
                         || Outgoing::text(original),
                         state.max_outbound_queue_bytes,
-                        &state.slow_consumer_drops,
+                        state.slow_consumer_drops.shard(0),
                     )
                     .await;
                 fanout
