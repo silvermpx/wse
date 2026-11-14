@@ -207,7 +207,7 @@ class TestApplicationAccepts:
         return asyncio.ensure_future(accept())
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("encryption", [False, True])
+    @pytest.mark.parametrize("encryption", [False, pytest.param(True, marks=needs_crypto)])
     async def test_topics_wait_for_the_acceptance(self, server_port, encryption):
         options = {"e2e_identity_key": identity_key()} if encryption else {}
         srv = RustWSEServer("127.0.0.1", server_port, client_subscriptions=True, **options)
