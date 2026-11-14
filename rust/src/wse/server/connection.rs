@@ -194,7 +194,6 @@ fn tell_application(
     true
 }
 
-
 /// A client that announced E2E now has its session: accepted by its token,
 /// it gets server_ready (sealed) and joins the broadcasts; then the
 /// application learns of it. False when the application has no room for it.

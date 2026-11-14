@@ -1,7 +1,7 @@
 //! The cluster manager: owns every peer link and routes commands, interest,
 //! gossip, registrations and presence between them.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -17,12 +17,16 @@ use super::{
     CAP_COMPRESSION, CAP_INTEREST_ROUTING, CAP_PRESENCE, CAP_RECOVERY,
     CLUSTER_RESYNC_INTERVAL_SECS, ClusterCommand, ClusterContext, ClusterDlq, ClusterDlqEntry,
     ClusterTlsConfig, InterestUpdate, MANAGER_QUEUE_CAP, MAX_CLUSTER_PEERS, MAX_FRAME_SIZE,
-    MAX_REMOTE_INTEREST_PER_PEER, PRESENCE_ROUND_FIRST, PRESENCE_ROUND_LAST, PeerInterest,
-    PeerRegistration, PresencePeerFrame, encode_drain, encode_msg, encode_msg_compressed,
-    encode_msg_with_recovery, encode_peer_announce, encode_presence_round, encode_presence_update,
-    encode_resync, encode_shutdown, encode_sub, encode_unsub,
+    MAX_KNOWN_PEERS, MAX_REMOTE_INTEREST_PER_PEER, PRESENCE_ROUND_FIRST, PRESENCE_ROUND_LAST,
+    PeerInterest, PeerRegistration, PresencePeerFrame, encode_drain, encode_msg,
+    encode_msg_compressed, encode_msg_with_recovery, encode_peer_announce, encode_presence_round,
+    encode_presence_update, encode_resync, encode_shutdown, encode_sub, encode_unsub,
 };
 use crate::wse::presence::PresenceManager;
+
+/// Ended link sessions remembered, so presence frames they still had on the
+/// way are dropped: far more than a link can have in flight.
+const ENDED_SESSIONS_KEPT: usize = 4096;
 use crate::wse::server::subscribe::MAX_TOPIC_LEN;
 
 /// Queue `frames` on a link whole or not at all: a RESYNC or a presence
@@ -133,9 +137,20 @@ pub(crate) async fn cluster_manager(
     let mut draining: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Track the latest session generation per peer to filter stale RESYNC continuations
     let mut peer_generation: HashMap<String, u64> = HashMap::new();
+    // RESYNC rounds of several frames being received, per peer: their
+    // session and the set so far, taken in place of the old one when whole.
+    let mut resync_rounds: HashMap<String, (u64, PeerInterest)> = HashMap::new();
     // Peers that missed a presence frame of this node (a full link): they get
     // a sync round on the next tick.
     let mut presence_dirty: HashSet<String> = HashSet::new();
+    // Link sessions that ended, newest last: their presence frames still on
+    // the way (another channel than the end) are not merged, or they would
+    // stay as ghosts of a link gone. Bounded; session numbers never repeat.
+    let mut ended_sessions: HashSet<u64> = HashSet::new();
+    let mut ended_order: VecDeque<u64> = VecDeque::new();
+    // The link session whose presence each origin's entries came from: a
+    // late end of an older session leaves a newer one's alone.
+    let mut presence_session: HashMap<String, u64> = HashMap::new();
     // Presence sync rounds being received, per origin: the link session they
     // came on and the users of each topic seen so far.
     let mut presence_rounds: HashMap<String, (u64, HashMap<String, HashSet<String>>)> =
@@ -412,7 +427,9 @@ pub(crate) async fn cluster_manager(
                     continue;
                 }
                 let is_self = ctx.cluster_addr.as_deref() == Some(&new_addr);
-                let already_known = !ctx.known_peers.insert(new_addr.clone());
+                let already_known = ctx.known_peers.contains(&new_addr)
+                    || ctx.known_peers.len() >= MAX_KNOWN_PEERS
+                    || !ctx.known_peers.insert(new_addr.clone());
                 if !is_self && !already_known {
                     dialing.retain(|_, task| !task.is_finished());
                     if dialing.contains_key(&new_addr) {
@@ -453,7 +470,7 @@ pub(crate) async fn cluster_manager(
                         }
                     }
                     // Only spawn connection to this peer if we don't already know it
-                    if ctx.known_peers.insert(addr.clone()) {
+                    if ctx.known_peers.len() < MAX_KNOWN_PEERS && ctx.known_peers.insert(addr.clone()) {
                         dialing.retain(|_, task| !task.is_finished());
                         if dialing.contains_key(&addr) {
                             // Still being dialed.
@@ -474,6 +491,9 @@ pub(crate) async fn cluster_manager(
                         // Bounded: a new topic past the cap is dropped, and so is
                         // a name longer than any node subscribes.
                         if topic.len() <= MAX_TOPIC_LEN {
+                            if let Some((_, round)) = resync_rounds.get_mut(&peer_addr) {
+                                round.insert(topic.clone(), MAX_REMOTE_INTEREST_PER_PEER);
+                            }
                             remote_interest
                                 .entry(peer_addr)
                                 .or_default()
@@ -481,29 +501,54 @@ pub(crate) async fn cluster_manager(
                         }
                     }
                     Some(InterestUpdate::Unsub { peer_addr, topic }) => {
+                        if let Some((_, round)) = resync_rounds.get_mut(&peer_addr) {
+                            round.remove(&topic);
+                        }
                         if let Some(interest) = remote_interest.get_mut(&peer_addr) {
                             interest.remove(&topic);
                         }
                     }
-                    Some(InterestUpdate::Resync { peer_addr, topics, is_continuation, generation }) => {
+                    Some(InterestUpdate::Resync { peer_addr, topics, is_continuation, more, generation }) => {
                         // The first frame of a RESYNC replaces the set; a continuation
-                        // extends it, and only for the session that started it.
+                        // extends it, and only for the session that started it. A
+                        // round of several frames is built apart and taken whole:
+                        // until its last frame the old set routes, with what the
+                        // round named so far, so no publish in between is missed.
                         if is_continuation && peer_generation.get(&peer_addr) != Some(&generation) {
                             continue;
                         }
                         if !is_continuation {
                             peer_generation.insert(peer_addr.clone(), generation);
-                            remote_interest.insert(peer_addr.clone(), PeerInterest::default());
+                            resync_rounds.remove(&peer_addr);
+                            if more {
+                                resync_rounds.insert(peer_addr.clone(), (generation, PeerInterest::default()));
+                            } else {
+                                remote_interest.insert(peer_addr.clone(), PeerInterest::default());
+                            }
                         }
                         let interest = remote_interest.entry(peer_addr.clone()).or_default();
+                        let mut round = resync_rounds
+                            .get_mut(&peer_addr)
+                            .filter(|(session, _)| *session == generation);
                         let offered = topics.len();
                         let kept = topics
                             .into_iter()
                             .filter(|t| {
-                                t.len() <= MAX_TOPIC_LEN
-                                    && interest.insert(t.clone(), MAX_REMOTE_INTEREST_PER_PEER)
+                                if t.len() > MAX_TOPIC_LEN {
+                                    return false;
+                                }
+                                if let Some((_, round)) = round.as_mut() {
+                                    round.insert(t.clone(), MAX_REMOTE_INTEREST_PER_PEER);
+                                }
+                                interest.insert(t.clone(), MAX_REMOTE_INTEREST_PER_PEER)
                             })
                             .count();
+                        if !more
+                            && let Some((session, whole)) = resync_rounds.remove(&peer_addr)
+                            && session == generation
+                        {
+                            remote_interest.insert(peer_addr.clone(), whole);
+                        }
                         if kept < offered {
                             tracing::warn!(
                                 "[WSE-Cluster] {peer_addr} advertised {} topics past {MAX_REMOTE_INTEREST_PER_PEER} or longer than {MAX_TOPIC_LEN} bytes; ignored",
@@ -514,19 +559,35 @@ pub(crate) async fn cluster_manager(
                     Some(InterestUpdate::PeerDisconnected { peer_addr, generation }) => {
                         // Only process disconnect if generation matches current session.
                         // Prevents a stale disconnect from clearing a newer session's interest.
+                        if ended_sessions.insert(generation) {
+                            ended_order.push_back(generation);
+                            if ended_order.len() > ENDED_SESSIONS_KEPT
+                                && let Some(oldest) = ended_order.pop_front()
+                            {
+                                ended_sessions.remove(&oldest);
+                            }
+                        }
                         let stale = peer_generation
                             .get(&peer_addr)
                             .is_some_and(|g| *g != generation);
-                        if !stale {
-                            // Purge this peer's presence sentinels so a crashed peer
-                            // (no per-user leave) leaves no ghost members behind.
+                        // Purge this peer's presence sentinels so a crashed peer
+                        // (no per-user leave) leaves no ghost members behind --
+                        // unless they came on a newer session of the address.
+                        let presence_newer = presence_session
+                            .get(&peer_addr)
+                            .is_some_and(|g| *g > generation);
+                        if !presence_newer {
+                            presence_session.remove(&peer_addr);
                             if let Some(ref pm) = presence {
                                 for (topic, user_id, data) in pm.purge_origin(&peer_addr) {
                                     tell_presence(&server_cmd_tx, "presence_leave", topic, &user_id, &data);
                                 }
                             }
+                        }
+                        if !stale {
                             remote_interest.remove(&peer_addr);
                             peer_generation.remove(&peer_addr);
+                            resync_rounds.remove(&peer_addr);
                             presence_rounds.remove(&peer_addr);
                             draining.remove(&peer_addr);
                             if !static_peers.contains(&peer_addr) {
@@ -582,9 +643,18 @@ pub(crate) async fn cluster_manager(
             }
             // Handle presence frames received from peers
             Some(pf) = presence_peer_rx.recv() => {
+                let (origin, generation) = match &pf {
+                    PresencePeerFrame::Update { origin, generation, .. }
+                    | PresencePeerFrame::Full { origin, generation, .. } => (origin, *generation),
+                };
+                // A session that ended: what it still had on the way is gone with it.
+                if ended_sessions.contains(&generation) {
+                    continue;
+                }
+                presence_session.insert(origin.clone(), generation);
                 if let Some(ref pm) = presence {
                     match pf {
-                        PresencePeerFrame::Update { origin, topic, user_id, action, data, updated_at } => {
+                        PresencePeerFrame::Update { origin, topic, user_id, action, data, updated_at, .. } => {
                             let data_val: serde_json::Value = serde_json::from_str(&data).unwrap_or(serde_json::Value::Null);
                             // Local subscribers hear of a change in membership
                             // only: a join of a user already present (another

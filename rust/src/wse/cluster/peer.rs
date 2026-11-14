@@ -201,12 +201,14 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
             Some(ClusterFrame::Resync {
                 topics,
                 is_continuation,
+                more,
             }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
                 let update = InterestUpdate::Resync {
                     peer_addr: peer_addr.clone(),
                     topics,
                     is_continuation,
+                    more,
                     generation,
                 };
                 if !to_manager(&ctx.interest_tx, update, &cancel).await {
@@ -244,6 +246,7 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
                     action,
                     data,
                     updated_at,
+                    generation,
                 };
                 if !to_manager(&ctx.presence_tx, frame, &cancel).await {
                     break;
@@ -537,10 +540,12 @@ where
 
     let peer_cancel = global_cancel.child_token();
     let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
+    let last_activity = Arc::new(AtomicU64::new(epoch_ms()));
     let link = Link {
         dialer: instance_id.to_owned(),
         session: session_gen,
         cancel: peer_cancel.clone(),
+        activity: Arc::clone(&last_activity),
     };
     match claim_link(&ctx.links, instance_id, &peer_instance_id, link) {
         Ok(()) => {}
@@ -595,7 +600,6 @@ where
     }
 
     let (peer_write_tx, peer_write_rx) = mpsc::channel::<Bytes>(10_000);
-    let last_activity = Arc::new(AtomicU64::new(epoch_ms()));
 
     let writer_handle = tokio::spawn(peer_writer(
         peer_write_rx,

@@ -83,6 +83,10 @@ pub(crate) const MAX_BATCH_BYTES: usize = 65_536;
 /// continuation frames from a prior connection corrupting the new session.
 static PEER_SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub(crate) const MAX_CLUSTER_PEERS: usize = 256;
+/// Peer addresses a node remembers (several addresses may name one node):
+/// what gossip adds past it is ignored, so a peer cannot grow the list, or
+/// the PEER_LIST every new link gets, without end.
+pub(crate) const MAX_KNOWN_PEERS: usize = MAX_CLUSTER_PEERS * 4;
 // Cluster peer channels are bounded (10K messages) to prevent OOM from slow peers.
 // This applies to BOTH directions: the per-peer writer channel (peer_write_tx) AND
 // the inbound MSG dispatch channel (dispatch_tx). When a peer publishes faster than

@@ -24,7 +24,14 @@ pub(crate) struct Link {
     /// Ends the link's tasks; a link that a better duplicate replaces is
     /// closed through it.
     pub cancel: CancellationToken,
+    /// When the link last received anything, on `epoch_ms`: a link of the
+    /// same dialer is replaced only once it fell silent.
+    pub activity: Arc<AtomicU64>,
 }
+
+/// A link that received nothing for this long (two heartbeats) is taken
+/// for dead when its dialer links again.
+const LINK_SILENT_MS: u64 = super::HEARTBEAT_INTERVAL_SECS * 2 * 1000;
 
 /// Live links by peer instance id.
 pub(crate) type Links = DashMap<String, Link>;
@@ -44,10 +51,11 @@ pub(crate) enum LinkRefused {
 /// older one. Two links to one instance appear when two nodes dial each other
 /// at the same moment, or when one node knows a peer under two addresses.
 /// Both nodes must then keep the same link, so the choice depends only on the
-/// two links: the one dialed by the lower instance id wins. A peer that dials
-/// again while we still hold its earlier link has given up on that one (a
-/// half-open connection), so the new link replaces it; a second link dialed by
-/// this node is surplus.
+/// two links: the one dialed by the lower instance id wins. A node that dials
+/// again while its earlier link is silent has given up on that one (a
+/// half-open connection), so the new link replaces it; while the earlier link
+/// is alive the node knows the other under two addresses, and the new link
+/// is surplus on both sides.
 pub(crate) fn claim_link(
     links: &Links,
     local: &str,
@@ -66,7 +74,8 @@ pub(crate) fn claim_link(
         Entry::Occupied(mut e) => {
             let existing = e.get();
             let replace = if existing.dialer == link.dialer {
-                link.dialer == peer
+                super::epoch_ms().saturating_sub(existing.activity.load(Ordering::Relaxed))
+                    > LINK_SILENT_MS
             } else {
                 link.dialer < existing.dialer
             };
@@ -231,6 +240,8 @@ pub(crate) enum PresencePeerFrame {
         action: u8,
         data: String,
         updated_at: u64,
+        /// The link session it came on: one that ended is not merged.
+        generation: u64,
     },
     Full {
         /// Reporting peer's address -- keys the per-origin presence sentinels.
@@ -263,6 +274,8 @@ pub(crate) enum InterestUpdate {
         peer_addr: String,
         topics: Vec<String>,
         is_continuation: bool,
+        /// More frames of this round follow.
+        more: bool,
         /// Session generation -- filters stale continuations from prior connections.
         generation: u64,
     },

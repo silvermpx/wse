@@ -268,15 +268,25 @@ async fn handle_cluster_inbound_generic<S>(
     // retrying with backoff, in case the link that won goes away.
     let cancel = global_cancel.child_token();
     let session_gen = PEER_SESSION_GENERATION.fetch_add(1, Ordering::AcqRel);
+    let last_activity = Arc::new(AtomicU64::new(epoch_ms()));
     let link = Link {
         dialer: peer_instance_id.clone(),
         session: session_gen,
         cancel: cancel.clone(),
+        activity: Arc::clone(&last_activity),
     };
     match claim_link(&ctx.links, instance_id, &peer_instance_id, link) {
         Ok(()) => {}
         Err(LinkRefused::SelfLink) => {
+            // Our HELLO tells the dialer it reached itself: it stops dialing
+            // this address.
             tracing::debug!("[WSE-Cluster] Closing inbound from {addr}: it is this node");
+            let mut hello_buf = BytesMut::new();
+            encode_hello(&mut hello_buf, instance_id, LOCAL_CAPABILITIES);
+            let mut frame = BytesMut::new();
+            write_framed(&mut frame, &hello_buf);
+            let _ = writer.write_all(&frame).await;
+            let _ = writer.flush().await;
             return;
         }
         Err(LinkRefused::Duplicate) => {
@@ -340,7 +350,6 @@ async fn handle_cluster_inbound_generic<S>(
     );
 
     let (write_tx, write_rx) = mpsc::channel::<Bytes>(10_000);
-    let last_activity = Arc::new(AtomicU64::new(epoch_ms()));
 
     // Register this inbound peer's write channel with the cluster manager
     // so it receives Publish/Sub/Unsub frames (bidirectional routing)

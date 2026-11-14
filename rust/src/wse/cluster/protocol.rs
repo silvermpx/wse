@@ -5,7 +5,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use super::{
     COMPRESSION_THRESHOLD, FLAG_COMPRESSED, FLAG_HAS_RECOVERY, MAGIC, MAX_CLUSTER_PEERS,
-    MAX_FRAME_SIZE, PROTOCOL_VERSION, PROTOCOL_VERSION_MIN,
+    MAX_FRAME_SIZE, MAX_KNOWN_PEERS, PROTOCOL_VERSION, PROTOCOL_VERSION_MIN,
 };
 
 // ---------------------------------------------------------------------------
@@ -262,9 +262,15 @@ pub(crate) fn encode_unsub(buf: &mut BytesMut, topic: &str) -> bool {
     true
 }
 
+/// RESYNC flag: not the round's first frame.
+const RESYNC_CONTINUATION: u8 = 0x01;
+/// RESYNC flag: more frames of the round follow.
+const RESYNC_MORE: u8 = 0x02;
+
 /// Encode RESYNC frame(s). Topics are joined by "\n" in the payload.
 /// Format: [u8 type=0x08][u8 flags][u16 LE topic_len=0][u32 LE payload_len][payload]
-/// flags=0x00 for first/only frame (replace semantics), 0x01 for continuation (extend).
+/// flags: 0x01 on a continuation (not the round's first frame), 0x02 when more
+/// frames of the round follow, so the receiver takes the new set only whole.
 /// Returns multiple frames if the payload exceeds MAX_FRAME_SIZE.
 pub(crate) fn encode_resync(topics: &[String]) -> Vec<BytesMut> {
     let payload = topics.join("\n");
@@ -304,7 +310,14 @@ pub(crate) fn encode_resync(topics: &[String]) -> Vec<BytesMut> {
                 None => window_end,
             }
         };
-        let flags = if frames.is_empty() { 0x00 } else { 0x01 };
+        let mut flags = if frames.is_empty() {
+            0x00
+        } else {
+            RESYNC_CONTINUATION
+        };
+        if chunk_end < payload_bytes.len() {
+            flags |= RESYNC_MORE;
+        }
         frames.push(encode_single(&payload_bytes[start..chunk_end], flags));
         start = if chunk_end < payload_bytes.len() && payload_bytes[chunk_end] == b'\n' {
             chunk_end + 1
@@ -338,11 +351,16 @@ pub(crate) fn encode_peer_announce(buf: &mut BytesMut, addr: &str) {
 /// Format: [u8 type=0x0A][u8 flags][u16 LE 0][u32 LE payload_len][payload]
 /// Payload: [u16 LE count][u16 LE addr1_len][addr1_bytes]...
 pub(crate) fn encode_peer_list(buf: &mut BytesMut, addrs: &[String]) {
-    // Cap at u16::MAX entries and skip addresses that exceed u16::MAX bytes
+    // At most MAX_KNOWN_PEERS addresses, within one frame.
+    let mut size = 2;
     let safe_addrs: Vec<&String> = addrs
         .iter()
         .filter(|a| a.len() <= u16::MAX as usize)
-        .take(u16::MAX as usize)
+        .take(MAX_KNOWN_PEERS)
+        .take_while(|a| {
+            size += 2 + a.len();
+            size <= MAX_FRAME_SIZE - 8
+        })
         .collect();
     let mut payload = BytesMut::new();
     payload.put_u16_le(safe_addrs.len() as u16);
@@ -480,6 +498,8 @@ pub(crate) enum ClusterFrame {
     Resync {
         topics: Vec<String>,
         is_continuation: bool,
+        /// More frames of this round follow.
+        more: bool,
     },
     PeerAnnounce {
         addr: String,
@@ -526,7 +546,7 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             let payload = if flags & FLAG_COMPRESSED != 0 {
                 let compressed = data.split_to(payload_len);
                 // zstd::bulk::decompress enforces MAX_FRAME_SIZE output cap (decompression bomb protection).
-                let decompressed = match zstd::bulk::decompress(&compressed, MAX_FRAME_SIZE) {
+                let mut decompressed = match zstd::bulk::decompress(&compressed, MAX_FRAME_SIZE) {
                     Ok(d) => d,
                     Err(e) => {
                         tracing::warn!(
@@ -535,6 +555,10 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                         return None;
                     }
                 };
+                // A frame that names no content size is decompressed into the
+                // whole cap: what is kept (a recovery copy, say) holds only
+                // its length, as the memory budget counts it.
+                decompressed.shrink_to_fit();
                 Bytes::from(decompressed)
             } else {
                 data.split_to(payload_len).freeze() // zero-copy: BytesMut -> Bytes
@@ -620,7 +644,8 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             };
             Some(ClusterFrame::Resync {
                 topics,
-                is_continuation: flags & 0x01 != 0,
+                is_continuation: flags & RESYNC_CONTINUATION != 0,
+                more: flags & RESYNC_MORE != 0,
             })
         }
         Some(MsgType::PeerAnnounce) => {

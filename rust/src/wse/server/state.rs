@@ -649,7 +649,10 @@ impl SharedState {
             max_inbound_messages: cfg.max_inbound_queue_size,
             max_inbound_bytes: cfg.max_inbound_queue_bytes,
             inbound_lifecycle: AtomicUsize::new(0),
-            max_lifecycle_events: cfg.max_connections.saturating_mul(2).max(MIN_LIFECYCLE_EVENTS),
+            max_lifecycle_events: cfg
+                .max_connections
+                .saturating_mul(2)
+                .max(MIN_LIFECYCLE_EVENTS),
             inbound_dropped: AtomicU64::new(0),
             conn_formats: DashMap::new(),
             conn_compression: DashMap::new(),

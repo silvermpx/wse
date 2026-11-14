@@ -1,7 +1,7 @@
 use super::*;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
@@ -307,7 +307,8 @@ fn test_encode_decode_resync_multiple() {
         frame,
         ClusterFrame::Resync {
             topics,
-            is_continuation: false
+            is_continuation: false,
+            more: false,
         }
     );
 }
@@ -321,7 +322,8 @@ fn test_encode_decode_resync_empty() {
         frame,
         ClusterFrame::Resync {
             topics: Vec::new(),
-            is_continuation: false
+            is_continuation: false,
+            more: false,
         }
     );
 }
@@ -346,6 +348,7 @@ fn resync_frames_never_exceed_the_frame_limit() {
             i += 1;
         }
         let frames = encode_resync(&topics);
+        let count = frames.len();
         let mut decoded = Vec::new();
         for (n, frame) in frames.into_iter().enumerate() {
             assert!(
@@ -357,8 +360,10 @@ fn resync_frames_never_exceed_the_frame_limit() {
                 ClusterFrame::Resync {
                     topics,
                     is_continuation,
+                    more,
                 } => {
                     assert_eq!(is_continuation, n > 0);
+                    assert_eq!(more, n + 1 < count);
                     decoded.extend(topics);
                 }
                 other => panic!("{other:?}"),
@@ -667,6 +672,7 @@ async fn test_sub_unsub_resync_roundtrip() {
         ClusterFrame::Resync {
             topics: vec!["a".into(), "b".into(), "c".into()],
             is_continuation: false,
+            more: false,
         }
     );
 
@@ -1407,12 +1413,22 @@ async fn dispatch_channel_is_bounded_and_sheds_when_full() {
 }
 
 fn link(dialer: &str, session: u64) -> (Link, tokio_util::sync::CancellationToken) {
+    link_heard(dialer, session, super::epoch_ms())
+}
+
+/// A link that last received anything at `heard` (epoch ms).
+fn link_heard(
+    dialer: &str,
+    session: u64,
+    heard: u64,
+) -> (Link, tokio_util::sync::CancellationToken) {
     let cancel = tokio_util::sync::CancellationToken::new();
     (
         Link {
             dialer: dialer.to_string(),
             session,
             cancel: cancel.clone(),
+            activity: Arc::new(AtomicU64::new(heard)),
         },
         cancel,
     )
@@ -1470,13 +1486,24 @@ fn simultaneous_links_settle_on_the_lower_dialer_on_both_nodes() {
 }
 
 #[test]
-fn a_redial_replaces_a_half_open_link_but_a_second_own_dial_is_surplus() {
+fn a_redial_replaces_a_silent_link_and_a_live_one_is_kept() {
+    // The peer dials again after its earlier link went quiet: half-open.
     let links = Links::new();
-    let (old, old_cancel) = link("peer", 1);
+    let (old, old_cancel) = link_heard("peer", 1, 0);
     assert_eq!(claim_link(&links, "me", "peer", old), Ok(()));
     let (redial, _) = link("peer", 2);
     assert_eq!(claim_link(&links, "me", "peer", redial), Ok(()));
     assert!(old_cancel.is_cancelled());
+
+    // The peer knows this node under two addresses: its earlier link is
+    // alive and stays, on this side and on the dialer's.
+    let (second_address, second_cancel) = link("peer", 3);
+    assert_eq!(
+        claim_link(&links, "me", "peer", second_address),
+        Err(LinkRefused::Duplicate)
+    );
+    assert!(!second_cancel.is_cancelled());
+    assert_eq!(links.get("peer").unwrap().session, 2);
 
     let other = Links::new();
     let (mine, _) = link("me", 1);
@@ -1497,7 +1524,8 @@ fn self_links_are_refused_and_release_leaves_a_successor_alone() {
         Err(LinkRefused::SelfLink)
     );
 
-    let (first, _) = link("peer", 1);
+    // A silent first link, replaced by the peer's redial.
+    let (first, _) = link_heard("peer", 1, 0);
     claim_link(&links, "me", "peer", first).unwrap();
     let (second, _) = link("peer", 2);
     claim_link(&links, "me", "peer", second).unwrap();

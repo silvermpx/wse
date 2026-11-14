@@ -79,6 +79,33 @@ def test_nodes_dialing_each_other_keep_one_link(nodes):
     assert (a.peers, b.peers) == (1, 1)
 
 
+def test_a_node_known_under_two_addresses_keeps_one_steady_link(nodes):
+    a, b = nodes(), nodes()
+    b.join()
+    # Two spellings of one node: two dialers on a.
+    a.server.connect_cluster(
+        peers=[b.addr, f"localhost:{b.cluster_port}"], cluster_port=a.cluster_port
+    )
+    assert wait_for(lambda: a.peers == 1 and b.peers == 1)
+    samples = []
+    deadline = time.monotonic() + 4.0
+    while time.monotonic() < deadline:
+        samples.append((a.peers, b.peers))
+        time.sleep(0.1)
+    assert set(samples) == {(1, 1)}, samples
+
+
+def test_a_node_listed_among_its_own_peers_stops_dialing_itself(nodes):
+    # The same list on every node, its own address included.
+    a = nodes()
+    a.server.connect_cluster(peers=[a.addr], cluster_port=a.cluster_port)
+    time.sleep(1.0)
+    first = a.server.health_snapshot().get("cluster_reconnect_count", 0)
+    time.sleep(4.0)
+    assert a.server.health_snapshot().get("cluster_reconnect_count", 0) == first
+    assert a.peers == 0
+
+
 def test_newer_node_joins_through_an_older_seed(nodes):
     seed, newcomer = nodes(), nodes()
     seed.join()
