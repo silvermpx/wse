@@ -62,10 +62,6 @@ pub(crate) fn tls_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(provider)
 }
 
-pub(crate) fn fill_random(buf: &mut [u8]) -> Result<(), Error> {
-    Ok(rand::fill(buf)?)
-}
-
 pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(digest::digest(&digest::SHA256, data).as_ref());
@@ -102,9 +98,14 @@ pub(crate) fn hkdf_sha256(
 pub(crate) const NONCE_LEN: usize = 12;
 pub(crate) const TAG_LEN: usize = 16;
 
-/// An AES-256-GCM key. The key schedule lives inside the library and is wiped
-/// when the key is dropped; share one key with `Arc` rather than copying it.
-pub(crate) struct Aes256Gcm(aead::LessSafeKey);
+/// An AES-256-GCM key: it opens frames whatever their nonce, and seals with
+/// a random nonce the library itself makes (the approved way in FIPS mode).
+/// The key schedule lives inside the library and is wiped when the key is
+/// dropped; share one key with `Arc` rather than copying it.
+pub(crate) struct Aes256Gcm {
+    open: aead::LessSafeKey,
+    seal: aead::RandomizedNonceKey,
+}
 
 impl Aes256Gcm {
     pub(crate) fn new(key: &[u8]) -> Result<Self, Error> {
@@ -112,22 +113,10 @@ impl Aes256Gcm {
             return Err(Error);
         }
         let unbound = aead::UnboundKey::new(&aead::AES_256_GCM, key)?;
-        Ok(Self(aead::LessSafeKey::new(unbound)))
-    }
-
-    /// Encrypt `buf` in place and append the 16-byte tag. A nonce must never
-    /// repeat under one key.
-    pub(crate) fn seal(
-        &self,
-        nonce: [u8; NONCE_LEN],
-        aad: &[u8],
-        buf: &mut Vec<u8>,
-    ) -> Result<(), Error> {
-        Ok(self.0.seal_in_place_append_tag(
-            aead::Nonce::assume_unique_for_key(nonce),
-            aead::Aad::from(aad),
-            buf,
-        )?)
+        Ok(Self {
+            open: aead::LessSafeKey::new(unbound),
+            seal: aead::RandomizedNonceKey::new(&aead::AES_256_GCM, key)?,
+        })
     }
 
     /// Check the tag and decrypt `buf` (ciphertext + tag) in place, returning
@@ -138,7 +127,7 @@ impl Aes256Gcm {
         aad: &[u8],
         buf: &'a mut [u8],
     ) -> Result<&'a mut [u8], Error> {
-        Ok(self.0.open_in_place(
+        Ok(self.open.open_in_place(
             aead::Nonce::assume_unique_for_key(nonce),
             aead::Aad::from(aad),
             buf,
@@ -146,15 +135,15 @@ impl Aes256Gcm {
     }
 
     /// `nonce || ciphertext || tag` with a fresh random nonce, no AAD: the
-    /// format of the current E2E frames and of the Python helpers.
+    /// format of the first-design E2E frames and of the Python helpers.
     pub(crate) fn seal_random_nonce(&self, plaintext: &[u8]) -> Result<Vec<u8>, Error> {
-        let mut nonce = [0u8; NONCE_LEN];
-        fill_random(&mut nonce)?;
         let mut body = Vec::with_capacity(plaintext.len() + TAG_LEN);
         body.extend_from_slice(plaintext);
-        self.seal(nonce, &[], &mut body)?;
+        let nonce = self
+            .seal
+            .seal_in_place_append_tag(aead::Aad::empty(), &mut body)?;
         let mut out = Vec::with_capacity(NONCE_LEN + body.len());
-        out.extend_from_slice(&nonce);
+        out.extend_from_slice(nonce.as_ref());
         out.extend_from_slice(&body);
         Ok(out)
     }
@@ -272,6 +261,36 @@ fn pem_body(text: &[u8]) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(body).ok()
 }
 
+/// An AES-256-GCM key sealing with a counter nonce (a fixed 4-byte IV and
+/// a 64-bit sequence number that only grows), as TLS 1.2 records do: the
+/// library checks the counter, which makes it the approved way in FIPS mode.
+pub(crate) struct CounterSealKey(aead::TlsRecordSealingKey);
+
+impl CounterSealKey {
+    pub(crate) fn new(key: &[u8]) -> Result<Self, Error> {
+        Ok(Self(aead::TlsRecordSealingKey::new(
+            &aead::AES_256_GCM,
+            aead::TlsProtocolId::TLS12,
+            key,
+        )?))
+    }
+
+    /// Encrypt `buf` in place and append the 16-byte tag. Each nonce's last
+    /// 8 bytes must be greater than the last one's.
+    pub(crate) fn seal(
+        &mut self,
+        nonce: [u8; NONCE_LEN],
+        aad: &[u8],
+        buf: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        Ok(self.0.seal_in_place_append_tag(
+            aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::from(aad),
+            buf,
+        )?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,15 +308,31 @@ mod tests {
 
     #[test]
     fn aad_is_bound() {
+        let mut sealer = CounterSealKey::new(&[1u8; 32]).unwrap();
         let key = Aes256Gcm::new(&[1u8; 32]).unwrap();
         let mut buf = b"frame".to_vec();
-        key.seal([0u8; NONCE_LEN], b"header", &mut buf).unwrap();
+        sealer.seal([0u8; NONCE_LEN], b"header", &mut buf).unwrap();
         let mut copy = buf.clone();
         assert!(key.open([0u8; NONCE_LEN], b"other", &mut copy).is_err());
         assert_eq!(
             key.open([0u8; NONCE_LEN], b"header", &mut buf).unwrap(),
             b"frame"
         );
+    }
+
+    #[test]
+    fn a_counter_nonce_must_grow() {
+        let mut sealer = CounterSealKey::new(&[2u8; 32]).unwrap();
+        let nonce = |seq: u64| {
+            let mut n = [9u8; NONCE_LEN];
+            n[4..].copy_from_slice(&seq.to_be_bytes());
+            n
+        };
+        sealer.seal(nonce(0), b"", &mut b"a".to_vec()).unwrap();
+        sealer.seal(nonce(1), b"", &mut b"b".to_vec()).unwrap();
+        assert!(sealer.seal(nonce(1), b"", &mut b"c".to_vec()).is_err());
+        assert!(sealer.seal(nonce(0), b"", &mut b"d".to_vec()).is_err());
+        sealer.seal(nonce(5), b"", &mut b"e".to_vec()).unwrap();
     }
 
     #[test]

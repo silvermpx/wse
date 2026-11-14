@@ -365,3 +365,66 @@ async def test_the_python_client_signs_and_checks(signing_server, server_port):
         while fill.type != "fill":
             fill = await client.recv(timeout=3.0)
         assert fill.payload == {"qty": "2"} and fill.signature.verified
+
+
+@pytest.mark.asyncio
+async def test_a_message_the_application_cannot_take_gets_busy_not_a_receipt(
+    server_port, server_key
+):
+    """Nothing drains the queue: once it is full a message is not received,
+    so no receipt, and the same n may come again once there is room."""
+    srv = start_server(server_port, signing_key=pem(server_key), max_inbound_queue_size=2)
+    try:
+        public = srv.signing_public_key()
+        audience = kid(base64.b64decode(public))
+        client = new_key()
+        async with await connect(server_port, token(client)) as ws:
+            busy = None
+            for i in range(10):
+                await ws.send(signed(client, order(audience, f"full-{i}")))
+                reply = await next_of(ws, lambda m: m.get("t") in ("signed", "error"))
+                if reply["t"] == "error":
+                    busy = reply["p"]
+                    break
+                assert server_body(public, reply)["p"]["n"] == f"full-{i}"
+            assert busy is not None and i > 0
+            assert (busy["code"], busy["reason"], busy["n"]) == (
+                "SIGNATURE_REFUSED",
+                "busy",
+                f"full-{i}",
+            )
+
+            # Room again: the same n is taken now.
+            await taken(srv, "signed")
+            await ws.send(signed(client, order(audience, f"full-{i}")))
+            receipt = server_body(public, await next_of(ws, is_type("signed")))
+            assert receipt["p"]["n"] == f"full-{i}"
+    finally:
+        srv.stop()
+
+
+@pytest.mark.asyncio
+async def test_the_python_client_never_queues_a_signed_message(server_port, server_key):
+    pytest.importorskip("wse_client")
+    from wse_client import AsyncWSEClient, SendResult, generate_signing_key
+
+    srv = start_server(server_port, signing_key=pem(server_key))
+    key = generate_signing_key()
+    client = AsyncWSEClient(
+        f"ws://127.0.0.1:{server_port}/wse",
+        token=token(key),
+        signing_key=key,
+        offline_queue=True,
+    )
+    try:
+        await client.connect()
+        srv.stop()
+        async with asyncio.timeout(5):
+            while client.is_connected:
+                await asyncio.sleep(0.05)
+        result = await client.send("order", {"qty": "1"}, signed=True, nonce="late-1")
+        assert result is SendResult.FAILED
+        assert await client.send("chat", {"text": "later"}) is SendResult.QUEUED
+    finally:
+        await client.disconnect()
+        srv.stop()

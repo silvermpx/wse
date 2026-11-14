@@ -359,3 +359,27 @@ class TestIssueToken:
             signing.issue_token("erin", ttl=60), public_pem, algorithm="ES256", issuer="me"
         )
         assert claims["sub"] == "erin" and claims["iss"] == "me"
+
+        # A new public key needs its private key: the old one would issue
+        # tokens the new key does not verify.
+        rotated = ec.generate_private_key(ec.SECP256R1())
+        rotated_public = rotated.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        rotated_private = rotated.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        with pytest.raises(ValueError, match="jwt_private_key"):
+            signing.reload_jwt_keys(rotated_public, jwt_previous_secret=public_pem)
+        signing.reload_jwt_keys(
+            rotated_public, jwt_previous_secret=public_pem, jwt_private_key=rotated_private
+        )
+        claims = rust_jwt_decode(
+            signing.issue_token("erin", ttl=60), rotated_public, algorithm="ES256", issuer="me"
+        )
+        assert claims["sub"] == "erin"
+        # The same public key keeps the private key it has.
+        signing.reload_jwt_keys(rotated_public)
+        assert signing.issue_token("erin", ttl=60)

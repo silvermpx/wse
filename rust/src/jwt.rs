@@ -224,6 +224,18 @@ const MAX_TOKEN_LEN: usize = 8192;
 // Clock skew tolerance for exp/nbf (seconds) -- RFC 8725 recommendation
 pub(crate) const CLOCK_SKEW_SECS: u64 = 30;
 
+/// A validated token's `exp` in seconds, read as the validation reads it: an
+/// integer, or a number with a fraction rounded to the nearest second (what
+/// `time.time() + 900` gives).
+pub(crate) fn exp_seconds(claims: &serde_json::Value) -> Option<u64> {
+    let exp = claims.get("exp")?;
+    exp.as_u64().or_else(|| {
+        exp.as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0 && *f < u64::MAX as f64)
+            .map(|f| f.round() as u64)
+    })
+}
+
 /// A shared secret for an HS* algorithm: long enough, and not a PEM key
 /// (an asymmetric key used as an HMAC secret lets anyone holding the public
 /// half mint tokens).
@@ -660,7 +672,8 @@ use crate::wse::server::TopicAcl;
 /// No `wse_topics` claim means no restriction (`None`). Inside the claim, an
 /// absent `allow` key allows every topic not denied, and an `allow` list
 /// allows only what it matches - so an explicit empty list allows nothing. A
-/// claim that is not an object of string lists denies everything: a
+/// claim that is not an object of string lists, an empty object, or one with
+/// any key besides `allow` and `deny` (a typo) denies everything: a
 /// restriction the issuer meant to set must never turn into "allow all".
 pub fn extract_topic_acl(claims: &serde_json::Value) -> Option<TopicAcl> {
     let topics = claims.get("wse_topics")?;
@@ -668,6 +681,12 @@ pub fn extract_topic_acl(claims: &serde_json::Value) -> Option<TopicAcl> {
         tracing::warn!("[WSE] wse_topics claim is not an object; denying all topics");
         return Some(TopicAcl::deny_all());
     };
+    if obj.is_empty() || obj.keys().any(|k| k != "allow" && k != "deny") {
+        tracing::warn!(
+            "[WSE] wse_topics claim is empty or has a key besides allow/deny; denying all topics"
+        );
+        return Some(TopicAcl::deny_all());
+    }
 
     let mut lists = [Vec::new(), Vec::new()];
     for (slot, key) in lists.iter_mut().zip(["allow", "deny"]) {
@@ -1573,12 +1592,51 @@ mod tests {
             serde_json::json!({"allow": [1, 2]}),
             serde_json::json!({"deny": "admin.*"}),
             serde_json::json!({"allow": []}),
+            serde_json::json!({}),
+            serde_json::json!({"allowed": ["chat.*"]}),
+            serde_json::json!({"allow": ["chat.*"], "denied": ["chat.secret"]}),
         ] {
             let acl = extract_topic_acl(&serde_json::json!({"wse_topics": claim.clone()}))
                 .expect("an ACL must be installed");
             assert!(!acl.is_allowed("chat.room"), "{claim} allowed chat.room");
             assert!(!acl.is_allowed("a.b:c"), "{claim} allowed a.b:c");
         }
+    }
+
+    #[test]
+    fn exp_is_read_as_the_validation_reads_it() {
+        assert_eq!(
+            exp_seconds(&serde_json::json!({"exp": 1_900_000_000})),
+            Some(1_900_000_000)
+        );
+        // time.time() + 900, rounded as the validation rounds it.
+        assert_eq!(
+            exp_seconds(&serde_json::json!({"exp": 1_900_000_000.6})),
+            Some(1_900_000_001)
+        );
+        assert_eq!(
+            exp_seconds(&serde_json::json!({"exp": 1_900_000_000.4})),
+            Some(1_900_000_000)
+        );
+        assert_eq!(exp_seconds(&serde_json::json!({"exp": -5.0})), None);
+        assert_eq!(exp_seconds(&serde_json::json!({"exp": "1900000000"})), None);
+        assert_eq!(exp_seconds(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn a_token_with_a_fractional_exp_validates() {
+        let config = hs256_config();
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+            + 900.25;
+        let claims = serde_json::json!({
+            "sub": "user", "exp": exp, "iss": config.issuer, "aud": config.audience,
+        });
+        let token = jwt_encode(&claims, &test_secret(), JwtAlgorithm::HS256, None).unwrap();
+        let decoded = jwt_decode(&token, &config).unwrap();
+        assert_eq!(exp_seconds(&decoded), Some(exp.round() as u64));
     }
 
     #[test]

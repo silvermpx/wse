@@ -32,9 +32,13 @@ impl RustWSEServer {
         if !self.shared.conn_last_activity.contains_key(conn_id) {
             return false;
         }
-        let acl = crate::wse::server::TopicAcl {
-            allow: allow.unwrap_or_default(),
-            deny: deny.unwrap_or_default(),
+        // An empty allow list allows nothing, as in the JWT claim.
+        let acl = match allow {
+            Some(allow) if allow.is_empty() => crate::wse::server::TopicAcl::deny_all(),
+            allow => crate::wse::server::TopicAcl {
+                allow: allow.unwrap_or_default(),
+                deny: deny.unwrap_or_default(),
+            },
         };
         self.shared.topics.acls.insert(conn_id.to_owned(), acl);
         // Gone meanwhile: its cleanup may have run before the insert.

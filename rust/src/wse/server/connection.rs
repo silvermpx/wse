@@ -154,12 +154,88 @@ struct Callbacks<'a> {
     on_signed_message: Option<&'a Arc<Py<PyAny>>>,
 }
 
+/// The application learns of a connection: the validated user id (its user
+/// for presence), or without jwt_secret the cookies for it to check.
+fn tell_application(
+    state: &Arc<SharedState>,
+    conn_id: &Arc<String>,
+    user_id: Option<String>,
+    cookies: &str,
+    drain: bool,
+    lane: Option<&Arc<CallbackLane>>,
+) {
+    if let (Some(pm), Some(user_id)) = (&state.presence, &user_id) {
+        pm.register_connection(conn_id, user_id);
+    }
+    if drain {
+        state.push_inbound(match user_id {
+            Some(user_id) => InboundEvent::AuthConnect {
+                conn_id: (**conn_id).clone(),
+                user_id,
+            },
+            None => InboundEvent::Connect {
+                conn_id: (**conn_id).clone(),
+                cookies: cookies.to_owned(),
+            },
+        });
+    } else if let Some(lane) = lane
+        && let Some(cb) = state.on_connect.read().unwrap().clone()
+    {
+        let cid = (**conn_id).clone();
+        let who = user_id.unwrap_or_else(|| cookies.to_owned());
+        lane.push(Box::new(move || fire_on_connect(&cb, &cid, &who)), None);
+    }
+}
+
+/// A client that announced E2E now has its session: accepted by its token,
+/// it gets server_ready (sealed) and joins the broadcasts; then the
+/// application learns of it.
+async fn admit_after_session(
+    state: &Arc<SharedState>,
+    conn_id: &Arc<String>,
+    handle: &ConnectionHandle,
+    user_id: Option<String>,
+    cookies: &str,
+    drain: bool,
+    lane: Option<&Arc<CallbackLane>>,
+) {
+    if let Some(ref user) = user_id {
+        let ready = build_server_ready(conn_id, user, state);
+        handle.send_control(Message::Text(ready.into()));
+        // Under the read lock: its cleanup (write lock) cannot run in between.
+        let conns = state.connections.read().await;
+        if conns.contains_key(conn_id.as_str()) {
+            handle.out.admitted.store(true, Ordering::Release);
+            state.topics.join(conn_id, handle);
+        }
+    }
+    tell_application(state, conn_id, user_id, cookies, drain, lane);
+}
+
+/// Before its session, a client that announced E2E sends client_hello and
+/// heartbeats only.
+fn handshake_message(text: &str) -> bool {
+    let json = text
+        .strip_prefix("WSE")
+        .filter(|rest| rest.starts_with('{'))
+        .unwrap_or(text);
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| {
+            v.get("t")
+                .and_then(serde_json::Value::as_str)
+                .map(|t| matches!(t, "client_hello" | "ping" | "pong" | "PONG"))
+        })
+        .unwrap_or(false)
+}
+
 /// A client's signed message: checked against the connection's key and the
-/// server's (`signing::check`), taken once per key and `n`, answered with the
-/// server's signed receipt and handed to the application with its proof
-/// (drain kind `signed`, or `on_signed_message`; `on_message` without the
-/// proof when there is no such callback). Refused with a `SIGNATURE_REFUSED`
-/// error otherwise.
+/// server's (`signing::check`), taken once per key and `n`, handed to the
+/// application with its proof (drain kind `signed`, or `on_signed_message`;
+/// `on_message` without the proof when there is no such callback) and then
+/// answered with the server's signed receipt. Refused with a
+/// `SIGNATURE_REFUSED` error otherwise, `busy` when the application cannot
+/// take it now: then it was not received and its `n` stays free.
 fn take_signed(
     state: &Arc<SharedState>,
     conn_id: &Arc<String>,
@@ -189,19 +265,17 @@ fn take_signed(
             .get("ts")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(now);
-        match state
-            .signed_seen
-            .entry(format!("{}:{}", verified.kid, verified.n))
-        {
+        let seen = format!("{}:{}", verified.kid, verified.n);
+        match state.signed_seen.entry(seen.clone()) {
             dashmap::Entry::Occupied(_) => Err(Refused::Replayed),
             dashmap::Entry::Vacant(slot) => {
                 slot.insert(ts.saturating_add(window));
-                Ok(verified)
+                Ok((verified, seen))
             }
         }
     });
-    let verified = match checked {
-        Ok(verified) => verified,
+    let (verified, seen) = match checked {
+        Ok(taken) => taken,
         Err(refused) => {
             // The message's n, when its body reads, so the client knows which.
             let n = envelope
@@ -209,38 +283,67 @@ fn take_signed(
                 .and_then(serde_json::Value::as_str)
                 .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
                 .and_then(|body| body.get("n").and_then(|n| n.as_str()).map(str::to_owned));
-            let mut p = serde_json::json!({
-                "code": "SIGNATURE_REFUSED",
-                "reason": refused.reason(),
-                "message": refused.message(),
-                "recoverable": true,
-            });
-            if let Some(n) = n {
-                p["n"] = serde_json::Value::String(n);
-            }
-            let error = serde_json::json!({"c": "WSE", "t": "error", "p": p, "v": 1});
-            queue_reply(handle, max_pending, Message::Text(error.to_string().into()));
+            refuse_signed(handle, max_pending, refused, n);
             return;
         }
     };
-    if let Some(signer) = &state.signer
-        && let Ok(receipt) = signer.receipt(&verified, now)
-    {
-        queue_reply(handle, max_pending, Message::Text(receipt.into()));
+    let receipt = state
+        .signer
+        .as_ref()
+        .and_then(|signer| signer.receipt(&verified, now).ok());
+    let n = verified.n.clone();
+    if deliver_signed(state, conn_id, verified.into_value(), size, callbacks) {
+        if let Some(receipt) = receipt {
+            queue_reply(handle, max_pending, Message::Text(receipt.into()));
+        }
+    } else {
+        // Not received: the client may send it again with the same n.
+        state.signed_seen.remove(&seen);
+        refuse_signed(handle, max_pending, Refused::Busy, Some(n));
     }
-    let mut value = verified.into_value();
+}
+
+/// The `SIGNATURE_REFUSED` error for a signed message, naming its `n` when
+/// known.
+fn refuse_signed(
+    handle: &ConnectionHandle,
+    max_pending: usize,
+    refused: Refused,
+    n: Option<String>,
+) {
+    let mut p = serde_json::json!({
+        "code": "SIGNATURE_REFUSED",
+        "reason": refused.reason(),
+        "message": refused.message(),
+        "recoverable": true,
+    });
+    if let Some(n) = n {
+        p["n"] = serde_json::Value::String(n);
+    }
+    let error = serde_json::json!({"c": "WSE", "t": "error", "p": p, "v": 1});
+    queue_reply(handle, max_pending, Message::Text(error.to_string().into()));
+}
+
+/// Hand a verified signed message to the application; false when it has no
+/// room for it now (or no callback takes it).
+fn deliver_signed(
+    state: &Arc<SharedState>,
+    conn_id: &Arc<String>,
+    mut value: serde_json::Value,
+    size: usize,
+    callbacks: &Callbacks<'_>,
+) -> bool {
     if callbacks.drain {
-        state.push_message(
+        return state.push_message(
             InboundEvent::Signed {
                 conn_id: (**conn_id).clone(),
                 value,
             },
             size,
         );
-        return;
     }
     let Some(lane) = callbacks.lane else {
-        return;
+        return false;
     };
     let callback = match (callbacks.on_signed_message, callbacks.on_message) {
         (Some(callback), _) => Arc::clone(callback),
@@ -250,7 +353,7 @@ fn take_signed(
             }
             Arc::clone(callback)
         }
-        (None, None) => return,
+        (None, None) => return false,
     };
     let cid = Arc::clone(conn_id);
     spawn_bounded_callback(lane, state, size, move || {
@@ -260,7 +363,7 @@ fn take_signed(
                 tracing::warn!("[WSE] signed message callback error: {e}");
             }
         });
-    });
+    })
 }
 
 /// A msgpack frame from a client that asked for msgpack: one value, as is or
@@ -273,25 +376,29 @@ fn inbound_msgpack(data: &[u8]) -> Result<rmpv::Value, ()> {
 /// `MAX_INFLIGHT_CALLBACKS` waiting callbacks (a client flooding messages is
 /// shed, counted in `rate_limited_total`) and room for its `bytes` in the
 /// server's budget of messages waiting for the application, the same one
-/// drain mode uses (counted in `inbound_dropped` when there is none).
+/// drain mode uses (counted in `inbound_dropped` when there is none). False
+/// when it was shed.
 fn spawn_bounded_callback<F>(
     lane: &Arc<CallbackLane>,
     state: &Arc<SharedState>,
     bytes: usize,
     work: F,
-) where
+) -> bool
+where
     F: FnOnce() + Send + 'static,
 {
     let Some(room) = SharedState::callback_room(state, bytes) else {
-        return;
+        return false;
     };
     let job: CallbackJob = Box::new(move || {
         let _room = room;
         work();
     });
-    if !lane.push(job, Some(MAX_INFLIGHT_CALLBACKS)) {
-        state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
+    if lane.push(job, Some(MAX_INFLIGHT_CALLBACKS)) {
+        return true;
     }
+    state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
+    false
 }
 
 /// Clone a TcpStream by duplicating the file descriptor.
@@ -485,6 +592,13 @@ async fn write_control(
     let queued: usize = batch.iter().map(ws_frame_size).sum();
     let mut close = false;
     for frame in batch.drain(..) {
+        let frame = match frame {
+            // Behind the session's keys every data frame is sealed, also one
+            // queued by a sender that looked just before the switch.
+            WsFrame::Msg(Message::Text(text)) if seal.is_some() => WsFrame::Seal(Bytes::from(text)),
+            WsFrame::Msg(Message::Binary(data)) if seal.is_some() => WsFrame::Seal(data),
+            frame => frame,
+        };
         let msg = match frame {
             WsFrame::Msg(msg) => msg,
             WsFrame::InstallSeal(state) => {
@@ -646,6 +760,8 @@ pub(super) async fn handle_connection(
         cookies: String,
         wants_msgpack: bool,
         refuses_compression: bool,
+        /// The client opens an E2E session first (`e2e=1`).
+        wants_e2e: bool,
         authorization: Option<String>,
     }
     let handshake_data: Arc<std::sync::OnceLock<HandshakeResult>> =
@@ -702,6 +818,7 @@ pub(super) async fn handle_connection(
                 let query = req.uri().query().unwrap_or("");
                 let wants_msgpack = query.contains("format=msgpack");
                 let refuses_compression = query.split('&').any(|kv| kv == "compression=false");
+                let wants_e2e = query.split('&').any(|kv| kv == "e2e=1");
                 let authorization = req
                     .headers()
                     .get("authorization")
@@ -711,6 +828,7 @@ pub(super) async fn handle_connection(
                     cookies,
                     wants_msgpack,
                     refuses_compression,
+                    wants_e2e,
                     authorization,
                 });
                 Ok(response)
@@ -746,13 +864,14 @@ pub(super) async fn handle_connection(
     let mut read_half = ws_stream;
     read_half.get_mut().silent = true;
 
-    let (cookie_str, use_msgpack, refuses_compression, auth_header) = handshake_data
+    let (cookie_str, use_msgpack, refuses_compression, announced_e2e, auth_header) = handshake_data
         .get()
         .map(|hd| {
             (
                 hd.cookies.clone(),
                 hd.wants_msgpack,
                 hd.refuses_compression,
+                hd.wants_e2e,
                 hd.authorization.clone(),
             )
         })
@@ -800,10 +919,7 @@ pub(super) async fn handle_connection(
                         if let Some(key) = ClientKey::from_claims(&claims) {
                             state.client_keys.insert(conn_id.to_string(), Arc::new(key));
                         }
-                        token_deadline = claims
-                            .get("exp")
-                            .and_then(serde_json::Value::as_u64)
-                            .map(token_valid_until);
+                        token_deadline = jwt::exp_seconds(&claims).map(token_valid_until);
                         Some(user_id.to_string())
                     } else {
                         state.auth_failures_total.fetch_add(1, Ordering::Relaxed);
@@ -863,7 +979,9 @@ pub(super) async fn handle_connection(
             // server_ready goes into the queue before the connection is in the
             // maps: no broadcast can reach it before, so server_ready is the
             // first frame.
-            if let Some(ref user_id) = rust_auth_user_id {
+            if let Some(ref user_id) = rust_auth_user_id
+                && !announced_e2e
+            {
                 let server_ready = build_server_ready(&conn_id, user_id, &state);
                 let sr_bytes = server_ready.len() + 4;
                 out.pending.fetch_add(sr_bytes, Ordering::Relaxed);
@@ -876,8 +994,9 @@ pub(super) async fn handle_connection(
             }
             conns.insert((*conn_id).clone(), own_handle.clone());
             // Accepted by its token. Without one, the application accepts it
-            // (ServerCommand::Accept) before broadcasts reach it.
-            if rust_auth_user_id.is_some() {
+            // (ServerCommand::Accept) before broadcasts reach it. A client that
+            // announced E2E is admitted once its session exists.
+            if rust_auth_user_id.is_some() && !announced_e2e {
                 out.admitted.store(true, Ordering::Release);
                 state.topics.join(&conn_id, &own_handle);
             }
@@ -920,31 +1039,20 @@ pub(super) async fn handle_connection(
         .conn_last_activity
         .insert((*conn_id).clone(), activity.clone());
 
-    // The user the server validated is the connection's user for presence.
-    if let (Some(pm), Some(user_id)) = (&state.presence, &rust_auth_user_id) {
-        pm.register_connection(&conn_id, user_id);
-    }
     // Callback mode: this connection's callbacks, in the order of its events.
     let lane = (!drain).then(CallbackLane::new);
-    // The connect event: the validated user id, or without jwt_secret the
-    // cookies for the application to check.
-    if drain {
-        state.push_inbound(match rust_auth_user_id {
-            Some(user_id) => InboundEvent::AuthConnect {
-                conn_id: (*conn_id).clone(),
-                user_id,
-            },
-            None => InboundEvent::Connect {
-                conn_id: (*conn_id).clone(),
-                cookies: cookie_str.clone(),
-            },
-        });
-    } else if let Some(ref lane) = lane
-        && let Some(cb) = state.on_connect.read().unwrap().clone()
-    {
-        let cid = (*conn_id).clone();
-        let who = rust_auth_user_id.unwrap_or_else(|| cookie_str.clone());
-        lane.push(Box::new(move || fire_on_connect(&cb, &cid, &who)), None);
+    // A client that announced E2E is unknown to the application until its
+    // session exists: then all it gets is sealed.
+    let mut awaiting_session = announced_e2e;
+    if !announced_e2e {
+        tell_application(
+            &state,
+            &conn_id,
+            rust_auth_user_id.clone(),
+            &cookie_str,
+            drain,
+            lane.as_ref(),
+        );
     }
 
     // Write task: the only writer to the socket. Two sources: the control
@@ -975,6 +1083,16 @@ pub(super) async fn handle_connection(
                 if write_finish.load(Ordering::Acquire) {
                     break;
                 }
+                // The broadcast frames queued so far, taken before the control
+                // frames: a control frame queued before one of them (an
+                // accepted connection's server_ready, queued before it joins
+                // the broadcasts) is then in the control queue too.
+                {
+                    let mut queue = out_write.frames.lock();
+                    if !queue.is_empty() {
+                        queue.swap_into(&mut shared);
+                    }
+                }
                 // Control frames first, without waiting: server_ready goes out
                 // before any broadcast, and a close, a pong or a reply is not
                 // held back by a busy topic.
@@ -1004,13 +1122,7 @@ pub(super) async fn handle_connection(
                         Sent::Failed => break,
                     }
                 }
-                // Then the broadcast frames queued so far.
-                {
-                    let mut queue = out_write.frames.lock();
-                    if !queue.is_empty() {
-                        queue.swap_into(&mut shared);
-                    }
-                }
+                // Then the broadcast frames.
                 if !shared.is_empty() {
                     wrote = true;
                     let len: usize = shared.iter().map(Bytes::len).sum();
@@ -1114,6 +1226,18 @@ pub(super) async fn handle_connection(
             // a plain WebSocket client may keep the link alive with those alone.
             let now = Instant::now();
             activity.store(state.activity_ms(now), Ordering::Relaxed);
+            // Before its session a client that announced E2E sends
+            // client_hello and heartbeats; anything else is not taken (the
+            // application does not know the connection yet).
+            if awaiting_session
+                && match &msg {
+                    Message::Text(text) => !handshake_message(text),
+                    Message::Binary(_) => true,
+                    _ => false,
+                }
+            {
+                continue;
+            }
             // In an E2E session the client sends sealed frames only.
             if session.is_some()
                 && match &msg {
@@ -1222,8 +1346,26 @@ pub(super) async fn handle_connection(
                                         .unwrap_or(1)
                                         as u32;
 
-                                    // An E2E session with an authenticated server.
-                                    if let Some(offer) = p.and_then(|p| p.get("e2e")) {
+                                    // An E2E session with an authenticated server. It
+                                    // is opened first, announced at the upgrade
+                                    // (`e2e=1`): the server holds everything else
+                                    // back until then, so nothing goes in plaintext.
+                                    let offer = p.and_then(|p| p.get("e2e"));
+                                    if offer.is_some() != announced_e2e {
+                                        queue_reply(
+                                            &own_handle,
+                                            max_pending,
+                                            Message::Text(E2E_UNSUPPORTED_ERROR.into()),
+                                        );
+                                        closer.close(
+                                            &tx,
+                                            &out.pending,
+                                            CLOSE_E2E_UNSUPPORTED,
+                                            "e2e session not announced",
+                                        );
+                                        continue;
+                                    }
+                                    if let Some(offer) = offer {
                                         let accepted =
                                             e2e_session::parse_offer(offer).and_then(|offer| {
                                                 e2e_session::accept(
@@ -1254,6 +1396,17 @@ pub(super) async fn handle_connection(
                                                 session = Some(accepted.recv);
                                                 state.conn_sealed.insert((*conn_id).clone());
                                                 let _ = out.cipher.set(Seal::Session);
+                                                awaiting_session = false;
+                                                admit_after_session(
+                                                    &state,
+                                                    &conn_id,
+                                                    &own_handle,
+                                                    rust_auth_user_id.clone(),
+                                                    &cookie_str,
+                                                    drain,
+                                                    lane.as_ref(),
+                                                )
+                                                .await;
                                             }
                                             Err(_) => {
                                                 queue_reply(
@@ -1720,11 +1873,15 @@ pub(super) async fn handle_connection(
 
         state.remove_local_interest(&disconnected_topics);
     }
-    if drain {
+    // A client that announced E2E and never opened its session was never
+    // known to the application: no disconnect event either.
+    let known = !awaiting_session;
+    if known && drain {
         state.push_inbound(InboundEvent::Disconnect {
             conn_id: (*conn_id).clone(),
         });
-    } else if let Some(ref lane) = lane
+    } else if known
+        && let Some(ref lane) = lane
         && let Some(cb) = state.on_disconnect.read().unwrap().clone()
     {
         // After every callback of this connection's messages.

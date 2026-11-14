@@ -536,7 +536,8 @@ class RustWSEServer:
     ) -> bool:
         """Set topic ACL for a connection programmatically.
 
-        allow: glob patterns (empty = allow all).
+        allow: glob patterns. Left out (None), every topic not denied is
+            allowed; an empty list allows none, as in the JWT claim.
         deny: glob patterns (deny takes precedence over allow).
         JWT `wse_topics` claim sets ACL automatically during auth.
         Returns False (and stores nothing) when the connection is gone.
@@ -584,6 +585,8 @@ class RustWSEServer:
         jwt_secret is the HMAC secret, or the public key of the asymmetric
         algorithms; jwt_previous_secret is accepted too while tokens signed
         with it are out. Algorithm, issuer, audience and cookie name stay.
+        With an asymmetric algorithm, a server that issues tokens
+        (jwt_private_key) needs the new private key with a new public key.
         Raises RuntimeError on a server without jwt_secret and ValueError
         for a key that does not fit the algorithm.
         """

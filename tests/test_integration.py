@@ -19,17 +19,17 @@ from wse_server._wse_accel import RustWSEServer
 # ---------------------------------------------------------------------------
 
 
-def ws_url(port: int) -> str:
-    return f"ws://127.0.0.1:{port}/wse"
+def ws_url(port: int, query: str = "") -> str:
+    return f"ws://127.0.0.1:{port}/wse" + (f"?{query}" if query else "")
 
 
-async def connect(port: int, token: str | None = None, timeout: float = 2.0):
+async def connect(port: int, token: str | None = None, timeout: float = 2.0, query: str = ""):
     """Connect to WSE server with optional JWT token."""
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return await websockets.connect(
-        ws_url(port),
+        ws_url(port, query),
         additional_headers=headers,
         open_timeout=timeout,
     )

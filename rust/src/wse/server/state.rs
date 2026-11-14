@@ -675,13 +675,21 @@ impl SharedState {
     }
 
     /// Queue a client's message of `bytes` bytes for the drain, or drop it
-    /// when there is no room (see `reserve_message`).
-    pub(super) fn push_message(&self, event: InboundEvent, bytes: usize) {
-        if self.reserve_message(bytes) {
-            let _ = self.inbound_tx.send(Queued {
-                event,
-                bytes: Some(bytes),
-            });
+    /// when there is no room (see `reserve_message`). False when dropped.
+    pub(super) fn push_message(&self, event: InboundEvent, bytes: usize) -> bool {
+        if !self.reserve_message(bytes) {
+            return false;
+        }
+        let queued = Queued {
+            event,
+            bytes: Some(bytes),
+        };
+        match self.inbound_tx.send(queued) {
+            Ok(()) => true,
+            Err(_) => {
+                self.release_message(bytes);
+                false
+            }
         }
     }
 

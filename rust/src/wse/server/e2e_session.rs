@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use zeroize::Zeroizing;
 
-use crate::crypto::{self, Aes256Gcm, IdentityKey};
+use crate::crypto::{self, Aes256Gcm, CounterSealKey, IdentityKey};
 
 /// The one suite: ECDH P-256, HKDF-SHA256, AES-256-GCM.
 pub(crate) const SUITE: &str = "p256-aes256gcm";
@@ -135,18 +135,23 @@ fn derive<const N: usize>(th: &[u8; 32], ikm: &[u8], label: &[u8]) -> Zeroizing<
     out
 }
 
-/// The key and IV of one epoch of one direction.
-struct EpochKeys {
-    key: Aes256Gcm,
+/// The key and IV of one epoch of one direction: `K` opens (the receiver)
+/// or seals with the counter nonce (the sender).
+struct EpochKeys<K> {
+    key: K,
     iv: [u8; 4],
 }
 
-impl EpochKeys {
-    fn new(th: &[u8; 32], secret: &[u8; 32]) -> Self {
-        let key = derive::<32>(th, secret, b"wse/e2e key");
+impl<K> EpochKeys<K> {
+    fn derive(
+        th: &[u8; 32],
+        secret: &[u8; 32],
+        key: impl FnOnce(&[u8]) -> Result<K, crypto::Error>,
+    ) -> Self {
+        let bytes = derive::<32>(th, secret, b"wse/e2e key");
         let iv = derive::<4>(th, secret, b"wse/e2e iv");
         Self {
-            key: Aes256Gcm::new(&key[..]).expect("32-byte key"),
+            key: key(&bytes[..]).expect("32-byte key"),
             iv: *iv,
         }
     }
@@ -157,6 +162,17 @@ impl EpochKeys {
         nonce[4..].copy_from_slice(&seq.to_be_bytes());
         nonce
     }
+}
+
+type SealKeys = EpochKeys<CounterSealKey>;
+type OpenKeys = EpochKeys<Aes256Gcm>;
+
+fn seal_keys(th: &[u8; 32], secret: &[u8; 32]) -> SealKeys {
+    EpochKeys::derive(th, secret, CounterSealKey::new)
+}
+
+fn open_keys(th: &[u8; 32], secret: &[u8; 32]) -> OpenKeys {
+    EpochKeys::derive(th, secret, Aes256Gcm::new)
 }
 
 fn next_secret(th: &[u8; 32], secret: &[u8; 32]) -> Zeroizing<[u8; 32]> {
@@ -186,7 +202,7 @@ pub(crate) struct SendState {
     th: [u8; 32],
     direction: u8,
     secret: Zeroizing<[u8; 32]>,
-    keys: EpochKeys,
+    keys: SealKeys,
     epoch: u32,
     seq: u64,
     epoch_frames: u64,
@@ -195,7 +211,7 @@ pub(crate) struct SendState {
 
 impl SendState {
     fn new(th: [u8; 32], direction: u8, secret: Zeroizing<[u8; 32]>) -> Self {
-        let keys = EpochKeys::new(&th, &secret);
+        let keys = seal_keys(&th, &secret);
         Self {
             th,
             direction,
@@ -220,7 +236,7 @@ impl SendState {
         if self.epoch_frames >= REKEY_FRAMES || self.epoch_started.elapsed() >= REKEY_AFTER {
             self.epoch = self.epoch.checked_add(1).ok_or(E2eError::Exhausted)?;
             self.secret = next_secret(&self.th, &self.secret);
-            self.keys = EpochKeys::new(&self.th, &self.secret);
+            self.keys = seal_keys(&self.th, &self.secret);
             self.epoch_frames = 0;
             self.epoch_started = Instant::now();
         }
@@ -249,7 +265,7 @@ pub(crate) struct RecvState {
     th: [u8; 32],
     direction: u8,
     secret: Zeroizing<[u8; 32]>,
-    keys: EpochKeys,
+    keys: OpenKeys,
     epoch: u32,
     expected_seq: u64,
     epoch_frames: u64,
@@ -257,7 +273,7 @@ pub(crate) struct RecvState {
 
 impl RecvState {
     fn new(th: [u8; 32], direction: u8, secret: Zeroizing<[u8; 32]>) -> Self {
-        let keys = EpochKeys::new(&th, &secret);
+        let keys = open_keys(&th, &secret);
         Self {
             th,
             direction,
@@ -296,7 +312,7 @@ impl RecvState {
             None
         } else if Some(epoch) == self.epoch.checked_add(1) {
             let secret = next_secret(&self.th, &self.secret);
-            let keys = EpochKeys::new(&self.th, &secret);
+            let keys = open_keys(&self.th, &secret);
             Some((secret, keys))
         } else {
             return Err(E2eError::BadFrame);

@@ -845,8 +845,10 @@ impl RustWSEServer {
     /// asymmetric algorithms) and optionally `jwt_previous_secret`, accepted
     /// too while tokens signed with it are still out. The algorithm, issuer,
     /// audience and cookie name stay. Open connections are not affected; new
-    /// ones are checked with the new keys. Raises RuntimeError on a server
-    /// without jwt_secret, ValueError for a key that does not fit.
+    /// ones are checked with the new keys. With an asymmetric algorithm and a
+    /// new public key, a server that issues tokens needs the new
+    /// `jwt_private_key` too. Raises RuntimeError on a server without
+    /// jwt_secret, ValueError for a key that does not fit.
     #[pyo3(signature = (jwt_secret, jwt_previous_secret = None, jwt_key_id = None, jwt_private_key = None))]
     fn reload_jwt_keys(
         &self,
@@ -870,6 +872,16 @@ impl RustWSEServer {
         }
         if let Some(ref key) = jwt_private_key {
             jwt::check_signing_key(alg, key).map_err(|e| key_error("jwt_private_key", e))?;
+        } else if current.signing_key.is_some()
+            && !matches!(alg.key_kind(), jwt::KeyKind::Secret { .. })
+            && jwt_secret.as_slice() != current.secret.as_slice()
+        {
+            // The private key it has belongs to the old public key: tokens
+            // issued with it would not verify any more.
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "jwt_private_key: a new jwt_secret needs the private key that goes with it, \
+                 for issue_token()",
+            ));
         }
         holder.store(Arc::new(JwtConfig {
             algorithm: alg,
@@ -910,7 +922,8 @@ impl RustWSEServer {
 
     /// Set topic ACL for a connection programmatically (for non-JWT auth).
     ///
-    /// - allow: list of glob patterns (empty = allow all)
+    /// - allow: list of glob patterns; left out, every topic not denied is
+    ///   allowed, and an empty list allows none (as in the JWT claim)
     /// - deny: list of glob patterns (deny takes precedence over allow)
     ///
     /// Returns False (and stores nothing) when the connection is gone.

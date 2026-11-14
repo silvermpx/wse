@@ -321,7 +321,9 @@ class SessionClient:
     async def open(cls, port: int, server_keys=None, unauthenticated=False):
         from wse_client.e2e_session import Offer
 
-        ws = await connect(port, make_token())
+        # The session is announced and opened first: nothing comes before
+        # server_hello but heartbeats.
+        ws = await connect(port, make_token(), query="e2e=1")
         offer = Offer()
         await ws.send(
             json.dumps({"t": "client_hello", "p": {"protocol_version": 1, "e2e": offer.message()}})
@@ -329,6 +331,7 @@ class SessionClient:
         async with asyncio.timeout(5):
             while True:
                 msg = json.loads(await ws.recv())
+                assert msg["t"] in ("server_hello", "ping", "error"), msg
                 if msg["t"] == "server_hello":
                     p = msg["p"]
                     session = offer.accept(
@@ -376,6 +379,55 @@ class TestE2eSessions:
             await client.send({"t": "chat", "p": {"text": "hi"}})
             assert drain_until(srv, "msg")[2]["p"] == {"text": "hi"}
             await client.ws.close()
+        finally:
+            srv.stop()
+
+    @pytest.mark.asyncio
+    async def test_nothing_goes_before_the_session(self, server_port):
+        """The application learns of an announced connection once its session
+        exists, and server_ready comes sealed: nothing goes in plaintext."""
+        srv = start_server(server_port, e2e_identity_key=identity_key())
+        try:
+            srv.broadcast_all(json.dumps({"t": "early", "p": {}}))
+            raw = await connect(server_port, make_token(), query="e2e=1")
+            await raw.send(json.dumps({"t": "chat", "p": {"text": "too early"}}))
+            await asyncio.sleep(0.3)
+            assert [e for e in srv.drain_inbound(64, 50) if e[0] in ("auth_connect", "msg")] == []
+            await raw.close()
+
+            pin = srv.e2e_identity_public_key()
+            client = await SessionClient.open(server_port, server_keys=[pin])
+            ready = await client.next_of_type("server_ready")
+            assert ready["p"]["details"]["user_id"]
+            _, conn_id, _ = drain_until(srv, "auth_connect")
+            srv.send_event(conn_id, {"t": "snapshot", "p": {"balance": 1}})
+            assert (await client.next_of_type("snapshot"))["p"] == {"balance": 1}
+            await client.ws.close()
+        finally:
+            srv.stop()
+
+    @pytest.mark.asyncio
+    async def test_an_offer_must_be_announced(self, server_port):
+        import websockets
+        from wse_client.e2e_session import Offer
+
+        srv = start_server(server_port, e2e_identity_key=identity_key())
+        try:
+            for query, hello in [
+                ("", {"protocol_version": 1, "e2e": Offer().message()}),
+                ("e2e=1", {"protocol_version": 1}),
+            ]:
+                ws = await connect(server_port, make_token(), query=query)
+                await ws.send(json.dumps({"t": "client_hello", "p": hello}))
+                codes = []
+                with pytest.raises(websockets.ConnectionClosed):
+                    async with asyncio.timeout(5):
+                        while True:
+                            msg = json.loads(await ws.recv())
+                            if msg.get("t") == "error":
+                                codes.append(msg["p"]["code"])
+                assert codes == ["E2E_UNSUPPORTED"]
+                assert ws.close_code == 4800
         finally:
             srv.stop()
 

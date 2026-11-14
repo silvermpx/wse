@@ -13,7 +13,7 @@ import websockets
 
 from tests.conftest import JWT_AUDIENCE, JWT_ISSUER, JWT_SECRET, make_token
 from tests.test_integration import connect, drain_all, drain_until, ws_url
-from wse_server._wse_accel import RustWSEServer
+from wse_server._wse_accel import RustWSEServer, rust_jwt_encode
 
 
 def start_server(port: int, **options) -> RustWSEServer:
@@ -471,3 +471,72 @@ class TestTokenExpiry:
         started = time.monotonic()
         assert await close_code(ws, timeout=15) == 4403
         assert 3 < time.monotonic() - started < 10
+
+    @pytest.mark.asyncio
+    async def test_a_fractional_exp_closes_it_too(self, server, server_port):
+        # time.time() + ttl, as many issuers write it.
+        now = time.time()
+        token = rust_jwt_encode(
+            {"sub": "u", "iss": JWT_ISSUER, "aud": JWT_AUDIENCE, "exp": now - 25.4, "iat": now},
+            JWT_SECRET,
+        )
+        ws = await connect(server_port, token)
+        drain_until(server, "auth_connect")
+        assert await close_code(ws, timeout=15) == 4403
+
+
+class TestTopicAclRules:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "claim",
+        [{}, {"allowed": ["chat.*"]}, {"allow": []}, {"allow": ["chat.*"], "denied": ["x"]}],
+    )
+    async def test_an_empty_or_misspelled_claim_allows_nothing(self, server_port, claim):
+        srv = RustWSEServer(
+            "127.0.0.1",
+            server_port,
+            jwt_secret=JWT_SECRET,
+            jwt_issuer=JWT_ISSUER,
+            jwt_audience=JWT_AUDIENCE,
+            client_subscriptions=True,
+        )
+        srv.enable_drain_mode()
+        srv.start()
+        now = int(time.time())
+        token = rust_jwt_encode(
+            {
+                "sub": "u",
+                "iss": JWT_ISSUER,
+                "aud": JWT_AUDIENCE,
+                "exp": now + 600,
+                "iat": now,
+                "wse_topics": claim,
+            },
+            JWT_SECRET,
+        )
+        try:
+            async with await connect(server_port, token) as ws:
+                drain_until(srv, "auth_connect")
+                p = {"action": "subscribe", "topics": ["admin.users"]}
+                await ws.send(json.dumps({"c": "WSE", "t": "subscription_update", "p": p, "v": 1}))
+                async with asyncio.timeout(3):
+                    while True:
+                        reply = json.loads(await ws.recv())
+                        if reply.get("t") == "subscription_update":
+                            break
+                assert reply["p"]["success_topics"] == []
+                assert reply["p"]["failed_topics"] == ["admin.users"]
+        finally:
+            srv.stop()
+
+    @pytest.mark.asyncio
+    async def test_set_topic_acl_with_an_empty_allow_list_allows_nothing(self, server, server_port):
+        async with await connect(server_port, make_token()):
+            _, conn_id, _ = drain_until(server, "auth_connect")
+            assert server.set_topic_acl(conn_id, allow=[])
+            assert server.subscribe_connection(conn_id, ["chat.room"]) == []
+            # Left out, allow takes every topic not denied.
+            assert server.set_topic_acl(conn_id, deny=["admin.*"])
+            assert server.subscribe_connection(conn_id, ["chat.room", "admin.users"]) == [
+                "chat.room"
+            ]

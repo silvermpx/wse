@@ -225,6 +225,9 @@ pub(crate) enum Refused {
     Replayed,
     /// The server has no signing key, so no audience to check.
     NotEnabled,
+    /// Verified, but the application could not take it now (its queue of
+    /// waiting messages is full): not received, so the same `n` may come again.
+    Busy,
 }
 
 impl Refused {
@@ -238,6 +241,7 @@ impl Refused {
             Self::Stale => "stale",
             Self::Replayed => "replayed",
             Self::NotEnabled => "not_enabled",
+            Self::Busy => "busy",
         }
     }
 
@@ -250,6 +254,7 @@ impl Refused {
             Self::Stale => "Signed message outside the time window",
             Self::Replayed => "Signed message already received",
             Self::NotEnabled => "The server takes no signed messages",
+            Self::Busy => "The application cannot take it now; send it again",
         }
     }
 }
@@ -275,7 +280,7 @@ pub(crate) fn check(
     if !key.verifies(CLIENT_LABEL, body, &signature) {
         return Err(Refused::BadSignature);
     }
-    let Ok(Value::Object(message)) = serde_json::from_str::<Value>(body) else {
+    let Some(Value::Object(message)) = parse_exact(body) else {
         return Err(Refused::Malformed);
     };
     if !message.get("t").is_some_and(Value::is_string) {
@@ -294,7 +299,7 @@ pub(crate) fn check(
     let n = message
         .get("n")
         .and_then(Value::as_str)
-        .filter(|n| !n.is_empty() && n.len() <= MAX_NONCE_LEN)
+        .filter(|n| !n.is_empty() && n.chars().count() <= MAX_NONCE_LEN)
         .ok_or(Refused::Malformed)?
         .to_owned();
     Ok(Verified {
@@ -304,6 +309,122 @@ pub(crate) fn check(
         kid: kid.to_owned(),
         n,
     })
+}
+
+/// A signed body as the application gets it, read so that it cannot say
+/// anything but its text: no key twice in an object (readers differ on which
+/// one counts) and every integer exact (past 64 bits it would come out
+/// rounded here and exact elsewhere). None when it is not such JSON.
+fn parse_exact(body: &str) -> Option<Value> {
+    if !integers_exact(body) {
+        return None;
+    }
+    let mut de = serde_json::Deserializer::from_str(body);
+    let Exact(value) = serde::Deserialize::deserialize(&mut de).ok()?;
+    de.end().ok()?;
+    Some(value)
+}
+
+/// Every integer literal of a JSON text (outside its strings) fits 64 bits.
+fn integers_exact(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            match b {
+                b'\\' => i += 1,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => {
+                in_string = true;
+                i += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+                {
+                    i += 1;
+                }
+                let literal = &body[start..i];
+                if !literal.contains(['.', 'e', 'E'])
+                    && literal.parse::<i64>().is_err()
+                    && literal.parse::<u64>().is_err()
+                {
+                    return false;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    true
+}
+
+/// JSON read into a `Value`, refusing an object with a key twice.
+struct Exact(Value);
+
+impl<'de> serde::Deserialize<'de> for Exact {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        de.deserialize_any(ExactVisitor).map(Exact)
+    }
+}
+
+struct ExactVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ExactVisitor {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JSON")
+    }
+    fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
+        Ok(Value::Bool(v))
+    }
+    fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
+        Ok(v.into())
+    }
+    fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
+        Ok(v.into())
+    }
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Value, E> {
+        serde_json::Number::from_f64(v)
+            .map(Value::Number)
+            .ok_or_else(|| E::custom("not a finite number"))
+    }
+    fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+        Ok(Value::String(v.to_owned()))
+    }
+    fn visit_string<E>(self, v: String) -> Result<Value, E> {
+        Ok(Value::String(v))
+    }
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(Exact(item)) = seq.next_element()? {
+            items.push(item);
+        }
+        Ok(Value::Array(items))
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if object.contains_key(&key) {
+                return Err(serde::de::Error::custom("a key twice"));
+            }
+            let Exact(value) = map.next_value()?;
+            object.insert(key, value);
+        }
+        Ok(Value::Object(object))
+    }
 }
 
 #[cfg(test)]
@@ -343,6 +464,65 @@ mod tests {
         assert_eq!(value["t"], "order");
         assert_eq!(value["p"]["qty"], "1.5");
         assert_eq!(value["signature"]["body"], text.as_str());
+    }
+
+    #[test]
+    fn a_body_that_could_be_read_two_ways_is_refused() {
+        let (pair, key) = client_pair();
+        let at = 1_000_000;
+        let take = |text: &str| {
+            check(
+                &envelope(&pair, &key.kid, text),
+                Some(&key),
+                "srv",
+                at,
+                WINDOW,
+            )
+        };
+        // A key twice: readers differ on which one counts.
+        let twice =
+            r#"{"t":"order","p":{"qty":"1"},"p":{"qty":"1000"},"aud":"srv","ts":1000000,"n":"d1"}"#;
+        assert_eq!(take(twice).err(), Some(Refused::Malformed));
+        let nested =
+            r#"{"t":"order","p":{"qty":"1","qty":"1000"},"aud":"srv","ts":1000000,"n":"d2"}"#;
+        assert_eq!(take(nested).err(), Some(Refused::Malformed));
+        // An integer past 64 bits would come out rounded here.
+        let big = r#"{"t":"order","p":{"qty":12345678901234567890123},"aud":"srv","ts":1000000,"n":"d3"}"#;
+        assert_eq!(take(big).err(), Some(Refused::Malformed));
+        // Exact numbers, and digits inside strings, are fine.
+        let fine = r#"{"t":"order","p":{"qty":18446744073709551615,"px":-12.5e-1,"id":"12345678901234567890123"},"aud":"srv","ts":1000000,"n":"d4"}"#;
+        assert!(take(fine).is_ok());
+        let escaped = r#"{"t":"order","p":{"note":"a \"quoted\" 99999999999999999999999"},"aud":"srv","ts":1000000,"n":"d5"}"#;
+        assert!(take(escaped).is_ok());
+    }
+
+    #[test]
+    fn a_nonce_is_counted_in_characters() {
+        let (pair, key) = client_pair();
+        let n: String = "ж".repeat(128);
+        let text = body("srv", 1_000_000, &n);
+        assert!(
+            check(
+                &envelope(&pair, &key.kid, &text),
+                Some(&key),
+                "srv",
+                1_000_000,
+                WINDOW
+            )
+            .is_ok()
+        );
+        let long = body("srv", 1_000_000, &"ж".repeat(129));
+        assert_eq!(
+            check(
+                &envelope(&pair, &key.kid, &long),
+                Some(&key),
+                "srv",
+                1_000_000,
+                WINDOW
+            )
+            .err(),
+            Some(Refused::Malformed)
+        );
     }
 
     #[test]

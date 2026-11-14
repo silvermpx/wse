@@ -187,3 +187,47 @@ class TestEncryption:
             await client.disconnect()
         finally:
             srv.stop()
+
+
+class TestApplicationAccepts:
+    """A server without jwt_secret: the application accepts each connection."""
+
+    @staticmethod
+    def accept_later(srv: RustWSEServer, delay: float) -> asyncio.Task:
+        async def accept() -> None:
+            async with asyncio.timeout(5):
+                while True:
+                    events = await asyncio.to_thread(srv.drain_inbound, 64, 50)
+                    for kind, conn_id, _ in events:
+                        if kind == "connect":
+                            await asyncio.sleep(delay)
+                            srv.accept_connection(conn_id, "bob")
+                            return
+
+        return asyncio.ensure_future(accept())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("encryption", [False, True])
+    async def test_topics_wait_for_the_acceptance(self, server_port, encryption):
+        options = {"e2e_identity_key": identity_key()} if encryption else {}
+        srv = RustWSEServer("127.0.0.1", server_port, client_subscriptions=True, **options)
+        srv.enable_drain_mode()
+        srv.start()
+        try:
+            accepting = self.accept_later(srv, 0.3)
+            client_options = (
+                {"encryption": True, "e2e_server_keys": [srv.e2e_identity_public_key()]}
+                if encryption
+                else {}
+            )
+            client = wse_client.AsyncWSEClient(
+                f"ws://127.0.0.1:{server_port}/wse", topics=["news"], **client_options
+            )
+            await client.connect()
+            await accepting
+            await subscribed(srv, "news")
+            publish(srv, "news", 3)
+            assert (await next_of_type(client, "tick")).payload == {"n": 3}
+            await client.disconnect()
+        finally:
+            srv.stop()

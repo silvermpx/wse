@@ -190,7 +190,7 @@ impl RustWSEServer {
                             loop {
                                 interval.tick().await;
                                 let now = crate::wse::server::signing::now_ms();
-                                seen_state.signed_seen.retain(|_, until| *until > now);
+                                seen_state.signed_seen.retain(|_, until| *until >= now);
                             }
                         });
                     }
