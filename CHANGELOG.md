@@ -1,6 +1,6 @@
 # Changelog
 
-## v3.0.0 (2026-11-14)
+## v3.0.0 (2026-11-15)
 
 Security, correctness and speed, and the engine for Rust applications.
 Upgrading from 2.x: see
