@@ -7,6 +7,9 @@ version = "3.1.0"
 
 kotlin { jvmToolchain(21) }
 
+// The shared wrapper, and the bindings generated for the JVM.
+sourceSets["main"].kotlin.srcDir("generated/jvm")
+
 dependencies {
     implementation("net.java.dev.jna:jna:5.19.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")

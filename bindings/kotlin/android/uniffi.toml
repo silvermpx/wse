@@ -1,0 +1,5 @@
+[bindings.kotlin]
+package_name = "dev.wse.ffi"
+generate_immutable_records = true
+# Android's own cleaner (minSdk 26 has no java.lang.ref.Cleaner).
+android = true

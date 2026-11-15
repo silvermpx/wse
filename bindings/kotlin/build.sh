@@ -8,5 +8,9 @@ cd "$root"
 cargo build -p wse-ffi --lib
 lib="$root/target/debug/libwse_ffi.so"
 [[ -f "$lib" ]] || lib="$root/target/debug/libwse_ffi.dylib"
-cargo run -q -p wse-bindgen --bin uniffi-bindgen -- generate -l kotlin --no-format -o "$here/src/main/kotlin" "$lib"
+# For the JVM, and for Android (its own cleaner), from the same library.
+cargo run -q -p wse-bindgen --bin uniffi-bindgen -- generate -l kotlin --no-format -o "$here/generated/jvm" "$lib"
+cargo run -q -p wse-bindgen --bin uniffi-bindgen -- generate -l kotlin --no-format \
+  --config "$here/android/uniffi.toml" -o "$here/generated/android" "$lib"
 echo "built $lib and the Kotlin bindings"
+
