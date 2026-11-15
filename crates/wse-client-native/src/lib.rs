@@ -1,0 +1,690 @@
+//! The WSE Rust client as mobile bindings need it: plain types that any
+//! binding generator can carry (UniFFI for Swift and Kotlin,
+//! flutter_rust_bridge for Dart), one tokio runtime for every client of the
+//! process, and calls that can be cancelled without losing anything.
+//!
+//! - [`NativeClient::connect`] runs on the shared [`runtime`] and gives up at
+//!   once when its [`CancelToken`] is cancelled.
+//! - What the server sends is read in batches, at most `max_items` and about
+//!   `max_bytes` each, with [`NativeClient::next_batch`]. A batch is handed
+//!   out again until the next call acknowledges its id, so a binding whose
+//!   call was cancelled after the batch was taken from the client loses
+//!   nothing: it asks again with the old id and gets the same batch.
+//! - Errors have a kind a binding can match on and a message; kinds added
+//!   later read as [`ErrorKind::Unknown`] in old code of the binding.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use tokio::runtime::Runtime;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use wse_client::{
+    Config, Error, Event, Events, GapReason, Incoming, OwnedMessage, Status, TokenProvider,
+};
+
+// -- the runtime --------------------------------------------------------------
+
+/// Worker threads of the shared runtime: a client spends most of its time
+/// waiting on its socket, and every client of the process shares them.
+const WORKER_THREADS: usize = 2;
+
+static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+static ON_THREAD_START: OnceLock<fn()> = OnceLock::new();
+
+/// Called on each thread of the runtime as it starts (on Android, to attach
+/// it to the JVM once). Takes effect only before the runtime's first use.
+pub fn set_on_thread_start(hook: fn()) {
+    let _ = ON_THREAD_START.set(hook);
+}
+
+/// The runtime every client of the process runs on.
+pub fn runtime() -> &'static Runtime {
+    RUNTIME.get_or_init(|| {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
+            .worker_threads(WORKER_THREADS)
+            .thread_name("wse")
+            .enable_all();
+        if let Some(hook) = ON_THREAD_START.get() {
+            builder.on_thread_start(*hook);
+        }
+        builder.build().expect("the WSE runtime starts")
+    })
+}
+
+/// Runs `work` on the shared runtime: dropping the returned future (a
+/// binding's call cancelled) stops the work too. A panic is an
+/// [`ErrorKind::Internal`] error, not one that unwinds into the binding.
+async fn on_runtime<T: Send + 'static>(
+    work: impl Future<Output = Result<T, NativeError>> + Send + 'static,
+) -> Result<T, NativeError> {
+    struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+    impl<T> Drop for AbortOnDrop<T> {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let mut task = AbortOnDrop(runtime().spawn(work));
+    match (&mut task.0).await {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => {
+            Err(NativeError::new(ErrorKind::Internal, "the call panicked"))
+        }
+        Err(_) => Err(NativeError::new(
+            ErrorKind::Cancelled,
+            "the call was cancelled",
+        )),
+    }
+}
+
+// -- errors -------------------------------------------------------------------
+
+/// What went wrong, for a binding to match on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ErrorKind {
+    /// The configuration cannot work: a URL that is not ws:// or wss://, a header that cannot be sent.
+    Config,
+    /// The server could not be reached or did not upgrade the connection.
+    Connect,
+    /// The server refused the credentials.
+    Auth,
+    /// The server did not confirm the connection in time.
+    Timeout,
+    /// The end-to-end session could not be opened or went wrong.
+    Encryption,
+    /// A signed message cannot be sent: no signing key, or no server key to sign for.
+    Signing,
+    /// The client gave up reconnecting.
+    GaveUp,
+    /// Not connected now: the client is reconnecting.
+    NotConnected,
+    /// The send queue is full.
+    Full,
+    /// The client was closed.
+    Closed,
+    /// A message could not be encoded (not JSON, say).
+    Encode,
+    /// A payload could not be decoded.
+    Decode,
+    /// The call was cancelled.
+    Cancelled,
+    /// Another call reads the events: one reader at a time.
+    Busy,
+    /// A panic inside the client.
+    Internal,
+    /// A kind this version does not know.
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeError {
+    pub kind: ErrorKind,
+    pub message: String,
+}
+
+impl NativeError {
+    pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for NativeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for NativeError {}
+
+impl From<Error> for NativeError {
+    fn from(error: Error) -> Self {
+        let kind = match &error {
+            Error::Config(_) => ErrorKind::Config,
+            Error::Connect(_) => ErrorKind::Connect,
+            Error::Auth(_) => ErrorKind::Auth,
+            Error::Timeout(_) => ErrorKind::Timeout,
+            Error::Encryption(_) => ErrorKind::Encryption,
+            Error::Signing(_) => ErrorKind::Signing,
+            Error::GaveUp(_) => ErrorKind::GaveUp,
+            Error::NotConnected => ErrorKind::NotConnected,
+            Error::Full => ErrorKind::Full,
+            Error::Closed => ErrorKind::Closed,
+            Error::Panicked => ErrorKind::Internal,
+            Error::Encode(_) => ErrorKind::Encode,
+            Error::Decode(_) => ErrorKind::Decode,
+            _ => ErrorKind::Unknown,
+        };
+        Self::new(kind, error.to_string())
+    }
+}
+
+// -- configuration ------------------------------------------------------------
+
+/// Where the client connects and how. Durations in milliseconds; zero means
+/// the Rust client's default.
+#[derive(Clone, Debug, Default)]
+pub struct NativeConfig {
+    /// ws://host:port/wse or wss://...
+    pub url: String,
+    /// The JWT (cookie and Authorization header); a token source takes its place.
+    pub token: Option<String>,
+    /// Topics subscribed to on every connection.
+    pub topics: Vec<String>,
+    /// The server sends msgpack instead of JSON.
+    pub msgpack: bool,
+    /// More headers for the upgrade request.
+    pub headers: Vec<(String, String)>,
+    /// Messages waiting to be sent at most (default 1024).
+    pub send_queue: u32,
+    /// Reconnect after a lost connection (default true).
+    pub reconnect: Option<bool>,
+    pub connect_timeout_ms: u64,
+    pub ready_timeout_ms: u64,
+    pub idle_timeout_ms: u64,
+    pub recovery_timeout_ms: u64,
+    /// End-to-end encryption, pinned to these identity keys of the server (base64).
+    pub server_identity_keys: Vec<String>,
+    /// This client's ECDSA P-256 private key (PKCS#8, PEM or DER), for send_signed.
+    pub signing_key: Option<Vec<u8>>,
+    /// The server's signing public keys the messages it signs are checked against.
+    pub server_signing_keys: Vec<String>,
+}
+
+/// The token for each connection attempt, asked of the application.
+pub trait TokenSource: Send + Sync + 'static {
+    fn token(&self) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
+}
+
+fn config_of(
+    native: NativeConfig,
+    tokens: Option<Arc<dyn TokenSource>>,
+) -> Result<Config, NativeError> {
+    let mut config = Config::new(native.url);
+    config.token = native.token;
+    if let Some(source) = tokens {
+        config.token_provider = Some(TokenProvider::new(move || source.token()));
+    }
+    config.topics = native.topics;
+    if native.msgpack {
+        config.format = wse_client::Format::Msgpack;
+    }
+    config.headers = native.headers;
+    if native.send_queue > 0 {
+        config.send_queue = native.send_queue as usize;
+    }
+    if let Some(reconnect) = native.reconnect {
+        config.reconnect.enabled = reconnect;
+    }
+    let ms = |value: u64, default: Duration| {
+        if value == 0 {
+            default
+        } else {
+            Duration::from_millis(value)
+        }
+    };
+    config.connect_timeout = ms(native.connect_timeout_ms, config.connect_timeout);
+    config.ready_timeout = ms(native.ready_timeout_ms, config.ready_timeout);
+    config.idle_timeout = ms(native.idle_timeout_ms, config.idle_timeout);
+    if native.recovery_timeout_ms > 0 {
+        config.recovery_timeout = Duration::from_millis(native.recovery_timeout_ms);
+    }
+    if !native.server_identity_keys.is_empty() {
+        config.encryption = Some(wse_client::Encryption::pinned(native.server_identity_keys));
+    }
+    config.signing_key = native.signing_key;
+    config.server_signing_keys = native.server_signing_keys;
+    Ok(config)
+}
+
+// -- cancellation ---------------------------------------------------------------
+
+/// Cancels the calls it is given to (connect, next_batch): a binding's own
+/// cancellation (a Swift Task, say) cancels it.
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken(CancellationToken);
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.cancel();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+}
+
+// -- what the client hears -----------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeSignature {
+    /// The exact text that was signed (a JSON object): keep it as it is.
+    pub body: String,
+    /// r || s in base64.
+    pub sig: String,
+    pub kid: String,
+    /// Checked against a pinned server signing key.
+    pub verified: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeMessage {
+    pub kind: String,
+    pub topic: Option<String>,
+    /// The message's stream and offset in its topic, when it has them.
+    pub epoch: Option<u32>,
+    pub offset: Option<u64>,
+    pub id: Option<String>,
+    /// The payload as JSON text, from msgpack too; None without a payload.
+    pub json: Option<String>,
+    pub signature: Option<NativeSignature>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopicRecovery {
+    pub topic: String,
+    pub recovered: bool,
+    pub count: u64,
+}
+
+/// One thing the client heard, in the order it came.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Item {
+    Message(NativeMessage),
+    /// Bytes the server application sent as they are.
+    Binary(Vec<u8>),
+    Connected {
+        connection_id: String,
+        user_id: Option<String>,
+        reconnected: bool,
+        recovery: bool,
+    },
+    Disconnected {
+        code: Option<u16>,
+        reason: String,
+        retry_in_ms: u64,
+        attempt: u32,
+    },
+    Subscribed {
+        topics: Vec<String>,
+        failed: Vec<String>,
+        recovery: Vec<TopicRecovery>,
+    },
+    /// Messages of a topic that will not come: reload what depends on them.
+    Gap {
+        topic: String,
+        epoch: u32,
+        first: Option<u64>,
+        last: Option<u64>,
+        reason: String,
+    },
+    ServerError {
+        code: String,
+        message: String,
+        details_json: String,
+    },
+    /// The client stopped for good: closed by the application, or the reason.
+    Closed {
+        error: Option<NativeError>,
+    },
+    /// Something this version does not know.
+    Unknown {
+        name: String,
+    },
+}
+
+impl Item {
+    /// About what it costs a binding to carry.
+    fn size(&self) -> usize {
+        64 + match self {
+            Item::Message(m) => {
+                m.kind.len()
+                    + m.topic.as_ref().map_or(0, String::len)
+                    + m.json.as_ref().map_or(0, String::len)
+                    + m.signature
+                        .as_ref()
+                        .map_or(0, |s| s.body.len() + s.sig.len())
+            }
+            Item::Binary(bytes) => bytes.len(),
+            Item::ServerError { details_json, .. } => details_json.len(),
+            _ => 0,
+        }
+    }
+}
+
+fn gap_reason(reason: GapReason) -> &'static str {
+    match reason {
+        GapReason::Timeout => "timeout",
+        GapReason::Overflow => "overflow",
+        GapReason::NotRecovered => "not_recovered",
+        GapReason::Unavailable => "unavailable",
+        GapReason::Incomplete => "incomplete",
+        GapReason::EpochChanged => "epoch_changed",
+        GapReason::Closed => "closed",
+        _ => "unknown",
+    }
+}
+
+fn message_of(message: &OwnedMessage) -> NativeMessage {
+    let position = message.position();
+    let json = match message.payload_json() {
+        Some(text) => Some(text.to_owned()),
+        None => message
+            .payload_value()
+            .ok()
+            .filter(|v| !v.is_null())
+            .map(|v| v.to_string()),
+    };
+    NativeMessage {
+        kind: message.kind().to_owned(),
+        topic: message.topic().map(str::to_owned),
+        epoch: position.map(|p| p.epoch),
+        offset: position.map(|p| p.offset),
+        id: message.id().map(str::to_owned),
+        json,
+        signature: message.signature().map(|s| NativeSignature {
+            body: s.body.clone(),
+            sig: s.sig.clone(),
+            kid: s.kid.clone(),
+            verified: s.verified,
+        }),
+    }
+}
+
+fn item_of(incoming: Incoming) -> Item {
+    match incoming {
+        Incoming::Message(message) => Item::Message(message_of(&message)),
+        Incoming::Binary(bytes) => Item::Binary(bytes.to_vec()),
+        Incoming::Event(event) => match event {
+            Event::Connected(c) => Item::Connected {
+                connection_id: c.connection_id,
+                user_id: c.user_id,
+                reconnected: c.reconnected,
+                recovery: c.recovery,
+            },
+            Event::Disconnected(d) => Item::Disconnected {
+                code: d.code,
+                reason: d.reason,
+                retry_in_ms: u64::try_from(d.retry_in.as_millis()).unwrap_or(u64::MAX),
+                attempt: d.attempt,
+            },
+            Event::Subscribed(s) => Item::Subscribed {
+                topics: s.topics,
+                failed: s.failed,
+                recovery: s
+                    .recovery
+                    .into_iter()
+                    .map(|r| TopicRecovery {
+                        topic: r.topic,
+                        recovered: r.recovered,
+                        count: r.count,
+                    })
+                    .collect(),
+            },
+            Event::Gap(g) => Item::Gap {
+                reason: gap_reason(g.reason).to_owned(),
+                topic: g.topic,
+                epoch: g.epoch,
+                first: g.first,
+                last: g.last,
+            },
+            Event::ServerError(e) => Item::ServerError {
+                code: e.code,
+                message: e.message,
+                details_json: e.details.to_string(),
+            },
+            Event::Closed(error) => Item::Closed {
+                error: error.map(NativeError::from),
+            },
+            other => Item::Unknown {
+                name: format!("{other:?}")
+                    .split(['(', ' ', '{'])
+                    .next()
+                    .unwrap_or("")
+                    .to_owned(),
+            },
+        },
+        _ => Item::Unknown {
+            name: "incoming".to_owned(),
+        },
+    }
+}
+
+/// Whether a batch carries items, or the end of the events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchKind {
+    Items,
+    /// Nothing more will come: the client closed.
+    End,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Batch {
+    /// Acknowledge it with the next call; until then it is handed out again.
+    pub id: u64,
+    pub kind: BatchKind,
+    pub items: Vec<Item>,
+}
+
+/// The events and the batch handed out but not acknowledged yet.
+struct Reader {
+    events: Events,
+    pending: Option<Batch>,
+    next_id: u64,
+    ended: bool,
+}
+
+// -- the client ---------------------------------------------------------------
+
+/// Statuses a binding shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeStatus {
+    Connecting,
+    Connected,
+    Reconnecting,
+    Closed,
+}
+
+pub struct NativeClient {
+    client: wse_client::Client,
+    reader: Mutex<Reader>,
+    closing: CancellationToken,
+}
+
+impl NativeClient {
+    /// Connects, and returns once the server took the connection, or fails;
+    /// gives up at once when `cancel` is cancelled.
+    pub async fn connect(
+        config: NativeConfig,
+        tokens: Option<Arc<dyn TokenSource>>,
+        cancel: &CancelToken,
+    ) -> Result<Self, NativeError> {
+        let config = config_of(config, tokens)?;
+        let cancel = cancel.0.clone();
+        let (client, events) = on_runtime(async move {
+            tokio::select! {
+                connected = wse_client::connect(config) => connected.map_err(NativeError::from),
+                () = cancel.cancelled() => Err(NativeError::new(ErrorKind::Cancelled, "connect was cancelled")),
+            }
+        })
+        .await?;
+        Ok(Self {
+            client,
+            reader: Mutex::new(Reader {
+                events,
+                pending: None,
+                next_id: 1,
+                ended: false,
+            }),
+            closing: CancellationToken::new(),
+        })
+    }
+
+    /// Sends `{"t": kind, "p": json}`; fails at once when the queue is full.
+    pub fn try_send(&self, kind: &str, json: &str) -> Result<(), NativeError> {
+        let payload = raw_json(json)?;
+        Ok(self.client.try_send(kind, &*payload)?)
+    }
+
+    /// Sends `{"t": kind, "p": json}`, waiting for room in the queue.
+    pub async fn send(&self, kind: String, json: String) -> Result<(), NativeError> {
+        let payload = raw_json(&json)?;
+        let client = self.client.clone();
+        on_runtime(async move {
+            client
+                .send(&kind, &*payload)
+                .await
+                .map_err(NativeError::from)
+        })
+        .await
+    }
+
+    /// Sends a signed message on this connection, or not at all; the nonce
+    /// it went with.
+    pub async fn send_signed(
+        &self,
+        kind: String,
+        json: String,
+        nonce: Option<String>,
+    ) -> Result<String, NativeError> {
+        let payload = raw_json(&json)?;
+        let client = self.client.clone();
+        on_runtime(async move {
+            client
+                .send_signed(&kind, &*payload, nonce.as_deref())
+                .await
+                .map_err(NativeError::from)
+        })
+        .await
+    }
+
+    pub fn subscribe(&self, topics: Vec<String>) -> Result<(), NativeError> {
+        Ok(self.client.subscribe(topics)?)
+    }
+
+    pub fn unsubscribe(&self, topics: Vec<String>) -> Result<(), NativeError> {
+        Ok(self.client.unsubscribe(topics)?)
+    }
+
+    /// Drops the connection and makes it again at once.
+    pub fn reconnect(&self) -> Result<(), NativeError> {
+        Ok(self.client.reconnect()?)
+    }
+
+    pub fn status(&self) -> NativeStatus {
+        match self.client.status() {
+            Status::Connecting => NativeStatus::Connecting,
+            Status::Connected => NativeStatus::Connected,
+            Status::Reconnecting => NativeStatus::Reconnecting,
+            _ => NativeStatus::Closed,
+        }
+    }
+
+    pub fn connection_id(&self) -> Option<String> {
+        self.client.connection_id()
+    }
+
+    pub fn user_id(&self) -> Option<String> {
+        self.client.user_id()
+    }
+
+    /// The next batch of what the client heard: the one with id `ack` is
+    /// acknowledged (0: none yet), the one handed out and not acknowledged is
+    /// handed out again. Waits for at least one item (or the end), then takes
+    /// what came with it, up to `max_items` and about `max_bytes`. One
+    /// reader at a time; `cancel` (or [`disconnect`](Self::disconnect)) ends
+    /// the wait.
+    pub async fn next_batch(
+        &self,
+        ack: u64,
+        max_items: u32,
+        max_bytes: u32,
+        cancel: &CancelToken,
+    ) -> Result<Batch, NativeError> {
+        let mut reader = self
+            .reader
+            .try_lock()
+            .map_err(|_| NativeError::new(ErrorKind::Busy, "another call reads the events"))?;
+        if let Some(pending) = &reader.pending {
+            if pending.id != ack {
+                return Ok(pending.clone());
+            }
+            reader.pending = None;
+        }
+        if reader.ended {
+            let id = reader.next_id;
+            return Ok(Batch {
+                id,
+                kind: BatchKind::End,
+                items: Vec::new(),
+            });
+        }
+        let max_items = max_items.max(1) as usize;
+        let max_bytes = max_bytes.max(1) as usize;
+        let id = reader.next_id;
+        reader.next_id += 1;
+        let first = tokio::select! {
+            first = reader.events.next() => first,
+            () = cancel.0.cancelled() => return Err(NativeError::new(ErrorKind::Cancelled, "next_batch was cancelled")),
+            () = self.closing.cancelled() => None,
+        };
+        let Some(first) = first else {
+            reader.ended = true;
+            let batch = Batch {
+                id,
+                kind: BatchKind::End,
+                items: Vec::new(),
+            };
+            reader.pending = Some(batch.clone());
+            return Ok(batch);
+        };
+        // From here on nothing awaits: what is taken from the events is the
+        // pending batch before this call can be dropped.
+        let mut items = vec![item_of(first)];
+        let mut bytes = items[0].size();
+        while items.len() < max_items && bytes < max_bytes {
+            match reader.events.try_next() {
+                Some(incoming) => {
+                    let item = item_of(incoming);
+                    bytes += item.size();
+                    items.push(item);
+                }
+                None => break,
+            }
+        }
+        let batch = Batch {
+            id,
+            kind: BatchKind::Items,
+            items,
+        };
+        reader.pending = Some(batch.clone());
+        Ok(batch)
+    }
+
+    /// Closes the client: what was sent goes out first, within `deadline_ms`;
+    /// a reader waiting in [`next_batch`](Self::next_batch) gets the end.
+    pub async fn disconnect(&self, deadline_ms: u64) {
+        self.closing.cancel();
+        let client = self.client.clone();
+        let deadline = Duration::from_millis(deadline_ms.max(1));
+        let _ = on_runtime(async move {
+            let _ = tokio::time::timeout(deadline, client.close()).await;
+            Ok(())
+        })
+        .await;
+    }
+}
+
+fn raw_json(json: &str) -> Result<Box<serde_json::value::RawValue>, NativeError> {
+    serde_json::value::RawValue::from_string(json.to_owned())
+        .map_err(|e| NativeError::new(ErrorKind::Encode, format!("the payload is not JSON: {e}")))
+}

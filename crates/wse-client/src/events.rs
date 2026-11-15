@@ -44,6 +44,12 @@ impl Events {
     pub async fn next(&mut self) -> Option<Incoming> {
         self.rx.recv().await
     }
+
+    /// What came already, without waiting: None when nothing is waiting
+    /// now (or the stream ended).
+    pub fn try_next(&mut self) -> Option<Incoming> {
+        self.rx.try_recv().ok()
+    }
 }
 
 impl futures_util::Stream for Events {

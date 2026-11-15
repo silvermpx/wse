@@ -2634,6 +2634,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wse-client-native"
+version = "3.0.1"
+dependencies = [
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "wse",
+ "wse-client",
+]
+
+[[package]]
 name = "wse-py"
 version = "3.0.1"
 dependencies = [
