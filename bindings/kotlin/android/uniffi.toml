@@ -1,5 +1,4 @@
-[bindings.kotlin]
-package_name = "dev.wse.ffi"
-generate_immutable_records = true
-# Android's own cleaner (minSdk 26 has no java.lang.ref.Cleaner).
+# For the Android bindings: on top of crates/wse-ffi/uniffi.toml, Android's
+# own cleaner (minSdk 26 has no java.lang.ref.Cleaner).
+[crates.wse_ffi.bindings.kotlin]
 android = true
