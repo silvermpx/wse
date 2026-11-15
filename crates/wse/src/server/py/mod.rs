@@ -530,6 +530,42 @@ impl RustWSEServer {
             .map_err(messaging::py_error)
     }
 
+    // -- users ----------------------------------------------------------------
+
+    /// The connections of a user on this server (the token's `sub`, or the
+    /// user_id given to accept_connection): every tab and device it has
+    /// open here.
+    fn get_user_connections(&self, user_id: &str) -> Vec<String> {
+        self.engine().user_connections(user_id)
+    }
+
+    /// Send a text frame to every connection of a user on this server.
+    /// Returns how many it went to.
+    fn send_to_user(&self, py: Python<'_>, user_id: &str, data: &str) -> PyResult<usize> {
+        self.send_to_user_impl(py, user_id, data)
+    }
+
+    /// `send_event` to every connection of a user on this server, each in
+    /// its own format. Returns how many it went to.
+    #[pyo3(signature = (user_id, event, compression_threshold = 1024))]
+    fn send_event_to_user(
+        &self,
+        py: Python<'_>,
+        user_id: &str,
+        event: &Bound<'_, PyDict>,
+        compression_threshold: usize,
+    ) -> PyResult<usize> {
+        self.send_event_to_user_impl(py, user_id, event, compression_threshold)
+    }
+
+    /// Close every connection of a user on this server (1000): a logout, a
+    /// revoked session, a banned account. Returns how many it closed.
+    fn disconnect_user(&self, user_id: &str) -> PyResult<usize> {
+        self.command_tx()?
+            .disconnect_user(user_id)
+            .map_err(messaging::py_error)
+    }
+
     /// Accept a connection the application authenticated itself (a server
     /// without `jwt_secret`): it gets server_ready, the message the clients
     /// wait for before they send anything, and `user_id` becomes its user

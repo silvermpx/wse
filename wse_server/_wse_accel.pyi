@@ -533,6 +533,32 @@ class RustWSEServer:
         """
         ...
 
+    # -- Users -----------------------------------------------------------------
+
+    def get_user_connections(self, user_id: str) -> list[str]:
+        """The connections of a user on this server (the token's sub, or the
+        user_id given to accept_connection): every tab and device it has open
+        here."""
+        ...
+    def send_to_user(self, user_id: str, data: str) -> int:
+        """Send a text frame to every connection of a user on this server.
+        Returns how many it went to. Waits, without the GIL, while 65,536
+        commands are queued for the server."""
+        ...
+    def send_event_to_user(
+        self,
+        user_id: str,
+        event: dict[str, Any],
+        compression_threshold: int = 1024,
+    ) -> int:
+        """send_event() to every connection of a user on this server, each in
+        its own format. Returns how many it went to."""
+        ...
+    def disconnect_user(self, user_id: str) -> int:
+        """Close every connection of a user on this server (1000): a logout, a
+        revoked session, a banned account. Returns how many it closed."""
+        ...
+
     # -- Topic Authorization ---------------------------------------------------
 
     def set_topic_acl(

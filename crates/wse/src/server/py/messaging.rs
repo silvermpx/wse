@@ -31,6 +31,29 @@ fn wait_for_room(py: Python<'_>, publisher: &Publisher) {
     }
 }
 
+/// An event dict as the envelope's fields: `c` and `v` are the server's,
+/// `t` counts only as text.
+fn event_fields(event: &Bound<'_, PyDict>) -> PyResult<serde_json::Map<String, serde_json::Value>> {
+    let mut fields = serde_json::Map::new();
+    for (key, value) in event.iter() {
+        let Ok(key) = key.extract::<String>() else {
+            continue;
+        };
+        match key.as_str() {
+            "c" | "v" => {}
+            "t" => {
+                if let Ok(t) = value.extract::<String>() {
+                    fields.insert(key, serde_json::Value::String(t));
+                }
+            }
+            _ => {
+                fields.insert(key, pyobj_to_json(&value)?);
+            }
+        }
+    }
+    Ok(fields)
+}
+
 impl RustWSEServer {
     pub(super) fn accept_connection_impl(
         &self,
@@ -110,28 +133,36 @@ impl RustWSEServer {
         if !self.shared.conn_last_activity.contains_key(conn_id) {
             return Ok(0);
         }
-        let mut fields = serde_json::Map::new();
-        for (key, value) in event.iter() {
-            let Ok(key) = key.extract::<String>() else {
-                continue;
-            };
-            // The envelope's own: `c` and `v` are the server's, `t` counts
-            // only as text.
-            match key.as_str() {
-                "c" | "v" => {}
-                "t" => {
-                    if let Ok(t) = value.extract::<String>() {
-                        fields.insert(key, serde_json::Value::String(t));
-                    }
-                }
-                _ => {
-                    fields.insert(key, pyobj_to_json(&value)?);
-                }
-            }
-        }
+        let fields = event_fields(event)?;
         wait_for_room(py, &publisher);
         publisher
             .send_event(conn_id, fields, compression_threshold)
+            .map_err(py_error)
+    }
+
+    pub(super) fn send_to_user_impl(
+        &self,
+        py: Python<'_>,
+        user_id: &str,
+        data: &str,
+    ) -> PyResult<usize> {
+        let publisher = self.command_tx()?;
+        wait_for_room(py, &publisher);
+        publisher.send_to_user(user_id, data).map_err(py_error)
+    }
+
+    pub(super) fn send_event_to_user_impl(
+        &self,
+        py: Python<'_>,
+        user_id: &str,
+        event: &Bound<'_, PyDict>,
+        compression_threshold: usize,
+    ) -> PyResult<usize> {
+        let publisher = self.command_tx()?;
+        let fields = event_fields(event)?;
+        wait_for_room(py, &publisher);
+        publisher
+            .send_event_to_user(user_id, &fields, compression_threshold)
             .map_err(py_error)
     }
 

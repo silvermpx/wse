@@ -1149,7 +1149,8 @@ cheap to clone):
 | `disconnect(conn_id)` | `Publisher::disconnect` |
 | `sign(event_type, payload, topic=...)` | `Publisher::sign` |
 | `sign(event_type, payload, to=user_id)` | `Publisher::sign_to` |
-| - | `Publisher::send_to_user`, `disconnect_user`: every connection of a user |
+| `send_to_user(user_id, text)`, `send_event_to_user(...)` | `Publisher::send_to_user`, `send_event_to_user`: every connection of a user |
+| `disconnect_user(user_id)`, `get_user_connections(user_id)` | `Publisher::disconnect_user`, `user_connections` |
 | `connect_cluster(...)` | `Server::connect_cluster(ClusterSettings)` |
 | `health_snapshot()` | `Publisher::health` |
 | `prometheus_metrics()` | `Publisher::prometheus_metrics` |

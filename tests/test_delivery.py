@@ -183,6 +183,52 @@ class TestQueueGroups:
             srv.stop()
 
 
+class TestUsers:
+    @pytest.mark.asyncio
+    async def test_a_user_is_reached_on_every_connection_and_only_there(self, server_port):
+        srv = start_server(server_port)
+        sockets = []
+        try:
+            tabs = [await connect(server_port, make_token("alice")) for _ in range(2)]
+            other = await connect(server_port, make_token("bob"))
+            sockets = [*tabs, other]
+            for _ in sockets:
+                drain_until(srv, "auth_connect")
+            assert len(srv.get_user_connections("alice")) == 2
+            (bob,) = srv.get_user_connections("bob")
+
+            assert srv.send_to_user("alice", json.dumps({"t": "note", "p": {"n": 1}})) == 2
+            assert srv.send_event_to_user("alice", {"t": "note", "p": {"n": 2}}) == 2
+            assert srv.send_to_user("nobody", json.dumps({"t": "note"})) == 0
+            srv.send(bob, json.dumps({"t": "marker"}))
+
+            async def kinds(ws, until: str) -> list:
+                seen = []
+                async with asyncio.timeout(5):
+                    while not seen or seen[-1][0] != until:
+                        msg = json.loads(await ws.recv())
+                        if msg.get("t") in ("note", "marker"):
+                            seen.append((msg["t"], msg.get("p", {}).get("n")))
+                return seen
+
+            for ws in tabs:
+                assert await kinds(ws, "note") == [("note", 1)]
+                assert await kinds(ws, "note") == [("note", 2)]
+            # Bob's connection got neither: the marker sent after them comes first.
+            assert await kinds(other, "marker") == [("marker", None)]
+
+            assert srv.disconnect_user("alice") == 2
+            for ws in tabs:
+                async with asyncio.timeout(5):
+                    await ws.wait_closed()
+                assert ws.close_code == 1000
+            assert srv.get_user_connections("bob") == [bob]
+        finally:
+            for ws in sockets:
+                await ws.close()
+            srv.stop()
+
+
 class TestClientCompression:
     async def received(self, ws) -> bytes:
         async with asyncio.timeout(5):

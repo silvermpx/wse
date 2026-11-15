@@ -68,6 +68,9 @@ Upgrading from 2.x: see
 - A FIPS 140-3 build (`fips` feature).
 - `accept_connection()` for applications that authenticate connections
   themselves; connections close when their token expires.
+- `send_to_user()`, `send_event_to_user()` and `disconnect_user()`: every
+  tab and device of a user at once (a logout, a revoked session).
+  `get_user_connections()` lists them.
 - `client_subscriptions=True`: clients subscribe and recover by themselves,
   within their topic ACL.
 - `allowed_origins`, `max_inbound_queue_bytes`, `is_draining()` and `with`.

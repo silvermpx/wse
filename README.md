@@ -281,6 +281,9 @@ server.broadcast(topic, text)               # to a topic's subscribers on every 
 server.broadcast_local(topic, text)         # to a topic's subscribers on this server
 server.broadcast_all(text)                  # to every connection on this server
 server.broadcast_all_bytes(data)
+server.send_to_user(user_id, text)          # to every tab and device of a user on this server
+server.send_event_to_user(user_id, {"t": "notice", "p": {}})
+server.disconnect_user(user_id)             # close them all: a logout, a revoked session
 ```
 
 A client that asked for MessagePack gets MessagePack from all of these except the two `_bytes` methods, which send their bytes as they are. When the server has 65,536 commands queued, these calls wait (without holding the GIL), so a publisher faster than its clients cannot run the server out of memory.
