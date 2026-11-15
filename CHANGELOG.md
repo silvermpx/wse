@@ -23,6 +23,9 @@ Upgrading from 2.x: see
   `set_topic_acl(conn_id, allow=[])`.
 - `reload_jwt_keys()` with a new public key needs the new `jwt_private_key`
   on a server that issues tokens.
+- A token with a `cnf` claim is taken only on a connection that proves the
+  key it names inside an E2E session; one whose `cnf` names no P-256 key is
+  refused. `bind_sessions=False` keeps a named key for signed messages only.
 - The rate limit applies to what clients send (close code 4429);
   `send_event()` is not throttled.
 - New close codes: 1013, 4403, 4408, 4429, 4800, 4802, 4803.
@@ -46,7 +49,10 @@ Upgrading from 2.x: see
     signed messages, disconnect, presence) and sends through a `Publisher`:
     topics with recovery, `send_to_user()` and `disconnect_user()` for
     every connection of a user, the cluster, drain, health and Prometheus
-    metrics. The Python package runs the same engine.
+    metrics. Sends never block: past 65,536 queued they fail with
+    `Error::Full`, and `Publisher::ready()` waits for room. A handler that
+    panics closes only its own connection (1011). The Python package runs
+    the same engine.
   - `wse-client`: the Rust client, on tokio and in the browser
     (WebAssembly, for Leptos, Yew, Dioxus). Messages read in place from
     their frames by a `Handler`, or a stream of owned ones; topics with
@@ -75,6 +81,12 @@ Upgrading from 2.x: see
   `signing_key`. Client keys are bound in the token (`cnf`) or with
   `set_client_key()`; both clients sign and check (`signed=True`,
   `sendSigned()`).
+- Sessions bound to the client's key: a token that names the client's key
+  (`cnf`) opens a connection only for the client that proves the key inside
+  its E2E session, so whatever terminates TLS cannot reuse a token it sees.
+  The clients prove their key by themselves and check that the server
+  names it; `accept_connection(..., client_key=)` binds the connections an
+  application authenticates itself.
 - `wse_server.prometheus.WSECollector`.
 
 ### Fixed

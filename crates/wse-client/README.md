@@ -107,15 +107,20 @@ async fn main() -> Result<(), wse_client::Error> {
   (`Encryption`): whatever terminates TLS in between sees nothing.
 - **Signed messages.** `Client::send_signed` signs with the client's key
   for the server's; the server's signed messages are checked against the
-  keys the client pins, and each carries its proof.
+  keys the client pins, and each carries its proof. With encryption, the
+  client also proves its key inside the session, which binds a token that
+  names the key to this client (`Encryption::bind_session`, on by default),
+  and stops unless the server confirms the key.
 - **Back-pressure.** A handler that waits in `ready` holds the server back;
   the stream of `connect` does the same while nobody reads it.
 
 ```rust,no_run
 # async fn run() -> Result<(), wse_client::Error> {
-// Kept by the client; the server learns `wse_client::public_key(&key)`.
+// Kept by the client. The backend names its public key in the client's
+// token (`cnf`: `wse_client::public_key_jwk(&key)`).
 let key = wse_client::generate_key();
 let mut config = wse_client::Config::new("wss://example.com/wse");
+config.token = Some("<a token whose cnf names the key>".into());
 config.encryption = Some(wse_client::Encryption::pinned([
     "<the server's e2e_identity_public_key>",
 ]));

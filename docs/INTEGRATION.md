@@ -144,6 +144,7 @@ Configure `jwt_secret`, `jwt_issuer`, `jwt_audience`, and optionally `jwt_cookie
 | `iat` | No (recommended) | Issued-at timestamp (Unix epoch) |
 | `iss` | If configured | Issuer (validated only when `jwt_issuer` is set) |
 | `aud` | If configured | Audience (validated only when `jwt_audience` is set) |
+| `cnf` | No | The client's public key, `{"jwk": {...}}` (RFC 7800) or its thumbprint `{"jkt": "..."}` (RFC 7638): the connection must open an E2E session and prove the key in it ([SECURITY.md](SECURITY.md#binding-a-session-to-the-clients-key)) |
 
 **Token delivery:** The client sends the token as an `Authorization: Bearer <token>` header or a cookie during the WebSocket handshake. The cookie name defaults to `access_token` and can be changed via the `jwt_cookie_name` constructor parameter.
 
@@ -151,7 +152,7 @@ Configure `jwt_secret`, `jwt_issuer`, `jwt_audience`, and optionally `jwt_cookie
 - With JWT configured: `auth_connect` event fires with the validated `user_id`
 - Without JWT configured: `connect` event fires with the raw cookies string
 
-**Authenticating in Python:** without `jwt_secret`, check the cookies of the `connect` event yourself, then call `server.accept_connection(conn_id, user_id)`. It sends the client `server_ready`, the message both clients wait for before they send anything, and makes `user_id` the connection's user for presence. Until then the connection gets no broadcasts and, with `client_subscriptions=True`, the server refuses every topic it asks for. Set its topic ACL (`set_topic_acl`) before accepting it: from then on the client may subscribe. Reject with `server.disconnect(conn_id)`.
+**Authenticating in Python:** without `jwt_secret`, check the cookies of the `connect` event yourself, then call `server.accept_connection(conn_id, user_id)`. It sends the client `server_ready`, the message both clients wait for before they send anything, and makes `user_id` the connection's user for presence. Until then the connection gets no broadcasts and, with `client_subscriptions=True`, the server refuses every topic it asks for. Set its topic ACL (`set_topic_acl`) before accepting it: from then on the client may subscribe. Reject with `server.disconnect(conn_id)`. An application that knows the client's public key accepts with `accept_connection(conn_id, user_id, client_key=key)`: the connection is admitted only once the client proves that key inside its E2E session, so a cookie copied on the way opens nothing ([SECURITY.md](SECURITY.md#binding-a-session-to-the-clients-key)).
 
 ```python
 for kind, conn_id, data in server.drain_inbound(256, 50):
@@ -1138,6 +1139,7 @@ cheap to clone):
 | `start()` | `server.start(listener, handler)` |
 | `drain_inbound()` / callbacks | the `Handler` |
 | `accept_connection(conn_id, user_id)` | `Publisher::accept` |
+| `accept_connection(conn_id, user_id, client_key=key)` | `Publisher::accept_bound` |
 | `send_event(conn_id, event)` | `Publisher::send_event` |
 | `broadcast_all(text)` | `Publisher::broadcast` |
 | `broadcast_local(topic, text)` | `Publisher::publish_local` |

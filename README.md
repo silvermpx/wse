@@ -21,7 +21,7 @@ In the browser, a React hook keeps one connection per page, with its subscriptio
 - **Presence.** Who is on a topic right now, with each user's status or other data, and an event when someone joins or leaves. Several tabs of one user count as one.
 - **Several instances.** In production a backend usually runs as several copies behind a load balancer, each with its own WSE server. The servers link to each other directly: an event published on one copy reaches the subscribers connected to any other, presence covers all of them, and one copy can be drained for a deploy while its clients move to the others. No Redis or other broker sits in between, and each topic goes only to the servers that have subscribers for it.
 - **Access.** Users sign in with a JWT checked during the WebSocket handshake: from a cookie in browsers, from the `Authorization` header elsewhere. Each connection can be limited to its own topics, by its token or by the application. The server can refuse pages from other sites, and it limits how much and how fast each client may send.
-- **End-to-end encryption.** Clients pin the server's public key and every frame is sealed, so a proxy or load balancer that terminates TLS can neither read nor change the traffic.
+- **End-to-end encryption.** Clients pin the server's public key and every frame is sealed, so a proxy or load balancer that terminates TLS can neither read nor change the traffic. A token that names the client's key opens a connection only for the client that holds the key, so a token seen on the way is of no use.
 - **Signed messages.** Orders, fills and other messages that may be disputed later carry their sender's signature, which can still be checked long after they arrived. The server confirms each one with a signed receipt.
 - **Speed.** The engine delivers on every CPU core: on 12 cores of an Intel Xeon it sends 7.4 to 9.4 million messages a second to 1,000-10,000 subscribers. A publisher faster than its clients is slowed down instead of filling memory.
 - **Operations.** Graceful drain for rolling deploys, health snapshots, Prometheus metrics, limits on connections, message sizes, send rates and memory, and guides for Docker and Kubernetes.
@@ -244,6 +244,7 @@ Sizes are in bytes, times in seconds.
 | `e2e_legacy` | `True` | Also serve 2.x clients' encryption, which has no server identity; `False` refuses it (code 4800) |
 | `signing_key` | `None` | PEM or DER (PKCS#8) P-256 private key for signed messages |
 | `signature_window` | 30 | How far a client's signed message may be off the server's clock |
+| `bind_sessions` | `True` | A token that names the client's key (`cnf`) is taken only on an end-to-end session in which the client proves that key; `False` keeps the key for signed messages only |
 
 ### Events
 
@@ -369,6 +370,8 @@ print(server.e2e_identity_public_key())   # the key clients pin
 ```
 
 Clients pin that key: `encryption=True, e2e_server_keys=[key]` in Python, `security: { encryptionEnabled: true, serverKeys: [key] }` in TypeScript, `Encryption::pinned([key])` in Rust. Each direction then has its own AES-256-GCM key; frames are numbered, and a replayed, reordered or forged frame ends the connection.
+
+The token still passes whatever terminates TLS. A token that names the client's key in its `cnf` claim is of no use there: the client signs the session's handshake with that key, and the server admits the connection only when the signature matches the key in the token. The clients do it by themselves when they have a `signing_key`, and stop if the server does not confirm their key.
 
 ### Signed messages
 

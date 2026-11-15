@@ -386,7 +386,7 @@ The server's own `error` messages (`{"c":"WSE","t":"error","p":{"code":...,"mess
 
 | Code | Sent when |
 |------|-----------|
-| `AUTH_FAILED` | The token was refused at the upgrade; the close (4401) follows |
+| `AUTH_FAILED` | The token was refused at the upgrade, or the session's proof of the token's key (`p.reason`: `proof_missing`, `proof_invalid`, see [Binding the session](#binding-the-session-to-the-clients-key)); the close (4401) follows |
 | `AUTH_REQUIRED` | No token, on a server with `jwt_secret`; the close (4401) follows |
 | `RATE_LIMITED` | A message was dropped over the client's rate limit (at most once a second) |
 | `KEY_EXCHANGE_FAILED` | The first design's key exchange failed |
@@ -404,9 +404,9 @@ Applications send their own codes in the same shape.
 | 1011 | The server application's handler failed (a Rust `Handler` call panicked) | reconnect |
 | 1013 | The client reads too slowly: its outbound queue stayed over `max_outbound_queue_bytes` for two ping intervals. Also: the server filled up during the upgrade | reconnect |
 | 4300 | Graceful drain (the code passed to `drain()`, 4300 by default) | reconnect |
-| 4401 | Authentication failed at the upgrade | stop (a client with a token provider retries with a new token) |
+| 4401 | Authentication failed: at the upgrade, or the session's proof of the token's key | stop (a client with a token provider retries with a new token) |
 | 4403 | The token the connection opened with expired | stop (a client with a token provider retries with a new token) |
-| 4408 | Nothing received from the client for `idle_timeout` seconds | reconnect |
+| 4408 | Nothing received from the client for `idle_timeout` seconds; or a connection that announced an E2E session did not open it, and prove its key, within 10 seconds | reconnect |
 | 4429 | The client kept sending past the rate limit for 10 seconds | reconnect |
 | 4800 | No E2E suite in common, or a first-design client on a server with `e2e_legacy=False` (after an `E2E_UNSUPPORTED` error) | stop, with an encryption error |
 | 4802 | An E2E frame from the client out of order, forged, or plaintext inside a session | reconnect (a new session) |
@@ -561,6 +561,25 @@ Binary frames:
 The nonce is the epoch's IV followed by `seq` (u64 BE); the additional data is the direction (`0x01` client to server, `0x02` server to client), `TH` and the 14-byte header. Each direction counts `seq` from 0, one per frame, across epochs. A receiver opens only the frame with the next `seq`, in the current epoch or the next one (whose key it derives on trial and keeps only when the tag holds), and at most 2^24 frames per epoch; anything else closes the connection with 4802. A sender moves to the next epoch after 2^20 frames or 600 seconds, and past `seq` 2^53 - 1 closes with 4803. The plaintext is the message as it would go unsealed: JSON, or `M:` msgpack on a msgpack connection.
 
 `server_hello` is the last plaintext frame the server sends: its sending keys are installed right behind it, and every data frame queued after them is sealed. Once it has answered `client_hello` the server takes only sealed frames (WebSocket control frames apart), and a client sends nothing but `client_hello` until it holds the keys. The server seals with the counter nonce above through the library's TLS 1.2 record construction, which refuses a nonce that does not grow: in a `fips` build that is the approved way to use AES-GCM.
+
+### Binding the session to the client's key
+
+A token is a bearer token: whatever terminates TLS sees it in the upgrade, and could open a session of its own with it. A token that names the client's key in its `cnf` claim (RFC 7800: `{"jwk": {...}}`, or `{"jkt": "<RFC 7638 thumbprint>"}`) binds the connection to that key, as TLS 1.3's client CertificateVerify binds a certificate to its handshake:
+
+1. The connection must open a session. A bound token without `e2e=1`, or a `cnf` that names no P-256 key, is refused at the upgrade (`AUTH_FAILED`, close 4401).
+2. The client's first sealed message is its proof:
+
+   ```json
+   {"c":"WSE","t":"client_auth","p":{"key":"<base64 uncompressed point>","sig":"<base64 r || s>"}}
+   ```
+
+   `sig` is ECDSA P-256/SHA-256 over `"WSE-E2E client_auth\0" | TH | key`: the label, the session's transcript hash (32 bytes) and the key (65 bytes).
+3. Until the proof holds the server admits nothing: no `server_ready`, no broadcasts, no pings, and the application does not learn of the connection. A first sealed message that is no proof, or a proof for another key or that does not verify, gets a sealed `error` `AUTH_FAILED` with `p.reason` (`proof_missing`, `proof_invalid`) and close 4401. A connection that has not opened its session and proved its key 10 seconds after the upgrade is closed with 4408; its heartbeats do not extend that.
+4. Then the sealed `server_ready` names the key: `p.details.cnf = {"jkt": "<thumbprint>"}`. A client bound to its key goes on only when that thumbprint is its own; otherwise its token was replaced on the way, by one naming no key or another, and it stops.
+
+`TH` covers both ephemeral keys, the connection id and the server's key id: no one in between can have a proof signed for a session of its own, whether or not the client pins the server's identity.
+
+A server application that authenticates its connections itself binds them the same way with `accept_connection(conn_id, user_id, client_key=...)` (`Publisher::accept_bound`): the proof and the accept meet in either order. A `client_auth` on a connection that nothing binds is ignored. On a server with `bind_sessions=False` a token's key only checks signed messages.
 
 ### The first design
 

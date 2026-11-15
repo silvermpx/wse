@@ -87,6 +87,7 @@ The Rust server extracts the JWT from cookies (configured via `jwt_cookie_name`)
 6. `nbf` claim (if present, 30s clock skew tolerance per RFC 7519)
 7. `iss` claim (if `jwt_issuer` configured)
 8. `aud` claim (if `jwt_audience` configured, supports string or array per RFC 7519)
+9. `cnf` claim (if present): it must name a P-256 key, and the connection must open an E2E session in which the client proves that key ([Binding a session to the client's key](#binding-a-session-to-the-clients-key))
 
 **Supported algorithms:**
 
@@ -99,6 +100,8 @@ The Rust server extracts the JWT from cookies (configured via `jwt_cookie_name`)
 **Issuing tokens:** `server.issue_token(sub, ttl=900, claims=None)` signs a token with the server's own configuration (algorithm, key, `jwt_key_id`, issuer and audience), for a login endpoint in the same process. The HMAC algorithms sign with `jwt_secret`; the asymmetric ones need `jwt_private_key`, kept in memory that is wiped when the server is dropped.
 
 **Key requirements:** HS256 secret must be >= 32 bytes (RFC 7518). RS256/ES256 keys must be valid PEM. Tokens without `exp` are rejected.
+
+**A token is a bearer token:** whoever holds it connects as its user. Behind a proxy, a load balancer or a CDN that terminates TLS, the token in the upgrade is in clear there. A token that names the client's key is of no use without that key: see [Binding a session to the client's key](#binding-a-session-to-the-clients-key).
 
 **Expiry of open connections:** a connection is closed with code 4403 when the token it opened with expires (its `exp` plus the 30-second skew). The clients reconnect with a fresh token from their token provider; without one they stop. Keep tokens short-lived: an open WebSocket is authorized exactly as long as its token.
 
@@ -247,6 +250,26 @@ It does not hide the size and timing of frames (the server does not compress for
 
 [PROTOCOL.md](PROTOCOL.md#end-to-end-encryption) specifies the handshake, the transcript and the frames. `tests/vectors/e2e.json`, made with an independent implementation, holds test vectors the server and both clients check.
 
+### Binding a session to the client's key
+
+E2E encryption keeps whatever terminates TLS from reading the messages, but the token still crosses it in clear, in the upgrade: with the token alone, whatever sees it could open a session of its own as the user. A token that names the client's key in its `cnf` claim binds the connection to that key, the way TLS 1.3 binds a client certificate to its handshake. When the session opens, the client signs the session's transcript hash with its private key, and the server admits the connection only when the signature verifies against the key the token names. The hash covers both sides' ephemeral keys, the connection id and the server's key id, so a proof is worth nothing in any other session, and a copied token is worth nothing without the key.
+
+1. Each client makes its own key pair and keeps the private key on the device: `generate_signing_key()` (Python), `generateSigningKey()` (TypeScript, a WebCrypto key that cannot be exported), `wse_client::generate_key()` (Rust). The same key signs the client's [messages](#signed-messages).
+2. The application's backend puts the public key in the token it issues, as RFC 7800's confirmation claim: `"cnf": {"jwk": {"kty": "EC", "crv": "P-256", "x": ..., "y": ...}}` (`public_key_jwk()` / `SigningKey.jwk` give it), or its RFC 7638 thumbprint, `"cnf": {"jkt": "..."}`. Put a key there only after the client has shown it holds the key, for instance with a signature over a challenge from the login endpoint, or with a passkey (WebAuthn) assertion.
+3. The client connects with E2E and the key (`signing_key` / `security.signingKey` / `Config::signing_key`). It proves the key on its own when the session opens, and goes on only when the sealed `server_ready` names its key: a token swapped on the way, for one naming no key or another key, stops it with an authentication error. `e2e_bind_session=False` (Python), `security.bindSession: false` (TypeScript) or `Encryption::bind_session = false` (Rust) keep the key for signed messages only: for a token that names no key (one bound with `set_client_key`, say), or a server with `bind_sessions=False`.
+
+What the server does with a token that names a key:
+
+| | |
+|-|-|
+| Without E2E | Refused at the upgrade: `AUTH_FAILED`, close 4401 |
+| A `cnf` that names no P-256 key | Refused at the upgrade: `AUTH_FAILED`, close 4401 |
+| Until the proof | Nothing is admitted: no `server_ready`, no messages, no pings, and the application does not learn of the connection |
+| A proof that is missing, for another key or that does not verify | Sealed `error` `AUTH_FAILED` (`proof_missing`, `proof_invalid`), close 4401 |
+| No session and proof 10 seconds after the upgrade | Close 4408 |
+
+`bind_sessions=False` (Rust: `Config::bind_sessions`) turns it off on the server: a token's key then only checks signed messages, and a copied token connects. An application that authenticates its connections itself, without `jwt_secret`, binds a connection with `accept_connection(conn_id, user_id, client_key=...)` (Rust: `Publisher::accept_bound`): the connection is admitted only when the client's proof holds for that key, and refused (`AUTH_FAILED`, 4401) when it proves another key, or none 10 seconds after the upgrade.
+
 ### Close codes
 
 | Code | Meaning |
@@ -254,6 +277,8 @@ It does not hide the size and timing of frames (the server does not compress for
 | 4800 | No E2E suite in common, or a first-design client on a server with `e2e_legacy=False` |
 | 4802 | A frame out of order, forged, or in plaintext inside a session |
 | 4803 | The frame counter is used up |
+| 4401 | The session's proof of the token's key is missing or wrong ([binding](#binding-a-session-to-the-clients-key)) |
+| 4408 | The session was not opened, or the key not proved, within 10 seconds of the upgrade |
 
 A client that refuses the server's identity or one of its frames ends the connection itself, stops reconnecting and reports an encryption error. Nothing is sent in plaintext instead.
 
@@ -284,7 +309,7 @@ Use it for the messages that may be disputed: orders, cancellations, fills, bala
 
 3. Bind the client's public key to the user, one of two ways:
 
-   - **In the token.** The application's backend puts the public key in the JWT the client connects with, as RFC 7800's confirmation claim: `"cnf": {"jwk": {"kty": "EC", "crv": "P-256", "x": ..., "y": ...}}` (`public_key_jwk()` / `SigningKey.jwk` give it).
+   - **In the token.** The application's backend puts the public key in the JWT the client connects with, as RFC 7800's confirmation claim: `"cnf": {"jwk": {"kty": "EC", "crv": "P-256", "x": ..., "y": ...}}` (`public_key_jwk()` / `SigningKey.jwk` give it). Such a token also [binds the session](#binding-a-session-to-the-clients-key) to the key: the client connects with E2E and proves the key when the session opens.
    - **By the application.** `server.set_client_key(conn_id, public_key)` binds a key to a connection whatever way the application checked it: its own key registry, an admin, or a passkey (WebAuthn) assertion over the new key, verified with a standard WebAuthn library. That last one proves a person approved the key.
 
    Non-repudiation is only as strong as this binding: whoever can bind a key to the user can sign as the user.
@@ -512,7 +537,7 @@ When circuit breaker opens:
 2. **Configure origin validation** (`allowed_origins`, or your reverse proxy) to prevent CSWSH
 3. **Use asymmetric algorithms (RS256/ES256)** when tokens are issued by an external auth service
 4. **Rotate JWT keys** periodically using `jwt_previous_secret`
-5. **Enable E2E encryption with a pinned server identity** when something between clients and the server (a TLS-terminating proxy, a CDN) must not read the messages
+5. **Enable E2E encryption with a pinned server identity** when something between clients and the server (a TLS-terminating proxy, a CDN) must not read the messages, and **name the client's key in its token** (`cnf`) so that it cannot reuse the token either
 6. **Enable mTLS** for cluster peer connections in production
 7. **Monitor circuit breaker** state for connection health
 8. **Use HTTP-only cookies** for web clients (prevents XSS token theft)

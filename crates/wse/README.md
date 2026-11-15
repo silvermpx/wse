@@ -90,7 +90,10 @@ with, and the `wse-client` crate's `chat_client` example talks to it.
   forward each topic only where it has subscribers.
 - **Security.** JWT validation in the handshake (HS*, RS*, PS*, ES*, EdDSA,
   key rotation), origin checks, rate limits, end-to-end encryption with the
-  server's identity key, signed messages both ways.
+  server's identity key, signed messages both ways. A token that names the
+  client's key (`cnf`) opens a session only for the client that proves the
+  key (`Config::bind_sessions`; `Publisher::accept_bound` when the
+  application authenticates connections itself).
 - **Operations.** Graceful drain, health snapshots and Prometheus metrics.
 
 ## Features

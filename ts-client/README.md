@@ -159,6 +159,7 @@ useWSE('cookie', ['notifications'], {
     // unauthenticated: true,                 //   or accept any server (passive listeners only)
     // legacyE2e: true,                       //   or the first design, for servers before 3.0
     signingKey: keyPair,                      // this client's P-256 key pair for sendSigned()
+    // bindSession: false,                    //   with encryption, a key bound by set_client_key() (see below)
     serverSigningKeys: [SERVER_SIGNING_KEY],  // the server's signing key(s) its signed messages are checked against
   },
 
@@ -342,14 +343,23 @@ server's signed messages arrive with their proof:
 import { generateSigningKey } from 'wse-client';
 
 const key = await generateSigningKey();   // the private key cannot be exported
-// Keep key.keyPair (IndexedDB stores CryptoKeyPair as is); register the public key with your
-// backend: key.jwk goes into the token's "cnf" claim, or the backend calls set_client_key().
+// Keep key.keyPair (IndexedDB stores CryptoKeyPair as is). Your backend puts key.jwk in the
+// token's "cnf" claim; the client proves the key inside its end-to-end session, so the token is
+// of no use to anyone without the key.
 
 const { sendSigned } = useWSE(token, topics, {
-  security: { encryptionEnabled: false, signingKey: key.keyPair, serverSigningKeys: [SERVER_SIGNING_KEY] },
+  security: {
+    encryptionEnabled: true,
+    serverKeys: [SERVER_KEY],
+    signingKey: key.keyPair,
+    serverSigningKeys: [SERVER_SIGNING_KEY],
+  },
 });
 await sendSigned('order', { side: 'buy', qty: '1.5' }, { nonce: 'o-17' });
 ```
+
+A backend can bind the key with `set_client_key()` instead and leave it out of the token; the
+client then signs with or without encryption, and with encryption needs `security.bindSession: false`.
 
 The server answers with a signed `receipt` message (`p.n` is the nonce); a message the server
 signed arrives with `message.signature` (`body`, `sig`, `kid`, `verified`), the proof to keep. One no

@@ -89,6 +89,7 @@ client.run_forever()
 | `e2e_server_keys` | list[str] | None | The server's identity public keys (`e2e_identity_public_key()`, base64) one of which must sign the handshake |
 | `e2e_unauthenticated` | bool | False | Accept a server without an identity key: safe only from passive listeners |
 | `e2e_legacy` | bool | False | Speak the first E2E design, for servers before 3.0 |
+| `e2e_bind_session` | bool | True | With `signing_key`, prove the key inside the session and require the server to confirm it: the token names the key in its `cnf` claim. `False` for a key bound with `set_client_key()` |
 | `endpoints` | list[str] | None | Additional endpoints for the built-in connection pool / failover |
 | `load_balancing` | LoadBalancingStrategy | WEIGHTED_RANDOM | Endpoint selection strategy when `endpoints` is set |
 | `rate_limit` | float \| None | 100 | Outbound limit for `send()` / `send_with_retry()` / `send_batch()` in messages per second; `None` disables it |
@@ -287,16 +288,21 @@ A message that may be disputed (an order) can go signed with this client's own k
 from wse_client import AsyncWSEClient, generate_signing_key, public_key_jwk
 
 key = generate_signing_key()          # keep it on this device
-# Register the public key with your backend: public_key_jwk(key) goes into the
-# token's "cnf" claim, or the backend calls server.set_client_key().
+# Your backend puts public_key_jwk(key) in the token's "cnf" claim. The client
+# proves the key inside its end-to-end session, so the token is of no use to
+# anyone without the key.
 
-client = AsyncWSEClient(url, token=token, signing_key=key, server_signing_keys=[SERVER_SIGNING_KEY])
-await client.send("order", {"side": "buy", "qty": "1.5"}, signed=True, nonce="o-17")
-
-async for event in client:
-    if event.type == "receipt":       # the server's signed receipt: event.payload["n"] == "o-17"
-        keep(event.signature)         # body, sig, kid: the proof
+async with AsyncWSEClient(
+    url, token=token, signing_key=key, server_signing_keys=[SERVER_SIGNING_KEY],
+    encryption=True, e2e_server_keys=[SERVER_KEY],
+) as client:
+    await client.send("order", {"side": "buy", "qty": "1.5"}, signed=True, nonce="o-17")
+    async for event in client:
+        if event.type == "receipt":   # the server's signed receipt: event.payload["n"] == "o-17"
+            keep(event.signature)     # body, sig, kid: the proof
 ```
+
+A backend can bind the key with `server.set_client_key()` instead and leave it out of the token; the client then sends signed messages with or without encryption, and with encryption needs `e2e_bind_session=False`.
 
 The server takes a signed message once (`nonce`, random by default), within its time window, and refuses anything else with a `SIGNATURE_REFUSED` error carrying `n`. A server-signed message no pinned key verifies, or one signed for another topic than the one it came on, is dropped; without `server_signing_keys` they arrive unchecked (`event.signature.verified` is False). Setup and guarantees: [SECURITY.md](../docs/SECURITY.md#signed-messages).
 
