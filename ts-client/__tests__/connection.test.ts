@@ -14,7 +14,7 @@ import {
   serverHelloMessage,
   tick,
 } from './helpers.js';
-import { acquireSession, makeSessionKey, wseActions, getCurrentSession } from '../services/WSESession.js';
+import { acquireSession, makeSessionKey, releaseSession, wseActions, getCurrentSession } from '../services/WSESession.js';
 import type { UseWSEConfig } from '../services/WSESession.js';
 import { useWSEStore } from '../stores/useWSEStore.js';
 import { ConnectionState } from '../types.js';
@@ -558,5 +558,75 @@ describe('secure-context independence', () => {
     for (const id of ids) {
       expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     }
+  });
+});
+
+describe("one user's data never reaches the next user", () => {
+  function frames(ws: FakeWebSocket) {
+    const orders = ws.appTextMessages().filter((m) => m.t === 'order');
+    const subs = ws.messagesOfType('subscription_update');
+    const topics = subs.flatMap((m: any) => m.p?.topics ?? []);
+    const recovery = subs.map((m: any) => m.p?.recovery).filter(Boolean);
+    return { orders, topics, recovery };
+  }
+
+  async function aliceLeavesAnOrderBehind(ws: FakeWebSocket) {
+    if (!ws.messagesOfType('subscription_update').length) await connectServer(ws, { user_id: 'alice' });
+    ws.serverSend({ c: 'U', t: 'price_update', tp: 'alice-private', e: '0000000a', o: 17, p: {}, v: 1 });
+    await tick(6);
+    ws.serverClose(1006);
+    await tick();
+    expect(wseActions.sendMessage('order', { qty: 1 })).toBe('queued');
+  }
+
+  it('after the last consumer leaves and another user arrives', async () => {
+    vi.useFakeTimers();
+    const alice = acquireSession({
+      key: makeSessionKey('alice-token', [ENDPOINT]),
+      auth: 'alice-token',
+      initialTopics: ['alice-private'],
+      config: { endpoints: [ENDPOINT], offline: { enabled: false } },
+    });
+    await tick();
+    await aliceLeavesAnOrderBehind(FakeWebSocket.last());
+    releaseSession(alice);
+    await tick();
+
+    acquireSession({
+      key: makeSessionKey('bob-token', [ENDPOINT]),
+      auth: 'bob-token',
+      initialTopics: [],
+      config: { endpoints: [ENDPOINT], offline: { enabled: false } },
+    });
+    await tick();
+    const bob = FakeWebSocket.last();
+    await connectServer(bob, { user_id: 'bob' });
+    await tick(6);
+    const seen = frames(bob);
+    expect(seen.orders).toHaveLength(0);
+    expect(seen.topics).not.toContain('alice-private');
+    expect(JSON.stringify(seen.recovery)).not.toContain('alice-private');
+  });
+
+  it('when a cookie session reconnects as another user', async () => {
+    vi.useFakeTimers();
+    // The page's own topic is "news"; Alice subscribes to hers herself.
+    start({}, 'cookie', ['news']);
+    await tick();
+    const first = FakeWebSocket.last();
+    await connectServer(first, { user_id: 'alice' });
+    wseActions.subscribe(['alice-private']);
+    await tick();
+    await aliceLeavesAnOrderBehind(first);
+
+    expect(await advanceUntilNewSocket(5_000)).toBe(true);
+    const bob = FakeWebSocket.last();
+    await connectServer(bob, { user_id: 'bob' });
+    await tick(6);
+    const seen = frames(bob);
+    expect(seen.orders).toHaveLength(0);
+    expect(seen.topics).not.toContain('alice-private');
+    expect(seen.topics).toContain('news');
+    expect(JSON.stringify(seen.recovery)).not.toContain('alice-private');
   });
 });

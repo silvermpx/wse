@@ -935,6 +935,11 @@ export class ConnectionManager {
     return !this.encryptionRequired || this.encryptionState === 'ready';
   }
 
+  /** Which socket is current: a new number for each one opened. */
+  socketGeneration(): number {
+    return this.socketId;
+  }
+
   /** True between server_ready and the end of the key exchange on an encrypted connection. */
   isAwaitingEncryptionKey(): boolean {
     return this.encryptionRequired && this.encryptionState === 'pending' && this.ws !== null;

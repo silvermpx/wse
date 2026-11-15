@@ -50,6 +50,8 @@ export interface ProcessorConnection {
   trySend(message: WSMessage): SendResult;
   sendControl(data: string | ArrayBuffer): boolean;
   isTransportReady(): boolean;
+  /** Which socket is current: a new number for each one opened. */
+  socketGeneration(): number;
   /** The server took the connection (server_ready). */
   isReady(): boolean;
   isAwaitingEncryptionKey(): boolean;
@@ -214,6 +216,8 @@ export class MessageProcessor {
   private connectionManager: ProcessorConnection | null = null;
   private isReady = false;
   private destroyed = false;
+  /** Messages that may go only on the socket they were made for (signed ones). */
+  private readonly liveOnly = new WeakMap<WSMessage, number>();
   private waitForHandlersInterval: ReturnType<typeof setInterval> | null = null;
 
   // Optional sink for measured round-trip latency (ms), set by the host. The
@@ -1600,9 +1604,19 @@ export class MessageProcessor {
   enqueueOutgoing(
     message: WSMessage,
     priority: number = MessagePriority.NORMAL,
-    options: { offline?: boolean; ttl?: number } = {},
+    options: { offline?: boolean; ttl?: number; liveOn?: number } = {},
   ): SendStatus {
     if (this.destroyed) return 'dropped';
+    // Only for the socket it was made on (a signed message): dropped once
+    // that one is gone, never sent on a later connection.
+    if (options.liveOn !== undefined) {
+      this.liveOnly.set(message, options.liveOn);
+      if (options.liveOn !== this.connectionManager?.socketGeneration()) {
+        this.countDropped(1);
+        logger.warn(`Dropping ${message.t}: its connection is gone`);
+        return 'dropped';
+      }
+    }
     const expiresAt = options.ttl !== undefined && Number.isFinite(options.ttl) && options.ttl >= 0
       ? Date.now() + options.ttl
       : undefined;
@@ -1622,7 +1636,7 @@ export class MessageProcessor {
       }
     }
 
-    if (options.offline && this.offlineQueue?.isAvailable() && !cm?.isTransportReady()) {
+    if (options.offline && options.liveOn === undefined && this.offlineQueue?.isAvailable() && !cm?.isTransportReady()) {
       const queue = this.offlineQueue;
       // Written for the user of this page's last connection (or, before any,
       // of this browser's): only that user's connection replays it.
@@ -1676,6 +1690,11 @@ export class MessageProcessor {
   /** Re-queue a message that was accepted but whose socket vanished before it went out. */
   requeue(message: WSMessage, priority: number = message.pri ?? MessagePriority.NORMAL): void {
     if (this.destroyed) return;
+    if (this.liveOnly.has(message)) {
+      this.countDropped(1);
+      logger.warn(`Dropping ${message.t}: its connection went before it was sent`);
+      return;
+    }
     this.enqueueInMemory(message, priority);
   }
 
@@ -1782,7 +1801,14 @@ export class MessageProcessor {
           logger.debug(`Dropping ${batch[i].type}: its ttl ran out while it was queued`);
           continue;
         }
-        const result = cm.trySend(this.toWire(batch[i]));
+        const wire = this.toWire(batch[i]);
+        const liveOn = this.liveOnly.get(wire);
+        if (liveOn !== undefined && liveOn !== cm.socketGeneration()) {
+          this.countDropped(1);
+          logger.warn(`Dropping ${batch[i].type}: its connection went before it was sent`);
+          continue;
+        }
+        const result = cm.trySend(wire);
         if (result === 'sent') continue;
         if (result === 'error') {
           this.countDropped(1);

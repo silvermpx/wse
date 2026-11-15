@@ -9,6 +9,18 @@
   back within the backoff (at most 30 s between attempts), as the Rust
   client does. The pause is an option now (`reconnection.circuitBreaker`;
   `ReconnectConfig.circuit_breaker_threshold` and `circuit_breaker_timeout`).
+- TypeScript client: one user's queued messages, subscriptions and
+  recovery positions never go out on the next user's connection: not when
+  the last component unmounts and another user signs in, nor when a cookie
+  session reconnects as another user (the server's `user_id` is checked
+  before anything is sent or resubscribed).
+- TypeScript client: a signed message goes on the connection it was signed
+  for or not at all: one held by the rate limit, or by encryption, is
+  dropped when that connection goes, and one whose connection changed while
+  it was being signed is not sent.
+- TypeScript client: the offline queue drops what is older than
+  `offline.maxAge` before it replays anything, and holds no more than
+  `offline.maxSize` messages under concurrent sends, across tabs too.
 
 ## v3.0.0 (2026-11-15)
 

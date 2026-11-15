@@ -267,6 +267,8 @@ export class WSESession {
 
   private userId: string | null = null;
   private topicsResolved: boolean;
+  /** The topics the consumers asked for: what another user starts from. */
+  private readonly consumerTopics = new Set<string>();
   private startPromise: Promise<void> | null = null;
   private windowListener: ((event: Event) => void) | null = null;
   private stopWatchingState: (() => void) | null = null;
@@ -299,6 +301,7 @@ export class WSESession {
     // server_ready restores this user's saved subscriptions (or defaults).
     const initial = params.initialTopics !== undefined ? uniqueTopics(params.initialTopics) : null;
     if (initial !== null) {
+      for (const topic of initial) this.consumerTopics.add(topic);
       useWSEStore.getState().addTopics(initial);
     }
     this.topicsResolved = initial !== null || useWSEStore.getState().activeTopics.length > 0;
@@ -309,6 +312,7 @@ export class WSESession {
     if (this.destroyed) return;
     params.config?.registerHandlers?.(this.processor);
     const topics = params.initialTopics !== undefined ? uniqueTopics(params.initialTopics) : [];
+    for (const topic of topics) this.consumerTopics.add(topic);
     if (topics.length > 0) {
       const active = new Set(useWSEStore.getState().activeTopics);
       const missing = topics.filter(t => !active.has(t));
@@ -445,11 +449,36 @@ export class WSESession {
     }
   }
 
+  /**
+   * The server took this connection for another user than the one whose
+   * data the page holds: nothing of that user's goes out on it, neither its
+   * queued messages nor its subscriptions or recovery positions. The
+   * consumers' own topics are subscribed again, for the new user.
+   */
+  private forgetPreviousUser(previous: string, next: string): void {
+    logger.warn(`The server took this connection for ${next}, not ${previous}: ${previous}'s queue, topics and positions are dropped`);
+    useMessageQueueStore.getState().clearQueue();
+    const store = useWSEStore.getState();
+    this.processor.forgetTopics(store.activeTopics);
+    sharedSequencer.reset();
+    store.setActiveTopics([...this.consumerTopics]);
+    this.topicsResolved = this.consumerTopics.size > 0;
+  }
+
   /** server_ready: (re)subscribe every active topic, asking for a replay where possible. */
   private handleServerReady(details: any): void {
     if (this.destroyed) return;
 
     const userId = typeof details?.user_id === 'string' && details.user_id ? details.user_id : null;
+    if (dataOwner && dataOwner.auth === this.auth) {
+      if (dataOwner.userId && userId && userId !== dataOwner.userId) {
+        // Another user on the same auth value (a cookie that changed): before
+        // anything is flushed or resubscribed, the previous user's queue,
+        // topics and positions go.
+        this.forgetPreviousUser(dataOwner.userId, userId);
+      }
+      if (userId) dataOwner.userId = userId;
+    }
     this.userId = userId;
 
     const store = useWSEStore.getState();
@@ -555,6 +584,11 @@ export class WSESession {
       logger.error(`Refusing to sign ${type}: a nonce is 1 to ${MAX_NONCE_LENGTH} characters`);
       return 'dropped';
     }
+    // Signed for this server and valid for its signature window: it goes out
+    // on the connection it was made for or not at all, never after a
+    // reconnect (not from a queue, nor when the connection changes while it
+    // is being signed).
+    const generation = this.connection?.socketGeneration();
     const audience = await this.processor.signingAudience();
     if (!audience) {
       logger.error(`Refusing to sign ${type}: the server has not named a signing key it may sign for`);
@@ -569,16 +603,18 @@ export class WSESession {
       return 'dropped';
     }
     if (this.destroyed) return 'dropped';
-    // Signed for this server and valid for its signature window: it goes out
-    // on the live connection or not at all, never from a queue after a
-    // reconnect.
-    if (!this.connection?.isTransportReady()) {
+    if (
+      !this.connection?.isTransportReady() ||
+      generation === undefined ||
+      this.connection.socketGeneration() !== generation
+    ) {
       logger.warn(`Signed ${type} not sent: no live connection`);
       return 'dropped';
     }
     const message: WSMessage = { ...envelope, p: undefined, id: generateId() };
     return this.processor.enqueueOutgoing(message, options.priority ?? MessagePriority.NORMAL, {
       ttl: SIGNED_MESSAGE_TTL_MS,
+      liveOn: generation,
     });
   }
 
@@ -708,6 +744,13 @@ const SIGNED_MESSAGE_TTL_MS = 10_000;
 let currentSession: WSESession | null = null;
 let pendingDestroy: ReturnType<typeof setTimeout> | null = null;
 let userDataPresent = false;
+/**
+ * Whose data the page holds (the outgoing queue, topics, recovery
+ * positions): the auth value it was made under and the user the server
+ * confirmed for it. Kept apart from the session, which may end and come
+ * back for someone else.
+ */
+let dataOwner: { auth: string; userId: string | null } | null = null;
 // Dedup ids and per-topic recovery positions survive session re-creation for
 // the same user (e.g. the last consumer unmounts and a new one mounts).
 const sharedSequencer = new EventSequencer();
@@ -730,6 +773,7 @@ function deleteOfflineDatabase(): void {
 
 function clearUserData(): void {
   userDataPresent = false;
+  dataOwner = null;
   sharedSequencer.reset();
   useWSEStore.getState().reset();
   useMessageQueueStore.getState().clearQueue();
@@ -769,6 +813,15 @@ export function acquireSession(params: SessionParams): WSESession {
       );
     }
     destroySession(currentSession, currentSession.auth !== params.auth);
+  }
+
+  // The data the page still holds from an earlier session (it ended without
+  // a sign-out) belongs to another user when the auth value differs.
+  if (userDataPresent && dataOwner && dataOwner.auth !== params.auth) {
+    clearUserData();
+  }
+  if (!dataOwner || dataOwner.auth !== params.auth) {
+    dataOwner = { auth: params.auth, userId: null };
   }
 
   const session = new WSESession(params, sharedSequencer);

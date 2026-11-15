@@ -102,6 +102,9 @@ export class OfflineQueue {
     });
 
     this.db = db;
+    // What a page left behind longer ago than maxAge goes before anything
+    // reads it.
+    await this.cleanup();
     await this.refreshSize();
   }
 
@@ -117,30 +120,51 @@ export class OfflineQueue {
   async enqueue(message: WSMessage, expiresAt?: number, owner?: string): Promise<boolean> {
     if (!this.isAvailable() || !this.db) return false;
 
-    await this.cleanup();
-    if (this._size >= this.config.maxSize) {
-      logger.warn(`Offline queue full (${this.config.maxSize}), message not persisted`);
-      return false;
-    }
-
     const id = message.id;
     if (!id) return false;
+
+    await this.cleanup();
+    const db = this.db;
+    if (!db) return false;
 
     this.lastTimestamp = Math.max(Date.now(), this.lastTimestamp + 0.001);
     const record: OfflineRecord = { id, timestamp: this.lastTimestamp, retries: 0, message };
     if (expiresAt !== undefined) record.expiresAt = expiresAt;
     if (owner !== undefined) record.owner = owner;
-    const tx = this.db.transaction([this.storeName], 'readwrite');
-    tx.objectStore(this.storeName).put(record);
-    await transactionDone(tx);
+
+    // The room is counted in the transaction that writes: IndexedDB runs
+    // read-write transactions on one store one after another, so concurrent
+    // enqueues (of this page or another tab) never all see the last free
+    // place. A message already stored may be written again.
+    const maxSize = this.config.maxSize;
+    const stored = await new Promise<boolean>((resolve, reject) => {
+      const tx = db.transaction([this.storeName], 'readwrite');
+      const store = tx.objectStore(this.storeName);
+      let written = false;
+      const total = store.count();
+      total.onsuccess = () => {
+        const same = store.count(id);
+        same.onsuccess = () => {
+          if (same.result === 0 && total.result >= maxSize) return;
+          store.put(record);
+          written = true;
+        };
+      };
+      tx.oncomplete = () => resolve(written);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
     await this.refreshSize();
-    return true;
+    if (!stored) logger.warn(`Offline queue full (${maxSize}), message not persisted`);
+    return stored;
   }
 
-  /** All persisted messages, oldest first. */
+  /** All persisted messages, oldest first; none older than maxAge. */
   async getAll(): Promise<OfflineRecord[]> {
     if (!this.db) return [];
 
+    await this.cleanup();
+    if (!this.db) return [];
     const tx = this.db.transaction([this.storeName], 'readonly');
     const index = tx.objectStore(this.storeName).index('timestamp');
 

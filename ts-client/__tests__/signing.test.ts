@@ -209,3 +209,66 @@ describe('signed messages through a session', () => {
     expect(await wseActions.sendSigned('order', {})).toBe('dropped');
   });
 });
+
+describe('signed messages go on the live connection or not at all', () => {
+  beforeEach(() => {
+    installFakeWebSocket();
+    resetClientState();
+  });
+
+  afterEach(() => {
+    resetClientState();
+  });
+
+  function start(config: UseWSEConfig = {}) {
+    return acquireSession({
+      key: makeSessionKey('cookie', [ENDPOINT]),
+      auth: 'cookie',
+      initialTopics: [],
+      config: { endpoints: [ENDPOINT], offline: { enabled: false }, ...config },
+    });
+  }
+
+  it('drops a signed message the rate limit held back when its connection goes', async () => {
+    const key = await generateSigningKey();
+    start({ security: { signingKey: key.keyPair }, rateLimit: { capacity: 1, refillRate: 1 } });
+    await tick();
+    const first = FakeWebSocket.last();
+    await connectServer(first, { signing: { kid: v.server.kid, public_key: v.server.public_key } });
+
+    // The one token goes to an ordinary message; the signed order waits.
+    wseActions.sendMessage('note', {});
+    await tick();
+    const status = await wseActions.sendSigned('order', { qty: '1' }, { nonce: 'o-late' });
+    await tick();
+    expect(first.appTextMessages().filter((m) => m.t === 'signed')).toHaveLength(0);
+
+    // The connection goes and another comes: the order must not go on it.
+    first.serverClose(1006);
+    await tick();
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    const second = FakeWebSocket.last();
+    expect(second).not.toBe(first);
+    await connectServer(second, { signing: { kid: v.server.kid, public_key: v.server.public_key } });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await tick(6);
+    expect(second.appTextMessages().filter((m) => m.t === 'signed')).toHaveLength(0);
+    expect(status).not.toBe('sent');
+  });
+
+  it('never re-queues a live-only message whose socket vanished', async () => {
+    start();
+    await tick();
+    const ws = FakeWebSocket.last();
+    await connectServer(ws);
+    const processor = getCurrentSession()!.processor;
+    const message: WSMessage = { t: 'signed', p: undefined, id: 'live-1', v: 1 } as WSMessage;
+    // Made for a socket that is not the current one: dropped, not sent.
+    expect(processor.enqueueOutgoing(message, 1, { liveOn: -1 })).not.toBe('sent');
+    await tick(6);
+    // And handed back by a socket that vanished: not queued again.
+    processor.requeue(message);
+    await tick(6);
+    expect(ws.appTextMessages().filter((m) => m.id === 'live-1')).toHaveLength(0);
+  });
+});
