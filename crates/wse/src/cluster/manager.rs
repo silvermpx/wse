@@ -224,6 +224,7 @@ pub(crate) async fn cluster_manager(
         }
         InboundLinks::MainPort(mut handed_over) => {
             let cancel = global_cancel.clone();
+            let tls = tls_config.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -231,8 +232,25 @@ pub(crate) async fn cluster_manager(
                             let Some((stream, addr)) = link else { break };
                             if let Some(admitted) = gate.admit(addr) {
                                 let inbound = inbound.clone();
+                                let tls = tls.as_ref().map(|holder| holder.load_full());
                                 tokio::spawn(async move {
-                                    inbound.run(stream, addr, admitted).await;
+                                    match tls {
+                                        Some(tls) => match tokio::time::timeout(
+                                            Duration::from_secs(5),
+                                            tls.acceptor.accept(stream),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(stream)) => inbound.run(stream, addr, admitted).await,
+                                            Ok(Err(e)) => tracing::warn!(
+                                                "[WSE-Cluster] TLS accept failed from {addr}: {e}"
+                                            ),
+                                            Err(_) => tracing::warn!(
+                                                "[WSE-Cluster] TLS accept timeout from {addr}"
+                                            ),
+                                        },
+                                        None => inbound.run(stream, addr, admitted).await,
+                                    }
                                 });
                             }
                         }

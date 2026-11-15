@@ -641,22 +641,25 @@ impl RustWSEServer {
     /// Connect to cluster peers via TCP mesh protocol.
     ///
     /// Two modes: static peers (pass peer addresses directly) or seed-based
-    /// discovery (pass seeds + cluster_addr for gossip). TLS is optional;
-    /// falls back to WSE_CLUSTER_TLS_CERT/KEY/CA env vars if not provided.
+    /// discovery (pass seeds + cluster_addr for gossip).
+    ///
+    /// The links are TLS, always: from `cluster_secret` (at least 32 random
+    /// bytes, the same on every node: a node without it cannot link), or
+    /// from certificate files (`tls_cert`, `tls_key`, `tls_ca`). Left out,
+    /// they come from WSE_CLUSTER_SECRET, or from WSE_CLUSTER_TLS_CERT/KEY/CA.
     ///
     /// Peers' links come in on `cluster_port` (bound on `cluster_host`,
-    /// 0.0.0.0 by default), or with `single_port=True` on the WebSocket port:
-    /// plaintext and unauthenticated, for a port only the cluster's own
-    /// network reaches. One of the two is required.
+    /// 0.0.0.0 by default), or with `single_port=True` on the WebSocket port.
+    /// One of the two is required.
     ///
     /// Raises RuntimeError if cluster is already connected or if seeds
-    /// is used without cluster_addr, ValueError for a missing or
-    /// contradictory listening option, OSError if `cluster_port` cannot be
-    /// bound.
-    #[pyo3(signature = (peers, tls_cert=None, tls_key=None, tls_ca=None, cluster_port=None, seeds=None, cluster_addr=None, cluster_host=None, single_port=false))]
+    /// is used without cluster_addr, ValueError for a missing or short
+    /// secret or a missing or contradictory option, OSError if
+    /// `cluster_port` cannot be bound.
+    #[pyo3(signature = (peers, tls_cert=None, tls_key=None, tls_ca=None, cluster_port=None, seeds=None, cluster_addr=None, cluster_host=None, single_port=false, cluster_secret=None))]
     #[expect(
         clippy::too_many_arguments,
-        reason = "PyO3 boundary: &self + 9 Python kwargs"
+        reason = "PyO3 boundary: &self + 10 Python kwargs"
     )]
     fn connect_cluster(
         &self,
@@ -669,13 +672,14 @@ impl RustWSEServer {
         cluster_addr: Option<String>,
         cluster_host: Option<String>,
         single_port: bool,
+        cluster_secret: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         self.connect_cluster_inner(
             peers,
             (tls_cert, tls_key, tls_ca),
             (cluster_port, cluster_host, single_port),
-            seeds,
-            cluster_addr,
+            (seeds, cluster_addr),
+            cluster_secret,
         )
     }
 

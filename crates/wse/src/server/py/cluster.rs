@@ -1,6 +1,6 @@
 //! Joining the cluster mesh, cluster TLS reload and the peer list.
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -15,34 +15,57 @@ impl RustWSEServer {
         peers: Vec<String>,
         tls: (Option<String>, Option<String>, Option<String>),
         listen: (Option<u16>, Option<String>, bool),
-        seeds: Option<Vec<String>>,
-        cluster_addr: Option<String>,
+        discovery: (Option<Vec<String>>, Option<String>),
+        secret: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let (tls_cert, tls_key, tls_ca) = tls;
         let (cluster_port, cluster_host, single_port) = listen;
+        let (seeds, cluster_addr) = discovery;
 
-        // The TLS files come from the call, or from the environment.
+        // The secret as bytes: a str is taken as its UTF-8.
+        let secret =
+            match secret {
+                None => None,
+                Some(value) if value.is_none() => None,
+                Some(value) => match value.extract::<String>() {
+                    Ok(text) => Some(text.into_bytes()),
+                    Err(_) => Some(value.extract::<Vec<u8>>().map_err(|_| {
+                        PyTypeError::new_err("cluster_secret must be str or bytes")
+                    })?),
+                },
+            };
         let tls = match (tls_cert, tls_key, tls_ca) {
             (Some(cert), Some(key), Some(ca)) => Some(ClusterTls::new(cert, key, ca)),
-            (None, None, None) => match (
-                std::env::var("WSE_CLUSTER_TLS_CERT").ok(),
-                std::env::var("WSE_CLUSTER_TLS_KEY").ok(),
-                std::env::var("WSE_CLUSTER_TLS_CA").ok(),
-            ) {
-                (Some(cert), Some(key), Some(ca)) => Some(ClusterTls::new(cert, key, ca)),
-                (None, None, None) => None,
-                _ => {
-                    return Err(PyRuntimeError::new_err(
-                        "Partial TLS env vars: set all of WSE_CLUSTER_TLS_CERT, \
-                         WSE_CLUSTER_TLS_KEY, WSE_CLUSTER_TLS_CA or none",
-                    ));
-                }
-            },
+            (None, None, None) => None,
             _ => {
                 return Err(PyRuntimeError::new_err(
                     "Partial TLS config: provide all of tls_cert, tls_key, tls_ca or none",
                 ));
             }
+        };
+        // The environment fills in what the call leaves out.
+        let (secret, tls) = match (secret, tls) {
+            (None, None) => {
+                let tls = match (
+                    std::env::var("WSE_CLUSTER_TLS_CERT").ok(),
+                    std::env::var("WSE_CLUSTER_TLS_KEY").ok(),
+                    std::env::var("WSE_CLUSTER_TLS_CA").ok(),
+                ) {
+                    (Some(cert), Some(key), Some(ca)) => Some(ClusterTls::new(cert, key, ca)),
+                    (None, None, None) => None,
+                    _ => {
+                        return Err(PyRuntimeError::new_err(
+                            "Partial TLS env vars: set all of WSE_CLUSTER_TLS_CERT, \
+                             WSE_CLUSTER_TLS_KEY, WSE_CLUSTER_TLS_CA or none",
+                        ));
+                    }
+                };
+                let secret = std::env::var("WSE_CLUSTER_SECRET")
+                    .ok()
+                    .map(String::into_bytes);
+                (secret, tls)
+            }
+            given => given,
         };
         let settings = ClusterSettings {
             peers,
@@ -51,6 +74,7 @@ impl RustWSEServer {
             port: cluster_port,
             host: cluster_host,
             single_port,
+            secret,
             tls,
         };
         // On the server's runtime; a stopped server is refused by the engine.

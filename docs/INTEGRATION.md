@@ -523,23 +523,31 @@ When recovery is enabled, every topic broadcast is stamped with `tp` (topic), `e
 
 Clustering connects multiple WSE instances into a broadcast mesh. Messages sent via `broadcast()` are forwarded to all peers.
 
-**Basic cluster (no TLS):**
+**Basic cluster:**
 
 ```python
-server.connect_cluster(peers=["10.0.0.2:9999", "10.0.0.3:9999"], cluster_port=9999)
+server.connect_cluster(
+    peers=["10.0.0.2:9999", "10.0.0.3:9999"],
+    cluster_port=9999,
+    cluster_secret=os.environ["WSE_CLUSTER_SECRET"],   # openssl rand -base64 32
+)
 ```
 
-Peers' links come in on `cluster_port` (on all interfaces; `cluster_host="10.0.0.1"` binds one). Without TLS they are unauthenticated, so keep that port on a private network.
+Peers' links come in on `cluster_port` (on all interfaces; `cluster_host="10.0.0.1"` binds one). The links are TLS, always: every node derives the same key from the cluster's secret, at least 32 random bytes, and proves it when a link opens, so a node without the secret cannot join. Left out, the secret comes from `WSE_CLUSTER_SECRET`. Without a secret or certificates, `connect_cluster()` raises `ValueError`.
 
-**Single port:** where the WebSocket port itself is reachable only from the cluster's network (a test setup, one host), the links can share it:
+**Single port:** the links can share the WebSocket port, in TLS as on their own:
 
 ```python
-server.connect_cluster(peers=["10.0.0.2:5007", "10.0.0.3:5007"], single_port=True)
+server.connect_cluster(
+    peers=["10.0.0.2:5007", "10.0.0.3:5007"],
+    single_port=True,
+    cluster_secret=os.environ["WSE_CLUSTER_SECRET"],
+)
 ```
 
 Without `cluster_port` or `single_port=True`, `connect_cluster()` raises `ValueError`; a port that cannot be bound raises `OSError`.
 
-**Cluster with mTLS:**
+**Cluster with certificates** (mutual TLS, from a CA of your own) instead of the secret:
 
 ```python
 server.connect_cluster(
@@ -559,6 +567,7 @@ server.connect_cluster(
     seeds=["10.0.0.2:9999"],
     cluster_addr="10.0.0.1:9999",
     cluster_port=9999,
+    cluster_secret=os.environ["WSE_CLUSTER_SECRET"],
 )
 ```
 

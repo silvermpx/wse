@@ -294,18 +294,13 @@ pub(crate) async fn serve<H: Handler>(
                             } else {
                                 None
                             };
+                            // A cluster link starts with a TLS ClientHello (a
+                            // handshake record, 0x16 0x03): the WebSocket port
+                            // speaks plain HTTP itself, which starts with a
+                            // letter (GET).
                             let is_cluster = match peeked {
-                                Some(peeked) => match peeked {
-                                Ok(Ok(n)) if n >= 4 => {
-                                    // Cluster frames start with 4-byte big-endian length prefix.
-                                    // Valid HELLO is 20-200 bytes, so first 3 bytes are 0x00.
-                                    // HTTP starts with ASCII letter (GET, POST, etc).
-                                    // TLS ClientHello starts with 0x16.
-                                    peek[0] == 0x00 && peek[1] == 0x00 && peek[2] == 0x00 && peek[3] > 0
-                                }
+                                Some(Ok(Ok(n))) if n >= 2 => peek[0] == 0x16 && peek[1] == 0x03,
                                 _ => false,
-                                },
-                                None => false,
                             };
                             if is_cluster {
                                 // Only in single-port mode, and then the

@@ -101,12 +101,18 @@ server.start()
 
 server.connect_cluster(
     peers=["10.0.0.2:9999", "10.0.0.3:9999"],
-    tls_ca="/etc/wse/ca.pem",
-    tls_cert="/etc/wse/node.pem",
-    tls_key="/etc/wse/node.key",
     cluster_port=9999,
+    cluster_secret=os.environ["WSE_CLUSTER_SECRET"],
 )
 ```
+
+The links between nodes are TLS, always. Every node derives the same key from the cluster's secret and proves it when a link opens: a node without the secret cannot join, and nothing between the nodes can read or change their traffic. Make the secret once and give it to every node like a password:
+
+```bash
+openssl rand -base64 32
+```
+
+A company CA can sign node certificates instead (`tls_ca`, `tls_cert`, `tls_key`; see [Certificate Generation](#certificate-generation)).
 
 ### Gossip Discovery
 
@@ -118,6 +124,7 @@ server.connect_cluster(
     seeds=["10.0.0.2:9999"],        # At least one seed node
     cluster_addr="10.0.0.1:9999",   # This node's cluster address
     cluster_port=9999,
+    cluster_secret=os.environ["WSE_CLUSTER_SECRET"],
 )
 ```
 
@@ -156,7 +163,7 @@ upstream wse_cluster {
 
 ### Certificate Generation
 
-For cluster mTLS, generate a shared CA and per-node certificates:
+For cluster mTLS instead of the secret, generate a shared CA and per-node certificates:
 
 ```bash
 # Certificate authority shared by every node
@@ -194,7 +201,7 @@ EXPOSE 5007 9999
 CMD ["python", "app.py"]
 ```
 
-WSE itself reads no `WSE_PORT`, `WSE_PEERS` or `WSE_SEEDS`: the compose and Kubernetes files below pass them to this `app.py`, which hands them to the server. (The server reads `WSE_CLUSTER_TLS_CERT`, `WSE_CLUSTER_TLS_KEY` and `WSE_CLUSTER_TLS_CA` itself, when `connect_cluster()` gets no TLS paths, and `RUST_LOG`.)
+WSE itself reads no `WSE_PORT`, `WSE_PEERS` or `WSE_SEEDS`: the compose and Kubernetes files below pass them to this `app.py`, which hands them to the server. (The server reads `WSE_CLUSTER_SECRET` itself, or `WSE_CLUSTER_TLS_CERT`, `WSE_CLUSTER_TLS_KEY` and `WSE_CLUSTER_TLS_CA`, when `connect_cluster()` gets neither a secret nor TLS paths, and `RUST_LOG`.)
 
 ```python
 # app.py
@@ -218,9 +225,7 @@ server.connect_cluster(
     seeds=addresses("WSE_SEEDS") or None,
     cluster_addr=os.environ.get("WSE_CLUSTER_ADDR"),
     cluster_port=int(os.environ.get("WSE_CLUSTER_PORT", "9999")),
-    tls_ca="/etc/wse/ca.pem",
-    tls_cert="/etc/wse/node.pem",
-    tls_key="/etc/wse/node.key",
+    # The cluster's secret comes from WSE_CLUSTER_SECRET.
 )
 # ... the application's drain_inbound() loop
 ```
@@ -236,6 +241,7 @@ services:
     environment:
       - WSE_PORT=5007
       - WSE_CLUSTER_PORT=9999
+      - WSE_CLUSTER_SECRET=${WSE_CLUSTER_SECRET}
       - WSE_PEERS=wse-2:9999,wse-3:9999
     volumes:
       - ./certs:/etc/wse:ro
@@ -247,6 +253,7 @@ services:
     environment:
       - WSE_PORT=5007
       - WSE_CLUSTER_PORT=9999
+      - WSE_CLUSTER_SECRET=${WSE_CLUSTER_SECRET}
       - WSE_PEERS=wse-1:9999,wse-3:9999
     volumes:
       - ./certs:/etc/wse:ro
@@ -258,6 +265,7 @@ services:
     environment:
       - WSE_PORT=5007
       - WSE_CLUSTER_PORT=9999
+      - WSE_CLUSTER_SECRET=${WSE_CLUSTER_SECRET}
       - WSE_PEERS=wse-1:9999,wse-2:9999
     volumes:
       - ./certs:/etc/wse:ro
@@ -302,6 +310,11 @@ spec:
                   fieldPath: metadata.name
             - name: WSE_CLUSTER_ADDR
               value: "$(POD_NAME).wse.default.svc.cluster.local:9999"
+            - name: WSE_CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: wse-cluster
+                  key: secret
           volumeMounts:
             - name: tls
               mountPath: /etc/wse

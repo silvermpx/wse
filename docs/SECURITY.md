@@ -334,9 +334,29 @@ The recovery stamp (`tp` / `e` / `o`) is outside the signature: it is the server
 
 ## Cluster Security
 
+Links between the nodes of a cluster are TLS, always: from the cluster's secret, or from certificates. A plaintext link is refused, on the cluster port and on the WebSocket port alike.
+
+### The cluster's secret
+
+```bash
+openssl rand -base64 32   # once: the same secret on every node
+```
+
+```python
+server.connect_cluster(
+    peers=["10.0.0.2:9999"],
+    cluster_port=9999,
+    cluster_secret=os.environ["WSE_CLUSTER_SECRET"],
+)
+```
+
+Every node derives the same P-256 key from the secret (HKDF-SHA256) and proves it in each link's TLS 1.3 handshake, as a raw public key (RFC 7250): both ends present the key and check that the other's is the cluster's. A node without the secret cannot complete the handshake, so it cannot join, read a topic or publish one; and the link is encrypted. No certificates to make or renew.
+
+The secret must be at least 32 random bytes: from one recorded handshake, a shorter or guessable one could be found offline. Keep it like a password; to change it, restart the nodes with the new one (nodes with different secrets do not link). `connect_cluster()` reads `WSE_CLUSTER_SECRET` when it is given neither a secret nor certificates.
+
 ### Mutual TLS (mTLS)
 
-All cluster peer connections support mutual TLS for authentication and encryption.
+Certificates from a CA of your own, instead of the secret: where a company PKI issues them, or each node needs an identity of its own.
 
 Configuration:
 ```python
@@ -355,7 +375,6 @@ Details:
 - Client verification: WebPkiClientVerifier (both sides present and verify certificates)
 - Single certificate/key pair for both server and client roles
 - TLS version: 1.3 by default (1.2 fallback)
-- Without TLS config, cluster connections use plaintext TCP (trusted networks only)
 
 Certificate generation example:
 ```bash
@@ -476,9 +495,8 @@ Deny always takes precedence over allow. Patterns support `*` (match any charact
 
 ### Cluster Authentication
 
-- **With TLS**: mutual TLS (mTLS) provides both encryption and authentication on the dedicated `cluster_port`
-- **Without TLS**: links are plaintext and unauthenticated: anyone who reaches the cluster port can join as a peer, read every topic and publish to any. Keep `cluster_port` on a private network (`cluster_host` binds it to one interface)
-- The WebSocket port takes cluster links only with `connect_cluster(..., single_port=True)`, which shares that port with clients: use it only where the WebSocket port, too, is reachable from the cluster's own network alone. Otherwise cluster frames arriving there are refused
+- Every link is TLS, authenticated both ways: by the key derived from the cluster's secret, or by certificates from the cluster's CA. A peer that has neither cannot finish the handshake, and plaintext links are refused
+- The WebSocket port takes cluster links only with `connect_cluster(..., single_port=True)`, in TLS as on the cluster port; there they start with a TLS ClientHello, which plain HTTP never does. Otherwise cluster links arriving there are refused
 - At most 64 inbound links may wait for their HELLO at once, 4 from one address, and at most 256 peer sessions are open
 
 ### Cluster Frame Protection
@@ -538,7 +556,7 @@ When circuit breaker opens:
 3. **Use asymmetric algorithms (RS256/ES256)** when tokens are issued by an external auth service
 4. **Rotate JWT keys** periodically using `jwt_previous_secret`
 5. **Enable E2E encryption with a pinned server identity** when something between clients and the server (a TLS-terminating proxy, a CDN) must not read the messages, and **name the client's key in its token** (`cnf`) so that it cannot reuse the token either
-6. **Enable mTLS** for cluster peer connections in production
+6. **Keep the cluster's secret** like a password (or the cluster's CA key, with certificates): whoever has it can join
 7. **Monitor circuit breaker** state for connection health
 8. **Use HTTP-only cookies** for web clients (prevents XSS token theft)
 9. **Use separate CA** for cluster certificates (isolate trust domains)

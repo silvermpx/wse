@@ -1,4 +1,5 @@
-"""Two-node clusters on loopback: forming, peers leaving, mutual TLS.
+"""Two-node clusters on loopback: forming, peers leaving, the cluster's secret,
+mutual TLS.
 
 Instance ids are time-ordered and made in connect_cluster(), so the node that
 joins first holds the lower id. Each scenario names which node dials.
@@ -15,6 +16,9 @@ import pytest
 
 from tests.conftest import _next_port
 from wse_server import RustWSEServer
+
+# Every link is TLS: from this secret, unless a test gives certificates.
+SECRET = "a test cluster secret of at least 32 bytes"
 
 
 def wait_for(predicate, timeout=10.0):
@@ -46,9 +50,10 @@ class Node:
     def peers(self):
         return self.server.cluster_peers_count()
 
-    def join(self, *peers, **tls):
+    def join(self, *peers, **security):
         listen = {"single_port": True} if self.single_port else {"cluster_port": self.cluster_port}
-        self.server.connect_cluster(peers=[p.addr for p in peers], **listen, **tls)
+        security = security or {"cluster_secret": SECRET}
+        self.server.connect_cluster(peers=[p.addr for p in peers], **listen, **security)
 
     def stop(self):
         if self.running:
@@ -84,7 +89,9 @@ def test_a_node_known_under_two_addresses_keeps_one_steady_link(nodes):
     b.join()
     # Two spellings of one node: two dialers on a.
     a.server.connect_cluster(
-        peers=[b.addr, f"localhost:{b.cluster_port}"], cluster_port=a.cluster_port
+        peers=[b.addr, f"localhost:{b.cluster_port}"],
+        cluster_port=a.cluster_port,
+        cluster_secret=SECRET,
     )
     assert wait_for(lambda: a.peers == 1 and b.peers == 1)
     samples = []
@@ -98,7 +105,7 @@ def test_a_node_known_under_two_addresses_keeps_one_steady_link(nodes):
 def test_a_node_listed_among_its_own_peers_stops_dialing_itself(nodes):
     # The same list on every node, its own address included.
     a = nodes()
-    a.server.connect_cluster(peers=[a.addr], cluster_port=a.cluster_port)
+    a.server.connect_cluster(peers=[a.addr], cluster_port=a.cluster_port, cluster_secret=SECRET)
     time.sleep(1.0)
     first = a.server.health_snapshot().get("cluster_reconnect_count", 0)
     time.sleep(4.0)
@@ -286,18 +293,22 @@ def test_subscriptions_made_before_joining_reach_peers(nodes):
 def test_a_listening_option_is_required(nodes):
     node = nodes()
     with pytest.raises(ValueError, match="cluster_port"):
-        node.server.connect_cluster(peers=[])
+        node.server.connect_cluster(peers=[], cluster_secret=SECRET)
     with pytest.raises(ValueError, match="exclude"):
-        node.server.connect_cluster(peers=[], cluster_port=_next_port(), single_port=True)
+        node.server.connect_cluster(
+            peers=[], cluster_port=_next_port(), single_port=True, cluster_secret=SECRET
+        )
     with pytest.raises(ValueError, match="cluster_host needs cluster_port"):
-        node.server.connect_cluster(peers=[], single_port=True, cluster_host="127.0.0.1")
+        node.server.connect_cluster(
+            peers=[], single_port=True, cluster_host="127.0.0.1", cluster_secret=SECRET
+        )
 
 
 def test_a_cluster_port_in_use_is_an_error_of_the_call(nodes):
     a, b = nodes(), nodes()
     a.join()
     with pytest.raises(OSError, match="cannot listen"):
-        b.server.connect_cluster(peers=[], cluster_port=a.cluster_port)
+        b.server.connect_cluster(peers=[], cluster_port=a.cluster_port, cluster_secret=SECRET)
 
 
 def test_the_websocket_port_refuses_cluster_links_without_single_port(nodes):
@@ -351,6 +362,73 @@ def test_single_port_cluster_forms_and_shares_presence(nodes):
             return await asyncio.to_thread(wait_for, lambda: "alice" in b.server.presence("room"))
 
     assert asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# The cluster's secret
+# ---------------------------------------------------------------------------
+
+
+def test_the_cluster_needs_its_secret_or_certificates(nodes, monkeypatch):
+    for name in (
+        "WSE_CLUSTER_SECRET",
+        "WSE_CLUSTER_TLS_CERT",
+        "WSE_CLUSTER_TLS_KEY",
+        "WSE_CLUSTER_TLS_CA",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    node = nodes()
+    with pytest.raises(ValueError, match="secret"):
+        node.server.connect_cluster(peers=[], cluster_port=_next_port())
+    with pytest.raises(ValueError, match="at least 32"):
+        node.server.connect_cluster(peers=[], cluster_port=_next_port(), cluster_secret="short")
+    with pytest.raises(ValueError, match="not both"):
+        node.server.connect_cluster(
+            peers=[],
+            cluster_port=_next_port(),
+            cluster_secret=SECRET,
+            tls_cert="node.pem",
+            tls_key="node.key",
+            tls_ca="ca.pem",
+        )
+    with pytest.raises(TypeError):
+        node.server.connect_cluster(peers=[], cluster_port=_next_port(), cluster_secret=42)
+
+
+def test_nodes_link_with_the_secret_from_the_environment(nodes, monkeypatch):
+    monkeypatch.setenv("WSE_CLUSTER_SECRET", SECRET)
+    a, b = nodes(), nodes()
+    for node, peers in ((a, []), (b, [a])):
+        node.server.connect_cluster(peers=[p.addr for p in peers], cluster_port=node.cluster_port)
+    assert wait_for(lambda: a.peers == 1 and b.peers == 1)
+
+
+def test_a_node_with_another_secret_does_not_link(nodes):
+    a, b = nodes(), nodes()
+    a.join()
+    b.join(a, cluster_secret=b"another secret, also of at least 32 bytes")
+    time.sleep(3.0)
+    assert (a.peers, b.peers) == (0, 0)
+
+
+def test_a_plaintext_peer_is_refused(nodes):
+    import socket
+    import struct
+
+    node = nodes()
+    node.join()
+    # What a node of a plaintext cluster sends first: a HELLO frame. The
+    # cluster port speaks TLS only and answers nothing.
+    hello = struct.pack("<BBHI", 0x04, 0, 0, 12) + b"WSE\x00" + struct.pack("<HHI", 1, 0, 15)
+    with socket.create_connection(("127.0.0.1", node.cluster_port), timeout=5) as sock:
+        sock.sendall(struct.pack(">I", len(hello)) + hello)
+        sock.settimeout(5)
+        try:
+            answer = sock.recv(64)
+        except (ConnectionResetError, TimeoutError):
+            answer = b""
+        assert b"WSE" not in answer
+    assert node.peers == 0
 
 
 # ---------------------------------------------------------------------------

@@ -711,14 +711,20 @@ class RustWSEServer:
         cluster_addr: str | None = None,
         cluster_host: str | None = None,
         single_port: bool = False,
+        cluster_secret: str | bytes | None = None,
     ) -> None:
         """Connect to cluster peers via TCP mesh protocol.
 
+        The links are TLS, always: from cluster_secret (at least 32 random
+        bytes, the same on every node: a node without it cannot link), or
+        from certificate files (tls_cert, tls_key, tls_ca). Left out, they
+        come from WSE_CLUSTER_SECRET, or from WSE_CLUSTER_TLS_CERT/KEY/CA.
+        Without either, ValueError.
+
         Peers' links come in on cluster_port (bound on cluster_host, 0.0.0.0
-        by default), or with single_port=True on the WebSocket port:
-        plaintext and unauthenticated, for a port only the cluster's own
-        network reaches. One of the two is required (ValueError otherwise);
-        a cluster_port that cannot be bound raises OSError.
+        by default), or with single_port=True on the WebSocket port. One of
+        the two is required (ValueError otherwise); a cluster_port that
+        cannot be bound raises OSError.
         """
         ...
     def cluster_connected(self) -> bool:

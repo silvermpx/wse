@@ -1,9 +1,11 @@
 """Multi-instance WSE with direct cluster protocol (no Redis).
 
 Run two instances on different ports. Messages published on one
-are delivered to subscribers on the other via direct TCP mesh.
+are delivered to subscribers on the other via direct TCP mesh. The links
+between them are TLS from the cluster's secret, the same on every node.
 
     pip install wse-server
+    export WSE_CLUSTER_SECRET="$(openssl rand -base64 32)"   # in both terminals
 
     # Terminal 1 (port 5007, peers with 5008)
     python examples/standalone_cluster.py --port 5007 --peers 127.0.0.1:5008
@@ -89,8 +91,8 @@ def main():
     server.start()
 
     try:
-        # Peers' links share the WebSocket port: fine on one host, never on a
-        # port reachable from outside (use cluster_port there).
+        # Peers' links share the WebSocket port, in TLS from the cluster's
+        # secret (WSE_CLUSTER_SECRET): a node without it cannot join.
         server.connect_cluster(args.peers, single_port=True)
         print(f"Cluster peers: {args.peers}")
     except Exception as e:

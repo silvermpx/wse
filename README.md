@@ -326,18 +326,20 @@ When the missed messages are no longer kept, `recovered` is `False` and the clie
 
 ### Cluster
 
+```bash
+openssl rand -base64 32   # the cluster's secret: the same on every server
+```
+
 ```python
 server.connect_cluster(
     peers=["10.0.0.2:9999", "10.0.0.3:9999"],
     cluster_port=9999,
-    tls_ca="/etc/wse/ca.pem",
-    tls_cert="/etc/wse/node.pem",
-    tls_key="/etc/wse/node.key",
+    cluster_secret=os.environ["WSE_CLUSTER_SECRET"],
 )
 server.broadcast("prices", text)   # reaches the subscribers on every server
 ```
 
-A new server can also join through one seed address (`seeds=[...]`, `cluster_addr=...`). On one host or a closed network the links can share the WebSocket port instead (`single_port=True`, without TLS). `cluster_info()` lists the linked peers. The protocol is described in [CLUSTER_PROTOCOL.md](https://github.com/silvermpx/wse/blob/main/docs/CLUSTER_PROTOCOL.md).
+The links between servers are TLS, always. Each server derives the same key from the secret and proves it when a link opens, so a server without the secret cannot join, and nothing between them can read or change the traffic. No certificates to make; a company CA can sign them instead (`tls_cert`, `tls_key`, `tls_ca`). A new server can also join through one seed address (`seeds=[...]`, `cluster_addr=...`), and the links can share the WebSocket port (`single_port=True`). `cluster_info()` lists the linked peers. The protocol is described in [CLUSTER_PROTOCOL.md](https://github.com/silvermpx/wse/blob/main/docs/CLUSTER_PROTOCOL.md).
 
 ### Running it
 
@@ -353,7 +355,7 @@ server.prometheus_metrics()                # text for a /metrics endpoint
 ## Security
 
 - **Tokens.** `issue_token(sub, ttl=900, claims=None)` signs tokens with the server's own settings, for a login endpoint in the same process, and `reload_jwt_keys()` replaces the keys of a running server. A connection is closed when its token expires (code 4403), and the clients reconnect with a fresh one.
-- **TLS.** Serve `wss://` through a reverse proxy or a load balancer (nginx, Caddy); the server itself speaks plain WebSocket. Cluster links have their own mutual TLS.
+- **TLS.** Serve `wss://` through a reverse proxy or a load balancer (nginx, Caddy); the server itself speaks plain WebSocket. Links between the servers of a cluster are always TLS, from the cluster's secret or from certificates.
 - **Browsers.** `allowed_origins` refuses pages from other sites, which could otherwise connect with your users' cookies.
 - **Limits.** Clients are rate-limited on what they send, and one that keeps going over is closed (code 4429). Frame sizes, subscriptions, queues and connections waiting in the handshake are all bounded.
 
@@ -406,7 +408,7 @@ More results: [benchmarks](https://github.com/silvermpx/wse/blob/main/docs/BENCH
 
 The Python API keeps its names, but some behaviour changed. What most applications notice:
 
-- `connect_cluster()` needs `cluster_port`, or `single_port=True`.
+- `connect_cluster()` needs `cluster_port` (or `single_port=True`), and the cluster's secret (`cluster_secret`) or TLS certificates: links between servers are always TLS.
 - `start()` raises `OSError` when the port is taken; `drain()` waits for the clients and returns how many it had to drop.
 - JWT settings are checked at startup, and a token without the configured `iss` or `aud` is refused.
 - End-to-end encryption now authenticates the server, so clients pin its key. 2.x clients keep working while `e2e_legacy=True`, the default.

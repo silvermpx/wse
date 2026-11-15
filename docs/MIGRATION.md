@@ -7,6 +7,7 @@
 ### Server
 
 - **`connect_cluster()` needs `cluster_port`**, or `single_port=True` to take cluster links on the WebSocket port, which is now opt-in.
+- **Links between cluster nodes are TLS, always**: `connect_cluster()` needs the cluster's secret (`cluster_secret`, at least 32 random bytes, or `WSE_CLUSTER_SECRET`) or TLS certificates, and refuses plaintext links. 2.x nodes speak plaintext, so they do not link with 3.0 nodes: upgrade every node of a cluster together.
 - **`start()` raises `OSError`** when the address is taken, and `connect_cluster()` when it cannot bind the cluster port.
 - **`drain()` blocks** until the clients are gone or the timeout, and returns how many it had to drop.
 - **JWT options are checked at startup.** HMAC secrets must be at least the hash size (32, 48 or 64 bytes); a PEM key is refused as an HMAC secret; `jwt_issuer` / `jwt_audience` now also reject tokens that omit the claim; any `jwt_*` option without `jwt_secret` is an error.

@@ -32,8 +32,9 @@ impl ClusterTls {
     }
 }
 
-/// How a server joins its cluster.
-#[derive(Clone, Debug, Default)]
+/// How a server joins its cluster. Its links are TLS, always: from the
+/// cluster's `secret`, or from certificate files (`tls`).
+#[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct ClusterSettings {
     /// Peers to link to (`host:port`).
@@ -47,11 +48,31 @@ pub struct ClusterSettings {
     pub port: Option<u16>,
     /// The address that port listens on; 0.0.0.0 by default.
     pub host: Option<String>,
-    /// Take peers' links on the WebSocket port instead of `port`: plaintext
-    /// and unauthenticated, for a port only the cluster's own network
-    /// reaches.
+    /// Take peers' links on the WebSocket port instead of `port`, in TLS as
+    /// on their own port.
     pub single_port: bool,
+    /// The cluster's shared secret, at least 32 random bytes
+    /// (`openssl rand -base64 32`): every node derives the same key from it
+    /// and proves it in each link's TLS handshake, so a node without it
+    /// cannot link. No certificates to make. It is wiped once read.
+    pub secret: Option<Vec<u8>>,
+    /// Mutual TLS from certificate files, instead of `secret`.
     pub tls: Option<ClusterTls>,
+}
+
+impl std::fmt::Debug for ClusterSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClusterSettings")
+            .field("peers", &self.peers)
+            .field("seeds", &self.seeds)
+            .field("cluster_addr", &self.cluster_addr)
+            .field("port", &self.port)
+            .field("host", &self.host)
+            .field("single_port", &self.single_port)
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .field("tls", &self.tls)
+            .finish()
+    }
 }
 
 /// A peer this node is linked to.
@@ -77,7 +98,12 @@ pub struct DeadLetter {
 
 /// Join the cluster: on the current tokio runtime, with the server
 /// running.
-pub(crate) fn connect(shared: &Arc<SharedState>, settings: ClusterSettings) -> Result<(), Error> {
+pub(crate) fn connect(
+    shared: &Arc<SharedState>,
+    mut settings: ClusterSettings,
+) -> Result<(), Error> {
+    use zeroize::Zeroize;
+    let invalid = |msg: &str| Err(Error::ClusterConfig(msg.to_owned()));
     if shared.cluster_cmd_tx.load().is_some() {
         return Err(Error::Cluster("Cluster already connected".to_owned()));
     }
@@ -86,18 +112,31 @@ pub(crate) fn connect(shared: &Arc<SharedState>, settings: ClusterSettings) -> R
             "seeds= requires cluster_addr= so peers can connect back to this node".to_owned(),
         ));
     }
-    let tls_config = settings
-        .tls
-        .as_ref()
-        .map(|tls| {
-            cluster::build_cluster_tls(&tls.cert, &tls.key, &tls.ca)
-                .map_err(|e| Error::Cluster(format!("TLS config error: {e}")))
-        })
-        .transpose()?;
+    // Links are TLS, always: a plaintext cluster would take anyone who
+    // reaches its port as a peer, reading every topic and publishing to any.
+    let tls_config = match (settings.secret.take(), settings.tls.as_ref()) {
+        (Some(mut secret), None) => {
+            let config = cluster::build_cluster_tls_from_secret(&secret);
+            secret.zeroize();
+            config.map_err(|e| Error::ClusterConfig(e.to_string()))?
+        }
+        (None, Some(tls)) => cluster::build_cluster_tls(&tls.cert, &tls.key, &tls.ca)
+            .map_err(|e| Error::Cluster(format!("TLS config error: {e}")))?,
+        (Some(mut secret), Some(_)) => {
+            secret.zeroize();
+            return invalid("a cluster secret or TLS certificates, not both");
+        }
+        (None, None) => {
+            return invalid(
+                "the cluster needs its secret (at least 32 random bytes: \
+                 openssl rand -base64 32), or TLS certificates: its links are TLS, \
+                 so a node without them cannot join",
+            );
+        }
+    };
 
-    // Where peers' links come in. The WebSocket port takes them only when
-    // asked to: there anyone who reaches the port could join as a peer.
-    let invalid = |msg: &str| Err(Error::ClusterConfig(msg.to_owned()));
+    // Where peers' links come in: their own port, or the WebSocket port
+    // when asked to.
     match (settings.port, settings.single_port) {
         (Some(_), true) => {
             return invalid("cluster_port and single_port=True exclude each other");
@@ -105,14 +144,10 @@ pub(crate) fn connect(shared: &Arc<SharedState>, settings: ClusterSettings) -> R
         (None, false) => {
             return invalid(
                 "connect_cluster needs cluster_port, the port peers' links come in on; \
-                 or single_port=True to take them on the WebSocket port, unauthenticated, \
-                 where that port is reachable only from the cluster's own network",
+                 or single_port=True to take them on the WebSocket port",
             );
         }
         _ => {}
-    }
-    if settings.single_port && tls_config.is_some() {
-        return invalid("cluster TLS needs cluster_port: single_port links are plaintext");
     }
     if settings.host.is_some() && settings.port.is_none() {
         return invalid("cluster_host needs cluster_port");
@@ -143,16 +178,15 @@ pub(crate) fn connect(shared: &Arc<SharedState>, settings: ClusterSettings) -> R
             (cluster::InboundLinks::Listener(listener), None)
         }
         None => {
-            tracing::warn!(
-                "[WSE-Cluster] single_port: cluster links are taken on the WebSocket port, \
-                 unauthenticated"
+            tracing::info!(
+                "[WSE-Cluster] single_port: cluster links come in on the WebSocket port"
             );
             let (tx, rx) = mpsc::unbounded_channel();
             (cluster::InboundLinks::MainPort(rx), Some(tx))
         }
     };
 
-    let tls_holder = tls_config.map(|cfg| Arc::new(arc_swap::ArcSwap::from_pointee(cfg)));
+    let tls_holder = Some(Arc::new(arc_swap::ArcSwap::from_pointee(tls_config)));
     *shared.cluster_tls_holder.write().unwrap() = tls_holder.clone();
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ClusterCommand>();
@@ -256,6 +290,12 @@ impl Publisher {
         let holder = guard
             .as_ref()
             .ok_or_else(|| Error::Cluster("Cluster TLS not configured".to_owned()))?;
+        if holder.load().from_secret {
+            return Err(Error::Cluster(
+                "the cluster's TLS comes from its secret: there are no certificates to reload"
+                    .to_owned(),
+            ));
+        }
         let config = cluster::build_cluster_tls(&tls.cert, &tls.key, &tls.ca)
             .map_err(|e| Error::Cluster(format!("TLS reload failed: {e}")))?;
         holder.store(Arc::new(config));

@@ -86,7 +86,8 @@ with, and the `wse-client` crate's `chat_client` example talks to it.
 - **Presence.** Who is on a topic, with their data, across the cluster.
 - **Users.** `send_to_user` reaches every tab and device of a user,
   `disconnect_user` closes them all.
-- **Cluster.** Nodes link over a binary protocol (optionally mutual TLS) and
+- **Cluster.** Nodes link over a binary protocol in TLS, from the cluster's
+  secret (`ClusterSettings::secret`) or from certificates, and
   forward each topic only where it has subscribers.
 - **Security.** JWT validation in the handshake (HS*, RS*, PS*, ES*, EdDSA,
   key rotation), origin checks, rate limits, end-to-end encryption with the

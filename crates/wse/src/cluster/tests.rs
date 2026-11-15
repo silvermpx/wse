@@ -908,6 +908,69 @@ async fn test_tls_rejects_wrong_ca() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A TLS link between two configs over loopback: what each end got from the
+/// other, or None for a side whose handshake failed.
+async fn secret_link(
+    server_tls: ClusterTlsConfig,
+    client_tls: ClusterTlsConfig,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut tls = server_tls.acceptor.accept(stream).await.ok()?;
+        tls.write_all(b"from the server").await.ok()?;
+        tls.flush().await.ok()?;
+        let mut got = vec![0u8; 15];
+        tls.read_exact(&mut got).await.ok()?;
+        Some(got)
+    });
+    let client = tokio::spawn(async move {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let name = ServerName::from(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let mut tls = client_tls.connector.connect(name, stream).await.ok()?;
+        tls.write_all(b"from the client").await.ok()?;
+        tls.flush().await.ok()?;
+        let mut got = vec![0u8; 15];
+        tls.read_exact(&mut got).await.ok()?;
+        Some(got)
+    });
+    (server.await.unwrap(), client.await.unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nodes_with_the_same_secret_link_in_tls() {
+    let secret = b"a cluster secret of at least thirty-two bytes";
+    let (server, client) = secret_link(
+        build_cluster_tls_from_secret(secret).unwrap(),
+        build_cluster_tls_from_secret(secret).unwrap(),
+    )
+    .await;
+    assert_eq!(server.as_deref(), Some(b"from the client".as_slice()));
+    assert_eq!(client.as_deref(), Some(b"from the server".as_slice()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_without_the_secret_cannot_link() {
+    let ours = b"a cluster secret of at least thirty-two bytes";
+    let theirs = b"another secret, also of at least thirty-two bytes";
+    // Neither way round: a dialer without it, nor a listener without it.
+    for (server, client) in [(ours.as_slice(), theirs.as_slice()), (theirs, ours)] {
+        let (server, client) = secret_link(
+            build_cluster_tls_from_secret(server).unwrap(),
+            build_cluster_tls_from_secret(client).unwrap(),
+        )
+        .await;
+        assert_eq!((server, client), (None, None));
+    }
+}
+
+#[test]
+fn a_short_secret_is_refused() {
+    let error = build_cluster_tls_from_secret(b"too short").err().unwrap();
+    assert!(error.to_string().contains("at least 32"), "{error}");
+}
+
 /// Test peer exchange: Node B sends PEER_LIST containing Node C's address to Node A.
 /// Verifies that PEER_ANNOUNCE and PEER_LIST are correctly exchanged during handshake.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

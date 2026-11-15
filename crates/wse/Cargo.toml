@@ -54,8 +54,9 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"], optio
 regex = { version = "1.13.1", optional = true }
 indexmap = { version = "2", optional = true }
 
-# The crypto: aws-lc-rs everywhere it builds...
-[target.'cfg(not(any(target_arch = "wasm32", wse_rustcrypto)))'.dependencies]
+# The crypto: aws-lc-rs everywhere it builds (the server's own keys, and the
+# protocol's unless RUSTFLAGS="--cfg wse_rustcrypto" asks for RustCrypto)...
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 aws-lc-rs = "1.19"
 
 # ...and the protocol's functions in pure Rust in the browser (or with

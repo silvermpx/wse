@@ -1,10 +1,10 @@
 # Cluster Protocol
 
-WSE uses a custom binary protocol for communication between cluster nodes. All inter-node traffic uses TCP with optional mTLS.
+WSE uses a custom binary protocol for communication between cluster nodes. All inter-node traffic is TLS over TCP: from the cluster's secret, or mutual TLS with certificates.
 
 ## Connection Establishment
 
-1. Node A connects to Node B via TCP (or TLS if configured)
+1. Node A connects to Node B via TCP and they open TLS (see [TLS](#tls)); a link that does not finish the TLS handshake goes no further
 2. Node A sends a HELLO frame
 3. Node B validates the HELLO (magic bytes, version, capabilities)
 4. Node B responds with its own HELLO frame
@@ -218,9 +218,22 @@ Compression is opportunistic: the sender compresses the payload and only uses th
 
 **Decompression bomb protection**: decompressed output is capped at 1 MB (MAX_FRAME_SIZE) via `zstd::bulk::decompress`. This prevents a malicious or corrupted peer from sending a small compressed payload that expands into an arbitrarily large buffer.
 
-## mTLS
+## TLS
 
-Optional mutual TLS provides authentication and encryption for inter-node traffic. When enabled, both sides of every peer connection verify each other's certificate against a shared CA.
+Every link is TLS, opened right after the TCP connect and before HELLO; a node takes no plaintext link. Its credentials come from one of two places.
+
+### From the cluster's secret
+
+`cluster_secret` (`ClusterSettings::secret`, or `WSE_CLUSTER_SECRET`), at least 32 bytes, the same on every node:
+
+1. Each node derives one P-256 private key from it: HKDF-SHA256 with salt `"WSE cluster"` and info `"WSE cluster key "` followed by a one-byte counter, 0 first; a 32-byte output past the curve's order (about once in 2^32) takes the next counter.
+2. Links speak TLS 1.3 only, with raw public keys (RFC 7250) on both sides: each end presents the key's SubjectPublicKeyInfo and accepts the other only if it is the same, after checking the handshake signature it made with it. Sessions are not resumed, so every link proves the key.
+
+A node without the secret cannot sign the handshake: it neither joins nor reads anything. Nothing on the wire tells an observer the key; a weak secret could still be guessed offline from a recorded handshake, hence the 32 random bytes.
+
+### From certificates (mTLS)
+
+Mutual TLS with certificates from a CA of the cluster's own: both sides of every peer connection verify each other's certificate against it.
 
 | Parameter | Value |
 |-----------|-------|
@@ -231,7 +244,11 @@ Optional mutual TLS provides authentication and encryption for inter-node traffi
 
 **Configuration**: pass `tls_ca`, `tls_cert`, and `tls_key` file paths to `connect_cluster()`. All three must be PEM-encoded. The node certificate is used for both accepting inbound connections (server role) and initiating outbound connections (client role).
 
-When TLS is configured, all peer connections are upgraded to TLS immediately after TCP connect, before the HELLO handshake. Plaintext connections are not accepted when TLS is enabled.
+All peer connections are upgraded to TLS immediately after TCP connect, before the HELLO handshake; plaintext connections are not accepted.
+
+### Single port
+
+With `single_port=True` the links come in on the WebSocket port. A cluster link starts with a TLS ClientHello (bytes `0x16 0x03`), which plain HTTP never does, so the server hands such a connection to the cluster and every other one to the WebSocket server.
 
 ## Dynamic Peer Discovery
 

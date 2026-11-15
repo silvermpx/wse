@@ -15,6 +15,9 @@ Upgrading from 2.x: see
   keep working while `e2e_legacy=True`, the default.
 - `connect_cluster()` needs `cluster_port`, or `single_port=True` to take
   peers on the WebSocket port.
+- Links between cluster nodes are TLS, always: `connect_cluster()` needs
+  the cluster's secret (`cluster_secret`) or certificates, and refuses
+  plaintext links. 2.x and 3.0 nodes do not link with each other.
 - `start()` and `connect_cluster()` raise `OSError` when the port is taken.
   `drain()` waits for the clients to leave and returns how many it dropped.
 - JWT settings are checked at startup. A token without the configured
@@ -61,6 +64,11 @@ Upgrading from 2.x: see
     their frames by a `Handler`, or a stream of owned ones; topics with
     recovery, reconnects, msgpack, end-to-end encryption and signed
     messages. It takes the protocol from `wse`, without the server.
+- The cluster's secret: TLS between the nodes without certificate files.
+  Every node derives the same key from one shared secret and proves it in
+  each link's TLS 1.3 handshake (raw public keys), so a node without the
+  secret cannot join, and links on the WebSocket port (`single_port`) are
+  TLS too.
 - Free-threaded Python wheels (3.14t, 3.15t), and wheels for Alpine Linux
   (musllinux) and Windows on ARM.
 - Every standard JWT algorithm, `issue_token()`, and `reload_jwt_keys()`

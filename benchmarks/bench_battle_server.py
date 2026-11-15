@@ -361,17 +361,23 @@ def publish_loop(server, mode: str, message_size: int, stop_event: threading.Eve
 
 
 
+# 3.x cluster links are TLS from the cluster's secret, the same on every node.
+CLUSTER_SECRET = os.environ.get("WSE_CLUSTER_SECRET", "the wse-bench cluster secret, 32+ bytes")
+
+
 def connect_cluster(server, peers, **kwargs):
-    """Join the cluster. Without a cluster port, peers come in on the
-    WebSocket port: 3.x does that only when asked (single_port), 2.x always
-    did and has no such option."""
+    """Join the cluster. 3.x takes the cluster's secret (unless certificates
+    are given), and peers on the WebSocket port only when asked (single_port,
+    for a node without a cluster port); 2.x has neither option."""
+    current = dict(kwargs)
+    if not any(kwargs.get(name) for name in ("tls_cert", "tls_key", "tls_ca")):
+        current["cluster_secret"] = CLUSTER_SECRET
     if kwargs.get("cluster_port") is None:
-        try:
-            server.connect_cluster(peers, single_port=True, **kwargs)
-            return
-        except TypeError:
-            pass
-    server.connect_cluster(peers, **kwargs)
+        current["single_port"] = True
+    try:
+        server.connect_cluster(peers, **current)
+    except TypeError:
+        server.connect_cluster(peers, **kwargs)
 
 
 def main():

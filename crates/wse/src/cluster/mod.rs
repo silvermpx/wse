@@ -36,7 +36,7 @@ pub(crate) use protocol::{
     encode_presence_update, encode_resync, encode_shutdown, encode_sub, encode_unsub,
     negotiate_capabilities, negotiate_version,
 };
-pub(crate) use tls::{ClusterTlsConfig, build_cluster_tls};
+pub(crate) use tls::{ClusterTlsConfig, build_cluster_tls, build_cluster_tls_from_secret};
 #[cfg(test)]
 use types::Links;
 pub(crate) use types::{
