@@ -14,6 +14,7 @@ import pytest
 
 from _fakes import FakeWSEServer, until
 from wse_client import (
+    WSEEncryptionError,
     AsyncWSEClient,
     ConnectionState,
     ReconnectConfig,
@@ -385,3 +386,96 @@ class TestReuse:
                 assert (await client.recv(timeout=2.0)).type == "hello"
                 await client.disconnect()
             assert len(srv.connections) == 2
+
+
+class TestWhatTheClientsShare:
+    """What the Rust and TypeScript clients do too."""
+
+    async def test_topics_wanted_while_disconnected_are_subscribed_on_reconnect(self):
+        async with FakeWSEServer() as srv:
+            client = make_client(srv.url, topics=["a"])
+            await client.connect()
+            port = srv.port
+            await srv.stop()
+            await until(lambda: not client.is_connected)
+            assert await client.subscribe(["b"]) is False
+            assert await client.unsubscribe(["a"]) is False
+            await srv.start(port=port)
+            conn = await until(lambda: len(srv.connections) == 2 and srv.connections[1])
+            await until(lambda: conn.find("subscription_update"), timeout=3.0)
+            (request,) = conn.find("subscription_update")
+            assert request["p"]["topics"] == ["b"]
+            await client.disconnect()
+
+    async def test_a_reader_that_falls_behind_loses_nothing(self):
+        reading = asyncio.Event()
+
+        async def flood(conn):
+            await reading.wait()
+            for i in range(60):
+                await conn.send_json({"c": "U", "t": "n", "p": {"i": i}})
+
+        async with FakeWSEServer(on_connect=flood) as srv:
+            client = make_client(srv.url, queue_size=4)
+            await client.connect()
+            got = []
+
+            async def read():
+                async for event in client:
+                    got.append(event.payload["i"])
+                    if len(got) == 60:
+                        return
+                    await asyncio.sleep(0.005)
+
+            reader = asyncio.ensure_future(read())
+            await asyncio.sleep(0)
+            reading.set()
+            await asyncio.wait_for(reader, timeout=10)
+            assert got == list(range(60))
+            await client.disconnect()
+
+    async def test_handlers_hear_connects_and_disconnects(self):
+        async with FakeWSEServer() as srv:
+            client = make_client(srv.url)
+            heard = []
+            client.on("connected")(lambda e: heard.append(("connected", e.payload)))
+            client.on("disconnected")(
+                lambda e: heard.append(("disconnected", e.payload))
+            )
+            await client.connect()
+            await srv.connections[0].ws.close(1001)
+            await until(lambda: len(srv.connections) == 2)
+            await until(lambda: len(heard) == 3)
+            (first, lost, again) = heard
+            assert first[0] == "connected" and first[1]["reconnected"] is False
+            assert first[1]["connection_id"] == "conn-0"
+            assert lost[0] == "disconnected" and lost[1]["code"] == 1001
+            assert lost[1]["reconnecting"] is True
+            assert again[0] == "connected" and again[1]["reconnected"] is True
+            await client.disconnect()
+
+    async def test_a_server_without_the_clients_encryption_ends_it(self):
+        async def refuse(conn):
+            await conn.ws.close(4800)
+
+        async with FakeWSEServer(send_server_ready=False, on_connect=refuse) as srv:
+            client = make_client(srv.url)
+            with pytest.raises(WSEEncryptionError):
+                await client.connect()
+            await asyncio.sleep(0.3)
+            assert len(srv.connections) == 1  # no reconnect
+            await client.disconnect()
+
+    async def test_the_token_cookie_keeps_the_callers_cookies_and_header(self):
+        async with FakeWSEServer() as srv:
+            client = make_client(
+                srv.url,
+                token="tok",
+                cookie_name="session",
+                extra_headers={"cookie": "theme=dark", "Authorization": "Bearer own"},
+            )
+            await client.connect()
+            headers = srv.connections[0].headers
+            assert headers["cookie"] == "theme=dark; session=tok"
+            assert headers["authorization"] == "Bearer own"
+            await client.disconnect()

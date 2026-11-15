@@ -176,3 +176,20 @@ def test_a_message_signed_for_one_user_reaches_that_user_only():
     client.connection_user = "u1"
     assert client.decode(envelope("u1")).type == "fill"
     assert client.decode(envelope("u2")) is None
+
+
+def test_a_signed_time_reads_as_the_other_clients_write_it():
+    from wse_client.protocol import _rfc3339_ms
+
+    assert _rfc3339_ms(1794600000123) == "2026-11-13T20:00:00.123Z"
+    assert _rfc3339_ms(5) == "1970-01-01T00:00:00.005Z"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nonce", ["", "x" * 129])
+async def test_a_nonce_is_1_to_128_characters(nonce):
+    from wse_client import AsyncWSEClient, generate_signing_key
+
+    client = AsyncWSEClient("ws://127.0.0.1:9/wse", signing_key=generate_signing_key())
+    with pytest.raises(ValueError, match="1 to 128"):
+        await client.send("order", {}, signed=True, nonce=nonce)

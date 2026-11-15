@@ -57,6 +57,7 @@ from .constants import (
     PROTOCOL_VERSION,
     RECONNECT_ABSOLUTE_CAP,
     WS_CLOSE_ABNORMAL,
+    WS_CLOSE_E2E_UNSUPPORTED,
     WS_CLOSE_GOING_AWAY,
     WS_CLOSE_NO_STATUS,
     WS_CLOSE_NORMAL,
@@ -65,6 +66,7 @@ from .errors import (
     WSEAuthError,
     WSECircuitBreakerError,
     WSEConnectionError,
+    WSEEncryptionError,
     WSEError,
     WSETimeoutError,
 )
@@ -142,8 +144,10 @@ class ConnectionManager:
         load_balancing: LoadBalancingStrategy = LoadBalancingStrategy.WEIGHTED_RANDOM,
         max_message_size: int | None = DEFAULT_MAX_MESSAGE_SIZE,
         query_params: dict[str, str] | None = None,
+        cookie_name: str = "access_token",
     ) -> None:
         self._url = url
+        self._cookie_name = cookie_name
         self._token = token
         self._token_provider = token_provider
         self._reconnect_cfg = reconnect or ReconnectConfig()
@@ -175,6 +179,12 @@ class ConnectionManager:
         self._on_open: Callable[[], Any] | None = None
         self._on_close: Callable[[], Any] | None = None
         self._on_terminal: Callable[[WSEError], Any] | None = None
+        # Awaited before each next frame is read: while the application is
+        # behind, the socket is not read.
+        self._before_read: Callable[[], Any] | None = None
+        # The server took this connection (server_ready): heartbeats go out
+        # only then, after whatever the handshake sends first.
+        self._handshake_done = False
 
         # State
         self._ws_cm: Any | None = None  # websocket context manager
@@ -295,6 +305,7 @@ class ConnectionManager:
         """The server confirmed this connection: reset the backoff, and from
         now on reconnect a lost connection (also when connect() has not
         resumed yet)."""
+        self._handshake_done = True
         self._reconnect_attempts = 0
         self._consecutive_failures = 0
         self._reconnect_armed = True
@@ -359,10 +370,16 @@ class ConnectionManager:
         """Low-level WebSocket open with auth headers."""
         headers = dict(self._extra_headers)
 
-        # Auth: cookie for Rust server + Authorization header as fallback
+        # Auth: the cookie the server reads first, and the Authorization
+        # header; the caller's own cookies are kept, and an Authorization
+        # header of its own wins.
         if token and token != "cookie":
-            headers["Cookie"] = f"access_token={token}"
-            headers["Authorization"] = f"Bearer {token}"
+            cookie = f"{self._cookie_name}={token}"
+            name = next((k for k in headers if k.lower() == "cookie"), "Cookie")
+            existing = headers.get(name)
+            headers[name] = f"{existing}; {cookie}" if existing else cookie
+            if not any(k.lower() == "authorization" for k in headers):
+                headers["Authorization"] = f"Bearer {token}"
 
         ws_cm = websockets.asyncio.client.connect(
             self._build_url(),
@@ -560,6 +577,8 @@ class ConnectionManager:
                 except Exception as exc:
                     # One bad frame never tears down the connection.
                     logger.warning("Error handling a frame, dropped: %s", exc)
+                if self._before_read is not None:
+                    await self._before_read()
         except asyncio.CancelledError:
             raise
         except ConnectionClosed as exc:
@@ -649,6 +668,24 @@ class ConnectionManager:
     async def _send_pong(self, timestamp: str) -> None:
         """Respond to server PING with PONG (control frame)."""
         await self.send_control(f"PONG:{timestamp}")
+
+    async def answer_ping(self, payload: dict[str, Any]) -> None:
+        """Answer a server ping that came sealed, sealed too."""
+        server_timestamp = (
+            payload.get("server_time")
+            or payload.get("timestamp")
+            or int(time.time() * 1000)
+        )
+        pong_msg = {
+            "c": "WSE",
+            "t": "PONG",
+            "p": {
+                "server_timestamp": server_timestamp,
+                "client_timestamp": int(time.time() * 1000),
+            },
+            "v": PROTOCOL_VERSION,
+        }
+        await self.send_control(_json.dumps(pong_msg, separators=(",", ":")))
 
     async def _respond_ping_json(self, data: str) -> None:
         """Respond to a JSON-format PING from server (control frame)."""
@@ -751,7 +788,11 @@ class ConnectionManager:
                     await self._force_reconnect()
                     return
 
-            await self._send_ping()
+            # Before the server took the connection the handshake goes first
+            # (in an E2E session bound to a key, the proof is the first
+            # sealed frame).
+            if self._handshake_done:
+                await self._send_ping()
 
     async def _send_ping(self) -> None:
         """Send one heartbeat PING (lowercase: the Rust server's fast path)."""
@@ -783,6 +824,7 @@ class ConnectionManager:
         self._server_ready = False
         self._client_hello_sent = False
         self._connection_id = None
+        self._handshake_done = False
 
         heartbeat = self._heartbeat_task
         self._heartbeat_task = None
@@ -803,6 +845,8 @@ class ConnectionManager:
     async def _teardown(self, code: int, reason: str) -> None:
         """Close the current socket on the client's initiative."""
         current = _current_task()
+        if self._ws is not None:
+            self._last_close = (code, reason)
         ws, ws_cm, recv_task = self._detach()
 
         tasks: list[asyncio.Task[Any]] = []
@@ -838,6 +882,15 @@ class ConnectionManager:
     def _handle_close_code(self, code: int, reason: str) -> None:
         """React to a server- or network-caused close (see module header)."""
         detail = f"code {code}" + (f": {reason}" if reason else "")
+        if code == WS_CLOSE_E2E_UNSUPPORTED:
+            # The server takes no end-to-end session this client speaks: no
+            # attempt would go otherwise.
+            self._fail(
+                WSEEncryptionError(
+                    f"The server refused this client's end-to-end encryption ({detail})"
+                )
+            )
+            return
         if code in AUTH_CLOSE_CODES:
             self._on_auth_rejected(
                 WSEAuthError(f"Authentication rejected by the server ({detail})")
@@ -960,7 +1013,8 @@ class ConnectionManager:
             if cfg.mode == ReconnectMode.LINEAR:
                 delay = cfg.base_delay + attempt * 1.0
             elif cfg.mode == ReconnectMode.FIBONACCI:
-                delay = cfg.base_delay * _fib(min(attempt, 10))
+                # 1, 1, 2, 3, 5... times the base delay: never 0.
+                delay = cfg.base_delay * _fib(min(attempt, 10) + 1)
             else:
                 # Exponential / Adaptive (same curve)
                 delay = cfg.base_delay * (cfg.factor**attempt)

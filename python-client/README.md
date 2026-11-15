@@ -72,6 +72,8 @@ client.connect()
 client.run_forever()
 ```
 
+Handlers also hear the connection itself: `connected` (`connection_id`, `user_id`, `reconnected`, `recovery`) each time the server takes a connection, `disconnected` (`code`, `reason`, `reconnecting`) when one is lost, and the server's `subscription_update` replies (`success_topics`, `failed_topics`, `recovery`). The event stream (`async for`, `recv()`) carries the server's messages only.
+
 ## Constructor Parameters
 
 `AsyncWSEClient(url, **kwargs)` (and `SyncWSEClient`, which takes the same keywords):
@@ -84,7 +86,8 @@ client.run_forever()
 | `topics` | list[str] | None | Topics to subscribe to after connecting |
 | `reconnect` | ReconnectConfig | default config | Reconnection strategy |
 | `extra_headers` | dict[str, str] | None | Additional HTTP headers for the handshake |
-| `queue_size` | int | 1000 | Max events buffered for the iterator / `recv()`; the oldest is dropped when full |
+| `queue_size` | int | 1000 | Events buffered for the iterator / `recv()`. Once the application reads them, a full buffer stops reading the socket until it has room, so nothing is dropped (the server holds back, or closes a client that stays behind, which then recovers); before that, with handlers only, the oldest is dropped |
+| `cookie_name` | str | `"access_token"` | The cookie the token goes in (the server's `jwt_cookie_name`). Cookies already in `extra_headers` are kept, and an `Authorization` header there wins over the token's |
 | `encryption` | bool | False | Require E2E encryption (needs the `[crypto]` extra and one of the three below) |
 | `e2e_server_keys` | list[str] | None | The server's identity public keys (`e2e_identity_public_key()`, base64) one of which must sign the handshake |
 | `e2e_unauthenticated` | bool | False | Accept a server without an identity key: safe only from passive listeners |
@@ -114,8 +117,8 @@ The `connect(url, **kwargs)` factory returns an `AsyncWSEClient` (not connected 
 | `send(type, payload, priority=NORMAL, correlation_id=None)` | Send a message; returns a `SendResult` |
 | `send_with_retry(type, payload, priority=NORMAL, correlation_id=None, max_retries=5)` | Send with exponential backoff; one message id across all attempts |
 | `send_batch(messages)` | Send multiple messages in a single frame |
-| `subscribe(topics, recover=False)` | Subscribe to topics, optionally recovering missed messages |
-| `unsubscribe(topics)` | Unsubscribe from topics (and forget their recovery positions) |
+| `subscribe(topics, recover=False)` | Subscribe to topics, optionally recovering missed messages; while disconnected the topics are subscribed on the next connection |
+| `unsubscribe(topics)` | Unsubscribe from topics (and forget their recovery positions), connected or not |
 | `request_snapshot(topics)` | Request a state snapshot; an identical request within 5 s is not resent |
 | `on(event_type)` | Register event handler (decorator) |
 | `on_any(handler)` | Register a wildcard handler that receives all events |
@@ -304,7 +307,7 @@ async with AsyncWSEClient(
 
 A backend can bind the key with `server.set_client_key()` instead and leave it out of the token; the client then sends signed messages with or without encryption, and with encryption needs `e2e_bind_session=False`.
 
-The server takes a signed message once (`nonce`, random by default), within its time window, and refuses anything else with a `SIGNATURE_REFUSED` error carrying `n`. A server-signed message no pinned key verifies, or one signed for another topic than the one it came on or for another user, is dropped; without `server_signing_keys` they arrive unchecked (`event.signature.verified` is False). Setup and guarantees: [SECURITY.md](../docs/SECURITY.md#signed-messages).
+The server takes a signed message once (`nonce`, 1 to 128 characters, random by default), within its time window, and refuses anything else with a `SIGNATURE_REFUSED` error carrying `n`. A server-signed message no pinned key verifies, or one signed for another topic than the one it came on or for another user, is dropped; without `server_signing_keys` they arrive unchecked (`event.signature.verified` is False). Setup and guarantees: [SECURITY.md](../docs/SECURITY.md#signed-messages).
 
 ### Circuit Breaker
 

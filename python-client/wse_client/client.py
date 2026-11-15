@@ -35,6 +35,7 @@ from .constants import (
     SEND_RETRY_BASE_DELAY,
     SEND_RETRY_MAX_DELAY,
     SERVER_READY_TIMEOUT,
+    WS_CLOSE_ABNORMAL,
     SNAPSHOT_DEDUP_WINDOW,
     SNAPSHOT_MAX_RETRIES,
     SNAPSHOT_RETRY_DELAY,
@@ -45,7 +46,7 @@ from .network_monitor import NetworkMonitor
 from .offline_queue import OfflineQueue
 from .protocol import MessageCodec, _json_loads
 from .rate_limiter import TokenBucketRateLimiter
-from .signing import ClientSigner, ServerKeys
+from .signing import MAX_NONCE_LEN, ClientSigner, ServerKeys
 from .types import (
     ConnectionQuality,
     ConnectionState,
@@ -236,6 +237,17 @@ class AsyncWSEClient:
             (``cnf``). A token copied on the way then opens nothing. False
             for a token that names no key, whose key the server application
             binds itself (``set_client_key``).
+        cookie_name: The cookie the token goes in (``access_token``, the
+            server's ``jwt_cookie_name`` default). Cookies already in
+            *extra_headers* are kept, and an ``Authorization`` header there
+            wins over the token's.
+
+    Besides the server's messages, handlers (:meth:`on`) get ``connected``
+    (``connection_id``, ``user_id``, ``reconnected``, ``recovery``) each
+    time the server takes a connection, ``disconnected`` (``code``,
+    ``reason``, ``reconnecting``) when one is lost, and the server's
+    ``subscription_update`` replies (``success_topics``, ``failed_topics``,
+    ``recovery``). The event stream carries the server's messages only.
 
     Example::
 
@@ -270,6 +282,7 @@ class AsyncWSEClient:
         signing_key: Any = None,
         server_signing_keys: list[str] | None = None,
         e2e_bind_session: bool = True,
+        cookie_name: str = "access_token",
     ) -> None:
         if wire_format not in _WIRE_FORMATS:
             raise ValueError(f"wire_format must be one of {_WIRE_FORMATS}")
@@ -394,6 +407,14 @@ class AsyncWSEClient:
         self._encryption_error: WSEEncryptionError | None = None
         self._abort_task: asyncio.Future[None] | None = None
         self._resubscribe_pending: set[str] = set()
+        # Some connection completed its handshake before: the next is a
+        # reconnect.
+        self._connected_before = False
+        # The application reads events (iteration or recv()): while it is
+        # behind, what comes next waits here and the socket is not read.
+        self._reading = False
+        self._overflow: deque[WSEEvent | _StreamEnd] = deque()
+        self._room: asyncio.Event | None = None
 
         # Reconnect config for later use
         self._reconnect_cfg = reconnect
@@ -422,6 +443,7 @@ class AsyncWSEClient:
             load_balancing=load_balancing,
             max_message_size=max_message_size,
             query_params=query or None,
+            cookie_name=cookie_name,
         )
 
         self._connection._on_pong = self._on_transport_pong
@@ -429,6 +451,7 @@ class AsyncWSEClient:
         self._connection._on_open = self._on_transport_open
         self._connection._on_close = self._on_transport_close
         self._connection._on_terminal = self._on_transport_terminal
+        self._connection._before_read = self._event_room
 
         # System handler dispatch table (dict lookup = O(1))
         self._system_handlers: dict[str, Callable[[WSEEvent], None]] = {
@@ -485,7 +508,9 @@ class AsyncWSEClient:
         queue = self._event_queue
         if queue is None:
             raise StopAsyncIteration
+        self._reading = True
         item = await queue.get()
+        self._refill()
         if isinstance(item, _StreamEnd):
             self._requeue_end(item)
             if item.error is not None:
@@ -664,6 +689,8 @@ class AsyncWSEClient:
         if signed:
             if self._signer is None:
                 raise WSEError("signed=True needs AsyncWSEClient(signing_key=...)")
+            if nonce is not None and not 1 <= len(nonce) <= MAX_NONCE_LEN:
+                raise ValueError(f"nonce must be 1 to {MAX_NONCE_LEN} characters")
             if self._server_signing_kid is None:
                 raise WSEError(
                     "the server has no signing key (none in its server_hello)"
@@ -815,8 +842,10 @@ class AsyncWSEClient:
             priority=MessagePriority.HIGH,
         )
         ok = await self._transmit(msg, strict=True)
+        # Sent or not, the topics are wanted: the next connection subscribes
+        # them.
+        self._subscribed_topics.update(new_topics)
         if ok:
-            self._subscribed_topics.update(new_topics)
             self._note_recovery_requested(recovery_info)
             self._stats.messages_sent += 1
         return ok
@@ -839,10 +868,13 @@ class AsyncWSEClient:
             priority=MessagePriority.HIGH,
         )
         ok = await self._transmit(msg, strict=True)
+        # Sent or not, they are no longer wanted: the next connection does
+        # not subscribe them again.
+        self._subscribed_topics -= set(topics)
+        self._resubscribe_pending -= set(topics)
+        for t in topics:
+            self._forget_topic(t)
         if ok:
-            self._subscribed_topics -= set(topics)
-            for t in topics:
-                self._forget_topic(t)
             self._stats.messages_sent += 1
         return ok
 
@@ -920,10 +952,12 @@ class AsyncWSEClient:
         queue = self._event_queue
         if queue is None:
             raise WSEConnectionError("Not connected")
+        self._reading = True
         if timeout is not None:
             item = await asyncio.wait_for(queue.get(), timeout=timeout)
         else:
             item = await queue.get()
+        self._refill()
 
         if isinstance(item, _StreamEnd):
             # Re-queue the marker so other callers also see the close signal
@@ -1071,23 +1105,70 @@ class AsyncWSEClient:
             self._event_queue = asyncio.Queue(maxsize=self._queue_size)
         if self._server_ready_event is None:
             self._server_ready_event = asyncio.Event()
+        if self._room is None:
+            self._room = asyncio.Event()
+            self._room.set()
 
     def _enqueue(self, item: WSEEvent | _StreamEnd) -> None:
         queue = self._event_queue
         if queue is None:
             return
+        # Behind already: in order, after what waits.
+        if self._overflow:
+            self._overflow.append(item)
+            return
         try:
             queue.put_nowait(item)
         except asyncio.QueueFull:
-            # Drop oldest to make room
+            if self._reading:
+                # The application reads, and is behind: the event waits, and
+                # the socket is not read until it has room (_event_room), so
+                # nothing is lost here; the server holds back, or closes a
+                # client that stays behind, which then recovers.
+                self._overflow.append(item)
+                if self._room is not None:
+                    self._room.clear()
+                return
+            # Nobody reads the stream (handlers only): the oldest goes.
             try:
                 queue.get_nowait()
                 queue.put_nowait(item)
             except (asyncio.QueueEmpty, asyncio.QueueFull):
                 pass
 
+    def _refill(self) -> None:
+        """Move what waits into the stream as the application reads it."""
+        queue = self._event_queue
+        if queue is None:
+            return
+        while self._overflow and not queue.full():
+            queue.put_nowait(self._overflow.popleft())
+        if not self._overflow and self._room is not None:
+            self._room.set()
+
+    async def _event_room(self) -> None:
+        """The receive loop waits here before reading on while the
+        application is behind."""
+        room = self._room
+        if room is not None and self._overflow:
+            await room.wait()
+
     def _push_stream_end(self, end: _StreamEnd) -> None:
-        self._enqueue(end)
+        # The end is never held back: the oldest event makes room for it.
+        queue = self._event_queue
+        if queue is None:
+            return
+        self._overflow.clear()
+        if self._room is not None:
+            self._room.set()
+        try:
+            queue.put_nowait(end)
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()
+                queue.put_nowait(end)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                pass
 
     def _requeue_end(self, end: _StreamEnd) -> None:
         if self._event_queue is not None:
@@ -1147,6 +1228,25 @@ class AsyncWSEClient:
 
     def _on_transport_close(self) -> None:
         """A live socket went away (any reason)."""
+        handshake = self._handshake
+        was_up = (
+            handshake is not None
+            and handshake.done()
+            and not handshake.cancelled()
+            and handshake.exception() is None
+        )
+        if was_up:
+            code, reason = self._connection.last_close or (WS_CLOSE_ABNORMAL, "")
+            self._invoke_handlers(
+                WSEEvent(
+                    type="disconnected",
+                    payload={
+                        "code": code,
+                        "reason": reason,
+                        "reconnecting": self._connection.reconnect_armed,
+                    },
+                )
+            )
         if self._server_ready_event is not None:
             self._server_ready_event.clear()
         # Sends waiting for this connection's key give up (and may queue).
@@ -1180,20 +1280,20 @@ class AsyncWSEClient:
                 await asyncio.wait([abort], timeout=5.0)
             raise
         except asyncio.TimeoutError:
-            if self._security is not None and not self._security.is_enabled:
-                err = WSEEncryptionError(
-                    "E2E key exchange did not complete within "
-                    f"{SERVER_READY_TIMEOUT:.0f}s (no server_hello with a key)"
+            failure = self._handshake_failure()
+            if failure is None:
+                logger.warning(
+                    "Neither server_ready nor server_hello received within %.0fs, "
+                    "proceeding anyway",
+                    SERVER_READY_TIMEOUT,
                 )
-                self._encryption_error = err
-                _reject(self._key_ready, err)
-                await self._connection.abort(err)
-                raise err from None
-            logger.warning(
-                "Neither server_ready nor server_hello received within %.0fs, "
-                "proceeding anyway",
-                SERVER_READY_TIMEOUT,
-            )
+                self._proceed_without_ready()
+                return
+            if isinstance(failure, WSEEncryptionError):
+                self._encryption_error = failure
+                _reject(self._key_ready, failure)
+            await self._connection.abort(failure)
+            raise failure from None
 
     async def _session_start(
         self, handshake: asyncio.Future[None], background: bool
@@ -1202,23 +1302,22 @@ class AsyncWSEClient:
         try:
             await asyncio.wait_for(asyncio.shield(handshake), SERVER_READY_TIMEOUT)
         except asyncio.TimeoutError:
-            if handshake is not self._handshake:
+            if handshake is not self._handshake or not background:
+                return  # connect() handles its own connection
+            failure = self._handshake_failure()
+            if isinstance(failure, WSEEncryptionError):
+                self._start_encryption_failure(failure)
                 return
-            if self._security is not None and not self._security.is_enabled:
-                if background:  # connect() handles its own connection
-                    self._start_encryption_failure(
-                        WSEEncryptionError(
-                            "E2E key exchange did not complete within "
-                            f"{SERVER_READY_TIMEOUT:.0f}s after reconnecting"
-                        )
-                    )
+            if failure is not None:
+                logger.warning("%s; reconnecting", failure)
+                await self._connection.force_reconnect()
                 return
-            if background:
-                logger.warning(
-                    "Neither server_ready nor server_hello within %.0fs after "
-                    "reconnecting, proceeding anyway",
-                    SERVER_READY_TIMEOUT,
-                )
+            logger.warning(
+                "Neither server_ready nor server_hello within %.0fs after "
+                "reconnecting, proceeding anyway",
+                SERVER_READY_TIMEOUT,
+            )
+            self._proceed_without_ready()
         except WSEError:
             return  # the connection failed or was replaced
         if handshake is not self._handshake or not self._connection.is_connected:
@@ -1226,6 +1325,38 @@ class AsyncWSEClient:
         await self._resubscribe()
         if self._offline_queue.size > 0:
             await self._flush_offline_queue()
+
+    def _handshake_failure(self) -> WSEError | None:
+        """Why a handshake that timed out failed; None for a server that
+        sent neither server_hello nor server_ready (one older than 3.0
+        without them), where the client proceeds."""
+        security = self._security
+        if security is not None:
+            # Fail closed: without its key, or without the sealed
+            # server_ready that confirms the session (and names the key the
+            # session is bound to), nothing goes out.
+            if not security.is_enabled:
+                return WSEEncryptionError(
+                    "E2E key exchange did not complete within "
+                    f"{SERVER_READY_TIMEOUT:.0f}s (no server_hello with a key)"
+                )
+            return WSEEncryptionError(
+                "the server did not confirm the E2E session within "
+                f"{SERVER_READY_TIMEOUT:.0f}s (no sealed server_ready)"
+            )
+        if self._server_features or self._server_hello_seen:
+            # A 3.x server answered: it sends server_ready once it takes the
+            # connection, and takes nothing before.
+            return WSEConnectionError(
+                f"server_ready not received within {SERVER_READY_TIMEOUT:.0f}s"
+            )
+        return None
+
+    def _proceed_without_ready(self) -> None:
+        fut = self._handshake
+        if fut is not None and not fut.done():
+            fut.set_result(None)
+            self._connection.mark_handshake_complete()
 
     def _maybe_complete_handshake(self) -> None:
         fut = self._handshake
@@ -1240,6 +1371,19 @@ class AsyncWSEClient:
             return
         fut.set_result(None)
         self._connection.mark_handshake_complete()
+        reconnected = self._connected_before
+        self._connected_before = True
+        self._invoke_handlers(
+            WSEEvent(
+                type="connected",
+                payload={
+                    "connection_id": self._connection.connection_id,
+                    "user_id": self._codec.connection_user,
+                    "reconnected": reconnected,
+                    "recovery": self._server_recovery_enabled,
+                },
+            )
+        )
 
     # -- Internal: sending ----------------------------------------------------
 
@@ -1274,14 +1418,41 @@ class AsyncWSEClient:
             return False
         return security.is_enabled
 
+    async def _wait_for_handshake(self, *, strict: bool) -> bool:
+        """Until the server took this connection (``server_ready``): nothing
+        of the application's goes before it. False when the connection went
+        away meanwhile or the handshake failed."""
+        fut = self._handshake
+        if fut is None:
+            return self._connection.is_connected
+        if not fut.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(fut), SERVER_READY_TIMEOUT)
+            except asyncio.TimeoutError:
+                return False
+            except WSEEncryptionError:
+                if strict:
+                    raise
+                return False
+            except WSEError:
+                return False
+        if fut.cancelled() or fut.exception() is not None:
+            return False
+        return fut is self._handshake and self._connection.is_connected
+
     async def _transmit(self, encoded: str, *, strict: bool = False) -> bool:
-        """Send one frame on the current connection; with encryption only
-        after the key exchange (never plaintext). False if not connected.
+        """Send one frame on the current connection, once the server took it
+        (``server_ready``); with encryption only after the key exchange
+        (never plaintext). False if not connected.
 
         With *strict* (the public send / subscribe methods) a failed key
         exchange raises :class:`WSEEncryptionError` instead of returning
         False."""
         if not self._connection.is_connected:
+            if strict and self._encryption_error is not None:
+                raise self._encryption_error
+            return False
+        if not await self._wait_for_handshake(strict=strict):
             if strict and self._encryption_error is not None:
                 raise self._encryption_error
             return False
@@ -2016,11 +2187,12 @@ class AsyncWSEClient:
             logger.debug("Subscribed to: %s", success_topics)
 
         recovery = p.get("recovery")
-        if not isinstance(recovery, dict):
-            return
-        for topic, info in recovery.items():
-            if isinstance(topic, str) and isinstance(info, dict):
-                self._on_recovery_reply(topic, info)
+        if isinstance(recovery, dict):
+            for topic, info in recovery.items():
+                if isinstance(topic, str) and isinstance(info, dict):
+                    self._on_recovery_reply(topic, info)
+        # What the server took and refused, for the application's handlers.
+        self._invoke_handlers(event)
 
     def _handle_error(self, event: WSEEvent) -> None:
         """Handle server error with code classification (matches TS error handler)."""
@@ -2215,8 +2387,9 @@ class AsyncWSEClient:
         self._stats.last_latency_ms = latency_ms
 
     def _handle_ping_event(self, event: WSEEvent) -> None:
-        """Backup PING handler (primary is in ConnectionManager)."""
-        pass
+        """A server ping that came sealed (an E2E session): answered with a
+        sealed PONG. Plaintext pings are answered by the connection itself."""
+        self._fire_task(self._connection.answer_ping(event.payload))
 
     def _handle_forward_event(self, event: WSEEvent) -> None:
         """Generic handler for response events (forwarded by _dispatch_event)."""

@@ -379,11 +379,7 @@ class MessageCodec:
             type=message["t"],
             payload=p if isinstance(p, dict) else {"data": p},
             id=message.get("n") if isinstance(message.get("n"), str) else None,
-            timestamp=(
-                datetime.fromtimestamp(ts / 1000, UTC).isoformat()
-                if isinstance(ts, int)
-                else None
-            ),
+            timestamp=_rfc3339_ms(ts) if isinstance(ts, int) else None,
             category=category.value if category else envelope.get("c"),
             topic=topic
             if isinstance(topic, str)
@@ -392,3 +388,10 @@ class MessageCodec:
             offset=int(offset) if isinstance(offset, int) else None,
             signature=proof,
         )
+
+
+def _rfc3339_ms(ms: int) -> str:
+    """Milliseconds since the epoch in RFC 3339, UTC, as the TypeScript and
+    Rust clients write a signed message's time."""
+    at = datetime.fromtimestamp(ms // 1000, UTC)
+    return f"{at:%Y-%m-%dT%H:%M:%S}.{ms % 1000:03d}Z"

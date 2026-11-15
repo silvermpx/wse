@@ -133,6 +133,8 @@ WS_CLOSE_RATE_LIMITED = 4429
 WS_CLOSE_SUBSCRIPTION_FAILED = 4430
 WS_CLOSE_INVALID_MESSAGE = 4400
 WS_CLOSE_SERVER_OVERLOAD = 4503
+# The server takes no end-to-end session this client speaks.
+WS_CLOSE_E2E_UNSUPPORTED = 4800
 
 # Server-sent close codes that end the client instead of reconnecting: the
 # server rejected the credentials (a token_provider gets a refresh first).

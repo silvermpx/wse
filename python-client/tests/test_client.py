@@ -612,3 +612,19 @@ class TestIterationEnd:
         await c.connect()
         c._dispatch_event(WSEEvent(type="fresh", payload={}))
         assert (await c.recv(timeout=1)).type == "fresh"
+
+
+class TestBackoff:
+    def test_fibonacci_waits_from_the_first_retry(self):
+        from wse_client.connection import ConnectionManager
+        from wse_client.types import ReconnectConfig, ReconnectMode
+
+        config = ReconnectConfig(
+            mode=ReconnectMode.FIBONACCI, base_delay=0.5, max_delay=60.0, jitter=False
+        )
+        manager = ConnectionManager("ws://x/wse", reconnect=config)
+        delays = []
+        for attempt in range(5):
+            manager._reconnect_attempts = attempt
+            delays.append(manager._calculate_delay())
+        assert delays == [0.5, 0.5, 1.0, 1.5, 2.5]

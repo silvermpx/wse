@@ -55,6 +55,9 @@ With encryption on, a 3.x client refuses to start without a pinned key, `e2e_una
 - `send()` returns `SendResult` (`SENT`, `QUEUED`, `FAILED`); the offline queue is opt-in (`offline_queue=True`).
 - Every close except an auth rejection reconnects; `connect()` raises `WSEAuthError` at once on a rejected token.
 - `wire_format="msgpack"` now sends msgpack too.
+- Nothing is sent before the server takes the connection (`server_ready`); with encryption, a session the server does not confirm within 10 s fails with `WSEEncryptionError` instead of going on.
+- An application that reads the stream holds the socket back when it falls behind (`queue_size`), instead of losing the oldest events.
+- `subscribe()` and `unsubscribe()` while disconnected return False, and apply on the next connection.
 
 ### TypeScript client
 

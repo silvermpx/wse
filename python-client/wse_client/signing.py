@@ -63,6 +63,10 @@ def key_id(public_key: bytes) -> str:
     return hashlib.sha256(public_key).digest()[:8].hex()
 
 
+# A signed message's `n`: 1 to this many characters, as the server takes it.
+MAX_NONCE_LEN = 128
+
+
 def generate_signing_key() -> Any:
     """A new ECDSA P-256 private key for this client's signed messages.
 

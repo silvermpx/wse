@@ -121,6 +121,13 @@ Upgrading from 2.x: see
   written for, and signed ones are never queued; the TypeScript client
   keeps one session per page; the Python sync client calls its error
   handler before `run_forever()` and `recv()` raise.
+- Python client, as the Rust and TypeScript ones: it sends nothing before
+  the server took the connection, and with encryption never without the
+  sealed `server_ready` (which names the key a bound session proves); it
+  answers sealed server pings; topics subscribed or dropped while
+  disconnected apply on the next connection; an application that reads
+  the stream slowly holds the socket back instead of losing events; and
+  handlers hear `connected`, `disconnected` and subscription replies.
 - The Rust utilities (filters, queues, transformer, msgpack) follow their
   documentation.
 

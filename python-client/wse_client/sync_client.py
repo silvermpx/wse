@@ -159,6 +159,9 @@ class SyncWSEClient:
 
         self._lock = threading.Lock()
         self._session: _Session | None = None
+        # The application reads the stream (recv, run_forever): from then on
+        # a full stream holds the client back instead of dropping.
+        self._reading = False
         self._running = False
         # The client ended and its error handler runs: the end reaches the
         # stream once it returns.
@@ -356,6 +359,7 @@ class SyncWSEClient:
             WSEAuthError / WSEEncryptionError: Why the client ended for good.
         """
         try:
+            self._reading = True
             item = self._event_queue.get(timeout=timeout)
         except queue.Empty:
             raise WSETimeoutError("recv() timed out")
@@ -412,6 +416,7 @@ class SyncWSEClient:
 
         while True:
             try:
+                self._reading = True
                 item = self._event_queue.get(timeout=1.0)
             except queue.Empty:
                 if not self._running and not self._ending and self._event_queue.empty():
@@ -609,7 +614,7 @@ class SyncWSEClient:
             async for event in client:
                 if self._session is not session:
                     break
-                self._put_event(event)
+                await self._hand_over(event, session)
         except asyncio.CancelledError:
             # close() or an abandoned connect(): finish the teardown below.
             current = asyncio.current_task()
@@ -676,6 +681,20 @@ class SyncWSEClient:
         thread = session.thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=join_timeout)
+
+    async def _hand_over(self, event: WSEEvent, session: _Session) -> None:
+        """Into the stream recv() and run_forever() read. Once the
+        application reads it, a full stream holds the client back, and its
+        socket with it: nothing is dropped. Before that the oldest goes."""
+        while self._session is session:
+            try:
+                self._event_queue.put_nowait(event)
+                return
+            except queue.Full:
+                if not self._reading:
+                    self._put_event(event)
+                    return
+                await asyncio.sleep(0.005)
 
     def _put_event(self, event: WSEEvent) -> None:
         try:

@@ -189,6 +189,60 @@ class TestEncryption:
             srv.stop()
 
 
+class TestSessionHealth:
+    @pytest.mark.asyncio
+    @needs_crypto
+    async def test_sealed_server_pings_are_answered(self, server_port):
+        # Idle for 3 s without a frame from the client closes it; the
+        # client's own heartbeat comes every 15 s, so only its answers to the
+        # server's sealed pings keep it open.
+        srv = start_server(
+            server_port, e2e_identity_key=identity_key(), ping_interval=1, idle_timeout=3
+        )
+        try:
+            client = client_for(
+                server_port, encryption=True, e2e_server_keys=[srv.e2e_identity_public_key()]
+            )
+            lost = []
+            client.on("disconnected")(lost.append)
+            await client.connect()
+            await asyncio.sleep(4.5)
+            assert client.is_connected and lost == []
+            await client.disconnect()
+        finally:
+            srv.stop()
+
+    @pytest.mark.asyncio
+    @needs_crypto
+    async def test_a_session_the_server_never_confirms_sends_nothing(
+        self, server_port, monkeypatch
+    ):
+        import wse_client.client as client_mod
+
+        monkeypatch.setattr(client_mod, "SERVER_READY_TIMEOUT", 1.0)
+        # No jwt_secret and no accept_connection(): the session opens, the
+        # sealed server_ready never comes.
+        srv = RustWSEServer("127.0.0.1", server_port, e2e_identity_key=identity_key())
+        srv.enable_drain_mode()
+        srv.start()
+        try:
+            client = wse_client.AsyncWSEClient(
+                f"ws://127.0.0.1:{server_port}/wse",
+                topics=["news"],
+                encryption=True,
+                e2e_server_keys=[srv.e2e_identity_public_key()],
+                reconnect=None,
+            )
+            with pytest.raises(wse_client.WSEEncryptionError, match="server_ready"):
+                await client.connect()
+            await asyncio.sleep(0.2)
+            events = srv.drain_inbound(64, 50)
+            assert not [e for e in events if e[0] == "msg"]
+            await client.disconnect()
+        finally:
+            srv.stop()
+
+
 class TestApplicationAccepts:
     """A server without jwt_secret: the application accepts each connection."""
 
