@@ -1062,7 +1062,7 @@ impl<H: Handler> Session<H> {
 fn rfc3339_ms(ms: u64) -> String {
     let secs = ms / 1000;
     let (days, of_day) = (secs / 86_400, secs % 86_400);
-    // Days since 1970-01-01 to a civil date (H. Hinnant's algorithm).
+    // Days since the epoch to a civil date (Howard Hinnant's algorithm).
     let z = days as i64 + 719_468;
     let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
