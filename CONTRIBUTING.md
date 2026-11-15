@@ -39,6 +39,14 @@ cargo test -p wse-protocol
 cargo test -p wse-client
 cargo test -p wse-client --no-default-features
 
+# The pure-Rust crypto the client has in the browser, natively
+RUSTFLAGS="--cfg wse_rustcrypto" CARGO_TARGET_DIR=target/rustcrypto \
+  cargo test -p wse-protocol -p wse-client --lib --tests
+
+# The client in the browser (wasm32), in Node 22, against the server example:
+# rustup target add wasm32-unknown-unknown; cargo install wasm-bindgen-cli
+# at the version in Cargo.lock; then see crates/wse-client/tests/browser.rs
+
 # Python server tests
 pytest tests/
 

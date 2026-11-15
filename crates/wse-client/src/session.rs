@@ -9,8 +9,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::time::Instant;
-use tokio_tungstenite::tungstenite::Utf8Bytes;
+use web_time::Instant;
 
 use crate::client::Shared;
 use crate::decode::{self, Envelope, epoch_of};
@@ -31,7 +30,7 @@ const HELD_MAX: usize = 1000;
 /// answer them.
 const UNANSWERED_MAX: u32 = 2;
 
-type Map<V> = HashMap<Box<str>, V, ahash::RandomState>;
+type Map<V> = HashMap<Box<str>, V, foldhash::fast::RandomState>;
 
 /// A topic waiting for the server to replay what it missed.
 struct Hole {
@@ -55,7 +54,7 @@ struct Topic {
 
 /// What the session asks of the connection.
 pub(crate) enum Outgoing {
-    Text(Utf8Bytes),
+    Text(String),
 }
 
 pub(crate) struct Session<H> {
@@ -596,7 +595,7 @@ impl<H: Handler> Session<H> {
             );
             push_json(&mut text, &topics);
             text.push_str("},\"v\":1}");
-            self.outbox.push(Outgoing::Text(text.into()));
+            self.outbox.push(Outgoing::Text(text));
         }
     }
 
@@ -766,7 +765,7 @@ impl<H: Handler> Session<H> {
         let pong = format!(
             r#"{{"c":"WSE","t":"PONG","p":{{"client_timestamp":{now},"server_timestamp":{echoed}}},"v":1}}"#
         );
-        self.outbox.push(Outgoing::Text(pong.into()));
+        self.outbox.push(Outgoing::Text(pong));
     }
 
     fn on_server_ready(&mut self, message: &Message<'_>) {
@@ -930,7 +929,7 @@ struct SigningKey {
 
 /// A `subscription_update` subscribing to `topics`, recovering from
 /// `positions`.
-fn subscription(topics: &[&str], positions: &[(&str, Position)]) -> Utf8Bytes {
+fn subscription(topics: &[&str], positions: &[(&str, Position)]) -> String {
     let mut text =
         String::from(r#"{"c":"WSE","t":"subscription_update","p":{"action":"subscribe","topics":"#);
     push_json(&mut text, topics);
@@ -950,7 +949,7 @@ fn subscription(topics: &[&str], positions: &[(&str, Position)]) -> Utf8Bytes {
         text.push('}');
     }
     text.push_str("},\"v\":1}");
-    text.into()
+    text
 }
 
 fn push_json<T: serde::Serialize + ?Sized>(text: &mut String, value: &T) {
@@ -959,14 +958,24 @@ fn push_json<T: serde::Serialize + ?Sized>(text: &mut String, value: &T) {
 }
 
 pub(crate) fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// The client's heartbeat as a message, where the WebSocket has no pings of
+/// its own to send (the browser's).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub(crate) fn ping() -> String {
+    format!(
+        r#"{{"c":"WSE","t":"ping","p":{{"timestamp":{}}},"v":1}}"#,
+        now_ms()
+    )
 }
 
 /// The first frame of a connection, with the end-to-end offer when it
 /// opens a session.
-pub(crate) fn client_hello(compression: bool, e2e: Option<serde_json::Value>) -> Utf8Bytes {
+pub(crate) fn client_hello(compression: bool, e2e: Option<serde_json::Value>) -> String {
     let mut p = serde_json::json!({
         "client_version": env!("CARGO_PKG_VERSION"),
         "protocol_version": 1,
@@ -979,9 +988,7 @@ pub(crate) fn client_hello(compression: bool, e2e: Option<serde_json::Value>) ->
     if let Some(e2e) = e2e {
         p["e2e"] = e2e;
     }
-    serde_json::json!({"c": "WSE", "t": "client_hello", "p": p, "v": 1})
-        .to_string()
-        .into()
+    serde_json::json!({"c": "WSE", "t": "client_hello", "p": p, "v": 1}).to_string()
 }
 
 #[cfg(test)]

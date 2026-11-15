@@ -8,7 +8,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde::Deserialize;
 
-use tokio_tungstenite::tungstenite::Utf8Bytes;
+use bytestring::ByteString;
 
 use crate::error::Error;
 
@@ -188,7 +188,7 @@ fn keep(frame: Option<&Bytes>, part: &[u8]) -> Bytes {
 
 fn keep_str(frame: Option<&Bytes>, part: &str) -> Text {
     // Bytes of a `str`: always UTF-8.
-    Text(Utf8Bytes::try_from(keep(frame, part.as_bytes())).unwrap_or_default())
+    Text(ByteString::try_from(keep(frame, part.as_bytes())).unwrap_or_default())
 }
 
 fn within(frame: &[u8], part: &[u8]) -> bool {
@@ -199,11 +199,11 @@ fn within(frame: &[u8], part: &[u8]) -> bool {
 
 /// UTF-8 text kept as shared bytes, checked once.
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub(crate) struct Text(Utf8Bytes);
+pub(crate) struct Text(ByteString);
 
 impl Text {
     pub(crate) fn as_str(&self) -> &str {
-        self.0.as_str()
+        &self.0
     }
 }
 

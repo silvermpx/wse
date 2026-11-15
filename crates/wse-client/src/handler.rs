@@ -7,6 +7,20 @@ use std::time::Duration;
 use crate::error::Error;
 use crate::message::{Message, Position};
 
+/// `Send`, except in the browser: a handler there may hold what the page
+/// has, and runs on its one thread.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MaybeSend: Send {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send> MaybeSend for T {}
+
+/// `Send`, except in the browser: a handler there may hold what the page
+/// has, and runs on its one thread.
+#[cfg(target_arch = "wasm32")]
+pub trait MaybeSend {}
+#[cfg(target_arch = "wasm32")]
+impl<T> MaybeSend for T {}
+
 /// What the application does with what the server sends.
 ///
 /// The client calls it from the connection's own task, in the order the
@@ -14,7 +28,7 @@ use crate::message::{Message, Position};
 /// the connection while it runs: hand long work to a task of its own.
 ///
 /// A closure taking `&Message` is a handler too.
-pub trait Handler: Send + 'static {
+pub trait Handler: MaybeSend + 'static {
     /// A message for the application: everything the server sends but its
     /// own protocol messages, duplicates dropped and topic messages in
     /// order.
@@ -31,17 +45,18 @@ pub trait Handler: Send + 'static {
     }
 
     /// Called before each frame is read. Waiting here holds the server back
-    /// while the application catches up; the heartbeat and sends go on
-    /// meanwhile, and the wait may be dropped for them and begun again: it
-    /// must lose nothing when dropped.
-    fn ready(&mut self) -> impl Future<Output = ()> + Send {
+    /// while the application catches up (in the browser, which cannot hold
+    /// a WebSocket back, the frames wait in memory); the heartbeat and sends
+    /// go on meanwhile, and the wait may be dropped for them and begun
+    /// again: it must lose nothing when dropped.
+    fn ready(&mut self) -> impl Future<Output = ()> + MaybeSend {
         std::future::ready(())
     }
 }
 
 impl<F> Handler for F
 where
-    F: FnMut(&Message<'_>) + Send + 'static,
+    F: FnMut(&Message<'_>) + MaybeSend + 'static,
 {
     fn message(&mut self, message: &Message<'_>) {
         self(message)

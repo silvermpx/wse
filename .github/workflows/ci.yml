@@ -343,6 +343,67 @@ jobs:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
 
   # ---------------------------------------------------------------------------
+  # Rust: the client in the browser (wasm32), run in Node against the
+  # `server` example; and its pure-Rust crypto natively, against the
+  # server's tests and the shared vectors.
+  # ---------------------------------------------------------------------------
+  rust-wasm:
+    name: Rust client (browser)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: ". -> target"
+          key: wasm
+
+      # Node 22 has the WebSocket the browser has.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: wasm-bindgen test runner (the version in Cargo.lock)
+        run: |
+          version="$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')"
+          if [ "$(wasm-bindgen-test-runner --version 2>/dev/null)" != "wasm-bindgen-test-runner ${version}" ]; then
+            cargo install wasm-bindgen-cli --version "$version" --locked
+          fi
+
+      - name: Clippy (wasm32)
+        run: cargo clippy -p wse-client --locked --target wasm32-unknown-unknown --all-targets -- -D warnings
+
+      - name: The browser client against a server
+        run: |
+          cargo build -p wse-client --locked --example server
+          WSE_PORT=5017 target/debug/examples/server > server.log 2>&1 &
+          for _ in $(seq 1 100); do grep -q '^signing_public_key ' server.log && break; sleep 0.1; done
+          cat server.log
+          WSE_TEST_URL="$(sed -n 's/^url //p' server.log)" \
+          WSE_TEST_IDENTITY="$(sed -n 's/^e2e_identity_public_key //p' server.log)" \
+          WSE_TEST_SIGNING="$(sed -n 's/^signing_public_key //p' server.log)" \
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+            cargo test -p wse-client --locked --target wasm32-unknown-unknown --test browser
+
+      - name: The pure-Rust crypto, natively
+        env:
+          RUSTFLAGS: --cfg wse_rustcrypto
+          CARGO_TARGET_DIR: target/rustcrypto
+        run: |
+          cargo test -p wse-protocol --locked --lib --tests
+          cargo test -p wse-client --locked --lib --tests
+
+  # ---------------------------------------------------------------------------
   # Rust: the `fips` build (aws-lc-rs from its FIPS 140-3 module), so the
   # option keeps compiling and its tests keep passing. It needs CMake and Go,
   # both on the runner image.
@@ -584,7 +645,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, checks, secrets, client, python-client, lint, rust-lint, rust-test, rust-fips, rust-msrv, test, benchmarks, security]
+    needs: [changes, checks, secrets, client, python-client, lint, rust-lint, rust-test, rust-wasm, rust-fips, rust-msrv, test, benchmarks, security]
     runs-on: ubuntu-latest
     steps:
       - name: Every job passed or was skipped

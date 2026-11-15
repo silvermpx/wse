@@ -596,7 +596,7 @@ Two compression layers:
 cargo add wse-client
 ```
 
-On tokio: a handler reads each message in place from its frame and decodes its payload into the application's types without copies; or a stream of owned messages. Topics with recovery, reconnects, msgpack, E2E encryption and signed messages.
+On tokio, and in the browser (WebAssembly, for Leptos, Yew, Dioxus): a handler reads each message in place from its frame and decodes its payload into the application's types without copies; or a stream of owned messages. Topics with recovery, reconnects, msgpack, E2E encryption and signed messages.
 
 ```rust
 let mut config = wse_client::Config::new("ws://localhost:5006/wse");

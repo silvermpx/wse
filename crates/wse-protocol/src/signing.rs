@@ -39,8 +39,8 @@ pub fn key_id(public_key: &[u8]) -> String {
 
 /// Now, in milliseconds since the Unix epoch: the clock of `ts`.
 pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
 }
 
@@ -56,7 +56,7 @@ pub fn signed_input(label: &[u8], body: &str) -> Vec<u8> {
 /// client's on the server, the server's on a client.
 pub struct PublicKey {
     pub kid: String,
-    key: aws_lc_rs::signature::ParsedPublicKey,
+    key: crypto::VerifyingKey,
 }
 
 impl PublicKey {
@@ -65,11 +65,7 @@ impl PublicKey {
         if public_key.len() != crypto::P256_PUBLIC_LEN || public_key[0] != 0x04 {
             return None;
         }
-        let key = aws_lc_rs::signature::ParsedPublicKey::new(
-            &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED,
-            public_key,
-        )
-        .ok()?;
+        let key = crypto::VerifyingKey::from_sec1(public_key)?;
         Some(Self {
             kid: key_id(public_key),
             key,
@@ -108,9 +104,7 @@ impl PublicKey {
 
     /// Whether `signature` (`r || s`) signs `label` and `body` with this key.
     pub fn verifies(&self, label: &[u8], body: &str, signature: &[u8]) -> bool {
-        self.key
-            .verify_sig(&signed_input(label, body), signature)
-            .is_ok()
+        self.key.verifies(&signed_input(label, body), signature)
     }
 }
 
@@ -269,13 +263,9 @@ impl<'de> serde::de::Visitor<'de> for ExactVisitor {
 mod tests {
     use super::*;
 
-    fn pair() -> (aws_lc_rs::signature::EcdsaKeyPair, PublicKey) {
-        use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
-        let rng = aws_lc_rs::rand::SystemRandom::new();
-        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
-        let pair =
-            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref()).unwrap();
-        let key = PublicKey::from_sec1(pair.public_key().as_ref()).unwrap();
+    fn pair() -> (IdentityKey, PublicKey) {
+        let pair = IdentityKey::from_pkcs8(&crypto::generate_p256_pkcs8().unwrap()).unwrap();
+        let key = PublicKey::from_sec1(pair.public_key()).unwrap();
         (pair, key)
     }
 
@@ -283,8 +273,7 @@ mod tests {
     fn a_jwk_names_the_same_key_as_its_point() {
         let (_, key) = pair();
         let (other, _) = pair();
-        use aws_lc_rs::signature::KeyPair;
-        let point = other.public_key().as_ref();
+        let point = other.public_key();
         let url = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let jwk = serde_json::json!({
             "kty": "EC", "crv": "P-256",
@@ -303,13 +292,8 @@ mod tests {
 
     #[test]
     fn a_signer_signs_under_its_label_only() {
-        let rng = aws_lc_rs::rand::SystemRandom::new();
-        let pkcs8 = aws_lc_rs::signature::EcdsaKeyPair::generate_pkcs8(
-            &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
-            &rng,
-        )
-        .unwrap();
-        let signer = Signer::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let pkcs8 = crypto::generate_p256_pkcs8().unwrap();
+        let signer = Signer::from_pkcs8(&pkcs8).unwrap();
         let body = r#"{"t":"order","ts":1,"n":"a"}"#;
         let env: Value =
             serde_json::from_str(&signer.sign_envelope(CLIENT_LABEL, body).unwrap()).unwrap();

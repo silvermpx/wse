@@ -1159,7 +1159,8 @@ subscriber; the server's log target is `wse`.
 The Rust client is [`wse-client`](https://crates.io/crates/wse-client): a
 `Handler` that reads each message in place from its frame, or a stream of
 owned messages; topics with recovery, reconnects, msgpack, E2E encryption
-and signed messages.
+and signed messages. It runs on tokio and in the browser (WebAssembly), where
+the page's cookie carries the token, as with the TypeScript client.
 
 ```bash
 cargo add wse-client tokio --features tokio/full

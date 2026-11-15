@@ -3,11 +3,15 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio_tungstenite::tungstenite::handshake::client::Request;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 
 use crate::error::Error;
@@ -64,7 +68,7 @@ impl Reconnect {
             secs = self.max_delay.as_secs_f64();
         }
         if self.jitter {
-            secs += secs * 0.2 * (fastrand::f64() - 0.5);
+            secs += secs * 0.2 * (random() - 0.5);
         }
         Duration::from_secs_f64(secs.clamp(0.0, 300.0))
     }
@@ -109,13 +113,39 @@ impl Encryption {
     }
 }
 
+/// A number in [0, 1), for the jitter of the waits.
+#[cfg(not(target_arch = "wasm32"))]
+fn random() -> f64 {
+    fastrand::f64()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn random() -> f64 {
+    js_sys::Math::random()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 type TokenFuture = Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
+#[cfg(target_arch = "wasm32")]
+type TokenFuture = Pin<Box<dyn Future<Output = Result<String, String>>>>;
 
 /// Fetches the token for each connection attempt, so an expired one is
-/// replaced without restarting the client.
+/// replaced without restarting the client. In the browser, which sends the
+/// page's cookies itself and no header, it is asked before each attempt (to
+/// refresh the cookie, say) and what it returns is not sent.
 #[derive(Clone)]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct TokenProvider(Arc<dyn Fn() -> TokenFuture + Send + Sync>);
 
+/// Fetches the token for each connection attempt, so an expired one is
+/// replaced without restarting the client. In the browser, which sends the
+/// page's cookies itself and no header, it is asked before each attempt (to
+/// refresh the cookie, say) and what it returns is not sent.
+#[derive(Clone)]
+#[cfg(target_arch = "wasm32")]
+pub struct TokenProvider(std::rc::Rc<dyn Fn() -> TokenFuture>);
+
+#[cfg(not(target_arch = "wasm32"))]
 impl TokenProvider {
     pub fn new<F, Fut, E>(provider: F) -> Self
     where
@@ -128,7 +158,24 @@ impl TokenProvider {
             Box::pin(async move { token.await.map_err(|e| e.to_string()) })
         }))
     }
+}
 
+#[cfg(target_arch = "wasm32")]
+impl TokenProvider {
+    pub fn new<F, Fut, E>(provider: F) -> Self
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: Future<Output = Result<String, E>> + 'static,
+        E: fmt::Display,
+    {
+        Self(std::rc::Rc::new(move || {
+            let token = provider();
+            Box::pin(async move { token.await.map_err(|e| e.to_string()) })
+        }))
+    }
+}
+
+impl TokenProvider {
     pub(crate) async fn token(&self) -> Result<String, String> {
         (self.0)().await
     }
@@ -148,7 +195,8 @@ pub struct Config {
     /// `ws://host:port/wse` or `wss://...`.
     pub url: String,
     /// The JWT, sent in the `access_token` cookie and as
-    /// `Authorization: Bearer`.
+    /// `Authorization: Bearer`. Not in the browser: it sends the page's
+    /// cookies itself, and no header.
     pub token: Option<String>,
     /// Asked for the token before each connection attempt; takes the place
     /// of `token`. A refused token is then fetched again (three times in a
@@ -178,14 +226,15 @@ pub struct Config {
     /// before reporting the gap (3 s); zero reports it at once.
     pub recovery_timeout: Duration,
     pub reconnect: Reconnect,
-    /// More headers for the upgrade request.
+    /// More headers for the upgrade request (not in the browser, which
+    /// sends none).
     pub headers: Vec<(String, String)>,
     /// Messages waiting to be sent at most; past it `try_send` fails and
     /// `send` waits (1024).
     pub send_queue: usize,
     /// The TLS configuration for `wss://`; by default the Mozilla root
-    /// certificates.
-    #[cfg(feature = "aws-lc")]
+    /// certificates. In the browser TLS is the browser's.
+    #[cfg(all(feature = "aws-lc", not(target_arch = "wasm32")))]
     pub tls: Option<Arc<rustls::ClientConfig>>,
     /// End-to-end encryption; none by default.
     #[cfg(feature = "aws-lc")]
@@ -223,7 +272,7 @@ impl Config {
             reconnect: Reconnect::default(),
             headers: Vec::new(),
             send_queue: 1024,
-            #[cfg(feature = "aws-lc")]
+            #[cfg(all(feature = "aws-lc", not(target_arch = "wasm32")))]
             tls: None,
             #[cfg(feature = "aws-lc")]
             encryption: None,
@@ -239,7 +288,7 @@ impl Config {
         let scheme = self.url.split_once("://").map(|(scheme, _)| scheme);
         match scheme {
             Some("ws") => {}
-            Some("wss") if cfg!(feature = "aws-lc") => {}
+            Some("wss") if cfg!(any(feature = "aws-lc", target_arch = "wasm32")) => {}
             Some("wss") => {
                 return Err(Error::Config(
                     "wss:// needs the aws-lc feature (TLS)".to_owned(),
@@ -260,12 +309,13 @@ impl Config {
         if self.send_queue == 0 {
             return Err(Error::Config("send_queue must be above zero".to_owned()));
         }
-        self.request(None, false).map(drop)
+        #[cfg(not(target_arch = "wasm32"))]
+        self.request(None, false)?;
+        Ok(())
     }
 
-    /// The upgrade request, with the token and what the client asks of the
-    /// server in the query.
-    pub(crate) fn request(&self, token: Option<&str>, e2e: bool) -> Result<Request, Error> {
+    /// The URL, with what the client asks of the server in the query.
+    pub(crate) fn url(&self, e2e: bool) -> String {
         let mut url = self.url.clone();
         let mut param = |kv: &str| {
             url.push(if url.contains('?') { '&' } else { '?' });
@@ -282,7 +332,15 @@ impl Config {
         if e2e {
             param("e2e=1");
         }
-        let mut request = url
+        url
+    }
+
+    /// The upgrade request, with the token and what the client asks of the
+    /// server in the query.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn request(&self, token: Option<&str>, e2e: bool) -> Result<Request, Error> {
+        let mut request = self
+            .url(e2e)
             .into_client_request()
             .map_err(|e| Error::Config(format!("{}: {e}", self.url)))?;
         let headers = request.headers_mut();
@@ -317,6 +375,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn the_request_carries_the_token_and_the_wishes() {
         let mut config = Config::new("ws://127.0.0.1:5006/wse?room=1");
         config.format = Format::Msgpack;

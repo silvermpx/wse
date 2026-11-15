@@ -1,0 +1,456 @@
+//! The connection's task in the browser: the browser's WebSocket, its
+//! events and timers, around the same session as everywhere else.
+//!
+//! The browser sends the page's cookies with the upgrade and no header, so
+//! the server takes the client by its cookie. It answers the server's
+//! protocol pings itself, so the client's heartbeat is a message.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use tokio::sync::{mpsc, watch};
+use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
+use web_sys::{BinaryType, CloseEvent, Event as DomEvent, MessageEvent, WebSocket};
+use web_time::Instant;
+
+use crate::client::{Control, Shared, Status};
+use crate::config::Config;
+use crate::decode::Decoder;
+use crate::error::Error;
+use crate::frames::{self, Data};
+use crate::handler::{Event, Handler};
+use crate::policy::{First, Lost, Next, Policy};
+use crate::security::{Keys, Sealing};
+use crate::session::{self, Outgoing, Session};
+
+/// Messages the application queued that go out in one turn.
+const SEND_BATCH: usize = 256;
+/// Events taken in one go when they came together.
+const READ_BATCH: usize = 64;
+/// The close code a browser may send of the normal ones.
+const CLOSE_NORMAL: u16 = 1000;
+
+/// What the WebSocket tells.
+enum Happened {
+    Open,
+    Text(String),
+    Binary(Bytes),
+    Error,
+    Close { code: u16, reason: String },
+}
+
+/// A browser WebSocket and its handlers, which report to `events`.
+struct Socket {
+    ws: WebSocket,
+    events: mpsc::UnboundedReceiver<Happened>,
+    _open: Closure<dyn FnMut(DomEvent)>,
+    _message: Closure<dyn FnMut(MessageEvent)>,
+    _error: Closure<dyn FnMut(DomEvent)>,
+    _close: Closure<dyn FnMut(CloseEvent)>,
+}
+
+impl Socket {
+    fn open(url: &str) -> Result<Self, Error> {
+        let ws = WebSocket::new(url).map_err(|e| Error::Connect(describe(&e)))?;
+        ws.set_binary_type(BinaryType::Arraybuffer);
+        let (tx, events) = mpsc::unbounded_channel();
+        let on_open = {
+            let tx = tx.clone();
+            Closure::<dyn FnMut(DomEvent)>::new(move |_| {
+                let _ = tx.send(Happened::Open);
+            })
+        };
+        let on_message = {
+            let tx = tx.clone();
+            Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+                let data = event.data();
+                let happened = match data.as_string() {
+                    Some(text) => Happened::Text(text),
+                    None => match data.dyn_into::<js_sys::ArrayBuffer>() {
+                        Ok(buffer) => {
+                            Happened::Binary(Bytes::from(js_sys::Uint8Array::new(&buffer).to_vec()))
+                        }
+                        Err(_) => return,
+                    },
+                };
+                let _ = tx.send(happened);
+            })
+        };
+        let on_error = {
+            let tx = tx.clone();
+            Closure::<dyn FnMut(DomEvent)>::new(move |_| {
+                let _ = tx.send(Happened::Error);
+            })
+        };
+        let on_close = Closure::<dyn FnMut(CloseEvent)>::new(move |event: CloseEvent| {
+            let _ = tx.send(Happened::Close {
+                code: event.code(),
+                reason: event.reason(),
+            });
+        });
+        ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+        ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+        ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+        ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+        Ok(Self {
+            ws,
+            events,
+            _open: on_open,
+            _message: on_message,
+            _error: on_error,
+            _close: on_close,
+        })
+    }
+
+    fn send(&self, frame: &Frame) -> Result<(), Error> {
+        let sent = match frame {
+            Frame::Text(text) => self.ws.send_with_str(text),
+            Frame::Binary(data) => self.ws.send_with_u8_array(data),
+        };
+        sent.map_err(|e| Error::Connect(describe(&e)))
+    }
+
+    fn close(&self, reason: &str) {
+        let _ = self.ws.close_with_code_and_reason(CLOSE_NORMAL, reason);
+    }
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        // The handlers go with the socket: nothing calls into them after.
+        self.ws.set_onopen(None);
+        self.ws.set_onmessage(None);
+        self.ws.set_onerror(None);
+        self.ws.set_onclose(None);
+        let _ = self.ws.close();
+    }
+}
+
+enum Frame {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+fn describe(error: &wasm_bindgen::JsValue) -> String {
+    error
+        .dyn_ref::<js_sys::Error>()
+        .map(|e| String::from(e.message()))
+        .or_else(|| error.as_string())
+        .unwrap_or_else(|| "the browser refused the WebSocket".to_owned())
+}
+
+/// Waits until `deadline`; forever without one.
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => sleep(deadline.saturating_duration_since(Instant::now())).await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn sleep(duration: Duration) {
+    let ms = duration.as_millis().min(u128::from(u32::MAX)) as u32;
+    gloo_timers::future::TimeoutFuture::new(ms).await;
+}
+
+pub(crate) struct Driver<H> {
+    config: Config,
+    shared: Arc<Shared>,
+    frames: mpsc::Receiver<String>,
+    control: mpsc::UnboundedReceiver<Control>,
+    status: watch::Sender<Status>,
+    decoder: Decoder,
+    keys: Arc<Keys>,
+    session: Session<H>,
+    policy: Policy,
+}
+
+impl<H: Handler> Driver<H> {
+    pub(crate) fn new(
+        config: Config,
+        handler: H,
+        shared: Arc<Shared>,
+        keys: Arc<Keys>,
+        frames: mpsc::Receiver<String>,
+        control: mpsc::UnboundedReceiver<Control>,
+        status: watch::Sender<Status>,
+    ) -> Self {
+        let session = Session::new(
+            handler,
+            Arc::clone(&shared),
+            Arc::clone(&keys),
+            &config.topics,
+            config.recovery_timeout,
+        );
+        Self {
+            decoder: Decoder::new(config.max_message_size),
+            keys,
+            config,
+            shared,
+            frames,
+            control,
+            status,
+            session,
+            policy: Policy::default(),
+        }
+    }
+
+    pub(crate) async fn run(mut self, mut first: First) {
+        let end = loop {
+            let lost = match self.open().await {
+                None => Lost::Shutdown,
+                Some(Ok(socket)) => self.serve(socket, &mut first).await,
+                Some(Err(error)) => Lost::Failed(error),
+            };
+            self.session.close();
+            // Messages queued for the lost connection go with it.
+            while self.frames.try_recv().is_ok() {}
+            match self.policy.after(lost, &self.config, &mut first) {
+                Next::Stop(end) => break end,
+                Next::Retry(disconnected) => {
+                    let retry_in = disconnected.retry_in;
+                    self.status.send_replace(Status::Reconnecting);
+                    self.session
+                        .handler
+                        .event(Event::Disconnected(disconnected));
+                    if !self.wait(retry_in).await {
+                        break None;
+                    }
+                }
+            }
+        };
+        self.session.finish();
+        self.shared
+            .ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.session.handler.event(Event::Closed(end.clone()));
+        self.status.send_replace(Status::Closed(end));
+    }
+
+    /// Opens a socket; `None` when the application closed the client
+    /// meanwhile.
+    async fn open(&mut self) -> Option<Result<Socket, Error>> {
+        if let Some(provider) = &self.config.token_provider
+            && let Err(e) = provider.token().await
+        {
+            return Some(Err(Error::Connect(format!("token provider: {e}"))));
+        }
+        let mut socket = match Socket::open(&self.config.url(self.keys.e2e)) {
+            Ok(socket) => socket,
+            Err(error) => return Some(Err(error)),
+        };
+        let deadline = Instant::now() + self.config.connect_timeout;
+        loop {
+            tokio::select! {
+                biased;
+                control = self.control.recv() => match control {
+                    None | Some(Control::Close) => return None,
+                    Some(Control::Reconnect) => {}
+                    Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
+                    Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
+                },
+                happened = socket.events.recv() => match happened {
+                    Some(Happened::Open) => return Some(Ok(socket)),
+                    Some(Happened::Close { code, reason }) => {
+                        return Some(Err(Error::Connect(format!(
+                            "closed before it opened ({code}{}{reason})",
+                            if reason.is_empty() { "" } else { ": " }
+                        ))));
+                    }
+                    Some(_) => {}
+                    None => return Some(Err(Error::Connect("the socket is gone".to_owned()))),
+                },
+                _ = sleep_until(Some(deadline)) => {
+                    return Some(Err(Error::Timeout(format!(
+                        "no upgrade within {:?}",
+                        self.config.connect_timeout
+                    ))));
+                }
+            }
+        }
+    }
+
+    /// Waits before the next attempt, doing what the application asks
+    /// meanwhile. False when it closed the client.
+    async fn wait(&mut self, delay: Duration) -> bool {
+        let until = Instant::now() + delay;
+        loop {
+            tokio::select! {
+                biased;
+                control = self.control.recv() => match control {
+                    None | Some(Control::Close) => return false,
+                    Some(Control::Reconnect) => return true,
+                    Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
+                    Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
+                },
+                Some(_) = self.frames.recv() => {}
+                _ = sleep_until(Some(until)) => return true,
+            }
+        }
+    }
+
+    /// One connection, until it ends.
+    async fn serve(&mut self, mut socket: Socket, first: &mut First) -> Lost {
+        let sealing = match self.keys.offer() {
+            Ok(sealing) => sealing,
+            Err(error) => return Lost::Fatal(error),
+        };
+        let hello = session::client_hello(
+            self.config.compression,
+            sealing.as_ref().and_then(Sealing::hello),
+        );
+        self.session.open(sealing);
+        self.session.outbox.push(Outgoing::Text(hello));
+        let ready_by = Instant::now() + self.config.ready_timeout;
+        let mut next_beat = Instant::now() + self.config.heartbeat;
+        let mut last_seen = Instant::now();
+
+        loop {
+            if let Err(lost) = self.write(&socket) {
+                return lost;
+            }
+            if let Some(error) = self.session.fatal.take() {
+                socket.close("client error");
+                return Lost::Fatal(error);
+            }
+            if std::mem::take(&mut self.session.became_ready) {
+                self.policy.connected();
+                self.status.send_replace(Status::Connected);
+                if let Some(first) = first.take() {
+                    let _ = first.send(Ok(()));
+                }
+            }
+            let deadline = if self.session.ready {
+                self.session.next_deadline()
+            } else {
+                Some(ready_by)
+            };
+
+            tokio::select! {
+                biased;
+                control = self.control.recv() => match control {
+                    None | Some(Control::Close) => {
+                        let _ = self.write(&socket);
+                        socket.close("client closed");
+                        return Lost::Shutdown;
+                    }
+                    Some(Control::Reconnect) => {
+                        socket.close("reconnecting");
+                        return Lost::Closed { code: None, reason: "reconnect asked".to_owned() };
+                    }
+                    Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
+                    Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
+                },
+                happened = socket.events.recv() => {
+                    // What already came is taken in one go, up to a batch.
+                    let mut happened = happened;
+                    let mut alive = false;
+                    for _ in 0..READ_BATCH {
+                        match happened {
+                            Some(Happened::Text(text)) => {
+                                alive |= frames::on_data(
+                                    &mut self.decoder,
+                                    &mut self.session,
+                                    Data::Text(&text, None),
+                                );
+                            }
+                            Some(Happened::Binary(data)) => {
+                                alive |= frames::on_data(
+                                    &mut self.decoder,
+                                    &mut self.session,
+                                    Data::Binary(&data),
+                                );
+                            }
+                            Some(Happened::Close { code, reason }) => {
+                                return Lost::Closed { code: Some(code), reason };
+                            }
+                            Some(Happened::Open | Happened::Error) => {}
+                            None => {
+                                return Lost::Closed {
+                                    code: None,
+                                    reason: "connection closed".to_owned(),
+                                };
+                            }
+                        }
+                        // What the frame asked for goes out first.
+                        if !self.session.outbox.is_empty()
+                            || self.session.fatal.is_some()
+                            || self.session.became_ready
+                        {
+                            break;
+                        }
+                        match socket.events.try_recv() {
+                            Ok(next) => happened = Some(next),
+                            Err(_) => break,
+                        }
+                    }
+                    if alive {
+                        last_seen = Instant::now();
+                    }
+                }
+                Some(text) = self.frames.recv(), if self.session.ready => {
+                    self.session.outbox.push(Outgoing::Text(text));
+                    for _ in 1..SEND_BATCH {
+                        match self.frames.try_recv() {
+                            Ok(text) => self.session.outbox.push(Outgoing::Text(text)),
+                            Err(_) => break,
+                        }
+                    }
+                }
+                _ = sleep_until(Some(next_beat)) => {
+                    next_beat = Instant::now() + self.config.heartbeat;
+                    if last_seen.elapsed() >= self.config.idle_timeout {
+                        socket.close("idle");
+                        return Lost::Closed {
+                            code: None,
+                            reason: format!("nothing from the server for {:?}", self.config.idle_timeout),
+                        };
+                    }
+                    // Sealed in an end-to-end session, like every message.
+                    if self.session.ready || self.session.sealing.is_none() {
+                        self.session.outbox.push(Outgoing::Text(session::ping()));
+                    }
+                }
+                _ = sleep_until(deadline) => {
+                    if !self.session.ready {
+                        socket.close("not ready");
+                        if self.session.sealing.as_ref().is_some_and(|s| !s.is_open()) {
+                            return Lost::Fatal(Error::Encryption(format!(
+                                "the server did not answer the end-to-end offer within {:?}",
+                                self.config.ready_timeout
+                            )));
+                        }
+                        return Lost::Failed(Error::Timeout(format!(
+                            "the server did not take the connection within {:?}",
+                            self.config.ready_timeout
+                        )));
+                    }
+                    self.session.on_deadline(Instant::now());
+                }
+            }
+        }
+    }
+
+    /// Sends what the session queued: sealed once an end-to-end session is
+    /// open.
+    fn write(&mut self, socket: &Socket) -> Result<(), Lost> {
+        for outgoing in self.session.outbox.drain(..) {
+            let Outgoing::Text(text) = outgoing;
+            let frame = match self.session.sealing.as_mut() {
+                Some(sealing) => match sealing.seal(&text) {
+                    Ok(Some(sealed)) => Frame::Binary(sealed),
+                    Ok(None) => Frame::Text(text),
+                    Err(error @ Error::Encryption(_)) => return Err(Lost::Fatal(error)),
+                    Err(error) => return Err(Lost::Failed(error)),
+                },
+                None => Frame::Text(text),
+            };
+            socket.send(&frame).map_err(|e| Lost::Closed {
+                code: None,
+                reason: e.to_string(),
+            })?;
+        }
+        Ok(())
+    }
+}

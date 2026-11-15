@@ -1,7 +1,8 @@
 # wse-client
 
 The Rust client of [WSE](https://github.com/silvermpx/wse): topics with
-recovery, reconnects, msgpack, end-to-end encryption and signed messages.
+recovery, reconnects, msgpack, end-to-end encryption and signed messages,
+on tokio and in the browser (WebAssembly).
 It speaks the protocol of the TypeScript and Python clients to the same
 servers: [`wse`](https://crates.io/crates/wse) in Rust and
 [`wse-server`](https://pypi.org/project/wse-server/) in Python.
@@ -126,11 +127,29 @@ client
 # }
 ```
 
+## In the browser
+
+The same crate builds for `wasm32-unknown-unknown`, for applications in
+Leptos, Yew, Dioxus and the like, with the same API. There the connection
+is the browser's WebSocket, on the page's task: a handler need not be
+`Send`, and `Client::connect` is awaited from the page's own futures.
+
+- The browser sends the page's cookies with the upgrade and no header, so
+  the server takes the client by its cookie (`jwt_cookie_name`); `token`,
+  `headers` and `tls` do not apply, and a `TokenProvider` is asked before
+  each attempt only to refresh what it must.
+- The browser cannot hold a WebSocket back: messages a handler is not
+  `ready` for wait in memory.
+- End-to-end encryption and signed messages run on RustCrypto there,
+  checked against the same vectors as aws-lc-rs.
+
 ## Features
 
 - `aws-lc` (default): `wss://` with rustls and the Mozilla root
-  certificates, end-to-end encryption and signed messages, on aws-lc-rs.
-  Without it the client speaks `ws://` only.
+  certificates, end-to-end encryption and signed messages, on aws-lc-rs (in
+  the browser: encryption and signing on RustCrypto, TLS the browser's).
+  Without it the client speaks `ws://` only, and in the browser has no
+  encryption or signing.
 - `fips`: aws-lc-rs built from its FIPS 140-3 validated module (needs CMake
   and Go).
 

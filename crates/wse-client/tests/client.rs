@@ -1,5 +1,7 @@
 //! The Rust client against the WSE server, both in this process.
 
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::time::Duration;
 
 use serde_json::json;

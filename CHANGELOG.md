@@ -47,11 +47,14 @@ Upgrading from 2.x: see
     topics with recovery, `send_to_user()` and `disconnect_user()` for
     every connection of a user, the cluster, drain, health and Prometheus
     metrics. The Python package runs the same engine.
-  - `wse-client`: the Rust client. Messages read in place from their frames
-    by a `Handler`, or a stream of owned ones; topics with recovery,
-    reconnects, msgpack, end-to-end encryption and signed messages.
+  - `wse-client`: the Rust client, on tokio and in the browser
+    (WebAssembly, for Leptos, Yew, Dioxus). Messages read in place from
+    their frames by a `Handler`, or a stream of owned ones; topics with
+    recovery, reconnects, msgpack, end-to-end encryption and signed
+    messages.
   - `wse-protocol`: the crypto, end-to-end sessions and signed messages the
-    server and the Rust client share.
+    server and the Rust client share; on aws-lc-rs, and on RustCrypto in the
+    browser.
 - Free-threaded Python wheels (3.14t, 3.15t), and wheels for Alpine Linux
   (musllinux) and Windows on ARM.
 - Every standard JWT algorithm, `issue_token()`, and `reload_jwt_keys()`

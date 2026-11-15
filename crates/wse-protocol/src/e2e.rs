@@ -12,7 +12,9 @@
 //! Frame: `E:` | format 0x01 | type | epoch u32be | seq u64be | ciphertext |
 //! tag. Nonce: the epoch's 4-byte IV | seq. AAD: direction | TH | header.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use web_time::Instant;
 
 use base64::Engine;
 use zeroize::Zeroizing;
@@ -655,13 +657,7 @@ mod tests {
     fn the_handshake_is_signed_and_both_sides_agree() {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
-        let rng = aws_lc_rs::rand::SystemRandom::new();
-        let pkcs8 = aws_lc_rs::signature::EcdsaKeyPair::generate_pkcs8(
-            &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
-            &rng,
-        )
-        .unwrap();
-        let identity = IdentityKey::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let identity = IdentityKey::from_pkcs8(&crypto::generate_p256_pkcs8().unwrap()).unwrap();
         let (client_secret, client_public) = crypto::ecdh_generate().unwrap();
         let offer = serde_json::json!({
             "suites": ["other", SUITE],
@@ -711,13 +707,7 @@ mod tests {
 
     #[test]
     fn a_client_and_a_server_open_a_session() {
-        let rng = aws_lc_rs::rand::SystemRandom::new();
-        let pkcs8 = aws_lc_rs::signature::EcdsaKeyPair::generate_pkcs8(
-            &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
-            &rng,
-        )
-        .unwrap();
-        let identity = IdentityKey::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let identity = IdentityKey::from_pkcs8(&crypto::generate_p256_pkcs8().unwrap()).unwrap();
         let pinned = vec![identity.public_key().to_vec()];
 
         let offer = ClientOffer::new().unwrap();

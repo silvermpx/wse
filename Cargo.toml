@@ -13,7 +13,6 @@ license = "MIT"
 # try_update on the atomics is stable since 1.95.
 rust-version = "1.95"
 repository = "https://github.com/silvermpx/wse"
-homepage = "https://github.com/silvermpx/wse"
 
 # The crates depend on one another at exactly the release's version.
 [workspace.dependencies]

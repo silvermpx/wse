@@ -6,36 +6,51 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-homepage.workspace = true
 readme = "README.md"
 keywords = ["websocket", "pubsub", "realtime", "tokio", "client"]
 categories = ["network-programming", "web-programming::websocket", "asynchronous"]
 
 [dependencies]
-tokio = { version = "1.54.1", features = ["rt", "net", "time", "sync", "macros"] }
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 bytes = "1"
+bytestring = "1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
 rmp = "0.8.15"
 rmp-serde = "1.3.1"
 flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs"] }
-ahash = "0.8.12"
+foldhash = "0.2"
 memchr = "2"
-fastrand = "2"
 tracing = "0.1"
-# TLS (wss://), end-to-end encryption and signing: one crypto library, as in
-# the server, and the server's own E2E and signing code.
+# std::time outside the browser, the browser's clock in it.
+web-time = "1"
+# End-to-end encryption and signing: the server's own code, on aws-lc-rs (in
+# the browser on RustCrypto).
 wse-protocol = { workspace = true, optional = true }
+base64 = { version = "0.23", optional = true }
+
+# Outside the browser: tokio, tokio-tungstenite, rustls for wss://.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.54.1", features = ["rt", "net", "time", "sync", "macros"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
+fastrand = "2"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"], optional = true }
 webpki-roots = { version = "1", optional = true }
-base64 = { version = "0.23", optional = true }
+
+# In the browser: its WebSocket and timers.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.54.1", default-features = false, features = ["sync", "macros"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["BinaryType", "CloseEvent", "Event", "MessageEvent", "WebSocket"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
 
 [features]
 default = ["aws-lc"]
 # wss:// with rustls and the Mozilla root certificates, end-to-end encryption
-# and signed messages, on aws-lc-rs.
+# and signed messages, on aws-lc-rs. In the browser: end-to-end encryption
+# and signed messages on RustCrypto (the browser does TLS).
 aws-lc = [
     "dep:wse-protocol",
     "dep:rustls",
@@ -48,7 +63,11 @@ aws-lc = [
 # aws-lc-rs built from its FIPS 140-3 validated module (needs CMake and Go).
 fips = ["aws-lc", "wse-protocol/fips", "rustls/fips"]
 
-[dev-dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 wse = { path = "../wse" }
 # The chat example reads the terminal.
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "io-std", "io-util"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+fastrand = "2"

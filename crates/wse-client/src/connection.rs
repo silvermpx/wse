@@ -1,5 +1,6 @@
-//! The connection's task: makes the connection, reads and writes its
-//! frames, keeps it alive, and makes it again when it is lost.
+//! The connection's task outside the browser: makes the connection, reads
+//! and writes its frames, keeps it alive, and makes it again when it is
+//! lost.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,59 +8,41 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::sync::{mpsc, watch};
+use tokio::time::MissedTickBehavior;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
-use tokio_tungstenite::tungstenite::{self, Message as Frame, Utf8Bytes};
+use tokio_tungstenite::tungstenite::{self, Message as Frame};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use web_time::Instant;
 
 use crate::client::{Control, Shared, Status};
 use crate::config::Config;
-use crate::decode::{Body, Decoder};
+use crate::decode::Decoder;
 use crate::error::Error;
-use crate::handler::{Disconnected, Event, Handler};
+use crate::frames::{self, Data};
+use crate::handler::{Event, Handler};
+use crate::policy::{First, Lost, Next, Policy};
 use crate::security::{Keys, Sealing};
 use crate::session::{self, Outgoing, Session};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// Close codes that mean the credentials were refused.
-const AUTH_CLOSE_CODES: [u16; 3] = [4401, 4403, 1008];
-/// No end-to-end suite in common: trying again is refused the same way.
-const CLOSE_E2E_UNSUPPORTED: u16 = 4800;
-/// Refused tokens in a row a token provider may replace before the client
-/// gives up.
-const AUTH_ATTEMPTS: u32 = 3;
 /// Messages the application queued that go out in one write.
 const SEND_BATCH: usize = 256;
 /// Frames read in one go when they came together.
 const READ_BATCH: usize = 64;
 
-/// How a connection ended.
-enum Lost {
-    /// The application closed the client.
-    Shutdown,
-    /// The connection went away.
-    Closed { code: Option<u16>, reason: String },
-    /// An attempt failed.
-    Failed(Error),
-    /// The client cannot go on.
-    Fatal(Error),
-}
-
 pub(crate) struct Driver<H> {
     config: Config,
     shared: Arc<Shared>,
-    frames: mpsc::Receiver<Utf8Bytes>,
+    frames: mpsc::Receiver<String>,
     control: mpsc::UnboundedReceiver<Control>,
     status: watch::Sender<Status>,
     decoder: Decoder,
     keys: Arc<Keys>,
     session: Session<H>,
-    /// Attempts since the last connection the server took.
-    attempts: u32,
-    auth_failures: u32,
+    policy: Policy,
 }
 
 impl<H: Handler> Driver<H> {
@@ -68,7 +51,7 @@ impl<H: Handler> Driver<H> {
         handler: H,
         shared: Arc<Shared>,
         keys: Arc<Keys>,
-        frames: mpsc::Receiver<Utf8Bytes>,
+        frames: mpsc::Receiver<String>,
         control: mpsc::UnboundedReceiver<Control>,
         status: watch::Sender<Status>,
     ) -> Self {
@@ -88,13 +71,11 @@ impl<H: Handler> Driver<H> {
             control,
             status,
             session,
-            attempts: 0,
-            auth_failures: 0,
+            policy: Policy::default(),
         }
     }
 
-    pub(crate) async fn run(mut self, first: oneshot::Sender<Result<(), Error>>) {
-        let mut first = Some(first);
+    pub(crate) async fn run(mut self, mut first: First) {
         let end = loop {
             // The attempt goes on while the application asks for things; a
             // close ends it at once.
@@ -121,64 +102,18 @@ impl<H: Handler> Driver<H> {
             self.session.close();
             // Messages queued for the lost connection go with it.
             while self.frames.try_recv().is_ok() {}
-            let (code, reason, error) = match lost {
-                Lost::Shutdown => break None,
-                Lost::Closed { code, reason } => {
-                    let error = close_error(code, &reason);
-                    (code, reason, error)
-                }
-                Lost::Failed(error) => (None, error.to_string(), error),
-                Lost::Fatal(error) => {
-                    if let Some(first) = first.take() {
-                        let _ = first.send(Err(error));
+            match self.policy.after(lost, &self.config, &mut first) {
+                Next::Stop(end) => break end,
+                Next::Retry(disconnected) => {
+                    let retry_in = disconnected.retry_in;
+                    self.status.send_replace(Status::Reconnecting);
+                    self.session
+                        .handler
+                        .event(Event::Disconnected(disconnected));
+                    if !self.wait(retry_in).await {
                         break None;
                     }
-                    break Some(error);
                 }
-            };
-            if let Some(first) = first.take() {
-                // The first connection is the caller's to retry.
-                let _ = first.send(Err(error));
-                break None;
-            }
-            match &error {
-                Error::Auth(_) => {
-                    self.auth_failures += 1;
-                    if self.config.token_provider.is_none() || self.auth_failures >= AUTH_ATTEMPTS {
-                        break Some(error);
-                    }
-                }
-                Error::Encryption(_) | Error::Config(_) => break Some(error),
-                _ => {}
-            }
-            if !self.config.reconnect.enabled {
-                break Some(error);
-            }
-            if let Some(max) = self.config.reconnect.max_attempts
-                && self.attempts >= max
-            {
-                break Some(Error::GaveUp(format!(
-                    "{} attempt(s); last: {error}",
-                    self.attempts
-                )));
-            }
-            let retry_in = self.config.reconnect.delay(self.attempts);
-            self.attempts += 1;
-            self.status.send_replace(Status::Reconnecting);
-            tracing::info!(
-                "[WSE] connection lost ({reason}); attempt {} in {retry_in:?}",
-                self.attempts
-            );
-            self.session
-                .handler
-                .event(Event::Disconnected(Disconnected {
-                    code,
-                    reason,
-                    retry_in,
-                    attempt: self.attempts,
-                }));
-            if !self.wait(retry_in).await {
-                break None;
             }
         };
         self.session.finish();
@@ -192,7 +127,7 @@ impl<H: Handler> Driver<H> {
     /// Waits before the next attempt, doing what the application asks
     /// meanwhile. False when it closed the client.
     async fn wait(&mut self, delay: Duration) -> bool {
-        let until = Instant::now() + delay;
+        let until = tokio::time::Instant::now() + delay;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(until) => return true,
@@ -208,11 +143,7 @@ impl<H: Handler> Driver<H> {
     }
 
     /// One connection, until it ends.
-    async fn serve(
-        &mut self,
-        mut ws: Ws,
-        first: &mut Option<oneshot::Sender<Result<(), Error>>>,
-    ) -> Lost {
+    async fn serve(&mut self, mut ws: Ws, first: &mut First) -> Lost {
         let sealing = match self.keys.offer() {
             Ok(sealing) => sealing,
             Err(error) => return Lost::Fatal(error),
@@ -225,7 +156,7 @@ impl<H: Handler> Driver<H> {
         self.session.outbox.push(Outgoing::Text(hello));
         let ready_by = Instant::now() + self.config.ready_timeout;
         let beat = self.config.heartbeat;
-        let mut heartbeat = tokio::time::interval_at(Instant::now() + beat, beat);
+        let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + beat, beat);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut last_seen = Instant::now();
         let mut flush = false;
@@ -242,8 +173,7 @@ impl<H: Handler> Driver<H> {
                 return Lost::Fatal(error);
             }
             if std::mem::take(&mut self.session.became_ready) {
-                self.attempts = 0;
-                self.auth_failures = 0;
+                self.policy.connected();
                 self.status.send_replace(Status::Connected);
                 if let Some(first) = first.take() {
                     let _ = first.send(Ok(()));
@@ -276,7 +206,7 @@ impl<H: Handler> Driver<H> {
                                 // frames show the server is alive.
                                 alive |= self.session.sealing.is_none();
                             }
-                            Some(Ok(frame)) => alive |= self.on_frame(frame),
+                            Some(Ok(frame)) => alive |= self.on_frame(&frame),
                             Some(Err(e)) => {
                                 return Lost::Closed { code: None, reason: e.to_string() };
                             }
@@ -359,66 +289,13 @@ impl<H: Handler> Driver<H> {
     }
 
     /// A data frame; true when it shows the server is alive.
-    fn on_frame(&mut self, frame: Frame) -> bool {
-        if self.session.sealing.is_some() {
-            return self.on_session_frame(frame);
-        }
-        match frame {
-            Frame::Text(text) => {
-                let bytes: &Bytes = text.as_ref();
-                self.session.on_json(text.as_str(), Some(bytes));
-            }
-            Frame::Binary(data) => match self.decoder.binary(&data) {
-                Ok(Body::Json(json)) => self.session.on_json(json, Some(&data)),
-                Ok(Body::Msgpack(bytes)) => self.session.on_msgpack(bytes, Some(&data)),
-                Ok(Body::Sealed) => {
-                    tracing::warn!("[WSE] sealed frame without an end-to-end session dropped");
-                }
-                Ok(Body::Binary) => self.session.handler.binary(&data),
-                Err(e) => tracing::warn!("[WSE] frame of {} bytes dropped: {e}", data.len()),
-            },
-            _ => {}
-        }
-        true
-    }
-
-    /// A frame on a connection with an end-to-end session: sealed, or one
-    /// of the few that may come before the session opens.
-    fn on_session_frame(&mut self, frame: Frame) -> bool {
-        match frame {
-            Frame::Binary(data) if data.starts_with(b"E:") => {
-                let Some(sealing) = self.session.sealing.as_mut() else {
-                    return false;
-                };
-                match sealing.open(&data) {
-                    Ok(Some(plain)) => {
-                        match plain.strip_prefix(b"M:") {
-                            Some(msgpack) => self.session.on_msgpack(msgpack, None),
-                            None => match std::str::from_utf8(&plain) {
-                                Ok(text) => self.session.on_json(text, None),
-                                Err(_) => tracing::warn!("[WSE] sealed frame not UTF-8 dropped"),
-                            },
-                        }
-                        true
-                    }
-                    // The server's close notice: its close frame follows.
-                    Ok(None) => true,
-                    Err(error) => {
-                        self.session.fail(error);
-                        false
-                    }
-                }
-            }
-            Frame::Text(text) => {
-                self.session.on_unsealed(Some(text.as_str()));
-                false
-            }
-            Frame::Binary(data) => {
-                self.session.on_unsealed(std::str::from_utf8(&data).ok());
-                false
-            }
-            _ => false,
-        }
+    fn on_frame(&mut self, frame: &Frame) -> bool {
+        let data = match frame {
+            Frame::Text(text) => Data::Text(text.as_str(), Some(text.as_ref())),
+            Frame::Binary(data) => Data::Binary(data),
+            _ => return self.session.sealing.is_none(),
+        };
+        frames::on_data(&mut self.decoder, &mut self.session, data)
     }
 
     /// Writes what the session queued, in one flush: sealed once an
@@ -431,13 +308,13 @@ impl<H: Handler> Driver<H> {
         for outgoing in self.session.outbox.drain(..) {
             let Outgoing::Text(text) = outgoing;
             let frame = match self.session.sealing.as_mut() {
-                Some(sealing) => match sealing.seal(text.as_str()) {
+                Some(sealing) => match sealing.seal(&text) {
                     Ok(Some(sealed)) => Frame::Binary(sealed.into()),
-                    Ok(None) => Frame::Text(text),
+                    Ok(None) => Frame::Text(text.into()),
                     Err(error @ Error::Encryption(_)) => return Err(Lost::Fatal(error)),
                     Err(error) => return Err(Lost::Failed(error)),
                 },
-                None => Frame::Text(text),
+                None => Frame::Text(text.into()),
             };
             ws.feed(frame).await.map_err(lost)?;
         }
@@ -540,22 +417,8 @@ async fn poll_once<F: std::future::Future>(future: F) -> Option<F::Output> {
 
 async fn sleep_until(deadline: Option<Instant>) {
     match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
         None => std::future::pending().await,
-    }
-}
-
-/// What a close means for the client.
-fn close_error(code: Option<u16>, reason: &str) -> Error {
-    let what = match code {
-        Some(code) if reason.is_empty() => format!("closed with {code}"),
-        Some(code) => format!("closed with {code}: {reason}"),
-        None => reason.to_owned(),
-    };
-    match code {
-        Some(code) if AUTH_CLOSE_CODES.contains(&code) => Error::Auth(what),
-        Some(CLOSE_E2E_UNSUPPORTED) => Error::Encryption(what),
-        _ => Error::Connect(what),
     }
 }
 

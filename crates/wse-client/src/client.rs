@@ -5,9 +5,11 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio_tungstenite::tungstenite::Utf8Bytes;
 
+#[cfg(target_arch = "wasm32")]
+use crate::browser::Driver;
 use crate::config::Config;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::connection::Driver;
 use crate::error::Error;
 use crate::handler::Handler;
@@ -58,7 +60,7 @@ pub struct Client {
     shared: Arc<Shared>,
     #[cfg_attr(not(feature = "aws-lc"), allow(dead_code))]
     keys: Arc<Keys>,
-    frames: mpsc::Sender<Utf8Bytes>,
+    frames: mpsc::Sender<String>,
     control: mpsc::UnboundedSender<Control>,
     status: watch::Receiver<Status>,
 }
@@ -103,7 +105,11 @@ impl Client {
         let driver = Driver::new(
             config, handler, shared, keys, frames_rx, control_rx, status_tx,
         );
-        tokio::spawn(driver.run(first_tx));
+        let run = driver.run(Some(first_tx));
+        #[cfg(not(target_arch = "wasm32"))]
+        tokio::spawn(run);
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(run);
         match first_rx.await {
             Ok(Ok(())) => Ok(client),
             Ok(Err(error)) => Err(error),
@@ -134,7 +140,7 @@ impl Client {
     pub async fn send_raw(&self, json: impl Into<String>) -> Result<(), Error> {
         self.ready()?;
         self.frames
-            .send(json.into().into())
+            .send(json.into())
             .await
             .map_err(|_| Error::Closed)
     }
@@ -165,17 +171,17 @@ impl Client {
         let n = match n {
             Some(n) => n,
             None => {
-                random = format!("{:032x}", fastrand::u128(..));
+                let mut bytes = [0u8; 16];
+                wse_protocol::crypto::fill_random(&mut bytes)
+                    .map_err(|_| Error::Signing("no random bytes".to_owned()))?;
+                random = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
                 &random
             }
         };
         let text = self
             .keys
             .sign(kind, &payload, &audience, n, crate::session::now_ms())?;
-        self.frames
-            .send(text.into())
-            .await
-            .map_err(|_| Error::Closed)
+        self.frames.send(text).await.map_err(|_| Error::Closed)
     }
 
     /// Subscribes to topics, on this connection and every later one; after
@@ -277,7 +283,7 @@ impl std::fmt::Debug for Client {
 }
 
 /// `{"t": kind, "p": payload}` in one pass.
-fn encode<P: Serialize + ?Sized>(kind: &str, payload: &P) -> Result<Utf8Bytes, Error> {
+fn encode<P: Serialize + ?Sized>(kind: &str, payload: &P) -> Result<String, Error> {
     #[derive(Serialize)]
     struct Out<'a, P: ?Sized> {
         t: &'a str,
@@ -287,6 +293,5 @@ fn encode<P: Serialize + ?Sized>(kind: &str, payload: &P) -> Result<Utf8Bytes, E
         t: kind,
         p: payload,
     })
-    .map(Utf8Bytes::from)
     .map_err(|e| Error::Encode(e.to_string()))
 }

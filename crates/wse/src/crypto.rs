@@ -32,7 +32,7 @@ pub(crate) fn tls_provider() -> Arc<rustls::crypto::CryptoProvider> {
 mod tests {
     #[test]
     fn the_library_is_reported() {
-        assert!(super::LIBRARY.starts_with("aws-lc-rs"));
+        assert!(super::LIBRARY.starts_with("aws-lc-rs") || super::LIBRARY == "RustCrypto");
         assert!(!super::tls_provider().cipher_suites.is_empty());
     }
 }

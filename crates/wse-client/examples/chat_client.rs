@@ -5,15 +5,22 @@
 //!
 //! Other servers: `WSE_URL=wss://...`.
 
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::io::{AsyncBufReadExt, BufReader};
+#[cfg(not(target_arch = "wasm32"))]
 use wse_client::{Config, Event, Incoming};
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(serde::Deserialize)]
 struct Said<'a> {
     from: &'a str,
     text: &'a str,
 }
 
+#[cfg(target_arch = "wasm32")]
+fn main() {}
+
+#[cfg(not(target_arch = "wasm32"))]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = std::env::var("WSE_URL").unwrap_or_else(|_| "ws://127.0.0.1:5006/wse".into());
