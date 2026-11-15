@@ -545,6 +545,7 @@ class TestDeadlinesOfBusyConnections:
 
     @pytest.mark.asyncio
     async def test_its_end_to_end_session_deadline(self, server_port):
+        pytest.importorskip("cryptography")  # the server's identity key
         from tests.test_delivery import identity_key, start_server
 
         srv = start_server(server_port, e2e_identity_key=identity_key())
