@@ -178,6 +178,8 @@ export class ConnectionManager {
   private usesCookieAuth = false;
   private rateLimiter: RateLimiter | null;
   private serverReady = false;
+  // server_hello came from a server of 3.0 or later, which always sends server_ready.
+  private serverSendsReady = false;
   private clientHelloSent = false;
   private connectionId: string | null = null;
   private readonly encryptionRequired: boolean;
@@ -450,7 +452,8 @@ export class ConnectionManager {
     if (ws !== this.ws) return;
 
     const reachedReady = this.serverReady;
-    const authRejected = code === 4401 || code === 4403 || this.authRejectedOnSocket;
+    // 1008: a policy violation, which servers send for a refused token too.
+    const authRejected = code === 4401 || code === 4403 || code === 1008 || this.authRejectedOnSocket;
 
     this.closeQuietly(ws, 4000, reason || 'closed');
     this.teardownSocket(ws);
@@ -458,6 +461,13 @@ export class ConnectionManager {
     logger.info(`[ConnectionManager] WebSocket closed on ${endpoint}: code=${code}${reason ? `, reason=${reason}` : ''}`);
 
     if (this.isDestroyed || this.stopReason !== 'none') return;
+
+    if (code === 4800) {
+      // The server takes no end-to-end session this client speaks: no
+      // attempt would go otherwise.
+      this.failEncryption("the server refused this client's end-to-end encryption (4800)");
+      if (this.stopReason !== 'none') return;
+    }
 
     if (!reachedReady) {
       this.recordAttemptFailure(endpoint);
@@ -576,6 +586,7 @@ export class ConnectionManager {
   /** Reset everything that belongs to one socket. */
   private resetSocketState(): void {
     this.serverReady = false;
+    this.serverSendsReady = false;
     this.clientHelloSent = false;
     this.connectionId = null;
     this.authRejectedOnSocket = false;
@@ -1111,8 +1122,28 @@ export class ConnectionManager {
     this.serverReadyTimer = setTimeout(() => {
       this.serverReadyTimer = null;
       if (socketId !== this.socketId || this.serverReady) return;
+      if (this.encryptionRequired && securityManager.isSessionMode()) {
+        // Fail closed: the sealed server_ready confirms the session (and
+        // names the key a bound session proves); without it nothing goes out.
+        this.failEncryption(`no sealed server_ready within ${timeout}ms`);
+        return;
+      }
+      if (this.serverSendsReady) {
+        // A 3.x server sends server_ready once it takes the connection, and
+        // takes nothing before it: this attempt failed.
+        logger.warn(`[ConnectionManager] No server_ready within ${timeout}ms; reconnecting`);
+        const ws = this.ws;
+        if (ws) {
+          this.closeQuietly(ws, 4000, 'No server_ready');
+          this.teardownSocket(ws);
+        }
+        this.recordAttemptFailure(this.currentEndpoint);
+        this.setState(ConnectionState.RECONNECTING);
+        this.scheduleReconnect();
+        return;
+      }
       logger.info(
-        `[ConnectionManager] No server_ready within ${timeout}ms (server without jwt_secret?); proceeding`
+        `[ConnectionManager] No server_ready within ${timeout}ms from a server before 3.0; proceeding`
       );
       this.handleServerReady({ connection_id: null, synthesized: true });
     }, timeout);
@@ -1124,7 +1155,7 @@ export class ConnectionManager {
     // Sealed: the server says the session is bound to this client's key.
     // Otherwise the token at the upgrade was not this client's (one put in its
     // place on the way), or names no key.
-    if (this.ownThumbprint !== null && !details?.synthesized && details?.cnf?.jkt !== this.ownThumbprint) {
+    if (this.ownThumbprint !== null && details?.cnf?.jkt !== this.ownThumbprint) {
       const ws = this.ws;
       this.closeQuietly(ws, 1000, 'Session not bound');
       this.teardownSocket(ws);
@@ -1282,6 +1313,9 @@ export class ConnectionManager {
     if (typeof payload?.ping_interval === 'number' && payload.ping_interval > 0) {
       this.serverPingInterval = payload.ping_interval;
     }
+    // A server of 3.0 or later always sends server_ready.
+    const major = Number.parseInt(String(payload?.server_version ?? ''), 10);
+    this.serverSendsReady = Number.isFinite(major) && major >= 3;
 
     if (!this.encryptionRequired || this.encryptionState !== 'pending' || this.isDestroyed) return;
 

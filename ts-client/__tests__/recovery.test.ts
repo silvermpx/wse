@@ -98,13 +98,35 @@ afterEach(() => {
 });
 
 describe('offset gaps', () => {
-  it('delivers across a gap, reports it, and keeps delivering', async () => {
+  it('asks for a gap on a live connection and fills it from the replay', async () => {
     start();
     await tick();
     const ws = FakeWebSocket.last();
     await connectServer(ws);
 
     await send(ws, stamped('prices', 1), stamped('prices', 2), stamped('prices', 5), stamped('prices', 6));
+    // Held while the replay is asked for, once for the whole hole.
+    expect(offsets()).toEqual([1, 2]);
+    const requests = ws.messagesOfType('subscription_update');
+    expect(requests).toHaveLength(2);
+    expect(requests[1].p).toMatchObject({
+      action: 'subscribe', topics: ['prices'], recover: true, recovery: { prices: { epoch: EPOCH, offset: 2 } },
+    });
+
+    await send(ws, stamped('prices', 3), stamped('prices', 4), recoveryReply('prices', 6, true));
+    expect(offsets()).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(gaps).toEqual([]);
+    expect(useWSEStore.getState().subscriptions.recoveryState.prices).toEqual({ epoch: EPOCH, offset: 6 });
+  });
+
+  it('delivers across a gap no replay fills, and reports it', async () => {
+    start();
+    await tick();
+    const ws = FakeWebSocket.last();
+    await connectServer(ws);
+
+    await send(ws, stamped('prices', 1), stamped('prices', 2), stamped('prices', 5), stamped('prices', 6));
+    await vi.advanceTimersByTimeAsync(10_000);
 
     expect(offsets()).toEqual([1, 2, 5, 6]);
     expect(gaps).toEqual([{
@@ -114,8 +136,25 @@ describe('offset gaps', () => {
     expect(s.subscriptions.recoveryState.prices).toEqual({ epoch: EPOCH, offset: 6 });
     expect(s.metrics.gapsDetected).toBe(1);
     expect(s.metrics.messagesMissed).toBe(2);
-    // No recovery request storm: the client did not resubscribe per gap.
-    expect(ws.messagesOfType('subscription_update')).toHaveLength(1);
+  });
+
+  it('asks again from where delivery is when the server cut the replay short', async () => {
+    start();
+    await tick();
+    const ws = FakeWebSocket.last();
+    await connectServer(ws);
+
+    await send(ws, stamped('prices', 1), stamped('prices', 9));
+    // The server replays 2..5 of the hole, then stops at its budget.
+    await send(ws, stamped('prices', 2), stamped('prices', 3), stamped('prices', 4), stamped('prices', 5));
+    await send(ws, recoveryReply('prices', 9, false));
+    const requests = ws.messagesOfType('subscription_update');
+    expect(requests).toHaveLength(3);
+    expect(requests[2].p.recovery).toEqual({ prices: { epoch: EPOCH, offset: 5 } });
+
+    await send(ws, stamped('prices', 6), stamped('prices', 7), stamped('prices', 8), recoveryReply('prices', 9, true));
+    expect(offsets()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(gaps).toEqual([]);
   });
 
   it('drops duplicates by (epoch, offset)', async () => {
@@ -161,8 +200,9 @@ describe('offset gaps', () => {
     expect(offsets()).toEqual([7, 0, 8, 1]);
     expect(gaps).toEqual([]);
 
-    // A hole in one stream is reported for that stream alone.
+    // A hole in one stream is asked for, then reported, for that stream alone.
     await send(ws, stamped('prices', 3, '0000000b'));
+    await vi.advanceTimersByTimeAsync(10_000);
     expect(gaps).toEqual([{
       topic: 'prices', epoch: '0000000b', fromOffset: 2, toOffset: 2, missed: 1, reason: 'offset_gap',
     }]);

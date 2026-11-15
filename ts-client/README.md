@@ -306,10 +306,13 @@ When the server runs with `recovery_enabled`, topic publications carry `tp`/`e`/
 (topic, epoch, offset). The client:
 
 - drops duplicates by `(epoch, offset)`;
-- delivers past a gap at once and reports it with `wseGap` (and `stats.gapsDetected` /
-  `stats.messagesMissed`) - a topic is never blacked out;
-- after a reconnect resubscribes with `recover: true` from the **last delivered** offset of each
-  topic, and holds out-of-order messages for up to `recoveryTimeoutMs` while the replay fills the hole;
+- on a gap, asks the server to replay the topic from the **last delivered** offset, on a live
+  connection as after a reconnect, and holds the messages after the hole for up to
+  `recoveryTimeoutMs` while the replay fills it; a replay the server cut at its budget is asked for
+  again from where delivery got to;
+- what no replay fills is delivered past the hole and reported with `wseGap` (and
+  `stats.gapsDetected` / `stats.messagesMissed`): a topic is never blacked out, and a stream the
+  server said it cannot replay is not asked for again;
 - forgets a topic's position when you unsubscribe from it.
 
 ## Encryption
@@ -435,7 +438,7 @@ import { WSE_VERSION, WS_CLIENT_VERSION, WS_PROTOCOL_VERSION, clearWSEStorage } 
   15 s polling); `setCompression()` and `performance.compressionThreshold` reach the server;
   `performance.memoryLimit` bounds the outgoing queue; `MessageOptions.ttl` drops stale messages;
   `diagnostics.sampleRate` times handlers; `diagnostics.healthCheckInterval` sets the heartbeat.
-- `wseRecoveryGap` became `wseGap` (with the missing range) and no longer triggers a resubscribe.
+- `wseRecoveryGap` became `wseGap` (with the missing range), reported once a replay did not fill the hole.
 - The periodic refresh failure event is `wseTokenRefreshFailed` (was `authTokenExpired`, which also
   closed the connection).
 - Saved subscriptions are stored per user id; the 2.x format is only reused when the server reports no user.

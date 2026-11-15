@@ -358,6 +358,37 @@ describe('E2E sessions', () => {
     expect(useWSEStore.getState().connectionState).toBe(ConnectionState.CONNECTED);
   });
 
+  it('fails closed when the server never confirms the session', async () => {
+    vi.useFakeTimers();
+    const failed: any[] = [];
+    const listener = (e: Event) => failed.push((e as CustomEvent).detail);
+    window.addEventListener('wseEncryptionFailed', listener);
+    try {
+      start({ security: pinned() }, ['prices']);
+      expect(wseActions.sendMessage('order', { id: 1 })).toBe('queued');
+      const { ws, hello } = await openSession();
+      // server_hello with the signed answer, but no sealed server_ready.
+      const server = await sessionServer(hello.p.e2e, 'conn-1', identity);
+      ws.serverSend(serverHelloMessage({
+        features: { compression: true, recovery: true, encryption: true },
+        connection_id: 'conn-1',
+        e2e: server.hello,
+      }));
+      await vi.advanceTimersByTimeAsync(11_000);
+
+      expect(failed).toHaveLength(1);
+      expect(failed[0].reason).toContain('server_ready');
+      expect(useWSEStore.getState().connectionState).toBe(ConnectionState.ERROR);
+      // Nothing of the application's went out, sealed or not.
+      const sent = sealedReader(ws, server);
+      expect((await sent()).map((m) => m.t)).not.toContain('order');
+      expect(ws.textMessages().map((m) => m.t)).toEqual(['client_hello']);
+    } finally {
+      window.removeEventListener('wseEncryptionFailed', listener);
+      vi.useRealTimers();
+    }
+  });
+
   it('skips heartbeats while the handshake is in flight, then seals them', async () => {
     start({ security: pinned(), diagnostics: { healthCheckInterval: 1_000 } } as UseWSEConfig);
     const { ws, hello } = await openSession();

@@ -549,6 +549,12 @@ export class WSESession {
       logger.error(`Refusing to sign ${type}: no security.signingKey`);
       return 'dropped';
     }
+    // The server takes 1 to 128 characters (code points, as it counts them).
+    const nonceLength = options.nonce === undefined ? 1 : [...options.nonce].length;
+    if (nonceLength < 1 || nonceLength > MAX_NONCE_LENGTH) {
+      logger.error(`Refusing to sign ${type}: a nonce is 1 to ${MAX_NONCE_LENGTH} characters`);
+      return 'dropped';
+    }
     const audience = await this.processor.signingAudience();
     if (!audience) {
       logger.error(`Refusing to sign ${type}: the server has not named a signing key it may sign for`);
@@ -695,6 +701,8 @@ export class WSESession {
 
 const OFFLINE_DB_NAME = 'wse_offline_queue';
 /** How long a signed message may wait behind older ones before it is stale. */
+// A signed message's nonce (`n`): 1 to this many characters.
+const MAX_NONCE_LENGTH = 128;
 const SIGNED_MESSAGE_TTL_MS = 10_000;
 
 let currentSession: WSESession | null = null;

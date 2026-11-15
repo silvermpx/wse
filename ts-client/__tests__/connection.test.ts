@@ -11,6 +11,7 @@ import {
   connectServer,
   installFakeWebSocket,
   resetClientState,
+  serverHelloMessage,
   tick,
 } from './helpers.js';
 import { acquireSession, makeSessionKey, wseActions, getCurrentSession } from '../services/WSESession.js';
@@ -425,6 +426,36 @@ describe('sending while not ready', () => {
     await vi.advanceTimersByTimeAsync(10_000);
     expect(ws.messagesOfType('client_hello')).toHaveLength(1);
     expect(ws.messagesOfType('subscription_update')[0].p.topics).toEqual(['news']);
+  });
+
+  it('reconnects when a 3.x server answers server_hello but never takes the connection', async () => {
+    vi.useFakeTimers();
+    start({}, 'cookie', ['news']);
+    await tick();
+    const ws = FakeWebSocket.last();
+    ws.serverOpen();
+    await tick();
+    ws.serverSend(serverHelloMessage({ server_version: '3.0.0' }));
+    await tick();
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    // Nothing went out as if the server had taken it, and a new attempt began.
+    expect(ws.messagesOfType('subscription_update')).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(FakeWebSocket.last()).not.toBe(ws);
+  });
+
+  it('a refused token closed with 1008 is not reconnected', async () => {
+    vi.useFakeTimers();
+    start();
+    await tick();
+    const ws = FakeWebSocket.last();
+    await connectServer(ws);
+    ws.serverClose(1008);
+    await tick();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(FakeWebSocket.last()).toBe(ws);
+    expect(useWSEStore.getState().connectionState).toBe(ConnectionState.ERROR);
   });
 });
 

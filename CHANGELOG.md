@@ -128,6 +128,13 @@ Upgrading from 2.x: see
   disconnected apply on the next connection; an application that reads
   the stream slowly holds the socket back instead of losing events; and
   handlers hear `connected`, `disconnected` and subscription replies.
+- TypeScript client, as the Rust and Python ones: with encryption, a
+  session the server does not confirm (no sealed `server_ready`) fails
+  closed instead of going on with a made-up one, and a 3.x server that
+  never takes the connection is tried again; a gap on a live connection is
+  asked for, and a replay the server cut short is asked for again; a close
+  with 1008 or 4800 ends the client; a signed message's nonce is 1 to 128
+  characters.
 - The Rust utilities (filters, queues, transformer, msgpack) follow their
   documentation.
 

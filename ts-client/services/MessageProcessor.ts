@@ -50,6 +50,8 @@ export interface ProcessorConnection {
   trySend(message: WSMessage): SendResult;
   sendControl(data: string | ArrayBuffer): boolean;
   isTransportReady(): boolean;
+  /** The server took the connection (server_ready). */
+  isReady(): boolean;
   isAwaitingEncryptionKey(): boolean;
   getRetryAfterMs(): number;
   handleServerReady(details: any): void;
@@ -99,6 +101,8 @@ interface RecoveryWindow {
   buffer: Map<number, WSMessage>;
   timer: ReturnType<typeof setTimeout> | null;
   confirmed: boolean;
+  /** The position the replay was asked from. */
+  anchor: number;
 }
 
 // Protocol/system message types: never throttled.
@@ -921,6 +925,21 @@ export class MessageProcessor {
         return;
       }
 
+      // A live connection: hold this one and ask the server for what is
+      // missing, as after a reconnect (one window per topic: a gap in another
+      // stream of a topic already waiting is delivered and reported). Not
+      // when the server said it cannot replay this stream.
+      if (
+        !open &&
+        this.unrecovered.get(topic)?.epoch !== epoch &&
+        this.requestReplay(topic, epoch, previous!.offset)
+      ) {
+        this.openRecoveryWindows({ [topic]: { epoch, offset: previous!.offset } });
+        this.recoveryWindows.get(topic)?.buffer.set(offset, message);
+        this.recordInbound(size);
+        return;
+      }
+
       // No replay pending: deliver now and report what is missing.
       const last = previous!.offset;
       this.sequencer.setTopicPosition(topic, epoch, offset);
@@ -1031,20 +1050,46 @@ export class MessageProcessor {
         buffer: new Map(),
         confirmed: false,
         timer: null,
+        anchor: position.offset,
       };
-      window.timer = setTimeout(() => {
-        window.timer = null;
-        void this.enqueueTask(() => {
-          if (this.recoveryWindows.get(topic) === window) {
-            if (window.buffer.size > 0) {
-              logger.warn(`Recovery for topic ${topic} did not fill the gap within ${this.recoveryTimeoutMs}ms`);
-            }
-            return this.flushRecoveryWindow(topic);
-          }
-        });
-      }, this.recoveryTimeoutMs);
       this.recoveryWindows.set(topic, window);
+      this.armRecoveryWindow(topic, window);
     }
+  }
+
+  /** The window's wait: past it, what is held goes out and holes are reported. */
+  private armRecoveryWindow(topic: string, window: RecoveryWindow): void {
+    if (window.timer) clearTimeout(window.timer);
+    window.timer = setTimeout(() => {
+      window.timer = null;
+      void this.enqueueTask(() => {
+        if (this.recoveryWindows.get(topic) === window) {
+          if (window.buffer.size > 0) {
+            logger.warn(`Recovery for topic ${topic} did not fill the gap within ${this.recoveryTimeoutMs}ms`);
+          }
+          return this.flushRecoveryWindow(topic);
+        }
+      });
+    }, this.recoveryTimeoutMs);
+  }
+
+  /**
+   * Ask the server to replay a topic's stream after `offset`: a gap on a live
+   * connection. False when it cannot be asked (not ready, no recovery).
+   */
+  private requestReplay(topic: string, epoch: string, offset: number): boolean {
+    if (this.destroyed || !(this.recoveryTimeoutMs > 0)) return false;
+    if (!useWSEStore.getState().subscriptions.serverRecoveryEnabled || !this.connectionManager?.isReady()) {
+      return false;
+    }
+    logger.info(`Asking for the replay of topic ${topic} after offset ${offset}`);
+    return this.queueOutgoing(
+      {
+        t: 'subscription_update',
+        p: { action: 'subscribe', topics: [topic], recover: true, recovery: { [topic]: { epoch, offset } } },
+      },
+      MessagePriority.HIGH,
+    );
   }
 
   private reportGap(gap: WSEGapEvent): void {
@@ -1101,6 +1146,20 @@ export class MessageProcessor {
         // runs ahead of the broadcasts still on their way: it never moves
         // the anchor.
         if (!window) continue;
+        // A replay the server cut at its budget moved delivery on in the same
+        // stream: ask again for the rest, from where delivery is.
+        const reached = this.sequencer.getStreamPosition(topic, window.epoch);
+        if (
+          serverEpoch === window.epoch &&
+          window.buffer.size > 0 &&
+          reached !== undefined &&
+          reached.offset > window.anchor &&
+          this.requestReplay(topic, window.epoch, reached.offset)
+        ) {
+          window.anchor = reached.offset;
+          this.armRecoveryWindow(topic, window);
+          continue;
+        }
         // The server cannot replay (history evicted, epoch changed): release
         // what is held. The anchor stays where delivery is, so nothing on its
         // way is dropped as a duplicate; the next message shows what was
