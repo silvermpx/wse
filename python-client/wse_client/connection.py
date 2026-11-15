@@ -200,6 +200,9 @@ class ConnectionManager:
         self._connected_at: float | None = None
         self._last_pong: float | None = None
         self._destroyed = False
+        # Bumped by disconnect(), destroy() and abort(): an attempt that
+        # started before one of them is void, and its socket is closed.
+        self._attempt_gen = 0
         # True while the client itself is closing (disconnect / abort): a
         # close it causes is never reconnected.
         self._intentional_close = False
@@ -292,7 +295,9 @@ class ConnectionManager:
             await self._attempt()
         except WSEError as exc:
             self._last_error = exc
-            self._set_state(ConnectionState.ERROR)
+            # Disconnected meanwhile: it stays disconnected.
+            if not self._intentional_close:
+                self._set_state(ConnectionState.ERROR)
             raise
         finally:
             self._is_connecting = False
@@ -322,6 +327,7 @@ class ConnectionManager:
         """
         if self._circuit_breaker and not self._circuit_breaker.can_execute():
             raise WSECircuitBreakerError("Circuit breaker is open")
+        gen = self._attempt_gen
 
         # Select endpoint from pool (failover support)
         if self._pool is not None:
@@ -330,6 +336,8 @@ class ConnectionManager:
             self._active_endpoint = selected
 
         token = await self._resolve_token()
+        if gen != self._attempt_gen:
+            raise WSEConnectionError("disconnect() was called while connecting")
         try:
             ws_cm, ws = await self._open_socket(token)
         except WSEError:
@@ -339,6 +347,11 @@ class ConnectionManager:
             if self._pool is not None:
                 self._pool.record_failure(self._active_endpoint)
             raise
+        if gen != self._attempt_gen:
+            # disconnect() came while the upgrade was on its way: the socket
+            # it brought is not used.
+            await _close_quietly(ws_cm)
+            raise WSEConnectionError("disconnect() was called while connecting")
 
         self._consecutive_failures = 0
         if self._circuit_breaker:
@@ -430,7 +443,9 @@ class ConnectionManager:
         await self._send_client_hello(ws)
 
     async def disconnect(self) -> None:
-        """Graceful, final shutdown: nothing reconnects afterwards."""
+        """Graceful, final shutdown: nothing reconnects afterwards, and a
+        connect() still on its way ends with WSEConnectionError."""
+        self._attempt_gen += 1
         self._intentional_close = True
         self._reconnect_armed = False
         self._cancel_reconnect()
@@ -454,6 +469,7 @@ class ConnectionManager:
         """
         if self._destroyed or self._state == ConnectionState.ERROR:
             return
+        self._attempt_gen += 1
         self._intentional_close = True
         self._reconnect_armed = False
         self._cancel_reconnect()

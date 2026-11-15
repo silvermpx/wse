@@ -18,6 +18,9 @@
   only new topics count against the limit.
 - Server: `drain()` returns only once the server refuses new connections,
   also when there is nobody to wait for, so no client gets in after it.
+- Python client: `disconnect()` while `connect()` waits for the server ends
+  that `connect()` with `WSEConnectionError`; the socket arriving after it
+  is closed, and the client stays disconnected.
 - TypeScript client: one user's queued messages, subscriptions and
   recovery positions never go out on the next user's connection: not when
   the last component unmounts and another user signs in, nor when a cookie

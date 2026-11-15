@@ -28,9 +28,7 @@ FAST = ReconnectConfig(base_delay=0.05, max_delay=0.2, jitter=False)
 
 def make_client(url: str, **kwargs) -> AsyncWSEClient:
     kwargs.setdefault("reconnect", FAST)
-    client = AsyncWSEClient(url, **kwargs)
-    # Many failed attempts in a row would open the breaker for 60 s.
-    return client
+    return AsyncWSEClient(url, **kwargs)
 
 
 def record_states(client: AsyncWSEClient) -> list[ConnectionState]:
@@ -478,3 +476,23 @@ class TestWhatTheClientsShare:
             assert headers["cookie"] == "theme=dark; session=tok"
             assert headers["authorization"] == "Bearer own"
             await client.disconnect()
+
+
+class TestDisconnectWhileConnecting:
+    async def test_a_disconnect_during_the_first_connect_is_final(self):
+        """disconnect() while connect() waits for the upgrade: the socket that
+        arrives afterwards is closed, and the client stays disconnected."""
+        async with FakeWSEServer(upgrade_delay=lambda _index: 0.4) as server:
+            client = make_client(server.url)
+            connecting = asyncio.create_task(client.connect())
+            await asyncio.sleep(0.1)
+            await client.disconnect()
+            with pytest.raises(WSEConnectionError):
+                await connecting
+            await asyncio.sleep(0.5)
+            assert not client.is_connected
+            assert not client.is_ready
+            assert client.state == ConnectionState.DISCONNECTED
+            await until(
+                lambda: all(conn.closed.is_set() for conn in server.connections)
+            )
