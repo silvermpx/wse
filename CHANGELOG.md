@@ -108,7 +108,8 @@ Upgrading from 2.x: see
   closed, on a plaintext frame too; gaps are recovered from the last
   delivered message; offline messages go out only for the user they were
   written for, and signed ones are never queued; the TypeScript client
-  keeps one session per page.
+  keeps one session per page; the Python sync client calls its error
+  handler before `run_forever()` and `recv()` raise.
 - The Rust utilities (filters, queues, transformer, msgpack) follow their
   documentation.
 

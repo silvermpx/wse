@@ -160,6 +160,12 @@ class SyncWSEClient:
         self._lock = threading.Lock()
         self._session: _Session | None = None
         self._running = False
+        # The client ended and its error handler runs: the end reaches the
+        # stream once it returns.
+        self._ending = False
+        # Moves on every connect(): an end that a new connect() overtook
+        # stays out of the new stream.
+        self._generation = 0
         self._background_error: BaseException | None = None
         self._on_error: Callable[[Exception], Any] | None = None
 
@@ -179,6 +185,7 @@ class SyncWSEClient:
             session = _Session()
             self._session = session
             self._running = True
+            self._generation += 1
             self._background_error = None
             self._purge_end_markers()
             thread = threading.Thread(
@@ -221,10 +228,13 @@ class SyncWSEClient:
             session = self._session
             self._session = None
             self._running = False
+            ending = self._ending
         if session is not None:
             self._stop_session(session, join_timeout=5.0)
-        # Signal queue consumers (recv / run_forever)
-        self._put_end_marker(_StreamEnd(None))
+        # Signal queue consumers (recv / run_forever), unless the client is
+        # ending already: its end, with the error, is on its way.
+        if not ending:
+            self._put_end_marker(_StreamEnd(None))
 
     def disconnect(self) -> None:
         """Alias for close."""
@@ -397,14 +407,14 @@ class SyncWSEClient:
         error nobody has seen yet: that error is raised first, and the next
         call connects again.
         """
-        if not self._running and not self._pending_unseen_error():
+        if not self._running and not self._ending and not self._pending_unseen_error():
             self.connect()
 
         while True:
             try:
                 item = self._event_queue.get(timeout=1.0)
             except queue.Empty:
-                if not self._running and self._event_queue.empty():
+                if not self._running and not self._ending and self._event_queue.empty():
                     return  # ended without a marker (defensive)
                 continue
 
@@ -619,24 +629,32 @@ class SyncWSEClient:
             self._session_ended(session, error)
 
     def _session_ended(self, session: _Session, error: BaseException | None) -> None:
-        """Called on the session thread when its client stopped."""
+        """Called on the session thread when its client stopped. The error
+        handler runs first: whoever sees the end in the stream (run_forever(),
+        recv()) sees it after the handler."""
         with self._lock:
             if self._session is not session or not session.connected:
                 return  # stale session, or connect() reports it itself
             self._session = None
             self._running = False
+            self._ending = True
+            generation = self._generation
             if error is not None:
                 self._background_error = error
-            self._put_end_marker(_StreamEnd(error))
-        if error is None:
-            return
-        logger.error("Client stopped: %s", error)
-        handler = self._on_error
-        if handler is not None and isinstance(error, Exception):
-            try:
-                handler(error)
-            except Exception:
-                pass
+        try:
+            if error is not None:
+                logger.error("Client stopped: %s", error)
+                handler = self._on_error
+                if handler is not None and isinstance(error, Exception):
+                    try:
+                        handler(error)
+                    except Exception:
+                        pass
+        finally:
+            with self._lock:
+                self._ending = False
+                if self._generation == generation:
+                    self._put_end_marker(_StreamEnd(error))
 
     def _abandon(self, session: _Session) -> None:
         """Give up on a session whose connect() failed or timed out."""

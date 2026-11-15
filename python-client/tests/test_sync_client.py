@@ -117,7 +117,13 @@ class TestSyncLifecycle:
                 reconnect=ReconnectConfig(base_delay=0.05, max_attempts=0),
             )
             errors: list[Exception] = []
-            client.set_error_handler(errors.append)
+
+            def slow_handler(error: Exception) -> None:
+                # run_forever() raises only once the handler has run.
+                time.sleep(0.2)
+                errors.append(error)
+
+            client.set_error_handler(slow_handler)
             client.connect(timeout=5)
             assert client.is_connected
             st.call(srv.connections[0].ws.close(1001))
@@ -131,6 +137,19 @@ class TestSyncLifecycle:
             client.connect(timeout=5)
             assert client.is_connected
             client.close()
+
+    def test_a_handler_that_closes_the_client_keeps_the_error(self):
+        st = ServerThread()
+        with st as srv:
+            client = SyncWSEClient(
+                srv.url,
+                reconnect=ReconnectConfig(base_delay=0.05, max_attempts=0),
+            )
+            client.set_error_handler(lambda error: client.close())
+            client.connect(timeout=5)
+            st.call(srv.connections[0].ws.close(1001))
+            with pytest.raises(WSEConnectionError, match="Gave up"):
+                client.run_forever()
 
     def test_recv_raises_auth_error(self):
         rejecting = {"on": False}
