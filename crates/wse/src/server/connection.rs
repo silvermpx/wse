@@ -1010,6 +1010,9 @@ struct Reader<'a, H: Handler> {
     proof_pending: bool,
     /// The application's side of the connection, once it heard of it.
     app: Option<H::Connection>,
+    /// When the last frame came: the read loop checks its deadlines
+    /// against it.
+    last_frame_at: Instant,
 }
 
 /// Hand a client's message to the application; false when it has no room
@@ -1102,6 +1105,7 @@ impl<H: Handler> Reader<'_, H> {
         // Every frame counts as activity, protocol pings and pongs included:
         // a plain WebSocket client may keep the link alive with those alone.
         let now = Instant::now();
+        self.last_frame_at = now;
         activity.store(state.activity_ms(now), Ordering::Relaxed);
         // Before its session a client that announced E2E sends
         // client_hello and heartbeats; anything else is not taken (the
@@ -1435,6 +1439,10 @@ pub(crate) async fn handle_connection<H: Handler>(
     let gate = state.clone();
 
     let mut ws_config = WebSocketConfig::default();
+    // tungstenite zero-fills its read buffer up to this size before every
+    // read: 16 KiB still takes a burst of small frames in one read, at an
+    // eighth of the default's cost (and memory per connection).
+    ws_config.read_buffer_size = 16 * 1024;
     // A sealed frame carries its `E:`, header and tag past the message.
     let limit = state.max_message_size.saturating_add(SEAL_OVERHEAD);
     ws_config.max_message_size = Some(limit);
@@ -1905,6 +1913,7 @@ pub(crate) async fn handle_connection<H: Handler>(
         binding,
         proof_pending: false,
         app,
+        last_frame_at: Instant::now(),
     };
 
     // A connection whose token expires is closed (4403): the clients come
@@ -1920,10 +1929,43 @@ pub(crate) async fn handle_connection<H: Handler>(
     // The application's side of a connection whose handler panicked: it hears
     // no more messages, and its disconnect still comes.
     let mut failed_app = None;
+    // The admission deadline passed: a client still without its session or
+    // proof goes; one of an application that binds the key itself is
+    // refused if the application expected a proof that has not come.
+    let admission_over = |reader: &Reader<'_, H>| {
+        if reader.awaiting_session || reader.proof_pending {
+            closer.close(
+                &tx,
+                &out.pending,
+                CLOSE_IDLE,
+                "no end-to-end session in time",
+            );
+        } else if state.jwt_config.is_none() && reader.session.is_some() {
+            use dashmap::mapref::entry::Entry;
+            match state.binds.entry((*conn_id).clone()) {
+                Entry::Occupied(entry) if matches!(entry.get(), Bind::Expected { .. }) => {
+                    entry.remove();
+                    refuse_unproved(&reader.conn, "proof_missing");
+                }
+                Entry::Occupied(_) => {}
+                Entry::Vacant(entry) => {
+                    entry.insert(Bind::Unproved);
+                }
+            }
+        }
+    };
     let read_loop = async {
         loop {
             let msg = tokio::select! {
                 biased;
+                // A frame that is there comes first: the timers are polled
+                // (a waker registered each time) only while none is, and a
+                // busy connection's deadlines are checked against its frames
+                // below.
+                next = read_half.next() => match next {
+                    Some(Ok(msg)) => msg,
+                    _ => break,
+                },
                 () = async { if let Some(sleep) = expiry.as_mut() { sleep.await } }, if expiry.is_some() => {
                     expiry = None;
                     closer.close(&tx, &out.pending, CLOSE_TOKEN_EXPIRED, "token expired");
@@ -1931,29 +1973,9 @@ pub(crate) async fn handle_connection<H: Handler>(
                 }
                 () = async { if let Some(sleep) = admission_due.as_mut() { sleep.await } }, if admission_due.is_some() => {
                     admission_due = None;
-                    if reader.awaiting_session || reader.proof_pending {
-                        closer.close(&tx, &out.pending, CLOSE_IDLE, "no end-to-end session in time");
-                    } else if state.jwt_config.is_none() && reader.session.is_some() {
-                        // An application binding the key itself: a proof
-                        // that has not come by now does not come.
-                        use dashmap::mapref::entry::Entry;
-                        match state.binds.entry((*conn_id).clone()) {
-                            Entry::Occupied(entry) if matches!(entry.get(), Bind::Expected { .. }) => {
-                                entry.remove();
-                                refuse_unproved(&reader.conn, "proof_missing");
-                            }
-                            Entry::Occupied(_) => {}
-                            Entry::Vacant(entry) => {
-                                entry.insert(Bind::Unproved);
-                            }
-                        }
-                    }
+                    admission_over(&reader);
                     continue;
                 }
-                next = read_half.next() => match next {
-                    Some(Ok(msg)) => msg,
-                    _ => break,
-                },
             };
             // A panic in a handler call, or in the frame's own handling,
             // closes this connection alone; its cleanup still runs.
@@ -1967,6 +1989,22 @@ pub(crate) async fn handle_connection<H: Handler>(
                     failed_app = reader.app.take().or(failed_app.take());
                     closer.close(&tx, &out.pending, CLOSE_INTERNAL_ERROR, "internal error");
                 }
+            }
+            // The deadlines a connection reached while its frames kept coming.
+            let at = reader.last_frame_at;
+            if expiry
+                .as_ref()
+                .is_some_and(|sleep| sleep.deadline().into_std() <= at)
+            {
+                expiry = None;
+                closer.close(&tx, &out.pending, CLOSE_TOKEN_EXPIRED, "token expired");
+            }
+            if admission_due
+                .as_ref()
+                .is_some_and(|sleep| sleep.deadline().into_std() <= at)
+            {
+                admission_due = None;
+                admission_over(&reader);
             }
         }
     };

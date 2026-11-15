@@ -518,6 +518,51 @@ class TestTokenExpiry:
         assert await close_code(ws, timeout=15) == 4403
 
 
+class TestDeadlinesOfBusyConnections:
+    """A connection that never stops sending meets its deadlines all the same:
+    the read loop takes frames first, and checks the deadlines against them."""
+
+    @staticmethod
+    async def chatter(ws, message: str) -> None:
+        try:
+            while True:
+                await ws.send(message)
+                await asyncio.sleep(0.01)
+        except websockets.ConnectionClosed:
+            pass
+
+    @pytest.mark.asyncio
+    async def test_its_token_expiry(self, server, server_port):
+        ws = await connect(server_port, make_token(exp_offset=-25))
+        drain_until(server, "auth_connect")
+        started = time.monotonic()
+        task = asyncio.create_task(self.chatter(ws, json.dumps({"t": "chat", "p": {}})))
+        try:
+            assert await close_code(ws, timeout=15) == 4403
+            assert 3 < time.monotonic() - started < 10
+        finally:
+            task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_its_end_to_end_session_deadline(self, server_port):
+        from tests.test_delivery import identity_key, start_server
+
+        srv = start_server(server_port, e2e_identity_key=identity_key())
+        try:
+            # Announced, never opened: heartbeats alone do not keep it.
+            ws = await connect(server_port, make_token(), query="e2e=1")
+            started = time.monotonic()
+            ping = json.dumps({"t": "ping", "p": {"timestamp": 1}})
+            task = asyncio.create_task(self.chatter(ws, ping))
+            try:
+                assert await close_code(ws, timeout=15) == 4408
+                assert 8 < time.monotonic() - started < 13
+            finally:
+                task.cancel()
+        finally:
+            srv.stop()
+
+
 class TestTopicAclRules:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
