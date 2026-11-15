@@ -29,7 +29,7 @@ import {
 } from '../types.js';
 import { useWSEStore } from '../stores/useWSEStore.js';
 import { useMessageQueueStore } from '../stores/useMessageQueueStore.js';
-import { EventSequencer } from './EventSequencer.js';
+import { EventSequencer, type TopicPosition } from './EventSequencer.js';
 import { CompressionManager, DecompressedSizeLimitError } from '../protocols/compression.js';
 import { logger } from '../utils/logger.js';
 import {
@@ -99,13 +99,34 @@ function isExpired(expiresAt: number | undefined, now: number): boolean {
   return expiresAt !== undefined && now > expiresAt;
 }
 
+/** A stream of a topic waiting for a requested replay to fill what it missed. */
 interface RecoveryWindow {
+  topic: string;
   epoch: string;
   buffer: Map<number, WSMessage>;
   timer: ReturnType<typeof setTimeout> | null;
   confirmed: boolean;
   /** The position the replay was asked from. */
   anchor: number;
+}
+
+const windowKey = (topic: string, epoch: string): string => `${topic}\u0000${epoch}`;
+
+/**
+ * How long past the server's history_ttl a stream that heard nothing is
+ * still named: the clocks of a server and a client do not tick together.
+ */
+const QUIET_MARGIN_MS = 5_000;
+
+/** A reply's streams (from 3.1): epoch -> the server's last offset. */
+function listedStreams(value: unknown): Record<string, number> | null {
+  if (!value || typeof value !== 'object') return null;
+  const out: Record<string, number> = {};
+  for (const [epoch, offset] of Object.entries(value as Record<string, unknown>)) {
+    const n = Number(offset);
+    if (Number.isSafeInteger(n) && n >= 0) out[epoch] = n;
+  }
+  return out;
 }
 
 // Protocol/system message types: never throttled.
@@ -244,7 +265,10 @@ export class MessageProcessor {
   private eventThrottleMs: number;
   private handlerSampleRate: number;
   private lastEventTime = new Map<string, number>();
+  /** By topic and stream (windowKey). */
   private recoveryWindows = new Map<string, RecoveryWindow>();
+  /** How long the server keeps a stream that receives nothing (history_ttl), in ms. */
+  private historyTtlMs: number | null = null;
   /** Topics the server could not recover, until their next message shows what was missed. */
   private unrecovered = new Map<string, { epoch: string; reported: boolean }>();
   private earlyEncryptedFrames: ArrayBuffer[] = [];
@@ -632,6 +656,12 @@ export class MessageProcessor {
     return kid;
   }
 
+  /** The server's history_ttl (seconds), when it names one. */
+  private takeHistoryTtl(value: unknown): void {
+    const seconds = Number(value);
+    if (value !== undefined && Number.isFinite(seconds) && seconds > 0) this.historyTtlMs = seconds * 1000;
+  }
+
   private processServerReady(message: WSMessage): void {
     const payload = message.p || {};
     const details = payload.details || payload;
@@ -639,6 +669,7 @@ export class MessageProcessor {
     if (typeof features.recovery === 'boolean') {
       useWSEStore.getState().setServerRecoveryEnabled(features.recovery);
     }
+    this.takeHistoryTtl(features.history_ttl);
     this.takeSigningKid(details.signing, true);
     this.connectionUser = typeof details.user_id === 'string' ? details.user_id : null;
     if (typeof details.user_id === 'string' && details.user_id) {
@@ -659,6 +690,7 @@ export class MessageProcessor {
       if (typeof payload.features.recovery === 'boolean') {
         store.setServerRecoveryEnabled(payload.features.recovery);
       }
+      this.takeHistoryTtl(payload.features.history_ttl);
       store.updateConfig({
         compressionEnabled: payload.features.compression ?? true,
         batchingEnabled: payload.features.batching ?? true,
@@ -916,31 +948,25 @@ export class MessageProcessor {
     }
 
     if (verdict === 'gap') {
-      const open = this.recoveryWindows.get(topic);
-      if (open && open.epoch === epoch) {
+      const open = this.recoveryWindows.get(windowKey(topic, epoch));
+      if (open) {
         if (open.buffer.size < MAX_RECOVERY_BUFFER) {
           // A replay was requested and may still fill the hole: hold it.
           open.buffer.set(offset, message);
           this.recordInbound(size);
           return;
         }
-        await this.flushRecoveryWindow(topic);
+        await this.flushRecoveryWindow(topic, epoch);
         // The flush may have advanced the position; re-evaluate this message.
         await this.handleStamped(message, size);
         return;
       }
 
       // A live connection: hold this one and ask the server for what is
-      // missing, as after a reconnect (one window per topic: a gap in another
-      // stream of a topic already waiting is delivered and reported). Not
-      // when the server said it cannot replay this stream.
-      if (
-        !open &&
-        this.unrecovered.get(topic)?.epoch !== epoch &&
-        this.requestReplay(topic, epoch, previous!.offset)
-      ) {
-        this.openRecoveryWindows({ [topic]: { epoch, offset: previous!.offset } });
-        this.recoveryWindows.get(topic)?.buffer.set(offset, message);
+      // missing in its stream, as after a reconnect. Not when the server
+      // said it cannot replay this stream.
+      if (this.unrecovered.get(topic)?.epoch !== epoch && this.requestReplay(topic, epoch, previous!.offset)) {
+        this.recoveryWindows.get(windowKey(topic, epoch))?.buffer.set(offset, message);
         this.recordInbound(size);
         return;
       }
@@ -967,8 +993,8 @@ export class MessageProcessor {
     this.recordInbound(size, { topic, epoch, offset });
     await this.deliver(message);
 
-    if (this.recoveryWindows.has(topic)) {
-      await this.drainRecoveryBuffer(topic);
+    if (this.recoveryWindows.has(windowKey(topic, epoch))) {
+      await this.drainRecoveryBuffer(topic, epoch);
     }
   }
 
@@ -979,12 +1005,19 @@ export class MessageProcessor {
     return mark !== undefined && mark.epoch === epoch && !mark.reported;
   }
 
-  /** Deliver held messages that are now in order. */
-  private async drainRecoveryBuffer(topic: string): Promise<void> {
-    const window = this.recoveryWindows.get(topic);
+  /** The topic's open recovery windows, one per stream. */
+  private windowsOf(topic: string): RecoveryWindow[] {
+    const out: RecoveryWindow[] = [];
+    for (const window of this.recoveryWindows.values()) if (window.topic === topic) out.push(window);
+    return out;
+  }
+
+  /** Deliver held messages of the stream that are now in order. */
+  private async drainRecoveryBuffer(topic: string, epoch: string): Promise<void> {
+    const window = this.recoveryWindows.get(windowKey(topic, epoch));
     if (!window) return;
 
-    let position = this.sequencer.getStreamPosition(topic, window.epoch);
+    let position = this.sequencer.getStreamPosition(topic, epoch);
     while (position) {
       for (const held of [...window.buffer.keys()]) {
         if (held <= position.offset) window.buffer.delete(held);
@@ -992,12 +1025,12 @@ export class MessageProcessor {
       const next = window.buffer.get(position.offset + 1);
       if (!next) break;
       window.buffer.delete(position.offset + 1);
-      await this.deliverHeld(topic, window.epoch, position.offset + 1, next);
-      position = this.sequencer.getStreamPosition(topic, window.epoch);
+      await this.deliverHeld(topic, epoch, position.offset + 1, next);
+      position = this.sequencer.getStreamPosition(topic, epoch);
     }
 
     if (window.confirmed && window.buffer.size === 0) {
-      this.closeRecoveryWindow(topic);
+      this.closeRecoveryWindow(topic, epoch);
     }
   }
 
@@ -1007,22 +1040,22 @@ export class MessageProcessor {
     await this.deliver(message);
   }
 
-  /** End a window: deliver everything held, in offset order, reporting holes. */
-  private async flushRecoveryWindow(topic: string): Promise<void> {
-    const window = this.recoveryWindows.get(topic);
+  /** End a stream's window: deliver everything held, in offset order, reporting holes. */
+  private async flushRecoveryWindow(topic: string, epoch: string): Promise<void> {
+    const window = this.recoveryWindows.get(windowKey(topic, epoch));
     if (!window) return;
-    this.closeRecoveryWindow(topic);
+    this.closeRecoveryWindow(topic, epoch);
 
     const offsets = [...window.buffer.keys()].sort((a, b) => a - b);
     for (const offset of offsets) {
       const message = window.buffer.get(offset)!;
-      const position = this.sequencer.getStreamPosition(topic, window.epoch);
+      const position = this.sequencer.getStreamPosition(topic, epoch);
       if (position) {
         if (offset <= position.offset) continue;
         if (offset > position.offset + 1) {
           this.reportGap({
             topic,
-            epoch: window.epoch,
+            epoch,
             fromOffset: position.offset + 1,
             toOffset: offset - 1,
             missed: offset - position.offset - 1,
@@ -1030,57 +1063,76 @@ export class MessageProcessor {
           });
         }
       }
-      await this.deliverHeld(topic, window.epoch, offset, message);
+      await this.deliverHeld(topic, epoch, offset, message);
     }
   }
 
-  private closeRecoveryWindow(topic: string): void {
-    const window = this.recoveryWindows.get(topic);
+  /** End every window of the topic. */
+  private async flushTopicWindows(topic: string): Promise<void> {
+    for (const window of this.windowsOf(topic)) {
+      await this.flushRecoveryWindow(topic, window.epoch);
+    }
+  }
+
+  private closeRecoveryWindow(topic: string, epoch: string): void {
+    const key = windowKey(topic, epoch);
+    const window = this.recoveryWindows.get(key);
     if (!window) return;
     if (window.timer) clearTimeout(window.timer);
-    this.recoveryWindows.delete(topic);
+    this.recoveryWindows.delete(key);
   }
 
   /**
    * A resubscribe asked the server to replay from these positions: hold
-   * out-of-order messages of these topics until the replay fills the hole,
-   * the server says it cannot, or recoveryTimeoutMs passes.
+   * out-of-order messages of each named stream until the replay fills its
+   * hole, the server says it cannot, or recoveryTimeoutMs passes.
    */
-  openRecoveryWindows(positions: Record<string, { epoch: string; offset: number }>): void {
+  openRecoveryWindows(
+    positions: Record<string, { epoch: string; offset: number; streams?: Record<string, number> }>,
+  ): void {
     if (this.destroyed || !(this.recoveryTimeoutMs > 0)) return;
     for (const [topic, position] of Object.entries(positions)) {
-      this.closeRecoveryWindow(topic);
-      const window: RecoveryWindow = {
-        epoch: position.epoch,
-        buffer: new Map(),
-        confirmed: false,
-        timer: null,
-        anchor: position.offset,
-      };
-      this.recoveryWindows.set(topic, window);
-      this.armRecoveryWindow(topic, window);
+      const streams =
+        position.streams && Object.keys(position.streams).length > 0
+          ? position.streams
+          : { [position.epoch]: position.offset };
+      for (const [epoch, offset] of Object.entries(streams)) {
+        let window = this.recoveryWindows.get(windowKey(topic, epoch));
+        if (window) {
+          window.confirmed = false;
+          window.anchor = offset;
+        } else {
+          window = { topic, epoch, buffer: new Map(), confirmed: false, timer: null, anchor: offset };
+          this.recoveryWindows.set(windowKey(topic, epoch), window);
+        }
+        this.armRecoveryWindow(window);
+      }
     }
   }
 
   /** The window's wait: past it, what is held goes out and holes are reported. */
-  private armRecoveryWindow(topic: string, window: RecoveryWindow): void {
+  private armRecoveryWindow(window: RecoveryWindow): void {
     if (window.timer) clearTimeout(window.timer);
     window.timer = setTimeout(() => {
       window.timer = null;
       void this.enqueueTask(() => {
-        if (this.recoveryWindows.get(topic) === window) {
+        if (this.recoveryWindows.get(windowKey(window.topic, window.epoch)) === window) {
           if (window.buffer.size > 0) {
-            logger.warn(`Recovery for topic ${topic} did not fill the gap within ${this.recoveryTimeoutMs}ms`);
+            logger.warn(
+              `Recovery for topic ${window.topic} did not fill the gap within ${this.recoveryTimeoutMs}ms`,
+            );
           }
-          return this.flushRecoveryWindow(topic);
+          return this.flushRecoveryWindow(window.topic, window.epoch);
         }
       });
     }, this.recoveryTimeoutMs);
   }
 
   /**
-   * Ask the server to replay a topic's stream after `offset`: a gap on a live
-   * connection. False when it cannot be asked (not ready, no recovery).
+   * Ask the server to replay a topic's stream `epoch` after `offset` (a gap
+   * on a live connection), naming where the client stands in every stream
+   * of the topic, and open their windows. False when it cannot be asked
+   * (not ready, no recovery).
    */
   private requestReplay(topic: string, epoch: string, offset: number): boolean {
     if (this.destroyed || !(this.recoveryTimeoutMs > 0)) return false;
@@ -1088,13 +1140,18 @@ export class MessageProcessor {
       return false;
     }
     logger.info(`Asking for the replay of topic ${topic} after offset ${offset}`);
-    return this.queueOutgoing(
+    const streams = this.getTopicPositions([topic])[topic]?.streams ?? {};
+    // From the gap's stream: where a server before 3.1 replays from.
+    const position = { epoch, offset, streams: { ...streams, [epoch]: offset } };
+    const queued = this.queueOutgoing(
       {
         t: 'subscription_update',
-        p: { action: 'subscribe', topics: [topic], recover: true, recovery: { [topic]: { epoch, offset } } },
+        p: { action: 'subscribe', topics: [topic], recover: true, recovery: { [topic]: position } },
       },
       MessagePriority.HIGH,
     );
+    if (queued) this.openRecoveryWindows({ [topic]: position });
+    return queued;
   }
 
   private reportGap(gap: WSEGapEvent): void {
@@ -1121,10 +1178,17 @@ export class MessageProcessor {
     if (!recovery || typeof recovery !== 'object') return;
 
     for (const [topic, info] of Object.entries(recovery as Record<string, any>)) {
-      if (info && info.recovered === false && info.epoch == null && this.recoveryWindows.has(topic)) {
+      const windows = this.windowsOf(topic);
+      const listed = listedStreams(info?.streams);
+      if (listed) {
+        await this.takeStreams(topic, info, listed, windows);
+        continue;
+      }
+      // A server before 3.1: one position per topic.
+      if (info && info.recovered === false && info.epoch == null && windows.length > 0) {
         // The server has no history of the topic any more (it restarted):
         // the stream this client was on is gone.
-        await this.flushRecoveryWindow(topic);
+        await this.flushTopicWindows(topic);
         const position = this.sequencer.getTopicPosition(topic);
         if (position) {
           this.reportGap({
@@ -1142,7 +1206,6 @@ export class MessageProcessor {
       const serverOffset = Number(info.offset);
       if (!Number.isFinite(serverOffset)) continue;
       const serverEpoch = String(info.epoch);
-      const window = this.recoveryWindows.get(topic);
 
       if (info.recovered === false) {
         // Only the answer to this client's own recovery request says
@@ -1150,26 +1213,25 @@ export class MessageProcessor {
         // another component subscribed too) carries the server head, which
         // runs ahead of the broadcasts still on their way: it never moves
         // the anchor.
-        if (!window) continue;
+        if (windows.length === 0) continue;
         // A replay the server cut at its budget moved delivery on in the same
         // stream: ask again for the rest, from where delivery is.
-        const reached = this.sequencer.getStreamPosition(topic, window.epoch);
+        const window = windows.find((w) => w.epoch === serverEpoch);
+        const reached = window && this.sequencer.getStreamPosition(topic, window.epoch);
         if (
-          serverEpoch === window.epoch &&
+          window &&
           window.buffer.size > 0 &&
           reached !== undefined &&
           reached.offset > window.anchor &&
           this.requestReplay(topic, window.epoch, reached.offset)
         ) {
-          window.anchor = reached.offset;
-          this.armRecoveryWindow(topic, window);
           continue;
         }
         // The server cannot replay (history evicted, epoch changed): release
         // what is held. The anchor stays where delivery is, so nothing on its
         // way is dropped as a duplicate; the next message shows what was
         // missed, reported as not recovered.
-        await this.flushRecoveryWindow(topic);
+        await this.flushTopicWindows(topic);
         const position = this.sequencer.getTopicPosition(topic);
         if (position && position.epoch !== serverEpoch) {
           // The stream restarted (as the Python client reports it).
@@ -1191,11 +1253,81 @@ export class MessageProcessor {
       // Recovered (or no flag): the replayed frames advance the anchor as
       // they are delivered. The reply's offset is the server head, which may
       // be past what was actually replayed, so it never moves the anchor.
-      if (window) {
+      for (const window of windows) {
         window.confirmed = true;
-        await this.drainRecoveryBuffer(topic);
+        await this.drainRecoveryBuffer(topic, window.epoch);
       }
     }
+  }
+
+  /**
+   * A reply that lists the server's streams of a topic (from 3.1): where the
+   * client starts in each one it did not know; when its own recovery did not
+   * recover, what each stream it knew lost. A stream it named that the
+   * server does not hold is forgotten: naming it again would fail every
+   * later recovery.
+   */
+  private async takeStreams(
+    topic: string,
+    info: any,
+    listed: Record<string, number>,
+    windows: RecoveryWindow[],
+  ): Promise<void> {
+    const asked = windows.length > 0;
+    if (info.recovered !== false) {
+      for (const window of windows) {
+        window.confirmed = true;
+        await this.drainRecoveryBuffer(topic, window.epoch);
+      }
+      for (const [epoch, offset] of Object.entries(listed)) {
+        if (!this.sequencer.getStreamPosition(topic, epoch)) this.raiseStream(topic, epoch, offset);
+      }
+      return;
+    }
+    // A replay the server cut at its budget: ask again from where delivery is.
+    if (asked && Number(info.count) > 0) {
+      const at = this.sequencer.getTopicPosition(topic);
+      if (at && this.requestReplay(topic, at.epoch, at.offset)) return;
+    }
+    const named = windows.map((w) => w.epoch);
+    await this.flushTopicWindows(topic);
+    const gaps: WSEGapEvent[] = [];
+    const gap = (epoch: string, from: number | null, to: number | null): WSEGapEvent => ({
+      topic,
+      epoch,
+      fromOffset: from,
+      toOffset: to,
+      missed: from !== null && to !== null ? to - from + 1 : null,
+      reason: 'not_recovered',
+    });
+    for (const [epoch, offset] of Object.entries(listed)) {
+      const own = this.sequencer.getStreamPosition(topic, epoch);
+      if (!own) {
+        this.raiseStream(topic, epoch, offset);
+      } else if (asked && offset > own.offset) {
+        gaps.push(gap(epoch, own.offset + 1, offset));
+        this.raiseStream(topic, epoch, offset);
+      }
+    }
+    if (asked) {
+      for (const epoch of named) {
+        if (epoch in listed) continue;
+        const own = this.sequencer.getStreamPosition(topic, epoch);
+        if (own) gaps.push(gap(epoch, own.offset + 1, null));
+        this.sequencer.forgetStream(topic, epoch);
+      }
+      // Not recovered with nothing to show for it: the server cannot show
+      // the client missed nothing.
+      const at = this.sequencer.getTopicPosition(topic);
+      if (gaps.length === 0 && at) gaps.push(gap(at.epoch, null, null));
+    }
+    for (const g of gaps) this.reportGap(g);
+  }
+
+  private raiseStream(topic: string, epoch: string, offset: number): void {
+    this.sequencer.raiseStream(topic, epoch, offset);
+    const at = this.sequencer.getTopicPosition(topic);
+    if (at) useWSEStore.getState().updateRecoveryState({ [topic]: at });
   }
 
   private setBaseline(topic: string, epoch: string, offset: number): void {
@@ -1203,15 +1335,27 @@ export class MessageProcessor {
     useWSEStore.getState().updateRecoveryState({ [topic]: { epoch, offset } });
   }
 
-  /** Last delivered (epoch, offset) of the given topics -- the recovery anchor. */
-  getTopicPositions(topics?: string[]): Record<string, { epoch: string; offset: number }> {
+  /**
+   * Where the client stands in the given topics, sent with a recovery: the
+   * last delivered message (the anchor) and each stream's last offset. A
+   * stream quiet for longer than the server keeps one is not named.
+   */
+  getTopicPositions(topics?: string[]): Record<string, TopicPosition> {
+    if (this.historyTtlMs !== null) {
+      const before = Date.now() - this.historyTtlMs - QUIET_MARGIN_MS;
+      for (const topic of topics ?? Object.keys(this.sequencer.getTopicPositions())) {
+        this.sequencer.forgetQuietStreams(topic, before, (epoch) =>
+          this.recoveryWindows.has(windowKey(topic, epoch)),
+        );
+      }
+    }
     return this.sequencer.getTopicPositions(topics);
   }
 
   /** Forget everything about topics the client unsubscribed from. */
   forgetTopics(topics: string[]): void {
     for (const topic of topics) {
-      this.closeRecoveryWindow(topic);
+      for (const window of this.windowsOf(topic)) this.closeRecoveryWindow(topic, window.epoch);
       this.unrecovered.delete(topic);
     }
     this.sequencer.clearTopics(topics);
@@ -1221,12 +1365,13 @@ export class MessageProcessor {
   /** The socket is gone: release held messages and drop undecryptable early frames. */
   handleConnectionClosed(): void {
     if (this.destroyed) return;
-    // The next connection's server names its own signing key.
+    // The next connection's server names its own signing key and history.
     this.serverSigningKid = null;
+    this.historyTtlMs = null;
     void this.enqueueTask(async () => {
       this.earlyEncryptedFrames = [];
-      for (const topic of [...this.recoveryWindows.keys()]) {
-        await this.flushRecoveryWindow(topic);
+      for (const window of [...this.recoveryWindows.values()]) {
+        await this.flushRecoveryWindow(window.topic, window.epoch);
       }
     });
   }

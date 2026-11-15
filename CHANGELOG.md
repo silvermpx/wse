@@ -18,6 +18,10 @@
   server was, reports per stream what a recovery that did not recover lost,
   forgets a stream the server no longer holds, and stops naming one quiet
   for longer than the server keeps it (`history_ttl`).
+- TypeScript client: the same, and a gap in one stream of a topic no longer
+  stops another stream's gap from being recovered: each stream waits for
+  its replay in its own window (as the Rust and Python clients do), instead
+  of one window per topic.
 
 ### Fixed
 

@@ -150,7 +150,7 @@ describe('offset gaps', () => {
     await send(ws, recoveryReply('prices', 9, false));
     const requests = ws.messagesOfType('subscription_update');
     expect(requests).toHaveLength(3);
-    expect(requests[2].p.recovery).toEqual({ prices: { epoch: EPOCH, offset: 5 } });
+    expect(requests[2].p.recovery).toEqual({ prices: { epoch: EPOCH, offset: 5, streams: { [EPOCH]: 5 } } });
 
     await send(ws, stamped('prices', 6), stamped('prices', 7), stamped('prices', 8), recoveryReply('prices', 9, true));
     expect(offsets()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
@@ -287,7 +287,9 @@ describe('recovery after a reconnect', () => {
     expect(useWSEStore.getState().subscriptions.recoveryState.prices).toEqual({ epoch: EPOCH, offset: 3 });
 
     const ws3 = await reconnect(ws2);
-    expect(ws3.messagesOfType('subscription_update')[0].p.recovery).toEqual({ prices: { epoch: EPOCH, offset: 3 } });
+    expect(ws3.messagesOfType('subscription_update')[0].p.recovery).toEqual({
+      prices: { epoch: EPOCH, offset: 3, streams: { [EPOCH]: 3 } },
+    });
   });
 
   it('a recovered:false reply keeps the anchor; the next message reports what was not recovered', async () => {
@@ -337,6 +339,118 @@ describe('recovery after a reconnect', () => {
     await send(ws, stamped('prices', 3), stamped('prices', 4));
     expect(offsets()).toEqual([1, 2, 3, 4]);
     expect(gaps).toEqual([]);
+  });
+});
+
+const OTHER = '0000000b';
+
+/** A reply that lists the server's streams of the topic (from 3.1). */
+function streamsReply(topic: string, recovered: boolean, streams: Record<string, number>, count = 0) {
+  return {
+    c: 'WSE',
+    t: 'subscription_update',
+    p: {
+      action: 'subscribe',
+      success: true,
+      success_topics: [topic],
+      recovery: { [topic]: { epoch: EPOCH, offset: 0, recovered, count, streams } },
+    },
+    v: 1,
+  };
+}
+
+describe('positions in every stream', () => {
+  it('holds a gap in a second stream for the same replay, and fills both', async () => {
+    start();
+    await tick();
+    const ws = FakeWebSocket.last();
+    await connectServer(ws);
+    await send(ws, stamped('prices', 1), stamped('prices', 0, OTHER));
+    // A hole in each stream, one after the other: the request for the
+    // first names where the client stands in both.
+    await send(ws, stamped('prices', 3), stamped('prices', 2, OTHER));
+    const requests = ws.messagesOfType('subscription_update');
+    expect(requests).toHaveLength(2);
+    expect(requests[1].p.recovery.prices).toEqual({ epoch: EPOCH, offset: 1, streams: { [EPOCH]: 1, [OTHER]: 0 } });
+    expect(offsets()).toEqual([1, 0]);
+    // The replay fills each stream from its own offset.
+    await send(ws, stamped('prices', 2), stamped('prices', 1, OTHER), streamsReply('prices', true, { [EPOCH]: 3, [OTHER]: 2 }));
+    expect(offsets()).toEqual([1, 0, 2, 3, 1, 2]);
+    expect(gaps).toEqual([]);
+  });
+
+  it('names every stream of the topic when it comes back', async () => {
+    start();
+    await tick();
+    const ws1 = FakeWebSocket.last();
+    await connectServer(ws1);
+    await send(ws1, stamped('prices', 4, OTHER), stamped('prices', 1), stamped('prices', 2));
+    const ws2 = await reconnect(ws1);
+    expect(ws2.messagesOfType('subscription_update')[0].p.recovery).toEqual({
+      prices: { epoch: EPOCH, offset: 2, streams: { [OTHER]: 4, [EPOCH]: 2 } },
+    });
+  });
+
+  it('starts a listed stream it did not know where the server was', async () => {
+    start();
+    await tick();
+    const ws = FakeWebSocket.last();
+    await connectServer(ws);
+    await send(ws, streamsReply('prices', false, { [OTHER]: 5 }));
+    await send(ws, stamped('prices', 3, OTHER), stamped('prices', 5, OTHER), stamped('prices', 6, OTHER));
+    expect(offsets()).toEqual([6]);
+    expect(gaps).toEqual([]);
+  });
+
+  it('starts a stream a recovered reply lists that the client did not know', async () => {
+    start();
+    await tick();
+    const ws1 = FakeWebSocket.last();
+    await connectServer(ws1);
+    await send(ws1, stamped('prices', 1));
+    const ws2 = await reconnect(ws1);
+    await send(ws2, streamsReply('prices', true, { [EPOCH]: 1, [OTHER]: 5 }));
+    await send(ws2, stamped('prices', 5, OTHER), stamped('prices', 6, OTHER));
+    expect(offsets()).toEqual([1, 6]);
+    expect(gaps).toEqual([]);
+  });
+
+  it('reports what each stream lost when the recovery did not recover', async () => {
+    start();
+    await tick();
+    const ws1 = FakeWebSocket.last();
+    await connectServer(ws1);
+    await send(ws1, stamped('prices', 1), stamped('prices', 2), stamped('prices', 4, OTHER));
+    const ws2 = await reconnect(ws1);
+    // The server no longer holds OTHER; EPOCH went on to 5.
+    await send(ws2, streamsReply('prices', false, { [EPOCH]: 5 }));
+    expect(gaps).toEqual([
+      { topic: 'prices', epoch: EPOCH, fromOffset: 3, toOffset: 5, missed: 3, reason: 'not_recovered' },
+      { topic: 'prices', epoch: OTHER, fromOffset: 5, toOffset: null, missed: null, reason: 'not_recovered' },
+    ]);
+    await send(ws2, stamped('prices', 6));
+    expect(offsets()).toEqual([1, 2, 4, 6]);
+    expect(gaps).toHaveLength(2);
+    // OTHER is forgotten: not named again.
+    const ws3 = await reconnect(ws2);
+    expect(ws3.messagesOfType('subscription_update')[0].p.recovery.prices.streams).toEqual({ [EPOCH]: 6 });
+  });
+
+  it('does not name a stream quiet for longer than the server keeps one', async () => {
+    start();
+    await tick();
+    const ready = { features: { recovery: true, encryption: false, history_ttl: 60 } };
+    const ws1 = FakeWebSocket.last();
+    await connectServer(ws1, ready);
+    await send(ws1, stamped('prices', 4, OTHER));
+    await vi.advanceTimersByTimeAsync(120_000);
+    await send(ws1, stamped('prices', 1));
+    ws1.serverClose(1001);
+    await tick();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const ws2 = FakeWebSocket.last();
+    await connectServer(ws2, ready);
+    expect(ws2.messagesOfType('subscription_update')[0].p.recovery.prices.streams).toEqual({ [EPOCH]: 1 });
   });
 });
 

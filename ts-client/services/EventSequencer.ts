@@ -7,6 +7,14 @@ import { logger } from '../utils/logger.js';
 /** Streams (origin epochs) remembered per topic: a cluster's nodes, plus restarts. */
 const MAX_STREAMS_PER_TOPIC = 32;
 
+/** Where a client stands in a topic: its last message, and its offset in each stream. */
+export interface TopicPosition {
+  epoch: string;
+  offset: number;
+  /** Epoch -> last offset delivered of that stream. */
+  streams: Record<string, number>;
+}
+
 export class EventSequencer {
   private sequence = 0;
   private seenIds: Map<string, number>;
@@ -20,6 +28,8 @@ export class EventSequencer {
    * order on its own. Most recently delivered last.
    */
   private streams = new Map<string, Map<string, number>>();
+  /** When each stream last moved or became known (ms since the epoch). */
+  private seen = new Map<string, Map<string, number>>();
   private readonly windowSize: number;
 
   private cleanupCounter = 0;
@@ -124,9 +134,63 @@ export class EventSequencer {
     streams.delete(epoch); // most recent last
     streams.set(epoch, offset);
     if (streams.size > MAX_STREAMS_PER_TOPIC) {
-      streams.delete(streams.keys().next().value!);
+      const oldest = streams.keys().next().value!;
+      streams.delete(oldest);
+      this.seen.get(topic)?.delete(oldest);
     }
+    this.touch(topic, epoch);
     this.topicPositions.set(topic, { epoch, offset });
+  }
+
+  private touch(topic: string, epoch: string): void {
+    let seen = this.seen.get(topic);
+    if (!seen) {
+      seen = new Map();
+      this.seen.set(topic, seen);
+    }
+    seen.set(epoch, Date.now());
+  }
+
+  /**
+   * Takes `offset` as where the stream of `epoch` stands, without a message
+   * delivered (a server's reply lists its streams): a stream not known yet
+   * starts there, as the oldest; a known one moves up to it. The last
+   * message delivered stays the topic's anchor.
+   */
+  raiseStream(topic: string, epoch: string, offset: number): void {
+    const streams = this.streams.get(topic);
+    const own = streams?.get(epoch);
+    if (own !== undefined) {
+      if (offset > own) {
+        streams!.set(epoch, offset);
+        this.touch(topic, epoch);
+      }
+      return;
+    }
+    if (streams && streams.size >= MAX_STREAMS_PER_TOPIC) return;
+    this.streams.set(topic, new Map([[epoch, offset], ...(streams ?? [])]));
+    this.touch(topic, epoch);
+    if (!this.topicPositions.has(topic)) this.topicPositions.set(topic, { epoch, offset });
+  }
+
+  /** Forgets the stream of `epoch`; the anchor moves to the last one left. */
+  forgetStream(topic: string, epoch: string): void {
+    const streams = this.streams.get(topic);
+    if (!streams?.delete(epoch)) return;
+    this.seen.get(topic)?.delete(epoch);
+    if (this.topicPositions.get(topic)?.epoch === epoch) {
+      const last = [...streams.entries()].pop();
+      if (last) this.topicPositions.set(topic, { epoch: last[0], offset: last[1] });
+      else this.topicPositions.delete(topic);
+    }
+  }
+
+  /** Forgets the streams of `topic` that did not move since `before` (ms), but those `keep` keeps. */
+  forgetQuietStreams(topic: string, before: number, keep: (epoch: string) => boolean): void {
+    const seen = this.seen.get(topic);
+    for (const epoch of [...(this.streams.get(topic)?.keys() ?? [])]) {
+      if ((seen?.get(epoch) ?? 0) < before && !keep(epoch)) this.forgetStream(topic, epoch);
+    }
   }
 
   /** Last delivered (epoch, offset) of a topic: the recovery anchor. */
@@ -141,20 +205,16 @@ export class EventSequencer {
   }
 
   /**
-   * Last delivered (epoch, offset) per topic -- the recovery anchor sent with
-   * a resubscribe. Restricted to `topics` when given.
+   * Where the client stands in each topic -- sent with a resubscribe: the
+   * last delivered (epoch, offset), the anchor a server before 3.1 replays
+   * from, and the last offset of each stream. Restricted to `topics` when
+   * given.
    */
-  getTopicPositions(topics?: string[]): Record<string, { epoch: string; offset: number }> {
-    const out: Record<string, { epoch: string; offset: number }> = {};
-    if (topics) {
-      for (const topic of topics) {
-        const pos = this.topicPositions.get(topic);
-        if (pos) out[topic] = { ...pos };
-      }
-    } else {
-      for (const [topic, pos] of this.topicPositions) {
-        out[topic] = { ...pos };
-      }
+  getTopicPositions(topics?: string[]): Record<string, TopicPosition> {
+    const out: Record<string, TopicPosition> = {};
+    for (const topic of topics ?? [...this.topicPositions.keys()]) {
+      const pos = this.topicPositions.get(topic);
+      if (pos) out[topic] = { ...pos, streams: Object.fromEntries(this.streams.get(topic) ?? []) };
     }
     return out;
   }
@@ -164,6 +224,7 @@ export class EventSequencer {
     for (const topic of topics) {
       this.topicPositions.delete(topic);
       this.streams.delete(topic);
+      this.seen.delete(topic);
     }
   }
 
@@ -207,6 +268,7 @@ export class EventSequencer {
     this.seenIds.clear();
     this.topicPositions.clear();
     this.streams.clear();
+    this.seen.clear();
     this.sequence = 0;
     this.cleanupCounter = 0;
 
@@ -220,6 +282,7 @@ export class EventSequencer {
     this.seenIds.clear();
     this.topicPositions.clear();
     this.streams.clear();
+    this.seen.clear();
     this.cleanupCounter = 0;
 
     logger.debug('EventSequencer reset');

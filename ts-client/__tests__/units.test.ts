@@ -139,9 +139,9 @@ describe('EventSequencer positions', () => {
     const s = new EventSequencer();
     s.checkTopicStamp('a', '01', 1);
     s.checkTopicStamp('b', '01', 5);
-    expect(s.getTopicPositions(['a', 'c'])).toEqual({ a: { epoch: '01', offset: 1 } });
+    expect(s.getTopicPositions(['a', 'c'])).toEqual({ a: { epoch: '01', offset: 1, streams: { '01': 1 } } });
     s.clearTopics(['a']);
-    expect(s.getTopicPositions()).toEqual({ b: { epoch: '01', offset: 5 } });
+    expect(s.getTopicPositions()).toEqual({ b: { epoch: '01', offset: 5, streams: { '01': 5 } } });
   });
 });
 
