@@ -4,6 +4,15 @@
 
 ### Added
 
+- TypeScript client without React: `wse-client/core` makes clients of their
+  own with `createWSEClient` (no React, no zustand, nothing read from the page
+  on import; two clients on one page share nothing), and `wse-client/react`
+  (a provider and hooks), `wse-client/vue` (a plugin and composables) and
+  `wse-client/svelte` (stores) hold a client while components use it. The
+  root `wse-client` and `useWSE` are as before; React, zustand and Vue are
+  optional peer dependencies. Outside browsers a `webSocket` factory may
+  send headers.
+
 - Recovery positions per stream. A client may name, with its recovery
   request, the last offset it holds of each stream of a topic (`streams`:
   one per server that publishes to it); the server then replays each stream

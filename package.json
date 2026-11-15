@@ -1,7 +1,7 @@
 {
   "name": "wse-client",
   "version": "3.0.1",
-  "description": "TypeScript client for WSE, with a React hook: topics with message recovery, reconnects, an offline queue, end-to-end encryption and signed messages.",
+  "description": "TypeScript client for WSE: a core without a framework, with React, Vue and Svelte adapters and the React hook useWSE; topics with message recovery, reconnects, an offline queue, end-to-end encryption and signed messages.",
   "type": "module",
   "main": "./dist/npm/index.js",
   "types": "./dist/npm/index.d.ts",
@@ -11,7 +11,43 @@
       "import": "./dist/npm/index.js",
       "default": "./dist/npm/index.js"
     },
+    "./core": {
+      "types": "./dist/npm/core/index.d.ts",
+      "import": "./dist/npm/core/index.js",
+      "default": "./dist/npm/core/index.js"
+    },
+    "./react": {
+      "types": "./dist/npm/react/index.d.ts",
+      "import": "./dist/npm/react/index.js",
+      "default": "./dist/npm/react/index.js"
+    },
+    "./vue": {
+      "types": "./dist/npm/vue/index.d.ts",
+      "import": "./dist/npm/vue/index.js",
+      "default": "./dist/npm/vue/index.js"
+    },
+    "./svelte": {
+      "types": "./dist/npm/svelte/index.d.ts",
+      "import": "./dist/npm/svelte/index.js",
+      "default": "./dist/npm/svelte/index.js"
+    },
     "./package.json": "./package.json"
+  },
+  "typesVersions": {
+    "*": {
+      "core": [
+        "./dist/npm/core/index.d.ts"
+      ],
+      "react": [
+        "./dist/npm/react/index.d.ts"
+      ],
+      "vue": [
+        "./dist/npm/vue/index.d.ts"
+      ],
+      "svelte": [
+        "./dist/npm/svelte/index.d.ts"
+      ]
+    }
   },
   "files": [
     "dist/npm/"
@@ -34,13 +70,16 @@
     "pubsub",
     "encryption",
     "rust",
-    "zustand"
+    "zustand",
+    "vue",
+    "svelte",
+    "typescript"
   ],
   "author": "silvermpx",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/silvermpx/wse.git",
+    "url": "git+https://github.com/silvermpx/wse.git",
     "directory": "ts-client"
   },
   "homepage": "https://github.com/silvermpx/wse",
@@ -60,7 +99,19 @@
   },
   "peerDependencies": {
     "react": ">=18",
+    "vue": ">=3.3",
     "zustand": ">=4"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "vue": {
+      "optional": true
+    },
+    "zustand": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@testing-library/dom": "^10.4.2",
@@ -73,6 +124,7 @@
     "react-dom": "^19.3.1",
     "typescript": "^7.0.2",
     "vitest": "^5.1.0",
+    "vue": "^3.5.45",
     "zustand": "^5.1.0"
   }
 }
