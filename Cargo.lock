@@ -3050,6 +3050,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -3062,24 +3063,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "wse-client-native"
-version = "3.0.1"
-dependencies = [
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
- "wse",
- "wse-client",
-]
-
-[[package]]
 name = "wse-ffi"
 version = "3.0.1"
 dependencies = [
  "async-trait",
  "uniffi",
- "wse-client-native",
+ "wse-client",
 ]
 
 [[package]]

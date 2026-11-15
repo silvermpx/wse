@@ -1,4 +1,7 @@
-//! The facade against the WSE server, both in this process.
+//! The client for mobile bindings (the `native` feature) against the WSE
+//! server, both in this process.
+
+#![cfg(all(feature = "native", not(target_arch = "wasm32")))]
 
 use std::future::Future;
 use std::pin::Pin;
@@ -7,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::net::TcpListener;
-use wse_client_native::{
+use wse_client::native::{
     BatchKind, CancelToken, ErrorKind, Item, NativeClient, NativeConfig, NativeStatus, TokenSource,
 };
 

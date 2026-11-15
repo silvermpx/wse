@@ -1,4 +1,4 @@
-//! The WSE Rust client as mobile bindings need it: plain types that any
+//! The client as mobile bindings need it (the `native` feature): plain types that any
 //! binding generator can carry (UniFFI for Swift and Kotlin,
 //! flutter_rust_bridge for Dart), one tokio runtime for every client of the
 //! process, and calls that can be cancelled without losing anything.
@@ -18,12 +18,12 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use crate::{
+    Config, Error, Event, Events, GapReason, Incoming, OwnedMessage, Status, TokenProvider,
+};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use wse_client::{
-    Config, Error, Event, Events, GapReason, Incoming, OwnedMessage, Status, TokenProvider,
-};
 
 // -- the runtime --------------------------------------------------------------
 
@@ -158,7 +158,6 @@ impl From<Error> for NativeError {
             Error::Panicked => ErrorKind::Internal,
             Error::Encode(_) => ErrorKind::Encode,
             Error::Decode(_) => ErrorKind::Decode,
-            _ => ErrorKind::Unknown,
         };
         Self::new(kind, error.to_string())
     }
@@ -212,7 +211,7 @@ fn config_of(
     }
     config.topics = native.topics;
     if native.msgpack {
-        config.format = wse_client::Format::Msgpack;
+        config.format = crate::Format::Msgpack;
     }
     config.headers = native.headers;
     if native.send_queue > 0 {
@@ -235,7 +234,7 @@ fn config_of(
         config.recovery_timeout = Duration::from_millis(native.recovery_timeout_ms);
     }
     if !native.server_identity_keys.is_empty() {
-        config.encryption = Some(wse_client::Encryption::pinned(native.server_identity_keys));
+        config.encryption = Some(crate::Encryption::pinned(native.server_identity_keys));
     }
     config.signing_key = native.signing_key;
     config.server_signing_keys = native.server_signing_keys;
@@ -370,7 +369,6 @@ fn gap_reason(reason: GapReason) -> &'static str {
         GapReason::Incomplete => "incomplete",
         GapReason::EpochChanged => "epoch_changed",
         GapReason::Closed => "closed",
-        _ => "unknown",
     }
 }
 
@@ -445,16 +443,6 @@ fn item_of(incoming: Incoming) -> Item {
             Event::Closed(error) => Item::Closed {
                 error: error.map(NativeError::from),
             },
-            other => Item::Unknown {
-                name: format!("{other:?}")
-                    .split(['(', ' ', '{'])
-                    .next()
-                    .unwrap_or("")
-                    .to_owned(),
-            },
-        },
-        _ => Item::Unknown {
-            name: "incoming".to_owned(),
         },
     }
 }
@@ -495,7 +483,7 @@ pub enum NativeStatus {
 }
 
 pub struct NativeClient {
-    client: wse_client::Client,
+    client: crate::Client,
     reader: Mutex<Reader>,
     closing: CancellationToken,
 }
@@ -512,7 +500,7 @@ impl NativeClient {
         let cancel = cancel.0.clone();
         let (client, events) = on_runtime(async move {
             tokio::select! {
-                connected = wse_client::connect(config) => connected.map_err(NativeError::from),
+                connected = crate::connect(config) => connected.map_err(NativeError::from),
                 () = cancel.cancelled() => Err(NativeError::new(ErrorKind::Cancelled, "connect was cancelled")),
             }
         })

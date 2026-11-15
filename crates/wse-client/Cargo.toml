@@ -37,6 +37,8 @@ tokio = { version = "1.54.1", features = ["rt", "net", "time", "sync", "macros"]
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
 fastrand = "2"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"], optional = true }
+# The cancel tokens of the `native` module.
+tokio-util = { version = "0.7", default-features = false, optional = true }
 webpki-roots = { version = "1", optional = true }
 
 # In the browser: its WebSocket and timers.
@@ -65,6 +67,9 @@ aws-lc = [
 ]
 # aws-lc-rs built from its FIPS 140-3 validated module (needs CMake and Go).
 fips = ["aws-lc", "wse/fips", "rustls/fips"]
+# The `native` module, for the Swift, Kotlin and Dart packages: plain types,
+# one shared runtime, events read in bounded batches. Not in the browser.
+native = ["aws-lc", "dep:tokio-util", "tokio/rt-multi-thread"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # The server, published before this crate: its tests and examples build
@@ -80,3 +85,7 @@ fastrand = "2"
 [package.metadata.docs.rs]
 # The crypto library's own build is the slow part: one target is enough.
 targets = ["x86_64-unknown-linux-gnu"]
+
+[[test]]
+name = "native"
+required-features = ["native"]

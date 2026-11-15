@@ -20,6 +20,9 @@ mod events;
 mod frames;
 mod handler;
 mod message;
+/// The client as mobile bindings (Swift, Kotlin, Dart) need it.
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+pub mod native;
 mod policy;
 mod scan;
 mod security;

@@ -1,4 +1,4 @@
-//! The WSE client for Swift and Kotlin: wse-client-native through UniFFI.
+//! The WSE client for Swift and Kotlin: the Rust client's native module through UniFFI.
 //!
 //! Every call that waits is async and returns a `Result`; a panic is an
 //! error, never an unwind into Swift or Kotlin. Swift does not cancel Rust
@@ -11,7 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use wse_client_native as native;
+use wse_client::native;
 
 uniffi::setup_scaffolding!();
 
