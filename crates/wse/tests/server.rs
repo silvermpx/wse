@@ -153,6 +153,23 @@ async fn a_server_starts_once_and_again_after_stop() {
     server.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drained_server_takes_no_one_once_drain_returns() {
+    for _ in 0..10 {
+        let server = wse::Server::new(wse::Config::default()).unwrap();
+        let (tx, _events) = mpsc::unbounded_channel();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        server.start(listener, Recorder { events: tx }).unwrap();
+        let dropped = server
+            .drain(1001, "moving", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(dropped, 0);
+        assert!(server.publisher().is_draining());
+        server.stop().await;
+    }
+}
+
 #[test]
 fn a_configuration_is_checked_as_a_whole() {
     let mut config = wse::Config::default();

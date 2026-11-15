@@ -146,6 +146,10 @@ impl RustWSEServer {
         timeout: u64,
     ) -> PyResult<usize> {
         let tx = self.command_tx()?;
+        // No connection registers from here on, before the first count: a
+        // registration checks this under the connections' write lock, and
+        // the count is taken under their read lock.
+        self.shared.draining.store(true, Ordering::SeqCst);
         tx.command(ServerCommand::Drain {
             close_code,
             close_reason: close_reason.to_owned(),
@@ -157,7 +161,7 @@ impl RustWSEServer {
         let remaining = py.detach(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(timeout);
             loop {
-                let left = shared.connection_count.load(Ordering::Relaxed);
+                let left = shared.connections.read().len();
                 if left == 0 || std::time::Instant::now() >= deadline {
                     return left;
                 }

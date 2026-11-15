@@ -113,6 +113,10 @@ impl Server {
     /// ends it.
     pub async fn drain(&self, code: u16, reason: &str, timeout: Duration) -> Result<usize, Error> {
         let publisher = self.publisher();
+        // No connection registers from here on, before the first count: a
+        // registration checks this under the connections' write lock, and
+        // the count is taken under their read lock.
+        self.shared.draining.store(true, Ordering::SeqCst);
         publisher.command(ServerCommand::Drain {
             close_code: code,
             close_reason: reason.to_owned(),
@@ -120,7 +124,7 @@ impl Server {
         // A timeout too far to count is no deadline at all.
         let deadline = tokio::time::Instant::now().checked_add(timeout);
         loop {
-            let left = self.shared.connection_count.load(Ordering::Relaxed);
+            let left = self.shared.connections.read().len();
             if left == 0 {
                 return Ok(0);
             }

@@ -89,6 +89,18 @@ class TestDrain:
         finally:
             srv.stop()
 
+    def test_drain_of_an_empty_server_returns_once_it_takes_no_one(self, server_port):
+        """drain() returns only after new connections are refused, even when
+        there is nobody to wait for."""
+        for _ in range(10):
+            srv = jwt_server(server_port)
+            srv.start()
+            try:
+                assert srv.drain(timeout=5) == 0
+                assert srv.is_draining()
+            finally:
+                srv.stop()
+
     def test_drain_drops_clients_that_stay_at_the_timeout(self, server_port):
         srv = jwt_server(server_port)
         srv.enable_drain_mode()
