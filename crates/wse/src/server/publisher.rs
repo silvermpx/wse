@@ -21,6 +21,9 @@ use crate::msgpack::serde_json_to_rmpv;
 pub enum Error {
     /// The server stopped: it takes nothing more.
     Stopped,
+    /// The server's command queue is full: the publisher is faster than the
+    /// server delivers. Await `Publisher::ready` and send again.
+    Full,
     /// The server is running already.
     Running,
     /// The server validates tokens itself and accepts its connections on
@@ -44,14 +47,17 @@ pub enum Error {
     Cluster(String),
     /// Cluster settings that exclude each other.
     ClusterConfig(String),
-    /// A port could not be bound.
-    Io(String),
+    /// A port could not be bound: why, and the message.
+    Io(std::io::ErrorKind, String),
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Stopped => f.write_str("the server stopped"),
+            Self::Full => f.write_str(
+                "the server's command queue is full: await Publisher::ready() and send again",
+            ),
             Self::Running => f.write_str("the server is running already"),
             Self::AcceptsByToken => f.write_str(
                 "this server validates tokens itself (jwt_secret) and accepts connections on \
@@ -66,7 +72,7 @@ impl std::fmt::Display for Error {
             | Self::BadJwtKey(what)
             | Self::Cluster(what)
             | Self::ClusterConfig(what)
-            | Self::Io(what) => f.write_str(what),
+            | Self::Io(_, what) => f.write_str(what),
             Self::TooManyTopics(conn_id, max) => {
                 write!(f, "Connection {conn_id} reached max subscriptions ({max})")
             }
@@ -80,17 +86,36 @@ impl std::error::Error for Error {}
 /// What the application reaches its server with: send, publish, subscribe,
 /// close. Cheap to clone; every clone reaches the same server, across
 /// restarts. While the server is stopped, sends fail with `Error::Stopped`.
+///
 /// Sends and broadcasts go through the server's command queue in the order
-/// they are made: when the queue is full, a fast publisher waits for room
-/// (`ready`, `wait_ready`) instead of filling memory.
+/// they are made, and never wait. The queue holds 65,536 commands: past
+/// that, they fail with `Error::Full` until the server has caught up. A
+/// publisher that may outrun its clients awaits `ready` before each send,
+/// and is held back to the speed the server delivers at.
 #[derive(Clone)]
 pub struct Publisher {
     pub(crate) shared: Arc<SharedState>,
+    /// Whether a send is refused while the command queue is full; the
+    /// Python layer waits for room itself and then queues.
+    refuse_full: bool,
 }
 
 impl Publisher {
     pub(crate) fn new(shared: Arc<SharedState>) -> Self {
-        Self { shared }
+        Self {
+            shared,
+            refuse_full: true,
+        }
+    }
+
+    /// A publisher whose caller waits for room before each send (`wait_ready`)
+    /// and then queues even if others filled the queue meanwhile.
+    #[cfg(feature = "python")]
+    pub(crate) fn waiting(shared: Arc<SharedState>) -> Self {
+        Self {
+            shared,
+            refuse_full: false,
+        }
     }
 
     /// Queue a command for the running server.
@@ -101,8 +126,14 @@ impl Publisher {
         }
     }
 
+    /// Queue the application's send or broadcast: refused while the
+    /// command queue is full.
     fn queue(&self, cmd: ServerCommand) -> Result<(), Error> {
-        self.command(cmd)
+        match &*self.shared.commands.load() {
+            Some(commands) if self.refuse_full && commands.is_full() => Err(Error::Full),
+            Some(commands) => commands.send(cmd).map_err(|_| Error::Stopped),
+            None => Err(Error::Stopped),
+        }
     }
 
     /// Whether the server is running: it takes sends and broadcasts.
@@ -114,8 +145,8 @@ impl Publisher {
             .is_some_and(|commands| !commands.is_closed())
     }
 
-    /// Whether the command queue is full: sends and broadcasts wait for room
-    /// before theirs.
+    /// Whether the command queue is full: sends and broadcasts fail with
+    /// `Error::Full` until it has room.
     pub fn is_full(&self) -> bool {
         self.shared
             .commands
@@ -124,7 +155,8 @@ impl Publisher {
             .is_some_and(|commands| commands.is_full())
     }
 
-    /// Wait for room in the command queue.
+    /// Wait for room in the command queue: a publisher awaits this before
+    /// its sends to be held back instead of refused.
     pub async fn ready(&self) {
         while self
             .shared
@@ -137,8 +169,10 @@ impl Publisher {
         }
     }
 
-    /// Block the calling thread until the command queue has room: for a
-    /// caller outside the runtime.
+    /// Block the calling thread until the command queue has room, for a
+    /// thread of the application's own. On the runtime, a `Handler`
+    /// included, await `ready` instead: blocking a worker thread holds
+    /// back the server's own tasks.
     pub fn wait_ready(&self) {
         if let Some(commands) = self.shared.commands.load_full() {
             commands.wait_for_room();
@@ -171,7 +205,7 @@ impl Publisher {
             return Ok(false);
         }
         let ready = build_server_ready(conn_id, user_id, shared);
-        self.queue(ServerCommand::Accept {
+        self.command(ServerCommand::Accept {
             conn_id: conn_id.to_owned(),
             ready,
         })?;

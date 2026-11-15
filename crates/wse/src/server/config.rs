@@ -9,15 +9,19 @@ use super::state::{SharedState, SharedStateConfig};
 use crate::jwt::{self, JwtConfig};
 
 /// What a server is configured with. Start from `Config::default()` and set
-/// the fields that differ: the defaults are those of the Python server.
-#[derive(Clone, Debug)]
+/// the fields that differ: the defaults are those of the Python server. Its
+/// `Debug` print shows whether a key is set, never the key.
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct Config {
     /// Registered connections at most; more are refused (1013).
     pub max_connections: usize,
-    /// Messages waiting for the application at most (drain and callbacks).
+    /// The Python package's queue of client messages waiting for the
+    /// application: a Rust `Handler` is called directly and never queued.
+    #[doc(hidden)]
     pub max_inbound_queue_size: usize,
-    /// Bytes of messages waiting for the application at most.
+    /// The same queue's bytes at most.
+    #[doc(hidden)]
     pub max_inbound_queue_bytes: usize,
     /// Origins a browser may connect from; None: any.
     pub allowed_origins: Option<Vec<String>>,
@@ -36,12 +40,13 @@ pub struct Config {
     pub signature_window: u64,
     /// A client's message is at most this many bytes.
     pub max_message_size: usize,
-    /// Seconds between the server's pings.
+    /// Seconds between the server's pings: at least 1, below `idle_timeout`.
     pub ping_interval: u64,
-    /// A connection silent for this many seconds is closed.
+    /// A connection silent for this many seconds is closed: at most a week.
     pub idle_timeout: u64,
     /// Bytes waiting to be written to one connection at most; past them it
-    /// misses messages, and a connection over them for two pings is closed.
+    /// misses messages, and a connection over them for two pings is closed
+    /// (1013). 0: no limit.
     pub max_outbound_queue_bytes: usize,
     /// Topics one connection may subscribe to at most; 0: no limit.
     pub max_subscriptions_per_connection: usize,
@@ -85,15 +90,19 @@ impl Default for Config {
 }
 
 /// Tokens the server validates itself, from the cookie or the
-/// Authorization header.
-#[derive(Clone, Debug)]
+/// Authorization header. Its `Debug` print leaves the keys out.
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct JwtSettings {
     /// The HMAC secret, or the public key (PEM) of the asymmetric algorithms.
     pub secret: Vec<u8>,
-    /// HS256 by default; see `jwt::JwtAlgorithm::supported`.
+    /// The algorithm tokens must use, whatever their own header says:
+    /// `HS256` (the default), `HS384`, `HS512`, `RS256`, `RS384`, `RS512`,
+    /// `PS256`, `PS384`, `PS512`, `ES256`, `ES384` or `EdDSA`.
     pub algorithm: Option<String>,
+    /// The `iss` a token must carry; None: any.
     pub issuer: Option<String>,
+    /// The `aud` a token must carry; None: any.
     pub audience: Option<String>,
     /// The cookie the token comes in; `access_token` by default.
     pub cookie_name: Option<String>,
@@ -124,7 +133,8 @@ impl JwtSettings {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct RecoverySettings {
-    /// Messages kept per topic (a power of two, at least 16).
+    /// Messages kept per topic: rounded up to a power of two, from 16 to
+    /// 65,536.
     pub buffer_size: usize,
     /// Seconds an idle topic's history lives.
     pub ttl: u64,
@@ -166,7 +176,14 @@ impl Default for PresenceSettings {
 
 /// A configuration that cannot run, and why.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConfigError(pub String);
+pub struct ConfigError(String);
+
+impl ConfigError {
+    /// What is wrong with the configuration.
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+}
 
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -240,6 +257,14 @@ impl Config {
             })?;
         if self.signature_window == 0 {
             return Err(invalid("signature_window must be at least 1 second"));
+        }
+        // A week at most: further out, the timers' instants overflow.
+        const MAX_IDLE_SECS: u64 = 7 * 86_400;
+        if self.idle_timeout > MAX_IDLE_SECS {
+            return Err(invalid(format!(
+                "idle_timeout must be at most {MAX_IDLE_SECS} seconds, got {}",
+                self.idle_timeout
+            )));
         }
         if self.ping_interval >= self.idle_timeout {
             return Err(invalid(format!(
@@ -323,5 +348,61 @@ impl JwtSettings {
                 .cookie_name
                 .unwrap_or_else(|| "access_token".to_string()),
         })
+    }
+}
+
+/// A secret in a `Debug` print: whether it is there, never what it is.
+struct Redacted(bool);
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0 { "Some(<redacted>)" } else { "None" })
+    }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("max_connections", &self.max_connections)
+            .field("max_inbound_queue_size", &self.max_inbound_queue_size)
+            .field("max_inbound_queue_bytes", &self.max_inbound_queue_bytes)
+            .field("allowed_origins", &self.allowed_origins)
+            .field("client_subscriptions", &self.client_subscriptions)
+            .field(
+                "e2e_identity_key",
+                &Redacted(self.e2e_identity_key.is_some()),
+            )
+            .field("e2e_legacy", &self.e2e_legacy)
+            .field("signing_key", &Redacted(self.signing_key.is_some()))
+            .field("signature_window", &self.signature_window)
+            .field("max_message_size", &self.max_message_size)
+            .field("ping_interval", &self.ping_interval)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("max_outbound_queue_bytes", &self.max_outbound_queue_bytes)
+            .field(
+                "max_subscriptions_per_connection",
+                &self.max_subscriptions_per_connection,
+            )
+            .field("rate_limit_capacity", &self.rate_limit_capacity)
+            .field("rate_limit_refill", &self.rate_limit_refill)
+            .field("jwt", &self.jwt)
+            .field("recovery", &self.recovery)
+            .field("presence", &self.presence)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for JwtSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtSettings")
+            .field("secret", &Redacted(true))
+            .field("algorithm", &self.algorithm)
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .field("cookie_name", &self.cookie_name)
+            .field("previous_secret", &Redacted(self.previous_secret.is_some()))
+            .field("key_id", &self.key_id)
+            .field("private_key", &Redacted(self.private_key.is_some()))
+            .finish()
     }
 }

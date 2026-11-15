@@ -12,7 +12,8 @@ React, and [`wse-client`](https://pypi.org/project/wse-client/) for Python.
 ```toml
 [dependencies]
 wse = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 ```
 
 ## A server
@@ -74,8 +75,9 @@ with, and the `wse-client` crate's `chat_client` example talks to it.
 
 - **Fan-out on every core.** Each connection belongs to a delivery lane, one
   per core; a broadcast to 10,000 connections is delivered by every core at
-  once, and a publisher faster than its clients is held back instead of
-  filling memory.
+  once. A publisher faster than its clients waits for room
+  (`Publisher::ready`) instead of filling memory: past 65,536 queued sends,
+  a send fails with `Error::Full`.
 - **Topics.** Exact names and glob patterns, queue groups (one member of a
   group gets each message), per-connection ACLs, from the JWT `wse_topics`
   claim or set by the application.

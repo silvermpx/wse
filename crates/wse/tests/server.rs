@@ -222,7 +222,6 @@ async fn a_handler_subscribes_its_connections_as_they_come() {
     // Subscribed later from the application's own code.
     let taken = publisher
         .subscribe(&conn_id, vec!["prices".into()], &wse::Subscribe::default())
-        .await
         .unwrap();
     assert_eq!(taken, vec!["prices".to_string()]);
     publisher
@@ -293,4 +292,255 @@ async fn a_user_is_reached_on_every_connection_it_has() {
     assert!(publisher.user_connections("alice").is_empty());
     assert_eq!(publisher.user_connections("bob").len(), 1);
     server.stop().await;
+}
+
+/// Panics on the message `boom`, and tells the test of everything else.
+struct Fragile {
+    events: mpsc::UnboundedSender<Event>,
+}
+
+impl wse::Handler for Fragile {
+    type Connection = String;
+
+    fn connect(&self, connect: &wse::Connect<'_>) -> Option<String> {
+        let conn_id = (**connect.conn_id).clone();
+        let _ = self.events.send(Event::Connect(conn_id.clone()));
+        Some(conn_id)
+    }
+
+    fn message(&self, _conn: &mut String, message: wse::Inbound, _size: usize) -> bool {
+        if let wse::Inbound::Json(value) = message {
+            assert_ne!(value["t"], "boom", "the handler's own bug");
+            let _ = self.events.send(Event::Message(value));
+        }
+        true
+    }
+
+    fn signed(&self, _conn: &mut String, _message: serde_json::Value, _size: usize) -> bool {
+        false
+    }
+
+    fn disconnect(&self, conn: String) {
+        let _ = self.events.send(Event::Disconnect(conn));
+    }
+}
+
+/// A client the application accepted: its connection id and its socket.
+async fn accepted_client(
+    addr: std::net::SocketAddr,
+    publisher: &wse::Publisher,
+    events: &mut mpsc::UnboundedReceiver<Event>,
+) -> (String, Client) {
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/wse"))
+        .await
+        .unwrap();
+    let Event::Connect(conn_id) = next_event(events).await else {
+        panic!("a connect event first");
+    };
+    assert!(publisher.accept(&conn_id, "alice").unwrap());
+    assert!(next_text(&mut ws).await.contains("server_ready"));
+    (conn_id, ws)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handler_that_panics_closes_its_connection_alone() {
+    let server = wse::Server::new(wse::Config::default()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut events) = mpsc::unbounded_channel();
+    server.start(listener, Fragile { events: tx }).unwrap();
+    let publisher = server.publisher();
+    let (doomed_id, mut doomed) = accepted_client(addr, &publisher, &mut events).await;
+    let (_, mut other) = accepted_client(addr, &publisher, &mut events).await;
+
+    doomed
+        .send(Message::Text(r#"{"t":"boom"}"#.into()))
+        .await
+        .unwrap();
+    let mut close_code = None;
+    while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_secs(5), doomed.next()).await {
+        if let Ok(Message::Close(Some(frame))) = frame {
+            close_code = Some(u16::from(frame.code));
+            break;
+        }
+    }
+    assert_eq!(close_code, Some(1011));
+    // The client answers the close (reading on sends its reply).
+    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_secs(5), doomed.next()).await {}
+    // Cleaned up, and the application still hears of its end.
+    let Event::Disconnect(gone) = next_event(&mut events).await else {
+        panic!("its disconnect");
+    };
+    assert_eq!(gone, doomed_id);
+    assert_eq!(publisher.connection_count(), 1);
+
+    // The other connection goes on, and new ones come in.
+    other
+        .send(Message::Text(r#"{"t":"fine"}"#.into()))
+        .await
+        .unwrap();
+    let Event::Message(message) = next_event(&mut events).await else {
+        panic!("its message");
+    };
+    assert_eq!(message["t"], "fine");
+    let (_, _again) = accepted_client(addr, &publisher, &mut events).await;
+    assert_eq!(publisher.connection_count(), 2);
+    server.stop().await;
+}
+
+/// Puts every connection on `room` with presence, and tells the test of the
+/// presence changes.
+struct Present {
+    changes: mpsc::UnboundedSender<wse::Presence>,
+}
+
+impl wse::Handler for Present {
+    type Connection = ();
+
+    fn connect(&self, connect: &wse::Connect<'_>) -> Option<()> {
+        let presence = wse::Subscribe::presence(serde_json::json!({"status": "here"}));
+        connect.subscribe(vec!["room".into()], &presence).ok()?;
+        Some(())
+    }
+
+    fn message(&self, _conn: &mut (), _message: wse::Inbound, _size: usize) -> bool {
+        true
+    }
+
+    fn signed(&self, _conn: &mut (), _message: serde_json::Value, _size: usize) -> bool {
+        false
+    }
+
+    fn disconnect(&self, _conn: ()) {}
+
+    fn presence(&self, event: wse::Presence) {
+        let _ = self.changes.send(event);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn presence_asked_for_in_connect_is_tracked() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let mut config = wse::Config::default();
+    config.jwt = Some(wse::JwtSettings::new(
+        "a-secret-of-at-least-thirty-two-bytes",
+    ));
+    config.presence = Some(wse::PresenceSettings::default());
+    let server = wse::Server::new(config).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut changes) = mpsc::unbounded_channel();
+    server.start(listener, Present { changes: tx }).unwrap();
+    let publisher = server.publisher();
+    let token = publisher
+        .issue_token("alice", Duration::from_secs(60), serde_json::Map::new())
+        .unwrap();
+    let mut request = format!("ws://{addr}/wse").into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    assert!(next_text(&mut ws).await.contains("server_ready"));
+
+    let change = tokio::time::timeout(Duration::from_secs(5), changes.recv())
+        .await
+        .expect("a presence change within 5 s")
+        .expect("the handler alive");
+    let wse::Presence::Join { topic, user_id, .. } = change else {
+        panic!("a join: {change:?}");
+    };
+    assert_eq!((topic.as_str(), user_id.as_str()), ("room", "alice"));
+    let members = publisher.presence("room");
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].user_id, "alice");
+    assert_eq!(members[0].data["status"], "here");
+    server.stop().await;
+}
+
+/// Takes its time over each disconnect, then notes it.
+struct SlowGoodbye {
+    said: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl wse::Handler for SlowGoodbye {
+    type Connection = ();
+
+    fn connect(&self, _connect: &wse::Connect<'_>) -> Option<()> {
+        Some(())
+    }
+
+    fn message(&self, _conn: &mut (), _message: wse::Inbound, _size: usize) -> bool {
+        true
+    }
+
+    fn signed(&self, _conn: &mut (), _message: serde_json::Value, _size: usize) -> bool {
+        false
+    }
+
+    fn disconnect(&self, _conn: ()) {
+        std::thread::sleep(Duration::from_millis(200));
+        self.said.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_returns_once_every_disconnect_was_heard() {
+    let server = wse::Server::new(wse::Config::default()).unwrap();
+    let said = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for _ in 0..2 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        server
+            .start(
+                listener,
+                SlowGoodbye {
+                    said: std::sync::Arc::clone(&said),
+                },
+            )
+            .unwrap();
+        let mut clients = Vec::new();
+        for _ in 0..3 {
+            clients.push(
+                tokio_tungstenite::connect_async(format!("ws://{addr}/wse"))
+                    .await
+                    .unwrap()
+                    .0,
+            );
+        }
+        while server.connection_count() < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let before = said.load(std::sync::atomic::Ordering::SeqCst);
+        server.stop().await;
+        assert_eq!(said.load(std::sync::atomic::Ordering::SeqCst), before + 3);
+        assert_eq!(server.connection_count(), 0);
+    }
+}
+
+#[test]
+fn keys_stay_out_of_debug_prints() {
+    let key = b"-----BEGIN PRIVATE KEY----- not a real one".to_vec();
+    let mut config = wse::Config::default();
+    config.signing_key = Some(key.clone());
+    config.e2e_identity_key = Some(key.clone());
+    let mut jwt = wse::JwtSettings::new(key.clone());
+    jwt.private_key = Some(key.clone());
+    config.jwt = Some(jwt);
+    let printed = format!("{config:?}");
+    assert!(!printed.contains(&format!("{key:?}")), "{printed}");
+    assert!(
+        printed.contains("signing_key: Some(<redacted>)"),
+        "{printed}"
+    );
+    let keys = format!("{:?}", wse::JwtKeys::new(key.clone()));
+    assert!(!keys.contains(&format!("{key:?}")), "{keys}");
+}
+
+#[test]
+fn timers_beyond_a_week_are_refused() {
+    let mut config = wse::Config::default();
+    config.idle_timeout = 8 * 86_400;
+    let error = wse::Server::new(config).err().unwrap();
+    assert!(error.message().contains("idle_timeout"), "{error}");
 }

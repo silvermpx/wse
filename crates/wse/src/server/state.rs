@@ -8,7 +8,7 @@ use ahash::AHashSet;
 use crossbeam_channel::{Receiver as CBReceiver, Sender as CBSender, unbounded};
 use dashmap::{DashMap, DashSet};
 
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 use super::signing::{ClientKey, ServerSigner};
@@ -21,6 +21,7 @@ use crate::jwt::JwtConfig;
 /// new token from their token provider.
 pub(crate) const CLOSE_NORMAL: u16 = 1000; // disconnect() by the application
 pub(crate) const CLOSE_GOING_AWAY: u16 = 1001; // the server stops
+pub(crate) const CLOSE_INTERNAL_ERROR: u16 = 1011; // the application's handler panicked
 pub(crate) const CLOSE_TRY_AGAIN_LATER: u16 = 1013; // too slow to read, or the server is full
 pub(crate) const CLOSE_TOKEN_EXPIRED: u16 = 4403; // the JWT the connection opened with expired
 pub(crate) const CLOSE_IDLE: u16 = 4408; // nothing received within idle_timeout
@@ -288,7 +289,7 @@ pub(crate) struct DeduplicationState {
 }
 
 /// How many commands wait for the command task before the application's
-/// sends wait for room (`Commands::send_waiting`).
+/// sends are refused (`Error::Full`); the Python layer waits for room then.
 pub(crate) const COMMAND_QUEUE: usize = 65_536;
 
 /// Where a running server's presence events go: its handler.
@@ -321,7 +322,7 @@ impl Commands {
     }
 
     /// Whether `COMMAND_QUEUE` commands wait already: the application's
-    /// sends and broadcasts wait for room (`wait_for_room`) before theirs.
+    /// sends and broadcasts are refused until there is room.
     pub(crate) fn is_full(&self) -> bool {
         self.queued.load(Ordering::Relaxed) >= COMMAND_QUEUE
     }
@@ -519,7 +520,7 @@ pub(crate) struct SharedStateConfig {
 }
 
 pub(crate) struct SharedState {
-    pub(crate) connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
+    pub(crate) connections: Arc<parking_lot::RwLock<HashMap<String, ConnectionHandle>>>,
     pub(super) max_connections: usize,
     // Origins a browser may open a connection from (None: any)
     pub(super) allowed_origins: Option<AHashSet<String>>,
@@ -795,7 +796,7 @@ impl SharedState {
     pub(super) fn new(cfg: SharedStateConfig) -> Self {
         let (tx, rx) = unbounded();
         Self {
-            connections: Arc::new(RwLock::new(HashMap::new())),
+            connections: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             max_connections: cfg.max_connections,
             allowed_origins: cfg.allowed_origins,
             client_subscriptions: cfg.client_subscriptions,

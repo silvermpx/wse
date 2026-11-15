@@ -115,7 +115,7 @@ pub fn rust_should_compress(data: &[u8], threshold: usize) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers: Python value -> rmp_serde::Value conversion
+// Helpers: Python value -> msgpack value conversion
 // ---------------------------------------------------------------------------
 
 /// Containers nested deeper than this are rejected with `ValueError`; deeper

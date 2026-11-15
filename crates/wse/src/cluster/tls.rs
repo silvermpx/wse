@@ -23,27 +23,40 @@ pub(crate) struct ClusterTlsConfig {
 /// Build cluster TLS config from PEM file paths.
 /// Requires: node cert, node private key (unencrypted), CA cert.
 pub(crate) fn build_cluster_tls(
-    cert_path: &str,
-    key_path: &str,
-    ca_path: &str,
+    cert_path: impl AsRef<std::path::Path>,
+    key_path: impl AsRef<std::path::Path>,
+    ca_path: impl AsRef<std::path::Path>,
 ) -> Result<ClusterTlsConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let (cert_path, key_path, ca_path) = (cert_path.as_ref(), key_path.as_ref(), ca_path.as_ref());
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
-        .map_err(|e| format!("Failed to open cert file '{}': {}", cert_path, e))?
+        .map_err(|e| format!("Failed to open cert file '{}': {}", cert_path.display(), e))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("Failed to parse certs from '{}': {}", cert_path, e))?;
+        .map_err(|e| {
+            format!(
+                "Failed to parse certs from '{}': {}",
+                cert_path.display(),
+                e
+            )
+        })?;
     if certs.is_empty() {
-        return Err(format!("No certificates found in '{}'", cert_path).into());
+        return Err(format!("No certificates found in '{}'", cert_path.display()).into());
     }
 
     let key = PrivateKeyDer::from_pem_file(key_path)
-        .map_err(|e| format!("Failed to load private key '{}': {}", key_path, e))?;
+        .map_err(|e| format!("Failed to load private key '{}': {}", key_path.display(), e))?;
 
     let ca_certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(ca_path)
-        .map_err(|e| format!("Failed to open CA file '{}': {}", ca_path, e))?
+        .map_err(|e| format!("Failed to open CA file '{}': {}", ca_path.display(), e))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("Failed to parse CA certs from '{}': {}", ca_path, e))?;
+        .map_err(|e| {
+            format!(
+                "Failed to parse CA certs from '{}': {}",
+                ca_path.display(),
+                e
+            )
+        })?;
     if ca_certs.is_empty() {
-        return Err(format!("No CA certificates found in '{}'", ca_path).into());
+        return Err(format!("No CA certificates found in '{}'", ca_path.display()).into());
     }
 
     let mut root_store = RootCertStore::empty();

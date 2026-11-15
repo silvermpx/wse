@@ -114,7 +114,7 @@ impl RustWSEServer {
             run::start(&self.shared, &handler)
         };
         self.cmd_tx
-            .store(Some(Arc::new(Publisher::new(Arc::clone(&self.shared)))));
+            .store(Some(Arc::new(Publisher::waiting(Arc::clone(&self.shared)))));
         let running = self.running.clone();
         let shared = self.shared.clone();
         let rt_handle = rt.handle().clone();

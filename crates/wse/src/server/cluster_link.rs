@@ -1,6 +1,7 @@
 //! Joining a server to its cluster: the peers it links to, the port their
 //! links come in on, TLS between nodes.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -10,18 +11,19 @@ use super::publisher::{Error, Publisher};
 use super::state::SharedState;
 use crate::cluster::{self, ClusterCommand};
 
-/// The PEM files of a cluster's mutual TLS: this node's certificate and key,
-/// and the CA every node's certificate is checked against.
+/// The PEM files of a cluster's mutual TLS, by their paths: this node's
+/// certificate and key, and the CA every node's certificate is checked
+/// against.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ClusterTls {
-    pub cert: String,
-    pub key: String,
-    pub ca: String,
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    pub ca: PathBuf,
 }
 
 impl ClusterTls {
-    pub fn new(cert: impl Into<String>, key: impl Into<String>, ca: impl Into<String>) -> Self {
+    pub fn new(cert: impl Into<PathBuf>, key: impl Into<PathBuf>, ca: impl Into<PathBuf>) -> Self {
         Self {
             cert: cert.into(),
             key: key.into(),
@@ -54,6 +56,7 @@ pub struct ClusterSettings {
 
 /// A peer this node is linked to.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ClusterPeer {
     pub address: String,
     pub instance_id: String,
@@ -64,6 +67,7 @@ pub struct ClusterPeer {
 
 /// A message a peer did not take, kept for a retry.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeadLetter {
     pub topic: String,
     pub payload: String,
@@ -130,9 +134,10 @@ pub(crate) fn connect(shared: &Arc<SharedState>, settings: ClusterSettings) -> R
                     tokio::net::TcpListener::from_std(listener)
                 })
                 .map_err(|e| {
-                    Error::Io(format!(
-                        "cannot listen for cluster links on {host}:{port}: {e}"
-                    ))
+                    Error::Io(
+                        e.kind(),
+                        format!("cannot listen for cluster links on {host}:{port}: {e}"),
+                    )
                 })?;
             tracing::info!("[WSE-Cluster] Cluster listener on {host}:{port}");
             (cluster::InboundLinks::Listener(listener), None)
@@ -207,6 +212,10 @@ pub(crate) fn connect(shared: &Arc<SharedState>, settings: ClusterSettings) -> R
 impl Server {
     /// Join the cluster: links to its peers, and the port their links come
     /// in on. Call it on the runtime the server runs on, once started.
+    ///
+    /// # Panics
+    ///
+    /// Outside a tokio runtime.
     pub fn connect_cluster(&self, settings: ClusterSettings) -> Result<(), Error> {
         connect(&self.publisher().shared, settings)
     }

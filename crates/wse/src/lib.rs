@@ -24,7 +24,9 @@ mod filters;
 mod jwt_py;
 #[cfg(feature = "python")]
 mod pylock;
+// Public for crates/wse-py only: no stable API.
 #[cfg(feature = "python")]
+#[doc(hidden)]
 pub mod python;
 #[cfg(feature = "python")]
 mod queue;

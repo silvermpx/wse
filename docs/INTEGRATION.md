@@ -1152,9 +1152,12 @@ cheap to clone):
 | `drain(code, reason, timeout)` | `Server::drain` |
 | `stop()` | `Server::stop` |
 
-A full queue holds a fast publisher back: `Publisher::is_full()`, or wait
-with `Publisher::ready().await`. The application sets up its own tracing
-subscriber; the server's log target is `wse`.
+Sends never wait: past 65,536 queued sends they fail with `Error::Full`,
+and a publisher that may outrun its clients awaits `Publisher::ready()`
+before each send. Handler calls run on the runtime's worker threads, in
+order for each connection; one that panics closes its connection (1011).
+The application sets up its own tracing subscriber; the server's log target
+is `wse`.
 
 The Rust client is [`wse-client`](https://crates.io/crates/wse-client): a
 `Handler` that reads each message in place from its frame, or a stream of
@@ -1163,7 +1166,7 @@ and signed messages. It runs on tokio and in the browser (WebAssembly), where
 the page's cookie carries the token, as with the TypeScript client.
 
 ```bash
-cargo add wse-client tokio --features tokio/full
+cargo add wse-client serde_json tokio --features tokio/full
 ```
 
 ```rust

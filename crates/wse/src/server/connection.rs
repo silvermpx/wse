@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,7 @@ use super::fanout::BEHIND_BYTES;
 use super::frames::{
     close_frame, encode_message, encode_ws_frame, write_all_frames, ws_frame_size,
 };
-use super::handler::{Connect, Handler, Inbound};
+use super::handler::{Connect, Handler, Inbound, Panicked, guarded};
 use super::handshake::{HANDSHAKE_TIMEOUT, HandshakeGuard, normalize_origin, reject_ws_auth};
 use super::messages::{build_server_hello, build_server_ready, normalize_json_keys};
 use super::signing::{self, ClientKey, Refused};
@@ -33,8 +33,8 @@ use super::state::{Activity, CloseOutbox, Outbox, Seal};
 use super::subscribe::{answer_subscription_request, requested_compression};
 use super::{
     CLOSE_E2E_BAD_FRAME, CLOSE_E2E_EXHAUSTED, CLOSE_E2E_UNSUPPORTED, CLOSE_GRACE,
-    CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED, CLOSE_TRY_AGAIN_LATER, Closer, ConnectionHandle,
-    SharedState, WsFrame,
+    CLOSE_INTERNAL_ERROR, CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED, CLOSE_TRY_AGAIN_LATER, Closer,
+    ConnectionHandle, SharedState, WsFrame,
 };
 use crate::jwt::{self, parse_cookie_value};
 use crate::msgpack::{decode_msgpack_guarded, rmpv_to_serde_json};
@@ -42,6 +42,31 @@ use crate::msgpack::{decode_msgpack_guarded, rmpv_to_serde_json};
 // ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
+
+/// A refusal any client can cause (a foreign origin, a bad token, a full
+/// server): logged once a second at most, with how many more there were;
+/// the rest at debug level. A flood of them is not a flood of lines.
+fn warn_refused(what: std::fmt::Arguments<'_>) {
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    static LEFT_OUT: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let last = LAST_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 1000
+        && LAST_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        match LEFT_OUT.swap(0, Ordering::Relaxed) {
+            0 => tracing::warn!("[WSE] {what}"),
+            more => tracing::warn!("[WSE] {what} ({more} more refusals in the last second)"),
+        }
+    } else {
+        LEFT_OUT.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!("[WSE] {what}");
+    }
+}
 
 /// Answer a protocol message the server handles itself (a ping, a client's
 /// compression wish, a subscription request when the server takes them),
@@ -84,10 +109,14 @@ enum Protocol {
     Application,
 }
 
+/// Why the application did not take a connection: the close code and the
+/// reason it is refused with.
+type Refusal = (u16, &'static str);
+
 /// The application learns of a connection: the validated user id (its user
-/// for presence), or without jwt_secret the cookies for it to check. None
-/// when it has no room for the connection now (it is then refused).
-#[must_use]
+/// for presence), or without jwt_secret the cookies for it to check. Refused
+/// when it has no room for the connection now, or when its `connect`
+/// panicked.
 fn tell_application<H: Handler>(
     state: &Arc<SharedState>,
     conn_id: &Arc<String>,
@@ -95,32 +124,40 @@ fn tell_application<H: Handler>(
     user_id: Option<&str>,
     cookies: &str,
     handler: &H,
-) -> Option<H::Connection> {
-    let app = handler.connect(&Connect {
-        conn_id,
-        user_id,
-        cookies,
-        state,
-        handle,
-    })?;
+) -> Result<H::Connection, Refusal> {
+    // Its user first, so that presence `connect` asks for is tracked. A
+    // refused connection's cleanup forgets both again.
     if let Some(user_id) = user_id {
         state.register_user(conn_id, user_id);
         if let Some(pm) = &state.presence {
             pm.register_connection(conn_id, user_id);
         }
     }
-    Some(app)
+    let connect = Connect {
+        conn_id,
+        user_id,
+        cookies,
+        state,
+        handle,
+    };
+    match guarded(|| handler.connect(&connect)) {
+        Ok(Some(app)) => Ok(app),
+        Ok(None) => Err((CLOSE_TRY_AGAIN_LATER, "server busy")),
+        Err(Panicked) => {
+            tracing::error!("[WSE] Handler::connect panicked for connection {conn_id}");
+            Err((CLOSE_INTERNAL_ERROR, "internal error"))
+        }
+    }
 }
 
 /// A client that announced E2E now has its session: accepted by its token,
 /// it gets server_ready (sealed) and joins the broadcasts; then the
-/// application learns of it. False when the application has no room for it.
+/// application learns of it, and may refuse it.
 ///
 /// Called from the connection's read loop: only the connection's own
 /// cleanup, after that loop, takes it out of the maps, so it is still in
 /// them here and the join needs no lock. The read loop waits on nothing but
 /// the socket.
-#[must_use]
 fn admit_after_session<H: Handler>(
     state: &Arc<SharedState>,
     conn_id: &Arc<String>,
@@ -128,7 +165,7 @@ fn admit_after_session<H: Handler>(
     user_id: Option<&str>,
     cookies: &str,
     handler: &H,
-) -> Option<H::Connection> {
+) -> Result<H::Connection, Refusal> {
     if let Some(user) = user_id {
         let ready = build_server_ready(conn_id, user, state);
         handle.send_control(Message::Text(ready.into()));
@@ -225,21 +262,19 @@ fn answer_client_hello<H: Handler>(
                 state.conn_sealed.insert((**conn_id).clone());
                 let _ = conn.handle.out.cipher.set(Seal::Session);
                 *admission.awaiting_session = false;
-                *admission.app = admit_after_session(
+                match admit_after_session(
                     state,
                     conn_id,
                     conn.handle,
                     admission.user_id,
                     admission.cookies,
                     admission.handler,
-                );
-                if admission.app.is_none() {
-                    conn.closer.close(
-                        conn.tx,
-                        &conn.handle.out.pending,
-                        CLOSE_TRY_AGAIN_LATER,
-                        "server busy",
-                    );
+                ) {
+                    Ok(app) => *admission.app = Some(app),
+                    Err((code, reason)) => {
+                        conn.closer
+                            .close(conn.tx, &conn.handle.out.pending, code, reason);
+                    }
                 }
             }
             Err(_) => conn.refuse(
@@ -1133,6 +1168,7 @@ pub(crate) async fn handle_connection<H: Handler>(
     state: Arc<SharedState>,
     hs_guard: HandshakeGuard,
     handler: Arc<H>,
+    stop: tokio_util::sync::CancellationToken,
 ) {
     // Clone the TCP stream FD for pre-framed raw writes (bypasses tungstenite).
     let (stream, mut raw_write) = match clone_tcp_stream(stream) {
@@ -1166,7 +1202,7 @@ pub(crate) async fn handle_connection<H: Handler>(
     ws_config.max_message_size = Some(state.max_message_size);
     ws_config.max_frame_size = Some(state.max_message_size);
     // A socket that sends nothing does not hold its place for long.
-    let ws_stream = match tokio::time::timeout(
+    let handshake = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         tokio_tungstenite::accept_hdr_async_with_config(
             ServerSocket {
@@ -1223,27 +1259,32 @@ pub(crate) async fn handle_connection<H: Handler>(
             },
             Some(ws_config),
         ),
-    )
-    .await
-    {
+    );
+    let handshake = tokio::select! {
+        handshake = handshake => handshake,
+        // The server stops: a connection not registered yet just goes.
+        () = stop.cancelled() => return,
+    };
+    let ws_stream = match handshake {
         Ok(Ok(ws)) => ws,
         Ok(Err(_)) if refused.load(Ordering::Relaxed) != ACCEPTED => {
             state
                 .connections_rejected_total
                 .fetch_add(1, Ordering::Relaxed);
             if refused.load(Ordering::Relaxed) == REFUSED_ORIGIN {
-                tracing::warn!("[WSE] Origin not allowed, refused {addr}");
+                warn_refused(format_args!("Origin not allowed, refused {addr}"));
             } else if !state.draining.load(Ordering::Relaxed) {
-                tracing::warn!("[WSE] Max connections reached, refused {addr}");
+                warn_refused(format_args!("Max connections reached, refused {addr}"));
             }
             return;
         }
         Ok(Err(e)) => {
-            tracing::warn!("[WSE] WS handshake failed for {addr}: {e}");
+            // Health probes and port scanners do this all day.
+            tracing::debug!("[WSE] WS handshake failed for {addr}: {e}");
             return;
         }
         Err(_) => {
-            tracing::warn!("[WSE] WS handshake timeout for {addr}");
+            tracing::debug!("[WSE] WS handshake timeout for {addr}");
             return;
         }
     };
@@ -1319,7 +1360,7 @@ pub(crate) async fn handle_connection<H: Handler>(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("[WSE] JWT validation failed for {addr}: {e}");
+                    warn_refused(format_args!("JWT validation failed for {addr}: {e}"));
                     state.auth_failures_total.fetch_add(1, Ordering::Relaxed);
                     state
                         .connections_rejected_total
@@ -1360,7 +1401,7 @@ pub(crate) async fn handle_connection<H: Handler>(
 
     // Register connection
     let registered = {
-        let mut conns = state.connections.write().await;
+        let mut conns = state.connections.write();
         // A draining or stopping server takes no one: the client comes back
         // to another server or later.
         let room = conns.len() < state.max_connections && !state.draining.load(Ordering::SeqCst);
@@ -1401,7 +1442,7 @@ pub(crate) async fn handle_connection<H: Handler>(
             tracing::debug!("[WSE] Draining, refusing {addr}");
             "server draining"
         } else {
-            tracing::warn!("[WSE] Max connections reached, rejecting {addr}");
+            warn_refused(format_args!("Max connections reached, rejecting {addr}"));
             "server full"
         };
         // The ACL and the client key were stored before the check.
@@ -1443,18 +1484,21 @@ pub(crate) async fn handle_connection<H: Handler>(
     let app = if announced_e2e {
         None
     } else {
-        tell_application(
+        match tell_application(
             &state,
             &conn_id,
             &own_handle,
             rust_auth_user_id.as_deref(),
             &cookie_str,
             &*handler,
-        )
+        ) {
+            Ok(app) => Some(app),
+            Err((code, reason)) => {
+                closer.close(&tx, &out.pending, code, reason);
+                None
+            }
+        }
     };
-    if !announced_e2e && app.is_none() {
-        closer.close(&tx, &out.pending, CLOSE_TRY_AGAIN_LATER, "server busy");
-    }
 
     // Write task: the only writer to the socket. Two sources: the control
     // queue (server_ready, replies, send_event, close) and the broadcast buffer
@@ -1600,6 +1644,9 @@ pub(crate) async fn handle_connection<H: Handler>(
     // Read loop. It ends when the client closes or the socket fails, and when
     // the server closed the connection and the client did not answer in time.
     let read_stop = closer.stop_registration();
+    // The application's side of a connection whose handler panicked: it hears
+    // no more messages, and its disconnect still comes.
+    let mut failed_app = None;
     let read_loop = async {
         loop {
             let msg = tokio::select! {
@@ -1614,22 +1661,31 @@ pub(crate) async fn handle_connection<H: Handler>(
                     _ => break,
                 },
             };
-            match reader.on_frame(msg) {
-                Flow::Next => {}
-                Flow::Stop => break,
+            // A panic in a handler call, or in the frame's own handling,
+            // closes this connection alone; its cleanup still runs.
+            match guarded(|| reader.on_frame(msg)) {
+                Ok(Flow::Next) => {}
+                Ok(Flow::Stop) => break,
+                Err(Panicked) => {
+                    tracing::error!(
+                        "[WSE] A handler call panicked for connection {conn_id}: closed (1011)"
+                    );
+                    failed_app = reader.app.take().or(failed_app.take());
+                    closer.close(&tx, &out.pending, CLOSE_INTERNAL_ERROR, "internal error");
+                }
             }
         }
     };
     // Stopped at once when the connection must go (`Closer`).
     let _ = futures_util::future::Abortable::new(read_loop, read_stop).await;
-    let app = reader.app.take();
+    let app = reader.app.take().or(failed_app);
     // The read side is done: the write task sends the close reply and ends.
     finish.store(true, Ordering::Release);
     own_handle.out.notify.notify_one();
 
     // Cleanup
     {
-        let mut conns = state.connections.write().await;
+        let mut conns = state.connections.write();
         conns.remove(&*conn_id);
         state.topics.leave(&conn_id, own_handle.lane);
         state.connection_count.store(conns.len(), Ordering::Relaxed);
@@ -1679,8 +1735,10 @@ pub(crate) async fn handle_connection<H: Handler>(
     // A connection the application never heard of (an announced client that
     // never opened its session, or one refused for want of room) gets no
     // disconnect event either.
-    if let Some(app) = app {
-        handler.disconnect(app);
+    if let Some(app) = app
+        && guarded(|| handler.disconnect(app)).is_err()
+    {
+        tracing::error!("[WSE] Handler::disconnect panicked for connection {conn_id}");
     }
     drop(tx);
     // A client that reads nothing more is not waited for past the grace.

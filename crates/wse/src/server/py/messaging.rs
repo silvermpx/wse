@@ -13,11 +13,12 @@ use crate::server::{Error, Publisher};
 pub(super) fn py_error(error: Error) -> PyErr {
     match error {
         Error::Stopped => PyRuntimeError::new_err("Channel closed"),
+        Error::Full => PyRuntimeError::new_err("the server's command queue is full"),
         Error::NoSigningKey => PyRuntimeError::new_err("sign() needs the server's signing_key"),
         Error::BadKey | Error::BadJwtKey(_) | Error::ClusterConfig(_) => {
             PyValueError::new_err(error.to_string())
         }
-        Error::Io(_) => pyo3::exceptions::PyOSError::new_err(error.to_string()),
+        Error::Io(..) => pyo3::exceptions::PyOSError::new_err(error.to_string()),
         error => PyRuntimeError::new_err(error.to_string()),
     }
 }

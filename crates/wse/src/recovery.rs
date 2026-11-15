@@ -875,7 +875,10 @@ impl RecoveryManager {
     /// left: what other nodes publish meanwhile is still relayed here, for
     /// the client that comes back within the history's lifetime.
     pub(crate) fn interest_linger(&self) -> Duration {
-        Duration::from_secs(self.config.history_ttl_secs)
+        // A history kept "forever" lingers ten years: an instant that far
+        // out is still one the clock can name.
+        const MAX_LINGER_SECS: u64 = 10 * 365 * 86_400;
+        Duration::from_secs(self.config.history_ttl_secs.min(MAX_LINGER_SECS))
     }
 
     /// A foreign buffer (`topic\0epoch`) is gone: its topic no longer

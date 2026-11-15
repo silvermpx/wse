@@ -40,7 +40,7 @@ impl RustWSEServer {
             presence,
         };
         let engine = self.engine();
-        py.detach(|| engine.subscribe_blocking(conn_id, topics, &options))
+        py.detach(|| engine.subscribe(conn_id, topics, &options))
             .map_err(py_error)
     }
 
@@ -84,7 +84,7 @@ impl RustWSEServer {
         let engine = self.engine();
         let asked = topics.clone();
         let results = py
-            .detach(|| engine.subscribe_with_recovery_blocking(conn_id, topics, &anchors))
+            .detach(|| engine.subscribe_with_recovery(conn_id, topics, &anchors))
             .map_err(py_error)?;
 
         let topics_dict = PyDict::new(py);

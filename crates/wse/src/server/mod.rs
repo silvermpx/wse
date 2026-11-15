@@ -113,8 +113,9 @@ pub use metrics::Health;
 pub use publisher::{Error, Publisher};
 pub(crate) use state::{
     CLOSE_E2E_BAD_FRAME, CLOSE_E2E_EXHAUSTED, CLOSE_E2E_UNSUPPORTED, CLOSE_GOING_AWAY, CLOSE_GRACE,
-    CLOSE_IDLE, CLOSE_NORMAL, CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED, CLOSE_TRY_AGAIN_LATER,
-    Closer, Commands, ConnectionHandle, QueueGroup, ServerCommand, SharedState, Tally,
+    CLOSE_IDLE, CLOSE_INTERNAL_ERROR, CLOSE_NORMAL, CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED,
+    CLOSE_TRY_AGAIN_LATER, Closer, Commands, ConnectionHandle, QueueGroup, ServerCommand,
+    SharedState, Tally,
 };
 
 // ---------------------------------------------------------------------------

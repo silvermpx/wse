@@ -2561,7 +2561,6 @@ dependencies = [
  "pyo3",
  "rcgen",
  "regex",
- "rmp-serde",
  "rmpv",
  "rustls",
  "rustls-pki-types",

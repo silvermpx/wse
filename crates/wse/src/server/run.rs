@@ -9,10 +9,12 @@ use ahash::AHashSet;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use super::commands::process_commands;
 use super::connection::handle_connection;
-use super::handler::Handler;
+use super::handler::{Handler, guarded};
 use super::handshake::{HANDSHAKE_TIMEOUT, HandshakeGuard, MAX_PENDING_HANDSHAKES};
 use super::{
     CLOSE_IDLE, CLOSE_TRY_AGAIN_LATER, Commands, ConnectionHandle, Fanout, ServerCommand,
@@ -55,7 +57,9 @@ pub(crate) fn start<H: Handler>(shared: &Arc<SharedState>, handler: &Arc<H>) -> 
     shared
         .presence_events
         .store(Some(Arc::new(Box::new(move |event| {
-            presence_handler.presence(event)
+            if guarded(|| presence_handler.presence(event)).is_err() {
+                tracing::error!("[WSE] Handler::presence panicked");
+            }
         }))));
     // For presence broadcasts from the disconnect cleanup paths.
     shared.commands.store(Some(Arc::new(commands)));
@@ -68,7 +72,9 @@ pub(crate) fn start<H: Handler>(shared: &Arc<SharedState>, handler: &Arc<H>) -> 
 /// Serve on `listener` until `running` is false: the command task, the
 /// periodic tasks (recovery cleanup, topic counter sweep, signed-message
 /// window, presence TTL sweep, ping / idle / slow-consumer check) and the
-/// accept loop. Returns once the command task has ended (`Shutdown`).
+/// accept loop. Returns once the command task has ended (`Shutdown`) and
+/// every task of this run with it, the connections' cleanup and their
+/// disconnect events included; what the run set up is gone then.
 pub(crate) async fn serve<H: Handler>(
     shared: Arc<SharedState>,
     started: Started,
@@ -82,14 +88,17 @@ pub(crate) async fn serve<H: Handler>(
         ..
     } = started;
     let cmd_handle = tokio::spawn(process_commands(cmd_rx, shared.clone(), fanout));
+    // This run's tasks: ended by `stop`, and waited for before the run ends.
+    let stop = CancellationToken::new();
+    let tasks = TaskTracker::new();
     // Spawn periodic recovery cleanup if recovery is enabled
     if let Some(ref recovery) = shared.recovery {
         let rm = recovery.clone();
         let cleanup_state = shared.clone();
-        tokio::spawn(async move {
+        let stop = stop.clone();
+        tasks.spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
+            while tick(&mut interval, &stop).await {
                 rm.cleanup();
                 cleanup_state.sweep_interest_linger();
             }
@@ -100,10 +109,10 @@ pub(crate) async fn serve<H: Handler>(
     // UUID-scoped topics), whether or not metrics are read.
     {
         let counts_state = shared.clone();
-        tokio::spawn(async move {
+        let stop = stop.clone();
+        tasks.spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
-            loop {
-                interval.tick().await;
+            while tick(&mut interval, &stop).await {
                 let counts = &counts_state.topic_message_counts;
                 if counts.len() > 10_000 {
                     counts.retain(|topic, _| counts_state.topics.subscribers.contains_key(topic));
@@ -115,10 +124,10 @@ pub(crate) async fn serve<H: Handler>(
     // is out of the window, as it could not be taken again.
     if shared.signer.is_some() {
         let seen_state = shared.clone();
-        tokio::spawn(async move {
+        let stop = stop.clone();
+        tasks.spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
-            loop {
-                interval.tick().await;
+            while tick(&mut interval, &stop).await {
                 let now = crate::server::signing::now_ms();
                 seen_state.signed_seen.retain(|_, until| *until >= now);
             }
@@ -128,14 +137,10 @@ pub(crate) async fn serve<H: Handler>(
     if let Some(ref pm) = shared.presence {
         let sweep_pm = pm.clone();
         let sweep_state = shared.clone();
-        let sweep_running = running.clone();
-        tokio::spawn(async move {
+        let stop = stop.clone();
+        tasks.spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                if !sweep_running.load(Ordering::Relaxed) {
-                    break;
-                }
+            while tick(&mut interval, &stop).await {
                 let removed = sweep_pm.sweep_dead_connections(|conn_id| {
                     if conn_id.starts_with("__remote__") {
                         return true;
@@ -154,7 +159,8 @@ pub(crate) async fn serve<H: Handler>(
     // Server-initiated ping + zombie detection + slow consumer detection
     {
         let ping_state = shared.clone();
-        tokio::spawn(async move {
+        let stop = stop.clone();
+        tasks.spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_secs(ping_state.ping_interval_secs));
             let idle_timeout = Duration::from_secs(ping_state.idle_timeout_secs);
@@ -163,11 +169,10 @@ pub(crate) async fn serve<H: Handler>(
             // of being slow (queue full on first check). If still full
             // on the next tick, they get disconnected.
             let mut suspected_slow: AHashSet<String> = AHashSet::new();
-            loop {
-                interval.tick().await;
+            while tick(&mut interval, &stop).await {
                 let now = std::time::Instant::now();
                 let snapshot: Vec<(String, ConnectionHandle)> = {
-                    let conns = ping_state.connections.read().await;
+                    let conns = ping_state.connections.read();
                     conns
                         .iter()
                         .map(|(cid, h)| (cid.clone(), h.clone()))
@@ -265,17 +270,29 @@ pub(crate) async fn serve<H: Handler>(
                         // single-port mode: the peek is for that.
                         let single_port =
                             shared.cluster_main_port.read().unwrap().is_some();
-                        tokio::spawn(async move {
+                        let stop = stop.clone();
+                        tasks.spawn(async move {
                             // Protocol detection: peek first 4 bytes to distinguish
                             // cluster binary frames (4-byte big-endian length prefix:
                             // 0x00 0x00 0x00 XX for frames < 256 bytes) from HTTP/WS
                             // (first byte is ASCII letter like 'G' for GET) or TLS
                             // (first byte 0x16 for ClientHello).
                             let mut peek = [0u8; 4];
-                            let is_cluster = single_port && match tokio::time::timeout(
-                                HANDSHAKE_TIMEOUT,
-                                stream.peek(&mut peek),
-                            ).await {
+                            let peeked = if single_port {
+                                tokio::select! {
+                                    peeked = tokio::time::timeout(
+                                        HANDSHAKE_TIMEOUT,
+                                        stream.peek(&mut peek),
+                                    ) => Some(peeked),
+                                    // The server stops: a socket not yet
+                                    // read just goes.
+                                    () = stop.cancelled() => return,
+                                }
+                            } else {
+                                None
+                            };
+                            let is_cluster = match peeked {
+                                Some(peeked) => match peeked {
                                 Ok(Ok(n)) if n >= 4 => {
                                     // Cluster frames start with 4-byte big-endian length prefix.
                                     // Valid HELLO is 20-200 bytes, so first 3 bytes are 0x00.
@@ -284,6 +301,8 @@ pub(crate) async fn serve<H: Handler>(
                                     peek[0] == 0x00 && peek[1] == 0x00 && peek[2] == 0x00 && peek[3] > 0
                                 }
                                 _ => false,
+                                },
+                                None => false,
                             };
                             if is_cluster {
                                 // Only in single-port mode, and then the
@@ -303,7 +322,8 @@ pub(crate) async fn serve<H: Handler>(
                                     ),
                                 }
                             } else {
-                                handle_connection(stream, addr, shared2, hs_guard, handler).await;
+                                handle_connection(stream, addr, shared2, hs_guard, handler, stop)
+                                    .await;
                             }
                         });
                     }
@@ -325,8 +345,24 @@ pub(crate) async fn serve<H: Handler>(
         }
     }
     let _ = cmd_handle.await;
+    // The command task closed every connection: the periodic tasks end, and
+    // the connections finish their cleanup.
+    stop.cancel();
+    tasks.close();
+    tasks.wait().await;
     running.store(false, Ordering::SeqCst);
+    // Lanes, queues and the handler go with the run, however it was stopped
+    // (`stop`, or the server dropped).
+    stopped(&shared);
     tracing::info!("[WSE] Shut down");
+}
+
+/// The next tick of a periodic task; false once its run is stopping.
+async fn tick(interval: &mut tokio::time::Interval, stop: &CancellationToken) -> bool {
+    tokio::select! {
+        () = stop.cancelled() => false,
+        _ = interval.tick() => true,
+    }
 }
 
 /// What a stopped server leaves: no lanes, no command queue, no cluster.

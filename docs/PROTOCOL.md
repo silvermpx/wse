@@ -401,6 +401,7 @@ Applications send their own codes in the same shape.
 |------|-----------|-------------|
 | 1000 | The application called `disconnect()` | reconnect |
 | 1001 | The server stops | reconnect |
+| 1011 | The server application's handler failed (a Rust `Handler` call panicked) | reconnect |
 | 1013 | The client reads too slowly: its outbound queue stayed over `max_outbound_queue_bytes` for two ping intervals. Also: the server filled up during the upgrade | reconnect |
 | 4300 | Graceful drain (the code passed to `drain()`, 4300 by default) | reconnect |
 | 4401 | Authentication failed at the upgrade | stop (a client with a token provider retries with a new token) |

@@ -49,7 +49,7 @@ pub(super) async fn process_commands(
         }
         match cmd {
             ServerCommand::SendText { conn_id, data } => {
-                let guard = state.connections.read().await;
+                let guard = state.connections.read();
                 if let Some(h) = guard.get(&conn_id) {
                     h.send_one(
                         Message::Text(data.into()),
@@ -62,7 +62,7 @@ pub(super) async fn process_commands(
                 // Under the read lock: its cleanup (write lock) cannot run
                 // between the join and here, so a gone connection never stays
                 // in the broadcast set.
-                let guard = state.connections.read().await;
+                let guard = state.connections.read();
                 if let Some(h) = guard.get(&conn_id)
                     && !h.out.admitted.swap(true, Ordering::AcqRel)
                 {
@@ -76,7 +76,7 @@ pub(super) async fn process_commands(
                 }
             }
             ServerCommand::SendBytes { conn_id, data } => {
-                let guard = state.connections.read().await;
+                let guard = state.connections.read();
                 if let Some(h) = guard.get(&conn_id) {
                     h.send_one(
                         Message::Binary(data.into()),
@@ -86,7 +86,7 @@ pub(super) async fn process_commands(
                 }
             }
             ServerCommand::SendPrebuilt { conn_id, message } => {
-                let guard = state.connections.read().await;
+                let guard = state.connections.read();
                 if let Some(h) = guard.get(&conn_id) {
                     let bytes = ws_frame_size(&WsFrame::Msg(message.clone())) as u64;
                     // Sealed for the connection's E2E key, if it has one.
@@ -156,7 +156,7 @@ pub(super) async fn process_commands(
                     .await;
             }
             ServerCommand::Disconnect { conn_id } => {
-                let guard = state.connections.read().await;
+                let guard = state.connections.read();
                 if let Some(h) = guard.get(&conn_id) {
                     h.close(CLOSE_NORMAL, "");
                 }
@@ -176,7 +176,7 @@ pub(super) async fn process_commands(
 
                 // Close every client with the drain code; one that does not answer
                 // is dropped after the close grace.
-                let guard = state.connections.read().await;
+                let guard = state.connections.read();
                 let n = guard.len();
                 for h in guard.values() {
                     h.close(close_code, &close_reason);
@@ -185,7 +185,7 @@ pub(super) async fn process_commands(
                 tracing::info!("[WSE] Drain: sent close to {n} connections");
             }
             ServerCommand::AbortAll => {
-                for h in state.connections.read().await.values() {
+                for h in state.connections.read().values() {
                     h.closer.abort();
                 }
             }
@@ -194,17 +194,15 @@ pub(super) async fn process_commands(
                 // is still in flight would come in after the close below and
                 // outlive the runtime.
                 state.draining.store(true, Ordering::SeqCst);
-                let guard = state.connections.read().await;
-                for h in guard.values() {
+                for h in state.connections.read().values() {
                     h.close(CLOSE_GOING_AWAY, "server shutting down");
                 }
-                drop(guard);
                 // Up to two seconds for the clients to answer, then the rest
                 // are dropped. Either way every connection's cleanup runs
                 // (disconnect events, presence, maps) before the runtime goes,
                 // so a later start() begins with none left over.
                 wait_for_no_connections(&state, Duration::from_secs(2)).await;
-                for h in state.connections.read().await.values() {
+                for h in state.connections.read().values() {
                     h.closer.abort();
                 }
                 wait_for_no_connections(&state, Duration::from_secs(1)).await;

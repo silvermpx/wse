@@ -43,3 +43,7 @@ fips = ["aws-lc-rs/fips"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(wse_rustcrypto)"] }
+
+[package.metadata.docs.rs]
+# The crypto library's own build is the slow part: one target is enough.
+targets = ["x86_64-unknown-linux-gnu"]

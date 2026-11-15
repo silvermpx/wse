@@ -19,6 +19,7 @@ pub struct Connect<'a> {
 
 /// A client's message, as the server read it.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Inbound {
     /// JSON text, or the message of a msgpack client, decoded; `type` and
     /// `payload` read as `t` and `p`.
@@ -31,7 +32,12 @@ pub enum Inbound {
 
 /// What the server tells the application. Each connection's calls come in
 /// order on the connection's own task: connect, its messages, disconnect.
-/// They should return fast; a handler hands long work to a task of its own.
+/// They run on the runtime's worker threads and should return fast; a
+/// handler hands long work to a task of its own.
+///
+/// A call that panics closes its connection (1011) and nothing else: the
+/// server cleans the connection up, and `disconnect` still comes for one
+/// that `connect` took.
 pub trait Handler: Send + Sync + 'static {
     /// What the handler keeps for one connection, from `connect` to
     /// `disconnect`.
@@ -54,14 +60,28 @@ pub trait Handler: Send + Sync + 'static {
     fn disconnect(&self, conn: Self::Connection);
 
     /// A user's first connection joined a topic with presence, or its last
-    /// one left. Called from whichever task saw it, not a connection's own.
+    /// one left. Called on whichever thread made the change: a connection's
+    /// own task (from inside `connect` when it subscribes with presence, and
+    /// from its cleanup), the caller of `Publisher::subscribe`,
+    /// `unsubscribe` or `update_presence`, the presence sweep, or a cluster
+    /// link. A lock held across those calls must not be taken here too.
     fn presence(&self, event: Presence) {
         let _ = event;
     }
 }
 
+/// A handler call that panicked: caught, and its connection closed.
+pub(crate) struct Panicked;
+
+/// Run a call into the application's handler; a panic in it is caught (the
+/// panic hook has reported it), so the server goes on and cleans up after it.
+pub(crate) fn guarded<R>(f: impl FnOnce() -> R) -> Result<R, Panicked> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| Panicked)
+}
+
 /// A user's presence on a topic changed.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Presence {
     Join {
         topic: String,

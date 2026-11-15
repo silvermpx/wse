@@ -43,6 +43,7 @@ impl Subscribe {
 
 /// Where a topic a connection subscribed to with recovery stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Recovered {
     /// The topic's history epoch (8 hex digits), when it has one.
     pub epoch: Option<String>,
@@ -60,6 +61,7 @@ pub struct Recovered {
 
 /// A user present on a topic.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Member {
     pub user_id: String,
     pub data: serde_json::Value,
@@ -67,14 +69,33 @@ pub struct Member {
     pub connections: usize,
 }
 
-/// New keys for the tokens a server validates (key rotation).
-#[derive(Clone, Debug)]
+/// New keys for the tokens a server validates (key rotation). Its `Debug`
+/// print leaves the keys out.
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct JwtKeys {
     pub secret: Vec<u8>,
     pub previous_secret: Option<Vec<u8>>,
     pub key_id: Option<String>,
     pub private_key: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for JwtKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let set = |key: bool| if key { "Some(<redacted>)" } else { "None" };
+        f.debug_struct("JwtKeys")
+            .field("secret", &format_args!("<redacted>"))
+            .field(
+                "previous_secret",
+                &format_args!("{}", set(self.previous_secret.is_some())),
+            )
+            .field("key_id", &self.key_id)
+            .field(
+                "private_key",
+                &format_args!("{}", set(self.private_key.is_some())),
+            )
+            .finish()
+    }
 }
 
 impl JwtKeys {
@@ -256,34 +277,16 @@ impl Publisher {
     }
 
     /// Subscribe a connection to `topics`: the ones its ACL allows, within
-    /// its limit. Returns the topics it took; none when it is gone.
-    pub async fn subscribe(
+    /// its limit. Returns the topics it took; none when it is gone. It does
+    /// not wait: a `Handler` may call it for its own connection (keep
+    /// `Connect::conn_id` in the handler's `Connection`).
+    pub fn subscribe(
         &self,
         conn_id: &str,
         topics: Vec<String>,
         options: &Subscribe,
     ) -> Result<Vec<String>, Error> {
-        let handle = self.shared.connections.read().await.get(conn_id).cloned();
-        match handle {
-            Some(handle) => subscribe(&self.shared, conn_id, &handle, topics, options),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    /// `subscribe` for a caller outside the runtime: it blocks the calling
-    /// thread for the connection's lookup.
-    pub fn subscribe_blocking(
-        &self,
-        conn_id: &str,
-        topics: Vec<String>,
-        options: &Subscribe,
-    ) -> Result<Vec<String>, Error> {
-        let handle = self
-            .shared
-            .connections
-            .blocking_read()
-            .get(conn_id)
-            .cloned();
+        let handle = self.shared.connections.read().get(conn_id).cloned();
         match handle {
             Some(handle) => subscribe(&self.shared, conn_id, &handle, topics, options),
             None => Ok(Vec::new()),
@@ -293,29 +296,13 @@ impl Publisher {
     /// Subscribe a connection to `topics`, each replaying what the
     /// connection missed after its position in `positions` (topic ->
     /// (epoch, offset)); a topic without a position only subscribes.
-    pub async fn subscribe_with_recovery(
+    pub fn subscribe_with_recovery(
         &self,
         conn_id: &str,
         topics: Vec<String>,
         positions: &HashMap<String, (u32, u64)>,
     ) -> Result<HashMap<String, Recovered>, Error> {
-        let handle = self.shared.connections.read().await.get(conn_id).cloned();
-        recover(&self.shared, conn_id, handle.as_ref(), topics, positions)
-    }
-
-    /// `subscribe_with_recovery` for a caller outside the runtime.
-    pub fn subscribe_with_recovery_blocking(
-        &self,
-        conn_id: &str,
-        topics: Vec<String>,
-        positions: &HashMap<String, (u32, u64)>,
-    ) -> Result<HashMap<String, Recovered>, Error> {
-        let handle = self
-            .shared
-            .connections
-            .blocking_read()
-            .get(conn_id)
-            .cloned();
+        let handle = self.shared.connections.read().get(conn_id).cloned();
         recover(&self.shared, conn_id, handle.as_ref(), topics, positions)
     }
 

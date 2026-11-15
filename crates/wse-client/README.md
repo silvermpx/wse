@@ -10,6 +10,8 @@ servers: [`wse`](https://crates.io/crates/wse) in Rust and
 ```toml
 [dependencies]
 wse-client = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 

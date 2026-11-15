@@ -212,7 +212,7 @@ impl RustWSEServer {
         });
         let shared = config
             .into_state()
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.0))?;
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(Self {
             host,
             port,

@@ -216,7 +216,7 @@ pub(super) fn build_server_hello(
                 "rate_limit_capacity": state.rate_capacity as u64,
                 "rate_limit_refill": state.rate_refill as u64
             },
-            "ping_interval": state.ping_interval_secs * 1000,
+            "ping_interval": state.ping_interval_secs.saturating_mul(1000),
             "connection_id": conn_id,
             "server_time": ts
         },

@@ -11,11 +11,13 @@ use super::state::SharedState;
 #[non_exhaustive]
 pub struct Health {
     pub connections: usize,
-    /// Events waiting for the Python application (drain mode).
+    /// Events waiting for a Python application (drain mode); 0 with a Rust
+    /// `Handler`, which is called directly.
     pub inbound_queue_depth: usize,
     /// Commands waiting for the command task.
     pub command_queue_depth: usize,
-    /// Client messages dropped for want of room in the application's queue.
+    /// Client messages a Python application had no room for; a Rust
+    /// `Handler` refuses its own (`message` returns false).
     pub inbound_dropped: u64,
     pub cluster_peer_count: u64,
     pub cluster_messages_sent: u64,
@@ -91,7 +93,7 @@ impl SharedState {
         ));
 
         out.push_str(
-            "# HELP wse_command_queue_depth Commands from Python waiting for the server\n",
+            "# HELP wse_command_queue_depth Sends and broadcasts waiting for the server\n",
         );
         out.push_str("# TYPE wse_command_queue_depth gauge\n");
         out.push_str(&format!(

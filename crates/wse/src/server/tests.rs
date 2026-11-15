@@ -674,3 +674,23 @@ fn a_tally_counts_on_shards_and_reads_their_sum() {
     let gap = (b as *const AtomicU64 as usize).abs_diff(a as *const AtomicU64 as usize);
     assert!(gap >= 128);
 }
+
+#[test]
+fn a_full_command_queue_refuses_the_applications_sends() {
+    let shared = Arc::new(Config::default().into_state().unwrap());
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let queued = Arc::new(AtomicUsize::new(state::COMMAND_QUEUE));
+    shared
+        .commands
+        .store(Some(Arc::new(Commands::new(tx, Arc::clone(&queued)))));
+    let publisher = Publisher::new(Arc::clone(&shared));
+    assert!(publisher.is_full());
+    assert_eq!(publisher.send("c", "x"), Err(Error::Full));
+    assert_eq!(publisher.publish("t", "{}"), Err(Error::Full));
+    assert_eq!(publisher.broadcast("{}"), Err(Error::Full));
+    // The server's own commands still go.
+    assert_eq!(publisher.disconnect("c"), Ok(()));
+    // With room again, sends go.
+    queued.store(0, Ordering::Relaxed);
+    assert_eq!(publisher.send("c", "x"), Ok(()));
+}

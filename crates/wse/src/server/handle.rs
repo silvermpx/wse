@@ -16,7 +16,8 @@ use crate::cluster::ClusterCommand;
 
 /// A WSE server: its configuration and state, from `new` until it is
 /// dropped. It serves on a listener once started, and can start again after
-/// `stop`.
+/// `stop`. It speaks plain WebSocket (`ws://`): `wss://` is a reverse proxy
+/// or a load balancer in front of it.
 ///
 /// ```no_run
 /// # async fn run(handler: impl wse::Handler) -> Result<(), Box<dyn std::error::Error>> {
@@ -30,7 +31,8 @@ use crate::cluster::ClusterCommand;
 pub struct Server {
     shared: Arc<SharedState>,
     running: Arc<AtomicBool>,
-    task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The running server's task; held by `stop` until the run has ended.
+    task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Server {
@@ -39,7 +41,7 @@ impl Server {
         Ok(Self {
             shared: Arc::new(config.into_state()?),
             running: Arc::new(AtomicBool::new(false)),
-            task: parking_lot::Mutex::new(None),
+            task: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -51,10 +53,17 @@ impl Server {
     }
 
     /// Serve on `listener`, telling `handler` of every connection: the
-    /// server's tasks run on the current tokio runtime (call it from within
-    /// one) until `stop`.
+    /// server's tasks run on the current tokio runtime until `stop`.
+    ///
+    /// # Panics
+    ///
+    /// Outside a tokio runtime.
     pub fn start<H: Handler>(&self, listener: TcpListener, handler: H) -> Result<(), Error> {
-        let mut task = self.task.lock();
+        // A `stop` still under way holds the lock: the server runs until it
+        // has returned.
+        let Ok(mut task) = self.task.try_lock() else {
+            return Err(Error::Running);
+        };
         if task.as_ref().is_some_and(|task| !task.is_finished()) {
             return Err(Error::Running);
         }
@@ -77,14 +86,16 @@ impl Server {
     }
 
     /// Stop: every connection is closed (1001, going away), the cluster
-    /// links too, and the server's tasks end before this returns.
+    /// links too. The server's tasks end, and the handler's `disconnect`
+    /// calls are made, before this returns.
     pub async fn stop(&self) {
-        let task = self.task.lock().take();
-        let Some(task) = task else {
+        let mut task = self.task.lock().await;
+        let Some(running) = task.take() else {
             return;
         };
         self.shut_down();
-        let _ = task.await;
+        let _ = running.await;
+        // The run cleans up after itself; this covers one that panicked.
         run::stopped(&self.shared);
     }
 
@@ -106,13 +117,14 @@ impl Server {
             close_code: code,
             close_reason: reason.to_owned(),
         })?;
-        let deadline = tokio::time::Instant::now() + timeout;
+        // A timeout too far to count is no deadline at all.
+        let deadline = tokio::time::Instant::now().checked_add(timeout);
         loop {
             let left = self.shared.connection_count.load(Ordering::Relaxed);
             if left == 0 {
                 return Ok(0);
             }
-            if tokio::time::Instant::now() >= deadline {
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
                 let _ = publisher.command(ServerCommand::AbortAll);
                 return Ok(left);
             }
@@ -127,8 +139,8 @@ impl Server {
 }
 
 impl Drop for Server {
-    /// Dropped while serving: the server is told to stop; its tasks end by
-    /// themselves.
+    /// Dropped while serving: the server is told to stop. Its run ends by
+    /// itself, and what it set up goes with it.
     fn drop(&mut self) {
         if self.task.get_mut().is_some() {
             self.shut_down();
