@@ -97,6 +97,31 @@ jobs:
       - name: No CPU-specific flags in committed cargo config
         run: python3 .github/scripts/release_preflight.py cargo-config
 
+      # A crate name someone else holds would fail the release after the
+      # gate, with npm and PyPI not out yet.
+      - name: The crate names are new or ours
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          failed=0
+          for crate in wse-protocol wse wse-client; do
+            code="$(curl -sS -o owners.json -w '%{http_code}' --retry 3 \
+              -A 'wse-release (github.com/silvermpx/wse)' \
+              "https://crates.io/api/v1/crates/${crate}/owners" || true)"
+            case "$code" in
+              404) echo "crates.io ${crate}: a new crate" ;;
+              200)
+                if python3 -c 'import json, os, sys; sys.exit(os.environ["OWNER"] not in [u["login"] for u in json.load(open("owners.json"))["users"]])'; then
+                  echo "crates.io ${crate}: owned by ${OWNER}"
+                else
+                  echo "::error::crates.io ${crate} belongs to someone else"; failed=1
+                fi ;;
+              *) echo "::error::crates.io answered HTTP ${code} for the owners of ${crate}"; failed=1 ;;
+            esac
+          done
+          rm -f owners.json
+          exit "$failed"
+
       # A re-run may find the version already uploaded by the attempt it
       # repeats; the publish jobs then skip what is there.
       - name: Version not published yet
@@ -538,17 +563,12 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Everything built, tested and carrying the release version: the one job
-  # that says whether this commit could be released. The publish jobs wait
-  # for it. (Not a required check: path filters keep this workflow off most
-  # pull requests, and a required check that never runs blocks the merge.)
-  # ---------------------------------------------------------------------------
-  # ---------------------------------------------------------------------------
   # The Rust crates: packaged, and each built from its package as crates.io
-  # builds it, the ones it depends on taken from the packages beside it.
+  # builds it, the ones it depends on taken from the packages beside it;
+  # their tests, and the client's browser build.
   # ---------------------------------------------------------------------------
   crates:
-    name: Rust crates (package, build)
+    name: Rust crates (package, build, test)
     needs: preflight
     runs-on: ubuntu-24.04
     permissions:
@@ -561,6 +581,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
         with:
           toolchain: stable
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
@@ -577,6 +598,18 @@ jobs:
             cargo package --locked --list -p "$crate"
           done
 
+      - name: The crates' tests
+        run: cargo test --locked -p wse-protocol -p wse -p wse-client
+
+      - name: The client in the browser (wasm32)
+        run: cargo check --locked -p wse-client --target wasm32-unknown-unknown
+
+  # ---------------------------------------------------------------------------
+  # Everything built, tested and carrying the release version: the one job
+  # that says whether this commit could be released. The publish jobs wait
+  # for it. (Not a required check: path filters keep this workflow off most
+  # pull requests, and a required check that never runs blocks the merge.)
+  # ---------------------------------------------------------------------------
   release-gate:
     name: Release gate
     needs: [preflight, build, sdist, test, test-musllinux, sdist-install, python-client, npm-package, crates]

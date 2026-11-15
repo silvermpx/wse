@@ -16,10 +16,14 @@ use std::time::Duration;
 
 use serde_json::json;
 use wasm_bindgen_test::wasm_bindgen_test;
-use wse_client::{Config, Encryption, Event, Events, Incoming, OwnedMessage};
+#[cfg(feature = "aws-lc")]
+use wse_client::Encryption;
+use wse_client::{Config, Event, Events, Incoming, OwnedMessage};
 
 const URL: Option<&str> = option_env!("WSE_TEST_URL");
+#[cfg(feature = "aws-lc")]
 const IDENTITY: Option<&str> = option_env!("WSE_TEST_IDENTITY");
+#[cfg(feature = "aws-lc")]
 const SIGNING: Option<&str> = option_env!("WSE_TEST_SIGNING");
 
 /// A setting of the test server, given at build time (see the top).
@@ -93,6 +97,7 @@ async fn msgpack_in_the_browser() {
     client.close().await;
 }
 
+#[cfg(feature = "aws-lc")]
 #[wasm_bindgen_test]
 async fn an_encrypted_session_from_the_browser() {
     let (url, identity) = (
@@ -117,6 +122,7 @@ async fn an_encrypted_session_from_the_browser() {
     assert!(matches!(error, wse_client::Error::Encryption(_)), "{error}");
 }
 
+#[cfg(feature = "aws-lc")]
 #[wasm_bindgen_test]
 async fn signed_messages_from_the_browser() {
     let (url, signing) = (

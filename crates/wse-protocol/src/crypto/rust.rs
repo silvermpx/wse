@@ -196,7 +196,7 @@ impl IdentityKey {
         // DER as it is; PEM decoded into a buffer wiped when dropped.
         let pem = pem_body(key);
         let der: &[u8] = pem.as_deref().map_or(key, Vec::as_slice);
-        let key = p256::ecdsa::SigningKey::from_pkcs8_der(&der).map_err(|_| Error)?;
+        let key = p256::ecdsa::SigningKey::from_pkcs8_der(der).map_err(|_| Error)?;
         let public = key.verifying_key().to_sec1_point(false).as_bytes().to_vec();
         Ok(Self { key, public })
     }

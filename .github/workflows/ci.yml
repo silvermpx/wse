@@ -381,7 +381,9 @@ jobs:
           fi
 
       - name: Clippy (wasm32)
-        run: cargo clippy -p wse-client --locked --target wasm32-unknown-unknown --all-targets -- -D warnings
+        run: |
+          cargo clippy -p wse-client --locked --target wasm32-unknown-unknown --all-targets -- -D warnings
+          cargo clippy -p wse-client --locked --target wasm32-unknown-unknown --no-default-features --all-targets -- -D warnings
 
       - name: The browser client against a server
         run: |
@@ -426,6 +428,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
         with:
           toolchain: stable
+          components: clippy
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
@@ -436,6 +439,13 @@ jobs:
         run: |
           cargo test -p wse --locked --features fips,python
           cargo test -p wse-client --locked --features fips
+        env:
+          PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
+
+      - name: Clippy (fips)
+        run: |
+          cargo clippy -p wse --locked --features fips,python --all-targets -- -D warnings
+          cargo clippy -p wse-client --locked --features fips --all-targets -- -D warnings
         env:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
 
@@ -472,13 +482,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: ". -> target"
 
       - name: cargo check (MSRV)
-        run: cargo +"$MSRV" check --workspace --locked
+        run: |
+          cargo +"$MSRV" check --workspace --locked
+          cargo +"$MSRV" check -p wse-client --locked --target wasm32-unknown-unknown
         env:
           MSRV: ${{ steps.msrv.outputs.version }}
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
