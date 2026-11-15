@@ -262,7 +262,9 @@ class TestChangeEndpoint:
             p = sub[0]["p"]
             assert p["topics"] == ["prices"]
             assert p["recover"] is True
-            assert p["recovery"] == {"prices": {"epoch": "0000000a", "offset": 7}}
+            assert p["recovery"] == {
+                "prices": {"epoch": "0000000a", "offset": 7, "streams": {"0000000a": 7}}
+            }
             await client.disconnect()
 
 

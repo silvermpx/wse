@@ -49,6 +49,9 @@ class EventSequencer:
         # epoch each), each in order on its own: the authoritative dedup and
         # gap detection for stamped messages.
         self._streams: dict[str, dict[str, int]] = {}
+        # When each stream last moved or became known (time.time(): a laptop's
+        # sleep counts, as it does for the server's history).
+        self._seen: dict[str, dict[str, float]] = {}
 
     def get_next_sequence(self) -> int:
         self._sequence += 1
@@ -115,8 +118,55 @@ class EventSequencer:
         streams.pop(epoch, None)  # most recent last
         streams[epoch] = offset
         if len(streams) > MAX_STREAMS_PER_TOPIC:
-            del streams[next(iter(streams))]
+            oldest = next(iter(streams))
+            del streams[oldest]
+            self._seen.get(topic, {}).pop(oldest, None)
+        self._seen.setdefault(topic, {})[epoch] = time.time()
         self._topic_positions[topic] = (epoch, offset)
+
+    def topic_streams(self, topic: str) -> dict[str, int]:
+        """The last offset of each stream of *topic*: epoch -> offset."""
+        return dict(self._streams.get(topic, {}))
+
+    def raise_stream(self, topic: str, epoch: str, offset: int) -> None:
+        """Take *offset* as where the stream of *epoch* stands without a
+        message delivered (a server's reply lists its streams): a stream not
+        known yet starts there, as the oldest; a known one moves up to it. The
+        last message delivered stays the topic's anchor."""
+        streams = self._streams.setdefault(topic, {})
+        own = streams.get(epoch)
+        if own is not None:
+            if offset > own:
+                streams[epoch] = offset
+                self._seen.setdefault(topic, {})[epoch] = time.time()
+            return
+        if len(streams) >= MAX_STREAMS_PER_TOPIC:
+            return
+        self._streams[topic] = {epoch: offset, **streams}
+        self._seen.setdefault(topic, {})[epoch] = time.time()
+        self._topic_positions.setdefault(topic, (epoch, offset))
+
+    def forget_stream(self, topic: str, epoch: str) -> None:
+        """Forget the stream of *epoch*; the anchor moves to the last one left."""
+        streams = self._streams.get(topic)
+        if not streams or streams.pop(epoch, None) is None:
+            return
+        self._seen.get(topic, {}).pop(epoch, None)
+        position = self._topic_positions.get(topic)
+        if position is not None and position[0] == epoch:
+            if streams:
+                last = next(reversed(streams))
+                self._topic_positions[topic] = (last, streams[last])
+            else:
+                del self._topic_positions[topic]
+
+    def forget_quiet_streams(self, topic: str, before: float, keep) -> None:
+        """Forget the streams of *topic* that did not move since *before*
+        (time.time()), but those *keep* keeps."""
+        seen = self._seen.get(topic, {})
+        for epoch in list(self._streams.get(topic, {})):
+            if seen.get(epoch, 0.0) < before and not keep(epoch):
+                self.forget_stream(topic, epoch)
 
     def topic_position(self, topic: str) -> tuple[str, int] | None:
         """Last delivered ``(epoch, offset)`` of a topic, for recovery requests."""
@@ -140,6 +190,7 @@ class EventSequencer:
         re-baselines on its first message instead of seeing a gap."""
         self._topic_positions.pop(topic, None)
         self._streams.pop(topic, None)
+        self._seen.pop(topic, None)
 
     def _cleanup_old_entries(self) -> None:
         # Age order == insertion order: drop the expired prefix only.
@@ -169,3 +220,4 @@ class EventSequencer:
         self._cleanup_counter = 0
         self._topic_positions.clear()
         self._streams.clear()
+        self._seen.clear()

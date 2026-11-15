@@ -96,7 +96,9 @@ class TestNoBlackout:
         c._on_raw_message(stamped(4))  # gap: 2..3 missing
         c._on_raw_message(stamped(5))
         await asyncio.sleep(0)
-        assert recovery_requests(c) == [{"prices": {"epoch": EPOCH, "offset": 1}}]
+        assert recovery_requests(c) == [
+            {"prices": {"epoch": EPOCH, "offset": 1, "streams": {EPOCH: 1}}}
+        ]
         assert offsets(drain(c)) == [1]  # 4 and 5 held while recovering
         await asyncio.sleep(0.2)
         assert offsets(drain(c)) == [("gap", 2, 3), 4, 5]
@@ -215,7 +217,9 @@ class TestNoBlackout:
         c._on_raw_message(stamped(2))
         c._on_raw_message(reply("prices", offset=2, recovered=False))
         await asyncio.sleep(0)
-        assert recovery_requests(c)[-1] == {"prices": {"epoch": EPOCH, "offset": 2}}
+        assert recovery_requests(c)[-1] == {
+            "prices": {"epoch": EPOCH, "offset": 2, "streams": {EPOCH: 2}}
+        }
         c._on_raw_message(stamped(3))
         c._on_raw_message(stamped(4))
         c._on_raw_message(reply("prices", offset=4, recovered=True))
@@ -273,8 +277,10 @@ class TestAnchor:
         c._on_raw_message(reply("prices", offset=10, recovered=True))
         await asyncio.sleep(0)
         assert recovery_requests(c) == [
-            {"prices": {"epoch": EPOCH, "offset": 1}},
-            {"prices": {"epoch": EPOCH, "offset": 4}},  # not the head (10)
+            {"prices": {"epoch": EPOCH, "offset": 1, "streams": {EPOCH: 1}}},
+            {
+                "prices": {"epoch": EPOCH, "offset": 4, "streams": {EPOCH: 4}}
+            },  # not the head (10)
         ]
         assert c.recovery_state["prices"] == (EPOCH, 4)
         for o in range(5, 10):
@@ -343,3 +349,69 @@ class TestTopicLifecycle:
         )
         c._on_raw_message(stamped(1))
         assert offsets(drain(c)) == [1]
+
+
+OTHER = "0000000f"
+
+
+def streams_reply(topic: str, *, recovered: bool, streams: dict[str, int]) -> str:
+    """A reply that lists the server's streams of the topic (from 3.1)."""
+    return json.dumps(
+        {
+            "c": "WSE",
+            "t": "subscription_update",
+            "p": {
+                "success_topics": [topic],
+                "recovery": {
+                    topic: {
+                        "epoch": EPOCH,
+                        "offset": 0,
+                        "recovered": recovered,
+                        "count": 0,
+                        "streams": streams,
+                    }
+                },
+            },
+        }
+    )
+
+
+class TestStreams:
+    async def test_a_recovery_names_every_stream_of_the_topic(self):
+        c = make_client()
+        for message in (stamped(4, epoch=OTHER), stamped(1), stamped(2)):
+            c._on_raw_message(message)
+        await c.subscribe(["prices"], recover=True)
+        assert recovery_requests(c) == [
+            {"prices": {"epoch": EPOCH, "offset": 2, "streams": {OTHER: 4, EPOCH: 2}}}
+        ]
+
+    async def test_a_listed_stream_it_did_not_know_starts_where_the_server_was(self):
+        c = make_client()
+        c._on_raw_message(streams_reply("prices", recovered=False, streams={OTHER: 5}))
+        for o in (3, 5, 6):
+            c._on_raw_message(stamped(o, epoch=OTHER))
+        assert offsets(drain(c)) == [6]
+
+    async def test_a_recovery_that_did_not_recover_reports_what_each_stream_lost(self):
+        c = make_client()
+        for message in (stamped(1), stamped(2), stamped(4, epoch=OTHER)):
+            c._on_raw_message(message)
+        await c.subscribe(["prices"], recover=True)
+        drain(c)
+        # OTHER the server does not hold any more; EPOCH went on to 5.
+        c._on_raw_message(streams_reply("prices", recovered=False, streams={EPOCH: 5}))
+        c._on_raw_message(stamped(6))
+        assert offsets(drain(c)) == [("gap", 3, 5), ("gap", 5, None), 6]
+        assert c._sequencer.stream_position("prices", OTHER) is None
+
+    async def test_a_stream_quiet_for_longer_than_the_server_keeps_it_is_not_named(
+        self,
+    ):
+        c = make_client()
+        c._history_ttl = 60.0
+        c._on_raw_message(stamped(4, epoch=OTHER))
+        c._sequencer._seen["prices"][OTHER] -= 120
+        c._on_raw_message(stamped(1))
+        await c.subscribe(["prices"], recover=True)
+        assert recovery_requests(c)[0]["prices"]["streams"] == {EPOCH: 1}

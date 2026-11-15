@@ -22,6 +22,8 @@
   stops another stream's gap from being recovered: each stream waits for
   its replay in its own window (as the Rust and Python clients do), instead
   of one window per topic.
+- Python client: the same recovery positions per stream as the Rust and
+  TypeScript clients.
 
 ### Fixed
 

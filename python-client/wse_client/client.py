@@ -119,6 +119,24 @@ class _Request:
 
     id: int
     for_gap: bool
+    #: The streams it named.
+    named: tuple[str, ...] = ()
+
+
+#: How long past the server's history_ttl a stream that heard nothing is
+#: still named: the clocks of a server and a client do not tick together.
+_QUIET_MARGIN = 5.0
+
+
+def _listed_streams(value: Any) -> dict[str, int] | None:
+    """A reply's streams (from 3.1): epoch -> the server's last offset."""
+    if not isinstance(value, dict):
+        return None
+    return {
+        str(epoch): offset
+        for epoch, offset in value.items()
+        if isinstance(offset, int) and not isinstance(offset, bool) and offset >= 0
+    }
 
 
 _HANDSHAKE_TYPES = frozenset({"server_hello", "error", "ping", "PING", "pong", "PONG"})
@@ -406,6 +424,9 @@ class AsyncWSEClient:
         # last offset delivered in order (or given up on). It only moves when
         # messages are delivered, never to a server-reported head.
         self._server_recovery_enabled = False
+        # How long the server keeps a stream that receives nothing
+        # (history_ttl, seconds): one quiet for longer is not named.
+        self._history_ttl: float | None = None
         self._recovery_timeout = recovery_timeout
         self._gaps: dict[tuple[str, str], _GapState] = {}
         # Topics with a recovery request out on this connection -> anchor sent.
@@ -1227,6 +1248,7 @@ class AsyncWSEClient:
         self._server_ready_event.clear()
         self._server_hello_seen = False
         self._server_recovery_enabled = False
+        self._history_ttl = None
         # The server of this connection names its own signing key, and the
         # user it takes the connection for.
         self._server_signing_kid = None
@@ -1545,31 +1567,51 @@ class AsyncWSEClient:
             self._stats.bytes_sent += len(encoded.encode("utf-8"))
         return ok
 
+    def _topic_streams(self, topic: str) -> dict[str, int]:
+        """Where the client stands in each stream of *topic*, but a stream
+        quiet for longer than the server keeps one: gone there, naming it
+        would fail the recovery."""
+        if self._history_ttl is not None:
+            gaps = self._gaps
+            self._sequencer.forget_quiet_streams(
+                topic,
+                time.time() - self._history_ttl - _QUIET_MARGIN,
+                lambda epoch: (topic, epoch) in gaps,
+            )
+        return self._sequencer.topic_streams(topic)
+
     def _subscription_payload(
         self, topics: list[str], *, recover: bool
-    ) -> tuple[dict[str, Any], dict[str, tuple[str, int]]]:
+    ) -> tuple[dict[str, Any], dict[str, tuple[tuple[str, int], dict[str, int]]]]:
         payload: dict[str, Any] = {"action": "subscribe", "topics": topics}
-        info: dict[str, tuple[str, int]] = {}
+        info: dict[str, tuple[tuple[str, int], dict[str, int]]] = {}
         if recover and self._server_recovery_enabled:
             for topic in topics:
+                streams = self._topic_streams(topic)
                 pos = self._sequencer.topic_position(topic)
                 if pos is not None:
-                    info[topic] = pos
+                    info[topic] = (pos, streams)
             if info:
                 payload["recover"] = True
                 payload["recovery"] = {
-                    t: {"epoch": pos[0], "offset": pos[1]} for t, pos in info.items()
+                    t: {"epoch": pos[0], "offset": pos[1], "streams": streams}
+                    for t, (pos, streams) in info.items()
                 }
         return payload, info
 
     def _note_recovery_requested(
-        self, info: dict[str, tuple[str, int]], *, rearm: bool = False
+        self,
+        info: dict[str, tuple[tuple[str, int], dict[str, int]]],
+        *,
+        rearm: bool = False,
     ) -> None:
         """Requests sent for *info*'s topics: the gap of each stream asked
         for waits for its own answer. *rearm*: the request goes after a
         reconnect, and the gap's wait starts again with it."""
-        for topic, pos in info.items():
-            request = _Request(id=self._next_request, for_gap=False)
+        for topic, (pos, streams) in info.items():
+            request = _Request(
+                id=self._next_request, for_gap=False, named=tuple(streams)
+            )
             self._next_request += 1
             gap = self._gaps.get((topic, pos[0]))
             if gap is not None:
@@ -1803,21 +1845,24 @@ class AsyncWSEClient:
         topics; this sends the recovery subscription_update directly."""
         if self._gaps.get((topic, gap.epoch)) is not gap or gap.request is not None:
             return
-        # From the last message of the stream with the hole: the server
-        # replays it and every other stream of the topic after that point.
+        # From the last message of the stream with the hole (where a server
+        # before 3.1 replays from), with where the client stands in each.
         pos = self._sequencer.stream_position(topic, gap.epoch)
         if pos is None:
             return
+        streams = self._topic_streams(topic)
         payload = {
             "action": "subscribe",
             "topics": [topic],
             "recover": True,
-            "recovery": {topic: {"epoch": pos[0], "offset": pos[1]}},
+            "recovery": {
+                topic: {"epoch": pos[0], "offset": pos[1], "streams": streams}
+            },
         }
         msg = self._codec.encode(
             "subscription_update", payload, priority=MessagePriority.HIGH
         )
-        self._note_recovery_requested({topic: pos})
+        self._note_recovery_requested({topic: (pos, streams)})
         request = gap.request
         try:
             ok = await self._transmit(msg)
@@ -1938,12 +1983,15 @@ class AsyncWSEClient:
         self._invoke_handlers(event)
         self._enqueue(event)
 
-    def _on_recovery_reply(self, topic: str, info: dict[str, Any]) -> None:
-        """Handle the per-topic recovery info of a subscription_update."""
+    def _on_recovery_reply(
+        self, topic: str, info: dict[str, Any], listed_streams: bool = False
+    ) -> _Request | None:
+        """Handle the per-topic recovery info of a subscription_update; the
+        request it answered."""
         recovered = bool(info.get("recovered", True))
         queue = self._recovery_requests.get(topic)
         if not queue:
-            return  # informational reply (plain subscribe): never moves the anchor
+            return None  # informational reply (plain subscribe): never moves the anchor
         request = queue.popleft()
         if not queue:
             del self._recovery_requests[topic]
@@ -1962,7 +2010,7 @@ class AsyncWSEClient:
             gap.answered = True
             self._drain_gap(topic, gap.epoch)  # the replay arrived before this reply
             if self._gaps.get((topic, gap.epoch)) is not gap:
-                return  # filled
+                return request  # filled
             pos = self._sequencer.stream_position(topic, gap.epoch)
             progressed = (
                 pos is not None
@@ -1978,12 +2026,14 @@ class AsyncWSEClient:
                 self._give_up_gap(
                     topic, gap.epoch, "incomplete" if recovered else "not_recovered"
                 )
-            return
+            return request
 
         if request.for_gap:
-            return  # the answer for a gap settled meanwhile
-        if recovered:
-            return  # replayed messages advanced the anchor as they arrived
+            return request  # the answer for a gap settled meanwhile
+        # Replayed messages advanced the anchor as they arrived; a server that
+        # lists its streams says with them what was missed.
+        if recovered or listed_streams:
+            return request
 
         # The server cannot replay after our anchor. Nothing moves the anchor
         # here -- messages still in flight would be dropped as duplicates; the
@@ -1991,19 +2041,60 @@ class AsyncWSEClient:
         pos = self._sequencer.topic_position(topic)
         epoch = info.get("epoch")
         if pos is None:
-            return
+            return request
         if epoch is None:
             # The server has no history of the topic any more (it
             # restarted): the stream this client was on is gone.
             self._report_gap(topic, pos[0], None, None, "epoch_changed")
-            return
+            return request
         if str(epoch) != pos[0]:
             self._report_gap(topic, str(epoch), None, None, "epoch_changed")
-            return
+            return request
         offset = info.get("offset")
         if isinstance(offset, int) and offset <= pos[1]:
-            return  # nothing was missed
+            return request  # nothing was missed
         self._unrecoverable[topic] = pos[0]
+        return request
+
+    def _take_streams(
+        self,
+        topic: str,
+        request: _Request | None,
+        listed: dict[str, int],
+        recovered: bool,
+    ) -> None:
+        """The streams the server holds of *topic*, as its reply lists them
+        (from 3.1): where the client starts in each one it did not know; when
+        a recovery did not recover, what each one it knew lost. A stream the
+        request named that the server does not hold is forgotten: naming it
+        again would fail every later recovery."""
+        lost = not recovered and request is not None and not request.for_gap
+        held = {epoch for (t, epoch) in self._gaps if t == topic}
+        reports: list[tuple[str, int | None, int | None]] = []
+        for epoch, offset in listed.items():
+            if epoch in held:
+                continue
+            own = self._sequencer.stream_position(topic, epoch)
+            if own is None:
+                self._sequencer.raise_stream(topic, epoch, offset)
+            elif lost and offset > own[1]:
+                reports.append((epoch, own[1] + 1, offset))
+                self._sequencer.raise_stream(topic, epoch, offset)
+        for epoch in request.named if request is not None else ():
+            if epoch in held or epoch in listed:
+                continue
+            own = self._sequencer.stream_position(topic, epoch)
+            if lost and own is not None:
+                reports.append((epoch, own[1] + 1, None))
+            self._sequencer.forget_stream(topic, epoch)
+        if lost and not reports:
+            # Not recovered with nothing to show for it: the server cannot
+            # show the client missed nothing.
+            pos = self._sequencer.topic_position(topic)
+            if pos is not None:
+                reports.append((pos[0], None, None))
+        for epoch, first, last in reports:
+            self._report_gap(topic, epoch, first, last, "not_recovered")
 
     def _forget_topic(self, topic: str) -> None:
         """Drop a topic's recovery state (unsubscribed)."""
@@ -2077,6 +2168,8 @@ class AsyncWSEClient:
         features = details.get("features")
         if isinstance(features, dict) and features.get("recovery"):
             self._server_recovery_enabled = True
+        if isinstance(features, dict):
+            self._take_history_ttl(features.get("history_ttl"))
 
         logger.info(
             "Server ready (connection_id=%s, recovery=%s)",
@@ -2084,6 +2177,15 @@ class AsyncWSEClient:
             self._server_recovery_enabled,
         )
         self._maybe_complete_handshake()
+
+    def _take_history_ttl(self, value: Any) -> None:
+        """The server's history_ttl (seconds), when it names one."""
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value > 0
+        ):
+            self._history_ttl = float(value)
 
     def _handle_server_hello(self, event: WSEEvent) -> None:
         """Handle server_hello with negotiated features and limits."""
@@ -2114,6 +2216,7 @@ class AsyncWSEClient:
 
         if features.get("recovery"):
             self._server_recovery_enabled = True
+        self._take_history_ttl(features.get("history_ttl"))
         self._take_signing_kid(p.get("signing"), sealed=False)
         # A 3.x server always sends server_ready (at once with jwt_secret,
         # from accept_connection() without), and takes nothing before it:
@@ -2214,7 +2317,12 @@ class AsyncWSEClient:
         if isinstance(recovery, dict):
             for topic, info in recovery.items():
                 if isinstance(topic, str) and isinstance(info, dict):
-                    self._on_recovery_reply(topic, info)
+                    listed = _listed_streams(info.get("streams"))
+                    request = self._on_recovery_reply(topic, info, listed is not None)
+                    if listed is not None:
+                        self._take_streams(
+                            topic, request, listed, bool(info.get("recovered", True))
+                        )
         # What the server took and refused, for the application's handlers.
         self._invoke_handlers(event)
 
