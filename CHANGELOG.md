@@ -25,6 +25,9 @@
   heartbeat runs out the writer stops waiting on the full socket, so the
   link is cleaned up and redialed; the catch-up exchange and its resend
   give up on a peer that does not read either.
+- CI runs the TypeScript client against the server of each change (JWT
+  cookies, an E2E session, recovery after a kick, a restart), and fails
+  rather than skips when it cannot.
 - TypeScript client: one user's queued messages, subscriptions and
   recovery positions never go out on the next user's connection: not when
   the last component unmounts and another user signs in, nor when a cookie

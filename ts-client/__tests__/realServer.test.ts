@@ -1,7 +1,8 @@
 // End-to-end against the real Rust server (opt-in).
 //
 // Runs only when WSE_E2E_PYTHON points to a Python that can import
-// wse_server (an installed wheel, or this repository's prebuilt module):
+// wse_server (an installed wheel, or this repository's prebuilt module); CI
+// also sets WSE_E2E_REQUIRED=1, which fails it instead of skipping:
 //
 //   WSE_E2E_PYTHON=.venv/bin/python npx vitest run ts-client/__tests__/realServer.test.ts
 //
@@ -28,6 +29,10 @@ import { generateSigningKey } from '../utils/signing.js';
 import type { WSEGapEvent } from '../types.js';
 
 const PYTHON = process.env.WSE_E2E_PYTHON;
+// CI sets WSE_E2E_REQUIRED: there the suite must run, not skip.
+if (process.env.WSE_E2E_REQUIRED === '1' && (!PYTHON || typeof WebSocket === 'undefined')) {
+  throw new Error('WSE_E2E_REQUIRED is set, but WSE_E2E_PYTHON is not, or this Node has no WebSocket');
+}
 
 describe.skipIf(!PYTHON || typeof WebSocket === 'undefined')('real RustWSEServer', () => {
   const port = 5600 + Math.floor(Math.random() * 300);
