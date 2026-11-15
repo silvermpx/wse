@@ -1,6 +1,6 @@
 [package]
 name = "wse-client"
-description = "Client for WSE servers: topics with recovery, reconnects, msgpack, end-to-end encryption and signed messages."
+description = "Rust client for WSE servers, natively and in the browser: topics with message recovery, reconnects, MessagePack, end-to-end encryption and signed messages."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

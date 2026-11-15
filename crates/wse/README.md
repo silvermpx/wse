@@ -1,9 +1,10 @@
 # wse
 
-A WebSocket engine for applications that publish to many clients at once:
-fan-out on every CPU core, topics with recovery for clients that come back,
-presence, a native cluster protocol, JWT validation, end-to-end encryption
-and signed messages. The same engine runs the Python package
+A WebSocket server for reactive user interfaces, run inside your Rust
+application: topics with recovery for clients that come back, presence,
+servers that form a cluster without a broker, JWT validation, end-to-end
+encryption and signed messages, delivered on every CPU core. The same
+engine runs the Python package
 [`wse-server`](https://pypi.org/project/wse-server/); the clients are
 [`wse-client`](https://crates.io/crates/wse-client) for Rust,
 [`wse-client`](https://www.npmjs.com/package/wse-client) for TypeScript and

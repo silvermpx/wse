@@ -1,6 +1,6 @@
 # wse-client (TypeScript / React)
 
-React client for [WSE (WebSocket Engine)](https://github.com/silvermpx/wse) - real-time event streaming with a single React hook.
+React client for [WSE](https://github.com/silvermpx/wse), the WebSocket server for reactive user interfaces: one hook keeps one connection per page, with topics, message recovery, reconnects, an offline queue, end-to-end encryption and signed messages.
 
 [![npm](https://img.shields.io/npm/v/wse-client)](https://www.npmjs.com/package/wse-client)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue)](https://www.typescriptlang.org/)

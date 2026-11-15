@@ -1,6 +1,6 @@
 [package]
 name = "wse"
-description = "WebSocket engine: fan-out on every core, topics with recovery, presence, a native cluster protocol, JWT, end-to-end encryption and signed messages."
+description = "WebSocket server for reactive user interfaces: topics with message recovery, presence, clustering without a broker, JWT, end-to-end encryption and signed messages."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

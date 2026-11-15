@@ -1,12 +1,12 @@
 # wse-client
 
-Python client for [WSE (WebSocket Engine)](https://github.com/silvermpx/wse) - real-time event streaming with auto-reconnect, message recovery, E2E encryption, and connection resilience.
+Python client for [WSE](https://github.com/silvermpx/wse), the WebSocket server for reactive user interfaces: topics with message recovery, reconnects, MessagePack, an offline queue, end-to-end encryption and signed messages.
 
 [![PyPI](https://img.shields.io/pypi/v/wse-client)](https://pypi.org/project/wse-client/)
 [![Python](https://img.shields.io/pypi/pyversions/wse-client)](https://pypi.org/project/wse-client/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](../LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/silvermpx/wse/blob/main/LICENSE)
 
-Pure Python, no Rust dependency. Speaks the same wire protocol as the TS client.
+Pure Python, no Rust dependency. It speaks the same protocol as the TypeScript and Rust clients.
 
 ## Installation
 
@@ -275,7 +275,7 @@ pip install wse-client[crypto]
 client = AsyncWSEClient(url, token=token, encryption=True, e2e_server_keys=[SERVER_KEY])
 ```
 
-`SERVER_KEY` is what the server's `e2e_identity_public_key()` returns; list two during a key rotation. Instead of pinning, `e2e_unauthenticated=True` accepts any server (safe only from passive listeners), and `e2e_legacy=True` speaks the first design to servers before 3.0. With `encryption=True` and none of the three, the client refuses to start. Setup, guarantees and the wire format: [SECURITY.md](../docs/SECURITY.md#end-to-end-encryption).
+`SERVER_KEY` is what the server's `e2e_identity_public_key()` returns; list two during a key rotation. Instead of pinning, `e2e_unauthenticated=True` accepts any server (safe only from passive listeners), and `e2e_legacy=True` speaks the first design to servers before 3.0. With `encryption=True` and none of the three, the client refuses to start. Setup, guarantees and the wire format: [SECURITY.md](https://github.com/silvermpx/wse/blob/main/docs/SECURITY.md#end-to-end-encryption).
 
 Encryption fails closed:
 
@@ -307,7 +307,7 @@ async with AsyncWSEClient(
 
 A backend can bind the key with `server.set_client_key()` instead and leave it out of the token; the client then sends signed messages with or without encryption, and with encryption needs `e2e_bind_session=False`.
 
-The server takes a signed message once (`nonce`, 1 to 128 characters, random by default), within its time window, and refuses anything else with a `SIGNATURE_REFUSED` error carrying `n`. A server-signed message no pinned key verifies, or one signed for another topic than the one it came on or for another user, is dropped; without `server_signing_keys` they arrive unchecked (`event.signature.verified` is False). Setup and guarantees: [SECURITY.md](../docs/SECURITY.md#signed-messages).
+The server takes a signed message once (`nonce`, 1 to 128 characters, random by default), within its time window, and refuses anything else with a `SIGNATURE_REFUSED` error carrying `n`. A server-signed message no pinned key verifies, or one signed for another topic than the one it came on or for another user, is dropped; without `server_signing_keys` they arrive unchecked (`event.signature.verified` is False). Setup and guarantees: [SECURITY.md](https://github.com/silvermpx/wse/blob/main/docs/SECURITY.md#signed-messages).
 
 ### Circuit Breaker
 
@@ -416,7 +416,7 @@ The client speaks WSE wire protocol v1:
 - **Handshake:** `client_hello` is the first frame of every connection; the connection is ready at the first `server_ready` or `server_hello` (with encryption: once the key exchange completed)
 - **Heartbeat:** JSON PING/PONG with latency tracking (sealed like every other frame inside an E2E session)
 
-Full protocol specification: [PROTOCOL.md](../docs/PROTOCOL.md)
+Full protocol specification: [PROTOCOL.md](https://github.com/silvermpx/wse/blob/main/docs/PROTOCOL.md)
 
 ## Requirements
 
