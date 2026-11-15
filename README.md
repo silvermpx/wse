@@ -1,138 +1,81 @@
-# WSE - WebSocket Engine
+# WSE
 
 [![PyPI - Server](https://img.shields.io/pypi/v/wse-server)](https://pypi.org/project/wse-server/)
 [![PyPI - Client](https://img.shields.io/pypi/v/wse-client)](https://pypi.org/project/wse-client/)
 [![npm](https://img.shields.io/npm/v/wse-client)](https://www.npmjs.com/package/wse-client)
 [![crates.io - Server](https://img.shields.io/crates/v/wse?label=crates.io%20wse)](https://crates.io/crates/wse)
 [![crates.io - Client](https://img.shields.io/crates/v/wse-client?label=crates.io%20wse-client)](https://crates.io/crates/wse-client)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/silvermpx/wse/blob/main/LICENSE)
 
-High-performance WebSocket engine in Rust, for Rust, Python and TypeScript: fan-out on every CPU core, native clustering, E2E encryption, signed messages, message recovery and presence tracking. The same engine runs in Rust applications (the [`wse`](https://crates.io/crates/wse) crate, on the application's tokio runtime) and in Python ([`wse-server`](https://pypi.org/project/wse-server/), through PyO3 with zero GIL overhead on the data path), with clients for Rust, Python and TypeScript/React. The Python package ships Rust-accelerated utilities for application code too: priority queues, rate limiters, event sequencing, compression, cryptography, and JWT.
+WSE is a WebSocket server for reactive user interfaces: trading terminals, dashboards, monitoring, chats, notifications. Your backend publishes events to topics, and WSE pushes each event to every client subscribed to it, so the screen changes the moment the data does, without polling.
 
-## Features
+WSE runs inside your backend rather than as a separate service. A Python application starts it with the `wse-server` package; a Rust application embeds the `wse` crate. Both are the same engine, written in Rust. Several servers form a cluster by themselves, with no Redis or other broker in between.
 
-### Server
+In the browser, a React hook keeps one connection per page, with its subscriptions and recovery; interfaces written in Rust (Leptos, Yew, Dioxus) use the Rust client compiled to WebAssembly. Services and bots connect with the Python or the Rust client.
 
-| Feature | Details |
-|---------|---------|
-| **Rust core** | tokio async runtime, tungstenite WebSocket transport, dedicated thread pool, zero GIL on the data path |
-| **JWT authentication** | HS256, RS256, ES256 algorithms via jsonwebtoken crate. Validated during handshake (0.01ms), cookie + Authorization header extraction, key rotation, kid validation |
-| **Protocol negotiation** | `client_hello`/`server_hello` handshake with feature discovery, capability advertisement, version agreement |
-| **Topic subscriptions** | Per-connection topic subscriptions with automatic cleanup on disconnect |
-| **Pre-framed broadcast** | WebSocket frame built once, shared via Arc across all connections, single allocation per broadcast |
-| **Vectored writes** | `write_vectored` (writev syscall) batches multiple frames per connection in a single kernel call |
-| **Write coalescing** | One write task per connection, the only writer to its socket: up to 256 control frames and every queued broadcast frame per turn |
-| **DashMap state** | Lock-free sharded concurrent hash maps for topics, formats, activity tracking |
-| **mimalloc allocator** | Global allocator optimized for multi-threaded workloads with frequent small allocations |
-| **Deduplication** | 50,000-entry AHashSet with FIFO eviction per `send_event()` call |
-| **Rate limiting** | Per-connection token bucket on what clients send: 100K capacity, 10K/s refill, client warning at 20% remaining |
-| **Idle detection** | Server pings every 25s, closes connections that sent nothing for 60s; every server close is enforced 5s later |
-| **Drain mode** | Lock-free crossbeam bounded channel, Python acquires GIL once per batch (not per event) |
-| **Compression** | zlib for client-facing messages above threshold (default 1024 bytes) |
-| **MessagePack** | Opt-in binary transport via `?format=msgpack`: everything the server sends such a client goes in msgpack (topics, broadcasts, replays, direct sends), and it may send in msgpack too; 24-41% fewer bytes than JSON on typical messages |
-| **Queue groups** | Round-robin dispatch within named groups for load-balanced worker pools |
-| **Topic ACL** | Per-connection allow/deny glob patterns for topic access control |
-| **Graceful drain** | `drain()` sends Close frame to all clients, rejects new connections, notifies cluster peers |
+## What it does
 
-### End-to-End Encryption
+- **Topics.** The backend publishes to topics such as `prices:BTC`, `orders:user-42` or `chat:room-7`, and clients subscribe by name or by pattern (`prices:*`). A message can also go to a single connection, or to one worker of a queue group. Each client chooses JSON or MessagePack.
+- **Nothing lost on reconnect.** Topics keep their latest messages, and every message carries its position. A client that loses its connection comes back with that position and receives what it missed, in order and without duplicates; if the gap is too old, it is told so and reloads. The clients track positions, drop duplicates and ask for what is missing by themselves.
+- **Clients that look after themselves.** They reconnect with backoff, get a fresh token, and report anything they could not recover. The TypeScript and Python clients can also keep what the user sends while offline and deliver it once the connection is back.
+- **Presence.** Who is on a topic right now, with each user's status or other data, and an event when someone joins or leaves. Several tabs of one user count as one.
+- **Several instances.** In production a backend usually runs as several copies behind a load balancer, each with its own WSE server. The servers link to each other directly: an event published on one copy reaches the subscribers connected to any other, presence covers all of them, and one copy can be drained for a deploy while its clients move to the others. No Redis or other broker sits in between, and each topic goes only to the servers that have subscribers for it.
+- **Access.** Users sign in with a JWT checked during the WebSocket handshake: from a cookie in browsers, from the `Authorization` header elsewhere. Each connection can be limited to its own topics, by its token or by the application. The server can refuse pages from other sites, and it limits how much and how fast each client may send.
+- **End-to-end encryption.** Clients pin the server's public key and every frame is sealed, so a proxy or load balancer that terminates TLS can neither read nor change the traffic.
+- **Signed messages.** Orders, fills and other messages that may be disputed later carry their sender's signature, which can still be checked long after they arrived. The server confirms each one with a signed receipt.
+- **Speed.** The engine delivers on every CPU core: on 12 cores of an Intel Xeon it sends 7.4 to 9.4 million messages a second to 1,000-10,000 subscribers. A publisher faster than its clients is slowed down instead of filling memory.
+- **Operations.** Graceful drain for rolling deploys, health snapshots, Prometheus metrics, limits on connections, message sizes, send rates and memory, and guides for Docker and Kubernetes.
 
-| Feature | Details |
-|---------|---------|
-| **Server identity** | The server signs every handshake with its identity key (ECDSA P-256, `e2e_identity_key`); clients pin the public key (`e2e_identity_public_key()`), so nothing in between, such as a TLS-terminating proxy, can answer for the server |
-| **Key exchange** | Ephemeral ECDH P-256 on both sides, per connection |
-| **Keys** | HKDF-SHA256 bound to the handshake transcript, one key schedule per direction |
-| **Frames** | AES-256-GCM; the nonce is the frame's sequence number, and only the next frame opens: a replayed, reordered, dropped or foreign frame ends the connection |
-| **Rekeying** | Each direction moves to a new key after 2^20 frames or 10 minutes |
-| **Everything sealed** | After the handshake every frame is sealed, pings and protocol messages included |
-| **Older clients** | `e2e_legacy=True` (the default) still serves 2.x clients with the first design: one key, random nonces, no server identity |
+## Packages
 
-See [SECURITY.md](docs/SECURITY.md#end-to-end-encryption) for setup and the threat model.
+| Package | Install | Use it for |
+|---------|---------|------------|
+| [`wse-server`](https://pypi.org/project/wse-server/) | `pip install wse-server` | The server, run from Python |
+| [`wse`](https://crates.io/crates/wse) | `cargo add wse` | The server, inside a Rust application (tokio) |
+| [`wse-client`](https://www.npmjs.com/package/wse-client) | `npm install wse-client` | Web interfaces: React and TypeScript |
+| [`wse-client`](https://crates.io/crates/wse-client) | `cargo add wse-client` | Interfaces in Rust (WebAssembly), and Rust services on tokio |
+| [`wse-client`](https://pypi.org/project/wse-client/) | `pip install wse-client` | Python services and scripts, with or without asyncio |
 
-### Signed Messages
+## A server in Python
 
-| Feature | Details |
-|---------|---------|
-| **Proof of origin** | A message that may be disputed (an order, a fill) travels as the exact text its sender signed with its own ECDSA P-256 key; whoever keeps the text, signature and key id can verify later who sent it |
-| **Client keys** | Made on the device (the browser's private key cannot be exported); bound to the user in the token (`cnf` claim) or by the application (`set_client_key`) |
-| **Checks** | The server takes a client's signed message only for its own key, within a time window, once per message id, and answers with a signed receipt |
-| **Server signatures** | `sign()` once with `signing_key`, then send or broadcast to anyone; clients check against the keys they pin |
-| **Survives the path** | msgpack, recovery replays and cluster relays leave the signed text as it was |
+```bash
+pip install wse-server
+```
 
-See [SECURITY.md](docs/SECURITY.md#signed-messages) for setup and guarantees.
+```python
+import json
+import threading
+import time
 
-### Cluster Protocol
+from wse_server import RustWSEServer
 
-| Feature | Details |
-|---------|---------|
-| **Topology** | Full TCP mesh, direct peer-to-peer connections |
-| **Wire format** | Length-prefixed binary frames: 8-byte header + topic + payload, 13 message types |
-| **Interest routing** | SUB/UNSUB/RESYNC frames, messages forwarded only to peers with matching subscribers |
-| **Gossip discovery** | PeerAnnounce/PeerList frames, new nodes need one seed address to join |
-| **mTLS** | rustls + tokio-rustls, P-256 certificates, WebPkiClientVerifier for both sides |
-| **Compression** | zstd level 1 for payloads above 256 bytes, capability-negotiated, output capped at 1 MB |
-| **Heartbeat** | 5s ping interval, 15s timeout, dead peer detection |
-| **Circuit breaker** | 10 failures to open, 60s reset, 3 half-open probe calls |
-| **Dead letter queue** | 1000-entry ring buffer for failed cluster sends |
-| **Presence sync** | PresenceUpdate frames, last-write-wins; a full sync round on connect, and again for a peer that missed an update, drops what the round does not hold |
-| **Topology API** | `cluster_info()` returns the linked peers: address, instance_id, capabilities, connected_at |
+server = RustWSEServer("0.0.0.0", 5007, jwt_secret=b"replace-with-a-strong-secret-key!")
+server.enable_drain_mode()
+server.start()
+print("token:", server.issue_token("user-1"))
 
-### Presence Tracking
 
-| Feature | Details |
-|---------|---------|
-| **Per-topic tracking** | Which users are active in each topic, with custom metadata (status, avatar, etc.) |
-| **User-level grouping** | Multiple connections from same JWT `sub` share one presence entry |
-| **Join/leave lifecycle** | `presence_join` on first connection, `presence_leave` on last disconnect |
-| **O(1) stats** | `presence_stats()` returns member/connection counts without iteration |
-| **Data updates** | `update_presence()` broadcasts to all topics where the user is present |
-| **Cluster sync** | Synchronized across all nodes, CRDT last-write-wins resolution |
-| **TTL sweep** | Background task every 30s removes entries from dead connections |
+def handle_events():
+    while server.is_running():
+        for kind, conn_id, data in server.drain_inbound(256, 50):
+            if kind == "auth_connect":  # data: the user id from the token
+                server.subscribe_connection(conn_id, ["prices"])
+            elif kind == "msg":  # data: the client's message, a dict
+                print(conn_id, data)
 
-### Message Recovery
 
-| Feature | Details |
-|---------|---------|
-| **Ring buffers** | Per-topic, power-of-2 capacity, bitmask indexing (single AND instruction) |
-| **Epoch+offset tracking** | Precise recovery positioning, epoch changes on buffer recreation |
-| **Memory management** | Global budget (default 256 MB), TTL eviction, LRU eviction when over budget |
-| **Zero-copy storage** | Recovery entries share `Bytes` (Arc) with the broadcast path |
-| **Recovery on reconnect** | `subscribe_with_recovery()` replays missed messages automatically |
-| **Per-message stamp** | When recovery is enabled, every topic broadcast carries `tp`/`e`/`o` (topic, epoch, offset) so clients dedup idempotently and detect gaps from the messages themselves |
+threading.Thread(target=handle_events, daemon=True).start()
 
-### Client SDKs (Rust, Python, TypeScript/React)
+price = 100.0
+while True:
+    price += 0.25
+    server.broadcast("prices", json.dumps({"t": "price", "p": {"symbol": "ACME", "price": price}}))
+    time.sleep(1)
+```
 
-| Feature | Details |
-|---------|---------|
-| **Auto-reconnection** | 4 strategies: exponential, linear, fibonacci, adaptive backoff with jitter |
-| **Connection pool** | Multi-endpoint with health scoring, 3 load balancing strategies, automatic failover |
-| **Circuit breaker** | CLOSED/OPEN/HALF_OPEN state machine, prevents connection storms |
-| **Rate limiting** | Client-side token bucket, coordinates with server feedback |
-| **E2E encryption** | Sessions with a pinned server identity (both clients speak the same protocol), the first design for 2.x servers |
-| **Signed messages** | `send(..., signed=True)` / `sendSigned()` with the client's own key; the server's signed messages checked against pinned keys |
-| **Event sequencing** | Duplicate detection (sliding window) + per-topic `(epoch, offset)` idempotent dedup with automatic gap recovery |
-| **Network monitor** | Real-time latency, jitter, and connection-quality scoring (Python client also estimates packet loss) |
-| **Priority queues** | 5 levels from CRITICAL to BACKGROUND |
-| **Offline queue** | IndexedDB persistence (TypeScript), replayed on reconnect |
-| **Compression** | Automatic zlib for messages above threshold |
-| **MessagePack** | `wire_format="msgpack"` / `wireFormat: 'msgpack'`: msgpack both ways |
+Clients connect to `ws://localhost:5007/wse` with the printed token: a browser sends it as the `access_token` cookie, other clients in the `Authorization: Bearer` header. Messages are JSON objects with their type in `t` and their data in `p`. The rest of the Python API is further down, and runnable examples are in [`examples/`](https://github.com/silvermpx/wse/tree/main/examples).
 
-### Transport Security
-
-| Feature | Details |
-|---------|---------|
-| **Origin validation** | `allowed_origins` refuses browser upgrades from other origins (403), against CSWSH |
-| **Cookie auth** | `access_token` HTTP-only cookie with `Secure + SameSite=Lax` (OWASP recommended for browsers) |
-| **Frame protection** | 1 MB max frame size, serde_json parsing (no eval), escaped user IDs in server_ready; inbound msgpack rejected beyond 64 nesting levels |
-| **Cluster frame protection** | zstd decompression output capped at 1 MB (MAX_FRAME_SIZE), protocol version validation |
-| **Slowloris protection** | At most 512 concurrent pre-handshake connections; sockets that never complete the WS upgrade are bounded and dropped |
-| **Bounded callback dispatch** | Callback mode caps in-flight `on_message` callbacks at 256 per connection; excess inbound work is shed and counted as rate-limited |
-| **Fail-closed recovery ACL** | Recovery replay applies the connection's topic ACL — unauthorized topics are never replayed or position-probed |
-
----
-
-## Quick Start
-
-### Rust
+## A server in Rust
 
 ```bash
 cargo add wse serde_json tokio --features tokio/full
@@ -154,7 +97,9 @@ impl Handler for App {
     }
 
     fn message(&self, user: &mut String, message: Inbound, _size: usize) -> bool {
-        println!("{user}: {message:?}");
+        if let Inbound::Json(message) = message {
+            println!("{user}: {message}");
+        }
         true
     }
 
@@ -170,445 +115,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = Config::default();
     config.jwt = Some(JwtSettings::new(std::env::var("JWT_SECRET")?));
     let server = Server::new(config)?;
-    server.start(tokio::net::TcpListener::bind("0.0.0.0:5006").await?, App)?;
-    server.publisher().publish("user:42", r#"{"t":"order_filled","p":{"id":7}}"#)?;
+    server.start(tokio::net::TcpListener::bind("0.0.0.0:5007").await?, App)?;
+
+    let publisher = server.publisher();
+    publisher.publish("user:42", r#"{"t":"order_filled","p":{"id":7}}"#)?;
+    publisher.send_to_user("42", r#"{"t":"notice","p":{"text":"hello"}}"#)?;
+
     tokio::signal::ctrl_c().await?;
     server.stop().await;
     Ok(())
 }
 ```
 
-See the [`wse` crate](crates/wse/README.md) and its chat example.
+The server runs on the application's own tokio runtime. The `Handler` hears connections and their messages; the `Publisher` sends to topics, to single connections and to every connection of a user. A complete chat room is in [`crates/wse/examples/chat.rs`](https://github.com/silvermpx/wse/blob/main/crates/wse/examples/chat.rs), and the crate's own [README](https://github.com/silvermpx/wse/blob/main/crates/wse/README.md) has the rest.
 
-### Python
+## Clients
+
+### TypeScript and React
 
 ```bash
-pip install wse-server
+npm install wse-client
 ```
 
-```python
-from wse_server import RustWSEServer, rust_jwt_encode
-import time, threading
-
-server = RustWSEServer(
-    "0.0.0.0", 5007,
-    max_connections=10_000,
-    jwt_secret=b"replace-with-a-strong-secret-key!",
-    jwt_issuer="my-app",
-    jwt_audience="my-api",
-)
-server.enable_drain_mode()
-server.start()
-
-def handle_events(srv):
-    while True:
-        for ev in srv.drain_inbound(256, 50):
-            if ev[0] == "auth_connect":
-                srv.subscribe_connection(ev[1], ["updates"])
-            elif ev[0] == "msg":
-                print(f"Message from {ev[1]}: {ev[2]}")
-            elif ev[0] == "disconnect":
-                print(f"Disconnected: {ev[1]}")
-
-threading.Thread(target=handle_events, args=(server,), daemon=True).start()
-
-while server.is_running():
-    time.sleep(1)
-```
-
-Generate a test token:
-
-```python
-token = rust_jwt_encode(
-    {"sub": "user-1", "iss": "my-app", "aud": "my-api",
-     "exp": int(time.time()) + 3600, "iat": int(time.time())},
-    b"replace-with-a-strong-secret-key!",
-)
-```
-
----
-
-## Server Configuration
-
-`RustWSEServer` constructor parameters:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `host` | required | Bind address |
-| `port` | required | Bind port |
-| `max_connections` | 1000 | Maximum concurrent WebSocket connections |
-| `jwt_secret` | None | JWT key for validation. HS256: shared secret (bytes, min 32). RS256/ES256: PEM public key. `None` disables auth |
-| `jwt_issuer` | None | Expected `iss` claim. Skipped if `None` |
-| `jwt_audience` | None | Expected `aud` claim. Skipped if `None` |
-| `jwt_cookie_name` | "access_token" | Cookie name for JWT token extraction |
-| `jwt_previous_secret` | None | Previous key for zero-downtime rotation. HS256: previous secret. RS256/ES256: previous public key PEM |
-| `jwt_key_id` | None | Expected `kid` header claim. Rejects tokens with mismatched key ID |
-| `jwt_algorithm` | None | JWT algorithm the server expects: `"HS256"` (default), `"HS384"`, `"HS512"`, `"RS256"`, `"RS384"`, `"RS512"`, `"PS256"`, `"PS384"`, `"PS512"`, `"ES256"`, `"ES384"` or `"EdDSA"`. The token's own `alg` header never overrides it. |
-| `jwt_private_key` | None | PEM private key `issue_token()` signs with for the asymmetric algorithms (RS*, PS*, ES*, EdDSA). Not needed for the HMAC ones (HS*), which sign with `jwt_secret` |
-| `max_inbound_queue_size` | 131072 | Client messages waiting for the application (drain queue or running callbacks) before new ones are dropped; connect, disconnect and presence events are never dropped |
-| `recovery_enabled` | False | Enable per-topic message recovery buffers |
-| `recovery_buffer_size` | 128 | Ring buffer slots per topic (rounded to power-of-2) |
-| `recovery_ttl` | 300 | Buffer TTL in seconds before eviction |
-| `recovery_max_messages` | 500 | Max messages returned per recovery response |
-| `recovery_memory_budget` | 268435456 | Global memory limit for all recovery buffers (bytes, default 256 MB) |
-| `presence_enabled` | False | Enable per-topic presence tracking |
-| `presence_max_data_size` | 4096 | Max bytes for a user's presence metadata |
-| `presence_max_members` | 0 | Max tracked members per topic (0 = unlimited) |
-| `max_outbound_queue_bytes` | 16777216 | Per-connection outbound buffer limit (bytes, default 16 MB). Messages dropped when exceeded |
-| `max_subscriptions_per_connection` | 0 | Max topics per connection (0 = unlimited). Prevents topic explosion DoS |
-| `rate_limit_capacity` | 100000.0 | Messages a client may send in a burst (token bucket capacity per connection, at least 1; `float("inf")` for no limit) |
-| `rate_limit_refill` | 10000.0 | Messages per second a client may send after the burst (refill rate, above 0) |
-| `max_message_size` | 1048576 | Maximum WebSocket frame size in bytes (default 1 MB) |
-| `ping_interval` | 25 | Server-initiated ping interval in seconds (at least 1, below `idle_timeout`) |
-| `idle_timeout` | 60 | Close connections that sent nothing for this many seconds (code 4408) |
-| `max_inbound_queue_bytes` | 67108864 | The same budget in bytes (default 64 MB); a single larger message still gets into an empty queue |
-| `allowed_origins` | None | Origins (`scheme://host[:port]`) browsers may connect from; others get HTTP 403. `None` checks nothing |
-| `client_subscriptions` | False | Answer the clients' own subscribe, unsubscribe and recovery requests in the server, within each connection's topic ACL; otherwise they reach the application as messages |
-| `e2e_identity_key` | None | PEM or DER (PKCS#8) ECDSA P-256 private key the server signs E2E handshakes with; clients pin its public key, `e2e_identity_public_key()`. Without it, E2E clients must accept an unauthenticated server |
-| `e2e_legacy` | True | Also serve the first E2E design (2.x clients); `False` refuses it with close code 4800 |
-| `signing_key` | None | PEM or DER (PKCS#8) ECDSA P-256 private key for signed messages, apart from `e2e_identity_key`: the server signs with it (`sign()`) and clients' signed messages must name it; clients pin `signing_public_key()` |
-| `signature_window` | 30 | Seconds a client's signed message may be off the server's clock |
-
----
-
-## API Reference
-
-### Lifecycle
-
-```python
-server.start()                          # Bind and start (OSError if the port is taken)
-server.stop()                           # Close every connection (1001) and stop
-server.drain(4300, "", timeout=30)      # Close clients, wait, return how many were forced
-server.is_running()                     # Check server status (bool)
-server.is_draining()                    # True between drain() and the next start()
-
-with RustWSEServer("0.0.0.0", 5007) as server:   # start() ... stop()
-    ...
-```
-
-Rust-side logs go to standard output at level `info`; set `RUST_LOG` (for example `RUST_LOG=wse=debug`) to change it.
-
-### Event Handling
-
-**Drain mode** (recommended) - events are queued in a lock-free crossbeam channel. Python polls in batches, acquiring the GIL once per batch.
-
-```python
-server.enable_drain_mode()              # Switch to batch-polling mode (call before start)
-events = server.drain_inbound(256, 50)  # Poll up to 256 events, wait up to 50ms
-```
-
-Each event is a tuple: `(event_type, conn_id, payload)`
-
-| Event Type | Trigger | Payload |
-|------------|---------|---------|
-| `"auth_connect"` | JWT-validated connection | user_id (string) |
-| `"connect"` | Connection without JWT | cookies (string) |
-| `"msg"` | Client sent WSE-prefixed JSON | parsed dict |
-| `"signed"` | Client's signed message that passed every check | the signed body's fields, and `signature` (`body`, `sig`, `kid`): the proof to keep |
-| `"raw"` | Client sent plain text | raw string |
-| `"bin"` | Client sent binary frame | bytes |
-| `"disconnect"` | Connection closed | None |
-| `"presence_join"` | User's first connection joined a topic | dict with user_id, topic, data |
-| `"presence_leave"` | User's last connection left a topic | dict with user_id, topic, data |
-
-**Callback mode** - alternative to drain mode. The callbacks of one connection run in the order of its events (`on_connect` first, `on_disconnect` last) on the server's worker threads; `on_connect(conn_id, user_id)` gets the validated user id, or the Cookie header without `jwt_secret`.
-
-```python
-server.set_callbacks(on_connect, on_message, on_disconnect, on_signed_message=None)
-```
-
-`on_signed_message(conn_id, data)` gets a client's signed message with its proof; without it such messages go to `on_message` without the proof.
-
-### Sending Messages
-
-```python
-server.send(conn_id, text)                      # Send text to one connection
-server.send_bytes(conn_id, data)                 # Send binary to one connection
-server.send_event(conn_id, event_dict)           # Send structured event (auto-serialized, deduped, rate-checked)
-
-server.broadcast_all(text)                       # Send to every connected client (text)
-server.broadcast_all_bytes(data)                 # Send to every connected client (binary)
-server.broadcast_local(topic, text)              # Fan-out to topic subscribers on this instance
-server.broadcast(topic, text)                    # Fan-out to topic subscribers across all cluster nodes
-```
-
-| Method | Scope | Notes |
-|--------|-------|-------|
-| `send` | Single connection | Raw text frame |
-| `send_bytes` | Single connection | Raw binary frame |
-| `send_event` | Single connection | JSON-serialized (msgpack for msgpack clients), compressed if above threshold, deduplication via 50K-entry FIFO window |
-| `broadcast_all` | All connections | Pre-framed, single frame build shared via Arc |
-| `broadcast_local` | Topic (local) | Pre-framed, DashMap subscriber lookup, stored in recovery buffer if enabled |
-| `broadcast` | Topic (all nodes) | Local fan-out + forwarded to cluster peers with matching interest |
-
-A client that asked for msgpack (`?format=msgpack`) gets in msgpack whatever would go to it as JSON text: topic messages, broadcasts, recovery replays, `send` and `send_event`. Bytes sent with `send_bytes` or `broadcast_all_bytes` go as they are.
-
-**Signed messages** (with `signing_key`): sign once, send to anyone.
-
-```python
-fill = server.sign("fill", {"order": "o-17", "qty": "2"}, topic="orders.u1")
-server.broadcast("orders.u1", fill)             # or send(conn_id, fill)
-server.set_client_key(conn_id, public_key)      # bind a client's key (or the token's cnf claim does)
-server.signing_public_key()                     # what clients pin (base64)
-```
-
-### Topic Subscriptions
-
-```python
-server.subscribe_connection(conn_id, ["prices", "news"])              # Subscribe; returns the topics it took (ACL, limits)
-server.subscribe_connection(conn_id, ["chat"], {"status": "online"})  # Subscribe with presence data
-server.subscribe_connection(conn_id, ["tasks"], queue_group="workers") # Subscribe with queue group (round-robin)
-server.unsubscribe_connection(conn_id, ["news"])                      # Unsubscribe from specific topics
-server.unsubscribe_connection(conn_id, None)                          # Unsubscribe from all topics
-server.get_topic_subscriber_count("prices")                           # Subscriber count for a topic
-```
-
-Subscriptions are cleaned up automatically on disconnect. In cluster mode, interest changes are propagated to peers via SUB/UNSUB frames.
-
-**Queue groups**: connections in the same `queue_group` receive messages round-robin instead of fanout. Normal subscribers (no queue group) still receive all messages. Useful for distributing work across a pool of consumers.
-
-### Topic ACL
-
-Per-connection topic access control with glob pattern matching.
-
-```python
-# Allow only "user:*" topics, deny everything else
-server.set_topic_acl(conn_id, allow=["user:*"])
-
-# Allow "data:*" but deny "data:internal:*"
-server.set_topic_acl(conn_id, allow=["data:*"], deny=["data:internal:*"])
-
-# Must be called before subscribe_connection
-server.subscribe_connection(conn_id, ["data:prices"])   # allowed
-server.subscribe_connection(conn_id, ["data:internal:audit"])  # denied
-```
-
-Deny patterns take precedence over allow patterns. Supports `*` (any characters) and `?` (single character) wildcards. Applied at subscribe time.
-
-### Presence Tracking
-
-Requires `presence_enabled=True` in the constructor.
-
-```python
-# Query members in a topic
-members = server.presence("chat-room")
-# {"alice": {"data": {"status": "online"}, "connections": 2},
-#  "bob":   {"data": {"status": "away"},   "connections": 1}}
-
-# Lightweight counts (O(1), no iteration)
-stats = server.presence_stats("chat-room")
-# {"num_users": 2, "num_connections": 3}
-
-# Update a user's presence data across all their subscribed topics
-server.update_presence(conn_id, {"status": "away"})
-```
-
-Presence is tracked at the user level (JWT `sub` claim). Multiple connections from the same user share a single presence entry. `presence_join` fires on first connection, `presence_leave` on last disconnect. In cluster mode, presence state is synchronized across all nodes using CRDT last-write-wins resolution.
-
-### Message Recovery
-
-Requires `recovery_enabled=True` in the constructor.
-
-```python
-result = server.subscribe_with_recovery(
-    conn_id, ["prices"],
-    recover=True,
-    epoch=client_epoch,       # From previous session
-    offset=client_offset,     # From previous session
-)
-# {"topics": {"prices": {"epoch": "0000007b", "offset": 456, "recovered": True, "count": 12}}}
-```
-
-The server maintains per-topic ring buffers (power-of-2 capacity, bitmask indexing). When recovery is enabled, every topic broadcast is stamped with `tp`/`e`/`o` (topic, epoch, offset) fields, so clients track their per-topic position from the messages themselves, drop duplicates idempotently by `(epoch, offset)`, and automatically request recovery when they detect an offset gap. On reconnect, the server replays missed messages from the ring buffer. If the gap is too large or the epoch has changed, the client receives a `NotRecovered` status and should re-subscribe from scratch.
-
-Memory is managed with a global budget (default 256 MB), TTL eviction for idle buffers, and LRU eviction when over budget.
-
-### Cluster
-
-```python
-# Join a cluster mesh with mTLS
-server.connect_cluster(
-    peers=["10.0.0.2:9999", "10.0.0.3:9999"],
-    tls_ca="/etc/wse/ca.pem",
-    tls_cert="/etc/wse/node.pem",
-    tls_key="/etc/wse/node.key",
-    cluster_port=9999,
-)
-
-# With gossip discovery (only seed addresses needed)
-server.connect_cluster(
-    peers=[],
-    seeds=["10.0.0.2:9999"],
-    cluster_addr="10.0.0.1:9999",
-    cluster_port=9999,
-)
-
-# One host or a closed network: links share the WebSocket port (plaintext)
-server.connect_cluster(peers=["10.0.0.2:5007"], single_port=True)
-
-server.cluster_connected()       # True if connected to at least one peer
-server.cluster_peers_count()     # Number of active peer connections
-server.cluster_info()            # Linked peers (address, instance_id, capabilities, connected_at)
-```
-
-Nodes form a full TCP mesh automatically. The cluster protocol uses a custom binary frame format with an 8-byte header, 12 message types, and capability negotiation during handshake. Features:
-
-- **Interest-based routing** - SUB/UNSUB/RESYNC frames. Messages are only forwarded to peers with matching subscribers.
-- **Gossip discovery** - PeerAnnounce/PeerList frames. New nodes need one seed address to join.
-- **mTLS** - mutual TLS via rustls with P-256 certificates and WebPkiClientVerifier.
-- **zstd compression** - payloads above 256 bytes compressed at level 1, capability-negotiated.
-- **Circuit breaker** - 10 failures to open, 60s reset, 3 half-open probe calls.
-- **Heartbeat** - 5s interval, 15s timeout, dead peer detection.
-- **Dead letter queue** - 1000-entry ring buffer for failed cluster sends.
-- **Presence sync** - PresenceUpdate/PresenceFull frames with CRDT conflict resolution.
-
-### Health Monitoring
-
-```python
-health = server.health_snapshot()
-# {
-#     "connections": 150,
-#     "inbound_queue_depth": 0,
-#     "inbound_dropped": 0,
-#     "uptime_secs": 3600.5,
-#     "recovery_enabled": True,
-#     "recovery_topic_count": 5,
-#     "recovery_total_bytes": 1048576,
-#     "cluster_connected": True,
-#     "cluster_peer_count": 2,
-#     "cluster_messages_sent": 50000,
-#     "cluster_messages_delivered": 49950,
-#     "cluster_messages_dropped": 0,
-#     "cluster_bytes_sent": 1048576,
-#     "cluster_bytes_received": 1024000,
-#     "cluster_reconnect_count": 0,
-#     "cluster_unknown_message_types": 0,
-#     "cluster_dlq_size": 0,
-#     "presence_enabled": True,
-#     "presence_topics": 3,
-#     "presence_total_users": 25,
-# }
-```
-
-### Connection Management
-
-```python
-server.get_connection_count()        # Lock-free AtomicUsize read
-server.get_connections()             # List all connection IDs (snapshot)
-server.disconnect(conn_id)           # Force-disconnect a connection
-server.drain(close_code=4300, close_reason="shutting down", timeout=10)  # Graceful drain
-server.inbound_queue_depth()         # Events waiting to be drained
-server.inbound_dropped_count()       # Client messages dropped over the inbound budget
-server.get_cluster_dlq_entries()     # Retrieve failed cluster messages from dead letter queue
-```
-
-`drain()` sends a WebSocket Close frame to all connected clients and rejects new connections. The drain wait runs as a separate task, so the command processor stays responsive. Use for zero-downtime deployments and rolling restarts.
-
----
-
-## Security
-
-### JWT Authentication
-
-Rust-native HS256 validation during the WebSocket handshake. Zero GIL acquisition, 0.01ms per decode.
-
-Token delivery:
-- **Browser clients**: `access_token` HTTP-only cookie (set by your login endpoint, attached automatically by the browser)
-- **Backend clients**: `Authorization: Bearer <token>` header and/or `access_token` cookie
-- **API clients**: `Authorization: Bearer <token>` header
-
-Required claims: `sub` (user ID), `exp` (expiration). Recommended: `iat` (issued at). Optional: `iss`, `aud` (validated if configured).
-
-`server.issue_token(sub, ttl=900, claims=None)` signs a token with the server's own configuration, for a login endpoint in the same process; `server.reload_jwt_keys(...)` swaps keys on a running server.
-
-### End-to-End Encryption
-
-On top of TLS, a client can seal every frame for the server alone. The server proves who it is with an identity key:
-
-```bash
-openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out e2e-identity.pem
-```
-
-```python
-server = RustWSEServer("0.0.0.0", 5007, jwt_secret=..., e2e_identity_key=open("e2e-identity.pem", "rb").read())
-print(server.e2e_identity_public_key())   # the key clients pin (base64)
-```
-
-Clients pin that key: `AsyncWSEClient(url, encryption=True, e2e_server_keys=[key])` in Python, `security: { encryptionEnabled: true, serverKeys: [key] }` in TypeScript. After the handshake every frame is sealed with a key per direction (AES-256-GCM, sequence numbers, rekeying); a replayed or forged frame ends the connection. Setup, key rotation and the threat model: [docs/SECURITY.md](docs/SECURITY.md#end-to-end-encryption).
-
-### Signed Messages
-
-E2E protects a message on its way; a signature proves later who sent it. Each client signs with its own key, kept on its device; the server signs with `signing_key`:
-
-```python
-client = AsyncWSEClient(url, token=token, signing_key=key, server_signing_keys=[server_key])
-await client.send("order", {"side": "buy", "qty": "1.5"}, signed=True, nonce="o-17")
-```
-
-The server takes it once, within `signature_window`, and only for its own key; the application gets the order with its proof, the client a signed receipt. Key binding and guarantees: [docs/SECURITY.md](docs/SECURITY.md#signed-messages).
-
-### Rate Limiting
-
-Per-connection token bucket on the messages clients send: 100,000 messages capacity, 10,000 messages/second refill. Clients receive a `rate_limit_warning` at 20% remaining capacity, and a `RATE_LIMITED` error when their messages are dropped; a client that keeps sending for 10 seconds after that is closed with code 4429. What the server sends is bounded by `max_outbound_queue_bytes` instead.
-
-### Deduplication
-
-`send_event()` maintains a 50,000-entry AHashSet with FIFO eviction. Duplicate message IDs are dropped before serialization.
-
-### Idle Detection
-
-Server pings every connected client every 25 seconds. Connections that sent nothing for 60 seconds are closed with code 4408; WebSocket protocol pings count as activity. A client that does not answer a close frame within 5 seconds is disconnected.
-
-Full security documentation: [docs/SECURITY.md](docs/SECURITY.md)
-
----
-
-## Wire Protocol
-
-WSE uses a custom wire protocol with categorized JSON messages:
-
-**Text frames:** JSON with `c` field for category: `"WSE"` (system), `"S"` (snapshot), `"U"` (update)
-
-**Binary frames:** `C:` (zlib compressed), `M:` (MessagePack), `E:` (E2E sealed), raw zlib (0x78 magic byte)
-
-**MessagePack transport:** opt-in per connection via the `?format=msgpack` query parameter (`wire_format="msgpack"` in the Python client, `wireFormat: 'msgpack'` in the TypeScript one). The server then sends that connection msgpack instead of JSON text, and reads msgpack from it; on typical messages that is 24-41% fewer bytes. E2E sealed frames carry it too.
-
-**Protocol negotiation:** `client_hello`/`server_hello` handshake with feature discovery, capability advertisement, and version agreement.
-
-Full protocol specification: [docs/PROTOCOL.md](docs/PROTOCOL.md)
-
----
-
-## Compression
-
-Two compression layers:
-
-- **Client-facing:** zlib for messages above the configurable threshold (default 1024 bytes). Applied automatically by `send_event()`.
-- **Inter-peer (cluster):** zstd level 1 for payloads above 256 bytes. Capability-negotiated during handshake. Decompression output capped at 1 MB (MAX_FRAME_SIZE).
-
----
-
-## Client SDKs
-
-### Rust
-
-```bash
-cargo add wse-client
-```
-
-On tokio, and in the browser (WebAssembly, for Leptos, Yew, Dioxus): a handler reads each message in place from its frame and decodes its payload into the application's types without copies; or a stream of owned messages. Topics with recovery, reconnects, msgpack, E2E encryption and signed messages.
-
-```rust
-let mut config = wse_client::Config::new("ws://localhost:5006/wse");
-config.token = Some(token);
-config.topics = vec!["updates".into()];
-let (client, mut events) = wse_client::connect(config).await?;
-while let Some(incoming) = events.next().await {
-    println!("{incoming:?}");
+```tsx
+import { useMemo, useState } from 'react';
+import { useWSE, type UseWSEConfig } from 'wse-client';
+
+export function Price() {
+  const [price, setPrice] = useState<number>();
+  const config = useMemo<UseWSEConfig>(() => ({
+    endpoints: ['wss://example.com/wse'],
+    registerHandlers: (processor) => {
+      processor.registerHandler('price', (msg) => setPrice(msg.p.price));
+    },
+  }), []);
+  const { connectionHealth } = useWSE('cookie', ['prices'], config);
+
+  return <p>{connectionHealth}: {price ?? '-'}</p>;
 }
 ```
 
-See the [`wse-client` crate](crates/wse-client/README.md).
+A browser cannot put headers on a WebSocket, so it signs in with the cookie your login endpoint sets (`access_token`); `'cookie'` tells the hook to connect. Every `useWSE()` on a page shares one connection. More in the [TypeScript client's README](https://github.com/silvermpx/wse/blob/main/ts-client/README.md).
 
 ### Python
 
@@ -616,119 +163,262 @@ See the [`wse-client` crate](crates/wse-client/README.md).
 pip install wse-client
 ```
 
-Full-featured async and sync client with connection pool, circuit breaker, auto-reconnect, E2E encryption, and msgpack binary transport.
-
 ```python
+import asyncio
+
 from wse_client import connect
 
-async with connect("ws://localhost:5007/wse", token="<jwt>") as client:
-    await client.subscribe(["updates"])
-    async for event in client:
-        print(event.type, event.payload)
+
+async def main():
+    async with connect("ws://localhost:5007/wse", token="<token>", topics=["prices"]) as client:
+        async for event in client:
+            print(event.type, event.payload)
+
+
+asyncio.run(main())
 ```
 
-**Sync interface:**
+`SyncWSEClient` does the same without asyncio. More in the [Python client's README](https://github.com/silvermpx/wse/blob/main/python-client/README.md).
 
-```python
-from wse_client import SyncWSEClient
-
-client = SyncWSEClient("ws://localhost:5007/wse", token="<jwt>")
-client.connect()
-client.subscribe(["updates"])
-
-@client.on("updates")
-def handle(event):
-    print(event.payload)
-
-client.run_forever()
-```
-
-Key features: 4 reconnect strategies (exponential, linear, fibonacci, adaptive), connection pool with health scoring and 3 load balancing strategies, circuit breaker, token bucket rate limiter, event sequencer with id dedup plus per-topic `(epoch, offset)` idempotent dedup and gap recovery, network quality monitoring (latency/jitter/packet loss).
-
-See [python-client/](python-client/) for full source and examples.
-
-### TypeScript / React
+### Rust
 
 ```bash
-npm install wse-client
+cargo add wse-client tokio --features tokio/full
 ```
 
-Single React hook (`useWSE`) for connection lifecycle, subscriptions, and message dispatch.
-
-```tsx
-import { useWSE } from 'wse-client';
-
-function App() {
-  const { sendMessage, connectionHealth } = useWSE(
-    '<jwt-token>',
-    ['updates'],
-    { endpoints: ['ws://localhost:5007/wse'] },
-  );
-
-  return <div>Status: {connectionHealth}</div>;
+```rust
+#[tokio::main]
+async fn main() -> Result<(), wse_client::Error> {
+    let mut config = wse_client::Config::new("ws://localhost:5007/wse");
+    config.token = Some("<token>".into());
+    config.topics = vec!["prices".into()];
+    let (_client, mut events) = wse_client::connect(config).await?;
+    while let Some(incoming) = events.next().await {
+        println!("{incoming:?}");
+    }
+    Ok(())
 }
 ```
 
-Key features: offline queue with IndexedDB persistence, adaptive quality management, connection pool with health scoring, E2E encryption (Web Crypto API), message batching, 5 priority levels, Zustand store for external state access.
+The same crate builds for the browser (`wasm32-unknown-unknown`), for Leptos, Yew or Dioxus apps, with the same API. A `Handler` can read each message straight from its frame into your own types, without copying it. More in the [Rust client's README](https://github.com/silvermpx/wse/blob/main/crates/wse-client/README.md).
 
-See [ts-client/](ts-client/) for full source and examples.
+## The Python server
 
----
+Everything here is a method or an option of `RustWSEServer`. The [integration guide](https://github.com/silvermpx/wse/blob/main/docs/INTEGRATION.md) has the complete reference.
+
+### Options
+
+Sizes are in bytes, times in seconds.
+
+| Option | Default | |
+|--------|---------|---|
+| `host`, `port` | required | The address to listen on |
+| `max_connections` | 1000 | Connections at once |
+| `jwt_secret` | `None` | The key that checks tokens: the shared secret for HS256/384/512 (at least 32, 48 or 64 bytes), or the PEM public key for the RSA, ECDSA and EdDSA algorithms. Without it the application checks each connection itself and calls `accept_connection()` |
+| `jwt_algorithm` | `"HS256"` | The algorithm tokens must use; a token's own `alg` header never overrides it |
+| `jwt_issuer`, `jwt_audience` | `None` | The `iss` and `aud` a token must carry |
+| `jwt_key_id` | `None` | The `kid` a token must carry |
+| `jwt_cookie_name` | `"access_token"` | The cookie a browser's token is read from |
+| `jwt_previous_secret` | `None` | The previous key, still accepted while clients move to the new one |
+| `jwt_private_key` | `None` | The PEM private key `issue_token()` signs with, for the RSA, ECDSA and EdDSA algorithms |
+| `allowed_origins` | `None` | The origins browsers may connect from (`"https://app.example.com"`); others get HTTP 403 |
+| `client_subscriptions` | `False` | Let clients subscribe, unsubscribe and recover by themselves, within their topic ACL. Otherwise their requests reach the application as messages |
+| `max_subscriptions_per_connection` | 0 | Topics per connection (0: no limit) |
+| `recovery_enabled` | `False` | Keep each topic's recent messages for clients that reconnect |
+| `recovery_buffer_size` | 128 | Messages kept per topic, rounded up to a power of two |
+| `recovery_ttl` | 300 | How long a quiet topic's messages are kept |
+| `recovery_max_messages` | 500 | Messages replayed for one request at most |
+| `recovery_memory_budget` | 256 MB | Memory for the kept messages of all topics |
+| `presence_enabled` | `False` | Track who is on each topic |
+| `presence_max_data_size` | 4096 | A user's presence data at most |
+| `presence_max_members` | 0 | Members per topic (0: no limit) |
+| `max_message_size` | 1 MB | The largest frame a client may send |
+| `rate_limit_capacity` | 100000 | Messages a client may send in a burst (`float("inf")`: no limit) |
+| `rate_limit_refill` | 10000 | Messages per second a client may send after the burst |
+| `max_outbound_queue_bytes` | 16 MB | Data waiting to be written to one client. Past it the client misses messages, and one over it for two pings is closed (code 1013) |
+| `max_inbound_queue_size` | 131072 | Client messages waiting for the application before new ones are dropped. Connect, disconnect and presence events are never dropped |
+| `max_inbound_queue_bytes` | 64 MB | The same limit in bytes |
+| `ping_interval` | 25 | Time between the server's pings |
+| `idle_timeout` | 60 | A client silent this long is closed (code 4408) |
+| `e2e_identity_key` | `None` | PEM or DER (PKCS#8) P-256 private key the server proves itself with in end-to-end encryption |
+| `e2e_legacy` | `True` | Also serve 2.x clients' encryption, which has no server identity; `False` refuses it (code 4800) |
+| `signing_key` | `None` | PEM or DER (PKCS#8) P-256 private key for signed messages |
+| `signature_window` | 30 | How far a client's signed message may be off the server's clock |
+
+### Events
+
+The application reads what clients do in batches:
+
+```python
+server.enable_drain_mode()                # before start()
+events = server.drain_inbound(256, 50)    # up to 256 events; waits up to 50 ms for the first
+```
+
+Each event is a tuple `(kind, conn_id, data)`:
+
+| Kind | When | `data` |
+|------|------|--------|
+| `"auth_connect"` | A client connected with a valid token | its user id (the token's `sub`) |
+| `"connect"` | A client connected to a server without `jwt_secret` | its Cookie header: check it, then call `accept_connection(conn_id, user_id)` |
+| `"msg"` | A JSON message | the message, a dict |
+| `"signed"` | A signed message that passed every check | its fields, and `signature` (`body`, `sig`, `kid`): the proof to keep |
+| `"raw"` | Text that is not JSON | the string |
+| `"bin"` | A binary frame | the bytes |
+| `"disconnect"` | The connection closed | `None` |
+| `"presence_join"` | A user's first connection joined a topic | `user_id`, `topic` and `data` |
+| `"presence_leave"` | A user's last connection left a topic | `user_id`, `topic` and `data` |
+
+Instead of polling, `set_callbacks(on_connect, on_message, on_disconnect, on_signed_message=None)` has the server call the application on its worker threads, each connection's callbacks in the order of its events.
+
+### Sending
+
+```python
+server.send(conn_id, text)                  # to one connection
+server.send_bytes(conn_id, data)            # binary, to one connection
+server.send_event(conn_id, {"t": "notice", "p": {"text": "hi"}})  # a dict, compressed when large
+server.broadcast(topic, text)               # to a topic's subscribers on every server of the cluster
+server.broadcast_local(topic, text)         # to a topic's subscribers on this server
+server.broadcast_all(text)                  # to every connection on this server
+server.broadcast_all_bytes(data)
+```
+
+A client that asked for MessagePack gets MessagePack from all of these except the two `_bytes` methods, which send their bytes as they are. When the server has 65,536 commands queued, these calls wait (without holding the GIL), so a publisher faster than its clients cannot run the server out of memory.
+
+### Topics
+
+```python
+server.set_topic_acl(conn_id, allow=["user:42:*"], deny=["user:42:admin"])
+server.subscribe_connection(conn_id, ["user:42:orders", "user:42:alerts:*"])  # returns the topics it took
+server.subscribe_connection(conn_id, ["chat"], {"status": "online"})         # with presence data
+server.subscribe_connection(conn_id, ["jobs"], queue_group="workers")        # one of "workers" gets each message
+server.unsubscribe_connection(conn_id, ["chat"])                             # or None: every topic
+server.get_topic_subscriber_count("chat")
+```
+
+The ACL takes `*` and `?` wildcards, and a deny wins over an allow. Set it before subscribing; a token can carry the same rules in its `wse_topics` claim. A pattern subscription gets only the topics the ACL allows.
+
+### Presence
+
+With `presence_enabled=True`:
+
+```python
+server.presence("chat")         # {"alice": {"data": {"status": "online"}, "connections": 2}, ...}
+server.presence_stats("chat")   # {"num_users": 2, "num_connections": 3}
+server.update_presence(conn_id, {"status": "away"})
+```
+
+A user is the token's `sub`, so two tabs of one user are one member.
+
+### Recovery
+
+With `recovery_enabled=True`, every message published to a topic carries its position: `tp`, `e` and `o` (topic, epoch, offset). The clients in this repository track it, drop duplicates, notice gaps and ask for what they missed. With `client_subscriptions=True` the server answers them itself; otherwise the application does:
+
+```python
+server.subscribe_with_recovery(conn_id, ["prices"], recover=True, epoch=epoch, offset=offset)
+# {"recovered": True, "topics": {"prices": {"epoch": "0000007b", "offset": 456, "recovered": True, "count": 12, ...}}}
+```
+
+When the missed messages are no longer kept, `recovered` is `False` and the client has to reload.
+
+### Cluster
+
+```python
+server.connect_cluster(
+    peers=["10.0.0.2:9999", "10.0.0.3:9999"],
+    cluster_port=9999,
+    tls_ca="/etc/wse/ca.pem",
+    tls_cert="/etc/wse/node.pem",
+    tls_key="/etc/wse/node.key",
+)
+server.broadcast("prices", text)   # reaches the subscribers on every server
+```
+
+A new server can also join through one seed address (`seeds=[...]`, `cluster_addr=...`). On one host or a closed network the links can share the WebSocket port instead (`single_port=True`, without TLS). `cluster_info()` lists the linked peers. The protocol is described in [CLUSTER_PROTOCOL.md](https://github.com/silvermpx/wse/blob/main/docs/CLUSTER_PROTOCOL.md).
+
+### Running it
+
+```python
+server.drain(4300, "deploy", timeout=30)   # refuse new clients, close the rest, wait; returns how many it forced
+server.stop()
+server.health_snapshot()                   # connections, queues, recovery, cluster and presence
+server.prometheus_metrics()                # text for a /metrics endpoint
+```
+
+`with RustWSEServer(...) as server:` starts the server and stops it at the end. Logs go to standard output at level `info`; `RUST_LOG=wse=debug` shows more.
+
+## Security
+
+- **Tokens.** `issue_token(sub, ttl=900, claims=None)` signs tokens with the server's own settings, for a login endpoint in the same process, and `reload_jwt_keys()` replaces the keys of a running server. A connection is closed when its token expires (code 4403), and the clients reconnect with a fresh one.
+- **TLS.** Serve `wss://` through a reverse proxy or a load balancer (nginx, Caddy); the server itself speaks plain WebSocket. Cluster links have their own mutual TLS.
+- **Browsers.** `allowed_origins` refuses pages from other sites, which could otherwise connect with your users' cookies.
+- **Limits.** Clients are rate-limited on what they send, and one that keeps going over is closed (code 4429). Frame sizes, subscriptions, queues and connections waiting in the handshake are all bounded.
+
+### End-to-end encryption
+
+```bash
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out e2e-identity.pem
+```
+
+```python
+server = RustWSEServer(
+    "0.0.0.0", 5007,
+    jwt_secret=secret,
+    e2e_identity_key=open("e2e-identity.pem", "rb").read(),
+)
+print(server.e2e_identity_public_key())   # the key clients pin
+```
+
+Clients pin that key: `encryption=True, e2e_server_keys=[key]` in Python, `security: { encryptionEnabled: true, serverKeys: [key] }` in TypeScript, `Encryption::pinned([key])` in Rust. Each direction then has its own AES-256-GCM key; frames are numbered, and a replayed, reordered or forged frame ends the connection.
+
+### Signed messages
+
+```python
+fill = server.sign("fill", {"order": "o-17", "qty": "2"}, topic="orders:u1")
+server.broadcast("orders:u1", fill)   # signed once, sent to any number of clients
+```
+
+Clients check such messages against the server's `signing_public_key()`, which they pin. They sign their own with a key that stays on the device: `send(..., signed=True)` in Python, `sendSigned()` in TypeScript, `send_signed()` in Rust. The server accepts each one once, within `signature_window`, and only with the key bound to that user, by the token's `cnf` claim or by `set_client_key()`.
+
+Setup, key rotation and what each guarantees: [SECURITY.md](https://github.com/silvermpx/wse/blob/main/docs/SECURITY.md).
 
 ## Performance
 
-3.0 against 2.5.1 on the same machine (Intel Xeon Gold 5412U, 48 threads), server and benchmark client on separate cores:
+A broadcast is encoded once and written out by every CPU core in parallel, each core serving its share of the connections. A publisher faster than its clients is slowed down rather than allowed to fill memory.
+
+3.0 against 2.5.1 on the same machine (Intel Xeon Gold 5412U, 24 cores), with the server and the benchmark client on separate cores:
 
 | Test | 2.5.1 | 3.0 |
 |------|-------|-----|
-| Broadcast, 1,000 / 5,000 / 10,000 subscribers | 5.4 / 6.0 / 7.4M deliveries/s | **9.4 / 8.2** / 7.4M |
-| Topic through a cluster peer, 1,000 / 10,000 subscribers | 5.9 / 5.7M deliveries/s | **6.8 / 8.4M** |
-| Inbound, 100 / 1,000 connections | 8.3 / 7.7M msg/s | 8.3 / 7.7M |
-| Peak memory under a publisher that never pauses | 35-39 GB | **19-21 GB** |
+| Broadcast to 1,000 / 5,000 / 10,000 subscribers | 5.4 / 6.0 / 7.4M deliveries/s | 9.4 / 8.2 / 7.4M |
+| A topic through a cluster peer, 1,000 / 10,000 subscribers | 5.9 / 5.7M deliveries/s | 6.8 / 8.4M |
+| Messages from clients, 100 / 1,000 connections | 8.3 / 7.7M msg/s | 8.3 / 7.7M |
+| Peak memory under a publisher that never pauses | 35-39 GB | 19-21 GB |
 
-Peak numbers measured with 2.x on AMD EPYC 7502P (32 cores / 64 threads, 128 GB RAM), Ubuntu 24.04:
+More results: [benchmarks](https://github.com/silvermpx/wse/blob/main/docs/BENCHMARKS.md), [fan-out](https://github.com/silvermpx/wse/blob/main/docs/BENCHMARKS_FANOUT.md), and the [Rust](https://github.com/silvermpx/wse/blob/main/docs/BENCHMARKS_RUST_CLIENT.md), [Python](https://github.com/silvermpx/wse/blob/main/docs/BENCHMARKS_PYTHON_CLIENT.md) and [TypeScript](https://github.com/silvermpx/wse/blob/main/docs/BENCHMARKS_TS_CLIENT.md) clients.
 
-| Mode | Peak Throughput | Connections | Message Loss |
-|------|----------------|-------------|--------------|
-| Standalone (fan-out) | 4.7M deliveries/s | 100K | 0% |
-| Standalone (inbound JSON) | 14.7M msg/s | 500K | 0% |
-| Standalone (inbound msgpack) | 30M msg/s | 500K | 0% |
-| Cluster (2 nodes, 50/50) | 6.6M deliveries/s | 500 per node | 0% |
+## Upgrading from 2.x
 
-Sub-millisecond latency. Median 0.38ms with JWT authentication. Connection handshake: 0.53ms median (Rust JWT path).
+The Python API keeps its names, but some behaviour changed. What most applications notice:
 
-Detailed results: [Benchmarks](docs/BENCHMARKS.md) | [Fan-out](docs/BENCHMARKS_FANOUT.md) | [Rust Client](docs/BENCHMARKS_RUST_CLIENT.md) | [Python Client](docs/BENCHMARKS_PYTHON_CLIENT.md) | [TS Client](docs/BENCHMARKS_TS_CLIENT.md)
+- `connect_cluster()` needs `cluster_port`, or `single_port=True`.
+- `start()` raises `OSError` when the port is taken; `drain()` waits for the clients and returns how many it had to drop.
+- JWT settings are checked at startup, and a token without the configured `iss` or `aud` is refused.
+- End-to-end encryption now authenticates the server, so clients pin its key. 2.x clients keep working while `e2e_legacy=True`, the default.
+- The rate limit applies to what clients send; `send_event()` is no longer throttled.
 
----
-
-## Examples
-
-Working examples in the [`examples/`](examples/) directory:
-
-| Example | Description |
-|---------|-------------|
-| [`standalone_basic.py`](examples/standalone_basic.py) | Basic server with JWT auth and echo |
-| [`standalone_broadcast.py`](examples/standalone_broadcast.py) | Topic-based pub/sub with broadcasting |
-| [`standalone_presence.py`](examples/standalone_presence.py) | Per-topic presence tracking with join/leave events |
-| [`standalone_recovery.py`](examples/standalone_recovery.py) | Message recovery on reconnect with epoch+offset |
-
----
+The full list, with the client changes: [MIGRATION.md](https://github.com/silvermpx/wse/blob/main/docs/MIGRATION.md#migrating-from-v2x-to-v30).
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md) - server internals, PyO3 bridge, concurrency model
-- [Integration Guide](docs/INTEGRATION.md) - complete setup and API reference
-- [Wire Protocol](docs/PROTOCOL.md) - message format specification
-- [Cluster Protocol](docs/CLUSTER_PROTOCOL.md) - TCP mesh, frame format, gossip, interest routing
-- [Rust Utilities](docs/RUST_UTILITIES.md) - priority queues, rate limiters, sequencing, compression, crypto, JWT
-- [Security](docs/SECURITY.md) - JWT, encryption, mTLS, rate limiting, circuit breaker
-- [Deployment](docs/DEPLOYMENT.md) - production setup, Docker, Kubernetes, cluster configuration
-- [Migration Guide](docs/MIGRATION.md) - upgrading to 3.0, and from v1.x to v2.x
-- [`wse`](crates/wse/README.md) and [`wse-client`](crates/wse-client/README.md) - the Rust crates
-- [Contributing](CONTRIBUTING.md) - development setup and coding standards
-- [Changelog](CHANGELOG.md) - version history
-
----
+- [Integration guide](https://github.com/silvermpx/wse/blob/main/docs/INTEGRATION.md): setup and the complete API
+- [Wire protocol](https://github.com/silvermpx/wse/blob/main/docs/PROTOCOL.md): messages, close codes, end-to-end encryption
+- [Cluster protocol](https://github.com/silvermpx/wse/blob/main/docs/CLUSTER_PROTOCOL.md)
+- [Security](https://github.com/silvermpx/wse/blob/main/docs/SECURITY.md)
+- [Deployment](https://github.com/silvermpx/wse/blob/main/docs/DEPLOYMENT.md): production setup, Docker, Kubernetes
+- [Architecture](https://github.com/silvermpx/wse/blob/main/docs/ARCHITECTURE.md): how the server works inside
+- [Rust utilities](https://github.com/silvermpx/wse/blob/main/docs/RUST_UTILITIES.md): queues, rate limiters, compression, crypto and JWT helpers the Python package also exports
+- [Changelog](https://github.com/silvermpx/wse/blob/main/CHANGELOG.md)
+- [Contributing](https://github.com/silvermpx/wse/blob/main/CONTRIBUTING.md)
 
 ## License
 
