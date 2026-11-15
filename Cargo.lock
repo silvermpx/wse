@@ -2559,6 +2559,7 @@ dependencies = [
 name = "wse"
 version = "3.0.0"
 dependencies = [
+ "aes-gcm",
  "ahash",
  "arc-swap",
  "aws-lc-rs",
@@ -2569,9 +2570,13 @@ dependencies = [
  "dashmap",
  "flate2",
  "futures-util",
+ "getrandom 0.4.3",
  "hex",
+ "hkdf",
+ "hmac",
  "indexmap",
  "jsonwebtoken",
+ "p256",
  "parking_lot",
  "proptest",
  "pyo3",
@@ -2582,6 +2587,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "sha2",
  "socket2",
  "tokio",
  "tokio-rustls",
@@ -2590,7 +2596,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "wse-protocol",
+ "web-time",
  "zeroize",
  "zstd",
 ]
@@ -2624,26 +2630,6 @@ dependencies = [
  "web-time",
  "webpki-roots 1.0.12",
  "wse",
- "wse-protocol",
- "zeroize",
-]
-
-[[package]]
-name = "wse-protocol"
-version = "3.0.0"
-dependencies = [
- "aes-gcm",
- "aws-lc-rs",
- "base64 0.23.1",
- "getrandom 0.4.3",
- "hex",
- "hkdf",
- "hmac",
- "p256",
- "serde",
- "serde_json",
- "sha2",
- "web-time",
  "zeroize",
 ]
 

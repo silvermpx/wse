@@ -7,7 +7,7 @@
 //!   needs CMake and Go:
 //!   `MATURIN_PEP517_ARGS="--features fips" pip install wse-server --no-binary wse-server`.
 //!
-//! The functions live in `wse_protocol::crypto`, shared with the Rust
+//! The functions live in `crate::protocol::crypto`, shared with the Rust
 //! client. TLS gets its provider from here explicitly; nothing is installed
 //! as the process-wide rustls default, so an application's own TLS setup is
 //! left alone.
@@ -17,7 +17,7 @@ compile_error!("choose a crypto library: the `aws-lc` feature (default) or `fips
 
 use std::sync::Arc;
 
-pub(crate) use wse_protocol::crypto::*;
+pub(crate) use crate::protocol::crypto::*;
 
 /// The rustls provider for cluster TLS.
 pub(crate) fn tls_provider() -> Arc<rustls::crypto::CryptoProvider> {

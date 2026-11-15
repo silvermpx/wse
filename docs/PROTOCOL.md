@@ -518,7 +518,7 @@ The negotiated protocol version is the minimum of both sides.
 
 ## End-to-End Encryption
 
-One suite, `p256-aes256gcm`: ECDH P-256, HKDF-SHA256 and AES-256-GCM, with the server's identity signing in ECDSA P-256/SHA-256 (`ES256`). [SECURITY.md](SECURITY.md#end-to-end-encryption) explains setup and guarantees; [`e2e.json`](https://github.com/silvermpx/wse/blob/main/crates/wse-protocol/tests/vectors/e2e.json) holds test vectors for everything below.
+One suite, `p256-aes256gcm`: ECDH P-256, HKDF-SHA256 and AES-256-GCM, with the server's identity signing in ECDSA P-256/SHA-256 (`ES256`). [SECURITY.md](SECURITY.md#end-to-end-encryption) explains setup and guarantees; [`e2e.json`](https://github.com/silvermpx/wse/blob/main/crates/wse/tests/vectors/e2e.json) holds test vectors for everything below.
 
 ### Handshake
 

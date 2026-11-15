@@ -18,7 +18,7 @@
 use base64::Engine;
 use serde_json::Value;
 
-use crate::crypto::{self, IdentityKey};
+use crate::protocol::crypto::{self, IdentityKey};
 
 /// What a client's signature covers before the body.
 pub const CLIENT_LABEL: &[u8] = b"WSE-SIG client\0";
@@ -196,8 +196,8 @@ impl Signer {
 
     /// The proof of this key over an end-to-end session (`client_auth`):
     /// what binds the session to a token naming the key.
-    pub fn prove_session(&self, th: &[u8; 32]) -> Result<String, crate::e2e::E2eError> {
-        crate::e2e::client_auth(th, &self.key)
+    pub fn prove_session(&self, th: &[u8; 32]) -> Result<String, crate::protocol::e2e::E2eError> {
+        crate::protocol::e2e::client_auth(th, &self.key)
     }
 
     /// From a PKCS#8 ECDSA P-256 private key, PEM or DER.
@@ -438,26 +438,26 @@ mod tests {
         let th = [7u8; 32];
         let message: Value = serde_json::from_str(&signer.prove_session(&th).unwrap()).unwrap();
         assert_eq!(message["t"], "client_auth");
-        let proved = crate::e2e::check_client_auth(&th, &message["p"]).unwrap();
+        let proved = crate::protocol::e2e::check_client_auth(&th, &message["p"]).unwrap();
         assert_eq!(key_id(&proved), signer.kid);
         // Another session's transcript: refused.
-        assert!(crate::e2e::check_client_auth(&[8u8; 32], &message["p"]).is_none());
+        assert!(crate::protocol::e2e::check_client_auth(&[8u8; 32], &message["p"]).is_none());
         // A signature under another label for the same bytes: refused.
         let mut p = message["p"].clone();
-        let input = crate::e2e::client_auth_input(&th, &proved);
+        let input = crate::protocol::e2e::client_auth_input(&th, &proved);
         let mut relabeled = CLIENT_LABEL.to_vec();
-        relabeled.extend_from_slice(&input[crate::e2e::CLIENT_AUTH_LABEL.len()..]);
+        relabeled.extend_from_slice(&input[crate::protocol::e2e::CLIENT_AUTH_LABEL.len()..]);
         let other_label = IdentityKey::from_pkcs8(&pkcs8)
             .unwrap()
             .sign(&relabeled)
             .unwrap();
         p["sig"] = b64().encode(other_label).into();
-        assert!(crate::e2e::check_client_auth(&th, &p).is_none());
+        assert!(crate::protocol::e2e::check_client_auth(&th, &p).is_none());
         // Another key named: the signature is not its.
         let (other, _) = pair();
         let mut p = message["p"].clone();
         p["key"] = b64().encode(other.public_key()).into();
-        assert!(crate::e2e::check_client_auth(&th, &p).is_none());
+        assert!(crate::protocol::e2e::check_client_auth(&th, &p).is_none());
     }
 
     #[test]

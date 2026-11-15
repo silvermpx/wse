@@ -26,9 +26,9 @@ memchr = "2"
 tracing = "0.1"
 # std::time outside the browser, the browser's clock in it.
 web-time = "1"
-# End-to-end encryption and signing: the server's own code, on aws-lc-rs (in
-# the browser on RustCrypto).
-wse-protocol = { workspace = true, optional = true }
+# End-to-end encryption and signing: the server's own code (`wse::protocol`,
+# the crate without its server), on aws-lc-rs (in the browser on RustCrypto).
+wse = { workspace = true, optional = true }
 base64 = { version = "0.23", optional = true }
 
 # Outside the browser: tokio, tokio-tungstenite, rustls for wss://.
@@ -54,7 +54,7 @@ default = ["aws-lc"]
 # and signed messages, on aws-lc-rs. In the browser: end-to-end encryption
 # and signed messages on RustCrypto (the browser does TLS).
 aws-lc = [
-    "dep:wse-protocol",
+    "dep:wse",
     "dep:zeroize",
     "dep:rustls",
     "dep:webpki-roots",
@@ -64,11 +64,12 @@ aws-lc = [
     "tokio-tungstenite/rustls-tls-webpki-roots",
 ]
 # aws-lc-rs built from its FIPS 140-3 validated module (needs CMake and Go).
-fips = ["aws-lc", "wse-protocol/fips", "rustls/fips"]
+fips = ["aws-lc", "wse/fips", "rustls/fips"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-# Published before this crate: its tests and examples build from the package.
-wse.workspace = true
+# The server, published before this crate: its tests and examples build
+# from the package.
+wse = { workspace = true, features = ["server"] }
 # The chat example reads the terminal.
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "io-std", "io-util"] }
 

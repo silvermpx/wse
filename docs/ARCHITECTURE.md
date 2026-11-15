@@ -12,9 +12,8 @@ The crates:
 
 | Crate | What it is |
 |---|---|
-| `crates/wse` | The engine: server, cluster, presence, recovery; the Python module behind the `python` feature |
+| `crates/wse` | The engine: server, cluster, presence, recovery; the Python module behind the `python` feature. Its `protocol` module (the crypto on aws-lc-rs, E2E sessions, signed messages) is what the Rust client shares: without the `server` feature the crate is that module alone |
 | `crates/wse-py` | The Python extension built from it (`wse-server` on PyPI) |
-| `crates/wse-protocol` | The crypto (aws-lc-rs), E2E sessions and signed messages, shared by the engine and the Rust client |
 | `crates/wse-client` | The Rust client |
 
 ```

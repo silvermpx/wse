@@ -209,16 +209,18 @@ impl Client {
         let payload =
             serde_json::value::to_raw_value(payload).map_err(|e| Error::Encode(e.to_string()))?;
         let n = match n {
-            Some(n) if n.is_empty() || n.chars().count() > wse_protocol::signing::MAX_NONCE_LEN => {
+            Some(n)
+                if n.is_empty() || n.chars().count() > wse::protocol::signing::MAX_NONCE_LEN =>
+            {
                 return Err(Error::Signing(format!(
                     "n must be 1 to {} characters",
-                    wse_protocol::signing::MAX_NONCE_LEN
+                    wse::protocol::signing::MAX_NONCE_LEN
                 )));
             }
             Some(n) => n.to_owned(),
             None => {
                 let mut bytes = [0u8; 16];
-                wse_protocol::crypto::fill_random(&mut bytes)
+                wse::protocol::crypto::fill_random(&mut bytes)
                     .map_err(|_| Error::Signing("no random bytes".to_owned()))?;
                 bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
             }

@@ -672,7 +672,7 @@ fn thumbprint(signing_key: &[u8]) -> String {
     let point = base64::engine::general_purpose::STANDARD
         .decode(wse_client::public_key(signing_key).unwrap())
         .unwrap();
-    wse_protocol::signing::thumbprint(&point).unwrap()
+    wse::protocol::signing::thumbprint(&point).unwrap()
 }
 
 #[cfg(feature = "aws-lc")]

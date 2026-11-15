@@ -19,7 +19,7 @@ use web_time::Instant;
 use base64::Engine;
 use zeroize::Zeroizing;
 
-use crate::crypto::{self, Aes256Gcm, CounterSealKey, IdentityKey};
+use crate::protocol::crypto::{self, Aes256Gcm, CounterSealKey, IdentityKey};
 
 /// The one suite: ECDH P-256, HKDF-SHA256, AES-256-GCM.
 pub const SUITE: &str = "p256-aes256gcm";
@@ -584,7 +584,7 @@ mod tests {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
         let v: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/vectors/e2e.json")).unwrap();
+            serde_json::from_str(include_str!("../../tests/vectors/e2e.json")).unwrap();
         let bytes = |k: &str| b64.decode(v[k].as_str().unwrap()).unwrap();
         let hexed = |k: &str| hex::decode(v[k].as_str().unwrap()).unwrap();
         let suites: Vec<String> = v["suites"]
@@ -640,7 +640,7 @@ mod tests {
     #[test]
     fn the_shared_vectors_are_refused() {
         let v: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/vectors/e2e.json")).unwrap();
+            serde_json::from_str(include_str!("../../tests/vectors/e2e.json")).unwrap();
         let hexed = |s: &serde_json::Value| hex::decode(s.as_str().unwrap()).unwrap();
         let th: [u8; 32] = hexed(&v["th"]).try_into().unwrap();
         let cases = v["refused"].as_array().unwrap();

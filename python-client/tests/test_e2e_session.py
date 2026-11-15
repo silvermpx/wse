@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(
 VECTORS = (
     pathlib.Path(__file__).resolve().parents[2]
     / "crates"
-    / "wse-protocol"
+    / "wse"
     / "tests"
     / "vectors"
     / "e2e.json"

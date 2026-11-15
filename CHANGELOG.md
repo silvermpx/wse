@@ -43,7 +43,7 @@ Upgrading from 2.x: see
 
 ### New
 
-- Rust crates on crates.io, released with the Python and npm packages:
+- Two Rust crates on crates.io, released with the Python and npm packages:
   - `wse`: the engine for Rust applications. A server runs on the
     application's tokio runtime with its own `Handler` (connect, messages,
     signed messages, disconnect, presence) and sends through a `Publisher`:
@@ -52,15 +52,15 @@ Upgrading from 2.x: see
     metrics. Sends never block: past 65,536 queued they fail with
     `Error::Full`, and `Publisher::ready()` waits for room. A handler that
     panics closes only its own connection (1011). The Python package runs
-    the same engine.
+    the same engine. Its `protocol` module holds the crypto, end-to-end
+    sessions and signed messages the server and the Rust client share, on
+    aws-lc-rs and, in the browser, on RustCrypto; without the default
+    `server` feature the crate is that module alone.
   - `wse-client`: the Rust client, on tokio and in the browser
     (WebAssembly, for Leptos, Yew, Dioxus). Messages read in place from
     their frames by a `Handler`, or a stream of owned ones; topics with
     recovery, reconnects, msgpack, end-to-end encryption and signed
-    messages.
-  - `wse-protocol`: the crypto, end-to-end sessions and signed messages the
-    server and the Rust client share; on aws-lc-rs, and on RustCrypto in the
-    browser.
+    messages. It takes the protocol from `wse`, without the server.
 - Free-threaded Python wheels (3.14t, 3.15t), and wheels for Alpine Linux
   (musllinux) and Windows on ARM.
 - Every standard JWT algorithm, `issue_token()`, and `reload_jwt_keys()`

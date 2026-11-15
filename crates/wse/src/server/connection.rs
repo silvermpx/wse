@@ -40,8 +40,8 @@ use super::{
 };
 use crate::jwt::{self, parse_cookie_value};
 use crate::msgpack::{decode_msgpack_guarded, rmpv_to_serde_json};
-use wse_protocol::e2e::check_client_auth;
-use wse_protocol::signing::{Binding, thumbprint};
+use crate::protocol::e2e::check_client_auth;
+use crate::protocol::signing::{Binding, thumbprint};
 
 // ---------------------------------------------------------------------------
 // Connection handler

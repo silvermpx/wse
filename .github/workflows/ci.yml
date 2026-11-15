@@ -300,6 +300,7 @@ jobs:
       - name: Clippy
         run: |
           cargo clippy -p wse --locked --all-targets -- -D warnings
+          cargo clippy -p wse --locked --no-default-features --all-targets -- -D warnings
           cargo clippy --workspace --locked --all-targets -- -D warnings
           cargo clippy -p wse-client --locked --no-default-features --all-targets -- -D warnings
 
@@ -336,7 +337,7 @@ jobs:
         run: |
           cargo test -p wse --locked
           cargo test -p wse --locked --features python
-          cargo test -p wse-protocol --locked
+          cargo test -p wse --locked --no-default-features
           cargo test -p wse-client --locked
           cargo test -p wse-client --locked --no-default-features
         env:
@@ -382,6 +383,7 @@ jobs:
 
       - name: Clippy (wasm32)
         run: |
+          cargo clippy -p wse --locked --target wasm32-unknown-unknown --no-default-features --all-targets -- -D warnings
           cargo clippy -p wse-client --locked --target wasm32-unknown-unknown --all-targets -- -D warnings
           cargo clippy -p wse-client --locked --target wasm32-unknown-unknown --no-default-features --all-targets -- -D warnings
 
@@ -402,7 +404,7 @@ jobs:
           RUSTFLAGS: --cfg wse_rustcrypto
           CARGO_TARGET_DIR: target/rustcrypto
         run: |
-          cargo test -p wse-protocol --locked --lib --tests
+          cargo test -p wse --locked --no-default-features --lib
           cargo test -p wse-client --locked --lib --tests
 
   # ---------------------------------------------------------------------------

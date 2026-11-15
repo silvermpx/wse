@@ -31,17 +31,20 @@ npm install
 ### Running Tests
 
 ```bash
-# Rust tests: the engine alone, then with its Python module; the shared
-# protocol crate; the Rust client, with its crypto and without
+# Rust tests: the engine, then with its Python module; the protocol alone
+# (the crate without its server, as the client uses it); the Rust client,
+# with its crypto and without
 cargo test -p wse
 cargo test -p wse --features python
-cargo test -p wse-protocol
+cargo test -p wse --no-default-features
 cargo test -p wse-client
 cargo test -p wse-client --no-default-features
 
 # The pure-Rust crypto the client has in the browser, natively
 RUSTFLAGS="--cfg wse_rustcrypto" CARGO_TARGET_DIR=target/rustcrypto \
-  cargo test -p wse-protocol -p wse-client --lib --tests
+  cargo test -p wse --no-default-features --lib
+RUSTFLAGS="--cfg wse_rustcrypto" CARGO_TARGET_DIR=target/rustcrypto \
+  cargo test -p wse-client --lib --tests
 
 # The client in the browser (wasm32), in Node 22, against the server example:
 # rustup target add wasm32-unknown-unknown; cargo install wasm-bindgen-cli
@@ -92,9 +95,8 @@ the one result a pull request needs.
 
 ```
 wse/
-  crates/wse/            # The engine (server, cluster, presence, recovery); its Python module behind `python`
+  crates/wse/            # The engine (server, cluster, presence, recovery) and the protocol it shares with the client; its Python module behind `python`
   crates/wse-client/     # The Rust client (wse-client on crates.io)
-  crates/wse-protocol/   # Crypto, E2E sessions and signed messages, shared by the engine and the Rust client
   crates/wse-py/         # The Python extension built from it (wse-server on PyPI)
   wse_server/            # Python server package (thin wrapper over Rust)
   python-client/         # Python client SDK (wse-client on PyPI)

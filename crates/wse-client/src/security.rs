@@ -1,5 +1,5 @@
 //! End-to-end sessions and signed messages, the client's side. The crypto
-//! and the session are the server's own (`wse-protocol`).
+//! and the session are the server's own (`wse::protocol`).
 
 #[cfg(feature = "aws-lc")]
 pub(crate) use with_crypto::*;
@@ -9,8 +9,8 @@ pub(crate) use without_crypto::*;
 #[cfg(feature = "aws-lc")]
 pub(crate) mod with_crypto {
     use base64::Engine;
-    use wse_protocol::e2e::{ClientOffer, E2eError, RecvState, SendState};
-    use wse_protocol::signing::{CLIENT_LABEL, PublicKey, SERVER_LABEL, Signer};
+    use wse::protocol::e2e::{ClientOffer, E2eError, RecvState, SendState};
+    use wse::protocol::signing::{CLIENT_LABEL, PublicKey, SERVER_LABEL, Signer};
 
     use crate::config::Config;
     use crate::error::Error;
@@ -208,14 +208,14 @@ pub(crate) mod with_crypto {
     /// ([`Config::signing_key`](crate::Config::signing_key)), or a key for a
     /// server.
     pub fn generate_key() -> Vec<u8> {
-        wse_protocol::crypto::generate_p256_pkcs8().expect("the system's random generator works")
+        wse::protocol::crypto::generate_p256_pkcs8().expect("the system's random generator works")
     }
 
     /// The public key of a PKCS#8 private key, base64 of the uncompressed
     /// point: what a server binds to a connection (`set_client_key`), and
     /// what clients pin.
     pub fn public_key(pkcs8: &[u8]) -> Result<String, Error> {
-        let key = wse_protocol::crypto::IdentityKey::from_pkcs8(pkcs8)
+        let key = wse::protocol::crypto::IdentityKey::from_pkcs8(pkcs8)
             .map_err(|_| Error::Config("not an ECDSA P-256 private key in PKCS#8".to_owned()))?;
         Ok(b64().encode(key.public_key()))
     }
@@ -224,7 +224,7 @@ pub(crate) mod with_crypto {
     /// of the token a server issues the client (RFC 7800): the server then
     /// takes the client's signed messages without being told the key.
     pub fn public_key_jwk(pkcs8: &[u8]) -> Result<serde_json::Value, Error> {
-        let key = wse_protocol::crypto::IdentityKey::from_pkcs8(pkcs8)
+        let key = wse::protocol::crypto::IdentityKey::from_pkcs8(pkcs8)
             .map_err(|_| Error::Config("not an ECDSA P-256 private key in PKCS#8".to_owned()))?;
         let point = key.public_key();
         let url = base64::engine::general_purpose::URL_SAFE_NO_PAD;

@@ -19,8 +19,8 @@ use serde_json::{Map, Value};
 
 use crate::crypto;
 #[cfg(test)]
-use wse_protocol::signing::signed_input;
-pub(crate) use wse_protocol::signing::{
+use crate::protocol::signing::signed_input;
+pub(crate) use crate::protocol::signing::{
     CLIENT_LABEL, MAX_NONCE_LEN, PublicKey as ClientKey, SERVER_LABEL, Signer, now_ms, parse_exact,
 };
 

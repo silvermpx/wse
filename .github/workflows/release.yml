@@ -1,7 +1,7 @@
 name: Release
 
 # A v* tag push builds every artifact of the packages (wse-server and
-# wse-client on PyPI, wse-client on npm, the wse, wse-client and wse-protocol
+# wse-client on PyPI, wse-client on npm, the wse and wse-client
 # crates), checks the tag against every version in the repo, installs and
 # tests every wheel, the sdist, the Python client, the npm package and the
 # crates as crates.io builds them, and only then publishes: crates.io first,
@@ -104,7 +104,7 @@ jobs:
           OWNER: ${{ github.repository_owner }}
         run: |
           failed=0
-          for crate in wse-protocol wse wse-client; do
+          for crate in wse wse-client; do
             code="$(curl -sS -o owners.json -w '%{http_code}' --retry 3 \
               -A 'wse-release (github.com/silvermpx/wse)' \
               "https://crates.io/api/v1/crates/${crate}/owners" || true)"
@@ -148,7 +148,7 @@ jobs:
             *) echo "::error::npm answered HTTP ${code} for wse-client ${NPM_VERSION}"; failed=1 ;;
           esac
           # crates.io asks API clients to name themselves.
-          for crate in wse-protocol wse wse-client; do
+          for crate in wse wse-client; do
             code="$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 \
               -A 'wse-release (github.com/silvermpx/wse)' \
               "https://crates.io/api/v1/crates/${crate}/${NPM_VERSION}" || true)"
@@ -589,17 +589,17 @@ jobs:
           key: crates
 
       - name: cargo publish --dry-run
-        run: cargo publish --locked --dry-run -p wse-protocol -p wse -p wse-client
+        run: cargo publish --locked --dry-run -p wse -p wse-client
 
       - name: What each package holds
         run: |
-          for crate in wse-protocol wse wse-client; do
+          for crate in wse wse-client; do
             echo "== ${crate}"
             cargo package --locked --list -p "$crate"
           done
 
       - name: The crates' tests
-        run: cargo test --locked -p wse-protocol -p wse -p wse-client
+        run: cargo test --locked -p wse -p wse-client
 
       - name: The client in the browser (wasm32)
         run: cargo check --locked -p wse-client --target wasm32-unknown-unknown
@@ -771,7 +771,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           packages=()
-          for crate in wse-protocol wse wse-client; do
+          for crate in wse wse-client; do
             code="$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 \
               -A 'wse-release (github.com/silvermpx/wse)' \
               "https://crates.io/api/v1/crates/${crate}/${VERSION}" || true)"

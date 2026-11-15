@@ -1,7 +1,8 @@
-# The WSE workspace: the engine (crates/wse, on crates.io as `wse`) and the
-# Python extension built from it (crates/wse-py, the `wse-server` package).
+# The WSE workspace: the server (crates/wse, on crates.io as `wse`), the Rust
+# client (crates/wse-client, `wse-client`) and the Python extension built from
+# the server (crates/wse-py, the `wse-server` package).
 [workspace]
-members = ["crates/wse", "crates/wse-client", "crates/wse-protocol", "crates/wse-py"]
+members = ["crates/wse", "crates/wse-client", "crates/wse-py"]
 # Their own lock files and tools: run on their own.
 exclude = ["benchmarks/rust-bench", "xtask"]
 resolver = "3"
@@ -14,11 +15,11 @@ license = "MIT"
 rust-version = "1.95"
 repository = "https://github.com/silvermpx/wse"
 
-# The crates depend on one another at exactly the release's version.
+# The client depends on the server's crate at exactly the release's version:
+# for the protocol (no default features), and in its tests and examples for
+# the server itself.
 [workspace.dependencies]
-wse-protocol = { version = "=3.0.0", path = "crates/wse-protocol" }
-# The Rust client's tests and examples run against the server.
-wse = { version = "=3.0.0", path = "crates/wse" }
+wse = { version = "=3.0.0", path = "crates/wse", default-features = false }
 
 [profile.release]
 lto = true

@@ -275,7 +275,7 @@ impl Publisher {
         if let Some(ref pm) = shared.presence {
             pm.register_connection(conn_id, user_id);
         }
-        let jkt = wse_protocol::signing::thumbprint(key.point()).unwrap_or_default();
+        let jkt = crate::protocol::signing::thumbprint(key.point()).unwrap_or_default();
         shared.client_keys.insert(conn_id.to_owned(), Arc::new(key));
         let ready = build_server_ready(conn_id, user_id, shared, Some(&jkt));
         self.command(ServerCommand::Accept {

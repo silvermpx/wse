@@ -98,9 +98,13 @@ with, and the `wse-client` crate's `chat_client` example talks to it.
 
 ## Features
 
-- `aws-lc` (default): aws-lc-rs for TLS, JWT and the E2E and signing crypto.
+- `server` (default): the server. Without it the crate is its `protocol`
+  module alone: the crypto, end-to-end sessions and signed messages that
+  the server and `wse-client` share, which is how the client depends on it,
+  in the browser too.
 - `fips`: aws-lc-rs built from its FIPS 140-3 validated module (needs CMake
-  and Go).
+  and Go). The crypto is aws-lc-rs otherwise, for TLS, JWT, end-to-end
+  encryption and signing.
 
 The protocol, the close codes and the cluster wire format are documented in
 the [repository](https://github.com/silvermpx/wse/tree/main/docs).

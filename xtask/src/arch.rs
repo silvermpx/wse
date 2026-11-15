@@ -26,7 +26,11 @@ use crate::lexer::{self, Lang};
 
 /// Engine sources: what a native wse-rs keeps.
 fn is_engine(path: &str) -> bool {
-    let engine_dirs = ["crates/wse/src/cluster/", "crates/wse/src/server/"];
+    let engine_dirs = [
+        "crates/wse/src/cluster/",
+        "crates/wse/src/protocol/",
+        "crates/wse/src/server/",
+    ];
     let engine_files = [
         "crates/wse/src/crypto.rs",
         "crates/wse/src/jwt.rs",
