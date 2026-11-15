@@ -124,7 +124,8 @@ fn uint(text: &str, i: usize) -> Option<(Option<u64>, usize)> {
 fn string_end(b: &[u8], i: usize) -> Option<usize> {
     let mut at = i + 1;
     loop {
-        at += memchr::memchr2(b'"', b'\\', &b[at..])?;
+        // An escape as the frame's last byte leaves `at` past the end.
+        at += memchr::memchr2(b'"', b'\\', b.get(at..)?)?;
         match b[at] {
             b'"' => return Some(at + 1),
             _ => at += 2,
@@ -244,6 +245,18 @@ mod tests {
         ] {
             assert!(envelope(text).is_none(), "{text}");
         }
+    }
+
+    /// Every cut-short form of a message, such as a frame ending in the
+    /// middle of an escape, is refused, never a panic.
+    #[test]
+    fn a_frame_cut_anywhere_is_refused() {
+        let whole = r#"{"t":"a\"b","p":{"s":"x\\y","u":"é"},"o":12,"tp":"q"}"#;
+        for end in (0..whole.len()).filter(|&end| whole.is_char_boundary(end)) {
+            assert!(envelope(&whole[..end]).is_none(), "{}", &whole[..end]);
+        }
+        assert!(envelope(r#"{"t":"\"#).is_none());
+        assert!(envelope(r#"{"p":{"a":"\"#).is_none());
     }
 
     /// Random messages read by both readers: the same fields, or the scan
