@@ -168,6 +168,43 @@ class TestRecovery:
             srv.stop()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("limit", [1, None])
+    async def test_a_held_topic_recovers_at_the_subscription_limit(self, server_port, limit):
+        """A topic the connection holds is no new subscription: asking to
+        recover it is not refused for want of room (configured or the
+        client's own cap)."""
+        options = {"max_subscriptions_per_connection": limit} if limit else {}
+        srv = start_server(server_port, **options)
+        try:
+            async with await connect(server_port, make_token()) as ws:
+                drain_until(srv, "auth_connect")
+                topics = ["a"] if limit else [f"t{i}" for i in range(1023)] + ["a"]
+                await ws.send(request("subscribe", topics))
+                _, reply = await messages_until_reply(ws)
+                assert "a" in reply["p"]["success_topics"]
+                publish(srv, "a", 0)
+                publish(srv, "a", 1)
+                first = None
+                async with asyncio.timeout(5):
+                    seen = 0
+                    while seen < 2:
+                        msg = json.loads(await ws.recv())
+                        if msg.get("tp") == "a":
+                            first = first or (msg["e"], msg["o"])
+                            seen += 1
+                epoch, offset = first
+                await ws.send(
+                    request("subscribe", ["a"], {"a": {"epoch": epoch, "offset": offset}})
+                )
+                replayed, reply = await messages_until_reply(ws)
+            assert reply["p"]["success"] is True, reply["p"]
+            assert reply["p"]["failed_topics"] == []
+            assert reply["p"]["recovery"]["a"]["recovered"] is True
+            assert [m["p"]["n"] for m in replayed] == [1]
+        finally:
+            srv.stop()
+
+    @pytest.mark.asyncio
     async def test_an_unknown_epoch_reports_the_last_offset_before_subscribing(self, server_port):
         srv = start_server(server_port)
         try:

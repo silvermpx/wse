@@ -13,6 +13,9 @@
   for a moment keeps its session. A refused frame is opened before it is
   dropped, so the next one is in sequence; a flood is still closed with
   4429 after ten seconds.
+- Server: a connection at its subscription limit (configured, or the 1,024
+  topics a client may hold on its own) can still recover a topic it holds:
+  only new topics count against the limit.
 - TypeScript client: one user's queued messages, subscriptions and
   recovery positions never go out on the next user's connection: not when
   the last component unmounts and another user signs in, nor when a cookie

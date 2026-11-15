@@ -106,17 +106,30 @@ impl SharedState {
                 "[WSE] Refusing {over} pattern(s): {MAX_PATTERNS_PER_CONNECTION} per connection (conn {conn_id})"
             );
         }
-        drop(held);
         let max_subs = self.max_subscriptions_per_connection;
         if max_subs > 0 {
-            let current = self.conn_topics.get(conn_id).map_or(0, |s| s.len())
+            // Only a topic the connection does not hold yet takes room: one
+            // it holds stays eligible (to recover it, say).
+            let current = held.as_ref().map_or(0, |held| held.len())
                 + self.conn_queue_groups.get(conn_id).map_or(0, |v| v.len());
-            let room = max_subs.saturating_sub(current);
-            if room == 0 {
+            let mut room = max_subs.saturating_sub(current);
+            let mut refused = false;
+            topics.retain(|t| {
+                if held.as_ref().is_some_and(|held| held.contains(t)) {
+                    return true;
+                }
+                if room == 0 {
+                    refused = true;
+                    return false;
+                }
+                room -= 1;
+                true
+            });
+            if refused && topics.is_empty() {
                 return Err(max_subs);
             }
-            topics.truncate(room);
         }
+        drop(held);
         Ok(topics)
     }
 
@@ -586,8 +599,20 @@ pub(crate) fn answer_subscription_request(
         }
     }
     if state.max_subscriptions_per_connection == 0 {
-        let held = state.conn_topics.get(conn_id).map_or(0, |held| held.len());
-        asked.truncate(CLIENT_SUBSCRIPTION_LIMIT.saturating_sub(held));
+        // Only topics it does not hold yet count against the cap.
+        let held = state.conn_topics.get(conn_id);
+        let mut room =
+            CLIENT_SUBSCRIPTION_LIMIT.saturating_sub(held.as_ref().map_or(0, |held| held.len()));
+        asked.retain(|t| {
+            if held.as_ref().is_some_and(|held| held.contains(t)) {
+                return true;
+            }
+            if room == 0 {
+                return false;
+            }
+            room -= 1;
+            true
+        });
     }
     // Not accepted yet (no token, and the application has not called
     // accept_connection): every topic is refused.
