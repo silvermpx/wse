@@ -1,6 +1,6 @@
 # Changelog
 
-## v3.0.1 (unreleased)
+## v3.0.1 (2026-11-15)
 
 ### Fixed
 
@@ -40,6 +40,15 @@
 - TypeScript client: the offline queue drops what is older than
   `offline.maxAge` before it replays anything, and holds no more than
   `offline.maxSize` messages under concurrent sends, across tabs too.
+
+### Performance
+
+- Server: messages from clients are read for less CPU: the WebSocket read
+  buffer, which is zero-filled before every read, is 16 KiB instead of
+  128 KiB, and a connection takes a frame that is waiting before it polls
+  its timers. On 1,000 connections (Intel Xeon Gold 5412U, server and
+  client on separate cores): 8.40M messages/s at 1,957 ns of CPU each,
+  against 7.75M at 2,170 ns for 3.0.0 and 7.90M at 2,098 ns for 2.5.1.
 
 ## v3.0.0 (2026-11-15)
 
