@@ -1,7 +1,7 @@
 """Make e2e.json: test vectors for the end-to-end encryption of WSE, computed
 with the `cryptography` package, independently of the server and the clients.
 
-    python tests/vectors/make_e2e_vectors.py > tests/vectors/e2e.json
+    python tests/vectors/make_e2e_vectors.py > crates/wse-protocol/tests/vectors/e2e.json
 
 ECDSA signatures are randomized: the vector holds one signature to verify.
 """

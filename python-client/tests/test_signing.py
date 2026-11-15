@@ -16,7 +16,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 VECTORS = (
-    pathlib.Path(__file__).resolve().parents[2] / "tests" / "vectors" / "sign.json"
+    pathlib.Path(__file__).resolve().parents[2] / "crates" / "wse" / "tests" / "vectors" / "sign.json"
 )
 
 

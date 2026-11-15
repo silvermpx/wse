@@ -1,7 +1,7 @@
 """Make sign.json: test vectors for WSE's signed messages, computed with the
 `cryptography` package, independently of the server and the clients.
 
-    python tests/vectors/make_sign_vectors.py > tests/vectors/sign.json
+    python tests/vectors/make_sign_vectors.py > crates/wse/tests/vectors/sign.json
 
 ECDSA signatures are randomized: each vector holds one signature to verify.
 """

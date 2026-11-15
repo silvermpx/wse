@@ -23,7 +23,7 @@ import {
 } from '../utils/signing.js';
 
 const v = JSON.parse(
-  readFileSync(fileURLToPath(new URL('../../tests/vectors/sign.json', import.meta.url)), 'utf8'),
+  readFileSync(fileURLToPath(new URL('../../crates/wse/tests/vectors/sign.json', import.meta.url)), 'utf8'),
 );
 const b64 = (s: string) => new Uint8Array(Buffer.from(s, 'base64'));
 const SIGN = { name: 'ECDSA', hash: 'SHA-256' } as const;

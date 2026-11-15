@@ -48,8 +48,6 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
-              - 'tests/vectors/**'
-              - 'tests/keys/**'
               - 'deny.toml'
               - '.github/workflows/ci.yml'
             server:
@@ -62,9 +60,11 @@ jobs:
               - '.github/workflows/ci.yml'
             python_client:
               - 'python-client/**'
+              - 'crates/*/tests/vectors/**'
               - '.github/workflows/ci.yml'
             ts_client:
               - 'ts-client/**'
+              - 'crates/*/tests/vectors/**'
               - 'package.json'
               - 'package-lock.json'
               - 'tsconfig.json'

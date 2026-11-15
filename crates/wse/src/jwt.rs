@@ -1001,9 +1001,9 @@ mod tests {
 
     // --- RS256 tests ---
 
-    const RSA_PRIVATE_KEY: &[u8] = include_bytes!("../../../tests/keys/rsa_private.pem");
-    const RSA_PUBLIC_KEY: &[u8] = include_bytes!("../../../tests/keys/rsa_public.pem");
-    const RSA2_PUBLIC_KEY: &[u8] = include_bytes!("../../../tests/keys/rsa2_public.pem");
+    const RSA_PRIVATE_KEY: &[u8] = include_bytes!("../tests/keys/rsa_private.pem");
+    const RSA_PUBLIC_KEY: &[u8] = include_bytes!("../tests/keys/rsa_public.pem");
+    const RSA2_PUBLIC_KEY: &[u8] = include_bytes!("../tests/keys/rsa2_public.pem");
 
     #[test]
     fn rs256_encode_decode_roundtrip() {
@@ -1114,9 +1114,9 @@ mod tests {
 
     // --- ES256 tests ---
 
-    const EC_PRIVATE_KEY: &[u8] = include_bytes!("../../../tests/keys/ec_private.pem");
-    const EC_PUBLIC_KEY: &[u8] = include_bytes!("../../../tests/keys/ec_public.pem");
-    const EC2_PUBLIC_KEY: &[u8] = include_bytes!("../../../tests/keys/ec2_public.pem");
+    const EC_PRIVATE_KEY: &[u8] = include_bytes!("../tests/keys/ec_private.pem");
+    const EC_PUBLIC_KEY: &[u8] = include_bytes!("../tests/keys/ec_public.pem");
+    const EC2_PUBLIC_KEY: &[u8] = include_bytes!("../tests/keys/ec2_public.pem");
 
     #[test]
     fn es256_encode_decode_roundtrip() {

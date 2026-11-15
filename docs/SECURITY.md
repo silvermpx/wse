@@ -248,7 +248,7 @@ TLS protects a connection up to whatever terminates it: a load balancer, a rever
 
 It does not hide the size and timing of frames (the server does not compress for E2E connections, so sizes say nothing about content), and the server process sees the plaintext: E2E protects the path between client and server, not the server.
 
-[PROTOCOL.md](PROTOCOL.md#end-to-end-encryption) specifies the handshake, the transcript and the frames. `tests/vectors/e2e.json`, made with an independent implementation, holds test vectors the server and both clients check.
+[PROTOCOL.md](PROTOCOL.md#end-to-end-encryption) specifies the handshake, the transcript and the frames. [`e2e.json`](https://github.com/silvermpx/wse/blob/main/crates/wse-protocol/tests/vectors/e2e.json), made with an independent implementation, holds test vectors the server and every client check.
 
 ### Binding a session to the client's key
 

@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { E2eError, E2eReceiver, E2eSender, keyId, transcript } from '../utils/e2eSession.js';
 
 const v = JSON.parse(
-  readFileSync(fileURLToPath(new URL('../../tests/vectors/e2e.json', import.meta.url)), 'utf8'),
+  readFileSync(fileURLToPath(new URL('../../crates/wse-protocol/tests/vectors/e2e.json', import.meta.url)), 'utf8'),
 );
 const b64 = (s: string) => new Uint8Array(Buffer.from(s, 'base64'));
 const unhex = (s: string) => new Uint8Array(Buffer.from(s, 'hex'));

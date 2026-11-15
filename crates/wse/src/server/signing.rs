@@ -396,12 +396,12 @@ mod tests {
         assert!(!key.verifies(CLIENT_LABEL, body, &sig));
     }
 
-    /// The vectors made by tests/vectors/make_sign_vectors.py with the
+    /// The vectors made by make_sign_vectors.py (the repository's tests/vectors) with the
     /// `cryptography` package: what the clients sign, the server takes.
     #[test]
     fn the_shared_vectors_verify() {
         let v: Value =
-            serde_json::from_str(include_str!("../../../../tests/vectors/sign.json")).unwrap();
+            serde_json::from_str(include_str!("../../tests/vectors/sign.json")).unwrap();
         assert_eq!(v["client_label"].as_str().unwrap().as_bytes(), CLIENT_LABEL);
         assert_eq!(v["server_label"].as_str().unwrap().as_bytes(), SERVER_LABEL);
         let client = &v["client"];
