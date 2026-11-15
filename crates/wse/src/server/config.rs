@@ -198,8 +198,20 @@ fn invalid(message: impl Into<String>) -> ConfigError {
 }
 
 impl Config {
-    /// The server's state, every option checked first.
-    pub(crate) fn into_state(self) -> Result<SharedState, ConfigError> {
+    /// The server's state, every option checked first. The private keys'
+    /// bytes are wiped once read.
+    pub(crate) fn into_state(mut self) -> Result<SharedState, ConfigError> {
+        let state = self.build();
+        for key in [&mut self.e2e_identity_key, &mut self.signing_key]
+            .into_iter()
+            .flatten()
+        {
+            zeroize::Zeroize::zeroize(key);
+        }
+        state
+    }
+
+    fn build(&mut self) -> Result<SharedState, ConfigError> {
         let at_least_one = [
             ("max_connections", self.max_connections),
             ("max_inbound_queue_size", self.max_inbound_queue_size),
@@ -229,6 +241,7 @@ impl Config {
         }
         let allowed_origins = self
             .allowed_origins
+            .take()
             .map(|origins| {
                 origins
                     .iter()
@@ -272,8 +285,8 @@ impl Config {
                 self.ping_interval, self.idle_timeout
             )));
         }
-        let jwt_config = self.jwt.map(JwtSettings::into_config).transpose()?;
-        let recovery = self.recovery.map(|recovery| {
+        let jwt_config = self.jwt.take().map(JwtSettings::into_config).transpose()?;
+        let recovery = self.recovery.take().map(|recovery| {
             let clamped = recovery.buffer_size.max(16);
             let bits = clamped.next_power_of_two().trailing_zeros();
             Arc::new(crate::recovery::RecoveryManager::new(

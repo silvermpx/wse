@@ -43,6 +43,9 @@ use crate::msgpack::{decode_msgpack_guarded, rmpv_to_serde_json};
 // Connection handler
 // ---------------------------------------------------------------------------
 
+/// What a sealed frame carries past its message: `E:`, the header, the tag.
+const SEAL_OVERHEAD: usize = 32;
+
 /// A refusal any client can cause (a foreign origin, a bad token, a full
 /// server): logged once a second at most, with how many more there were;
 /// the rest at debug level. A flood of them is not a flood of lines.
@@ -1199,8 +1202,10 @@ pub(crate) async fn handle_connection<H: Handler>(
     let gate = state.clone();
 
     let mut ws_config = WebSocketConfig::default();
-    ws_config.max_message_size = Some(state.max_message_size);
-    ws_config.max_frame_size = Some(state.max_message_size);
+    // A sealed frame carries its `E:`, header and tag past the message.
+    let limit = state.max_message_size.saturating_add(SEAL_OVERHEAD);
+    ws_config.max_message_size = Some(limit);
+    ws_config.max_frame_size = Some(limit);
     // A socket that sends nothing does not hold its place for long.
     let handshake = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,

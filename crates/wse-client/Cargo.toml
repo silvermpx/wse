@@ -14,6 +14,8 @@ categories = ["network-programming", "web-programming::websocket", "asynchronous
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 bytes = "1"
 bytestring = "1"
+# The signing key's bytes, wiped once read.
+zeroize = { version = "1", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
 rmp = "0.8.15"
@@ -53,6 +55,7 @@ default = ["aws-lc"]
 # and signed messages on RustCrypto (the browser does TLS).
 aws-lc = [
     "dep:wse-protocol",
+    "dep:zeroize",
     "dep:rustls",
     "dep:webpki-roots",
     "dep:base64",

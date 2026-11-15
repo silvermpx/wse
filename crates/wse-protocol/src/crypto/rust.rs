@@ -116,7 +116,8 @@ impl Aes256Gcm {
 pub fn ecdh_generate() -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), Error> {
     let secret = p256::SecretKey::try_generate().map_err(|_| Error)?;
     let public = point(&secret.public_key());
-    Ok((Zeroizing::new(secret.to_bytes().to_vec()), public))
+    let scalar = Zeroizing::new(secret.to_bytes());
+    Ok((Zeroizing::new(scalar.to_vec()), public))
 }
 
 /// ECDH with a stored private scalar: `derive` gets the shared secret.
@@ -192,7 +193,9 @@ pub struct IdentityKey {
 impl IdentityKey {
     /// From a PKCS#8 private key, PEM (`-----BEGIN PRIVATE KEY-----`) or DER.
     pub fn from_pkcs8(key: &[u8]) -> Result<Self, Error> {
-        let der = pem_body(key).unwrap_or_else(|| key.to_vec());
+        // DER as it is; PEM decoded into a buffer wiped when dropped.
+        let pem = pem_body(key);
+        let der: &[u8] = pem.as_deref().map_or(key, Vec::as_slice);
         let key = p256::ecdsa::SigningKey::from_pkcs8_der(&der).map_err(|_| Error)?;
         let public = key.verifying_key().to_sec1_point(false).as_bytes().to_vec();
         Ok(Self { key, public })
@@ -262,13 +265,15 @@ impl CounterSealKey {
         Ok(Self { key, last: None })
     }
 
-    /// Encrypt `buf` in place and append the 16-byte tag. Each nonce's last
-    /// 8 bytes must be greater than the last one's.
+    /// Encrypt `buf[from..]` in place and append the 16-byte tag; what
+    /// comes before `from` stays as it is. Each nonce's last 8 bytes must be
+    /// greater than the last one's.
     pub fn seal(
         &mut self,
         nonce: [u8; NONCE_LEN],
         aad: &[u8],
         buf: &mut Vec<u8>,
+        from: usize,
     ) -> Result<(), Error> {
         let mut counter = [0u8; 8];
         counter.copy_from_slice(&nonce[4..]);
@@ -278,7 +283,11 @@ impl CounterSealKey {
         }
         let tag = self
             .key
-            .encrypt_inout_detached(&Nonce::from(nonce), aad, InOutBuf::from(&mut buf[..]))
+            .encrypt_inout_detached(
+                &Nonce::from(nonce),
+                aad,
+                InOutBuf::from(buf.get_mut(from..).ok_or(Error)?),
+            )
             .map_err(|_| Error)?;
         buf.extend_from_slice(&tag);
         self.last = Some(counter);

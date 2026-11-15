@@ -36,19 +36,24 @@ pub const TAG_LEN: usize = 16;
 /// Uncompressed SEC1 P-256 public key: `0x04 || X || Y`.
 pub const P256_PUBLIC_LEN: usize = 65;
 
-/// The DER inside a PEM block, if `text` is one.
-fn pem_body(text: &[u8]) -> Option<Vec<u8>> {
+/// The DER inside a PEM block, if `text` is one: a private key's, wiped
+/// when dropped, as is the text it was read from.
+fn pem_body(text: &[u8]) -> Option<zeroize::Zeroizing<Vec<u8>>> {
     use base64::Engine;
     let text = std::str::from_utf8(text).ok()?;
     if !text.trim_start().starts_with("-----BEGIN") {
         return None;
     }
-    let body: String = text
-        .lines()
-        .filter(|line| !line.starts_with("-----"))
-        .flat_map(|line| line.trim().chars())
-        .collect();
-    base64::engine::general_purpose::STANDARD.decode(body).ok()
+    let body: zeroize::Zeroizing<String> = zeroize::Zeroizing::new(
+        text.lines()
+            .filter(|line| !line.starts_with("-----"))
+            .flat_map(|line| line.trim().chars())
+            .collect(),
+    );
+    base64::engine::general_purpose::STANDARD
+        .decode(body.as_bytes())
+        .ok()
+        .map(zeroize::Zeroizing::new)
 }
 
 #[cfg(test)]
@@ -71,12 +76,33 @@ mod tests {
         let mut sealer = CounterSealKey::new(&[1u8; 32]).unwrap();
         let key = Aes256Gcm::new(&[1u8; 32]).unwrap();
         let mut buf = b"frame".to_vec();
-        sealer.seal([0u8; NONCE_LEN], b"header", &mut buf).unwrap();
+        sealer
+            .seal([0u8; NONCE_LEN], b"header", &mut buf, 0)
+            .unwrap();
         let mut copy = buf.clone();
         assert!(key.open([0u8; NONCE_LEN], b"other", &mut copy).is_err());
         assert_eq!(
             key.open([0u8; NONCE_LEN], b"header", &mut buf).unwrap(),
             b"frame"
+        );
+    }
+
+    #[test]
+    fn a_tail_is_sealed_in_place_behind_its_prefix() {
+        let mut sealer = CounterSealKey::new(&[3u8; 32]).unwrap();
+        let key = Aes256Gcm::new(&[3u8; 32]).unwrap();
+        let mut buf = b"E:headframe".to_vec();
+        sealer.seal([0u8; NONCE_LEN], b"aad", &mut buf, 6).unwrap();
+        assert_eq!(&buf[..6], b"E:head");
+        assert_eq!(buf.len(), 11 + TAG_LEN);
+        assert_eq!(
+            key.open([0u8; NONCE_LEN], b"aad", &mut buf[6..]).unwrap(),
+            b"frame"
+        );
+        assert!(
+            sealer
+                .seal([1u8; NONCE_LEN], b"", &mut Vec::new(), 1)
+                .is_err()
         );
     }
 
@@ -88,11 +114,11 @@ mod tests {
             n[4..].copy_from_slice(&seq.to_be_bytes());
             n
         };
-        sealer.seal(nonce(0), b"", &mut b"a".to_vec()).unwrap();
-        sealer.seal(nonce(1), b"", &mut b"b".to_vec()).unwrap();
-        assert!(sealer.seal(nonce(1), b"", &mut b"c".to_vec()).is_err());
-        assert!(sealer.seal(nonce(0), b"", &mut b"d".to_vec()).is_err());
-        sealer.seal(nonce(5), b"", &mut b"e".to_vec()).unwrap();
+        sealer.seal(nonce(0), b"", &mut b"a".to_vec(), 0).unwrap();
+        sealer.seal(nonce(1), b"", &mut b"b".to_vec(), 0).unwrap();
+        assert!(sealer.seal(nonce(1), b"", &mut b"c".to_vec(), 0).is_err());
+        assert!(sealer.seal(nonce(0), b"", &mut b"d".to_vec(), 0).is_err());
+        sealer.seal(nonce(5), b"", &mut b"e".to_vec(), 0).unwrap();
     }
 
     #[test]

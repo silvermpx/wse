@@ -195,7 +195,9 @@ pub struct IdentityKey(aws_lc_rs::signature::EcdsaKeyPair);
 impl IdentityKey {
     /// From a PKCS#8 private key, PEM (`-----BEGIN PRIVATE KEY-----`) or DER.
     pub fn from_pkcs8(key: &[u8]) -> Result<Self, Error> {
-        let der = pem_body(key).unwrap_or_else(|| key.to_vec());
+        // DER as it is; PEM decoded into a buffer wiped when dropped.
+        let pem = pem_body(key);
+        let der: &[u8] = pem.as_deref().map_or(key, Vec::as_slice);
         aws_lc_rs::signature::EcdsaKeyPair::from_pkcs8(
             &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
             &der,
@@ -272,18 +274,42 @@ impl CounterSealKey {
         )?))
     }
 
-    /// Encrypt `buf` in place and append the 16-byte tag. Each nonce's last
-    /// 8 bytes must be greater than the last one's.
+    /// Encrypt `buf[from..]` in place and append the 16-byte tag; what
+    /// comes before `from` stays as it is. Each nonce's last 8 bytes must be
+    /// greater than the last one's.
     pub fn seal(
         &mut self,
         nonce: [u8; NONCE_LEN],
         aad: &[u8],
         buf: &mut Vec<u8>,
+        from: usize,
     ) -> Result<(), Error> {
+        if from > buf.len() {
+            return Err(Error);
+        }
         Ok(self.0.seal_in_place_append_tag(
             aead::Nonce::assume_unique_for_key(nonce),
             aead::Aad::from(aad),
-            buf,
+            &mut Tail { buf, from },
         )?)
+    }
+}
+
+/// The part of a buffer from `from` on, sealed in place: the tag goes on
+/// the buffer's end.
+struct Tail<'a> {
+    buf: &'a mut Vec<u8>,
+    from: usize,
+}
+
+impl AsMut<[u8]> for Tail<'_> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[self.from..]
+    }
+}
+
+impl<'a> Extend<&'a u8> for Tail<'_> {
+    fn extend<I: IntoIterator<Item = &'a u8>>(&mut self, bytes: I) {
+        self.buf.extend(bytes);
     }
 }

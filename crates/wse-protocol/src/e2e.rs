@@ -259,19 +259,22 @@ impl SendState {
             self.epoch_started = Instant::now();
         }
         let hdr = header(frame_type, self.epoch, self.seq);
+        // One buffer: the prefix and header, then the plaintext sealed in
+        // place behind them, its tag last.
         let mut out = Vec::with_capacity(2 + HEADER_LEN + plaintext.len() + TAG_LEN);
         out.extend_from_slice(b"E:");
         out.extend_from_slice(&hdr);
-        let mut body = plaintext.to_vec();
+        let body = out.len();
+        out.extend_from_slice(plaintext);
         self.keys
             .key
             .seal(
                 self.keys.nonce(self.seq),
                 &aad(self.direction, &self.th, &hdr),
-                &mut body,
+                &mut out,
+                body,
             )
             .map_err(|_| E2eError::BadFrame)?;
-        out.extend_from_slice(&body);
         self.seq += 1;
         self.epoch_frames += 1;
         Ok(out)

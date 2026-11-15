@@ -27,9 +27,10 @@ aws-lc-rs = "1.19"
 # RUSTFLAGS="--cfg wse_rustcrypto", to test them natively).
 [target.'cfg(any(target_arch = "wasm32", wse_rustcrypto))'.dependencies]
 p256 = { version = "0.14", default-features = false, features = ["ecdh", "ecdsa", "pkcs8", "getrandom", "alloc"] }
-aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+# Key schedules and MAC states wiped when dropped, as aws-lc-rs does.
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
 hkdf = "0.13"
-hmac = "0.13"
+hmac = { version = "0.13", features = ["zeroize"] }
 sha2 = "0.11"
 getrandom = "0.4"
 

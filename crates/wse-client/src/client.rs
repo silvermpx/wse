@@ -91,13 +91,21 @@ impl Client {
 
     /// [`connect`](Self::connect) with a handler that is given the client,
     /// to send from it.
-    pub async fn connect_with<H, F>(config: Config, make: F) -> Result<Self, Error>
+    pub async fn connect_with<H, F>(
+        #[cfg_attr(not(feature = "aws-lc"), allow(unused_mut))] mut config: Config,
+        make: F,
+    ) -> Result<Self, Error>
     where
         H: Handler,
         F: FnOnce(Client) -> H,
     {
         config.check()?;
         let keys = Arc::new(Keys::from_config(&config)?);
+        // Read into the keys: the bytes of this copy go.
+        #[cfg(feature = "aws-lc")]
+        if let Some(mut key) = config.signing_key.take() {
+            zeroize::Zeroize::zeroize(&mut key);
+        }
         let shared = Arc::new(Shared {
             ready: AtomicBool::new(false),
             connection: Mutex::new(None),
