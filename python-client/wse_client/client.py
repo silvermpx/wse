@@ -1122,8 +1122,10 @@ class AsyncWSEClient:
         self._server_ready_event.clear()
         self._server_hello_seen = False
         self._server_recovery_enabled = False
-        # The server of this connection names its own signing key.
+        # The server of this connection names its own signing key, and the
+        # user it takes the connection for.
         self._server_signing_kid = None
+        self._codec.connection_user = None
         self._encryption_error = None
         self._recovery_requests.clear()
         self._unrecoverable.clear()
@@ -1867,6 +1869,8 @@ class AsyncWSEClient:
                 self._start_binding_failure("server_ready names no key, or another")
                 return
         conn_id = payload.get("connection_id") or details.get("connection_id")
+        user_id = details.get("user_id")
+        self._codec.connection_user = user_id if isinstance(user_id, str) else None
         self._take_signing_kid(details.get("signing"), sealed=True)
         self._connection.handle_server_ready(
             conn_id if isinstance(conn_id, str) else None

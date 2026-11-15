@@ -227,6 +227,9 @@ export class MessageProcessor {
   private serverSigningKid: string | null = null;
   /** The user server_ready named for this connection. */
   private userId: string | null = null;
+  // The user the server took this connection for: a message the server
+  // signed for a user is taken only when it is this one.
+  private connectionUser: string | null = null;
   private maxMessageSize: number;
   private recoveryTimeoutMs: number;
   private eventThrottleMs: number;
@@ -489,8 +492,8 @@ export class MessageProcessor {
   /**
    * A message the server signed: checked against the pinned keys, then the
    * message its signed text says, with the proof; the recovery stamp stays
-   * the server's. Null when the check fails or the text names another topic
-   * than the one it came on.
+   * the server's. Null when the check fails, or the text names another topic
+   * than the one it came on, or another user than this connection's.
    */
   private async openSigned(envelope: WSMessage): Promise<WSMessage | null> {
     let opened;
@@ -505,6 +508,10 @@ export class MessageProcessor {
     // subscribers.
     if (envelope.tp !== undefined && message.tp !== envelope.tp) {
       logger.warn(`Dropping a message signed for topic ${message.tp} that came on ${envelope.tp}`);
+      return null;
+    }
+    if (message.to !== undefined && message.to !== this.connectionUser) {
+      logger.warn(`Dropping a message signed for user ${String(message.to)}: not this connection's`);
       return null;
     }
     const delivered: WSMessage = {
@@ -624,6 +631,7 @@ export class MessageProcessor {
       useWSEStore.getState().setServerRecoveryEnabled(features.recovery);
     }
     this.takeSigningKid(details.signing, true);
+    this.connectionUser = typeof details.user_id === 'string' ? details.user_id : null;
     if (typeof details.user_id === 'string' && details.user_id) {
       this.userId = details.user_id;
       storeOwner(details.user_id);

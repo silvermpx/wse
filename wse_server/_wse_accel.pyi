@@ -506,9 +506,7 @@ class RustWSEServer:
     def get_connections(self) -> list[str]:
         """List of active connection IDs, read without waiting for the server."""
         ...
-    def accept_connection(
-        self, conn_id: str, user_id: str, client_key: str | None = None
-    ) -> bool:
+    def accept_connection(self, conn_id: str, user_id: str, client_key: str | None = None) -> bool:
         """Accept a connection the application authenticated itself.
 
         For a server without jwt_secret: the connection gets server_ready, the
@@ -570,11 +568,20 @@ class RustWSEServer:
         """The key clients pin to check the messages the server signs: base64
         of the uncompressed P-256 point of signing_key, None without one."""
         ...
-    def sign(self, event_type: str, payload: Any = None, topic: str | None = None) -> str:
+    def sign(
+        self,
+        event_type: str,
+        payload: Any = None,
+        topic: str | None = None,
+        to: str | None = None,
+    ) -> str:
         """A message signed with signing_key, ready for send() and the
         broadcasts: its type, payload and, for a topic message, the topic the
-        signature covers. Sign once, send to any number of connections.
-        Raises RuntimeError without signing_key."""
+        signature covers. *to* names the one user it is for (the token's sub,
+        or the user_id given to accept_connection): the signature covers it,
+        and other users' clients drop the message. Sign once, send to any
+        number of connections. Raises RuntimeError without signing_key and
+        ValueError for an empty *to*."""
         ...
     def set_client_key(self, conn_id: str, public_key: str | None) -> bool:
         """Bind the public key a connection signs its messages with (base64

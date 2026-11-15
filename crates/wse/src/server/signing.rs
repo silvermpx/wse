@@ -52,12 +52,14 @@ impl ServerSigner {
     }
 
     /// A signed message of type `t` with payload `p`, stamped now with a new
-    /// `n`; `tp` names the topic it is for, so it is good for that topic only.
+    /// `n`; `tp` names the topic it is for, so it is good for that topic
+    /// only, and `to` the user it is for, so it is good for that user only.
     pub(crate) fn sign_event(
         &self,
         t: &str,
         p: Value,
         topic: Option<&str>,
+        to: Option<&str>,
         now_ms: u64,
     ) -> Result<String, crypto::Error> {
         let mut body = Map::new();
@@ -72,6 +74,9 @@ impl ServerSigner {
         );
         if let Some(topic) = topic {
             body.insert("tp".into(), Value::String(topic.to_owned()));
+        }
+        if let Some(user) = to {
+            body.insert("to".into(), Value::String(user.to_owned()));
         }
         self.envelope(&Value::Object(body).to_string())
     }
@@ -88,6 +93,7 @@ impl ServerSigner {
                 "sha256": digest,
                 "received": now_ms,
             }),
+            None,
             None,
             now_ms,
         )
@@ -378,7 +384,13 @@ mod tests {
         let signer = ServerSigner::from_pkcs8(pkcs8.as_ref()).unwrap();
         let env: Value = serde_json::from_str(
             &signer
-                .sign_event("fill", serde_json::json!({"px": "10"}), Some("orders"), 5)
+                .sign_event(
+                    "fill",
+                    serde_json::json!({"px": "10"}),
+                    Some("orders"),
+                    None,
+                    5,
+                )
                 .unwrap(),
         )
         .unwrap();
@@ -394,6 +406,28 @@ mod tests {
         let sig = b64().decode(env["sig"].as_str().unwrap()).unwrap();
         assert!(key.verifies(SERVER_LABEL, body, &sig));
         assert!(!key.verifies(CLIENT_LABEL, body, &sig));
+    }
+
+    #[test]
+    fn a_message_for_one_user_names_them_under_the_signature() {
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8 = aws_lc_rs::signature::EcdsaKeyPair::generate_pkcs8(
+            &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &rng,
+        )
+        .unwrap();
+        let signer = ServerSigner::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let body = |to| {
+            let env: Value = serde_json::from_str(
+                &signer
+                    .sign_event("fill", serde_json::json!({"px": "10"}), None, to, 5)
+                    .unwrap(),
+            )
+            .unwrap();
+            serde_json::from_str::<Value>(env["sb"].as_str().unwrap()).unwrap()
+        };
+        assert_eq!(body(Some("u1"))["to"], "u1");
+        assert!(body(None).get("to").is_none());
     }
 
     /// The vectors made by make_sign_vectors.py (the repository's tests/vectors) with the

@@ -16,7 +16,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 VECTORS = (
-    pathlib.Path(__file__).resolve().parents[2] / "crates" / "wse" / "tests" / "vectors" / "sign.json"
+    pathlib.Path(__file__).resolve().parents[2]
+    / "crates"
+    / "wse"
+    / "tests"
+    / "vectors"
+    / "sign.json"
 )
 
 
@@ -158,3 +163,16 @@ def test_a_message_signed_for_no_topic_is_not_taken_on_one():
     body = json.dumps({"t": "fill", "p": {}, "ts": 1, "n": "a"})
     envelope = {"t": "signed", "sb": body, "sig": "AA", "kid": "k", "tp": "orders.u1"}
     assert codec(None).decode(json.dumps(envelope)) is None
+
+
+def test_a_message_signed_for_one_user_reaches_that_user_only():
+    def envelope(to: str) -> str:
+        body = json.dumps({"t": "fill", "p": {}, "ts": 1, "n": "a", "to": to})
+        return json.dumps({"t": "signed", "sb": body, "sig": "AA", "kid": "k"})
+
+    client = codec(None)
+    # Before the server names the connection's user, nobody's.
+    assert client.decode(envelope("u1")) is None
+    client.connection_user = "u1"
+    assert client.decode(envelope("u1")).type == "fill"
+    assert client.decode(envelope("u2")) is None

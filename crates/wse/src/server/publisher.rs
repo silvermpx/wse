@@ -458,10 +458,16 @@ impl SharedState {
         event_type: &str,
         payload: serde_json::Value,
         topic: Option<&str>,
+        to: Option<&str>,
     ) -> Result<String, Error> {
         let signer = self.signer.as_ref().ok_or(Error::NoSigningKey)?;
+        if to.is_some_and(str::is_empty) {
+            return Err(Error::Encode(
+                "a signed message's user (to) is empty".to_owned(),
+            ));
+        }
         signer
-            .sign_event(event_type, payload, topic, signing::now_ms())
+            .sign_event(event_type, payload, topic, to, signing::now_ms())
             .map_err(|_| Error::Encode("signing failed".to_owned()))
     }
 

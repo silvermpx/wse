@@ -105,6 +105,9 @@ pub(crate) struct Session<H> {
     pub(crate) became_ready: bool,
     pub(crate) connected_before: bool,
     server_recovery: bool,
+    /// The user the server took the connection for: a message the server
+    /// signed for a user is taken only when it is this one.
+    user_id: Option<String>,
 }
 
 impl<H: Handler> Session<H> {
@@ -135,6 +138,7 @@ impl<H: Handler> Session<H> {
             became_ready: false,
             connected_before: false,
             server_recovery: false,
+            user_id: None,
         }
     }
 
@@ -146,6 +150,7 @@ impl<H: Handler> Session<H> {
         self.ready = false;
         self.became_ready = false;
         self.server_recovery = false;
+        self.user_id = None;
         self.requests.clear();
         self.unrecoverable.clear();
         self.unanswered = 0;
@@ -306,8 +311,8 @@ impl<H: Handler> Session<H> {
 
     /// A message the server signed: checked against the pinned keys, then
     /// delivered as its signed body says, with the proof. Dropped when the
-    /// check fails, or when the body names another topic than the one it
-    /// came on.
+    /// check fails, when the body names another topic than the one it came
+    /// on, or another user than this connection's.
     fn on_signed<'a>(&mut self, outer: Envelope<'a>, frame: Option<&'a Bytes>) {
         let (Some(body), Some(sig), Some(kid)) = (outer.sb, outer.sig, outer.kid) else {
             tracing::warn!("[WSE] malformed signed message dropped");
@@ -343,15 +348,25 @@ impl<H: Handler> Session<H> {
             _ => {}
         }
         // The time the server signed, in milliseconds: the one a reader can
-        // trust, written as the other clients write it.
+        // trust, written as the other clients write it; and the user the
+        // message is for, when it is for one.
         #[derive(serde::Deserialize)]
-        struct SignedAt {
+        struct Signed<'b> {
             ts: Option<u64>,
+            #[serde(borrow)]
+            to: Option<Cow<'b, str>>,
         }
-        let signed_at = serde_json::from_str::<SignedAt>(&body)
-            .ok()
-            .and_then(|at| at.ts)
-            .map(|ms| Cow::Owned(rfc3339_ms(ms)));
+        let Ok(Signed { ts, to }) = serde_json::from_str::<Signed<'_>>(&body) else {
+            tracing::warn!("[WSE] signed message dropped: its body is malformed");
+            return;
+        };
+        if let Some(to) = to
+            && self.user_id.as_deref() != Some(&*to)
+        {
+            tracing::warn!("[WSE] message signed for user {to} dropped: not this connection's");
+            return;
+        }
+        let signed_at = ts.map(|ms| Cow::Owned(rfc3339_ms(ms)));
         let signature = Signature {
             body: body.to_string(),
             sig: sig.into_owned(),
@@ -1012,6 +1027,7 @@ impl<H: Handler> Session<H> {
         if let Ok(mut connection) = self.shared.connection.lock() {
             *connection = Some((connection_id.clone(), user_id.clone()));
         }
+        self.user_id.clone_from(&user_id);
         self.shared.ready.store(true, Ordering::Release);
         let topics: Vec<String> = self.wanted.iter().cloned().collect();
         if !topics.is_empty() {

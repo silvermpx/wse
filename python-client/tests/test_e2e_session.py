@@ -15,7 +15,14 @@ pytestmark = pytest.mark.skipif(
     reason="cryptography not installed",
 )
 
-VECTORS = pathlib.Path(__file__).resolve().parents[2] / "crates" / "wse-protocol" / "tests" / "vectors" / "e2e.json"
+VECTORS = (
+    pathlib.Path(__file__).resolve().parents[2]
+    / "crates"
+    / "wse-protocol"
+    / "tests"
+    / "vectors"
+    / "e2e.json"
+)
 
 
 @pytest.fixture(scope="module")

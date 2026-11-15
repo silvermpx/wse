@@ -175,6 +175,25 @@ describe('signed messages through a session', () => {
     expect(got).toHaveLength(1);
   });
 
+  it("takes a message signed for one user on that user's connection only", async () => {
+    start();
+    await tick();
+    const ws = FakeWebSocket.last();
+    await connectServer(ws, { user_id: 'u1' });
+    const got: WSMessage[] = [];
+    getCurrentSession()!.processor.registerHandler('fill', (m) => got.push(m));
+    const signedFor = (to: string, px: string) => ({
+      t: 'signed',
+      sb: JSON.stringify({ t: 'fill', p: { px }, ts: 1, n: px, to }),
+      sig: 'AA',
+      kid: 'k',
+    });
+    ws.serverSend(signedFor('u2', '1'));
+    ws.serverSend(signedFor('u1', '2'));
+    await tick(6);
+    expect(got.map((m) => m.p.px)).toEqual(['2']);
+  });
+
   it('refuses to sign without a key or before the server names its key', async () => {
     const key = await generateSigningKey();
     start({ security: { encryptionEnabled: false, signingKey: key.keyPair } });

@@ -379,16 +379,19 @@ impl RustWSEServer {
 
     /// A message signed with the server's signing_key, ready for send(),
     /// broadcast() and the rest: its type, payload and, for a topic message,
-    /// the topic, which the signature covers. Sign once, send to any number
-    /// of connections.
-    #[pyo3(signature = (event_type, payload = None, topic = None))]
+    /// the topic, which the signature covers. `to` names the one user it is
+    /// for (the token's sub, or the user_id given to accept_connection):
+    /// the signature covers it, and other users' clients drop the message.
+    /// Sign once, send to any number of connections.
+    #[pyo3(signature = (event_type, payload = None, topic = None, to = None))]
     fn sign(
         &self,
         event_type: &str,
         payload: Option<&Bound<'_, PyAny>>,
         topic: Option<&str>,
+        to: Option<&str>,
     ) -> PyResult<String> {
-        self.sign_impl(event_type, payload, topic)
+        self.sign_impl(event_type, payload, topic, to)
     }
 
     /// Bind the public key a connection signs its messages with (base64 of

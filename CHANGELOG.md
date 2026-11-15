@@ -80,7 +80,8 @@ Upgrading from 2.x: see
   window, and answers with a signed receipt; it signs its own with
   `signing_key`. Client keys are bound in the token (`cnf`) or with
   `set_client_key()`; both clients sign and check (`signed=True`,
-  `sendSigned()`).
+  `sendSigned()`). A message the server signs for one user names them
+  (`to`), and other users' clients drop it.
 - Sessions bound to the client's key: a token that names the client's key
   (`cnf`) opens a connection only for the client that proves the key inside
   its E2E session, so whatever terminates TLS cannot reuse a token it sees.

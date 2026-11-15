@@ -121,6 +121,9 @@ class MessageCodec:
         self._max_size = max_message_size
         self._server_keys = server_keys or ServerKeys(None)
         self._sequence = 0
+        # The user the server took this connection for (server_ready): a
+        # message the server signed for a user is delivered only to them.
+        self.connection_user: str | None = None
 
     @property
     def server_keys(self) -> ServerKeys:
@@ -345,7 +348,7 @@ class MessageCodec:
         """A message the server signed: checked against the pinned keys, then
         delivered as the signed text says, with the proof. Dropped when the
         check fails, or when the text names another topic than the one it
-        came on."""
+        came on, or another user than this connection's."""
         try:
             message, proof = self._server_keys.open(envelope)
         except SignatureError as exc:
@@ -360,6 +363,12 @@ class MessageCodec:
                 "Dropping a message signed for topic %r that came on %r",
                 signed_topic,
                 topic,
+            )
+            return None
+        to = message.get("to")
+        if to is not None and to != self.connection_user:
+            logger.warning(
+                "Dropping a message signed for user %r: not this connection's", to
             )
             return None
         epoch = envelope.get("e")

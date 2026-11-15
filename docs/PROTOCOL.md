@@ -627,7 +627,7 @@ The server takes the message only when the connection holds a key with id `kid` 
 
 ### Server to client
 
-The server signs with its own key (`signing_key`, apart from the E2E identity key). The body carries `t`, `p`, `ts`, `n` and, for a topic message, `tp`: a client drops a message whose signed `tp` is not the topic it came on. `server_ready` (`p.details.signing`) and `server_hello` (`p.signing`) name the key: `{"kid": ..., "public_key": ...}`. Clients check signatures against the keys they pin, not against these.
+The server signs with its own key (`signing_key`, apart from the E2E identity key). The body carries `t`, `p`, `ts`, `n`; for a topic message `tp`, and a client drops a message whose signed `tp` is not the topic it came on; for a message to one user `to`, that user's id (the token's `sub`, or the `user_id` the application accepted the connection for), and a client drops a message whose `to` is not the `user_id` of its `server_ready`. `server_ready` (`p.details.signing`) and `server_hello` (`p.signing`) name the key: `{"kid": ..., "public_key": ...}`. Clients check signatures against the keys they pin, not against these.
 
 The receipt for a client's signed message is a server-signed message of type `receipt`: `p` holds the client's `kid` and `n`, `sha256` (SHA-256 of the body it got, base64) and `received` (the server's time, milliseconds).
 

@@ -363,7 +363,7 @@ client then signs with or without encryption, and with encryption needs `securit
 
 The server answers with a signed `receipt` message (`p.n` is the nonce); a message the server
 signed arrives with `message.signature` (`body`, `sig`, `kid`, `verified`), the proof to keep. One no
-pinned key verifies, or signed for another topic than the one it came on, is dropped. Signing is
+pinned key verifies, or signed for another topic than the one it came on or for another user, is dropped. Signing is
 asynchronous: await `sendSigned` before sending what must follow it. Setup and guarantees:
 [SECURITY.md](../docs/SECURITY.md#signed-messages).
 

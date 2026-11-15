@@ -380,7 +380,7 @@ fill = server.sign("fill", {"order": "o-17", "qty": "2"}, topic="orders:u1")
 server.broadcast("orders:u1", fill)   # signed once, sent to any number of clients
 ```
 
-Clients check such messages against the server's `signing_public_key()`, which they pin. They sign their own with a key that stays on the device: `send(..., signed=True)` in Python, `sendSigned()` in TypeScript, `send_signed()` in Rust. The server accepts each one once, within `signature_window`, and only with the key bound to that user, by the token's `cnf` claim or by `set_client_key()`.
+Clients check such messages against the server's `signing_public_key()`, which they pin. They sign their own with a key that stays on the device: `send(..., signed=True)` in Python, `sendSigned()` in TypeScript, `send_signed()` in Rust. The server accepts each one once, within `signature_window`, and only with the key bound to that user, by the token's `cnf` claim or by `set_client_key()`. A message the server signs for one user names them, `server.sign("fill", {...}, to=user_id)`: the proof shows whom it was for, and other users' clients drop it.
 
 Setup, key rotation and what each guarantees: [SECURITY.md](https://github.com/silvermpx/wse/blob/main/docs/SECURITY.md).
 

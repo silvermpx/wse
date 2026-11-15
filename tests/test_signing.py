@@ -283,6 +283,13 @@ class TestServerSigned:
                 # The recovery stamp is the server's, around the signed text.
                 assert envelope["tp"] == "orders.u1" and "o" in envelope
 
+    def test_a_message_for_one_user_names_them_under_the_signature(self, signing_server):
+        srv = signing_server
+        envelope = json.loads(srv.sign("fill", {"qty": "1"}, to="trader"))
+        assert server_body(srv.signing_public_key(), envelope)["to"] == "trader"
+        with pytest.raises(ValueError):
+            srv.sign("fill", {}, to="")
+
     def test_without_a_signing_key_there_is_nothing_to_sign_or_check(self, server_port):
         srv = RustWSEServer("127.0.0.1", server_port, jwt_secret=JWT_SECRET)
         assert srv.signing_public_key() is None
@@ -370,6 +377,15 @@ async def test_the_python_client_signs_and_checks(signing_server, server_port):
         while fill.type != "fill":
             fill = await client.recv(timeout=3.0)
         assert fill.payload == {"qty": "2"} and fill.signature.verified
+
+        # Signed for one user: this client's user is "trader".
+        srv.send(conn_id, srv.sign("fill", {"qty": "3"}, to="someone-else"))
+        srv.send(conn_id, srv.sign("fill", {"qty": "4"}, to="trader"))
+        fill = await client.recv(timeout=3.0)
+        while fill.type != "fill":
+            fill = await client.recv(timeout=3.0)
+        assert fill.payload == {"qty": "4"}
+        assert json.loads(fill.signature.body)["to"] == "trader"
 
 
 @pytest.mark.asyncio

@@ -393,14 +393,28 @@ impl Publisher {
     }
 
     /// A server-signed event: the `signed` envelope a client checks with
-    /// `signing_public_key`.
+    /// `signing_public_key`. With a `topic`, the signature covers it, and
+    /// clients take the message on that topic only. Sign once, send to any
+    /// number of connections.
     pub fn sign(
         &self,
         event_type: &str,
         payload: serde_json::Value,
         topic: Option<&str>,
     ) -> Result<String, Error> {
-        self.shared.sign(event_type, payload, topic)
+        self.shared.sign(event_type, payload, topic, None)
+    }
+
+    /// `sign`, for one user: the signature covers `user_id` (`to`), so the
+    /// message proves whom it was for, and only that user's clients take
+    /// it. Send it with `send_to_user` or `send_event`.
+    pub fn sign_to(
+        &self,
+        user_id: &str,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> Result<String, Error> {
+        self.shared.sign(event_type, payload, None, Some(user_id))
     }
 
     /// The server's public key for signed messages (base64 of an

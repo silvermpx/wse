@@ -1147,6 +1147,8 @@ cheap to clone):
 | `subscribe_connection(conn_id, topics)` | `Publisher::subscribe`, or `Connect::subscribe` in `connect` |
 | `subscribe_with_recovery(...)` | `Publisher::subscribe_with_recovery` |
 | `disconnect(conn_id)` | `Publisher::disconnect` |
+| `sign(event_type, payload, topic=...)` | `Publisher::sign` |
+| `sign(event_type, payload, to=user_id)` | `Publisher::sign_to` |
 | - | `Publisher::send_to_user`, `disconnect_user`: every connection of a user |
 | `connect_cluster(...)` | `Server::connect_cluster(ClusterSettings)` |
 | `health_snapshot()` | `Publisher::health` |

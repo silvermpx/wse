@@ -525,6 +525,21 @@ async fn signed_messages_both_ways() {
         .publish_local("fills", r#"{"t":"after"}"#)
         .unwrap();
     assert_eq!(next_message(&mut events).await.kind(), "after");
+
+    // Signed for one user: taken by that user's client only.
+    let theirs = stand
+        .publisher
+        .sign_to("mallory", "fill", json!({"px": "2"}))
+        .unwrap();
+    stand.publisher.send_to_user("judy", &theirs).unwrap();
+    let mine = stand
+        .publisher
+        .sign_to("judy", "fill", json!({"px": "3"}))
+        .unwrap();
+    stand.publisher.send_to_user("judy", &mine).unwrap();
+    let fill = next_message(&mut events).await;
+    assert_eq!(fill.payload_value().unwrap()["px"], "3");
+    assert!(fill.signature().unwrap().body.contains(r#""to":"judy""#));
     client.close().await;
     stand.server.stop().await;
 }

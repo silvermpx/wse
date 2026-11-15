@@ -54,16 +54,20 @@ impl RustWSEServer {
         event_type: &str,
         payload: Option<&Bound<'_, PyAny>>,
         topic: Option<&str>,
+        to: Option<&str>,
     ) -> PyResult<String> {
         if self.shared.signer.is_none() {
             return Err(py_error(Error::NoSigningKey));
+        }
+        if to.is_some_and(str::is_empty) {
+            return Err(PyValueError::new_err("to must name a user"));
         }
         let payload = match payload {
             Some(p) if !p.is_none() => pyobj_to_json(p)?,
             _ => serde_json::Value::Null,
         };
         self.shared
-            .sign(event_type, payload, topic)
+            .sign(event_type, payload, topic, to)
             .map_err(py_error)
     }
 

@@ -328,7 +328,7 @@ Use it for the messages that may be disputed: orders, cancellations, fills, bala
 
 The server remembers `n` within the window on its own node only. A message replayed to another node of a cluster within the window is taken there too: the application deduplicates by `n` where it executes the order (an order id it already has is a no-op).
 
-The recovery stamp (`tp` / `e` / `o`) is outside the signature: it is the server's delivery position, protected by TLS and E2E. A topic message's signed body names its topic, and clients drop one that comes on another.
+The recovery stamp (`tp` / `e` / `o`) is outside the signature: it is the server's delivery position, protected by TLS and E2E. A topic message's signed body names its topic, and clients drop one that comes on another. A message for one user names that user (`sign(..., to=user_id)`, `Publisher::sign_to`): the proof shows whom it was for, and the clients of other users drop it.
 
 **Rotating the server's key:** clients pin a list. Pin the old and the new key, switch the server, then drop the old one; keep old public keys wherever signatures must still be verified.
 
