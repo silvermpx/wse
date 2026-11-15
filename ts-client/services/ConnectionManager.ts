@@ -73,6 +73,13 @@ export interface ConnectionManagerConfig {
   refreshAuthToken?: () => Promise<void>;
 
   /**
+   * Makes the WebSocket for a URL. Default: the environment's global
+   * WebSocket. Outside browsers (Node, React Native) it may pass headers,
+   * an Authorization one say, as that environment's WebSocket allows.
+   */
+  webSocket?: (url: string) => WebSocket;
+
+  /**
    * Require E2E encryption: application messages are held until the ECDH key
    * exchange completes and the connection fails closed when it cannot.
    */
@@ -356,11 +363,12 @@ export class ConnectionManager {
     let endpoint: string;
     let ws: WebSocket;
     try {
-      if (typeof WebSocket === 'undefined') {
+      if (!this.config.webSocket && typeof WebSocket === 'undefined') {
         throw new Error('WebSocket is not available in this environment');
       }
       endpoint = this.connectionPool.getBestEndpoint();
-      ws = new WebSocket(this.buildUrl(endpoint));
+      const url = this.buildUrl(endpoint);
+      ws = this.config.webSocket ? this.config.webSocket(url) : new WebSocket(url);
     } catch (error) {
       logger.error('[ConnectionManager] Cannot open a WebSocket:', errorMessage(error));
       this.ctx.state.getState().setLastError(`Cannot open a WebSocket: ${errorMessage(error)}`);

@@ -322,7 +322,7 @@ export function collectDiagnostics(): Record<string, unknown> {
     recoveryState: store.subscriptions.recoveryState,
     errorHistory: store.errorHistory,
     config: session
-      ? { ...session.options, refreshAuthToken: undefined, registerHandlers: undefined, queryClient: undefined }
+      ? { ...session.options, refreshAuthToken: undefined, registerHandlers: undefined, queryClient: undefined, webSocket: undefined }
       : null,
     quality: session?.quality
       ? { current: session.quality.getCurrentQuality(), strategy: session.quality.getCurrentStrategyName() }

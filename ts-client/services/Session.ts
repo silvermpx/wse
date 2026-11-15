@@ -113,6 +113,13 @@ export interface UseWSEConfig {
   serverReadyTimeout?: number;
 
   /**
+   * Makes the WebSocket for a URL; default the global WebSocket. Outside
+   * browsers (Node, React Native) it may pass the headers that environment's
+   * WebSocket allows, an Authorization one say.
+   */
+  webSocket?: (url: string) => WebSocket;
+
+  /**
    * TanStack Query client whose query defaults (staleTime, refetchInterval,
    * refetchOnWindowFocus) follow the measured connection quality: little
    * polling while the socket is fast and steady, more when it is slow,
@@ -139,6 +146,7 @@ export interface ResolvedWSEOptions {
   refreshAuthToken?: () => Promise<void>;
   registerHandlers?: (messageProcessor: HandlerRegistry) => void;
   queryClient?: QueryClientLike;
+  webSocket?: (url: string) => WebSocket;
 }
 
 export const DEFAULT_RECONNECTION: ReconnectionStrategy = {
@@ -201,6 +209,7 @@ export function resolveOptions(config: UseWSEConfig | undefined): ResolvedWSEOpt
     refreshAuthToken: config?.refreshAuthToken,
     registerHandlers: config?.registerHandlers,
     queryClient: config?.queryClient,
+    webSocket: config?.webSocket,
   };
 }
 
@@ -459,6 +468,7 @@ export class WSESession {
           threshold: o.performance.compressionThreshold,
         },
         wireFormat: o.wireFormat,
+        webSocket: o.webSocket,
         context: this.ctx,
       },
     );
