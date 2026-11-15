@@ -7,11 +7,11 @@
 [![crates.io - Client](https://img.shields.io/crates/v/wse-client?label=crates.io%20wse-client)](https://crates.io/crates/wse-client)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/silvermpx/wse/blob/main/LICENSE)
 
-WSE is a WebSocket server for reactive user interfaces: trading terminals, dashboards, monitoring, chats, notifications. Your backend publishes events to topics, and WSE pushes each event to every client subscribed to it, so the screen changes the moment the data does, without polling.
+WSE is a WebSocket engine for reactive user interfaces: trading terminals, dashboards, monitoring, chats, notifications. Your backend publishes events to topics, and WSE pushes each event to every client subscribed to it, so the screen changes the moment the data does, without polling.
 
-WSE runs inside your backend rather than as a separate service. A Python application starts it with the `wse-server` package; a Rust application embeds the `wse` crate. Both are the same engine, written in Rust. Several servers form a cluster by themselves, with no Redis or other broker in between.
+WSE runs inside your backend rather than as a separate service. A Python application starts it with the `wse-server` package, where it runs in threads of its own, outside the GIL; a Rust application embeds the `wse` crate. Both are the same engine, written in Rust. Several servers form a cluster by themselves, with no Redis or other broker in between.
 
-In the browser, a React hook keeps one connection per page, with its subscriptions and recovery; interfaces written in Rust (Leptos, Yew, Dioxus) use the Rust client compiled to WebAssembly. Services and bots connect with the Python or the Rust client.
+In the browser, the TypeScript client keeps one connection per page, with its subscriptions and recovery, and gives React a hook; interfaces written in Rust (Leptos, Yew, Dioxus) use the Rust client compiled to WebAssembly. Services and bots connect with the Python or the Rust client.
 
 ## What it does
 
@@ -32,7 +32,7 @@ In the browser, a React hook keeps one connection per page, with its subscriptio
 |---------|---------|------------|
 | [`wse-server`](https://pypi.org/project/wse-server/) | `pip install wse-server` | The server, run from Python |
 | [`wse`](https://crates.io/crates/wse) | `cargo add wse` | The server, inside a Rust application (tokio) |
-| [`wse-client`](https://www.npmjs.com/package/wse-client) | `npm install wse-client` | Web interfaces: React and TypeScript |
+| [`wse-client`](https://www.npmjs.com/package/wse-client) | `npm install wse-client` | Web interfaces in TypeScript, with a React hook |
 | [`wse-client`](https://crates.io/crates/wse-client) | `cargo add wse-client` | Interfaces in Rust (WebAssembly), and Rust services on tokio |
 | [`wse-client`](https://pypi.org/project/wse-client/) | `pip install wse-client` | Python services and scripts, with or without asyncio |
 

@@ -1,7 +1,7 @@
 {
   "name": "wse-client",
   "version": "3.0.0",
-  "description": "React and TypeScript client for WSE servers: hooks, topics with message recovery, reconnects, an offline queue, end-to-end encryption and signed messages.",
+  "description": "TypeScript client for WSE, with a React hook: topics with message recovery, reconnects, an offline queue, end-to-end encryption and signed messages.",
   "type": "module",
   "main": "./dist/npm/index.js",
   "types": "./dist/npm/index.d.ts",

@@ -1,6 +1,6 @@
 # wse
 
-A WebSocket server for reactive user interfaces, run inside your Rust
+A WebSocket engine for reactive user interfaces, run inside your Rust
 application: topics with recovery for clients that come back, presence,
 servers that form a cluster without a broker, JWT validation, end-to-end
 encryption and signed messages, delivered on every CPU core. The same

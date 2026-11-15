@@ -1,6 +1,6 @@
 # wse-client
 
-Python client for [WSE](https://github.com/silvermpx/wse), the WebSocket server for reactive user interfaces: topics with message recovery, reconnects, MessagePack, an offline queue, end-to-end encryption and signed messages.
+Python client for [WSE](https://github.com/silvermpx/wse), the WebSocket engine for reactive user interfaces: topics with message recovery, reconnects, MessagePack, an offline queue, end-to-end encryption and signed messages.
 
 [![PyPI](https://img.shields.io/pypi/v/wse-client)](https://pypi.org/project/wse-client/)
 [![Python](https://img.shields.io/pypi/pyversions/wse-client)](https://pypi.org/project/wse-client/)

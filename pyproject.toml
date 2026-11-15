@@ -6,7 +6,7 @@ build-backend = "maturin"
 [project]
 name = "wse-server"
 version = "3.0.0"
-description = "WebSocket server for reactive user interfaces, with a Rust core: topics with message recovery, presence, clustering without a broker, JWT authentication, end-to-end encryption and signed messages."
+description = "WebSocket engine for reactive user interfaces, with a Rust core: topics with message recovery, presence, clustering without a broker, JWT authentication, end-to-end encryption and signed messages."
 readme = "README.md"
 # PEP 639: an SPDX expression (core metadata License-Expression). The table
 # form next to license-files is what PEP 639 tells build tools to reject, and

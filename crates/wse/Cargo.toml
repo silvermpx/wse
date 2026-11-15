@@ -1,6 +1,6 @@
 [package]
 name = "wse"
-description = "WebSocket server for reactive user interfaces: topics with message recovery, presence, clustering without a broker, JWT, end-to-end encryption and signed messages."
+description = "WebSocket engine for reactive user interfaces: topics with message recovery, presence, clustering without a broker, JWT, end-to-end encryption and signed messages."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
