@@ -251,7 +251,8 @@ pub struct Config {
     /// sends none).
     pub headers: Vec<(String, String)>,
     /// Messages waiting to be sent at most; past it `try_send` fails and
-    /// `send` waits (1024).
+    /// `send` waits (1024). What a lost connection did not write goes out
+    /// on the next one, once the server takes it.
     pub send_queue: usize,
     /// The TLS configuration for `wss://`: an `Arc` of a
     /// `rustls::ClientConfig` of rustls 0.23, which this crate builds on,

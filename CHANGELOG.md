@@ -135,6 +135,9 @@ Upgrading from 2.x: see
   asked for, and a replay the server cut short is asked for again; a close
   with 1008 or 4800 ends the client; a signed message's nonce is 1 to 128
   characters.
+- Rust client, as the TypeScript one: what the application sent and a lost
+  connection did not write goes out on the next connection instead of
+  being dropped.
 - The Rust utilities (filters, queues, transformer, msgpack) follow their
   documentation.
 

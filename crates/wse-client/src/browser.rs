@@ -259,8 +259,8 @@ impl<H: Handler> Driver<H> {
                 Some(Err(error)) => Lost::Failed(error),
             };
             self.session.close();
-            // Messages queued for the lost connection go with it.
-            while self.frames.try_recv().is_ok() {}
+            // What the application sent and the lost connection did not
+            // write goes out on the next one, once the server takes it.
             match self.policy.after(lost, &self.config, &mut first) {
                 Next::Stop(end) => break end,
                 Next::Retry(disconnected) => {
@@ -365,7 +365,6 @@ impl<H: Handler> Driver<H> {
                     Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                     Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
                 },
-                Some(_) = self.frames.recv() => {}
                 _ = sleep_until(Some(until)) => return true,
                 () = sleep_until(self.session.next_deadline()) => {
                     self.session.on_deadline(Instant::now());
