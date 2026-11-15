@@ -30,7 +30,6 @@ import {
   RateLimitConfig,
   CircuitBreakerState,
 } from '../types.js';
-import { useWSEStore } from '../stores/useWSEStore.js';
 import { logger } from '../utils/logger.js';
 import { RateLimiter } from './RateLimiter.js';
 import { ConnectionPool } from './ConnectionPool.js';
@@ -47,10 +46,9 @@ import {
   RATE_LIMIT_CAPACITY,
   RATE_LIMIT_REFILL_RATE,
 } from '../constants.js';
-import { securityManager } from '../utils/security.js';
 import { proveSession, thumbprint, type SigningKey } from '../utils/signing.js';
 import { generateId } from '../utils/id.js';
-import { dispatchWSEEvent } from '../utils/events.js';
+import { createClientContext, type ClientContext } from '../core/context.js';
 
 /**
  * Outcome of trySend():
@@ -65,6 +63,8 @@ export type SendResult = 'sent' | 'not_ready' | 'rate_limited' | 'error';
  * Configuration for the connection manager.
  */
 export interface ConnectionManagerConfig {
+  /** The client this connection is of: its state, keys and events. Default: one of its own. */
+  context?: ClientContext;
   /**
    * Optional callback to refresh the auth cookie. Called every 10 minutes in
    * cookie mode and once after an auth rejection. Must throw (reject) when the
@@ -214,6 +214,7 @@ export class ConnectionManager {
 
   private refreshAuthTokenFn: (() => Promise<void>) | null;
   private readonly config: ConnectionManagerConfig;
+  private readonly ctx: ClientContext;
   private browserListenersInstalled = false;
   // The session is bound to this client's key: its thumbprint, which the
   // sealed server_ready must name, once known.
@@ -228,6 +229,7 @@ export class ConnectionManager {
     config?: ConnectionManagerConfig
   ) {
     this.config = config ?? {};
+    this.ctx = this.config.context ?? createClientContext();
     this.encryptionRequired = !!this.config.encryptionRequired;
     const e2e = this.config.e2e ?? {};
     if (this.encryptionRequired && !e2e.legacy && !(e2e.serverKeys?.length) && !e2e.unauthenticated) {
@@ -244,7 +246,7 @@ export class ConnectionManager {
           'pin keys for a 3.x server, or use legacyE2e alone for a server before 3.0',
       );
     }
-    securityManager.configureE2e(
+    this.ctx.security.configureE2e(
       this.encryptionRequired && !e2e.legacy
         ? { serverKeys: e2e.serverKeys, unauthenticated: e2e.unauthenticated }
         : null,
@@ -328,7 +330,7 @@ export class ConnectionManager {
     url.searchParams.set('encryption', String(this.encryptionRequired));
     if (this.msgpack) url.searchParams.set('format', 'msgpack');
     // An E2E session is opened first: the server holds everything back until then.
-    if (this.encryptionRequired && securityManager.isSessionMode()) url.searchParams.set('e2e', '1');
+    if (this.encryptionRequired && this.ctx.security.isSessionMode()) url.searchParams.set('e2e', '1');
     return url.toString();
   }
 
@@ -361,7 +363,7 @@ export class ConnectionManager {
       ws = new WebSocket(this.buildUrl(endpoint));
     } catch (error) {
       logger.error('[ConnectionManager] Cannot open a WebSocket:', errorMessage(error));
-      useWSEStore.getState().setLastError(`Cannot open a WebSocket: ${errorMessage(error)}`);
+      this.ctx.state.getState().setLastError(`Cannot open a WebSocket: ${errorMessage(error)}`);
       this.recordAttemptFailure(null);
       this.setState(ConnectionState.RECONNECTING);
       this.scheduleReconnect();
@@ -378,7 +380,7 @@ export class ConnectionManager {
     if (this.state !== ConnectionState.RECONNECTING) {
       this.setState(ConnectionState.CONNECTING);
     }
-    useWSEStore.getState().incrementMetric('connectionAttempts');
+    this.ctx.state.getState().incrementMetric('connectionAttempts');
     logger.info(`[ConnectionManager] Connecting to ${endpoint}`);
 
     const startedAt = Date.now();
@@ -429,7 +431,7 @@ export class ConnectionManager {
   }
 
   private handleOpen(endpoint: string, connectMs: number): void {
-    const store = useWSEStore.getState();
+    const store = this.ctx.state.getState();
     this.lastInboundAt = Date.now();
 
     this.connectionPool.recordSuccess(endpoint, connectMs);
@@ -450,7 +452,7 @@ export class ConnectionManager {
 
     // An E2E session comes first: the offer goes out now, server_ready
     // follows the session, sealed.
-    if (this.encryptionRequired && securityManager.isSessionMode()) {
+    if (this.encryptionRequired && this.ctx.security.isSessionMode()) {
       this.encryptionState = 'pending';
       this.startEncryptionTimer();
       void this.sendClientHello();
@@ -489,7 +491,7 @@ export class ConnectionManager {
     }
 
     if (code !== 1000 && code !== 1001) {
-      useWSEStore.getState().setLastError(
+      this.ctx.state.getState().setLastError(
         `Connection closed (code ${code}${reason ? `: ${reason}` : ''})`,
         code,
       );
@@ -503,7 +505,7 @@ export class ConnectionManager {
     this.reconnectAttempts++;
     this.connectionCircuitBreaker?.recordFailure();
     if (endpoint) this.connectionPool.recordFailure(endpoint);
-    const store = useWSEStore.getState();
+    const store = this.ctx.state.getState();
     store.updateMetrics({
       reconnectCount: this.reconnectAttempts, // consecutive failed attempts
       failedConnections: store.metrics.failedConnections + 1,
@@ -512,7 +514,7 @@ export class ConnectionManager {
   }
 
   private handleAuthRejection(code: number, reason: string): void {
-    const store = useWSEStore.getState();
+    const store = this.ctx.state.getState();
     const effectiveCode = code === 4403 ? 4403 : 4401;
     store.setLastError('Authentication failed', effectiveCode);
     store.incrementMetric('authFailures');
@@ -549,7 +551,7 @@ export class ConnectionManager {
       '(sign in again, then call forceReconnect() or remount with a new auth value)'
     );
     this.setState(ConnectionState.ERROR);
-    dispatchWSEEvent('wseAuthFailed', {
+    this.ctx.emit('wseAuthFailed', {
       code,
       reason: reason || 'Authentication failed',
       refreshFailed: refreshError !== undefined,
@@ -625,7 +627,7 @@ export class ConnectionManager {
     // Fresh ECDH key pair for the next connection; a derivation still in
     // flight for this one can no longer install its key.
     if (this.encryptionRequired) {
-      securityManager.resetEncryption();
+      this.ctx.security.resetEncryption();
     }
 
     if (this.pendingAttempt) {
@@ -646,7 +648,7 @@ export class ConnectionManager {
   private setState(state: ConnectionState): void {
     this.state = state;
     try {
-      useWSEStore.getState().setConnectionState(state);
+      this.ctx.state.getState().setConnectionState(state);
     } catch {
       // Store unavailable (should not happen)
     }
@@ -749,8 +751,8 @@ export class ConnectionManager {
         `[ConnectionManager] Periodic token refresh failed (${errorMessage(error)}); ` +
         `keeping the connection, retrying in ${Math.round(retryIn / 1000)}s`
       );
-      useWSEStore.getState().setLastError('Token refresh failed (connection kept)');
-      dispatchWSEEvent('wseTokenRefreshFailed', {
+      this.ctx.state.getState().setLastError('Token refresh failed (connection kept)');
+      this.ctx.emit('wseTokenRefreshFailed', {
         error: errorMessage(error),
         failures: this.tokenRefreshFailures,
         retryInMs: retryIn,
@@ -797,9 +799,9 @@ export class ConnectionManager {
     if (this.reconnectAttempts >= this.maxAttempts) {
       this.stopReason = 'max_attempts';
       logger.error(`[ConnectionManager] Max reconnection attempts (${this.maxAttempts}) reached`);
-      useWSEStore.getState().setLastError('Max reconnection attempts reached');
+      this.ctx.state.getState().setLastError('Max reconnection attempts reached');
       this.setState(ConnectionState.ERROR);
-      dispatchWSEEvent('wseReconnectFailed', { attempts: this.reconnectAttempts });
+      this.ctx.emit('wseReconnectFailed', { attempts: this.reconnectAttempts });
       return;
     }
 
@@ -916,7 +918,7 @@ export class ConnectionManager {
     if (!this.connectionCircuitBreaker) return;
     const m = this.connectionCircuitBreaker.getMetrics();
     try {
-      useWSEStore.getState().updateCircuitBreaker({
+      this.ctx.state.getState().updateCircuitBreaker({
         state: m.state,
         failures: m.failures,
         successCount: m.successes,
@@ -970,7 +972,7 @@ export class ConnectionManager {
     if (this.rateLimiter && !this.rateLimiter.canSend()) {
       const retryAfter = this.rateLimiter.getRetryAfter();
       logger.debug(`[ConnectionManager] Rate limited. Retry after ${retryAfter}s`);
-      dispatchWSEEvent('clientRateLimitExceeded', {
+      this.ctx.emit('clientRateLimitExceeded', {
         retryAfter,
         stats: this.rateLimiter.getStats(),
       });
@@ -1003,7 +1005,7 @@ export class ConnectionManager {
           }
           let frame: ArrayBuffer;
           try {
-            frame = await securityManager.encryptForTransport(data);
+            frame = await this.ctx.security.encryptForTransport(data);
           } catch (error) {
             if (socketId !== this.socketId) {
               this.reportUndeliverable(message);
@@ -1050,7 +1052,7 @@ export class ConnectionManager {
   }
 
   private recordSent(bytes: number): void {
-    const store = useWSEStore.getState();
+    const store = this.ctx.state.getState();
     store.updateMetrics({
       messagesSent: store.metrics.messagesSent + 1,
       bytesSent: store.metrics.bytesSent + bytes,
@@ -1088,7 +1090,7 @@ export class ConnectionManager {
     if (!this.ws || this.ws.readyState !== WS_OPEN || this.isDestroyed) {
       return false;
     }
-    if (this.encryptionRequired && securityManager.isSessionMode()) {
+    if (this.encryptionRequired && this.ctx.security.isSessionMode()) {
       if (this.encryptionState === 'ready' && typeof data === 'string') return this.sendSealed(data);
       if (this.clientHelloSent) {
         logger.debug('[ConnectionManager] Control frame skipped: the E2E session is not ready');
@@ -1106,7 +1108,7 @@ export class ConnectionManager {
     this.encryptedSendQueue = this.encryptedSendQueue.then(async () => {
       if (socketId !== this.socketId || this.ws !== ws || ws.readyState !== WS_OPEN) return;
       try {
-        const frame = await securityManager.encryptForTransport(data);
+        const frame = await this.ctx.security.encryptForTransport(data);
         if (socketId === this.socketId && this.ws === ws && ws.readyState === WS_OPEN) ws.send(frame);
       } catch (error) {
         logger.error('[ConnectionManager] Encryption failed, control frame dropped:', errorMessage(error));
@@ -1138,7 +1140,7 @@ export class ConnectionManager {
     this.serverReadyTimer = setTimeout(() => {
       this.serverReadyTimer = null;
       if (socketId !== this.socketId || this.serverReady) return;
-      if (this.encryptionRequired && securityManager.isSessionMode()) {
+      if (this.encryptionRequired && this.ctx.security.isSessionMode()) {
         // Fail closed: the sealed server_ready confirms the session (and
         // names the key a bound session proves); without it nothing goes out.
         this.failEncryption(`no sealed server_ready within ${timeout}ms`);
@@ -1199,13 +1201,13 @@ export class ConnectionManager {
     this.authRefreshTried = false;
     this.connectionCircuitBreaker?.recordSuccess();
     this.mirrorCircuitBreaker();
-    useWSEStore.getState().updateMetrics({ reconnectCount: 0 });
+    this.ctx.state.getState().updateMetrics({ reconnectCount: 0 });
 
     logger.info('[ConnectionManager] Server ready');
 
     // The first design exchanges keys after server_ready; a session was
     // opened before it (handleOpen).
-    if (this.encryptionRequired && !securityManager.isSessionMode()) {
+    if (this.encryptionRequired && !this.ctx.security.isSessionMode()) {
       this.encryptionState = 'pending';
       this.startEncryptionTimer();
     }
@@ -1253,17 +1255,17 @@ export class ConnectionManager {
     const socketId = this.socketId;
     let encryptionPublicKey: string | null = null;
     let e2eOffer: Record<string, unknown> | null = null;
-    if (this.encryptionRequired && securityManager.isSessionMode()) {
+    if (this.encryptionRequired && this.ctx.security.isSessionMode()) {
       try {
-        e2eOffer = await securityManager.createOffer();
+        e2eOffer = await this.ctx.security.createOffer();
       } catch (error) {
         if (socketId === this.socketId) this.failEncryption(`cannot make the E2E offer (${errorMessage(error)})`);
         return;
       }
     } else if (this.encryptionRequired) {
       try {
-        await securityManager.generateKeyPair();
-        encryptionPublicKey = await securityManager.getPublicKeyRaw();
+        await this.ctx.security.generateKeyPair();
+        encryptionPublicKey = await this.ctx.security.getPublicKeyRaw();
       } catch (error) {
         if (socketId === this.socketId) this.failEncryption(`cannot generate the ECDH key pair (${errorMessage(error)})`);
         return;
@@ -1337,15 +1339,15 @@ export class ConnectionManager {
 
     const socketId = this.socketId;
     try {
-      if (securityManager.isSessionMode()) {
-        await securityManager.acceptServerHello(payload);
+      if (this.ctx.security.isSessionMode()) {
+        await this.ctx.security.acceptServerHello(payload);
       } else {
         const key = payload?.encryption_public_key;
         if (!payload?.features?.encryption || typeof key !== 'string' || key.length === 0) {
           this.failEncryption('the server did not confirm encryption in server_hello');
           return;
         }
-        await securityManager.setServerPublicKeyRaw(key);
+        await this.ctx.security.setServerPublicKeyRaw(key);
       }
     } catch (error) {
       if (socketId === this.socketId) {
@@ -1355,7 +1357,7 @@ export class ConnectionManager {
     }
 
     if (socketId !== this.socketId || this.encryptionState !== 'pending') return;
-    if (!securityManager.isTransportEncryptionReady()) {
+    if (!this.ctx.security.isTransportEncryptionReady()) {
       this.failEncryption('no transport key after the key exchange');
       return;
     }
@@ -1363,8 +1365,8 @@ export class ConnectionManager {
     // Bound to this client's key: its proof is the first message the session
     // seals, before anything else is let through.
     const bindKey = this.config.e2e?.bindKey;
-    const th = securityManager.transcriptHash();
-    if (bindKey && securityManager.isSessionMode() && th) {
+    const th = this.ctx.security.transcriptHash();
+    if (bindKey && this.ctx.security.isSessionMode() && th) {
       let proof: string;
       try {
         const key = await bindKey;
@@ -1380,7 +1382,7 @@ export class ConnectionManager {
 
     this.encryptionState = 'ready';
     this.clearEncryptionTimer();
-    useWSEStore.getState().updateSecurity({
+    this.ctx.state.getState().updateSecurity({
       encryptionEnabled: true,
       encryptionAlgorithm: 'AES-GCM-256',
     });
@@ -1412,9 +1414,9 @@ export class ConnectionManager {
     }
     this.encryptionState = 'failed';
 
-    useWSEStore.getState().setLastError(`Encryption failed: ${reason}`);
+    this.ctx.state.getState().setLastError(`Encryption failed: ${reason}`);
     this.setState(ConnectionState.ERROR);
-    dispatchWSEEvent('wseEncryptionFailed', { reason });
+    this.ctx.emit('wseEncryptionFailed', { reason });
   }
 
   /** The server reported AUTH_FAILED/AUTH_REQUIRED: treat the coming close as an auth rejection. */
@@ -1494,7 +1496,7 @@ export class ConnectionManager {
     this.authRefreshTried = false;
     this.stopReason = 'none';
     this.clearReconnectTimer();
-    useWSEStore.getState().updateMetrics({ reconnectCount: 0 });
+    this.ctx.state.getState().updateMetrics({ reconnectCount: 0 });
 
     const ws = this.ws;
     if (ws) {

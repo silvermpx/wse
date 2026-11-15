@@ -1,0 +1,711 @@
+// =============================================================================
+// WebSocket Engine - Connection State
+// =============================================================================
+//
+// What a client knows of its connection, metrics, topics and errors, with the
+// actions that change it: the state of one client's store (core/store.ts), and
+// of the React entry's useWSEStore.
+
+import type { StateCreator } from '../store.js';
+import {
+  WSEState,
+  ConnectionState,
+  NetworkDiagnostics,
+  ConnectionInfo,
+  ConnectionMetrics,
+  CircuitBreakerInfo,
+  CircuitBreakerState,
+  DiagnosticsData,
+  QueueStats,
+  ConnectionQuality,
+  PerformanceMetrics,
+  SecurityInfo,
+  SubscriptionInfo,
+  OfflineQueueStats,
+  TopicRecoveryPosition,
+} from '../../types.js';
+
+/** Recovery position written together with an inbound message (see recordInbound). */
+export interface InboundRecoveryPosition {
+  topic: string;
+  epoch: string;
+  offset: number;
+}
+
+export interface WSEStore extends WSEState {
+  // Actions - Connection
+  setConnectionState: (state: ConnectionState) => void;
+  setActiveEndpoint: (endpoint: string | null) => void;
+  setPreferredEndpoint: (endpoint: string | null) => void;
+  updateEndpoint: (endpoint: string, updates: Partial<ConnectionInfo>) => void;
+  addEndpoint: (endpoint: string) => void;
+
+  // Actions - Metrics
+  updateMetrics: (updates: Partial<ConnectionMetrics>) => void;
+  recordLatency: (latency: number) => void;
+  /** One sampled handler run time (ms), see diagnostics.sampleRate. */
+  recordHandlerTime: (ms: number) => void;
+  incrementMetric: (key: keyof ConnectionMetrics, value?: number) => void;
+
+  // Actions - Circuit Breaker
+  updateCircuitBreaker: (updates: Partial<CircuitBreakerInfo>) => void;
+  recordCircuitBreakerFailure: () => void;
+  recordCircuitBreakerSuccess: () => void;
+  resetCircuitBreaker: () => void;
+  checkCircuitBreakerTimeout: () => void;
+
+  // Actions - Inbound traffic (one store write per message)
+  recordInbound: (bytes: number, position?: InboundRecoveryPosition) => void;
+
+  // Actions - Subscriptions
+  setActiveTopics: (topics: string[]) => void;
+  /** Add topics to activeTopics atomically (reads the live state, never a render snapshot). */
+  addTopics: (topics: string[]) => void;
+  /** Remove topics from activeTopics atomically. */
+  removeTopics: (topics: string[]) => void;
+  addPendingSubscription: (topic: string) => void;
+  confirmSubscription: (topic: string) => void;
+  failSubscription: (topic: string) => void;
+  setServerRecoveryEnabled: (enabled: boolean) => void;
+  updateRecoveryState: (positions: Record<string, TopicRecoveryPosition>) => void;
+  removeRecoveryTopics: (topics: string[]) => void;
+
+  // Actions - Queue
+  updateQueueStats: (stats: Partial<QueueStats>) => void;
+  updateOfflineQueue: (updates: Partial<OfflineQueueStats>) => void;
+
+  // Actions - Diagnostics
+  updateDiagnostics: (diagnostics: DiagnosticsData | null) => void;
+
+  // Actions - Performance
+  updatePerformance: (updates: Partial<PerformanceMetrics>) => void;
+
+  // Actions - Security
+  updateSecurity: (updates: Partial<SecurityInfo>) => void;
+
+  // Actions - Errors
+  setLastError: (error: string | null, code?: number) => void;
+  clearErrors: () => void;
+
+  // Actions - Configuration
+  updateConfig: (updates: Partial<WSEState['config']>) => void;
+
+  // Computed getters
+  isConnected: () => boolean;
+  canReconnect: () => boolean;
+  getConnectionQuality: () => ConnectionQuality;
+
+  /** Stops the circuit breaker's timer (the store is no longer used). */
+  clearTimers: () => void;
+
+  // Reset
+  reset: () => void;
+}
+
+const initialMetrics: ConnectionMetrics = {
+  messagesReceived: 0,
+  messagesSent: 0,
+  messagesQueued: 0,
+  messagesDropped: 0,
+  compressionRatio: 1,
+  compressionHits: 0,
+  reconnectCount: 0,
+  connectionAttempts: 0,
+  successfulConnections: 0,
+  failedConnections: 0,
+  lastLatency: null,
+  avgLatency: null,
+  minLatency: null,
+  maxLatency: null,
+  latencyP95: null,
+  latencyP99: null,
+  bytesReceived: 0,
+  bytesSent: 0,
+  bandwidth: 0,
+  messageRate: 0,
+  connectedSince: null,
+  lastMessageReceived: null,
+  lastMessageSent: null,
+  lastHealthCheck: null,
+  lastErrorCode: null,
+  lastErrorMessage: null,
+  authFailures: 0,
+  protocolErrors: 0,
+  networkJitter: 0,
+  packetLoss: 0,
+  gapsDetected: 0,
+  messagesMissed: 0,
+  handlerTimeAvg: null,
+  handlerTimeMax: null,
+};
+
+const initialCircuitBreaker: CircuitBreakerInfo = {
+  state: CircuitBreakerState.CLOSED,
+  failures: 0,
+  lastFailureTime: null,
+  successCount: 0,
+  nextRetryTime: null,
+  threshold: 5,
+  timeout: 60000,
+};
+
+const initialQueueStats: QueueStats = {
+  size: 0,
+  capacity: 10000,
+  utilizationPercent: 0,
+  oldestMessageAge: null,
+  priorityDistribution: {},
+  processingRate: 0,
+  backpressure: false,
+  bytes: 0,
+  memoryLimit: 0,
+};
+
+const initialOfflineQueue: OfflineQueueStats = {
+  enabled: true,
+  size: 0,
+  capacity: 1000,
+  oldestMessageAge: null,
+  persistedToStorage: true,
+};
+
+const initialPerformance: PerformanceMetrics = {
+  cpuUsage: 0,
+  memoryUsage: 0,
+  gcPauseTime: 0,
+  eventLoopLag: 0,
+};
+
+const initialSecurity: SecurityInfo = {
+  encryptionEnabled: false,
+  encryptionAlgorithm: null,
+  sessionKeyRotation: null,
+  lastKeyRotation: null,
+};
+
+const initialSubscriptions: SubscriptionInfo = {
+  topics: [],
+  pendingSubscriptions: [],
+  failedSubscriptions: [],
+  lastUpdate: null,
+  recoveryState: {},
+  serverRecoveryEnabled: false,
+};
+
+const initialState: WSEState = {
+  // Connection
+  connectionState: ConnectionState.PENDING,
+  activeEndpoint: null,
+  preferredEndpoint: null,
+  endpoints: [],
+
+  // Metrics
+  metrics: initialMetrics,
+  diagnostics: null,
+  performance: initialPerformance,
+
+  // Circuit Breaker
+  circuitBreaker: initialCircuitBreaker,
+
+  // Queues
+  messageQueue: initialQueueStats,
+  offlineQueue: initialOfflineQueue,
+
+  // Security
+  security: initialSecurity,
+
+  // Subscriptions
+  subscriptions: initialSubscriptions,
+  activeTopics: [],
+
+  // Errors
+  lastError: null,
+  errorHistory: [],
+
+  // Configuration
+  config: {
+    reconnectEnabled: true,
+    maxReconnectAttempts: -1,
+    compressionEnabled: true,
+    batchingEnabled: true,
+    offlineModeEnabled: true,
+    healthCheckInterval: 30000,
+    metricsInterval: 60000,
+  },
+
+  // Sequence
+  sequence: 0,
+};
+
+function sameTopics(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+// Latency tracking with bounded history
+const LATENCY_HISTORY_SIZE = 100;
+
+export const createWSEState: StateCreator<WSEStore> = (set, get) => {
+  // Each store's own: the latency window and the circuit breaker's timer.
+  let latencyHistory: number[] = [];
+  let circuitBreakerTimer: ReturnType<typeof setTimeout> | null = null;
+
+  return {
+    ...initialState,
+
+    // Connection Actions
+  setConnectionState: (state) => set((prev) => {
+    if (prev.connectionState === state) {
+      return prev;
+    }
+
+    if (state === ConnectionState.CONNECTED && circuitBreakerTimer) {
+      clearTimeout(circuitBreakerTimer);
+      circuitBreakerTimer = null;
+    }
+
+    return {
+      connectionState: state,
+      metrics: state === ConnectionState.CONNECTED && !prev.metrics.connectedSince
+        ? { ...prev.metrics, connectedSince: Date.now() }
+        : prev.metrics
+    };
+  }),
+
+    setActiveEndpoint: (endpoint) => set({ activeEndpoint: endpoint }),
+    setPreferredEndpoint: (endpoint) => set({ preferredEndpoint: endpoint }),
+
+    updateEndpoint: (endpoint, updates) => set((state) => ({
+      endpoints: state.endpoints.map(e =>
+        e.endpoint === endpoint ? { ...e, ...updates } : e
+      ),
+    })),
+
+    addEndpoint: (endpoint) => set((state) => {
+      const existing = state.endpoints.find(e => e.endpoint === endpoint);
+      if (existing) return state;
+
+      return {
+        endpoints: [...state.endpoints, {
+          endpoint,
+          state: ConnectionState.PENDING,
+          healthScore: 100,
+          lastConnected: null,
+          averageLatency: null,
+          failureCount: 0,
+          successCount: 0,
+        }],
+      };
+    }),
+
+    // Optimized metrics updates
+    updateMetrics: (updates) => set((state) => ({
+      metrics: { ...state.metrics, ...updates },
+    })),
+
+    recordHandlerTime: (ms) => set((state) => {
+      if (!Number.isFinite(ms) || ms < 0) return state;
+      const { handlerTimeAvg, handlerTimeMax } = state.metrics;
+      return {
+        metrics: {
+          ...state.metrics,
+          handlerTimeAvg: handlerTimeAvg === null ? ms : handlerTimeAvg * 0.9 + ms * 0.1,
+          handlerTimeMax: handlerTimeMax === null || ms > handlerTimeMax ? ms : handlerTimeMax,
+        },
+      };
+    }),
+
+    recordLatency: (latency) => set((state) => {
+      latencyHistory.push(latency);
+      if (latencyHistory.length > LATENCY_HISTORY_SIZE) {
+        latencyHistory = latencyHistory.slice(-LATENCY_HISTORY_SIZE);
+      }
+
+      const metrics = { ...state.metrics };
+      metrics.lastLatency = latency;
+
+      if (metrics.avgLatency === null) {
+        metrics.avgLatency = latency;
+      } else {
+        metrics.avgLatency = metrics.avgLatency * 0.9 + latency * 0.1;
+      }
+
+      if (metrics.minLatency === null || latency < metrics.minLatency) {
+        metrics.minLatency = latency;
+      }
+      if (metrics.maxLatency === null || latency > metrics.maxLatency) {
+        metrics.maxLatency = latency;
+      }
+
+      if (latencyHistory.length >= 10) {
+        const sorted = [...latencyHistory].sort((a, b) => a - b);
+        const p95Index = Math.floor(sorted.length * 0.95);
+        const p99Index = Math.floor(sorted.length * 0.99);
+        metrics.latencyP95 = sorted[p95Index];
+        metrics.latencyP99 = sorted[p99Index];
+      }
+
+      metrics.lastMessageReceived = Date.now();
+
+      return { metrics };
+    }),
+
+    incrementMetric: (key, value = 1) => set((state) => {
+      const current = state.metrics[key];
+      if (typeof current !== 'number') return state;
+
+      return {
+        metrics: {
+          ...state.metrics,
+          [key]: current + value,
+        },
+      };
+    }),
+
+    // Circuit Breaker Actions
+    updateCircuitBreaker: (updates) => set((state) => {
+      if (updates.state && updates.state !== state.circuitBreaker.state) {
+        if (circuitBreakerTimer) {
+          clearTimeout(circuitBreakerTimer);
+          circuitBreakerTimer = null;
+        }
+
+        if (updates.state === CircuitBreakerState.OPEN && updates.nextRetryTime) {
+          const timeUntilRetry = updates.nextRetryTime - Date.now();
+          if (timeUntilRetry > 0) {
+            circuitBreakerTimer = setTimeout(() => {
+              const currentState = get();
+              if (currentState.circuitBreaker.state === CircuitBreakerState.OPEN) {
+                currentState.updateCircuitBreaker({
+                  state: CircuitBreakerState.HALF_OPEN,
+                  successCount: 0
+                });
+              }
+            }, timeUntilRetry);
+          }
+        }
+      }
+
+      return {
+        circuitBreaker: { ...state.circuitBreaker, ...updates },
+      };
+    }),
+
+    recordCircuitBreakerFailure: () => set((state) => {
+      const failures = state.circuitBreaker.failures + 1;
+      const shouldOpen = failures >= state.circuitBreaker.threshold;
+
+      const updates: Partial<CircuitBreakerInfo> = {
+        failures,
+        lastFailureTime: Date.now(),
+      };
+
+      if (shouldOpen && state.circuitBreaker.state !== CircuitBreakerState.OPEN) {
+        updates.state = CircuitBreakerState.OPEN;
+        updates.nextRetryTime = Date.now() + state.circuitBreaker.timeout;
+        updates.successCount = 0;
+
+        if (circuitBreakerTimer) {
+          clearTimeout(circuitBreakerTimer);
+        }
+        circuitBreakerTimer = setTimeout(() => {
+          const currentState = get();
+          if (currentState.circuitBreaker.state === CircuitBreakerState.OPEN) {
+            currentState.updateCircuitBreaker({
+              state: CircuitBreakerState.HALF_OPEN,
+              successCount: 0
+            });
+          }
+        }, state.circuitBreaker.timeout);
+      }
+
+      return {
+        circuitBreaker: {
+          ...state.circuitBreaker,
+          ...updates,
+        },
+      };
+    }),
+
+    recordCircuitBreakerSuccess: () => set((state) => {
+      const successCount = state.circuitBreaker.successCount + 1;
+      const updates: Partial<CircuitBreakerInfo> = {
+        successCount,
+      };
+
+      if (state.circuitBreaker.state === CircuitBreakerState.HALF_OPEN && successCount >= 3) {
+        updates.state = CircuitBreakerState.CLOSED;
+        updates.failures = 0;
+        updates.successCount = 0;
+        updates.lastFailureTime = null;
+        updates.nextRetryTime = null;
+      }
+
+      if (state.circuitBreaker.state === CircuitBreakerState.CLOSED) {
+        updates.failures = 0;
+      }
+
+      return {
+        circuitBreaker: {
+          ...state.circuitBreaker,
+          ...updates,
+        },
+      };
+    }),
+
+    resetCircuitBreaker: () => {
+      if (circuitBreakerTimer) {
+        clearTimeout(circuitBreakerTimer);
+        circuitBreakerTimer = null;
+      }
+      set({ circuitBreaker: initialCircuitBreaker });
+    },
+
+    checkCircuitBreakerTimeout: () => set((state) => {
+      if (state.circuitBreaker.state === CircuitBreakerState.OPEN &&
+          state.circuitBreaker.nextRetryTime &&
+          Date.now() >= state.circuitBreaker.nextRetryTime) {
+        return {
+          circuitBreaker: {
+            ...state.circuitBreaker,
+            state: CircuitBreakerState.HALF_OPEN,
+            successCount: 0,
+          },
+        };
+      }
+      return state;
+    }),
+
+    // Inbound traffic: metrics and (for stamped messages) the recovery anchor
+    // in ONE write, instead of two or three store updates per message.
+    recordInbound: (bytes, position) => set((state) => {
+      const metrics = {
+        ...state.metrics,
+        messagesReceived: state.metrics.messagesReceived + 1,
+        bytesReceived: state.metrics.bytesReceived + bytes,
+        lastMessageReceived: Date.now(),
+      };
+      if (!position) return { metrics };
+      return {
+        metrics,
+        subscriptions: {
+          ...state.subscriptions,
+          recoveryState: {
+            ...state.subscriptions.recoveryState,
+            [position.topic]: { epoch: position.epoch, offset: position.offset },
+          },
+        },
+      };
+    }),
+
+    // Subscription Actions
+    setActiveTopics: (topics) => set((state) => {
+      const next = [...new Set(topics)];
+      if (sameTopics(state.activeTopics, next)) return state;
+      return {
+        activeTopics: next,
+        subscriptions: {
+          ...state.subscriptions,
+          topics: next,
+          lastUpdate: Date.now(),
+        },
+      };
+    }),
+
+    addTopics: (topics) => set((state) => {
+      const next = [...new Set([...state.activeTopics, ...topics])];
+      if (sameTopics(state.activeTopics, next)) return state;
+      return {
+        activeTopics: next,
+        subscriptions: {
+          ...state.subscriptions,
+          topics: next,
+          lastUpdate: Date.now(),
+        },
+      };
+    }),
+
+    removeTopics: (topics) => set((state) => {
+      const drop = new Set(topics);
+      const next = state.activeTopics.filter(t => !drop.has(t));
+      if (sameTopics(state.activeTopics, next)) return state;
+      return {
+        activeTopics: next,
+        subscriptions: {
+          ...state.subscriptions,
+          topics: next,
+          lastUpdate: Date.now(),
+        },
+      };
+    }),
+
+    addPendingSubscription: (topic) => set((state) => ({
+      subscriptions: {
+        ...state.subscriptions,
+        pendingSubscriptions: [...new Set([...state.subscriptions.pendingSubscriptions, topic])],
+      }
+    })),
+
+    confirmSubscription: (topic) => set((state) => ({
+      activeTopics: [...new Set([...state.activeTopics, topic])],
+      subscriptions: {
+        ...state.subscriptions,
+        topics: [...new Set([...state.subscriptions.topics, topic])],
+        pendingSubscriptions: state.subscriptions.pendingSubscriptions.filter(t => t !== topic),
+        failedSubscriptions: state.subscriptions.failedSubscriptions.filter(t => t !== topic),
+        lastUpdate: Date.now(),
+      }
+    })),
+
+    failSubscription: (topic) => set((state) => ({
+      subscriptions: {
+        ...state.subscriptions,
+        pendingSubscriptions: state.subscriptions.pendingSubscriptions.filter(t => t !== topic),
+        failedSubscriptions: [...new Set([...state.subscriptions.failedSubscriptions, topic])],
+      }
+    })),
+
+    setServerRecoveryEnabled: (enabled) => set((state) => ({
+      subscriptions: {
+        ...state.subscriptions,
+        serverRecoveryEnabled: enabled,
+      }
+    })),
+
+    updateRecoveryState: (positions) => set((state) => ({
+      subscriptions: {
+        ...state.subscriptions,
+        recoveryState: { ...state.subscriptions.recoveryState, ...positions },
+      }
+    })),
+
+    removeRecoveryTopics: (topics) => set((state) => {
+      const cleaned = { ...state.subscriptions.recoveryState };
+      for (const t of topics) {
+        delete cleaned[t];
+      }
+      return { subscriptions: { ...state.subscriptions, recoveryState: cleaned } };
+    }),
+
+    // Queue Actions
+    updateQueueStats: (stats) => set((state) => ({
+      messageQueue: { ...state.messageQueue, ...stats },
+    })),
+
+    updateOfflineQueue: (updates) => set((state) => ({
+      offlineQueue: { ...state.offlineQueue, ...updates },
+    })),
+
+    // Diagnostics Actions
+    updateDiagnostics: (diagnostics) => set({ diagnostics }),
+
+    // Performance Actions
+    updatePerformance: (updates) => set((state) => ({
+      performance: { ...state.performance, ...updates },
+    })),
+
+    // Security Actions
+    updateSecurity: (updates) => set((state) => ({
+      security: { ...state.security, ...updates },
+    })),
+
+    // Error Actions
+    setLastError: (error, code) => set((state) => {
+      // When clearing error (null), don't add to history
+      if (error === null) {
+        return {
+          lastError: null,
+          metrics: {
+            ...state.metrics,
+            lastErrorMessage: null,
+          },
+        };
+      }
+
+      return {
+        lastError: error,
+        errorHistory: [
+          ...state.errorHistory.slice(-49),
+          { timestamp: Date.now(), error, code },
+        ],
+        metrics: {
+          ...state.metrics,
+          lastErrorCode: code ?? state.metrics.lastErrorCode,
+          lastErrorMessage: error,
+        },
+      };
+    }),
+
+    clearErrors: () => set({ lastError: null, errorHistory: [] }),
+
+    // Configuration Actions
+    updateConfig: (updates) => set((state) => ({
+      config: { ...state.config, ...updates },
+    })),
+
+    // Computed Getters
+    isConnected: () => get().connectionState === ConnectionState.CONNECTED,
+
+    canReconnect: () => {
+      const state = get();
+
+      if (!state.config.reconnectEnabled) {
+        return false;
+      }
+
+      if (state.connectionState !== ConnectionState.DISCONNECTED &&
+          state.connectionState !== ConnectionState.ERROR &&
+          state.connectionState !== ConnectionState.RECONNECTING) {
+        return false;
+      }
+
+      if (state.circuitBreaker.state === CircuitBreakerState.OPEN) {
+        if (state.circuitBreaker.nextRetryTime &&
+            Date.now() >= state.circuitBreaker.nextRetryTime) {
+          state.updateCircuitBreaker({ state: CircuitBreakerState.HALF_OPEN });
+          return true;
+        }
+        return false;
+      }
+
+      // No attempt cap here: the ConnectionManager owns the reconnection
+      // policy (reconnection.maxAttempts, -1 = infinite). A second hard-coded
+      // cap of 10 in this store used to park every tab after ~5 minutes of
+      // outage, whatever maxAttempts said.
+      return true;
+    },
+
+    getConnectionQuality: () => {
+      const { avgLatency, packetLoss } = get().metrics;
+      if (!avgLatency) return ConnectionQuality.UNKNOWN;
+
+      if (avgLatency < 50 && packetLoss < 0.1) return ConnectionQuality.EXCELLENT;
+      if (avgLatency < 150 && packetLoss < 1) return ConnectionQuality.GOOD;
+      if (avgLatency < 300 && packetLoss < 3) return ConnectionQuality.FAIR;
+      return ConnectionQuality.POOR;
+    },
+
+    clearTimers: () => {
+      if (circuitBreakerTimer) {
+        clearTimeout(circuitBreakerTimer);
+        circuitBreakerTimer = null;
+      }
+    },
+
+    // Reset
+    reset: () => {
+      if (circuitBreakerTimer) {
+        clearTimeout(circuitBreakerTimer);
+        circuitBreakerTimer = null;
+      }
+
+      latencyHistory = [];
+
+      set(initialState);
+    },
+  };
+};
+

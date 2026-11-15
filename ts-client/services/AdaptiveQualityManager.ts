@@ -75,6 +75,8 @@ export interface AdaptiveQualityOptions {
    * nothing; a longer one switches to the polling strategy. Default 5000.
    */
   outageGraceMs?: number;
+  /** Where its `connectionQualityChanged` events go. Default: the page's window. */
+  emit?: (type: string, detail?: unknown) => void;
 }
 
 export interface QualityChangeDetail {
@@ -127,8 +129,10 @@ export class AdaptiveQualityManager {
   private planned = false;
   private outageTimer: ReturnType<typeof setTimeout> | null = null;
   private destroyed = false;
+  private readonly emit: (type: string, detail?: unknown) => void;
 
   constructor(options: AdaptiveQualityOptions = {}) {
+    this.emit = options.emit ?? dispatchWSEEvent;
     this.queryClient = options.queryClient ?? null;
     const grace = options.outageGraceMs ?? DEFAULT_OUTAGE_GRACE_MS;
     this.outageGraceMs = Number.isFinite(grace) && grace >= 0 ? grace : DEFAULT_OUTAGE_GRACE_MS;
@@ -291,7 +295,7 @@ export class AdaptiveQualityManager {
         recentReconnects: this.reconnects.length,
       },
     };
-    dispatchWSEEvent('connectionQualityChanged', detail);
+    this.emit('connectionQualityChanged', detail);
   }
 
   private restoreDefaults(): void {

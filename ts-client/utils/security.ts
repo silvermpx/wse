@@ -5,11 +5,6 @@
 import { E2eOffer, type E2eSession, type E2eTrust } from './e2eSession.js';
 import { logger } from './logger.js';
 
-// Check for Web Crypto API availability
-if (typeof window !== 'undefined' && !window.crypto?.subtle) {
-  logger.warn('Web Crypto API not available. HTTPS required for crypto.subtle');
-}
-
 // Security error types
 export class SecurityError extends Error {
   constructor(

@@ -10,6 +10,8 @@ export interface OfflineQueueConfig {
   maxSize: number;
   maxAge: number;
   persistToStorage: boolean;
+  /** The IndexedDB database. Default `wse_offline_queue` (the default client's). */
+  dbName?: string;
 }
 
 /** One persisted message. `message` is the complete wire message (cid/enc kept). */
@@ -76,6 +78,7 @@ export class OfflineQueue {
 
   constructor(config: OfflineQueueConfig) {
     this.config = config;
+    if (config.dbName) this.dbName = config.dbName;
   }
 
   async initialize(): Promise<void> {

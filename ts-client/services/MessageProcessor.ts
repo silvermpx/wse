@@ -27,8 +27,6 @@ import {
   SendStatus,
   WSEGapEvent,
 } from '../types.js';
-import { useWSEStore } from '../stores/useWSEStore.js';
-import { useMessageQueueStore } from '../stores/useMessageQueueStore.js';
 import { EventSequencer, type TopicPosition } from './EventSequencer.js';
 import { CompressionManager, DecompressedSizeLimitError } from '../protocols/compression.js';
 import { logger } from '../utils/logger.js';
@@ -39,10 +37,8 @@ import {
   DEFAULT_RECOVERY_TIMEOUT_MS,
   OFFLINE_OWNER_STORAGE_KEY,
 } from '../constants.js';
-import { securityManager } from '../utils/security.js';
 import { generateId } from '../utils/id.js';
-import { ownerEpoch } from './ownership.js';
-import { dispatchWSEEvent } from '../utils/events.js';
+import { createClientContext, OFFLINE_OWNER_KEY, type ClientContext } from '../core/context.js';
 import type { SendResult } from './ConnectionManager.js';
 import type { OfflineQueue } from './OfflineQueue.js';
 
@@ -64,6 +60,8 @@ export interface ProcessorConnection {
 }
 
 export interface MessageProcessorOptions {
+  /** The client this processor is of: its state, queue, keys and events. Default: one of its own. */
+  context?: ClientContext;
   /** Inbound size limit in bytes (characters for text frames); checked while inflating. */
   maxMessageSize?: number;
   /** Hold window for out-of-order messages while a requested replay may fill a gap. */
@@ -154,23 +152,6 @@ const MAX_RECOVERY_BUFFER = 1000;
 const MAX_EARLY_ENCRYPTED_FRAMES = 1000;
 const MAX_LOGGED_UNHANDLED_TYPES = 1000;
 const PARKED = Symbol('parked');
-
-/** The user of this browser's last connection, kept across page loads. */
-function storedOwner(): string | undefined {
-  try {
-    return localStorage.getItem(OFFLINE_OWNER_STORAGE_KEY) ?? undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function storeOwner(user: string): void {
-  try {
-    localStorage.setItem(OFFLINE_OWNER_STORAGE_KEY, user);
-  } catch {
-    // no storage: owners come from this page's connections only
-  }
-}
 
 function isSystemType(type: string): boolean {
   return SYSTEM_TYPES.has(type) || type.includes('snapshot');
@@ -291,11 +272,14 @@ export class MessageProcessor {
     'PONG',
   ]);
 
+  private readonly ctx: ClientContext;
+
   constructor(
     private batchSize: number = 10,
     private batchTimeout: number = 100,
     options: MessageProcessorOptions = {},
   ) {
+    this.ctx = options.context ?? createClientContext();
     this.ownsSequencer = !options.sequencer;
     this.sequencer = options.sequencer ?? new EventSequencer();
     this.maxMessageSize = options.maxMessageSize && options.maxMessageSize > 0
@@ -414,7 +398,7 @@ export class MessageProcessor {
     this.inboundChain = run.catch((error) => {
       logger.error('Error processing message:', error);
       try {
-        useWSEStore.getState().setLastError('Message processing error');
+        this.ctx.state.getState().setLastError('Message processing error');
       } catch {
         // ignore
       }
@@ -423,11 +407,11 @@ export class MessageProcessor {
   }
 
   private recordInbound(bytes: number, position?: { topic: string; epoch: string; offset: number }): void {
-    useWSEStore.getState().recordInbound(bytes, position);
+    this.ctx.state.getState().recordInbound(bytes, position);
   }
 
   private countDropped(count: number): void {
-    const store = useWSEStore.getState();
+    const store = this.ctx.state.getState();
     store.updateMetrics({ messagesDropped: store.metrics.messagesDropped + count });
   }
 
@@ -435,12 +419,12 @@ export class MessageProcessor {
     let message: WSMessage | null | typeof PARKED;
     let size: number;
 
-    if (securityManager.isSessionMode() && !isSealed(data)) {
+    if (this.ctx.security.isSessionMode() && !isSealed(data)) {
       // An E2E session is opened first and then every frame is sealed:
       // unsealed come only the server's answer to the offer, an error and
       // heartbeats before it. Anything else was put in by whatever sits
       // between client and server.
-      if (securityManager.isTransportEncryptionReady()) {
+      if (this.ctx.security.isTransportEncryptionReady()) {
         this.connectionManager?.failEncryption('E2E frame refused (a plaintext frame inside the session)');
         return;
       }
@@ -619,7 +603,7 @@ export class MessageProcessor {
     if (typeof clientTs === 'number' && clientTs > 0) {
       const latency = Date.now() - clientTs;
       if (latency >= 0) {
-        useWSEStore.getState().recordLatency(latency);
+        this.ctx.state.getState().recordLatency(latency);
         this.onLatency?.(latency);
       }
     }
@@ -632,7 +616,7 @@ export class MessageProcessor {
    */
   private takeSigningKid(signing: any, sealed: boolean): void {
     if (typeof signing?.kid !== 'string') return;
-    if (!sealed && securityManager.isSessionMode()) return;
+    if (!sealed && this.ctx.security.isSessionMode()) return;
     this.serverSigningKid = signing.kid;
   }
 
@@ -656,6 +640,23 @@ export class MessageProcessor {
     return kid;
   }
 
+  /** The user of this client's last connection, kept across page loads. */
+  private storedOwner(): string | undefined {
+    try {
+      return this.ctx.storage.get(OFFLINE_OWNER_KEY) ?? undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private storeOwner(user: string): void {
+    try {
+      this.ctx.storage.set(OFFLINE_OWNER_KEY, user);
+    } catch {
+      // no storage: owners come from this page's connections only
+    }
+  }
+
   /** The server's history_ttl (seconds), when it names one. */
   private takeHistoryTtl(value: unknown): void {
     const seconds = Number(value);
@@ -667,21 +668,21 @@ export class MessageProcessor {
     const details = payload.details || payload;
     const features = details.features || {};
     if (typeof features.recovery === 'boolean') {
-      useWSEStore.getState().setServerRecoveryEnabled(features.recovery);
+      this.ctx.state.getState().setServerRecoveryEnabled(features.recovery);
     }
     this.takeHistoryTtl(features.history_ttl);
     this.takeSigningKid(details.signing, true);
     this.connectionUser = typeof details.user_id === 'string' ? details.user_id : null;
     if (typeof details.user_id === 'string' && details.user_id) {
       this.userId = details.user_id;
-      storeOwner(details.user_id);
+      this.storeOwner(details.user_id);
     }
     this.connectionManager?.handleServerReady(details);
   }
 
   private async processServerHello(message: WSMessage): Promise<void> {
     const payload = message.p || {};
-    const store = useWSEStore.getState();
+    const store = this.ctx.state.getState();
     this.takeSigningKid(payload.signing, false);
 
     if (payload.features) {
@@ -699,7 +700,7 @@ export class MessageProcessor {
     }
 
     if (payload.limits?.max_queue_size) {
-      useMessageQueueStore.getState().setCapacity(payload.limits.max_queue_size);
+      this.ctx.queue.getState().setCapacity(payload.limits.max_queue_size);
     }
 
     const cm = this.connectionManager;
@@ -750,7 +751,7 @@ export class MessageProcessor {
       const timestamp = parseInt(data.split(':').pop() || '0', 10);
       const latency = Date.now() - timestamp;
       if (timestamp > 0 && latency >= 0) {
-        useWSEStore.getState().recordLatency(latency);
+        this.ctx.state.getState().recordLatency(latency);
         this.onLatency?.(latency);
       }
       return null;
@@ -776,7 +777,7 @@ export class MessageProcessor {
     if (view.length >= 2 && view[0] === 67 && view[1] === 58) {
       try {
         const decompressed = this.compression.decompress(data.slice(2), this.maxMessageSize);
-        const store = useWSEStore.getState();
+        const store = this.ctx.state.getState();
         store.incrementMetric('compressionHits');
         const text = new TextDecoder().decode(decompressed);
         const { json } = stripCategoryPrefix(text);
@@ -810,7 +811,7 @@ export class MessageProcessor {
     if (view.length > 2 && view[0] === 0x78 && [0x01, 0x5e, 0x9c, 0xda].includes(view[1])) {
       try {
         const decompressed = this.compression.decompress(data, this.maxMessageSize);
-        useWSEStore.getState().incrementMetric('compressionHits');
+        this.ctx.state.getState().incrementMetric('compressionHits');
         const { json } = stripCategoryPrefix(new TextDecoder().decode(decompressed));
         return JSON.parse(json);
       } catch (error) {
@@ -845,10 +846,10 @@ export class MessageProcessor {
 
   private async processEncryptedFrame(data: ArrayBuffer): Promise<WSMessage | null | typeof PARKED> {
     const cm = this.connectionManager;
-    if (!securityManager.isTransportEncryptionReady()) {
-      if (securityManager.hasPendingKeyDerivation()) {
+    if (!this.ctx.security.isTransportEncryptionReady()) {
+      if (this.ctx.security.hasPendingKeyDerivation()) {
         // The key is being derived right now: wait for it instead of dropping.
-        const ok = await securityManager.waitForTransportKey();
+        const ok = await this.ctx.security.waitForTransportKey();
         if (!ok) {
           logger.warn('Encrypted message dropped: the key exchange failed');
           return null;
@@ -869,7 +870,7 @@ export class MessageProcessor {
     }
 
     try {
-      const plaintext = await securityManager.decryptBytesFromTransport(data);
+      const plaintext = await this.ctx.security.decryptBytesFromTransport(data);
       if (!plaintext) {
         logger.warn('Decryption returned nothing for an encrypted message');
         return null;
@@ -897,9 +898,9 @@ export class MessageProcessor {
   private async skipSealedFrame(buffer: ArrayBuffer): Promise<void> {
     const view = new Uint8Array(buffer);
     if (view.length < 2 || view[0] !== 69 || view[1] !== 58) return;
-    if (!securityManager.isSessionMode() || !securityManager.isTransportEncryptionReady()) return;
+    if (!this.ctx.security.isSessionMode() || !this.ctx.security.isTransportEncryptionReady()) return;
     try {
-      await securityManager.decryptBytesFromTransport(buffer);
+      await this.ctx.security.decryptBytesFromTransport(buffer);
     } catch (error) {
       if (error instanceof E2eError) {
         this.connectionManager?.failEncryption(`E2E frame refused (${error.message})`);
@@ -911,7 +912,7 @@ export class MessageProcessor {
     if (this.earlyEncryptedFrames.length === 0) return;
     const frames = this.earlyEncryptedFrames;
     this.earlyEncryptedFrames = [];
-    if (!securityManager.isTransportEncryptionReady()) {
+    if (!this.ctx.security.isTransportEncryptionReady()) {
       logger.warn(`Dropping ${frames.length} encrypted frame(s): the key exchange did not complete`);
       return;
     }
@@ -1036,7 +1037,7 @@ export class MessageProcessor {
 
   private async deliverHeld(topic: string, epoch: string, offset: number, message: WSMessage): Promise<void> {
     this.sequencer.setTopicPosition(topic, epoch, offset);
-    useWSEStore.getState().updateRecoveryState({ [topic]: { epoch, offset } });
+    this.ctx.state.getState().updateRecoveryState({ [topic]: { epoch, offset } });
     await this.deliver(message);
   }
 
@@ -1136,7 +1137,7 @@ export class MessageProcessor {
    */
   private requestReplay(topic: string, epoch: string, offset: number): boolean {
     if (this.destroyed || !(this.recoveryTimeoutMs > 0)) return false;
-    if (!useWSEStore.getState().subscriptions.serverRecoveryEnabled || !this.connectionManager?.isReady()) {
+    if (!this.ctx.state.getState().subscriptions.serverRecoveryEnabled || !this.connectionManager?.isReady()) {
       return false;
     }
     logger.info(`Asking for the replay of topic ${topic} after offset ${offset}`);
@@ -1158,7 +1159,7 @@ export class MessageProcessor {
     logger.warn(
       `Gap on topic ${gap.topic}: ${gap.missed ?? 'an unknown number of'} message(s) missing (${gap.reason})`
     );
-    const store = useWSEStore.getState();
+    const store = this.ctx.state.getState();
     store.updateMetrics({
       gapsDetected: store.metrics.gapsDetected + 1,
       messagesMissed: store.metrics.messagesMissed + (gap.missed ?? 0),
@@ -1168,7 +1169,7 @@ export class MessageProcessor {
     } catch (error) {
       logger.error('Gap listener failed:', error);
     }
-    dispatchWSEEvent('wseGap', gap);
+    this.ctx.emit('wseGap', gap);
   }
 
   /** Recovery bookkeeping for a subscription_update reply (runs before any handler). */
@@ -1327,12 +1328,12 @@ export class MessageProcessor {
   private raiseStream(topic: string, epoch: string, offset: number): void {
     this.sequencer.raiseStream(topic, epoch, offset);
     const at = this.sequencer.getTopicPosition(topic);
-    if (at) useWSEStore.getState().updateRecoveryState({ [topic]: at });
+    if (at) this.ctx.state.getState().updateRecoveryState({ [topic]: at });
   }
 
   private setBaseline(topic: string, epoch: string, offset: number): void {
     this.sequencer.setTopicPosition(topic, epoch, offset);
-    useWSEStore.getState().updateRecoveryState({ [topic]: { epoch, offset } });
+    this.ctx.state.getState().updateRecoveryState({ [topic]: { epoch, offset } });
   }
 
   /**
@@ -1359,7 +1360,7 @@ export class MessageProcessor {
       this.unrecovered.delete(topic);
     }
     this.sequencer.clearTopics(topics);
-    useWSEStore.getState().removeRecoveryTopics(topics);
+    this.ctx.state.getState().removeRecoveryTopics(topics);
   }
 
   /** The socket is gone: release held messages and drop undecryptable early frames. */
@@ -1399,7 +1400,7 @@ export class MessageProcessor {
       const started = sampled ? monotonicNow() : 0;
       try {
         const result: unknown = handler(message);
-        if (sampled) useWSEStore.getState().recordHandlerTime(monotonicNow() - started);
+        if (sampled) this.ctx.state.getState().recordHandlerTime(monotonicNow() - started);
         if (result && typeof (result as Promise<unknown>).then === 'function') {
           (result as Promise<unknown>).catch((error) => {
             logger.error(`Error in handler for ${type}:`, error);
@@ -1417,7 +1418,7 @@ export class MessageProcessor {
     }
     // Catch-all for messages no handler claimed: one fixed event name, so a
     // server message type can never collide with a real DOM event.
-    dispatchWSEEvent('wseMessage', message);
+    this.ctx.emit('wseMessage', message);
   }
 
   // ---------------------------------------------------------------------------
@@ -1437,28 +1438,28 @@ export class MessageProcessor {
     this.messageHandlers.set('health_check_response', (msg) => this.handleHealthCheckResponse(msg));
     this.messageHandlers.set('rate_limit_warning', (msg) => this.handleRateLimitWarning(msg));
     this.messageHandlers.set('connection_quality', (msg) => this.handleConnectionQuality(msg));
-    this.messageHandlers.set('snapshot_complete', (msg) => dispatchWSEEvent('snapshotComplete', msg.p));
+    this.messageHandlers.set('snapshot_complete', (msg) => this.ctx.emit('snapshotComplete', msg.p));
     this.messageHandlers.set('heartbeat', () => this.handleHeartbeat());
 
     // Presence handlers
-    this.messageHandlers.set('presence_join', (msg) => dispatchWSEEvent('presenceJoin', msg.p));
-    this.messageHandlers.set('presence_leave', (msg) => dispatchWSEEvent('presenceLeave', msg.p));
-    this.messageHandlers.set('presence_update', (msg) => dispatchWSEEvent('presenceUpdate', msg.p));
+    this.messageHandlers.set('presence_join', (msg) => this.ctx.emit('presenceJoin', msg.p));
+    this.messageHandlers.set('presence_leave', (msg) => this.ctx.emit('presenceLeave', msg.p));
+    this.messageHandlers.set('presence_update', (msg) => this.ctx.emit('presenceUpdate', msg.p));
 
     // Debug / configuration / encryption responses
-    this.messageHandlers.set('debug_response', (msg) => dispatchWSEEvent('debugResponse', msg.p));
-    this.messageHandlers.set('sequence_stats_response', (msg) => dispatchWSEEvent('sequenceStatsResponse', msg.p));
-    this.messageHandlers.set('config_response', (msg) => dispatchWSEEvent('configResponse', msg.p));
-    this.messageHandlers.set('config_update_response', (msg) => dispatchWSEEvent('configUpdateResponse', msg.p));
+    this.messageHandlers.set('debug_response', (msg) => this.ctx.emit('debugResponse', msg.p));
+    this.messageHandlers.set('sequence_stats_response', (msg) => this.ctx.emit('sequenceStatsResponse', msg.p));
+    this.messageHandlers.set('config_response', (msg) => this.ctx.emit('configResponse', msg.p));
+    this.messageHandlers.set('config_update_response', (msg) => this.ctx.emit('configUpdateResponse', msg.p));
     this.messageHandlers.set('encryption_response', (msg) => this.handleEncryptionResponse(msg));
     this.messageHandlers.set('key_rotation_response', (msg) => this.handleKeyRotationResponse(msg));
-    this.messageHandlers.set('batch_message_result', (msg) => dispatchWSEEvent('batchMessageResult', msg.p));
-    this.messageHandlers.set('metrics_response', (msg) => dispatchWSEEvent('metricsResponse', msg.p));
+    this.messageHandlers.set('batch_message_result', (msg) => this.ctx.emit('batchMessageResult', msg.p));
+    this.messageHandlers.set('metrics_response', (msg) => this.ctx.emit('metricsResponse', msg.p));
     this.messageHandlers.set('connection_state_response', (msg) => this.handleConnectionStateResponse(msg));
 
     // Sync request handler
     this.messageHandlers.set('sync_request', () => {
-      const store = useWSEStore.getState();
+      const store = this.ctx.state.getState();
       this.queueOutgoing({
         t: 'sync_response',
         p: {
@@ -1474,7 +1475,7 @@ export class MessageProcessor {
     // Config update handler
     this.messageHandlers.set('config_update', (msg) => {
       const config = msg.p || {};
-      const store = useWSEStore.getState();
+      const store = this.ctx.state.getState();
 
       if (config.compression_enabled !== undefined) {
         store.updateConfig({ compressionEnabled: config.compression_enabled });
@@ -1489,7 +1490,7 @@ export class MessageProcessor {
         }
       }
       if (config.max_queue_size !== undefined) {
-        useMessageQueueStore.getState().setCapacity(config.max_queue_size);
+        this.ctx.queue.getState().setCapacity(config.max_queue_size);
       }
 
       logger.debug('Configuration updated:', config);
@@ -1497,8 +1498,8 @@ export class MessageProcessor {
 
     // Metrics request handler
     this.messageHandlers.set('metrics_request', () => {
-      const store = useWSEStore.getState();
-      const queueStore = useMessageQueueStore.getState();
+      const store = this.ctx.state.getState();
+      const queueStore = this.ctx.queue.getState();
 
       this.queueOutgoing({
         t: 'metrics_response',
@@ -1532,7 +1533,7 @@ export class MessageProcessor {
 
   private handleSubscriptionUpdate(message: WSMessage): void {
     const payload = message.p || {};
-    const store = useWSEStore.getState();
+    const store = this.ctx.state.getState();
 
     if (payload.success) {
       payload.success_topics?.forEach((topic: string) => {
@@ -1546,11 +1547,11 @@ export class MessageProcessor {
       });
     }
 
-    dispatchWSEEvent('subscriptionUpdate', payload);
+    this.ctx.emit('subscriptionUpdate', payload);
   }
 
   private handleError(message: WSMessage): void {
-    const store = useWSEStore.getState();
+    const store = this.ctx.state.getState();
 
     const errorData = message.p || {};
     const errorMessage = errorData.message || 'Unknown error';
@@ -1566,11 +1567,11 @@ export class MessageProcessor {
     );
 
     if (errorCode === 'INIT_ERROR' && !recoverable) {
-      dispatchWSEEvent('wseInitializationError', { message: errorMessage, code: errorCode, recoverable: false, details });
+      this.ctx.emit('wseInitializationError', { message: errorMessage, code: errorCode, recoverable: false, details });
     }
 
     if (errorCode === 'SERVER_ERROR') {
-      dispatchWSEEvent('wseServerError', { message: errorMessage, code: errorCode, details });
+      this.ctx.emit('wseServerError', { message: errorMessage, code: errorCode, details });
     }
 
     if (errorCode === 'CIRCUIT_BREAKER_OPEN') {
@@ -1581,7 +1582,7 @@ export class MessageProcessor {
     }
 
     if (errorCode === 'RATE_LIMITED' || errorCode === 'RATE_LIMIT_EXCEEDED' || String(errorMessage).includes('Rate limit')) {
-      dispatchWSEEvent('rateLimitExceeded', {
+      this.ctx.emit('rateLimitExceeded', {
         message: errorMessage,
         retryAfter: errorData.retry_after || errorData.retryAfter,
         ...details
@@ -1589,14 +1590,14 @@ export class MessageProcessor {
     }
 
     if (errorCode === 'SUBSCRIPTION_FAILED') {
-      dispatchWSEEvent('subscriptionFailed', {
+      this.ctx.emit('subscriptionFailed', {
         message: errorMessage,
         topics: errorData.topics || [],
         ...details
       });
     }
 
-    dispatchWSEEvent('serverError', {
+    this.ctx.emit('serverError', {
       message: errorMessage,
       code: errorCode,
       details: errorData,
@@ -1611,7 +1612,7 @@ export class MessageProcessor {
     });
 
     if (!recoverable || errorCode === 'PROTOCOL_ERROR' || errorCode === 'INVALID_MESSAGE') {
-      dispatchWSEEvent('criticalError', {
+      this.ctx.emit('criticalError', {
         code: errorCode,
         message: errorMessage,
         shouldReconnect: errorData.shouldReconnect !== false
@@ -1621,7 +1622,7 @@ export class MessageProcessor {
 
   private handleConnectionStateChange(message: WSMessage): void {
     const payload = message.p || {};
-    const store = useWSEStore.getState();
+    const store = this.ctx.state.getState();
 
     if (payload.new_state) {
       const stateMap: Record<string, ConnectionState> = {
@@ -1640,7 +1641,7 @@ export class MessageProcessor {
       }
     }
 
-    dispatchWSEEvent('connectionStateChange', {
+    this.ctx.emit('connectionStateChange', {
       oldState: payload.old_state,
       newState: payload.new_state,
       connectionId: payload.connection_id,
@@ -1649,7 +1650,7 @@ export class MessageProcessor {
   }
 
   private handleHealthCheck(): void {
-    const store = useWSEStore.getState();
+    const store = this.ctx.state.getState();
     store.updateMetrics({ lastHealthCheck: Date.now() });
 
     this.queueOutgoing({
@@ -1658,7 +1659,7 @@ export class MessageProcessor {
         client_version: WS_CLIENT_VERSION,
         stats: store.metrics,
         diagnostics: store.diagnostics,
-        queue_size: useMessageQueueStore.getState().size,
+        queue_size: this.ctx.queue.getState().size,
       }
     }, MessagePriority.CRITICAL);
   }
@@ -1666,19 +1667,19 @@ export class MessageProcessor {
   private handleHealthCheckResponse(message: WSMessage): void {
     const payload = message.p || {};
     if (payload.diagnostics) {
-      useWSEStore.getState().updateDiagnostics(payload.diagnostics);
+      this.ctx.state.getState().updateDiagnostics(payload.diagnostics);
     }
   }
 
   private handleRateLimitWarning(message: WSMessage): void {
     const warning = message.p || {};
     logger.warn('Rate limit warning:', warning);
-    useWSEStore.getState().setLastError(`Rate limit: remaining=${warning.remaining}, limit=${warning.limit}`, 429);
+    this.ctx.state.getState().setLastError(`Rate limit: remaining=${warning.remaining}, limit=${warning.limit}`, 429);
   }
 
   private handleConnectionQuality(message: WSMessage): void {
     const payload = message.p || {};
-    const store = useWSEStore.getState();
+    const store = this.ctx.state.getState();
 
     if (payload.suggestions && payload.suggestions.length > 0) {
       const currentDiagnostics = store.diagnostics || {
@@ -1715,26 +1716,26 @@ export class MessageProcessor {
   }
 
   private handleHeartbeat(): void {
-    useWSEStore.getState().updateMetrics({ lastHealthCheck: Date.now() });
+    this.ctx.state.getState().updateMetrics({ lastHealthCheck: Date.now() });
   }
 
   // An application's own messages: passed on as events. The store's security
   // state follows the real handshake alone; a message claiming encryption
   // must not make the client show it.
   private handleEncryptionResponse(message: WSMessage): void {
-    dispatchWSEEvent('encryptionResponse', message.p || {});
+    this.ctx.emit('encryptionResponse', message.p || {});
   }
 
   private handleKeyRotationResponse(message: WSMessage): void {
-    dispatchWSEEvent('keyRotationResponse', message.p || {});
+    this.ctx.emit('keyRotationResponse', message.p || {});
   }
 
   private handleConnectionStateResponse(message: WSMessage): void {
     const payload = message.p || {};
     if (payload.metrics) {
-      useWSEStore.getState().updateMetrics(payload.metrics);
+      this.ctx.state.getState().updateMetrics(payload.metrics);
     }
-    dispatchWSEEvent('connectionStateResponse', payload);
+    this.ctx.emit('connectionStateResponse', payload);
   }
 
   // ---------------------------------------------------------------------------
@@ -1756,7 +1757,7 @@ export class MessageProcessor {
     // Made for the user whose data the page holds now: once another user's
     // takes its place, it does not go out (not even from a write to the
     // offline queue that ends after that).
-    const owner = ownerEpoch();
+    const owner = this.ctx.owner.current();
     // Only for the socket it was made on (a signed message): dropped once
     // that one is gone, never sent on a later connection.
     if (options.liveOn !== undefined) {
@@ -1772,7 +1773,7 @@ export class MessageProcessor {
       : undefined;
 
     const cm = this.connectionManager;
-    const queueEmpty = useMessageQueueStore.getState().size === 0;
+    const queueEmpty = this.ctx.queue.getState().size === 0;
     const offlinePending = (this.offlineQueue?.getStats().size ?? 0) > 0;
 
     // Fast path keeps latency low; it is skipped while anything older is
@@ -1790,7 +1791,7 @@ export class MessageProcessor {
       const queue = this.offlineQueue;
       // Written for the user of this page's last connection (or, before any,
       // of this browser's): only that user's connection replays it.
-      queue.enqueue(message, expiresAt, this.userId ?? storedOwner()).then(
+      queue.enqueue(message, expiresAt, this.userId ?? this.storedOwner()).then(
         (stored) => {
           if (!stored) this.enqueueInMemory(message, priority, expiresAt, owner);
           else this.scheduleFlush(0);
@@ -1810,16 +1811,16 @@ export class MessageProcessor {
     message: WSMessage,
     priority: number,
     expiresAt?: number,
-    owner: number = ownerEpoch(),
+    owner: number = this.ctx.owner.current(),
     liveOn?: number,
   ): boolean {
     if (this.destroyed) return false;
-    if (owner !== ownerEpoch()) {
+    if (owner !== this.ctx.owner.current()) {
       this.countDropped(1);
       logger.warn(`Dropping ${message.t}: it was made for the previous user`);
       return false;
     }
-    const queueStore = useMessageQueueStore.getState();
+    const queueStore = this.ctx.queue.getState();
     const queued: QueuedMessage = {
       id: message.id || generateId(),
       type: message.t,
@@ -1843,7 +1844,7 @@ export class MessageProcessor {
       return false;
     }
 
-    useWSEStore.getState().incrementMetric('messagesQueued');
+    this.ctx.state.getState().incrementMetric('messagesQueued');
     if (this.connectionManager?.isTransportReady()) {
       this.scheduleFlush(0);
     }
@@ -1909,7 +1910,7 @@ export class MessageProcessor {
     }
 
     this.flushing = true;
-    const queueStore = useMessageQueueStore.getState();
+    const queueStore = this.ctx.queue.getState();
     try {
       do {
         this.flushRequested = false;
@@ -1951,7 +1952,7 @@ export class MessageProcessor {
 
     const step = Math.max(1, this.batchSize);
     while (!this.destroyed) {
-      const queueStore = useMessageQueueStore.getState();
+      const queueStore = this.ctx.queue.getState();
       if (queueStore.size === 0) return false;
       queueStore.setProcessing(true);
       const batch = queueStore.dequeue(step);
@@ -1965,7 +1966,7 @@ export class MessageProcessor {
           continue;
         }
         const wire = this.toWire(batch[i]);
-        if (batch[i].owner !== undefined && batch[i].owner !== ownerEpoch()) {
+        if (batch[i].owner !== undefined && batch[i].owner !== this.ctx.owner.current()) {
           this.countDropped(1);
           logger.warn(`Dropping ${batch[i].type}: it was made for the previous user`);
           continue;
@@ -1984,7 +1985,7 @@ export class MessageProcessor {
           continue;
         }
         // Not sent: everything from here on goes back, in order.
-        useMessageQueueStore.getState().requeue(batch.slice(i));
+        this.ctx.queue.getState().requeue(batch.slice(i));
         if (result === 'rate_limited') {
           this.scheduleFlush(cm.getRetryAfterMs());
         }
@@ -2065,7 +2066,7 @@ export class MessageProcessor {
    */
   async processBatch(): Promise<WSMessage[]> {
     if (this.destroyed) return [];
-    const messages = useMessageQueueStore.getState().dequeue(this.batchSize);
+    const messages = this.ctx.queue.getState().dequeue(this.batchSize);
     return messages.map(msg => ({
       ...this.toWire(msg),
       seq: this.sequencer.getNextSequence(),

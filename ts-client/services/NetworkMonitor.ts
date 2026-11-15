@@ -3,7 +3,7 @@
 // =============================================================================
 
 import { NetworkDiagnostics, ConnectionQuality } from '../types.js';
-import { useWSEStore } from '../stores/useWSEStore.js';
+import { createClientContext, type ClientContext } from '../core/context.js';
 import { logger } from '../utils/logger.js';
 
 /**
@@ -31,11 +31,15 @@ export class NetworkMonitor {
    *   the result to the store. useWSE passes diagnostics.enabled here, so
    *   `diagnostics: { enabled: false }` really leaves no timer running.
    */
+  private readonly ctx: ClientContext;
+
   constructor(
     private maxHistorySize = 100,
     private diagnosticsIntervalMs = 30000,
     autoAnalyze = true,
+    context?: ClientContext,
   ) {
+    this.ctx = context ?? createClientContext();
     if (autoAnalyze && typeof window !== 'undefined' && diagnosticsIntervalMs > 0) {
       this.startDiagnostics();
     }
@@ -134,7 +138,7 @@ export class NetworkMonitor {
     this.diagnosticsInterval = setInterval(() => {
       const diagnostics = this.analyze();
 
-      const store = useWSEStore.getState();
+      const store = this.ctx.state.getState();
       store.updateDiagnostics(diagnostics);
 
       if (diagnostics.quality === ConnectionQuality.POOR) {

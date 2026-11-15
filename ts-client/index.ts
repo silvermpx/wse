@@ -45,14 +45,14 @@ export { eventTransformer } from './protocols/transformer.js';
 // Services (for advanced usage)
 // ---------------------------------------------------------------------------
 
-export { ConnectionManager } from './services/ConnectionManager.js';
+export { ConnectionManager } from './legacy/services.js';
 export type { ConnectionManagerConfig, SendResult } from './services/ConnectionManager.js';
-export { MessageProcessor } from './services/MessageProcessor.js';
+export { MessageProcessor } from './legacy/services.js';
 export type { MessageProcessorOptions, ProcessorConnection } from './services/MessageProcessor.js';
 export { RateLimiter } from './services/RateLimiter.js';
 export { ConnectionPool } from './services/ConnectionPool.js';
 export type { ConnectionPoolConfig } from './services/ConnectionPool.js';
-export { NetworkMonitor } from './services/NetworkMonitor.js';
+export { NetworkMonitor } from './legacy/services.js';
 export { AdaptiveQualityManager, QUALITY_STRATEGIES } from './services/AdaptiveQualityManager.js';
 export type {
   AdaptiveQualityOptions,
