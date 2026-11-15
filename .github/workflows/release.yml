@@ -4,8 +4,8 @@ name: Release
 # wse-client on PyPI, wse-client on npm, the wse, wse-client and wse-protocol
 # crates), checks the tag against every version in the repo, installs and
 # tests every wheel, the sdist, the Python client, the npm package and the
-# crates as crates.io builds them, and only then publishes: npm first, then
-# PyPI, then crates.io, then the GitHub release. Nothing is uploaded until
+# crates as crates.io builds them, and only then publishes: crates.io first,
+# then npm, then PyPI, then the GitHub release. Nothing is uploaded until
 # everything has passed.
 #
 # Pull requests and pushes to main that touch packaging run the same build
@@ -619,14 +619,15 @@ jobs:
           python -m twine check --strict artifacts/wheels-*/*.whl artifacts/sdist/*.tar.gz artifacts/python-client-dist/*
 
   # ---------------------------------------------------------------------------
-  # Publish (v* tag pushes only), in order: npm, PyPI, GitHub release. npm
-  # goes first because its trusted publisher is the newest moving part: if it
-  # fails, nothing is on PyPI yet. Every publish job skips what an earlier
-  # attempt already uploaded, so "Re-run failed jobs" finishes a release.
+  # Publish (v* tag pushes only), in order: crates.io, npm, PyPI, GitHub
+  # release. The newest moving part goes first, crates.io and its token, then
+  # npm and its trusted publisher: if one fails, nothing after it is out yet.
+  # Every publish job skips what an earlier attempt already uploaded, so
+  # "Re-run failed jobs" finishes a release.
   # ---------------------------------------------------------------------------
   publish-npm:
     name: Publish wse-client to npm
-    needs: [preflight, release-gate]
+    needs: [preflight, release-gate, publish-crates]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     environment:
@@ -714,7 +715,7 @@ jobs:
   # the crates exist, crates.io trusted publishing can take its place.
   publish-crates:
     name: Publish the Rust crates to crates.io
-    needs: [preflight, release-gate, publish-pypi]
+    needs: [preflight, release-gate]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     environment:
