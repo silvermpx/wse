@@ -1,0 +1,21 @@
+name: wse_client
+description: The WSE client for Dart and Flutter, on the Rust client through flutter_rust_bridge.
+version: 3.1.0
+homepage: https://github.com/silvermpx/wse
+publish_to: none
+
+environment:
+  sdk: ^3.10.0
+  flutter: ">=3.38.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_rust_bridge: 2.13.0
+  flutter_rust_bridge_hooks: 2.13.0
+  hooks: ^2.1.0
+  code_assets: ^2.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
