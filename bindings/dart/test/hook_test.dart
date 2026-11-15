@@ -41,10 +41,11 @@ void main() {
       );
 
   test('a release takes the listed library of its target', () async {
-    await File('${dir.path}/wse_dart-9.9.9-aarch64-apple-ios-sim.dylib').writeAsBytes(library);
+    await Directory('${dir.path}/libs').create();
+    await File('${dir.path}/libs/wse_dart-9.9.9-aarch64-apple-ios-sim.dylib').writeAsBytes(library);
     await run(
       binaries: {'aarch64-apple-ios-sim': digest, 'aarch64-apple-ios': '00'},
-      userDefines: {'binaries': '.'},
+      userDefines: {'binaries': 'libs'},
       sdk: IOSSdk.iPhoneSimulator,
       check: (assets) {
         expect(assets, hasLength(1));

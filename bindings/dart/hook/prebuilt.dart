@@ -72,7 +72,11 @@ Future<void> _prebuilt(
   // Kept under the library's own name, whichever way it came.
   final library = File.fromUri(input.outputDirectoryShared.resolve('$_crate-$version/$triple/$fileName'));
   if (!await library.exists() || sha256.convert(await library.readAsBytes()).toString() != digest) {
-    final local = input.userDefines.path('binaries');
+    // A directory, whether or not the define ends in a slash.
+    final local = switch (input.userDefines.path('binaries')) {
+      null => null,
+      final path => Directory.fromUri(path).uri,
+    };
     final from = local?.resolve(released) ?? base.resolve(released);
     final bytes = local != null ? await File.fromUri(from).readAsBytes() : await _download(from);
     _check(bytes, digest, local != null ? from.toFilePath() : '$from');
