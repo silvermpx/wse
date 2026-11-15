@@ -80,8 +80,9 @@ describe('reconnection policy', () => {
       FakeWebSocket.last().serverClose(1006);
       await tick();
       expect(state()).toBe(ConnectionState.RECONNECTING);
-      // Never more than maxDelay (30 s) or the circuit breaker's 60 s pause.
-      expect(await advanceUntilNewSocket(61_000)).toBe(true);
+      // Never more than maxDelay (30 s) and its jitter (10%): no pause after
+      // five failures.
+      expect(await advanceUntilNewSocket(34_000)).toBe(true);
       expect(FakeWebSocket.instances).toHaveLength(i + 2);
     }
 
@@ -98,13 +99,41 @@ describe('reconnection policy', () => {
     start({ reconnection: { baseDelay: 1000, maxDelay: 5000, jitter: false } });
     await tick();
 
-    // Four failures stay below the circuit breaker (5): the delay is pure backoff.
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 8; i++) {
       FakeWebSocket.last().serverClose(1006);
       await tick();
       await vi.advanceTimersByTimeAsync(5_000);
     }
-    expect(FakeWebSocket.instances).toHaveLength(5);
+    expect(FakeWebSocket.instances).toHaveLength(9);
+    expect(useWSEStore.getState().circuitBreaker.state).toBe('closed');
+  });
+
+  it('pauses after failureThreshold failures only when a circuit breaker is set', async () => {
+    vi.useFakeTimers();
+    start({
+      reconnection: {
+        baseDelay: 1000,
+        maxDelay: 5000,
+        jitter: false,
+        circuitBreaker: { failureThreshold: 3, resetTimeout: 20_000 },
+      },
+    });
+    await tick();
+    for (let i = 0; i < 3; i++) {
+      FakeWebSocket.last().serverClose(1006);
+      await tick();
+      if (i < 2) await vi.advanceTimersByTimeAsync(5_000);
+    }
+    expect(FakeWebSocket.instances).toHaveLength(3);
+    expect(useWSEStore.getState().circuitBreaker.state).toBe('open');
+
+    // The backoff would have tried again within 5 s; the breaker waits 20 s.
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(FakeWebSocket.instances).toHaveLength(3);
+    expect(await advanceUntilNewSocket(6_000)).toBe(true);
+    await connectServer(FakeWebSocket.last());
+    expect(state()).toBe(ConnectionState.CONNECTED);
+    expect(useWSEStore.getState().circuitBreaker.state).toBe('closed');
   });
 
   it('honours a finite maxAttempts and reports when it gives up', async () => {
@@ -327,7 +356,9 @@ describe('endpoint switching and forced reconnects', () => {
 
   it('forceReconnect() during an outage with the circuit breaker open connects at once', async () => {
     vi.useFakeTimers();
-    start({ reconnection: { jitter: false } });
+    start({
+      reconnection: { jitter: false, circuitBreaker: { failureThreshold: 5, resetTimeout: 60_000 } },
+    });
     await tick();
     for (let i = 0; i < 5; i++) {
       FakeWebSocket.last().serverClose(1006);

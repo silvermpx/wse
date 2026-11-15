@@ -286,6 +286,13 @@ class AsyncWSEClient:
     ) -> None:
         if wire_format not in _WIRE_FORMATS:
             raise ValueError(f"wire_format must be one of {_WIRE_FORMATS}")
+        if reconnect is not None and (
+            reconnect.circuit_breaker_threshold < 0
+            or reconnect.circuit_breaker_timeout < 0
+        ):
+            raise ValueError(
+                "circuit_breaker_threshold and circuit_breaker_timeout must be >= 0"
+            )
         if rate_limit is not None and rate_limit <= 0:
             raise ValueError("rate_limit must be > 0, or None to disable it")
         if max_message_size is not None and max_message_size <= 0:
@@ -351,7 +358,17 @@ class AsyncWSEClient:
             )
         self._rate_limited_total = 0
         self._last_rate_limit_log = 0.0
-        self._circuit_breaker = CircuitBreaker()
+        # A pause after failed attempts in a row, only when asked for.
+        breaker_after = reconnect.circuit_breaker_threshold if reconnect else 0
+        self._circuit_breaker: CircuitBreaker | None = (
+            CircuitBreaker(
+                failure_threshold=breaker_after,
+                reset_timeout=reconnect.circuit_breaker_timeout,
+                success_threshold=1,
+            )
+            if reconnect is not None and breaker_after > 0
+            else None
+        )
         self._sequencer = EventSequencer()
         self._network_monitor = NetworkMonitor()
         self._offline_queue = OfflineQueue(
@@ -1046,6 +1063,12 @@ class AsyncWSEClient:
 
     # -- Stats ----------------------------------------------------------------
 
+    def _breaker_state(self) -> str:
+        """The reconnect circuit breaker's state; closed when there is none."""
+        if self._circuit_breaker is None:
+            return "closed"
+        return self._circuit_breaker.state.value
+
     def get_stats(self) -> dict[str, Any]:
         """Return client statistics."""
         diag = self._network_monitor.analyze()
@@ -1070,8 +1093,9 @@ class AsyncWSEClient:
                 "stability": diag.stability,
             },
             "circuit_breaker": {
-                "state": self._circuit_breaker.state.value,
-                "can_execute": self._circuit_breaker.state.value != "open",
+                "enabled": self._circuit_breaker is not None,
+                "state": self._breaker_state(),
+                "can_execute": self._breaker_state() != "open",
             },
             "rate_limiter": (
                 dict(
@@ -2344,7 +2368,7 @@ class AsyncWSEClient:
                     "packet_loss": diag.packet_loss,
                 },
                 "circuit_breaker": {
-                    "state": self._circuit_breaker.state.value,
+                    "state": self._breaker_state(),
                 },
                 "subscriptions": list(self._subscribed_topics),
                 "event_sequencer": self._sequencer.get_stats(),

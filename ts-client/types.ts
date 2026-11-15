@@ -65,6 +65,13 @@ export interface ReconnectionStrategy {
   maxAttempts: number;
   factor: number;
   jitter: boolean;
+  /**
+   * Stop trying for `resetTimeout` ms after `failureThreshold` failed
+   * attempts in a row, then try once and pause again if that fails. Off by
+   * default: the backoff alone spaces the attempts, at most `maxDelay`
+   * apart, so the client is back soon after the server is.
+   */
+  circuitBreaker?: { failureThreshold: number; resetTimeout: number };
 }
 
 export interface SecurityConfig {

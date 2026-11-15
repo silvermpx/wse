@@ -311,7 +311,7 @@ The server takes a signed message once (`nonce`, 1 to 128 characters, random by 
 
 ### Circuit Breaker
 
-Prevents connection storms during outages. Opens after 5 consecutive failures, rejects further attempts for 60s, then enters half-open state for recovery probing. While it is open, reconnect attempts wait on the backoff schedule.
+Off by default: the backoff alone spaces reconnect attempts, at most `max_delay` (30 s) apart, so the client is back soon after the server. To pause after failures in a row instead, set `ReconnectConfig(circuit_breaker_threshold=5, circuit_breaker_timeout=60.0)`: after five failed attempts nothing is tried for 60 s, then one attempt, and a failure pauses again. `get_stats()["circuit_breaker"]` shows whether it is on and its state.
 
 States: CLOSED (normal) -> OPEN (blocking) -> HALF_OPEN (probing) -> CLOSED (recovered)
 

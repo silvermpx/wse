@@ -531,23 +531,21 @@ Deny always takes precedence over allow. Patterns support `*` (match any charact
 | Reset timeout | 60 seconds |
 | Half-open probe calls | 3 |
 
-**Client-side circuit breaker** (TypeScript/Python SDKs):
-
-| Parameter | Value |
-|-----------|-------|
-| Failure threshold | 5 |
-| Reset timeout | 60 seconds |
+**Client-side circuit breaker** (TypeScript and Python clients): off by
+default, so clients reconnect on their backoff alone (at most 30 seconds
+apart) and are back soon after the server. An application can turn it on
+with its own threshold and pause (`reconnection.circuitBreaker` in
+TypeScript, `ReconnectConfig.circuit_breaker_threshold` and
+`circuit_breaker_timeout` in Python).
 
 States:
 - **CLOSED**: Normal operation
 - **OPEN**: Errors exceeded threshold, connection degraded
 - **HALF_OPEN**: Testing recovery with limited calls
 
-When circuit breaker opens:
-1. Connection state changes to `DEGRADED`
-2. Client notified via `connection_state_change`
-3. After reset timeout, transitions to `HALF_OPEN`
-4. On success, closes; on failure, reopens
+When a client's breaker opens, the client stays reconnecting and makes no
+attempt until the pause ends (`HALF_OPEN`); then one attempt: a connection
+closes the breaker, a failure opens it again. A manual reconnect resets it.
 
 ## Best Practices
 

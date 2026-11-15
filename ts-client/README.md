@@ -151,6 +151,7 @@ useWSE('cookie', ['notifications'], {
     maxAttempts: -1,                          // consecutive failures before giving up; -1 = forever (default)
     factor: 1.5,                              // for 'exponential'
     jitter: true,
+    // circuitBreaker: { failureThreshold: 5, resetTimeout: 60000 }, // pause after failures in a row (off by default)
   },
 
   security: {
@@ -401,7 +402,7 @@ The logger defaults to `WARN` in production and `INFO` in development (`WSE_LOG_
 | **Compression** | Inflates `C:` (zlib) frames from the server with a size limit |
 | **MessagePack** | `wireFormat: 'msgpack'`: msgpack both ways via `@msgpack/msgpack` (24-41% fewer bytes than JSON) |
 | **Rate limiting** | Configurable client-side token bucket (default 1000 burst, 100 msg/s); control frames exempt |
-| **Circuit breaker** | Pauses reconnects after 5 consecutive failures (60 s), reset by `forceReconnect` |
+| **Circuit breaker** | Off by default: the backoff alone spaces reconnects (at most `maxDelay` apart). `reconnection.circuitBreaker: { failureThreshold, resetTimeout }` pauses them after that many failures in a row; `forceReconnect` resets it |
 | **Idempotent delivery** | Per-topic `(epoch, offset)` dedup, gap reporting, recovery from the last delivered offset |
 | **Connection pool** | Multi-endpoint with health scoring |
 | **Network monitor** | Latency and jitter from PONG round-trips (with `diagnostics.enabled`) |

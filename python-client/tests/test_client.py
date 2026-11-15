@@ -10,6 +10,7 @@ from wse_client.types import (
     ConnectionQuality,
     ConnectionState,
     MessagePriority,
+    ReconnectConfig,
     SendResult,
     WSEEvent,
 )
@@ -628,3 +629,49 @@ class TestBackoff:
             manager._reconnect_attempts = attempt
             delays.append(manager._calculate_delay())
         assert delays == [0.5, 0.5, 1.0, 1.5, 2.5]
+
+
+class TestReconnectPause:
+    """No pause after failed attempts unless one is asked for: the backoff
+    alone spaces the attempts, so the client is back soon after the server."""
+
+    def test_no_circuit_breaker_by_default(self):
+        client = AsyncWSEClient("ws://x/wse")
+        assert client._circuit_breaker is None
+        assert client.get_stats()["circuit_breaker"] == {
+            "enabled": False,
+            "state": "closed",
+            "can_execute": True,
+        }
+
+    async def test_attempts_go_on_after_any_number_of_failures(self):
+        from wse_client.connection import ConnectionManager
+        from wse_client.errors import WSEConnectionError
+
+        manager = ConnectionManager("ws://127.0.0.1:9/wse", reconnect=ReconnectConfig())
+        for _ in range(8):
+            with pytest.raises(WSEConnectionError):
+                await manager._attempt()
+
+    async def test_a_configured_breaker_pauses_after_its_threshold(self):
+        from wse_client.errors import WSECircuitBreakerError, WSEConnectionError
+
+        client = AsyncWSEClient(
+            "ws://127.0.0.1:9/wse",
+            reconnect=ReconnectConfig(
+                circuit_breaker_threshold=3, circuit_breaker_timeout=20.0
+            ),
+        )
+        assert client.get_stats()["circuit_breaker"]["enabled"] is True
+        for _ in range(3):
+            with pytest.raises(WSEConnectionError):
+                await client._connection._attempt()
+        with pytest.raises(WSECircuitBreakerError):
+            await client._connection._attempt()
+        assert client.get_stats()["circuit_breaker"]["state"] == "open"
+
+    def test_negative_settings_are_refused(self):
+        with pytest.raises(ValueError):
+            AsyncWSEClient(
+                "ws://x/wse", reconnect=ReconnectConfig(circuit_breaker_threshold=-1)
+            )

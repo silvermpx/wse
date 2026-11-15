@@ -1,5 +1,15 @@
 # Changelog
 
+## v3.0.1 (unreleased)
+
+### Fixed
+
+- TypeScript and Python clients: after five failed reconnect attempts they
+  no longer stop trying for a minute, so a server that restarts takes them
+  back within the backoff (at most 30 s between attempts), as the Rust
+  client does. The pause is an option now (`reconnection.circuitBreaker`;
+  `ReconnectConfig.circuit_breaker_threshold` and `circuit_breaker_timeout`).
+
 ## v3.0.0 (2026-11-15)
 
 Security, correctness and speed, and the engine for Rust applications.

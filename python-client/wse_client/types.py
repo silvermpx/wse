@@ -219,6 +219,12 @@ class ReconnectConfig:
         max_attempts: Max retries, ``-1`` for infinite.
         factor: Multiplier per attempt for exponential backoff.
         jitter: Randomize delays to avoid thundering herd.
+        circuit_breaker_threshold: Failed attempts in a row after which no
+            attempt is made for ``circuit_breaker_timeout`` seconds (then one
+            is tried, and a failure pauses again). ``0``, the default, never
+            pauses: the backoff alone spaces the attempts, at most
+            ``max_delay`` apart, so the client is back soon after the server.
+        circuit_breaker_timeout: That pause, in seconds.
     """
 
     mode: ReconnectMode = ReconnectMode.EXPONENTIAL
@@ -227,3 +233,5 @@ class ReconnectConfig:
     max_attempts: int = -1  # -1 = infinite (matches TS client)
     factor: float = 1.5
     jitter: bool = True
+    circuit_breaker_threshold: int = 0
+    circuit_breaker_timeout: float = 60.0

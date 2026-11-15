@@ -30,7 +30,6 @@ def make_client(url: str, **kwargs) -> AsyncWSEClient:
     kwargs.setdefault("reconnect", FAST)
     client = AsyncWSEClient(url, **kwargs)
     # Many failed attempts in a row would open the breaker for 60 s.
-    client._circuit_breaker._failure_threshold = 10_000
     return client
 
 

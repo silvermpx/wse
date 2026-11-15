@@ -199,7 +199,8 @@ export class ConnectionManager {
   private isDestroyed = false;
 
   // Circuit breaker for connection attempts: a pause, never a death sentence.
-  private connectionCircuitBreaker: CircuitBreaker;
+  /** Only when `reconnection.circuitBreaker` asks for one. */
+  private connectionCircuitBreaker: CircuitBreaker | null;
 
   // Serialized queue for encrypted sends (preserves message ordering)
   /** The server sends msgpack to this client, and gets it back. */
@@ -255,11 +256,14 @@ export class ConnectionManager {
       loadBalancingStrategy: 'weighted-random',
     });
 
-    this.connectionCircuitBreaker = new CircuitBreaker({
-      failureThreshold: 5,
-      resetTimeout: 60000,
-      successThreshold: 1,
-    });
+    const breaker = this.reconnectionStrategy.circuitBreaker;
+    this.connectionCircuitBreaker = breaker
+      ? new CircuitBreaker({
+          failureThreshold: Math.max(1, Math.floor(breaker.failureThreshold)),
+          resetTimeout: Math.max(0, breaker.resetTimeout),
+          successThreshold: 1,
+        })
+      : null;
 
     this.refreshAuthTokenFn = this.config.refreshAuthToken ?? null;
 
@@ -335,7 +339,7 @@ export class ConnectionManager {
       this.teardownSocket(previous);
     }
 
-    if (!this.connectionCircuitBreaker.canExecute()) {
+    if (this.connectionCircuitBreaker && !this.connectionCircuitBreaker.canExecute()) {
       logger.warn('[ConnectionManager] Connection circuit breaker is OPEN, delaying reconnect');
       this.setState(ConnectionState.RECONNECTING);
       this.scheduleReconnect();
@@ -491,7 +495,7 @@ export class ConnectionManager {
 
   private recordAttemptFailure(endpoint: string | null): void {
     this.reconnectAttempts++;
-    this.connectionCircuitBreaker.recordFailure();
+    this.connectionCircuitBreaker?.recordFailure();
     if (endpoint) this.connectionPool.recordFailure(endpoint);
     const store = useWSEStore.getState();
     store.updateMetrics({
@@ -794,8 +798,8 @@ export class ConnectionManager {
     }
 
     let delay = this.calculateReconnectDelay();
-    const breaker = this.connectionCircuitBreaker.getMetrics();
-    if (breaker.state === CircuitBreakerState.OPEN && breaker.nextRetryTime) {
+    const breaker = this.connectionCircuitBreaker?.getMetrics();
+    if (breaker && breaker.state === CircuitBreakerState.OPEN && breaker.nextRetryTime) {
       delay = Math.max(delay, breaker.nextRetryTime - Date.now());
     }
     delay = Math.max(0, Math.round(delay));
@@ -872,7 +876,7 @@ export class ConnectionManager {
       this.stopReason = 'none';
       this.reconnectAttempts = 0;
     }
-    this.connectionCircuitBreaker.reset();
+    this.connectionCircuitBreaker?.reset();
     this.mirrorCircuitBreaker();
     logger.info(`[ConnectionManager] ${reason}: reconnecting now`);
     this.clearReconnectTimer();
@@ -903,6 +907,7 @@ export class ConnectionManager {
   }
 
   private mirrorCircuitBreaker(): void {
+    if (!this.connectionCircuitBreaker) return;
     const m = this.connectionCircuitBreaker.getMetrics();
     try {
       useWSEStore.getState().updateCircuitBreaker({
@@ -1181,7 +1186,7 @@ export class ConnectionManager {
     // The connection was accepted: this is where the backoff resets.
     this.reconnectAttempts = 0;
     this.authRefreshTried = false;
-    this.connectionCircuitBreaker.recordSuccess();
+    this.connectionCircuitBreaker?.recordSuccess();
     this.mirrorCircuitBreaker();
     useWSEStore.getState().updateMetrics({ reconnectCount: 0 });
 
@@ -1472,7 +1477,7 @@ export class ConnectionManager {
     if (this.isDestroyed) return;
 
     logger.info('[ConnectionManager] Force reconnect');
-    this.connectionCircuitBreaker.reset();
+    this.connectionCircuitBreaker?.reset();
     this.mirrorCircuitBreaker();
     this.reconnectAttempts = 0;
     this.authRefreshTried = false;
@@ -1569,6 +1574,6 @@ export class ConnectionManager {
       logger.error('[ConnectionManager] Error destroying connection pool:', e);
     }
 
-    this.connectionCircuitBreaker.reset();
+    this.connectionCircuitBreaker?.reset();
   }
 }

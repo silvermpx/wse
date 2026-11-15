@@ -30,7 +30,6 @@ def make_client(url: str, **kwargs) -> AsyncWSEClient:
     kwargs.setdefault("reconnect", FAST)
     # The fake server speaks the first E2E design.
     client = AsyncWSEClient(url, encryption=True, e2e_legacy=True, **kwargs)
-    client._circuit_breaker._failure_threshold = 10_000
     return client
 
 
