@@ -2557,7 +2557,7 @@ dependencies = [
 
 [[package]]
 name = "wse"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -2603,7 +2603,7 @@ dependencies = [
 
 [[package]]
 name = "wse-client"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2635,7 +2635,7 @@ dependencies = [
 
 [[package]]
 name = "wse-py"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "mimalloc",
  "pyo3",
