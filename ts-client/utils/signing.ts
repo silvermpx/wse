@@ -62,6 +62,42 @@ function input(label: string, body: string): Uint8Array<ArrayBuffer> {
   return out;
 }
 
+function b64url(b: Uint8Array): string {
+  return b64encode(b).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
+ * What a client's proof of its key over an E2E session covers before the
+ * session's transcript hash and the client's public key.
+ */
+export const CLIENT_AUTH_LABEL = 'WSE-E2E client_auth\0';
+
+/**
+ * The RFC 7638 thumbprint of a P-256 public key: base64url of SHA-256 of
+ * its JWK's required members. What a token names the key by (`cnf.jkt`),
+ * and what the server confirms a session is bound to.
+ */
+export async function thumbprint(jwk: JsonWebKey): Promise<string> {
+  const text = `{"crv":"P-256","kty":"EC","x":"${jwk.x}","y":"${jwk.y}"}`;
+  return b64url(new Uint8Array(await subtle().digest('SHA-256', encoder.encode(text))));
+}
+
+/**
+ * The proof of `key` over the E2E session `th` (`client_auth`), the first
+ * message the session seals: whoever copied the token on the way cannot
+ * make one for a session of its own.
+ */
+export async function proveSession(key: SigningKey, th: Uint8Array): Promise<string> {
+  const label = encoder.encode(CLIENT_AUTH_LABEL);
+  const point = b64decode(key.publicKey);
+  const data = new Uint8Array(new ArrayBuffer(label.length + th.length + point.length));
+  data.set(label, 0);
+  data.set(th, label.length);
+  data.set(point, label.length + th.length);
+  const sig = new Uint8Array(await subtle().sign(SIGN, key.keyPair.privateKey, data));
+  return JSON.stringify({ c: 'WSE', t: 'client_auth', p: { key: key.publicKey, sig: b64encode(sig) } });
+}
+
 /** This client's key for signed messages, and what the server needs of it. */
 export interface SigningKey {
   /** The key pair: its private key signs (non-extractable when made here). */

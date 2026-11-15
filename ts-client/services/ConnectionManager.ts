@@ -48,6 +48,7 @@ import {
   RATE_LIMIT_REFILL_RATE,
 } from '../constants.js';
 import { securityManager } from '../utils/security.js';
+import { proveSession, thumbprint, type SigningKey } from '../utils/signing.js';
 import { generateId } from '../utils/id.js';
 import { dispatchWSEEvent } from '../utils/events.js';
 
@@ -81,7 +82,13 @@ export interface ConnectionManagerConfig {
    * Who may answer the E2E handshake: `serverKeys` (pinned identity keys) or
    * `unauthenticated`; `legacy` speaks the first design instead.
    */
-  e2e?: { serverKeys?: string[]; unauthenticated?: boolean; legacy?: boolean };
+  e2e?: {
+    serverKeys?: string[];
+    unauthenticated?: boolean;
+    legacy?: boolean;
+    /** This client's signing key: the session is bound to it. */
+    bindKey?: Promise<SigningKey>;
+  };
 
   /** Outbound rate limit; false disables it. Default 1000 burst, 100/s. */
   rateLimit?: RateLimitConfig | false;
@@ -200,6 +207,9 @@ export class ConnectionManager {
   private refreshAuthTokenFn: (() => Promise<void>) | null;
   private readonly config: ConnectionManagerConfig;
   private browserListenersInstalled = false;
+  // The session is bound to this client's key: its thumbprint, which the
+  // sealed server_ready must name, once known.
+  private ownThumbprint: string | null = null;
 
   constructor(
     private endpoints: string[],
@@ -1111,6 +1121,21 @@ export class ConnectionManager {
   handleServerReady(details: any): void {
     if (this.isDestroyed || !this.ws || this.ws.readyState !== WS_OPEN) return;
 
+    // Sealed: the server says the session is bound to this client's key.
+    // Otherwise the token at the upgrade was not this client's (one put in its
+    // place on the way), or names no key.
+    if (this.ownThumbprint !== null && !details?.synthesized && details?.cnf?.jkt !== this.ownThumbprint) {
+      const ws = this.ws;
+      this.closeQuietly(ws, 1000, 'Session not bound');
+      this.teardownSocket(ws);
+      this.enterAuthFailed(
+        4401,
+        "the server did not bind the session to this client's key; " +
+          'for a token that names no key, set security.bindSession to false',
+      );
+      return;
+    }
+
     if (details && typeof details.connection_id === 'string') {
       this.connectionId = details.connection_id;
     }
@@ -1283,6 +1308,24 @@ export class ConnectionManager {
     if (!securityManager.isTransportEncryptionReady()) {
       this.failEncryption('no transport key after the key exchange');
       return;
+    }
+
+    // Bound to this client's key: its proof is the first message the session
+    // seals, before anything else is let through.
+    const bindKey = this.config.e2e?.bindKey;
+    const th = securityManager.transcriptHash();
+    if (bindKey && securityManager.isSessionMode() && th) {
+      let proof: string;
+      try {
+        const key = await bindKey;
+        this.ownThumbprint = await thumbprint(key.jwk);
+        proof = await proveSession(key, th);
+      } catch (error) {
+        if (socketId === this.socketId) this.failEncryption(`cannot prove the signing key (${errorMessage(error)})`);
+        return;
+      }
+      if (socketId !== this.socketId || this.encryptionState !== 'pending') return;
+      this.sendSealed(proof);
     }
 
     this.encryptionState = 'ready';

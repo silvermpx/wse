@@ -410,6 +410,12 @@ export class WSESession {
           serverKeys: o.security.serverKeys,
           unauthenticated: o.security.unauthenticated,
           legacy: o.security.legacyE2e,
+          // An E2E session with a signing key is bound to it, unless told not to.
+          bindKey:
+            o.security.encryptionEnabled && !o.security.legacyE2e && o.security.signingKey
+            && o.security.bindSession !== false
+              ? (this.signingKey ??= signingKeyFrom(o.security.signingKey))
+              : undefined,
         },
         rateLimit: o.rateLimit,
         serverReadyTimeout: o.serverReadyTimeout,

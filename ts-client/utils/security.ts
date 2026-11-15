@@ -304,6 +304,11 @@ export class SecurityManager {
     return offer.message();
   }
 
+  /** The hash of the session's handshake, once it is open: what the client's proof signs. */
+  transcriptHash(): Uint8Array | null {
+    return this.e2eSession?.sender.th ?? null;
+  }
+
   /** Complete the handshake from server_hello.p; rejects when it does not check. */
   async acceptServerHello(payload: any): Promise<void> {
     const offer = this.e2eOffer;

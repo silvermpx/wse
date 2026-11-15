@@ -11,12 +11,15 @@ import type { UseWSEConfig } from '../services/WSESession.js';
 import type { WSMessage } from '../types.js';
 import { keyId } from '../utils/e2eSession.js';
 import {
+  CLIENT_AUTH_LABEL,
   CLIENT_LABEL,
   SERVER_LABEL,
   ServerSigningKeys,
   SignatureError,
   generateSigningKey,
+  proveSession,
   signMessage,
+  thumbprint,
 } from '../utils/signing.js';
 
 const v = JSON.parse(
@@ -90,6 +93,39 @@ describe('signing with a WebCrypto key', () => {
     expect(body).toMatchObject({ t: 'order', aud: 'ed94c7318b47fe94', n: 'o-1' });
     expect(typeof body.ts).toBe('number');
     expect(await verifies(key.keyPair.publicKey, CLIENT_LABEL, envelope.sb, envelope.sig)).toBe(true);
+  });
+});
+
+describe('binding a session to the key', () => {
+  it('names a key by its RFC 7638 thumbprint', async () => {
+    // The key and thumbprint of RFC 9449's examples.
+    const jwk = {
+      kty: 'EC',
+      crv: 'P-256',
+      x: 'l8tFrhx-34tV3hRICRDY9zCkDlpBhF42UQUfWVAWBFs',
+      y: '9VE4jf_Ok_o64zbTTlcuNJajHmt6v9TDVrU0CdvGRDA',
+    };
+    expect(await thumbprint(jwk)).toBe('0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I');
+  });
+
+  it('proves the key over its own session only', async () => {
+    const key = await generateSigningKey();
+    const th = new Uint8Array(32).fill(7);
+    const message = JSON.parse(await proveSession(key, th));
+    expect(message.t).toBe('client_auth');
+    expect(message.p.key).toBe(key.publicKey);
+    const point = b64(key.publicKey);
+    const signed = (hash: Uint8Array) => {
+      const label = new TextEncoder().encode(CLIENT_AUTH_LABEL);
+      const data = new Uint8Array(label.length + hash.length + point.length);
+      data.set(label, 0);
+      data.set(hash, label.length);
+      data.set(point, label.length + hash.length);
+      return data;
+    };
+    const publicKey = await importPoint(key.publicKey);
+    expect(await crypto.subtle.verify(SIGN, publicKey, b64(message.p.sig), signed(th))).toBe(true);
+    expect(await crypto.subtle.verify(SIGN, publicKey, b64(message.p.sig), signed(new Uint8Array(32).fill(8)))).toBe(false);
   });
 });
 

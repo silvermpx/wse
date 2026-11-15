@@ -6,7 +6,8 @@ subscribe_with_recovery() and replies like examples/standalone_recovery.py.
 Signs E2E sessions with an identity key made for the run (the same one
 across a restart), which the client pins, and its own messages with a signing
 key made for the run; binds a client's signing key when it sends
-"register_key" and answers each signed message with a signed "fill". Uses an
+"register_key" and answers each signed message with a signed "fill";
+"bind <jwk>" issues a token naming that key, which binds the session. Uses an
 installed wse-server, or
 the prebuilt module of this repository; needs cryptography for the key.
 """
@@ -43,9 +44,12 @@ def emit(obj):
     print(json.dumps(obj), flush=True)
 
 
-def make_token():
+def make_token(cnf=None):
     now = int(time.time())
-    return rust_jwt_encode({"sub": "alice", "exp": now + 3600, "iat": now}, SECRET)
+    claims = {"sub": "alice", "exp": now + 3600, "iat": now}
+    if cnf is not None:
+        claims["cnf"] = cnf
+    return rust_jwt_encode(claims, SECRET)
 
 
 class Runner:
@@ -188,6 +192,10 @@ for line in sys.stdin:
         r.stop()
     elif cmd[0] == "start":
         r.start()
+    elif cmd[0] == "bind":
+        # A token naming the client's key (its JWK): the session is bound to it.
+        jwk = json.loads(line.strip().split(" ", 1)[1])
+        emit({"event": "bound_token", "token": make_token({"jwk": jwk})})
     elif cmd[0] == "quit":
         r.stop()
         break

@@ -94,6 +94,15 @@ export interface SecurityConfig {
    */
   signingKey?: CryptoKeyPair;
   /**
+   * With signingKey and an E2E session, the session is bound to the key
+   * (true, the default): the client proves the key inside the session, and
+   * goes on only once the server confirms the session is bound to it, as the
+   * token names it (`cnf`). A token copied on the way then opens nothing.
+   * False for a token that names no key, whose key the server application
+   * binds itself (set_client_key).
+   */
+  bindSession?: boolean;
+  /**
    * The server's signing public keys (base64, its signing_public_key()) the
    * messages it signs are checked against; one no pinned key verifies is
    * dropped. Without them signed messages are delivered unchecked

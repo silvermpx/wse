@@ -172,6 +172,9 @@ describe.skipIf(!PYTHON || typeof WebSocket === 'undefined')('real RustWSEServer
           serverKeys: [identity],
           signingKey: key.keyPair,
           serverSigningKeys: [signing],
+          // The application binds the key itself (register_key): the token
+          // names none.
+          bindSession: false,
         },
         registerHandlers: (p) => {
           p.registerHandler('key_registered', () => {
@@ -200,6 +203,47 @@ describe.skipIf(!PYTHON || typeof WebSocket === 'undefined')('real RustWSEServer
     expect(receipts[0].signature.verified).toBe(true);
     expect(fills[0].p).toEqual({ n: 'ts-1' });
     expect(fills[0].signature.verified).toBe(true);
+  }, 30_000);
+
+  it('binds its session to the key its token names', async () => {
+    destroyCurrentSession({ clearUserData: true });
+    const key = await generateSigningKey();
+    send(`bind ${JSON.stringify({ kty: 'EC', crv: 'P-256', x: key.jwk.x, y: key.jwk.y })}`);
+    let bound = '';
+    await vi.waitFor(() => {
+      const ev = events.find((e) => e.event === 'bound_token');
+      expect(ev).toBeDefined();
+      bound = ev.token;
+    }, { timeout: 5_000 });
+    const plain = token;
+    token = bound;
+    try {
+      acquireSession({
+        key: makeSessionKey('cookie', [endpoint]),
+        auth: 'cookie',
+        initialTopics: [],
+        config: {
+          endpoints: [endpoint],
+          offline: { enabled: false },
+          security: {
+            encryptionEnabled: true,
+            serverKeys: [identity],
+            signingKey: key.keyPair,
+            serverSigningKeys: [signing],
+          },
+        },
+      });
+      // Admitted only once its proof of the key holds; then it signs with it.
+      await vi.waitFor(() => expect(transportReady()).toBe(true), { timeout: 10_000 });
+      expect(await wseActions.sendSigned('order', { qty: '1' }, { nonce: 'bound-1' })).toBe('sent');
+      await vi.waitFor(
+        () => expect(events.some((e) => e.event === 'signed' && e.n === 'bound-1' && e.kid === key.kid)).toBe(true),
+        { timeout: 5_000 },
+      );
+    } finally {
+      destroyCurrentSession({ clearUserData: true });
+      token = plain;
+    }
   }, 30_000);
 
   it('speaks the first E2E design to a server that still offers it', async () => {
