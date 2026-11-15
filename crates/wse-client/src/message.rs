@@ -187,8 +187,10 @@ fn keep(frame: Option<&Bytes>, part: &[u8]) -> Bytes {
 }
 
 fn keep_str(frame: Option<&Bytes>, part: &str) -> Text {
-    // Bytes of a `str`: always UTF-8.
-    Text(ByteString::try_from(keep(frame, part.as_bytes())).unwrap_or_default())
+    let bytes = keep(frame, part.as_bytes());
+    // SAFETY: `keep` returns the bytes of `part`, a slice of the frame or a
+    // copy: those of a `str`, UTF-8 already.
+    Text(unsafe { ByteString::from_bytes_unchecked(bytes) })
 }
 
 fn within(frame: &[u8], part: &[u8]) -> bool {

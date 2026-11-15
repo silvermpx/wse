@@ -51,14 +51,18 @@ pub(crate) enum Body<'a> {
 /// Reads frames; keeps its inflate state and buffer between them.
 pub(crate) struct Decoder {
     max_size: usize,
+    /// The client asked for msgpack: a frame may be a msgpack value without
+    /// its `M:`.
+    msgpack: bool,
     inflater: Decompress,
     inflated: Vec<u8>,
 }
 
 impl Decoder {
-    pub(crate) fn new(max_size: usize) -> Self {
+    pub(crate) fn new(max_size: usize, msgpack: bool) -> Self {
         Self {
             max_size,
+            msgpack,
             inflater: Decompress::new(true),
             inflated: Vec::new(),
         }
@@ -80,7 +84,7 @@ impl Decoder {
                 self.inflate(data)?;
                 text(&self.inflated).map(Body::Json)
             }
-            [0x80..=0x8f | 0xde | 0xdf, ..] => Ok(Body::Msgpack(data)),
+            [0x80..=0x8f | 0xde | 0xdf, ..] if self.msgpack => Ok(Body::Msgpack(data)),
             _ => match std::str::from_utf8(data) {
                 Ok(json) if json.trim_start().starts_with('{') => Ok(Body::Json(json)),
                 _ => Ok(Body::Binary),
@@ -551,7 +555,7 @@ impl<'a> Cursor<'a> {
             0xc6 | 0xdb => (self.be(4)? as usize, 0),
             0xc7 => (self.be(1)? as usize + 1, 0),
             0xc8 => (self.be(2)? as usize + 1, 0),
-            0xc9 => (self.be(4)? as usize + 1, 0),
+            0xc9 => (usize::try_from(self.be(4)?).ok()?.checked_add(1)?, 0),
             0xca => (4, 0),
             0xcb => (8, 0),
             0xcc | 0xd0 => (1, 0),
@@ -566,7 +570,7 @@ impl<'a> Cursor<'a> {
             0xdc => (0, self.be(2)? as usize),
             0xdd => (0, self.be(4)? as usize),
             0xde => (0, 2 * self.be(2)? as usize),
-            0xdf => (0, 2 * self.be(4)? as usize),
+            0xdf => (0, usize::try_from(self.be(4)?).ok()?.checked_mul(2)?),
             0xc1 => return None,
         };
         self.take(bytes)?;
@@ -807,14 +811,14 @@ mod tests {
         let message = format!(r#"{{"t":"big","p":{{"s":"{}"}}}}"#, "x".repeat(50_000));
         let mut frame = b"C:".to_vec();
         frame.extend(zlib(message.as_bytes()));
-        let mut decoder = Decoder::new(1 << 20);
+        let mut decoder = Decoder::new(1 << 20, true);
         let Ok(Body::Json(text)) = decoder.binary(&frame) else {
             panic!("JSON after inflating");
         };
         assert_eq!(text, message);
         // The same decoder again, then one with a lower limit.
         assert!(matches!(decoder.binary(&frame), Ok(Body::Json(_))));
-        let mut small = Decoder::new(10_000);
+        let mut small = Decoder::new(10_000, true);
         assert!(matches!(small.binary(&frame), Err(Dropped::TooBig)));
         // Cut short.
         assert!(decoder.binary(&frame[..frame.len() / 2]).is_err());
@@ -822,7 +826,7 @@ mod tests {
 
     #[test]
     fn binary_frames_are_told_apart() {
-        let mut decoder = Decoder::new(1 << 20);
+        let mut decoder = Decoder::new(1 << 20, true);
         assert!(matches!(decoder.binary(b"{\"t\":1}"), Ok(Body::Json(_))));
         assert!(matches!(decoder.binary(b"M:\x80"), Ok(Body::Msgpack(_))));
         assert!(matches!(decoder.binary(b"E:\x01"), Ok(Body::Sealed)));

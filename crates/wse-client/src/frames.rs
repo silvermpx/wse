@@ -24,16 +24,31 @@ pub(crate) fn on_data<H: Handler>(
         return on_session_data(session, data);
     }
     match data {
-        Data::Text(text, frame) => session.on_json(text, frame),
-        Data::Binary(data) => match decoder.binary(data) {
-            Ok(Body::Json(json)) => session.on_json(json, Some(data)),
-            Ok(Body::Msgpack(bytes)) => session.on_msgpack(bytes, Some(data)),
-            Ok(Body::Sealed) => {
-                tracing::warn!("[WSE] sealed frame without an end-to-end session dropped");
+        Data::Text(text, frame) => {
+            let _ = session.on_json(text, frame);
+        }
+        Data::Binary(data) => {
+            // A frame with the protocol's prefix is the protocol's; one only
+            // guessed at, and not a message after all, is the application's.
+            let prefixed = matches!(data.as_ref(), [b'C' | b'M' | b'E', b':', ..]);
+            let understood = match decoder.binary(data) {
+                Ok(Body::Json(json)) => session.on_json(json, Some(data)),
+                Ok(Body::Msgpack(bytes)) => session.on_msgpack(bytes, Some(data)),
+                Ok(Body::Sealed) => {
+                    tracing::warn!("[WSE] sealed frame without an end-to-end session dropped");
+                    true
+                }
+                Ok(Body::Binary) => false,
+                Err(e) if prefixed => {
+                    tracing::warn!("[WSE] frame of {} bytes dropped: {e}", data.len());
+                    true
+                }
+                Err(_) => false,
+            };
+            if !understood && !prefixed {
+                session.handler.binary(data);
             }
-            Ok(Body::Binary) => session.handler.binary(data),
-            Err(e) => tracing::warn!("[WSE] frame of {} bytes dropped: {e}", data.len()),
-        },
+        }
     }
     true
 }
@@ -48,12 +63,19 @@ fn on_session_data<H: Handler>(session: &mut Session<H>, data: Data<'_>) -> bool
             };
             match sealing.open(data) {
                 Ok(Some(plain)) => {
-                    match plain.strip_prefix(b"M:") {
-                        Some(msgpack) => session.on_msgpack(msgpack, None),
-                        None => match std::str::from_utf8(&plain) {
-                            Ok(text) => session.on_json(text, None),
-                            Err(_) => tracing::warn!("[WSE] sealed frame not UTF-8 dropped"),
-                        },
+                    // Kept as shared bytes: messages kept by the application
+                    // slice them, not copy them.
+                    let plain = Bytes::from(plain);
+                    let understood = match plain.strip_prefix(b"M:") {
+                        Some(msgpack) => session.on_msgpack(msgpack, Some(&plain)),
+                        None => std::str::from_utf8(&plain)
+                            .ok()
+                            .filter(|text| text.trim_start().starts_with('{'))
+                            .is_some_and(|text| session.on_json(text, Some(&plain))),
+                    };
+                    // Bytes the server application sent as they are, sealed.
+                    if !understood {
+                        session.handler.binary(&plain);
                     }
                     true
                 }

@@ -51,10 +51,12 @@ pub(crate) struct Shared {
 
 /// A connection to a WSE server, made again when it is lost.
 ///
-/// Clones share the connection, which lives as long as a handle does (or
-/// until [`close`](Self::close)). Sends go out in the order they were made;
-/// what the server sends goes to the [`Handler`] the client was made with,
-/// or to the [`Events`](crate::Events) of [`connect`](crate::connect).
+/// Clones share the connection, which lives as long as the application
+/// holds a handle (or until [`close`](Self::close)); the client a handler
+/// is given by [`connect_with`](Self::connect_with) does not keep it.
+/// Sends go out in the order they were made; what the server sends goes to
+/// the [`Handler`] the client was made with, or to the
+/// [`Events`](crate::Events) of [`connect`](crate::connect).
 #[derive(Clone)]
 pub struct Client {
     shared: Arc<Shared>,
@@ -63,6 +65,18 @@ pub struct Client {
     frames: mpsc::Sender<String>,
     control: mpsc::UnboundedSender<Control>,
     status: watch::Receiver<Status>,
+    /// The application's hold on the connection; none for a handler's.
+    _owner: Option<Arc<Owner>>,
+}
+
+/// The application's handles hold one of these: when the last goes, the
+/// connection is closed.
+struct Owner(mpsc::UnboundedSender<Control>);
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        let _ = self.0.send(Control::Close);
+    }
 }
 
 impl Client {
@@ -93,19 +107,37 @@ impl Client {
         let (frames_tx, frames_rx) = mpsc::channel(config.send_queue);
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (status_tx, status_rx) = watch::channel(Status::Connecting);
-        let client = Client {
+        let for_handler = Client {
             shared: Arc::clone(&shared),
             keys: Arc::clone(&keys),
             frames: frames_tx,
-            control: control_tx,
+            control: control_tx.clone(),
             status: status_rx,
+            _owner: None,
         };
-        let handler = make(client.clone());
+        let client = Client {
+            _owner: Some(Arc::new(Owner(control_tx))),
+            ..for_handler.clone()
+        };
+        let handler = make(for_handler);
         let (first_tx, first_rx) = oneshot::channel();
+        let ended = (Arc::clone(&shared), status_tx.clone());
         let driver = Driver::new(
             config, handler, shared, keys, frames_rx, control_rx, status_tx,
         );
-        let run = driver.run(Some(first_tx));
+        let run = async move {
+            use futures_util::FutureExt;
+            // A handler that panics ends the client, which says so.
+            if std::panic::AssertUnwindSafe(driver.run(Some(first_tx)))
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                let (shared, status) = ended;
+                shared.ready.store(false, Ordering::Release);
+                status.send_replace(Status::Closed(Some(Error::Panicked)));
+            }
+        };
         #[cfg(not(target_arch = "wasm32"))]
         tokio::spawn(run);
         #[cfg(target_arch = "wasm32")]
@@ -147,16 +179,17 @@ impl Client {
 
     /// Sends a signed message `{"t": kind, "p": payload}`: signed with
     /// [`Config::signing_key`] for the server's signing key, so whoever
-    /// keeps it can show who sent it. `n` names it once (an order id, say;
-    /// a random one when `None`). The server answers with a signed
-    /// `receipt`, or an error `SIGNATURE_REFUSED`.
+    /// keeps it can show who sent it. `n` names it once, 1 to 128
+    /// characters (an order id, say; a random one when `None`). Returns the
+    /// `n` it went with: the server's signed `receipt`, or its error
+    /// `SIGNATURE_REFUSED`, names it.
     #[cfg(feature = "aws-lc")]
     pub async fn send_signed<P: Serialize + ?Sized>(
         &self,
         kind: &str,
         payload: &P,
         n: Option<&str>,
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         self.ready()?;
         let audience = self
             .shared
@@ -167,21 +200,26 @@ impl Client {
             .ok_or_else(|| Error::Signing("the server named no signing key".to_owned()))?;
         let payload =
             serde_json::value::to_raw_value(payload).map_err(|e| Error::Encode(e.to_string()))?;
-        let random;
         let n = match n {
-            Some(n) => n,
+            Some(n) if n.is_empty() || n.chars().count() > wse_protocol::signing::MAX_NONCE_LEN => {
+                return Err(Error::Signing(format!(
+                    "n must be 1 to {} characters",
+                    wse_protocol::signing::MAX_NONCE_LEN
+                )));
+            }
+            Some(n) => n.to_owned(),
             None => {
                 let mut bytes = [0u8; 16];
                 wse_protocol::crypto::fill_random(&mut bytes)
                     .map_err(|_| Error::Signing("no random bytes".to_owned()))?;
-                random = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-                &random
+                bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
             }
         };
         let text = self
             .keys
-            .sign(kind, &payload, &audience, n, crate::session::now_ms())?;
-        self.frames.send(text).await.map_err(|_| Error::Closed)
+            .sign(kind, &payload, &audience, &n, crate::session::now_ms())?;
+        self.frames.send(text).await.map_err(|_| Error::Closed)?;
+        Ok(n)
     }
 
     /// Subscribes to topics, on this connection and every later one; after

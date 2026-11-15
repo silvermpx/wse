@@ -32,6 +32,9 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const SEND_BATCH: usize = 256;
 /// Frames read in one go when they came together.
 const READ_BATCH: usize = 64;
+/// What a frame may carry past the message itself: a sealed frame's `E:`,
+/// header and tag.
+const FRAME_OVERHEAD: usize = 32;
 
 pub(crate) struct Driver<H> {
     config: Config,
@@ -63,7 +66,10 @@ impl<H: Handler> Driver<H> {
             config.recovery_timeout,
         );
         Self {
-            decoder: Decoder::new(config.max_message_size),
+            decoder: Decoder::new(
+                config.max_message_size,
+                config.format == crate::config::Format::Msgpack,
+            ),
             keys,
             config,
             shared,
@@ -91,6 +97,10 @@ impl<H: Handler> Driver<H> {
                             Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                             Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
                         },
+                        // What is held for a gap is not held past its wait.
+                        () = sleep_until(self.session.next_deadline()) => {
+                            self.session.on_deadline(Instant::now());
+                        }
                     }
                 }
             };
@@ -122,6 +132,9 @@ impl<H: Handler> Driver<H> {
             .store(false, std::sync::atomic::Ordering::Release);
         self.session.handler.event(Event::Closed(end.clone()));
         self.status.send_replace(Status::Closed(end));
+        // What the handler still holds (the stream's last items, its end)
+        // reaches a reader that goes on reading.
+        let _ = tokio::time::timeout(self.config.idle_timeout, self.session.handler.ready()).await;
     }
 
     /// Waits before the next attempt, doing what the application asks
@@ -138,6 +151,9 @@ impl<H: Handler> Driver<H> {
                     Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
                 },
                 Some(_) = self.frames.recv() => {}
+                () = sleep_until(self.session.next_deadline()) => {
+                    self.session.on_deadline(Instant::now());
+                }
             }
         }
     }
@@ -153,7 +169,7 @@ impl<H: Handler> Driver<H> {
             sealing.as_ref().and_then(Sealing::hello),
         );
         self.session.open(sealing);
-        self.session.outbox.push(Outgoing::Text(hello));
+        self.session.outbox.push(Outgoing::Handshake(hello));
         let ready_by = Instant::now() + self.config.ready_timeout;
         let beat = self.config.heartbeat;
         let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + beat, beat);
@@ -162,15 +178,17 @@ impl<H: Handler> Driver<H> {
         let mut flush = false;
 
         loop {
-            if !self.session.outbox.is_empty() || flush {
-                flush = false;
-                if let Err(lost) = self.write(&mut ws).await {
-                    return lost;
-                }
-            }
             if let Some(error) = self.session.fatal.take() {
+                // Nothing the failed frame asked for goes out.
+                self.session.outbox.clear();
                 self.close(&mut ws, CloseCode::Normal, "client error").await;
                 return Lost::Fatal(error);
+            }
+            if !self.session.outbox.is_empty() || flush {
+                flush = false;
+                if let Err(lost) = self.write_in_time(&mut ws).await {
+                    return lost;
+                }
             }
             if std::mem::take(&mut self.session.became_ready) {
                 self.policy.connected();
@@ -184,9 +202,12 @@ impl<H: Handler> Driver<H> {
             } else {
                 Some(ready_by)
             };
+            // Reads wait for the application once the server took the
+            // connection: the handshake is never held back.
+            let gate = self.session.ready;
 
             tokio::select! {
-                frame = read(&mut self.session.handler, &mut ws) => {
+                frame = read(&mut self.session.handler, &mut ws, gate) => {
                     // What already came is read in one go, up to a batch.
                     let mut frame = frame;
                     let mut alive = false;
@@ -224,7 +245,7 @@ impl<H: Handler> Driver<H> {
                         {
                             break;
                         }
-                        match poll_once(read(&mut self.session.handler, &mut ws)).await {
+                        match poll_once(read(&mut self.session.handler, &mut ws, gate)).await {
                             Some(next) => frame = next,
                             None => break,
                         }
@@ -244,17 +265,24 @@ impl<H: Handler> Driver<H> {
                 }
                 control = self.control.recv() => match control {
                     None | Some(Control::Close) => {
+                        self.take_queued();
                         self.close(&mut ws, CloseCode::Normal, "client closed").await;
                         return Lost::Shutdown;
                     }
                     Some(Control::Reconnect) => {
+                        self.take_queued();
                         self.close(&mut ws, CloseCode::Away, "reconnecting").await;
-                        return Lost::Closed { code: None, reason: "reconnect asked".to_owned() };
+                        return Lost::Requested;
                     }
                     Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                     Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
                 },
                 _ = heartbeat.tick() => {
+                    // While the application is behind, reads wait for it,
+                    // not for the server: silence then says nothing.
+                    if poll_once(self.session.handler.ready()).await.is_none() {
+                        last_seen = Instant::now();
+                    }
                     if last_seen.elapsed() >= self.config.idle_timeout {
                         self.close(&mut ws, CloseCode::Away, "idle").await;
                         return Lost::Closed {
@@ -262,11 +290,22 @@ impl<H: Handler> Driver<H> {
                             reason: format!("nothing from the server for {:?}", self.config.idle_timeout),
                         };
                     }
-                    let now = session::now_ms().to_be_bytes();
-                    if let Err(e) = ws.feed(Frame::Ping(Bytes::copy_from_slice(&now))).await {
-                        return Lost::Closed { code: None, reason: e.to_string() };
+                    if self.session.sealing.is_some() {
+                        // In an end-to-end session only sealed frames show
+                        // the server is alive: a sealed ping gets a sealed
+                        // answer.
+                        if self.session.ready {
+                            self.session.outbox.push(Outgoing::Text(session::ping()));
+                        }
+                    } else {
+                        let now = session::now_ms().to_be_bytes();
+                        let ping = ws.feed(Frame::Ping(Bytes::copy_from_slice(&now)));
+                        match tokio::time::timeout(self.config.idle_timeout, ping).await {
+                            Ok(Ok(())) => flush = true,
+                            Ok(Err(e)) => return Lost::Closed { code: None, reason: e.to_string() },
+                            Err(_) => return self.stalled(),
+                        }
                     }
-                    flush = true;
                 }
                 _ = sleep_until(deadline) => {
                     if !self.session.ready {
@@ -298,19 +337,53 @@ impl<H: Handler> Driver<H> {
         frames::on_data(&mut self.decoder, &mut self.session, data)
     }
 
+    /// What the application sent before it closed goes out first.
+    fn take_queued(&mut self) {
+        if self.session.ready {
+            while let Ok(text) = self.frames.try_recv() {
+                self.session.outbox.push(Outgoing::Text(text));
+            }
+        }
+    }
+
+    /// `write`, unless the server takes nothing for `idle_timeout`: a link
+    /// gone dark fills the socket's buffer, and the write would wait for as
+    /// long as the system keeps the connection.
+    async fn write_in_time(&mut self, ws: &mut Ws) -> Result<(), Lost> {
+        match tokio::time::timeout(self.config.idle_timeout, self.write(ws)).await {
+            Ok(written) => written,
+            Err(_) => Err(self.stalled()),
+        }
+    }
+
+    fn stalled(&self) -> Lost {
+        Lost::Closed {
+            code: None,
+            reason: format!("the server took nothing for {:?}", self.config.idle_timeout),
+        }
+    }
+
     /// Writes what the session queued, in one flush: sealed once an
-    /// end-to-end session is open.
+    /// end-to-end session is open. On a connection with a session nothing
+    /// goes in plaintext but the handshake.
     async fn write(&mut self, ws: &mut Ws) -> Result<(), Lost> {
         let lost = |e: tungstenite::Error| Lost::Closed {
             code: None,
             reason: e.to_string(),
         };
         for outgoing in self.session.outbox.drain(..) {
-            let Outgoing::Text(text) = outgoing;
+            let (text, handshake) = match outgoing {
+                Outgoing::Text(text) => (text, false),
+                Outgoing::Handshake(text) => (text, true),
+            };
             let frame = match self.session.sealing.as_mut() {
                 Some(sealing) => match sealing.seal(&text) {
                     Ok(Some(sealed)) => Frame::Binary(sealed.into()),
-                    Ok(None) => Frame::Text(text.into()),
+                    Ok(None) if handshake => Frame::Text(text.into()),
+                    Ok(None) => {
+                        tracing::error!("[WSE] a message before the end-to-end session not sent");
+                        continue;
+                    }
                     Err(error @ Error::Encryption(_)) => return Err(Lost::Fatal(error)),
                     Err(error) => return Err(Lost::Failed(error)),
                 },
@@ -321,16 +394,17 @@ impl<H: Handler> Driver<H> {
         ws.flush().await.map_err(lost)
     }
 
-    /// Closes the connection on the client's side.
+    /// Closes the connection on the client's side, with what is queued
+    /// written first.
     async fn close(&mut self, ws: &mut Ws, code: CloseCode, reason: &str) {
-        let _ = self.write(ws).await;
         let frame = CloseFrame {
             code,
             reason: reason.into(),
         };
-        // The server answers within its own 5 s; past one, it is not waited
-        // for.
+        // The server answers within its own 5 s; past one, neither it nor a
+        // write it does not take is waited for.
         let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            let _ = self.write(ws).await;
             ws.close(Some(frame)).await?;
             while ws.next().await.is_some() {}
             Ok::<_, tungstenite::Error>(())
@@ -343,9 +417,14 @@ impl<H: Handler> Driver<H> {
 async fn open_socket(config: &Config, shared: &Shared, keys: &Keys) -> Result<Ws, Error> {
     let token = match &config.token_provider {
         Some(provider) => {
-            let token = provider
-                .token()
+            let token = tokio::time::timeout(config.connect_timeout, provider.token())
                 .await
+                .map_err(|_| {
+                    Error::Timeout(format!(
+                        "no token from the token provider within {:?}",
+                        config.connect_timeout
+                    ))
+                })?
                 .map_err(|e| Error::Connect(format!("token provider: {e}")))?;
             Some(token)
         }
@@ -353,8 +432,9 @@ async fn open_socket(config: &Config, shared: &Shared, keys: &Keys) -> Result<Ws
     };
     let request = config.request(token.as_deref(), keys.e2e)?;
     let mut ws_config = WebSocketConfig::default();
-    ws_config.max_message_size = Some(config.max_message_size + 16);
-    ws_config.max_frame_size = Some(config.max_message_size + 16);
+    let limit = config.max_message_size.saturating_add(FRAME_OVERHEAD);
+    ws_config.max_message_size = Some(limit);
+    ws_config.max_frame_size = Some(limit);
     #[cfg(feature = "aws-lc")]
     let open = tokio_tungstenite::connect_async_tls_with_config(
         request,
@@ -391,16 +471,24 @@ fn tls(config: &Config) -> Option<tokio_tungstenite::Connector> {
     if !config.url.starts_with("wss://") {
         return None;
     }
-    let tls = config.tls.clone().unwrap_or_else(default_tls);
+    // `Config::check` made sure it is a rustls::ClientConfig.
+    let tls = config
+        .tls
+        .clone()
+        .and_then(|tls| tls.downcast::<rustls::ClientConfig>().ok())
+        .unwrap_or_else(default_tls);
     Some(tokio_tungstenite::Connector::Rustls(tls))
 }
 
-/// The next frame, once the handler is ready for it.
+/// The next frame, once the handler is ready for it when `gate`.
 async fn read<H: Handler>(
     handler: &mut H,
     ws: &mut Ws,
+    gate: bool,
 ) -> Option<Result<Frame, tungstenite::Error>> {
-    handler.ready().await;
+    if gate {
+        handler.ready().await;
+    }
     ws.next().await
 }
 

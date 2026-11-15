@@ -58,13 +58,14 @@ aws-lc = [
     "dep:base64",
     "rustls/aws_lc_rs",
     "rustls/prefer-post-quantum",
-    "tokio-tungstenite/__rustls-tls",
+    "tokio-tungstenite/rustls-tls-webpki-roots",
 ]
 # aws-lc-rs built from its FIPS 140-3 validated module (needs CMake and Go).
 fips = ["aws-lc", "wse-protocol/fips", "rustls/fips"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-wse = { path = "../wse" }
+# Published before this crate: its tests and examples build from the package.
+wse.workspace = true
 # The chat example reads the terminal.
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "io-std", "io-util"] }
 

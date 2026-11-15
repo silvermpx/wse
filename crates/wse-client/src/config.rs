@@ -18,6 +18,7 @@ use crate::error::Error;
 
 /// The wire format the server sends this client.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Format {
     /// JSON (the default).
     #[default]
@@ -188,8 +189,9 @@ impl fmt::Debug for TokenProvider {
 }
 
 /// What a client connects to and how it behaves. The defaults are those of
-/// the Python and TypeScript clients.
-#[derive(Clone, Debug)]
+/// the Python and TypeScript clients. Its `Debug` print leaves the token,
+/// the headers' values and the signing key out.
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct Config {
     /// `ws://host:port/wse` or `wss://...`.
@@ -198,9 +200,10 @@ pub struct Config {
     /// `Authorization: Bearer`. Not in the browser: it sends the page's
     /// cookies itself, and no header.
     pub token: Option<String>,
-    /// Asked for the token before each connection attempt; takes the place
-    /// of `token`. A refused token is then fetched again (three times in a
-    /// row at most) instead of ending the client.
+    /// Asked for the token before each connection attempt (within
+    /// `connect_timeout`); takes the place of `token`. A refused token is
+    /// then fetched again instead of ending the client, three times at most
+    /// between two connections the server took.
     pub token_provider: Option<TokenProvider>,
     /// The cookie the token goes in: the server's `jwt_cookie_name`.
     pub cookie_name: String,
@@ -232,10 +235,17 @@ pub struct Config {
     /// Messages waiting to be sent at most; past it `try_send` fails and
     /// `send` waits (1024).
     pub send_queue: usize,
-    /// The TLS configuration for `wss://`; by default the Mozilla root
-    /// certificates. In the browser TLS is the browser's.
+    /// The TLS configuration for `wss://`: an `Arc` of a
+    /// `rustls::ClientConfig` of rustls 0.23, which this crate builds on,
+    /// held as `Any` so that rustls's own versions are not this crate's.
+    /// By default the Mozilla root certificates on aws-lc-rs. In the browser
+    /// TLS is the browser's.
+    ///
+    /// ```ignore
+    /// config.tls = Some(std::sync::Arc::new(my_rustls_client_config));
+    /// ```
     #[cfg(all(feature = "aws-lc", not(target_arch = "wasm32")))]
-    pub tls: Option<Arc<rustls::ClientConfig>>,
+    pub tls: Option<Arc<dyn std::any::Any + Send + Sync>>,
     /// End-to-end encryption; none by default.
     #[cfg(feature = "aws-lc")]
     pub encryption: Option<Encryption>,
@@ -251,6 +261,59 @@ pub struct Config {
     /// signed messages are delivered unchecked.
     #[cfg(feature = "aws-lc")]
     pub server_signing_keys: Vec<String>,
+}
+
+/// Messages waiting to be sent at most.
+const MAX_SEND_QUEUE: usize = 1 << 20;
+/// The longest wait a client is configured with.
+const MAX_WAIT: Duration = Duration::from_secs(7 * 86_400);
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted = |set: bool| if set { "Some(<redacted>)" } else { "None" };
+        let headers: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(name, _)| (name.as_str(), "<redacted>"))
+            .collect();
+        let mut f = f.debug_struct("Config");
+        f.field("url", &self.url)
+            .field("token", &format_args!("{}", redacted(self.token.is_some())))
+            .field("token_provider", &self.token_provider)
+            .field("cookie_name", &self.cookie_name)
+            .field("topics", &self.topics)
+            .field("format", &self.format)
+            .field("compression", &self.compression)
+            .field("max_message_size", &self.max_message_size)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("ready_timeout", &self.ready_timeout)
+            .field("heartbeat", &self.heartbeat)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("recovery_timeout", &self.recovery_timeout)
+            .field("reconnect", &self.reconnect)
+            .field("headers", &headers)
+            .field("send_queue", &self.send_queue);
+        #[cfg(all(feature = "aws-lc", not(target_arch = "wasm32")))]
+        f.field(
+            "tls",
+            &format_args!(
+                "{}",
+                if self.tls.is_some() {
+                    "Some(..)"
+                } else {
+                    "None"
+                }
+            ),
+        );
+        #[cfg(feature = "aws-lc")]
+        f.field("encryption", &self.encryption)
+            .field(
+                "signing_key",
+                &format_args!("{}", redacted(self.signing_key.is_some())),
+            )
+            .field("server_signing_keys", &self.server_signing_keys);
+        f.finish()
+    }
 }
 
 impl Config {
@@ -306,8 +369,38 @@ impl Config {
                 "heartbeat must be above zero and below idle_timeout".to_owned(),
             ));
         }
-        if self.send_queue == 0 {
-            return Err(Error::Config("send_queue must be above zero".to_owned()));
+        if !(1..=MAX_SEND_QUEUE).contains(&self.send_queue) {
+            return Err(Error::Config(format!(
+                "send_queue must be 1 to {MAX_SEND_QUEUE}"
+            )));
+        }
+        if self.max_message_size == 0 {
+            return Err(Error::Config(
+                "max_message_size must be above zero".to_owned(),
+            ));
+        }
+        // A week at most: further out, the timers' instants overflow, and the
+        // browser's cannot count past 24.8 days.
+        for (name, wait) in [
+            ("connect_timeout", self.connect_timeout),
+            ("ready_timeout", self.ready_timeout),
+            ("heartbeat", self.heartbeat),
+            ("idle_timeout", self.idle_timeout),
+            ("recovery_timeout", self.recovery_timeout),
+        ] {
+            if wait > MAX_WAIT {
+                return Err(Error::Config(format!("{name} must be at most a week")));
+            }
+        }
+        #[cfg(all(feature = "aws-lc", not(target_arch = "wasm32")))]
+        if self
+            .tls
+            .as_ref()
+            .is_some_and(|tls| !tls.is::<rustls::ClientConfig>())
+        {
+            return Err(Error::Config(
+                "tls must be an Arc of a rustls::ClientConfig (rustls 0.23)".to_owned(),
+            ));
         }
         #[cfg(not(target_arch = "wasm32"))]
         self.request(None, false)?;

@@ -5,10 +5,12 @@
 //! the server takes the client by its cookie. It answers the server's
 //! protocol pings itself, so the client's heartbeat is a message.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use bytestring::ByteString;
 use tokio::sync::{mpsc, watch};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
@@ -31,11 +33,16 @@ const SEND_BATCH: usize = 256;
 const READ_BATCH: usize = 64;
 /// The close code a browser may send of the normal ones.
 const CLOSE_NORMAL: u16 = 1000;
+/// Bytes the browser may hold unsent before the application's messages
+/// wait: the browser's WebSocket never waits itself.
+const MAX_BUFFERED: u32 = 1 << 20;
+/// How often a full socket is looked at again.
+const BUFFERED_CHECK: Duration = Duration::from_millis(20);
 
 /// What the WebSocket tells.
 enum Happened {
     Open,
-    Text(String),
+    Text(ByteString),
     Binary(Bytes),
     Error,
     Close { code: u16, reason: String },
@@ -67,7 +74,7 @@ impl Socket {
             Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
                 let data = event.data();
                 let happened = match data.as_string() {
-                    Some(text) => Happened::Text(text),
+                    Some(text) => Happened::Text(ByteString::from(text)),
                     None => match data.dyn_into::<js_sys::ArrayBuffer>() {
                         Ok(buffer) => {
                             Happened::Binary(Bytes::from(js_sys::Uint8Array::new(&buffer).to_vec()))
@@ -115,6 +122,11 @@ impl Socket {
     fn close(&self, reason: &str) {
         let _ = self.ws.close_with_code_and_reason(CLOSE_NORMAL, reason);
     }
+
+    /// Whether the browser holds so much unsent that more should wait.
+    fn is_full(&self) -> bool {
+        self.ws.buffered_amount() >= MAX_BUFFERED
+    }
 }
 
 impl Drop for Socket {
@@ -149,9 +161,49 @@ async fn sleep_until(deadline: Option<Instant>) {
     }
 }
 
+/// The browser's timers take at most 2^31 - 1 ms (24.8 days); a longer
+/// wait is several.
 async fn sleep(duration: Duration) {
-    let ms = duration.as_millis().min(u128::from(u32::MAX)) as u32;
-    gloo_timers::future::TimeoutFuture::new(ms).await;
+    const MAX_MS: u128 = i32::MAX as u128;
+    let mut left = duration.as_millis();
+    loop {
+        let ms = left.min(MAX_MS);
+        gloo_timers::future::TimeoutFuture::new(ms as u32).await;
+        left -= ms;
+        if left == 0 {
+            return;
+        }
+    }
+}
+
+/// A timer kept across turns of the loop, made again only when its moment
+/// changes: a browser timer costs a JavaScript callback each.
+struct Timer {
+    at: Option<Instant>,
+    sleep: Pin<Box<dyn std::future::Future<Output = ()>>>,
+}
+
+impl Timer {
+    fn new() -> Self {
+        Self {
+            at: None,
+            sleep: Box::pin(std::future::pending()),
+        }
+    }
+
+    /// Fires at `at`; never without one.
+    fn set(&mut self, at: Option<Instant>) {
+        if self.at != at {
+            self.at = at;
+            self.sleep = Box::pin(sleep_until(at));
+        }
+    }
+
+    async fn fired(&mut self) {
+        (&mut self.sleep).await;
+        self.at = None;
+        self.sleep = Box::pin(std::future::pending());
+    }
 }
 
 pub(crate) struct Driver<H> {
@@ -184,7 +236,10 @@ impl<H: Handler> Driver<H> {
             config.recovery_timeout,
         );
         Self {
-            decoder: Decoder::new(config.max_message_size),
+            decoder: Decoder::new(
+                config.max_message_size,
+                config.format == crate::config::Format::Msgpack,
+            ),
             keys,
             config,
             shared,
@@ -231,16 +286,38 @@ impl<H: Handler> Driver<H> {
     /// Opens a socket; `None` when the application closed the client
     /// meanwhile.
     async fn open(&mut self) -> Option<Result<Socket, Error>> {
-        if let Some(provider) = &self.config.token_provider
-            && let Err(e) = provider.token().await
-        {
-            return Some(Err(Error::Connect(format!("token provider: {e}"))));
+        let deadline = Instant::now() + self.config.connect_timeout;
+        if let Some(provider) = self.config.token_provider.clone() {
+            // Asked to refresh the page's cookie; the client may close, or
+            // give up on it, meanwhile.
+            let fetch = provider.token();
+            let mut fetch = std::pin::pin!(fetch);
+            let fetched = loop {
+                tokio::select! {
+                    biased;
+                    control = self.control.recv() => match control {
+                        None | Some(Control::Close) => return None,
+                        Some(Control::Reconnect) => {}
+                        Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
+                        Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
+                    },
+                    token = &mut fetch => break token,
+                    _ = sleep_until(Some(deadline)) => {
+                        return Some(Err(Error::Timeout(format!(
+                            "no token from the token provider within {:?}",
+                            self.config.connect_timeout
+                        ))));
+                    }
+                }
+            };
+            if let Err(e) = fetched {
+                return Some(Err(Error::Connect(format!("token provider: {e}"))));
+            }
         }
         let mut socket = match Socket::open(&self.config.url(self.keys.e2e)) {
             Ok(socket) => socket,
             Err(error) => return Some(Err(error)),
         };
-        let deadline = Instant::now() + self.config.connect_timeout;
         loop {
             tokio::select! {
                 biased;
@@ -250,6 +327,10 @@ impl<H: Handler> Driver<H> {
                     Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                     Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
                 },
+                // What is held for a gap is not held past its wait.
+                () = sleep_until(self.session.next_deadline()) => {
+                    self.session.on_deadline(Instant::now());
+                }
                 happened = socket.events.recv() => match happened {
                     Some(Happened::Open) => return Some(Ok(socket)),
                     Some(Happened::Close { code, reason }) => {
@@ -286,6 +367,9 @@ impl<H: Handler> Driver<H> {
                 },
                 Some(_) = self.frames.recv() => {}
                 _ = sleep_until(Some(until)) => return true,
+                () = sleep_until(self.session.next_deadline()) => {
+                    self.session.on_deadline(Instant::now());
+                }
             }
         }
     }
@@ -301,18 +385,23 @@ impl<H: Handler> Driver<H> {
             sealing.as_ref().and_then(Sealing::hello),
         );
         self.session.open(sealing);
-        self.session.outbox.push(Outgoing::Text(hello));
+        self.session.outbox.push(Outgoing::Handshake(hello));
         let ready_by = Instant::now() + self.config.ready_timeout;
-        let mut next_beat = Instant::now() + self.config.heartbeat;
         let mut last_seen = Instant::now();
+        let mut beat = Timer::new();
+        beat.set(Some(Instant::now() + self.config.heartbeat));
+        let mut wake = Timer::new();
+        let mut recheck = Timer::new();
 
         loop {
-            if let Err(lost) = self.write(&socket) {
-                return lost;
-            }
             if let Some(error) = self.session.fatal.take() {
+                // Nothing the failed frame asked for goes out.
+                self.session.outbox.clear();
                 socket.close("client error");
                 return Lost::Fatal(error);
+            }
+            if let Err(lost) = self.write(&socket) {
+                return lost;
             }
             if std::mem::take(&mut self.session.became_ready) {
                 self.policy.connected();
@@ -321,23 +410,30 @@ impl<H: Handler> Driver<H> {
                     let _ = first.send(Ok(()));
                 }
             }
-            let deadline = if self.session.ready {
+            wake.set(if self.session.ready {
                 self.session.next_deadline()
             } else {
                 Some(ready_by)
-            };
+            });
+            // The application's messages wait while the browser holds a
+            // megabyte unsent; the socket is looked at again shortly.
+            let room = !socket.is_full();
+            recheck.set((!room).then(|| Instant::now() + BUFFERED_CHECK));
 
             tokio::select! {
                 biased;
                 control = self.control.recv() => match control {
                     None | Some(Control::Close) => {
+                        self.take_queued();
                         let _ = self.write(&socket);
                         socket.close("client closed");
                         return Lost::Shutdown;
                     }
                     Some(Control::Reconnect) => {
+                        self.take_queued();
+                        let _ = self.write(&socket);
                         socket.close("reconnecting");
-                        return Lost::Closed { code: None, reason: "reconnect asked".to_owned() };
+                        return Lost::Requested;
                     }
                     Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                     Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
@@ -352,7 +448,7 @@ impl<H: Handler> Driver<H> {
                                 alive |= frames::on_data(
                                     &mut self.decoder,
                                     &mut self.session,
-                                    Data::Text(&text, None),
+                                    Data::Text(&text, Some(text.as_bytes())),
                                 );
                             }
                             Some(Happened::Binary(data)) => {
@@ -389,7 +485,7 @@ impl<H: Handler> Driver<H> {
                         last_seen = Instant::now();
                     }
                 }
-                Some(text) = self.frames.recv(), if self.session.ready => {
+                Some(text) = self.frames.recv(), if self.session.ready && room => {
                     self.session.outbox.push(Outgoing::Text(text));
                     for _ in 1..SEND_BATCH {
                         match self.frames.try_recv() {
@@ -398,8 +494,8 @@ impl<H: Handler> Driver<H> {
                         }
                     }
                 }
-                _ = sleep_until(Some(next_beat)) => {
-                    next_beat = Instant::now() + self.config.heartbeat;
+                () = beat.fired() => {
+                    beat.set(Some(Instant::now() + self.config.heartbeat));
                     if last_seen.elapsed() >= self.config.idle_timeout {
                         socket.close("idle");
                         return Lost::Closed {
@@ -412,7 +508,8 @@ impl<H: Handler> Driver<H> {
                         self.session.outbox.push(Outgoing::Text(session::ping()));
                     }
                 }
-                _ = sleep_until(deadline) => {
+                () = recheck.fired() => {}
+                () = wake.fired() => {
                     if !self.session.ready {
                         socket.close("not ready");
                         if self.session.sealing.as_ref().is_some_and(|s| !s.is_open()) {
@@ -432,15 +529,32 @@ impl<H: Handler> Driver<H> {
         }
     }
 
+    /// What the application sent before it closed goes out first.
+    fn take_queued(&mut self) {
+        if self.session.ready {
+            while let Ok(text) = self.frames.try_recv() {
+                self.session.outbox.push(Outgoing::Text(text));
+            }
+        }
+    }
+
     /// Sends what the session queued: sealed once an end-to-end session is
-    /// open.
+    /// open. On a connection with a session nothing goes in plaintext but
+    /// the handshake.
     fn write(&mut self, socket: &Socket) -> Result<(), Lost> {
         for outgoing in self.session.outbox.drain(..) {
-            let Outgoing::Text(text) = outgoing;
+            let (text, handshake) = match outgoing {
+                Outgoing::Text(text) => (text, false),
+                Outgoing::Handshake(text) => (text, true),
+            };
             let frame = match self.session.sealing.as_mut() {
                 Some(sealing) => match sealing.seal(&text) {
                     Ok(Some(sealed)) => Frame::Binary(sealed),
-                    Ok(None) => Frame::Text(text),
+                    Ok(None) if handshake => Frame::Text(text),
+                    Ok(None) => {
+                        tracing::error!("[WSE] a message before the end-to-end session not sent");
+                        continue;
+                    }
                     Err(error @ Error::Encryption(_)) => return Err(Lost::Fatal(error)),
                     Err(error) => return Err(Lost::Failed(error)),
                 },

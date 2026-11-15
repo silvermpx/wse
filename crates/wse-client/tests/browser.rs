@@ -7,8 +7,8 @@
 //!     CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
 //!     cargo test -p wse-client --target wasm32-unknown-unknown --test browser
 //!
-//! The runner runs it in Node, whose WebSocket is the browser's; without a
-//! server the tests pass without running.
+//! The runner runs it in Node, whose WebSocket is the browser's. Built
+//! without `WSE_TEST_URL`, the tests fail: they need the server.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -21,6 +21,11 @@ use wse_client::{Config, Encryption, Event, Events, Incoming, OwnedMessage};
 const URL: Option<&str> = option_env!("WSE_TEST_URL");
 const IDENTITY: Option<&str> = option_env!("WSE_TEST_IDENTITY");
 const SIGNING: Option<&str> = option_env!("WSE_TEST_SIGNING");
+
+/// A setting of the test server, given at build time (see the top).
+fn given(value: Option<&'static str>, name: &str) -> &'static str {
+    value.unwrap_or_else(|| panic!("{name} is not set: these tests need the example server"))
+}
 
 /// `future`, or a panic after `secs`.
 async fn within<F: std::future::Future>(secs: u64, future: F) -> F::Output {
@@ -49,7 +54,7 @@ async fn message(events: &mut Events, kind: &str) -> OwnedMessage {
 
 #[wasm_bindgen_test]
 async fn a_browser_client_hears_its_topic_and_is_heard() {
-    let Some(url) = URL else { return };
+    let url = given(URL, "WSE_TEST_URL");
     let mut config = Config::new(url);
     config.topics = vec!["ticks".into()];
     let (client, mut events) = wse_client::connect(config).await.unwrap();
@@ -77,7 +82,7 @@ async fn a_browser_client_hears_its_topic_and_is_heard() {
 
 #[wasm_bindgen_test]
 async fn msgpack_in_the_browser() {
-    let Some(url) = URL else { return };
+    let url = given(URL, "WSE_TEST_URL");
     let mut config = Config::new(url);
     config.format = wse_client::Format::Msgpack;
     config.topics = vec!["ticks".into()];
@@ -90,9 +95,10 @@ async fn msgpack_in_the_browser() {
 
 #[wasm_bindgen_test]
 async fn an_encrypted_session_from_the_browser() {
-    let (Some(url), Some(identity)) = (URL, IDENTITY) else {
-        return;
-    };
+    let (url, identity) = (
+        given(URL, "WSE_TEST_URL"),
+        given(IDENTITY, "WSE_TEST_IDENTITY"),
+    );
     let mut config = Config::new(url);
     config.encryption = Some(Encryption::pinned([identity]));
     config.topics = vec!["ticks".into()];
@@ -113,9 +119,10 @@ async fn an_encrypted_session_from_the_browser() {
 
 #[wasm_bindgen_test]
 async fn signed_messages_from_the_browser() {
-    let (Some(url), Some(signing)) = (URL, SIGNING) else {
-        return;
-    };
+    let (url, signing) = (
+        given(URL, "WSE_TEST_URL"),
+        given(SIGNING, "WSE_TEST_SIGNING"),
+    );
     let key = wse_client::generate_key();
     let mut config = Config::new(url);
     config.signing_key = Some(key.clone());

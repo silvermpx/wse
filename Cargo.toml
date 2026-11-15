@@ -17,6 +17,8 @@ repository = "https://github.com/silvermpx/wse"
 # The crates depend on one another at exactly the release's version.
 [workspace.dependencies]
 wse-protocol = { version = "=3.0.0", path = "crates/wse-protocol" }
+# The Rust client's tests and examples run against the server.
+wse = { version = "=3.0.0", path = "crates/wse" }
 
 [profile.release]
 lto = true

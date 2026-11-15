@@ -1,6 +1,13 @@
 // The README shows encryption and signing: the crate documentation with them.
 #![cfg_attr(feature = "aws-lc", doc = include_str!("../README.md"))]
 
+// In the browser the crypto is RustCrypto: there is no FIPS module there.
+#[cfg(all(feature = "fips", target_arch = "wasm32"))]
+compile_error!("the fips feature needs aws-lc-rs, which does not build for the browser");
+// WebAssembly outside the browser has no WebSocket of the page to drive.
+#[cfg(all(target_arch = "wasm32", not(target_os = "unknown")))]
+compile_error!("wse-client runs natively, or in the browser (wasm32-unknown-unknown)");
+
 #[cfg(target_arch = "wasm32")]
 mod browser;
 mod client;

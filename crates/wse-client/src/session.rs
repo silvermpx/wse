@@ -2,7 +2,7 @@
 //! the application, the topics subscribed and where each stands, and the
 //! gaps being recovered. No I/O: what it sends goes in its outbox.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -32,29 +32,44 @@ const UNANSWERED_MAX: u32 = 2;
 
 type Map<V> = HashMap<Box<str>, V, foldhash::fast::RandomState>;
 
-/// A topic waiting for the server to replay what it missed.
+/// A stream of a topic waiting for the server to replay what it missed.
 struct Hole {
     epoch: u32,
     /// What came past the hole, by offset.
     held: BTreeMap<u64, OwnedMessage>,
     deadline: Instant,
-    /// A request is out, not answered yet.
-    in_flight: bool,
+    /// The request out for it, not answered yet.
+    request: Option<u64>,
     /// The offset the last request asked from.
     requested_from: Option<u64>,
-    /// Some answer came for this topic.
+    /// An answer came for it.
     answered: bool,
 }
 
 #[derive(Default)]
 struct Topic {
     streams: Streams,
-    hole: Option<Box<Hole>>,
+    /// One per stream with a gap: usually none, at most one per node that
+    /// publishes on the topic.
+    holes: Vec<Hole>,
+}
+
+/// A recovery request out. The server answers a connection's requests in
+/// order, so each topic's answers settle its requests front to back.
+struct Request {
+    id: u64,
+    /// Asked for a hole, not by a subscription.
+    for_hole: bool,
 }
 
 /// What the session asks of the connection.
 pub(crate) enum Outgoing {
+    /// Sealed on a connection with an end-to-end session; never sent there
+    /// in plaintext.
     Text(String),
+    /// The handshake's own (client_hello, the answer to a ping): as it is
+    /// before the session opens, sealed after.
+    Handshake(String),
 }
 
 pub(crate) struct Session<H> {
@@ -65,8 +80,9 @@ pub(crate) struct Session<H> {
     /// connection.
     wanted: BTreeSet<String>,
     topics: Map<Topic>,
-    /// Positions recoveries were asked from, by topic, until answered.
-    requests: Map<Position>,
+    /// The recovery requests out, by topic, oldest first.
+    requests: Map<VecDeque<Request>>,
+    next_request: u64,
     /// Topics whose history the server said it cannot replay, by epoch.
     unrecoverable: Map<u32>,
     unanswered: u32,
@@ -108,6 +124,7 @@ impl<H: Handler> Session<H> {
             wanted: topics.iter().cloned().collect(),
             topics: Map::default(),
             requests: Map::default(),
+            next_request: 0,
             unrecoverable: Map::default(),
             unanswered: 0,
             holes: 0,
@@ -133,9 +150,16 @@ impl<H: Handler> Session<H> {
         self.unanswered = 0;
         self.outbox.clear();
         for topic in self.topics.values_mut() {
-            if let Some(hole) = &mut topic.hole {
-                hole.in_flight = false;
+            for hole in &mut topic.holes {
+                hole.request = None;
             }
+        }
+        // The new connection's server names its own key and id.
+        if let Ok(mut server_kid) = self.shared.server_kid.lock() {
+            *server_kid = None;
+        }
+        if let Ok(mut connection) = self.shared.connection.lock() {
+            *connection = None;
         }
     }
 
@@ -147,38 +171,60 @@ impl<H: Handler> Session<H> {
         self.shared.ready.store(false, Ordering::Release);
         self.requests.clear();
         for topic in self.topics.values_mut() {
-            if let Some(hole) = &mut topic.hole {
-                hole.in_flight = false;
+            for hole in &mut topic.holes {
+                hole.request = None;
             }
         }
     }
 
     /// The client stops: whatever is held is delivered, its gaps reported.
     pub(crate) fn finish(&mut self) {
-        let held: Vec<Box<str>> = self
-            .topics
-            .iter()
-            .filter(|(_, t)| t.hole.is_some())
-            .map(|(name, _)| name.clone())
-            .collect();
-        for topic in held {
-            self.give_up(&topic, GapReason::Closed);
+        for (topic, epoch) in self.holes_where(|_| true) {
+            self.give_up(&topic, epoch, GapReason::Closed);
         }
+    }
+
+    /// The holes `pick` picks, by topic and stream.
+    fn holes_where(&self, pick: impl Fn(&Hole) -> bool) -> Vec<(Box<str>, u32)> {
+        self.topics
+            .iter()
+            .flat_map(|(name, topic)| {
+                topic
+                    .holes
+                    .iter()
+                    .filter(|hole| pick(hole))
+                    .map(move |hole| (name.clone(), hole.epoch))
+            })
+            .collect()
     }
 
     // -- Frames ------------------------------------------------------------
 
-    pub(crate) fn on_json(&mut self, text: &str, frame: Option<&Bytes>) {
+    /// A JSON message; false when `text` is not one.
+    pub(crate) fn on_json(&mut self, text: &str, frame: Option<&Bytes>) -> bool {
         match decode::json_envelope(text) {
-            Ok(envelope) => self.on_envelope(envelope, frame),
-            Err(e) => tracing::debug!("[WSE] frame dropped: {e}"),
+            Ok(envelope) => {
+                self.on_envelope(envelope, frame);
+                true
+            }
+            Err(e) => {
+                tracing::debug!("[WSE] not a message: {e}");
+                false
+            }
         }
     }
 
-    pub(crate) fn on_msgpack(&mut self, data: &[u8], frame: Option<&Bytes>) {
+    /// A msgpack message; false when `data` is not one.
+    pub(crate) fn on_msgpack(&mut self, data: &[u8], frame: Option<&Bytes>) -> bool {
         match decode::msgpack_envelope(data) {
-            Ok(envelope) => self.on_envelope(envelope, frame),
-            Err(e) => tracing::debug!("[WSE] frame dropped: {e}"),
+            Ok(envelope) => {
+                self.on_envelope(envelope, frame);
+                true
+            }
+            Err(e) => {
+                tracing::debug!("[WSE] not a message: {e}");
+                false
+            }
         }
     }
 
@@ -195,7 +241,14 @@ impl<H: Handler> Session<H> {
             )
         });
         match envelope {
-            Some(envelope) if handshake && !open => self.on_envelope(envelope, None),
+            Some(mut envelope) if handshake && !open => {
+                // What the handshake needs, never a topic's message nor the
+                // application's: nothing unsealed reaches either.
+                envelope.tp = None;
+                envelope.e = None;
+                envelope.o = None;
+                self.dispatch(&envelope.into_message(None));
+            }
             _ => {
                 let why = if open { "inside" } else { "before" };
                 self.fail(Error::Encryption(format!(
@@ -222,12 +275,12 @@ impl<H: Handler> Session<H> {
             match envelope.p {
                 Some(Payload::Json(p)) => {
                     for message in decode::json_batch(p).unwrap_or_default() {
-                        self.on_json(message, frame);
+                        let _ = self.on_json(message, frame);
                     }
                 }
                 Some(Payload::Msgpack(p)) => {
                     for message in decode::msgpack_batch(p).unwrap_or_default() {
-                        self.on_msgpack(message, frame);
+                        let _ = self.on_msgpack(message, frame);
                     }
                 }
                 _ => {}
@@ -236,7 +289,7 @@ impl<H: Handler> Session<H> {
         }
         let message = envelope.into_message(frame);
         match (message.position, &message.topic) {
-            (Some(at), Some(_)) => self.on_stamped(message, at),
+            (Some(at), Some(_)) if !is_protocol(message.kind()) => self.on_stamped(message, at),
             _ => self.dispatch(&message),
         }
     }
@@ -265,13 +318,19 @@ impl<H: Handler> Session<H> {
             tracing::warn!("[WSE] signed message dropped: its body has no type");
             return;
         }
-        if let (Some(came_on), Some(signed_for)) = (&outer.tp, &signed.tp)
-            && came_on != signed_for
-        {
-            tracing::warn!(
-                "[WSE] message signed for topic {signed_for} that came on {came_on} dropped"
-            );
-            return;
+        match (&outer.tp, &signed.tp) {
+            (Some(came_on), Some(signed_for)) if came_on != signed_for => {
+                tracing::warn!(
+                    "[WSE] message signed for topic {signed_for} that came on {came_on} dropped"
+                );
+                return;
+            }
+            // Signed for one connection, not for a topic's subscribers.
+            (Some(came_on), None) => {
+                tracing::warn!("[WSE] message signed for no topic that came on {came_on} dropped");
+                return;
+            }
+            _ => {}
         }
         let signature = Signature {
             body: body.to_string(),
@@ -284,6 +343,8 @@ impl<H: Handler> Session<H> {
             t: signed.t,
             p: signed.p,
             c: outer.c,
+            // The time the server signed: the one a reader can trust.
+            ts: signed.ts,
             tp: outer.tp.or(signed.tp),
             e: outer.e,
             o: outer.o,
@@ -293,7 +354,7 @@ impl<H: Handler> Session<H> {
         message.id = id;
         message.signature = Some(Arc::new(signature));
         match (message.position, &message.topic) {
-            (Some(at), Some(_)) => self.on_stamped(message, at),
+            (Some(at), Some(_)) if !is_protocol(message.kind()) => self.on_stamped(message, at),
             _ => self.dispatch(&message),
         }
     }
@@ -320,7 +381,7 @@ impl<H: Handler> Session<H> {
             None => self.topics.entry(name.into()).or_default(),
         };
         // A hole in another stream of the topic does not hold this one.
-        let held_here = topic.hole.as_ref().is_some_and(|h| h.epoch == at.epoch);
+        let held_here = topic.holes.iter().any(|h| h.epoch == at.epoch);
         match topic.streams.check(at) {
             Verdict::Duplicate => {}
             Verdict::Deliver => {
@@ -329,27 +390,26 @@ impl<H: Handler> Session<H> {
                 }
                 self.handler.message(&message);
                 if held_here {
-                    let name: Box<str> = name.into();
-                    self.drain(&name);
+                    self.drain(name, at.epoch);
                 }
             }
             Verdict::Gap if held_here => {
-                let hole = topic.hole.as_mut().expect("held_here");
+                let Some(hole) = topic.holes.iter_mut().find(|h| h.epoch == at.epoch) else {
+                    return;
+                };
                 hole.held
                     .entry(at.offset)
                     .or_insert_with(|| message.to_owned());
                 if hole.held.len() > HELD_MAX {
-                    let name: Box<str> = name.into();
-                    self.give_up(&name, GapReason::Overflow);
+                    self.give_up(name, at.epoch, GapReason::Overflow);
                 }
             }
             Verdict::Gap => {
-                let name: Box<str> = name.into();
-                if self.unrecoverable.get(&name) == Some(&at.epoch) {
-                    self.unrecoverable.remove(&name);
-                    self.skip(&name, &message, at, GapReason::NotRecovered);
-                } else if !self.start_hole(&name, &message, at) {
-                    self.skip(&name, &message, at, GapReason::Unavailable);
+                if self.unrecoverable.get(name) == Some(&at.epoch) {
+                    self.unrecoverable.remove(name);
+                    self.skip(name, &message, at, GapReason::NotRecovered);
+                } else if !self.start_hole(name, &message, at) {
+                    self.skip(name, &message, at, GapReason::Unavailable);
                 }
             }
         }
@@ -370,117 +430,133 @@ impl<H: Handler> Session<H> {
         let Some(topic) = self.topics.get_mut(name) else {
             return false;
         };
-        if topic.hole.is_some() || topic.streams.stream(at.epoch).is_none() {
+        if topic.holes.iter().any(|h| h.epoch == at.epoch)
+            || topic.streams.stream(at.epoch).is_none()
+        {
             return false;
         }
         let deadline = Instant::now() + self.recovery_timeout;
         let mut held = BTreeMap::new();
         held.insert(at.offset, message.to_owned());
-        topic.hole = Some(Box::new(Hole {
+        topic.holes.push(Hole {
             epoch: at.epoch,
             held,
             deadline,
-            in_flight: false,
+            request: None,
             requested_from: None,
             answered: false,
-        }));
+        });
         self.holes += 1;
         self.next_deadline = Some(self.next_deadline.map_or(deadline, |d| d.min(deadline)));
-        self.request_recovery(name);
+        self.request_recovery(name, at.epoch);
         true
     }
 
     /// Asks the server to replay a topic from the last message of the
     /// stream with the hole: it replays that stream, and every other
     /// stream of the topic, from that point.
-    fn request_recovery(&mut self, name: &str) {
+    fn request_recovery(&mut self, name: &str, epoch: u32) {
         let Some(topic) = self.topics.get_mut(name) else {
             return;
         };
-        let Some(hole) = topic.hole.as_mut() else {
+        let Some(hole) = topic.holes.iter_mut().find(|h| h.epoch == epoch) else {
             return;
         };
-        if hole.in_flight {
+        if hole.request.is_some() {
             return;
         }
-        let Some(from) = topic.streams.stream(hole.epoch) else {
+        let Some(from) = topic.streams.stream(epoch) else {
             return;
         };
-        hole.in_flight = true;
+        let id = self.next_request;
+        self.next_request += 1;
+        hole.request = Some(id);
         hole.requested_from = Some(from.offset);
-        self.requests.insert(name.into(), from);
+        self.requests
+            .entry(name.into())
+            .or_default()
+            .push_back(Request { id, for_hole: true });
         let request = subscription(&[name], &[(name, from)]);
         self.outbox.push(Outgoing::Text(request));
     }
 
     /// Delivers what became in order; closes a filled hole.
-    fn drain(&mut self, name: &str) {
+    fn drain(&mut self, name: &str, epoch: u32) {
         loop {
             let Some(topic) = self.topics.get_mut(name) else {
                 return;
             };
-            let Some(hole) = topic.hole.as_mut() else {
+            let Some(hole) = topic.holes.iter_mut().find(|h| h.epoch == epoch) else {
                 return;
             };
-            let Some(last) = topic.streams.stream(hole.epoch) else {
+            let Some(next_offset) = topic
+                .streams
+                .stream(epoch)
+                .and_then(|last| last.offset.checked_add(1))
+            else {
                 break;
             };
-            hole.held = hole.held.split_off(&(last.offset + 1));
-            let Some(next) = hole.held.remove(&(last.offset + 1)) else {
+            hole.held = hole.held.split_off(&next_offset);
+            let Some(next) = hole.held.remove(&next_offset) else {
                 break;
             };
             topic.streams.advance(Position {
-                epoch: hole.epoch,
-                offset: last.offset + 1,
+                epoch,
+                offset: next_offset,
             });
             self.handler.message(&next.as_message());
         }
         let filled = self
             .topics
             .get(name)
-            .and_then(|t| t.hole.as_ref())
+            .and_then(|t| t.holes.iter().find(|h| h.epoch == epoch))
             .is_some_and(|h| h.held.is_empty());
         if filled {
-            self.close_hole(name);
+            self.close_hole(name, epoch);
             tracing::info!("[WSE] recovered the gap on {name}");
         }
     }
 
-    fn close_hole(&mut self, name: &str) -> Option<Box<Hole>> {
-        let hole = self.topics.get_mut(name)?.hole.take()?;
+    fn close_hole(&mut self, name: &str, epoch: u32) -> Option<Hole> {
+        let holes = &mut self.topics.get_mut(name)?.holes;
+        let index = holes.iter().position(|h| h.epoch == epoch)?;
+        let hole = holes.swap_remove(index);
         self.holes -= 1;
         if self.next_deadline == Some(hole.deadline) || self.holes == 0 {
-            self.next_deadline = self
-                .topics
-                .values()
-                .filter_map(|t| t.hole.as_ref().map(|h| h.deadline))
-                .min();
+            self.next_deadline = self.first_deadline();
         }
         Some(hole)
     }
 
+    /// The deadline of the hole that gives up first.
+    fn first_deadline(&self) -> Option<Instant> {
+        self.topics
+            .values()
+            .flat_map(|t| t.holes.iter().map(|h| h.deadline))
+            .min()
+    }
+
     /// Stops waiting: reports what is missing, delivers what is held.
-    fn give_up(&mut self, name: &str, reason: GapReason) {
-        let Some(hole) = self.close_hole(name) else {
+    fn give_up(&mut self, name: &str, epoch: u32, reason: GapReason) {
+        let Some(hole) = self.close_hole(name, epoch) else {
             return;
         };
         let mut last = self
             .topics
             .get(name)
-            .and_then(|t| t.streams.stream(hole.epoch))
+            .and_then(|t| t.streams.stream(epoch))
             .map(|p| p.offset);
         for (offset, message) in hole.held {
             if last.is_some_and(|last| offset <= last) {
                 continue;
             }
-            if let Some(last) = last.filter(|&last| offset > last + 1) {
-                self.report(name, hole.epoch, Some(last + 1), Some(offset - 1), reason);
+            if let Some(first) = last.and_then(|last| last.checked_add(1))
+                && offset > first
+            {
+                self.report(name, epoch, Some(first), Some(offset - 1), reason);
             }
             if let Some(topic) = self.topics.get_mut(name) {
-                topic.streams.advance(Position {
-                    epoch: hole.epoch,
-                    offset,
-                });
+                topic.streams.advance(Position { epoch, offset });
             }
             self.handler.message(&message.as_message());
             last = Some(offset);
@@ -494,14 +570,10 @@ impl<H: Handler> Session<H> {
         };
         let last = topic.streams.stream(at.epoch);
         topic.streams.advance(at);
-        if let Some(last) = last.filter(|last| at.offset > last.offset + 1) {
-            self.report(
-                name,
-                at.epoch,
-                Some(last.offset + 1),
-                Some(at.offset - 1),
-                reason,
-            );
+        if let Some(first) = last.and_then(|last| last.offset.checked_add(1))
+            && at.offset > first
+        {
+            self.report(name, at.epoch, Some(first), Some(at.offset - 1), reason);
         }
         self.handler.message(message);
     }
@@ -535,24 +607,16 @@ impl<H: Handler> Session<H> {
 
     /// Holes whose wait is over give up.
     pub(crate) fn on_deadline(&mut self, now: Instant) {
-        let expired: Vec<Box<str>> = self
-            .topics
-            .iter()
-            .filter(|(_, t)| t.hole.as_ref().is_some_and(|h| h.deadline <= now))
-            .map(|(name, _)| name.clone())
-            .collect();
-        for name in expired {
-            let unanswered = self
-                .topics
-                .get(&name)
-                .and_then(|t| t.hole.as_ref())
-                .is_some_and(|h| h.in_flight && !h.answered);
-            if unanswered {
-                // Nothing came back: the server application may not answer
-                // recovery requests. After a few, stop asking.
-                self.unanswered += 1;
-            }
-            self.give_up(&name, GapReason::Timeout);
+        // Nothing came back for these: the server application may not
+        // answer recovery requests. After a few, the client stops asking.
+        let unanswered = self
+            .holes_where(|h| h.deadline <= now && h.request.is_some() && !h.answered)
+            .len();
+        self.unanswered = self
+            .unanswered
+            .saturating_add(u32::try_from(unanswered).unwrap_or(u32::MAX));
+        for (name, epoch) in self.holes_where(|h| h.deadline <= now) {
+            self.give_up(&name, epoch, GapReason::Timeout);
         }
     }
 
@@ -577,14 +641,10 @@ impl<H: Handler> Session<H> {
         for topic in &topics {
             self.wanted.remove(topic);
             if let Some(state) = self.topics.remove(topic.as_str())
-                && state.hole.is_some()
+                && !state.holes.is_empty()
             {
-                self.holes -= 1;
-                self.next_deadline = self
-                    .topics
-                    .values()
-                    .filter_map(|t| t.hole.as_ref().map(|h| h.deadline))
-                    .min();
+                self.holes -= state.holes.len();
+                self.next_deadline = self.first_deadline();
             }
             self.requests.remove(topic.as_str());
             self.unrecoverable.remove(topic.as_str());
@@ -614,18 +674,39 @@ impl<H: Handler> Session<H> {
                 }
             }
         }
+        let now = Instant::now();
         for &(topic, at) in &positions {
-            self.requests.insert(topic.into(), at);
-            if let Some(hole) = self.topics.get_mut(topic).and_then(|t| t.hole.as_mut())
-                && hole.epoch == at.epoch
-            {
-                hole.in_flight = true;
+            let id = self.next_request;
+            self.next_request += 1;
+            let hole = self
+                .topics
+                .get_mut(topic)
+                .and_then(|t| t.holes.iter_mut().find(|h| h.epoch == at.epoch));
+            let for_hole = hole.is_some();
+            if let Some(hole) = hole {
+                hole.request = Some(id);
                 hole.requested_from = Some(at.offset);
+                // The wait starts again with the request: the replay comes
+                // after it, not before.
+                hole.deadline = now + self.recovery_timeout;
             }
+            self.requests
+                .entry(topic.into())
+                .or_default()
+                .push_back(Request { id, for_hole });
+        }
+        if self.holes > 0 {
+            self.next_deadline = self.first_deadline();
         }
         let names: Vec<&str> = topics.iter().map(String::as_str).collect();
         self.outbox
             .push(Outgoing::Text(subscription(&names, &positions)));
+        // Holes in the topics' other streams ask for themselves.
+        for (topic, epoch) in self.holes_where(|h| h.request.is_none()) {
+            if topics.iter().any(|t| **t == *topic) {
+                self.request_recovery(&topic, epoch);
+            }
+        }
     }
 
     fn on_subscription_reply(&mut self, message: &Message<'_>) {
@@ -680,19 +761,28 @@ impl<H: Handler> Session<H> {
         has_epoch: bool,
         offset: Option<u64>,
     ) {
-        let requested = self.requests.remove(name);
-        let hole = self.topics.get_mut(name).and_then(|t| t.hole.as_mut());
+        let Some(request) = self.requests.get_mut(name).and_then(VecDeque::pop_front) else {
+            return; // an answer to a plain subscription: nothing moves
+        };
+        if self.requests.get(name).is_some_and(VecDeque::is_empty) {
+            self.requests.remove(name);
+        }
+        self.unanswered = 0;
+        let hole = self
+            .topics
+            .get_mut(name)
+            .and_then(|t| t.holes.iter_mut().find(|h| h.request == Some(request.id)));
         if let Some(hole) = hole {
-            if !hole.in_flight {
-                return; // not the answer to a request of this client's
-            }
-            hole.in_flight = false;
+            hole.request = None;
             hole.answered = true;
             let (hole_epoch, requested_from) = (hole.epoch, hole.requested_from);
-            self.unanswered = 0;
             // The replay came before this answer.
-            self.drain(name);
-            let Some(topic) = self.topics.get(name).filter(|t| t.hole.is_some()) else {
+            self.drain(name, hole_epoch);
+            let Some(topic) = self
+                .topics
+                .get(name)
+                .filter(|t| t.holes.iter().any(|h| h.epoch == hole_epoch))
+            else {
                 return; // filled
             };
             let progressed = topic
@@ -700,24 +790,24 @@ impl<H: Handler> Session<H> {
                 .stream(hole_epoch)
                 .zip(requested_from)
                 .is_some_and(|(at, from)| at.offset > from);
-            if recovered && progressed {
-                // A replay cut short by back-pressure: ask again from where
-                // it got to.
-                self.request_recovery(name);
+            // A replay the server's outbound budget cut short answers
+            // `recovered: false` in the same history, past where it was
+            // asked from: ask again from where it got to.
+            if progressed && (recovered || epoch == Some(hole_epoch)) {
+                self.request_recovery(name, hole_epoch);
             } else {
                 let reason = if recovered {
                     GapReason::Incomplete
                 } else {
                     GapReason::NotRecovered
                 };
-                self.give_up(name, reason);
+                self.give_up(name, hole_epoch, reason);
             }
             return;
         }
-        if requested.is_none() {
-            return; // an answer to a plain subscription: nothing moves
+        if request.for_hole {
+            return; // the answer for a hole settled meanwhile
         }
-        self.unanswered = 0;
         if recovered {
             return; // the replay moved the position as it came
         }
@@ -765,7 +855,7 @@ impl<H: Handler> Session<H> {
         let pong = format!(
             r#"{{"c":"WSE","t":"PONG","p":{{"client_timestamp":{now},"server_timestamp":{echoed}}},"v":1}}"#
         );
-        self.outbox.push(Outgoing::Text(pong));
+        self.outbox.push(Outgoing::Handshake(pong));
     }
 
     fn on_server_ready(&mut self, message: &Message<'_>) {
@@ -828,9 +918,12 @@ impl<H: Handler> Session<H> {
                 Ok(()) => tracing::info!("[WSE] end-to-end session open"),
                 Err(error) => self.fail(error),
             }
-            // server_hello comes unsealed: the sealed server_ready names
-            // the signing key.
-        } else if let Some(signing) = hello.signing {
+            // server_hello comes unsealed, and anyone in between may have
+            // written it: only the sealed server_ready takes the connection
+            // and names the signing key. Nothing goes before it.
+            return;
+        }
+        if let Some(signing) = hello.signing {
             self.take_signing_key(signing.kid);
         }
         // A 3.x server sends server_ready, at once or when its application
@@ -916,6 +1009,21 @@ impl<H: Handler> Session<H> {
     }
 }
 
+/// The server's own messages: never a topic's, whatever they carry.
+fn is_protocol(kind: &str) -> bool {
+    matches!(
+        kind,
+        "ping"
+            | "PING"
+            | "pong"
+            | "PONG"
+            | "server_ready"
+            | "server_hello"
+            | "subscription_update"
+            | "error"
+    )
+}
+
 #[derive(serde::Deserialize, Default)]
 #[serde(default)]
 struct Features {
@@ -963,9 +1071,9 @@ pub(crate) fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// The client's heartbeat as a message, where the WebSocket has no pings of
-/// its own to send (the browser's).
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+/// The client's heartbeat as a message: where the WebSocket has no pings of
+/// its own to send (the browser's), and in an end-to-end session, where only
+/// a sealed answer shows the server is alive.
 pub(crate) fn ping() -> String {
     format!(
         r#"{{"c":"WSE","t":"ping","p":{{"timestamp":{}}},"v":1}}"#,
@@ -1057,7 +1165,9 @@ mod tests {
         session
             .outbox
             .drain(..)
-            .map(|Outgoing::Text(text)| serde_json::from_str(text.as_str()).unwrap())
+            .map(|(Outgoing::Text(text) | Outgoing::Handshake(text))| {
+                serde_json::from_str(text.as_str()).unwrap()
+            })
             .collect()
     }
 
@@ -1074,6 +1184,142 @@ mod tests {
     }
 
     const E: &str = "0000000a";
+
+    /// The server's answer to a recovery request for `t`.
+    fn reply(s: &mut Session<Seen>, epoch: &str, offset: u64, recovered: bool, count: u64) {
+        s.on_json(
+            &format!(
+                r#"{{"c":"WSE","t":"subscription_update","p":{{"success_topics":["t"],"recovery":{{"t":{{"epoch":"{epoch}","offset":{offset},"recovered":{recovered},"count":{count}}}}}}}}}"#
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn an_unsealed_handshake_frame_never_reaches_a_topic() {
+        let mut s = session(Duration::from_secs(3));
+        // Before a session: a ping with a topic's stamp, written by whoever
+        // sits in between.
+        s.on_unsealed(Some(
+            r#"{"t":"ping","tp":"t","e":"0000000a","o":18446744073709551615,"p":{}}"#,
+        ));
+        assert!(s.handler.offsets.is_empty());
+        assert!(
+            s.topics
+                .get("t")
+                .and_then(|t| t.streams.position())
+                .is_none()
+        );
+        // Answered as a ping, by the handshake's own kind of message.
+        assert!(matches!(
+            s.outbox.as_slice(),
+            [Outgoing::Handshake(pong)] if pong.contains("PONG")
+        ));
+        // A stamped protocol message moves no topic either.
+        ready(&mut s, true);
+        s.on_json(
+            r#"{"t":"error","tp":"t","e":"0000000a","o":99,"p":{"code":"X","message":"y"}}"#,
+            None,
+        );
+        feed(&mut s, E, &[1]);
+        assert_eq!(s.handler.offsets, [1]);
+    }
+
+    #[test]
+    fn a_late_answer_settles_only_its_own_hole() {
+        let mut s = session(Duration::from_secs(3));
+        ready(&mut s, true);
+        sent(&mut s);
+        feed(&mut s, E, &[1, 3]);
+        // The replay fills the hole before its answer comes.
+        feed(&mut s, E, &[2]);
+        assert_eq!(s.handler.offsets, [1, 2, 3]);
+        // Another hole, another request.
+        feed(&mut s, E, &[5]);
+        assert_eq!(sent(&mut s).len(), 2);
+        // The first request's answer is not the second's.
+        reply(&mut s, E, 3, true, 1);
+        assert!(gaps(&s).is_empty());
+        feed(&mut s, E, &[4]);
+        reply(&mut s, E, 5, true, 1);
+        assert_eq!(s.handler.offsets, [1, 2, 3, 4, 5]);
+        assert!(gaps(&s).is_empty());
+        assert_eq!(s.next_deadline(), None);
+    }
+
+    #[test]
+    fn gaps_in_two_streams_of_a_topic_are_recovered_each() {
+        const F: &str = "0000000b";
+        let mut s = session(Duration::from_secs(3));
+        ready(&mut s, true);
+        sent(&mut s);
+        feed(&mut s, E, &[1]);
+        feed(&mut s, F, &[1]);
+        feed(&mut s, E, &[3]);
+        // A gap in the other stream is held too, not skipped.
+        feed(&mut s, F, &[3]);
+        assert_eq!(sent(&mut s).len(), 2);
+        feed(&mut s, E, &[2]);
+        feed(&mut s, F, &[2]);
+        reply(&mut s, E, 3, true, 1);
+        reply(&mut s, F, 3, true, 1);
+        assert_eq!(s.handler.offsets, [1, 1, 2, 3, 2, 3]);
+        assert!(gaps(&s).is_empty());
+        assert_eq!(s.next_deadline(), None);
+    }
+
+    #[test]
+    fn a_replay_the_server_cut_short_is_asked_for_again() {
+        let mut s = session(Duration::from_secs(3));
+        ready(&mut s, true);
+        sent(&mut s);
+        feed(&mut s, E, &[1, 5]);
+        sent(&mut s);
+        // The server's outbound budget let one through.
+        feed(&mut s, E, &[2]);
+        reply(&mut s, E, 2, false, 1);
+        assert!(gaps(&s).is_empty());
+        let again = sent(&mut s);
+        assert_eq!(
+            again[0]["p"]["recovery"],
+            serde_json::json!({"t": {"epoch": E, "offset": 2}})
+        );
+        feed(&mut s, E, &[3, 4]);
+        reply(&mut s, E, 4, true, 2);
+        assert_eq!(s.handler.offsets, [1, 2, 3, 4, 5]);
+        assert!(gaps(&s).is_empty());
+    }
+
+    #[test]
+    fn a_reconnect_gives_a_hole_its_whole_wait_again() {
+        let mut s = session(Duration::from_secs(3));
+        ready(&mut s, true);
+        feed(&mut s, E, &[1, 3]);
+        let first = s.next_deadline().unwrap();
+        s.close();
+        std::thread::sleep(Duration::from_millis(20));
+        s.open(None);
+        ready(&mut s, true);
+        assert!(s.next_deadline().unwrap() > first);
+        assert!(gaps(&s).is_empty());
+    }
+
+    #[test]
+    fn a_message_signed_for_no_topic_is_not_taken_on_one() {
+        let mut s = session(Duration::from_secs(3));
+        ready(&mut s, true);
+        s.on_json(
+            r#"{"t":"signed","tp":"t","e":"0000000a","o":1,"sb":"{\"t\":\"fill\",\"p\":{}}","sig":"AA","kid":"k"}"#,
+            None,
+        );
+        assert!(s.handler.offsets.is_empty());
+        // Signed for the topic it came on: taken.
+        s.on_json(
+            r#"{"t":"signed","tp":"t","e":"0000000a","o":1,"sb":"{\"t\":\"fill\",\"tp\":\"t\",\"p\":{}}","sig":"AA","kid":"k"}"#,
+            None,
+        );
+        assert_eq!(s.handler.offsets, [1]);
+    }
 
     #[test]
     fn a_gap_is_filled_by_the_replay_and_what_came_past_it_follows() {

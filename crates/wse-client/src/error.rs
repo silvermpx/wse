@@ -27,6 +27,8 @@ pub enum Error {
     Full,
     /// The client was closed.
     Closed,
+    /// The application's handler panicked: the client stopped.
+    Panicked,
     /// A message could not be encoded.
     Encode(String),
     /// A payload did not decode into the type asked for.
@@ -46,6 +48,7 @@ impl fmt::Display for Error {
             Self::NotConnected => f.write_str("not connected"),
             Self::Full => f.write_str("the send queue is full"),
             Self::Closed => f.write_str("the client is closed"),
+            Self::Panicked => f.write_str("the handler panicked"),
             Self::Encode(why) => write!(f, "cannot encode the message: {why}"),
             Self::Decode(why) => write!(f, "cannot decode the payload: {why}"),
         }

@@ -44,11 +44,12 @@ pub trait Handler: MaybeSend + 'static {
         let _ = data;
     }
 
-    /// Called before each frame is read. Waiting here holds the server back
-    /// while the application catches up (in the browser, which cannot hold
-    /// a WebSocket back, the frames wait in memory); the heartbeat and sends
-    /// go on meanwhile, and the wait may be dropped for them and begun
-    /// again: it must lose nothing when dropped.
+    /// Called before each frame is read once the server took the
+    /// connection. Waiting here holds the server back while the application
+    /// catches up; the heartbeat and sends go on meanwhile, and the wait may
+    /// be dropped for them and begun again: it must lose nothing when
+    /// dropped. Not called in the browser, which cannot hold a WebSocket
+    /// back: there the frames wait in memory.
     fn ready(&mut self) -> impl Future<Output = ()> + MaybeSend {
         std::future::ready(())
     }

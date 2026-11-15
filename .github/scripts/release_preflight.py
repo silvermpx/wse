@@ -182,16 +182,17 @@ def collect() -> list[Source]:
             semver=True,
         )
     )
-    protocol = _toml("Cargo.toml")["workspace"]["dependencies"]["wse-protocol"]["version"]
-    sources.append(
-        Source(
-            "wse-protocol, as the crates require it (=version)",
-            "Cargo.toml",
-            str(protocol).removeprefix("="),
-            line_of(ROOT / "Cargo.toml", r"^wse-protocol\s*="),
-            semver=True,
+    pins = _toml("Cargo.toml")["workspace"]["dependencies"]
+    for crate in ("wse-protocol", "wse"):
+        sources.append(
+            Source(
+                f"{crate}, as the crates require it (=version)",
+                "Cargo.toml",
+                str(pins[crate]["version"]).removeprefix("="),
+                line_of(ROOT / "Cargo.toml", rf"^{crate}\s*="),
+                semver=True,
+            )
         )
-    )
     lock = _toml("Cargo.lock").get("package", [])
     for crate in ("wse", "wse-client", "wse-protocol", "wse-py"):
         locked = [p for p in lock if p.get("name") == crate]
@@ -297,7 +298,9 @@ def cmd_versions(args: argparse.Namespace) -> int:
         own = next(
             s
             for s in sources
-            if s.value is not None and s.label in ("wse-server version", "Rust crate version")
+            if s.value is not None
+            and s.label
+            in ("wse-server version", "Rust workspace version (the wse crate and the extension)")
         )
         assert own.value is not None
         expected = normalize(own.value)

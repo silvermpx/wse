@@ -523,3 +523,104 @@ async fn signed_messages_both_ways() {
     client.close().await;
     stand.server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn what_was_sent_before_close_goes_out() {
+    let mut stand = stand().await;
+    let (client, _events) = wse_client::connect(stand.config("alice")).await.unwrap();
+    stand.connect_id().await;
+    for n in 0..20 {
+        client.send("bye", &json!({"n": n})).await.unwrap();
+    }
+    client.close().await;
+    for n in 0..20 {
+        loop {
+            if let Heard::Message(message) = stand.heard().await {
+                assert_eq!(message["t"], "bye");
+                assert_eq!(message["p"]["n"], n);
+                break;
+            }
+        }
+    }
+    stand.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_asked_for_happens_at_once_without_reconnects() {
+    let mut stand = stand().await;
+    let mut config = stand.config("alice");
+    config.reconnect.enabled = false;
+    config.reconnect.base_delay = Duration::from_secs(30);
+    let (client, mut events) = wse_client::connect(config).await.unwrap();
+    let first = stand.connect_id().await;
+    client.reconnect().unwrap();
+    let second = stand.connect_id().await;
+    assert_ne!(first, second);
+    loop {
+        if let Event::Connected(connected) = next_event(&mut events).await
+            && connected.reconnected
+        {
+            break;
+        }
+    }
+    assert_eq!(client.status(), Status::Connected);
+    client.close().await;
+    stand.server.stop().await;
+}
+
+/// Panics on the message `boom`.
+struct Fragile;
+
+impl wse_client::Handler for Fragile {
+    fn message(&mut self, message: &wse_client::Message<'_>) {
+        assert_ne!(message.kind(), "boom", "the handler's own bug");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handler_that_panics_ends_the_client_and_says_so() {
+    let mut stand = stand().await;
+    let client = wse_client::Client::connect(stand.config("alice"), Fragile)
+        .await
+        .unwrap();
+    let conn_id = stand.connect_id().await;
+    stand.publisher.send(&conn_id, r#"{"t":"boom"}"#).unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(5), client.closed())
+        .await
+        .expect("closed within 5 s");
+    assert_eq!(closed, Some(Error::Panicked));
+    assert!(!client.is_connected());
+    assert!(matches!(
+        client.status(),
+        Status::Closed(Some(Error::Panicked))
+    ));
+    stand.server.stop().await;
+}
+
+/// Keeps the client it was given, as a bot that answers from its handler.
+struct Keeper {
+    _client: wse_client::Client,
+}
+
+impl wse_client::Handler for Keeper {
+    fn message(&mut self, _message: &wse_client::Message<'_>) {}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_client_a_handler_keeps_does_not_keep_the_connection() {
+    let mut stand = stand().await;
+    let client = wse_client::Client::connect_with(stand.config("alice"), |client| Keeper {
+        _client: client,
+    })
+    .await
+    .unwrap();
+    let conn_id = stand.connect_id().await;
+    drop(client);
+    loop {
+        if let Heard::Disconnect(gone) = stand.heard().await {
+            assert_eq!(gone, conn_id);
+            break;
+        }
+    }
+    stand.server.stop().await;
+}

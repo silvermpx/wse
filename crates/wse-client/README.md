@@ -140,8 +140,10 @@ is the browser's WebSocket, on the page's task: a handler need not be
   the server takes the client by its cookie (`jwt_cookie_name`); `token`,
   `headers` and `tls` do not apply, and a `TokenProvider` is asked before
   each attempt only to refresh what it must.
-- The browser cannot hold a WebSocket back: messages a handler is not
-  `ready` for wait in memory.
+- The browser cannot hold a WebSocket back: what comes waits in memory
+  until the handler or the stream takes it (`Handler::ready` is not called
+  there), and the client's own sends wait while the browser holds a
+  megabyte unsent.
 - End-to-end encryption and signed messages run on RustCrypto there,
   checked against the same vectors as aws-lc-rs.
 
@@ -150,8 +152,8 @@ is the browser's WebSocket, on the page's task: a handler need not be
 - `aws-lc` (default): `wss://` with rustls and the Mozilla root
   certificates, end-to-end encryption and signed messages, on aws-lc-rs (in
   the browser: encryption and signing on RustCrypto, TLS the browser's).
-  Without it the client speaks `ws://` only, and in the browser has no
-  encryption or signing.
+  Without it there is no end-to-end encryption or signing, and natively no
+  `wss://`; in the browser `wss://` is the browser's own TLS.
 - `fips`: aws-lc-rs built from its FIPS 140-3 validated module (needs CMake
   and Go).
 

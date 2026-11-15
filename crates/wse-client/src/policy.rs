@@ -19,6 +19,8 @@ const AUTH_ATTEMPTS: u32 = 3;
 pub(crate) enum Lost {
     /// The application closed the client.
     Shutdown,
+    /// The application asked for a new connection.
+    Requested,
     /// The connection went away.
     Closed { code: Option<u16>, reason: String },
     /// An attempt failed.
@@ -58,6 +60,17 @@ impl Policy {
     pub(crate) fn after(&mut self, lost: Lost, config: &Config, first: &mut First) -> Next {
         let (code, reason, error) = match lost {
             Lost::Shutdown => return Next::Stop(None),
+            // Asked for: at once, whatever the reconnect settings say, and
+            // the counts start over.
+            Lost::Requested => {
+                self.connected();
+                return Next::Retry(Disconnected {
+                    code: None,
+                    reason: "reconnect asked".to_owned(),
+                    retry_in: std::time::Duration::ZERO,
+                    attempt: 0,
+                });
+            }
             Lost::Closed { code, reason } => {
                 let error = close_error(code, &reason);
                 (code, reason, error)
