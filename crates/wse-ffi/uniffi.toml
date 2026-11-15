@@ -1,0 +1,10 @@
+[bindings.swift]
+module_name = "WseFFI"
+ffi_module_name = "WseFFIC"
+ffi_module_filename = "WseFFIC"
+generate_immutable_records = true
+
+[bindings.kotlin]
+package_name = "dev.wse.ffi"
+generate_immutable_records = true
+android = false

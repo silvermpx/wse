@@ -2,7 +2,7 @@
 # client (crates/wse-client, `wse-client`) and the Python extension built from
 # the server (crates/wse-py, the `wse-server` package).
 [workspace]
-members = ["crates/wse", "crates/wse-client", "crates/wse-client-native", "crates/wse-py"]
+members = ["crates/wse", "crates/wse-client", "crates/wse-client-native", "crates/wse-ffi", "crates/wse-bindgen", "crates/wse-py"]
 # Their own lock files and tools: run on their own.
 exclude = ["benchmarks/rust-bench", "xtask"]
 resolver = "3"

@@ -1,0 +1,20 @@
+[package]
+name = "wse-ffi"
+description = "The WSE client for Swift and Kotlin, through UniFFI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+# Shipped inside the Swift package and the Android library, not on crates.io.
+publish = false
+
+[lib]
+name = "wse_ffi"
+# A static library for Apple platforms comes from `cargo rustc --crate-type staticlib`.
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+wse-client-native = { version = "=3.0.1", path = "../wse-client-native" }
+uniffi = "=0.32.2"
+async-trait = "0.1"

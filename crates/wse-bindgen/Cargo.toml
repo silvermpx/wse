@@ -1,0 +1,12 @@
+[package]
+name = "wse-bindgen"
+description = "Generates the Swift and Kotlin bindings of wse-ffi."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+uniffi = { version = "=0.32.2", features = ["cli"] }
