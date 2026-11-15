@@ -10,9 +10,10 @@ use flate2::write::ZlibEncoder;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use uuid::Uuid;
 
-use super::messages::{build_server_ready, inject_category, message_category};
+use super::CLOSE_AUTH_FAILED;
+use super::messages::{build_auth_failed, build_server_ready, inject_category, message_category};
 use super::signing;
-use super::state::{ServerCommand, SharedState};
+use super::state::{Bind, ServerCommand, SharedState};
 use crate::msgpack::serde_json_to_rmpv;
 
 /// Why the server did not take a message or a request.
@@ -43,6 +44,9 @@ pub enum Error {
     Jwt(String),
     /// A key does not fit the configured algorithm.
     BadJwtKey(String),
+    /// The connection has no end-to-end session: it cannot be bound to a
+    /// key.
+    NoSession,
     /// The cluster could not be joined, or its TLS reloaded.
     Cluster(String),
     /// Cluster settings that exclude each other.
@@ -77,6 +81,9 @@ impl std::fmt::Display for Error {
                 write!(f, "Connection {conn_id} reached max subscriptions ({max})")
             }
             Self::NoJwt => f.write_str("this server does not validate tokens (no jwt_secret)"),
+            Self::NoSession => {
+                f.write_str("the connection has no end-to-end session: it cannot be bound to a key")
+            }
         }
     }
 }
@@ -204,7 +211,73 @@ impl Publisher {
             }
             return Ok(false);
         }
-        let ready = build_server_ready(conn_id, user_id, shared);
+        let ready = build_server_ready(conn_id, user_id, shared, None);
+        self.command(ServerCommand::Accept {
+            conn_id: conn_id.to_owned(),
+            ready,
+        })?;
+        Ok(true)
+    }
+
+    /// `accept`, with the connection bound to `client_key` (base64 of an
+    /// uncompressed P-256 point): the key the application knows for
+    /// `user_id`. The connection is admitted once the client has proved
+    /// that key inside its end-to-end session (it does so by itself, with
+    /// its signing key), and refused (4401) when it proves another key, or
+    /// none by the admission deadline; whoever copied its cookie on the way
+    /// cannot. `Error::NoSession` for a connection without a session.
+    pub fn accept_bound(
+        &self,
+        conn_id: &str,
+        user_id: &str,
+        client_key: &str,
+    ) -> Result<bool, Error> {
+        use dashmap::mapref::entry::Entry;
+        let shared = &self.shared;
+        if shared.jwt_config.is_some() {
+            return Err(Error::AcceptsByToken);
+        }
+        let key = signing::ClientKey::from_base64(client_key).ok_or(Error::BadKey)?;
+        if !shared.conn_last_activity.contains_key(conn_id) {
+            return Ok(false);
+        }
+        if !shared.conn_sealed.contains(conn_id) {
+            return Err(Error::NoSession);
+        }
+        let proved = match shared.binds.entry(conn_id.to_owned()) {
+            Entry::Occupied(entry) if matches!(entry.get(), Bind::Expected { .. }) => {
+                return Ok(true); // accepted already
+            }
+            Entry::Occupied(entry) => entry.remove(),
+            Entry::Vacant(entry) => {
+                // The proof comes later: it admits the connection then.
+                entry.insert(Bind::Expected {
+                    point: key.point().to_vec(),
+                    user_id: user_id.to_owned(),
+                });
+                return Ok(true);
+            }
+        };
+        if !matches!(&proved, Bind::Proved(point) if point.as_slice() == key.point()) {
+            let reason = if matches!(proved, Bind::Proved(_)) {
+                "proof_invalid"
+            } else {
+                "proof_missing"
+            };
+            self.command(ServerCommand::Refuse {
+                conn_id: conn_id.to_owned(),
+                message: build_auth_failed(reason),
+                code: CLOSE_AUTH_FAILED,
+            })?;
+            return Ok(false);
+        }
+        shared.register_user(conn_id, user_id);
+        if let Some(ref pm) = shared.presence {
+            pm.register_connection(conn_id, user_id);
+        }
+        let jkt = wse_protocol::signing::thumbprint(key.point()).unwrap_or_default();
+        shared.client_keys.insert(conn_id.to_owned(), Arc::new(key));
+        let ready = build_server_ready(conn_id, user_id, shared, Some(&jkt));
         self.command(ServerCommand::Accept {
             conn_id: conn_id.to_owned(),
             ready,

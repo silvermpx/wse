@@ -167,6 +167,18 @@ pub(super) fn inject_category(data: &str) -> String {
 }
 
 /// Build a JSON error message for auth failures.
+/// The refusal of a connection whose session is not bound to its key:
+/// `AUTH_FAILED`, and why (`proof_missing`, `proof_invalid`).
+pub(super) fn build_auth_failed(reason: &str) -> String {
+    let mut error: serde_json::Value = serde_json::from_str(&build_error_json(
+        "AUTH_FAILED",
+        "the session is not bound to the client's key",
+    ))
+    .unwrap_or_default();
+    error["p"]["reason"] = reason.into();
+    error.to_string()
+}
+
 pub(super) fn build_error_json(code: &str, message: &str) -> String {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let payload = serde_json::json!({
@@ -241,7 +253,14 @@ pub(super) fn build_server_hello(
 }
 
 /// Build server_ready JSON message (sent immediately from Rust after JWT validation).
-pub(super) fn build_server_ready(conn_id: &str, user_id: &str, state: &SharedState) -> String {
+/// `server_ready` for `conn_id` and its user; `cnf`, the thumbprint of the
+/// key the connection proved, when its token binds one.
+pub(super) fn build_server_ready(
+    conn_id: &str,
+    user_id: &str,
+    state: &SharedState,
+    cnf: Option<&str>,
+) -> String {
     let recovery_enabled = state.recovery.is_some();
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let msg_id = Uuid::now_v7().to_string();
@@ -279,6 +298,11 @@ pub(super) fn build_server_ready(conn_id: &str, user_id: &str, state: &SharedSta
             "kid": signer.kid,
             "public_key": signer.public_key,
         });
+    }
+    // Sealed: the client learns its session is bound to its own key, and
+    // not to a token whatever sits in between put in its place.
+    if let Some(jkt) = cnf {
+        val["p"]["details"]["cnf"] = serde_json::json!({"jkt": jkt});
     }
     val.to_string()
 }

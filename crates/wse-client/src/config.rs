@@ -79,7 +79,7 @@ impl Reconnect {
 /// connection, so whatever terminates TLS in between (a proxy, a load
 /// balancer) sees nothing.
 #[cfg(feature = "aws-lc")]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Encryption {
     /// The server's identity public keys (base64 of the uncompressed
@@ -89,6 +89,24 @@ pub struct Encryption {
     /// Without `server_keys`: go on with a server that does not sign.
     /// Protects from passive observers only.
     pub unauthenticated: bool,
+    /// With [`Config::signing_key`], the session is bound to it (true, the
+    /// default): the client proves the key inside the session, and goes on
+    /// only once the server confirms the session is bound to that key, as
+    /// its token names it (`cnf`). A token copied on the way then opens
+    /// nothing. False for a token that names no key, whose key the server
+    /// application binds itself (`set_client_key`).
+    pub bind_session: bool,
+}
+
+#[cfg(feature = "aws-lc")]
+impl Default for Encryption {
+    fn default() -> Self {
+        Self {
+            server_keys: Vec::new(),
+            unauthenticated: false,
+            bind_session: true,
+        }
+    }
 }
 
 #[cfg(feature = "aws-lc")]
@@ -101,15 +119,15 @@ impl Encryption {
     {
         Self {
             server_keys: server_keys.into_iter().map(Into::into).collect(),
-            unauthenticated: false,
+            ..Self::default()
         }
     }
 
     /// A session with whatever server answers.
     pub fn unauthenticated() -> Self {
         Self {
-            server_keys: Vec::new(),
             unauthenticated: true,
+            ..Self::default()
         }
     }
 }

@@ -38,6 +38,12 @@ pub struct Config {
     pub signing_key: Option<Vec<u8>>,
     /// How far, in seconds, a signed message's time may be from the server's.
     pub signature_window: u64,
+    /// A token that names the client's key (`cnf`) binds the connection to
+    /// it (true, the default): the client must open an end-to-end session
+    /// and prove the key inside it before it is admitted, so a token copied
+    /// on the way opens nothing. False: the key only checks the client's
+    /// signed messages, and the token is a bearer token like any other.
+    pub bind_sessions: bool,
     /// A client's message is at most this many bytes.
     pub max_message_size: usize,
     /// Seconds between the server's pings: at least 1, below `idle_timeout`.
@@ -75,6 +81,7 @@ impl Default for Config {
             e2e_legacy: true,
             signing_key: None,
             signature_window: 30,
+            bind_sessions: true,
             max_message_size: 1024 * 1024,
             ping_interval: 25,
             idle_timeout: 60,
@@ -321,6 +328,7 @@ impl Config {
             max_subscriptions_per_connection: self.max_subscriptions_per_connection,
             signer,
             signature_window_secs: self.signature_window,
+            bind_sessions: self.bind_sessions,
         }))
     }
 }
@@ -388,6 +396,7 @@ impl std::fmt::Debug for Config {
             .field("e2e_legacy", &self.e2e_legacy)
             .field("signing_key", &Redacted(self.signing_key.is_some()))
             .field("signature_window", &self.signature_window)
+            .field("bind_sessions", &self.bind_sessions)
             .field("max_message_size", &self.max_message_size)
             .field("ping_interval", &self.ping_interval)
             .field("idle_timeout", &self.idle_timeout)

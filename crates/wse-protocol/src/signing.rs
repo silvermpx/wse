@@ -57,6 +57,7 @@ pub fn signed_input(label: &[u8], body: &str) -> Vec<u8> {
 pub struct PublicKey {
     pub kid: String,
     key: crypto::VerifyingKey,
+    point: Vec<u8>,
 }
 
 impl PublicKey {
@@ -69,7 +70,13 @@ impl PublicKey {
         Some(Self {
             kid: key_id(public_key),
             key,
+            point: public_key.to_vec(),
         })
+    }
+
+    /// The uncompressed point, `0x04 || X || Y`.
+    pub fn point(&self) -> &[u8] {
+        &self.point
     }
 
     /// From the base64 of an uncompressed SEC1 point.
@@ -96,16 +103,79 @@ impl PublicKey {
         Self::from_sec1(&point)
     }
 
-    /// The key a token binds to its holder: `cnf.jwk`. None when the claim is
-    /// missing or not a P-256 key.
-    pub fn from_claims(claims: &Value) -> Option<Self> {
-        Self::from_jwk(claims.get("cnf")?.get("jwk")?)
-    }
-
     /// Whether `signature` (`r || s`) signs `label` and `body` with this key.
     pub fn verifies(&self, label: &[u8], body: &str, signature: &[u8]) -> bool {
         self.key.verifies(&signed_input(label, body), signature)
     }
+}
+
+/// The key a token binds its holder to (`cnf`, RFC 7800): the key itself
+/// (`jwk`), or its thumbprint (`jkt`, RFC 7638) with the key coming in the
+/// client's proof.
+pub enum Binding {
+    Key(PublicKey),
+    Thumbprint(String),
+}
+
+impl Binding {
+    /// A token's binding: none without `cnf`. A `cnf` that names no P-256
+    /// key is an error: its holder could not be told, and the token must
+    /// not pass as one that binds nothing.
+    pub fn from_claims(claims: &Value) -> Result<Option<Self>, BadBinding> {
+        let Some(cnf) = claims.get("cnf") else {
+            return Ok(None);
+        };
+        if let Some(jwk) = cnf.get("jwk") {
+            return PublicKey::from_jwk(jwk)
+                .map(|key| Some(Self::Key(key)))
+                .ok_or(BadBinding);
+        }
+        match cnf.get("jkt").and_then(Value::as_str) {
+            Some(jkt) if is_thumbprint(jkt) => Ok(Some(Self::Thumbprint(jkt.to_owned()))),
+            _ => Err(BadBinding),
+        }
+    }
+
+    /// Whether `point` (uncompressed) is the bound key.
+    pub fn holds(&self, point: &[u8]) -> bool {
+        match self {
+            Self::Key(key) => key.point() == point,
+            Self::Thumbprint(jkt) => thumbprint(point).is_some_and(|t| t == *jkt),
+        }
+    }
+
+    /// The bound key's thumbprint.
+    pub fn thumbprint(&self) -> String {
+        match self {
+            Self::Key(key) => thumbprint(key.point()).unwrap_or_default(),
+            Self::Thumbprint(jkt) => jkt.clone(),
+        }
+    }
+}
+
+/// A token's `cnf` that names no P-256 key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BadBinding;
+
+/// The RFC 7638 thumbprint of a P-256 public key (an uncompressed point):
+/// base64url, unpadded, of SHA-256 of its JWK's required members in order.
+pub fn thumbprint(point: &[u8]) -> Option<String> {
+    if point.len() != crypto::P256_PUBLIC_LEN || point[0] != 0x04 {
+        return None;
+    }
+    let b64u = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let jwk = format!(
+        r#"{{"crv":"P-256","kty":"EC","x":"{}","y":"{}"}}"#,
+        b64u.encode(&point[1..33]),
+        b64u.encode(&point[33..])
+    );
+    Some(b64u.encode(crypto::sha256(jwk.as_bytes())))
+}
+
+fn is_thumbprint(jkt: &str) -> bool {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(jkt)
+        .is_ok_and(|digest| digest.len() == 32)
 }
 
 /// A key that signs messages: the server's, or a client's.
@@ -118,6 +188,18 @@ pub struct Signer {
 }
 
 impl Signer {
+    /// The RFC 7638 thumbprint of this key: what a token names it by
+    /// (`cnf.jkt`), and what the server confirms a session is bound to.
+    pub fn thumbprint(&self) -> String {
+        thumbprint(self.key.public_key()).unwrap_or_default()
+    }
+
+    /// The proof of this key over an end-to-end session (`client_auth`):
+    /// what binds the session to a token naming the key.
+    pub fn prove_session(&self, th: &[u8; 32]) -> Result<String, crate::e2e::E2eError> {
+        crate::e2e::client_auth(th, &self.key)
+    }
+
     /// From a PKCS#8 ECDSA P-256 private key, PEM or DER.
     pub fn from_pkcs8(key: &[u8]) -> Result<Self, crypto::Error> {
         let key = IdentityKey::from_pkcs8(key)?;
@@ -283,11 +365,99 @@ mod tests {
         assert_eq!(from_jwk.kid, key_id(point));
         assert_ne!(from_jwk.kid, key.kid);
         let claims = serde_json::json!({"sub": "u", "cnf": {"jwk": jwk}});
-        assert_eq!(PublicKey::from_claims(&claims).unwrap().kid, from_jwk.kid);
+        let Ok(Some(Binding::Key(bound))) = Binding::from_claims(&claims) else {
+            panic!("bound by its jwk");
+        };
+        assert_eq!(bound.kid, from_jwk.kid);
         assert!(
             PublicKey::from_jwk(&serde_json::json!({"kty": "OKP", "crv": "Ed25519"})).is_none()
         );
         assert!(PublicKey::from_base64("not base64!").is_none());
+    }
+
+    #[test]
+    fn a_thumbprint_is_rfc_7638s() {
+        // The key and thumbprint of RFC 9449's examples.
+        let url = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let mut point = vec![0x04];
+        point.extend(
+            url.decode("l8tFrhx-34tV3hRICRDY9zCkDlpBhF42UQUfWVAWBFs")
+                .unwrap(),
+        );
+        point.extend(
+            url.decode("9VE4jf_Ok_o64zbTTlcuNJajHmt6v9TDVrU0CdvGRDA")
+                .unwrap(),
+        );
+        assert_eq!(
+            thumbprint(&point).as_deref(),
+            Some("0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I")
+        );
+        assert_eq!(thumbprint(&point[1..]), None);
+    }
+
+    #[test]
+    fn a_token_binds_by_key_or_thumbprint_and_nothing_else() {
+        let (pair, key) = pair();
+        let point = pair.public_key();
+        let jkt = thumbprint(point).unwrap();
+        let claims = |cnf: Value| serde_json::json!({"sub": "u", "cnf": cnf});
+        let by_jkt = Binding::from_claims(&claims(serde_json::json!({"jkt": jkt})))
+            .unwrap()
+            .unwrap();
+        assert!(by_jkt.holds(point));
+        assert_eq!(by_jkt.thumbprint(), jkt);
+        let (other, _) = super::tests::pair();
+        assert!(!by_jkt.holds(other.public_key()));
+        let by_key = Binding::Key(key);
+        assert!(by_key.holds(point));
+        assert_eq!(by_key.thumbprint(), jkt);
+        // No cnf: nothing bound. A cnf naming no P-256 key: refused.
+        assert!(matches!(
+            Binding::from_claims(&serde_json::json!({"sub": "u"})),
+            Ok(None)
+        ));
+        for bad in [
+            serde_json::json!({"jkt": "short"}),
+            serde_json::json!({"jkt": 7}),
+            serde_json::json!({"jwk": {"kty": "OKP", "crv": "Ed25519", "x": "AA"}}),
+            serde_json::json!({"x5t#S256": "AAAA"}),
+            serde_json::json!("a string"),
+        ] {
+            assert_eq!(
+                Binding::from_claims(&claims(bad.clone())).err(),
+                Some(BadBinding),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_proof_holds_for_its_session_and_key_only() {
+        let pkcs8 = crypto::generate_p256_pkcs8().unwrap();
+        let signer = Signer::from_pkcs8(&pkcs8).unwrap();
+        let th = [7u8; 32];
+        let message: Value = serde_json::from_str(&signer.prove_session(&th).unwrap()).unwrap();
+        assert_eq!(message["t"], "client_auth");
+        let proved = crate::e2e::check_client_auth(&th, &message["p"]).unwrap();
+        assert_eq!(key_id(&proved), signer.kid);
+        // Another session's transcript: refused.
+        assert!(crate::e2e::check_client_auth(&[8u8; 32], &message["p"]).is_none());
+        // A signature under another label for the same bytes: refused.
+        let mut p = message["p"].clone();
+        let input = crate::e2e::client_auth_input(&th, &proved);
+        let mut relabeled = CLIENT_LABEL.to_vec();
+        relabeled.extend_from_slice(&input[crate::e2e::CLIENT_AUTH_LABEL.len()..]);
+        let other_label = IdentityKey::from_pkcs8(&pkcs8)
+            .unwrap()
+            .sign(&relabeled)
+            .unwrap();
+        p["sig"] = b64().encode(other_label).into();
+        assert!(crate::e2e::check_client_auth(&th, &p).is_none());
+        // Another key named: the signature is not its.
+        let (other, _) = pair();
+        let mut p = message["p"].clone();
+        p["key"] = b64().encode(other.public_key()).into();
+        assert!(crate::e2e::check_client_auth(&th, &p).is_none());
     }
 
     #[test]

@@ -31,6 +31,8 @@ pub(crate) mod with_crypto {
         server: Vec<PublicKey>,
         /// This client's signing key.
         signer: Option<Signer>,
+        /// Sessions are bound to the signing key.
+        bind_session: bool,
     }
 
     impl Keys {
@@ -46,6 +48,10 @@ pub(crate) mod with_crypto {
                         ))
                     })
             };
+            let bind_session = config
+                .encryption
+                .as_ref()
+                .is_some_and(|encryption| encryption.bind_session);
             let (e2e, identities, unauthenticated) = match &config.encryption {
                 None => (false, Vec::new(), false),
                 Some(encryption) => {
@@ -87,12 +93,34 @@ pub(crate) mod with_crypto {
                 })
                 .transpose()?;
             Ok(Self {
+                bind_session: bind_session && e2e && signer.is_some(),
                 e2e,
                 identities,
                 unauthenticated,
                 server,
                 signer,
             })
+        }
+
+        /// The proof of this client's key over the session `th`
+        /// (`client_auth`), when its sessions are bound to it.
+        pub(crate) fn prove_session(&self, th: &[u8; 32]) -> Result<Option<String>, Error> {
+            match &self.signer {
+                Some(signer) if self.bind_session => signer
+                    .prove_session(th)
+                    .map(Some)
+                    .map_err(|e| Error::Encryption(format!("the session proof: {e}"))),
+                _ => Ok(None),
+            }
+        }
+
+        /// The thumbprint the server must confirm a session is bound to,
+        /// when sessions are.
+        pub(crate) fn bound_thumbprint(&self) -> Option<String> {
+            self.signer
+                .as_ref()
+                .filter(|_| self.bind_session)
+                .map(Signer::thumbprint)
         }
 
         /// A server-signed message: verified against a pinned key (true),
@@ -227,6 +255,11 @@ pub(crate) mod with_crypto {
             self.recv.is_some()
         }
 
+        /// The hash of the session's handshake, once it is open.
+        pub(crate) fn transcript_hash(&self) -> Option<[u8; 32]> {
+            self.send.as_ref().map(SendState::transcript_hash)
+        }
+
         /// Opens the session with the server's answer.
         pub(crate) fn accept(
             &mut self,
@@ -298,6 +331,14 @@ mod without_crypto {
         pub(crate) fn offer(&self) -> Result<Option<Sealing>, Error> {
             Ok(None)
         }
+
+        pub(crate) fn prove_session(&self, _: &[u8; 32]) -> Result<Option<String>, Error> {
+            Ok(None)
+        }
+
+        pub(crate) fn bound_thumbprint(&self) -> Option<String> {
+            None
+        }
     }
 
     pub(crate) enum Sealing {}
@@ -307,6 +348,9 @@ mod without_crypto {
             match *self {}
         }
         pub(crate) fn is_open(&self) -> bool {
+            match *self {}
+        }
+        pub(crate) fn transcript_hash(&self) -> Option<[u8; 32]> {
             match *self {}
         }
         pub(crate) fn accept(

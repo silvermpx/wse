@@ -23,6 +23,7 @@ pub(crate) const CLOSE_NORMAL: u16 = 1000; // disconnect() by the application
 pub(crate) const CLOSE_GOING_AWAY: u16 = 1001; // the server stops
 pub(crate) const CLOSE_INTERNAL_ERROR: u16 = 1011; // the application's handler panicked
 pub(crate) const CLOSE_TRY_AGAIN_LATER: u16 = 1013; // too slow to read, or the server is full
+pub(crate) const CLOSE_AUTH_FAILED: u16 = 4401; // the token, or the proof of its key, was refused
 pub(crate) const CLOSE_TOKEN_EXPIRED: u16 = 4403; // the JWT the connection opened with expired
 pub(crate) const CLOSE_IDLE: u16 = 4408; // nothing received within idle_timeout
 pub(crate) const CLOSE_RATE_LIMITED: u16 = 4429; // kept sending past the rate limit
@@ -295,6 +296,19 @@ pub(crate) const COMMAND_QUEUE: usize = 65_536;
 /// Where a running server's presence events go: its handler.
 pub(crate) type PresenceEvents = Box<dyn Fn(super::handler::Presence) + Send + Sync>;
 
+/// Where a connection the application binds to a key stands: the client's
+/// proof and the application's accept come in either order, and the second
+/// admits the connection when they name the same key.
+pub(crate) enum Bind {
+    /// The client proved this key (an uncompressed point) over its session.
+    Proved(Vec<u8>),
+    /// The application accepted the connection for this user and key.
+    Expected { point: Vec<u8>, user_id: String },
+    /// No proof that holds came by the admission deadline, or one came that
+    /// does not hold: the application's accept is refused.
+    Unproved,
+}
+
 /// The sending side of the command queue. It counts what waits in the queue,
 /// so the application can be held back while the queue is full: a publisher
 /// faster than the server then waits for it instead of filling memory.
@@ -484,6 +498,12 @@ pub(crate) enum ServerCommand {
     Disconnect {
         conn_id: String,
     },
+    /// Refuse a connection: `message` (an error), then a close with `code`.
+    Refuse {
+        conn_id: String,
+        message: String,
+        code: u16,
+    },
     Shutdown,
     /// Graceful drain: stop accepting, close all clients with custom code, wait.
     Drain {
@@ -517,6 +537,7 @@ pub(crate) struct SharedStateConfig {
     pub max_subscriptions_per_connection: usize,
     pub signer: Option<ServerSigner>,
     pub signature_window_secs: u64,
+    pub bind_sessions: bool,
 }
 
 pub(crate) struct SharedState {
@@ -537,7 +558,12 @@ pub(crate) struct SharedState {
     // within the window, each until it is too old to come again.
     pub(crate) signer: Option<ServerSigner>,
     pub(super) signature_window_ms: u64,
+    /// A token naming a key binds its connection to it (`Config::bind_sessions`).
+    pub(super) bind_sessions: bool,
     pub(super) client_keys: DashMap<String, Arc<ClientKey>>,
+    /// Connections the application binds to a key itself (no JWT
+    /// configuration): its accept and the client's proof meet here.
+    pub(super) binds: DashMap<String, Bind>,
     // Each user's connections, and each connection's user: what a send to a
     // user reaches.
     pub(crate) user_conns: DashMap<String, AHashSet<String>>,
@@ -805,7 +831,9 @@ impl SharedState {
             conn_sealed: DashSet::new(),
             signer: cfg.signer,
             signature_window_ms: cfg.signature_window_secs.saturating_mul(1000),
+            bind_sessions: cfg.bind_sessions,
             client_keys: DashMap::new(),
+            binds: DashMap::new(),
             user_conns: DashMap::new(),
             conn_user: DashMap::new(),
             signed_seen: DashMap::new(),

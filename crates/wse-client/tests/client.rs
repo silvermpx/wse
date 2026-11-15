@@ -467,6 +467,11 @@ async fn signed_messages_both_ways() {
     config.token = Some(token);
     config.signing_key = Some(signing_key);
     config.server_signing_keys = vec![stand.publisher.signing_public_key().unwrap()];
+    // A token naming the key binds the session to it: opened end to end.
+    config.encryption = Some(wse_client::Encryption::pinned([stand
+        .publisher
+        .e2e_identity_public_key()
+        .unwrap()]));
     config.topics = vec!["fills".into()];
     let (client, mut events) = wse_client::connect(config).await.unwrap();
     while !matches!(next_event(&mut events).await, Event::Subscribed(_)) {}
@@ -623,4 +628,215 @@ async fn the_client_a_handler_keeps_does_not_keep_the_connection() {
         }
     }
     stand.server.stop().await;
+}
+
+/// A token for `user` naming `cnf`, and a client config with an end-to-end
+/// session pinned to the stand's identity and `signing_key`.
+#[cfg(feature = "aws-lc")]
+fn bound_config(stand: &Stand, user: &str, cnf: serde_json::Value, signing_key: &[u8]) -> Config {
+    let mut claims = serde_json::Map::new();
+    claims.insert("cnf".into(), cnf);
+    let token = stand
+        .publisher
+        .issue_token(user, Duration::from_secs(600), claims)
+        .unwrap();
+    let mut config = Config::new(&stand.url);
+    config.token = Some(token);
+    config.signing_key = Some(signing_key.to_vec());
+    config.encryption = Some(wse_client::Encryption::pinned([stand
+        .publisher
+        .e2e_identity_public_key()
+        .unwrap()]));
+    config.reconnect.enabled = false;
+    config
+}
+
+#[cfg(feature = "aws-lc")]
+fn thumbprint(signing_key: &[u8]) -> String {
+    use base64::Engine;
+    let point = base64::engine::general_purpose::STANDARD
+        .decode(wse_client::public_key(signing_key).unwrap())
+        .unwrap();
+    wse_protocol::signing::thumbprint(&point).unwrap()
+}
+
+#[cfg(feature = "aws-lc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_is_bound_to_the_key_its_token_names() {
+    let mut stand = secure_stand().await;
+    let key = wse_client::generate_key();
+    // Named by the key itself, then by its thumbprint.
+    for cnf in [
+        json!({"jwk": wse_client::public_key_jwk(&key).unwrap()}),
+        json!({"jkt": thumbprint(&key)}),
+    ] {
+        let config = bound_config(&stand, "kate", cnf.clone(), &key);
+        let (client, _events) = wse_client::connect(config)
+            .await
+            .expect("bound and admitted");
+        stand.connect_id().await;
+        client.send("hello", &json!({})).await.unwrap();
+        loop {
+            if let Heard::Message(message) = stand.heard().await {
+                assert_eq!(message["t"], "hello", "{cnf}");
+                break;
+            }
+        }
+        client.close().await;
+    }
+    stand.server.stop().await;
+}
+
+#[cfg(feature = "aws-lc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_copied_without_its_key_opens_nothing() {
+    let mut stand = secure_stand().await;
+    let owner = wse_client::generate_key();
+    let thief = wse_client::generate_key();
+    let cnf = json!({"jwk": wse_client::public_key_jwk(&owner).unwrap()});
+    // The token, with another key: no proof of the one it names.
+    let config = bound_config(&stand, "leo", cnf.clone(), &thief);
+    let error = wse_client::connect(config).await.err().unwrap();
+    assert!(matches!(error, Error::Auth(_)), "{error}");
+    // The token over a connection without a session: refused at once.
+    let mut config = bound_config(&stand, "leo", cnf, &thief);
+    config.encryption = None;
+    let error = wse_client::connect(config).await.err().unwrap();
+    assert!(matches!(error, Error::Auth(_)), "{error}");
+    // The application never heard of either.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), stand.heard.recv())
+            .await
+            .is_err()
+    );
+    stand.server.stop().await;
+}
+
+#[cfg(feature = "aws-lc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cnf_that_names_no_key_is_refused() {
+    let stand = secure_stand().await;
+    let key = wse_client::generate_key();
+    for cnf in [json!({"jkt": "short"}), json!({"x5t#S256": "AAAA"})] {
+        let config = bound_config(&stand, "mia", cnf.clone(), &key);
+        let error = wse_client::connect(config).await.err().unwrap();
+        assert!(matches!(error, Error::Auth(_)), "{cnf}: {error}");
+    }
+    stand.server.stop().await;
+}
+
+#[cfg(feature = "aws-lc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_bound_to_its_key_needs_a_token_that_names_it() {
+    let mut stand = secure_stand().await;
+    let key = wse_client::generate_key();
+    // A token naming no key, as one put in place of the client's own would.
+    let mut config = stand.config("noor");
+    config.signing_key = Some(key.clone());
+    config.encryption = Some(wse_client::Encryption::pinned([stand
+        .publisher
+        .e2e_identity_public_key()
+        .unwrap()]));
+    config.reconnect.enabled = false;
+    let error = wse_client::connect(config.clone()).await.err().unwrap();
+    assert!(matches!(error, Error::Auth(_)), "{error}");
+    // Keys the application binds itself: the session is not bound.
+    if let Some(encryption) = config.encryption.as_mut() {
+        encryption.bind_session = false;
+    }
+    let (client, _events) = wse_client::connect(config).await.unwrap();
+    stand.connect_id().await;
+    client.close().await;
+    stand.server.stop().await;
+}
+
+/// An application that checks its connections itself and knows its user's
+/// key: it binds each connection to that key.
+#[cfg(feature = "aws-lc")]
+struct KeyedApp {
+    publisher: wse::Publisher,
+    key: String,
+    heard: mpsc::UnboundedSender<Heard>,
+}
+
+#[cfg(feature = "aws-lc")]
+impl wse::Handler for KeyedApp {
+    type Connection = String;
+
+    fn connect(&self, connect: &wse::Connect<'_>) -> Option<String> {
+        let conn_id = (**connect.conn_id).clone();
+        let _ = self.publisher.accept_bound(&conn_id, "olga", &self.key);
+        let _ = self.heard.send(Heard::Connect(conn_id.clone()));
+        Some(conn_id)
+    }
+
+    fn message(&self, _conn: &mut String, message: wse::Inbound, _size: usize) -> bool {
+        if let wse::Inbound::Json(value) = message {
+            let _ = self.heard.send(Heard::Message(value));
+        }
+        true
+    }
+
+    fn signed(&self, _conn: &mut String, _message: serde_json::Value, _size: usize) -> bool {
+        false
+    }
+
+    fn disconnect(&self, conn: String) {
+        let _ = self.heard.send(Heard::Disconnect(conn));
+    }
+}
+
+#[cfg(feature = "aws-lc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_application_binds_a_connection_to_the_key_it_knows() {
+    let key = wse_client::generate_key();
+    let mut config = wse::Config::default();
+    config.e2e_identity_key = Some(wse_client::generate_key());
+    let server = wse::Server::new(config).unwrap();
+    let publisher = server.publisher();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/wse", listener.local_addr().unwrap());
+    let (tx, mut heard) = mpsc::unbounded_channel();
+    server
+        .start(
+            listener,
+            KeyedApp {
+                publisher: publisher.clone(),
+                key: wse_client::public_key(&key).unwrap(),
+                heard: tx,
+            },
+        )
+        .unwrap();
+    let identity = publisher.e2e_identity_public_key().unwrap();
+    let client_config = |signing_key: &[u8]| {
+        let mut config = Config::new(&url);
+        config.signing_key = Some(signing_key.to_vec());
+        config.encryption = Some(wse_client::Encryption::pinned([identity.clone()]));
+        config.reconnect.enabled = false;
+        config
+    };
+
+    // The key the application knows: admitted, its messages heard.
+    let (client, _events) = wse_client::connect(client_config(&key)).await.unwrap();
+    client.send("hello", &json!({})).await.unwrap();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), heard.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let Heard::Message(message) = event {
+            assert_eq!(message["t"], "hello");
+            break;
+        }
+    }
+    client.close().await;
+
+    // Another key: refused.
+    let other = wse_client::generate_key();
+    let error = wse_client::connect(client_config(&other))
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(error, Error::Auth(_)), "{error}");
+    server.stop().await;
 }

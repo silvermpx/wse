@@ -32,13 +32,21 @@ fn wait_for_room(py: Python<'_>, publisher: &Publisher) {
 }
 
 impl RustWSEServer {
-    pub(super) fn accept_connection_impl(&self, conn_id: &str, user_id: &str) -> PyResult<bool> {
+    pub(super) fn accept_connection_impl(
+        &self,
+        conn_id: &str,
+        user_id: &str,
+        client_key: Option<&str>,
+    ) -> PyResult<bool> {
         if self.shared.jwt_config.is_some() {
             return Err(py_error(Error::AcceptsByToken));
         }
-        self.command_tx()?
-            .accept(conn_id, user_id)
-            .map_err(py_error)
+        let publisher = self.command_tx()?;
+        match client_key {
+            Some(key) => publisher.accept_bound(conn_id, user_id, key),
+            None => publisher.accept(conn_id, user_id),
+        }
+        .map_err(py_error)
     }
 
     pub(super) fn sign_impl(

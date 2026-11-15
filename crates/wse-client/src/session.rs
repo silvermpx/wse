@@ -241,6 +241,15 @@ impl<H: Handler> Session<H> {
                 Some("server_hello" | "error" | "ping" | "PING" | "pong" | "PONG")
             )
         });
+        // A server pings inside the session only: an unsealed ping is not
+        // answered, or its answer could reach the server once its side of
+        // the session is open, and be refused there.
+        let ping = envelope
+            .as_ref()
+            .is_some_and(|e| matches!(e.t.as_deref(), Some("ping" | "PING" | "pong" | "PONG")));
+        if ping && !open {
+            return;
+        }
         match envelope {
             Some(mut envelope) if handshake && !open => {
                 // What the handshake needs, never a topic's message nor the
@@ -882,8 +891,27 @@ impl<H: Handler> Session<H> {
             user_id: Option<String>,
             features: Features,
             signing: Option<SigningKey>,
+            cnf: Option<Cnf>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Cnf {
+            jkt: Option<String>,
         }
         let ready = message.payload::<Ready>().unwrap_or_default();
+        // A session bound to this client's key: the server, sealed, says so.
+        // Otherwise the token at the upgrade was not this client's (one put
+        // in its place on the way), or names no key.
+        if self.sealing.is_some()
+            && let Some(own) = self.keys.bound_thumbprint()
+            && ready.details.cnf.as_ref().and_then(|c| c.jkt.as_deref()) != Some(own.as_str())
+        {
+            self.fail(Error::Auth(
+                "the server did not bind the session to this client's key (cnf); for a token \
+                 that names no key, set Encryption::bind_session to false"
+                    .to_owned(),
+            ));
+            return;
+        }
         // Sealed in an end-to-end session: what it names can be trusted.
         if let Some(signing) = ready.details.signing {
             self.take_signing_key(signing.kid);
@@ -925,7 +953,17 @@ impl<H: Handler> Session<H> {
                     )
                 });
             match answer {
-                Ok(()) => tracing::info!("[WSE] end-to-end session open"),
+                Ok(()) => {
+                    tracing::info!("[WSE] end-to-end session open");
+                    // Bound to this client's key: its proof is the first
+                    // message the session seals.
+                    let th = self.sealing.as_ref().and_then(Sealing::transcript_hash);
+                    match th.map(|th| self.keys.prove_session(&th)).transpose() {
+                        Ok(Some(Some(proof))) => self.outbox.insert(0, Outgoing::Text(proof)),
+                        Ok(_) => {}
+                        Err(error) => self.fail(error),
+                    }
+                }
                 Err(error) => self.fail(error),
             }
             // server_hello comes unsealed, and anyone in between may have
@@ -1243,11 +1281,8 @@ mod tests {
                 .and_then(|t| t.streams.position())
                 .is_none()
         );
-        // Answered as a ping, by the handshake's own kind of message.
-        assert!(matches!(
-            s.outbox.as_slice(),
-            [Outgoing::Handshake(pong)] if pong.contains("PONG")
-        ));
+        // Not answered either: a server pings inside the session only.
+        assert!(s.outbox.is_empty());
         // A stamped protocol message moves no topic either.
         ready(&mut s, true);
         s.on_json(

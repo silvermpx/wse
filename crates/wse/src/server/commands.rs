@@ -155,6 +155,21 @@ pub(super) async fn process_commands(
                     .publish(topic, || Outgoing::text(stamped), None)
                     .await;
             }
+            ServerCommand::Refuse {
+                conn_id,
+                message,
+                code,
+            } => {
+                let guard = state.connections.read();
+                if let Some(h) = guard.get(&conn_id) {
+                    h.send_one(
+                        Message::Text(message.into()),
+                        state.max_outbound_queue_bytes,
+                        state.slow_consumer_drops.shard(usize::from(h.lane)),
+                    );
+                    h.close(code, "authentication failed");
+                }
+            }
             ServerCommand::Disconnect { conn_id } => {
                 let guard = state.connections.read();
                 if let Some(h) = guard.get(&conn_id) {

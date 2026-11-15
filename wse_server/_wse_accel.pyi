@@ -368,6 +368,7 @@ class RustWSEServer:
         e2e_legacy: bool = True,
         signing_key: bytes | None = None,
         signature_window: int = 30,
+        bind_sessions: bool = True,
     ) -> Self: ...
 
     # -- Lifecycle ------------------------------------------------------------
@@ -505,7 +506,9 @@ class RustWSEServer:
     def get_connections(self) -> list[str]:
         """List of active connection IDs, read without waiting for the server."""
         ...
-    def accept_connection(self, conn_id: str, user_id: str) -> bool:
+    def accept_connection(
+        self, conn_id: str, user_id: str, client_key: str | None = None
+    ) -> bool:
         """Accept a connection the application authenticated itself.
 
         For a server without jwt_secret: the connection gets server_ready, the
@@ -516,6 +519,12 @@ class RustWSEServer:
         checking the cookies of its "connect" event. Returns False when the
         connection is gone; raises RuntimeError on a server that validates
         tokens itself.
+
+        With client_key (base64 of the user's P-256 public key) the
+        connection is bound to that key: admitted once the client has proved
+        it inside its end-to-end session, refused (4401) when it proves
+        another key or none, so a cookie copied on the way opens nothing.
+        RuntimeError for a connection without an end-to-end session.
         """
         ...
     def disconnect(self, conn_id: str) -> None:

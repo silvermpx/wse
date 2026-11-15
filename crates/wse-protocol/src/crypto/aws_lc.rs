@@ -200,7 +200,7 @@ impl IdentityKey {
         let der: &[u8] = pem.as_deref().map_or(key, Vec::as_slice);
         aws_lc_rs::signature::EcdsaKeyPair::from_pkcs8(
             &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
-            &der,
+            der,
         )
         .map(Self)
         .map_err(|_| Error)

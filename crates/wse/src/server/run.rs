@@ -214,7 +214,10 @@ pub(crate) async fn serve<H: Handler>(
                         handle.close(CLOSE_IDLE, "idle timeout");
                         continue;
                     }
-                    if handle.closer.is_closing() {
+                    // Not admitted yet (an end-to-end session or its proof
+                    // under way, or the application's accept): nothing goes
+                    // to it but its handshake.
+                    if handle.closer.is_closing() || !handle.out.admitted.load(Ordering::Acquire) {
                         continue;
                     }
                     let ts =

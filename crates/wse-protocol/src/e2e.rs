@@ -27,6 +27,8 @@ pub const SUITE: &str = "p256-aes256gcm";
 pub const SIGNATURE_ALG: &str = "ES256";
 
 const TRANSCRIPT_LABEL: &[u8] = b"WSE-E2E server_hello\0";
+/// What a client's proof of its key covers before the transcript hash.
+pub const CLIENT_AUTH_LABEL: &[u8] = b"WSE-E2E client_auth\0";
 const FRAME_FORMAT: u8 = 0x01;
 pub const FRAME_DATA: u8 = 0;
 const FRAME_CLOSE: u8 = 1;
@@ -228,6 +230,11 @@ pub struct SendState {
 }
 
 impl SendState {
+    /// The hash of the session's handshake: what a client's proof signs.
+    pub fn transcript_hash(&self) -> [u8; 32] {
+        self.th
+    }
+
     fn new(th: [u8; 32], direction: u8, secret: Zeroizing<[u8; 32]>) -> Self {
         let keys = seal_keys(&th, &secret);
         Self {
@@ -293,6 +300,11 @@ pub struct RecvState {
 }
 
 impl RecvState {
+    /// The hash of the session's handshake: what a client's proof signs.
+    pub fn transcript_hash(&self) -> [u8; 32] {
+        self.th
+    }
+
     fn new(th: [u8; 32], direction: u8, secret: Zeroizing<[u8; 32]>) -> Self {
         let keys = open_keys(&th, &secret);
         Self {
@@ -413,6 +425,47 @@ pub fn accept(
         send: SendState::new(th, SERVER_TO_CLIENT, s2c),
         recv: RecvState::new(th, CLIENT_TO_SERVER, c2s),
     })
+}
+
+/// What a client signs to prove its key over a session, as TLS 1.3's client
+/// CertificateVerify does: the label, the session's transcript hash (both
+/// ephemeral keys, the connection id, the server's key id), and the client's
+/// public key, uncompressed. Whoever sits between client and server cannot
+/// get it signed for a session of its own.
+pub fn client_auth_input(th: &[u8; 32], client_public: &[u8]) -> Vec<u8> {
+    let mut input = Vec::with_capacity(CLIENT_AUTH_LABEL.len() + th.len() + client_public.len());
+    input.extend_from_slice(CLIENT_AUTH_LABEL);
+    input.extend_from_slice(th);
+    input.extend_from_slice(client_public);
+    input
+}
+
+/// A client's proof of `key` over the session `th`: the first message it
+/// seals, `{"c":"WSE","t":"client_auth","p":{"key":..,"sig":..}}`.
+pub fn client_auth(th: &[u8; 32], key: &IdentityKey) -> Result<String, E2eError> {
+    let public = key.public_key();
+    let signature = key
+        .sign(&client_auth_input(th, public))
+        .map_err(|_| E2eError::Unsupported)?;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    Ok(serde_json::json!({
+        "c": "WSE",
+        "t": "client_auth",
+        "p": {"key": b64.encode(public), "sig": b64.encode(signature)},
+    })
+    .to_string())
+}
+
+/// The key a `client_auth` payload proves over the session `th`: its
+/// uncompressed point, when its signature holds.
+pub fn check_client_auth(th: &[u8; 32], p: &serde_json::Value) -> Option<Vec<u8>> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let key = b64.decode(p.get("key")?.as_str()?).ok()?;
+    let signature = b64.decode(p.get("sig")?.as_str()?).ok()?;
+    if key.len() != crypto::P256_PUBLIC_LEN || key[0] != 0x04 {
+        return None;
+    }
+    crypto::verify_p256(&key, &client_auth_input(th, &key), &signature).then_some(key)
 }
 
 /// A client's offer, fresh for each connection: its ephemeral key and random

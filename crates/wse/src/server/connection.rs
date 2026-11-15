@@ -27,17 +27,21 @@ use super::frames::{
 };
 use super::handler::{Connect, Handler, Inbound, Panicked, guarded};
 use super::handshake::{HANDSHAKE_TIMEOUT, HandshakeGuard, normalize_origin, reject_ws_auth};
-use super::messages::{build_server_hello, build_server_ready, normalize_json_keys};
+use super::messages::{
+    build_auth_failed, build_server_hello, build_server_ready, normalize_json_keys,
+};
 use super::signing::{self, ClientKey, Refused};
-use super::state::{Activity, CloseOutbox, Outbox, Seal};
+use super::state::{Activity, Bind, CloseOutbox, Outbox, Seal};
 use super::subscribe::{answer_subscription_request, requested_compression};
 use super::{
-    CLOSE_E2E_BAD_FRAME, CLOSE_E2E_EXHAUSTED, CLOSE_E2E_UNSUPPORTED, CLOSE_GRACE,
-    CLOSE_INTERNAL_ERROR, CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED, CLOSE_TRY_AGAIN_LATER, Closer,
-    ConnectionHandle, SharedState, WsFrame,
+    CLOSE_AUTH_FAILED, CLOSE_E2E_BAD_FRAME, CLOSE_E2E_EXHAUSTED, CLOSE_E2E_UNSUPPORTED,
+    CLOSE_GRACE, CLOSE_IDLE, CLOSE_INTERNAL_ERROR, CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED,
+    CLOSE_TRY_AGAIN_LATER, Closer, ConnectionHandle, SharedState, WsFrame,
 };
 use crate::jwt::{self, parse_cookie_value};
 use crate::msgpack::{decode_msgpack_guarded, rmpv_to_serde_json};
+use wse_protocol::e2e::check_client_auth;
+use wse_protocol::signing::{Binding, thumbprint};
 
 // ---------------------------------------------------------------------------
 // Connection handler
@@ -45,6 +49,11 @@ use crate::msgpack::{decode_msgpack_guarded, rmpv_to_serde_json};
 
 /// What a sealed frame carries past its message: `E:`, the header, the tag.
 const SEAL_OVERHEAD: usize = 32;
+
+/// How long a client that announced an end-to-end session has to open it,
+/// and to prove its token's key in it, from the upgrade on; its heartbeats
+/// meanwhile do not count.
+const ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A refusal any client can cause (a foreign origin, a bad token, a full
 /// server): logged once a second at most, with how many more there were;
@@ -98,6 +107,9 @@ fn answer_protocol_message(
             Protocol::Answered
         }
         Some("signed") => Protocol::Signed,
+        // A proof the connection was not asked for (its token binds no
+        // key): the server's to drop, not the application's.
+        Some("client_auth") => Protocol::Answered,
         _ => Protocol::Application,
     }
 }
@@ -153,9 +165,10 @@ fn tell_application<H: Handler>(
     }
 }
 
-/// A client that announced E2E now has its session: accepted by its token,
-/// it gets server_ready (sealed) and joins the broadcasts; then the
-/// application learns of it, and may refuse it.
+/// A client that announced E2E now has its session (and proved its token's
+/// key in it, `cnf`, when the token binds one): accepted by its token, it
+/// gets server_ready (sealed) and joins the broadcasts; then the application
+/// learns of it, and may refuse it.
 ///
 /// Called from the connection's read loop: only the connection's own
 /// cleanup, after that loop, takes it out of the maps, so it is still in
@@ -168,9 +181,10 @@ fn admit_after_session<H: Handler>(
     user_id: Option<&str>,
     cookies: &str,
     handler: &H,
+    cnf: Option<&str>,
 ) -> Result<H::Connection, Refusal> {
     if let Some(user) = user_id {
-        let ready = build_server_ready(conn_id, user, state);
+        let ready = build_server_ready(conn_id, user, state, cnf);
         handle.send_control(Message::Text(ready.into()));
         handle.out.admitted.store(true, Ordering::Release);
         state.topics.join(conn_id, handle);
@@ -204,11 +218,147 @@ struct Admission<'a, H: Handler> {
     announced_e2e: bool,
     session: &'a mut Option<RecvState>,
     awaiting_session: &'a mut bool,
+    /// The token binds a key: the session's first message must prove it.
+    bound: bool,
+    proof_pending: &'a mut bool,
     /// The application's side of the connection, once it heard of it.
     app: &'a mut Option<H::Connection>,
     handler: &'a H,
     user_id: Option<&'a str>,
     cookies: &'a str,
+}
+
+/// What a connection whose token binds a key needs to be admitted once its
+/// proof is in.
+struct ProofAdmission<'a, H: Handler> {
+    binding: &'a Binding,
+    th: [u8; 32],
+    app: &'a mut Option<H::Connection>,
+    handler: &'a H,
+    user_id: Option<&'a str>,
+    cookies: &'a str,
+}
+
+/// The first sealed message of a connection whose token binds a key (`cnf`):
+/// the client's proof of that key over this session (`client_auth`). Whoever
+/// copied the token from the upgrade cannot make one for a session of its
+/// own. The connection is admitted when it holds, refused (4401) when not.
+#[cold]
+#[inline(never)]
+fn take_proof<H: Handler>(conn: &Conn<'_>, plaintext: &[u8], admission: ProofAdmission<'_, H>) {
+    let (state, conn_id) = (conn.state, conn.conn_id);
+    let proof = std::str::from_utf8(plaintext)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .filter(|val| val.get("t").and_then(serde_json::Value::as_str) == Some("client_auth"));
+    let proved = match &proof {
+        None => Err("proof_missing"),
+        Some(val) => val
+            .get("p")
+            .and_then(|p| check_client_auth(&admission.th, p))
+            .filter(|point| admission.binding.holds(point))
+            .ok_or("proof_invalid"),
+    };
+    let point = match proved {
+        Ok(point) => point,
+        Err(reason) => {
+            refuse_unproved(conn, reason);
+            return;
+        }
+    };
+    // The client's signed messages are checked against the key it proved.
+    if let Some(key) = ClientKey::from_sec1(&point) {
+        state.client_keys.insert((**conn_id).clone(), Arc::new(key));
+    }
+    let jkt = admission.binding.thumbprint();
+    match admit_after_session(
+        state,
+        conn_id,
+        conn.handle,
+        admission.user_id,
+        admission.cookies,
+        admission.handler,
+        Some(&jkt),
+    ) {
+        Ok(app) => *admission.app = Some(app),
+        Err((code, reason)) => {
+            conn.closer
+                .close(conn.tx, &conn.handle.out.pending, code, reason);
+        }
+    }
+}
+
+/// A connection without the proof its admission needs: `AUTH_FAILED`
+/// (sealed), and why, then 4401.
+fn refuse_unproved(conn: &Conn<'_>, reason: &str) {
+    conn.state
+        .auth_failures_total
+        .fetch_add(1, Ordering::Relaxed);
+    warn_refused(format_args!(
+        "Connection {}: no proof of its key ({reason})",
+        conn.conn_id
+    ));
+    queue_reply(
+        conn.handle,
+        conn.max_pending,
+        Message::Text(build_auth_failed(reason).into()),
+    );
+    conn.closer.close(
+        conn.tx,
+        &conn.handle.out.pending,
+        CLOSE_AUTH_FAILED,
+        "authentication failed",
+    );
+}
+
+/// A client's proof over its session on a server whose application binds
+/// keys itself (`Publisher::accept_bound`): it meets the application's
+/// accept, before or after it, and the second of them admits the connection
+/// when both name the same key.
+#[cold]
+#[inline(never)]
+fn take_late_proof(conn: &Conn<'_>, val: &serde_json::Value, th: &[u8; 32]) {
+    use dashmap::mapref::entry::Entry;
+    let (state, conn_id) = (conn.state, conn.conn_id);
+    let proved = val.get("p").and_then(|p| check_client_auth(th, p));
+    let expected = match state.binds.entry((**conn_id).clone()) {
+        Entry::Occupied(entry) if matches!(entry.get(), Bind::Expected { .. }) => entry.remove(),
+        // A second proof, or one past its time: the first counts.
+        Entry::Occupied(_) => return,
+        Entry::Vacant(entry) => {
+            entry.insert(proved.map_or(Bind::Unproved, Bind::Proved));
+            return;
+        }
+    };
+    let Bind::Expected { point, user_id } = expected else {
+        return;
+    };
+    if proved.as_deref() == Some(point.as_slice()) {
+        admit_bound(conn, &user_id, &point);
+    } else {
+        refuse_unproved(conn, "proof_invalid");
+    }
+}
+
+/// A connection the application accepted for `user_id`, proved to hold its
+/// key: server_ready (sealed, naming the key), then the broadcasts.
+fn admit_bound(conn: &Conn<'_>, user_id: &str, point: &[u8]) {
+    let (state, conn_id, handle) = (conn.state, conn.conn_id, conn.handle);
+    if handle.out.admitted.load(Ordering::Acquire) {
+        return;
+    }
+    state.register_user(conn_id, user_id);
+    if let Some(pm) = &state.presence {
+        pm.register_connection(conn_id, user_id);
+    }
+    if let Some(key) = ClientKey::from_sec1(point) {
+        state.client_keys.insert((**conn_id).clone(), Arc::new(key));
+    }
+    let jkt = thumbprint(point).unwrap_or_default();
+    let ready = build_server_ready(conn_id, user_id, state, Some(&jkt));
+    handle.send_control(Message::Text(ready.into()));
+    handle.out.admitted.store(true, Ordering::Release);
+    state.topics.join(conn_id, handle);
 }
 
 /// The client's hello, once a connection: compression, then an E2E session
@@ -265,18 +415,25 @@ fn answer_client_hello<H: Handler>(
                 state.conn_sealed.insert((**conn_id).clone());
                 let _ = conn.handle.out.cipher.set(Seal::Session);
                 *admission.awaiting_session = false;
-                match admit_after_session(
-                    state,
-                    conn_id,
-                    conn.handle,
-                    admission.user_id,
-                    admission.cookies,
-                    admission.handler,
-                ) {
-                    Ok(app) => *admission.app = Some(app),
-                    Err((code, reason)) => {
-                        conn.closer
-                            .close(conn.tx, &conn.handle.out.pending, code, reason);
+                if admission.bound {
+                    // Admitted once the client proves the key its token
+                    // binds, in its first sealed message.
+                    *admission.proof_pending = true;
+                } else {
+                    match admit_after_session(
+                        state,
+                        conn_id,
+                        conn.handle,
+                        admission.user_id,
+                        admission.cookies,
+                        admission.handler,
+                        None,
+                    ) {
+                        Ok(app) => *admission.app = Some(app),
+                        Err((code, reason)) => {
+                            conn.closer
+                                .close(conn.tx, &conn.handle.out.pending, code, reason);
+                        }
                     }
                 }
             }
@@ -846,6 +1003,11 @@ struct Reader<'a, H: Handler> {
     awaiting_session: bool,
     /// The client's sending state of an E2E session: frames open in order only.
     session: Option<RecvState>,
+    /// The key the client's token binds it to: proved inside the session
+    /// before the connection is admitted.
+    binding: Option<Binding>,
+    /// The session is open, the proof not in yet.
+    proof_pending: bool,
     /// The application's side of the connection, once it heard of it.
     app: Option<H::Connection>,
 }
@@ -884,6 +1046,8 @@ impl<H: Handler> Reader<'_, H> {
         let handler = self.handler;
         let session = &mut self.session;
         let awaiting_session = &mut self.awaiting_session;
+        let binding = &self.binding;
+        let proof_pending = &mut self.proof_pending;
         let hello_answered = &mut self.hello_answered;
         let app = &mut self.app;
         let inbound_limit = &mut self.inbound_limit;
@@ -983,6 +1147,8 @@ impl<H: Handler> Reader<'_, H> {
                                             announced_e2e,
                                             session,
                                             awaiting_session,
+                                            bound: binding.is_some(),
+                                            proof_pending,
                                             app,
                                             handler,
                                             user_id: rust_auth_user_id,
@@ -1060,6 +1226,27 @@ impl<H: Handler> Reader<'_, H> {
                     };
                     if let Some(opened) = opened {
                         match opened {
+                            Ok(plaintext) if *proof_pending => {
+                                *proof_pending = false;
+                                if let (Some(binding), Some(th)) = (
+                                    binding.as_ref(),
+                                    session.as_ref().map(RecvState::transcript_hash),
+                                ) {
+                                    take_proof(
+                                        &conn,
+                                        &plaintext,
+                                        ProofAdmission {
+                                            binding,
+                                            th,
+                                            app,
+                                            handler,
+                                            user_id: rust_auth_user_id,
+                                            cookies: cookie_str,
+                                        },
+                                    );
+                                }
+                                return Flow::Next;
+                            }
                             Ok(plaintext) => {
                                 // Decrypted payload is UTF-8 text (JSON with optional prefix)
                                 if let Ok(text) = std::str::from_utf8(&plaintext) {
@@ -1082,6 +1269,20 @@ impl<H: Handler> Reader<'_, H> {
                                         serde_json::from_str::<serde_json::Value>(json_str)
                                     {
                                         let val = normalize_json_keys(val);
+                                        // A proof the token did not ask for:
+                                        // for an application binding the key
+                                        // itself, or for no one.
+                                        if val.get("t").and_then(serde_json::Value::as_str)
+                                            == Some("client_auth")
+                                        {
+                                            if state.jwt_config.is_none()
+                                                && let Some(th) =
+                                                    session.as_ref().map(RecvState::transcript_hash)
+                                            {
+                                                take_late_proof(&conn, &val, &th);
+                                            }
+                                            return Flow::Next;
+                                        }
                                         // The clients encrypt their protocol
                                         // messages too (all of them in a session).
                                         match answer_protocol_message(
@@ -1321,6 +1522,7 @@ pub(crate) async fn handle_connection<H: Handler>(
     // When the token stops being valid (its exp, plus the clock skew the
     // validation allows).
     let mut token_deadline: Option<tokio::time::Instant> = None;
+    let mut binding: Option<Binding> = None;
     let rust_auth_user_id: Option<String> = if let Some(ref jwt_holder) = state.jwt_config {
         let jwt_cfg = &*jwt_holder.load();
         let token = parse_cookie_value(&cookie_str, &jwt_cfg.cookie_name).or_else(|| {
@@ -1347,10 +1549,39 @@ pub(crate) async fn handle_connection<H: Handler>(
                         if let Some(acl) = jwt::extract_topic_acl(&claims) {
                             state.topics.acls.insert(conn_id.to_string(), acl);
                         }
-                        // The key the token binds to its holder (`cnf`), for
-                        // the client's signed messages.
-                        if let Some(key) = ClientKey::from_claims(&claims) {
-                            state.client_keys.insert(conn_id.to_string(), Arc::new(key));
+                        // The key the token binds its holder to (`cnf`): proved
+                        // inside an end-to-end session before the connection is
+                        // admitted, so a token copied from the upgrade opens
+                        // nothing. A `cnf` that names no key is refused, not
+                        // taken for a token that binds none.
+                        let refused = match Binding::from_claims(&claims) {
+                            Ok(None) => None,
+                            Ok(Some(bound)) if state.bind_sessions && announced_e2e => {
+                                binding = Some(bound);
+                                None
+                            }
+                            Ok(Some(_)) if state.bind_sessions => {
+                                Some("A token bound to a key needs an end-to-end session")
+                            }
+                            // Not binding sessions: the key only checks the
+                            // client's signed messages (one named by its
+                            // thumbprint alone cannot).
+                            Ok(Some(bound)) => {
+                                if let Binding::Key(key) = bound {
+                                    state.client_keys.insert(conn_id.to_string(), Arc::new(key));
+                                }
+                                None
+                            }
+                            Err(_) => Some("The token's cnf names no P-256 key"),
+                        };
+                        if let Some(message) = refused {
+                            state.auth_failures_total.fetch_add(1, Ordering::Relaxed);
+                            state
+                                .connections_rejected_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            state.topics.acls.remove(&*conn_id);
+                            reject_ws_auth(&mut raw_write, "AUTH_FAILED", message).await;
+                            return;
                         }
                         token_deadline = jwt::exp_seconds(&claims).map(token_valid_until);
                         Some(user_id.to_string())
@@ -1417,7 +1648,7 @@ pub(crate) async fn handle_connection<H: Handler>(
             if let Some(ref user_id) = rust_auth_user_id
                 && !announced_e2e
             {
-                let server_ready = build_server_ready(&conn_id, user_id, &state);
+                let server_ready = build_server_ready(&conn_id, user_id, &state, None);
                 let sr_bytes = server_ready.len() + 4;
                 out.pending.fetch_add(sr_bytes, Ordering::Relaxed);
                 if tx
@@ -1639,12 +1870,17 @@ pub(crate) async fn handle_connection<H: Handler>(
         hello_answered: false,
         awaiting_session,
         session: None,
+        binding,
+        proof_pending: false,
         app,
     };
 
     // A connection whose token expires is closed (4403): the clients come
     // back with a new token from their token provider.
     let mut expiry = token_deadline.map(|deadline| Box::pin(tokio::time::sleep_until(deadline)));
+    // A client that announced an end-to-end session is admitted once it has
+    // one, and its proof when its token binds a key, or it goes.
+    let mut admission_due = announced_e2e.then(|| Box::pin(tokio::time::sleep(ADMISSION_TIMEOUT)));
 
     // Read loop. It ends when the client closes or the socket fails, and when
     // the server closed the connection and the client did not answer in time.
@@ -1659,6 +1895,27 @@ pub(crate) async fn handle_connection<H: Handler>(
                 () = async { if let Some(sleep) = expiry.as_mut() { sleep.await } }, if expiry.is_some() => {
                     expiry = None;
                     closer.close(&tx, &out.pending, CLOSE_TOKEN_EXPIRED, "token expired");
+                    continue;
+                }
+                () = async { if let Some(sleep) = admission_due.as_mut() { sleep.await } }, if admission_due.is_some() => {
+                    admission_due = None;
+                    if reader.awaiting_session || reader.proof_pending {
+                        closer.close(&tx, &out.pending, CLOSE_IDLE, "no end-to-end session in time");
+                    } else if state.jwt_config.is_none() && reader.session.is_some() {
+                        // An application binding the key itself: a proof
+                        // that has not come by now does not come.
+                        use dashmap::mapref::entry::Entry;
+                        match state.binds.entry((*conn_id).clone()) {
+                            Entry::Occupied(entry) if matches!(entry.get(), Bind::Expected { .. }) => {
+                                entry.remove();
+                                refuse_unproved(&reader.conn, "proof_missing");
+                            }
+                            Entry::Occupied(_) => {}
+                            Entry::Vacant(entry) => {
+                                entry.insert(Bind::Unproved);
+                            }
+                        }
+                    }
                     continue;
                 }
                 next = read_half.next() => match next {
@@ -1702,6 +1959,7 @@ pub(crate) async fn handle_connection<H: Handler>(
     state.conn_encryption.remove(&*conn_id);
     state.topics.acls.remove(&*conn_id);
     state.client_keys.remove(&*conn_id);
+    state.binds.remove(&*conn_id);
     state.unregister_user(&conn_id);
     // Queue group cleanup: remove this connection from all queue groups
     if let Some((_, memberships)) = state.conn_queue_groups.remove(&*conn_id) {

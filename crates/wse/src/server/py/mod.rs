@@ -98,6 +98,7 @@ struct ServerParams {
     e2e_legacy: bool,
     signing_key: Option<Vec<u8>>,
     signature_window: u64,
+    bind_sessions: bool,
     max_message_size: usize,
     ping_interval: u64,
     idle_timeout: u64,
@@ -178,6 +179,7 @@ impl RustWSEServer {
         config.e2e_legacy = srv.e2e_legacy;
         config.signing_key = srv.signing_key;
         config.signature_window = srv.signature_window;
+        config.bind_sessions = srv.bind_sessions;
         config.max_message_size = srv.max_message_size;
         config.ping_interval = srv.ping_interval;
         config.idle_timeout = srv.idle_timeout;
@@ -253,7 +255,7 @@ impl RustWSEServer {
     /// compression, encryption, ping/pong). Python handles application logic
     /// via drain mode or callbacks.
     #[new]
-    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, jwt_previous_secret = None, jwt_key_id = None, jwt_algorithm = None, jwt_private_key = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_bytes = 16_777_216, max_subscriptions_per_connection = 0, max_inbound_queue_bytes = 67_108_864, allowed_origins = None, client_subscriptions = false, e2e_identity_key = None, e2e_legacy = true, signing_key = None, signature_window = 30))]
+    #[pyo3(signature = (host, port, max_connections = 1000, jwt_secret = None, jwt_issuer = None, jwt_audience = None, jwt_cookie_name = None, jwt_previous_secret = None, jwt_key_id = None, jwt_algorithm = None, jwt_private_key = None, max_inbound_queue_size = 131072, recovery_enabled = false, recovery_buffer_size = 128, recovery_ttl = 300, recovery_max_messages = 500, recovery_memory_budget = 268435456, presence_enabled = false, presence_max_data_size = 4096, presence_max_members = 0, rate_limit_capacity = 100_000.0, rate_limit_refill = 10_000.0, max_message_size = 1_048_576, ping_interval = 25, idle_timeout = 60, max_outbound_queue_bytes = 16_777_216, max_subscriptions_per_connection = 0, max_inbound_queue_bytes = 67_108_864, allowed_origins = None, client_subscriptions = false, e2e_identity_key = None, e2e_legacy = true, signing_key = None, signature_window = 30, bind_sessions = true))]
     #[expect(
         clippy::too_many_arguments,
         reason = "PyO3 __init__: 34 Python kwargs with defaults"
@@ -293,6 +295,7 @@ impl RustWSEServer {
         e2e_legacy: bool,
         signing_key: Option<Vec<u8>>,
         signature_window: u64,
+        bind_sessions: bool,
     ) -> PyResult<Self> {
         Self::build(
             host,
@@ -307,6 +310,7 @@ impl RustWSEServer {
                 e2e_legacy,
                 signing_key,
                 signature_window,
+                bind_sessions,
                 max_message_size,
                 ping_interval,
                 idle_timeout,
@@ -530,8 +534,20 @@ impl RustWSEServer {
     /// cookies of its "connect" event. Returns False when the connection is
     /// gone. A server that validates tokens itself sends server_ready on its
     /// own and raises RuntimeError here.
-    fn accept_connection(&self, conn_id: &str, user_id: &str) -> PyResult<bool> {
-        self.accept_connection_impl(conn_id, user_id)
+    ///
+    /// With client_key (base64 of the user's P-256 public key), the
+    /// connection is bound to it: admitted once the client has proved the key
+    /// inside its end-to-end session, refused (4401) when it proves another
+    /// or none, so a cookie copied on the way opens nothing. RuntimeError for
+    /// a connection without an end-to-end session.
+    #[pyo3(signature = (conn_id, user_id, client_key = None))]
+    fn accept_connection(
+        &self,
+        conn_id: &str,
+        user_id: &str,
+        client_key: Option<&str>,
+    ) -> PyResult<bool> {
+        self.accept_connection_impl(conn_id, user_id, client_key)
     }
 
     /// Return True if the server is running.
