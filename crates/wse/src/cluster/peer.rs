@@ -61,12 +61,18 @@ pub(super) async fn peer_writer<W: AsyncWriteExt + Unpin>(
         }
 
         let bytes_count = buf.len() as u64;
-        if writer.write_all(&buf).await.is_err() {
-            break;
-        }
         // flush() is required for TLS -- rustls buffers encrypted data internally
         // and only writes to the TCP socket on flush. For plain TCP this is a no-op.
-        if writer.flush().await.is_err() {
+        // A peer that stops reading fills the socket: the write waits on it
+        // only until the link is cancelled (its heartbeat ran out, say).
+        let written = tokio::select! {
+            written = async {
+                writer.write_all(&buf).await?;
+                writer.flush().await
+            } => written,
+            () = cancel.cancelled() => break,
+        };
+        if written.is_err() {
             break;
         }
         metrics.bytes_sent.fetch_add(bytes_count, Ordering::Relaxed);
@@ -472,7 +478,7 @@ where
         writer.write_all(&request).await?;
         writer.flush().await
     };
-    let receive = tokio::time::timeout(RESUME_TIMEOUT, async {
+    let receive = async {
         let mut wanted: Vec<ResumePoint> = Vec::new();
         loop {
             let Ok(Some(ClusterFrame::Resume { points, last })) = read_frame(reader).await else {
@@ -486,10 +492,31 @@ where
                 return Some(wanted);
             }
         }
-    });
-    let (sent, received) = tokio::join!(send, receive);
+    };
+    // Both ways within the time: a peer that does not read ours holds the
+    // link no longer than one that does not send its own.
+    let (sent, received) =
+        tokio::time::timeout(RESUME_TIMEOUT, async { tokio::join!(send, receive) })
+            .await
+            .ok()?;
     sent.ok()?;
-    received.ok().flatten()
+    received
+}
+
+/// A write to a peer that must make progress within the heartbeat timeout:
+/// one that stopped reading does not hold the link for good.
+async fn write_progressing<W>(writer: &mut W, bytes: &[u8]) -> std::io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let stalled = || std::io::Error::new(std::io::ErrorKind::TimedOut, "the peer stopped reading");
+    let within = Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
+    tokio::time::timeout(within, writer.write_all(bytes))
+        .await
+        .map_err(|_| stalled())??;
+    tokio::time::timeout(within, writer.flush())
+        .await
+        .map_err(|_| stalled())?
 }
 
 /// What the peer missed of the streams this node publishes, after where its
@@ -521,17 +548,14 @@ where
             write_framed(&mut out, &frame);
             sent += 1;
             if out.len() >= MAX_BATCH_BYTES {
-                writer.write_all(&out).await?;
+                write_progressing(writer, &out).await?;
                 bytes += out.len() as u64;
                 out.clear();
             }
         }
     }
-    if !out.is_empty() {
-        writer.write_all(&out).await?;
-        bytes += out.len() as u64;
-    }
-    writer.flush().await?;
+    write_progressing(writer, &out).await?;
+    bytes += out.len() as u64;
     ctx.metrics.messages_sent.fetch_add(sent, Ordering::Relaxed);
     ctx.metrics.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
     Ok(sent)

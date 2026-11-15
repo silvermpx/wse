@@ -1804,3 +1804,29 @@ fn snapshots_are_queued_whole_or_not_at_all() {
     let queued: Vec<Bytes> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert_eq!(queued, [&b"a"[..], &b"b"[..], &b"1"[..]]);
 }
+
+/// A peer that stops reading: once the link is cancelled (its heartbeat ran
+/// out), the writer stops at once instead of waiting on a full socket for
+/// as long as the peer keeps it open.
+#[tokio::test]
+async fn a_cancelled_link_stops_writing_to_a_peer_that_stopped_reading() {
+    let (ours, _theirs) = tokio::io::duplex(1024);
+    let (tx, rx) = mpsc::channel::<Bytes>(16);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let writer = tokio::spawn(super::peer::peer_writer(
+        rx,
+        ours,
+        cancel.clone(),
+        Arc::new(ClusterMetrics::new()),
+    ));
+    for _ in 0..4 {
+        tx.send(Bytes::from(vec![0u8; 256 * 1024])).await.unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!writer.is_finished(), "the writer waits on the full socket");
+    cancel.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(1), writer)
+        .await
+        .expect("the writer stops once the link is cancelled")
+        .unwrap();
+}

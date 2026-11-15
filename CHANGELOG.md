@@ -21,6 +21,10 @@
 - Python client: `disconnect()` while `connect()` waits for the server ends
   that `connect()` with `WSEConnectionError`; the socket arriving after it
   is closed, and the client stays disconnected.
+- Cluster: a peer that stops reading no longer holds its link: once the
+  heartbeat runs out the writer stops waiting on the full socket, so the
+  link is cleaned up and redialed; the catch-up exchange and its resend
+  give up on a peer that does not read either.
 - TypeScript client: one user's queued messages, subscriptions and
   recovery positions never go out on the next user's connection: not when
   the last component unmounts and another user signs in, nor when a cookie
