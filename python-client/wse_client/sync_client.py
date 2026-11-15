@@ -121,6 +121,7 @@ class SyncWSEClient:
         wire_format: str = "json",
         signing_key: Any = None,
         server_signing_keys: list[str] | None = None,
+        e2e_bind_session: bool = True,
     ) -> None:
         self._url = url
         self._token = token
@@ -146,6 +147,7 @@ class SyncWSEClient:
             "wire_format": wire_format,
             "signing_key": signing_key,
             "server_signing_keys": server_signing_keys,
+            "e2e_bind_session": e2e_bind_session,
         }
         self._queue_size = queue_size
 

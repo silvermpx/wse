@@ -139,7 +139,11 @@ def server_key():
 
 @pytest.fixture()
 def signing_server(server_port, server_key):
-    srv = start_server(server_port, signing_key=pem(server_key), recovery_enabled=True)
+    # Tokens naming the client's key over plain connections: the key only
+    # checks signed messages here (sessions bound to it: the last tests).
+    srv = start_server(
+        server_port, signing_key=pem(server_key), recovery_enabled=True, bind_sessions=False
+    )
     yield srv
     srv.stop()
 
@@ -287,7 +291,7 @@ class TestServerSigned:
 
     @pytest.mark.asyncio
     async def test_a_server_without_a_key_refuses_signed_messages(self, server_port):
-        srv = start_server(server_port)
+        srv = start_server(server_port, bind_sessions=False)
         try:
             client = new_key()
             async with await connect(server_port, token(client)) as ws:
@@ -313,6 +317,7 @@ async def test_callback_mode_hands_the_proof_to_on_signed_message(server_port, s
         jwt_issuer=JWT_ISSUER,
         jwt_audience=JWT_AUDIENCE,
         signing_key=pem(server_key),
+        bind_sessions=False,
     )
     got: list[dict] = []
     done = threading.Event()
@@ -373,7 +378,9 @@ async def test_a_message_the_application_cannot_take_gets_busy_not_a_receipt(
 ):
     """Nothing drains the queue: once it is full a message is not received,
     so no receipt, and the same n may come again once there is room."""
-    srv = start_server(server_port, signing_key=pem(server_key), max_inbound_queue_size=2)
+    srv = start_server(
+        server_port, signing_key=pem(server_key), max_inbound_queue_size=2, bind_sessions=False
+    )
     try:
         public = srv.signing_public_key()
         audience = kid(base64.b64decode(public))
@@ -408,7 +415,7 @@ async def test_the_python_client_never_queues_a_signed_message(server_port, serv
     pytest.importorskip("wse_client")
     from wse_client import AsyncWSEClient, SendResult, generate_signing_key
 
-    srv = start_server(server_port, signing_key=pem(server_key))
+    srv = start_server(server_port, signing_key=pem(server_key), bind_sessions=False)
     key = generate_signing_key()
     client = AsyncWSEClient(
         f"ws://127.0.0.1:{server_port}/wse",
@@ -427,4 +434,40 @@ async def test_the_python_client_never_queues_a_signed_message(server_port, serv
         assert await client.send("chat", {"text": "later"}) is SendResult.QUEUED
     finally:
         await client.disconnect()
+        srv.stop()
+
+
+@pytest.mark.asyncio
+async def test_the_python_client_binds_its_session_to_its_key(server_port, server_key):
+    """A token naming the client's key opens a session only with the proof
+    of that key inside it: one copied on the way, without the key, does not."""
+    pytest.importorskip("wse_client")
+    from wse_client import AsyncWSEClient, WSEAuthError, generate_signing_key
+
+    identity = new_key()
+    srv = start_server(server_port, signing_key=pem(server_key), e2e_identity_key=pem(identity))
+    url = f"ws://127.0.0.1:{server_port}/wse"
+    key = generate_signing_key()
+
+    def client(signing_key) -> AsyncWSEClient:
+        return AsyncWSEClient(
+            url,
+            token=token(key),
+            signing_key=signing_key,
+            server_signing_keys=[srv.signing_public_key()],
+            encryption=True,
+            e2e_server_keys=[srv.e2e_identity_public_key()],
+            reconnect=None,
+        )
+
+    try:
+        async with client(key) as bound:
+            await bound.send("order", {"qty": "1"}, signed=True, nonce="bound-1")
+            _, _, message = await taken(srv, "signed")
+            assert message["n"] == "bound-1"
+
+        with pytest.raises(WSEAuthError):
+            async with client(generate_signing_key()):
+                pass
+    finally:
         srv.stop()

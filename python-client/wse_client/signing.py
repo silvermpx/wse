@@ -123,10 +123,34 @@ def public_key_jwk(private_key: Any) -> dict[str, str]:
 
 
 def _sign(private_key: Any, label: bytes, body: str) -> str:
+    return _sign_bytes(private_key, label + body.encode())
+
+
+def _sign_bytes(private_key: Any, data: bytes) -> str:
+    """An ECDSA P-256 / SHA-256 signature of *data*, ``r || s`` in base64."""
     hashes, _, ec, utils = _crypto()
-    der = private_key.sign(label + body.encode(), ec.ECDSA(hashes.SHA256()))
+    der = private_key.sign(data, ec.ECDSA(hashes.SHA256()))
     r, s = utils.decode_dss_signature(der)
     return base64.b64encode(r.to_bytes(32, "big") + s.to_bytes(32, "big")).decode()
+
+
+#: What a client's proof of its key over an E2E session covers before the
+#: session's transcript hash and the client's public key.
+CLIENT_AUTH_LABEL = b"WSE-E2E client_auth\x00"
+
+
+def thumbprint(point: bytes) -> str:
+    """The RFC 7638 thumbprint of a P-256 public key (an uncompressed
+    point): base64url, unpadded, of SHA-256 of its JWK's required members."""
+
+    def b64url(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+    jwk = '{"crv":"P-256","kty":"EC","x":"%s","y":"%s"}' % (
+        b64url(point[1:33]),
+        b64url(point[33:65]),
+    )
+    return b64url(hashlib.sha256(jwk.encode()).digest())
 
 
 def _verify(public_key: Any, label: bytes, body: str, sig: str) -> bool:
@@ -153,6 +177,24 @@ class ClientSigner:
     def __init__(self, private_key: Any) -> None:
         self._key = load_signing_key(private_key)
         self.kid = key_id(_point(self._key))
+        #: The key's RFC 7638 thumbprint: what a token names it by
+        #: (``cnf.jkt``), and what the server confirms a session is bound to.
+        self.thumbprint = thumbprint(_point(self._key))
+
+    def prove_session(self, transcript_hash: bytes) -> str:
+        """The proof of this key over an E2E session (``client_auth``), the
+        first message the session seals: whoever copied the token on the way
+        cannot make one for a session of its own."""
+        point = _point(self._key)
+        sig = _sign_bytes(self._key, CLIENT_AUTH_LABEL + transcript_hash + point)
+        return json.dumps(
+            {
+                "c": "WSE",
+                "t": "client_auth",
+                "p": {"key": base64.b64encode(point).decode(), "sig": sig},
+            },
+            separators=(",", ":"),
+        )
 
     def envelope(
         self,

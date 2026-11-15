@@ -104,6 +104,11 @@ class SecurityManager:
         return self._enabled and self._aes_key is not None
 
     @property
+    def transcript_hash(self) -> bytes | None:
+        """The hash of the session's handshake, once it is open."""
+        return self._session.transcript_hash if self._session is not None else None
+
+    @property
     def session_mode(self) -> bool:
         """A session (not the first design): every frame after the
         handshake is sealed, control frames included."""

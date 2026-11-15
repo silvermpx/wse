@@ -277,6 +277,12 @@ class Session:
         self._sender = sender
         self._receiver = receiver
 
+    @property
+    def transcript_hash(self) -> bytes:
+        """The hash of the session's handshake: what the client's proof of
+        its key signs."""
+        return self._sender.th
+
     def seal(self, plaintext: bytes) -> bytes:
         """``plaintext`` as the body of a binary frame."""
         return self._sender.seal(plaintext)

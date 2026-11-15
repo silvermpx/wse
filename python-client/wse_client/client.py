@@ -39,7 +39,7 @@ from .constants import (
     SNAPSHOT_MAX_RETRIES,
     SNAPSHOT_RETRY_DELAY,
 )
-from .errors import WSEConnectionError, WSEEncryptionError, WSEError
+from .errors import WSEAuthError, WSEConnectionError, WSEEncryptionError, WSEError
 from .event_sequencer import EventSequencer
 from .network_monitor import NetworkMonitor
 from .offline_queue import OfflineQueue
@@ -229,6 +229,13 @@ class AsyncWSEClient:
             checked against; a signed message no pinned key verifies is
             dropped. Without them signed messages are delivered unchecked
             (``event.signature.verified`` is False).
+        e2e_bind_session: With *signing_key* and *encryption*, the session
+            is bound to the key (True, the default): the client proves the
+            key inside the session, and goes on only once the server
+            confirms the session is bound to it, as the token names it
+            (``cnf``). A token copied on the way then opens nothing. False
+            for a token that names no key, whose key the server application
+            binds itself (``set_client_key``).
 
     Example::
 
@@ -262,6 +269,7 @@ class AsyncWSEClient:
         wire_format: str = "json",
         signing_key: Any = None,
         server_signing_keys: list[str] | None = None,
+        e2e_bind_session: bool = True,
     ) -> None:
         if wire_format not in _WIRE_FORMATS:
             raise ValueError(f"wire_format must be one of {_WIRE_FORMATS}")
@@ -309,6 +317,13 @@ class AsyncWSEClient:
         # from its server_hello (the audience of what the client signs).
         self._signer = ClientSigner(signing_key) if signing_key is not None else None
         self._server_signing_kid: str | None = None
+        # The session is bound to the signing key: proved, and confirmed.
+        self._bind_session = (
+            e2e_bind_session
+            and self._signer is not None
+            and self._security is not None
+            and self._security.session_mode
+        )
         # Messages go out in msgpack too, except frames sealed for E2E.
         self._send_packed = (
             msgpack_handler
@@ -1842,6 +1857,15 @@ class AsyncWSEClient:
         details = payload.get("details")
         if not isinstance(details, dict):
             details = {}
+        if self._bind_session and self._signer is not None:
+            # Sealed: the server says the session is bound to this client's
+            # key. Otherwise the token at the upgrade was not this client's
+            # (one put in its place on the way), or names no key.
+            cnf = details.get("cnf")
+            jkt = cnf.get("jkt") if isinstance(cnf, dict) else None
+            if jkt != self._signer.thumbprint:
+                self._start_binding_failure("server_ready names no key, or another")
+                return
         conn_id = payload.get("connection_id") or details.get("connection_id")
         self._take_signing_kid(details.get("signing"), sealed=True)
         self._connection.handle_server_ready(
@@ -1908,7 +1932,13 @@ class AsyncWSEClient:
                 )
                 return
             logger.info("E2E encryption enabled")
-            _resolve(self._key_ready)
+            th = security.transcript_hash
+            if self._bind_session and self._signer is not None and th is not None:
+                # Bound to this client's key: its proof is the first message
+                # the session seals, before anything waiting for the key.
+                self._fire_task(self._send_proof(self._signer.prove_session(th)))
+            else:
+                _resolve(self._key_ready)
 
         server_version = p.get("server_version", "unknown")
         logger.info(
@@ -1917,6 +1947,29 @@ class AsyncWSEClient:
             list(self._server_features.keys()),
         )
         self._maybe_complete_handshake()
+
+    async def _send_proof(self, proof: str) -> None:
+        """The session's first sealed message, then the rest may go."""
+        try:
+            sent = await self._connection.send(proof)
+        except WSEError:
+            sent = False
+        if sent:
+            _resolve(self._key_ready)
+        # Not sent: the connection is going, and the next one proves again.
+
+    def _start_binding_failure(self, reason: str) -> None:
+        """The session is not bound to this client's key: end the client."""
+        err = WSEAuthError(
+            f"the server did not bind the session to this client's key ({reason}); "
+            "for a token that names no key, pass e2e_bind_session=False"
+        )
+        logger.error("%s -- closing the connection", err)
+        _reject(self._key_ready, err)
+        _reject(self._handshake, err)
+        self._abort_task = asyncio.ensure_future(self._connection.abort(err))
+        self._background_tasks.add(self._abort_task)
+        self._abort_task.add_done_callback(self._background_tasks.discard)
 
     def _take_signing_kid(self, signing: Any, *, sealed: bool) -> None:
         """The server's signing key id, the audience of what this client
