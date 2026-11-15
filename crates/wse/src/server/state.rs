@@ -266,6 +266,39 @@ pub(super) struct Queued {
     bytes: Option<usize>,
 }
 
+/// The clients' messages waiting for the drain, and their size: every
+/// connection's task adds to these and the drain takes from them, so they
+/// keep a cache line of their own, away from what each message only reads.
+#[repr(align(128))]
+#[derive(Default)]
+struct InboundRoom {
+    messages: AtomicUsize,
+    bytes: AtomicUsize,
+}
+
+/// What one drain took off the channel, given back to the budgets at once
+/// when it is done.
+#[derive(Default)]
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub(super) struct Taken {
+    messages: usize,
+    bytes: usize,
+    lifecycle: usize,
+}
+
+impl Taken {
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
+    pub(super) fn take(&mut self, queued: Queued) -> InboundEvent {
+        if let Some(bytes) = queued.bytes {
+            self.messages += 1;
+            self.bytes += bytes;
+        } else if queued.event.is_lifecycle() {
+            self.lifecycle += 1;
+        }
+        queued.event
+    }
+}
+
 /// A message's room in the inbound budget while its callback runs.
 #[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub(super) struct CallbackRoom {
@@ -578,9 +611,7 @@ pub(crate) struct SharedState {
     pub(super) inbound_rx: CBReceiver<Queued>,
     // The clients' messages in the channel, their size and the limits of both
     #[cfg_attr(not(feature = "python"), allow(dead_code))]
-    inbound_messages: AtomicUsize,
-    #[cfg_attr(not(feature = "python"), allow(dead_code))]
-    inbound_bytes: AtomicUsize,
+    inbound_room: InboundRoom,
     #[cfg_attr(not(feature = "python"), allow(dead_code))]
     max_inbound_messages: usize,
     #[cfg_attr(not(feature = "python"), allow(dead_code))]
@@ -840,8 +871,7 @@ impl SharedState {
             drain_mode: AtomicBool::new(false),
             inbound_tx: tx,
             inbound_rx: rx,
-            inbound_messages: AtomicUsize::new(0),
-            inbound_bytes: AtomicUsize::new(0),
+            inbound_room: InboundRoom::default(),
             max_inbound_messages: cfg.max_inbound_queue_size,
             max_inbound_bytes: cfg.max_inbound_queue_bytes,
             inbound_lifecycle: AtomicUsize::new(0),
@@ -938,8 +968,8 @@ impl SharedState {
     /// the message is counted in `inbound_dropped`.
     #[cfg_attr(not(feature = "python"), allow(dead_code))]
     fn reserve_message(&self, bytes: usize) -> bool {
-        let queued = self.inbound_messages.fetch_add(1, Ordering::AcqRel);
-        let held = self.inbound_bytes.fetch_add(bytes, Ordering::AcqRel);
+        let queued = self.inbound_room.messages.fetch_add(1, Ordering::AcqRel);
+        let held = self.inbound_room.bytes.fetch_add(bytes, Ordering::AcqRel);
         if queued >= self.max_inbound_messages
             || (held > 0 && held.saturating_add(bytes) > self.max_inbound_bytes)
         {
@@ -952,8 +982,8 @@ impl SharedState {
 
     #[cfg_attr(not(feature = "python"), allow(dead_code))]
     fn release_message(&self, bytes: usize) {
-        self.inbound_messages.fetch_sub(1, Ordering::AcqRel);
-        self.inbound_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        self.inbound_room.messages.fetch_sub(1, Ordering::AcqRel);
+        self.inbound_room.bytes.fetch_sub(bytes, Ordering::AcqRel);
     }
 
     /// Queue a client's message of `bytes` bytes for the drain, or drop it
@@ -983,15 +1013,22 @@ impl SharedState {
         }
     }
 
-    /// The drain took `queued` off the channel: its room is free again.
+    /// A drain took these off the channel: their room is free again, given
+    /// back in one step for the whole batch.
     #[cfg_attr(not(feature = "python"), allow(dead_code))]
-    pub(super) fn taken(&self, queued: Queued) -> InboundEvent {
-        if let Some(bytes) = queued.bytes {
-            self.release_message(bytes);
-        } else if queued.event.is_lifecycle() {
-            self.inbound_lifecycle.fetch_sub(1, Ordering::AcqRel);
+    pub(super) fn give_back(&self, taken: Taken) {
+        if taken.messages > 0 {
+            self.inbound_room
+                .messages
+                .fetch_sub(taken.messages, Ordering::AcqRel);
+            self.inbound_room
+                .bytes
+                .fetch_sub(taken.bytes, Ordering::AcqRel);
         }
-        queued.event
+        if taken.lifecycle > 0 {
+            self.inbound_lifecycle
+                .fetch_sub(taken.lifecycle, Ordering::AcqRel);
+        }
     }
 
     /// Room for a message handed to an on_message callback, given back when

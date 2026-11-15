@@ -7,7 +7,7 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 
 use super::RustWSEServer;
 use super::convert::json_to_pyobj;
-use crate::server::state::InboundEvent;
+use crate::server::state::{InboundEvent, Taken};
 
 impl RustWSEServer {
     pub(super) fn drain_inbound_impl(
@@ -19,6 +19,7 @@ impl RustWSEServer {
         // Collect events with GIL released (channel recv happens without GIL)
         let events: Vec<InboundEvent> = py.detach(|| {
             let mut events = Vec::with_capacity(max_count.min(4096));
+            let mut taken = Taken::default();
 
             // First event: block with timeout (efficient — no busy wait)
             match self
@@ -26,18 +27,20 @@ impl RustWSEServer {
                 .inbound_rx
                 .recv_timeout(Duration::from_millis(timeout_ms))
             {
-                Ok(queued) => events.push(self.shared.taken(queued)),
+                Ok(queued) => events.push(taken.take(queued)),
                 Err(_) => return events, // Timeout or disconnected
             }
 
             // Drain remaining without blocking (batch read)
             while events.len() < max_count {
                 match self.shared.inbound_rx.try_recv() {
-                    Ok(queued) => events.push(self.shared.taken(queued)),
+                    Ok(queued) => events.push(taken.take(queued)),
                     Err(_) => break,
                 }
             }
 
+            // Their room is free again: once for the batch, not per event.
+            self.shared.give_back(taken);
             events
         });
 
