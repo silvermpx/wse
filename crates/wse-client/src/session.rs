@@ -2,6 +2,7 @@
 //! the application, the topics subscribed and where each stands, and the
 //! gaps being recovered. No I/O: what it sends goes in its outbox.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -332,6 +333,16 @@ impl<H: Handler> Session<H> {
             }
             _ => {}
         }
+        // The time the server signed, in milliseconds: the one a reader can
+        // trust, written as the other clients write it.
+        #[derive(serde::Deserialize)]
+        struct SignedAt {
+            ts: Option<u64>,
+        }
+        let signed_at = serde_json::from_str::<SignedAt>(&body)
+            .ok()
+            .and_then(|at| at.ts)
+            .map(|ms| Cow::Owned(rfc3339_ms(ms)));
         let signature = Signature {
             body: body.to_string(),
             sig: sig.into_owned(),
@@ -343,8 +354,7 @@ impl<H: Handler> Session<H> {
             t: signed.t,
             p: signed.p,
             c: outer.c,
-            // The time the server signed: the one a reader can trust.
-            ts: signed.ts,
+            ts: signed_at,
             tp: outer.tp.or(signed.tp),
             e: outer.e,
             o: outer.o,
@@ -1009,6 +1019,29 @@ impl<H: Handler> Session<H> {
     }
 }
 
+/// Milliseconds since the Unix epoch in RFC 3339, UTC, as the TypeScript
+/// client's `toISOString()` writes them.
+fn rfc3339_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (days, of_day) = (secs / 86_400, secs % 86_400);
+    // Days since 1970-01-01 to a civil date (H. Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        of_day / 3600,
+        of_day % 3600 / 60,
+        of_day % 60,
+        ms % 1000
+    )
+}
+
 /// The server's own messages: never a topic's, whatever they carry.
 fn is_protocol(kind: &str) -> bool {
     matches!(
@@ -1302,6 +1335,13 @@ mod tests {
         ready(&mut s, true);
         assert!(s.next_deadline().unwrap() > first);
         assert!(gaps(&s).is_empty());
+    }
+
+    #[test]
+    fn signed_times_read_as_the_other_clients_write_them() {
+        assert_eq!(rfc3339_ms(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(rfc3339_ms(951_782_400_000), "2000-02-29T00:00:00.000Z");
+        assert_eq!(rfc3339_ms(1_700_000_000_123), "2023-11-14T22:13:20.123Z");
     }
 
     #[test]

@@ -218,6 +218,14 @@ export class ConnectionManager {
           'or security.unauthenticated, or security.legacyE2e for servers before 3.0',
       );
     }
+    if (this.encryptionRequired && e2e.legacy && e2e.serverKeys?.length) {
+      // The first design has no server identity: the pinned keys could not
+      // be checked, and whatever terminates TLS could answer.
+      throw new Error(
+        'security.legacyE2e speaks the first design, which cannot check security.serverKeys: ' +
+          'pin keys for a 3.x server, or use legacyE2e alone for a server before 3.0',
+      );
+    }
     securityManager.configureE2e(
       this.encryptionRequired && !e2e.legacy
         ? { serverKeys: e2e.serverKeys, unauthenticated: e2e.unauthenticated }

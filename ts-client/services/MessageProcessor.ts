@@ -501,7 +501,9 @@ export class MessageProcessor {
       return null;
     }
     const { message, proof } = opened;
-    if (envelope.tp !== undefined && message.tp !== undefined && message.tp !== envelope.tp) {
+    // Signed for another topic, or for one connection and not for a topic's
+    // subscribers.
+    if (envelope.tp !== undefined && message.tp !== envelope.tp) {
       logger.warn(`Dropping a message signed for topic ${message.tp} that came on ${envelope.tp}`);
       return null;
     }

@@ -173,7 +173,7 @@ class Direction {
 export class E2eSender extends Direction {
   private seq = 0;
   private epochFrames = 0;
-  private epochStarted = Date.now();
+  private epochStarted = performance.now();
   private chain: Promise<unknown> = Promise.resolve();
 
   /** `plaintext` as the body of a binary frame. Calls seal in call order. */
@@ -190,12 +190,12 @@ export class E2eSender extends Direction {
 
   private async sealNow(plaintext: Uint8Array<ArrayBuffer>): Promise<Uint8Array<ArrayBuffer>> {
     if (this.seq > SEQ_MAX) throw new E2eError('e2e frame counter used up', E2E_CLOSE_EXHAUSTED);
-    if (this.epochFrames >= REKEY_FRAMES || Date.now() - this.epochStarted >= REKEY_AFTER_MS) {
+    if (this.epochFrames >= REKEY_FRAMES || performance.now() - this.epochStarted >= REKEY_AFTER_MS) {
       this.secret = await this.nextSecret();
       this.epoch += 1;
       this.keys = await epochKeys(this.th, this.secret);
       this.epochFrames = 0;
-      this.epochStarted = Date.now();
+      this.epochStarted = performance.now();
     }
     const hdr = header(FRAME_DATA, this.epoch, this.seq);
     const sealed = await subtle().encrypt(

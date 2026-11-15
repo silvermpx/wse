@@ -167,8 +167,75 @@ class TestNoBlackout:
         c._on_raw_message(stamped(0, epoch="0000000b"))
         c._on_raw_message(stamped(1, epoch="0000000b"))
         assert offsets(drain(c)) == [1, 0, 1]
-        assert "prices" in c._gaps
+        assert ("prices", EPOCH) in c._gaps
         assert c.recovery_state["prices"] == ("0000000b", 1)
+
+    async def test_a_late_answer_settles_only_its_own_gap(self):
+        c = make_client(timeout=5.0)
+        c._on_raw_message(stamped(1))
+        c._on_raw_message(stamped(3))
+        await asyncio.sleep(0)
+        # The replay fills the gap before its answer comes.
+        c._on_raw_message(stamped(2))
+        # Another gap, another request.
+        c._on_raw_message(stamped(5))
+        await asyncio.sleep(0)
+        assert len(recovery_requests(c)) == 2
+        # The first request's answer is not the second's.
+        c._on_raw_message(reply("prices", offset=3, recovered=True))
+        assert ("prices", EPOCH) in c._gaps
+        c._on_raw_message(stamped(4))
+        c._on_raw_message(reply("prices", offset=5, recovered=True))
+        assert offsets(drain(c)) == [1, 2, 3, 4, 5]
+        assert c._gaps == {}
+
+    async def test_gaps_in_two_streams_are_recovered_each(self):
+        other = "0000000b"
+        c = make_client(timeout=5.0)
+        c._on_raw_message(stamped(1))
+        c._on_raw_message(stamped(1, epoch=other))
+        c._on_raw_message(stamped(3))
+        # A gap in the other stream is held too, not skipped.
+        c._on_raw_message(stamped(3, epoch=other))
+        await asyncio.sleep(0)
+        assert len(recovery_requests(c)) == 2
+        c._on_raw_message(stamped(2))
+        c._on_raw_message(stamped(2, epoch=other))
+        c._on_raw_message(reply("prices", offset=3, recovered=True))
+        c._on_raw_message(reply("prices", offset=3, recovered=True, epoch=other))
+        assert offsets(drain(c)) == [1, 1, 2, 3, 2, 3]
+        assert c._gaps == {}
+
+    async def test_a_replay_the_server_cut_short_is_asked_for_again(self):
+        c = make_client(timeout=5.0)
+        c._on_raw_message(stamped(1))
+        c._on_raw_message(stamped(5))
+        await asyncio.sleep(0)
+        # The server's outbound budget let one through.
+        c._on_raw_message(stamped(2))
+        c._on_raw_message(reply("prices", offset=2, recovered=False))
+        await asyncio.sleep(0)
+        assert recovery_requests(c)[-1] == {"prices": {"epoch": EPOCH, "offset": 2}}
+        c._on_raw_message(stamped(3))
+        c._on_raw_message(stamped(4))
+        c._on_raw_message(reply("prices", offset=4, recovered=True))
+        assert offsets(drain(c)) == [1, 2, 3, 4, 5]
+
+    async def test_a_stamped_protocol_message_moves_no_topic(self):
+        c = make_client(timeout=5.0)
+        c._on_raw_message(
+            json.dumps(
+                {
+                    "t": "error",
+                    "tp": "prices",
+                    "e": EPOCH,
+                    "o": 99,
+                    "p": {"code": "X", "message": "y"},
+                }
+            )
+        )
+        c._on_raw_message(stamped(1))
+        assert [e.offset for e in drain(c) if e.type == "price"] == [1]
 
     async def test_streams_alternating_are_no_gaps(self):
         c = make_client(timeout=5.0)

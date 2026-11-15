@@ -353,11 +353,9 @@ class MessageCodec:
             return None
         topic = envelope.get("tp")
         signed_topic = message.get("tp")
-        if (
-            isinstance(topic, str)
-            and signed_topic is not None
-            and signed_topic != topic
-        ):
+        if isinstance(topic, str) and signed_topic != topic:
+            # Signed for another topic, or for one connection and not for a
+            # topic's subscribers.
             logger.warning(
                 "Dropping a message signed for topic %r that came on %r",
                 signed_topic,

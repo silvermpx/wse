@@ -152,3 +152,9 @@ def test_keys_load_from_pem_and_bad_keys_are_refused():
         load_signing_key(ec.generate_private_key(ec.SECP384R1()))
     with pytest.raises(ValueError):
         ServerKeys(["AAAA"])
+
+
+def test_a_message_signed_for_no_topic_is_not_taken_on_one():
+    body = json.dumps({"t": "fill", "p": {}, "ts": 1, "n": "a"})
+    envelope = {"t": "signed", "sb": body, "sig": "AA", "kid": "k", "tp": "orders.u1"}
+    assert codec(None).decode(json.dumps(envelope)) is None

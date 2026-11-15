@@ -13,8 +13,8 @@ import json
 import time
 
 from uuid import uuid4
-from collections import defaultdict
-from dataclasses import dataclass, field
+from collections import defaultdict, deque
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable
 
@@ -98,18 +98,43 @@ class _StreamEnd:
 
 @dataclass(eq=False)
 class _GapState:
-    """A topic waiting for a recovery replay to fill an offset gap."""
+    """A stream of a topic waiting for a recovery replay to fill an offset
+    gap: one per stream with a hole (a topic published on several nodes has
+    one stream per node)."""
 
     epoch: str
     # Messages that arrived past the hole, by offset (same epoch).
     buffer: dict[int, WSEEvent] = field(default_factory=dict)
     timer: asyncio.TimerHandle | None = None
-    in_flight: bool = False  # a recovery request is out, no reply yet
+    request: int | None = None  # its recovery request out, not answered yet
     requested_from: int | None = None  # anchor offset of the last request
-    answered: bool = False  # some reply for this topic arrived
+    answered: bool = False  # an answer for it arrived
+
+
+@dataclass(eq=False)
+class _Request:
+    """A recovery request out. The server answers a connection's requests in
+    order, so each topic's answers settle its requests front to back."""
+
+    id: int
+    for_gap: bool
 
 
 _HANDSHAKE_TYPES = frozenset({"server_hello", "error", "ping", "PING", "pong", "PONG"})
+
+# The server's own messages: never a topic's, whatever stamp they carry.
+_PROTOCOL_TYPES = frozenset(
+    {
+        "ping",
+        "PING",
+        "pong",
+        "PONG",
+        "server_ready",
+        "server_hello",
+        "subscription_update",
+        "error",
+    }
+)
 
 
 def _handshake_frame(data: str | bytes) -> bool:
@@ -337,9 +362,10 @@ class AsyncWSEClient:
         # messages are delivered, never to a server-reported head.
         self._server_recovery_enabled = False
         self._recovery_timeout = recovery_timeout
-        self._gaps: dict[str, _GapState] = {}
+        self._gaps: dict[tuple[str, str], _GapState] = {}
         # Topics with a recovery request out on this connection -> anchor sent.
-        self._recovery_requests: dict[str, tuple[str, int]] = {}
+        self._recovery_requests: dict[str, deque[_Request]] = {}
+        self._next_request = 0
         # Topics the server said it cannot replay -> epoch of the anchor.
         self._unrecoverable: dict[str, str] = {}
         self._recovery_unanswered = 0
@@ -504,8 +530,8 @@ class AsyncWSEClient:
         self._offline_queue.clear()
 
         # Messages held for a gap are delivered before the stream ends.
-        for topic in list(self._gaps):
-            self._give_up_gap(topic, "closed")
+        for topic, epoch in list(self._gaps):
+            self._give_up_gap(topic, epoch, "closed")
 
         # Signal iterator to stop (drop oldest if queue is full)
         self._push_stream_end(_StreamEnd(None))
@@ -1089,7 +1115,7 @@ class AsyncWSEClient:
         self._recovery_unanswered = 0
         self._snapshot_inflight.clear()
         for gap in self._gaps.values():
-            gap.in_flight = False
+            gap.request = None
         lost = WSEConnectionError("Connection replaced")
         _reject(self._handshake, lost)
         _reject(self._key_ready, lost)
@@ -1111,15 +1137,15 @@ class AsyncWSEClient:
         self._recovery_requests.clear()
         self._snapshot_inflight.clear()
         for gap in self._gaps.values():
-            gap.in_flight = False
+            gap.request = None
 
     def _on_transport_terminal(self, error: WSEError) -> None:
         """The transport gave up for good: end the event stream with *error*."""
         self._terminal_error = error
         _reject(self._handshake, error)
         _reject(self._key_ready, error)
-        for topic in list(self._gaps):
-            self._give_up_gap(topic, "closed")
+        for topic, epoch in list(self._gaps):
+            self._give_up_gap(topic, epoch, "closed")
         self._push_stream_end(_StreamEnd(error))
 
     async def _await_handshake(self) -> None:
@@ -1324,13 +1350,36 @@ class AsyncWSEClient:
                 }
         return payload, info
 
-    def _note_recovery_requested(self, info: dict[str, tuple[str, int]]) -> None:
+    def _note_recovery_requested(
+        self, info: dict[str, tuple[str, int]], *, rearm: bool = False
+    ) -> None:
+        """Requests sent for *info*'s topics: the gap of each stream asked
+        for waits for its own answer. *rearm*: the request goes after a
+        reconnect, and the gap's wait starts again with it."""
         for topic, pos in info.items():
-            self._recovery_requests[topic] = pos
-            gap = self._gaps.get(topic)
-            if gap is not None and gap.epoch == pos[0]:
-                gap.in_flight = True
+            request = _Request(id=self._next_request, for_gap=False)
+            self._next_request += 1
+            gap = self._gaps.get((topic, pos[0]))
+            if gap is not None:
+                gap.request = request.id
                 gap.requested_from = pos[1]
+                request.for_gap = True
+                if rearm:
+                    self._arm_gap(topic, gap)
+            self._recovery_requests.setdefault(topic, deque()).append(request)
+
+    def _arm_gap(self, topic: str, gap: _GapState) -> None:
+        """The gap gives up recovery_timeout from now."""
+        if gap.timer is not None:
+            gap.timer.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            gap.timer = None
+            return
+        gap.timer = loop.call_later(
+            self._recovery_timeout, self._on_gap_deadline, topic, gap
+        )
 
     async def _resubscribe(self) -> None:
         """Subscribe this connection to the topics wanted before it opened."""
@@ -1346,8 +1395,12 @@ class AsyncWSEClient:
         )
         logger.info("Re-subscribing to %d topics (recover=%s)", len(topics), bool(info))
         if await self._transmit(msg):
-            self._note_recovery_requested(info)
+            self._note_recovery_requested(info, rearm=True)
             self._stats.messages_sent += 1
+            # Gaps in the topics' other streams ask for themselves.
+            for (topic, _epoch), gap in list(self._gaps.items()):
+                if topic in topics and gap.request is None:
+                    self._fire_task(self._request_recovery(topic, gap))
         else:
             logger.warning("Re-subscribe failed; retried on the next connection")
 
@@ -1389,6 +1442,8 @@ class AsyncWSEClient:
             self._stats.bytes_received += len(data.encode("utf-8"))
 
         security = self._security
+        # Unsealed before the session: only what the handshake needs.
+        handshake_only = False
         if (
             security is not None
             and security.session_mode
@@ -1402,6 +1457,7 @@ class AsyncWSEClient:
                 reason = "a plaintext frame inside the session"
             elif _handshake_frame(data):
                 reason = None
+                handshake_only = True
             else:
                 reason = "a plaintext frame before the session"
             if reason is not None:
@@ -1421,6 +1477,12 @@ class AsyncWSEClient:
 
         events = result if isinstance(result, list) else [result]
         for event in events:
+            if handshake_only:
+                # Never a topic's message nor the application's: nothing
+                # unsealed reaches either.
+                if event.type not in _HANDSHAKE_TYPES:
+                    continue
+                event = replace(event, topic=None, epoch=None, offset=None)
             try:
                 self._process_event(event)
             except Exception as exc:
@@ -1438,7 +1500,12 @@ class AsyncWSEClient:
         (which carries seq=1 while the client expected 0) and stalled the
         handshake. Unstamped messages fall back to id-based dedup.
         """
-        if event.topic and event.epoch and event.offset is not None:
+        if (
+            event.topic
+            and event.epoch
+            and event.offset is not None
+            and event.type not in _PROTOCOL_TYPES
+        ):
             self._process_stamped(event)
             return
         if event.id and self._sequencer.is_duplicate(event.id):
@@ -1459,11 +1526,8 @@ class AsyncWSEClient:
     def _process_stamped(self, event: WSEEvent) -> None:
         topic, epoch, offset = event.topic, event.epoch, event.offset
         assert topic is not None and epoch is not None and offset is not None
-        gap = self._gaps.get(topic)
-        if gap is not None and gap.epoch != epoch:
-            # Another stream of the topic (a topic published on several
-            # nodes): in order on its own, apart from the hole in this one.
-            gap = None
+        # A hole in another stream of the topic does not hold this one.
+        gap = self._gaps.get((topic, epoch))
 
         verdict = self._sequencer.check_topic_stamp(topic, epoch, offset)
         if verdict == "duplicate":
@@ -1472,14 +1536,14 @@ class AsyncWSEClient:
             self._unrecoverable.pop(topic, None)
             self._dispatch_event(event)
             if gap is not None:
-                self._drain_gap(topic)
+                self._drain_gap(topic, epoch)
             return
 
         # verdict == "gap"
         if gap is not None:
             gap.buffer.setdefault(offset, event)
             if len(gap.buffer) > RECOVERY_BUFFER_MAX:
-                self._give_up_gap(topic, "overflow")
+                self._give_up_gap(topic, epoch, "overflow")
             return
         if self._unrecoverable.get(topic) == epoch:
             # The server already said it cannot replay this topic's history.
@@ -1509,12 +1573,14 @@ class AsyncWSEClient:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return False
+        if (topic, epoch) in self._gaps:
+            return False
         gap = _GapState(epoch=epoch)
         gap.buffer[offset] = event
         gap.timer = loop.call_later(
             self._recovery_timeout, self._on_gap_deadline, topic, gap
         )
-        self._gaps[topic] = gap
+        self._gaps[(topic, epoch)] = gap
         self._fire_task(self._request_recovery(topic, gap))
         return True
 
@@ -1523,7 +1589,7 @@ class AsyncWSEClient:
 
         subscribe() can't be reused here because it filters already-subscribed
         topics; this sends the recovery subscription_update directly."""
-        if self._gaps.get(topic) is not gap or gap.in_flight:
+        if self._gaps.get((topic, gap.epoch)) is not gap or gap.request is not None:
             return
         # From the last message of the stream with the hole: the server
         # replays it and every other stream of the topic after that point.
@@ -1540,20 +1606,26 @@ class AsyncWSEClient:
             "subscription_update", payload, priority=MessagePriority.HIGH
         )
         self._note_recovery_requested({topic: pos})
+        request = gap.request
         try:
             ok = await self._transmit(msg)
         except WSEError:
             ok = False
-        if not ok and self._gaps.get(topic) is gap:
+        if not ok and self._gaps.get((topic, gap.epoch)) is gap:
             # Not sent: the resubscribe of the next connection or the
             # deadline takes over.
-            gap.in_flight = False
-            self._recovery_requests.pop(topic, None)
+            gap.request = None
+            queue = self._recovery_requests.get(topic)
+            if queue is not None:
+                for sent in [r for r in queue if r.id == request]:
+                    queue.remove(sent)
+                if not queue:
+                    del self._recovery_requests[topic]
             logger.debug("Recovery request for '%s' not sent", topic)
 
-    def _drain_gap(self, topic: str) -> None:
+    def _drain_gap(self, topic: str, epoch: str) -> None:
         """Deliver held messages that became in order; close a filled gap."""
-        gap = self._gaps.get(topic)
+        gap = self._gaps.get((topic, epoch))
         if gap is None:
             return
         while True:
@@ -1567,7 +1639,7 @@ class AsyncWSEClient:
                 break
             self._sequencer.set_topic_position(topic, gap.epoch, pos[1] + 1)
             self._dispatch_event(nxt)
-        if not gap.buffer and self._gaps.get(topic) is gap:
+        if not gap.buffer and self._gaps.get((topic, epoch)) is gap:
             self._close_gap(topic, gap)
             self._gap_stats["recovered"] += 1
             logger.info("Recovered offset gap on '%s'", topic)
@@ -1576,12 +1648,12 @@ class AsyncWSEClient:
         if gap.timer is not None:
             gap.timer.cancel()
             gap.timer = None
-        if self._gaps.get(topic) is gap:
-            del self._gaps[topic]
+        if self._gaps.get((topic, gap.epoch)) is gap:
+            del self._gaps[(topic, gap.epoch)]
 
-    def _give_up_gap(self, topic: str, reason: str) -> None:
+    def _give_up_gap(self, topic: str, epoch: str, reason: str) -> None:
         """Stop waiting: report the holes, deliver the held messages."""
-        gap = self._gaps.get(topic)
+        gap = self._gaps.get((topic, epoch))
         if gap is None:
             return
         self._close_gap(topic, gap)
@@ -1607,14 +1679,14 @@ class AsyncWSEClient:
         self._dispatch_event(event)
 
     def _on_gap_deadline(self, topic: str, gap: _GapState) -> None:
-        if self._gaps.get(topic) is not gap:
+        if self._gaps.get((topic, gap.epoch)) is not gap:
             return
         gap.timer = None
-        if gap.in_flight and not gap.answered:
+        if gap.request is not None and not gap.answered:
             # Nothing came back at all: the application may not answer
             # recovery requests. After a few, stop asking on this connection.
             self._recovery_unanswered += 1
-        self._give_up_gap(topic, "timeout")
+        self._give_up_gap(topic, gap.epoch, "timeout")
 
     def _report_gap(
         self,
@@ -1657,17 +1729,27 @@ class AsyncWSEClient:
     def _on_recovery_reply(self, topic: str, info: dict[str, Any]) -> None:
         """Handle the per-topic recovery info of a subscription_update."""
         recovered = bool(info.get("recovered", True))
-        requested = self._recovery_requests.pop(topic, None)
-        gap = self._gaps.get(topic)
+        queue = self._recovery_requests.get(topic)
+        if not queue:
+            return  # informational reply (plain subscribe): never moves the anchor
+        request = queue.popleft()
+        if not queue:
+            del self._recovery_requests[topic]
+        self._recovery_unanswered = 0
+        gap = next(
+            (
+                g
+                for (t, _epoch), g in self._gaps.items()
+                if t == topic and g.request == request.id
+            ),
+            None,
+        )
 
         if gap is not None:
-            if not gap.in_flight:
-                return  # not the answer to a request of ours
-            gap.in_flight = False
+            gap.request = None
             gap.answered = True
-            self._recovery_unanswered = 0
-            self._drain_gap(topic)  # the replay arrived before this reply
-            if self._gaps.get(topic) is not gap:
+            self._drain_gap(topic, gap.epoch)  # the replay arrived before this reply
+            if self._gaps.get((topic, gap.epoch)) is not gap:
                 return  # filled
             pos = self._sequencer.stream_position(topic, gap.epoch)
             progressed = (
@@ -1675,17 +1757,19 @@ class AsyncWSEClient:
                 and gap.requested_from is not None
                 and pos[1] > gap.requested_from
             )
-            if recovered and progressed:
-                # Partial replay (the server stops on back-pressure but
-                # still says recovered): ask again from the new anchor.
+            # A replay the server's outbound budget cut short answers
+            # recovered=False in the same history, past where it was asked
+            # from: ask again from where it got to.
+            if progressed and (recovered or info.get("epoch") == gap.epoch):
                 self._fire_task(self._request_recovery(topic, gap))
             else:
-                self._give_up_gap(topic, "incomplete" if recovered else "not_recovered")
+                self._give_up_gap(
+                    topic, gap.epoch, "incomplete" if recovered else "not_recovered"
+                )
             return
 
-        if requested is None:
-            return  # informational reply (plain subscribe): never moves the anchor
-        self._recovery_unanswered = 0
+        if request.for_gap:
+            return  # the answer for a gap settled meanwhile
         if recovered:
             return  # replayed messages advanced the anchor as they arrived
 
@@ -1712,9 +1796,9 @@ class AsyncWSEClient:
     def _forget_topic(self, topic: str) -> None:
         """Drop a topic's recovery state (unsubscribed)."""
         self._sequencer.clear_topic(topic)
-        gap = self._gaps.get(topic)
-        if gap is not None:
-            self._close_gap(topic, gap)
+        for (t, _epoch), gap in list(self._gaps.items()):
+            if t == topic:
+                self._close_gap(topic, gap)
         self._recovery_requests.pop(topic, None)
         self._unrecoverable.pop(topic, None)
 

@@ -75,6 +75,14 @@ class SecurityManager:
                 "encryption needs the server's e2e identity key (e2e_server_keys), "
                 "or e2e_unauthenticated=True, or e2e_legacy=True for servers before 3.0"
             )
+        if legacy and server_keys:
+            # The first design has no server identity: the pinned keys could
+            # not be checked, and whatever terminates TLS could answer.
+            raise WSEEncryptionError(
+                "e2e_legacy=True speaks the first design, which cannot check "
+                "e2e_server_keys: pin keys for a 3.x server, or use e2e_legacy "
+                "alone for a server before 3.0"
+            )
         self._legacy = legacy
         self._server_keys = list(server_keys or [])
         self._unauthenticated = unauthenticated

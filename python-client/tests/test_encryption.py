@@ -263,3 +263,15 @@ class TestPlaintextInsideASession:
         assert conn._last_pong == 0.0
         assert isinstance(client._encryption_error, WSEEncryptionError)
         await client.disconnect()
+
+
+def test_the_first_design_with_pinned_keys_is_refused():
+    """The first design has no server identity: pinned keys could not be
+    checked, and whatever terminates TLS could answer."""
+    with pytest.raises(WSEEncryptionError, match="cannot check"):
+        AsyncWSEClient(
+            "ws://localhost:5006/wse",
+            encryption=True,
+            e2e_legacy=True,
+            e2e_server_keys=["BAAA"],
+        )
