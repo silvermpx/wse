@@ -371,7 +371,7 @@ print(server.e2e_identity_public_key())   # the key clients pin
 
 Clients pin that key: `encryption=True, e2e_server_keys=[key]` in Python, `security: { encryptionEnabled: true, serverKeys: [key] }` in TypeScript, `Encryption::pinned([key])` in Rust. Each direction then has its own AES-256-GCM key; frames are numbered, and a replayed, reordered or forged frame ends the connection.
 
-The token still passes whatever terminates TLS. A token that names the client's key in its `cnf` claim is of no use there: the client signs the session's handshake with that key, and the server admits the connection only when the signature matches the key in the token. The clients do it by themselves when they have a `signing_key`, and stop if the server does not confirm their key.
+The token still passes whatever terminates TLS. A token that names the client's key in its `cnf` claim is of no use there: the client signs the session's handshake with that key, and the server admits the connection only when the signature matches the key in the token. Clients with encryption on and a `signing_key` do this by themselves, and stop if the server does not confirm their key.
 
 ### Signed messages
 
