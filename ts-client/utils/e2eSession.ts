@@ -14,6 +14,8 @@
 // Frame: "E:" | 0x01 | type | epoch u32be | seq u64be | ciphertext | tag.
 // =============================================================================
 
+import { webCrypto, webCryptoOrNull } from './webcrypto.js';
+
 export const E2E_SUITE = 'p256-aes256gcm';
 export const E2E_SIGNATURE_ALG = 'ES256';
 
@@ -43,7 +45,7 @@ export class E2eError extends Error {
 }
 
 const subtle = (): SubtleCrypto => {
-  const s = globalThis.crypto?.subtle;
+  const s = webCryptoOrNull()?.subtle;
   if (!s) throw new E2eError('WebCrypto is not available (HTTPS or localhost only)', E2E_CLOSE_UNSUPPORTED);
   return s;
 };
@@ -302,7 +304,7 @@ export class E2eOffer {
     const pair = (await subtle().generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits'])) as CryptoKeyPair;
     const publicKey = new Uint8Array(await subtle().exportKey('raw', pair.publicKey));
     const random = bytes(32);
-    globalThis.crypto.getRandomValues(random);
+    webCrypto().getRandomValues(random);
     return new E2eOffer(pair, publicKey, random);
   }
 

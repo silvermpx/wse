@@ -2,6 +2,8 @@
 // WebSocket Engine - Message ID generation
 // =============================================================================
 
+import { webCryptoOrNull } from './webcrypto.js';
+
 /**
  * Return a random RFC 4122 version-4 UUID.
  *
@@ -12,8 +14,7 @@
  * with no Web Crypto at all (IDs are message identifiers, not secrets).
  */
 export function generateId(): string {
-  const c: Crypto | undefined =
-    typeof globalThis !== 'undefined' ? (globalThis as { crypto?: Crypto }).crypto : undefined;
+  const c: Crypto | undefined = webCryptoOrNull() ?? undefined;
 
   if (c && typeof c.randomUUID === 'function') {
     try {

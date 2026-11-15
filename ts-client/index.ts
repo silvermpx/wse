@@ -29,6 +29,7 @@ export { useMessageQueueStore } from './stores/useMessageQueueStore.js';
 export { logger, Logger, LogLevel } from './utils/logger.js';
 export { CircuitBreaker, createCircuitBreaker } from './utils/circuitBreaker.js';
 export { generateId } from './utils/id.js';
+export { setWebCrypto } from './utils/webcrypto.js';
 export {
   generateSigningKey,
   signingKeyFrom,

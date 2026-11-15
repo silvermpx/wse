@@ -174,3 +174,24 @@ describe('options and versions', () => {
     expect(typeof api.useWSE).toBe('function');
   });
 });
+
+describe('pieces React Native needs', () => {
+  it('builds the endpoint query by hand, keeping what is there', async () => {
+    const { withParams } = await import('../services/ConnectionManager.js');
+    expect(withParams('ws://h:1/wse', [['a', '1']])).toBe('ws://h:1/wse?a=1');
+    expect(withParams('wss://h/wse?x=2&a=0#f', [['a', '1'], ['b', 'c d']])).toBe('wss://h/wse?x=2&a=1&b=c%20d#f');
+  });
+
+  it('uses the WebCrypto it is given', async () => {
+    const { setWebCrypto } = await import('../utils/webcrypto.js');
+    const { generateId } = await import('../utils/id.js');
+    const fake = { randomUUID: () => '00000000-0000-4000-8000-000000000000', getRandomValues: (b: Uint8Array) => b, subtle: {} };
+    setWebCrypto(fake as unknown as Crypto);
+    try {
+      expect(generateId()).toBe('00000000-0000-4000-8000-000000000000');
+    } finally {
+      setWebCrypto(null);
+    }
+    expect(generateId()).not.toBe('00000000-0000-4000-8000-000000000000');
+  });
+});

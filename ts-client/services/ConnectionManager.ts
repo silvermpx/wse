@@ -329,16 +329,21 @@ export class ConnectionManager {
     return max;
   }
 
+  /**
+   * The endpoint with the client's parameters. Built by hand: React Native's
+   * URL is a partial stand-in that does not take ws:// URLs apart.
+   */
   private buildUrl(endpoint: string): string {
-    const url = new URL(endpoint);
-    url.searchParams.set('client_version', WS_CLIENT_VERSION);
-    url.searchParams.set('protocol_version', String(WS_PROTOCOL_VERSION));
-    url.searchParams.set('compression', String(this.compressionEnabled && this.compressionThreshold > 0));
-    url.searchParams.set('encryption', String(this.encryptionRequired));
-    if (this.msgpack) url.searchParams.set('format', 'msgpack');
+    const params: Array<[string, string]> = [
+      ['client_version', WS_CLIENT_VERSION],
+      ['protocol_version', String(WS_PROTOCOL_VERSION)],
+      ['compression', String(this.compressionEnabled && this.compressionThreshold > 0)],
+      ['encryption', String(this.encryptionRequired)],
+    ];
+    if (this.msgpack) params.push(['format', 'msgpack']);
     // An E2E session is opened first: the server holds everything back until then.
-    if (this.encryptionRequired && this.ctx.security.isSessionMode()) url.searchParams.set('e2e', '1');
-    return url.toString();
+    if (this.encryptionRequired && this.ctx.security.isSessionMode()) params.push(['e2e', '1']);
+    return withParams(endpoint, params);
   }
 
   private openSocket(): Promise<void> {
@@ -1597,4 +1602,19 @@ export class ConnectionManager {
 
     this.connectionCircuitBreaker?.reset();
   }
+}
+
+/** `url` with `params` set in its query (an existing one of the same name is replaced). */
+export function withParams(url: string, params: Array<[string, string]>): string {
+  const hashAt = url.indexOf('#');
+  const hash = hashAt >= 0 ? url.slice(hashAt) : '';
+  const base = hashAt >= 0 ? url.slice(0, hashAt) : url;
+  const queryAt = base.indexOf('?');
+  const path = queryAt >= 0 ? base.slice(0, queryAt) : base;
+  const names = new Set(params.map(([name]) => name));
+  const kept = (queryAt >= 0 ? base.slice(queryAt + 1).split('&') : []).filter(
+    (pair) => pair !== '' && !names.has(decodeURIComponent((pair.split('=')[0] ?? '').replace(/\+/g, ' '))),
+  );
+  const added = params.map(([name, value]) => `${encodeURIComponent(name)}=${encodeURIComponent(value)}`);
+  return `${path}?${[...kept, ...added].join('&')}${hash}`;
 }

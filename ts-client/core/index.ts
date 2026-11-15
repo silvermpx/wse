@@ -43,6 +43,7 @@ export type { OfflineQueueConfig, OfflineRecord } from '../services/OfflineQueue
 export { logger, Logger, LogLevel } from '../utils/logger.js';
 export { CircuitBreaker, createCircuitBreaker } from '../utils/circuitBreaker.js';
 export { generateId } from '../utils/id.js';
+export { setWebCrypto } from '../utils/webcrypto.js';
 export { generateSigningKey, signingKeyFrom, signMessage, ServerSigningKeys, SignatureError } from '../utils/signing.js';
 export type { SignatureProof, SigningKey } from '../utils/signing.js';
 export { CompressionManager, DecompressedSizeLimitError } from '../protocols/compression.js';

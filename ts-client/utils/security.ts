@@ -4,6 +4,7 @@
 
 import { E2eOffer, type E2eSession, type E2eTrust } from './e2eSession.js';
 import { logger } from './logger.js';
+import { webCrypto } from './webcrypto.js';
 
 // Security error types
 export class SecurityError extends Error {
@@ -69,7 +70,7 @@ export class SecurityManager {
 
   private async generateEncryptionKey(): Promise<void> {
     try {
-      this.encryptionKey = await crypto.subtle.generateKey(
+      this.encryptionKey = await webCrypto().subtle.generateKey(
         { name: 'AES-GCM', length: 256 },
         true,
         ['encrypt', 'decrypt']
@@ -81,7 +82,7 @@ export class SecurityManager {
 
   async generateKeyPair(): Promise<void> {
     try {
-      this.sessionKeyPair = await crypto.subtle.generateKey(
+      this.sessionKeyPair = await webCrypto().subtle.generateKey(
         { name: 'ECDH', namedCurve: 'P-256' },
         true,
         ['deriveKey', 'deriveBits']
@@ -94,7 +95,7 @@ export class SecurityManager {
   async getPublicKey(): Promise<JsonWebKey | null> {
     if (!this.sessionKeyPair) return null;
     try {
-      return await crypto.subtle.exportKey('jwk', this.sessionKeyPair.publicKey);
+      return await webCrypto().subtle.exportKey('jwk', this.sessionKeyPair.publicKey);
     } catch (error) {
       logger.error('Failed to export public key:', error);
       return null;
@@ -104,7 +105,7 @@ export class SecurityManager {
   async getPublicKeyRaw(): Promise<string | null> {
     if (!this.sessionKeyPair) return null;
     try {
-      const raw = await crypto.subtle.exportKey('raw', this.sessionKeyPair.publicKey);
+      const raw = await webCrypto().subtle.exportKey('raw', this.sessionKeyPair.publicKey);
       return this.arrayBufferToBase64(raw);
     } catch (error) {
       logger.error('Failed to export raw public key:', error);
@@ -116,7 +117,7 @@ export class SecurityManager {
     const generation = this.keyGeneration;
     const run = (async () => {
       const keyData = this.base64ToArrayBuffer(b64key);
-      const serverKey = await crypto.subtle.importKey(
+      const serverKey = await webCrypto().subtle.importKey(
         'raw', keyData,
         { name: 'ECDH', namedCurve: 'P-256' },
         false, []
@@ -180,7 +181,7 @@ export class SecurityManager {
         throw new Error('Invalid curve for ECDH');
       }
 
-      this.serverPublicKey = await crypto.subtle.importKey(
+      this.serverPublicKey = await webCrypto().subtle.importKey(
         'jwk', publicKeyJwk,
         { name: 'ECDH', namedCurve: 'P-256' },
         false, []
@@ -199,19 +200,19 @@ export class SecurityManager {
     if (!this.sessionKeyPair || !this.serverPublicKey) return;
 
     try {
-      const sharedSecretBits = await crypto.subtle.deriveBits(
+      const sharedSecretBits = await webCrypto().subtle.deriveBits(
         { name: 'ECDH', public: this.serverPublicKey },
         this.sessionKeyPair.privateKey,
         256
       );
 
-      const sharedSecret = await crypto.subtle.importKey(
+      const sharedSecret = await webCrypto().subtle.importKey(
         'raw', sharedSecretBits, 'HKDF', false, ['deriveKey']
       );
 
       // RFC 5869: salt = empty (zero-salt default), info = context label
       // Must match server.rs, security.rs, and Python client exactly
-      const encryptionKey = await crypto.subtle.deriveKey(
+      const encryptionKey = await webCrypto().subtle.deriveKey(
         {
           name: 'HKDF',
           hash: 'SHA-256',
@@ -247,10 +248,10 @@ export class SecurityManager {
       // the recent-IV set before using one rather than only recording it. With
       // a CSPRNG the redraw effectively never fires (birthday bound ~2^48), but
       // consulting the set is what makes the guard real instead of write-only.
-      let iv = crypto.getRandomValues(new Uint8Array(12));
+      let iv = webCrypto().getRandomValues(new Uint8Array(12));
       let ivHex = Array.from(iv).map(b => b.toString(16).padStart(2, '0')).join('');
       for (let attempt = 0; this.usedIVs.has(ivHex) && attempt < 8; attempt++) {
-        iv = crypto.getRandomValues(new Uint8Array(12));
+        iv = webCrypto().getRandomValues(new Uint8Array(12));
         ivHex = Array.from(iv).map(b => b.toString(16).padStart(2, '0')).join('');
       }
       if (this.usedIVs.has(ivHex)) {
@@ -265,7 +266,7 @@ export class SecurityManager {
         if (first) this.usedIVs.delete(first);
       }
 
-      const encrypted = await crypto.subtle.encrypt(
+      const encrypted = await webCrypto().subtle.encrypt(
         { name: 'AES-GCM', iv: iv as BufferSource },
         this.encryptionKey,
         encoded
@@ -330,7 +331,7 @@ export class SecurityManager {
     }
     if (!this.encryptionEnabled || !this.encryptionKey) return null;
     try {
-      const decrypted = await crypto.subtle.decrypt(
+      const decrypted = await webCrypto().subtle.decrypt(
         { name: 'AES-GCM', iv: view.slice(2, 14) },
         this.encryptionKey,
         view.slice(14),

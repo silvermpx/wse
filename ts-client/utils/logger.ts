@@ -31,23 +31,25 @@ export function defaultLogLevel(isDevelopment: boolean): LogLevel {
   return isDevelopment ? LogLevel.INFO : LogLevel.WARN;
 }
 
+// Read from process.env only: React Native's bundler cannot parse a module's
+// meta property, and the bundlers that know it define process.env.NODE_ENV.
 function detectDevelopment(): boolean {
   try {
-    if (typeof import.meta !== 'undefined' && (import.meta as any).env?.DEV) return true;
+    return typeof process !== 'undefined' && process.env?.NODE_ENV === 'development';
   } catch {
-    // import.meta.env is a bundler convention; absent in plain Node.
+    return false;
   }
-  return typeof process !== 'undefined' && process.env?.NODE_ENV === 'development';
 }
 
+/** WSE_LOG_LEVEL from the environment, or set on globalThis before the client loads. */
 function detectEnvLevel(): string | undefined {
   try {
-    const viteLevel = typeof import.meta !== 'undefined' ? (import.meta as any).env?.VITE_LOG_LEVEL : undefined;
-    if (viteLevel) return viteLevel;
+    const own = (globalThis as { WSE_LOG_LEVEL?: unknown }).WSE_LOG_LEVEL;
+    if (typeof own === 'string' && own) return own;
+    return typeof process !== 'undefined' ? process.env?.WSE_LOG_LEVEL : undefined;
   } catch {
-    // ignore
+    return undefined;
   }
-  return typeof process !== 'undefined' ? process.env?.WSE_LOG_LEVEL : undefined;
 }
 
 class Logger {

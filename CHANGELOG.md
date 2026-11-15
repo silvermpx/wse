@@ -34,6 +34,15 @@
 - Python client: the same recovery positions per stream as the Rust and
   TypeScript clients.
 
+### Changed
+
+- TypeScript client: it no longer reads `import.meta` (React Native's
+  bundler cannot parse it), so `VITE_LOG_LEVEL` is not read any more; set
+  `WSE_LOG_LEVEL` in `process.env` or on `globalThis`, or call
+  `logger.setLevel()`. `setWebCrypto()` gives the client a WebCrypto where
+  the environment has none (react-native-quick-crypto's), and the endpoint
+  URL is built without `URL`, which React Native only half implements.
+
 ### Fixed
 
 - Server: recovery from positions per stream no longer depends on the order

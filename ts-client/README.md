@@ -388,8 +388,9 @@ const health = useWSEStore((s) => s.connectionState);
 
 ## Logging
 
-The logger defaults to `WARN` in production and `INFO` in development (`WSE_LOG_LEVEL` /
-`VITE_LOG_LEVEL` override it). Error entries are kept in localStorage only after
+The logger defaults to `WARN` in production and `INFO` in development (`process.env.NODE_ENV`).
+`WSE_LOG_LEVEL`, in `process.env` or set on `globalThis` before the client loads, overrides it, and so does
+`logger.setLevel()`. Error entries are kept in localStorage only after
 `logger.setPersistErrors(true)`, and never with their data.
 
 ## Features

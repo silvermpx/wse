@@ -9,6 +9,7 @@
 // the signer's side and the body. See docs/PROTOCOL.md (Signed messages).
 
 import { keyId } from './e2eSession.js';
+import { webCryptoOrNull } from './webcrypto.js';
 
 export const CLIENT_LABEL = 'WSE-SIG client\0';
 export const SERVER_LABEL = 'WSE-SIG server\0';
@@ -37,7 +38,7 @@ export class SignatureError extends Error {
 }
 
 const subtle = (): SubtleCrypto => {
-  const s = globalThis.crypto?.subtle;
+  const s = webCryptoOrNull()?.subtle;
   if (!s) throw new SignatureError('WebCrypto is not available (HTTPS or localhost only)');
   return s;
 };
