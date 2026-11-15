@@ -224,6 +224,9 @@ pub(crate) enum PeerRegistration {
         peer_addr: String,
         write_tx: mpsc::Sender<Bytes>,
         negotiated_caps: u32,
+        /// Told once the manager routes to the link: a catch-up owed to the
+        /// peer is taken from the recovery buffers then.
+        taken: Option<tokio::sync::oneshot::Sender<()>>,
     },
     Deregister {
         peer_addr: String,

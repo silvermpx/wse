@@ -4,8 +4,8 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use super::{
-    COMPRESSION_THRESHOLD, FLAG_COMPRESSED, FLAG_HAS_RECOVERY, MAGIC, MAX_CLUSTER_PEERS,
-    MAX_FRAME_SIZE, MAX_KNOWN_PEERS, PROTOCOL_VERSION, PROTOCOL_VERSION_MIN,
+    COMPRESSION_THRESHOLD, FLAG_COMPRESSED, FLAG_HAS_RECOVERY, FLAG_REPLAYED, MAGIC,
+    MAX_CLUSTER_PEERS, MAX_FRAME_SIZE, MAX_KNOWN_PEERS, PROTOCOL_VERSION, PROTOCOL_VERSION_MIN,
 };
 
 // ---------------------------------------------------------------------------
@@ -28,6 +28,7 @@ pub(crate) enum MsgType {
     PresenceUpdate = 0x0B,
     PresenceFull = 0x0C,
     Drain = 0x0D,
+    Resume = 0x0E,
 }
 
 impl MsgType {
@@ -46,6 +47,7 @@ impl MsgType {
             0x0B => Some(Self::PresenceUpdate),
             0x0C => Some(Self::PresenceFull),
             0x0D => Some(Self::Drain),
+            0x0E => Some(Self::Resume),
             _ => None,
         }
     }
@@ -266,6 +268,76 @@ pub(crate) fn encode_unsub(buf: &mut BytesMut, topic: &str) -> bool {
 const RESYNC_CONTINUATION: u8 = 0x01;
 /// RESYNC flag: more frames of the round follow.
 const RESYNC_MORE: u8 = 0x02;
+
+/// A MSG frame of a message the peer missed while its link was down, sent
+/// again from where its RESUME said it stands: compressed like any, with its
+/// recovery trailer, and marked so the peer waits for room to deliver it
+/// instead of shedding it. False when it does not fit a frame.
+pub(crate) fn encode_replayed(
+    buf: &mut BytesMut,
+    topic: &str,
+    payload: &str,
+    origin_epoch: u32,
+    origin_offset: u64,
+) -> bool {
+    let start = buf.len();
+    if !encode_msg_with_recovery(buf, topic, payload, origin_epoch, origin_offset, true) {
+        return false;
+    }
+    if buf.len() - start > MAX_FRAME_SIZE {
+        buf.truncate(start);
+        return false;
+    }
+    buf[start + 1] |= FLAG_REPLAYED;
+    true
+}
+
+/// The last RESUME frame of a node's request.
+pub(crate) const RESUME_LAST: u8 = 0x01;
+
+/// Where a node stands in the streams other nodes relay to it, as it asks on
+/// a new link for what it missed: (topic, the origin's epoch, the last offset
+/// it holds with nothing missing before it).
+pub(crate) type ResumePoint = (String, u32, u64);
+
+/// Encode a node's RESUME request: one frame or more, the last flagged.
+/// Format: [u8 type=0x0E][u8 flags][u16 LE 0][u32 LE payload_len][payload],
+/// the payload a run of [u16 LE topic_len][topic][u32 LE epoch][u64 LE offset].
+pub(crate) fn encode_resume(points: &[ResumePoint]) -> Vec<BytesMut> {
+    fn header(buf: &mut BytesMut) {
+        buf.put_u8(MsgType::Resume as u8);
+        buf.put_u8(0);
+        buf.put_u16_le(0);
+        buf.put_u32_le(0);
+    }
+    let mut frames = Vec::new();
+    let mut buf = BytesMut::new();
+    header(&mut buf);
+    for (topic, epoch, offset) in points {
+        let topic = topic.as_bytes();
+        let Ok(len) = u16::try_from(topic.len()) else {
+            continue;
+        };
+        let entry = 2 + topic.len() + 12;
+        if buf.len() + entry > MAX_FRAME_SIZE && buf.len() > 8 {
+            frames.push(std::mem::take(&mut buf));
+            header(&mut buf);
+        }
+        buf.put_u16_le(len);
+        buf.put_slice(topic);
+        buf.put_u32_le(*epoch);
+        buf.put_u64_le(*offset);
+    }
+    frames.push(buf);
+    if let Some(last) = frames.last_mut() {
+        last[1] = RESUME_LAST;
+    }
+    for frame in &mut frames {
+        let len = (frame.len() - 8) as u32;
+        frame[4..8].copy_from_slice(&len.to_le_bytes());
+    }
+    frames
+}
 
 /// Encode RESYNC frame(s). Topics are joined by "\n" in the payload.
 /// Format: [u8 type=0x08][u8 flags][u16 LE topic_len=0][u32 LE payload_len][payload]
@@ -521,6 +593,19 @@ pub(crate) enum ClusterFrame {
     },
     /// Graceful drain: this node is shutting down, migrate connections.
     Drain,
+    /// Part of a peer's request, on a new link, for what it missed.
+    Resume {
+        points: Vec<ResumePoint>,
+        /// The request's last frame.
+        last: bool,
+    },
+    /// A message sent again for a peer that missed it (a MSG frame marked
+    /// replayed): always with its origin's position.
+    Replayed {
+        topic: String,
+        payload: Bytes,
+        position: (u32, u64),
+    },
     Unknown {
         msg_type: u8,
     },
@@ -574,10 +659,43 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             } else {
                 None
             };
+            if flags & FLAG_REPLAYED != 0
+                && let Some(position) = recovery
+            {
+                return Some(ClusterFrame::Replayed {
+                    topic,
+                    payload,
+                    position,
+                });
+            }
             Some(ClusterFrame::Msg {
                 topic,
                 payload,
                 recovery,
+            })
+        }
+        Some(MsgType::Resume) => {
+            if data.remaining() < payload_len {
+                return None;
+            }
+            let mut payload = data.split_to(payload_len);
+            let mut points = Vec::new();
+            while payload.has_remaining() {
+                if payload.remaining() < 2 {
+                    return None;
+                }
+                let topic_len = payload.get_u16_le() as usize;
+                if payload.remaining() < topic_len + 12 {
+                    return None;
+                }
+                let topic = String::from_utf8(payload.split_to(topic_len).to_vec()).ok()?;
+                let epoch = payload.get_u32_le();
+                let offset = payload.get_u64_le();
+                points.push((topic, epoch, offset));
+            }
+            Some(ClusterFrame::Resume {
+                points,
+                last: flags & RESUME_LAST != 0,
             })
         }
         Some(MsgType::Ping) => Some(ClusterFrame::Ping),

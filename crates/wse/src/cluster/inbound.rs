@@ -15,14 +15,16 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::peer::{
-    heartbeat_task, peer_dispatch_task, peer_reader, peer_writer, read_frame, tell_disconnected,
+    exchange_resume, go_live, heartbeat_task, peer_dispatch_task, peer_reader, peer_writer,
+    read_frame, tell_disconnected,
 };
 use super::protocol::write_framed;
 use super::{
-    ClusterContext, ClusterFrame, ClusterTlsConfig, DispatchItem, LOCAL_CAPABILITIES, Link,
-    LinkRefused, MAX_CLUSTER_PEERS, PEER_DISPATCH_QUEUE_CAP, PEER_SESSION_GENERATION,
-    PROTOCOL_VERSION, PeerInfo, PeerRegistration, claim_link, encode_hello, encode_peer_announce,
-    encode_peer_list, epoch_ms, negotiate_capabilities, negotiate_version, release_link,
+    CAP_RESUME, ClusterContext, ClusterFrame, ClusterTlsConfig, DispatchItem, Link, LinkRefused,
+    MAX_CLUSTER_PEERS, PEER_DISPATCH_QUEUE_CAP, PEER_SESSION_GENERATION, PROTOCOL_VERSION,
+    PeerInfo, PeerRegistration, RESUME_TIMEOUT, claim_link, encode_hello, encode_peer_announce,
+    encode_peer_list, epoch_ms, local_capabilities, negotiate_capabilities, negotiate_version,
+    release_link,
 };
 
 // ---------------------------------------------------------------------------
@@ -224,6 +226,7 @@ async fn handle_cluster_inbound_generic<S>(
         global_cancel,
     } = session;
     let instance_id: &str = &instance_id;
+    let local_caps = local_capabilities(&ctx);
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     // Read peer's HELLO frame
@@ -239,11 +242,7 @@ async fn handle_cluster_inbound_generic<S>(
             protocol_version,
             capabilities,
         }) => match negotiate_version(PROTOCOL_VERSION, protocol_version) {
-            Some(v) => (
-                peer_id,
-                v,
-                negotiate_capabilities(LOCAL_CAPABILITIES, capabilities),
-            ),
+            Some(v) => (peer_id, v, negotiate_capabilities(local_caps, capabilities)),
             None => {
                 tracing::warn!(
                     "[WSE-Cluster] Version mismatch with inbound {addr}: local={PROTOCOL_VERSION}, remote={protocol_version}"
@@ -282,7 +281,7 @@ async fn handle_cluster_inbound_generic<S>(
             // this address.
             tracing::debug!("[WSE-Cluster] Closing inbound from {addr}: it is this node");
             let mut hello_buf = BytesMut::new();
-            encode_hello(&mut hello_buf, instance_id, LOCAL_CAPABILITIES);
+            encode_hello(&mut hello_buf, instance_id, local_caps);
             let mut frame = BytesMut::new();
             write_framed(&mut frame, &hello_buf);
             let _ = writer.write_all(&frame).await;
@@ -299,7 +298,7 @@ async fn handle_cluster_inbound_generic<S>(
 
     // Send our HELLO response
     let mut hello_buf = BytesMut::new();
-    encode_hello(&mut hello_buf, instance_id, LOCAL_CAPABILITIES);
+    encode_hello(&mut hello_buf, instance_id, local_caps);
     let mut frame = BytesMut::new();
     write_framed(&mut frame, &hello_buf);
     if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
@@ -307,6 +306,18 @@ async fn handle_cluster_inbound_generic<S>(
         release_link(&ctx.links, &peer_instance_id, session_gen);
         return;
     }
+
+    // Catch-up: each node first says where it stands in the other's streams.
+    let wanted = if peer_caps & CAP_RESUME != 0 {
+        let Some(wanted) = exchange_resume(&mut reader, &mut writer, &ctx).await else {
+            tracing::warn!("[WSE-Cluster] No RESUME from inbound {addr} within {RESUME_TIMEOUT:?}");
+            release_link(&ctx.links, &peer_instance_id, session_gen);
+            return;
+        };
+        Some(wanted)
+    } else {
+        None
+    };
 
     // This node's interest (RESYNC) and presence follow from the manager once
     // the link is registered, in order with every change after them.
@@ -351,21 +362,6 @@ async fn handle_cluster_inbound_generic<S>(
 
     let (write_tx, write_rx) = mpsc::channel::<Bytes>(10_000);
 
-    // Register this inbound peer's write channel with the cluster manager
-    // so it receives Publish/Sub/Unsub frames (bidirectional routing)
-    let _ = peer_reg_tx.send(PeerRegistration::Register {
-        peer_addr: peer_addr_str.clone(),
-        write_tx: write_tx.clone(),
-        negotiated_caps: peer_caps,
-    });
-
-    let writer_handle = tokio::spawn(peer_writer(
-        write_rx,
-        writer,
-        cancel.clone(),
-        ctx.metrics.clone(),
-    ));
-
     let (dispatch_tx, dispatch_rx) = mpsc::channel::<DispatchItem>(PEER_DISPATCH_QUEUE_CAP);
 
     let dispatch_handle =
@@ -379,6 +375,27 @@ async fn handle_cluster_inbound_generic<S>(
         dispatch_tx,
         cancel.clone(),
         (last_activity.clone(), session_gen),
+    ));
+
+    // Publish/Sub/Unsub frames from the manager (bidirectional routing),
+    // after what the peer missed.
+    if !go_live(
+        &mut writer,
+        &peer_reg_tx,
+        (&peer_addr_str, write_tx.clone(), peer_caps),
+        wanted,
+        &ctx,
+    )
+    .await
+    {
+        cancel.cancel();
+    }
+
+    let writer_handle = tokio::spawn(peer_writer(
+        write_rx,
+        writer,
+        cancel.clone(),
+        ctx.metrics.clone(),
     ));
 
     let heartbeat_handle = tokio::spawn(heartbeat_task(write_tx, cancel.clone(), last_activity));

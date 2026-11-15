@@ -285,8 +285,10 @@ impl ForeignRecoveryBuffer {
             + BUFFER_OVERHEAD
     }
 
-    /// Insert at the origin node's offset. Handles gaps and out-of-order arrival.
-    fn push_at(&mut self, data: Bytes, origin_offset: u64, seq: u64) {
+    /// Insert at the origin node's offset. Handles gaps and out-of-order
+    /// arrival. False when it is here already, or older than what is kept:
+    /// nothing new for this node.
+    fn push_at(&mut self, data: Bytes, origin_offset: u64, seq: u64) -> bool {
         let capacity = self.mask + 1;
 
         // First message sets the baseline (handles origin_offset = 0 correctly).
@@ -297,8 +299,8 @@ impl ForeignRecoveryBuffer {
         }
 
         // Skip if already stored (duplicate or behind tail).
-        if origin_offset < self.tail_offset {
-            return;
+        if origin_offset < self.tail_offset || self.seq_at(origin_offset).is_some() {
+            return false;
         }
 
         // Advance head if this is a new high-water mark.
@@ -344,6 +346,21 @@ impl ForeignRecoveryBuffer {
         });
         self.total_bytes += data_len;
         self.last_write = Instant::now();
+        true
+    }
+
+    /// The last offset held with nothing missing between it and the oldest
+    /// kept: what a peer is asked to send after, once its link is back.
+    /// None for a buffer that holds nothing to anchor on.
+    fn contiguous_through(&self) -> Option<u64> {
+        if !self.initialized || self.head_offset <= self.tail_offset {
+            return None;
+        }
+        let mut offset = self.tail_offset;
+        while offset < self.head_offset && self.seq_at(offset).is_some() {
+            offset += 1;
+        }
+        offset.checked_sub(1)
     }
 
     /// Recover messages after `after_offset`, same logic as TopicRecoveryBuffer.
@@ -551,13 +568,15 @@ impl RecoveryManager {
     ///
     /// The epoch and offset belong to the originating node. This lets clients
     /// recover using the original epoch/offset from any node in the cluster.
+    /// False when this node has it already: a peer sends what a lost link
+    /// missed again, and only what is new here is delivered.
     pub(crate) fn push_foreign(
         &self,
         topic: &str,
         data: Bytes,
         origin_epoch: u32,
         origin_offset: u64,
-    ) {
+    ) -> bool {
         // Key: "topic\0epoch" -- null byte separator is safe (never in topic
         // names). Written into this thread's buffer: a buffer that exists is
         // found without allocating a key.
@@ -568,11 +587,17 @@ impl RecoveryManager {
             use std::fmt::Write;
             key.clear();
             let _ = write!(key, "{topic}\0{origin_epoch}");
-            self.push_foreign_at(key, data, origin_epoch, origin_offset);
-        });
+            self.push_foreign_at(key, data, origin_epoch, origin_offset)
+        })
     }
 
-    fn push_foreign_at(&self, key: &str, data: Bytes, origin_epoch: u32, origin_offset: u64) {
+    fn push_foreign_at(
+        &self,
+        key: &str,
+        data: Bytes,
+        origin_epoch: u32,
+        origin_offset: u64,
+    ) -> bool {
         let mut created = false;
         let mut entry = match self.foreign_buffers.get_mut(key) {
             Some(entry) => entry,
@@ -583,7 +608,7 @@ impl RecoveryManager {
             None if self.total_bytes.load(Ordering::Relaxed)
                 >= self.config.global_memory_budget =>
             {
-                return;
+                return true;
             }
             None => self
                 .foreign_buffers
@@ -606,7 +631,7 @@ impl RecoveryManager {
         }
         let buf = entry.value_mut();
         let old_bytes = if created { 0 } else { buf.footprint() };
-        buf.push_at(
+        let new = buf.push_at(
             data,
             origin_offset,
             self.arrival.fetch_add(1, Ordering::Relaxed),
@@ -623,6 +648,41 @@ impl RecoveryManager {
                     Some(cur.saturating_sub(old_bytes - new_bytes))
                 });
         }
+        new
+    }
+
+    /// Where this node stands in each stream relayed to it: (topic, origin
+    /// epoch, the last offset held with nothing missing before it). A peer
+    /// whose link was lost sends what came after it once the link is back.
+    pub(crate) fn foreign_positions(&self) -> Vec<(String, u32, u64)> {
+        self.foreign_buffers
+            .iter()
+            .filter_map(|entry| {
+                let (topic, _) = entry.key().split_once('\0')?;
+                let through = entry.value().contiguous_through()?;
+                Some((topic.to_owned(), entry.value().epoch, through))
+            })
+            .collect()
+    }
+
+    /// What this node published to `topic` in its stream `epoch` after
+    /// `after`, oldest first, for a peer that missed it: from the oldest kept
+    /// when some of it is gone, nothing when the stream is not this node's.
+    pub(crate) fn published_after(&self, topic: &str, epoch: u32, after: u64) -> Vec<(u64, Bytes)> {
+        let Some(buf) = self.buffers.get(topic) else {
+            return Vec::new();
+        };
+        if buf.epoch != epoch {
+            return Vec::new();
+        }
+        let tail = buf.tail_offset();
+        let from = after.saturating_add(1).max(tail);
+        buf.entries
+            .iter()
+            .skip((from - tail) as usize)
+            .zip(from..)
+            .map(|((data, _), offset)| (offset, data.clone()))
+            .collect()
     }
 
     /// Attempt to recover messages for a topic after a given offset.
@@ -1180,6 +1240,71 @@ mod tests {
                 }
             ),
         }
+    }
+
+    #[test]
+    fn a_relayed_message_held_already_is_not_new() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        assert!(mgr.push_foreign("t", make_data("m0"), 7, 0));
+        assert!(mgr.push_foreign("t", make_data("m1"), 7, 1));
+        // Sent again by a peer catching this node up: held, so not delivered.
+        assert!(!mgr.push_foreign("t", make_data("m1"), 7, 1));
+        assert!(!mgr.push_foreign("t", make_data("m0"), 7, 0));
+        // Past a hole, then the hole itself: both new.
+        assert!(mgr.push_foreign("t", make_data("m3"), 7, 3));
+        assert!(mgr.push_foreign("t", make_data("m2"), 7, 2));
+        assert!(!mgr.push_foreign("t", make_data("m2"), 7, 2));
+    }
+
+    #[test]
+    fn a_node_asks_from_its_first_hole_in_each_relayed_stream() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        for offset in [0, 1, 2, 4, 5] {
+            mgr.push_foreign("a", make_data("x"), 7, offset);
+        }
+        for offset in 10..13 {
+            mgr.push_foreign("b", make_data("y"), 9, offset);
+        }
+        let mut points = mgr.foreign_positions();
+        points.sort();
+        assert_eq!(
+            points,
+            vec![("a".to_owned(), 7, 2), ("b".to_owned(), 9, 12)]
+        );
+        // The hole filled: from the newest on.
+        mgr.push_foreign("a", make_data("x"), 7, 3);
+        assert!(mgr.foreign_positions().contains(&("a".to_owned(), 7, 5)));
+    }
+
+    #[test]
+    fn a_peer_gets_what_this_node_published_after_its_position() {
+        let mgr = RecoveryManager::new(RecoveryConfig {
+            buffer_size_bits: 2, // 4 kept
+            ..RecoveryConfig::default()
+        });
+        for i in 0..6 {
+            mgr.push("t", make_data(&format!("m{i}")));
+        }
+        let (epoch, head) = mgr.get_position("t").unwrap();
+        assert_eq!(head, 6);
+        let sent = |after| -> Vec<(u64, String)> {
+            mgr.published_after("t", epoch, after)
+                .into_iter()
+                .map(|(offset, data)| (offset, String::from_utf8(data.to_vec()).unwrap()))
+                .collect()
+        };
+        assert_eq!(sent(3), vec![(4, "m4".to_owned()), (5, "m5".to_owned())]);
+        // What is gone is skipped: from the oldest kept (offset 2).
+        assert_eq!(sent(0).first(), Some(&(2, "m2".to_owned())));
+        assert_eq!(sent(0).len(), 4);
+        assert!(sent(5).is_empty());
+        assert!(sent(u64::MAX).is_empty());
+        // Another node's stream, or another epoch: nothing.
+        assert!(
+            mgr.published_after("t", epoch.wrapping_add(1), 0)
+                .is_empty()
+        );
+        assert!(mgr.published_after("other", epoch, 0).is_empty());
     }
 
     #[test]

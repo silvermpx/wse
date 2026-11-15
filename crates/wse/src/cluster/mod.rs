@@ -30,11 +30,11 @@ pub(crate) use manager::cluster_manager;
 #[cfg(test)]
 pub(crate) use protocol::encode_presence_full;
 pub(crate) use protocol::{
-    ClusterFrame, PRESENCE_ROUND, PRESENCE_ROUND_FIRST, PRESENCE_ROUND_LAST, decode_frame,
-    encode_drain, encode_hello, encode_msg, encode_msg_compressed, encode_msg_with_recovery,
-    encode_peer_announce, encode_peer_list, encode_ping, encode_pong, encode_presence_round,
-    encode_presence_update, encode_resync, encode_shutdown, encode_sub, encode_unsub,
-    negotiate_capabilities, negotiate_version,
+    ClusterFrame, PRESENCE_ROUND, PRESENCE_ROUND_FIRST, PRESENCE_ROUND_LAST, ResumePoint,
+    decode_frame, encode_drain, encode_hello, encode_msg, encode_msg_compressed,
+    encode_msg_with_recovery, encode_peer_announce, encode_peer_list, encode_ping, encode_pong,
+    encode_presence_round, encode_presence_update, encode_replayed, encode_resume, encode_resync,
+    encode_shutdown, encode_sub, encode_unsub, negotiate_capabilities, negotiate_version,
 };
 pub(crate) use tls::{ClusterTlsConfig, build_cluster_tls, build_cluster_tls_from_secret};
 #[cfg(test)]
@@ -46,7 +46,7 @@ pub(crate) use types::{
 };
 
 use std::sync::atomic::AtomicU64;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 
@@ -109,16 +109,38 @@ pub(crate) const CAP_INTEREST_ROUTING: u32 = 1 << 0; // SUB/UNSUB interest routi
 pub(crate) const CAP_COMPRESSION: u32 = 1 << 1; // zstd frame compression
 pub(crate) const CAP_PRESENCE: u32 = 1 << 2; // Presence sync
 pub(crate) const CAP_RECOVERY: u32 = 1 << 3; // Cross-node recovery
+/// Catch-up on a new link: each node says where it stands in the streams the
+/// other publishes (RESUME), and gets what it missed before anything live.
+/// Offered by a node that keeps recovery buffers.
+pub(crate) const CAP_RESUME: u32 = 1 << 4;
 
 /// Our capabilities bitmask
 pub(crate) const LOCAL_CAPABILITIES: u32 =
     CAP_INTEREST_ROUTING | CAP_COMPRESSION | CAP_PRESENCE | CAP_RECOVERY;
 
+/// What this node offers in its HELLO: catch-up too when it keeps recovery
+/// buffers (both nodes need them, one to say where it stands and the other
+/// to send what came after).
+pub(crate) fn local_capabilities(ctx: &ClusterContext) -> u32 {
+    if ctx.recovery.is_some() {
+        LOCAL_CAPABILITIES | CAP_RESUME
+    } else {
+        LOCAL_CAPABILITIES
+    }
+}
+
 // Per-frame flags of MSG frames (the flags byte of the frame header)
-// bit 0: compressed (zstd), bit 1: has recovery trailer, bits 2-7: reserved.
+// bit 0: compressed (zstd), bit 1: has recovery trailer, bit 2: sent again
+// for a peer that missed it (catch-up), bits 3-7: reserved.
 // PRESENCE_FULL frames carry their sync round bits there (protocol.rs).
 const FLAG_COMPRESSED: u8 = 0x01;
 const FLAG_HAS_RECOVERY: u8 = 0x02;
+const FLAG_REPLAYED: u8 = 0x04;
+/// How long a new link waits for the peer's RESUME request.
+const RESUME_TIMEOUT: Duration = Duration::from_secs(5);
+/// Positions a RESUME request may name: more than any node's recovery
+/// buffers hold within their memory budget.
+const MAX_RESUME_POINTS: usize = 1 << 20;
 
 /// Dispatch tuple: (topic, payload, optional origin recovery position).
 type DispatchItem = (String, Bytes, Option<(u32, u64)>);

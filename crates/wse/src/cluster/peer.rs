@@ -15,12 +15,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::protocol::write_framed;
 use super::{
-    ClusterCommand, ClusterContext, ClusterFrame, ClusterMetrics, ClusterTlsConfig, DispatchItem,
-    HEARTBEAT_INTERVAL_SECS, HEARTBEAT_TIMEOUT_SECS, InterestUpdate, LOCAL_CAPABILITIES, Link,
-    LinkRefused, MAX_BATCH_BYTES, MAX_FRAME_SIZE, PEER_DISPATCH_QUEUE_CAP, PEER_SESSION_GENERATION,
-    PRESENCE_ROUND, PRESENCE_ROUND_FIRST, PRESENCE_ROUND_LAST, PROTOCOL_VERSION, PeerInfo,
-    PeerRegistration, PresencePeerFrame, RoundPart, claim_link, decode_frame, encode_hello,
-    encode_peer_announce, encode_peer_list, encode_ping, encode_pong, epoch_ms,
+    CAP_RESUME, ClusterCommand, ClusterContext, ClusterFrame, ClusterMetrics, ClusterTlsConfig,
+    DispatchItem, HEARTBEAT_INTERVAL_SECS, HEARTBEAT_TIMEOUT_SECS, InterestUpdate, Link,
+    LinkRefused, MAX_BATCH_BYTES, MAX_FRAME_SIZE, MAX_RESUME_POINTS, PEER_DISPATCH_QUEUE_CAP,
+    PEER_SESSION_GENERATION, PRESENCE_ROUND, PRESENCE_ROUND_FIRST, PRESENCE_ROUND_LAST,
+    PROTOCOL_VERSION, PeerInfo, PeerRegistration, PresencePeerFrame, RESUME_TIMEOUT, ResumePoint,
+    RoundPart, claim_link, decode_frame, encode_hello, encode_peer_announce, encode_peer_list,
+    encode_ping, encode_pong, encode_replayed, encode_resume, epoch_ms, local_capabilities,
     negotiate_capabilities, negotiate_version, release_link,
 };
 use crate::reliability::{CircuitBreaker, ExponentialBackoff};
@@ -140,6 +141,21 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
                 if dispatch_tx.try_send((topic, payload, recovery)).is_err() {
                     ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
                 }
+            }
+            Some(ClusterFrame::Replayed {
+                topic,
+                payload,
+                position,
+            }) => {
+                last_activity.store(epoch_ms(), Ordering::Relaxed);
+                // What this node missed while the link was down: delivered,
+                // so it waits for room instead of being shed.
+                if !to_manager(&dispatch_tx, (topic, payload, Some(position)), &cancel).await {
+                    break;
+                }
+            }
+            Some(ClusterFrame::Resume { .. }) => {
+                // Taken during the handshake only.
             }
             Some(ClusterFrame::Ping) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
@@ -343,8 +359,12 @@ pub(super) async fn peer_dispatch_task(
         for (topic, payload, rec) in batch.drain(..) {
             // Store the unframed payload in the foreign recovery buffer
             // (cross-node recovery), the form the local buffer stores too.
-            if let (Some(rm), Some((epoch, offset))) = (&ctx.recovery, rec) {
-                rm.push_foreign(&topic, payload.clone(), epoch, offset);
+            // One this node has already (a peer catching it up sends from
+            // where it stands with nothing missing) is not delivered again.
+            if let (Some(rm), Some((epoch, offset))) = (&ctx.recovery, rec)
+                && !rm.push_foreign(&topic, payload.clone(), epoch, offset)
+            {
+                continue;
             }
 
             // Per-topic message count for the Prometheus top-N metrics.
@@ -427,6 +447,142 @@ pub(super) async fn heartbeat_task(
 // Handshake helpers
 // ---------------------------------------------------------------------------
 
+/// The catch-up on a new link (CAP_RESUME): this node's RESUME request goes
+/// out while the peer's comes in, so a large one each way cannot stall on
+/// the other. The peer's request, or None when it did not come whole in time.
+pub(super) async fn exchange_resume<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    ctx: &ClusterContext,
+) -> Option<Vec<ResumePoint>>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let points = ctx
+        .recovery
+        .as_ref()
+        .map(|rm| rm.foreign_positions())
+        .unwrap_or_default();
+    let mut request = BytesMut::new();
+    for frame in encode_resume(&points) {
+        write_framed(&mut request, &frame);
+    }
+    let send = async {
+        writer.write_all(&request).await?;
+        writer.flush().await
+    };
+    let receive = tokio::time::timeout(RESUME_TIMEOUT, async {
+        let mut wanted: Vec<ResumePoint> = Vec::new();
+        loop {
+            let Ok(Some(ClusterFrame::Resume { points, last })) = read_frame(reader).await else {
+                return None;
+            };
+            if wanted.len() + points.len() > MAX_RESUME_POINTS {
+                return None;
+            }
+            wanted.extend(points);
+            if last {
+                return Some(wanted);
+            }
+        }
+    });
+    let (sent, received) = tokio::join!(send, receive);
+    sent.ok()?;
+    received.ok().flatten()
+}
+
+/// What the peer missed of the streams this node publishes, after where its
+/// RESUME request says it stands: written to the link before anything live
+/// goes to it.
+pub(super) async fn write_replay<W>(
+    writer: &mut W,
+    wanted: &[ResumePoint],
+    ctx: &ClusterContext,
+) -> std::io::Result<u64>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some(rm) = &ctx.recovery else {
+        return Ok(0);
+    };
+    let mut out = BytesMut::with_capacity(MAX_BATCH_BYTES);
+    let mut frame = BytesMut::new();
+    let (mut sent, mut bytes) = (0u64, 0u64);
+    for (topic, epoch, after) in wanted {
+        for (offset, data) in rm.published_after(topic, *epoch, *after) {
+            let Ok(payload) = std::str::from_utf8(&data) else {
+                continue;
+            };
+            frame.clear();
+            if !encode_replayed(&mut frame, topic, payload, *epoch, offset) {
+                continue;
+            }
+            write_framed(&mut out, &frame);
+            sent += 1;
+            if out.len() >= MAX_BATCH_BYTES {
+                writer.write_all(&out).await?;
+                bytes += out.len() as u64;
+                out.clear();
+            }
+        }
+    }
+    if !out.is_empty() {
+        writer.write_all(&out).await?;
+        bytes += out.len() as u64;
+    }
+    writer.flush().await?;
+    ctx.metrics.messages_sent.fetch_add(sent, Ordering::Relaxed);
+    ctx.metrics.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+    Ok(sent)
+}
+
+/// Hand a live link to the manager, which routes publishes, interest and
+/// presence to it from then on, starting with this node's RESYNC and
+/// presence: they wait in the link's channel until its writer runs. With a
+/// catch-up owed, the peer first gets what it missed, taken from the
+/// recovery buffers once the manager routes to the link: every message is
+/// in one or the other, and one in both is delivered there once. False when
+/// the link failed meanwhile.
+pub(super) async fn go_live<W>(
+    writer: &mut W,
+    peer_reg_tx: &mpsc::UnboundedSender<PeerRegistration>,
+    link: (&str, mpsc::Sender<Bytes>, u32),
+    wanted: Option<Vec<ResumePoint>>,
+    ctx: &ClusterContext,
+) -> bool
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let (peer_addr, write_tx, negotiated_caps) = link;
+    let (taken, routed) = match wanted {
+        Some(_) => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (Some(tx), Some(rx))
+        }
+        None => (None, None),
+    };
+    let _ = peer_reg_tx.send(PeerRegistration::Register {
+        peer_addr: peer_addr.to_owned(),
+        write_tx,
+        negotiated_caps,
+        taken,
+    });
+    let (Some(wanted), Some(routed)) = (wanted, routed) else {
+        return true;
+    };
+    // An Err: the manager stopped, and the cluster with it.
+    let _ = routed.await;
+    match write_replay(writer, &wanted, ctx).await {
+        Ok(0) => true,
+        Ok(sent) => {
+            tracing::info!("[WSE-Cluster] Sent {peer_addr} the {sent} messages it missed");
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Read one length-prefixed frame (the HELLO of a handshake). `Ok(None)` is a
 /// frame of an impossible size or one that does not decode.
 pub(super) async fn read_frame<R: AsyncReadExt + Unpin>(
@@ -489,8 +645,9 @@ where
 {
     let (peer_addr, instance_id) = ids;
 
+    let local_caps = local_capabilities(ctx);
     let mut hello_buf = BytesMut::new();
-    encode_hello(&mut hello_buf, instance_id, LOCAL_CAPABILITIES);
+    encode_hello(&mut hello_buf, instance_id, local_caps);
     let mut frame = BytesMut::new();
     write_framed(&mut frame, &hello_buf);
     if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
@@ -520,11 +677,7 @@ where
             protocol_version,
             capabilities,
         }) => match negotiate_version(PROTOCOL_VERSION, protocol_version) {
-            Some(v) => (
-                peer_id,
-                v,
-                negotiate_capabilities(LOCAL_CAPABILITIES, capabilities),
-            ),
+            Some(v) => (peer_id, v, negotiate_capabilities(local_caps, capabilities)),
             None => {
                 tracing::warn!(
                     "[WSE-Cluster] Version mismatch with {peer_addr}: local={PROTOCOL_VERSION}, remote={protocol_version}"
@@ -560,6 +713,18 @@ where
             return Outcome::Duplicate;
         }
     }
+
+    // Catch-up: each node first says where it stands in the other's streams.
+    let wanted = if peer_caps & CAP_RESUME != 0 {
+        let Some(wanted) = exchange_resume(&mut reader, &mut writer, ctx).await else {
+            tracing::warn!("[WSE-Cluster] No RESUME from {peer_addr} within {RESUME_TIMEOUT:?}");
+            release_link(&ctx.links, &peer_instance_id, session_gen);
+            return Outcome::Failed;
+        };
+        Some(wanted)
+    } else {
+        None
+    };
 
     tracing::info!(
         "[WSE-Cluster] Connected to {peer_addr} (v{peer_version}, caps=0x{peer_caps:08x})"
@@ -601,13 +766,6 @@ where
 
     let (peer_write_tx, peer_write_rx) = mpsc::channel::<Bytes>(10_000);
 
-    let writer_handle = tokio::spawn(peer_writer(
-        peer_write_rx,
-        writer,
-        peer_cancel.clone(),
-        ctx.metrics.clone(),
-    ));
-
     let (dispatch_tx, dispatch_rx) = mpsc::channel::<DispatchItem>(PEER_DISPATCH_QUEUE_CAP);
     let dispatch_handle = tokio::spawn(peer_dispatch_task(
         dispatch_rx,
@@ -625,20 +783,30 @@ where
         (last_activity.clone(), session_gen),
     ));
 
+    if !go_live(
+        &mut writer,
+        peer_reg_tx,
+        (peer_addr, peer_write_tx.clone(), peer_caps),
+        wanted,
+        ctx,
+    )
+    .await
+    {
+        peer_cancel.cancel();
+    }
+
+    let writer_handle = tokio::spawn(peer_writer(
+        peer_write_rx,
+        writer,
+        peer_cancel.clone(),
+        ctx.metrics.clone(),
+    ));
+
     let heartbeat_handle = tokio::spawn(heartbeat_task(
-        peer_write_tx.clone(),
+        peer_write_tx,
         peer_cancel.clone(),
         last_activity,
     ));
-
-    // From now on the manager routes publishes, interest and presence here,
-    // with the capabilities this handshake negotiated, starting with this
-    // node's RESYNC and presence.
-    let _ = peer_reg_tx.send(PeerRegistration::Register {
-        peer_addr: peer_addr.to_owned(),
-        write_tx: peer_write_tx,
-        negotiated_caps: peer_caps,
-    });
 
     // The link ends when any of its tasks ends, when a better duplicate
     // replaces it, or on shutdown (the token is a child of the global one).

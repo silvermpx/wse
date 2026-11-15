@@ -88,7 +88,9 @@ with, and the `wse-client` crate's `chat_client` example talks to it.
   `disconnect_user` closes them all.
 - **Cluster.** Nodes link over a binary protocol in TLS, from the cluster's
   secret (`ClusterSettings::secret`) or from certificates, and
-  forward each topic only where it has subscribers.
+  forward each topic only where it has subscribers. With recovery on, a
+  link that drops and comes back loses nothing: each node gets what it
+  missed from the other, in order, before anything new.
 - **Security.** JWT validation in the handshake (HS*, RS*, PS*, ES*, EdDSA,
   key rotation), origin checks, rate limits, end-to-end encryption with the
   server's identity key, signed messages both ways. A token that names the

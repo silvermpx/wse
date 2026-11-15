@@ -626,7 +626,7 @@ pub(crate) async fn cluster_manager(
             // Handle inbound peer registrations/deregistrations
             Some(reg) = peer_reg_rx.recv() => {
                 match reg {
-                    PeerRegistration::Register { peer_addr, write_tx, negotiated_caps } => {
+                    PeerRegistration::Register { peer_addr, write_tx, negotiated_caps, taken } => {
                         // A live session, outbound or inbound, with the caps its
                         // handshake negotiated. This node's interest and presence
                         // go out from here, in the order of every SUB, UNSUB and
@@ -646,6 +646,9 @@ pub(crate) async fn cluster_manager(
                         }
                         peer_txs.retain(|(a, _, _)| a != &peer_addr);
                         peer_txs.push((peer_addr.clone(), write_tx, negotiated_caps));
+                        if let Some(taken) = taken {
+                            let _ = taken.send(());
+                        }
                         tracing::debug!("[WSE-Cluster] Link up: {peer_addr} (caps=0x{negotiated_caps:08x})");
                     }
                     PeerRegistration::Deregister { peer_addr } => {

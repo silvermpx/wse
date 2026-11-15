@@ -8,7 +8,8 @@ WSE uses a custom binary protocol for communication between cluster nodes. All i
 2. Node A sends a HELLO frame
 3. Node B validates the HELLO (magic bytes, version, capabilities)
 4. Node B responds with its own HELLO frame
-5. Both nodes begin heartbeat exchange
+5. When both keep recovery buffers (CAP_RESUME), each sends its RESUME request and then gets what it missed from the other before anything live (see [RESUME](#resume-0x0e---catch-up-after-a-lost-link))
+6. Both nodes begin heartbeat exchange
 
 If the HELLO handshake fails - wrong magic bytes, unsupported version, or malformed payload - the connection is closed immediately and the initiator retries with exponential backoff.
 
@@ -20,8 +21,8 @@ On the wire every frame follows a 4-byte big-endian length (u32), the length of 
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
-| 0 | 1 | type | Message type (0x01 - 0x0D) |
-| 1 | 1 | flags | Per type: MSG bit 0 compressed (zstd), bit 1 recovery trailer; RESYNC bit 0 continuation; PresenceFull bits 0-2 sync round; otherwise 0 |
+| 0 | 1 | type | Message type (0x01 - 0x0E) |
+| 1 | 1 | flags | Per type: MSG bit 0 compressed (zstd), bit 1 recovery trailer, bit 2 replayed; RESYNC bit 0 continuation; RESUME bit 0 last; PresenceFull bits 0-2 sync round; otherwise 0 |
 | 2 | 2 | topic_len | Topic field length (little-endian u16) |
 | 4 | 4 | payload_len | Payload field length (little-endian u32) |
 | 8 | N | topic | Topic string (UTF-8, N = topic_len) |
@@ -46,6 +47,8 @@ If FLAG_COMPRESSED (0x01) is set in the flags byte, the payload is zstd-compress
 The payload is the message as the sending node's own subscribers got it: JSON text, with its recovery stamp when recovery is on. The receiving node builds the WebSocket frame once for all of its subscribers (and msgpack or sealed frames for those that need them).
 
 If FLAG_HAS_RECOVERY (0x02) is set, a 12-byte **recovery trailer** is appended *after* the payload (and is **not** counted in `payload_len`): a little-endian `u32` origin epoch followed by a little-endian `u64` origin offset. The receiving node stores the payload in a foreign recovery buffer keyed by `(topic, origin_epoch)`, so a client that reconnects to a different node can still recover with its original `(epoch, offset)` — provided that node had interest in (and therefore received) the topic's messages. With recovery on, a node keeps its interest in a topic for the history's lifetime (`recovery_ttl`) after the topic's last local subscriber leaves, so what other nodes publish meanwhile still reaches it. A topic published on several nodes has one stream per origin (one epoch each): a recovery replays, from every stream, what reached this node after the client's last message, in the order it arrived, and reports `recovered: false` when a stream no longer holds all of that or when this node's interest was interrupted since.
+
+If FLAG_REPLAYED (0x04) is set, the message is one the receiver missed while its link was down, sent again after its RESUME request (it always has the recovery trailer). The receiver waits for room to deliver it instead of shedding it, and delivers a message it holds already (same origin epoch and offset) only once.
 
 ### PING (0x02) / PONG (0x03) - Heartbeat
 
@@ -76,6 +79,7 @@ The magic bytes `WSE\x00` prevent accidental connections from non-WSE services. 
 | 1 | CAP_COMPRESSION | zstd compression support |
 | 2 | CAP_PRESENCE | Presence sync support |
 | 3 | CAP_RECOVERY | MSG frames carry the origin's recovery position |
+| 4 | CAP_RESUME | Catch-up after a lost link (RESUME); offered by a node with recovery on |
 
 Negotiated capabilities are the bitwise AND of both peers. A feature is only active when both sides advertise support for it.
 
@@ -192,6 +196,22 @@ node's interest entries so it stops routing **new** messages there, but keeps th
 TCP connection open so in-flight delivery can finish (lame-duck). See
 [Drain Notification](#drain-notification).
 
+### RESUME (0x0E) - Catch-up After a Lost Link
+
+```
+[header: type=0x0E, flags, payload_len=N]
+[N bytes: entries, each:
+   [2 bytes: topic length (little-endian u16)] [topic]
+   [4 bytes: origin epoch (little-endian u32)]
+   [8 bytes: offset (little-endian u64)]]
+```
+
+Where the sender stands in every stream other nodes relay to it: for each foreign recovery buffer, the topic, the origin's epoch and the last offset it holds with nothing missing before it. A request over the frame limit is split; flags `0x01` marks its last frame, and a node with nothing relayed to it sends one empty frame with that flag.
+
+When CAP_RESUME is negotiated, each node sends its request right after HELLO and reads the other's. Then it hands the link to its cluster manager and, once the manager routes publishes to it, sends the peer every message of its own streams the request names after the offset given (from the oldest still kept when some are gone) as MSG frames marked replayed, before anything live: what was published before the manager took the link is in this catch-up, what after it follows it, and a message in both is delivered once. Streams of other origins or of an earlier epoch (the node restarted) are skipped. A peer that does not send its whole request within 5 seconds is dropped, and redials.
+
+So a link that drops and comes back loses nothing the origin still holds: the receiving node's subscribers get the missed messages in order, followed by the live ones, and its recovery buffers have no hole. A message shed on a full link is filled in the same way the next time the link comes up.
+
 ## Interest-Based Routing
 
 Without interest routing, every MSG is forwarded to every peer regardless of whether that peer has subscribers for the topic. This works but wastes bandwidth in clusters where topics are partitioned across nodes.
@@ -270,7 +290,8 @@ Gossip is lightweight: PeerAnnounce and PeerList go out when links come up, and 
 | Graceful shutdown | SHUTDOWN frame sent to all peers, then immediate cancel |
 | Dead letter queue | 1,000 entries, FIFO eviction |
 | Write batching | 64 KB batch limit per flush |
-| Backpressure | Bounded per-peer outbound channel (10,000 frames), messages dropped on overflow. The inbound MSG dispatch queue per peer is likewise bounded (10,000); overflow is shed (counted in `messages_dropped`) so the reader stays responsive to heartbeats. A shed message is not stored for recovery on the receiving node: a client recovering there across it gets `recovered: false`. Interest and presence updates reach the manager through bounded queues (65,536); a peer that sends them faster than the manager keeps up waits, slowed down at its socket |
+| Catch-up | After a lost link, each node gets what it missed of the other's streams before anything live ([RESUME](#resume-0x0e---catch-up-after-a-lost-link)), as far as the origin's recovery buffers still hold it |
+| Backpressure | Bounded per-peer outbound channel (10,000 frames), messages dropped on overflow. The inbound MSG dispatch queue per peer is likewise bounded (10,000); overflow is shed (counted in `messages_dropped`) so the reader stays responsive to heartbeats. A shed message is missing on the receiving node until the link next comes up and its RESUME asks for it: a client recovering there across it meanwhile gets `recovered: false`. Interest and presence updates reach the manager through bounded queues (65,536); a peer that sends them faster than the manager keeps up waits, slowed down at its socket |
 
 ### Circuit Breaker
 

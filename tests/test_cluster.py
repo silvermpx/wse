@@ -198,6 +198,107 @@ def test_relayed_messages_carry_the_position_they_got_at_their_origin(nodes):
     assert offsets == list(range(offsets[0], offsets[0] + 5)), offsets
 
 
+class Blink:
+    """A TCP proxy in front of a node's cluster port that can drop every link
+    through it and refuse new ones for a while."""
+
+    def __init__(self, target):
+        self.target = target
+        self.port = _next_port()
+        self.open = True
+        self.links = set()
+
+    @property
+    def addr(self):
+        return f"127.0.0.1:{self.port}"
+
+    async def start(self):
+        self.server = await asyncio.start_server(self._link, "127.0.0.1", self.port)
+
+    async def _link(self, down_reader, down_writer):
+        if not self.open:
+            down_writer.transport.abort()
+            return
+        up_reader, up_writer = await asyncio.open_connection("127.0.0.1", self.target.cluster_port)
+        pair = (down_writer, up_writer)
+        self.links.add(pair)
+
+        async def pipe(src, dst):
+            try:
+                while data := await src.read(65536):
+                    dst.write(data)
+                    await dst.drain()
+            except ConnectionError:
+                pass
+            finally:
+                dst.transport.abort()
+
+        await asyncio.gather(pipe(down_reader, up_writer), pipe(up_reader, down_writer))
+        self.links.discard(pair)
+
+    def cut(self):
+        self.open = False
+        for down, up in list(self.links):
+            down.transport.abort()
+            up.transport.abort()
+
+    def close(self):
+        self.cut()
+        self.server.close()
+
+
+async def until(predicate, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "timed out"
+        await asyncio.sleep(0.05)
+
+
+def test_messages_published_while_a_link_was_down_arrive_after_it(nodes):
+    """A node whose link blinked asks the other, once it is back, for what
+    it missed: its clients get it in order, then what is published next."""
+    websockets = pytest.importorskip("websockets")
+    origin, relay = nodes(recovery=True), nodes(recovery=True)
+    origin.join()
+
+    def publish(n):
+        origin.server.broadcast("news", json.dumps({"t": "news", "p": {"n": n}}))
+
+    async def scenario():
+        blink = Blink(origin)
+        await blink.start()
+        try:
+            relay.join(blink)
+            await until(lambda: origin.peers == 1 and relay.peers == 1)
+            async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as ws:
+                await subscribe_next_client(relay, ["news"])
+                await asyncio.sleep(0.5)  # the SUB reaches the origin
+                publish(0)
+                publish(1)
+                seen = await messages_of_type(ws, "news", 2)
+
+                blink.cut()
+                await until(lambda: origin.peers == 0 and relay.peers == 0)
+                publish(2)
+                publish(3)
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(ws.recv(), timeout=0.5)
+
+                blink.open = True
+                await until(lambda: origin.peers == 1 and relay.peers == 1, timeout=20.0)
+                publish(4)
+                seen += await messages_of_type(ws, "news", 3)
+        finally:
+            blink.close()
+        return seen
+
+    seen = asyncio.run(scenario())
+    assert [m["p"]["n"] for m in seen] == [0, 1, 2, 3, 4]
+    offsets = [m["o"] for m in seen]
+    assert offsets == list(range(offsets[0], offsets[0] + 5)), offsets
+    assert len({m["e"] for m in seen}) == 1
+
+
 def test_a_signed_message_crosses_the_cluster_unchanged(nodes):
     websockets = pytest.importorskip("websockets")
     pytest.importorskip("cryptography")

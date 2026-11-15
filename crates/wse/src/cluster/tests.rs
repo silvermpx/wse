@@ -1269,6 +1269,84 @@ fn test_msg_recovery_flag_with_compression() {
 }
 
 #[test]
+fn a_resume_request_round_trips_in_frames_under_the_limit() {
+    // None held: one frame, the last, naming nothing.
+    let frames = encode_resume(&[]);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        decode_frame(frames[0].clone()),
+        Some(ClusterFrame::Resume {
+            points: Vec::new(),
+            last: true
+        })
+    );
+    // More than a frame holds: split, only the last flagged, nothing lost.
+    let topic = "t".repeat(1000);
+    let points: Vec<ResumePoint> = (0..3000u64)
+        .map(|i| (format!("{topic}{i}"), i as u32, i * 7))
+        .collect();
+    let frames = encode_resume(&points);
+    assert!(frames.len() > 1);
+    let mut got = Vec::new();
+    for (i, frame) in frames.into_iter().enumerate() {
+        assert!(frame.len() <= MAX_FRAME_SIZE);
+        let Some(ClusterFrame::Resume { points, last }) = decode_frame(frame) else {
+            panic!("not a RESUME frame");
+        };
+        assert_eq!(last, got.len() + points.len() == 3000, "frame {i}");
+        got.extend(points);
+    }
+    assert_eq!(got, points);
+}
+
+#[test]
+fn a_truncated_resume_request_does_not_decode() {
+    let mut frame = encode_resume(&[("topic".to_owned(), 1, 2)]).remove(0);
+    let len = frame.len();
+    frame.truncate(len - 3);
+    let short = (frame.len() - 8) as u32;
+    frame[4..8].copy_from_slice(&short.to_le_bytes());
+    assert_eq!(decode_frame(frame), None);
+}
+
+#[test]
+fn a_replayed_message_is_marked_and_keeps_its_position() {
+    let mut buf = BytesMut::new();
+    let payload = r#"{"t":"x","p":{"n":1}}"#.repeat(40);
+    assert!(encode_replayed(&mut buf, "news", &payload, 9, 41));
+    assert_eq!(
+        decode_frame(buf),
+        Some(ClusterFrame::Replayed {
+            topic: "news".to_owned(),
+            payload: Bytes::from(payload),
+            position: (9, 41),
+        })
+    );
+    // A live one stays a MSG.
+    let mut buf = BytesMut::new();
+    assert!(encode_msg_with_recovery(
+        &mut buf, "news", "{}", 9, 42, true
+    ));
+    assert!(matches!(decode_frame(buf), Some(ClusterFrame::Msg { .. })));
+}
+
+#[test]
+fn catch_up_is_offered_with_recovery_buffers_only() {
+    assert_eq!(LOCAL_CAPABILITIES & CAP_RESUME, 0);
+    assert_ne!(
+        negotiate_capabilities(
+            LOCAL_CAPABILITIES | CAP_RESUME,
+            LOCAL_CAPABILITIES | CAP_RESUME
+        ) & CAP_RESUME,
+        0
+    );
+    assert_eq!(
+        negotiate_capabilities(LOCAL_CAPABILITIES | CAP_RESUME, LOCAL_CAPABILITIES) & CAP_RESUME,
+        0
+    );
+}
+
+#[test]
 fn test_encode_decode_drain() {
     let mut buf = BytesMut::new();
     encode_drain(&mut buf);

@@ -339,7 +339,7 @@ server.connect_cluster(
 server.broadcast("prices", text)   # reaches the subscribers on every server
 ```
 
-The links between servers are TLS, always. Each server derives the same key from the secret and proves it when a link opens, so a server without the secret cannot join, and nothing between them can read or change the traffic. No certificates to make; a company CA can sign them instead (`tls_cert`, `tls_key`, `tls_ca`). A new server can also join through one seed address (`seeds=[...]`, `cluster_addr=...`), and the links can share the WebSocket port (`single_port=True`). `cluster_info()` lists the linked peers. The protocol is described in [CLUSTER_PROTOCOL.md](https://github.com/silvermpx/wse/blob/main/docs/CLUSTER_PROTOCOL.md).
+The links between servers are TLS, always. Each server derives the same key from the secret and proves it when a link opens, so a server without the secret cannot join, and nothing between them can read or change the traffic. No certificates to make; a company CA can sign them instead (`tls_cert`, `tls_key`, `tls_ca`). A new server can also join through one seed address (`seeds=[...]`, `cluster_addr=...`), and the links can share the WebSocket port (`single_port=True`). `cluster_info()` lists the linked peers. With recovery on, a link between two servers that drops and comes back loses nothing: each gets what it missed from the other, in order, before anything new. The protocol is described in [CLUSTER_PROTOCOL.md](https://github.com/silvermpx/wse/blob/main/docs/CLUSTER_PROTOCOL.md).
 
 ### Running it
 

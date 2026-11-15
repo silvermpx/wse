@@ -114,7 +114,9 @@ Upgrading from 2.x: see
   covers patterns; a new peer receives the full interest and presence
   state; presence stays consistent after a lost leave or link; relayed
   messages keep their recovery position, and a topic published on several
-  nodes recovers from all of them.
+  nodes recovers from all of them. With recovery on, a node whose link
+  dropped gets what it missed once the link is back, in order and before
+  anything live, as far as the publishing node still holds it.
 - Clients: reconnect until the server rejects the token; encryption fails
   closed, on a plaintext frame too; gaps are recovered from the last
   delivered message; offline messages go out only for the user they were

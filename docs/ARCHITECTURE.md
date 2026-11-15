@@ -448,6 +448,8 @@ These are the `RustWSEServer` constructor parameters (internally, `recovery_buff
 
 Recovery works across nodes for any topic the new node has interest in. Inter-node MSG frames carry a 12-byte recovery trailer with the origin `(epoch, offset)` (see [Cluster Protocol](CLUSTER_PROTOCOL.md#msg-0x01---application-message)); the receiving node stores those payloads in **foreign recovery buffers** keyed by `(topic, origin_epoch)`. So a client that reconnects to a *different* node can still recover with its original `(epoch, offset)` — provided that node had local subscribers for the topic (and therefore received its MSG frames under interest routing).
 
+A link between two nodes that drops and comes back loses nothing either: on the new link each node says where it stands in the other's streams (RESUME), and the other sends what came after from its own recovery buffer before anything live, so the subscribers get the missed messages in order and the foreign buffers have no hole ([Cluster Protocol](CLUSTER_PROTOCOL.md#resume-0x0e---catch-up-after-a-lost-link)).
+
 If the new node never had interest in the topic, it has no buffer for it and recovery returns `NoHistory`; the client re-subscribes from scratch. **Sticky sessions** (e.g., HAProxy `stick-table`, or consistent hashing by user ID) are therefore an optimization that *guarantees* recovery, no longer a requirement for it to work at all.
 
 ---
