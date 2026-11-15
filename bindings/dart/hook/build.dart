@@ -1,10 +1,7 @@
-// Builds the Rust library from source with Cargo (the app needs a Rust
-// toolchain); a release of the package downloads prebuilt binaries instead.
-import 'package:flutter_rust_bridge_hooks/flutter_rust_bridge_hooks.dart';
+// Takes the prebuilt Rust library of this release (checked by its SHA-256),
+// or builds it from source with Cargo when the app asks for that or this is
+// a checkout of the repository; see prebuilt.dart.
+import 'binaries.dart';
+import 'prebuilt.dart';
 
-void main(List<String> args) => build(args, (input, output) async {
-      await const FlutterRustBridgeNativeAssetsBuilder(
-        cratePath: 'rust',
-        extraCargoEnvironmentVariables: {'IPHONEOS_DEPLOYMENT_TARGET': '15.0'},
-      ).run(input: input, output: output);
-    });
+void main(List<String> args) => runHook(args, version: version, binaries: binaries);

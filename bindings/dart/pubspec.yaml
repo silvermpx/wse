@@ -15,6 +15,7 @@ dependencies:
   flutter_rust_bridge_hooks: 2.13.0
   hooks: ^2.1.0
   code_assets: ^2.2.0
+  crypto: ^3.0.8
 
 dev_dependencies:
   flutter_test:
