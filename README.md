@@ -3,9 +3,11 @@
 [![PyPI - Server](https://img.shields.io/pypi/v/wse-server)](https://pypi.org/project/wse-server/)
 [![PyPI - Client](https://img.shields.io/pypi/v/wse-client)](https://pypi.org/project/wse-client/)
 [![npm](https://img.shields.io/npm/v/wse-client)](https://www.npmjs.com/package/wse-client)
+[![crates.io - Server](https://img.shields.io/crates/v/wse?label=crates.io%20wse)](https://crates.io/crates/wse)
+[![crates.io - Client](https://img.shields.io/crates/v/wse-client?label=crates.io%20wse-client)](https://crates.io/crates/wse-client)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-High-performance WebSocket server built in Rust with native clustering, E2E encryption, signed messages, message recovery, presence tracking, and real-time fan-out. Exposed to Python via PyO3 with zero GIL overhead on the data path. Ships with Rust-accelerated utilities for application code: priority queues, rate limiters, event sequencing, compression, cryptography, and JWT.
+High-performance WebSocket engine in Rust, for Rust, Python and TypeScript: fan-out on every CPU core, native clustering, E2E encryption, signed messages, message recovery and presence tracking. The same engine runs in Rust applications (the [`wse`](https://crates.io/crates/wse) crate, on the application's tokio runtime) and in Python ([`wse-server`](https://pypi.org/project/wse-server/), through PyO3 with zero GIL overhead on the data path), with clients for Rust, Python and TypeScript/React. The Python package ships Rust-accelerated utilities for application code too: priority queues, rate limiters, event sequencing, compression, cryptography, and JWT.
 
 ## Features
 
@@ -97,7 +99,7 @@ See [SECURITY.md](docs/SECURITY.md#signed-messages) for setup and guarantees.
 | **Recovery on reconnect** | `subscribe_with_recovery()` replays missed messages automatically |
 | **Per-message stamp** | When recovery is enabled, every topic broadcast carries `tp`/`e`/`o` (topic, epoch, offset) so clients dedup idempotently and detect gaps from the messages themselves |
 
-### Client SDKs (Python + TypeScript/React)
+### Client SDKs (Rust, Python, TypeScript/React)
 
 | Feature | Details |
 |---------|---------|
@@ -129,6 +131,56 @@ See [SECURITY.md](docs/SECURITY.md#signed-messages) for setup and guarantees.
 ---
 
 ## Quick Start
+
+### Rust
+
+```bash
+cargo add wse serde_json tokio --features tokio/full
+```
+
+```rust
+use wse::{Config, Connect, Handler, Inbound, JwtSettings, Server, Subscribe};
+
+/// Every connection joins its user's topic.
+struct App;
+
+impl Handler for App {
+    type Connection = String;
+
+    fn connect(&self, connect: &Connect<'_>) -> Option<String> {
+        let user = connect.user_id?.to_owned();
+        connect.subscribe(vec![format!("user:{user}")], &Subscribe::default()).ok()?;
+        Some(user)
+    }
+
+    fn message(&self, user: &mut String, message: Inbound, _size: usize) -> bool {
+        println!("{user}: {message:?}");
+        true
+    }
+
+    fn signed(&self, _user: &mut String, _message: serde_json::Value, _size: usize) -> bool {
+        false
+    }
+
+    fn disconnect(&self, _user: String) {}
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = Config::default();
+    config.jwt = Some(JwtSettings::new(std::env::var("JWT_SECRET")?));
+    let server = Server::new(config)?;
+    server.start(tokio::net::TcpListener::bind("0.0.0.0:5006").await?, App)?;
+    server.publisher().publish("user:42", r#"{"t":"order_filled","p":{"id":7}}"#)?;
+    tokio::signal::ctrl_c().await?;
+    server.stop().await;
+    Ok(())
+}
+```
+
+See the [`wse` crate](crates/wse/README.md) and its chat example.
+
+### Python
 
 ```bash
 pip install wse-server
@@ -538,6 +590,26 @@ Two compression layers:
 
 ## Client SDKs
 
+### Rust
+
+```bash
+cargo add wse-client
+```
+
+On tokio, and in the browser (WebAssembly, for Leptos, Yew, Dioxus): a handler reads each message in place from its frame and decodes its payload into the application's types without copies; or a stream of owned messages. Topics with recovery, reconnects, msgpack, E2E encryption and signed messages.
+
+```rust
+let mut config = wse_client::Config::new("ws://localhost:5006/wse");
+config.token = Some(token);
+config.topics = vec!["updates".into()];
+let (client, mut events) = wse_client::connect(config).await?;
+while let Some(incoming) = events.next().await {
+    println!("{incoming:?}");
+}
+```
+
+See the [`wse-client` crate](crates/wse-client/README.md).
+
 ### Python
 
 ```bash
@@ -651,7 +723,8 @@ Working examples in the [`examples/`](examples/) directory:
 - [Rust Utilities](docs/RUST_UTILITIES.md) - priority queues, rate limiters, sequencing, compression, crypto, JWT
 - [Security](docs/SECURITY.md) - JWT, encryption, mTLS, rate limiting, circuit breaker
 - [Deployment](docs/DEPLOYMENT.md) - production setup, Docker, Kubernetes, cluster configuration
-- [Migration Guide](docs/MIGRATION.md) - upgrading from v1.x to v2.x
+- [Migration Guide](docs/MIGRATION.md) - upgrading to 3.0, and from v1.x to v2.x
+- [`wse`](crates/wse/README.md) and [`wse-client`](crates/wse-client/README.md) - the Rust crates
 - [Contributing](CONTRIBUTING.md) - development setup and coding standards
 - [Changelog](CHANGELOG.md) - version history
 
