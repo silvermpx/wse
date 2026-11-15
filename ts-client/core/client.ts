@@ -67,6 +67,8 @@ export interface Lease {
 /** What a page shows of a client; the same object until something in it changes. */
 export interface WSEClientSnapshot {
   readonly connection: ConnectionState;
+  /** The reasons the connection is paused for (none: not paused). */
+  readonly paused: readonly string[];
   /** The server took the connection: messages go out. */
   readonly ready: boolean;
   readonly endpoint: string | null;
@@ -98,6 +100,13 @@ export interface WSEClient {
   sendSigned(type: string, payload: unknown, options?: SignedMessageOptions): Promise<SendStatus>;
   reconnect(): void;
   /**
+   * Pause the connection for `reason` ('background', 'offline', 'manual', ...):
+   * it ends while any reason holds, and shares, topics and positions stay.
+   */
+  pause(reason: string): void;
+  /** Clear `reason`; once none is left the client connects again and recovers what it missed. */
+  resume(reason: string): void;
+  /**
    * The user signed out: the connection ends, and what the client held for
    * the user (queue, topics, positions, what it kept in storage) goes. The
    * client is done; a new sign-in makes a new client.
@@ -113,6 +122,7 @@ const STOP_DELAY_MS = 0;
 function shallowSame(a: WSEClientSnapshot, b: WSEClientSnapshot): boolean {
   return (
     a.connection === b.connection &&
+    a.paused === b.paused &&
     a.ready === b.ready &&
     a.endpoint === b.endpoint &&
     a.lastError === b.lastError &&
@@ -148,6 +158,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
   let shares = 0;
   let stopTimer: ReturnType<typeof setTimeout> | null = null;
   let done = false;
+  let paused: readonly string[] = [];
   const topicShares = new Map<string, number>();
   const messageListeners = new Map<string, Set<(message: WSMessage) => void>>();
   for (const topic of uniqueTopics(options.topics)) topicShares.set(topic, 1);
@@ -156,6 +167,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
 
   const snapshotOf = (s: WSEStore): WSEClientSnapshot => ({
     connection: s.connectionState,
+    paused,
     ready: s.connectionState === ConnectionState.CONNECTED,
     endpoint: s.activeEndpoint,
     topics: s.activeTopics,
@@ -198,7 +210,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
   // -- the session -------------------------------------------------------------
 
   const start = () => {
-    if (session || done) return;
+    if (session || done || paused.length > 0) return;
     session = new WSESession(
       {
         key: auth,
@@ -312,6 +324,27 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     return ok ? 'queued' : 'dropped';
   };
 
+  const notifySnapshot = () => {
+    const next = snapshotOf(ctx.state.getState());
+    if (shallowSame(next, snapshot)) return;
+    snapshot = next;
+    for (const listener of [...snapshotListeners]) listener(snapshot);
+  };
+
+  const pause = (reason: string) => {
+    if (done || paused.includes(reason)) return;
+    paused = [...paused, reason];
+    if (paused.length === 1) stop();
+    notifySnapshot();
+  };
+
+  const resume = (reason: string) => {
+    if (!paused.includes(reason)) return;
+    paused = paused.filter((r) => r !== reason);
+    notifySnapshot();
+    if (paused.length === 0 && shares > 0) start();
+  };
+
   const end = (clear: boolean) => {
     if (done) return;
     done = true;
@@ -372,6 +405,8 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
       return current.sendSigned(type, payload, signOptions);
     },
     reconnect: () => live()?.forceReconnect(),
+    pause,
+    resume,
     signOut: () => end(true),
     destroy: () => end(false),
   };

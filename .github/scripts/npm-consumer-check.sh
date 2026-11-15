@@ -60,13 +60,14 @@ import * as core from 'wse-client/core';
 import * as react from 'wse-client/react';
 import * as vue from 'wse-client/vue';
 import * as svelte from 'wse-client/svelte';
+import * as reactNative from 'wse-client/react-native';
 
-for (const [name, entry] of Object.entries({ 'wse-client': wse, core, react, vue, svelte })) {
+for (const [name, entry] of Object.entries({ 'wse-client': wse, core, react, vue, svelte, 'react-native': reactNative })) {
   const names = Object.keys(entry);
   if (names.length === 0) throw new Error(`${name} exports nothing`);
   console.log(`${name}: ${names.length} exports`);
 }
-if (typeof react.WSEProvider !== 'function' || typeof vue.wsePlugin !== 'function') {
+if (typeof react.WSEProvider !== 'function' || typeof vue.wsePlugin !== 'function' || typeof reactNative.createReactNativeClient !== 'function') {
   throw new Error('an adapter is missing its entry points');
 }
 EOF

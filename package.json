@@ -31,6 +31,11 @@
       "import": "./dist/npm/svelte/index.js",
       "default": "./dist/npm/svelte/index.js"
     },
+    "./react-native": {
+      "types": "./dist/npm/react-native/index.d.ts",
+      "import": "./dist/npm/react-native/index.js",
+      "default": "./dist/npm/react-native/index.js"
+    },
     "./package.json": "./package.json"
   },
   "typesVersions": {
@@ -46,6 +51,9 @@
       ],
       "svelte": [
         "./dist/npm/svelte/index.d.ts"
+      ],
+      "react-native": [
+        "./dist/npm/react-native/index.d.ts"
       ]
     }
   },
@@ -73,7 +81,8 @@
     "zustand",
     "vue",
     "svelte",
-    "typescript"
+    "typescript",
+    "react-native"
   ],
   "author": "silvermpx",
   "license": "MIT",

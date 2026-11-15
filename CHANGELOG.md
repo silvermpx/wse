@@ -11,7 +11,13 @@
   `wse-client/svelte` (stores) hold a client while components use it. The
   root `wse-client` and `useWSE` are as before; React, zustand and Vue are
   optional peer dependencies. Outside browsers a `webSocket` factory may
-  send headers.
+  send headers. A client pauses for any number of reasons (`pause`,
+  `resume`) and catches up from its positions once none is left.
+- `wse-client/react-native`: `createReactNativeClient` sends the token as an
+  Authorization header, pauses the connection while the app is in the
+  background (after a grace period) and makes it again in the foreground,
+  and takes the app's crypto (react-native-quick-crypto) and AppState
+  instead of importing them.
 
 - Recovery positions per stream. A client may name, with its recovery
   request, the last offset it holds of each stream of a topic (`streams`:
