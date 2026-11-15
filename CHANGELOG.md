@@ -9,6 +9,10 @@
   back within the backoff (at most 30 s between attempts), as the Rust
   client does. The pause is an option now (`reconnection.circuitBreaker`;
   `ReconnectConfig.circuit_breaker_threshold` and `circuit_breaker_timeout`).
+- Server: a client of an end-to-end session that goes over its rate limit
+  for a moment keeps its session. A refused frame is opened before it is
+  dropped, so the next one is in sequence; a flood is still closed with
+  4429 after ten seconds.
 - TypeScript client: one user's queued messages, subscriptions and
   recovery positions never go out on the next user's connection: not when
   the last component unmounts and another user signs in, nor when a cookie

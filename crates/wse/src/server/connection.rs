@@ -1015,6 +1015,48 @@ struct Reader<'a, H: Handler> {
 /// Hand a client's message to the application; false when it has no room
 /// for it (or has not heard of the connection).
 #[inline]
+/// One of the client's messages against its rate limit: false when it is
+/// not taken (refused, and the client told at most once a second; or the
+/// connection closed for flooding).
+fn within_rate(conn: &Conn<'_>, limit: &mut InboundLimit, now: Instant) -> bool {
+    match limit.check(now) {
+        Rate::Pass => true,
+        Rate::Warn { used, left } => {
+            let warning = format!(
+                "{{\"c\":\"WSE\",\"t\":\"rate_limit_warning\",\"p\":{{\"current_rate\":{},\"limit\":{},\"remaining\":{},\"retry_after\":1.0}},\"v\":1}}",
+                used as u64, limit.capacity as u64, left as u64,
+            );
+            queue_reply(conn.handle, conn.max_pending, Message::Text(warning.into()));
+            true
+        }
+        Rate::Limited { notify } => {
+            conn.state
+                .rate_limited_total
+                .fetch_add(1, Ordering::Relaxed);
+            if notify {
+                queue_reply(
+                    conn.handle,
+                    conn.max_pending,
+                    Message::Text(RATE_LIMITED_ERROR.into()),
+                );
+            }
+            false
+        }
+        Rate::Close => {
+            conn.state
+                .rate_limited_total
+                .fetch_add(1, Ordering::Relaxed);
+            conn.closer.close(
+                conn.tx,
+                &conn.handle.out.pending,
+                CLOSE_RATE_LIMITED,
+                "rate limit exceeded",
+            );
+            false
+        }
+    }
+}
+
 fn deliver<H: Handler>(
     handler: &H,
     app: &mut Option<H::Connection>,
@@ -1084,33 +1126,16 @@ impl<H: Handler> Reader<'_, H> {
             closer.close(tx, &out.pending, CLOSE_E2E_BAD_FRAME, "e2e frame refused");
             return Flow::Next;
         }
-        if matches!(msg, Message::Text(_) | Message::Binary(_)) {
-            match inbound_limit.check(now) {
-                Rate::Pass => {}
-                Rate::Warn { used, left } => {
-                    let warning = format!(
-                        "{{\"c\":\"WSE\",\"t\":\"rate_limit_warning\",\"p\":{{\"current_rate\":{},\"limit\":{},\"remaining\":{},\"retry_after\":1.0}},\"v\":1}}",
-                        used as u64, inbound_limit.capacity as u64, left as u64,
-                    );
-                    queue_reply(own_handle, max_pending, Message::Text(warning.into()));
-                }
-                Rate::Limited { notify } => {
-                    state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
-                    if notify {
-                        queue_reply(
-                            own_handle,
-                            max_pending,
-                            Message::Text(RATE_LIMITED_ERROR.into()),
-                        );
-                    }
-                    return Flow::Next;
-                }
-                Rate::Close => {
-                    state.rate_limited_total.fetch_add(1, Ordering::Relaxed);
-                    closer.close(tx, &out.pending, CLOSE_RATE_LIMITED, "rate limit exceeded");
-                    return Flow::Next;
-                }
-            }
+        // A sealed frame of an E2E session is opened before the rate limit
+        // is applied to it: opening advances the session's sequence, so a
+        // frame dropped unopened would refuse every later one.
+        let sealed =
+            session.is_some() && matches!(&msg, Message::Binary(data) if data.starts_with(b"E:"));
+        if !sealed
+            && matches!(msg, Message::Text(_) | Message::Binary(_))
+            && !within_rate(&conn, inbound_limit, now)
+        {
+            return Flow::Next;
         }
         match msg {
             Message::Text(text) => {
@@ -1206,7 +1231,14 @@ impl<H: Handler> Reader<'_, H> {
                 if data.len() >= 2 && data[0] == b'E' && data[1] == b':' {
                     let opened = match (session.as_mut(), out.cipher.get()) {
                         (Some(session), _) => match session.open(&data) {
-                            Ok(Some(plaintext)) => Some(Ok(plaintext)),
+                            // Opened, so the session stays in step; taken
+                            // only within the rate limit.
+                            Ok(Some(plaintext)) => {
+                                if !within_rate(&conn, inbound_limit, now) {
+                                    return Flow::Next;
+                                }
+                                Some(Ok(plaintext))
+                            }
                             // The client's close_notify: it closes next.
                             Ok(None) => return Flow::Next,
                             Err(_) => {

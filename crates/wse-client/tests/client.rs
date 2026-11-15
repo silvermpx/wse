@@ -855,3 +855,76 @@ async fn an_application_binds_a_connection_to_the_key_it_knows() {
     assert!(matches!(error, Error::Auth(_)), "{error}");
     server.stop().await;
 }
+
+#[cfg(feature = "aws-lc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_encrypted_session_outlives_a_short_burst_over_the_rate_limit() {
+    let mut config = wse::Config::default();
+    config.e2e_identity_key = Some(wse_client::generate_key());
+    config.rate_limit_capacity = 4.0;
+    config.rate_limit_refill = 2.0;
+    let mut stand = stand_with(config).await;
+    let identity = stand.publisher.e2e_identity_public_key().unwrap();
+    let mut client_config = stand.config("lena");
+    client_config.encryption = Some(wse_client::Encryption::pinned([identity]));
+    let (client, _events) = wse_client::connect(client_config).await.unwrap();
+    stand.connect_id().await;
+
+    // More than the bucket holds at once: the server refuses some of them.
+    for n in 0..8 {
+        client.send("burst", &json!({ "n": n })).await.unwrap();
+    }
+    // Once it refilled, the same session goes on.
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    client.send("after", &json!({ "ok": true })).await.unwrap();
+    loop {
+        match stand.heard().await {
+            Heard::Message(message) if message["t"] == "after" => break,
+            Heard::Disconnect(_) => panic!("the server dropped the session after the burst"),
+            _ => {}
+        }
+    }
+    client.close().await;
+    stand.server.stop().await;
+}
+
+#[cfg(feature = "aws-lc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_encrypted_flood_is_still_closed_for_flooding() {
+    let mut config = wse::Config::default();
+    config.e2e_identity_key = Some(wse_client::generate_key());
+    config.rate_limit_capacity = 4.0;
+    config.rate_limit_refill = 2.0;
+    let stand = stand_with(config).await;
+    let identity = stand.publisher.e2e_identity_public_key().unwrap();
+    let mut client_config = stand.config("mira");
+    client_config.encryption = Some(wse_client::Encryption::pinned([identity]));
+    client_config.reconnect.enabled = false;
+    let (client, mut events) = wse_client::connect(client_config).await.unwrap();
+
+    let started = std::time::Instant::now();
+    let flooder = client.clone();
+    let flood = tokio::spawn(async move {
+        for n in 0u64.. {
+            if flooder.try_send("flood", &json!({ "n": n })).is_err() && !flooder.is_connected() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    // The server closes it after ten seconds over the limit, as any flood
+    // (4429), not on the first frame after a refused one (4802).
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(incoming) = events.next().await {
+            if let Incoming::Event(Event::Disconnected(_)) = incoming {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("closed within 15 s");
+    let after = started.elapsed();
+    assert!(after >= Duration::from_secs(9), "closed after {after:?}");
+    flood.abort();
+    stand.server.stop().await;
+}
