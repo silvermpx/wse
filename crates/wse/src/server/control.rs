@@ -41,6 +41,37 @@ impl Subscribe {
     }
 }
 
+/// Where a client stands in a topic, as the clients send it to recover:
+/// its last message (`epoch`, `offset`) and, from 3.1, the last offset it
+/// holds of each stream of the topic (`streams`: epoch, offset). With the
+/// streams, each one is replayed from its own offset, whatever node the
+/// client was on before; without them, every stream from the last message,
+/// in the order this node had them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TopicPosition {
+    pub epoch: u32,
+    pub offset: u64,
+    pub streams: Option<Vec<(u32, u64)>>,
+}
+
+impl TopicPosition {
+    /// The last message only, as clients before 3.1 send it.
+    pub fn new(epoch: u32, offset: u64) -> Self {
+        Self {
+            epoch,
+            offset,
+            streams: None,
+        }
+    }
+
+    /// With the last offset the client holds of each stream.
+    pub fn with_streams(mut self, streams: Vec<(u32, u64)>) -> Self {
+        self.streams = Some(streams);
+        self
+    }
+}
+
 /// Where a topic a connection subscribed to with recovery stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -57,6 +88,9 @@ pub struct Recovered {
     pub count: usize,
     /// Whether the connection was subscribed (its ACL allows the topic).
     pub subscribed: bool,
+    /// Each stream of the topic this node held when the connection
+    /// subscribed (epoch, last offset): where the client starts in it.
+    pub streams: Vec<(u32, u64)>,
 }
 
 /// A user present on a topic.
@@ -138,7 +172,7 @@ fn recover(
     conn_id: &str,
     handle: Option<&ConnectionHandle>,
     topics: Vec<String>,
-    positions: &HashMap<String, (u32, u64)>,
+    positions: &HashMap<String, TopicPosition>,
 ) -> Result<HashMap<String, Recovered>, Error> {
     let (accepted, recovered) = match handle {
         Some(handle) => shared
@@ -156,13 +190,10 @@ fn recover(
     Ok(topics
         .into_iter()
         .map(|topic| {
-            let r = recovered.get(&topic).copied().unwrap_or(TopicRecovery {
-                epoch: None,
-                offset: 0,
-                recovered: false,
-                recoverable: false,
-                count: 0,
-            });
+            let r = recovered
+                .get(&topic)
+                .cloned()
+                .unwrap_or(TopicRecovery::UNKNOWN);
             let subscribed = accepted.contains(&topic);
             let result = Recovered {
                 epoch: r.epoch_hex(),
@@ -171,6 +202,7 @@ fn recover(
                 recovered: r.recovered,
                 count: r.count,
                 subscribed,
+                streams: r.streams,
             };
             (topic, result)
         })
@@ -295,12 +327,29 @@ impl Publisher {
 
     /// Subscribe a connection to `topics`, each replaying what the
     /// connection missed after its position in `positions` (topic ->
-    /// (epoch, offset)); a topic without a position only subscribes.
+    /// (epoch, offset) of its last message); a topic without a position
+    /// only subscribes.
     pub fn subscribe_with_recovery(
         &self,
         conn_id: &str,
         topics: Vec<String>,
         positions: &HashMap<String, (u32, u64)>,
+    ) -> Result<HashMap<String, Recovered>, Error> {
+        let positions = positions
+            .iter()
+            .map(|(topic, (epoch, offset))| (topic.clone(), TopicPosition::new(*epoch, *offset)))
+            .collect();
+        self.subscribe_with_positions(conn_id, topics, &positions)
+    }
+
+    /// [`subscribe_with_recovery`](Self::subscribe_with_recovery) with the
+    /// positions the clients send from 3.1: each stream of a topic is
+    /// replayed from the client's own offset in it.
+    pub fn subscribe_with_positions(
+        &self,
+        conn_id: &str,
+        topics: Vec<String>,
+        positions: &HashMap<String, TopicPosition>,
     ) -> Result<HashMap<String, Recovered>, Error> {
         let handle = self.shared.connections.read().get(conn_id).cloned();
         recover(&self.shared, conn_id, handle.as_ref(), topics, positions)

@@ -709,3 +709,55 @@ def test_a_topic_published_on_two_nodes_recovers_both(nodes):
     result, replayed = asyncio.run(scenario())
     assert result["topics"]["room"]["recovered"] is True
     assert [m["p"]["text"] for m in replayed] == ["a3", "b3", "a4", "b4"]
+
+
+def test_a_client_that_moves_node_gets_each_stream_from_its_own_offset(nodes):
+    """Nodes have a topic's streams in their own order: a client that names
+    its offset in each loses nothing when it comes back on another node than
+    the one whose order it saw."""
+    websockets = pytest.importorskip("websockets")
+    a, b = nodes(recovery=True), nodes(recovery=True)
+    a.join(b)
+    b.join(a)
+    assert wait_for(lambda: a.peers == 1 and b.peers == 1)
+
+    def publish(node, text):
+        node.server.broadcast("room", json.dumps({"t": "chat", "p": {"text": text}}))
+        time.sleep(0.1)  # in this order on b, relayed or not
+
+    async def scenario():
+        async with websockets.connect(f"ws://127.0.0.1:{b.port}/wse") as ws:
+            await subscribe_next_client(b, ["room"])
+            await asyncio.sleep(0.5)  # the SUB reaches a
+            publish(a, "a0")
+            publish(b, "b0")
+            # b has b1 before a1. A client on a node that had a1 first got
+            # a1 there, and lost its link before b1.
+            publish(b, "b1")
+            publish(a, "a1")
+            seen = {m["p"]["text"]: m for m in await messages_of_type(ws, "chat", 4)}
+        a1, b0 = seen["a1"], seen["b0"]
+        position = {
+            "epoch": a1["e"],
+            "offset": a1["o"],
+            "streams": {a1["e"]: a1["o"], b0["e"]: b0["o"]},
+        }
+        async with websockets.connect(f"ws://127.0.0.1:{b.port}/wse") as ws:
+            deadline = time.monotonic() + 5
+            conn_id = None
+            while conn_id is None and time.monotonic() < deadline:
+                for event in b.server.drain_inbound(16, 50):
+                    if event[0] == "connect":
+                        conn_id = event[1]
+                await asyncio.sleep(0.05)
+            result = b.server.subscribe_with_recovery(
+                conn_id, ["room"], recover=True, positions={"room": position}
+            )
+            replayed = await messages_of_type(ws, "chat", 1)
+        return result, replayed, a1, seen["b1"]
+
+    result, replayed, a1, b1 = asyncio.run(scenario())
+    room = result["topics"]["room"]
+    assert room["recovered"] is True
+    assert [m["p"]["text"] for m in replayed] == ["b1"]
+    assert room["streams"] == {a1["e"]: a1["o"], b1["e"]: b1["o"]}

@@ -234,6 +234,11 @@ pub(super) fn build_server_hello(
         },
         "v": 1
     });
+    // How long a quiet stream of a topic stays recoverable here: a client
+    // forgets one it heard nothing of for longer, instead of naming it.
+    if let Some(recovery) = &state.recovery {
+        val["p"]["features"]["history_ttl"] = recovery.history_secs().into();
+    }
     if let Some(pubkey) = encryption_pubkey {
         val["p"]["encryption_public_key"] = serde_json::Value::String(pubkey.to_string());
     }
@@ -298,6 +303,9 @@ pub(super) fn build_server_ready(
             "kid": signer.kid,
             "public_key": signer.public_key,
         });
+    }
+    if let Some(recovery) = &state.recovery {
+        val["p"]["details"]["features"]["history_ttl"] = recovery.history_secs().into();
     }
     // Sealed: the client learns its session is bound to its own key, and
     // not to a token whatever sits in between put in its place.

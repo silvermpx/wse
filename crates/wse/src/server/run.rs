@@ -97,7 +97,7 @@ pub(crate) async fn serve<H: Handler>(
         let cleanup_state = shared.clone();
         let stop = stop.clone();
         tasks.spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            let mut interval = tokio::time::interval(crate::recovery::CLEANUP_INTERVAL);
             while tick(&mut interval, &stop).await {
                 rm.cleanup();
                 cleanup_state.sweep_interest_linger();

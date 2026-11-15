@@ -61,18 +61,21 @@ from their last-seen position:
 
 - `tp` — the topic. A single connection receives many topics, so the topic is
   needed to attribute each `(epoch, offset)` to the right per-topic sequence.
-- `e` — the topic buffer's epoch as an 8-hex string. It changes when the server
-  restarts (the buffer is recreated), invalidating old offsets.
-- `o` — the message's offset within that topic's buffer, monotonically
-  increasing. The same `(tp, e, o)` is stamped on the live message and on any
-  recovery replay of it, giving each message a stable identity across both.
+- `e` — the epoch of the message's stream, as an 8-hex string. Each server
+  that publishes to a topic stamps its own stream with its own epoch, so in a
+  cluster one topic interleaves several streams. A server begins a new epoch
+  when it restarts, or when the topic's history was dropped and begins again.
+- `o` — the message's offset within its stream, monotonically increasing. The
+  same `(tp, e, o)` is stamped on the live message and on any recovery replay
+  of it, giving each message a stable identity across both.
 
-Client dedup / gap logic (per topic): a different `e` than last seen → epoch
-changed, accept and re-baseline; `o <= last` on the same epoch → duplicate,
-drop; `o == last + 1` → in order; `o > last + 1` → gap, recover from the last
-in-order position. Control/system messages (`server_ready`, `ping`, …) are **not**
-stamped. The cluster inter-node MSG frame carries the same `(epoch, offset)` in a
-binary trailer (see [Cluster Protocol](CLUSTER_PROTOCOL.md)).
+Client dedup / gap logic, per stream `(tp, e)`: a stream not seen before →
+accept and start it; `o <= last` → duplicate, drop; `o == last + 1` → in
+order; `o > last + 1` → gap, recover from the last in-order position. Each
+stream is in order on its own; a message of one stream is no gap in another.
+Control/system messages (`server_ready`, `ping`, …) are **not** stamped. The
+cluster inter-node MSG frame carries the same `(epoch, offset)` in a binary
+trailer (see [Cluster Protocol](CLUSTER_PROTOCOL.md)).
 
 ## Message Categories
 
@@ -299,16 +302,21 @@ One request covers many topics:
 },"id":"...","v":1}
 ```
 
-To resume after a gap or a reconnect, a subscribe carries `recover: true` and, under `recovery`, the last position the client has for each topic that has one: the `e` and `o` of the last message it delivered in order. Topics without a position are only listed in `topics`. Subscribing to a topic already subscribed is harmless and still recovers.
+To resume after a gap or a reconnect, a subscribe carries `recover: true` and, under `recovery`, the last position the client has for each topic that has one: the `e` and `o` of the last message it delivered in order, and under `streams` the last offset it holds of each stream of the topic. Topics without a position are only listed in `topics`. Subscribing to a topic already subscribed is harmless and still recovers.
 
 ```json
 {"c":"WSE","t":"subscription_update","p":{
   "action": "subscribe",
   "topics": ["chat_messages", "prices"],
   "recover": true,
-  "recovery": {"chat_messages": {"epoch": "0000abcd", "offset": 456}}
+  "recovery": {"chat_messages": {
+    "epoch": "0000abcd", "offset": 456,
+    "streams": {"0000abcd": 456, "00007e57": 88}
+  }}
 },"v":1}
 ```
+
+With `streams`, each stream is replayed from the client's own offset in it, whatever server it was on before: the order in which servers had the streams does not matter. The reply says `recovered: false`, and nothing is replayed, when the server cannot show the client missed nothing: a named stream it does not hold, or holds with a hole after the client's offset, or holds only since it took the topic up again; a stream the client does not name that has a message from before the client's last one, or that the server does not hold from its first message; one of the topic's histories dropped with messages from after the client's last one; more than `recovery_max_messages` in all. A server before 3.1 ignores `streams`. Without them (clients before 3.1), every stream but the last message's is replayed from that message's place in the server's own order, which another server may have had differently.
 
 ### Recovery Reply
 
@@ -320,8 +328,10 @@ A subscribe gets one reply; an unsubscribe gets none. The missed messages of eac
   "success_topics": ["chat_messages", "prices"],
   "failed_topics": [],
   "recovery": {
-    "chat_messages": {"epoch": "0000abcd", "offset": 512, "recovered": true, "count": 56},
-    "prices": {"epoch": "00001f2e", "offset": 90, "recovered": false, "count": 0}
+    "chat_messages": {"epoch": "0000abcd", "offset": 512, "recovered": true, "count": 56,
+                      "streams": {"0000abcd": 512, "00007e57": 93}},
+    "prices": {"epoch": "00001f2e", "offset": 90, "recovered": false, "count": 0,
+               "streams": {"00001f2e": 90}}
   }
 },"v":1}
 ```
@@ -335,6 +345,7 @@ A subscribe gets one reply; an unsubscribe gets none. The missed messages of eac
 | `recovery[topic].offset` | Inclusive: the last offset the client now has. When `recovered` is `false`, the last offset published before the subscription began; everything after it arrives live, so a client may take it as its position without skipping anything |
 | `recovery[topic].recovered` | `true` when every missed message was replayed. `false` when there was no position, the epoch changed (a server restart), the history was evicted or too long (`recovery_max_messages`), or the connection's outbound budget cut the replay short (then `offset` is the last one replayed) |
 | `recovery[topic].count` | Messages replayed |
+| `recovery[topic].streams` | Each stream of the topic the server held when the subscription began, epoch to its last offset there: everything after it arrives live. A client takes, per stream, the larger of its own offset and this one, and forgets a stream it named that is missing here (this server cannot replay it, so naming it again fails every later recovery). From 3.1 |
 
 An omitted `recovered` means `true`. With `client_subscriptions=True` the server answers these requests itself; otherwise the application answers them, with `subscribe_with_recovery(conn_id, topics, recover=True, positions=p["recovery"])` and a reply built from its result.
 
@@ -506,7 +517,7 @@ Sent by the server in response to `client_hello`:
 |-------|------|-------------|
 | `server_version` | `string` | WSE server version |
 | `protocol_version` | `int` | Negotiated protocol version (minimum of client and server) |
-| `features` | `object` | `compression`, `recovery`, `cluster`, `msgpack` and `encryption` describe this server; `batching` and `priority_queue` are always `true`, kept for older clients |
+| `features` | `object` | `compression`, `recovery`, `cluster`, `msgpack` and `encryption` describe this server; `batching` and `priority_queue` are always `true`, kept for older clients. With recovery, `history_ttl` is how many seconds a stream that receives nothing stays recoverable here (from 3.1; also in `server_ready`): a client forgets a stream it heard nothing of for longer, instead of naming it |
 | `limits` | `object` | Server-enforced limits for this connection |
 | `ping_interval` | `int` | Server ping interval in milliseconds |
 | `connection_id` | `string` | Unique connection identifier |

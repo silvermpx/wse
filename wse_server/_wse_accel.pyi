@@ -667,13 +667,16 @@ class RustWSEServer:
         """Subscribe with message recovery.
 
         positions maps each topic to its own {"epoch": "<8 hex>", "offset": n}
-        (the shape the clients send in p["recovery"]); a single epoch and
-        offset apply to every topic. Missed messages are replayed before
+        and, from clients 3.1 on, "streams": {"<8 hex>": n} (the shape the
+        clients send in p["recovery"]); a single epoch and offset apply to
+        every topic. With "streams", each stream of a topic is replayed from
+        the client's own offset in it. Missed messages are replayed before
         anything sent to the connection afterwards. Returns {"recovered":
         bool, "topics": {topic: {"epoch", "offset", "recoverable",
-        "recovered", "count", "subscribed"}}}; "offset" is the last offset the
-        client has (or may take as had). Raises ValueError for a malformed
-        position.
+        "recovered", "count", "subscribed", "streams"}}}; "offset" is the
+        last offset the client has (or may take as had), "streams" each
+        stream's last offset here when the subscription began. Raises
+        ValueError for a malformed position.
         """
         ...
     def unsubscribe_connection(self, conn_id: str, topics: list[str] | None = None) -> None:

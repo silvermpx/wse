@@ -30,7 +30,7 @@ mod server;
 pub use server::{
     ClusterPeer, ClusterSettings, ClusterTls, Config, ConfigError, Connect, DeadLetter, Error,
     Handler, Health, Inbound, JwtKeys, JwtSettings, Member, Presence, PresenceSettings, Publisher,
-    Recovered, RecoverySettings, Server, Subscribe,
+    Recovered, RecoverySettings, Server, Subscribe, TopicPosition,
 };
 
 // The Python module and its helpers: built into the `wse-server` package.

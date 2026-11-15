@@ -52,6 +52,9 @@ impl Default for RecoveryConfig {
     }
 }
 
+/// How often expired and over-budget buffers are removed.
+pub(crate) const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Largest per-topic message limit: 2^16 = 65536 messages.
 pub(crate) const MAX_BUFFER_SIZE_BITS: u32 = 16;
 
@@ -74,6 +77,32 @@ struct RecoveryEntry {
 
 /// A stored message and its place in this node's arrival order.
 type Arrived = (u64, Bytes);
+
+/// The streams' messages in one list: each stream in its own order, the
+/// streams interleaved by when their messages arrived here.
+fn interleave(streams: Vec<Vec<Arrived>>) -> Vec<Bytes> {
+    let mut out = Vec::with_capacity(streams.iter().map(Vec::len).sum());
+    let mut streams: Vec<_> = streams
+        .into_iter()
+        .map(|stream| stream.into_iter().peekable())
+        .collect();
+    while let Some((_, i)) = streams
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(i, stream)| stream.peek().map(|(seq, _)| (*seq, i)))
+        .min()
+    {
+        if let Some((_, data)) = streams[i].next() {
+            out.push(data);
+        }
+    }
+    out
+}
+
+/// The topic of a foreign buffer's key (`topic\0epoch`).
+fn foreign_topic(key: &str) -> &str {
+    key.split_once('\0').map_or(key, |(topic, _)| topic)
+}
 
 // ---------------------------------------------------------------------------
 // TopicRecoveryBuffer -- per-topic ring buffer
@@ -214,6 +243,24 @@ impl TopicRecoveryBuffer {
                     .then(|| self.entries.back().map(|(_, seq)| *seq))
                     .flatten()
             })
+    }
+
+    /// The whole stream, when this node holds all of it (nothing evicted)
+    /// and every message arrived after `seq`.
+    fn whole_after(&self, seq: u64) -> Option<Vec<Arrived>> {
+        (self.evicted_through == 0 && self.entries.iter().all(|(_, s)| *s > seq)).then(|| {
+            self.entries
+                .iter()
+                .map(|(data, s)| (*s, data.clone()))
+                .collect()
+        })
+    }
+
+    /// The latest arrival number among what it holds or evicted (0: none).
+    fn last_seq(&self) -> u64 {
+        self.entries
+            .back()
+            .map_or(self.evicted_through, |(_, seq)| *seq)
     }
 
     /// The messages that arrived after `seq`; None when one of them was
@@ -429,6 +476,39 @@ impl ForeignRecoveryBuffer {
             .map(|entry| entry.seq.saturating_sub(1))
     }
 
+    /// The whole stream, when this node holds all of it from its first
+    /// offset without a hole (nothing evicted) and every message arrived
+    /// after `seq`.
+    fn whole_after(&self, seq: u64) -> Option<Vec<Arrived>> {
+        if !self.initialized || self.tail_offset != 0 || self.evicted_through != 0 {
+            return None;
+        }
+        if self.head_offset > 0 && self.contiguous_through() != Some(self.head_offset - 1) {
+            return None;
+        }
+        let mut held: Vec<&RecoveryEntry> = self.entries.iter().flatten().collect();
+        if held.iter().any(|entry| entry.seq <= seq) {
+            return None;
+        }
+        held.sort_unstable_by_key(|entry| entry.offset);
+        Some(
+            held.into_iter()
+                .map(|entry| (entry.seq, entry.data.clone()))
+                .collect(),
+        )
+    }
+
+    /// The latest arrival number among what it holds or evicted (0: none).
+    fn last_seq(&self) -> u64 {
+        self.entries
+            .iter()
+            .flatten()
+            .map(|entry| entry.seq)
+            .max()
+            .unwrap_or(0)
+            .max(self.evicted_through)
+    }
+
     /// The messages that arrived after `seq`; None when one of them was
     /// evicted already, or one never came (shed on the way, or relayed while
     /// this node had no interest): a hole among them.
@@ -482,6 +562,11 @@ pub(crate) struct RecoveryManager {
     /// topic began: other nodes relay a topic only while this node has it,
     /// so the relayed streams are whole from there on only.
     interest_since: DashMap<String, u64>,
+    /// Per topic with buffers left, the latest arrival among the messages of
+    /// its buffers removed (expired, or over the budget): a client whose last
+    /// message came before it may have missed them, in a stream it never
+    /// heard from.
+    removed_through: DashMap<String, u64>,
     config: RecoveryConfig,
     total_bytes: AtomicUsize,
 }
@@ -494,6 +579,7 @@ impl RecoveryManager {
             foreign_epochs: DashMap::new(),
             arrival: AtomicU64::new(1),
             interest_since: DashMap::new(),
+            removed_through: DashMap::new(),
             config,
             total_bytes: AtomicUsize::new(0),
         }
@@ -816,6 +902,169 @@ impl RecoveryManager {
         }
     }
 
+    /// Recover for a client that names the last offset it holds of each
+    /// stream of `topic` (`named`: epoch, offset), and its last message
+    /// (`anchor`).
+    ///
+    /// Each named stream comes from its own offset, so the order the streams
+    /// arrived in on the client's last node does not matter. A stream it does
+    /// not name comes only whole: held here from its first message, every
+    /// one of which arrived after the anchor. Anything else is not
+    /// recovered, because nothing here proves what the client missed: a
+    /// named stream this node does not hold, or holds with a hole or only
+    /// since its interest in the topic began again; an unnamed one with a
+    /// message from before the anchor; a buffer of the topic removed with
+    /// messages from after it; more than `max_recovery_messages`.
+    pub(crate) fn recover_streams(
+        &self,
+        topic: &str,
+        anchor: (u32, u64),
+        named: &[(u32, u64)],
+    ) -> RecoveryResult {
+        let max = self.config.max_recovery_messages;
+        let not_recovered = RecoveryResult::NotRecovered {
+            epoch: anchor.0,
+            offset: anchor.1,
+        };
+        let position = |epoch: u32| named.iter().find(|(e, _)| *e == epoch).map(|(_, o)| *o);
+        let since = self.interest_since.get(topic).map(|since| *since);
+        let foreign_epochs: Vec<u32> = self
+            .foreign_epochs
+            .get(topic)
+            .map(|epochs| epochs.clone())
+            .unwrap_or_default();
+
+        // Where the client's last message stands in this node's arrival
+        // order, if it is here.
+        let local_anchor = self
+            .buffers
+            .get(topic)
+            .filter(|buf| buf.epoch == anchor.0)
+            .map(|buf| buf.seq_at(anchor.1));
+        let anchor_seq = match local_anchor {
+            Some(seq) => seq,
+            None => self
+                .foreign_buffers
+                .get(&format!("{topic}\0{}", anchor.0))
+                .and_then(|fbuf| fbuf.seq_at(anchor.1)),
+        };
+        if let Some(removed) = self.removed_through.get(topic).map(|r| *r)
+            && anchor_seq.is_none_or(|seq| removed > seq)
+        {
+            return not_recovered;
+        }
+
+        let mut streams: Vec<Vec<Arrived>> = Vec::with_capacity(foreign_epochs.len() + 1);
+        let mut missed = 0usize;
+        let mut head = anchor.1.saturating_add(1);
+        let mut seen: Vec<u32> = Vec::with_capacity(foreign_epochs.len() + 1);
+
+        if let Some(buf) = self.buffers.get(topic) {
+            seen.push(buf.epoch);
+            if buf.epoch == anchor.0 {
+                head = head.max(buf.head_offset);
+            }
+            let more = match position(buf.epoch) {
+                Some(offset) => {
+                    missed += buf.head_offset.saturating_sub(offset.saturating_add(1)) as usize;
+                    if missed > max {
+                        return not_recovered;
+                    }
+                    buf.recover_since(offset, max)
+                }
+                None => anchor_seq.and_then(|seq| buf.whole_after(seq)),
+            };
+            let Some(more) = more else {
+                return not_recovered;
+            };
+            streams.push(more);
+        }
+
+        for epoch in foreign_epochs {
+            let Some(fbuf) = self.foreign_buffers.get(&format!("{topic}\0{epoch}")) else {
+                continue;
+            };
+            seen.push(epoch);
+            if epoch == anchor.0 {
+                head = head.max(fbuf.head_offset);
+            }
+            // Relayed here only while this node has the topic: whole only
+            // from where its current interest began.
+            let more = match position(epoch) {
+                Some(offset) => {
+                    // The first message it needs, or with none, the newest
+                    // here: everything after it came while this node had
+                    // the topic.
+                    let first = offset.saturating_add(1);
+                    let from = if first >= fbuf.head_offset {
+                        fbuf.seq_at(fbuf.head_offset.saturating_sub(1))
+                    } else {
+                        fbuf.seq_at(first)
+                    };
+                    let covered = from.is_some_and(|seq| since.is_some_and(|since| seq >= since));
+                    missed += fbuf.head_offset.saturating_sub(first) as usize;
+                    if !covered || missed > max {
+                        return not_recovered;
+                    }
+                    fbuf.recover_since(offset, max)
+                }
+                None => anchor_seq
+                    .filter(|_| {
+                        fbuf.entries
+                            .iter()
+                            .flatten()
+                            .map(|entry| entry.seq)
+                            .min()
+                            .is_none_or(|first| since.is_some_and(|since| first >= since))
+                    })
+                    .and_then(|seq| fbuf.whole_after(seq)),
+            };
+            let Some(more) = more else {
+                return not_recovered;
+            };
+            streams.push(more);
+        }
+
+        // A stream the client names that this node does not hold.
+        if named.iter().any(|(epoch, _)| !seen.contains(epoch)) {
+            return not_recovered;
+        }
+        if streams.iter().map(Vec::len).sum::<usize>() > max {
+            return not_recovered;
+        }
+        RecoveryResult::Recovered {
+            publications: interleave(streams),
+            epoch: anchor.0,
+            offset: head.saturating_sub(1),
+        }
+    }
+
+    /// The streams this node holds of `topic`: each one's epoch and the last
+    /// offset here. Read once a connection subscribed, it is where the
+    /// connection starts in each: what comes after reaches it live.
+    pub(crate) fn streams(&self, topic: &str) -> Vec<(u32, u64)> {
+        let mut streams = Vec::new();
+        if let Some(buf) = self.buffers.get(topic)
+            && buf.head_offset > 0
+        {
+            streams.push((buf.epoch, buf.head_offset - 1));
+        }
+        let foreign_epochs: Vec<u32> = self
+            .foreign_epochs
+            .get(topic)
+            .map(|epochs| epochs.clone())
+            .unwrap_or_default();
+        for epoch in foreign_epochs {
+            if let Some(fbuf) = self.foreign_buffers.get(&format!("{topic}\0{epoch}"))
+                && fbuf.initialized
+                && fbuf.head_offset > 0
+            {
+                streams.push((epoch, fbuf.head_offset - 1));
+            }
+        }
+        streams
+    }
+
     /// Get the current (epoch, head_offset) for a topic, if a buffer exists.
     pub(crate) fn get_position(&self, topic: &str) -> Option<(u32, u64)> {
         self.buffers
@@ -844,6 +1093,7 @@ impl RecoveryManager {
         }
         for key in &to_remove {
             if let Some((_, removed)) = self.buffers.remove(key) {
+                self.note_removed(key, removed.last_seq());
                 let _ = self
                     .total_bytes
                     .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
@@ -862,6 +1112,7 @@ impl RecoveryManager {
         for key in &foreign_to_remove {
             if let Some((_, removed)) = self.foreign_buffers.remove(key) {
                 self.forget_foreign(key, removed.epoch);
+                self.note_removed(foreign_topic(key), removed.last_seq());
                 let _ = self
                     .total_bytes
                     .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
@@ -901,6 +1152,7 @@ impl RecoveryManager {
                 }
                 if is_local {
                     if let Some((_, removed)) = self.buffers.remove(&key) {
+                        self.note_removed(&key, removed.last_seq());
                         let _ = self.total_bytes.try_update(
                             Ordering::Relaxed,
                             Ordering::Relaxed,
@@ -909,6 +1161,7 @@ impl RecoveryManager {
                     }
                 } else if let Some((_, removed)) = self.foreign_buffers.remove(&key) {
                     self.forget_foreign(&key, removed.epoch);
+                    self.note_removed(foreign_topic(&key), removed.last_seq());
                     let _ =
                         self.total_bytes
                             .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
@@ -917,6 +1170,29 @@ impl RecoveryManager {
                 }
             }
         }
+
+        // A topic with no buffer left recovers nothing: what was removed of
+        // it no longer matters.
+        let gone: Vec<String> = self
+            .removed_through
+            .iter()
+            .map(|entry| entry.key().clone())
+            .filter(|topic| {
+                !self.buffers.contains_key(topic) && !self.foreign_epochs.contains_key(topic)
+            })
+            .collect();
+        for topic in gone {
+            self.removed_through.remove(&topic);
+        }
+    }
+
+    /// A buffer of `topic` was removed with messages up to arrival `seq`.
+    fn note_removed(&self, topic: &str, seq: u64) {
+        if seq == 0 {
+            return;
+        }
+        let mut through = self.removed_through.entry(topic.to_owned()).or_insert(0);
+        *through = (*through).max(seq);
     }
 
     /// This node took an interest in `topic` (its first local subscriber,
@@ -951,6 +1227,15 @@ impl RecoveryManager {
             self.foreign_epochs
                 .remove_if(topic, |_, epochs| epochs.is_empty());
         }
+    }
+
+    /// How long, in seconds, a stream that receives nothing is still kept
+    /// here (its history's lifetime, until the next cleanup): a client that
+    /// heard nothing of a stream for longer can forget it.
+    pub(crate) fn history_secs(&self) -> u64 {
+        self.config
+            .history_ttl_secs
+            .saturating_add(CLEANUP_INTERVAL.as_secs())
     }
 
     /// Return the number of topic buffers currently held.
@@ -1490,6 +1775,222 @@ mod tests {
             mgr.recover("room", epoch, 0),
             RecoveryResult::NotRecovered { .. }
         ));
+    }
+
+    /// The texts of a recovery, or None when it did not recover.
+    fn replayed(result: RecoveryResult) -> Option<Vec<String>> {
+        match result {
+            RecoveryResult::Recovered { publications, .. } => Some(
+                publications
+                    .iter()
+                    .map(|p| String::from_utf8(p.to_vec()).unwrap())
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_client_from_a_node_that_saw_the_streams_in_another_order_loses_nothing() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.interest_began("room");
+        let (a, b) = (0xa, 0xb);
+        mgr.push_foreign("room", make_data("a0"), a, 0);
+        mgr.push_foreign("room", make_data("b0"), b, 0);
+        // This node had b1 before a1; the client's node had a1 first, and
+        // the client got a1 only.
+        mgr.push_foreign("room", make_data("b1"), b, 1);
+        mgr.push_foreign("room", make_data("a1"), a, 1);
+        assert_eq!(
+            replayed(mgr.recover_streams("room", (a, 1), &[(a, 1), (b, 0)])),
+            Some(vec!["b1".to_owned()])
+        );
+    }
+
+    #[test]
+    fn every_named_stream_comes_from_its_own_offset() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.interest_began("room");
+        mgr.push("room", make_data("l0"));
+        mgr.push_foreign("room", make_data("f0"), 7, 0);
+        mgr.push("room", make_data("l1"));
+        mgr.push_foreign("room", make_data("f1"), 7, 1);
+        mgr.push("room", make_data("l2"));
+        let (local, _) = mgr.get_position("room").unwrap();
+        // In this node's arrival order.
+        assert_eq!(
+            replayed(mgr.recover_streams("room", (local, 0), &[(local, 0), (7, 0)])),
+            Some(vec!["l1".to_owned(), "f1".to_owned(), "l2".to_owned()])
+        );
+        // Up to date in both: nothing.
+        assert_eq!(
+            replayed(mgr.recover_streams("room", (local, 2), &[(local, 2), (7, 1)])),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn a_named_stream_this_node_does_not_hold_is_not_recovered() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.interest_began("room");
+        mgr.push_foreign("room", make_data("a0"), 0xa, 0);
+        assert_eq!(
+            replayed(mgr.recover_streams("room", (0xa, 0), &[(0xa, 0), (0xc, 4)])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_named_stream_with_a_hole_after_the_position_is_not_recovered() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.interest_began("room");
+        mgr.push_foreign("room", make_data("a0"), 0xa, 0);
+        // a1 was shed on the way here.
+        mgr.push_foreign("room", make_data("a2"), 0xa, 2);
+        assert_eq!(
+            replayed(mgr.recover_streams("room", (0xa, 0), &[(0xa, 0)])),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unnamed_stream_that_came_before_the_last_message_is_not_recovered() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.interest_began("room");
+        // c0 came here before a0: whether the client should have had it
+        // nothing here says.
+        mgr.push_foreign("room", make_data("c0"), 0xc, 0);
+        mgr.push_foreign("room", make_data("a0"), 0xa, 0);
+        assert_eq!(
+            replayed(mgr.recover_streams("room", (0xa, 0), &[(0xa, 0)])),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unnamed_stream_that_came_after_the_last_message_is_replayed() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.interest_began("room");
+        mgr.push_foreign("room", make_data("a0"), 0xa, 0);
+        mgr.push_foreign("room", make_data("c0"), 0xc, 0);
+        mgr.push_foreign("room", make_data("c1"), 0xc, 1);
+        assert_eq!(
+            replayed(mgr.recover_streams("room", (0xa, 0), &[(0xa, 0)])),
+            Some(vec!["c0".to_owned(), "c1".to_owned()])
+        );
+    }
+
+    #[test]
+    fn an_unnamed_stream_held_from_its_middle_is_not_recovered() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.interest_began("room");
+        mgr.push_foreign("room", make_data("a0"), 0xa, 0);
+        // What came of c before c5 this node never had.
+        mgr.push_foreign("room", make_data("c5"), 0xc, 5);
+        assert_eq!(
+            replayed(mgr.recover_streams("room", (0xa, 0), &[(0xa, 0)])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stream_removed_after_the_last_message_is_not_recovered() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.interest_began("room");
+        mgr.push_foreign("room", make_data("a0"), 0xa, 0);
+        mgr.push_foreign("room", make_data("c0"), 0xc, 0);
+        std::thread::sleep(Duration::from_millis(2));
+        mgr.push_foreign("room", make_data("a1"), 0xa, 1);
+        // Over the memory budget the oldest buffer goes: c, with what the
+        // client missed.
+        let budget = mgr.total_bytes() - 1;
+        let mgr = RecoveryManager {
+            config: RecoveryConfig {
+                global_memory_budget: budget,
+                ..RecoveryConfig::default()
+            },
+            ..mgr
+        };
+        mgr.cleanup();
+        assert!(!mgr.streams("room").iter().any(|(epoch, _)| *epoch == 0xc));
+        assert_eq!(
+            replayed(mgr.recover_streams("room", (0xa, 0), &[(0xa, 0)])),
+            None
+        );
+    }
+
+    #[test]
+    fn more_than_the_recovery_limit_is_not_recovered() {
+        let mgr = RecoveryManager::new(RecoveryConfig {
+            max_recovery_messages: 2,
+            ..RecoveryConfig::default()
+        });
+        mgr.interest_began("room");
+        for i in 0..2 {
+            mgr.push_foreign("room", make_data("a"), 0xa, i);
+            mgr.push_foreign("room", make_data("b"), 0xb, i);
+        }
+        assert_eq!(
+            replayed(mgr.recover_streams("room", (0xa, 0), &[(0xa, 0), (0xb, 0)])),
+            Some(vec!["a".to_owned(), "b".to_owned()])
+        );
+        mgr.push_foreign("room", make_data("b"), 0xb, 2);
+        assert_eq!(
+            replayed(mgr.recover_streams("room", (0xa, 0), &[(0xa, 0), (0xb, 0)])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_named_stream_relayed_before_the_topic_came_back_here_is_not_recovered() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.interest_began("room");
+        mgr.push_foreign("room", make_data("a0"), 0xa, 0);
+        mgr.push_foreign("room", make_data("a1"), 0xa, 1);
+        assert!(replayed(mgr.recover_streams("room", (0xa, 1), &[(0xa, 1)])).is_some());
+        // The topic left this node and came back: what was published in
+        // between was not relayed here.
+        mgr.interest_ended("room");
+        mgr.interest_began("room");
+        assert_eq!(
+            replayed(mgr.recover_streams("room", (0xa, 1), &[(0xa, 1)])),
+            None
+        );
+        assert_eq!(
+            replayed(mgr.recover_streams("room", (0xa, 0), &[(0xa, 0)])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stream_relayed_out_of_order_is_replayed_in_its_own_order() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.interest_began("room");
+        mgr.push_foreign("room", make_data("a0"), 0xa, 0);
+        mgr.push_foreign("room", make_data("b0"), 0xb, 0);
+        mgr.push_foreign("room", make_data("b2"), 0xb, 2);
+        mgr.push_foreign("room", make_data("a1"), 0xa, 1);
+        mgr.push_foreign("room", make_data("b1"), 0xb, 1);
+        assert_eq!(
+            replayed(mgr.recover_streams("room", (0xa, 0), &[(0xa, 0), (0xb, 0)])),
+            Some(vec!["a1".to_owned(), "b1".to_owned(), "b2".to_owned()])
+        );
+    }
+
+    #[test]
+    fn the_streams_of_a_topic_are_what_this_node_holds_at_their_last_offsets() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.interest_began("room");
+        assert!(mgr.streams("room").is_empty());
+        mgr.push("room", make_data("l0"));
+        mgr.push("room", make_data("l1"));
+        mgr.push_foreign("room", make_data("f3"), 7, 3);
+        let (local, _) = mgr.get_position("room").unwrap();
+        let mut streams = mgr.streams("room");
+        streams.sort_unstable();
+        let mut expected = vec![(local, 1), (7, 3)];
+        expected.sort_unstable();
+        assert_eq!(streams, expected);
     }
 
     #[test]

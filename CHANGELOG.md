@@ -2,7 +2,26 @@
 
 ## Unreleased
 
+### Added
+
+- Recovery positions per stream. A client may name, with its recovery
+  request, the last offset it holds of each stream of a topic (`streams`:
+  one per server that publishes to it); the server then replays each stream
+  from that offset. The subscription reply lists each stream the server
+  holds, with its last offset (`streams`), and `server_hello` and
+  `server_ready` say how long a quiet stream stays recoverable
+  (`features.history_ttl`). Python: `subscribe_with_recovery(positions=...)`
+  takes `streams` and returns them; Rust: `TopicPosition` and
+  `Publisher::subscribe_with_positions`.
+
 ### Fixed
+
+- Server: recovery from positions per stream no longer depends on the order
+  in which a node had the topic's streams. A client that moved to another
+  node of a cluster, and named its offsets, could otherwise be told
+  `recovered` while a message of another stream was missing (the old single
+  position is still read as before). The reply is `recovered: false` when
+  nothing on the node shows the client missed nothing.
 
 - Rust client: one user's queued messages and recovery positions never go
   out on the next user's connection. When the token provider's next token

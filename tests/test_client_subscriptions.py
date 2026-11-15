@@ -168,6 +168,88 @@ class TestRecovery:
             srv.stop()
 
     @pytest.mark.asyncio
+    async def test_the_reply_names_each_stream_of_the_topic_held_here(self, server_port):
+        """Where the client starts in each stream: what follows comes live."""
+        srv = start_server(server_port)
+        try:
+            async with await connect(server_port, make_token()) as ws:
+                drain_until(srv, "auth_connect")
+                await ws.send(request("subscribe", ["a"]))
+                _, reply = await messages_until_reply(ws)
+                assert reply["p"]["recovery"]["a"]["streams"] == {}
+                for n in range(3):
+                    publish(srv, "a", n)
+                async with asyncio.timeout(5):
+                    seen = []
+                    while len(seen) < 3:
+                        msg = json.loads(await ws.recv())
+                        if msg.get("tp") == "a":
+                            seen.append(msg)
+            async with await connect(server_port, make_token()) as ws:
+                drain_until(srv, "auth_connect")
+                await ws.send(request("subscribe", ["a"]))
+                _, reply = await messages_until_reply(ws)
+            assert reply["p"]["recovery"]["a"]["streams"] == {seen[-1]["e"]: seen[-1]["o"]}
+        finally:
+            srv.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_client_naming_its_streams_gets_each_from_its_own_offset(self, server_port):
+        srv = start_server(server_port)
+        try:
+            async with await connect(server_port, make_token()) as ws:
+                drain_until(srv, "auth_connect")
+                await ws.send(request("subscribe", ["a"]))
+                await messages_until_reply(ws)
+                publish(srv, "a", 0)
+                publish(srv, "a", 1)
+                async with asyncio.timeout(5):
+                    seen = []
+                    while len(seen) < 2:
+                        msg = json.loads(await ws.recv())
+                        if msg.get("tp") == "a":
+                            seen.append(msg)
+            for n in range(2, 5):
+                publish(srv, "a", n)
+            epoch, offset = seen[0]["e"], seen[0]["o"]
+            position = {"epoch": epoch, "offset": offset, "streams": {epoch: offset}}
+            async with await connect(server_port, make_token()) as ws:
+                drain_until(srv, "auth_connect")
+                await ws.send(request("subscribe", ["a"], {"a": position}))
+                replayed, reply = await messages_until_reply(ws)
+            assert [m["p"]["n"] for m in replayed] == [1, 2, 3, 4]
+            rec = reply["p"]["recovery"]["a"]
+            assert rec["recovered"] is True and rec["count"] == 4
+            assert rec["streams"] == {epoch: replayed[-1]["o"]}
+
+            # A stream it names that this node never had: nothing proves
+            # what it missed there.
+            position["streams"]["0badf00d"] = 7
+            async with await connect(server_port, make_token()) as ws:
+                drain_until(srv, "auth_connect")
+                await ws.send(request("subscribe", ["a"], {"a": position}))
+                replayed, reply = await messages_until_reply(ws)
+            assert replayed == []
+            assert reply["p"]["recovery"]["a"]["recovered"] is False
+        finally:
+            srv.stop()
+
+    @pytest.mark.asyncio
+    async def test_server_ready_says_how_long_a_quiet_stream_is_kept(self, server_port):
+        srv = start_server(server_port, recovery_ttl=60)
+        try:
+            async with await connect(server_port, make_token()) as ws:
+                async with asyncio.timeout(5):
+                    while True:
+                        msg = json.loads(await ws.recv())
+                        if msg.get("t") == "server_ready":
+                            break
+            # The history's lifetime, until the next cleanup.
+            assert msg["p"]["details"]["features"]["history_ttl"] == 90
+        finally:
+            srv.stop()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("limit", [1, None])
     async def test_a_held_topic_recovers_at_the_subscription_limit(self, server_port, limit):
         """A topic the connection holds is no new subscription: asking to

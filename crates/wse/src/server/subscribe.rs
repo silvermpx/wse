@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
+use super::control::TopicPosition;
 use super::handler::Presence;
 use super::{
     ConnectionHandle, QueueGroup, ServerCommand, SharedState, format_presence_msg, is_pattern,
@@ -27,32 +28,48 @@ pub(crate) const MAX_TOPICS_PER_REQUEST: usize = 1024;
 /// `max_subscriptions_per_connection`: the application may subscribe it to
 /// more, a client alone not.
 pub(crate) const CLIENT_SUBSCRIPTION_LIMIT: usize = 1024;
+/// Streams of one topic a client may name in a recovery request: more than
+/// its clients remember.
+pub(crate) const MAX_STREAMS_PER_TOPIC: usize = 64;
 
 /// What a recovery did for one topic, in the terms the clients read: the
 /// topic's epoch and an offset (inclusive: the last one the client has, or
 /// may take as had), whether the gap was filled, and how many messages were
 /// replayed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TopicRecovery {
     pub(crate) epoch: Option<u32>,
     pub(crate) offset: u64,
     pub(crate) recovered: bool,
     pub(crate) recoverable: bool,
     pub(crate) count: usize,
+    /// Each stream of the topic this node held when the connection
+    /// subscribed (epoch, last offset): where the client starts in it.
+    pub(crate) streams: Vec<(u32, u64)>,
 }
 
 impl TopicRecovery {
     /// A topic with no position to report.
-    const UNKNOWN: Self = Self {
+    pub(crate) const UNKNOWN: Self = Self {
         epoch: None,
         offset: 0,
         recovered: false,
         recoverable: false,
         count: 0,
+        streams: Vec::new(),
     };
 
     pub(crate) fn epoch_hex(&self) -> Option<String> {
         self.epoch.map(|epoch| format!("{epoch:08x}"))
+    }
+
+    /// The streams as the clients read them: epoch (8 hex digits) -> offset.
+    pub(crate) fn streams_json(&self) -> serde_json::Value {
+        self.streams
+            .iter()
+            .map(|(epoch, offset)| (format!("{epoch:08x}"), serde_json::Value::from(*offset)))
+            .collect::<serde_json::Map<_, _>>()
+            .into()
     }
 }
 
@@ -416,10 +433,11 @@ impl SharedState {
         self.recovery.as_ref().and_then(|r| r.get_position(topic))
     }
 
-    /// Replay to `handle` the messages of `topic` after `anchor` (the
-    /// client's last (epoch, offset)), queued before anything sent to the
-    /// connection after this call. `head_before` is the topic's head taken
-    /// before the connection subscribed.
+    /// Replay to `handle` the messages of `topic` the client missed after
+    /// `position` (its last message, and from 3.1 its offset in each stream),
+    /// queued before anything sent to the connection after this call.
+    /// `head_before` is the topic's head taken once the connection
+    /// subscribed, `streams` every stream's then.
     ///
     /// When nothing is recovered, the reported position is the last offset
     /// before the subscription: what follows reaches the client live, so a
@@ -430,8 +448,9 @@ impl SharedState {
         &self,
         handle: &ConnectionHandle,
         topic: &str,
-        anchor: Option<(u32, u64)>,
+        position: Option<&TopicPosition>,
         head_before: Option<(u32, u64)>,
+        streams: Vec<(u32, u64)>,
     ) -> TopicRecovery {
         let Some(ref recovery) = self.recovery else {
             return TopicRecovery::UNKNOWN;
@@ -443,13 +462,28 @@ impl SharedState {
                 recovered: false,
                 recoverable: true,
                 count: 0,
+                streams: streams.clone(),
             },
-            _ => TopicRecovery::UNKNOWN,
+            _ => TopicRecovery {
+                streams: streams.clone(),
+                ..TopicRecovery::UNKNOWN
+            },
         };
-        let Some((epoch, after)) = anchor else {
+        let Some(position) = position else {
             return not_recovered;
         };
-        match recovery.recover(topic, epoch, after) {
+        let (epoch, after) = (position.epoch, position.offset);
+        let result = match &position.streams {
+            Some(named) if named.len() <= MAX_STREAMS_PER_TOPIC => {
+                recovery.recover_streams(topic, (epoch, after), named)
+            }
+            Some(_) => RecoveryResult::NotRecovered {
+                epoch,
+                offset: after,
+            },
+            None => recovery.recover(topic, epoch, after),
+        };
+        match result {
             RecoveryResult::Recovered {
                 publications,
                 epoch,
@@ -480,6 +514,7 @@ impl SharedState {
                     recovered: queued == total,
                     recoverable: true,
                     count: queued,
+                    streams,
                 }
             }
             RecoveryResult::NotRecovered { epoch, offset } => {
@@ -504,19 +539,29 @@ impl SharedState {
         conn_id: &str,
         handle: &ConnectionHandle,
         requested: Vec<String>,
-        anchors: &HashMap<String, (u32, u64)>,
+        positions: &HashMap<String, TopicPosition>,
     ) -> Result<(Vec<String>, HashMap<String, TopicRecovery>), usize> {
         let accepted = self.admit_topics(conn_id, requested, None)?;
         self.subscribe_topics(conn_id, handle, &accepted, None);
-        let heads: Vec<Option<(u32, u64)>> = accepted.iter().map(|t| self.topic_head(t)).collect();
+        // Each topic's head and streams, read now that it is subscribed.
+        let heads: Vec<_> = accepted
+            .iter()
+            .map(|t| {
+                let streams = self
+                    .recovery
+                    .as_ref()
+                    .map(|r| r.streams(t))
+                    .unwrap_or_default();
+                (self.topic_head(t), streams)
+            })
+            .collect();
         let recovered = accepted
             .iter()
             .zip(heads)
-            .map(|(topic, head)| {
-                let anchor = anchors.get(topic).copied();
+            .map(|(topic, (head, streams))| {
                 (
                     topic.clone(),
-                    self.recover_topic(handle, topic, anchor, head),
+                    self.recover_topic(handle, topic, positions.get(topic), head, streams),
                 )
             })
             .collect();
@@ -544,11 +589,27 @@ pub(crate) fn requested_compression(
 }
 
 /// A client's position for a topic as it sends it: `{"epoch": "<8 hex>",
-/// "offset": <int>}`.
-pub(crate) fn parse_anchor(position: &serde_json::Value) -> Option<(u32, u64)> {
+/// "offset": <int>}`, and from 3.1 `"streams": {"<8 hex>": <int>, ...}`.
+pub(crate) fn parse_position(position: &serde_json::Value) -> Option<TopicPosition> {
     let epoch = u32::from_str_radix(position.get("epoch")?.as_str()?, 16).ok()?;
     let offset = position.get("offset")?.as_u64()?;
-    Some((epoch, offset))
+    let streams = match position.get("streams") {
+        None => None,
+        Some(streams) => Some(
+            streams
+                .as_object()?
+                .iter()
+                .map(|(epoch, offset)| {
+                    Some((u32::from_str_radix(epoch, 16).ok()?, offset.as_u64()?))
+                })
+                .collect::<Option<Vec<_>>>()?,
+        ),
+    };
+    Some(TopicPosition {
+        epoch,
+        offset,
+        streams,
+    })
 }
 
 /// Answer a client's own `subscription_update` (with `client_subscriptions`
@@ -583,13 +644,15 @@ pub(crate) fn answer_subscription_request(
         _ => return,
     }
     let recover = p.get("recover").and_then(serde_json::Value::as_bool) == Some(true);
-    let anchors: HashMap<String, (u32, u64)> = if recover {
+    let positions: HashMap<String, TopicPosition> = if recover {
         p.get("recovery")
             .and_then(serde_json::Value::as_object)
             .map(|positions| {
                 positions
                     .iter()
-                    .filter_map(|(topic, position)| Some((topic.clone(), parse_anchor(position)?)))
+                    .filter_map(|(topic, position)| {
+                        Some((topic.clone(), parse_position(position)?))
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -629,7 +692,7 @@ pub(crate) fn answer_subscription_request(
     let (accepted, recovered) = if handle.out.admitted.load(Ordering::Acquire) && !asked.is_empty()
     {
         state
-            .subscribe_and_recover(conn_id, handle, asked, &anchors)
+            .subscribe_and_recover(conn_id, handle, asked, &positions)
             .unwrap_or_default()
     } else {
         Default::default()
@@ -649,6 +712,7 @@ pub(crate) fn answer_subscription_request(
                     "offset": r.offset,
                     "recovered": r.recovered,
                     "count": r.count,
+                    "streams": r.streams_json(),
                 }),
             )
         })

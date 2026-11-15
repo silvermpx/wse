@@ -11,7 +11,8 @@ use super::RustWSEServer;
 use super::convert::pyobj_to_json;
 use super::messaging::py_error;
 use crate::server::Subscribe;
-use crate::server::subscribe::parse_anchor;
+use crate::server::TopicPosition;
+use crate::server::subscribe::parse_position;
 
 impl RustWSEServer {
     pub(super) fn set_topic_acl_impl(
@@ -59,16 +60,17 @@ impl RustWSEServer {
         positions: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Py<PyDict>> {
         // Each topic recovers from its own position: `positions` maps a topic
-        // to {"epoch": "<8 hex>", "offset": n}, the shape the clients send;
-        // a single epoch/offset applies to every topic.
-        let mut anchors: HashMap<String, (u32, u64)> = HashMap::new();
+        // to {"epoch": "<8 hex>", "offset": n, "streams": {"<8 hex>": n}},
+        // the shape the clients send; a single epoch/offset applies to every
+        // topic.
+        let mut anchors: HashMap<String, TopicPosition> = HashMap::new();
         if recover {
             if let Some(positions) = positions {
                 for (topic, position) in positions.iter() {
                     let topic: String = topic.extract()?;
-                    let anchor = parse_anchor(&pyobj_to_json(&position)?).ok_or_else(|| {
+                    let anchor = parse_position(&pyobj_to_json(&position)?).ok_or_else(|| {
                         PyValueError::new_err(format!(
-                            "positions[{topic:?}] must be {{\"epoch\": \"<8 hex digits>\", \"offset\": <int>}}"
+                            "positions[{topic:?}] must be {{\"epoch\": \"<8 hex digits>\", \"offset\": <int>}}, with \"streams\": {{\"<8 hex digits>\": <int>}} if any"
                         ))
                     })?;
                     anchors.insert(topic, anchor);
@@ -77,14 +79,14 @@ impl RustWSEServer {
                 let epoch = u32::from_str_radix(epoch, 16)
                     .map_err(|e| PyValueError::new_err(format!("Invalid epoch hex string: {e}")))?;
                 for topic in &topics {
-                    anchors.insert(topic.clone(), (epoch, offset));
+                    anchors.insert(topic.clone(), TopicPosition::new(epoch, offset));
                 }
             }
         }
         let engine = self.engine();
         let asked = topics.clone();
         let results = py
-            .detach(|| engine.subscribe_with_recovery(conn_id, topics, &anchors))
+            .detach(|| engine.subscribe_with_positions(conn_id, topics, &anchors))
             .map_err(py_error)?;
 
         let topics_dict = PyDict::new(py);
@@ -99,6 +101,11 @@ impl RustWSEServer {
             topic_dict.set_item("recovered", r.recovered)?;
             topic_dict.set_item("count", r.count)?;
             topic_dict.set_item("subscribed", r.subscribed)?;
+            let streams = PyDict::new(py);
+            for (epoch, offset) in &r.streams {
+                streams.set_item(format!("{epoch:08x}"), offset)?;
+            }
+            topic_dict.set_item("streams", streams)?;
             topics_dict.set_item(topic.as_str(), topic_dict)?;
         }
         let result_dict = PyDict::new(py);
