@@ -15,7 +15,8 @@
   4429 after ten seconds.
 - Server: a connection at its subscription limit (configured, or the 1,024
   topics a client may hold on its own) can still recover a topic it holds:
-  only new topics count against the limit.
+  only new memberships count against the limit (a queue group of a topic
+  it holds is a new one).
 - Server: `drain()` returns only once the server refuses new connections,
   also when there is nobody to wait for, so no client gets in after it.
 - Python client: `disconnect()` while `connect()` waits for the server ends

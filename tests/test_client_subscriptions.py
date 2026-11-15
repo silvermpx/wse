@@ -205,6 +205,27 @@ class TestRecovery:
             srv.stop()
 
     @pytest.mark.asyncio
+    async def test_queue_groups_of_a_held_topic_count_against_the_limit(self, server_port):
+        """A queue-group membership of a topic the connection holds is a new
+        membership: at the limit it is refused, while recovering the held
+        topic still is not."""
+        srv = start_server(server_port, max_subscriptions_per_connection=1)
+        try:
+            async with await connect(server_port, make_token()):
+                _, conn_id, _ = drain_until(srv, "auth_connect")
+                assert srv.subscribe_connection(conn_id, ["a"]) == ["a"]
+                for group in ("g1", "g2", "g3"):
+                    try:
+                        taken = srv.subscribe_connection(conn_id, ["a"], queue_group=group)
+                    except RuntimeError:
+                        taken = []
+                    assert taken == [], group
+                # The held topic itself is still taken again (to recover it).
+                assert srv.subscribe_connection(conn_id, ["a"]) == ["a"]
+        finally:
+            srv.stop()
+
+    @pytest.mark.asyncio
     async def test_an_unknown_epoch_reports_the_last_offset_before_subscribing(self, server_port):
         srv = start_server(server_port)
         try:

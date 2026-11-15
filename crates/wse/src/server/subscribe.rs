@@ -60,12 +60,14 @@ impl SharedState {
     /// The topics of `requested` that `conn_id` may take: allowed by its topic
     /// ACL, valid names (not empty, at most `MAX_TOPIC_LEN` bytes, no ASCII
     /// control characters: the cluster RESYNC newline-delimits topics), within
-    /// its pattern budget and `max_subscriptions_per_connection`.
+    /// its pattern budget and `max_subscriptions_per_connection`, for a
+    /// plain subscription or a membership of `queue_group`.
     /// `Err(limit)` when the connection holds that many already.
     pub(crate) fn admit_topics(
         &self,
         conn_id: &str,
         requested: Vec<String>,
+        queue_group: Option<&str>,
     ) -> Result<Vec<String>, usize> {
         let mut topics: Vec<String> = match self.topics.acls.get(conn_id) {
             Some(acl) => requested
@@ -108,14 +110,22 @@ impl SharedState {
         }
         let max_subs = self.max_subscriptions_per_connection;
         if max_subs > 0 {
-            // Only a topic the connection does not hold yet takes room: one
-            // it holds stays eligible (to recover it, say).
+            // Only a membership the connection does not hold yet takes
+            // room: the same one again (a held topic, to recover it; or the
+            // same queue group) does not, a new kind of it does.
+            let memberships = self.conn_queue_groups.get(conn_id);
             let current = held.as_ref().map_or(0, |held| held.len())
-                + self.conn_queue_groups.get(conn_id).map_or(0, |v| v.len());
+                + memberships.as_ref().map_or(0, |v| v.len());
+            let held_already = |t: &String| match queue_group {
+                None => held.as_ref().is_some_and(|held| held.contains(t)),
+                Some(group) => memberships
+                    .as_ref()
+                    .is_some_and(|v| v.iter().any(|(topic, g)| topic == t && g == group)),
+            };
             let mut room = max_subs.saturating_sub(current);
             let mut refused = false;
             topics.retain(|t| {
-                if held.as_ref().is_some_and(|held| held.contains(t)) {
+                if held_already(t) {
                     return true;
                 }
                 if room == 0 {
@@ -496,7 +506,7 @@ impl SharedState {
         requested: Vec<String>,
         anchors: &HashMap<String, (u32, u64)>,
     ) -> Result<(Vec<String>, HashMap<String, TopicRecovery>), usize> {
-        let accepted = self.admit_topics(conn_id, requested)?;
+        let accepted = self.admit_topics(conn_id, requested, None)?;
         self.subscribe_topics(conn_id, handle, &accepted, None);
         let heads: Vec<Option<(u32, u64)>> = accepted.iter().map(|t| self.topic_head(t)).collect();
         let recovered = accepted

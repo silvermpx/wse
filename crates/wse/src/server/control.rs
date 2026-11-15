@@ -118,7 +118,7 @@ fn subscribe(
     options: &Subscribe,
 ) -> Result<Vec<String>, Error> {
     let accepted = shared
-        .admit_topics(conn_id, topics)
+        .admit_topics(conn_id, topics, options.queue_group.as_deref())
         .map_err(|max| Error::TooManyTopics(conn_id.to_owned(), max))?;
     shared.subscribe_topics(conn_id, handle, &accepted, options.queue_group.as_deref());
     // Gone meanwhile: its cleanup (it removes the activity entry first) may
