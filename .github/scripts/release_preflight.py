@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Release checks for wse-server (PyPI), wse-client (PyPI), wse-client (npm) and
-the wse crate (crates.io).
+"""Release checks for wse-server (PyPI), wse-client (PyPI), wse-client (npm), the
+wse and wse-client crates (crates.io), and the files of the mobile packages
+(the Swift XCFramework, the Android library, the Dart package and its
+prebuilt libraries) attached to the GitHub release.
 
 Subcommands:
 
@@ -55,6 +57,22 @@ _PRE = {
 }
 # What npm and Cargo accept and this script can map back to PEP 440.
 _SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:-(?:a|alpha|b|beta|rc)\.?\d+)?$")
+
+# The targets the Dart package's build hook has a prebuilt library for; the
+# release workflow's dart-binaries jobs build exactly these.
+DART_TARGETS = (
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
+    "x86_64-apple-ios",
+    "aarch64-linux-android",
+    "armv7-linux-androideabi",
+    "x86_64-linux-android",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+)
 
 
 class CheckError(Exception):
@@ -193,8 +211,30 @@ def collect() -> list[Source]:
                 semver=True,
             )
         )
+    for rel, crate in (
+        ("crates/wse-ffi/Cargo.toml", "wse-client"),
+        ("bindings/dart/rust/Cargo.toml", "wse-client"),
+    ):
+        sources.append(
+            Source(
+                f"{crate}, as {_toml(rel)['package']['name']} requires it (=version)",
+                rel,
+                str(_toml(rel)["dependencies"][crate]["version"]).removeprefix("="),
+                line_of(ROOT / rel, rf"^{crate}\s*="),
+                semver=True,
+            )
+        )
+    sources.append(
+        Source(
+            "wse-dart crate version (the Dart package's Rust library)",
+            "bindings/dart/rust/Cargo.toml",
+            str(_toml("bindings/dart/rust/Cargo.toml")["package"]["version"]),
+            line_of(ROOT / "bindings/dart/rust/Cargo.toml", r"^version\s*="),
+            semver=True,
+        )
+    )
     lock = _toml("Cargo.lock").get("package", [])
-    for crate in ("wse", "wse-client", "wse-py"):
+    for crate in ("wse", "wse-client", "wse-py", "wse-ffi", "wse-dart"):
         locked = [p for p in lock if p.get("name") == crate]
         if len(locked) != 1:
             raise CheckError(
@@ -258,12 +298,36 @@ def collect() -> list[Source]:
             )
         )
 
+    pubspec = ROOT / "bindings/dart/pubspec.yaml"
+    pub = re.search(r"^version:\s*(\S+)\s*$", pubspec.read_text(encoding="utf-8"), re.M)
+    sources.append(
+        Source(
+            "wse_client (pub.dev) version",
+            "bindings/dart/pubspec.yaml",
+            pub.group(1) if pub else None,
+            line_of(pubspec, r"^version:"),
+            semver=True,
+        )
+    )
+    gradle = ROOT / "bindings/kotlin/build.gradle.kts"
+    kotlin = re.search(r'^version = "([^"]+)"$', gradle.read_text(encoding="utf-8"), re.M)
+    sources.append(
+        Source(
+            "Kotlin bindings version",
+            "bindings/kotlin/build.gradle.kts",
+            kotlin.group(1) if kotlin else None,
+            line_of(gradle, r"^version = "),
+            semver=True,
+        )
+    )
+
     # Version constants in code: compared when they are literals.
     for rel, name, label in (
         ("wse_server/__init__.py", "__version__", "wse_server.__version__"),
         ("python-client/wse_client/constants.py", "CLIENT_VERSION", "wse_client CLIENT_VERSION"),
         ("ts-client/constants.ts", "WS_CLIENT_VERSION", "TS WS_CLIENT_VERSION"),
         ("ts-client/index.ts", "WSE_VERSION", "TS WSE_VERSION"),
+        ("bindings/dart/hook/binaries.dart", "const version", "Dart build hook version"),
     ):
         found = _literal(rel, name, label, required=False)
         if found is not None:
@@ -407,6 +471,23 @@ def _artifact_version(name: str) -> tuple[str, str] | None:
     return None
 
 
+def _mobile_files(version: str) -> dict[str, str]:
+    """The mobile packages' release files of ``version`` (SemVer), each with its kind."""
+    files = {
+        f"WseFFIC-{version}.xcframework.zip": "Swift XCFramework",
+        f"WseFFIC-{version}.xcframework.zip.checksum": "Swift XCFramework checksum",
+        f"wse-client-android-{version}.aar": "Android library",
+        f"wse_client-dart-{version}.tar.gz": "Dart package",
+    }
+    for target in DART_TARGETS:
+        ext = "dylib" if "-apple-" in target else "dll" if "-windows-" in target else "so"
+        files[f"wse_dart-{version}-{target}.{ext}"] = f"Dart library {target}"
+    return files
+
+
+_MOBILE_PREFIXES = ("WseFFIC-", "wse-client-android-", "wse_client-dart-", "wse_dart-")
+
+
 def cmd_artifacts(args: argparse.Namespace) -> int:
     expected = normalize(args.version)
     kinds = {
@@ -416,10 +497,24 @@ def cmd_artifacts(args: argparse.Namespace) -> int:
         ("wse_client", ".tar.gz"): "wse-client sdist",
         ("npm:wse-client", ".tgz"): "npm tarball",
     }
-    counts = dict.fromkeys(kinds.values(), 0)
+    mobile = _mobile_files(args.npm_version)
+    counts = dict.fromkeys([*kinds.values(), *mobile.values()], 0)
     errors = 0
     files = sorted(p for d in args.dirs for p in Path(d).rglob("*") if p.is_file())
     for path in files:
+        if path.name in mobile:
+            counts[mobile[path.name]] += 1
+            print(f"  {'ok':<9}  {path}")
+            continue
+        if path.name.startswith(_MOBILE_PREFIXES):
+            errors += 1
+            print(f"  {'MISMATCH':<9}  {path}")
+            gh_error(
+                str(path),
+                None,
+                f"{path.name} is not a mobile release file of {args.npm_version}",
+            )
+            continue
         parsed = _artifact_version(path.name)
         if parsed is None:
             print(f"  ignored    {path}")

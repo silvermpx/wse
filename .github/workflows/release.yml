@@ -2,11 +2,13 @@ name: Release
 
 # A v* tag push builds every artifact of the packages (wse-server and
 # wse-client on PyPI, wse-client on npm, the wse and wse-client
-# crates), checks the tag against every version in the repo, installs and
-# tests every wheel, the sdist, the Python client, the npm package and the
-# crates as crates.io builds them, and only then publishes: crates.io first,
-# then npm, then PyPI, then the GitHub release. Nothing is uploaded until
-# everything has passed.
+# crates, and the mobile packages: the Swift XCFramework, the Android library
+# and the Dart package with its prebuilt libraries), checks the tag against
+# every version in the repo, installs and tests every wheel, the sdist, the
+# Python client, the npm package, the crates as crates.io builds them and the
+# mobile packages, and only then publishes: crates.io first, then npm, then
+# PyPI, then the GitHub release, which carries the mobile packages. Nothing is
+# uploaded until everything has passed.
 #
 # Pull requests and pushes to main that touch packaging run the same build
 # and test jobs as a dry run, and workflow_dispatch runs that dry run by hand
@@ -30,6 +32,14 @@ on:
       - 'package-lock.json'
       - 'tsconfig.json'
       - 'ts-client/constants.ts'
+      - 'bindings/swift/build.sh'
+      - 'bindings/kotlin/build.sh'
+      - 'bindings/kotlin/android/build-libs.sh'
+      - 'bindings/kotlin/android/build.gradle.kts'
+      - 'bindings/dart/pubspec.yaml'
+      - 'bindings/dart/hook/**'
+      - 'bindings/dart/rust/Cargo.toml'
+      - 'bindings/dart/rust/rust-toolchain.toml'
   pull_request:
     paths:
       - '.github/workflows/release.yml'
@@ -45,6 +55,14 @@ on:
       - 'package-lock.json'
       - 'tsconfig.json'
       - 'ts-client/constants.ts'
+      - 'bindings/swift/build.sh'
+      - 'bindings/kotlin/build.sh'
+      - 'bindings/kotlin/android/build-libs.sh'
+      - 'bindings/kotlin/android/build.gradle.kts'
+      - 'bindings/dart/pubspec.yaml'
+      - 'bindings/dart/hook/**'
+      - 'bindings/dart/rust/Cargo.toml'
+      - 'bindings/dart/rust/rust-toolchain.toml'
   workflow_dispatch:
 
 permissions: {}
@@ -605,6 +623,233 @@ jobs:
         run: cargo check --locked -p wse-client --target wasm32-unknown-unknown
 
   # ---------------------------------------------------------------------------
+  # The mobile packages, attached to the GitHub release: the Swift
+  # XCFramework (zip, and the checksum SwiftPM asks for), the Android library
+  # (AAR), and the Dart package with the prebuilt Rust libraries its build
+  # hook downloads from this release. Each is built and tested here; their
+  # registries are set up by hand.
+  # ---------------------------------------------------------------------------
+  swift-package:
+    name: Swift XCFramework
+    needs: preflight
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+          targets: x86_64-apple-darwin, aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios
+
+      - name: Build, then the tests on the Mac and on an iOS simulator
+        env:
+          SIMULATOR: '1'
+        run: bindings/swift/run-tests.sh
+
+      - name: Zip, and its checksum
+        env:
+          VERSION: ${{ needs.preflight.outputs.npm-version }}
+        run: |
+          mkdir -p dist
+          zip="dist/WseFFIC-${VERSION}.xcframework.zip"
+          ditto -c -k --sequesterRsrc --keepParent bindings/swift/WseFFIC.xcframework "$zip"
+          (cd bindings/swift && swift package compute-checksum "../../$zip") > "$zip.checksum"
+          cat "$zip.checksum"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: swift-package
+          path: dist/*
+          if-no-files-found: error
+
+  android-package:
+    name: Android library (AAR)
+    needs: preflight
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880  # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c  # v6.4.1
+        with:
+          gradle-version: '9.9.1'
+
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519  # v2.90.5
+        with:
+          tool: cargo-ndk@4.1.2
+
+      # The newest NDK on the runner links for 16 KB pages; build-libs.sh checks.
+      - name: Bindings, and the libraries of every ABI
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          bindings/kotlin/build.sh
+          bindings/kotlin/android/build-libs.sh
+
+      - name: AAR
+        env:
+          VERSION: ${{ needs.preflight.outputs.npm-version }}
+        run: |
+          (cd bindings/kotlin/android && gradle --no-daemon -q assembleRelease)
+          mkdir -p dist
+          cp bindings/kotlin/android/build/outputs/aar/*-release.aar "dist/wse-client-android-${VERSION}.aar"
+          unzip -l "dist/wse-client-android-${VERSION}.aar"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: android-package
+          path: dist/*
+          if-no-files-found: error
+
+  dart-binaries:
+    name: Dart libraries (${{ matrix.name }})
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # The targets of DART_TARGETS in release_preflight.py. Linux builds on
+        # the oldest Ubuntu runner, for the oldest glibc.
+        include:
+          - name: apple
+            runner: macos-latest
+            targets: aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+          - name: android
+            runner: ubuntu-24.04
+            targets: aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+          - name: linux-x64
+            runner: ubuntu-22.04
+            targets: x86_64-unknown-linux-gnu
+          - name: linux-arm64
+            runner: ubuntu-22.04-arm
+            targets: aarch64-unknown-linux-gnu
+          - name: windows-x64
+            runner: windows-latest
+            targets: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The Rust the Dart package pins, with these targets
+        shell: bash
+        env:
+          TARGETS: ${{ matrix.targets }}
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' bindings/dart/rust/rust-toolchain.toml)"
+          read -ra targets <<< "$TARGETS"
+          rustup toolchain install "$channel" --profile minimal --target "${targets[@]}"
+          rustup default "$channel"
+
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519  # v2.90.5
+        if: matrix.name == 'android'
+        with:
+          tool: cargo-ndk@4.1.2
+
+      # Windows: aws-lc's assembly from the objects it ships, without NASM.
+      - name: Build
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.npm-version }}
+          TARGETS: ${{ matrix.targets }}
+          AWS_LC_SYS_PREBUILT_NASM: '1'
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-}"
+          read -ra targets <<< "$TARGETS"
+          bash .github/scripts/dart-binaries.sh "$VERSION" dist "${targets[@]}"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: dart-binaries-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  dart-package:
+    name: Dart package
+    needs: [preflight, dart-binaries]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2  # v2.23.0
+        with:
+          flutter-version: '3.50.0'
+          channel: stable
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: dart-binaries-*
+          path: dart-binaries/
+          merge-multiple: true
+
+      - name: Stage the package
+        env:
+          VERSION: ${{ needs.preflight.outputs.npm-version }}
+        run: bash .github/scripts/stage-dart-package.sh "$VERSION" dart-binaries dart-package
+
+      # The staged package's tests, its build hook taking this runner's
+      # library from the files above and checking it against the list.
+      - name: The tests on the prebuilt library
+        run: |
+          cargo build -q --locked -p wse-client --example server
+          WSE_PORT=5019 target/debug/examples/server > server.log 2>&1 &
+          for _ in $(seq 1 100); do grep -q '^url ' server.log && break; sleep 0.1; done
+          cp -r dart-package dart-check
+          cat >> dart-check/pubspec.yaml <<'EOF'
+          hooks:
+            user_defines:
+              wse_client:
+                build: binary
+                binaries: ../dart-binaries
+          EOF
+          cd dart-check
+          flutter pub get
+          WSE_TEST_URL="$(sed -n 's/^url //p' ../server.log)" flutter test
+
+      - name: pub.dev's checks (dry run)
+        working-directory: dart-package
+        run: dart pub publish --dry-run
+
+      - name: Pack
+        env:
+          VERSION: ${{ needs.preflight.outputs.npm-version }}
+        run: |
+          mkdir -p dist
+          tar -czf "dist/wse_client-dart-${VERSION}.tar.gz" -C dart-package .
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: dart-package
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
   # Everything built, tested and carrying the release version: the one job
   # that says whether this commit could be released. The publish jobs wait
   # for it. (Not a required check: path filters keep this workflow off most
@@ -612,7 +857,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release-gate:
     name: Release gate
-    needs: [preflight, build, sdist, test, test-musllinux, sdist-install, python-client, npm-package, crates]
+    needs: [preflight, build, sdist, test, test-musllinux, sdist-install, python-client, npm-package, crates, swift-package, android-package, dart-binaries, dart-package]
     # Runs (and fails) when a job above failed: a gate skipped because of a
     # failed dependency would report success to branch protection.
     if: always()
