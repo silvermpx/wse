@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ENDPOINT, FakeWebSocket, connectServer, installFakeWebSocket, resetClientState, tick } from './helpers.js';
-import { acquireSession, getCurrentSession, makeSessionKey, wseActions } from '../services/WSESession.js';
+import { acquireSession, getCurrentSession, makeSessionKey, releaseSession, wseActions } from '../services/WSESession.js';
 import type { UseWSEConfig } from '../services/WSESession.js';
 import type { WSMessage } from '../types.js';
 import { keyId } from '../utils/e2eSession.js';
@@ -254,6 +254,32 @@ describe('signed messages go on the live connection or not at all', () => {
     await tick(6);
     expect(second.appTextMessages().filter((m) => m.t === 'signed')).toHaveLength(0);
     expect(status).not.toBe('sent');
+  });
+
+  it('drops a held signed message when its session ends and another starts for the same user', async () => {
+    const key = await generateSigningKey();
+    const config: UseWSEConfig = { security: { signingKey: key.keyPair }, rateLimit: { capacity: 1, refillRate: 1 } };
+    const session = start(config);
+    await tick();
+    const first = FakeWebSocket.last();
+    await connectServer(first, { signing: { kid: v.server.kid, public_key: v.server.public_key } });
+    wseActions.sendMessage('note', {});
+    await tick();
+    await wseActions.sendSigned('order', { qty: '1' }, { nonce: 'o-remount' });
+    await tick();
+    expect(first.appTextMessages().filter((m) => m.t === 'signed')).toHaveLength(0);
+
+    // The last consumer leaves; the same user comes back on a new session.
+    releaseSession(session);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    start(config);
+    await tick();
+    const second = FakeWebSocket.last();
+    expect(second).not.toBe(first);
+    await connectServer(second, { signing: { kid: v.server.kid, public_key: v.server.public_key } });
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    await tick(6);
+    expect(second.appTextMessages().filter((m) => m.t === 'signed')).toHaveLength(0);
   });
 
   it('never re-queues a live-only message whose socket vanished', async () => {

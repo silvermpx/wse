@@ -608,6 +608,21 @@ describe("one user's data never reaches the next user", () => {
     expect(JSON.stringify(seen.recovery)).not.toContain('alice-private');
   });
 
+  it('keeps an explicitly empty topic list empty for the next user', async () => {
+    vi.useFakeTimers();
+    start({}, 'cookie', []);
+    await tick();
+    const first = FakeWebSocket.last();
+    await connectServer(first, { user_id: 'alice' });
+    first.serverClose(1006);
+    await tick();
+    expect(await advanceUntilNewSocket(5_000)).toBe(true);
+    const bob = FakeWebSocket.last();
+    await connectServer(bob, { user_id: 'bob' });
+    await tick(6);
+    expect(frames(bob).topics).toEqual([]);
+  });
+
   it('when a cookie session reconnects as another user', async () => {
     vi.useFakeTimers();
     // The page's own topic is "news"; Alice subscribes to hers herself.

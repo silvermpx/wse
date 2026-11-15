@@ -17,6 +17,7 @@
 //     stores, outgoing queues, recovery positions, saved subscriptions, the
 //     IndexedDB offline queue and the opt-in error log.
 
+import { nextOwnerEpoch } from './ownership.js';
 import {
   ConnectionState,
   DiagnosticsConfig,
@@ -269,6 +270,8 @@ export class WSESession {
   private topicsResolved: boolean;
   /** The topics the consumers asked for: what another user starts from. */
   private readonly consumerTopics = new Set<string>();
+  /** A consumer named its topics, an empty list included: no defaults then. */
+  private topicsExplicit = false;
   private startPromise: Promise<void> | null = null;
   private windowListener: ((event: Event) => void) | null = null;
   private stopWatchingState: (() => void) | null = null;
@@ -301,6 +304,7 @@ export class WSESession {
     // server_ready restores this user's saved subscriptions (or defaults).
     const initial = params.initialTopics !== undefined ? uniqueTopics(params.initialTopics) : null;
     if (initial !== null) {
+      this.topicsExplicit = true;
       for (const topic of initial) this.consumerTopics.add(topic);
       useWSEStore.getState().addTopics(initial);
     }
@@ -312,6 +316,7 @@ export class WSESession {
     if (this.destroyed) return;
     params.config?.registerHandlers?.(this.processor);
     const topics = params.initialTopics !== undefined ? uniqueTopics(params.initialTopics) : [];
+    if (params.initialTopics !== undefined) this.topicsExplicit = true;
     for (const topic of topics) this.consumerTopics.add(topic);
     if (topics.length > 0) {
       const active = new Set(useWSEStore.getState().activeTopics);
@@ -457,12 +462,13 @@ export class WSESession {
    */
   private forgetPreviousUser(previous: string, next: string): void {
     logger.warn(`The server took this connection for ${next}, not ${previous}: ${previous}'s queue, topics and positions are dropped`);
+    nextOwnerEpoch();
     useMessageQueueStore.getState().clearQueue();
     const store = useWSEStore.getState();
     this.processor.forgetTopics(store.activeTopics);
     sharedSequencer.reset();
     store.setActiveTopics([...this.consumerTopics]);
-    this.topicsResolved = this.consumerTopics.size > 0;
+    this.topicsResolved = this.topicsExplicit || this.consumerTopics.size > 0;
   }
 
   /** server_ready: (re)subscribe every active topic, asking for a replay where possible. */
@@ -774,6 +780,7 @@ function deleteOfflineDatabase(): void {
 function clearUserData(): void {
   userDataPresent = false;
   dataOwner = null;
+  nextOwnerEpoch();
   sharedSequencer.reset();
   useWSEStore.getState().reset();
   useMessageQueueStore.getState().clearQueue();

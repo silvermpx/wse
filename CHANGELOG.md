@@ -32,11 +32,14 @@
   recovery positions never go out on the next user's connection: not when
   the last component unmounts and another user signs in, nor when a cookie
   session reconnects as another user (the server's `user_id` is checked
-  before anything is sent or resubscribed).
+  before anything is sent or resubscribed), nor when a send that a full
+  offline queue hands back comes after the change. A topic list given as
+  empty stays empty for the next user instead of the default topics.
 - TypeScript client: a signed message goes on the connection it was signed
   for or not at all: one held by the rate limit, or by encryption, is
-  dropped when that connection goes, and one whose connection changed while
-  it was being signed is not sent.
+  dropped when that connection goes, also when its session ends and another
+  starts, and one whose connection changed while it was being signed is not
+  sent.
 - TypeScript client: the offline queue drops what is older than
   `offline.maxAge` before it replays anything, and holds no more than
   `offline.maxSize` messages under concurrent sends, across tabs too.

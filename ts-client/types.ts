@@ -306,6 +306,10 @@ export interface QueuedMessage {
   bytes?: number;
   /** Epoch ms after which the message is dropped instead of sent (MessageOptions.ttl). */
   expiresAt?: number;
+  /** The owner number it was made under (ownership.ts): another user's once it changed. */
+  owner?: number;
+  /** The only socket it may go on (a signed message); dropped once that one is gone. */
+  liveOn?: number;
 }
 
 export interface MessageOptions {

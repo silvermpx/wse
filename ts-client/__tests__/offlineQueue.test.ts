@@ -168,6 +168,37 @@ describe('offline messages belong to their user', () => {
     await vi.waitFor(() => expect(getCurrentSession()!.offlineQueue!.getStats().size).toBe(0));
     expect(bob.appTextMessages().filter((m) => m.t === 'transfer')).toEqual([]);
   });
+
+  it("never sends one user's message that a full queue handed back after another took the connection", async () => {
+    acquireSession({
+      key: makeSessionKey('cookie', [ENDPOINT]),
+      auth: 'cookie',
+      initialTopics: [],
+      config: { endpoints: [ENDPOINT], offline: { enabled: true, maxSize: 1 } },
+    });
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    await vi.waitFor(() => expect(getCurrentSession()!.offlineQueue?.isAvailable()).toBe(true));
+    const first = FakeWebSocket.last();
+    first.serverOpen();
+    first.serverSend(serverReadyMessage({ user_id: 'alice' }));
+    await vi.waitFor(() => expect(useWSEStore.getState().connectionState).toBe(ConnectionState.CONNECTED));
+    first.serverClose(1006);
+    await vi.waitFor(() => expect(useWSEStore.getState().connectionState).not.toBe(ConnectionState.CONNECTED));
+    // Alice fills the queue while offline.
+    expect(wseActions.sendMessage('transfer', { n: 1 }, { offline: true })).toBe('queued');
+    await vi.waitFor(() => expect(getCurrentSession()!.offlineQueue!.getStats().size).toBe(1));
+
+    // The next connection opens; Alice sends once more, and the server takes
+    // the connection for Bob before her write is refused by the full queue.
+    await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThan(1), { timeout: 5_000 });
+    const bob = FakeWebSocket.last();
+    bob.serverOpen();
+    expect(wseActions.sendMessage('transfer', { n: 2 }, { offline: true })).toBe('queued');
+    bob.serverSend(serverReadyMessage({ user_id: 'bob' }));
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(bob.appTextMessages().filter((m) => m.t === 'transfer')).toEqual([]);
+  });
 });
 
 describe('the offline queue keeps its limits', () => {

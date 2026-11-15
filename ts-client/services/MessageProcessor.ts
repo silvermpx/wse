@@ -41,6 +41,7 @@ import {
 } from '../constants.js';
 import { securityManager } from '../utils/security.js';
 import { generateId } from '../utils/id.js';
+import { ownerEpoch } from './ownership.js';
 import { dispatchWSEEvent } from '../utils/events.js';
 import type { SendResult } from './ConnectionManager.js';
 import type { OfflineQueue } from './OfflineQueue.js';
@@ -1607,6 +1608,10 @@ export class MessageProcessor {
     options: { offline?: boolean; ttl?: number; liveOn?: number } = {},
   ): SendStatus {
     if (this.destroyed) return 'dropped';
+    // Made for the user whose data the page holds now: once another user's
+    // takes its place, it does not go out (not even from a write to the
+    // offline queue that ends after that).
+    const owner = ownerEpoch();
     // Only for the socket it was made on (a signed message): dropped once
     // that one is gone, never sent on a later connection.
     if (options.liveOn !== undefined) {
@@ -1642,22 +1647,33 @@ export class MessageProcessor {
       // of this browser's): only that user's connection replays it.
       queue.enqueue(message, expiresAt, this.userId ?? storedOwner()).then(
         (stored) => {
-          if (!stored) this.enqueueInMemory(message, priority, expiresAt);
+          if (!stored) this.enqueueInMemory(message, priority, expiresAt, owner);
           else this.scheduleFlush(0);
         },
         (error) => {
           logger.error('Failed to persist offline message, keeping it in memory:', error);
-          this.enqueueInMemory(message, priority, expiresAt);
+          this.enqueueInMemory(message, priority, expiresAt, owner);
         },
       );
       return 'queued';
     }
 
-    return this.enqueueInMemory(message, priority, expiresAt) ? 'queued' : 'dropped';
+    return this.enqueueInMemory(message, priority, expiresAt, owner, options.liveOn) ? 'queued' : 'dropped';
   }
 
-  private enqueueInMemory(message: WSMessage, priority: number, expiresAt?: number): boolean {
+  private enqueueInMemory(
+    message: WSMessage,
+    priority: number,
+    expiresAt?: number,
+    owner: number = ownerEpoch(),
+    liveOn?: number,
+  ): boolean {
     if (this.destroyed) return false;
+    if (owner !== ownerEpoch()) {
+      this.countDropped(1);
+      logger.warn(`Dropping ${message.t}: it was made for the previous user`);
+      return false;
+    }
     const queueStore = useMessageQueueStore.getState();
     const queued: QueuedMessage = {
       id: message.id || generateId(),
@@ -1672,6 +1688,8 @@ export class MessageProcessor {
       // Sized only when a memory bound is set: serializing costs a full pass.
       bytes: queueStore.memoryLimit > 0 ? estimateBytes(message) : undefined,
       expiresAt,
+      owner,
+      liveOn,
     };
 
     if (!queueStore.enqueue(queued)) {
@@ -1802,7 +1820,12 @@ export class MessageProcessor {
           continue;
         }
         const wire = this.toWire(batch[i]);
-        const liveOn = this.liveOnly.get(wire);
+        if (batch[i].owner !== undefined && batch[i].owner !== ownerEpoch()) {
+          this.countDropped(1);
+          logger.warn(`Dropping ${batch[i].type}: it was made for the previous user`);
+          continue;
+        }
+        const liveOn = batch[i].liveOn ?? this.liveOnly.get(wire);
         if (liveOn !== undefined && liveOn !== cm.socketGeneration()) {
           this.countDropped(1);
           logger.warn(`Dropping ${batch[i].type}: its connection went before it was sent`);

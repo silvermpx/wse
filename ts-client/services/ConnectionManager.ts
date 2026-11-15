@@ -159,8 +159,13 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+// Sockets are numbered across every connection manager of the page: a
+// message tied to one socket never matches a later manager's.
+let lastSocketId = 0;
+
 export class ConnectionManager {
   private ws: WebSocket | null = null;
+  /** The current socket's number, unique on the page (see lastSocketId). */
   private socketId = 0;
   private pendingAttempt: { socketId: number; settle: (error?: Error) => void } | null = null;
 
@@ -364,7 +369,8 @@ export class ConnectionManager {
     }
 
     ws.binaryType = 'arraybuffer';
-    const socketId = ++this.socketId;
+    const socketId = ++lastSocketId;
+    this.socketId = socketId;
     this.ws = ws;
     this.currentEndpoint = endpoint;
     this.resetSocketState();
