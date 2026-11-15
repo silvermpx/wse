@@ -832,9 +832,22 @@ jobs:
           flutter pub get
           WSE_TEST_URL="$(sed -n 's/^url //p' ../server.log)" flutter test
 
+      # flutter_rust_bridge's Dart and Rust halves must be one version, so
+      # the package pins it and its hooks exactly, and pub warns about the
+      # two pins (exit 65). Any other warning fails.
       - name: pub.dev's checks (dry run)
         working-directory: dart-package
-        run: dart pub publish --dry-run
+        run: |
+          code=0
+          dart pub publish --dry-run > ../pub-dry-run.txt 2>&1 || code=$?
+          cat ../pub-dry-run.txt
+          if [ "$code" -eq 65 ] && grep -q '^Package has 2 warnings' ../pub-dry-run.txt \
+            && grep -q 'dependency on "flutter_rust_bridge" should allow more than one version' ../pub-dry-run.txt \
+            && grep -q 'dependency on "flutter_rust_bridge_hooks" should allow more than one version' ../pub-dry-run.txt; then
+            echo "Only the two exact flutter_rust_bridge pins."
+            code=0
+          fi
+          exit "$code"
 
       - name: Pack
         env:
