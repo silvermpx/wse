@@ -1,10 +1,31 @@
 /// The WSE client for Dart and Flutter, on the Rust client.
 library;
 
+import 'dart:io';
+
+import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart' show ExternalLibrary;
+
 import 'src/rust/api.dart' as rust;
 import 'src/rust/frb_generated.dart';
 
 export 'src/rust/api.dart' show WseConfig, WseError, WseItem, WseItemKind;
+
+/// Under `flutter test` the build hook puts the library in
+/// build/native_assets/<os>/, where loading it by name does not look; a
+/// directory named in FRB_DART_LOAD_EXTERNAL_LIBRARY_NATIVE_LIB_DIR wins.
+ExternalLibrary? _testLibrary() {
+  final env = Platform.environment;
+  if (!env.containsKey('FLUTTER_TEST') || env.containsKey('FRB_DART_LOAD_EXTERNAL_LIBRARY_NATIVE_LIB_DIR')) {
+    return null;
+  }
+  final file = switch (Platform.operatingSystem) {
+    'macos' => File('build/native_assets/macos/libwse_dart.dylib'),
+    'linux' => File('build/native_assets/linux/libwse_dart.so'),
+    'windows' => File('build/native_assets/windows/wse_dart.dll'),
+    _ => null,
+  };
+  return file != null && file.existsSync() ? ExternalLibrary.open(file.absolute.path) : null;
+}
 
 /// A connection to a WSE server, made again when it is lost.
 class WseClient {
@@ -17,7 +38,7 @@ class WseClient {
   bool _ended = false;
 
   /// Loads the native library; call once before anything else.
-  static Future<void> init() => RustLib.init();
+  static Future<void> init() => RustLib.init(externalLibrary: _testLibrary());
 
   /// Connects, and completes once the server took the connection.
   static Future<WseClient> connect(rust.WseConfig config) async =>
