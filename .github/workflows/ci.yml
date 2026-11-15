@@ -35,6 +35,7 @@ jobs:
       server: ${{ steps.filter.outputs.server }}
       python_client: ${{ steps.filter.outputs.python_client }}
       ts_client: ${{ steps.filter.outputs.ts_client }}
+      mobile: ${{ steps.filter.outputs.mobile }}
       benchmarks: ${{ steps.filter.outputs.benchmarks }}
     steps:
       # Credentials stay: on a push the filter fetches the previous commit.
@@ -45,6 +46,7 @@ jobs:
           filters: |
             rust:
               - 'crates/**'
+              - 'bindings/dart/rust/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
@@ -70,6 +72,14 @@ jobs:
               - 'tsconfig.json'
               - 'vitest.config.ts'
               - '.github/scripts/npm-consumer-check.sh'
+              - '.github/workflows/ci.yml'
+            mobile:
+              - 'crates/wse-client/**'
+              - 'crates/wse-ffi/**'
+              - 'crates/wse-bindgen/**'
+              - 'bindings/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
               - '.github/workflows/ci.yml'
             benchmarks:
               - 'benchmarks/**'
@@ -549,6 +559,216 @@ jobs:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
 
   # ---------------------------------------------------------------------------
+  # Mobile: the native module for Swift (macOS and an iOS simulator), Kotlin
+  # (JVM, and Android in an emulator) and Dart/Flutter (host tests, the
+  # example app on an iOS simulator and in the emulator). The committed
+  # bindings must equal what the generators make from this checkout. The
+  # Dart package's build hook builds with the Rust its rust-toolchain.toml
+  # names; the jobs that run it install that one.
+  # ---------------------------------------------------------------------------
+  swift:
+    name: Swift (macOS, iOS simulator)
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+          targets: x86_64-apple-darwin, aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: ". -> target"
+          key: swift
+
+      - name: Build, then the tests on the Mac and on an iOS simulator
+        env:
+          PROFILE: debug
+          SIMULATOR: '1'
+        run: bindings/swift/run-tests.sh
+
+      - name: The committed bindings are the generated ones
+        run: git diff --exit-code -- bindings/swift/Sources
+
+  kotlin:
+    name: Kotlin (JVM)
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: ". -> target"
+          key: kotlin
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880  # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c  # v6.4.1
+        with:
+          gradle-version: '9.9.1'
+
+      - name: Build and test
+        run: bindings/kotlin/run-tests.sh
+
+      - name: The committed bindings are the generated ones
+        run: git diff --exit-code -- bindings/kotlin/generated
+
+  android:
+    name: Android (emulator)
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Let the emulator use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: The Rust the Dart package pins
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' bindings/dart/rust/rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --target x86_64-linux-android
+          rustup default "$channel"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: ". -> target"
+          key: android
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880  # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c  # v6.4.1
+        with:
+          gradle-version: '9.9.1'
+
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519  # v2.90.5
+        with:
+          tool: cargo-ndk@4.1.2
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2  # v2.23.0
+        with:
+          flutter-version: '3.50.0'
+          channel: stable
+
+      # The newest NDK on the runner links for 16 KB pages.
+      - name: Kotlin, then the Flutter example, in an emulator
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d  # v2.38.0
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect
+          script: |
+            ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ANDROID_SERIAL=emulator-5554 bindings/kotlin/android/run-emulator-tests.sh
+            bindings/dart/example/run-integration-tests.sh emulator-5554
+
+  dart:
+    name: Dart (Flutter ${{ matrix.flutter }})
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest Flutter the package supports, and the newest.
+        flutter: ['3.38.10', '3.50.0']
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The Rust the Dart package pins
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' bindings/dart/rust/rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal
+          rustup default "$channel"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: ". -> target"
+          key: dart
+
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519  # v2.90.5
+        with:
+          tool: cargo-expand@1.0.127,flutter_rust_bridge_codegen@2.13.0
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2  # v2.23.0
+        with:
+          flutter-version: ${{ matrix.flutter }}
+          channel: stable
+
+      - name: Generate the bindings, then the tests
+        run: bindings/dart/run-tests.sh
+
+      - name: The committed bindings are the generated ones
+        if: matrix.flutter == '3.50.0'
+        run: git diff --exit-code -- bindings/dart/lib/src/rust bindings/dart/rust/src
+
+  flutter-ios:
+    name: Flutter (iOS simulator)
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
+    runs-on: macos-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The Rust the Dart package pins
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' bindings/dart/rust/rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --target aarch64-apple-ios-sim
+          rustup default "$channel"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: ". -> target"
+          key: flutter-ios
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2  # v2.23.0
+        with:
+          flutter-version: '3.50.0'
+          channel: stable
+
+      - name: The example app on an iOS simulator
+        run: |
+          device="$(xcrun simctl list devices available | grep -m1 -E 'iPhone' | sed -E 's/.*\(([0-9A-F-]{36})\).*/\1/')"
+          xcrun simctl boot "$device"
+          xcrun simctl bootstatus "$device" -b
+          bindings/dart/example/run-integration-tests.sh "$device"
+
+  # ---------------------------------------------------------------------------
   # Python server: build Rust + run tests
   # ---------------------------------------------------------------------------
   test:
@@ -710,7 +930,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, checks, secrets, client, client-server, python-client, lint, rust-lint, rust-test, rust-wasm, rust-fips, rust-msrv, test, benchmarks, security]
+    needs: [changes, checks, secrets, client, client-server, python-client, lint, rust-lint, rust-test, rust-wasm, rust-fips, rust-msrv, swift, kotlin, android, dart, flutter-ios, test, benchmarks, security]
     runs-on: ubuntu-latest
     steps:
       - name: Every job passed or was skipped
