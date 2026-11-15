@@ -2,12 +2,17 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
-use tokio::net::TcpListener;
-use tokio::sync::mpsc;
-use wse_client::{Config, Error, Event, Events, Format, Incoming, OwnedMessage, Status};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{broadcast, mpsc};
+use wse_client::{
+    Config, Error, Event, Events, Format, Incoming, OwnedMessage, Status, TokenProvider,
+};
 
 const SECRET: &str = "a-test-secret-of-at-least-thirty-two-bytes";
 
@@ -83,13 +88,15 @@ async fn stand_with(mut config: wse::Config) -> Stand {
 }
 
 impl Stand {
-    fn config(&self, user: &str) -> Config {
-        let token = self
-            .publisher
+    fn token(&self, user: &str) -> String {
+        self.publisher
             .issue_token(user, Duration::from_secs(600), serde_json::Map::new())
-            .unwrap();
+            .unwrap()
+    }
+
+    fn config(&self, user: &str) -> Config {
         let mut config = Config::new(&self.url);
-        config.token = Some(token);
+        config.token = Some(self.token(user));
         config.reconnect.base_delay = Duration::from_millis(50);
         config
     }
@@ -129,6 +136,91 @@ async fn next_event(events: &mut Events) -> Event {
     loop {
         if let Incoming::Event(event) = next(events).await {
             return event;
+        }
+    }
+}
+
+/// The network between a client and the server: it can stop taking what the
+/// client writes, and it can be cut.
+struct Link {
+    url: String,
+    held: Arc<AtomicBool>,
+    cut: broadcast::Sender<()>,
+}
+
+impl Link {
+    async fn to(server_url: &str) -> Self {
+        let server = server_url
+            .trim_start_matches("ws://")
+            .trim_end_matches("/wse")
+            .to_owned();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/wse", listener.local_addr().unwrap());
+        let held = Arc::new(AtomicBool::new(false));
+        let (cut, _) = broadcast::channel(1);
+        let (link_held, link_cut) = (Arc::clone(&held), cut.clone());
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(server) = TcpStream::connect(&server).await else {
+                    continue;
+                };
+                let held = Arc::clone(&link_held);
+                let mut cut = link_cut.subscribe();
+                tokio::spawn(async move {
+                    let (mut from_client, mut to_client) = client.into_split();
+                    let (mut from_server, mut to_server) = server.into_split();
+                    let up = async {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            while held.load(Ordering::Acquire) {
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                            let n = from_client.read(&mut buf).await?;
+                            if n == 0 {
+                                return Ok::<_, std::io::Error>(());
+                            }
+                            to_server.write_all(&buf[..n]).await?;
+                        }
+                    };
+                    let down = tokio::io::copy(&mut from_server, &mut to_client);
+                    // Whichever ends first, both sockets go with this task.
+                    tokio::select! {
+                        _ = up => {}
+                        _ = down => {}
+                        _ = cut.recv() => {}
+                    }
+                });
+            }
+        });
+        Self { url, held, cut }
+    }
+
+    fn hold(&self, held: bool) {
+        self.held.store(held, Ordering::Release);
+    }
+
+    fn cut(&self) {
+        let _ = self.cut.send(());
+    }
+}
+
+/// `len` characters no compression shrinks much.
+fn noise(len: usize) -> String {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            char::from(b'a' + (state % 26) as u8)
+        })
+        .collect()
+}
+
+async fn next_connected(events: &mut Events) -> wse_client::Connected {
+    loop {
+        if let Event::Connected(connected) = next_event(events).await {
+            return connected;
         }
     }
 }
@@ -926,5 +1018,122 @@ async fn an_encrypted_flood_is_still_closed_for_flooding() {
     let after = started.elapsed();
     assert!(after >= Duration::from_secs(9), "closed after {after:?}");
     flood.abort();
+    stand.server.stop().await;
+}
+
+/// Sends until the client's queue is full: the link has stopped taking what
+/// the client writes, and the client stopped taking it from the queue.
+fn fill_queue(client: &wse_client::Client, kind: &str, payload: &serde_json::Value) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match client.try_send(kind, payload) {
+            Ok(()) => {}
+            Err(Error::Full) => return,
+            Err(error) => panic!("{error}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the queue never filled"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn what_one_user_queued_does_not_go_out_for_the_next() {
+    let mut stand = stand().await;
+    let link = Link::to(&stand.url).await;
+    let token = Arc::new(Mutex::new(stand.token("alice")));
+    let current = Arc::clone(&token);
+    let mut config = Config::new(&link.url);
+    config.token_provider = Some(TokenProvider::new(move || {
+        let token = current.lock().unwrap().clone();
+        async move { Ok::<_, String>(token) }
+    }));
+    config.reconnect.base_delay = Duration::from_millis(50);
+    config.send_queue = 4;
+    let (client, mut events) = wse_client::connect(config).await.unwrap();
+    stand.connect_id().await;
+
+    // Alice's orders back up in the client while the network holds them.
+    link.hold(true);
+    fill_queue(&client, "alice_order", &json!({ "pad": noise(64 * 1024) }));
+
+    // The network goes; the next connection is Bob's.
+    *token.lock().unwrap() = stand.token("bob");
+    link.cut();
+    while !matches!(next_event(&mut events).await, Event::Disconnected(_)) {}
+    link.hold(false);
+    let again = next_connected(&mut events).await;
+    assert_eq!(again.user_id.as_deref(), Some("bob"));
+    client.send("bob_hello", &json!({})).await.unwrap();
+    loop {
+        if let Heard::Message(message) = stand.heard().await {
+            assert_eq!(message["t"], "bob_hello", "Alice's order went out for Bob");
+            break;
+        }
+    }
+    client.close().await;
+    stand.server.stop().await;
+}
+
+#[cfg(feature = "aws-lc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_signed_message_goes_on_its_own_connection_or_not_at_all() {
+    let mut stand = secure_stand().await;
+    let link = Link::to(&stand.url).await;
+    let signing_key = wse_client::generate_key();
+    let cnf = json!({ "jwk": wse_client::public_key_jwk(&signing_key).unwrap() });
+    let mut config = bound_config(&stand, "judy", cnf, &signing_key);
+    config.url = link.url.clone();
+    config.reconnect.enabled = true;
+    config.reconnect.base_delay = Duration::from_millis(50);
+    config.send_queue = 4;
+    let (client, mut events) = wse_client::connect(config).await.unwrap();
+    stand.connect_id().await;
+
+    // Orders signed for this connection back up while the network holds
+    // them.
+    link.hold(true);
+    let order = json!({ "pad": noise(64 * 1024) });
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    for n in 0.. {
+        let nonce = format!("order-{n}");
+        let sent = tokio::time::timeout(
+            Duration::from_millis(300),
+            client.send_signed("order", &order, Some(&nonce)),
+        )
+        .await;
+        match sent {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => panic!("{error}"),
+            // The queue is full: the client stopped taking from it.
+            Err(_) => break,
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the queue never filled"
+        );
+    }
+
+    // The network goes and comes back: the same user, another connection.
+    link.cut();
+    while !matches!(next_event(&mut events).await, Event::Disconnected(_)) {}
+    link.hold(false);
+    next_connected(&mut events).await;
+    client.send("after", &json!({})).await.unwrap();
+    loop {
+        match stand.heard().await {
+            Heard::Signed(order) => {
+                panic!("{} went out on the next connection", order["n"])
+            }
+            Heard::Message(message) => {
+                assert_eq!(message["t"], "after");
+                break;
+            }
+            _ => {}
+        }
+    }
+    client.close().await;
     stand.server.stop().await;
 }

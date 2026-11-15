@@ -110,7 +110,11 @@ async fn main() -> Result<(), wse_client::Error> {
   keys the client pins, and each carries its proof. With encryption, the
   client also proves its key inside the session, which binds a token that
   names the key to this client (`Encryption::bind_session`, on by default),
-  and stops unless the server confirms the key.
+  and stops unless the server confirms the key. A signed message goes out
+  on the connection it was signed on, or not at all.
+- **Another user.** When the token provider's next token is another
+  user's, what the last user queued and did not send goes nowhere, and the
+  topics are subscribed again from the start.
 - **Back-pressure.** A handler that waits in `ready` holds the server back;
   the stream of `connect` does the same while nobody reads it.
 

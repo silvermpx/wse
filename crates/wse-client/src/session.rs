@@ -12,7 +12,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use web_time::Instant;
 
-use crate::client::Shared;
+use crate::client::{Queued, Shared};
 use crate::decode::{self, Envelope, epoch_of};
 use crate::error::Error;
 use crate::handler::{
@@ -108,6 +108,12 @@ pub(crate) struct Session<H> {
     /// The user the server took the connection for: a message the server
     /// signed for a user is taken only when it is this one.
     user_id: Option<String>,
+    /// The user the server took the last connection for, once there was one.
+    last_user: Option<Option<String>>,
+    /// [`Shared::users`] and [`Shared::connections`], which only the session
+    /// moves.
+    users: u64,
+    connections: u64,
 }
 
 impl<H: Handler> Session<H> {
@@ -139,6 +145,21 @@ impl<H: Handler> Session<H> {
             connected_before: false,
             server_recovery: false,
             user_id: None,
+            last_user: None,
+            users: 0,
+            connections: 0,
+        }
+    }
+
+    /// A message the application sent, for this connection's outbox: none
+    /// that was sent as another user, or signed on another connection.
+    pub(crate) fn queue(&mut self, frame: Queued) {
+        if frame.user != self.users {
+            tracing::warn!("[WSE] a message sent as the previous user was dropped");
+        } else if frame.only_on.is_some_and(|on| on != self.connections) {
+            tracing::warn!("[WSE] a signed message whose connection went was dropped");
+        } else {
+            self.outbox.push(Outgoing::Text(frame.text));
         }
     }
 
@@ -1027,7 +1048,15 @@ impl<H: Handler> Session<H> {
         if let Ok(mut connection) = self.shared.connection.lock() {
             *connection = Some((connection_id.clone(), user_id.clone()));
         }
+        if self.last_user.as_ref().is_some_and(|last| *last != user_id) {
+            self.forget_user();
+        }
+        self.last_user = Some(user_id.clone());
         self.user_id.clone_from(&user_id);
+        self.connections += 1;
+        self.shared
+            .connections
+            .store(self.connections, Ordering::Release);
         self.shared.ready.store(true, Ordering::Release);
         let topics: Vec<String> = self.wanted.iter().cloned().collect();
         if !topics.is_empty() {
@@ -1044,6 +1073,18 @@ impl<H: Handler> Session<H> {
             reconnected,
             recovery: self.server_recovery,
         }));
+    }
+
+    /// The server took the connection for another user than the last: what
+    /// the last one sent and was not sent yet, and where its topics stood,
+    /// are not this one's.
+    fn forget_user(&mut self) {
+        self.users += 1;
+        self.shared.users.store(self.users, Ordering::Release);
+        self.topics.clear();
+        self.unrecoverable.clear();
+        self.holes = 0;
+        self.next_deadline = None;
     }
 
     fn on_error(&mut self, message: &Message<'_>) {
@@ -1189,8 +1230,6 @@ pub(crate) fn client_hello(compression: bool, e2e: Option<serde_json::Value>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicBool;
 
     /// What reached the application.
     #[derive(Default)]
@@ -1211,12 +1250,7 @@ mod tests {
     }
 
     fn session(recovery_timeout: Duration) -> Session<Seen> {
-        let shared = Arc::new(Shared {
-            ready: AtomicBool::new(false),
-            connection: Mutex::new(None),
-            token: Mutex::new(None),
-            server_kid: Mutex::new(None),
-        });
+        let shared = Arc::new(Shared::new(None));
         let keys = Arc::new(Keys::from_config(&crate::Config::new("ws://x")).unwrap());
         let mut session = Session::new(
             Seen::default(),
@@ -1230,9 +1264,13 @@ mod tests {
     }
 
     fn ready(session: &mut Session<Seen>, recovery: bool) {
+        ready_as(session, "u", recovery);
+    }
+
+    fn ready_as(session: &mut Session<Seen>, user: &str, recovery: bool) {
         session.on_json(
             &format!(
-                r#"{{"c":"WSE","t":"server_ready","p":{{"details":{{"connection_id":"c1","user_id":"u","features":{{"recovery":{recovery}}}}}}}}}"#
+                r#"{{"c":"WSE","t":"server_ready","p":{{"details":{{"connection_id":"c1","user_id":"{user}","features":{{"recovery":{recovery}}}}}}}}}"#
             ),
             None,
         );
@@ -1498,6 +1536,23 @@ mod tests {
     }
 
     #[test]
+    fn a_connection_for_another_user_asks_for_its_topics_afresh() {
+        let mut s = session(Duration::from_secs(3));
+        ready(&mut s, true);
+        feed(&mut s, E, &[1, 2]);
+        sent(&mut s);
+        s.close();
+        s.open(None);
+        ready_as(&mut s, "someone else", true);
+        let request = sent(&mut s);
+        assert_eq!(request[0]["p"]["topics"], serde_json::json!(["t"]));
+        assert_eq!(request[0]["p"].get("recovery"), None);
+        // Where the last user's stream stood holds nothing back.
+        feed(&mut s, E, &[1]);
+        assert_eq!(s.handler.offsets, [1, 2, 1]);
+    }
+
+    #[test]
     fn a_topic_left_starts_over_when_joined_again() {
         let mut s = session(Duration::from_secs(3));
         ready(&mut s, true);
@@ -1567,12 +1622,7 @@ mod tests {
                 )
             })
             .collect();
-        let shared = Arc::new(Shared {
-            ready: AtomicBool::new(false),
-            connection: Mutex::new(None),
-            token: Mutex::new(None),
-            server_kid: Mutex::new(None),
-        });
+        let shared = Arc::new(Shared::new(None));
         let keys = Arc::new(Keys::from_config(&crate::Config::new("ws://x")).unwrap());
         let mut s = Session::new(Decode(0.0), shared, keys, &[], Duration::from_secs(3));
         s.open(None);

@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Rust client: one user's queued messages and recovery positions never go
+  out on the next user's connection. When the token provider's next token
+  is another user's, what the last user queued and did not send is dropped,
+  and the topics are subscribed again from the start, as the TypeScript
+  client does.
+- Rust client: a signed message goes on the connection it was signed on or
+  not at all; one still queued when the connection was lost is dropped
+  instead of going out on the next connection, as in the TypeScript and
+  Python clients.
+
 ## v3.0.1 (2026-11-15)
 
 ### Fixed

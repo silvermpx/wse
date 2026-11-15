@@ -1,6 +1,6 @@
 //! The application's handle on a connection.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -37,16 +37,63 @@ pub(crate) enum Control {
     Close,
 }
 
+/// A message the application sent, on its way to the connection's task.
+pub(crate) struct Queued {
+    pub(crate) text: String,
+    /// The user it was sent as ([`Shared::users`]): it goes nowhere once the
+    /// server took a connection for another user.
+    pub(crate) user: u64,
+    /// A signed message goes on the connection it was signed on
+    /// ([`Shared::connections`]), or not at all.
+    pub(crate) only_on: Option<u64>,
+}
+
+/// The user and connection a message was sent for.
+struct SentFor {
+    user: u64,
+    /// What a signed message goes on.
+    #[cfg_attr(not(feature = "aws-lc"), allow(dead_code))]
+    connection: u64,
+}
+
+impl SentFor {
+    fn frame(&self, text: String) -> Queued {
+        Queued {
+            text,
+            user: self.user,
+            only_on: None,
+        }
+    }
+}
+
 /// What the handles and the connection's task share.
 pub(crate) struct Shared {
     /// The server took the current connection: messages may go.
     pub(crate) ready: AtomicBool,
+    /// Counts the times the server took a connection for another user than
+    /// the one before.
+    pub(crate) users: AtomicU64,
+    /// Counts the connections the server took.
+    pub(crate) connections: AtomicU64,
     /// The current connection's id and user.
     pub(crate) connection: Mutex<Option<(String, Option<String>)>>,
     /// The token for the next connection attempt.
     pub(crate) token: Mutex<Option<String>>,
     /// The server's signing key: what signed messages are for.
     pub(crate) server_kid: Mutex<Option<String>>,
+}
+
+impl Shared {
+    pub(crate) fn new(token: Option<String>) -> Self {
+        Self {
+            ready: AtomicBool::new(false),
+            users: AtomicU64::new(0),
+            connections: AtomicU64::new(0),
+            connection: Mutex::new(None),
+            token: Mutex::new(token),
+            server_kid: Mutex::new(None),
+        }
+    }
 }
 
 /// A connection to a WSE server, made again when it is lost.
@@ -57,12 +104,17 @@ pub(crate) struct Shared {
 /// Sends go out in the order they were made; what the server sends goes to
 /// the [`Handler`] the client was made with, or to the
 /// [`Events`](crate::Events) of [`connect`](crate::connect).
+///
+/// A message still queued when the connection is lost goes out on the next
+/// one, unless the server takes that one for another user: then it goes
+/// nowhere, and the topics start over. A signed message goes out on the
+/// connection it was signed on, or not at all.
 #[derive(Clone)]
 pub struct Client {
     shared: Arc<Shared>,
     #[cfg_attr(not(feature = "aws-lc"), allow(dead_code))]
     keys: Arc<Keys>,
-    frames: mpsc::Sender<String>,
+    frames: mpsc::Sender<Queued>,
     control: mpsc::UnboundedSender<Control>,
     status: watch::Receiver<Status>,
     /// The application's hold on the connection; none for a handler's.
@@ -106,12 +158,7 @@ impl Client {
         if let Some(mut key) = config.signing_key.take() {
             zeroize::Zeroize::zeroize(&mut key);
         }
-        let shared = Arc::new(Shared {
-            ready: AtomicBool::new(false),
-            connection: Mutex::new(None),
-            token: Mutex::new(config.token.clone()),
-            server_kid: Mutex::new(None),
-        });
+        let shared = Arc::new(Shared::new(config.token.clone()));
         let (frames_tx, frames_rx) = mpsc::channel(config.send_queue);
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (status_tx, status_rx) = watch::channel(Status::Connecting);
@@ -160,27 +207,32 @@ impl Client {
     /// Sends a message `{"t": kind, "p": payload}`; fails at once when the
     /// queue is full.
     pub fn try_send<P: Serialize + ?Sized>(&self, kind: &str, payload: &P) -> Result<(), Error> {
-        self.ready()?;
+        let for_now = self.ready()?;
         let text = encode(kind, payload)?;
-        self.frames.try_send(text).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => Error::Full,
-            mpsc::error::TrySendError::Closed(_) => Error::Closed,
-        })
+        self.frames
+            .try_send(for_now.frame(text))
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => Error::Full,
+                mpsc::error::TrySendError::Closed(_) => Error::Closed,
+            })
     }
 
     /// Sends a message `{"t": kind, "p": payload}`, waiting for room in the
     /// queue.
     pub async fn send<P: Serialize + ?Sized>(&self, kind: &str, payload: &P) -> Result<(), Error> {
-        self.ready()?;
+        let for_now = self.ready()?;
         let text = encode(kind, payload)?;
-        self.frames.send(text).await.map_err(|_| Error::Closed)
+        self.frames
+            .send(for_now.frame(text))
+            .await
+            .map_err(|_| Error::Closed)
     }
 
     /// Sends JSON text as it is: a message the application built itself.
     pub async fn send_raw(&self, json: impl Into<String>) -> Result<(), Error> {
-        self.ready()?;
+        let for_now = self.ready()?;
         self.frames
-            .send(json.into())
+            .send(for_now.frame(json.into()))
             .await
             .map_err(|_| Error::Closed)
     }
@@ -198,7 +250,7 @@ impl Client {
         payload: &P,
         n: Option<&str>,
     ) -> Result<String, Error> {
-        self.ready()?;
+        let for_now = self.ready()?;
         let audience = self
             .shared
             .server_kid
@@ -228,7 +280,12 @@ impl Client {
         let text = self
             .keys
             .sign(kind, &payload, &audience, &n, crate::session::now_ms())?;
-        self.frames.send(text).await.map_err(|_| Error::Closed)?;
+        // Signed for this connection: it goes on it or not at all.
+        let frame = Queued {
+            only_on: Some(for_now.connection),
+            ..for_now.frame(text)
+        };
+        self.frames.send(frame).await.map_err(|_| Error::Closed)?;
         Ok(n)
     }
 
@@ -306,9 +363,16 @@ impl Client {
         connection.as_ref().and_then(|(_, user)| user.clone())
     }
 
-    fn ready(&self) -> Result<(), Error> {
+    /// The user and connection a message is sent for, read before the flag:
+    /// one taken in between leaves the message with those before it, which
+    /// it does not go out for.
+    fn ready(&self) -> Result<SentFor, Error> {
+        let sent_for = SentFor {
+            user: self.shared.users.load(Ordering::Acquire),
+            connection: self.shared.connections.load(Ordering::Acquire),
+        };
         if self.shared.ready.load(Ordering::Acquire) {
-            Ok(())
+            Ok(sent_for)
         } else if matches!(*self.status.borrow(), Status::Closed(_)) {
             Err(Error::Closed)
         } else {

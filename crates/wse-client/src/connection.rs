@@ -16,7 +16,7 @@ use tokio_tungstenite::tungstenite::{self, Message as Frame};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use web_time::Instant;
 
-use crate::client::{Control, Shared, Status};
+use crate::client::{Control, Queued, Shared, Status};
 use crate::config::Config;
 use crate::decode::Decoder;
 use crate::error::Error;
@@ -39,7 +39,7 @@ const FRAME_OVERHEAD: usize = 32;
 pub(crate) struct Driver<H> {
     config: Config,
     shared: Arc<Shared>,
-    frames: mpsc::Receiver<String>,
+    frames: mpsc::Receiver<Queued>,
     control: mpsc::UnboundedReceiver<Control>,
     status: watch::Sender<Status>,
     decoder: Decoder,
@@ -54,7 +54,7 @@ impl<H: Handler> Driver<H> {
         handler: H,
         shared: Arc<Shared>,
         keys: Arc<Keys>,
-        frames: mpsc::Receiver<String>,
+        frames: mpsc::Receiver<Queued>,
         control: mpsc::UnboundedReceiver<Control>,
         status: watch::Sender<Status>,
     ) -> Self {
@@ -253,11 +253,11 @@ impl<H: Handler> Driver<H> {
                         last_seen = Instant::now();
                     }
                 }
-                Some(text) = self.frames.recv(), if self.session.ready => {
-                    self.session.outbox.push(Outgoing::Text(text));
+                Some(frame) = self.frames.recv(), if self.session.ready => {
+                    self.session.queue(frame);
                     for _ in 1..SEND_BATCH {
                         match self.frames.try_recv() {
-                            Ok(text) => self.session.outbox.push(Outgoing::Text(text)),
+                            Ok(frame) => self.session.queue(frame),
                             Err(_) => break,
                         }
                     }
@@ -339,8 +339,8 @@ impl<H: Handler> Driver<H> {
     /// What the application sent before it closed goes out first.
     fn take_queued(&mut self) {
         if self.session.ready {
-            while let Ok(text) = self.frames.try_recv() {
-                self.session.outbox.push(Outgoing::Text(text));
+            while let Ok(frame) = self.frames.try_recv() {
+                self.session.queue(frame);
             }
         }
     }
