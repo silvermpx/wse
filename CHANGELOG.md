@@ -13,6 +13,11 @@
   (`features.history_ttl`). Python: `subscribe_with_recovery(positions=...)`
   takes `streams` and returns them; Rust: `TopicPosition` and
   `Publisher::subscribe_with_positions`.
+- Rust client: a recovery names the client's offset in every stream of the
+  topic; it starts a stream the server lists that it did not know where the
+  server was, reports per stream what a recovery that did not recover lost,
+  forgets a stream the server no longer holds, and stops naming one quiet
+  for longer than the server keeps it (`history_ttl`).
 
 ### Fixed
 

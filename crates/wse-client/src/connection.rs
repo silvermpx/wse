@@ -208,6 +208,8 @@ impl<H: Handler> Driver<H> {
             tokio::select! {
                 frame = read(&mut self.session.handler, &mut ws, gate) => {
                     // What already came is read in one go, up to a batch.
+                    let now = Instant::now();
+                    self.session.clock = now;
                     let mut frame = frame;
                     let mut alive = false;
                     for _ in 0..READ_BATCH {
@@ -250,7 +252,7 @@ impl<H: Handler> Driver<H> {
                         }
                     }
                     if alive {
-                        last_seen = Instant::now();
+                        last_seen = now;
                     }
                 }
                 Some(frame) = self.frames.recv(), if self.session.ready => {

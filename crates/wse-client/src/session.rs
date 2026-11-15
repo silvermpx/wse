@@ -61,7 +61,13 @@ struct Request {
     id: u64,
     /// Asked for a hole, not by a subscription.
     for_hole: bool,
+    /// The streams it named.
+    named: Vec<u32>,
 }
+
+/// How long past the server's `history_ttl` a stream that heard nothing is
+/// still named: the clocks of a node and a client do not tick together.
+const QUIET_MARGIN: Duration = Duration::from_secs(5);
 
 /// What the session asks of the connection.
 pub(crate) enum Outgoing {
@@ -114,6 +120,12 @@ pub(crate) struct Session<H> {
     /// moves.
     users: u64,
     connections: u64,
+    /// When the frames being read came: the connection's task sets it once
+    /// per batch.
+    pub(crate) clock: Instant,
+    /// How long the server keeps a stream that receives nothing
+    /// (`history_ttl`): one quiet for longer is not named in a recovery.
+    history_ttl: Option<Duration>,
 }
 
 impl<H: Handler> Session<H> {
@@ -148,6 +160,8 @@ impl<H: Handler> Session<H> {
             last_user: None,
             users: 0,
             connections: 0,
+            clock: Instant::now(),
+            history_ttl: None,
         }
     }
 
@@ -171,6 +185,7 @@ impl<H: Handler> Session<H> {
         self.ready = false;
         self.became_ready = false;
         self.server_recovery = false;
+        self.history_ttl = None;
         self.user_id = None;
         self.requests.clear();
         self.unrecoverable.clear();
@@ -437,7 +452,7 @@ impl<H: Handler> Session<H> {
         };
         // A hole in another stream of the topic does not hold this one.
         let held_here = topic.holes.iter().any(|h| h.epoch == at.epoch);
-        match topic.streams.check(at) {
+        match topic.streams.check(at, self.clock) {
             Verdict::Duplicate => {}
             Verdict::Deliver => {
                 if !self.unrecoverable.is_empty() {
@@ -527,11 +542,19 @@ impl<H: Handler> Session<H> {
         self.next_request += 1;
         hole.request = Some(id);
         hole.requested_from = Some(from.offset);
+        // From the hole's stream (where a server before 3.1 replays from),
+        // with where the client stands in each.
+        let streams: Vec<Position> = topic.streams.positions().collect();
+        let named = streams.iter().map(|s| s.epoch).collect();
         self.requests
             .entry(name.into())
             .or_default()
-            .push_back(Request { id, for_hole: true });
-        let request = subscription(&[name], &[(name, from)]);
+            .push_back(Request {
+                id,
+                for_hole: true,
+                named,
+            });
+        let request = subscription(&[name], &[(name, from, streams)]);
         self.outbox.push(Outgoing::Text(request));
     }
 
@@ -555,10 +578,13 @@ impl<H: Handler> Session<H> {
             let Some(next) = hole.held.remove(&next_offset) else {
                 break;
             };
-            topic.streams.advance(Position {
-                epoch,
-                offset: next_offset,
-            });
+            topic.streams.advance(
+                Position {
+                    epoch,
+                    offset: next_offset,
+                },
+                self.clock,
+            );
             self.handler.message(&next.as_message());
         }
         let filled = self
@@ -611,7 +637,9 @@ impl<H: Handler> Session<H> {
                 self.report(name, epoch, Some(first), Some(offset - 1), reason);
             }
             if let Some(topic) = self.topics.get_mut(name) {
-                topic.streams.advance(Position { epoch, offset });
+                topic
+                    .streams
+                    .advance(Position { epoch, offset }, self.clock);
             }
             self.handler.message(&message.as_message());
             last = Some(offset);
@@ -624,7 +652,7 @@ impl<H: Handler> Session<H> {
             return;
         };
         let last = topic.streams.stream(at.epoch);
-        topic.streams.advance(at);
+        topic.streams.advance(at, self.clock);
         if let Some(first) = last.and_then(|last| last.offset.checked_add(1))
             && at.offset > first
         {
@@ -662,6 +690,7 @@ impl<H: Handler> Session<H> {
 
     /// Holes whose wait is over give up.
     pub(crate) fn on_deadline(&mut self, now: Instant) {
+        self.clock = now;
         // Nothing came back for these: the server application may not
         // answer recovery requests. After a few, the client stops asking.
         let unanswered = self
@@ -719,20 +748,35 @@ impl<H: Handler> Session<H> {
     fn send_subscription(&mut self, topics: &[String]) {
         let mut positions = Vec::new();
         if self.server_recovery {
+            // A stream that heard nothing for longer than the server keeps
+            // one is gone there: naming it would fail the recovery.
+            let quiet_before = self
+                .history_ttl
+                .and_then(|ttl| self.clock.checked_sub(ttl + QUIET_MARGIN));
             for topic in topics {
-                if let Some(at) = self
-                    .topics
-                    .get(topic.as_str())
-                    .and_then(|t| t.streams.position())
-                {
-                    positions.push((topic.as_str(), at));
+                let Some(t) = self.topics.get_mut(topic.as_str()) else {
+                    continue;
+                };
+                if let Some(before) = quiet_before {
+                    let holes = &t.holes;
+                    t.streams
+                        .forget_quiet(before, |epoch| holes.iter().any(|h| h.epoch == epoch));
+                }
+                if let Some(at) = t.streams.position() {
+                    positions.push((
+                        topic.as_str(),
+                        at,
+                        t.streams.positions().collect::<Vec<_>>(),
+                    ));
                 }
             }
         }
         let now = Instant::now();
-        for &(topic, at) in &positions {
+        for (topic, at, streams) in &positions {
+            let (topic, at) = (*topic, *at);
             let id = self.next_request;
             self.next_request += 1;
+            let named = streams.iter().map(|s| s.epoch).collect();
             let hole = self
                 .topics
                 .get_mut(topic)
@@ -748,7 +792,11 @@ impl<H: Handler> Session<H> {
             self.requests
                 .entry(topic.into())
                 .or_default()
-                .push_back(Request { id, for_hole });
+                .push_back(Request {
+                    id,
+                    for_hole,
+                    named,
+                });
         }
         if self.holes > 0 {
             self.next_deadline = self.first_deadline();
@@ -779,6 +827,8 @@ impl<H: Handler> Session<H> {
             offset: Option<u64>,
             recovered: Option<bool>,
             count: u64,
+            /// From 3.1: each stream the server holds, epoch -> last offset.
+            streams: Option<BTreeMap<String, u64>>,
         }
         let Ok(reply) = message.payload::<Reply>() else {
             tracing::debug!("[WSE] unreadable subscription reply dropped");
@@ -791,7 +841,28 @@ impl<H: Handler> Session<H> {
         for (topic, info) in &reply.recovery {
             let epoch = info.epoch.as_deref().and_then(epoch_of);
             let recovered = info.recovered.unwrap_or(true);
-            self.on_recovery_reply(topic, recovered, epoch, info.epoch.is_some(), info.offset);
+            let streams: Option<Vec<Position>> = info.streams.as_ref().map(|streams| {
+                streams
+                    .iter()
+                    .filter_map(|(epoch, offset)| {
+                        Some(Position {
+                            epoch: epoch_of(epoch)?,
+                            offset: *offset,
+                        })
+                    })
+                    .collect()
+            });
+            let request = self.on_recovery_reply(
+                topic,
+                recovered,
+                epoch,
+                info.epoch.is_some(),
+                info.offset,
+                streams.is_some(),
+            );
+            if let Some(streams) = &streams {
+                self.take_streams(topic, request.as_ref(), streams, recovered);
+            }
             recovery.push(Recovery {
                 topic: topic.clone(),
                 recovered,
@@ -808,6 +879,7 @@ impl<H: Handler> Session<H> {
         }));
     }
 
+    /// The answer to the oldest request out for `name`: which one it was.
     fn on_recovery_reply(
         &mut self,
         name: &str,
@@ -815,9 +887,10 @@ impl<H: Handler> Session<H> {
         epoch: Option<u32>,
         has_epoch: bool,
         offset: Option<u64>,
-    ) {
+        listed_streams: bool,
+    ) -> Option<Request> {
         let Some(request) = self.requests.get_mut(name).and_then(VecDeque::pop_front) else {
-            return; // an answer to a plain subscription: nothing moves
+            return None; // an answer to a plain subscription: nothing moves
         };
         if self.requests.get(name).is_some_and(VecDeque::is_empty) {
             self.requests.remove(name);
@@ -838,7 +911,7 @@ impl<H: Handler> Session<H> {
                 .get(name)
                 .filter(|t| t.holes.iter().any(|h| h.epoch == hole_epoch))
             else {
-                return; // filled
+                return Some(request); // filled
             };
             let progressed = topic
                 .streams
@@ -858,16 +931,18 @@ impl<H: Handler> Session<H> {
                 };
                 self.give_up(name, hole_epoch, reason);
             }
-            return;
+            return Some(request);
         }
         if request.for_hole {
-            return; // the answer for a hole settled meanwhile
+            return Some(request); // the answer for a hole settled meanwhile
         }
-        if recovered {
-            return; // the replay moved the position as it came
+        // The replay moved the position as it came; a server that lists its
+        // streams says with them what was missed.
+        if recovered || listed_streams {
+            return Some(request);
         }
         let Some(at) = self.topics.get(name).and_then(|t| t.streams.position()) else {
-            return;
+            return Some(request);
         };
         match epoch {
             // The server has no history of the topic any more, or a new one:
@@ -878,12 +953,65 @@ impl<H: Handler> Session<H> {
             }
             _ => {
                 if offset.is_some_and(|offset| offset <= at.offset) {
-                    return; // nothing was missed
+                    return Some(request); // nothing was missed
                 }
                 // The next gap of this stream is reported at once instead of
                 // asked for: the server cannot replay it.
                 self.unrecoverable.insert(name.into(), at.epoch);
             }
+        }
+        Some(request)
+    }
+
+    /// The streams the server holds of a topic, as its reply lists them
+    /// (from 3.1): where the client starts in each one it did not know;
+    /// when a recovery did not recover, what each one it knew lost. A stream
+    /// the request named that the server does not hold is forgotten: naming
+    /// it again would fail every later recovery.
+    fn take_streams(
+        &mut self,
+        name: &str,
+        request: Option<&Request>,
+        listed: &[Position],
+        recovered: bool,
+    ) {
+        let now = self.clock;
+        let lost = !recovered && request.is_some_and(|r| !r.for_hole);
+        let mut reports: Vec<(u32, Option<u64>, Option<u64>)> = Vec::new();
+        let topic = self.topics.entry(name.into()).or_default();
+        let holes: Vec<u32> = topic.holes.iter().map(|h| h.epoch).collect();
+        for at in listed {
+            if holes.contains(&at.epoch) {
+                continue;
+            }
+            match topic.streams.stream(at.epoch) {
+                None => topic.streams.raise(*at, now),
+                Some(own) if lost && at.offset > own.offset => {
+                    reports.push((at.epoch, own.offset.checked_add(1), Some(at.offset)));
+                    topic.streams.raise(*at, now);
+                }
+                Some(_) => {}
+            }
+        }
+        for &epoch in request.map(|r| r.named.as_slice()).unwrap_or_default() {
+            if holes.contains(&epoch) || listed.iter().any(|at| at.epoch == epoch) {
+                continue;
+            }
+            if lost && let Some(own) = topic.streams.stream(epoch) {
+                reports.push((epoch, own.offset.checked_add(1), None));
+            }
+            topic.streams.forget(epoch);
+        }
+        // Not recovered with nothing to show for it: the server cannot show
+        // the client missed nothing.
+        if lost
+            && reports.is_empty()
+            && let Some(at) = topic.streams.position()
+        {
+            reports.push((at.epoch, None, None));
+        }
+        for (epoch, first, last) in reports {
+            self.report(name, epoch, first, last, GapReason::NotRecovered);
         }
     }
 
@@ -959,6 +1087,9 @@ impl<H: Handler> Session<H> {
         if ready.details.features.recovery {
             self.server_recovery = true;
         }
+        if let Some(ttl) = ready.details.features.history_ttl {
+            self.history_ttl = Some(Duration::from_secs(ttl));
+        }
         self.take_connection(connection_id, ready.details.user_id);
     }
 
@@ -975,6 +1106,9 @@ impl<H: Handler> Session<H> {
         let hello = message.payload::<Hello>().unwrap_or_default();
         if hello.features.recovery {
             self.server_recovery = true;
+        }
+        if let Some(ttl) = hello.features.history_ttl {
+            self.history_ttl = Some(Duration::from_secs(ttl));
         }
         if let Some(sealing) = &mut self.sealing {
             let answer = hello
@@ -1156,6 +1290,8 @@ fn is_protocol(kind: &str) -> bool {
 #[serde(default)]
 struct Features {
     recovery: bool,
+    /// Seconds a stream that receives nothing stays recoverable (3.1).
+    history_ttl: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1164,23 +1300,35 @@ struct SigningKey {
 }
 
 /// A `subscription_update` subscribing to `topics`, recovering from
-/// `positions`.
-fn subscription(topics: &[&str], positions: &[(&str, Position)]) -> String {
+/// `positions`: per topic, its last message and where it stands in each
+/// stream.
+fn subscription(topics: &[&str], positions: &[(&str, Position, Vec<Position>)]) -> String {
     let mut text =
         String::from(r#"{"c":"WSE","t":"subscription_update","p":{"action":"subscribe","topics":"#);
     push_json(&mut text, topics);
     if !positions.is_empty() {
         text.push_str(r#","recover":true,"recovery":{"#);
-        for (i, (topic, at)) in positions.iter().enumerate() {
+        for (i, (topic, at, streams)) in positions.iter().enumerate() {
             if i > 0 {
                 text.push(',');
             }
             push_json(&mut text, topic);
             let _ = write!(
                 text,
-                r#":{{"epoch":"{:08x}","offset":{}}}"#,
+                r#":{{"epoch":"{:08x}","offset":{}"#,
                 at.epoch, at.offset
             );
+            if !streams.is_empty() {
+                text.push_str(r#","streams":{"#);
+                for (j, stream) in streams.iter().enumerate() {
+                    if j > 0 {
+                        text.push(',');
+                    }
+                    let _ = write!(text, r#""{:08x}":{}"#, stream.epoch, stream.offset);
+                }
+                text.push('}');
+            }
+            text.push('}');
         }
         text.push('}');
     }
@@ -1404,7 +1552,7 @@ mod tests {
         let again = sent(&mut s);
         assert_eq!(
             again[0]["p"]["recovery"],
-            serde_json::json!({"t": {"epoch": E, "offset": 2}})
+            serde_json::json!({"t": {"epoch": E, "offset": 2, "streams": {E: 2}}})
         );
         feed(&mut s, E, &[3, 4]);
         reply(&mut s, E, 4, true, 2);
@@ -1461,7 +1609,7 @@ mod tests {
         let request = sent(&mut s);
         assert_eq!(
             request[0]["p"]["recovery"],
-            serde_json::json!({"t": {"epoch": E, "offset": 2}})
+            serde_json::json!({"t": {"epoch": E, "offset": 2, "streams": {E: 2}}})
         );
         // The replay: 3, then 4 and 5 again.
         feed(&mut s, E, &[3, 4, 5]);
@@ -1514,7 +1662,7 @@ mod tests {
                 "action": "subscribe",
                 "topics": ["t"],
                 "recover": true,
-                "recovery": {"t": {"epoch": E, "offset": 2}},
+                "recovery": {"t": {"epoch": E, "offset": 2, "streams": {E: 2}}},
             })
         );
         // The server restarted meanwhile: its history began again.
@@ -1552,6 +1700,120 @@ mod tests {
         assert_eq!(s.handler.offsets, [1, 2, 1]);
     }
 
+    /// The server's answer for `t`, listing its streams (from 3.1).
+    fn reply_streams(s: &mut Session<Seen>, recovered: bool, streams: &[(&str, u64)]) {
+        let streams: serde_json::Map<String, serde_json::Value> = streams
+            .iter()
+            .map(|(epoch, offset)| ((*epoch).to_owned(), (*offset).into()))
+            .collect();
+        let reply = serde_json::json!({
+            "c": "WSE",
+            "t": "subscription_update",
+            "p": {
+                "success_topics": ["t"],
+                "recovery": {"t": {
+                    "epoch": E, "offset": 0, "recovered": recovered, "count": 0,
+                    "streams": streams,
+                }},
+            },
+        });
+        s.on_json(&reply.to_string(), None);
+    }
+
+    fn reconnect(s: &mut Session<Seen>) -> Vec<serde_json::Value> {
+        sent(s);
+        s.close();
+        s.open(None);
+        ready(s, true);
+        sent(s)
+    }
+
+    const F: &str = "0000000f";
+
+    #[test]
+    fn a_recovery_names_every_stream_of_the_topic() {
+        let mut s = session(Duration::from_secs(3));
+        ready(&mut s, true);
+        feed(&mut s, F, &[4]);
+        feed(&mut s, E, &[1, 2]);
+        let request = reconnect(&mut s);
+        assert_eq!(
+            request[0]["p"]["recovery"],
+            serde_json::json!({"t": {"epoch": E, "offset": 2, "streams": {E: 2, F: 4}}})
+        );
+    }
+
+    #[test]
+    fn a_listed_stream_the_client_did_not_know_starts_where_the_server_was() {
+        let mut s = session(Duration::from_secs(3));
+        ready(&mut s, true);
+        sent(&mut s);
+        reply_streams(&mut s, false, &[(F, 5)]);
+        feed(&mut s, F, &[3, 5, 6]);
+        assert_eq!(s.handler.offsets, [6]);
+        assert!(gaps(&s).is_empty());
+    }
+
+    #[test]
+    fn a_recovery_that_did_not_recover_reports_what_each_stream_lost() {
+        let mut s = session(Duration::from_secs(3));
+        ready(&mut s, true);
+        feed(&mut s, E, &[1, 2]);
+        feed(&mut s, F, &[4]);
+        reconnect(&mut s);
+        // F the server does not hold any more; E went on to 5.
+        reply_streams(&mut s, false, &[(E, 5)]);
+        assert_eq!(
+            gaps(&s),
+            [
+                (Some(3), Some(5), GapReason::NotRecovered),
+                (Some(5), None, GapReason::NotRecovered),
+            ]
+        );
+        feed(&mut s, E, &[6]);
+        assert_eq!(s.handler.offsets, [1, 2, 4, 6]);
+        // F is forgotten: not named again.
+        let request = reconnect(&mut s);
+        assert_eq!(
+            request[0]["p"]["recovery"]["t"]["streams"],
+            serde_json::json!({E: 6})
+        );
+    }
+
+    #[test]
+    fn a_recovery_with_nothing_to_show_still_says_it_did_not_recover() {
+        let mut s = session(Duration::from_secs(3));
+        ready(&mut s, true);
+        feed(&mut s, E, &[1, 2]);
+        reconnect(&mut s);
+        reply_streams(&mut s, false, &[(E, 2)]);
+        assert_eq!(gaps(&s), [(None, None, GapReason::NotRecovered)]);
+    }
+
+    #[test]
+    fn a_stream_quiet_for_longer_than_the_server_keeps_it_is_not_named() {
+        let mut s = session(Duration::from_secs(3));
+        s.on_json(
+            r#"{"c":"WSE","t":"server_ready","p":{"details":{"connection_id":"c1","user_id":"u","features":{"recovery":true,"history_ttl":60}}}}"#,
+            None,
+        );
+        feed(&mut s, F, &[4]);
+        s.clock += Duration::from_secs(120);
+        feed(&mut s, E, &[1]);
+        sent(&mut s);
+        s.close();
+        s.open(None);
+        s.on_json(
+            r#"{"c":"WSE","t":"server_ready","p":{"details":{"connection_id":"c2","user_id":"u","features":{"recovery":true,"history_ttl":60}}}}"#,
+            None,
+        );
+        let request = sent(&mut s);
+        assert_eq!(
+            request[0]["p"]["recovery"]["t"]["streams"],
+            serde_json::json!({E: 1})
+        );
+    }
+
     #[test]
     fn a_topic_left_starts_over_when_joined_again() {
         let mut s = session(Duration::from_secs(3));
@@ -1568,16 +1830,15 @@ mod tests {
 
     #[test]
     fn requests_are_json() {
-        let text = subscription(
-            &["a\"b", "c"],
-            &[(
-                "c",
-                Position {
-                    epoch: 0xab,
-                    offset: 7,
-                },
-            )],
-        );
+        let last = Position {
+            epoch: 0xab,
+            offset: 7,
+        };
+        let other = Position {
+            epoch: 0x12,
+            offset: 3,
+        };
+        let text = subscription(&["a\"b", "c"], &[("c", last, vec![other, last])]);
         let value: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
         assert_eq!(
             value["p"],
@@ -1585,7 +1846,11 @@ mod tests {
                 "action": "subscribe",
                 "topics": ["a\"b", "c"],
                 "recover": true,
-                "recovery": {"c": {"epoch": "000000ab", "offset": 7}},
+                "recovery": {"c": {
+                    "epoch": "000000ab",
+                    "offset": 7,
+                    "streams": {"00000012": 3, "000000ab": 7},
+                }},
             })
         );
         let hello: serde_json::Value =
