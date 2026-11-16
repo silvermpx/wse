@@ -9,6 +9,9 @@ import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.buffer
+import kotlinx.coroutines.flow.cancellable
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
@@ -208,6 +211,42 @@ class WseClientTest {
         val at = checkNotNull(cancelledAt)
         assertEquals(listOf(at, at + 1u), got + listOfNotNull(next))
         client.disconnect(1_000u)
+    }
+
+    @Test
+    fun aCollectorCancelledBehindAnOperatorLeavesTheItemForTheNextReader(): Unit = runBlocking {
+        val operators: List<(Flow<WseItem>) -> Flow<WseItem>> = listOf({ it.cancellable() }, { it.buffer(0) })
+        for (operator in operators) {
+            val client = connectClient(WseConfig(url = url, topics = listOf("ticks"), insecure = true))
+            val events = client.events()
+            // Several ticks wait in one batch.
+            delay(700)
+            var cancelledAt: ULong? = null
+            val got = mutableListOf<ULong>()
+            val collector = launch {
+                val job = coroutineContext.job
+                // Cancelled as the first tick goes out: the operator checks before it hands on.
+                events.handingOver = { item ->
+                    if (cancelledAt == null && item is WseItem.Message && item.message.topic == "ticks") {
+                        cancelledAt = item.message.offset
+                        job.cancel()
+                    }
+                }
+                operator(events.asFlow()).collect { item ->
+                    if (item is WseItem.Message && item.message.topic == "ticks") got += checkNotNull(item.message.offset)
+                }
+            }
+            collector.join()
+            events.handingOver = null
+            var next: ULong? = null
+            while (next == null) {
+                val item = events.next() ?: break
+                if (item is WseItem.Message && item.message.topic == "ticks") next = item.message.offset
+            }
+            // The collector never had it: it comes to the next reader.
+            assertEquals(listOf(checkNotNull(cancelledAt)), got + listOfNotNull(next))
+            client.disconnect(1_000u)
+        }
     }
 
     @Test

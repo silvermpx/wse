@@ -7,6 +7,7 @@ import java.util.WeakHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.FlowCollector
 
@@ -70,13 +71,14 @@ class WseEvents internal constructor(
     }
 
     /**
-     * As a Flow: each collection goes on from where the last one stopped. An item is taken when it
-     * is handed to the collector: one a cancelled collector never got comes again.
+     * As a Flow: each collection goes on from where the last one stopped. An item is taken once its
+     * collector returned from it, or stopped the collection while it still ran (`first()`,
+     * `take()`, its own failure). One whose collection was cancelled before that comes again to the
+     * next reader: a collector cancelled while it handled an item may see it twice.
      */
     fun asFlow(): Flow<WseItem> = Items()
 
-    // Not the flow builder: its emit checks for cancellation before the collector runs, so a
-    // collector cancelled from another thread right then would lose an item already taken.
+    // Not the flow builder: its emit checks for cancellation before the collector runs.
     private inner class Items : Flow<WseItem> {
         override suspend fun collect(collector: FlowCollector<WseItem>) = reading {
             while (true) {
@@ -84,9 +86,15 @@ class WseEvents internal constructor(
                 // Cancelled before the hand-over: the item stays for the next reader.
                 currentCoroutineContext().ensureActive()
                 handingOver?.invoke(item)
-                // From here on nothing checks or suspends before the collector has it.
+                try {
+                    collector.emit(item)
+                } catch (stopped: Throwable) {
+                    // Stopped while running, the collector had it. Cancelled, it may not have
+                    // (an operator in between checks before it hands on): it comes again.
+                    if (currentCoroutineContext().isActive) index++
+                    throw stopped
+                }
                 index++
-                collector.emit(item)
             }
         }
     }
