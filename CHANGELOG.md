@@ -14,11 +14,12 @@ holds a topic until the application reloaded its state.
   background, UTF-8 codecs where Hermes has none). The root `wse-client` and
   `useWSE` are unchanged; React, zustand and Vue are optional peers. Server
   rendering and hydration are tested for React, Vue and Svelte 5.
-- Mobile clients on the Rust client's `native` feature: Swift (iOS 15+,
-  macOS 12+; the package at github.com/silvermpx/wse-swift), Kotlin (Android
-  API 26+ and the JVM; `io.github.silvermpx:wse-client-android` on Maven
-  Central) and Dart for Flutter (`wse_client` on pub.dev, with prebuilt
-  libraries checked by SHA-256). Async calls, events in bounded batches that
+- Clients for phones and desktops on the Rust client's `native` feature:
+  Swift (iOS 15+, macOS 12+; the package at github.com/silvermpx/wse-swift),
+  Kotlin (Android API 26+ and the JVM; `io.github.silvermpx:wse-client-android`
+  on Maven Central) and Dart for Flutter (`wse_client` on pub.dev, for Android,
+  iOS, macOS, Windows and Linux apps, with prebuilt libraries checked by
+  SHA-256). Async calls, events in bounded batches that
   come again until acknowledged, pause and resume with app-lifecycle and
   network helpers, end-to-end encryption and signed messages. wss:// is
   checked by the system's certificate verifier, a private CA or the Mozilla

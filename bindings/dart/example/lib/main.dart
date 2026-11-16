@@ -1,5 +1,10 @@
 // Shows a WSE connection: its status and the last tick of the server's
-// `ticks` topic. Every word on the screen is in German and English.
+// `ticks` topic. Every word on the screen, and in the menu bar of macOS, is in
+// German and English.
+import 'dart:ui' show AppExitType;
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:wse_client/wse_client.dart';
 
@@ -20,6 +25,7 @@ const _texts = {
     'tick': 'Letzter Tick',
     'none': 'noch keiner',
     'switch': 'English',
+    'quit': 'WSE Demo beenden',
   },
   Language.en: {
     'title': 'WSE example',
@@ -30,6 +36,7 @@ const _texts = {
     'tick': 'Last tick',
     'none': 'none yet',
     'switch': 'Deutsch',
+    'quit': 'Quit WSE Demo',
   },
 };
 
@@ -55,6 +62,10 @@ class _ExampleAppState extends State<ExampleApp> {
   WseClient? _client;
 
   String t(String key) => _texts[_language]![key]!;
+
+  void _switchLanguage() => setState(
+    () => _language = _language == Language.de ? Language.en : Language.de,
+  );
 
   @override
   void initState() {
@@ -95,7 +106,7 @@ class _ExampleAppState extends State<ExampleApp> {
 
   @override
   Widget build(BuildContext context) {
-    return WidgetsApp(
+    final app = WidgetsApp(
       title: t('title'),
       color: _accent,
       textStyle: const TextStyle(fontSize: 18, color: _ink),
@@ -124,11 +135,7 @@ class _ExampleAppState extends State<ExampleApp> {
                 const SizedBox(height: 24),
                 GestureDetector(
                   key: const Key('language'),
-                  onTap: () => setState(
-                    () => _language = _language == Language.de
-                        ? Language.en
-                        : Language.de,
-                  ),
+                  onTap: _switchLanguage,
                   child: DecoratedBox(
                     decoration: BoxDecoration(
                       border: Border.all(color: _accent),
@@ -151,6 +158,33 @@ class _ExampleAppState extends State<ExampleApp> {
           ),
         ),
       ),
+    );
+    // macOS shows a menu bar: in the app's language, as everything else.
+    if (defaultTargetPlatform != TargetPlatform.macOS) return app;
+    return PlatformMenuBar(
+      menus: [
+        PlatformMenu(
+          label: 'WSE Demo',
+          menus: [
+            PlatformMenuItem(label: t('switch'), onSelected: _switchLanguage),
+            PlatformMenuItemGroup(
+              members: [
+                PlatformMenuItem(
+                  label: t('quit'),
+                  shortcut: const SingleActivator(
+                    LogicalKeyboardKey.keyQ,
+                    meta: true,
+                  ),
+                  onSelected: () => ServicesBinding.instance.exitApplication(
+                    AppExitType.required,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ],
+      child: app,
     );
   }
 }

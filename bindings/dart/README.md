@@ -150,6 +150,24 @@ missed. Dispose of both with the client.
 In `flutter test` the package loads the library its build hook made for the
 host, so tests that use the client run on the developer's machine too.
 
+## Desktop apps
+
+On Windows, macOS and Linux the package works as it does on a phone, and the
+release build takes the same prebuilt library: the app runs from any folder
+and needs no Rust toolchain. The example runs on all three
+(`flutter run -d macos`, `windows` or `linux`). A macOS app runs in the App
+Sandbox, which lets it open connections only with this entitlement in
+`macos/Runner/DebugProfile.entitlements` and
+`macos/Runner/Release.entitlements`:
+
+```xml
+<key>com.apple.security.network.client</key>
+<true/>
+```
+
+A Linux app builds with GTK 3, as every Flutter app on Linux. A minimized
+window counts as gone to the background (`WseAppLifecycle`, above).
+
 ## License
 
 MIT

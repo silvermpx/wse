@@ -2,11 +2,14 @@
 // the wss:// door of the CA it is given and finds the system's verifier
 // turning that door down, has an end-to-end encrypted session with the
 // pinned server echo, and gets a signed receipt for a signed message. It
-// prints "WSE_CHECK ok" or what failed, and shows nothing.
+// prints "WSE_CHECK ok" or what failed, and shows nothing; on a desktop it
+// also writes that to the file WSE_CHECK_FILE names (where it may: a macOS
+// app's sandbox keeps it to its stdout) and exits, 0 for ok.
 // run-integration-tests.sh builds it with MODE=release and passes the server
 // with --dart-define (WSE_URL, WSE_TLS_URL, WSE_CA, WSE_IDENTITY,
 // WSE_SIGNING).
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/widgets.dart';
 import 'package:wse_client/wse_client.dart';
@@ -26,6 +29,19 @@ Future<void> main() async {
     outcome = 'failed: $error';
   }
   debugPrint('WSE_CHECK $outcome');
+  if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
+    stdout.writeln('WSE_CHECK $outcome');
+    await stdout.flush();
+    final file = Platform.environment['WSE_CHECK_FILE'];
+    if (file != null) {
+      try {
+        File(file).writeAsStringSync('$outcome\n');
+      } on FileSystemException {
+        // Sandboxed: the outcome went to stdout.
+      }
+    }
+    exit(outcome == 'ok' ? 0 : 1);
+  }
 }
 
 Future<String> check() async {

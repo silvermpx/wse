@@ -13,7 +13,7 @@ WSE is a WebSocket engine for reactive user interfaces: trading terminals, dashb
 
 WSE runs inside your backend rather than as a separate service. A Python application starts it with the `wse-server` package, where it runs in threads of its own, outside the GIL; a Rust application embeds the `wse` crate. Both are the same engine, written in Rust. Several servers form a cluster by themselves, with no Redis or other broker in between.
 
-In the browser, the TypeScript client keeps the connection, its subscriptions and recovery, on a page without a framework or with React, Vue or Svelte; React Native apps use it too. Interfaces written in Rust (Leptos, Yew, Dioxus) use the Rust client compiled to WebAssembly. iOS, Android and Flutter apps use the Rust client through its Swift, Kotlin and Dart packages. Services and bots connect with the Python or the Rust client.
+In the browser, the TypeScript client keeps the connection, its subscriptions and recovery, on a page without a framework or with React, Vue or Svelte; React Native apps use it too. Interfaces written in Rust (Leptos, Yew, Dioxus) use the Rust client compiled to WebAssembly. iOS, Android and Flutter apps, on phones and on desktops, use the Rust client through its Swift, Kotlin and Dart packages. Services and bots connect with the Python or the Rust client.
 
 ## What it does
 

@@ -864,11 +864,13 @@ jobs:
 
   # The staged package's tests on each platform with a prebuilt library: the
   # build hook takes this runner's from the release's files and checks it
-  # against the list the package carries.
+  # against the list the package carries. Then its example as a desktop app:
+  # the integration test, and the release build run from a folder of its own.
   dart-check:
     name: Dart package on ${{ matrix.name }}
     needs: [preflight, dart-package]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60  # a desktop app can hang
     permissions:
       contents: read
     strategy:
@@ -933,6 +935,23 @@ jobs:
           mkdir dart-package
           tar -xzf "dart-dist/wse_client-dart-${VERSION}.tar.gz" -C dart-package
           bash .github/scripts/dart-check.sh dart-package dart-binaries
+
+      # A Flutter app on Linux is a GTK app: its build tools, and a display.
+      - name: Linux desktop tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libstdc++-12-dev xvfb
+
+      - name: The example app on this desktop, on the prebuilt library
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: '1'
+        run: |
+          case "$RUNNER_OS" in
+            macOS) .github/scripts/dart-app-check.sh dart-package dart-binaries macos ;;
+            Windows) .github/scripts/dart-app-check.sh dart-package dart-binaries windows ;;
+            Linux) xvfb-run -a .github/scripts/dart-app-check.sh dart-package dart-binaries linux ;;
+          esac
 
   # The staged package's example app on an Android emulator (its integration
   # test, then its release build) and on an iOS simulator, the build hook
@@ -1006,7 +1025,7 @@ jobs:
           arch: x86_64
           disable-animations: true
           emulator-options: -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect
-          script: .github/scripts/dart-mobile-check.sh dart-package dart-binaries emulator-5554
+          script: .github/scripts/dart-app-check.sh dart-package dart-binaries emulator-5554
 
       - name: The example on an iOS simulator, on the prebuilt library
         if: matrix.name == 'iOS'
@@ -1014,7 +1033,7 @@ jobs:
           device="$(xcrun simctl list devices available | grep -m1 -E 'iPhone' | sed -E 's/.*\(([0-9A-F-]{36})\).*/\1/')"
           xcrun simctl boot "$device"
           xcrun simctl bootstatus "$device" -b
-          .github/scripts/dart-mobile-check.sh dart-package dart-binaries "$device"
+          .github/scripts/dart-app-check.sh dart-package dart-binaries "$device"
 
   # The release AAR in an app built with R8, on an emulator: the system's
   # TLS, a tick, an end-to-end encrypted echo and a signed receipt.

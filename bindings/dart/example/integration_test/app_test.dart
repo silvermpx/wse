@@ -4,6 +4,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
@@ -36,10 +37,12 @@ void main() {
     expect(find.text('Verbindung: verbunden'), findsOneWidget);
     expect(find.textContaining('Letzter Tick: '), findsOneWidget);
     expect(find.textContaining('noch keiner'), findsNothing);
+    expectMenu(tester, ['English', 'WSE Demo beenden']);
     await tester.tap(find.byKey(const Key('language')));
     await tester.pump();
     expect(find.text('Connection: connected'), findsOneWidget);
     expect(find.textContaining('Verbindung'), findsNothing);
+    expectMenu(tester, ['Deutsch', 'Quit WSE Demo']);
   });
 
   test('a direct client hears the ticks too', () async {
@@ -120,4 +123,30 @@ void main() {
     await items.cancel();
     await client.close();
   });
+}
+
+/// The menu bar's items on macOS, in the app's language; the other systems
+/// show none.
+void expectMenu(WidgetTester tester, List<String> labels) {
+  if (defaultTargetPlatform != TargetPlatform.macOS) {
+    expect(find.byType(PlatformMenuBar), findsNothing);
+    return;
+  }
+  final bar = tester.widget<PlatformMenuBar>(find.byType(PlatformMenuBar));
+  final shown = <String>[];
+  void walk(List<PlatformMenuItem> items) {
+    for (final item in items) {
+      switch (item) {
+        case PlatformMenu(:final menus):
+          walk(menus);
+        case PlatformMenuItemGroup(:final members):
+          walk(members);
+        default:
+          shown.add(item.label);
+      }
+    }
+  }
+
+  walk(bar.menus);
+  expect(shown, labels);
 }
