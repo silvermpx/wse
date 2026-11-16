@@ -3306,7 +3306,7 @@ dependencies = [
 
 [[package]]
 name = "wse"
-version = "3.0.1"
+version = "3.1.0"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -3352,14 +3352,14 @@ dependencies = [
 
 [[package]]
 name = "wse-bindgen"
-version = "3.0.1"
+version = "3.1.0"
 dependencies = [
  "uniffi",
 ]
 
 [[package]]
 name = "wse-client"
-version = "3.0.1"
+version = "3.1.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -3392,7 +3392,7 @@ dependencies = [
 
 [[package]]
 name = "wse-dart"
-version = "3.0.1"
+version = "3.1.0"
 dependencies = [
  "flutter_rust_bridge",
  "wse-client",
@@ -3400,7 +3400,7 @@ dependencies = [
 
 [[package]]
 name = "wse-ffi"
-version = "3.0.1"
+version = "3.1.0"
 dependencies = [
  "async-trait",
  "uniffi",
@@ -3409,7 +3409,7 @@ dependencies = [
 
 [[package]]
 name = "wse-py"
-version = "3.0.1"
+version = "3.1.0"
 dependencies = [
  "mimalloc",
  "pyo3",

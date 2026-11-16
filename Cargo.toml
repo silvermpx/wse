@@ -8,7 +8,7 @@ exclude = ["benchmarks/rust-bench", "xtask"]
 resolver = "3"
 
 [workspace.package]
-version = "3.0.1"
+version = "3.1.0"
 edition = "2024"
 license = "MIT"
 # try_update on the atomics is stable since 1.95.
@@ -19,7 +19,7 @@ repository = "https://github.com/silvermpx/wse"
 # for the protocol (no default features), and in its tests and examples for
 # the server itself.
 [workspace.dependencies]
-wse = { version = "=3.0.1", path = "crates/wse", default-features = false }
+wse = { version = "=3.1.0", path = "crates/wse", default-features = false }
 
 [profile.release]
 lto = true
