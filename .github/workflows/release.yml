@@ -1336,12 +1336,15 @@ jobs:
   # release. The newest moving part goes first, crates.io and its token, then
   # npm and its trusted publisher: if one fails, nothing after it is out yet.
   # Every publish job skips what an earlier attempt already uploaded, so
-  # "Re-run failed jobs" finishes a release.
+  # "Re-run failed jobs" finishes a release. Their conditions name the results
+  # they wait for: a tag that publishes a dry run's files skips the build and
+  # test jobs, and a job with a skipped job anywhere above it is skipped too
+  # unless its condition says otherwise.
   # ---------------------------------------------------------------------------
   publish-npm:
     name: Publish wse-client to npm
     needs: [preflight, release-gate, publish-crates]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.release-gate.result == 'success' && needs.publish-crates.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-24.04
     environment:
       name: release
@@ -1387,7 +1390,7 @@ jobs:
   publish-pypi:
     name: Publish wse-client and wse-server to PyPI
     needs: [preflight, release-gate, publish-npm]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.release-gate.result == 'success' && needs.publish-npm.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-24.04
     environment:
       name: release
@@ -1439,7 +1442,7 @@ jobs:
   publish-crates:
     name: Publish the Rust crates to crates.io
     needs: [preflight, release-gate]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.release-gate.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-24.04
     environment:
       name: release
@@ -1480,7 +1483,7 @@ jobs:
   github-release:
     name: GitHub release
     needs: [preflight, publish-pypi, publish-crates]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.publish-pypi.result == 'success' && needs.publish-crates.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -1505,7 +1508,7 @@ jobs:
   publish-maven-central:
     name: Publish the Android library to Maven Central
     needs: [preflight, release-gate]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.release-gate.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-24.04
     environment:
       name: release
@@ -1542,7 +1545,7 @@ jobs:
   publish-pub-dev:
     name: Publish wse_client to pub.dev
     needs: [preflight, release-gate, github-release]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.release-gate.result == 'success' && needs.github-release.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-24.04
     environment:
       name: release
@@ -1598,7 +1601,7 @@ jobs:
   publish-swift:
     name: Publish the Swift package (silvermpx/wse-swift)
     needs: [preflight, github-release]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && needs.github-release.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-24.04
     environment:
       name: release
