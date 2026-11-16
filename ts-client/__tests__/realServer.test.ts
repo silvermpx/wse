@@ -149,8 +149,16 @@ describe.skipIf(!PYTHON || typeof WebSocket === 'undefined')('real RustWSEServer
     await vi.waitFor(() => expect(events.some((e) => e.event === 'stopped')).toBe(true), { timeout: 5_000 });
     await new Promise((r) => setTimeout(r, 2_000));
     expect(useWSEStore.getState().connectionState).toBe('reconnecting');
+    const subscribes = events.filter((e) => e.event === 'subscribe').length;
     send('start');
     await vi.waitFor(() => expect(transportReady()).toBe(true), { timeout: 15_000 });
+    // Published once the restarted server holds the client's subscription:
+    // before that a message reaches nobody, and the new epoch's history is
+    // not the client's to recover.
+    await vi.waitFor(
+      () => expect(events.filter((e) => e.event === 'subscribe').length).toBeGreaterThan(subscribes),
+      { timeout: 10_000 },
+    );
     send('publish 3');
     await vi.waitFor(() => expect(epochs.size).toBe(2), { timeout: 10_000 });
     expect(gaps.map((g) => g.reason)).toContain('epoch_changed');
