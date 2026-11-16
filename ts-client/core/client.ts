@@ -278,6 +278,17 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
   });
   let snapshot = snapshotOf(ctx.state.getState());
   const snapshotListeners = new Set<(snapshot: WSEClientSnapshot) => void>();
+  // One listener that throws costs the others nothing, nor the client's own
+  // state, which changes in the same call.
+  const tellSnapshot = () => {
+    for (const listener of [...snapshotListeners]) {
+      try {
+        listener(snapshot);
+      } catch (error) {
+        logger.error('A listener of the client state failed:', error);
+      }
+    }
+  };
   let transportReady = false;
   ctx.state.subscribe((s) => {
     // The connection went: what the client holds of its topics is not current.
@@ -286,7 +297,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     const next = snapshotOf(s);
     if (shallowSame(next, snapshot)) return;
     snapshot = next;
-    for (const listener of [...snapshotListeners]) listener(snapshot);
+    tellSnapshot();
   });
   const state: WSEClientState = {
     getSnapshot: () => snapshot,
@@ -474,7 +485,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     const next = snapshotOf(ctx.state.getState());
     if (shallowSame(next, snapshot)) return;
     snapshot = next;
-    for (const listener of [...snapshotListeners]) listener(snapshot);
+    tellSnapshot();
   };
 
   const pause = (reason: string) => {

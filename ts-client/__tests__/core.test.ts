@@ -102,6 +102,23 @@ describe('a client of its own', () => {
     expect(counted.send('two', {})).toBe('dropped');
   });
 
+  it('a state listener that throws leaves the others and the client working', async () => {
+    const c = client(A);
+    const seen: string[] = [];
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    c.state.listen(() => {
+      throw new Error('a broken listener');
+    });
+    c.state.listen((snapshot) => seen.push(snapshot.connection));
+    const lease = c.retain();
+    await tick();
+    await connectServer(socketOf(A)[0]);
+    expect(seen).toContain('connected');
+    expect(c.state.getSnapshot().ready).toBe(true);
+    lease.release();
+    errors.mockRestore();
+  });
+
   it('is ready once the server took the connection, not when the socket opens', async () => {
     const c = client(A);
     c.retain();
