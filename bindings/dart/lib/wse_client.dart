@@ -1,6 +1,7 @@
 /// The WSE client for Dart and Flutter, on the Rust client.
 library;
 
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart' show ExternalLibrary;
@@ -47,25 +48,69 @@ class WseClient {
   /// What the server sends, in order, until the client closes. A batch is
   /// acknowledged only once all of it was handed out, so a listener that
   /// stops in between gets the rest from the next one; one reader at a time.
-  Stream<rust.WseItem> events({int maxItems = 256, int maxBytes = 1 << 20}) async* {
-    while (true) {
-      final batch = _batch;
-      if (batch != null && _index < batch.items.length) {
-        yield batch.items[_index++];
-        continue;
+  /// Cancelling a listener that waits for the server ends the wait.
+  Stream<rust.WseItem> events({int maxItems = 256, int maxBytes = 1 << 20}) {
+    late final StreamController<rust.WseItem> controller;
+    Future<void>? pumping;
+    rust.WseCancel? waiting;
+    Completer<void>? resumed;
+    var cancelled = false;
+
+    Future<void> pump() async {
+      try {
+        while (!cancelled) {
+          final batch = _batch;
+          if (batch != null && _index < batch.items.length) {
+            if (controller.isPaused) {
+              await (resumed = Completer<void>()).future;
+              continue;
+            }
+            // Handed out: the listener has it once add returns.
+            final item = batch.items[_index++];
+            controller.add(item);
+            continue;
+          }
+          if (_ended) break;
+          if (batch != null) _acknowledged = batch.id;
+          final cancel = waiting = rust.WseCancel();
+          final rust.WseBatch next;
+          try {
+            next = await _native.nextBatch(
+                ack: _acknowledged, maxItems: maxItems, maxBytes: maxBytes, cancel: cancel);
+          } finally {
+            waiting = null;
+          }
+          if (next.end) {
+            _ended = true;
+            _batch = null;
+            break;
+          }
+          _batch = next;
+          _index = 0;
+        }
+      } catch (error, stack) {
+        if (!cancelled) controller.addError(error, stack);
       }
-      if (_ended) return;
-      if (batch != null) _acknowledged = batch.id;
-      final next = await _native.nextBatch(
-          ack: _acknowledged, maxItems: maxItems, maxBytes: maxBytes, cancel: rust.WseCancel());
-      if (next.end) {
-        _ended = true;
-        _batch = null;
-        return;
-      }
-      _batch = next;
-      _index = 0;
+      if (!cancelled) await controller.close();
     }
+
+    void wake() {
+      resumed?.complete();
+      resumed = null;
+    }
+
+    controller = StreamController<rust.WseItem>(
+      sync: true,
+      onListen: () => pumping = Future<void>.microtask(pump),
+      onResume: wake,
+      onCancel: () {
+        cancelled = true;
+        waiting?.cancel();
+        wake();
+        return pumping;
+      },
+    );
+    return controller.stream;
   }
 
   /// Sends `{"t": kind, "p": json}`, waiting for room in the queue.

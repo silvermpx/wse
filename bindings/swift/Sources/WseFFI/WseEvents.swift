@@ -20,6 +20,35 @@ public extension WseClient {
     func events(maxItems: UInt32 = 256, maxBytes: UInt32 = 1 << 20) -> WseEvents {
         WseEvents(client: self, maxItems: maxItems, maxBytes: maxBytes)
     }
+
+    /// Sends `{"t": kind, "p": json}`, waiting for room in the queue.
+    /// Cancelling the Task gives up the wait; a message already queued still
+    /// goes.
+    func send(kind: String, json: String) async throws {
+        try await cancellable { try await self.send(kind: kind, json: json, cancel: $0) }
+    }
+
+    /// Sends on the connection that is ready now, or not at all, waiting for
+    /// room in the queue. Cancelling the Task gives up the wait.
+    func sendLive(kind: String, json: String) async throws {
+        try await cancellable { try await self.sendLive(kind: kind, json: json, cancel: $0) }
+    }
+
+    /// Sends a signed message on this connection, or not at all; the nonce it
+    /// went with. Cancelling the Task gives up the wait.
+    func sendSigned(kind: String, json: String, nonce: String? = nil) async throws -> String {
+        try await cancellable { try await self.sendSigned(kind: kind, json: json, nonce: nonce, cancel: $0) }
+    }
+}
+
+/// Runs `call` with a token the Task's cancellation cancels.
+private func cancellable<T>(_ call: (WseCancel) async throws -> T) async throws -> T {
+    let cancel = WseCancel()
+    return try await withTaskCancellationHandler {
+        try await call(cancel)
+    } onCancel: {
+        cancel.cancel()
+    }
 }
 
 /// The events of a client. A batch is acknowledged only once all of it was

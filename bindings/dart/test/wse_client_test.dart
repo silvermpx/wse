@@ -59,6 +59,22 @@ void main() {
     await client.close();
   });
 
+  test('cancelling a listener that waits ends it, and the next one reads on', () async {
+    // No topics: past its first items the server stays quiet.
+    final client = await WseClient.connect(wseConfig(url));
+    final waiting = client.events().listen((_) {});
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    await waiting.cancel().timeout(const Duration(seconds: 2));
+    // The next listener is not refused as a second reader, and loses nothing.
+    await client.send('echo', '{"text":"again"}');
+    final echoed = await client
+        .events()
+        .firstWhere((item) => item.kind == WseItemKind.message && item.name == 'echoed')
+        .timeout(const Duration(seconds: 5));
+    expect(echoed.json, '{"text":"again"}');
+    await client.close();
+  });
+
   test('a payload must be JSON', () async {
     final client = await WseClient.connect(wseConfig(url));
     expect(() => client.trySend('x', 'not json'), throwsA(isA<WseError>()));

@@ -432,9 +432,15 @@ impl WseClient {
         Ok(self.0.try_send(&kind, &json)?)
     }
 
-    /// Sends `{"t": kind, "p": json}`, waiting for room in the queue.
-    pub async fn send(&self, kind: String, json: String) -> Result<(), WseError> {
-        Ok(self.0.send(kind, json).await?)
+    /// Sends `{"t": kind, "p": json}`, waiting for room in the queue;
+    /// `cancel` gives up the wait (a message already queued still goes).
+    pub async fn send(
+        &self,
+        kind: String,
+        json: String,
+        cancel: Arc<WseCancel>,
+    ) -> Result<(), WseError> {
+        Ok(self.0.send(kind, json, &cancel.0).await?)
     }
 
     /// Sends `{"t": kind, "p": json}` on the connection that is ready now, or not at all:
@@ -444,9 +450,15 @@ impl WseClient {
         Ok(self.0.try_send_live(&kind, &json)?)
     }
 
-    /// `try_send_live`, waiting for room in the queue.
-    pub async fn send_live(&self, kind: String, json: String) -> Result<(), WseError> {
-        Ok(self.0.send_live(kind, json).await?)
+    /// `try_send_live`, waiting for room in the queue; `cancel` gives up
+    /// the wait.
+    pub async fn send_live(
+        &self,
+        kind: String,
+        json: String,
+        cancel: Arc<WseCancel>,
+    ) -> Result<(), WseError> {
+        Ok(self.0.send_live(kind, json, &cancel.0).await?)
     }
 
     /// Sends a signed message on this connection, or not at all; the nonce it went with.
@@ -455,8 +467,9 @@ impl WseClient {
         kind: String,
         json: String,
         nonce: Option<String>,
+        cancel: Arc<WseCancel>,
     ) -> Result<String, WseError> {
-        Ok(self.0.send_signed(kind, json, nonce).await?)
+        Ok(self.0.send_signed(kind, json, nonce, &cancel.0).await?)
     }
 
     pub fn subscribe(&self, topics: Vec<String>) -> Result<(), WseError> {

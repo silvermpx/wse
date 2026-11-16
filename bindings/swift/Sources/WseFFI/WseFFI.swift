@@ -766,19 +766,21 @@ public protocol WseClientProtocol: AnyObject, Sendable {
     func reconnect() throws 
     
     /**
-     * Sends `{"t": kind, "p": json}`, waiting for room in the queue.
+     * Sends `{"t": kind, "p": json}`, waiting for room in the queue;
+     * `cancel` gives up the wait (a message already queued still goes).
      */
-    func send(kind: String, json: String) async throws 
+    func send(kind: String, json: String, cancel: WseCancel) async throws 
     
     /**
-     * `try_send_live`, waiting for room in the queue.
+     * `try_send_live`, waiting for room in the queue; `cancel` gives up
+     * the wait.
      */
-    func sendLive(kind: String, json: String) async throws 
+    func sendLive(kind: String, json: String, cancel: WseCancel) async throws 
     
     /**
      * Sends a signed message on this connection, or not at all; the nonce it went with.
      */
-    func sendSigned(kind: String, json: String, nonce: String?) async throws  -> String
+    func sendSigned(kind: String, json: String, nonce: String?, cancel: WseCancel) async throws  -> String
     
     func status()  -> WseStatus
     
@@ -912,14 +914,15 @@ open func reconnect()throws   {try rustCallWithError(FfiConverterTypeWseError_li
 }
     
     /**
-     * Sends `{"t": kind, "p": json}`, waiting for room in the queue.
+     * Sends `{"t": kind, "p": json}`, waiting for room in the queue;
+     * `cancel` gives up the wait (a message already queued still goes).
      */
-open func send(kind: String, json: String)async throws   {
+open func send(kind: String, json: String, cancel: WseCancel)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_wse_ffi_fn_method_wseclient_send(
-                        self.uniffiCloneHandle(),FfiConverterString.lower(kind),FfiConverterString.lower(json)
+                        self.uniffiCloneHandle(),FfiConverterString.lower(kind),FfiConverterString.lower(json),FfiConverterTypeWseCancel_lower(cancel)
                 )
             },
             pollFunc: ffi_wse_ffi_rust_future_poll_void,
@@ -931,14 +934,15 @@ open func send(kind: String, json: String)async throws   {
 }
     
     /**
-     * `try_send_live`, waiting for room in the queue.
+     * `try_send_live`, waiting for room in the queue; `cancel` gives up
+     * the wait.
      */
-open func sendLive(kind: String, json: String)async throws   {
+open func sendLive(kind: String, json: String, cancel: WseCancel)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_wse_ffi_fn_method_wseclient_send_live(
-                        self.uniffiCloneHandle(),FfiConverterString.lower(kind),FfiConverterString.lower(json)
+                        self.uniffiCloneHandle(),FfiConverterString.lower(kind),FfiConverterString.lower(json),FfiConverterTypeWseCancel_lower(cancel)
                 )
             },
             pollFunc: ffi_wse_ffi_rust_future_poll_void,
@@ -952,12 +956,12 @@ open func sendLive(kind: String, json: String)async throws   {
     /**
      * Sends a signed message on this connection, or not at all; the nonce it went with.
      */
-open func sendSigned(kind: String, json: String, nonce: String?)async throws  -> String  {
+open func sendSigned(kind: String, json: String, nonce: String?, cancel: WseCancel)async throws  -> String  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_wse_ffi_fn_method_wseclient_send_signed(
-                        self.uniffiCloneHandle(),FfiConverterString.lower(kind),FfiConverterString.lower(json),FfiConverterOptionString.lower(nonce)
+                        self.uniffiCloneHandle(),FfiConverterString.lower(kind),FfiConverterString.lower(json),FfiConverterOptionString.lower(nonce),FfiConverterTypeWseCancel_lower(cancel)
                 )
             },
             pollFunc: ffi_wse_ffi_rust_future_poll_rust_buffer,
@@ -2826,13 +2830,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wse_ffi_checksum_method_wseclient_reconnect() != 25763) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_wse_ffi_checksum_method_wseclient_send() != 29894) {
+    if (uniffi_wse_ffi_checksum_method_wseclient_send() != 38848) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_wse_ffi_checksum_method_wseclient_send_live() != 8723) {
+    if (uniffi_wse_ffi_checksum_method_wseclient_send_live() != 56021) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_wse_ffi_checksum_method_wseclient_send_signed() != 14514) {
+    if (uniffi_wse_ffi_checksum_method_wseclient_send_signed() != 57399) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_method_wseclient_status() != 33306) {

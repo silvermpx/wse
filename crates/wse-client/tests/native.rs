@@ -263,7 +263,7 @@ async fn the_token_comes_from_the_application_and_payloads_are_json() {
         ErrorKind::Encode
     );
     client
-        .send("order".into(), r#"{"qty":1}"#.into())
+        .send("order".into(), r#"{"qty":1}"#.into(), &CancelToken::new())
         .await
         .unwrap();
     client.disconnect(1_000).await;
@@ -278,7 +278,11 @@ async fn a_live_send_goes_on_the_ready_connection_or_fails() {
         .unwrap();
     client.try_send_live("valve", r#"{"open":true}"#).unwrap();
     client
-        .send_live("valve".into(), r#"{"open":false}"#.into())
+        .send_live(
+            "valve".into(),
+            r#"{"open":false}"#.into(),
+            &CancelToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -290,5 +294,34 @@ async fn a_live_send_goes_on_the_ready_connection_or_fails() {
         client.try_send_live("valve", "{}").unwrap_err().kind,
         ErrorKind::Closed
     );
+    stand.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_send_does_not_go_out() {
+    let stand = stand().await;
+    let client = NativeClient::connect(stand.config("cy"), None, &CancelToken::new())
+        .await
+        .unwrap();
+    let cancelled = CancelToken::new();
+    cancelled.cancel();
+    let refused = [
+        client
+            .send("order".into(), "{}".into(), &cancelled)
+            .await
+            .unwrap_err(),
+        client
+            .send_live("order".into(), "{}".into(), &cancelled)
+            .await
+            .unwrap_err(),
+    ];
+    for error in refused {
+        assert_eq!(error.kind, ErrorKind::Cancelled);
+    }
+    client
+        .send("after".into(), "{}".into(), &CancelToken::new())
+        .await
+        .unwrap();
+    client.disconnect(1_000).await;
     stand.server.stop().await;
 }

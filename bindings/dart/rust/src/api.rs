@@ -319,7 +319,7 @@ impl WseNativeClient {
     }
 
     pub async fn send(&self, kind: String, json: String) -> Result<(), WseError> {
-        Ok(self.0.send(kind, json).await?)
+        Ok(self.0.send(kind, json, &native::CancelToken::new()).await?)
     }
 
     #[frb(sync)]
@@ -328,7 +328,10 @@ impl WseNativeClient {
     }
 
     pub async fn send_live(&self, kind: String, json: String) -> Result<(), WseError> {
-        Ok(self.0.send_live(kind, json).await?)
+        Ok(self
+            .0
+            .send_live(kind, json, &native::CancelToken::new())
+            .await?)
     }
 
     pub async fn send_signed(
@@ -337,7 +340,10 @@ impl WseNativeClient {
         json: String,
         nonce: Option<String>,
     ) -> Result<String, WseError> {
-        Ok(self.0.send_signed(kind, json, nonce).await?)
+        Ok(self
+            .0
+            .send_signed(kind, json, nonce, &native::CancelToken::new())
+            .await?)
     }
 
     #[frb(sync)]

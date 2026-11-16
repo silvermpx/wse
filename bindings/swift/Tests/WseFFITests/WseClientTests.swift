@@ -64,6 +64,27 @@ final class WseClientTests: XCTestCase {
         XCTAssertThrowsError(try client.trySendLive(kind: "valve", json: "{}"))
     }
 
+    func testACancelledSendDoesNotGoOut() async throws {
+        let client = try await WseClient.connect(WseConfig(url: url))
+        let cancel = WseCancel()
+        cancel.cancel()
+        do {
+            try await client.send(kind: "order", json: "{}", cancel: cancel)
+            XCTFail("a cancelled send went out")
+        } catch WseError.Cancelled {}
+        // The wrapper hands the Task's cancellation to the call.
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await client.send(kind: "order", json: "{}")
+        }
+        do {
+            try await task.value
+            XCTFail("a cancelled Task sent")
+        } catch WseError.Cancelled {}
+        try await client.send(kind: "after", json: "{}")
+        await client.disconnect(deadlineMs: 1_000)
+    }
+
     func testAPayloadMustBeJson() async throws {
         let client = try await WseClient.connect(WseConfig(url: url))
         XCTAssertThrowsError(try client.trySend(kind: "x", json: "not json"))

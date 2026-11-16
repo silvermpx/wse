@@ -7,7 +7,10 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 
@@ -53,6 +56,42 @@ class WseClientTest {
             withTimeout(200) { connectClient(WseConfig(url = "ws://10.255.255.1:9/wse", connectTimeoutMs = 30_000u)) }
         }
         assertTrue(System.nanoTime() - started < 5_000_000_000)
+    }
+
+    @Test
+    fun aCollectorCancelledAtAnItemLosesNotTheNext(): Unit = runBlocking {
+        val client = connectClient(WseConfig(url = url, topics = listOf("ticks")))
+        val events = client.events()
+        // Several ticks wait in one batch.
+        delay(700)
+        var first: ULong? = null
+        val collector = launch {
+            events.asFlow().collect { item ->
+                if (item is WseItem.Message && item.message.topic == "ticks") {
+                    first = item.message.offset
+                    // The collector's job ends here; the handler returns as usual.
+                    coroutineContext.job.cancel()
+                }
+            }
+        }
+        collector.join()
+        var next: ULong? = null
+        while (next == null) {
+            val item = events.next() ?: break
+            if (item is WseItem.Message && item.message.topic == "ticks") next = item.message.offset
+        }
+        assertEquals(first!! + 1u, next)
+        client.disconnect(1_000u)
+    }
+
+    @Test
+    fun aCancelledSendDoesNotGoOut(): Unit = runBlocking {
+        val client = connectClient(WseConfig(url = url))
+        val cancel = WseCancel()
+        cancel.cancel()
+        assertFailsWith<WseException.Cancelled> { client.send("order", "{}", cancel) }
+        client.send("after", "{}")
+        client.disconnect(1_000u)
     }
 
     @Test

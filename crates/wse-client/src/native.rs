@@ -532,15 +532,23 @@ impl NativeClient {
         Ok(self.client.try_send(kind, &*payload)?)
     }
 
-    /// Sends `{"t": kind, "p": json}`, waiting for room in the queue.
-    pub async fn send(&self, kind: String, json: String) -> Result<(), NativeError> {
+    /// Sends `{"t": kind, "p": json}`, waiting for room in the queue;
+    /// `cancel` gives up the wait (a message already queued still goes).
+    pub async fn send(
+        &self,
+        kind: String,
+        json: String,
+        cancel: &CancelToken,
+    ) -> Result<(), NativeError> {
         let payload = raw_json(&json)?;
         let client = self.client.clone();
+        let cancel = cancel.0.clone();
         on_runtime(async move {
-            client
-                .send(&kind, &*payload)
-                .await
-                .map_err(NativeError::from)
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(cancelled("send")),
+                sent = client.send(&kind, &*payload) => sent.map_err(NativeError::from),
+            }
         })
         .await
     }
@@ -553,15 +561,23 @@ impl NativeClient {
         Ok(self.client.try_send_live(kind, &*payload)?)
     }
 
-    /// [`NativeClient::try_send_live`], waiting for room in the queue.
-    pub async fn send_live(&self, kind: String, json: String) -> Result<(), NativeError> {
+    /// [`NativeClient::try_send_live`], waiting for room in the queue;
+    /// `cancel` gives up the wait.
+    pub async fn send_live(
+        &self,
+        kind: String,
+        json: String,
+        cancel: &CancelToken,
+    ) -> Result<(), NativeError> {
         let payload = raw_json(&json)?;
         let client = self.client.clone();
+        let cancel = cancel.0.clone();
         on_runtime(async move {
-            client
-                .send_live(&kind, &*payload)
-                .await
-                .map_err(NativeError::from)
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(cancelled("send_live")),
+                sent = client.send_live(&kind, &*payload) => sent.map_err(NativeError::from),
+            }
         })
         .await
     }
@@ -573,14 +589,19 @@ impl NativeClient {
         kind: String,
         json: String,
         nonce: Option<String>,
+        cancel: &CancelToken,
     ) -> Result<String, NativeError> {
         let payload = raw_json(&json)?;
         let client = self.client.clone();
+        let cancel = cancel.0.clone();
         on_runtime(async move {
-            client
-                .send_signed(&kind, &*payload, nonce.as_deref())
-                .await
-                .map_err(NativeError::from)
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(cancelled("send_signed")),
+                sent = client.send_signed(&kind, &*payload, nonce.as_deref()) => {
+                    sent.map_err(NativeError::from)
+                }
+            }
         })
         .await
     }
@@ -700,6 +721,10 @@ impl NativeClient {
         })
         .await;
     }
+}
+
+fn cancelled(call: &str) -> NativeError {
+    NativeError::new(ErrorKind::Cancelled, format!("{call} was cancelled"))
 }
 
 fn raw_json(json: &str) -> Result<Box<serde_json::value::RawValue>, NativeError> {
