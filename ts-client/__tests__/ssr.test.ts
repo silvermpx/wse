@@ -6,6 +6,7 @@ import { renderToString as reactToString } from 'react-dom/server';
 import { renderToString as vueToString } from 'vue/server-renderer';
 import { render as svelteRender } from 'svelte/server';
 import { newClient, reactPage, vuePage } from './ssr/render.js';
+import { createWSEClient } from '../core/index.js';
 import { compiledStatus } from './ssr/svelte.js';
 
 afterEach(() => {
@@ -53,5 +54,32 @@ describe('the server render', () => {
     expect(body).toContain('connection: pending');
     expect(opened).not.toHaveBeenCalled();
     client.destroy();
+  });
+
+  it("leaves a server runtime's own localStorage alone", () => {
+    // Node 25 has a localStorage of its own: one for the whole server, not a
+    // page's, so whatever one request kept there the next would read.
+    const touched: string[] = [];
+    vi.stubGlobal('localStorage', {
+      get length() {
+        return 0;
+      },
+      key: () => null,
+      getItem: (key: string) => (touched.push(`get ${key}`), null),
+      setItem: (key: string) => void touched.push(`set ${key}`),
+      removeItem: (key: string) => void touched.push(`remove ${key}`),
+      clear: () => void touched.push('clear'),
+    });
+    noSocket();
+    const client = createWSEClient({
+      endpoints: ['ws://ssr.test/wse'],
+      storage: 'app:alice',
+      consumer: 'board',
+      topics: ['prices'],
+    });
+    reactToString(reactPage(client));
+    client.subscribe(['news']).release();
+    client.signOut();
+    expect(touched).toEqual([]);
   });
 });

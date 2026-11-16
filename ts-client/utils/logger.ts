@@ -2,6 +2,8 @@
 // WebSocket Engine - Logger
 // =============================================================================
 
+import { pageLocalStorage } from './pageStorage.js';
+
 export enum LogLevel {
   DEBUG = 0,
   INFO = 1,
@@ -188,9 +190,7 @@ class Logger {
   /** Remove the persisted error log from localStorage. */
   clearPersistedErrors(): void {
     try {
-      if (typeof localStorage !== 'undefined') {
-        localStorage.removeItem(ERROR_LOG_STORAGE_KEY);
-      }
+      pageLocalStorage()?.removeItem(ERROR_LOG_STORAGE_KEY);
     } catch {
       // Ignore storage errors
     }
@@ -251,9 +251,10 @@ class Logger {
   // ---------------------------------------------------------------------------
 
   private sendToLoggingService(entry: LogEntry): void {
-    if (typeof localStorage === 'undefined') return;
+    const storage = pageLocalStorage();
+    if (!storage) return;
     try {
-      const existing = localStorage.getItem(ERROR_LOG_STORAGE_KEY);
+      const existing = storage.getItem(ERROR_LOG_STORAGE_KEY);
       const parsed = existing ? JSON.parse(existing) : [];
       const logs: unknown[] = Array.isArray(parsed) ? parsed : [];
 
@@ -269,7 +270,7 @@ class Logger {
         logs.splice(0, logs.length - 100);
       }
 
-      localStorage.setItem(ERROR_LOG_STORAGE_KEY, JSON.stringify(logs));
+      storage.setItem(ERROR_LOG_STORAGE_KEY, JSON.stringify(logs));
     } catch {
       // Ignore storage errors
     }

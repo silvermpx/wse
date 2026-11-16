@@ -14,6 +14,7 @@ import { createQueueState, type MessageQueueStore } from './state/queueState.js'
 import { SecurityManager } from '../utils/security.js';
 import type { WSMessage } from '../types.js';
 import type { TopicPosition } from '../services/EventSequencer.js';
+import { pageLocalStorage } from '../utils/pageStorage.js';
 
 /**
  * Whose data the client's queues hold: a new number each time it drops one
@@ -95,13 +96,7 @@ export function memoryStorage(): ClientStorage {
 }
 
 /** The page's localStorage, when there is one and it may be used. */
-function pageStorage(): Storage | null {
-  try {
-    return typeof localStorage !== 'undefined' ? localStorage : null;
-  } catch {
-    return null;
-  }
-}
+const pageStorage = pageLocalStorage;
 
 /** Deletes an IndexedDB database, when the environment has IndexedDB. */
 export function deleteDatabase(name: string): void {
