@@ -210,7 +210,7 @@ impl fmt::Debug for TokenProvider {
 /// connection about to subscribe, each topic's position in each of its
 /// streams. A topic left out starts with none; None leaves delivery where it
 /// is.
-pub(crate) type Committed = Arc<
+pub(crate) type Committed = std::sync::Arc<
     dyn Fn(
             Option<&str>,
         ) -> Option<std::collections::BTreeMap<String, Vec<crate::message::Position>>>
