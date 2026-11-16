@@ -55,7 +55,10 @@ The offline queue is durable only for a part of the application named by a stabl
 (`consumer: 'checkout'`): it lives in an IndexedDB database of its own scope -- the storage name,
 the consumer and the realm (the first endpoint, or `realm`) -- so another server or another part of
 the application never reads it. Two clients of one scope (two tabs) may both write to it, but one at
-a time replays it: the other is `busy` until the first lets go or stops renewing its lease (15 s).
+a time replays it: the other is `busy` until the first lets go or stops renewing its lease (15 s),
+and then sends what the first stored. A stored message stays in the database until it went out:
+the client claims it for 30 s while sending it, so one whose sending was cut off (the tab paused or
+closed in between) goes again later, with the same `id`, and may arrive twice.
 `state.getSnapshot().storage` says where the queue lives (`memory`, `durable`, `busy`,
 `unavailable`), each change is a `wseStorage` event, and a storage that fails (a database that will
 not open, a full quota, another tab upgrading the database) is a `wseStorageError` event with the
@@ -342,8 +345,11 @@ useWSE('cookie', topics, { queryClient });
 
 ## Receiving Messages
 
-Register handlers by message type with `registerHandlers` (above). Messages that no handler claims
-are dispatched as **one** window event, `wseMessage`, whose `detail` is the whole message:
+Register handlers by message type with `registerHandlers` (above). The client handles its own
+protocol messages first (`server_ready`, `subscription_update`, `PONG`, snapshots, presence and the
+like): a handler for one of those types runs after the client's and cannot replace it, and
+`clearHandlers()` clears only the application's. Messages that no handler claims are dispatched as
+**one** window event, `wseMessage`, whose `detail` is the whole message:
 
 ```tsx
 useEffect(() => {
@@ -474,7 +480,9 @@ and the schema; the client keeps it in its storage, and `client.checkpoint()` gi
 the application's own state (pass it back as `delivery.checkpoint`). A checkpoint of anything else
 is refused with a `wseCheckpointRejected` event. After a reconnect the recovery starts from it, so
 a message that came but was not applied comes again: the application applies repeats safely.
-Messages held past `maxHeld` (10,000), or a break during the resync, start the resync over; a
+A send that waits for its topics (`requires`) belongs to the user who made it: when the user
+changes it is dropped, never sent as the next one, and while it waits it counts toward
+`memoryLimit`. Messages held past `maxHeld` (10,000), or a break during the resync, start the resync over; a
 handler that fails is called again (1 s, then twice as long, up to 30 s). Offsets JavaScript cannot
 hold exactly (above 2^53 - 1) are refused and break the topic off.
 

@@ -51,14 +51,22 @@
   what has no hole, bound to the realm, user, consumer and schema; recovery
   starts from it. Sends can wait for topics to be continuous (`requires`).
   An offset JavaScript cannot hold exactly breaks the topic off instead of
-  being rounded. The Swift, Kotlin and Dart clients have the same states
-  and delivery (`WseDelivery`): a `Resync` item asks the app for the state,
-  `resynced(round)` hands on what was held.
+  being rounded. A send waiting for its topics belongs to the user who made
+  it (dropped when the user changes, never sent as the next one) and counts
+  toward `memoryLimit`. The Swift, Kotlin and Dart clients have the same
+  states and delivery (`WseDelivery`): a `Resync` item asks the app for the
+  state, `resynced(round)` hands on what was held. A checkpoint is never
+  another user's: when the user changes, what was delivered to the last one
+  is forgotten.
 - TypeScript client of its own: the offline queue is durable only for a
   named `consumer`, in an IndexedDB database of its scope (the storage
   name, the consumer and the `realm`); clients of one scope (tabs) hold a
   lease, so one at a time replays the queue and the others are `busy`
-  until it lets go. Where the queue lives is in the snapshot (`storage`) and
+  until it lets go; the next one then sends what the last stored. A stored
+  message stays in the database until it went out: claimed for 30 s while
+  it is sent, it goes again (same `id`) when its sending was cut off by a
+  pause or a closed tab, so it may arrive twice but is never lost. Where the
+  queue lives is in the snapshot (`storage`) and
   a `wseStorage` event; a storage that fails is a `wseStorageError` event
   instead of being swallowed. The database moves to version 2 in one
   transaction, its records kept; a tab holding the old version open is
@@ -84,7 +92,8 @@
   emulator and in the Flutter example.
 - React Native: on a runtime without `TextDecoder` (Hermes before React
   Native 0.85) or `TextEncoder`, the entry installs UTF-8 ones before the
-  MessagePack codec needs them; loading the client failed there.
+  MessagePack codec needs them; loading the client failed there. The
+  package's `sideEffects` names that module, so bundlers keep it.
 - Releases: the gate waits for CI to pass on the same commit; the release
   AAR runs in an app built with R8 on an emulator (the system's TLS, an
   encrypted echo, a signed receipt); the XCFramework's tests run in the
@@ -119,7 +128,9 @@
   server was, reports per stream what a recovery that did not recover lost,
   forgets a stream the server no longer holds, and stops naming one that
   stayed quiet on a connection for longer than the server keeps it
-  (`history_ttl`); time away from the server keeps every position.
+  (`history_ttl`). Silence counts only while the connection's frames show it
+  alive: time away from the server, and a close noticed only after the
+  machine slept or the app was suspended, keep every position.
 - TypeScript client: the same, and a gap in one stream of a topic no longer
   stops another stream's gap from being recovered: each stream waits for
   its replay in its own window (as the Rust and Python clients do), instead
@@ -129,6 +140,12 @@
 
 ### Changed
 
+- TypeScript client: it handles its own protocol messages (`server_ready`,
+  `subscription_update`, `PONG`, snapshots, presence and the like) before
+  the application's handlers; a handler registered for one of those types
+  runs after the client's instead of replacing it, so it cannot stop a
+  recovery or a resync, and `clearHandlers()` clears only the
+  application's.
 - TypeScript client: it no longer reads `import.meta` (React Native's
   bundler cannot parse it), so `VITE_LOG_LEVEL` is not read any more; set
   `WSE_LOG_LEVEL` in `process.env` or on `globalThis`, or call
@@ -144,9 +161,9 @@
   published in between is now replayed ahead of the reply or, when it
   cannot be, the reply starts earlier and the client sees a gap.
 - TypeScript client: two clients of one offline queue (two tabs of one
-  application and user) send a stored message once: it is taken out of
-  IndexedDB in one transaction before it is sent, and put back when it is
-  not sent.
+  application and user) no longer both send a stored message: one claims it
+  in one IndexedDB transaction before it is sent and removes it once it
+  went out.
 - TypeScript client: `maxQueueSize` bounds the send queue; the capacity
   was never stored.
 - Server: recovery from positions per stream no longer depends on the order
