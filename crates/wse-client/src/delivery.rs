@@ -94,7 +94,8 @@ pub(crate) struct Delivery {
     max_held: usize,
     /// The saved checkpoint, until the first connection says whose it is.
     pending: Option<String>,
-    user: Option<String>,
+    /// The user of the last connection, once there was one.
+    user: Option<Option<String>>,
     states: BTreeMap<String, State>,
     held: HashMap<String, Held>,
     progress: HashMap<String, BTreeMap<u32, Progress>>,
@@ -234,7 +235,8 @@ impl Delivery {
         match item {
             Item::Message(message) => self.take_message(message, items),
             Item::Connected { ref user_id, .. } => {
-                self.user.clone_from(user_id);
+                let user = user_id.clone();
+                self.user_is(user.as_deref());
                 items.push(item);
             }
             Item::Subscribed {
@@ -558,7 +560,7 @@ impl Delivery {
         serde_json::to_string(&Saved {
             v: 1,
             realm: self.realm.clone(),
-            user: self.user.clone(),
+            user: self.user.clone().flatten(),
             consumer: self.consumer.clone(),
             schema: self.schema.clone(),
             topics,
@@ -576,7 +578,7 @@ impl Delivery {
         if !self.barrier() {
             return None;
         }
-        self.user = user.map(str::to_owned);
+        self.user_is(user);
         self.take_saved();
         Some(
             self.progress
@@ -600,6 +602,17 @@ impl Delivery {
         )
     }
 
+    /// A connection of `user`: what another user applied is not this one's.
+    fn user_is(&mut self, user: Option<&str>) {
+        let user = user.map(str::to_owned);
+        if self.user.as_ref().is_some_and(|last| *last != user) {
+            self.progress.clear();
+            self.received.clear();
+            self.again.clear();
+        }
+        self.user = Some(user);
+    }
+
     fn take_saved(&mut self) {
         let Some(text) = self.pending.take() else {
             return;
@@ -612,7 +625,7 @@ impl Delivery {
             Some("version")
         } else if saved.realm != self.realm {
             Some("realm")
-        } else if saved.user != self.user {
+        } else if saved.user != self.user.clone().flatten() {
             Some("user")
         } else if saved.consumer != self.consumer {
             Some("consumer")
@@ -675,5 +688,99 @@ fn continuity_item(topic: &str, state: &State) -> Item {
         topic: topic.to_owned(),
         continuity: state.continuity,
         reason: state.reason.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(topic: &str, epoch: u32, offset: u64) -> Item {
+        Item::Message(NativeMessage {
+            kind: "m".into(),
+            topic: Some(topic.into()),
+            epoch: Some(epoch),
+            offset: Some(offset),
+            id: None,
+            json: None,
+            payload_error: None,
+            signature: None,
+        })
+    }
+
+    fn connected(user: &str) -> Item {
+        Item::Connected {
+            connection_id: "c".into(),
+            user_id: Some(user.into()),
+            reconnected: false,
+            recovery: true,
+        }
+    }
+
+    fn disconnected() -> Item {
+        Item::Disconnected {
+            code: Some(1006),
+            reason: "gone".into(),
+            retry_in_ms: 0,
+            attempt: 1,
+        }
+    }
+
+    /// A connection of `user` that took topic t and resynced it.
+    fn resynced(d: &mut Delivery, user: &str) {
+        d.committed(Some(user));
+        let mut items = Vec::new();
+        d.take(connected(user), &mut items);
+        d.take(
+            Item::Subscribed {
+                topics: vec!["t".into()],
+                failed: Vec::new(),
+                recovery: Vec::new(),
+            },
+            &mut items,
+        );
+        let round = items
+            .iter()
+            .find_map(|i| match i {
+                Item::Resync { round, .. } => Some(*round),
+                _ => None,
+            })
+            .expect("a resync round");
+        d.resynced(round);
+    }
+
+    #[test]
+    fn a_checkpoint_is_never_another_users() {
+        let mut d = Delivery::new(
+            Some(NativeDelivery {
+                consumer: "board".into(),
+                ..NativeDelivery::default()
+            }),
+            "ws://x/wse",
+            &["t".to_owned()],
+        )
+        .unwrap();
+        resynced(&mut d, "alice");
+        let mut items = Vec::new();
+        d.take(message("t", 1, 99), &mut items);
+        d.commit("t", 1, 99);
+        assert_eq!(
+            d.committed(Some("alice")).unwrap()["t"],
+            [Position {
+                epoch: 1,
+                offset: 99
+            }]
+        );
+
+        // The next connection is Bob's: nothing of what Alice applied.
+        d.take(disconnected(), &mut items);
+        let positions = d.committed(Some("bob")).unwrap();
+        assert!(
+            positions.get("t").is_none_or(Vec::is_empty),
+            "{positions:?}"
+        );
+        let saved: serde_json::Value = serde_json::from_str(&d.checkpoint()).unwrap();
+        assert_eq!(saved["user"], "bob");
+        assert_eq!(saved["topics"], serde_json::json!({}));
     }
 }
