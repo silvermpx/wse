@@ -124,10 +124,33 @@ class WseAndroidTest {
         client.disconnect(1_000u)
     }
 
+    @Test
+    fun theDevicesNetworkGoingAndComingPausesAndBringsBackTheClient(): Unit = runBlocking {
+        val client = connectClient(WseConfig(url = url, insecure = true))
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val monitor = WseNetworkMonitor(context, client)
+        onMain { monitor.start() }
+        try {
+            // The device's own network goes: airplane mode, as a user turns it on.
+            shell("cmd connectivity airplane-mode enable")
+            waitFor(30_000) { client.status() == WseStatus.PAUSED }
+            shell("cmd connectivity airplane-mode disable")
+            waitFor(60_000) { client.status() == WseStatus.CONNECTED }
+        } finally {
+            shell("cmd connectivity airplane-mode disable")
+            onMain { monitor.stop() }
+            client.disconnect(1_000u)
+        }
+    }
+
+    private fun shell(command: String) {
+        InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommand(command).close()
+    }
+
     private fun onMain(run: () -> Unit) = InstrumentationRegistry.getInstrumentation().runOnMainSync(run)
 
-    private suspend fun waitFor(done: () -> Boolean) {
-        withTimeout(5_000) {
+    private suspend fun waitFor(millis: Long = 5_000, done: () -> Boolean) {
+        withTimeout(millis) {
             while (!done()) delay(20)
         }
     }
