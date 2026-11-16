@@ -334,6 +334,12 @@ export interface MessageOptions {
    * (in memory or offline) after that is dropped instead of sent late.
    */
   ttl?: number;
+  /**
+   * Topics whose state the message depends on (a client of its own): it is
+   * held until each of them is continuous, as after a resync. A live message
+   * cannot wait and is dropped.
+   */
+  requires?: string[];
 }
 
 export interface SignedMessageOptions {
@@ -365,7 +371,8 @@ export interface WSEGapEvent {
   toOffset: number | null;
   /** Number of missing messages, or null when unknown. */
   missed: number | null;
-  reason: 'offset_gap' | 'not_recovered' | 'epoch_changed';
+  /** unsafe_offset: an offset JavaScript cannot hold exactly; the message was refused. */
+  reason: 'offset_gap' | 'not_recovered' | 'epoch_changed' | 'unsafe_offset';
 }
 
 // ---------------------------------------------------------------------------

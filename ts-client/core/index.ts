@@ -8,6 +8,15 @@
 
 export { createWSEClient } from './client.js';
 export type { Lease, WSEClient, WSEClientOptions, WSEClientSnapshot, WSEClientState } from './client.js';
+export type {
+  CheckpointMismatch,
+  ContinuityReason,
+  DeliveryMode,
+  DeliveryOptions,
+  ResyncRequest,
+  ResyncResult,
+  TopicState,
+} from './delivery.js';
 
 export { createStore } from './store.js';
 export type { GetState, SetState, StateCreator, StoreApi } from './store.js';

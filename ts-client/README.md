@@ -410,6 +410,55 @@ When the server runs with `recovery_enabled`, topic publications carry `tp`/`e`/
   server said it cannot replay is not asked for again;
 - forgets a topic's position when you unsubscribe from it.
 
+### Topic states and recover-or-resync
+
+A client of its own says of each topic it holds whether the server took it and whether its
+messages run without a break: `state.getSnapshot().topicStates.prices` is
+`{ subscription: 'requested' | 'active' | 'denied', continuity: 'continuous' | 'resync_required' |
+'resyncing', reason }`, and each change of continuity is a `wseContinuity` event with the topic and
+the reason (`offset_gap`, `not_recovered`, `epoch_changed`, `unsafe_offset`, `overflow`, ...).
+
+By default (`delivery: { mode: 'best-effort' }`) messages keep coming after a break; the
+application reloads what depends on the topic and calls `client.resync(['prices'])`, or gives a
+`resync` handler that the client calls itself.
+
+Where every fact counts, `recover-or-resync` puts a barrier in front of each topic that is not
+continuous: from a cold start, after every reconnect and after a break, its messages are held
+until the application's handler brought its state up to date:
+
+```ts
+const client = createWSEClient({
+  endpoints: ['wss://example.com/wse'],
+  storage: 'board:alice',
+  delivery: {
+    mode: 'recover-or-resync',
+    consumer: 'board',                 // the one consumer that commits
+    schema: '3',                       // a checkpoint of another schema is refused
+    resync: async ({ topics, reasons, committed, signal }) => {
+      const state = await fetch(`/api/board?since=${JSON.stringify(committed)}`, { signal });
+      const { version } = await apply(await state.json());
+      // Of what came meanwhile, drop what the state has already.
+      return { includes: (msg) => msg.p.version <= version };
+    },
+  },
+});
+client.onMessage('order_update', (msg) => {
+  applyToStore(msg.p);                 // safe to apply twice
+  client.commit(msg);                  // the checkpoint moves through what was applied
+});
+client.send('cancel', { id: 9 }, { requires: ['orders'] }); // goes once orders is continuous
+```
+
+The checkpoint is what the consumer committed, per stream only through what was applied without a
+hole. It is bound to the realm (the first endpoint, or `delivery.realm`), the user, the consumer
+and the schema; the client keeps it in its storage, and `client.checkpoint()` gives it to save with
+the application's own state (pass it back as `delivery.checkpoint`). A checkpoint of anything else
+is refused with a `wseCheckpointRejected` event. After a reconnect the recovery starts from it, so
+a message that came but was not applied comes again: the application applies repeats safely.
+Messages held past `maxHeld` (10,000), or a break during the resync, start the resync over; a
+handler that fails is called again (1 s, then twice as long, up to 30 s). Offsets JavaScript cannot
+hold exactly (above 2^53 - 1) are refused and break the topic off.
+
 ## Encryption
 
 With `security.encryptionEnabled: true` every frame is sealed for the server alone, and the server

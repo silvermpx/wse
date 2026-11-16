@@ -38,6 +38,7 @@ import {
 } from './context.js';
 import type { StoreApi } from './store.js';
 import type { WSEStore } from './state/wseState.js';
+import { Delivery, checkDeliveryOptions, type DeliveryOptions, type TopicState } from './delivery.js';
 
 export interface WSEClientOptions extends UseWSEConfig {
   /**
@@ -58,6 +59,13 @@ export interface WSEClientOptions extends UseWSEConfig {
   storage?: string | ClientStorage;
   /** Also dispatch the client's events on the page's window, as useWSE does. Default false. */
   windowEvents?: boolean;
+  /**
+   * How the topics' messages reach the application: 'best-effort' (default)
+   * or 'recover-or-resync', where a topic that is not continuous holds its
+   * messages until the application's resync handler brought its state up to
+   * date (see core/delivery.ts).
+   */
+  delivery?: DeliveryOptions;
 }
 
 /** A share of a client (or of its topics), released once. */
@@ -75,6 +83,8 @@ export interface WSEClientSnapshot {
   readonly endpoint: string | null;
   readonly topics: readonly string[];
   readonly lastError: string | null;
+  /** Each topic held: whether the server took it, and whether its messages run without a break. */
+  readonly topicStates: Readonly<Record<string, TopicState>>;
 }
 
 export interface WSEClientState {
@@ -108,6 +118,23 @@ export interface WSEClient {
   /** Clear `reason`; once none is left the client connects again and recovers what it missed. */
   resume(reason: string): void;
   /**
+   * The consumer applied `message`: the checkpoint moves on through what was
+   * applied without a hole.
+   */
+  commit(message: WSMessage): void;
+  /**
+   * What the consumer committed, bound to the realm, the user, the consumer
+   * and the schema: to save with the application's own state and give back
+   * as delivery.checkpoint.
+   */
+  checkpoint(): string;
+  /**
+   * Bring `topics` up to date: through the resync handler when there is one
+   * (behind the barrier in recover-or-resync); without one the application
+   * says it did so itself, and they read continuous again.
+   */
+  resync(topics: string[]): void;
+  /**
    * The user signed out: the connection ends, and what the client held for
    * the user (queue, topics, positions, what it kept in storage) goes. The
    * client is done; a new sign-in makes a new client.
@@ -127,14 +154,27 @@ function shallowSame(a: WSEClientSnapshot, b: WSEClientSnapshot): boolean {
     a.ready === b.ready &&
     a.endpoint === b.endpoint &&
     a.lastError === b.lastError &&
-    a.topics === b.topics
+    a.topics === b.topics &&
+    a.topicStates === b.topicStates
   );
 }
 
 export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
+  checkDeliveryOptions(options.delivery);
   const auth = options.auth && options.auth.trim() !== '' ? options.auth : 'cookie';
   const listeners = new Map<string, Set<(detail: any) => void>>();
+  // Made below; the services reach it only once the client runs.
+  let delivery: Delivery;
   const emit = (type: string, detail?: unknown) => {
+    if (type === 'wseGap') {
+      const gap = detail as { topic: string; reason: any };
+      delivery.brokeOff(gap.topic, gap.reason);
+    } else if (type === 'subscriptionUpdate') {
+      const reply = (detail ?? {}) as Record<string, any>;
+      if (reply.action !== 'unsubscribe') {
+        delivery.subscribed(stringsOf(reply.success_topics), stringsOf(reply.failed_topics));
+      }
+    }
     const set = listeners.get(type);
     if (set) {
       for (const listener of [...set]) {
@@ -151,7 +191,14 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     typeof options.storage === 'string'
       ? namespacedStorage(options.storage)
       : (options.storage ?? memoryStorage());
-  const ctx: ClientContext = createClientContext({ emit, storage });
+  const ctx: ClientContext = createClientContext({
+    emit,
+    storage,
+    delivery: {
+      hold: (message) => delivery.hold(message),
+      recoveryPositions: (topics) => delivery.recoveryPositions(topics),
+    },
+  });
   // The queue's limits hold from the first send, before anything starts.
   const { performance } = resolveOptions(options);
   ctx.queue.getState().setCapacity(performance.maxQueueSize);
@@ -167,6 +214,24 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
   const topicShares = new Map<string, number>();
   const messageListeners = new Map<string, Set<(message: WSMessage) => void>>();
   for (const topic of uniqueTopics(options.topics)) topicShares.set(topic, 1);
+  // Sends that wait for topics to be continuous (requires), in order.
+  const waiting: Array<{ type: string; payload: unknown; options: MessageOptions; expiresAt?: number }> = [];
+  // The snapshot is read only once everything below exists.
+  let wired = false;
+
+  delivery = new Delivery(options.delivery, options.endpoints?.[0] ?? null, {
+    route: (message) => live()?.processor.routeHeld(message),
+    received: (topic) => live()?.processor.getTopicPositions([topic])[topic]?.streams ?? {},
+    user: () => dataOwner.userId,
+    emit,
+    changed: () => {
+      if (!wired) return;
+      notifySnapshot();
+      flushWaiting();
+    },
+    storage,
+  });
+  delivery.track([...topicShares.keys()]);
 
   // -- the snapshot ------------------------------------------------------
 
@@ -177,10 +242,15 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     endpoint: s.activeEndpoint,
     topics: s.activeTopics,
     lastError: s.lastError,
+    topicStates: delivery.topicStates(),
   });
   let snapshot = snapshotOf(ctx.state.getState());
   const snapshotListeners = new Set<(snapshot: WSEClientSnapshot) => void>();
+  let transportReady = false;
   ctx.state.subscribe((s) => {
+    // The connection went: what the client holds of its topics is not current.
+    if (transportReady && !s.transportReady) delivery.connectionLost();
+    transportReady = s.transportReady;
     const next = snapshotOf(s);
     if (shallowSame(next, snapshot)) return;
     snapshot = next;
@@ -236,6 +306,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     const ended = session;
     session = null;
     ended?.destroy();
+    if (ended) delivery.connectionLost();
   };
 
   const live = () => (session && !session.destroyed ? session : null);
@@ -271,6 +342,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
       return n === 0;
     });
     if (added.length > 0 && !done) {
+      delivery.track(added);
       const current = live();
       if (current) current.subscribe(added, subscribeOptions);
       else ctx.state.getState().addTopics(added);
@@ -290,6 +362,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
           return true;
         });
         if (removed.length === 0 || done) return;
+        delivery.untrack(removed);
         const current = live();
         if (current) {
           current.unsubscribe(removed);
@@ -304,6 +377,40 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
 
   const send = (type: string, payload: unknown, sendOptions: MessageOptions = {}): SendStatus => {
     if (done) return 'dropped';
+    const required = sendOptions.requires;
+    if (required && required.length > 0 && !delivery.continuous(required)) {
+      if (sendOptions.live) {
+        logger.warn(`${type} not sent: ${required.join(', ')} not continuous, and a live message cannot wait`);
+        return 'dropped';
+      }
+      if (waiting.length >= performance.maxQueueSize) return 'dropped';
+      waiting.push({ type, payload, options: sendOptions, expiresAt: expiryOf(sendOptions) });
+      return 'queued';
+    }
+    return sendNow(type, payload, sendOptions);
+  };
+
+  /** Sends that waited for their topics, once each topic is continuous; late ones go. */
+  const flushWaiting = () => {
+    if (waiting.length === 0 || done) return;
+    const now = Date.now();
+    for (let i = 0; i < waiting.length; ) {
+      const entry = waiting[i];
+      if (entry.expiresAt !== undefined && entry.expiresAt <= now) {
+        waiting.splice(i, 1);
+        logger.warn(`${entry.type} not sent: it waited past its ttl`);
+        continue;
+      }
+      if (!delivery.continuous(entry.options.requires ?? [])) {
+        i++;
+        continue;
+      }
+      waiting.splice(i, 1);
+      sendNow(entry.type, entry.payload, entry.options);
+    }
+  };
+
+  const sendNow = (type: string, payload: unknown, sendOptions: MessageOptions): SendStatus => {
     const current = live();
     if (current) return current.sendMessage(type, payload, sendOptions);
     // Not started yet: kept until the connection takes it, unless it is
@@ -363,6 +470,9 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
       stopTimer = null;
     }
     stop();
+    waiting.length = 0;
+    if (clear) delivery.forget();
+    delivery.close();
     ctx.state.getState().clearTimers();
     if (clear) {
       ctx.owner.next();
@@ -374,6 +484,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     ctx.state.getState().setConnectionState(ConnectionState.DISCONNECTED);
   };
 
+  wired = true;
   return {
     retain,
     state,
@@ -417,7 +528,16 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     reconnect: () => live()?.forceReconnect(),
     pause,
     resume,
+    commit: (message) => delivery.commit(message),
+    checkpoint: () => delivery.checkpoint(),
+    resync: (topics) => {
+      if (!done) delivery.resync(uniqueTopics(topics));
+    },
     signOut: () => end(true),
     destroy: () => end(false),
   };
+}
+
+function stringsOf(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
 }

@@ -945,6 +945,13 @@ export class MessageProcessor {
       await this.deliver(message);
       return;
     }
+    if (!Number.isSafeInteger(offset) || offset < 0) {
+      // JavaScript cannot hold it exactly: ordering and dedup by it would be
+      // wrong, so the message is refused and the topic breaks off.
+      this.recordInbound(size);
+      this.reportGap({ topic, epoch, fromOffset: null, toOffset: null, missed: null, reason: 'unsafe_offset' });
+      return;
+    }
 
     // A topic published on several cluster nodes interleaves their streams
     // (one epoch each): every one is in order on its own, and a message of
@@ -1398,7 +1405,26 @@ export class MessageProcessor {
   // Message Routing
   // ---------------------------------------------------------------------------
 
-  private routeMessage(message: WSMessage): void {
+  /** A message the client's delivery held, handed on past its barrier. */
+  routeHeld(message: WSMessage): void {
+    this.routeMessage(message, true);
+  }
+
+  /**
+   * Where delivery stands in `topics` is set back to `positions` (what the
+   * application committed): what came after is taken again when replayed.
+   */
+  rewindPositions(topics: readonly string[], positions: Record<string, TopicPosition>): void {
+    this.sequencer.clearTopics([...topics]);
+    for (const [topic, position] of Object.entries(positions)) {
+      for (const [epoch, offset] of Object.entries(position.streams)) {
+        this.sequencer.setTopicPosition(topic, epoch, offset);
+      }
+    }
+  }
+
+  private routeMessage(message: WSMessage, released = false): void {
+    if (!released && message.tp && this.ctx.delivery?.hold(message)) return;
     const type = message.t;
 
     if (this.eventThrottleMs > 0 && !isSystemType(type)) {

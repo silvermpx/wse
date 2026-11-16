@@ -12,6 +12,8 @@ import { createStore, type StoreApi } from './store.js';
 import { createWSEState, type WSEStore } from './state/wseState.js';
 import { createQueueState, type MessageQueueStore } from './state/queueState.js';
 import { SecurityManager } from '../utils/security.js';
+import type { WSMessage } from '../types.js';
+import type { TopicPosition } from '../services/EventSequencer.js';
 
 /**
  * Whose data the client's queues hold: a new number each time it drops one
@@ -44,6 +46,16 @@ export interface ClientContext {
   readonly owner: OwnerGeneration;
   readonly emit: Emit;
   readonly storage: ClientStorage;
+  /** A client of its own: its topics' delivery (core/delivery.ts). */
+  readonly delivery?: DeliveryGate;
+}
+
+/** Where a client's delivery meets its services. */
+export interface DeliveryGate {
+  /** A message of a topic, about to reach the handlers: true when it is held instead. */
+  hold(message: WSMessage): boolean;
+  /** Where the recovery of `topics` starts (what the application committed); null: where delivery is. */
+  recoveryPositions(topics: readonly string[]): Record<string, TopicPosition> | null;
 }
 
 export function ownerGeneration(): OwnerGeneration {
@@ -142,6 +154,7 @@ export function namespacedStorage(namespace: string): ClientStorage {
 export interface ContextOptions {
   emit?: Emit;
   storage?: ClientStorage;
+  delivery?: DeliveryGate;
 }
 
 /** A context of its own: new stores, keys and owner. */
@@ -153,6 +166,7 @@ export function createClientContext(options: ContextOptions = {}): ClientContext
     owner: ownerGeneration(),
     emit: options.emit ?? (() => {}),
     storage: options.storage ?? memoryStorage(),
+    delivery: options.delivery,
   };
 }
 

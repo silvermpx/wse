@@ -39,7 +39,7 @@ import { MessageProcessor } from './MessageProcessor.js';
 import { NetworkMonitor } from './NetworkMonitor.js';
 import { AdaptiveQualityManager, QueryClientLike } from './AdaptiveQualityManager.js';
 import { OfflineQueue } from './OfflineQueue.js';
-import { EventSequencer } from './EventSequencer.js';
+import { EventSequencer, type TopicPosition } from './EventSequencer.js';
 import { EventHandlers } from '../handlers/EventHandlers.js';
 import { logger } from '../utils/logger.js';
 import { generateId } from '../utils/id.js';
@@ -536,8 +536,9 @@ export class WSESession {
     if (topics.length === 0) return;
 
     const payload: Record<string, any> = { action: 'subscribe', topics };
-    // The anchor is the last DELIVERED position of each topic.
-    const positions = this.processor.getTopicPositions(topics);
+    // The anchor is the last DELIVERED position of each topic, or what the
+    // application committed, in the recover-or-resync mode.
+    const positions = this.recoveryPositions(topics);
     if (Object.keys(positions).length > 0) {
       payload.recover = true;
       payload.recovery = positions;
@@ -547,6 +548,18 @@ export class WSESession {
 
     this.sendSystem('subscription_update', payload);
     this.requestSnapshot(topics);
+  }
+
+  /**
+   * Where the recovery of `topics` starts: what the application committed,
+   * delivery set back to it, in the recover-or-resync mode; else where
+   * delivery is.
+   */
+  private recoveryPositions(topics: string[]): Record<string, TopicPosition> {
+    const committed = this.ctx.delivery?.recoveryPositions(topics) ?? null;
+    if (!committed) return this.processor.getTopicPositions(topics);
+    this.processor.rewindPositions(topics, committed);
+    return committed;
   }
 
   private sendSystem(type: string, payload: any, priority: MessagePriority = MessagePriority.HIGH): SendStatus {
@@ -571,13 +584,14 @@ export class WSESession {
     if (!this.connection?.isReady()) return;
 
     const payload: Record<string, any> = { action: 'subscribe', topics: unique };
-    if (options?.recover) {
-      const positions = this.processor.getTopicPositions(unique);
-      if (Object.keys(positions).length > 0) {
-        payload.recover = true;
-        payload.recovery = positions;
-        this.processor.openRecoveryWindows(positions);
-      }
+    // In the recover-or-resync mode a topic recovers from what the
+    // application committed of it, if anything.
+    const positions =
+      this.ctx.delivery?.recoveryPositions(unique) || options?.recover ? this.recoveryPositions(unique) : {};
+    if (Object.keys(positions).length > 0) {
+      payload.recover = true;
+      payload.recovery = positions;
+      this.processor.openRecoveryWindows(positions);
     }
     this.sendSystem('subscription_update', payload);
   }

@@ -41,6 +41,17 @@
   ready connection whatever `offline` says); Rust: `Client::send_live` and
   `try_send_live` (and in Swift, Kotlin and Dart); Python:
   `send(..., live=True)`.
+- TypeScript client of its own: each topic's state (`topicStates`: the
+  server took it or refused it; its messages run on or broke off, and why,
+  with a `wseContinuity` event), and an opt-in `recover-or-resync` delivery:
+  a topic that is not continuous (a cold start, every reconnect, a break)
+  holds its messages until the application's resync handler loaded its
+  state, then hands on what the state does not have. The checkpoint is what
+  the consumer committed it applied (`commit`, `checkpoint()`), only through
+  what has no hole, bound to the realm, user, consumer and schema; recovery
+  starts from it. Sends can wait for topics to be continuous (`requires`).
+  An offset JavaScript cannot hold exactly breaks the topic off instead of
+  being rounded.
 - Rust client: `pause(reason)` and `resume(reason)`, as in the TypeScript
   core client: the connection ends (what is queued goes out first) and no
   attempt is made while any reason holds; topics and positions stay, and
