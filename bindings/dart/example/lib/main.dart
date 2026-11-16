@@ -3,7 +3,10 @@
 import 'package:flutter/widgets.dart';
 import 'package:wse_client/wse_client.dart';
 
-const serverUrl = String.fromEnvironment('WSE_URL', defaultValue: 'ws://127.0.0.1:5007/wse');
+const serverUrl = String.fromEnvironment(
+  'WSE_URL',
+  defaultValue: 'ws://127.0.0.1:5007/wse',
+);
 
 enum Language { de, en }
 
@@ -61,7 +64,9 @@ class _ExampleAppState extends State<ExampleApp> {
 
   Future<void> _connect() async {
     try {
-      final client = await WseClient.connect(wseConfig(serverUrl, topics: ['ticks']));
+      final client = await WseClient.connect(
+        wseConfig(serverUrl, topics: ['ticks']),
+      );
       if (!mounted) {
         await client.close();
         return;
@@ -101,23 +106,42 @@ class _ExampleAppState extends State<ExampleApp> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(t('title'), style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w600)),
+                Text(
+                  t('title'),
+                  style: const TextStyle(
+                    fontSize: 26,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
                 const SizedBox(height: 24),
                 Text('${t('status')}: ${t(_status)}', key: const Key('status')),
                 const SizedBox(height: 8),
-                Text('${t('tick')}: ${_tick ?? t('none')}', key: const Key('tick')),
+                Text(
+                  '${t('tick')}: ${_tick ?? t('none')}',
+                  key: const Key('tick'),
+                ),
                 const SizedBox(height: 24),
                 GestureDetector(
                   key: const Key('language'),
-                  onTap: () => setState(() => _language = _language == Language.de ? Language.en : Language.de),
+                  onTap: () => setState(
+                    () => _language = _language == Language.de
+                        ? Language.en
+                        : Language.de,
+                  ),
                   child: DecoratedBox(
                     decoration: BoxDecoration(
                       border: Border.all(color: _accent),
                       borderRadius: BorderRadius.circular(8),
                     ),
                     child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                      child: Text(t('switch'), style: const TextStyle(color: _accent)),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 10,
+                      ),
+                      child: Text(
+                        t('switch'),
+                        style: const TextStyle(color: _accent),
+                      ),
                     ),
                   ),
                 ),

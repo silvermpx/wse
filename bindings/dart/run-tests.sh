@@ -19,6 +19,10 @@ cd "$here"
 CARGO_TARGET_DIR="$target/frb-expand" flutter_rust_bridge_codegen generate
 # In the workspace's own style, as cargo fmt --check wants it.
 (cd "$root" && cargo fmt -p wse-dart)
+# Clean as pub.dev scores it: no analysis issues, the formatter's own layout.
+dart="$(dirname "$(command -v "$flutter")")/dart"
+"$flutter" analyze --suppress-analytics lib test hook
+"$dart" format --output=none --set-exit-if-changed lib test hook example/lib example/integration_test
 port="${WSE_PORT:-$((20000 + RANDOM % 20000))}"
 cd "$root"
 cargo build -q -p wse-client --example server

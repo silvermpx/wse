@@ -4,4 +4,5 @@
 import 'binaries.dart';
 import 'prebuilt.dart';
 
-void main(List<String> args) => runHook(args, version: version, binaries: binaries);
+void main(List<String> args) =>
+    runHook(args, version: version, binaries: binaries);
