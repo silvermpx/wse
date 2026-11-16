@@ -8,8 +8,11 @@
 //!   lint            comments + arch + names
 //!   commits [RANGE] commit messages carry no AI co-author or
 //!                   "generated with" lines (default: origin/main..HEAD)
-//!   fast            the quick local gate: cargo fmt --check, clippy with
-//!                   warnings denied, then lint
+//!   fast            the quick local gate, CI's Rust lint job: cargo fmt
+//!                   --check, clippy with warnings denied for each build of
+//!                   the crates, then lint
+//!   hooks           installs the gate before every push (hooks/pre-push):
+//!                   git takes its hooks from hooks/
 //!
 //! Each command exits non-zero on a finding, so CI runs the same commands.
 
@@ -33,9 +36,10 @@ fn main() -> ExitCode {
         Some("lint") => run_comments(&root) & run_arch(&root) & run_names(&root),
         Some("commits") => run_commits(&root, args.get(1).map(String::as_str)),
         Some("fast") => run_fast(&root),
+        Some("hooks") => run_hooks(&root),
         _ => {
             eprintln!(
-                "usage: cargo xtask <comments | arch | names | lint | commits [RANGE] | fast>"
+                "usage: cargo xtask <comments | arch | names | lint | commits [RANGE] | fast | hooks>"
             );
             return ExitCode::from(2);
         }
@@ -241,40 +245,67 @@ fn ai_attribution(body: &str) -> Vec<String> {
         .collect()
 }
 
+fn run_hooks(root: &Path) -> bool {
+    let status = Command::new("git")
+        .args(["config", "core.hooksPath", "hooks"])
+        .current_dir(root)
+        .status();
+    if !matches!(status, Ok(s) if s.success()) {
+        eprintln!("hooks: git config core.hooksPath failed");
+        return false;
+    }
+    println!("hooks: git runs hooks/pre-push before every push");
+    true
+}
+
 fn run_fast(root: &Path) -> bool {
-    let steps: [(&str, &[&str], &str); 4] = [
-        ("rustfmt", &["fmt", "--check"], "rust"),
-        ("rustfmt (xtask)", &["fmt", "--check"], "xtask"),
+    // CI's Rust lint job, then the xtask's own: format, then clippy with
+    // warnings denied for every build the crates are made in.
+    let xtask = root.join("xtask/Cargo.toml");
+    let xtask = xtask.to_str().expect("a UTF-8 repository path");
+    let clippy = |extra: &[&'static str]| -> Vec<&'static str> {
+        let mut args = vec!["clippy", "--locked", "--all-targets"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--", "-D", "warnings"]);
+        args
+    };
+    let steps: Vec<(&str, Vec<&str>)> = vec![
+        ("rustfmt", vec!["fmt", "--all", "--", "--check"]),
         (
-            "clippy",
-            &[
+            "rustfmt (xtask)",
+            vec!["fmt", "--manifest-path", xtask, "--", "--check"],
+        ),
+        ("clippy wse", clippy(&["-p", "wse"])),
+        (
+            "clippy wse, no default features",
+            clippy(&["-p", "wse", "--no-default-features"]),
+        ),
+        ("clippy workspace", clippy(&["--workspace"])),
+        (
+            "clippy wse-client, no default features",
+            clippy(&["-p", "wse-client", "--no-default-features"]),
+        ),
+        (
+            "clippy wse-client, native",
+            clippy(&["-p", "wse-client", "--features", "native"]),
+        ),
+        ("clippy (xtask)", {
+            let mut args = vec![
                 "clippy",
                 "--locked",
                 "--all-targets",
-                "--",
-                "-D",
-                "warnings",
-            ],
-            "rust",
-        ),
-        (
-            "clippy (xtask)",
-            &[
-                "clippy",
-                "--locked",
-                "--all-targets",
-                "--",
-                "-D",
-                "warnings",
-            ],
-            "xtask",
-        ),
+                "--manifest-path",
+                xtask,
+            ];
+            args.extend_from_slice(&["--", "-D", "warnings"]);
+            args
+        }),
     ];
-    for (name, args, dir) in steps {
+    for (name, args) in steps {
         println!("== {name}");
         let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-            .args(args)
-            .current_dir(root.join(dir))
+            .args(&args)
+            .current_dir(root)
             .status();
         if !matches!(status, Ok(s) if s.success()) {
             eprintln!("fast: {name} failed");
