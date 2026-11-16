@@ -13,10 +13,15 @@
 //!                   the crates, then lint
 //!   hooks           installs the gate before every push (hooks/pre-push):
 //!                   git takes its hooks from hooks/
+//!   check [LANE]    fast, then CI's jobs on this machine side by side (see
+//!                   check.rs): each lane this machine has the tools for,
+//!                   the others reported as skipped with the reason; with
+//!                   LANE, that lane alone
 //!
 //! Each command exits non-zero on a finding, so CI runs the same commands.
 
 mod arch;
+mod check;
 mod comments;
 mod lexer;
 mod names;
@@ -37,9 +42,14 @@ fn main() -> ExitCode {
         Some("commits") => run_commits(&root, args.get(1).map(String::as_str)),
         Some("fast") => run_fast(&root),
         Some("hooks") => run_hooks(&root),
+        // Without a lane, CI's Rust lint first, as CI runs it before the tests.
+        Some("check") => match args.get(1) {
+            Some(lane) => check::run(&root, Some(lane)),
+            None => run_fast(&root) && check::run(&root, None),
+        },
         _ => {
             eprintln!(
-                "usage: cargo xtask <comments | arch | names | lint | commits [RANGE] | fast | hooks>"
+                "usage: cargo xtask <comments | arch | names | lint | commits [RANGE] | fast | hooks | check [LANE]>"
             );
             return ExitCode::from(2);
         }

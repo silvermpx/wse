@@ -81,10 +81,27 @@ RUSTFLAGS="-C target-cpu=native" maturin develop --release
 ### Repository Checks
 
 ```bash
-cargo xtask fast      # rustfmt, clippy, then the checks below
+cargo xtask hooks     # once: the gate before every push (hooks/pre-push)
+cargo xtask fast      # CI's Rust lint: rustfmt, clippy for each build, then the checks below
 cargo xtask lint      # comments, version-free names and the engine boundary
 cargo xtask commits   # commit messages of your branch (origin/main..HEAD)
+cargo xtask check     # fast, then CI's jobs on this machine side by side (check LANE: one)
 ```
+
+The gate before a push checks the pushed commit in a worktree of its own
+(kept under `~/.cache/prepush/`): `cargo xtask fast`, the TypeScript client's
+types and tests, the Python client's lint and tests (through uv), and for the
+pushed range the commit messages and a gitleaks scan. A push leaves only once
+it passes.
+
+`cargo xtask check` runs `fast`, then CI's jobs here: the Rust tests, the TypeScript client,
+the Python client and server (and the TypeScript client against it), Kotlin
+on the JVM, the Dart package, the Flutter example as a desktop app, and Swift.
+A lane this machine has no tools for is skipped with the reason (Swift needs
+a Mac; a Linux desktop app needs GTK 3 and xvfb), so a Mac and a Linux
+machine between them cover CI. `FLUTTER=` and `GRADLE=` name those tools when
+they are not on PATH. Each lane builds under `target/xtask-check/<lane>/` and
+logs to `target/xtask-check/<lane>.log`.
 
 - **Comments** say why the code is the way it is, in plain English, for the
   next reader. Issue, ticket and audit numbers, plan or wave numbers and the
@@ -186,10 +203,8 @@ Receiver now correctly validates total wire frame size.
 
 1. Create a feature branch from `main`.
 2. Make your changes with clear, focused commits.
-3. Ensure all tests pass locally.
-4. Run `cargo xtask fast`.
-5. Run `ruff format` and `ruff check` for Python changes.
-6. Open a PR against `main` with a clear description.
+3. Run `cargo xtask check` (and install the push gate once: `cargo xtask hooks`).
+4. Open a PR against `main` with a clear description.
 
 ## Reporting Issues
 
