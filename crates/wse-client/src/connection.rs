@@ -230,6 +230,7 @@ impl<H: Handler> Driver<H> {
         let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + beat, beat);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut last_seen = Instant::now();
+        let mut asleep = session::SleepWatch::new(web_time::SystemTime::now(), last_seen);
         let mut flush = false;
 
         loop {
@@ -345,6 +346,17 @@ impl<H: Handler> Driver<H> {
                     Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
                 },
                 _ = heartbeat.tick() => {
+                    // The machine slept: a new connection recovers what was
+                    // missed, rather than waiting out the idle timeout.
+                    if let Some(slept) =
+                        asleep.slept(web_time::SystemTime::now(), Instant::now(), self.config.heartbeat)
+                    {
+                        self.close(&mut ws, CloseCode::Away, "slept").await;
+                        return Lost::Closed {
+                            code: None,
+                            reason: format!("the machine slept for about {}s", slept.as_secs()),
+                        };
+                    }
                     // While the application is behind, reads wait for it,
                     // not for the server: silence then says nothing.
                     if poll_once(self.session.handler.ready()).await.is_none() {

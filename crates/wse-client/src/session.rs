@@ -1428,6 +1428,42 @@ fn push_json<T: serde::Serialize + ?Sized>(text: &mut String, value: &T) {
     text.push_str(&serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned()));
 }
 
+/// What the machine's two clocks say about a sleep between two readings: a
+/// monotonic clock stands still while the machine sleeps (Linux, macOS),
+/// the wall clock does not. A connection that crossed a sleep may be gone
+/// without a word (a router that forgot it): the idle check, on the
+/// monotonic clock, would see it only after `idle_timeout` of waking time.
+/// In a browser the page's own socket and events see to that.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct SleepWatch {
+    wall: web_time::SystemTime,
+    mono: Instant,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SleepWatch {
+    pub(crate) fn new(wall: web_time::SystemTime, mono: Instant) -> Self {
+        Self { wall, mono }
+    }
+
+    /// How long the machine slept since the last reading, when that is at
+    /// least `at_least`. A wall clock set back, or a skew shorter than
+    /// `at_least`, is no sleep.
+    pub(crate) fn slept(
+        &mut self,
+        wall: web_time::SystemTime,
+        mono: Instant,
+        at_least: Duration,
+    ) -> Option<Duration> {
+        let walled = wall.duration_since(self.wall).unwrap_or(Duration::ZERO);
+        let ran = mono.saturating_duration_since(self.mono);
+        self.wall = wall;
+        self.mono = mono;
+        let gap = walled.saturating_sub(ran);
+        (gap >= at_least).then_some(gap)
+    }
+}
+
 pub(crate) fn now_ms() -> u64 {
     web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)
@@ -1949,6 +1985,53 @@ mod tests {
         pongs(&mut s, 12);
         feed(&mut s, E, &[1]);
         assert_eq!(named_after_reconnect(&mut s), serde_json::json!({E: 1}));
+    }
+
+    #[test]
+    fn the_clocks_tell_a_sleep_longer_than_a_beat() {
+        let beat = Duration::from_secs(15);
+        let wall = web_time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mono = Instant::now();
+        let mut watch = SleepWatch::new(wall, mono);
+        // A beat awake: both clocks moved alike.
+        assert_eq!(watch.slept(wall + beat, mono + beat, beat), None);
+        // Ten minutes asleep: the wall clock went on, the monotonic one stood.
+        assert_eq!(
+            watch.slept(
+                wall + beat * 2 + Duration::from_secs(600),
+                mono + beat * 2,
+                beat
+            ),
+            Some(Duration::from_secs(600))
+        );
+        // Awake again: nothing more.
+        assert_eq!(
+            watch.slept(
+                wall + beat * 3 + Duration::from_secs(600),
+                mono + beat * 3,
+                beat
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_clock_set_back_or_a_short_skew_is_no_sleep() {
+        let beat = Duration::from_secs(15);
+        let wall = web_time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mono = Instant::now();
+        let mut watch = SleepWatch::new(wall, mono);
+        // Set back an hour.
+        assert_eq!(
+            watch.slept(wall - Duration::from_secs(3600), mono + beat, beat),
+            None
+        );
+        // A few seconds of skew between the clocks.
+        let wall = wall - Duration::from_secs(3600);
+        assert_eq!(
+            watch.slept(wall + beat + Duration::from_secs(3), mono + beat * 2, beat),
+            None
+        );
     }
 
     #[test]
