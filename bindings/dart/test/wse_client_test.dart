@@ -316,6 +316,67 @@ void main() {
     await tester.runAsync(() => client.close());
   });
 
+  testWidgets('on a desktop a minimized window keeps the client', (
+    tester,
+  ) async {
+    final client = (await tester.runAsync(
+      () => WseClient.connect(wseConfig(url, insecure: true)),
+    ))!;
+    final lifecycle = WseAppLifecycle(
+      client,
+      grace: const Duration(seconds: 5),
+    );
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+    await tester.pump(const Duration(seconds: 10));
+    await settle(tester, client, 'paused');
+    expect(client.status, 'connected');
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    lifecycle.dispose();
+    await tester.runAsync(() => client.close());
+  }, variant: TargetPlatformVariant.desktop());
+
+  testWidgets('a minimized window pauses the client when the app asks for it', (
+    tester,
+  ) async {
+    final client = (await tester.runAsync(
+      () => WseClient.connect(wseConfig(url, insecure: true)),
+    ))!;
+    final lifecycle = WseAppLifecycle(
+      client,
+      grace: const Duration(seconds: 5),
+      pauseMinimized: true,
+    );
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+    await tester.pump(const Duration(seconds: 5));
+    await settle(tester, client, 'paused');
+    expect(client.status, 'paused');
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await settle(tester, client, 'connected');
+    expect(client.status, 'connected');
+    lifecycle.dispose();
+    await tester.runAsync(() => client.close());
+  }, variant: TargetPlatformVariant.desktop());
+
+  testWidgets('on a phone a hidden app pauses the client after the grace', (
+    tester,
+  ) async {
+    final client = (await tester.runAsync(
+      () => WseClient.connect(wseConfig(url, insecure: true)),
+    ))!;
+    final lifecycle = WseAppLifecycle(
+      client,
+      grace: const Duration(seconds: 5),
+    );
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+    await tester.pump(const Duration(seconds: 5));
+    await settle(tester, client, 'paused');
+    expect(client.status, 'paused');
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await settle(tester, client, 'connected');
+    lifecycle.dispose();
+    await tester.runAsync(() => client.close());
+  }, variant: TargetPlatformVariant.mobile());
+
   testWidgets('no network pauses the client, another network renews it', (
     tester,
   ) async {

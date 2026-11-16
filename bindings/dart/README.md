@@ -123,9 +123,9 @@ development).
 
 `WseAppLifecycle(client)` pauses the client five seconds after the app went
 to the background and resumes it when the app comes back. On a desktop a
-minimized window counts as gone to the background too, and a window that only
-lost focus does not; leave `WseAppLifecycle` out where a minimized app should
-keep receiving.
+minimized window keeps running and keeps receiving: there it pauses the
+client only with `pauseMinimized: true`, and a window that only lost focus
+never pauses it.
 `WseNetworkMonitor(client)` pauses it while the device has no network and
 makes the connection again when the network moves to other interfaces (Wi-Fi
 to mobile, say); the app feeds it what it sees, with connectivity_plus for
@@ -166,7 +166,7 @@ Sandbox, which lets it open connections only with this entitlement in
 ```
 
 A Linux app builds with GTK 3, as every Flutter app on Linux. A minimized
-window counts as gone to the background (`WseAppLifecycle`, above).
+window keeps receiving (`WseAppLifecycle`, above).
 
 ## License
 

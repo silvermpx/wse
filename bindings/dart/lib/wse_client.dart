@@ -5,7 +5,8 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart' show listEquals;
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform, listEquals;
 import 'package:flutter/widgets.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart'
     show ExternalLibrary;
@@ -333,14 +334,34 @@ final class WseTrust {
 /// Pauses [client] [grace] after the app went to the background, and
 /// resumes it when the app comes back. It pauses for a reason of its own, so
 /// a pause of the application's stays. Dispose of it with the client.
+///
+/// On a phone the background is where the system may stop the app. On a
+/// desktop (Windows, macOS, Linux) a minimized window keeps running and keeps
+/// receiving: there it pauses the client only with [pauseMinimized]. A window
+/// that only lost focus never pauses it.
 class WseAppLifecycle with WidgetsBindingObserver {
-  WseAppLifecycle(this.client, {this.grace = const Duration(seconds: 5)}) {
+  WseAppLifecycle(
+    this.client, {
+    this.grace = const Duration(seconds: 5),
+    bool? pauseMinimized,
+  }) : pauseMinimized = pauseMinimized ?? !_desktop {
     WidgetsBinding.instance.addObserver(this);
   }
 
   final WseClient client;
   final Duration grace;
+
+  /// Whether a hidden app, on a desktop a minimized window, pauses the
+  /// client: by default on a phone, not on a desktop.
+  final bool pauseMinimized;
   Timer? _pending;
+
+  static bool get _desktop => switch (defaultTargetPlatform) {
+    TargetPlatform.windows ||
+    TargetPlatform.macOS ||
+    TargetPlatform.linux => true,
+    _ => false,
+  };
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
@@ -349,6 +370,8 @@ class WseAppLifecycle with WidgetsBindingObserver {
         _pending?.cancel();
         _pending = null;
         _control(() => client.resume('background'));
+      case AppLifecycleState.hidden when !pauseMinimized:
+        break;
       case AppLifecycleState.hidden:
       case AppLifecycleState.paused:
         _pending ??= Timer(
