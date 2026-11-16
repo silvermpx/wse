@@ -4,7 +4,7 @@
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import * as pako from 'pako';
 import { generateId } from '../utils/id.js';
 import { Logger, LogLevel, ERROR_LOG_STORAGE_KEY, defaultLogLevel } from '../utils/logger.js';
@@ -117,6 +117,12 @@ describe('saved subscriptions', () => {
 });
 
 describe('CompressionManager limits', () => {
+  // 32 MiB of zeros, compressed: made once, outside the tests' time limits.
+  let bomb: Uint8Array;
+  beforeAll(() => {
+    bomb = pako.deflate(new Uint8Array(32 * 1024 * 1024));
+  }, 60_000);
+
   it('inflates zlib, gzip and raw deflate data', () => {
     const text = new TextEncoder().encode('hello '.repeat(100));
     const cm = new CompressionManager();
@@ -127,7 +133,6 @@ describe('CompressionManager limits', () => {
   });
 
   it('stops inflating as soon as the output passes the limit', () => {
-    const bomb = pako.deflate(new Uint8Array(32 * 1024 * 1024));
     const cm = new CompressionManager(1024, 6, 256 * 1024);
     const buffer = bomb.buffer.slice(bomb.byteOffset, bomb.byteOffset + bomb.byteLength) as ArrayBuffer;
     expect(() => cm.decompress(buffer)).toThrow(DecompressedSizeLimitError);

@@ -5,7 +5,7 @@
 // fill a hole within a bounded window, no message is dropped for its age,
 // and inbound size limits apply while inflating.
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as pako from 'pako';
 import {
   ENDPOINT,
@@ -474,6 +474,13 @@ describe('no age-based dropping', () => {
 });
 
 describe('inbound size limits', () => {
+  // ~64 MiB of zeros compresses to ~64 KiB: a decompression bomb, made once,
+  // outside the tests' time limits.
+  let bomb: Uint8Array;
+  beforeAll(() => {
+    bomb = pako.deflate(new Uint8Array(64 * 1024 * 1024));
+  }, 60_000);
+
   it('drops a text frame above maxMessageSize', async () => {
     start({ maxMessageSize: 1024 });
     await tick();
@@ -492,8 +499,6 @@ describe('inbound size limits', () => {
     const ws = FakeWebSocket.last();
     await connectServer(ws);
 
-    // ~64 MiB of zeros compresses to ~64 KiB: a decompression bomb.
-    const bomb = pako.deflate(new Uint8Array(64 * 1024 * 1024));
     const frame = new Uint8Array(2 + bomb.length);
     frame.set([67, 58]);
     frame.set(bomb, 2);
