@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # The staged Dart package's example app on a phone's system: its integration
 # test on DEVICE (an Android emulator's or an iOS simulator's flutter id),
-# and on an Android emulator its release build too, the package's build hook
-# taking the device's prebuilt library from BINARIES and checking it against
-# the list the package carries -- never a build from source. The app runs
-# from a copy of the package in WORK (default dart-mobile-check).
+# then its release build -- run on an Android emulator, made for an iPhone
+# beside an iOS simulator (which runs debug builds only) -- the package's
+# build hook taking each target's prebuilt library from BINARIES and checking
+# it against the list the package carries: never a build from source. The
+# app runs from a copy of the package in WORK (default dart-mobile-check).
 #
 #   .github/scripts/dart-mobile-check.sh dart-package dart-binaries emulator-5554
 set -euo pipefail
@@ -24,6 +25,4 @@ hooks:
       binaries: $binaries
 YAML
 APP="$work/example" "$root/bindings/dart/example/run-integration-tests.sh" "$device"
-if [[ "$device" == emulator-* ]]; then
-  APP="$work/example" MODE=release "$root/bindings/dart/example/run-integration-tests.sh" "$device"
-fi
+APP="$work/example" MODE=release "$root/bindings/dart/example/run-integration-tests.sh" "$device"
