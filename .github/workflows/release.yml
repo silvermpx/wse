@@ -53,6 +53,7 @@ on:
       - 'bindings/dart/example/run-integration-tests.sh'
       - 'bindings/dart/rust/Cargo.toml'
       - 'bindings/dart/rust/rust-toolchain.toml'
+      - 'tests/clients/**'
   pull_request:
     paths:
       - '.github/workflows/release.yml'
@@ -84,6 +85,7 @@ on:
       - 'bindings/dart/example/run-integration-tests.sh'
       - 'bindings/dart/rust/Cargo.toml'
       - 'bindings/dart/rust/rust-toolchain.toml'
+      - 'tests/clients/**'
   workflow_dispatch:
 
 permissions: {}
@@ -654,6 +656,49 @@ jobs:
           name: npm-package
           path: npm-dist/*.tgz
           if-no-files-found: error
+
+  # The release's npm package in Angular and Solid applications, as each
+  # framework's tooling makes them: a production build, server rendering,
+  # hydration in Chromium, one connection, German and English.
+  framework-check:
+    name: Framework application (${{ matrix.fixture }})
+    needs: [preflight, npm-package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        fixture: [angular20, angular21, angular22, solid1, solid2]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '24'
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: npm-package
+          path: npm-dist/
+
+      - name: Chromium, and what it needs here
+        run: |
+          cd tests/clients/harness
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      - name: The application
+        env:
+          FIXTURE: ${{ matrix.fixture }}
+        run: bash .github/scripts/framework-consumer-check.sh npm-dist/wse-client-*.tgz "$FIXTURE"
 
   # ---------------------------------------------------------------------------
   # The Rust crates: packaged, and each built from its package as crates.io
@@ -1494,7 +1539,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release-gate:
     name: Release gate
-    needs: [preflight, build, sdist, test, test-musllinux, sdist-install, python-client, npm-package, crates, swift-package, android-package, jvm-natives, jvm-package, jvm-check, android-release-app, react-native-app, maven-central, swift-repo, dart-binaries, dart-package, dart-check, dart-mobile]
+    needs: [preflight, build, sdist, test, test-musllinux, sdist-install, python-client, npm-package, framework-check, crates, swift-package, android-package, jvm-natives, jvm-package, jvm-check, android-release-app, react-native-app, maven-central, swift-repo, dart-binaries, dart-package, dart-check, dart-mobile]
     # Runs (and fails) when a job above failed: a gate skipped because of a
     # failed dependency would report success to branch protection.
     if: always()

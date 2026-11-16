@@ -1,0 +1,9 @@
+{
+  "name": "wse-clients-harness",
+  "private": true,
+  "type": "module",
+  "description": "Runs the framework applications of tests/clients in Node and in a browser.",
+  "dependencies": {
+    "playwright": "1.65.1"
+  }
+}

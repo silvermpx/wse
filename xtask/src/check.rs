@@ -57,6 +57,22 @@ npx tsc --noEmit
 npx vitest run",
     },
     Lane {
+        // The Angular and Solid adapters in applications, built against the
+        // packed client (Angular 22 needs Node 22.22 or newer).
+        name: "frameworks",
+        needs: &[tool("node"), tool("npm"), tool("cargo")],
+        only_on: None,
+        script: "[ -d node_modules ] || { echo 'npm ci first: no node_modules'; exit 1; }
+node -e 'const [a, b] = process.versions.node.split(\".\").map(Number); process.exit(a > 22 || (a === 22 && b >= 22) ? 0 : 1)' \\
+  || { echo 'skip: Angular 22 needs Node 22.22 or newer on PATH'; exit 3; }
+npm run build > /dev/null
+rm -rf \"${CARGO_TARGET_DIR:?}/npm-dist\" && mkdir -p \"$CARGO_TARGET_DIR/npm-dist\"
+npm pack --ignore-scripts --pack-destination \"$CARGO_TARGET_DIR/npm-dist\" > /dev/null
+for fixture in angular20 angular21 angular22 solid1 solid2; do
+  .github/scripts/framework-consumer-check.sh \"$CARGO_TARGET_DIR\"/npm-dist/wse-client-*.tgz \"$fixture\"
+done",
+    },
+    Lane {
         name: "python-client",
         needs: &[tool("uvx")],
         only_on: None,

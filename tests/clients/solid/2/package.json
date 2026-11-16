@@ -1,0 +1,17 @@
+{
+  "name": "wse-solid-2-check",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@solidjs/web": "2.0.0-rc.23",
+    "solid-js": "2.0.0-rc.23"
+  },
+  "devDependencies": {
+    "@solidjs/vite-plugin": "3.0.0-next.57",
+    "typescript": "6.0.3",
+    "vite": "8.3.8"
+  }
+}

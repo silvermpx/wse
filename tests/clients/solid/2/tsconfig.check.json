@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "skipLibCheck": false
+  },
+  "include": [
+    "src/Page.tsx",
+    "src/text.ts",
+    "src/endpoint.ts"
+  ]
+}

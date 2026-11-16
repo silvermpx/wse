@@ -74,6 +74,8 @@ jobs:
               - '.github/scripts/npm-consumer-check.sh'
               - '.github/scripts/rn-bundle-check.sh'
               - '.github/scripts/rn-app-check.sh'
+              - '.github/scripts/framework-consumer-check.sh'
+              - 'tests/clients/**'
               - '.github/workflows/ci.yml'
             mobile:
               - 'crates/wse-client/**'
@@ -220,6 +222,57 @@ jobs:
   # E2E session with the server's own code, recovery after a kick, a stop and
   # a restart. Required: a missing prerequisite fails, it never skips.
   # ---------------------------------------------------------------------------
+  # The Angular and Solid adapters in applications as each framework's
+  # tooling makes them, built against the packed client: a production build,
+  # server rendering, hydration in Chromium, one connection, German and
+  # English (framework-consumer-check.sh).
+  frameworks:
+    name: Framework application (${{ matrix.fixture }})
+    needs: changes
+    if: needs.changes.outputs.ts_client == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        fixture: [angular20, angular21, angular22, solid1, solid2]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: ". -> target"
+          key: frameworks
+
+      - name: The packed client
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+          mkdir -p npm-dist
+          npm pack --ignore-scripts --pack-destination npm-dist
+
+      - name: Chromium, and what it needs here
+        run: |
+          cd tests/clients/harness
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      - name: The application
+        env:
+          FIXTURE: ${{ matrix.fixture }}
+        run: bash .github/scripts/framework-consumer-check.sh npm-dist/wse-client-*.tgz "$FIXTURE"
+
   client-server:
     name: Client (TS) against the server
     needs: changes
@@ -1046,7 +1099,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, checks, secrets, client, client-server, python-client, lint, rust-lint, rust-test, rust-wasm, rust-fips, rust-msrv, swift, kotlin, android, react-native, dart, flutter-ios, test, benchmarks, security]
+    needs: [changes, checks, secrets, client, frameworks, client-server, python-client, lint, rust-lint, rust-test, rust-wasm, rust-fips, rust-msrv, swift, kotlin, android, react-native, dart, flutter-ios, test, benchmarks, security]
     runs-on: ubuntu-latest
     steps:
       - name: Every job passed or was skipped
