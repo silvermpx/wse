@@ -708,9 +708,17 @@ internal object IntegrityCheckingUniffiLib {
     internal fun ensureInitialized() = Unit
     external fun uniffi_wse_ffi_checksum_func_connect(
     ): Int
+    external fun uniffi_wse_ffi_checksum_func_generate_signing_key(
+    ): Int
+    external fun uniffi_wse_ffi_checksum_func_signing_public_key(
+    ): Int
     external fun uniffi_wse_ffi_checksum_method_wsecancel_cancel(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wsecancel_is_cancelled(
+    ): Int
+    external fun uniffi_wse_ffi_checksum_method_wseclient_checkpoint(
+    ): Int
+    external fun uniffi_wse_ffi_checksum_method_wseclient_commit(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_connection_id(
     ): Int
@@ -724,6 +732,10 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_resume(
     ): Int
+    external fun uniffi_wse_ffi_checksum_method_wseclient_resync(
+    ): Int
+    external fun uniffi_wse_ffi_checksum_method_wseclient_resynced(
+    ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_send(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_send_live(
@@ -733,6 +745,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_wse_ffi_checksum_method_wseclient_status(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_subscribe(
+    ): Int
+    external fun uniffi_wse_ffi_checksum_method_wseclient_topic_states(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_try_send(
     ): Int
@@ -781,6 +795,10 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_wse_ffi_fn_free_wseclient(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
+    external fun uniffi_wse_ffi_fn_method_wseclient_checkpoint(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_wse_ffi_fn_method_wseclient_commit(`ptr`: Long,`topic`: RustBuffer.ByValue,`epoch`: Int,`offset`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_connection_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_wse_ffi_fn_method_wseclient_disconnect(`ptr`: Long,`deadlineMs`: Long,
@@ -793,6 +811,10 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_resume(`ptr`: Long,`reason`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
+    external fun uniffi_wse_ffi_fn_method_wseclient_resync(`ptr`: Long,`topics`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_wse_ffi_fn_method_wseclient_resynced(`ptr`: Long,`round`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_send(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,`cancel`: Long,
     ): Long
     external fun uniffi_wse_ffi_fn_method_wseclient_send_live(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,`cancel`: Long,
@@ -803,6 +825,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_wse_ffi_fn_method_wseclient_subscribe(`ptr`: Long,`topics`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
+    external fun uniffi_wse_ffi_fn_method_wseclient_topic_states(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
     external fun uniffi_wse_ffi_fn_method_wseclient_try_send(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_try_send_live(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -821,6 +845,10 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_wse_ffi_fn_func_connect(`config`: RustBuffer.ByValue,`tokens`: RustBuffer.ByValue,`cancel`: Long,
     ): Long
+    external fun uniffi_wse_ffi_fn_func_generate_signing_key(uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_wse_ffi_fn_func_signing_public_key(`key`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
     external fun ffi_wse_ffi_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun ffi_wse_ffi_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -943,10 +971,22 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_wse_ffi_checksum_func_connect() and 0xFFFF) != 44227) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_wse_ffi_checksum_func_generate_signing_key() and 0xFFFF) != 46208) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_wse_ffi_checksum_func_signing_public_key() and 0xFFFF) != 19003) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_wse_ffi_checksum_method_wsecancel_cancel() and 0xFFFF) != 25563) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_method_wsecancel_is_cancelled() and 0xFFFF) != 13465) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_checkpoint() and 0xFFFF) != 3771) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_commit() and 0xFFFF) != 10196) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_connection_id() and 0xFFFF) != 49499) {
@@ -967,6 +1007,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_resume() and 0xFFFF) != 28459) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_resync() and 0xFFFF) != 62144) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_resynced() and 0xFFFF) != 1990) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_send() and 0xFFFF) != 38848) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -980,6 +1026,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_subscribe() and 0xFFFF) != 16488) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_topic_states() and 0xFFFF) != 63419) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_try_send() and 0xFFFF) != 33752) {
@@ -1870,6 +1919,17 @@ public object FfiConverterTypeWseCancel: FfiConverter<WseCancel, Long> {
 
 public interface WseClientInterface {
 
+    /**
+     * What the consumer committed, to save with the application's own
+     * state and give back as `WseDelivery.checkpoint`.
+     */
+    fun `checkpoint`(): kotlin.String
+
+    /**
+     * The consumer applied the message at `epoch`, `offset` of `topic`.
+     */
+    fun `commit`(`topic`: kotlin.String, `epoch`: kotlin.UInt, `offset`: kotlin.ULong)
+
     fun `connectionId`(): kotlin.String?
 
     /**
@@ -1898,6 +1958,18 @@ public interface WseClientInterface {
     fun `resume`(`reason`: kotlin.String)
 
     /**
+     * Bring `topics` up to date: in recover-or-resync a resync round asks
+     * for it; in best effort the application did so itself.
+     */
+    fun `resync`(`topics`: List<kotlin.String>)
+
+    /**
+     * recover-or-resync: the application brought the topics of `round` up
+     * to date; what they held comes next.
+     */
+    fun `resynced`(`round`: kotlin.ULong)
+
+    /**
      * Sends `{"t": kind, "p": json}`, waiting for room in the queue;
      * `cancel` gives up the wait (a message already queued still goes).
      */
@@ -1917,6 +1989,12 @@ public interface WseClientInterface {
     fun `status`(): WseStatus
 
     fun `subscribe`(`topics`: List<kotlin.String>)
+
+    /**
+     * Each topic held: whether the server took it, and whether its
+     * messages run without a break.
+     */
+    fun `topicStates`(): List<WseTopicState>
 
     /**
      * Sends `{"t": kind, "p": json}`; fails at once when the queue is full.
@@ -2038,6 +2116,41 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
         }
     }
 
+
+    /**
+     * What the consumer committed, to save with the application's own
+     * state and give back as `WseDelivery.checkpoint`.
+     */override fun `checkpoint`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_wse_ffi_fn_method_wseclient_checkpoint(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * The consumer applied the message at `epoch`, `offset` of `topic`.
+     */override fun `commit`(`topic`: kotlin.String, `epoch`: kotlin.UInt, `offset`: kotlin.ULong)
+        =
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_wse_ffi_fn_method_wseclient_commit(
+        it,
+
+        FfiConverterString.lower(`topic`),
+        FfiConverterUInt.lower(`epoch`),
+        FfiConverterULong.lower(`offset`),_status)
+}
+    }
+
+
+
     override fun `connectionId`(): kotlin.String? {
             return FfiConverterOptionalString.lift(
     callWithHandle {
@@ -2156,6 +2269,40 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
 
 
     /**
+     * Bring `topics` up to date: in recover-or-resync a resync round asks
+     * for it; in best effort the application did so itself.
+     */override fun `resync`(`topics`: List<kotlin.String>)
+        =
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_wse_ffi_fn_method_wseclient_resync(
+        it,
+
+        FfiConverterSequenceString.lower(`topics`),_status)
+}
+    }
+
+
+
+
+    /**
+     * recover-or-resync: the application brought the topics of `round` up
+     * to date; what they held comes next.
+     */override fun `resynced`(`round`: kotlin.ULong)
+        =
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_wse_ffi_fn_method_wseclient_resynced(
+        it,
+
+        FfiConverterULong.lower(`round`),_status)
+}
+    }
+
+
+
+
+    /**
      * Sends `{"t": kind, "p": json}`, waiting for room in the queue;
      * `cancel` gives up the wait (a message already queued still goes).
      */
@@ -2265,6 +2412,23 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
 }
     }
 
+
+
+
+    /**
+     * Each topic held: whether the server took it, and whether its
+     * messages run without a break.
+     */override fun `topicStates`(): List<WseTopicState> {
+            return FfiConverterSequenceTypeWseTopicState.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_wse_ffi_fn_method_wseclient_topic_states(
+        it,
+        _status)
+}
+    }
+    )
+    }
 
 
 
@@ -2804,6 +2968,22 @@ data class WseConfig (
     val `signingKey`: kotlin.ByteArray? = null
     ,
     val `serverSigningKeys`: List<kotlin.String> = listOf()
+    ,
+    /**
+     * The certificates a wss:// server's chain must lead to; none: the
+     * system's verifier.
+     */
+    val `trust`: WseTrust? = null
+    ,
+    /**
+     * Allows ws://, which sends everything in the clear: for development.
+     */
+    val `insecure`: kotlin.Boolean = false
+    ,
+    /**
+     * recover-or-resync; none: best effort.
+     */
+    val `delivery`: WseDelivery? = null
 
 ){
 
@@ -2834,6 +3014,9 @@ public object FfiConverterTypeWseConfig: FfiConverterRustBuffer<WseConfig> {
             FfiConverterSequenceString.read(buf),
             FfiConverterOptionalByteArray.read(buf),
             FfiConverterSequenceString.read(buf),
+            FfiConverterOptionalTypeWseTrust.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalTypeWseDelivery.read(buf),
         )
     }
 
@@ -2851,7 +3034,10 @@ public object FfiConverterTypeWseConfig: FfiConverterRustBuffer<WseConfig> {
             FfiConverterULong.allocationSize(value.`recoveryTimeoutMs`) +
             FfiConverterSequenceString.allocationSize(value.`serverIdentityKeys`) +
             FfiConverterOptionalByteArray.allocationSize(value.`signingKey`) +
-            FfiConverterSequenceString.allocationSize(value.`serverSigningKeys`)
+            FfiConverterSequenceString.allocationSize(value.`serverSigningKeys`) +
+            FfiConverterOptionalTypeWseTrust.allocationSize(value.`trust`) +
+            FfiConverterBoolean.allocationSize(value.`insecure`) +
+            FfiConverterOptionalTypeWseDelivery.allocationSize(value.`delivery`)
     )
 
     override fun write(value: WseConfig, buf: ByteBuffer) {
@@ -2869,6 +3055,84 @@ public object FfiConverterTypeWseConfig: FfiConverterRustBuffer<WseConfig> {
             FfiConverterSequenceString.write(value.`serverIdentityKeys`, buf)
             FfiConverterOptionalByteArray.write(value.`signingKey`, buf)
             FfiConverterSequenceString.write(value.`serverSigningKeys`, buf)
+            FfiConverterOptionalTypeWseTrust.write(value.`trust`, buf)
+            FfiConverterBoolean.write(value.`insecure`, buf)
+            FfiConverterOptionalTypeWseDelivery.write(value.`delivery`, buf)
+    }
+}
+
+
+
+/**
+ * The recover-or-resync delivery: a topic that is not continuous (a cold
+ * start, every reconnect, a break) holds its messages until the
+ * application brought its state up to date (a `Resync` item, then
+ * `resynced(round)`); the checkpoint is what it committed it applied, and
+ * recovery starts from it.
+ */
+data class WseDelivery (
+    /**
+     * The one consumer that commits, by a stable name.
+     */
+    val `consumer`: kotlin.String
+    ,
+    /**
+     * The application's data schema: a checkpoint of another is refused.
+     */
+    val `schema`: kotlin.String? = null
+    ,
+    /**
+     * The server's realm (default: the URL): a checkpoint of another is refused.
+     */
+    val `realm`: kotlin.String? = null
+    ,
+    /**
+     * The checkpoint the application saved last (`checkpoint()`).
+     */
+    val `checkpoint`: kotlin.String? = null
+    ,
+    /**
+     * Messages a topic holds while it resyncs (0: 10,000); more starts the resync over.
+     */
+    val `maxHeld`: kotlin.UInt = 0u
+
+){
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeWseDelivery: FfiConverterRustBuffer<WseDelivery> {
+    override fun read(buf: ByteBuffer): WseDelivery {
+        return WseDelivery(
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: WseDelivery) = (
+            FfiConverterString.allocationSize(value.`consumer`) +
+            FfiConverterOptionalString.allocationSize(value.`schema`) +
+            FfiConverterOptionalString.allocationSize(value.`realm`) +
+            FfiConverterOptionalString.allocationSize(value.`checkpoint`) +
+            FfiConverterUInt.allocationSize(value.`maxHeld`)
+    )
+
+    override fun write(value: WseDelivery, buf: ByteBuffer) {
+            FfiConverterString.write(value.`consumer`, buf)
+            FfiConverterOptionalString.write(value.`schema`, buf)
+            FfiConverterOptionalString.write(value.`realm`, buf)
+            FfiConverterOptionalString.write(value.`checkpoint`, buf)
+            FfiConverterUInt.write(value.`maxHeld`, buf)
     }
 }
 
@@ -3038,6 +3302,52 @@ public object FfiConverterTypeWseSignature: FfiConverterRustBuffer<WseSignature>
 
 
 
+/**
+ * Where a stream of a topic stands.
+ */
+data class WseStreamPosition (
+    val `topic`: kotlin.String
+    ,
+    val `epoch`: kotlin.UInt
+    ,
+    val `offset`: kotlin.ULong
+
+){
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeWseStreamPosition: FfiConverterRustBuffer<WseStreamPosition> {
+    override fun read(buf: ByteBuffer): WseStreamPosition {
+        return WseStreamPosition(
+            FfiConverterString.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: WseStreamPosition) = (
+            FfiConverterString.allocationSize(value.`topic`) +
+            FfiConverterUInt.allocationSize(value.`epoch`) +
+            FfiConverterULong.allocationSize(value.`offset`)
+    )
+
+    override fun write(value: WseStreamPosition, buf: ByteBuffer) {
+            FfiConverterString.write(value.`topic`, buf)
+            FfiConverterUInt.write(value.`epoch`, buf)
+            FfiConverterULong.write(value.`offset`, buf)
+    }
+}
+
+
+
 data class WseTopicRecovery (
     val `topic`: kotlin.String
     ,
@@ -3081,6 +3391,57 @@ public object FfiConverterTypeWseTopicRecovery: FfiConverterRustBuffer<WseTopicR
 
 
 
+data class WseTopicState (
+    val `topic`: kotlin.String
+    ,
+    val `subscription`: WseSubscription
+    ,
+    val `continuity`: WseContinuity
+    ,
+    /**
+     * Why it is not continuous: cold_start, reconnected, offset_gap, ...
+     */
+    val `reason`: kotlin.String?
+
+){
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeWseTopicState: FfiConverterRustBuffer<WseTopicState> {
+    override fun read(buf: ByteBuffer): WseTopicState {
+        return WseTopicState(
+            FfiConverterString.read(buf),
+            FfiConverterTypeWseSubscription.read(buf),
+            FfiConverterTypeWseContinuity.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: WseTopicState) = (
+            FfiConverterString.allocationSize(value.`topic`) +
+            FfiConverterTypeWseSubscription.allocationSize(value.`subscription`) +
+            FfiConverterTypeWseContinuity.allocationSize(value.`continuity`) +
+            FfiConverterOptionalString.allocationSize(value.`reason`)
+    )
+
+    override fun write(value: WseTopicState, buf: ByteBuffer) {
+            FfiConverterString.write(value.`topic`, buf)
+            FfiConverterTypeWseSubscription.write(value.`subscription`, buf)
+            FfiConverterTypeWseContinuity.write(value.`continuity`, buf)
+            FfiConverterOptionalString.write(value.`reason`, buf)
+    }
+}
+
+
+
 
 enum class WseBatchKind {
 
@@ -3110,6 +3471,44 @@ public object FfiConverterTypeWseBatchKind: FfiConverterRustBuffer<WseBatchKind>
     override fun allocationSize(value: WseBatchKind) = 4UL
 
     override fun write(value: WseBatchKind, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Whether a topic's messages run without a break.
+ */
+
+enum class WseContinuity {
+
+    CONTINUOUS,
+    RESYNC_REQUIRED,
+    RESYNCING;
+
+
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeWseContinuity: FfiConverterRustBuffer<WseContinuity> {
+    override fun read(buf: ByteBuffer) = try {
+        WseContinuity.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: WseContinuity) = 4UL
+
+    override fun write(value: WseContinuity, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -3579,6 +3978,50 @@ sealed class WseItem {
     }
 
     /**
+     * recover-or-resync: bring the state of `topics` up to date (the
+     * reason of each, what the consumer committed), then call
+     * `resynced(round)`; their messages wait till then.
+     */
+    data class Resync(
+        val `round`: kotlin.ULong,
+        val `topics`: List<kotlin.String>,
+        val `reasons`: List<kotlin.String>,
+        val `committed`: List<dev.wse.ffi.WseStreamPosition>) : WseItem()
+
+    {
+
+
+        companion object
+    }
+
+    /**
+     * A topic's continuity changed, and why it is not continuous.
+     */
+    data class Continuity(
+        val `topic`: kotlin.String,
+        val `continuity`: dev.wse.ffi.WseContinuity,
+        val `reason`: kotlin.String?) : WseItem()
+
+    {
+
+
+        companion object
+    }
+
+    /**
+     * The saved checkpoint is not this client's: its realm, user,
+     * consumer, schema or version, or it is malformed.
+     */
+    data class CheckpointRejected(
+        val `reason`: kotlin.String) : WseItem()
+
+    {
+
+
+        companion object
+    }
+
+    /**
      * Something this version does not know.
      */
     data class Unknown(
@@ -3647,7 +4090,21 @@ public object FfiConverterTypeWseItem : FfiConverterRustBuffer<WseItem>{
             9 -> WseItem.Closed(
                 FfiConverterOptionalString.read(buf),
                 )
-            10 -> WseItem.Unknown(
+            10 -> WseItem.Resync(
+                FfiConverterULong.read(buf),
+                FfiConverterSequenceString.read(buf),
+                FfiConverterSequenceString.read(buf),
+                FfiConverterSequenceTypeWseStreamPosition.read(buf),
+                )
+            11 -> WseItem.Continuity(
+                FfiConverterString.read(buf),
+                FfiConverterTypeWseContinuity.read(buf),
+                FfiConverterOptionalString.read(buf),
+                )
+            12 -> WseItem.CheckpointRejected(
+                FfiConverterString.read(buf),
+                )
+            13 -> WseItem.Unknown(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
@@ -3732,6 +4189,32 @@ public object FfiConverterTypeWseItem : FfiConverterRustBuffer<WseItem>{
                 + FfiConverterOptionalString.allocationSize(value.`reason`)
             )
         }
+        is WseItem.Resync -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterULong.allocationSize(value.`round`)
+                + FfiConverterSequenceString.allocationSize(value.`topics`)
+                + FfiConverterSequenceString.allocationSize(value.`reasons`)
+                + FfiConverterSequenceTypeWseStreamPosition.allocationSize(value.`committed`)
+            )
+        }
+        is WseItem.Continuity -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`topic`)
+                + FfiConverterTypeWseContinuity.allocationSize(value.`continuity`)
+                + FfiConverterOptionalString.allocationSize(value.`reason`)
+            )
+        }
+        is WseItem.CheckpointRejected -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`reason`)
+            )
+        }
         is WseItem.Unknown -> {
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
@@ -3802,8 +4285,28 @@ public object FfiConverterTypeWseItem : FfiConverterRustBuffer<WseItem>{
                 FfiConverterOptionalString.write(value.`reason`, buf)
                 Unit
             }
-            is WseItem.Unknown -> {
+            is WseItem.Resync -> {
                 buf.putInt(10)
+                FfiConverterULong.write(value.`round`, buf)
+                FfiConverterSequenceString.write(value.`topics`, buf)
+                FfiConverterSequenceString.write(value.`reasons`, buf)
+                FfiConverterSequenceTypeWseStreamPosition.write(value.`committed`, buf)
+                Unit
+            }
+            is WseItem.Continuity -> {
+                buf.putInt(11)
+                FfiConverterString.write(value.`topic`, buf)
+                FfiConverterTypeWseContinuity.write(value.`continuity`, buf)
+                FfiConverterOptionalString.write(value.`reason`, buf)
+                Unit
+            }
+            is WseItem.CheckpointRejected -> {
+                buf.putInt(12)
+                FfiConverterString.write(value.`reason`, buf)
+                Unit
+            }
+            is WseItem.Unknown -> {
+                buf.putInt(13)
                 FfiConverterString.write(value.`name`, buf)
                 Unit
             }
@@ -3847,6 +4350,44 @@ public object FfiConverterTypeWseStatus: FfiConverterRustBuffer<WseStatus> {
     override fun allocationSize(value: WseStatus) = 4UL
 
     override fun write(value: WseStatus, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Whether the server took a topic.
+ */
+
+enum class WseSubscription {
+
+    REQUESTED,
+    ACTIVE,
+    DENIED;
+
+
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeWseSubscription: FfiConverterRustBuffer<WseSubscription> {
+    override fun read(buf: ByteBuffer) = try {
+        WseSubscription.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: WseSubscription) = 4UL
+
+    override fun write(value: WseSubscription, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -3914,6 +4455,108 @@ public object FfiConverterTypeWseTokenError : FfiConverterRustBuffer<WseTokenExc
     }
 
 }
+
+
+
+/**
+ * Which certificates a wss:// server's chain must lead to.
+ */
+sealed class WseTrust {
+
+    /**
+     * The system's own verifier: the roots the device trusts and its
+     * revocation checks. On Android the library sets it up as the app
+     * starts (`WseTls.init`).
+     */
+    object Platform : WseTrust()
+
+
+    /**
+     * The Mozilla root certificates built into the library: the same on
+     * every device.
+     */
+    object Mozilla : WseTrust()
+
+
+    /**
+     * Only these CA certificates, PEM or DER: a private CA.
+     */
+    data class Roots(
+        val `certificates`: List<kotlin.ByteArray>) : WseTrust()
+
+    {
+
+
+        companion object
+    }
+
+
+
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeWseTrust : FfiConverterRustBuffer<WseTrust>{
+    override fun read(buf: ByteBuffer): WseTrust {
+        return when(buf.getInt()) {
+            1 -> WseTrust.Platform
+            2 -> WseTrust.Mozilla
+            3 -> WseTrust.Roots(
+                FfiConverterSequenceByteArray.read(buf),
+                )
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: WseTrust): ULong = when(value) {
+        is WseTrust.Platform -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is WseTrust.Mozilla -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is WseTrust.Roots -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterSequenceByteArray.allocationSize(value.`certificates`)
+            )
+        }
+    }
+
+    override fun write(value: WseTrust, buf: ByteBuffer) {
+        when(value) {
+            is WseTrust.Platform -> {
+                buf.putInt(1)
+                Unit
+            }
+            is WseTrust.Mozilla -> {
+                buf.putInt(2)
+                Unit
+            }
+            is WseTrust.Roots -> {
+                buf.putInt(3)
+                FfiConverterSequenceByteArray.write(value.`certificates`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
 
 
 
@@ -4113,6 +4756,38 @@ public object FfiConverterOptionalTypeWseTokenSource: FfiConverterRustBuffer<Wse
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeWseDelivery: FfiConverterRustBuffer<WseDelivery?> {
+    override fun read(buf: ByteBuffer): WseDelivery? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeWseDelivery.read(buf)
+    }
+
+    override fun allocationSize(value: WseDelivery?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeWseDelivery.allocationSize(value)
+        }
+    }
+
+    override fun write(value: WseDelivery?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeWseDelivery.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeWseSignature: FfiConverterRustBuffer<WseSignature?> {
     override fun read(buf: ByteBuffer): WseSignature? {
         if (buf.get().toInt() == 0) {
@@ -4135,6 +4810,38 @@ public object FfiConverterOptionalTypeWseSignature: FfiConverterRustBuffer<WseSi
         } else {
             buf.put(1)
             FfiConverterTypeWseSignature.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeWseTrust: FfiConverterRustBuffer<WseTrust?> {
+    override fun read(buf: ByteBuffer): WseTrust? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeWseTrust.read(buf)
+    }
+
+    override fun allocationSize(value: WseTrust?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeWseTrust.allocationSize(value)
+        }
+    }
+
+    override fun write(value: WseTrust?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeWseTrust.write(value, buf)
         }
     }
 }
@@ -4173,6 +4880,34 @@ public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.Str
 /**
  * @suppress
  */
+public object FfiConverterSequenceByteArray: FfiConverterRustBuffer<List<kotlin.ByteArray>> {
+    override fun read(buf: ByteBuffer): List<kotlin.ByteArray> {
+        val len = buf.getInt()
+        return List<kotlin.ByteArray>(len) {
+            FfiConverterByteArray.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<kotlin.ByteArray>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterByteArray.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<kotlin.ByteArray>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterByteArray.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeWseHeader: FfiConverterRustBuffer<List<WseHeader>> {
     override fun read(buf: ByteBuffer): List<WseHeader> {
         val len = buf.getInt()
@@ -4201,6 +4936,34 @@ public object FfiConverterSequenceTypeWseHeader: FfiConverterRustBuffer<List<Wse
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeWseStreamPosition: FfiConverterRustBuffer<List<WseStreamPosition>> {
+    override fun read(buf: ByteBuffer): List<WseStreamPosition> {
+        val len = buf.getInt()
+        return List<WseStreamPosition>(len) {
+            FfiConverterTypeWseStreamPosition.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<WseStreamPosition>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeWseStreamPosition.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<WseStreamPosition>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeWseStreamPosition.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeWseTopicRecovery: FfiConverterRustBuffer<List<WseTopicRecovery>> {
     override fun read(buf: ByteBuffer): List<WseTopicRecovery> {
         val len = buf.getInt()
@@ -4219,6 +4982,34 @@ public object FfiConverterSequenceTypeWseTopicRecovery: FfiConverterRustBuffer<L
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeWseTopicRecovery.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeWseTopicState: FfiConverterRustBuffer<List<WseTopicState>> {
+    override fun read(buf: ByteBuffer): List<WseTopicState> {
+        val len = buf.getInt()
+        return List<WseTopicState>(len) {
+            FfiConverterTypeWseTopicState.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<WseTopicState>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeWseTopicState.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<WseTopicState>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeWseTopicState.write(it, buf)
         }
     }
 }
@@ -4277,5 +5068,34 @@ public object FfiConverterSequenceTypeWseItem: FfiConverterRustBuffer<List<WseIt
         { FfiConverterTypeWseClient.lift(it) },
         // Error FFI converter
         WseException.ErrorHandler,
+    )
+    }
+
+        /**
+         * A new ECDSA P-256 private key (PKCS#8 DER) for signed messages: keep it
+         * in the platform's keystore.
+         */ fun `generateSigningKey`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_wse_ffi_fn_func_generate_signing_key(
+
+        _status)
+}
+    )
+    }
+
+
+        /**
+         * The public key of a PKCS#8 private key (base64 of the uncompressed
+         * point): what the server binds to a connection for its signed messages.
+         */
+    @Throws(WseException::class) fun `signingPublicKey`(`key`: kotlin.ByteArray): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCallWithError(WseException) { _status ->
+    UniffiLib.uniffi_wse_ffi_fn_func_signing_public_key(
+
+
+        FfiConverterByteArray.lower(`key`),_status)
+}
     )
     }
