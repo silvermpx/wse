@@ -28,7 +28,9 @@
   source instead. The release attaches the XCFramework, the AAR and the
   prebuilt libraries. They are built on the `wse-client` crate's `native`
   feature: a shared runtime, cancellable calls, and events read in batches
-  that come again until they are acknowledged. A wss:// server's
+  of at most the items asked and about the bytes asked, which come again
+  until they are acknowledged (an item whose Kotlin collection was
+  cancelled while it was handed out comes again to the next reader). A wss:// server's
   certificate is checked by the system's verifier (rustls-platform-verifier:
   the Security framework on Apple platforms, Android's own through the JVM,
   set up as the app starts), or against a private CA's certificates or the
@@ -51,13 +53,17 @@
   what has no hole, bound to the realm, user, consumer and schema; recovery
   starts from it. Sends can wait for topics to be continuous (`requires`).
   An offset JavaScript cannot hold exactly breaks the topic off instead of
-  being rounded. A send waiting for its topics belongs to the user who made
-  it (dropped when the user changes, never sent as the next one) and counts
-  toward `memoryLimit`. The Swift, Kotlin and Dart clients have the same
-  states and delivery (`WseDelivery`): a `Resync` item asks the app for the
-  state, `resynced(round)` hands on what was held. A checkpoint is never
-  another user's: when the user changes, what was delivered to the last one
-  is forgotten.
+  being rounded. A send that requires topics waits in the outgoing queue and
+  goes only while they are continuous, checked right before it goes (also
+  after a reconnect); it belongs to the user who made it (dropped when the
+  user changes), counts against `maxQueueSize` and `memoryLimit` with every
+  other send, and is never written to the offline queue. The Swift, Kotlin
+  and Dart clients have the same states and delivery (`WseDelivery`): a
+  `Resync` item asks the app for the state, `resynced(round)` hands on what
+  was held. A checkpoint is never another user's: the user changes where
+  the events show it, what was delivered to the last one is forgotten, and
+  a message of theirs committed later counts for nobody (`commit(message)`
+  takes back the user generation the message carries).
 - TypeScript client of its own: the offline queue is durable only for a
   named `consumer`, in an IndexedDB database of its scope (the storage
   name, the consumer and the `realm`); clients of one scope (tabs) hold a
@@ -65,8 +71,12 @@
   until it lets go; the next one then sends what the last stored. A stored
   message stays in the database until it went out: claimed for 30 s while
   it is sent, it goes again (same `id`) when its sending was cut off by a
-  pause or a closed tab, so it may arrive twice but is never lost. Where the
-  queue lives is in the snapshot (`storage`) and
+  pause or a closed tab, so it may arrive twice but is never lost; one that
+  went and could not be removed is reported (`wseStorageError`, operation
+  `remove`), never sent again by that client, and its removal tried again.
+  What a client keeps (its checkpoint, topics and offline queue's user) is
+  apart for each consumer and realm, and signing out clears only that.
+  Where the queue lives is in the snapshot (`storage`) and
   a `wseStorage` event; a storage that fails is a `wseStorageError` event
   instead of being swallowed. The database moves to version 2 in one
   transaction, its records kept; a tab holding the old version open is
@@ -100,7 +110,8 @@
   Release configuration on an iOS simulator; the Dart package's tests run
   on its prebuilt library on Linux (x64, arm64), macOS (arm64, x64) and
   Windows, and its example app on its prebuilt libraries on an Android
-  emulator (debug and release builds) and an iOS simulator; the npm
+  emulator (debug and release builds) and an iOS simulator (its release
+  build made for an iPhone); the npm
   package is bundled by Metro and compiled by Hermes, the bundle runs
   without TextEncoder and TextDecoder, and an app made from React Native's
   template runs it in a release build (Hermes) on an emulator against a

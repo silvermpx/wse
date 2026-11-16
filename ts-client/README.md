@@ -48,8 +48,9 @@ A client holds nothing of the page: two clients on one page share no state, and 
 `wse-client/core` reads or changes nothing. It connects while any share (`retain()`) is held and
 stops when the last is released; `subscribe(topics)` holds topics the same way, and `onMessage` and
 `on` take any number of listeners. With `storage: 'myapp:alice'` it keeps its topics in the page's
-storage under that name; by default it keeps them in memory. `destroy()` ends it and keeps what it
-stored; `signOut()` ends it and forgets the user.
+storage under that name, apart for each consumer and realm (staging beside production keeps its
+own); by default it keeps them in memory. `destroy()` ends it and keeps what it stored; `signOut()`
+ends it and forgets the user.
 
 The offline queue is durable only for a part of the application named by a stable `consumer`
 (`consumer: 'checkout'`): it lives in an IndexedDB database of its own scope -- the storage name,
@@ -58,7 +59,9 @@ the application never reads it. Two clients of one scope (two tabs) may both wri
 a time replays it: the other is `busy` until the first lets go or stops renewing its lease (15 s),
 and then sends what the first stored. A stored message stays in the database until it went out:
 the client claims it for 30 s while sending it, so one whose sending was cut off (the tab paused or
-closed in between) goes again later, with the same `id`, and may arrive twice.
+closed in between) goes again later, with the same `id`, and may arrive twice. When a message that
+went cannot be removed, a `wseStorageError` (operation `remove`) says so: this client never sends it
+again, and tries the removal again a second later, then twice as long each time up to 30 s.
 `state.getSnapshot().storage` says where the queue lives (`memory`, `durable`, `busy`,
 `unavailable`), each change is a `wseStorage` event, and a storage that fails (a database that will
 not open, a full quota, another tab upgrading the database) is a `wseStorageError` event with the
@@ -479,10 +482,14 @@ hole. It is bound to the realm (the first endpoint, or `realm`), the user, the c
 and the schema; the client keeps it in its storage, and `client.checkpoint()` gives it to save with
 the application's own state (pass it back as `delivery.checkpoint`). A checkpoint of anything else
 is refused with a `wseCheckpointRejected` event. After a reconnect the recovery starts from it, so
-a message that came but was not applied comes again: the application applies repeats safely.
-A send that waits for its topics (`requires`) belongs to the user who made it: when the user
-changes it is dropped, never sent as the next one, and while it waits it counts toward
-`memoryLimit`. Messages held past `maxHeld` (10,000), or a break during the resync, start the resync over; a
+a message that came but was not applied comes again: the application applies repeats safely. A
+message handed on before the connection became another user's counts for nobody when it is
+committed later. A send that requires topics waits in the outgoing queue, in its place, and goes
+only while each of them is continuous on the connection: checked right before it goes, so one kept
+behind the rate limit does not go after a reconnect before the resync. It belongs to the user who
+made it (dropped when the user changes, never sent as the next one), counts against
+`maxQueueSize` and `memoryLimit` with every other send, and is never written to the offline queue.
+Messages held past `maxHeld` (10,000), or a break during the resync, start the resync over; a
 handler that fails is called again (1 s, then twice as long, up to 30 s). Offsets JavaScript cannot
 hold exactly (above 2^53 - 1) are refused and break the topic off.
 

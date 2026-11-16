@@ -87,7 +87,9 @@ user's, and a message of theirs committed later counts for nobody.
 
 `events()` is the client's stream, until it closes; one reader at a time. A
 collector cancelled in between loses nothing: the next collection gets the
-rest. Cancelling the coroutine of `connectClient` gives up the attempt.
+rest, and an item whose collection was cancelled while it was handed out
+(behind `cancellable()` or `buffer()`, say) comes again, so it may be seen
+twice. Cancelling the coroutine of `connectClient` gives up the attempt.
 `disconnect` sends what is queued and closes.
 
 ## Tests
