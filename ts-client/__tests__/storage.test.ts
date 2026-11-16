@@ -100,6 +100,94 @@ describe('the durable queue', () => {
   });
 });
 
+describe('the lease of a scope', () => {
+  const orders = (ws: FakeWebSocket) => ws.appTextMessages().filter((m) => m.t === 'order');
+
+  it('taken over, finds what the last holder stored', async () => {
+    const first = client({ consumer: 'checkout' });
+    first.retain();
+    await vi.waitFor(() => expect(first.state.getSnapshot().storage).toBe('durable'));
+    const second = client({ consumer: 'checkout' });
+    second.retain();
+    await vi.waitFor(() => expect(second.state.getSnapshot().storage).toBe('busy'));
+    const [, socket] = FakeWebSocket.instances;
+    socket.serverOpen();
+    socket.serverSend(serverReadyMessage());
+
+    // The holder stores an order while it has no connection, then goes.
+    expect(first.send('order', { id: 1 }, { offline: true })).toBe('queued');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    first.destroy();
+    await vi.waitFor(() => expect(second.state.getSnapshot().storage).toBe('durable'), { timeout: 5_000 });
+    await vi.waitFor(() => expect(orders(socket)).toHaveLength(1), { timeout: 5_000 });
+  }, 20_000);
+
+  it('held, finds what another client of the scope stored meanwhile', async () => {
+    const holder = client({ consumer: 'checkout' });
+    holder.retain();
+    await vi.waitFor(() => expect(holder.state.getSnapshot().storage).toBe('durable'));
+    const socket = FakeWebSocket.last();
+    socket.serverOpen();
+    socket.serverSend(serverReadyMessage());
+    const other = client({ consumer: 'checkout' });
+    other.retain();
+    await vi.waitFor(() => expect(other.state.getSnapshot().storage).toBe('busy'));
+    expect(other.send('order', { id: 2 }, { offline: true })).toBe('queued');
+    await vi.waitFor(() => expect(orders(socket)).toHaveLength(1), { timeout: 8_000 });
+  }, 20_000);
+});
+
+describe('a stored message being taken', () => {
+  it('survives a pause in the middle, and goes once after it', async () => {
+    const stored = new OfflineQueue({ ...CONFIG, dbName: SCOPE });
+    await stored.initialize();
+    expect(await stored.enqueue({ t: 'order', p: { id: 1 }, id: 'order-1' } as any)).toBe(true);
+    stored.destroy();
+
+    // The taking is held up, after its transaction, until the client paused.
+    let go!: () => void;
+    const held = new Promise<void>((resolve) => (go = resolve));
+    const claim = OfflineQueue.prototype.claim;
+    const taking = vi.spyOn(OfflineQueue.prototype, 'claim').mockImplementation(async function (
+      this: OfflineQueue,
+      limit: number,
+    ) {
+      const records = await claim.call(this, limit);
+      if (records.length > 0) await held;
+      return records;
+    });
+
+    const c = client({ consumer: 'checkout' });
+    c.retain();
+    await vi.waitFor(() => expect(c.state.getSnapshot().storage).toBe('durable'));
+    const first = FakeWebSocket.last();
+    first.serverOpen();
+    first.serverSend(serverReadyMessage());
+    await vi.waitFor(() => expect(taking).toHaveBeenCalled());
+    c.pause('manual');
+    go();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(first.appTextMessages().filter((m) => m.t === 'order')).toEqual([]);
+    taking.mockRestore();
+
+    // Still stored.
+    const check = new OfflineQueue({ ...CONFIG, dbName: SCOPE });
+    await check.initialize();
+    expect((await check.getAll()).map((r) => r.id)).toEqual(['order-1']);
+    check.destroy();
+
+    // Back: it goes, once.
+    c.resume('manual');
+    await vi.waitFor(() => expect(FakeWebSocket.last()).not.toBe(first));
+    const second = FakeWebSocket.last();
+    second.serverOpen();
+    second.serverSend(serverReadyMessage());
+    await vi.waitFor(() => expect(second.appTextMessages().filter((m) => m.t === 'order')).toHaveLength(1));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(second.appTextMessages().filter((m) => m.t === 'order')).toHaveLength(1);
+  });
+});
+
 describe('a storage that fails', () => {
   it('says so when the database cannot be opened', async () => {
     vi.spyOn(indexedDB, 'open').mockImplementation(() => {

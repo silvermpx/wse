@@ -398,6 +398,7 @@ export class Delivery {
    * saved checkpoint is taken here, once the connection named its user.
    */
   recoveryPositions(topics: readonly string[]): Record<string, TopicPosition> | null {
+    this.userIs(this.hooks.user());
     if (!this.barrier) return null;
     this.takeSaved();
     const out: Record<string, TopicPosition> = {};
@@ -410,6 +411,18 @@ export class Delivery {
       out[topic] = { epoch, offset, streams: Object.fromEntries(entries) };
     }
     return out;
+  }
+
+  /** The user of the last connection, once there was one. */
+  private lastUser: string | null | undefined = undefined;
+
+  /** A connection of `user`: what another user applied is not this one's. */
+  private userIs(user: string | null): void {
+    if (this.lastUser !== undefined && this.lastUser !== user) {
+      this.progress.clear();
+      this.schedulePersist();
+    }
+    this.lastUser = user;
   }
 
   private takeSaved(): void {

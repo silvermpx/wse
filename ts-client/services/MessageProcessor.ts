@@ -224,7 +224,14 @@ export class MessageProcessor {
   private sequencer: EventSequencer;
   private readonly ownsSequencer: boolean;
   private compression: CompressionManager;
+  /** The application's handlers, one per type. */
   private messageHandlers: Map<string, (message: WSMessage) => void>;
+  /**
+   * The client's own handling of protocol messages (subscription replies,
+   * errors, rate limit warnings, ...): it runs first, whatever the
+   * application registers for the same type, and cannot be replaced.
+   */
+  private builtIns = new Map<string, (message: WSMessage) => void>();
   private connectionManager: ProcessorConnection | null = null;
   private isReady = false;
   private destroyed = false;
@@ -1490,6 +1497,15 @@ export class MessageProcessor {
       this.lastEventTime.set(type, now);
     }
 
+    const builtIn = this.builtIns.get(type);
+    if (builtIn) {
+      try {
+        builtIn(message);
+      } catch (error) {
+        logger.error(`Error handling ${type}:`, error);
+      }
+    }
+
     const handler = this.messageHandlers.get(type);
     if (handler) {
       const sampled = this.handlerSampleRate > 0 && Math.random() < this.handlerSampleRate;
@@ -1507,6 +1523,7 @@ export class MessageProcessor {
       }
       return;
     }
+    if (builtIn) return;
 
     if (!this.unhandledTypesLogged.has(type) && this.unhandledTypesLogged.size < MAX_LOGGED_UNHANDLED_TYPES) {
       this.unhandledTypesLogged.add(type);
@@ -1522,39 +1539,39 @@ export class MessageProcessor {
   // ---------------------------------------------------------------------------
 
   private registerDefaultHandlers(): void {
-    // Protocol work for these types happens in runProtocolHook(); the
-    // defaults below only publish state/events and can be replaced.
-    this.messageHandlers.set('server_ready', () => {});
-    this.messageHandlers.set('server_hello', () => {});
-    this.messageHandlers.set('PONG', () => {});
-    this.messageHandlers.set('subscription_update', (msg) => this.handleSubscriptionUpdate(msg));
-    this.messageHandlers.set('error', (msg) => this.handleError(msg));
-    this.messageHandlers.set('connection_state_change', (msg) => this.handleConnectionStateChange(msg));
-    this.messageHandlers.set('health_check', () => this.handleHealthCheck());
-    this.messageHandlers.set('health_check_response', (msg) => this.handleHealthCheckResponse(msg));
-    this.messageHandlers.set('rate_limit_warning', (msg) => this.handleRateLimitWarning(msg));
-    this.messageHandlers.set('connection_quality', (msg) => this.handleConnectionQuality(msg));
-    this.messageHandlers.set('snapshot_complete', (msg) => this.ctx.emit('snapshotComplete', msg.p));
-    this.messageHandlers.set('heartbeat', () => this.handleHeartbeat());
+    // Protocol work for these types happens in runProtocolHook() and here;
+    // what the application registers for a type runs after, never instead.
+    this.builtIns.set('server_ready', () => {});
+    this.builtIns.set('server_hello', () => {});
+    this.builtIns.set('PONG', () => {});
+    this.builtIns.set('subscription_update', (msg) => this.handleSubscriptionUpdate(msg));
+    this.builtIns.set('error', (msg) => this.handleError(msg));
+    this.builtIns.set('connection_state_change', (msg) => this.handleConnectionStateChange(msg));
+    this.builtIns.set('health_check', () => this.handleHealthCheck());
+    this.builtIns.set('health_check_response', (msg) => this.handleHealthCheckResponse(msg));
+    this.builtIns.set('rate_limit_warning', (msg) => this.handleRateLimitWarning(msg));
+    this.builtIns.set('connection_quality', (msg) => this.handleConnectionQuality(msg));
+    this.builtIns.set('snapshot_complete', (msg) => this.ctx.emit('snapshotComplete', msg.p));
+    this.builtIns.set('heartbeat', () => this.handleHeartbeat());
 
     // Presence handlers
-    this.messageHandlers.set('presence_join', (msg) => this.ctx.emit('presenceJoin', msg.p));
-    this.messageHandlers.set('presence_leave', (msg) => this.ctx.emit('presenceLeave', msg.p));
-    this.messageHandlers.set('presence_update', (msg) => this.ctx.emit('presenceUpdate', msg.p));
+    this.builtIns.set('presence_join', (msg) => this.ctx.emit('presenceJoin', msg.p));
+    this.builtIns.set('presence_leave', (msg) => this.ctx.emit('presenceLeave', msg.p));
+    this.builtIns.set('presence_update', (msg) => this.ctx.emit('presenceUpdate', msg.p));
 
     // Debug / configuration / encryption responses
-    this.messageHandlers.set('debug_response', (msg) => this.ctx.emit('debugResponse', msg.p));
-    this.messageHandlers.set('sequence_stats_response', (msg) => this.ctx.emit('sequenceStatsResponse', msg.p));
-    this.messageHandlers.set('config_response', (msg) => this.ctx.emit('configResponse', msg.p));
-    this.messageHandlers.set('config_update_response', (msg) => this.ctx.emit('configUpdateResponse', msg.p));
-    this.messageHandlers.set('encryption_response', (msg) => this.handleEncryptionResponse(msg));
-    this.messageHandlers.set('key_rotation_response', (msg) => this.handleKeyRotationResponse(msg));
-    this.messageHandlers.set('batch_message_result', (msg) => this.ctx.emit('batchMessageResult', msg.p));
-    this.messageHandlers.set('metrics_response', (msg) => this.ctx.emit('metricsResponse', msg.p));
-    this.messageHandlers.set('connection_state_response', (msg) => this.handleConnectionStateResponse(msg));
+    this.builtIns.set('debug_response', (msg) => this.ctx.emit('debugResponse', msg.p));
+    this.builtIns.set('sequence_stats_response', (msg) => this.ctx.emit('sequenceStatsResponse', msg.p));
+    this.builtIns.set('config_response', (msg) => this.ctx.emit('configResponse', msg.p));
+    this.builtIns.set('config_update_response', (msg) => this.ctx.emit('configUpdateResponse', msg.p));
+    this.builtIns.set('encryption_response', (msg) => this.handleEncryptionResponse(msg));
+    this.builtIns.set('key_rotation_response', (msg) => this.handleKeyRotationResponse(msg));
+    this.builtIns.set('batch_message_result', (msg) => this.ctx.emit('batchMessageResult', msg.p));
+    this.builtIns.set('metrics_response', (msg) => this.ctx.emit('metricsResponse', msg.p));
+    this.builtIns.set('connection_state_response', (msg) => this.handleConnectionStateResponse(msg));
 
     // Sync request handler
-    this.messageHandlers.set('sync_request', () => {
+    this.builtIns.set('sync_request', () => {
       const store = this.ctx.state.getState();
       this.queueOutgoing({
         t: 'sync_response',
@@ -1569,7 +1586,7 @@ export class MessageProcessor {
     });
 
     // Config update handler
-    this.messageHandlers.set('config_update', (msg) => {
+    this.builtIns.set('config_update', (msg) => {
       const config = msg.p || {};
       const store = this.ctx.state.getState();
 
@@ -1593,7 +1610,7 @@ export class MessageProcessor {
     });
 
     // Metrics request handler
-    this.messageHandlers.set('metrics_request', () => {
+    this.builtIns.set('metrics_request', () => {
       const store = this.ctx.state.getState();
       const queueStore = this.ctx.queue.getState();
 
@@ -1618,7 +1635,7 @@ export class MessageProcessor {
     });
 
     // Priority message handler
-    this.messageHandlers.set('priority_message', (msg) => {
+    this.builtIns.set('priority_message', (msg) => {
       const payload = msg.p || {};
       if (payload.type && payload.type !== 'priority_message' && this.messageHandlers.has(payload.type)) {
         const handler = this.messageHandlers.get(payload.type);
@@ -2104,8 +2121,9 @@ export class MessageProcessor {
     let sent = 0;
     let foreign = 0;
     for (;;) {
-      // Taken out of the database before they go: another client of the
-      // same database (another tab) never sends the same message.
+      // Taken (marked as this client's, still stored) before they go:
+      // another client of the same database (another tab) never sends the
+      // same message, and one that stops before it went loses nothing.
       let records: OfflineRecord[];
       try {
         records = await queue.claim(OFFLINE_REPLAY_BATCH);
@@ -2115,16 +2133,20 @@ export class MessageProcessor {
       }
       if (records.length === 0) break;
 
+      // What went, or will never go, leaves the database.
+      const gone: string[] = [];
       const nowMs = Date.now();
       const user = this.userId;
+      let stopped = -1;
       for (let i = 0; i < records.length; i++) {
         const record = records[i];
         if (this.destroyed || !cm.isTransportReady()) {
-          await this.putBack(queue, records.slice(i));
-          return true;
+          stopped = i;
+          break;
         }
         if (isExpired(record.expiresAt, nowMs)) {
           this.countDropped(1);
+          gone.push(record.id);
           continue;
         }
         // Written for another user: never sent on this user's connection.
@@ -2133,23 +2155,34 @@ export class MessageProcessor {
         if (user !== null && record.owner !== undefined && record.owner !== user) {
           foreign++;
           this.countDropped(1);
+          gone.push(record.id);
           continue;
         }
         const result = cm.trySend(record.message);
         if (result === 'sent') {
           sent++;
+          gone.push(record.id);
           continue;
         }
         if (result === 'error') {
           this.countDropped(1);
+          gone.push(record.id);
           continue;
         }
         if (result === 'rate_limited') {
           this.scheduleFlush(cm.getRetryAfterMs());
         }
-        await this.putBack(queue, records.slice(i));
+        stopped = i;
+        break;
+      }
+      // Its transaction starts before anything else can run: a client
+      // closed right after the sends still has it remove them.
+      const removed = this.forgetSent(queue, gone);
+      if (stopped >= 0) {
+        await Promise.all([removed, this.putBack(queue, records.slice(stopped))]);
         return true;
       }
+      await removed;
     }
     if (foreign > 0) {
       logger.warn(`Dropped ${foreign} offline message(s) written for another user`);
@@ -2158,6 +2191,14 @@ export class MessageProcessor {
       logger.info(`Replayed ${sent} offline message(s)`);
     }
     return false;
+  }
+
+  /** Offline messages that went (or never will) leave the database. */
+  private async forgetSent(queue: OfflineQueue, ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    await queue.remove(ids).catch((error) => {
+      logger.error('Removing sent offline messages failed:', error);
+    });
   }
 
   /** Offline messages taken and not sent go back, in their place. */
@@ -2202,13 +2243,13 @@ export class MessageProcessor {
     this.messageHandlers.delete(type);
   }
 
+  /** Forget the application's handlers; the client's own stay. */
   clearHandlers(): void {
     this.messageHandlers.clear();
-    this.registerDefaultHandlers();
   }
 
   getRegisteredHandlers(): string[] {
-    return Array.from(this.messageHandlers.keys());
+    return [...new Set([...this.builtIns.keys(), ...this.messageHandlers.keys()])];
   }
 
   isHandlerRegistered(type: string): boolean {

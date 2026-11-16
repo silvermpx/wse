@@ -20,6 +20,8 @@ export interface OfflineQueueConfig {
   dbName?: string;
   /** What failed, and why: the client reports it to the application. */
   onError?: (operation: OfflineOperation, error: unknown) => void;
+  /** Who takes messages to send (claim()): the same for every session of one client. */
+  holder?: string;
 }
 
 /** What the queue was doing when its storage failed. */
@@ -38,7 +40,16 @@ export interface OfflineRecord {
   expiresAt?: number;
   /** The user it was written for; replayed only on that user's connection. */
   owner?: string;
+  /** Taken to be sent (claim()) by this client, until this time: it stays stored until it went. */
+  claimedBy?: string;
+  claimedUntil?: number;
 }
+
+/**
+ * How long a message taken to be sent stays the taker's: a client that
+ * stopped (closed, crashed) before it went leaves it to others after this.
+ */
+export const CLAIM_TTL_MS = 30_000;
 
 function requestToPromise<T>(request: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -66,6 +77,8 @@ function toRecord(raw: any): OfflineRecord | null {
       message: raw.message as WSMessage,
       expiresAt: typeof raw.expiresAt === 'number' ? raw.expiresAt : undefined,
       owner: typeof raw.owner === 'string' ? raw.owner : undefined,
+      claimedBy: typeof raw.claimedBy === 'string' ? raw.claimedBy : undefined,
+      claimedUntil: typeof raw.claimedUntil === 'number' ? raw.claimedUntil : undefined,
     };
   }
   if (typeof raw.t === 'string') {
@@ -84,6 +97,8 @@ const LEASE_STORE = 'lease';
 const LEASE_KEY = 'owner';
 
 export class OfflineQueue {
+  /** Who takes messages to send: the client's, else one of this queue's own. */
+  private readonly holder: string;
   private dbName = 'wse_offline_queue';
   private storeName = 'messages';
   private db: IDBDatabase | null = null;
@@ -96,6 +111,7 @@ export class OfflineQueue {
   constructor(config: OfflineQueueConfig) {
     this.config = config;
     if (config.dbName) this.dbName = config.dbName;
+    this.holder = config.holder ?? `queue-${Math.random().toString(36).slice(2)}-${Date.now()}`;
   }
 
   async initialize(): Promise<void> {
@@ -198,6 +214,9 @@ export class OfflineQueue {
       this.report('lease', error);
       this.leased = false;
     }
+    // Its holder sends what is stored now: what the last holder left, and
+    // what other clients of the scope wrote meanwhile.
+    if (this.leased) await this.refreshSize();
     return this.leased;
   }
 
@@ -299,9 +318,12 @@ export class OfflineQueue {
   }
 
   /**
-   * Take up to `limit` messages out, oldest first, in one transaction: a
+   * Take up to `limit` messages to send, oldest first, in one transaction: a
    * message is handed to one taker only, however many clients (tabs) share
-   * the database. What the taker does not send it puts back (restore).
+   * the database. It stays stored, marked as this client's for
+   * CLAIM_TTL_MS: the taker removes what went (remove) and gives back what
+   * did not (restore); a taker that stopped in between leaves it to be taken
+   * again -- by its own client at once, by others once the mark ran out.
    */
   async claim(limit: number): Promise<OfflineRecord[]> {
     if (!this.db) return [];
@@ -322,37 +344,52 @@ export class OfflineQueue {
     const index = tx.objectStore(this.storeName).index('timestamp');
     const done = transactionDone(tx);
 
+    const now = Date.now();
+    const holder = this.holder;
     const records = await new Promise<OfflineRecord[]>((resolve, reject) => {
       const out: OfflineRecord[] = [];
       const request = index.openCursor();
       request.onsuccess = () => {
         const cursor = request.result;
-        if (cursor && out.length < limit) {
-          // An unreadable record goes too: nothing could ever send it.
-          const record = toRecord(cursor.value);
-          if (record) out.push(record);
-          cursor.delete();
-          cursor.continue();
-        } else {
+        if (!cursor || out.length >= limit) {
           resolve(out);
+          return;
         }
+        const record = toRecord(cursor.value);
+        if (!record) {
+          // Unreadable: nothing could ever send it.
+          cursor.delete();
+        } else if (record.claimedBy !== undefined && record.claimedBy !== holder && (record.claimedUntil ?? 0) > now) {
+          // Another client's, being sent.
+        } else {
+          const claimed: OfflineRecord = { ...record, claimedBy: holder, claimedUntil: now + CLAIM_TTL_MS };
+          cursor.update(claimed);
+          out.push(claimed);
+        }
+        cursor.continue();
       };
       request.onerror = () => reject(request.error);
     });
     await done;
-    await this.refreshSize();
     return records;
   }
 
-  /** Put back messages taken with claim() and not sent: they keep their place. */
+  /** Give back messages taken with claim() and not sent: they keep their place, for any taker. */
   async restore(records: OfflineRecord[]): Promise<void> {
     if (!this.db || records.length === 0) return;
 
     const tx = this.db.transaction([this.storeName], 'readwrite');
     const store = tx.objectStore(this.storeName);
-    for (const record of records) store.put(record);
+    for (const record of records) {
+      const read = store.get(record.id);
+      read.onsuccess = () => {
+        const current = toRecord(read.result);
+        if (!current || current.claimedBy !== this.holder) return;
+        const { claimedBy: _by, claimedUntil: _until, ...free } = current;
+        store.put(free);
+      };
+    }
     await transactionDone(tx);
-    await this.refreshSize();
   }
 
   /** Delete the given ids (the messages that were actually sent). */

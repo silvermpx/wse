@@ -231,6 +231,35 @@ describe('recover-or-resync', () => {
     expect(JSON.parse(c.checkpoint()).topics).toEqual({ prices: { [EPOCH]: 0 } });
   });
 
+  it('a checkpoint is never another user’s', async () => {
+    const { answers, resync } = resyncs();
+    const c = client({ topics: ['prices'], consumer: 'board', delivery: { mode: 'recover-or-resync', resync } });
+    const heard: WSMessage[] = [];
+    c.onMessage('price_update', (m) => heard.push(m));
+    c.retain();
+    await tick();
+    const ws1 = FakeWebSocket.last();
+    await connectServer(ws1, { user_id: 'alice' });
+    await send(ws1, reply(['prices']));
+    answers[0].resolve();
+    await tick();
+    await send(ws1, stamped('prices', 1), stamped('prices', 2));
+    c.commit(heard[0]);
+    c.commit(heard[1]);
+    expect(JSON.parse(c.checkpoint()).topics).toEqual({ prices: { [EPOCH]: 2 } });
+
+    // The next connection is Bob's: nothing of what Alice applied.
+    ws1.serverClose(1001);
+    await tick();
+    for (let i = 0; i < 60 && FakeWebSocket.last() === ws1; i++) await vi.advanceTimersByTimeAsync(500);
+    const ws2 = FakeWebSocket.last();
+    await connectServer(ws2, { user_id: 'bob' });
+    expect(ws2.messagesOfType('subscription_update')[0].p.recovery).toBeUndefined();
+    const saved = JSON.parse(c.checkpoint());
+    expect(saved.user).toBe('bob');
+    expect(saved.topics).toEqual({});
+  });
+
   it('a checkpoint of another consumer is refused aloud and recovers nothing', async () => {
     const { resync } = resyncs();
     const theirs = JSON.stringify({ v: 1, realm: URL, user: 'alice', consumer: 'audit', schema: null, topics: { prices: { [EPOCH]: 9 } } });
@@ -327,5 +356,74 @@ describe('recover-or-resync', () => {
     answers[1].resolve();
     await tick();
     expect(c.state.getSnapshot().topicStates.prices.continuity).toBe('continuous');
+  });
+});
+
+describe('sends that wait for their topics', () => {
+  it('of one user never go out on the next user’s connection', async () => {
+    const { requests, answers, resync } = resyncs();
+    const c = client({ topics: ['prices'], consumer: 'board', delivery: { mode: 'recover-or-resync', resync } });
+    c.retain();
+    await tick();
+    const alice = FakeWebSocket.last();
+    await connectServer(alice, { user_id: 'alice' });
+    await send(alice, reply(['prices']));
+    expect(c.send('order', { madeBy: 'alice' }, { requires: ['prices'] })).toBe('queued');
+
+    // Back after a pause, the browser's cookie is Bob's.
+    c.pause('manual');
+    await tick();
+    c.resume('manual');
+    await tick();
+    const bob = FakeWebSocket.last();
+    expect(bob).not.toBe(alice);
+    await connectServer(bob, { user_id: 'bob' });
+    await send(bob, reply(['prices']));
+    answers[answers.length - 1].resolve();
+    await tick();
+    expect(requests.length).toBeGreaterThanOrEqual(2);
+    expect(c.state.getSnapshot().topicStates.prices.continuity).toBe('continuous');
+    expect(bob.messagesOfType('order')).toEqual([]);
+    expect(alice.messagesOfType('order')).toEqual([]);
+  });
+
+  it('count against the memory limit with what is queued', async () => {
+    const { resync } = resyncs();
+    const c = client({
+      topics: ['news'],
+      consumer: 'board',
+      delivery: { mode: 'recover-or-resync', resync },
+      performance: { memoryLimit: 500 },
+    });
+    expect(c.send('note', { text: 'x'.repeat(1000) }, { requires: ['news'] })).toBe('dropped');
+    expect(c.send('note', { text: 'small' }, { requires: ['news'] })).toBe('queued');
+    // Together they would pass it too.
+    expect(c.send('note', { text: 'y'.repeat(300) }, { requires: ['news'] })).toBe('dropped');
+  });
+});
+
+describe('the protocol’s own messages', () => {
+  it('are handled for the client whatever the application listens to', async () => {
+    const { requests, resync } = resyncs();
+    const c = client({ topics: ['prices'], consumer: 'board', delivery: { mode: 'recover-or-resync', resync } });
+    const seen: unknown[] = [];
+    const stop = c.onMessage('subscription_update', (m) => seen.push(m.p));
+    c.retain();
+    await tick();
+    const ws = FakeWebSocket.last();
+    await connectServer(ws, { user_id: 'alice' });
+    await send(ws, reply(['prices']));
+    expect(seen).toHaveLength(1);
+    expect(requests).toHaveLength(1);
+    expect(c.state.getSnapshot().topicStates.prices.subscription).toBe('active');
+
+    // Nor when it stops listening.
+    stop();
+    const news = c.subscribe(['news']);
+    await tick();
+    await send(ws, reply(['news']));
+    expect(c.state.getSnapshot().topicStates.news.subscription).toBe('active');
+    expect(requests).toHaveLength(2);
+    news.release();
   });
 });

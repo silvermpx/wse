@@ -242,8 +242,18 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
   const topicShares = new Map<string, number>();
   const messageListeners = new Map<string, Set<(message: WSMessage) => void>>();
   for (const topic of uniqueTopics(options.topics)) topicShares.set(topic, 1);
-  // Sends that wait for topics to be continuous (requires), in order.
-  const waiting: Array<{ type: string; payload: unknown; options: MessageOptions; expiresAt?: number }> = [];
+  // Sends that wait for topics to be continuous (requires), in order: each
+  // of the user it was made for (the owner generation), and its size, which
+  // counts against the memory limit with what is queued.
+  const waiting: Array<{
+    type: string;
+    payload: unknown;
+    options: MessageOptions;
+    expiresAt?: number;
+    owner: number;
+    bytes: number;
+  }> = [];
+  let waitingBytes = 0;
   // The snapshot is read only once everything below exists.
   let wired = false;
 
@@ -431,21 +441,59 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
         logger.warn(`${type} not sent: ${required.join(', ')} not continuous, and a live message cannot wait`);
         return 'dropped';
       }
+      dropForeignWaiting();
       if (waiting.length >= performance.maxQueueSize) return 'dropped';
-      waiting.push({ type, payload, options: sendOptions, expiresAt: expiryOf(sendOptions) });
+      let bytes: number;
+      try {
+        bytes = JSON.stringify(buildMessage(type, payload, sendOptions)).length;
+      } catch (error) {
+        logger.error(`${type} not sent: it cannot be serialised:`, error);
+        return 'dropped';
+      }
+      const queue = ctx.queue.getState();
+      if (queue.memoryLimit > 0 && queue.bytes + waitingBytes + bytes > queue.memoryLimit) {
+        logger.warn(`${type} not sent: waiting, it would pass the memory limit (${queue.memoryLimit} bytes)`);
+        return 'dropped';
+      }
+      waiting.push({
+        type,
+        payload,
+        options: sendOptions,
+        expiresAt: expiryOf(sendOptions),
+        owner: ctx.owner.current(),
+        bytes,
+      });
+      waitingBytes += bytes;
       return 'queued';
     }
     return sendNow(type, payload, sendOptions);
   };
 
+  /** Waiting sends of a user the client no longer has go: never out as another's. */
+  const dropForeignWaiting = () => {
+    const owner = ctx.owner.current();
+    for (let i = 0; i < waiting.length; ) {
+      if (waiting[i].owner === owner) {
+        i++;
+        continue;
+      }
+      const [entry] = waiting.splice(i, 1);
+      waitingBytes -= entry.bytes;
+      logger.warn(`${entry.type} not sent: it was made for the previous user`);
+    }
+  };
+
   /** Sends that waited for their topics, once each topic is continuous; late ones go. */
   const flushWaiting = () => {
     if (waiting.length === 0 || done) return;
+    // Checked right before each one goes on: the user may have changed.
+    dropForeignWaiting();
     const now = Date.now();
     for (let i = 0; i < waiting.length; ) {
       const entry = waiting[i];
       if (entry.expiresAt !== undefined && entry.expiresAt <= now) {
         waiting.splice(i, 1);
+        waitingBytes -= entry.bytes;
         logger.warn(`${entry.type} not sent: it waited past its ttl`);
         continue;
       }
@@ -454,6 +502,8 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
         continue;
       }
       waiting.splice(i, 1);
+      // Its bytes move to the queue's count as it goes on.
+      waitingBytes -= entry.bytes;
       sendNow(entry.type, entry.payload, entry.options);
     }
   };
@@ -520,6 +570,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     stop();
     stopListeningToPage();
     waiting.length = 0;
+    waitingBytes = 0;
     if (clear) delivery.forget();
     delivery.close();
     ctx.state.getState().clearTimers();

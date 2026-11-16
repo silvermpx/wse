@@ -41,6 +41,9 @@ import { NetworkMonitor } from './NetworkMonitor.js';
 import { AdaptiveQualityManager, QueryClientLike } from './AdaptiveQualityManager.js';
 import { OfflineQueue } from './OfflineQueue.js';
 
+/** The page-wide client's name to the offline queue: one per page load. */
+const PAGE_HOLDER = generateId();
+
 /** A lease held is renewed this often (it runs out after LEASE_TTL_MS). */
 const LEASE_RENEW_MS = 5_000;
 /** A busy client asks for the lease again this often. */
@@ -425,6 +428,9 @@ export class WSESession {
         ...o.offline,
         dbName: offlineDatabase,
         onError: (operation, error) => this.storageFailed(operation, error),
+        // Every session of this client takes as one: what one took and did
+        // not send, the next takes again at once.
+        holder: this.ctx.leaseHolder ?? PAGE_HOLDER,
       });
       try {
         await queue.initialize();
@@ -624,8 +630,9 @@ export class WSESession {
     if (this.destroyed) return;
     const before = this.ctx.state.getState().storageState;
     this.setStorageState(held ? 'durable' : 'busy');
-    // Taken over: what waits in it goes out now.
-    if (held && before !== 'durable') this.processor.flushSoon();
+    // Taken over, or something waits in it (stored by another client of the
+    // scope meanwhile): it goes out now.
+    if (held && (before !== 'durable' || queue.getStats().size > 0)) this.processor.flushSoon();
     this.leaseTimer = setTimeout(() => void this.holdLease(queue, holder), held ? LEASE_RENEW_MS : LEASE_RETRY_MS);
   }
 
