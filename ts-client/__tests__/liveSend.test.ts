@@ -71,6 +71,18 @@ describe('live-only messages', () => {
     expect(status).not.toBe('sent');
   });
 
+  it('is dropped with no session at all, and never sent once one starts', async () => {
+    // Before the first consumer mounts (and after the last one left).
+    expect(wseActions.sendMessage('valve', { open: true }, { live: true })).toBe('dropped');
+    start();
+    await tick();
+    const ws = FakeWebSocket.last();
+    await connectServer(ws);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await tick(6);
+    expect(ws.appTextMessages().filter((m) => m.t === 'valve')).toHaveLength(0);
+  });
+
   it('leaves ordinary messages as they were: held and sent on the next connection', async () => {
     start({ rateLimit: { capacity: 1, refillRate: 1 } });
     await tick();

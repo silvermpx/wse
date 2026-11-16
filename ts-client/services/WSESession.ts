@@ -216,7 +216,12 @@ function sendMessageAction(type: string, payload: any, options: MessageOptions =
   const session = getCurrentSession();
   if (session) return session.sendMessage(type, payload, options);
 
-  // No session yet: keep the message; the next session flushes it.
+  // No session yet: keep the message; the next session flushes it. A live
+  // one is for the connection of now only, and there is none.
+  if (options.live) {
+    logger.warn(`${type} not sent: no live connection`);
+    return 'dropped';
+  }
   if (options.encrypted) {
     logger.error(`Refusing to queue ${type}: it requires encryption and no encrypted session exists`);
     return 'dropped';
