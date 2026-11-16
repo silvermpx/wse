@@ -19,6 +19,10 @@
   no Rust. `Wse` is the client for Java, on the JVM and on Android: futures
   for the calls that wait, builders for the configuration, the events read
   one at a time, and plain numbers where the Kotlin API has unsigned ones.
+- TypeScript: `wake()` and `close(deadlineMs)` for a client without a page
+  (Node, Electron's main process, a worker): `wake()` connects at once when
+  the application hears the network or the machine is back, and `close`
+  sends what the client holds within the deadline before it ends.
 
 ### Fixed
 
@@ -29,6 +33,10 @@
   others from hearing the change.
 - TypeScript: under Node 25 and newer, which has a `localStorage` of its own,
   server rendering no longer takes it for a page's.
+- TypeScript: a storage named for the page in a runtime without one wrote
+  into nothing, and the topics and the checkpoint went unsaid. They stay in
+  memory now, and a `wseStorageError` says so; an offline queue without
+  IndexedDB reads `unavailable`.
 - Rust client (and Swift, Kotlin, Dart): a connection that died while the
   device slept is made again at the first heartbeat after waking (15 s at
   most), not when the server's silence runs out (40 s).
