@@ -37,6 +37,17 @@ const client = createReactNativeClient({ endpoints: ['wss://example.com/wse'], a
 if (client.state.getSnapshot().connection !== 'pending') throw new Error('not pending');
 if (typeof useWSEState !== 'function') throw new Error('useWSEState missing');
 client.destroy();
+globalThis.wseCheck = 'ok';
+JS
+# The bundle run where Hermes before React Native 0.85 runs it: no
+# TextEncoder, no TextDecoder, no web APIs.
+cat > run.cjs <<'JS'
+const { readFileSync } = require('node:fs');
+const vm = require('node:vm');
+const sandbox = { console, setTimeout, clearTimeout, setInterval, clearInterval, queueMicrotask };
+vm.createContext(sandbox);
+vm.runInContext(readFileSync(process.argv[2], 'utf8'), sandbox, { filename: process.argv[2] });
+if (sandbox.wseCheck !== 'ok') throw new Error('the bundle did not run to its end');
 JS
 cat > babel.config.js <<'JS'
 module.exports = { presets: ['module:@react-native/babel-preset'] };
@@ -45,10 +56,10 @@ cat > metro.config.js <<'JS'
 module.exports = {
   projectRoot: __dirname,
   resolver: {
-    // As React Native resolves a package: its exports, the react-native
-    // condition first.
+    // As React Native resolves a package (@react-native/metro-config): its
+    // exports with the react-native condition; Metro adds import or require.
     unstable_enablePackageExports: true,
-    unstable_conditionNames: ['react-native', 'import', 'require', 'default'],
+    unstable_conditionNames: ['react-native'],
     platforms: ['ios', 'android'],
   },
   transformer: {
@@ -61,5 +72,6 @@ for platform in android ios; do
   npx --no-install metro build index.js --platform "$platform" --minify false --out "bundle.$platform.js" > /dev/null
   hermesc="$(node -e "const p=require('path');const os=process.platform==='darwin'?'osx-bin':process.platform==='win32'?'win64-bin':'linux64-bin';console.log(p.join(p.dirname(require.resolve('hermes-compiler/package.json')),'hermesc',os,'hermesc'))")"
   "$hermesc" -emit-binary -O -out "bundle.$platform.hbc" "bundle.$platform.js"
-  echo "$platform: $(wc -c < "bundle.$platform.js") bytes of JavaScript, $(wc -c < "bundle.$platform.hbc") bytes of Hermes bytecode"
+  node run.cjs "bundle.$platform.js"
+  echo "$platform: $(wc -c < "bundle.$platform.js") bytes of JavaScript, $(wc -c < "bundle.$platform.hbc") bytes of Hermes bytecode, runs without TextEncoder and TextDecoder"
 done

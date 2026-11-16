@@ -98,6 +98,45 @@ echo "::group::Import in Node as an ES module"
 node entry.js
 echo "::endgroup::"
 
+# The React Native entry bundled as an app's bundler does (package.json's
+# sideEffects honoured), then run where Hermes before React Native 0.85
+# runs it: no TextEncoder, no TextDecoder, no web APIs.
+cat > rn-entry.js <<'EOF'
+import { createReactNativeClient } from 'wse-client/react-native';
+
+const appState = { currentState: 'active', addEventListener: () => ({ remove() {} }) };
+const client = createReactNativeClient({ endpoints: ['wss://example.com/wse'], appState });
+if (client.state.getSnapshot().connection !== 'pending') throw new Error('not pending');
+client.destroy();
+globalThis.wseCheck = 'ok';
+EOF
+cat > rn-run.mjs <<'EOF'
+import { build } from 'esbuild';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
+
+const result = await build({
+  entryPoints: ['rn-entry.js'],
+  bundle: true,
+  format: 'iife',
+  platform: 'neutral',
+  mainFields: ['module', 'main'],
+  conditions: ['react-native', 'import', 'default'],
+  define: { 'process.env.NODE_ENV': '"production"' },
+  outfile: 'out/rn.js',
+  logLevel: 'warning',
+});
+if (result.errors.length || result.warnings.length) process.exit(1);
+const sandbox = { console, setTimeout, clearTimeout, setInterval, clearInterval, queueMicrotask };
+vm.createContext(sandbox);
+vm.runInContext(readFileSync('out/rn.js', 'utf8'), sandbox, { filename: 'rn.js' });
+if (sandbox.wseCheck !== 'ok') throw new Error('the React Native bundle did not run to its end');
+console.log('the React Native entry runs without TextEncoder and TextDecoder');
+EOF
+echo "::group::The React Native entry, bundled, without TextEncoder and TextDecoder"
+node rn-run.mjs
+echo "::endgroup::"
+
 echo "::group::Types and package layout (attw, publint)"
 # ESM only: CommonJS consumers use a dynamic import.
 npx --yes @arethetypeswrong/cli@0.18.5 "$tarball" --profile esm-only

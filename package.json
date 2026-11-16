@@ -98,7 +98,9 @@
   "engines": {
     "node": ">=18"
   },
-  "sideEffects": false,
+  "sideEffects": [
+    "./dist/npm/react-native/textCodec.js"
+  ],
   "publishConfig": {
     "provenance": true
   },
