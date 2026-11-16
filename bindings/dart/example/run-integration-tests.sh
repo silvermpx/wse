@@ -6,10 +6,12 @@
 # builds lib/check.dart in release mode instead: on an Android emulator it is
 # installed and run, and its outcome read from the log; for an iOS simulator,
 # which runs debug builds only, the release build is made for a device.
+# APP names another copy of the example to run (default: this one), such as
+# the one in a staged package whose build hook takes prebuilt libraries.
 set -euo pipefail
 device="${1:?usage: run-integration-tests.sh <device id>}"
-here="$(cd "$(dirname "$0")" && pwd)"
-root="$(cd "$here/../../.." && pwd)"
+root="$(cd "$(dirname "$0")/../../.." && pwd)"
+here="$(cd "${APP:-$(dirname "$0")}" && pwd)"
 # Cargo's target directory: CARGO_TARGET_DIR (relative to the repository), else target/.
 target="$(cd "$root" && mkdir -p "${CARGO_TARGET_DIR:-target}" && cd "${CARGO_TARGET_DIR:-target}" && pwd)"
 export CARGO_TARGET_DIR="$target"
@@ -32,8 +34,11 @@ if [[ "$device" == emulator-* ]]; then
   adb -s "$device" reverse "tcp:$port" "tcp:$port"
   adb -s "$device" reverse "tcp:$((port + 1))" "tcp:$((port + 1))"
 fi
-# The package's Android part carries the Java part of Android's certificate verifier.
-"$root/bindings/rustls-platform-verifier.sh" "$here/../android/libs/rustls-platform-verifier.jar"
+# The package's Android part carries the Java part of Android's certificate
+# verifier; a staged package has its own.
+if [[ -z "${APP:-}" ]]; then
+  "$root/bindings/rustls-platform-verifier.sh" "$here/../android/libs/rustls-platform-verifier.jar"
+fi
 defines=(
   --dart-define="WSE_URL=ws://127.0.0.1:$port/wse"
   --dart-define="WSE_TLS_URL=wss://127.0.0.1:$((port + 1))/wse"

@@ -918,6 +918,86 @@ jobs:
           tar -xzf "dart-dist/wse_client-dart-${VERSION}.tar.gz" -C dart-package
           bash .github/scripts/dart-check.sh dart-package dart-binaries
 
+  # The staged package's example app on an Android emulator (its integration
+  # test, then its release build) and on an iOS simulator, the build hook
+  # taking the device's prebuilt library from the release's files.
+  dart-mobile:
+    name: Dart package on ${{ matrix.name }}
+    needs: [preflight, dart-package]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Android
+            runner: ubuntu-24.04
+          - name: iOS
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Let the emulator use KVM
+        if: matrix.name == 'Android'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880  # v6.3.0
+        if: matrix.name == 'Android'
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2  # v2.23.0
+        with:
+          flutter-version: '3.50.0'
+          channel: stable
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: dart-binaries-*
+          path: dart-binaries/
+          merge-multiple: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: dart-package
+          path: dart-dist/
+
+      - name: Unpack the package
+        env:
+          VERSION: ${{ needs.preflight.outputs.npm-version }}
+        run: |
+          mkdir dart-package
+          tar -xzf "dart-dist/wse_client-dart-${VERSION}.tar.gz" -C dart-package
+
+      - name: The example on an emulator, on the prebuilt libraries
+        if: matrix.name == 'Android'
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d  # v2.38.0
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect
+          script: .github/scripts/dart-mobile-check.sh dart-package dart-binaries emulator-5554
+
+      - name: The example on an iOS simulator, on the prebuilt library
+        if: matrix.name == 'iOS'
+        run: |
+          device="$(xcrun simctl list devices available | grep -m1 -E 'iPhone' | sed -E 's/.*\(([0-9A-F-]{36})\).*/\1/')"
+          xcrun simctl boot "$device"
+          .github/scripts/dart-mobile-check.sh dart-package dart-binaries "$device"
+
   # The release AAR in an app built with R8, on an emulator: the system's
   # TLS, a tick, an end-to-end encrypted echo and a signed receipt.
   android-release-app:
@@ -975,7 +1055,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release-gate:
     name: Release gate
-    needs: [preflight, build, sdist, test, test-musllinux, sdist-install, python-client, npm-package, crates, swift-package, android-package, android-release-app, dart-binaries, dart-package, dart-check]
+    needs: [preflight, build, sdist, test, test-musllinux, sdist-install, python-client, npm-package, crates, swift-package, android-package, android-release-app, dart-binaries, dart-package, dart-check, dart-mobile]
     # Runs (and fails) when a job above failed: a gate skipped because of a
     # failed dependency would report success to branch protection.
     if: always()
