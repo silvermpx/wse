@@ -196,6 +196,10 @@ export function resolveOptions(config: UseWSEConfig | undefined): ResolvedWSEOpt
       maxQueueSize: 10000,
       memoryLimit: 50 * 1024 * 1024,
       compressionThreshold: 1024,
+      maxPendingInbound: 10_000,
+      maxPendingInboundBytes: 64 * 1024 * 1024,
+      maxPendingEncrypted: 256,
+      maxPendingEncryptedBytes: 16 * 1024 * 1024,
       ...config?.performance,
     },
     offline: {
@@ -335,6 +339,8 @@ export class WSESession {
         sequencer,
         handlerSampleRate: this.options.diagnostics.enabled ? this.options.diagnostics.sampleRate : 0,
         context: this.ctx,
+        maxPendingInbound: this.options.performance.maxPendingInbound,
+        maxPendingInboundBytes: this.options.performance.maxPendingInboundBytes,
       },
     );
 
@@ -492,6 +498,10 @@ export class WSESession {
           this.processor.handleConnectionClosed();
         },
         onUndeliverable: (message) => this.processor.requeue(message),
+        maxPendingEncrypted: o.performance.maxPendingEncrypted,
+        maxPendingEncryptedBytes: o.performance.maxPendingEncryptedBytes,
+        // The encryptions caught up: what waited in the queue goes on.
+        onSendDrain: () => this.processor.flushSoon(),
         heartbeatInterval: o.diagnostics.healthCheckInterval,
         compression: {
           enabled: this.deps.compression?.() ?? o.performance.compressionThreshold > 0,

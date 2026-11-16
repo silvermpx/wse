@@ -57,7 +57,11 @@ import { createClientContext, type ClientContext } from '../core/context.js';
  * - 'rate_limited' the client-side rate limit is exhausted; retry later
  * - 'error'        the message cannot be serialised; retrying will not help
  */
-export type SendResult = 'sent' | 'not_ready' | 'rate_limited' | 'error';
+/**
+ * 'busy': the frames waiting to be encrypted reached their bound; the
+ * message waits (the queue goes on once they catch up, onSendDrain).
+ */
+export type SendResult = 'sent' | 'not_ready' | 'rate_limited' | 'busy' | 'error';
 
 /**
  * Configuration for the connection manager.
@@ -117,6 +121,13 @@ export interface ConnectionManagerConfig {
 
   /** Called with a message accepted by trySend() whose socket vanished before it went out. */
   onUndeliverable?: (message: WSMessage) => void;
+
+  /** Frames waiting to be encrypted, at most (default 256), and their bytes (default 16 MiB). */
+  maxPendingEncrypted?: number;
+  maxPendingEncryptedBytes?: number;
+
+  /** Called once the encryptions caught up after a send was turned away as 'busy'. */
+  onSendDrain?: () => void;
 
   /** Heartbeat ping interval in ms (round-trip measurement, dead-socket check). */
   heartbeatInterval?: number;
@@ -218,6 +229,11 @@ export class ConnectionManager {
   /** The server sends msgpack to this client, and gets it back. */
   private readonly msgpack: boolean;
   private encryptedSendQueue: Promise<void> = Promise.resolve();
+  /** Application frames in the chain of encryptions, and their bytes. */
+  private sealing = 0;
+  private sealingBytes = 0;
+  /** A send was turned away as 'busy': say so once the chain catches up. */
+  private drainWanted = false;
 
   private refreshAuthTokenFn: (() => Promise<void>) | null;
   private readonly config: ConnectionManagerConfig;
@@ -636,6 +652,9 @@ export class ConnectionManager {
     this.clearEncryptionTimer();
     this.resetSocketState();
     this.encryptedSendQueue = Promise.resolve();
+    this.sealing = 0;
+    this.sealingBytes = 0;
+    this.drainWanted = false;
 
     // Fresh ECDH key pair for the next connection; a derivation still in
     // flight for this one can no longer install its key.
@@ -1010,28 +1029,43 @@ export class ConnectionManager {
     const ws = this.ws!;
     try {
       if (this.encryptionRequired) {
+        // The chain of encryptions is no unbounded buffer: past its bound the
+        // message waits in the queue.
+        const maxFrames = this.config.maxPendingEncrypted ?? 256;
+        const maxBytes = this.config.maxPendingEncryptedBytes ?? 16 * 1024 * 1024;
+        if (this.sealing > 0 && (this.sealing >= maxFrames || this.sealingBytes + data.length > maxBytes)) {
+          this.drainWanted = true;
+          return 'busy';
+        }
+        const size = data.length;
+        this.sealing++;
+        this.sealingBytes += size;
         const socketId = this.socketId;
         this.encryptedSendQueue = this.encryptedSendQueue.then(async () => {
-          if (socketId !== this.socketId || this.ws !== ws || ws.readyState !== WS_OPEN) {
-            this.reportUndeliverable(message);
-            return;
-          }
-          let frame: ArrayBuffer;
           try {
-            frame = await this.ctx.security.encryptForTransport(data);
-          } catch (error) {
-            if (socketId !== this.socketId) {
+            if (socketId !== this.socketId || this.ws !== ws || ws.readyState !== WS_OPEN) {
               this.reportUndeliverable(message);
-            } else {
-              logger.error('[ConnectionManager] Encryption failed, message dropped:', errorMessage(error));
+              return;
             }
-            return;
+            let frame: ArrayBuffer;
+            try {
+              frame = await this.ctx.security.encryptForTransport(data);
+            } catch (error) {
+              if (socketId !== this.socketId) {
+                this.reportUndeliverable(message);
+              } else {
+                logger.error('[ConnectionManager] Encryption failed, message dropped:', errorMessage(error));
+              }
+              return;
+            }
+            if (socketId !== this.socketId || this.ws !== ws || ws.readyState !== WS_OPEN) {
+              this.reportUndeliverable(message);
+              return;
+            }
+            ws.send(frame);
+          } finally {
+            this.sealed(size, socketId);
           }
-          if (socketId !== this.socketId || this.ws !== ws || ws.readyState !== WS_OPEN) {
-            this.reportUndeliverable(message);
-            return;
-          }
-          ws.send(frame);
         });
       } else if (this.msgpack) {
         // The JSON value as msgpack, so both formats carry the same message.
@@ -1049,6 +1083,19 @@ export class ConnectionManager {
 
     this.recordSent(data.length);
     return 'sent';
+  }
+
+  /** An application frame left the chain of encryptions. */
+  private sealed(size: number, socketId: number): void {
+    // A new socket started the count over.
+    if (socketId !== this.socketId) return;
+    this.sealing--;
+    this.sealingBytes -= size;
+    const maxFrames = this.config.maxPendingEncrypted ?? 256;
+    if (this.drainWanted && this.sealing <= Math.floor(maxFrames / 2)) {
+      this.drainWanted = false;
+      this.config.onSendDrain?.();
+    }
   }
 
   /** Boolean form of trySend() (true = handed to the socket). */

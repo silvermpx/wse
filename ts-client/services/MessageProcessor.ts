@@ -53,6 +53,8 @@ export interface ProcessorConnection {
   isReady(): boolean;
   isAwaitingEncryptionKey(): boolean;
   getRetryAfterMs(): number;
+  /** Drop the socket and connect again at once; the recovery restores what was missed. */
+  forceReconnect(): void;
   handleServerReady(details: any): void;
   handleServerHello(payload: any): Promise<void>;
   failEncryption(reason: string): void;
@@ -77,6 +79,9 @@ export interface MessageProcessorOptions {
    * the handlerTimeAvg / handlerTimeMax metrics. 0 (default) measures none.
    */
   handlerSampleRate?: number;
+  /** Inbound frames waiting to be processed, at most, and their bytes: past either the connection is dropped. */
+  maxPendingInbound?: number;
+  maxPendingInboundBytes?: number;
 }
 
 /** Estimated size of a queued message in bytes (its serialized length). */
@@ -235,6 +240,15 @@ export class MessageProcessor {
 
   // Inbound
   private inboundChain: Promise<void> = Promise.resolve();
+  /** Inbound frames of the current socket queued and not processed yet, and their bytes. */
+  private pendingFrames = 0;
+  private pendingBytes = 0;
+  /** The socket the counts are of: an older one's frames still in the chain no longer count. */
+  private countedOn = -1;
+  private maxPendingInbound: number;
+  private maxPendingInboundBytes: number;
+  /** The socket whose frames are dropped: it overran the bound and goes. */
+  private overloadedOn: number | null = null;
   // Signed messages: the server keys they are checked against, and the
   // server's signing key id from server_ready / server_hello (the audience
   // of what this client signs).
@@ -298,6 +312,8 @@ export class MessageProcessor {
     this.compression = new CompressionManager(1024, 6, this.maxMessageSize);
     this.recoveryTimeoutMs = options.recoveryTimeoutMs ?? DEFAULT_RECOVERY_TIMEOUT_MS;
     this.eventThrottleMs = options.eventThrottleMs ?? 0;
+    this.maxPendingInbound = options.maxPendingInbound ?? 10_000;
+    this.maxPendingInboundBytes = options.maxPendingInboundBytes ?? 64 * 1024 * 1024;
     const rate = options.handlerSampleRate ?? 0;
     this.handlerSampleRate = Number.isFinite(rate) ? Math.min(Math.max(rate, 0), 1) : 0;
     this.offlineQueue = options.offlineQueue ?? null;
@@ -403,7 +419,39 @@ export class MessageProcessor {
    */
   processIncoming(data: string | ArrayBuffer): Promise<void> {
     if (this.destroyed) return Promise.resolve();
-    return this.enqueueTask(() => this.processFrame(data));
+    const cm = this.connectionManager;
+    const socket = cm?.socketGeneration() ?? 0;
+    if (this.overloadedOn === socket) return Promise.resolve();
+    if (this.countedOn !== socket) {
+      this.countedOn = socket;
+      this.pendingFrames = 0;
+      this.pendingBytes = 0;
+    }
+    const size = typeof data === 'string' ? data.length : data.byteLength;
+    if (
+      this.pendingFrames >= this.maxPendingInbound ||
+      (this.pendingFrames > 0 && this.pendingBytes + size > this.maxPendingInboundBytes)
+    ) {
+      // A browser WebSocket cannot slow the server down: the connection goes,
+      // and the recovery after it brings what this one would have.
+      this.overloadedOn = socket;
+      logger.warn(`Inbound overloaded (${this.pendingFrames} frames, ${this.pendingBytes} bytes waiting): reconnecting`);
+      this.ctx.emit('wseOverloaded', { frames: this.pendingFrames, bytes: this.pendingBytes });
+      cm?.forceReconnect();
+      return Promise.resolve();
+    }
+    this.pendingFrames++;
+    this.pendingBytes += size;
+    return this.enqueueTask(async () => {
+      try {
+        await this.processFrame(data);
+      } finally {
+        if (this.countedOn === socket) {
+          this.pendingFrames--;
+          this.pendingBytes -= size;
+        }
+      }
+    });
   }
 
   private enqueueTask(task: () => Promise<void> | void): Promise<void> {

@@ -140,6 +140,21 @@ export interface PerformanceConfig {
    * also be switched at runtime with setCompression().
    */
   compressionThreshold: number;
+  /**
+   * Inbound frames waiting to be processed, at most (default 10,000), and
+   * their bytes (default 64 MiB). A browser WebSocket cannot slow the
+   * server down: past either bound the client drops the connection (a
+   * wseOverloaded event) and recovers what it missed from where delivery is.
+   */
+  maxPendingInbound: number;
+  maxPendingInboundBytes: number;
+  /**
+   * Frames waiting to be encrypted, at most (default 256), and their bytes
+   * (default 16 MiB): past either a message waits in the outgoing queue
+   * instead of growing the chain of encryptions.
+   */
+  maxPendingEncrypted: number;
+  maxPendingEncryptedBytes: number;
 }
 
 export interface OfflineConfig {

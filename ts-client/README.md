@@ -469,6 +469,16 @@ Messages held past `maxHeld` (10,000), or a break during the resync, start the r
 handler that fails is called again (1 s, then twice as long, up to 30 s). Offsets JavaScript cannot
 hold exactly (above 2^53 - 1) are refused and break the topic off.
 
+### Bounds
+
+What the client takes on has a bound in messages and bytes (`performance`): inbound frames waiting
+to be processed (`maxPendingInbound`, 10,000; `maxPendingInboundBytes`, 64 MiB) and frames waiting
+to be encrypted (`maxPendingEncrypted`, 256; `maxPendingEncryptedBytes`, 16 MiB), besides the
+outgoing queue's `maxQueueSize` and `memoryLimit`. A browser WebSocket cannot slow the server down:
+past the inbound bound the client drops the connection (a `wseOverloaded` event) and recovers what
+it missed from where delivery is. Past the encryption bound a message waits in the outgoing queue,
+in order, until the encryptions catch up; control frames keep their place in the sealed sequence.
+
 ## Encryption
 
 With `security.encryptionEnabled: true` every frame is sealed for the server alone, and the server

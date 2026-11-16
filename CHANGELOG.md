@@ -63,6 +63,12 @@
   instead of being swallowed. The database moves to version 2 in one
   transaction, its records kept; a tab holding the old version open is
   reported, and a connection closes for another tab's upgrade.
+- TypeScript client: bounds on the work it takes on, in messages and bytes
+  (`performance.maxPendingInbound`, `maxPendingInboundBytes`,
+  `maxPendingEncrypted`, `maxPendingEncryptedBytes`). Past the inbound
+  bound the connection is dropped (a `wseOverloaded` event) and the
+  recovery brings what it would have; past the encryption bound a message
+  waits in the outgoing queue instead of growing the chain of encryptions.
 - Rust client: `pause(reason)` and `resume(reason)`, as in the TypeScript
   core client: the connection ends (what is queued goes out first) and no
   attempt is made while any reason holds; topics and positions stay, and
