@@ -8,9 +8,18 @@ messages to the app in order.
 
 ## Android
 
-Each release attaches `wse-client-android-<version>.aar`: the bindings, the
-Kotlin wrapper and the Rust library for `arm64-v8a`, `armeabi-v7a` and
-`x86_64`, linked for 16 KB pages. An app adds it with the libraries it uses:
+The library is on Maven Central: the bindings, the Kotlin wrapper and the
+Rust library for `arm64-v8a`, `armeabi-v7a` and `x86_64`, linked for 16 KB
+pages; what it uses (JNA, kotlinx-coroutines, AndroidX) comes with it.
+
+```kotlin
+dependencies {
+    implementation("io.github.silvermpx:wse-client-android:3.1.0")
+}
+```
+
+Each release also attaches the same `wse-client-android-<version>.aar`; an app
+that adds the file itself adds the libraries it uses too:
 
 ```kotlin
 dependencies {

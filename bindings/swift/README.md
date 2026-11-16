@@ -5,6 +5,17 @@ crates.io) through UniFFI, with an async API. It keeps a connection to a WSE
 server, reconnects when the connection is lost, recovers the messages it
 missed, and hands the server's messages to the app in order.
 
+## Install
+
+The Swift package lives in its own repository, which each release writes:
+
+```swift
+.package(url: "https://github.com/silvermpx/wse-swift", from: "3.1.0")
+```
+
+with the product `WseFFI` in the target's dependencies. It downloads the
+release's `WseFFIC-<version>.xcframework.zip`, checked against its checksum.
+
 ## Build
 
 ```sh
@@ -17,7 +28,8 @@ with the targets `aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios
 aarch64-apple-ios-sim x86_64-apple-ios`, and Xcode. Each release attaches
 the built `WseFFIC-<version>.xcframework.zip` and its SwiftPM checksum.
 
-Add the package to an app by its path (`bindings/swift`), product `WseFFI`.
+A checkout's package is added to an app by its path (`bindings/swift`),
+product `WseFFI`.
 
 ## Use
 

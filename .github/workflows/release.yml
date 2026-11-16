@@ -7,8 +7,10 @@ name: Release
 # every version in the repo, installs and tests every wheel, the sdist, the
 # Python client, the npm package, the crates as crates.io builds them and the
 # mobile packages, and only then publishes: crates.io first, then npm, then
-# PyPI, then the GitHub release, which carries the mobile packages. Nothing is
-# uploaded until everything has passed.
+# PyPI, then the GitHub release, which carries the mobile packages; beside
+# them the Android library goes to Maven Central, and after the GitHub release
+# the Dart package to pub.dev and the Swift package to its repository
+# (silvermpx/wse-swift). Nothing is uploaded until everything has passed.
 #
 # Pull requests and pushes to main that touch packaging run the same build
 # and test jobs as a dry run, and workflow_dispatch runs that dry run by hand
@@ -1097,6 +1099,69 @@ jobs:
           emulator-options: -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect
           script: bash .github/scripts/rn-app-check.sh npm-dist/wse-client-*.tgz emulator-5554
 
+  # The Android library for Maven Central (io.github.silvermpx:wse-client-android):
+  # on every run its bundle is signed with the release key and the Central
+  # Portal is asked whether it takes the token; publish-maven-central uploads
+  # it on a tag. A pull request from a fork, without the secrets, builds it
+  # unsigned.
+  maven-central:
+    name: Maven Central bundle (signed, not uploaded)
+    needs: [preflight, android-package]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: android-package
+          path: dist/
+
+      - name: The bundle, and the Portal's answer to the token
+        env:
+          VERSION: ${{ needs.preflight.outputs.npm-version }}
+          MAVEN_GPG_PRIVATE_KEY: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+        run: |
+          mode=--check
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] && [ -z "$MAVEN_GPG_PRIVATE_KEY" ]; then mode=; fi
+          bash .github/scripts/maven-central.sh "$VERSION" "dist/wse-client-android-${VERSION}.aar" maven $mode
+
+  # The Swift package's own repository (silvermpx/wse-swift) as the release
+  # writes it, built on a Mac against this run's XCFramework, and the deploy
+  # key tried; publish-swift commits and tags it on a tag.
+  swift-repo:
+    name: Swift package repository (built, not pushed)
+    needs: [preflight, swift-package]
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: swift-package
+          path: dist/
+
+      - name: The package, built here
+        env:
+          VERSION: ${{ needs.preflight.outputs.npm-version }}
+          SWIFT_REPO_DEPLOY_KEY: ${{ secrets.SWIFT_REPO_DEPLOY_KEY }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != pull_request ] && [ -z "$SWIFT_REPO_DEPLOY_KEY" ]; then
+            echo "::error::no SWIFT_REPO_DEPLOY_KEY: the release could not write silvermpx/wse-swift"
+            exit 1
+          fi
+          bash .github/scripts/swift-repo.sh "$VERSION" "dist/WseFFIC-${VERSION}.xcframework.zip" swift-repo --check
+
   # ---------------------------------------------------------------------------
   # Everything built, tested and carrying the release version: the one job
   # that says whether this commit could be released. The publish jobs wait
@@ -1105,7 +1170,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release-gate:
     name: Release gate
-    needs: [preflight, build, sdist, test, test-musllinux, sdist-install, python-client, npm-package, crates, swift-package, android-package, android-release-app, react-native-app, dart-binaries, dart-package, dart-check, dart-mobile]
+    needs: [preflight, build, sdist, test, test-musllinux, sdist-install, python-client, npm-package, crates, swift-package, android-package, android-release-app, react-native-app, maven-central, swift-repo, dart-binaries, dart-package, dart-check, dart-mobile]
     # Runs (and fails) when a job above failed: a gate skipped because of a
     # failed dependency would report success to branch protection.
     if: always()
@@ -1308,3 +1373,111 @@ jobs:
           generate_release_notes: true
           prerelease: ${{ needs.preflight.outputs.prerelease == 'true' }}
           files: release/*
+
+  # On Maven Central as io.github.silvermpx:wse-client-android: the bundle the
+  # dry run built, signed, uploaded and waited for until it is published.
+  publish-maven-central:
+    name: Publish the Android library to Maven Central
+    needs: [preflight, release-gate]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment:
+      name: release
+      url: https://central.sonatype.com/artifact/io.github.silvermpx/wse-client-android
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: android-package
+          path: dist/
+
+      - name: Upload, and wait until Maven Central has it
+        env:
+          VERSION: ${{ needs.preflight.outputs.npm-version }}
+          MAVEN_GPG_PRIVATE_KEY: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+        run: bash .github/scripts/maven-central.sh "$VERSION" "dist/wse-client-android-${VERSION}.aar" maven --upload
+
+  # On pub.dev as wse_client, once its prebuilt libraries are on the GitHub
+  # release it downloads them from. pub.dev takes a package's first version
+  # from its owner by hand (dart pub publish from this release's
+  # wse_client-dart-<version>.tar.gz) and the later ones from this job, by the
+  # job's own token (automated publishing for silvermpx/wse, tags v{{version}}).
+  publish-pub-dev:
+    name: Publish wse_client to pub.dev
+    needs: [preflight, release-gate, github-release]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment:
+      name: release
+      url: https://pub.dev/packages/wse_client
+    permissions:
+      id-token: write
+    steps:
+      # Trades the job's OIDC token for pub.dev's (PUB_TOKEN).
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d  # v1
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2  # v2.23.0
+        with:
+          flutter-version: '3.50.0'
+          channel: stable
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: dart-package
+          path: dart-dist/
+
+      - name: Publish the tested package
+        env:
+          VERSION: ${{ needs.preflight.outputs.npm-version }}
+        run: |
+          code="$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 "https://pub.dev/api/packages/wse_client/versions/${VERSION}" || true)"
+          if [ "$code" = 200 ]; then
+            echo "wse_client ${VERSION} is on pub.dev already (by hand, or an earlier attempt); nothing to publish."
+            exit 0
+          fi
+          code="$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 "https://pub.dev/api/packages/wse_client" || true)"
+          if [ "$code" = 404 ]; then
+            echo "::warning::wse_client is not on pub.dev yet: its first version goes by hand, from wse_client-dart-${VERSION}.tar.gz of this release."
+            exit 0
+          fi
+          mkdir dart-package
+          tar -xzf "dart-dist/wse_client-dart-${VERSION}.tar.gz" -C dart-package
+          cd dart-package
+          flutter pub publish --force
+
+  # The Swift package's repository (silvermpx/wse-swift): this version's
+  # Package.swift, naming the XCFramework on the GitHub release, committed and
+  # tagged there.
+  publish-swift:
+    name: Publish the Swift package (silvermpx/wse-swift)
+    needs: [preflight, github-release]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment:
+      name: release
+      url: https://github.com/silvermpx/wse-swift
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: swift-package
+          path: dist/
+
+      - name: Commit and tag the version there
+        env:
+          VERSION: ${{ needs.preflight.outputs.npm-version }}
+          SWIFT_REPO_DEPLOY_KEY: ${{ secrets.SWIFT_REPO_DEPLOY_KEY }}
+        run: bash .github/scripts/swift-repo.sh "$VERSION" "dist/WseFFIC-${VERSION}.xcframework.zip" swift-repo --push

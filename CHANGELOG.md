@@ -115,7 +115,13 @@
   package is bundled by Metro and compiled by Hermes, the bundle runs
   without TextEncoder and TextDecoder, and an app made from React Native's
   template runs it in a release build (Hermes) on an emulator against a
-  server. The system's certificate verifier is
+  server. A tag also publishes the Android library to Maven Central
+  (`io.github.silvermpx:wse-client-android`), the Dart package to pub.dev
+  (`wse_client`; pub.dev takes its first version by hand) and the Swift
+  package to its own repository (github.com/silvermpx/wse-swift); every dry
+  run signs the Maven bundle and asks the Central Portal about the token, and
+  builds the Swift package against its XCFramework. The system's certificate
+  verifier is
   seen to connect where the system trusts the server's CA: on Linux, an
   iOS simulator and an Android emulator.
 - Rust client: `pause(reason)` and `resume(reason)`, as in the TypeScript
