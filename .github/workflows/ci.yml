@@ -82,6 +82,7 @@ jobs:
               - 'bindings/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - '.github/scripts/maven-central.sh'
               - '.github/workflows/ci.yml'
             benchmarks:
               - 'benchmarks/**'
@@ -600,11 +601,31 @@ jobs:
       - name: The committed bindings are the generated ones
         run: git diff --exit-code -- bindings/swift/Sources
 
+  # The Kotlin tests on the JVM, then the JVM package the way an application
+  # gets it (run-jvm-consumer-check.sh): made with this runner's library,
+  # installed from a Maven repository and run on Java 17; on Linux in
+  # Alpine's Java image (musl) too, with the musl library built in the
+  # container the release builds it in.
   kotlin:
-    name: Kotlin (JVM)
+    name: Kotlin (JVM, ${{ matrix.name }})
     needs: changes
     if: needs.changes.outputs.mobile == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            runner: ubuntu-24.04
+            alpine: '1'
+          - name: macOS
+            runner: macos-latest
+          - name: Windows
+            runner: windows-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -617,22 +638,33 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: ". -> target"
-          key: kotlin
+          key: kotlin-${{ matrix.name }}
 
       - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880  # v6.3.0
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: '17'
 
       - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c  # v6.4.1
         with:
           gradle-version: '9.9.1'
 
+      # Windows: aws-lc's assembly from the objects it ships, without NASM.
       - name: Build and test
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: '1'
         run: bindings/kotlin/run-tests.sh
 
       - name: The committed bindings are the generated ones
         run: git diff --exit-code -- bindings/kotlin/generated
+
+      - name: The JVM package as an application gets it
+        env:
+          ALPINE: ${{ matrix.alpine }}
+          MUSL_IMAGE: ghcr.io/rust-cross/rust-musl-cross:x86_64-musl@sha256:3f1010eb48311dfde5d51f011163451940af34bd317355c4a8652ce6b4b61051
+          ALPINE_JAVA_IMAGE: eclipse-temurin:21-jre-alpine@sha256:ac05c3c42b7c2f1a52c9bd52f01041fa1958231b15ebeae7420429cbc5baf474
+          AWS_LC_SYS_PREBUILT_NASM: '1'
+        run: bindings/kotlin/run-jvm-consumer-check.sh
 
   android:
     name: Android (emulator)

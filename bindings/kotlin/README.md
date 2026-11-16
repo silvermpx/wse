@@ -1,10 +1,10 @@
-# WSE client for Kotlin and Android
+# WSE client for Kotlin and Java
 
-The WSE client for Android (API 26+) and the JVM: the Rust client
+The WSE client for Android (API 26+) and the JVM (Java 17+): the Rust client
 (`wse-client` on crates.io) through UniFFI, with suspend functions and a
-Flow of events. It keeps a connection to a WSE server, reconnects when the
-connection is lost, recovers the messages it missed, and hands the server's
-messages to the app in order.
+Flow of events for Kotlin, and futures for Java. It keeps a connection to a
+WSE server, reconnects when the connection is lost, recovers the messages it
+missed, and hands the server's messages to the app in order.
 
 ## Android
 
@@ -43,6 +43,45 @@ Android NDK, JDK 21 and Gradle):
 bindings/kotlin/build.sh                    # the bindings
 bindings/kotlin/android/build-libs.sh       # the Rust library of every ABI
 (cd bindings/kotlin/android && gradle assembleRelease)
+```
+
+## The JVM
+
+For services and desktop apps in Java or Kotlin, on Java 17 or newer. The JAR
+on Maven Central carries the bindings, the Kotlin wrapper and the Rust library
+for Linux (x64 and arm64, glibc 2.17 and newer on x64 and 2.28 on arm64, and
+musl, as in Alpine), macOS (Apple silicon and Intel, 10.15 and newer) and
+Windows (x64 and arm64). It needs no Rust and no build step; JNA,
+kotlinx-coroutines and the Kotlin standard library come as its dependencies.
+
+```kotlin
+dependencies {
+    implementation("io.github.silvermpx:wse-client-jvm:3.2.0")
+}
+```
+
+```xml
+<dependency>
+  <groupId>io.github.silvermpx</groupId>
+  <artifactId>wse-client-jvm</artifactId>
+  <version>3.2.0</version>
+</dependency>
+```
+
+JNA loads the library for the platform from the JAR; on a musl system the
+musl build. Java 22 and newer print a warning when a library loads native
+code: `java --enable-native-access=ALL-UNNAMED` (or `Enable-Native-Access:
+ALL-UNNAMED` in an executable JAR's manifest) allows it. Each release also
+attaches the same `wse-client-jvm-<version>.jar`, which needs those three
+dependencies beside it.
+
+To build it from a checkout (Rust, JDK 17 or newer and Gradle), with this
+machine's library:
+
+```sh
+bindings/kotlin/build.sh                    # the bindings
+bindings/kotlin/jvm-natives.sh natives "$(rustc -vV | sed -n 's/^host: //p')"
+(cd bindings/kotlin && WSE_JVM_NATIVES="$PWD/../../natives" gradle jar)
 ```
 
 ## Use
@@ -101,11 +140,52 @@ rest, and an item whose collection was cancelled while it was handed out
 twice. Cancelling the coroutine of `connectClient` gives up the attempt.
 `disconnect` sends what is queued and closes.
 
+## Java
+
+Java calls the client through `Wse`: the calls that wait return a
+`CompletableFuture` (cancelling it gives the call up), the configuration
+comes from a builder, and the events are read one at a time, the thread
+waiting for each. The client's other methods (`status()`, `subscribe(...)`,
+`trySend(...)`, `pause(...)`, `checkpoint()`, ...) are called on it as they
+are. Android apps written in Java use the same.
+
+```java
+import dev.wse.ffi.*;
+
+WseClient client = Wse.connect(Wse.config("wss://example.com/wse").token(token).topics("prices").build()).join();
+Wse.send(client, "order", "{\"id\":1}").join();
+client.trySendLive("open_valve", "{\"id\":7}");   // on this connection or not at all
+
+WseEventReader events = Wse.events(client);
+for (WseItem item; (item = events.next()) != null; ) {
+    if (item instanceof WseItem.Message m) {
+        System.out.println(m.getMessage().getTopic() + " " + m.getMessage().getJson());
+    } else if (item instanceof WseItem.Gap gap) {
+        System.out.println("lost messages on " + gap.getTopic() + ": reload it");
+    }
+}
+```
+
+`events.next(Duration)` waits at most that long: nothing in time is a
+`TimeoutException`, and the next call goes on from there. A token that
+changes comes from `Wse.tokens(() -> fetchToken())`, a supplier of a
+`CompletionStage<String>` asked before each connection attempt. The
+recover-or-resync delivery is `Wse.config(url).delivery(Wse.delivery("board").checkpoint(saved).build())`;
+`Wse.resynced(client, resync)` and `Wse.commit(client, message)` answer its
+items. Signed messages: `Wse.generateSigningKey()`, `Wse.signingPublicKey(key)`
+and `Wse.sendSigned(...)`. Kotlin's unsigned numbers are hidden from Java:
+`Wse.retryInMillis(...)`, `Wse.attempt(...)` and `Wse.closeCode(...)` give a
+`Disconnected` item's as plain numbers.
+
 ## Tests
 
 ```sh
-bindings/kotlin/run-tests.sh                     # on the JVM
+bindings/kotlin/run-tests.sh                     # on the JVM, in Kotlin and in Java
+bindings/kotlin/run-jvm-consumer-check.sh        # the JVM package in a Java application
 bindings/kotlin/android/run-emulator-tests.sh    # in an Android emulator
 ```
 
 They run against the Rust client's example server, which the scripts start.
+`run-jvm-consumer-check.sh` makes the JAR with this machine's library, lays
+it out in a Maven repository and runs an application that installs it from
+there (`ALPINE=1` on Linux runs it in Alpine too).

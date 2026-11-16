@@ -77,10 +77,12 @@ VIRTUAL_ENV=\"$venv\" \"$venv/bin/maturin\" develop --release --locked
 WSE_E2E_PYTHON=\"$venv/bin/python\" WSE_E2E_REQUIRED=1 npx vitest run --project client ts-client/__tests__/realServer.test.ts",
     },
     Lane {
+        // The tests on the JVM, then the JVM package as an application gets it.
         name: "kotlin-jvm",
         needs: &[tool("java"), tool_or("gradle", "GRADLE"), tool("cargo")],
         only_on: None,
-        script: "bindings/kotlin/run-tests.sh",
+        script: "bindings/kotlin/run-tests.sh
+bindings/kotlin/run-jvm-consumer-check.sh",
     },
     Lane {
         name: "dart",

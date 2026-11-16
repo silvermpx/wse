@@ -1,0 +1,285 @@
+// The client for Java, on the JVM and on Android. Kotlin's suspend functions
+// come as futures, the events one at a time with the calling thread waiting
+// for them, and the bindings' unsigned numbers, which Java does not see, as
+// int and long. Kotlin code uses connectClient, the suspend functions and
+// WseEvents.asFlow instead.
+package dev.wse.ffi
+
+import java.time.Duration
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CompletionStage
+import java.util.concurrent.TimeoutException
+import java.util.function.Supplier
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.future.await
+import kotlinx.coroutines.future.future
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
+
+/**
+ * The client for Java. A call that waits returns a future, and cancelling the future gives the
+ * call up; the client's other methods (`status`, `subscribe`, `trySend`, `pause`, ...) are called
+ * on it as they are.
+ *
+ * ```java
+ * WseClient client = Wse.connect(Wse.config("wss://example.com/wse").token(token).topics("prices").build()).join();
+ * Wse.send(client, "order", "{\"id\":1}").join();
+ * WseEventReader events = Wse.events(client);
+ * for (WseItem item; (item = events.next()) != null; ) {
+ *     if (item instanceof WseItem.Message m) System.out.println(m.getMessage().getKind());
+ * }
+ * ```
+ */
+object Wse {
+    // The calls behind the futures: one failing fails its own future only.
+    private val calls = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /** A configuration for the server at [url] (ws://host:port/wse or wss://...). */
+    @JvmStatic
+    fun config(url: String): WseConfigBuilder = WseConfigBuilder(url)
+
+    /** The recover-or-resync delivery of [consumer], the one consumer that commits, by a stable name. */
+    @JvmStatic
+    fun delivery(consumer: String): WseDeliveryBuilder = WseDeliveryBuilder(consumer)
+
+    /**
+     * Tokens from Java: [supplier] is asked before each connection attempt and returns the token's
+     * future. A future that fails is a [WseTokenException.Failed] with its message.
+     */
+    @JvmStatic
+    fun tokens(supplier: Supplier<out CompletionStage<String>>): WseTokenSource = FutureTokens(supplier)
+
+    /** Connects; the future completes once the server took the connection. */
+    @JvmStatic
+    @JvmOverloads
+    fun connect(config: WseConfig, tokens: WseTokenSource? = null): CompletableFuture<WseClient> =
+        calls.future { connectClient(config, tokens) }
+
+    /** Sends `{"t": kind, "p": json}`, waiting for room in the queue; a message already queued still goes. */
+    @JvmStatic
+    fun send(client: WseClient, kind: String, json: String): CompletableFuture<Void?> =
+        calls.future {
+            client.send(kind, json)
+            null
+        }
+
+    /** Sends on the connection that is ready now, or not at all, waiting for room in the queue. */
+    @JvmStatic
+    fun sendLive(client: WseClient, kind: String, json: String): CompletableFuture<Void?> =
+        calls.future {
+            client.sendLive(kind, json)
+            null
+        }
+
+    /** Sends a signed message on this connection, or not at all; the future gives the nonce it went with. */
+    @JvmStatic
+    @JvmOverloads
+    fun sendSigned(client: WseClient, kind: String, json: String, nonce: String? = null): CompletableFuture<String> =
+        calls.future { client.sendSigned(kind, json, nonce) }
+
+    /** Sends what is queued, for at most [deadline], and closes. */
+    @JvmStatic
+    fun disconnect(client: WseClient, deadline: Duration): CompletableFuture<Void?> =
+        calls.future {
+            client.disconnect(millis(deadline))
+            null
+        }
+
+    /** The client's events, one at a time. */
+    @JvmStatic
+    fun events(client: WseClient): WseEventReader = WseEventReader(client.events())
+
+    /** The consumer applied [message]; see `WseClient.commit` in Kotlin. */
+    @JvmStatic
+    fun commit(client: WseClient, message: WseMessage) = client.commit(message)
+
+    /** The application brought the topics of [resync] up to date: what they held is handed on. */
+    @JvmStatic
+    fun resynced(client: WseClient, resync: WseItem.Resync) = client.resynced(resync.round)
+
+    /** A new ECDSA P-256 private key (PKCS#8, DER) for signed messages. */
+    @JvmStatic
+    fun generateSigningKey(): ByteArray = dev.wse.ffi.generateSigningKey()
+
+    /** The public key of [key] (base64), for the server to check this client's signed messages against. */
+    @JvmStatic
+    @Throws(WseException::class)
+    fun signingPublicKey(key: ByteArray): String = dev.wse.ffi.signingPublicKey(key)
+
+    /** When the next attempt is made, in milliseconds. */
+    @JvmStatic
+    fun retryInMillis(disconnected: WseItem.Disconnected): Long = disconnected.retryInMs.toSignedLong()
+
+    /** Attempts made since the last connection the server took. */
+    @JvmStatic
+    fun attempt(disconnected: WseItem.Disconnected): Long = disconnected.attempt.toLong()
+
+    /** The close code, or -1 when the connection was cut or never made. */
+    @JvmStatic
+    fun closeCode(disconnected: WseItem.Disconnected): Int = disconnected.code?.toInt() ?: -1
+}
+
+/**
+ * A client's events for Java: one item at a time, the calling thread waiting for it. An item goes
+ * to one reader, as with [WseEvents]: a second reading at the same time gets [WseException.Busy].
+ */
+class WseEventReader internal constructor(private val events: WseEvents) {
+    /** The next item, waiting as long as it takes; null once the client closed. */
+    @Throws(WseException::class, InterruptedException::class)
+    fun next(): WseItem? = runBlocking { events.next() }
+
+    /**
+     * The next item if one comes within [timeout]; null once the client closed. Nothing in time is
+     * a [TimeoutException], and the next call goes on from there: nothing is lost.
+     */
+    @Throws(WseException::class, InterruptedException::class, TimeoutException::class)
+    fun next(timeout: Duration): WseItem? {
+        val next = runBlocking { withTimeoutOrNull(timeout.toMillis()) { Next(events.next()) } }
+        return (next ?: throw TimeoutException("no event within $timeout")).item
+    }
+
+    private class Next(val item: WseItem?)
+}
+
+/** A [WseConfig] for Java, field by field (Kotlin names the fields in `WseConfig(...)` instead). */
+class WseConfigBuilder internal constructor(private val url: String) {
+    private var token: String? = null
+    private var topics = emptyList<String>()
+    private var msgpack = false
+    private val headers = mutableListOf<WseHeader>()
+    private var sendQueue = 0u
+    private var reconnect = true
+    private var connectTimeout = 0uL
+    private var readyTimeout = 0uL
+    private var idleTimeout = 0uL
+    private var recoveryTimeout = 0uL
+    private var serverIdentityKeys = emptyList<String>()
+    private var signingKey: ByteArray? = null
+    private var serverSigningKeys = emptyList<String>()
+    private var trust: WseTrust? = null
+    private var insecure = false
+    private var delivery: WseDelivery? = null
+
+    /** The token for the handshake's Authorization header (a token source gives each attempt's instead). */
+    fun token(token: String?): WseConfigBuilder = apply { this.token = token }
+
+    /** The topics to hold. */
+    fun topics(vararg topics: String): WseConfigBuilder = apply { this.topics = topics.toList() }
+
+    /** The topics to hold. */
+    fun topics(topics: List<String>): WseConfigBuilder = apply { this.topics = topics.toList() }
+
+    /** MessagePack instead of JSON on the wire. */
+    fun msgpack(msgpack: Boolean): WseConfigBuilder = apply { this.msgpack = msgpack }
+
+    /** A header for the handshake. */
+    fun header(name: String, value: String): WseConfigBuilder = apply { headers += WseHeader(name, value) }
+
+    /** Messages waiting to be sent at most (0: 1024). */
+    fun sendQueue(messages: Int): WseConfigBuilder = apply { sendQueue = count(messages) }
+
+    /** Whether a lost connection is made again (true by default). */
+    fun reconnect(reconnect: Boolean): WseConfigBuilder = apply { this.reconnect = reconnect }
+
+    /** For the socket, TLS and the upgrade (zero: 10 s). */
+    fun connectTimeout(timeout: Duration): WseConfigBuilder = apply { connectTimeout = millis(timeout) }
+
+    /** For the server to confirm the connection after the upgrade (zero: 10 s). */
+    fun readyTimeout(timeout: Duration): WseConfigBuilder = apply { readyTimeout = millis(timeout) }
+
+    /** Silence from the server after which the connection is taken for dead and made again (zero: 40 s). */
+    fun idleTimeout(timeout: Duration): WseConfigBuilder = apply { idleTimeout = millis(timeout) }
+
+    /** How long a topic waits for the server to replay what it missed before it reports a gap (zero: 3 s). */
+    fun recoveryTimeout(timeout: Duration): WseConfigBuilder = apply { recoveryTimeout = millis(timeout) }
+
+    /** End-to-end encryption, pinned to these server identity keys (base64). */
+    fun serverIdentityKeys(vararg keys: String): WseConfigBuilder = apply { serverIdentityKeys = keys.toList() }
+
+    /** End-to-end encryption, pinned to these server identity keys (base64). */
+    fun serverIdentityKeys(keys: List<String>): WseConfigBuilder = apply { serverIdentityKeys = keys.toList() }
+
+    /** This client's ECDSA P-256 private key (PKCS#8, PEM or DER), for signed messages. */
+    fun signingKey(key: ByteArray?): WseConfigBuilder = apply { signingKey = key }
+
+    /** The server's signing keys (base64) its signed messages are checked against. */
+    fun serverSigningKeys(vararg keys: String): WseConfigBuilder = apply { serverSigningKeys = keys.toList() }
+
+    /** The server's signing keys (base64) its signed messages are checked against. */
+    fun serverSigningKeys(keys: List<String>): WseConfigBuilder = apply { serverSigningKeys = keys.toList() }
+
+    /** The certificates a wss:// server's chain must lead to; null: the system's verifier. */
+    fun trust(trust: WseTrust?): WseConfigBuilder = apply { this.trust = trust }
+
+    /** Allows ws://, which sends everything in the clear: for development. */
+    fun insecure(insecure: Boolean): WseConfigBuilder = apply { this.insecure = insecure }
+
+    /** The recover-or-resync delivery ([Wse.delivery]); null: best effort. */
+    fun delivery(delivery: WseDelivery?): WseConfigBuilder = apply { this.delivery = delivery }
+
+    fun build(): WseConfig =
+        WseConfig(
+            url = url,
+            token = token,
+            topics = topics,
+            msgpack = msgpack,
+            headers = headers.toList(),
+            sendQueue = sendQueue,
+            reconnect = reconnect,
+            connectTimeoutMs = connectTimeout,
+            readyTimeoutMs = readyTimeout,
+            idleTimeoutMs = idleTimeout,
+            recoveryTimeoutMs = recoveryTimeout,
+            serverIdentityKeys = serverIdentityKeys,
+            signingKey = signingKey,
+            serverSigningKeys = serverSigningKeys,
+            trust = trust,
+            insecure = insecure,
+            delivery = delivery,
+        )
+}
+
+/** A [WseDelivery] for Java, field by field. */
+class WseDeliveryBuilder internal constructor(private val consumer: String) {
+    private var schema: String? = null
+    private var realm: String? = null
+    private var checkpoint: String? = null
+    private var maxHeld = 0u
+
+    /** The application's data schema: a checkpoint of another is refused. */
+    fun schema(schema: String?): WseDeliveryBuilder = apply { this.schema = schema }
+
+    /** The server's realm (by default its URL): a checkpoint of another is refused. */
+    fun realm(realm: String?): WseDeliveryBuilder = apply { this.realm = realm }
+
+    /** The checkpoint the application saved last (`client.checkpoint()`). */
+    fun checkpoint(checkpoint: String?): WseDeliveryBuilder = apply { this.checkpoint = checkpoint }
+
+    /** Messages a topic holds while it resyncs (0: 10,000); more starts the resync over. */
+    fun maxHeld(messages: Int): WseDeliveryBuilder = apply { maxHeld = count(messages) }
+
+    fun build(): WseDelivery = WseDelivery(consumer, schema, realm, checkpoint, maxHeld)
+}
+
+private class FutureTokens(private val supplier: Supplier<out CompletionStage<String>>) : WseTokenSource {
+    override suspend fun token(): String =
+        try {
+            supplier.get().await()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            throw WseTokenException.Failed(error.message ?: error.toString())
+        }
+}
+
+private fun millis(duration: Duration): ULong = duration.toMillis().coerceAtLeast(0).toULong()
+
+private fun count(value: Int): UInt {
+    require(value >= 0) { "a count is not negative: $value" }
+    return value.toUInt()
+}
+
+private fun ULong.toSignedLong(): Long = coerceAtMost(Long.MAX_VALUE.toULong()).toLong()

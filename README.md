@@ -13,7 +13,7 @@ WSE is a WebSocket engine for reactive user interfaces: trading terminals, dashb
 
 WSE runs inside your backend rather than as a separate service. A Python application starts it with the `wse-server` package, where it runs in threads of its own, outside the GIL; a Rust application embeds the `wse` crate. Both are the same engine, written in Rust. Several servers form a cluster by themselves, with no Redis or other broker in between.
 
-In the browser, the TypeScript client keeps the connection, its subscriptions and recovery, on a page without a framework or with React, Vue or Svelte; React Native apps use it too. Interfaces written in Rust (Leptos, Yew, Dioxus) use the Rust client compiled to WebAssembly. iOS, Android and Flutter apps, on phones and on desktops, use the Rust client through its Swift, Kotlin and Dart packages. Services and bots connect with the Python or the Rust client.
+In the browser, the TypeScript client keeps the connection, its subscriptions and recovery, on a page without a framework or with React, Vue, Svelte, Angular or Solid; React Native apps use it too. Interfaces written in Rust (Leptos, Yew, Dioxus) use the Rust client compiled to WebAssembly. iOS, Android and Flutter apps, on phones and on desktops, use the Rust client through its Swift, Kotlin and Dart packages. Services and bots connect with the Python or the Rust client, or, on the JVM, in Java or Kotlin.
 
 ## What it does
 
@@ -34,12 +34,13 @@ In the browser, the TypeScript client keeps the connection, its subscriptions an
 |---------|---------|------------|
 | [`wse-server`](https://pypi.org/project/wse-server/) | `pip install wse-server` | The server, run from Python |
 | [`wse`](https://crates.io/crates/wse) | `cargo add wse` | The server, inside a Rust application (tokio) |
-| [`wse-client`](https://www.npmjs.com/package/wse-client) | `npm install wse-client` | Web interfaces in TypeScript: without a framework, React, Vue, Svelte; React Native apps |
+| [`wse-client`](https://www.npmjs.com/package/wse-client) | `npm install wse-client` | Web interfaces in TypeScript: without a framework, React, Vue, Svelte, Angular, Solid; React Native apps |
 | [`wse-client`](https://crates.io/crates/wse-client) | `cargo add wse-client` | Interfaces in Rust (WebAssembly), and Rust services on tokio |
 | [`wse-client`](https://pypi.org/project/wse-client/) | `pip install wse-client` | Python services and scripts, with or without asyncio |
 | [`wse_client`](https://pub.dev/packages/wse_client) | `flutter pub add wse_client` | Flutter and Dart apps (Android, iOS, macOS, Linux, Windows) |
 | [`wse-swift`](https://github.com/silvermpx/wse-swift) | Swift Package Manager: `https://github.com/silvermpx/wse-swift` | iOS and macOS apps |
 | [`wse-client-android`](https://central.sonatype.com/artifact/io.github.silvermpx/wse-client-android) | `implementation("io.github.silvermpx:wse-client-android:3.1.0")` | Android apps |
+| [`wse-client-jvm`](https://central.sonatype.com/artifact/io.github.silvermpx/wse-client-jvm) | `implementation("io.github.silvermpx:wse-client-jvm:3.2.0")` | Java and Kotlin services and desktop apps on the JVM (Linux, macOS, Windows) |
 
 ## A server in Python
 
@@ -207,9 +208,9 @@ async fn main() -> Result<(), wse_client::Error> {
 
 The same crate builds for the browser (`wasm32-unknown-unknown`), for Leptos, Yew or Dioxus apps, with the same API. A `Handler` can read each message straight from its frame into your own types, without copying it. More in the [Rust client's README](https://github.com/silvermpx/wse/blob/main/crates/wse-client/README.md).
 
-### Swift, Kotlin and Flutter
+### Swift, Kotlin, Java and Flutter
 
-iOS, Android and Flutter apps use the Rust client through packages of their own: the same reconnects, recovery, end-to-end encryption and signed messages, with async calls and the events as a stream, and helpers that pause the connection while the app is in the background or offline.
+iOS, Android and Flutter apps use the Rust client through packages of their own: the same reconnects, recovery, end-to-end encryption and signed messages, with async calls and the events as a stream, and helpers that pause the connection while the app is in the background or offline. The Kotlin package also runs on the JVM (`wse-client-jvm`, Java 17 and newer, Linux, macOS and Windows), and Java calls it with futures.
 
 ```swift
 let client = try await WseClient.connect(
@@ -223,6 +224,14 @@ for try await item in client.events() {
 val client = connectClient(WseConfig(url = "wss://example.com/wse", token = token, topics = listOf("prices")))
 client.events().asFlow().collect { item ->
     if (item is WseItem.Message) println("${item.message.kind}: ${item.message.json}")
+}
+```
+
+```java
+WseClient client = Wse.connect(Wse.config("wss://example.com/wse").token(token).topics("prices").build()).join();
+WseEventReader events = Wse.events(client);
+for (WseItem item; (item = events.next()) != null; ) {
+    if (item instanceof WseItem.Message m) System.out.println(m.getMessage().getKind() + ": " + m.getMessage().getJson());
 }
 ```
 

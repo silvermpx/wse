@@ -1,5 +1,38 @@
 # Changelog
 
+## v3.2.0 (unreleased)
+
+### Added
+
+- Angular: `wse-client/angular`, for Angular 20 and newer:
+  `provideWSEClient`, `injectWSEState`, `injectWSETopics`, `injectWSEMessage`
+  and `injectWSEEvent`, signals that take the client's connection, topics and
+  listeners after the first render in a browser, outside Angular's zone, and
+  let them go with their injector. On a server they take nothing.
+- Solid: `wse-client/solid`, for Solid 1.9 and 2.0: `createWSEState`,
+  `createWSETopics`, `onWSEMessage`, `onWSEEvent` and `WSEContext`, with the
+  client given, as an accessor (a new client after a sign-in) or from the
+  context. On a server and while hydrating they take nothing.
+- The JVM: `io.github.silvermpx:wse-client-jvm` on Maven Central, for Java and
+  Kotlin on Java 17 and newer. The JAR carries the Rust library for Linux (x64
+  and arm64, glibc and musl), macOS and Windows (x64 and arm64), so it needs
+  no Rust. `Wse` is the client for Java, on the JVM and on Android: futures
+  for the calls that wait, builders for the configuration, the events read
+  one at a time, and plain numbers where the Kotlin API has unsigned ones.
+
+### Fixed
+
+- React: `useWSETopics` takes a changed topic list before it lets the old one
+  go, so a topic in both stays subscribed with its recovery position; it was
+  unsubscribed and subscribed again.
+- TypeScript: a state listener that throws is logged and no longer keeps the
+  others from hearing the change.
+- TypeScript: under Node 25 and newer, which has a `localStorage` of its own,
+  server rendering no longer takes it for a page's.
+- Rust client (and Swift, Kotlin, Dart): a connection that died while the
+  device slept is made again at the first heartbeat after waking (15 s at
+  most), not when the server's silence runs out (40 s).
+
 ## v3.1.0 (2026-11-16)
 
 Clients for every platform: the TypeScript client without React, mobile

@@ -399,7 +399,7 @@ private fun findLibraryName(componentName: String): String {
     if (libOverride != null) {
         return libOverride
     }
-    return "wse_ffi"
+    return WseNativeLibrary.name
 }
 
 // Define FFI callback types
