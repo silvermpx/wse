@@ -8,7 +8,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.FlowCollector
 
 /** Connects, and returns once the server took the connection. Cancelling the coroutine gives up the attempt. */
 suspend fun connectClient(config: WseConfig, tokens: WseTokenSource? = null): WseClient =
@@ -29,6 +29,9 @@ class WseEvents internal constructor(
     private var acknowledged: ULong = 0u
     private var ended = false
     private val reading = AtomicBoolean(false)
+
+    /** Runs as an item is about to be handed over (tests cancel the collector there). */
+    internal var handingOver: ((WseItem) -> Unit)? = null
 
     /** The next item, or null once the client closed. */
     suspend fun next(): WseItem? = reading {
@@ -70,14 +73,20 @@ class WseEvents internal constructor(
      * As a Flow: each collection goes on from where the last one stopped. An item is taken when it
      * is handed to the collector: one a cancelled collector never got comes again.
      */
-    fun asFlow(): Flow<WseItem> = flow {
-        reading {
+    fun asFlow(): Flow<WseItem> = Items()
+
+    // Not the flow builder: its emit checks for cancellation before the collector runs, so a
+    // collector cancelled from another thread right then would lose an item already taken.
+    private inner class Items : Flow<WseItem> {
+        override suspend fun collect(collector: FlowCollector<WseItem>) = reading {
             while (true) {
                 val item = peek() ?: return@reading
                 // Cancelled before the hand-over: the item stays for the next reader.
                 currentCoroutineContext().ensureActive()
+                handingOver?.invoke(item)
+                // From here on nothing checks or suspends before the collector has it.
                 index++
-                emit(item)
+                collector.emit(item)
             }
         }
     }

@@ -177,6 +177,40 @@ class WseClientTest {
     }
 
     @Test
+    fun aCollectorCancelledAsAnItemIsHandedOverGetsIt(): Unit = runBlocking {
+        val client = connectClient(WseConfig(url = url, topics = listOf("ticks"), insecure = true))
+        val events = client.events()
+        // Several ticks wait in one batch.
+        delay(700)
+        var cancelledAt: ULong? = null
+        val got = mutableListOf<ULong>()
+        val collector = launch {
+            val job = coroutineContext.job
+            // Another thread cancels the collector just as the first tick goes out.
+            events.handingOver = { item ->
+                if (cancelledAt == null && item is WseItem.Message && item.message.topic == "ticks") {
+                    cancelledAt = item.message.offset
+                    job.cancel()
+                }
+            }
+            events.asFlow().collect { item ->
+                if (item is WseItem.Message && item.message.topic == "ticks") got += checkNotNull(item.message.offset)
+            }
+        }
+        collector.join()
+        events.handingOver = null
+        var next: ULong? = null
+        while (next == null) {
+            val item = events.next() ?: break
+            if (item is WseItem.Message && item.message.topic == "ticks") next = item.message.offset
+        }
+        // The tick it was cancelled at reached it, and the next reader goes on after it.
+        val at = checkNotNull(cancelledAt)
+        assertEquals(listOf(at, at + 1u), got + listOfNotNull(next))
+        client.disconnect(1_000u)
+    }
+
+    @Test
     fun everyCallReadsOneStreamOneReaderAtATime(): Unit = runBlocking {
         // No topics: past its first items the server stays quiet.
         val client = connectClient(WseConfig(url = url, insecure = true))
