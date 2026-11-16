@@ -11,7 +11,7 @@
 
 import { createContext, createElement, useContext, useEffect, useRef, useSyncExternalStore } from 'react';
 import type { ReactNode } from 'react';
-import type { WSEClient, WSEClientSnapshot } from '../core/client.js';
+import type { Lease, WSEClient, WSEClientSnapshot } from '../core/client.js';
 import type { WSMessage } from '../types.js';
 
 export * from '../core/index.js';
@@ -54,10 +54,21 @@ export function useWSEState(client?: WSEClient): WSEClientSnapshot {
 export function useWSETopics(topics: string[], client?: WSEClient): void {
   const c = useClient(client, 'useWSETopics');
   const key = JSON.stringify([...new Set(topics)].sort());
+  const held = useRef<Lease | null>(null);
+  // A new list is taken before the old one is let go: a topic in both stays
+  // subscribed, with its recovery position.
   useEffect(() => {
-    const lease = c.subscribe(JSON.parse(key) as string[]);
-    return () => lease.release();
+    const previous = held.current;
+    held.current = c.subscribe(JSON.parse(key) as string[]);
+    previous?.release();
   }, [c, key]);
+  useEffect(
+    () => () => {
+      held.current?.release();
+      held.current = null;
+    },
+    [],
+  );
 }
 
 /** Hear the messages of `type` while the component is mounted; `handler` may change each render. */

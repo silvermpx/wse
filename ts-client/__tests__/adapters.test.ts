@@ -55,6 +55,30 @@ describe('react', () => {
     await vi.advanceTimersByTimeAsync(10);
     expect(FakeWebSocket.last().closeCalls.length).toBeGreaterThan(0);
   });
+
+  it('a changed topic list keeps the topics it still holds', async () => {
+    function Topics({ topics }: { topics: string[] }) {
+      useWSETopics(topics);
+      return null;
+    }
+    const tree = (topics: string[]) => createElement(WSEProvider, { client }, createElement(Topics, { topics }));
+    const view = render(tree(['a', 'b']));
+    await act(async () => {
+      await tick();
+    });
+    await act(async () => {
+      await connectServer(FakeWebSocket.last());
+    });
+    view.rerender(tree(['a', 'b', 'c']));
+    await act(async () => {
+      await tick();
+    });
+    const updates = FakeWebSocket.last()
+      .messagesOfType('subscription_update')
+      .map((m) => `${m.p.action}:${[...m.p.topics].sort().join(',')}`);
+    // Topics a and b are never let go, so they keep their recovery positions.
+    expect(updates).toEqual(['subscribe:a,b', 'subscribe:c']);
+  });
 });
 
 describe('vue', () => {
