@@ -19,10 +19,22 @@
   no Rust. `Wse` is the client for Java, on the JVM and on Android: futures
   for the calls that wait, builders for the configuration, the events read
   one at a time, and plain numbers where the Kotlin API has unsigned ones.
+- Rust client: the recover-or-resync delivery for every Rust application,
+  natively and in the browser; it was the Swift, Kotlin and Dart packages'
+  only. `Config::delivery` with a `Delivery`, `Event::Resync`,
+  `Event::Continuity` and `Event::CheckpointRejected`, and
+  `Client::topic_states`, `commit`, `checkpoint`, `resynced` and `resync`,
+  through the events stream and through a handler (which may resync from
+  itself). The mobile packages run on the same code now.
 - TypeScript: `wake()` and `close(deadlineMs)` for a client without a page
   (Node, Electron's main process, a worker): `wake()` connects at once when
   the application hears the network or the machine is back, and `close`
   sends what the client holds within the deadline before it ends.
+
+### Changed
+
+- Rust client: the events stream and a handler hear `Event::Continuity` when
+  a topic's messages break off, in best effort too.
 
 ### Fixed
 

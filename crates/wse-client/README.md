@@ -151,6 +151,55 @@ client
 # }
 ```
 
+## Where every fact counts
+
+`Config::delivery` with a `Delivery` (recover-or-resync) holds a topic that
+is not continuous -- from a cold start, after every reconnect, after a break
+-- until the application brought its state of it up to date: an
+`Event::Resync` asks for it, and `Client::resynced(round)` hands on what was
+held, in order. After applying a message the application calls
+`client.commit(&message)`; `client.checkpoint()` is what to save with its own
+state and give back as `Delivery::checkpoint`, and recovery starts from it,
+so a message can come twice: apply a repeat safely. A checkpoint of another
+realm, user, consumer or schema is refused aloud (`Event::CheckpointRejected`),
+and a message handed out before the events showed another user counts for
+nobody when it is committed.
+
+```rust,no_run
+# async fn run() -> Result<(), wse_client::Error> {
+use wse_client::{Delivery, Event, Incoming};
+
+let mut config = wse_client::Config::new("wss://example.com/wse");
+config.topics = vec!["orders".into()];
+let mut delivery = Delivery::new("board");
+delivery.checkpoint = None; // what the application saved last
+config.delivery = Some(delivery);
+let (client, mut events) = wse_client::connect(config).await?;
+while let Some(item) = events.next().await {
+    match item {
+        Incoming::Event(Event::Resync(resync)) => {
+            // Load the state of resync.topics, then:
+            client.resynced(resync.round)?;
+        }
+        Incoming::Message(message) => {
+            // Apply it, then:
+            client.commit(&message.as_message());
+            // ...and save client.checkpoint() with the application's state.
+        }
+        _ => {}
+    }
+}
+# Ok(())
+# }
+```
+
+A handler works the same, and may call `resynced` itself: what was held comes
+once it returns. `Event::Continuity` says how a topic's continuity changes and
+`Client::topic_states()` where each topic stands; without a delivery (best
+effort) nothing is held, and the states and the checkpoint are kept all the
+same. It is the delivery of the TypeScript client and of the Swift, Kotlin
+and Dart packages, natively and in the browser.
+
 ## In the browser
 
 The same crate builds for `wasm32-unknown-unknown`, for applications in

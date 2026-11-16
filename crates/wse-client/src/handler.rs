@@ -4,6 +4,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+use crate::delivery::{Continuity, StreamPosition};
 use crate::error::Error;
 use crate::message::{Message, Position};
 
@@ -86,9 +87,58 @@ pub enum Event {
     Gap(Gap),
     /// An `error` message from the server.
     ServerError(ServerError),
+    /// recover-or-resync ([`Config::delivery`]): the topics wait for the
+    /// application to bring its state of them up to date;
+    /// [`Client::resynced`] with the round then hands on what they held.
+    ///
+    /// [`Config::delivery`]: crate::Config::delivery
+    /// [`Client::resynced`]: crate::Client::resynced
+    Resync(Resync),
+    /// A topic's continuity changed: its messages run without a break, or
+    /// they broke off and the application's state of it is to be brought up
+    /// to date.
+    Continuity(TopicContinuity),
+    /// The checkpoint the delivery was given is not this client's (its
+    /// realm, user, consumer or schema differs), or not one at all: recovery
+    /// starts without it.
+    CheckpointRejected(CheckpointRejected),
     /// The client stopped for good: closed by the application (`None`), or
     /// the reason.
     Closed(Option<Error>),
+}
+
+/// Topics waiting for the application to bring its state of them up to date.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Resync {
+    /// What to give [`Client::resynced`](crate::Client::resynced) once the
+    /// application's state of the topics is up to date.
+    pub round: u64,
+    pub topics: Vec<String>,
+    /// Why, for each topic in order: `cold_start`, `reconnected`,
+    /// `requested`, `overflow`, or the reason of the gap.
+    pub reasons: Vec<String>,
+    /// Where the consumer stands in each stream of the topics: what it
+    /// committed it applied.
+    pub committed: Vec<StreamPosition>,
+}
+
+/// A topic's continuity, as it changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TopicContinuity {
+    pub topic: String,
+    pub continuity: Continuity,
+    /// Why it is not continuous.
+    pub reason: Option<String>,
+}
+
+/// Why the delivery's checkpoint was not taken: `malformed`, `version`,
+/// `realm`, `user`, `consumer` or `schema`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CheckpointRejected {
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,6 +231,21 @@ pub enum GapReason {
     EpochChanged,
     /// The client stopped while waiting.
     Closed,
+}
+
+impl GapReason {
+    /// The reason as the other clients name it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Overflow => "overflow",
+            Self::NotRecovered => "not_recovered",
+            Self::Unavailable => "unavailable",
+            Self::Incomplete => "incomplete",
+            Self::EpochChanged => "epoch_changed",
+            Self::Closed => "closed",
+        }
+    }
 }
 
 /// An `error` message from the server.

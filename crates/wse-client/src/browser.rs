@@ -225,7 +225,7 @@ pub(crate) struct Driver<H> {
 impl<H: Handler> Driver<H> {
     pub(crate) fn new(
         config: Config,
-        handler: H,
+        handler: crate::delivery::Delivered<H>,
         shared: Arc<Shared>,
         keys: Arc<Keys>,
         frames: mpsc::Receiver<Queued>,
@@ -329,6 +329,7 @@ impl<H: Handler> Driver<H> {
                         }
                         Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                         Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
+                        Some(Control::Drain) => self.session.handler.drain(),
                     },
                     token = &mut fetch => break token,
                     _ = sleep_until(Some(deadline)) => {
@@ -363,6 +364,7 @@ impl<H: Handler> Driver<H> {
                     }
                     Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                     Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
+                    Some(Control::Drain) => self.session.handler.drain(),
                 },
                 // What is held for a gap is not held past its wait.
                 () = sleep_until(self.session.next_deadline()) => {
@@ -406,6 +408,7 @@ impl<H: Handler> Driver<H> {
                 Some(Control::Reconnect) => {}
                 Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                 Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
+                Some(Control::Drain) => self.session.handler.drain(),
             }
         }
         true
@@ -430,6 +433,7 @@ impl<H: Handler> Driver<H> {
                     }
                     Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                     Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
+                    Some(Control::Drain) => self.session.handler.drain(),
                 },
                 _ = sleep_until(Some(until)) => return true,
                 () = sleep_until(self.session.next_deadline()) => {
@@ -512,6 +516,7 @@ impl<H: Handler> Driver<H> {
                     }
                     Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                     Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
+                    Some(Control::Drain) => self.session.handler.drain(),
                 },
                 happened = socket.events.recv() => {
                     // What already came is taken in one go, up to a batch.

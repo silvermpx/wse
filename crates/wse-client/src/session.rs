@@ -14,6 +14,7 @@ use web_time::Instant;
 
 use crate::client::{Queued, Shared};
 use crate::decode::{self, Envelope, epoch_of};
+use crate::delivery::Delivered;
 use crate::error::Error;
 use crate::handler::{
     Connected, Event, Gap, GapReason, Handler, Recovery, ServerError, Subscribed,
@@ -85,7 +86,9 @@ pub(crate) enum Outgoing {
 }
 
 pub(crate) struct Session<H> {
-    pub(crate) handler: H,
+    /// The application's handler, behind the delivery's gate where the
+    /// client was made with one.
+    pub(crate) handler: Delivered<H>,
     shared: Arc<Shared>,
     recovery_timeout: Duration,
     /// Topics the client subscribed to: subscribed again on every
@@ -147,7 +150,7 @@ pub(crate) struct Session<H> {
 
 impl<H: Handler> Session<H> {
     pub(crate) fn new(
-        handler: H,
+        handler: Delivered<H>,
         shared: Arc<Shared>,
         keys: Arc<Keys>,
         topics: &[String],
@@ -1524,7 +1527,7 @@ mod tests {
         let shared = Arc::new(Shared::new(None));
         let keys = Arc::new(Keys::from_config(&crate::Config::new("ws://x")).unwrap());
         let mut session = Session::new(
-            Seen::default(),
+            Delivered::new(Seen::default(), None),
             shared,
             keys,
             &["t".to_owned()],
@@ -1581,6 +1584,7 @@ mod tests {
     fn gaps(session: &Session<Seen>) -> Vec<(Option<u64>, Option<u64>, GapReason)> {
         session
             .handler
+            .inner
             .events
             .iter()
             .filter_map(|e| match e {
@@ -1610,7 +1614,7 @@ mod tests {
         s.on_unsealed(Some(
             r#"{"t":"ping","tp":"t","e":"0000000a","o":18446744073709551615,"p":{}}"#,
         ));
-        assert!(s.handler.offsets.is_empty());
+        assert!(s.handler.inner.offsets.is_empty());
         assert!(
             s.topics
                 .get("t")
@@ -1626,7 +1630,7 @@ mod tests {
             None,
         );
         feed(&mut s, E, &[1]);
-        assert_eq!(s.handler.offsets, [1]);
+        assert_eq!(s.handler.inner.offsets, [1]);
     }
 
     #[test]
@@ -1660,7 +1664,7 @@ mod tests {
         );
         // 3 and 4 come again, and are taken.
         feed(&mut s, E, &[3, 4, 5]);
-        assert_eq!(s.handler.offsets, [1, 2, 3, 4, 3, 4, 5]);
+        assert_eq!(s.handler.inner.offsets, [1, 2, 3, 4, 3, 4, 5]);
     }
 
     #[test]
@@ -1671,7 +1675,7 @@ mod tests {
         feed(&mut s, E, &[1, 3]);
         // The replay fills the hole before its answer comes.
         feed(&mut s, E, &[2]);
-        assert_eq!(s.handler.offsets, [1, 2, 3]);
+        assert_eq!(s.handler.inner.offsets, [1, 2, 3]);
         // Another hole, another request.
         feed(&mut s, E, &[5]);
         assert_eq!(sent(&mut s).len(), 2);
@@ -1680,7 +1684,7 @@ mod tests {
         assert!(gaps(&s).is_empty());
         feed(&mut s, E, &[4]);
         reply(&mut s, E, 5, true, 1);
-        assert_eq!(s.handler.offsets, [1, 2, 3, 4, 5]);
+        assert_eq!(s.handler.inner.offsets, [1, 2, 3, 4, 5]);
         assert!(gaps(&s).is_empty());
         assert_eq!(s.next_deadline(), None);
     }
@@ -1701,7 +1705,7 @@ mod tests {
         feed(&mut s, F, &[2]);
         reply(&mut s, E, 3, true, 1);
         reply(&mut s, F, 3, true, 1);
-        assert_eq!(s.handler.offsets, [1, 1, 2, 3, 2, 3]);
+        assert_eq!(s.handler.inner.offsets, [1, 1, 2, 3, 2, 3]);
         assert!(gaps(&s).is_empty());
         assert_eq!(s.next_deadline(), None);
     }
@@ -1724,7 +1728,7 @@ mod tests {
         );
         feed(&mut s, E, &[3, 4]);
         reply(&mut s, E, 4, true, 2);
-        assert_eq!(s.handler.offsets, [1, 2, 3, 4, 5]);
+        assert_eq!(s.handler.inner.offsets, [1, 2, 3, 4, 5]);
         assert!(gaps(&s).is_empty());
     }
 
@@ -1757,13 +1761,13 @@ mod tests {
             r#"{"t":"signed","tp":"t","e":"0000000a","o":1,"sb":"{\"t\":\"fill\",\"p\":{}}","sig":"AA","kid":"k"}"#,
             None,
         );
-        assert!(s.handler.offsets.is_empty());
+        assert!(s.handler.inner.offsets.is_empty());
         // Signed for the topic it came on: taken.
         s.on_json(
             r#"{"t":"signed","tp":"t","e":"0000000a","o":1,"sb":"{\"t\":\"fill\",\"tp\":\"t\",\"p\":{}}","sig":"AA","kid":"k"}"#,
             None,
         );
-        assert_eq!(s.handler.offsets, [1]);
+        assert_eq!(s.handler.inner.offsets, [1]);
     }
 
     #[test]
@@ -1772,7 +1776,7 @@ mod tests {
         ready(&mut s, true);
         assert_eq!(sent(&mut s)[0]["p"]["topics"], serde_json::json!(["t"]));
         feed(&mut s, E, &[1, 2, 4, 5]);
-        assert_eq!(s.handler.offsets, [1, 2]);
+        assert_eq!(s.handler.inner.offsets, [1, 2]);
         // The client asks from the last one it has.
         let request = sent(&mut s);
         assert_eq!(
@@ -1785,11 +1789,11 @@ mod tests {
             r#"{"c":"WSE","t":"subscription_update","p":{"success_topics":["t"],"failed_topics":[],"recovery":{"t":{"epoch":"0000000a","offset":5,"recovered":true,"count":3}}}}"#,
             None,
         );
-        assert_eq!(s.handler.offsets, [1, 2, 3, 4, 5]);
+        assert_eq!(s.handler.inner.offsets, [1, 2, 3, 4, 5]);
         assert!(gaps(&s).is_empty());
         assert_eq!(s.next_deadline(), None);
         feed(&mut s, E, &[6]);
-        assert_eq!(s.handler.offsets, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(s.handler.inner.offsets, [1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
@@ -1797,12 +1801,12 @@ mod tests {
         let mut s = session(Duration::from_secs(3));
         ready(&mut s, true);
         feed(&mut s, E, &[1, 3, 4]);
-        assert_eq!(s.handler.offsets, [1]);
+        assert_eq!(s.handler.inner.offsets, [1]);
         s.on_deadline(Instant::now() + Duration::from_secs(4));
-        assert_eq!(s.handler.offsets, [1, 3, 4]);
+        assert_eq!(s.handler.inner.offsets, [1, 3, 4]);
         assert_eq!(gaps(&s), [(Some(2), Some(2), GapReason::Timeout)]);
         feed(&mut s, E, &[5]);
-        assert_eq!(s.handler.offsets, [1, 3, 4, 5]);
+        assert_eq!(s.handler.inner.offsets, [1, 3, 4, 5]);
     }
 
     #[test]
@@ -1810,7 +1814,7 @@ mod tests {
         let mut s = session(Duration::from_secs(3));
         ready(&mut s, false);
         feed(&mut s, E, &[1, 4, 4, 5]);
-        assert_eq!(s.handler.offsets, [1, 4, 5]);
+        assert_eq!(s.handler.inner.offsets, [1, 4, 5]);
         assert_eq!(gaps(&s), [(Some(2), Some(3), GapReason::Unavailable)]);
     }
 
@@ -1841,6 +1845,7 @@ mod tests {
         assert_eq!(gaps(&s), [(None, None, GapReason::EpochChanged)]);
         let Some(Event::Connected(again)) = s
             .handler
+            .inner
             .events
             .iter()
             .rev()
@@ -1865,7 +1870,7 @@ mod tests {
         assert_eq!(request[0]["p"].get("recovery"), None);
         // Where the last user's stream stood holds nothing back.
         feed(&mut s, E, &[1]);
-        assert_eq!(s.handler.offsets, [1, 2, 1]);
+        assert_eq!(s.handler.inner.offsets, [1, 2, 1]);
     }
 
     /// The server's answer for `t`, listing its streams (from 3.1).
@@ -1918,7 +1923,7 @@ mod tests {
         sent(&mut s);
         reply_streams(&mut s, false, &[(F, 5)]);
         feed(&mut s, F, &[3, 5, 6]);
-        assert_eq!(s.handler.offsets, [6]);
+        assert_eq!(s.handler.inner.offsets, [6]);
         assert!(gaps(&s).is_empty());
     }
 
@@ -1939,7 +1944,7 @@ mod tests {
             ]
         );
         feed(&mut s, E, &[6]);
-        assert_eq!(s.handler.offsets, [1, 2, 4, 6]);
+        assert_eq!(s.handler.inner.offsets, [1, 2, 4, 6]);
         // F is forgotten: not named again.
         let request = reconnect(&mut s);
         assert_eq!(
@@ -1988,6 +1993,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn the_clocks_tell_a_sleep_longer_than_a_beat() {
         let beat = Duration::from_secs(15);
         let wall = web_time::UNIX_EPOCH + Duration::from_secs(1_000_000);
@@ -2016,6 +2022,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn a_clock_set_back_or_a_short_skew_is_no_sleep() {
         let beat = Duration::from_secs(15);
         let wall = web_time::UNIX_EPOCH + Duration::from_secs(1_000_000);
@@ -2119,7 +2126,7 @@ mod tests {
         let requests = sent(&mut s);
         assert_eq!(requests.last().unwrap()["p"].get("recovery"), None);
         feed(&mut s, E, &[9]);
-        assert_eq!(s.handler.offsets, [1, 2, 9]);
+        assert_eq!(s.handler.inner.offsets, [1, 2, 9]);
         assert!(gaps(&s).is_empty());
     }
 
@@ -2185,7 +2192,7 @@ mod tests {
         let shared = Arc::new(Shared::new(None));
         let keys = Arc::new(Keys::from_config(&crate::Config::new("ws://x")).unwrap());
         let mut s = Session::new(
-            Decode(0.0),
+            Delivered::new(Decode(0.0), None),
             shared,
             keys,
             &[],
@@ -2214,7 +2221,7 @@ mod tests {
         let value = started.elapsed().as_nanos() as f64 / n as f64;
         println!(
             "per message: session {all:.0} ns (envelope {envelope:.0} ns); a serde_json::Value {value:.0} ns [{kinds} {}]",
-            s.handler.0
+            s.handler.inner.0
         );
     }
 }

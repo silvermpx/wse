@@ -72,6 +72,8 @@ pub struct Message<'a> {
     /// The frame the message was read from, when it is one the message can
     /// keep without a copy.
     pub(crate) frame: Option<&'a Bytes>,
+    /// The user generation it was handed out in: a commit counts in it only.
+    pub(crate) generation: u32,
 }
 
 impl<'a> Message<'a> {
@@ -163,6 +165,7 @@ impl<'a> Message<'a> {
                 Payload::Json(text) => OwnedPayload::Json(keep_str(frame, text)),
                 Payload::Msgpack(bytes) => OwnedPayload::Msgpack(keep(frame, bytes)),
             },
+            generation: self.generation,
         }
     }
 }
@@ -236,9 +239,29 @@ pub struct OwnedMessage {
     priority: Option<u8>,
     signature: Option<Arc<Signature>>,
     payload: OwnedPayload,
+    /// The user generation it was handed out in.
+    pub(crate) generation: u32,
 }
 
 impl OwnedMessage {
+    /// A message of `kind` on `topic` at `position`, without a payload.
+    #[cfg(test)]
+    pub(crate) fn for_test(kind: &str, topic: Option<&str>, position: Option<Position>) -> Self {
+        Self {
+            kind: Text(ByteString::from(kind)),
+            category: None,
+            topic: topic.map(|t| Text(ByteString::from(t))),
+            id: None,
+            correlation_id: None,
+            timestamp: None,
+            position,
+            priority: None,
+            signature: None,
+            payload: OwnedPayload::None,
+            generation: 0,
+        }
+    }
+
     /// The message type (`t`).
     pub fn kind(&self) -> &str {
         self.kind.as_str()
@@ -333,6 +356,7 @@ impl OwnedMessage {
             payload: self.payload_ref(),
             signature: self.signature.clone(),
             frame: None,
+            generation: self.generation,
         }
     }
 }

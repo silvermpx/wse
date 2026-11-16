@@ -18,7 +18,7 @@ use serde_json::json;
 use wasm_bindgen_test::wasm_bindgen_test;
 #[cfg(feature = "aws-lc")]
 use wse_client::Encryption;
-use wse_client::{Config, Event, Events, Incoming, OwnedMessage};
+use wse_client::{Config, Continuity, Delivery, Event, Events, Incoming, OwnedMessage, Resync};
 
 const URL: Option<&str> = option_env!("WSE_TEST_URL");
 #[cfg(feature = "aws-lc")]
@@ -54,6 +54,57 @@ async fn message(events: &mut Events, kind: &str) -> OwnedMessage {
             return message;
         }
     }
+}
+
+async fn resync(events: &mut Events) -> Resync {
+    loop {
+        if let Incoming::Event(Event::Resync(resync)) = next(events).await {
+            return resync;
+        }
+    }
+}
+
+#[wasm_bindgen_test]
+async fn recover_or_resync_in_the_browser() {
+    let url = given(URL, "WSE_TEST_URL");
+    let mut config = Config::new(url);
+    config.topics = vec!["ticks".into()];
+    config.delivery = Some(Delivery::new("board"));
+    let (client, mut events) = wse_client::connect(config).await.unwrap();
+    // A cold start: the topic is held until the application resynced it.
+    let cold = resync(&mut events).await;
+    assert_eq!(cold.reasons, ["cold_start"]);
+    // Ticks come ten times a second; none reaches the application while it
+    // loads its state.
+    gloo_timers::future::sleep(Duration::from_millis(300)).await;
+    while let Some(item) = events.try_next() {
+        assert!(!matches!(item, Incoming::Message(_)), "held: {item:?}");
+    }
+    client.resynced(cold.round).unwrap();
+    let first = message(&mut events, "tick").await;
+    let second = message(&mut events, "tick").await;
+    let (a, b) = (first.position().unwrap(), second.position().unwrap());
+    assert_eq!(b.offset, a.offset + 1, "what was held, in order");
+    assert_eq!(client.topic_states()[0].continuity, Continuity::Continuous);
+    // Applied in order: the checkpoint moves through both.
+    client.commit(&first.as_message());
+    client.commit(&second.as_message());
+    let saved: serde_json::Value = serde_json::from_str(&client.checkpoint()).unwrap();
+    assert_eq!(
+        saved["topics"]["ticks"][format!("{:08x}", b.epoch)],
+        b.offset
+    );
+
+    // A reconnect resyncs, and recovery starts from what was committed: the
+    // tick after it comes again.
+    client.reconnect().unwrap();
+    let again = resync(&mut events).await;
+    assert_eq!(again.reasons, ["reconnected"]);
+    assert_eq!(again.committed[0].offset, b.offset);
+    client.resynced(again.round).unwrap();
+    let next_one = message(&mut events, "tick").await;
+    assert_eq!(next_one.position().unwrap().offset, b.offset + 1);
+    client.close().await;
 }
 
 #[wasm_bindgen_test]

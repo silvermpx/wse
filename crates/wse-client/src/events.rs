@@ -2,11 +2,14 @@
 //! application that reads them in a loop.
 
 use std::collections::VecDeque;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use tokio::sync::mpsc;
 
 use crate::client::Client;
 use crate::config::Config;
+use crate::delivery;
 use crate::error::Error;
 use crate::handler::{Event, Handler};
 use crate::message::{Message, OwnedMessage};
@@ -24,9 +27,22 @@ pub enum Incoming {
 /// What the server sends, in order. While the application does not read,
 /// the client stops reading too and the server holds back; in the browser,
 /// which cannot hold a WebSocket back, what comes waits in memory.
-#[derive(Debug)]
+///
+/// The delivery ([`Config::delivery`]) sees what is read in the order it is
+/// read: a message read before the events show another user is the last
+/// user's, and a topic not continuous holds its messages here until
+/// [`Client::resynced`].
 pub struct Events {
     rx: Receiver,
+    gate: delivery::Shared,
+    /// Says that the gate made something (held messages handed on).
+    wake: mpsc::UnboundedReceiver<()>,
+}
+
+impl std::fmt::Debug for Events {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Events").finish_non_exhaustive()
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -42,24 +58,70 @@ impl Events {
     /// The next message or event; `None` once the client stopped and
     /// everything was read.
     pub async fn next(&mut self) -> Option<Incoming> {
-        self.rx.recv().await
+        futures_util::future::poll_fn(|cx| self.poll(cx)).await
     }
 
     /// What came already, without waiting: None when nothing is waiting
     /// now (or the stream ended).
     pub fn try_next(&mut self) -> Option<Incoming> {
-        self.rx.try_recv().ok()
+        while self.wake.try_recv().is_ok() {}
+        loop {
+            if let Some(item) = delivery::lock(&self.gate).take_out() {
+                return Some(item);
+            }
+            let incoming = self.rx.try_recv().ok()?;
+            if let Some(item) = self.pass(incoming) {
+                return Some(item);
+            }
+        }
+    }
+
+    /// One item read, through the delivery's gate: None when it holds it.
+    /// Taken and passed without a wait, so a read given up loses nothing.
+    fn pass(&mut self, incoming: Incoming) -> Option<Incoming> {
+        let mut gate = delivery::lock(&self.gate);
+        match incoming {
+            Incoming::Message(message) => gate.owned(message).map(Incoming::Message),
+            Incoming::Event(event) => {
+                gate.event(&event);
+                Some(Incoming::Event(event))
+            }
+            binary => Some(binary),
+        }
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<Incoming>> {
+        loop {
+            // What the gate made comes first: it is older than what waits.
+            if let Some(item) = delivery::lock(&self.gate).take_out() {
+                return Poll::Ready(Some(item));
+            }
+            // A wake only says to look again; its waker stays registered.
+            while let Poll::Ready(Some(())) = self.wake.poll_recv(cx) {}
+            match self.rx.poll_recv(cx) {
+                Poll::Ready(Some(incoming)) => {
+                    if let Some(item) = self.pass(incoming) {
+                        return Poll::Ready(Some(item));
+                    }
+                }
+                Poll::Ready(None) => return Poll::Ready(delivery::lock(&self.gate).take_out()),
+                Poll::Pending => {
+                    // Made while the queue was looked at.
+                    return match delivery::lock(&self.gate).take_out() {
+                        Some(item) => Poll::Ready(Some(item)),
+                        None => Poll::Pending,
+                    };
+                }
+            }
+        }
     }
 }
 
 impl futures_util::Stream for Events {
     type Item = Incoming;
 
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Incoming>> {
-        self.rx.poll_recv(cx)
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Incoming>> {
+        self.poll(cx)
     }
 }
 
@@ -78,8 +140,9 @@ pub async fn connect(config: Config) -> Result<(Client, Events), Error> {
         tx,
         waiting: VecDeque::new(),
     };
-    let client = Client::connect(config, queue).await?;
-    Ok((client, Events { rx }))
+    let (wake_tx, wake) = mpsc::unbounded_channel();
+    let (client, gate) = Client::start(config, |_| queue, Some(wake_tx)).await?;
+    Ok((client, Events { rx, gate, wake }))
 }
 
 /// A handler that puts everything in the stream's queue.

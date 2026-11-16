@@ -18,9 +18,7 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use crate::{
-    Config, Error, Event, Events, GapReason, Incoming, OwnedMessage, Status, TokenProvider,
-};
+use crate::{Config, Error, Event, Events, Incoming, OwnedMessage, Status, TokenProvider};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -241,8 +239,9 @@ pub struct NativeTopicState {
     pub topic: String,
     pub subscription: NativeSubscription,
     pub continuity: NativeContinuity,
-    /// Why it is not continuous: cold_start, reconnected, offset_gap,
-    /// not_recovered, epoch_changed, overflow, requested, ...
+    /// Why it is not continuous: cold_start, reconnected, requested,
+    /// overflow, or the reason of the gap (timeout, not_recovered,
+    /// epoch_changed, ...).
     pub reason: Option<String>,
 }
 
@@ -279,7 +278,6 @@ pub trait TokenSource: Send + Sync + 'static {
 fn config_of(
     native: NativeConfig,
     tokens: Option<Arc<dyn TokenSource>>,
-    delivery: &Arc<std::sync::Mutex<crate::delivery::Delivery>>,
 ) -> Result<Config, NativeError> {
     if native.url.starts_with("ws://") && !native.insecure {
         return Err(NativeError::new(
@@ -294,13 +292,14 @@ fn config_of(
         .transpose()?;
     let mut config = Config::new(native.url);
     config.tls = tls;
-    if native.delivery.is_some() {
-        // Recovery starts from what the application committed.
-        let delivery = Arc::clone(delivery);
-        config.committed = Some(Arc::new(move |user| {
-            delivery.lock().ok().and_then(|mut d| d.committed(user))
-        }));
-    }
+    config.delivery = native.delivery.map(|native| {
+        let mut delivery = crate::Delivery::new(native.consumer);
+        delivery.schema = native.schema;
+        delivery.realm = native.realm;
+        delivery.checkpoint = native.checkpoint;
+        delivery.max_held = native.max_held as usize;
+        delivery
+    });
     config.token = native.token;
     if let Some(source) = tokens {
         config.token_provider = Some(TokenProvider::new(move || source.token()));
@@ -611,18 +610,6 @@ impl Item {
     }
 }
 
-fn gap_reason(reason: GapReason) -> &'static str {
-    match reason {
-        GapReason::Timeout => "timeout",
-        GapReason::Overflow => "overflow",
-        GapReason::NotRecovered => "not_recovered",
-        GapReason::Unavailable => "unavailable",
-        GapReason::Incomplete => "incomplete",
-        GapReason::EpochChanged => "epoch_changed",
-        GapReason::Closed => "closed",
-    }
-}
-
 fn message_of(message: &OwnedMessage) -> NativeMessage {
     let position = message.position();
     // The same payload reads the same in either format: none (absent or
@@ -651,7 +638,23 @@ fn message_of(message: &OwnedMessage) -> NativeMessage {
             kid: s.kid.clone(),
             verified: s.verified,
         }),
-        generation: 0,
+        generation: message.generation,
+    }
+}
+
+fn subscription_of(subscription: crate::Subscription) -> NativeSubscription {
+    match subscription {
+        crate::Subscription::Requested => NativeSubscription::Requested,
+        crate::Subscription::Active => NativeSubscription::Active,
+        crate::Subscription::Denied => NativeSubscription::Denied,
+    }
+}
+
+fn continuity_of(continuity: crate::Continuity) -> NativeContinuity {
+    match continuity {
+        crate::Continuity::Continuous => NativeContinuity::Continuous,
+        crate::Continuity::ResyncRequired => NativeContinuity::ResyncRequired,
+        crate::Continuity::Resyncing => NativeContinuity::Resyncing,
     }
 }
 
@@ -687,7 +690,7 @@ fn item_of(incoming: Incoming) -> Item {
                     .collect(),
             },
             Event::Gap(g) => Item::Gap {
-                reason: gap_reason(g.reason).to_owned(),
+                reason: g.reason.as_str().to_owned(),
                 topic: g.topic,
                 epoch: g.epoch,
                 first: g.first,
@@ -698,6 +701,26 @@ fn item_of(incoming: Incoming) -> Item {
                 message: e.message,
                 details_json: e.details.to_string(),
             },
+            Event::Resync(r) => Item::Resync {
+                round: r.round,
+                topics: r.topics,
+                reasons: r.reasons,
+                committed: r
+                    .committed
+                    .into_iter()
+                    .map(|p| StreamPosition {
+                        topic: p.topic,
+                        epoch: p.epoch,
+                        offset: p.offset,
+                    })
+                    .collect(),
+            },
+            Event::Continuity(c) => Item::Continuity {
+                topic: c.topic,
+                continuity: continuity_of(c.continuity),
+                reason: c.reason,
+            },
+            Event::CheckpointRejected(c) => Item::CheckpointRejected { reason: c.reason },
             Event::Closed(error) => Item::Closed {
                 error: error.map(NativeError::from),
             },
@@ -745,9 +768,6 @@ pub struct NativeClient {
     client: crate::Client,
     reader: Mutex<Reader>,
     closing: CancellationToken,
-    delivery: Arc<std::sync::Mutex<crate::delivery::Delivery>>,
-    /// Items the delivery made outside the events wake a waiting reader.
-    woken: Arc<tokio::sync::Notify>,
 }
 
 impl NativeClient {
@@ -758,10 +778,7 @@ impl NativeClient {
         tokens: Option<Arc<dyn TokenSource>>,
         cancel: &CancelToken,
     ) -> Result<Self, NativeError> {
-        let delivery =
-            crate::delivery::Delivery::new(config.delivery.clone(), &config.url, &config.topics)?;
-        let delivery = Arc::new(std::sync::Mutex::new(delivery));
-        let config = config_of(config, tokens, &delivery)?;
+        let config = config_of(config, tokens)?;
         let cancel = cancel.0.clone();
         let (client, events) = on_runtime(async move {
             tokio::select! {
@@ -779,49 +796,48 @@ impl NativeClient {
                 ended: false,
             }),
             closing: CancellationToken::new(),
-            delivery,
-            woken: Arc::new(tokio::sync::Notify::new()),
         })
-    }
-
-    fn delivery(&self) -> std::sync::MutexGuard<'_, crate::delivery::Delivery> {
-        self.delivery
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Each topic held: whether the server took it, and whether its
     /// messages run without a break.
     pub fn topic_states(&self) -> Vec<NativeTopicState> {
-        self.delivery().topic_states()
+        self.client
+            .topic_states()
+            .into_iter()
+            .map(|state| NativeTopicState {
+                topic: state.topic,
+                subscription: subscription_of(state.subscription),
+                continuity: continuity_of(state.continuity),
+                reason: state.reason,
+            })
+            .collect()
     }
 
     /// The consumer applied the message at `epoch`, `offset` of `topic`: the
     /// checkpoint moves on through what was applied without a hole.
     pub fn commit(&self, topic: &str, epoch: u32, offset: u64, generation: u32) {
-        self.delivery().commit(topic, epoch, offset, generation);
+        self.client.commit_at(topic, epoch, offset, generation);
     }
 
     /// What the consumer committed, bound to the realm, the user, the
     /// consumer and the schema: to save with the application's own state and
     /// give back as [`NativeDelivery::checkpoint`].
     pub fn checkpoint(&self) -> String {
-        self.delivery().checkpoint()
+        self.client.checkpoint()
     }
 
     /// recover-or-resync: the application brought the topics of `round` up
     /// to date; what they held comes next.
     pub fn resynced(&self, round: u64) {
-        self.delivery().resynced(round);
-        self.woken.notify_one();
+        let _ = self.client.resynced(round);
     }
 
     /// Bring `topics` up to date: in recover-or-resync a resync round asks
     /// for it; in best effort the application did so itself, and they read
     /// continuous again.
     pub fn resync(&self, topics: Vec<String>) {
-        self.delivery().resync(&topics);
-        self.woken.notify_one();
+        let _ = self.client.resync(topics);
     }
 
     /// Sends `{"t": kind, "p": json}`; fails at once when the queue is full.
@@ -905,12 +921,10 @@ impl NativeClient {
     }
 
     pub fn subscribe(&self, topics: Vec<String>) -> Result<(), NativeError> {
-        self.delivery().track(&topics);
         Ok(self.client.subscribe(topics)?)
     }
 
     pub fn unsubscribe(&self, topics: Vec<String>) -> Result<(), NativeError> {
-        self.delivery().untrack(&topics);
         Ok(self.client.unsubscribe(topics)?)
     }
 
@@ -984,43 +998,36 @@ impl NativeClient {
         let max_bytes = max_bytes.max(1) as usize;
         let id = reader.next_id;
         reader.next_id += 1;
-        // What the delivery holds is safe with it; what it hands out goes into
-        // this batch before anything awaits again, as far as the batch has
-        // room (the first item may be larger than max_bytes alone).
+        // The events' delivery holds what it holds; one read off them goes
+        // into this batch before anything awaits again, as far as the batch
+        // has room (the first item may be larger than max_bytes alone).
         let mut batch = Room {
             items: Vec::new(),
             bytes: 0,
             max_items,
             max_bytes,
         };
-        loop {
-            self.delivery_out(&mut batch);
-            if !batch.items.is_empty() {
-                break;
-            }
-            let first = tokio::select! {
-                first = reader.events.next() => first,
-                () = self.woken.notified() => continue,
-                () = cancel.0.cancelled() => return Err(NativeError::new(ErrorKind::Cancelled, "next_batch was cancelled")),
-                () = self.closing.cancelled() => None,
+        let first = tokio::select! {
+            first = reader.events.next() => first,
+            () = cancel.0.cancelled() => return Err(NativeError::new(ErrorKind::Cancelled, "next_batch was cancelled")),
+            () = self.closing.cancelled() => None,
+        };
+        let Some(first) = first else {
+            reader.ended = true;
+            let batch = Batch {
+                id,
+                kind: BatchKind::End,
+                items: Vec::new(),
             };
-            let Some(first) = first else {
-                reader.ended = true;
-                let batch = Batch {
-                    id,
-                    kind: BatchKind::End,
-                    items: Vec::new(),
-                };
-                reader.pending = Some(batch.clone());
-                return Ok(batch);
-            };
-            self.take_into(item_of(first), &mut batch);
-        }
+            reader.pending = Some(batch.clone());
+            return Ok(batch);
+        };
+        batch.push(item_of(first));
         while batch.has_room() {
             let Some(incoming) = reader.events.try_next() else {
                 break;
             };
-            self.take_into(item_of(incoming), &mut batch);
+            batch.push(item_of(incoming));
         }
         let batch = Batch {
             id,
@@ -1029,36 +1036,6 @@ impl NativeClient {
         };
         reader.pending = Some(batch.clone());
         Ok(batch)
-    }
-
-    /// Items the delivery made outside the events, as far as `batch` has room.
-    fn delivery_out(&self, batch: &mut Room) {
-        let mut delivery = self.delivery();
-        while batch.has_room() {
-            match delivery.take_out() {
-                Some(item) => batch.push(item),
-                None => break,
-            }
-        }
-    }
-
-    /// The items one event makes, as far as `batch` has room; the rest waits
-    /// with the delivery, first in the next batch.
-    fn take_into(&self, event: Item, batch: &mut Room) {
-        let mut delivery = self.delivery();
-        let mut made = Vec::new();
-        delivery.take(event, &mut made);
-        let mut made = made.into_iter();
-        while batch.has_room() {
-            match made.next() {
-                Some(item) => batch.push(item),
-                None => return,
-            }
-        }
-        let rest: Vec<Item> = made.collect();
-        if !rest.is_empty() {
-            delivery.put_back(rest);
-        }
     }
 
     /// Closes the client: what was sent goes out first, within `deadline_ms`;

@@ -15,8 +15,6 @@ mod config;
 #[cfg(not(target_arch = "wasm32"))]
 mod connection;
 mod decode;
-/// The client as mobile bindings (Swift, Kotlin, Dart) need it.
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod delivery;
 mod error;
 mod events;
@@ -35,11 +33,12 @@ pub use client::{Client, Status};
 #[cfg(feature = "aws-lc")]
 pub use config::Encryption;
 pub use config::{Config, Format, Reconnect, TokenProvider};
+pub use delivery::{Continuity, Delivery, StreamPosition, Subscription, TopicState};
 pub use error::Error;
 pub use events::{Events, Incoming, connect};
 pub use handler::{
-    Connected, Disconnected, Event, Gap, GapReason, Handler, MaybeSend, Paused, Recovery,
-    ServerError, Subscribed,
+    CheckpointRejected, Connected, Disconnected, Event, Gap, GapReason, Handler, MaybeSend, Paused,
+    Recovery, Resync, ServerError, Subscribed, TopicContinuity,
 };
 pub use message::{Message, OwnedMessage, Position, Signature};
 #[cfg(feature = "aws-lc")]

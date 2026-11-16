@@ -268,6 +268,23 @@ fn run_hooks(root: &Path) -> bool {
     true
 }
 
+/// The toolchain cargo runs has the standard library of `target`.
+fn has_target(target: &str) -> bool {
+    Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .is_some_and(|sysroot| {
+            Path::new(sysroot.trim())
+                .join("lib/rustlib")
+                .join(target)
+                .join("lib")
+                .is_dir()
+        })
+}
+
 fn run_fast(root: &Path) -> bool {
     // CI's Rust lint job, then the xtask's own: format, then clippy with
     // warnings denied for every build the crates are made in.
@@ -311,6 +328,35 @@ fn run_fast(root: &Path) -> bool {
             args
         }),
     ];
+    // CI's browser build too, where this toolchain has the target.
+    let wasm = ["--target", "wasm32-unknown-unknown"];
+    let mut steps = steps;
+    if has_target("wasm32-unknown-unknown") {
+        steps.extend([
+            (
+                "clippy wse, browser",
+                clippy(&["-p", "wse", "--no-default-features", wasm[0], wasm[1]]),
+            ),
+            (
+                "clippy wse-client, browser",
+                clippy(&["-p", "wse-client", wasm[0], wasm[1]]),
+            ),
+            (
+                "clippy wse-client, browser, no default features",
+                clippy(&[
+                    "-p",
+                    "wse-client",
+                    "--no-default-features",
+                    wasm[0],
+                    wasm[1],
+                ]),
+            ),
+        ]);
+    } else {
+        println!(
+            "fast: no wasm32-unknown-unknown here (rustup target add it): CI checks the browser build"
+        );
+    }
     for (name, args) in steps {
         println!("== {name}");
         let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))

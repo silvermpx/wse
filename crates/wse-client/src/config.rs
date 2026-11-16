@@ -280,8 +280,13 @@ pub struct Config {
     /// End-to-end encryption; none by default.
     #[cfg(feature = "aws-lc")]
     pub encryption: Option<Encryption>,
-    /// Where each recovery starts when the application says so (the
-    /// `native` module's recover-or-resync); None: from where delivery is.
+    /// The recover-or-resync delivery: a topic that is not continuous holds
+    /// its messages until the application brought its state up to date, and
+    /// recovery starts from what it committed. None: best effort, where the
+    /// topics' states and the checkpoint are kept all the same.
+    pub delivery: Option<crate::Delivery>,
+    /// Where each recovery starts: what the application committed, as the
+    /// delivery keeps it.
     pub(crate) committed: Option<Committed>,
     /// This client's ECDSA P-256 private key (PKCS#8, PEM or DER) for
     /// [`Client::send_signed`](crate::Client::send_signed). The server
@@ -326,7 +331,8 @@ impl fmt::Debug for Config {
             .field("recovery_timeout", &self.recovery_timeout)
             .field("reconnect", &self.reconnect)
             .field("headers", &headers)
-            .field("send_queue", &self.send_queue);
+            .field("send_queue", &self.send_queue)
+            .field("delivery", &self.delivery);
         #[cfg(all(feature = "aws-lc", not(target_arch = "wasm32")))]
         f.field(
             "tls",
@@ -373,6 +379,7 @@ impl Config {
             tls: None,
             #[cfg(feature = "aws-lc")]
             encryption: None,
+            delivery: None,
             committed: None,
             #[cfg(feature = "aws-lc")]
             signing_key: None,

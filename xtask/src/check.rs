@@ -49,6 +49,24 @@ const LANES: &[Lane] = &[
 cargo test --locked -p wse-client --features native",
     },
     Lane {
+        // The client built for the browser, against the example server (in
+        // Node, whose WebSocket is the browser's).
+        name: "rust-browser",
+        needs: &[tool("cargo"), tool("wasm-bindgen-test-runner")],
+        only_on: None,
+        script: "cargo build -q -p wse-client --locked --example server
+log=\"$CARGO_TARGET_DIR/browser-server.log\"
+WSE_PORT=$((20000 + RANDOM % 20000)) \"$CARGO_TARGET_DIR/debug/examples/server\" > \"$log\" 2>&1 &
+server=$!
+trap 'kill $server 2> /dev/null' EXIT
+for _ in $(seq 1 100); do grep -q '^signing_public_key ' \"$log\" && break; sleep 0.1; done
+WSE_TEST_URL=\"$(sed -n 's/^url //p' \"$log\")\" \\
+WSE_TEST_IDENTITY=\"$(sed -n 's/^e2e_identity_public_key //p' \"$log\")\" \\
+WSE_TEST_SIGNING=\"$(sed -n 's/^signing_public_key //p' \"$log\")\" \\
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \\
+  cargo test -p wse-client --locked --target wasm32-unknown-unknown --test browser",
+    },
+    Lane {
         name: "typescript",
         needs: &[tool("node"), tool("npx")],
         only_on: None,

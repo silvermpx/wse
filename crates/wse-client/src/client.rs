@@ -11,8 +11,10 @@ use crate::browser::Driver;
 use crate::config::Config;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::connection::Driver;
+use crate::delivery::{self, Gate, TopicState};
 use crate::error::Error;
 use crate::handler::Handler;
+use crate::message::Message;
 use crate::security::Keys;
 
 /// Where the client stands.
@@ -38,7 +40,20 @@ pub(crate) enum Control {
     Reconnect,
     Pause(String),
     Resume(String),
+    /// The delivery's gate made something for the handler (held messages
+    /// handed on): it goes to the handler now.
+    Drain,
     Close,
+}
+
+/// Where what the delivery's gate makes outside the messages goes to the
+/// application.
+#[derive(Clone)]
+pub(crate) enum Wake {
+    /// The handler, from the connection's task.
+    Session,
+    /// The [`Events`](crate::Events) stream, at its next read.
+    Reader(mpsc::UnboundedSender<()>),
 }
 
 /// A message the application sent, on its way to the connection's task.
@@ -132,6 +147,9 @@ pub struct Client {
     frames: mpsc::Sender<Queued>,
     control: mpsc::UnboundedSender<Control>,
     status: watch::Receiver<Status>,
+    /// The delivery: the topics' states, what was held and committed.
+    gate: delivery::Shared,
+    wake: Wake,
     /// The application's hold on the connection; none for a handler's.
     _owner: Option<Arc<Owner>>,
 }
@@ -158,15 +176,40 @@ impl Client {
 
     /// [`connect`](Self::connect) with a handler that is given the client,
     /// to send from it.
-    pub async fn connect_with<H, F>(
-        #[cfg_attr(not(feature = "aws-lc"), allow(unused_mut))] mut config: Config,
+    pub async fn connect_with<H, F>(config: Config, make: F) -> Result<Self, Error>
+    where
+        H: Handler,
+        F: FnOnce(Client) -> H,
+    {
+        Self::start(config, make, None)
+            .await
+            .map(|(client, _)| client)
+    }
+
+    /// Connects. The delivery's gate stands before the handler, or, with
+    /// `reader` (the [`Events`](crate::Events) stream's wake), where the
+    /// stream is read: it is returned for it.
+    pub(crate) async fn start<H, F>(
+        mut config: Config,
         make: F,
-    ) -> Result<Self, Error>
+        reader: Option<mpsc::UnboundedSender<()>>,
+    ) -> Result<(Self, delivery::Shared), Error>
     where
         H: Handler,
         F: FnOnce(Client) -> H,
     {
         config.check()?;
+        let gate = Gate::new(config.delivery.clone(), &config.url, &config.topics)?;
+        let gate = Arc::new(std::sync::Mutex::new(gate));
+        // Recovery starts from what the application committed.
+        let committed = Arc::clone(&gate);
+        config.committed = Some(Arc::new(move |user| {
+            delivery::lock(&committed).committed(user)
+        }));
+        let (wake, in_session) = match reader {
+            Some(reader) => (Wake::Reader(reader), None),
+            None => (Wake::Session, Some(Arc::clone(&gate))),
+        };
         let keys = Arc::new(Keys::from_config(&config)?);
         // Read into the keys: the bytes of this copy go.
         #[cfg(feature = "aws-lc")]
@@ -183,6 +226,8 @@ impl Client {
             frames: frames_tx,
             control: control_tx.clone(),
             status: status_rx,
+            gate: Arc::clone(&gate),
+            wake,
             _owner: None,
         };
         let client = Client {
@@ -196,6 +241,7 @@ impl Client {
         if let Ok(mut slot) = shared.stop.lock() {
             *slot = Some(stop);
         }
+        let handler = crate::delivery::Delivered::new(handler, in_session);
         let driver = Driver::new(
             config, handler, shared, keys, frames_rx, control_rx, status_tx,
         );
@@ -227,7 +273,7 @@ impl Client {
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(run);
         match first_rx.await {
-            Ok(Ok(())) => Ok(client),
+            Ok(Ok(())) => Ok((client, gate)),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(Error::Closed),
         }
@@ -372,7 +418,8 @@ impl Client {
         I: IntoIterator<Item = T>,
         T: Into<String>,
     {
-        let topics = topics.into_iter().map(Into::into).collect();
+        let topics: Vec<String> = topics.into_iter().map(Into::into).collect();
+        delivery::lock(&self.gate).track(&topics);
         self.control(Control::Subscribe(topics))
     }
 
@@ -382,8 +429,69 @@ impl Client {
         I: IntoIterator<Item = T>,
         T: Into<String>,
     {
-        let topics = topics.into_iter().map(Into::into).collect();
+        let topics: Vec<String> = topics.into_iter().map(Into::into).collect();
+        delivery::lock(&self.gate).untrack(&topics);
         self.control(Control::Unsubscribe(topics))
+    }
+
+    /// Each topic held: whether the server took it, and whether its
+    /// messages run without a break.
+    pub fn topic_states(&self) -> Vec<TopicState> {
+        delivery::lock(&self.gate).topic_states()
+    }
+
+    /// The consumer applied `message` (a topic message): the checkpoint
+    /// moves on through what was applied without a hole. A message handed
+    /// out before the events showed another user counts for nobody. An
+    /// [`OwnedMessage`](crate::OwnedMessage) commits as `owned.as_message()`.
+    pub fn commit(&self, message: &Message<'_>) {
+        if let (Some(topic), Some(at)) = (message.topic(), message.position()) {
+            self.commit_at(topic, at.epoch, at.offset, message.generation);
+        }
+    }
+
+    pub(crate) fn commit_at(&self, topic: &str, epoch: u32, offset: u64, generation: u32) {
+        delivery::lock(&self.gate).commit(topic, epoch, offset, generation);
+    }
+
+    /// What the consumer committed, bound to the realm, the user, the
+    /// consumer and the schema: to save with the application's own state and
+    /// give back as [`Delivery::checkpoint`](crate::Delivery::checkpoint).
+    pub fn checkpoint(&self) -> String {
+        delivery::lock(&self.gate).checkpoint()
+    }
+
+    /// recover-or-resync: the application brought the topics of `round`
+    /// ([`Event::Resync`](crate::Event::Resync)) up to date; what they held
+    /// comes next.
+    pub fn resynced(&self, round: u64) -> Result<(), Error> {
+        delivery::lock(&self.gate).resynced(round);
+        self.wake()
+    }
+
+    /// Bring `topics` up to date: in recover-or-resync a resync round asks
+    /// for it; in best effort the application did so itself, and they read
+    /// continuous again.
+    pub fn resync<I, T>(&self, topics: I) -> Result<(), Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        let topics: Vec<String> = topics.into_iter().map(Into::into).collect();
+        delivery::lock(&self.gate).resync(&topics);
+        self.wake()
+    }
+
+    /// What the gate made goes to the application.
+    fn wake(&self) -> Result<(), Error> {
+        match &self.wake {
+            Wake::Session => self.control(Control::Drain),
+            // A stream nobody reads any more has nobody to tell.
+            Wake::Reader(reader) => {
+                let _ = reader.send(());
+                Ok(())
+            }
+        }
     }
 
     /// Drops the connection and makes it again at once.

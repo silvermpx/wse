@@ -177,6 +177,7 @@ impl<'a> Envelope<'a> {
             priority: self.pri.map(|p| p.min(u64::from(u8::MAX)) as u8),
             signature: None,
             frame,
+            generation: 0,
         }
     }
 }
