@@ -342,10 +342,10 @@ A subscribe gets one reply; an unsubscribe gets none. The missed messages of eac
 | `success_topics` | Topics subscribed |
 | `failed_topics` | Topics refused: denied by the connection's topic ACL, invalid names, or over its subscription limits |
 | `recovery[topic].epoch` | The topic's epoch, 8 hex digits; `null` when the topic has no history yet |
-| `recovery[topic].offset` | Inclusive: the last offset the client now has. When `recovered` is `false`, the last offset published before the subscription began; everything after it arrives live, so a client may take it as its position without skipping anything |
+| `recovery[topic].offset` | Inclusive: the last offset the client now has. When `recovered` is `false`, where the client starts: everything after it arrives live, and a message at or before it published once the subscription began was sent before this reply, so a client may take it as its position without skipping anything |
 | `recovery[topic].recovered` | `true` when every missed message was replayed. `false` when there was no position, the epoch changed (a server restart), the history was evicted or too long (`recovery_max_messages`), or the connection's outbound budget cut the replay short (then `offset` is the last one replayed) |
 | `recovery[topic].count` | Messages replayed |
-| `recovery[topic].streams` | Each stream of the topic the server held when the subscription began, epoch to its last offset there: everything after it arrives live. A client takes, per stream, the larger of its own offset and this one, and forgets a stream it named that is missing here (this server cannot replay it, so naming it again fails every later recovery). From 3.1 |
+| `recovery[topic].streams` | Each stream of the topic the server holds, epoch to the offset the client starts from in it: everything after it arrives live, and what was published at or before it once the subscription began was sent before this reply. A client takes, per stream, the larger of its own offset and this one, and forgets a stream it named that is missing here (this server cannot replay it, so naming it again fails every later recovery). From 3.1 |
 
 An omitted `recovered` means `true`. With `client_subscriptions=True` the server answers these requests itself; otherwise the application answers them, with `subscribe_with_recovery(conn_id, topics, recover=True, positions=p["recovery"])` and a reply built from its result.
 

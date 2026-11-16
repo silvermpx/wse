@@ -48,6 +48,9 @@ pub(crate) struct TopicRecovery {
     pub(crate) streams: Vec<(u32, u64)>,
 }
 
+/// A topic's head and each of its streams' last offset, at one moment.
+type Heads = (Option<(u32, u64)>, Vec<(u32, u64)>);
+
 impl TopicRecovery {
     /// A topic with no position to report.
     pub(crate) const UNKNOWN: Self = Self {
@@ -541,31 +544,105 @@ impl SharedState {
         requested: Vec<String>,
         positions: &HashMap<String, TopicPosition>,
     ) -> Result<(Vec<String>, HashMap<String, TopicRecovery>), usize> {
+        self.subscribe_and_recover_with(conn_id, handle, requested, positions, || {})
+    }
+
+    /// [`Self::subscribe_and_recover`], calling `subscribed` between the
+    /// subscription and the reading of the heads (where a publish may land).
+    pub(crate) fn subscribe_and_recover_with(
+        &self,
+        conn_id: &str,
+        handle: &ConnectionHandle,
+        requested: Vec<String>,
+        positions: &HashMap<String, TopicPosition>,
+        subscribed: impl FnOnce(),
+    ) -> Result<(Vec<String>, HashMap<String, TopicRecovery>), usize> {
         let accepted = self.admit_topics(conn_id, requested, None)?;
+        let streams_of = |t: &str| {
+            self.recovery
+                .as_ref()
+                .map(|r| r.streams(t))
+                .unwrap_or_default()
+        };
+        // Where the topics taken up without a position stood just before the
+        // subscription: what was published after it is the client's.
+        let before: Vec<_> = accepted
+            .iter()
+            .map(|t| (!positions.contains_key(t)).then(|| (self.topic_head(t), streams_of(t))))
+            .collect();
         self.subscribe_topics(conn_id, handle, &accepted, None);
+        subscribed();
         // Each topic's head and streams, read now that it is subscribed.
         let heads: Vec<_> = accepted
             .iter()
-            .map(|t| {
-                let streams = self
-                    .recovery
-                    .as_ref()
-                    .map(|r| r.streams(t))
-                    .unwrap_or_default();
-                (self.topic_head(t), streams)
-            })
+            .map(|t| (self.topic_head(t), streams_of(t)))
             .collect();
         let recovered = accepted
             .iter()
             .zip(heads)
-            .map(|(topic, (head, streams))| {
-                (
-                    topic.clone(),
-                    self.recover_topic(handle, topic, positions.get(topic), head, streams),
-                )
+            .zip(before)
+            .map(|((topic, (head, streams)), before)| {
+                let outcome = match before {
+                    None => self.recover_topic(handle, topic, positions.get(topic), head, streams),
+                    Some(before) => self.start_topic(handle, topic, before, (head, streams)),
+                };
+                (topic.clone(), outcome)
             })
             .collect();
         Ok((accepted, recovered))
+    }
+
+    /// A topic taken up without a position: the client starts where the
+    /// reply says. What was published between `before` (the topic's head
+    /// and streams just before the subscription) and `after` (just after)
+    /// reaches the live queue only when published after the subscription,
+    /// and the reply goes out ahead of the broadcasts: so it is replayed
+    /// ahead of the reply, and the client starts at `after`. When it cannot
+    /// be replayed, the client starts at `before`, and a message missing
+    /// from what comes live reads as a gap.
+    fn start_topic(
+        &self,
+        handle: &ConnectionHandle,
+        topic: &str,
+        before: Heads,
+        after: Heads,
+    ) -> TopicRecovery {
+        let Some(ref recovery) = self.recovery else {
+            return TopicRecovery::UNKNOWN;
+        };
+        let starting = |(head, streams): Heads| match head {
+            Some((epoch, head)) if head > 0 => TopicRecovery {
+                epoch: Some(epoch),
+                offset: head - 1,
+                recovered: false,
+                recoverable: true,
+                count: 0,
+                streams,
+            },
+            _ => TopicRecovery {
+                streams,
+                ..TopicRecovery::UNKNOWN
+            },
+        };
+        if before.1 == after.1 {
+            return starting(after);
+        }
+        let Some(publications) = recovery.published_since(topic, &before.1) else {
+            return starting(before);
+        };
+        for payload in publications {
+            let Ok(text) = Utf8Bytes::try_from(payload) else {
+                return starting(before);
+            };
+            if !handle.send_one(
+                Message::Text(text),
+                self.max_outbound_queue_bytes,
+                self.slow_consumer_drops.shard(usize::from(handle.lane)),
+            ) {
+                return starting(before);
+            }
+        }
+        starting(after)
     }
 }
 

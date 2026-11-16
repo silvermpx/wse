@@ -694,3 +694,66 @@ fn a_full_command_queue_refuses_the_applications_sends() {
     queued.store(0, Ordering::Relaxed);
     assert_eq!(publisher.send("c", "x"), Ok(()));
 }
+
+#[test]
+fn a_message_published_while_a_connection_subscribes_reaches_it() {
+    let state = Config {
+        recovery: Some(RecoverySettings::default()),
+        ..Config::default()
+    }
+    .into_state()
+    .unwrap();
+    let recovery = Arc::clone(state.recovery.as_ref().unwrap());
+    let publish = |text: &str| {
+        let stamped = recovery
+            .push_stamped("t", |epoch, offset| {
+                bytes::Bytes::from(fanout::stamp_recovery_fields(text, "t", epoch, offset))
+            })
+            .unwrap();
+        let drops = AtomicU64::new(0);
+        state
+            .topics
+            .fanout("t", &Outgoing::text(stamped), 0, &drops);
+    };
+    publish(r#"{"c":"U","t":"m","p":{"n":0}}"#);
+    let (h, mut rx) = test_handle();
+    let (_, outcome) = state
+        .subscribe_and_recover_with(
+            "c1",
+            &h,
+            vec!["t".to_owned()],
+            &std::collections::HashMap::new(),
+            // Subscribed, its streams not read yet.
+            || publish(r#"{"c":"U","t":"m","p":{"n":1}}"#),
+        )
+        .unwrap();
+    // The client starts where the reply says: a message at or before that
+    // offset is one it has. The one published meanwhile it must have got
+    // before the reply (control frames go out before broadcasts).
+    let start = outcome["t"].streams.clone();
+    let mut before_reply = Vec::new();
+    while let Ok(frame) = rx.try_recv() {
+        if let WsFrame::Msg(tokio_tungstenite::tungstenite::protocol::Message::Text(text)) = frame {
+            before_reply.push(text.to_string());
+        }
+    }
+    let at_or_before = |text: &str| {
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        let (epoch, offset) = (
+            u32::from_str_radix(value["e"].as_str().unwrap(), 16).unwrap(),
+            value["o"].as_u64().unwrap(),
+        );
+        start.iter().any(|(e, o)| *e == epoch && offset <= *o)
+    };
+    // Every message after the subscription the client gets: live, or, at or
+    // before where it starts, before the reply.
+    for live in queued(&h) {
+        let text = std::str::from_utf8(&live[2..]).unwrap();
+        if at_or_before(text) {
+            assert!(
+                before_reply.iter().any(|t| t == text),
+                "{text} is at or before the start {start:?} and came only live"
+            );
+        }
+    }
+}

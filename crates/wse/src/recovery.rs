@@ -1039,6 +1039,56 @@ impl RecoveryManager {
         }
     }
 
+    /// What the streams of `topic` hold beyond `before` (each one's last
+    /// offset at some moment; a stream not in it, from its first message),
+    /// in arrival order: what was published since. None past
+    /// `max_recovery_messages`, or when a stream no longer holds all of it.
+    pub(crate) fn published_since(&self, topic: &str, before: &[(u32, u64)]) -> Option<Vec<Bytes>> {
+        let max = self.config.max_recovery_messages;
+        let last = |epoch: u32| before.iter().find(|(e, _)| *e == epoch).map(|(_, o)| *o);
+        let mut streams: Vec<Vec<Arrived>> = Vec::new();
+        let mut total = 0u64;
+        if let Some(buf) = self.buffers.get(topic) {
+            let more = match last(buf.epoch) {
+                Some(offset) => {
+                    total += buf.head_offset.saturating_sub(offset.saturating_add(1));
+                    buf.recover_since(offset, max)?
+                }
+                None => {
+                    total += buf.head_offset;
+                    buf.whole_after(0)?
+                }
+            };
+            streams.push(more);
+        }
+        let foreign_epochs: Vec<u32> = self
+            .foreign_epochs
+            .get(topic)
+            .map(|epochs| epochs.clone())
+            .unwrap_or_default();
+        for epoch in foreign_epochs {
+            let Some(fbuf) = self.foreign_buffers.get(&format!("{topic}\0{epoch}")) else {
+                continue;
+            };
+            let more = match last(epoch) {
+                Some(offset) => {
+                    total += fbuf.head_offset.saturating_sub(offset.saturating_add(1));
+                    fbuf.recover_since(offset, max)?
+                }
+                None => {
+                    total += fbuf.head_offset;
+                    fbuf.whole_after(0)?
+                }
+            };
+            streams.push(more);
+        }
+        let held = streams.iter().map(Vec::len).sum::<usize>();
+        if total > max as u64 || held as u64 != total {
+            return None;
+        }
+        Some(interleave(streams))
+    }
+
     /// The streams this node holds of `topic`: each one's epoch and the last
     /// offset here. Read once a connection subscribed, it is where the
     /// connection starts in each: what comes after reaches it live.
