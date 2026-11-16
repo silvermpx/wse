@@ -41,6 +41,45 @@ run_for() {
   wait "$pid"
 }
 
+# The integration test on an iOS simulator. Flutter 3.50 can miss the line
+# with the app's VM Service in the simulator's log and then wait for it
+# forever: the build done, and no test ever runs (flutter/flutter#181771,
+# fixed after 3.50). The expanded reporter names each test as it starts, so
+# the build's line staying the last for IOS_STALL_SECONDS (default 240; the
+# first test starts within seconds) is that miss and nothing else: the test
+# is stopped, the app too, and the test runs again, three times at most.
+simulator_test() {
+  local stall="${IOS_STALL_SECONDS:-240}" output pid code=1 run stalled
+  for run in 1 2 3; do
+    output="$(mktemp)"
+    "$flutter" test integration_test -d "$device" --reporter expanded --suppress-analytics "${defines[@]}" \
+      > >(tee "$output") 2>&1 &
+    pid=$!
+    stalled=""
+    while kill -0 "$pid" 2>/dev/null; do
+      sleep 5
+      if grep -v '^[[:space:]]*$' "$output" | tail -n 1 | grep -q "Xcode build done" \
+        && (($(date +%s) - $(stat -f %m "$output") > stall)); then
+        stalled=1
+        break
+      fi
+    done
+    if [[ -z "$stalled" ]]; then
+      code=0
+      wait "$pid" || code=$?
+      rm -f "$output"
+      return "$code"
+    fi
+    echo "flutter test said nothing for $stall s after the build: it missed the app's VM Service (run $run of 3)" >&2
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    pkill -f "simctl spawn $device log stream" 2>/dev/null || true
+    xcrun simctl terminate "$device" dev.wse.wseClientExample 2>/dev/null || true
+    rm -f "$output"
+  done
+  return 1
+}
+
 cd "$root"
 cargo build -q -p wse-client --example server
 program="$target/debug/examples/server"
@@ -75,7 +114,11 @@ cd "$here"
 "$flutter" pub get --suppress-analytics > /dev/null
 case "${MODE:-debug}" in
   debug)
-    "$flutter" test integration_test -d "$device" --suppress-analytics "${defines[@]}"
+    if [[ "$device" =~ ^[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}$ ]]; then
+      simulator_test
+    else
+      "$flutter" test integration_test -d "$device" --suppress-analytics "${defines[@]}"
+    fi
     ;;
   release)
     case "$device" in
