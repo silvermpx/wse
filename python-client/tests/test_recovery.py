@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -68,6 +69,16 @@ def offsets(events: list[WSEEvent]) -> list[object]:
         else e.offset
         for e in events
     ]
+
+
+class Clock:
+    """A time.time() the test moves."""
+
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
 
 
 def recovery_requests(client: AsyncWSEClient) -> list[dict]:
@@ -406,18 +417,67 @@ class TestStreams:
         assert c._sequencer.stream_position("prices", OTHER) is None
 
     async def test_a_stream_quiet_for_longer_than_the_server_keeps_it_is_not_named(
-        self,
+        self, monkeypatch
     ):
+        clock = Clock(1000.0)
+        monkeypatch.setattr(time, "time", clock)
         c = make_client()
         c._history_ttl = 60.0
         c._on_raw_message(stamped(4, epoch=OTHER))
-        # Connected all along: OTHER heard nothing for two minutes.
-        c._sequencer._seen["prices"][OTHER] -= 120
-        c._live_since["prices"] -= 120
-        c._on_raw_message(stamped(1))
+        # Connected all along, a frame every 15 seconds: OTHER heard nothing
+        # for three minutes.
+        for offset in range(1, 13):
+            clock.now += 15
+            c._on_raw_message(stamped(offset))
         c._on_transport_close()
         await c.subscribe(["prices"], recover=True)
-        assert recovery_requests(c)[0]["prices"]["streams"] == {EPOCH: 1}
+        assert recovery_requests(c)[0]["prices"]["streams"] == {EPOCH: 12}
+
+    async def test_a_close_heard_only_after_a_sleep_keeps_the_stream(self, monkeypatch):
+        clock = Clock(1000.0)
+        monkeypatch.setattr(time, "time", clock)
+        c = make_client()
+        c._history_ttl = 60.0
+        c._on_raw_message(stamped(1))
+        # Asleep until 1400: the server went on publishing and keeping the
+        # stream, and the close is heard only on waking.
+        clock.now = 1400.0
+        c._on_transport_close()
+        await c.subscribe(["prices"], recover=True)
+        assert [r["prices"]["streams"] for r in recovery_requests(c)] == [{EPOCH: 1}]
+
+    async def test_frames_read_on_waking_prove_nothing_about_the_sleep(
+        self, monkeypatch
+    ):
+        clock = Clock(1000.0)
+        monkeypatch.setattr(time, "time", clock)
+        c = make_client()
+        c._history_ttl = 60.0
+        c._on_raw_message(stamped(1))
+        # Sent before the sleep, read after it.
+        clock.now = 1400.0
+        c._on_raw_message(stamped(1, topic="news"))
+        c._on_transport_close()
+        await c.subscribe(["prices"], recover=True)
+        assert [r["prices"]["streams"] for r in recovery_requests(c)] == [{EPOCH: 1}]
+
+    async def test_a_sleep_the_connection_lived_through_counts_from_waking(
+        self, monkeypatch
+    ):
+        clock = Clock(1000.0)
+        monkeypatch.setattr(time, "time", clock)
+        c = make_client()
+        c._history_ttl = 60.0
+        c._on_raw_message(stamped(4, epoch=OTHER))
+        clock.now = 1400.0
+        # The connection outlived the sleep: frames go on every 15 seconds
+        # and OTHER stays silent for three more minutes.
+        for offset in range(1, 13):
+            clock.now += 15
+            c._on_raw_message(stamped(offset))
+        c._on_transport_close()
+        await c.subscribe(["prices"], recover=True)
+        assert recovery_requests(c)[0]["prices"]["streams"] == {EPOCH: 12}
 
     async def test_time_away_does_not_count_as_a_quiet_stream(self):
         c = make_client()

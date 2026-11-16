@@ -68,6 +68,7 @@ impl<H: Handler> Driver<H> {
             Arc::clone(&keys),
             &config.topics,
             config.recovery_timeout,
+            config.idle_timeout,
         );
         session.committed = config.committed.clone();
         Self {
@@ -308,6 +309,7 @@ impl<H: Handler> Driver<H> {
                     }
                     if alive {
                         last_seen = now;
+                        self.session.alive_at(now);
                     }
                 }
                 Some(frame) = self.frames.recv(), if self.session.ready => {

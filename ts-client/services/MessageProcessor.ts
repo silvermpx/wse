@@ -35,6 +35,7 @@ import {
   WS_PROTOCOL_VERSION,
   DEFAULT_MAX_INBOUND_MESSAGE_SIZE,
   DEFAULT_RECOVERY_TIMEOUT_MS,
+  IDLE_TIMEOUT,
   OFFLINE_OWNER_STORAGE_KEY,
 } from '../constants.js';
 import { generateId } from '../utils/id.js';
@@ -55,6 +56,8 @@ export interface ProcessorConnection {
   getRetryAfterMs(): number;
   /** Drop the socket and connect again at once; the recovery restores what was missed. */
   forceReconnect(): void;
+  /** How long (ms) a healthy socket never stays silent; IDLE_TIMEOUT when absent. */
+  idleLimit?(): number;
   handleServerReady(details: any): void;
   handleServerHello(payload: any): Promise<void>;
   failEncryption(reason: string): void;
@@ -281,6 +284,15 @@ export class MessageProcessor {
    * Emptied when the connection goes: time away proves nothing.
    */
   private liveSince = new Map<string, number>();
+  /**
+   * When this connection's last frame came (ms; it was surely alive then),
+   * and when the run of frames ending there began. A pause between two
+   * frames longer than the idle limit (a laptop asleep, a frozen tab) starts
+   * a new run: what is read on waking may have been sent before it, and
+   * proves nothing about the time between.
+   */
+  private lastFrameAt: number | null = null;
+  private framesSince: number | null = null;
   /** Topics the server could not recover, until their next message shows what was missed. */
   private unrecovered = new Map<string, { epoch: string; reported: boolean }>();
   private earlyEncryptedFrames: ArrayBuffer[] = [];
@@ -427,6 +439,10 @@ export class MessageProcessor {
   processIncoming(data: string | ArrayBuffer): Promise<void> {
     if (this.destroyed) return Promise.resolve();
     const cm = this.connectionManager;
+    const now = Date.now();
+    const last = this.lastFrameAt;
+    if (last === null || now - last > this.idleLimit()) this.framesSince = now;
+    this.lastFrameAt = now;
     const socket = cm?.socketGeneration() ?? 0;
     if (this.overloadedOn === socket) return Promise.resolve();
     if (this.countedOn !== socket) {
@@ -1433,23 +1449,35 @@ export class MessageProcessor {
     for (const topic of topics) this.liveSince.delete(topic);
   }
 
+  private idleLimit(): number {
+    return this.connectionManager?.idleLimit?.() ?? IDLE_TIMEOUT;
+  }
+
   /** The socket is gone: release held messages and drop undecryptable early frames. */
   handleConnectionClosed(): void {
     if (this.destroyed) return;
     // A stream that heard nothing for longer than the server keeps one, while
     // this connection had its topic, is gone there: naming it would fail the
-    // recovery. Silence while away shows nothing, so nothing is forgotten
+    // recovery. Silence counts only within the run of frames read up to the
+    // last one, never up to a close heard late (after a sleep the server kept
+    // publishing), and that last frame may trail its sending by up to the
+    // idle limit. Silence while away shows nothing, so nothing is forgotten
     // for it.
-    if (this.historyTtlMs !== null) {
-      const before = Date.now() - this.historyTtlMs - QUIET_MARGIN_MS;
-      for (const [topic, since] of this.liveSince) {
-        if (since > before) continue;
-        this.sequencer.forgetQuietStreams(topic, before, (epoch) =>
-          this.recoveryWindows.has(windowKey(topic, epoch)),
-        );
+    const last = this.lastFrameAt;
+    if (this.historyTtlMs !== null && last !== null) {
+      const before = last - this.historyTtlMs - QUIET_MARGIN_MS - this.idleLimit();
+      if (this.framesSince !== null && this.framesSince <= before) {
+        for (const [topic, since] of this.liveSince) {
+          if (since > before) continue;
+          this.sequencer.forgetQuietStreams(topic, before, (epoch) =>
+            this.recoveryWindows.has(windowKey(topic, epoch)),
+          );
+        }
       }
     }
     this.liveSince.clear();
+    this.lastFrameAt = null;
+    this.framesSince = null;
     // The next connection's server names its own signing key and history.
     this.serverSigningKid = null;
     this.historyTtlMs = null;

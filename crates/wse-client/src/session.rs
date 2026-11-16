@@ -132,6 +132,15 @@ pub(crate) struct Session<H> {
     /// (`history_ttl`): one quiet for longer while connected is not named in
     /// a recovery.
     history_ttl: Option<Duration>,
+    /// How long a healthy connection never stays silent.
+    idle_timeout: Duration,
+    /// When this connection last showed the server alive, and when the run
+    /// of such frames ending there began. A pause between two longer than
+    /// the idle limit (the machine asleep, the app suspended) starts a new
+    /// run: what is read on waking may have been sent before it, and proves
+    /// nothing about the time between.
+    last_alive: Option<Instant>,
+    alive_since: Option<Instant>,
     /// What the application committed: where its recoveries start.
     pub(crate) committed: Option<crate::config::Committed>,
 }
@@ -143,6 +152,7 @@ impl<H: Handler> Session<H> {
         keys: Arc<Keys>,
         topics: &[String],
         recovery_timeout: Duration,
+        idle_timeout: Duration,
     ) -> Self {
         Self {
             handler,
@@ -170,8 +180,22 @@ impl<H: Handler> Session<H> {
             connections: 0,
             clock: Instant::now(),
             history_ttl: None,
+            idle_timeout,
+            last_alive: None,
+            alive_since: None,
             committed: None,
         }
+    }
+
+    /// Frames that show the server alive were read at `now`.
+    pub(crate) fn alive_at(&mut self, now: Instant) {
+        if self
+            .last_alive
+            .is_none_or(|last| now.saturating_duration_since(last) > self.idle_timeout)
+        {
+            self.alive_since = Some(now);
+        }
+        self.last_alive = Some(now);
     }
 
     /// A message the application sent, for this connection's outbox: none
@@ -196,6 +220,8 @@ impl<H: Handler> Session<H> {
         self.became_ready = false;
         self.server_recovery = false;
         self.history_ttl = None;
+        self.last_alive = None;
+        self.alive_since = None;
         self.user_id = None;
         self.requests.clear();
         self.unrecoverable.clear();
@@ -224,11 +250,19 @@ impl<H: Handler> Session<H> {
         self.requests.clear();
         // A stream that heard nothing for longer than the server keeps one,
         // while this connection had its topic, is gone there: naming it would
-        // fail the recovery. Silence while away shows nothing, so nothing is
-        // forgotten for it.
-        let quiet_before = self
-            .history_ttl
-            .and_then(|ttl| self.clock.checked_sub(ttl + QUIET_MARGIN));
+        // fail the recovery. Silence counts only within the run of frames
+        // read up to the last one, never up to a close read late (after a
+        // sleep the server kept publishing), and that last frame may trail
+        // its sending by up to the idle limit. Silence while away shows
+        // nothing, so nothing is forgotten for it.
+        let quiet_before = match (self.history_ttl, self.last_alive, self.alive_since) {
+            (Some(ttl), Some(last), Some(since)) => last
+                .checked_sub(ttl + QUIET_MARGIN + self.idle_timeout)
+                .filter(|before| since <= *before),
+            _ => None,
+        };
+        self.last_alive = None;
+        self.alive_since = None;
         for topic in self.topics.values_mut() {
             for hole in &mut topic.holes {
                 hole.request = None;
@@ -1459,6 +1493,7 @@ mod tests {
             keys,
             &["t".to_owned()],
             recovery_timeout,
+            Duration::from_secs(40),
         );
         session.open(None);
         session
@@ -1483,6 +1518,16 @@ mod tests {
                 &format!(r#"{{"tp":"t","e":"{epoch}","o":{o},"c":"U","t":"m","p":{{}}}}"#),
                 None,
             );
+        }
+        session.alive_at(session.clock);
+    }
+
+    /// The server's frames go on every 15 seconds, `n` times (the
+    /// heartbeat's PONGs).
+    fn pongs(session: &mut Session<Seen>, n: u32) {
+        for _ in 0..n {
+            session.clock += Duration::from_secs(15);
+            session.alive_at(session.clock);
         }
     }
 
@@ -1877,6 +1922,20 @@ mod tests {
         assert_eq!(gaps(&s), [(None, None, GapReason::NotRecovered)]);
     }
 
+    /// The streams the recovery after a reconnect names.
+    fn named_after_reconnect(s: &mut Session<Seen>) -> serde_json::Value {
+        sent(s);
+        s.close();
+        s.open(None);
+        s.on_json(
+            r#"{"c":"WSE","t":"server_ready","p":{"details":{"connection_id":"c2","user_id":"u","features":{"recovery":true,"history_ttl":60}}}}"#,
+            None,
+        );
+        let request = sent(s);
+        assert_eq!(request[0]["p"]["recover"], true);
+        request[0]["p"]["recovery"]["t"]["streams"].clone()
+    }
+
     #[test]
     fn a_stream_quiet_for_longer_than_the_server_keeps_it_is_not_named() {
         let mut s = session(Duration::from_secs(3));
@@ -1885,20 +1944,60 @@ mod tests {
             None,
         );
         feed(&mut s, F, &[4]);
-        s.clock += Duration::from_secs(120);
+        // Connected all along, a frame every 15 seconds: F heard nothing
+        // for three minutes.
+        pongs(&mut s, 12);
         feed(&mut s, E, &[1]);
-        sent(&mut s);
-        s.close();
-        s.open(None);
+        assert_eq!(named_after_reconnect(&mut s), serde_json::json!({E: 1}));
+    }
+
+    #[test]
+    fn a_close_heard_only_after_a_sleep_keeps_the_stream() {
+        let mut s = session(Duration::from_secs(3));
         s.on_json(
-            r#"{"c":"WSE","t":"server_ready","p":{"details":{"connection_id":"c2","user_id":"u","features":{"recovery":true,"history_ttl":60}}}}"#,
+            r#"{"c":"WSE","t":"server_ready","p":{"details":{"connection_id":"c1","user_id":"u","features":{"recovery":true,"history_ttl":60}}}}"#,
             None,
         );
-        let request = sent(&mut s);
-        assert_eq!(
-            request[0]["p"]["recovery"]["t"]["streams"],
-            serde_json::json!({E: 1})
+        feed(&mut s, E, &[1]);
+        // Asleep (or the app suspended) for 400 seconds: the server went on
+        // publishing and keeping the stream, and the close is read on waking.
+        s.clock += Duration::from_secs(400);
+        assert_eq!(named_after_reconnect(&mut s), serde_json::json!({E: 1}));
+    }
+
+    #[test]
+    fn frames_read_on_waking_prove_nothing_about_the_time_asleep() {
+        let mut s = session(Duration::from_secs(3));
+        s.on_json(
+            r#"{"c":"WSE","t":"server_ready","p":{"details":{"connection_id":"c1","user_id":"u","features":{"recovery":true,"history_ttl":60}}}}"#,
+            None,
         );
+        feed(&mut s, E, &[1]);
+        s.clock += Duration::from_secs(400);
+        // Sent before the sleep, read after it.
+        feed(&mut s, F, &[1]);
+        assert_eq!(
+            named_after_reconnect(&mut s),
+            serde_json::json!({E: 1, F: 1})
+        );
+    }
+
+    #[test]
+    fn a_sleep_the_connection_lived_through_counts_from_waking() {
+        let mut s = session(Duration::from_secs(3));
+        s.on_json(
+            r#"{"c":"WSE","t":"server_ready","p":{"details":{"connection_id":"c1","user_id":"u","features":{"recovery":true,"history_ttl":60}}}}"#,
+            None,
+        );
+        feed(&mut s, F, &[4]);
+        s.clock += Duration::from_secs(400);
+        // The connection outlived the sleep: what the server sent meanwhile
+        // is read on waking, the PONGs go on, and F stays silent for three
+        // more minutes.
+        feed(&mut s, E, &[1]);
+        pongs(&mut s, 12);
+        feed(&mut s, E, &[2]);
+        assert_eq!(named_after_reconnect(&mut s), serde_json::json!({E: 2}));
     }
 
     #[test]
@@ -2002,7 +2101,14 @@ mod tests {
             .collect();
         let shared = Arc::new(Shared::new(None));
         let keys = Arc::new(Keys::from_config(&crate::Config::new("ws://x")).unwrap());
-        let mut s = Session::new(Decode(0.0), shared, keys, &[], Duration::from_secs(3));
+        let mut s = Session::new(
+            Decode(0.0),
+            shared,
+            keys,
+            &[],
+            Duration::from_secs(3),
+            Duration::from_secs(40),
+        );
         s.open(None);
         let started = std::time::Instant::now();
         for frame in &frames {

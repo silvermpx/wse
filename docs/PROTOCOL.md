@@ -517,7 +517,7 @@ Sent by the server in response to `client_hello`:
 |-------|------|-------------|
 | `server_version` | `string` | WSE server version |
 | `protocol_version` | `int` | Negotiated protocol version (minimum of client and server) |
-| `features` | `object` | `compression`, `recovery`, `cluster`, `msgpack` and `encryption` describe this server; `batching` and `priority_queue` are always `true`, kept for older clients. With recovery, `history_ttl` is how many seconds a stream that receives nothing stays recoverable here (from 3.1; also in `server_ready`): a client forgets a stream it heard nothing of for longer, instead of naming it |
+| `features` | `object` | `compression`, `recovery`, `cluster`, `msgpack` and `encryption` describe this server; `batching` and `priority_queue` are always `true`, kept for older clients. With recovery, `history_ttl` is how many seconds a stream that receives nothing stays recoverable here (from 3.1; also in `server_ready`): a client forgets a stream it heard nothing of for longer while the connection's frames showed it alive, instead of naming it |
 | `limits` | `object` | Server-enforced limits for this connection |
 | `ping_interval` | `int` | Server ping interval in milliseconds |
 | `connection_id` | `string` | Unique connection identifier |

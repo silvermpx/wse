@@ -25,6 +25,7 @@ from .connection import ConnectionManager
 from .constants import (
     CLIENT_VERSION,
     DEFAULT_MAX_MESSAGE_SIZE,
+    IDLE_TIMEOUT,
     KEY_EXCHANGE_TIMEOUT,
     PROTOCOL_VERSION,
     RATE_LIMIT_REFILL_RATE,
@@ -434,6 +435,13 @@ class AsyncWSEClient:
         # then shows a quiet stream. Emptied when the connection goes: time
         # away proves nothing.
         self._live_since: dict[str, float] = {}
+        # When this connection's last frame was read (it was surely alive
+        # then), and when the run of frames ending there began. A pause
+        # between two frames longer than the idle limit (a laptop asleep, a
+        # stalled loop) starts a new run: what is read on waking may have
+        # been sent before it, and proves nothing about the time between.
+        self._last_frame_at: float | None = None
+        self._frames_since: float | None = None
         self._recovery_timeout = recovery_timeout
         self._gaps: dict[tuple[str, str], _GapState] = {}
         # Topics with a recovery request out on this connection -> anchor sent.
@@ -1261,6 +1269,8 @@ class AsyncWSEClient:
         self._server_hello_seen = False
         self._server_recovery_enabled = False
         self._history_ttl = None
+        self._last_frame_at = None
+        self._frames_since = None
         # The server of this connection names its own signing key, and the
         # user it takes the connection for.
         self._server_signing_kid = None
@@ -1315,17 +1325,25 @@ class AsyncWSEClient:
             gap.request = None
         # A stream that heard nothing for longer than the server keeps one,
         # while this connection had its topic, is gone there: naming it would
-        # fail the recovery. Silence while away shows nothing, so nothing is
-        # forgotten for it.
-        if self._history_ttl is not None:
-            before = time.time() - self._history_ttl - _QUIET_MARGIN
-            gaps = self._gaps
-            for topic, since in self._live_since.items():
-                if since <= before:
-                    self._sequencer.forget_quiet_streams(
-                        topic, before, lambda epoch, t=topic: (t, epoch) in gaps
-                    )
+        # fail the recovery. Silence counts only within the run of frames
+        # read up to the last one, never up to a close heard late (after a
+        # sleep the server kept publishing), and that last frame may trail
+        # its sending by up to the idle limit. Silence while away shows
+        # nothing, so nothing is forgotten for it.
+        last = self._last_frame_at
+        frames_since = self._frames_since
+        if self._history_ttl is not None and last is not None:
+            before = last - self._history_ttl - _QUIET_MARGIN - IDLE_TIMEOUT
+            if frames_since is not None and frames_since <= before:
+                gaps = self._gaps
+                for topic, since in self._live_since.items():
+                    if since <= before:
+                        self._sequencer.forget_quiet_streams(
+                            topic, before, lambda epoch, t=topic: (t, epoch) in gaps
+                        )
         self._live_since.clear()
+        self._last_frame_at = None
+        self._frames_since = None
 
     def _on_transport_terminal(self, error: WSEError) -> None:
         """The transport gave up for good: end the event stream with *error*."""
@@ -1705,6 +1723,11 @@ class AsyncWSEClient:
 
     def _on_raw_message(self, data: str | bytes) -> None:
         """Decode raw WebSocket frame and dispatch."""
+        now = time.time()
+        last = self._last_frame_at
+        if last is None or now - last > IDLE_TIMEOUT:
+            self._frames_since = now
+        self._last_frame_at = now
         self._stats.messages_received += 1
         if isinstance(data, bytes):
             self._stats.bytes_received += len(data)

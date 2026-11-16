@@ -443,7 +443,9 @@ describe('positions in every stream', () => {
     const ws1 = FakeWebSocket.last();
     await connectServer(ws1, ready);
     await send(ws1, stamped('prices', 4, OTHER));
-    await vi.advanceTimersByTimeAsync(120_000);
+    // Connected all along (the heartbeat's PONGs keep coming): OTHER heard
+    // nothing for over three minutes.
+    await vi.advanceTimersByTimeAsync(200_000);
     await send(ws1, stamped('prices', 1));
     ws1.serverClose(1001);
     await tick();
@@ -451,6 +453,70 @@ describe('positions in every stream', () => {
     const ws2 = FakeWebSocket.last();
     await connectServer(ws2, ready);
     expect(ws2.messagesOfType('subscription_update')[0].p.recovery.prices.streams).toEqual({ [EPOCH]: 1 });
+  });
+
+  it('keeps a stream whose close is heard only after a sleep', async () => {
+    start();
+    await tick();
+    const ready = { features: { recovery: true, encryption: false, history_ttl: 60 } };
+    const ws1 = FakeWebSocket.last();
+    await connectServer(ws1, ready);
+    await send(ws1, stamped('prices', 1));
+    // Asleep for 400 seconds: nothing ran, the server went on publishing
+    // and keeping the stream, and the close is heard only on waking.
+    vi.setSystemTime(Date.now() + 400_000);
+    ws1.serverClose(1006);
+    await tick();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const ws2 = FakeWebSocket.last();
+    expect(ws2).not.toBe(ws1);
+    await connectServer(ws2, ready);
+    const request = ws2.messagesOfType('subscription_update')[0].p;
+    expect(request.recover).toBe(true);
+    expect(request.recovery.prices.streams).toEqual({ [EPOCH]: 1 });
+  });
+
+  it('takes frames read on waking for no proof of the time asleep', async () => {
+    start();
+    await tick();
+    const ready = { features: { recovery: true, encryption: false, history_ttl: 60 } };
+    const ws1 = FakeWebSocket.last();
+    await connectServer(ws1, ready);
+    await send(ws1, stamped('prices', 1));
+    vi.setSystemTime(Date.now() + 400_000);
+    // Sent before the sleep, read after it.
+    await send(ws1, stamped('news', 1));
+    ws1.serverClose(1006);
+    await tick();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const ws2 = FakeWebSocket.last();
+    expect(ws2).not.toBe(ws1);
+    await connectServer(ws2, ready);
+    const request = ws2.messagesOfType('subscription_update')[0].p;
+    expect(request.recover).toBe(true);
+    expect(request.recovery.prices.streams).toEqual({ [EPOCH]: 1 });
+  });
+
+  it('counts silence again from waking when the connection lived through a sleep', async () => {
+    start();
+    await tick();
+    const ready = { features: { recovery: true, encryption: false, history_ttl: 60 } };
+    const ws1 = FakeWebSocket.last();
+    await connectServer(ws1, ready);
+    await send(ws1, stamped('prices', 4, OTHER));
+    vi.setSystemTime(Date.now() + 400_000);
+    // The connection outlived the sleep: what the server sent meanwhile is
+    // read on waking, the PONGs go on, and OTHER stays silent for over
+    // three more minutes.
+    await send(ws1, stamped('prices', 1));
+    await vi.advanceTimersByTimeAsync(200_000);
+    await send(ws1, stamped('prices', 2));
+    ws1.serverClose(1001);
+    await tick();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const ws2 = FakeWebSocket.last();
+    await connectServer(ws2, ready);
+    expect(ws2.messagesOfType('subscription_update')[0].p.recovery.prices.streams).toEqual({ [EPOCH]: 2 });
   });
 
   it('does not count time away as a quiet stream', async () => {

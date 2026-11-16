@@ -1534,7 +1534,7 @@ export class ConnectionManager {
    * The server pings every ping_interval and answers our pings, so a healthy
    * socket never stays silent this long; a half-open one does.
    */
-  private idleLimit(): number {
+  idleLimit(): number {
     return Math.max(IDLE_TIMEOUT, this.serverPingInterval * 2.5);
   }
 
