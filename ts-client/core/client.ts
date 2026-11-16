@@ -168,7 +168,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
   const snapshotOf = (s: WSEStore): WSEClientSnapshot => ({
     connection: s.connectionState,
     paused,
-    ready: s.connectionState === ConnectionState.CONNECTED,
+    ready: s.transportReady && s.connectionState === ConnectionState.CONNECTED,
     endpoint: s.activeEndpoint,
     topics: s.activeTopics,
     lastError: s.lastError,

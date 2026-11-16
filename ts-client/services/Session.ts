@@ -458,9 +458,13 @@ export class WSESession {
         rateLimit: o.rateLimit,
         serverReadyTimeout: o.serverReadyTimeout,
         onTransportReady: () => {
+          this.ctx.state.getState().setTransportReady(true);
           void this.processor.flush();
         },
-        onSocketClosed: () => this.processor.handleConnectionClosed(),
+        onSocketClosed: () => {
+          this.ctx.state.getState().setTransportReady(false);
+          this.processor.handleConnectionClosed();
+        },
         onUndeliverable: (message) => this.processor.requeue(message),
         heartbeatInterval: o.diagnostics.healthCheckInterval,
         compression: {

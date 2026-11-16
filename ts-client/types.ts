@@ -468,6 +468,11 @@ export interface SubscriptionInfo {
 
 export interface WSEState {
   connectionState: ConnectionState;
+  /**
+   * The server took the connection and, when encryption is on, the keys are
+   * agreed: messages go out now. False while the socket is merely open.
+   */
+  transportReady: boolean;
   activeEndpoint: string | null;
   preferredEndpoint: string | null;
   endpoints: ConnectionInfo[];

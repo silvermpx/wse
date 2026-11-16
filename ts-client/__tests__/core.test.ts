@@ -5,7 +5,15 @@
 // remount, and end for good on signOut.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { FakeWebSocket, connectServer, installFakeWebSocket, resetClientState, stamped, tick } from './helpers.js';
+import {
+  FakeWebSocket,
+  connectServer,
+  installFakeWebSocket,
+  resetClientState,
+  serverReadyMessage,
+  stamped,
+  tick,
+} from './helpers.js';
 import { createWSEClient, type WSEClient } from '../core/index.js';
 import { useWSEStore } from '../stores/useWSEStore.js';
 
@@ -82,6 +90,22 @@ describe('a client of its own', () => {
     expect(wsB.closeCalls).toHaveLength(0);
     expect(b.state.getSnapshot().ready).toBe(true);
     window.removeEventListener('wseGap', windowEvents);
+  });
+
+  it('is ready once the server took the connection, not when the socket opens', async () => {
+    const c = client(A);
+    c.retain();
+    await tick();
+    const ws = socketOf(A)[0];
+    ws.serverOpen();
+    await tick();
+    expect(c.state.getSnapshot().ready).toBe(false);
+    ws.serverSend(serverReadyMessage());
+    await tick();
+    expect(c.state.getSnapshot().ready).toBe(true);
+    ws.serverClose(1006);
+    await tick();
+    expect(c.state.getSnapshot().ready).toBe(false);
   });
 
   it('keeps one connection when its last share is released and taken again at once', async () => {

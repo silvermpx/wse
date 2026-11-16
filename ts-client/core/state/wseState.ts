@@ -35,6 +35,7 @@ export interface InboundRecoveryPosition {
 export interface WSEStore extends WSEState {
   // Actions - Connection
   setConnectionState: (state: ConnectionState) => void;
+  setTransportReady: (ready: boolean) => void;
   setActiveEndpoint: (endpoint: string | null) => void;
   setPreferredEndpoint: (endpoint: string | null) => void;
   updateEndpoint: (endpoint: string, updates: Partial<ConnectionInfo>) => void;
@@ -195,6 +196,7 @@ const initialSubscriptions: SubscriptionInfo = {
 const initialState: WSEState = {
   // Connection
   connectionState: ConnectionState.PENDING,
+  transportReady: false,
   activeEndpoint: null,
   preferredEndpoint: null,
   endpoints: [],
@@ -257,6 +259,8 @@ export const createWSEState: StateCreator<WSEStore> = (set, get) => {
     ...initialState,
 
     // Connection Actions
+  setTransportReady: (ready) => set((prev) => (prev.transportReady === ready ? prev : { transportReady: ready })),
+
   setConnectionState: (state) => set((prev) => {
     if (prev.connectionState === state) {
       return prev;
@@ -269,6 +273,7 @@ export const createWSEState: StateCreator<WSEStore> = (set, get) => {
 
     return {
       connectionState: state,
+      transportReady: state === ConnectionState.CONNECTED ? prev.transportReady : false,
       metrics: state === ConnectionState.CONNECTED && !prev.metrics.connectedSince
         ? { ...prev.metrics, connectedSince: Date.now() }
         : prev.metrics
