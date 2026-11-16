@@ -36,7 +36,20 @@
   ready connection whatever `offline` says); Rust: `Client::send_live` and
   `try_send_live` (and in Swift, Kotlin and Dart); Python:
   `send(..., live=True)`.
-
+- Rust client: `pause(reason)` and `resume(reason)`, as in the TypeScript
+  core client: the connection ends (what is queued goes out first) and no
+  attempt is made while any reason holds; topics and positions stay, and
+  the last reason cleared connects at once and recovers what was missed. A
+  `Paused` event and status say so. The Swift, Kotlin and Dart clients have
+  them too, with helpers that pause a client in the background and while
+  there is no network, and make its connection again when the network
+  changes (`WseAppLifecycle`, `WseNetworkMonitor`): on iOS the whole app
+  counts, on Android the process, so a scene or an Activity closing does
+  not pause it.
+- Rust client: `Client::close_within(deadline)` gives what is queued the
+  deadline to go out and then stops the connection where it stands; a link
+  that takes nothing no longer holds a close for as long as the system
+  keeps the connection. The mobile clients' `disconnect` uses it.
 - Recovery positions per stream. A client may name, with its recovery
   request, the last offset it holds of each stream of a topic (`streams`:
   one per server that publishes to it); the server then replays each stream
@@ -49,8 +62,9 @@
 - Rust client: a recovery names the client's offset in every stream of the
   topic; it starts a stream the server lists that it did not know where the
   server was, reports per stream what a recovery that did not recover lost,
-  forgets a stream the server no longer holds, and stops naming one quiet
-  for longer than the server keeps it (`history_ttl`).
+  forgets a stream the server no longer holds, and stops naming one that
+  stayed quiet on a connection for longer than the server keeps it
+  (`history_ttl`); time away from the server keeps every position.
 - TypeScript client: the same, and a gap in one stream of a topic no longer
   stops another stream's gap from being recovered: each stream waits for
   its replay in its own window (as the Rust and Python clients do), instead
@@ -69,6 +83,17 @@
 
 ### Fixed
 
+- Server: a message published to a topic while a client subscribes to it
+  reaches the client. The subscription reply could start after the message,
+  and the client then took it for one it had and dropped it; what was
+  published in between is now replayed ahead of the reply or, when it
+  cannot be, the reply starts earlier and the client sees a gap.
+- TypeScript client: two clients of one offline queue (two tabs of one
+  application and user) send a stored message once: it is taken out of
+  IndexedDB in one transaction before it is sent, and put back when it is
+  not sent.
+- TypeScript client: `maxQueueSize` bounds the send queue; the capacity
+  was never stored.
 - Server: recovery from positions per stream no longer depends on the order
   in which a node had the topic's streams. A client that moved to another
   node of a cluster, and named its offsets, could otherwise be told

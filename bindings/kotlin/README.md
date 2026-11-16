@@ -17,6 +17,7 @@ dependencies {
     implementation(files("libs/wse-client-android-3.1.0.aar"))
     implementation("net.java.dev.jna:jna:5.19.1@aar")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+    implementation("androidx.lifecycle:lifecycle-process:2.11.0")
 }
 ```
 
@@ -50,6 +51,14 @@ client.events().asFlow().collect { item ->
     }
 }
 ```
+
+On Android, `WseAppLifecycle(client).start()` pauses the client five seconds
+after the app went to the background and resumes it when it comes back (the
+process's lifecycle: an Activity turning does not touch the connection), and
+`WseNetworkMonitor(context, client).start()` pauses it while there is no
+network and makes the connection again when the network changes. Both pause
+for reasons of their own: `client.pause("manual")` stays until the app
+resumes it.
 
 `events()` is the client's stream, until it closes; one reader at a time. A
 collector cancelled in between loses nothing: the next collection gets the

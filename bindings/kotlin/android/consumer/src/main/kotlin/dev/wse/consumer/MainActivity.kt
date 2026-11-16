@@ -9,6 +9,7 @@ import dev.wse.ffi.WseConfig
 import dev.wse.ffi.WseItem
 import dev.wse.ffi.connectClient
 import dev.wse.ffi.events
+import dev.wse.ffi.send
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel

@@ -40,6 +40,14 @@ for try await item in client.events() {
 }
 ```
 
+On iOS, `WseAppLifecycle(client: client)` pauses the client five seconds after
+the app went to the background and resumes it when it comes back (the whole
+app: one scene closing does not pause it), and `WseNetworkMonitor(client:
+client)` pauses it while there is no network path and makes the connection
+again when the path moves to other interfaces (macOS too). Both pause for
+reasons of their own: `try client.pause(reason: "manual")` stays until the
+app resumes it. Keep them as long as the client.
+
 `events()` is the client's stream, until it closes; one reader at a time.
 A Task cancelled while reading loses nothing: the next read gets the rest.
 Cancelling the Task of `connect` gives up the attempt. `disconnect` sends

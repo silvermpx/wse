@@ -2,6 +2,9 @@
 // URL in WSE_TEST_URL.
 
 import XCTest
+#if canImport(UIKit)
+import UIKit
+#endif
 @testable import WseFFI
 
 final class WseClientTests: XCTestCase {
@@ -105,6 +108,48 @@ final class WseClientTests: XCTestCase {
         }
         XCTAssertEqual(echoed, #"{"text":"after"}"#)
         await client.disconnect(deadlineMs: 1_000)
+    }
+
+    func testTheNetworkPausesTheClientAndRenewsItsConnection() async throws {
+        let client = try await WseClient.connect(WseConfig(url: url))
+        let monitor = WseNetworkMonitor(client: client, settle: 0, observing: false)
+        monitor.update(usable: true, interfaces: ["en0"])
+        monitor.update(usable: false, interfaces: [])
+        try await waitFor { client.status() == .paused }
+        monitor.update(usable: true, interfaces: ["en0"])
+        try await waitFor { client.status() == .connected }
+        // Over another interface: the connection is made again.
+        monitor.update(usable: true, interfaces: ["pdp_ip0"])
+        var renewed = false
+        for try await item in client.events() {
+            if case let .disconnected(_, reason, _, _) = item, reason == "reconnect asked" {
+                renewed = true
+                break
+            }
+        }
+        XCTAssertTrue(renewed)
+        await client.disconnect(deadlineMs: 1_000)
+    }
+
+    #if canImport(UIKit)
+    func testTheAppInTheBackgroundPausesTheClient() async throws {
+        let client = try await WseClient.connect(WseConfig(url: url))
+        let lifecycle = WseAppLifecycle(client: client, grace: 0)
+        NotificationCenter.default.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+        try await waitFor { client.status() == .paused }
+        NotificationCenter.default.post(name: UIApplication.willEnterForegroundNotification, object: nil)
+        try await waitFor { client.status() == .connected }
+        withExtendedLifetime(lifecycle) {}
+        await client.disconnect(deadlineMs: 1_000)
+    }
+    #endif
+
+    /// Waits up to five seconds for `done`.
+    private func waitFor(_ done: () -> Bool) async throws {
+        for _ in 0..<250 where !done() {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertTrue(done())
     }
 
     func testAPayloadMustBeJson() async throws {

@@ -17,7 +17,7 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
     }
-    sourceSets["main"].kotlin.srcDirs("../src/main/kotlin", "../generated/android")
+    sourceSets["main"].kotlin.srcDirs("src/main/kotlin", "../src/main/kotlin", "../generated/android")
     sourceSets["androidTest"].kotlin.srcDirs("src/androidTest/kotlin")
     // cargo-ndk's output: one folder per ABI.
     sourceSets["main"].jniLibs.srcDirs(System.getenv("WSE_JNI_LIBS") ?: "../../../target/android-jniLibs")
@@ -31,6 +31,7 @@ dependencies {
     implementation("net.java.dev.jna:jna:5.19.1@aar")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
     implementation("androidx.annotation:annotation:1.9.1")
+    implementation("androidx.lifecycle:lifecycle-process:2.11.0")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test:runner:1.7.0")
     androidTestImplementation("org.jetbrains.kotlin:kotlin-test:2.4.21")

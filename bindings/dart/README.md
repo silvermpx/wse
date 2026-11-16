@@ -48,6 +48,7 @@ Future<void> main() async {
     wseConfig('wss://example.com/wse', token: token, topics: ['prices']),
   );
   await client.send('order', '{"id": 1}');
+  client.trySendLive('open_valve', '{"id": 7}'); // on this connection or not at all
   await for (final item in client.events()) {
     switch (item.kind) {
       case WseItemKind.message:
@@ -65,7 +66,33 @@ Future<void> main() async {
 subscriptions, gaps it could not recover, server errors, and the end when the
 client closes. One listener reads it at a time; a listener that stops in
 between loses nothing, the next one gets the rest. `close()` sends what is
-queued and closes.
+queued and closes; a closed client's calls throw a `WseError` of kind
+`closed`.
+
+## Background and network
+
+`WseAppLifecycle(client)` pauses the client five seconds after the app went
+to the background and resumes it when the app comes back.
+`WseNetworkMonitor(client)` pauses it while the device has no network and
+makes the connection again when the network moves to other interfaces (Wi-Fi
+to mobile, say); the app feeds it what it sees, with connectivity_plus for
+one:
+
+```dart
+final lifecycle = WseAppLifecycle(client);
+final network = WseNetworkMonitor(client);
+Connectivity().onConnectivityChanged.listen(
+  (results) => network.update(
+    usable: !results.contains(ConnectivityResult.none),
+    interfaces: [for (final result in results) result.name],
+  ),
+);
+```
+
+Both pause for reasons of their own: `client.pause('manual')` stays until
+the app calls `client.resume('manual')`. A paused client keeps its topics and
+positions; once no reason is left it connects again and recovers what it
+missed. Dispose of both with the client.
 
 In `flutter test` the package loads the library its build hook made for the
 host, so tests that use the client run on the developer's machine too.
