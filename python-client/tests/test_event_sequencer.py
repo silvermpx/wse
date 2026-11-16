@@ -111,11 +111,12 @@ class TestDedupWindowCost:
         import time
 
         seq = EventSequencer(window_size=10_000)
-        start = time.perf_counter()
+        # This process's CPU time: other work on the machine does not count.
+        start = time.process_time()
         for i in range(60_000):
             seq.is_duplicate(f"id-{i}")
         # The old min() scan took seconds here; O(1) eviction takes ~0.1 s.
-        assert time.perf_counter() - start < 2.0
+        assert time.process_time() - start < 2.0
         assert len(seq._seen_ids) == 10_000
 
     def test_cleanup_drops_only_expired_prefix(self, monkeypatch):
