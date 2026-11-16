@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds the Android libraries of wse-ffi with cargo-ndk into
 # target/android-jniLibs, one folder per ABI (default: arm64-v8a,
-# armeabi-v7a and x86_64), and checks that each loads on 16 KB pages. Also
+# armeabi-v7a and x86_64), and checks that each 64-bit one loads on 16 KB
+# pages (the devices with them run no 32-bit code). Also
 # fetches the Java part of Android's certificate verifier into
 # target/android-verifier/rustls-platform-verifier.jar, for the AAR.
 # Needs ANDROID_NDK_HOME.
@@ -23,12 +24,13 @@ cd "$root"
 cargo ndk "${args[@]}" -P 26 -o "$jni" build -p wse-ffi --release --locked
 objdump="$(ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-objdump | head -1)"
 for abi in "${abis[@]}"; do
+  [[ "$abi" == armeabi-v7a ]] && continue
   lib="$jni/$abi/libwse_ffi.so"
   if "$objdump" -p "$lib" | grep LOAD | grep -qv 'align 2\*\*1[4-9]'; then
     echo "$lib has a segment aligned below 16 KB" >&2
     exit 1
   fi
 done
-echo "built ${abis[*]} into $jni (16 KB pages)"
+echo "built ${abis[*]} into $jni (the 64-bit ones on 16 KB pages)"
 
 "$root/bindings/rustls-platform-verifier.sh" "$target/android-verifier/rustls-platform-verifier.jar"

@@ -2,8 +2,9 @@
 # Builds the Dart package's Rust library (wse-dart) for each TARGET and copies
 # it into OUT under the name the package's build hook downloads:
 # wse_dart-VERSION-TARGET.EXT. Android goes through cargo-ndk (API 24,
-# ANDROID_NDK_HOME) and must load on 16 KB pages; Apple targets are built for
-# iOS 15 and macOS 10.15.
+# ANDROID_NDK_HOME), and its 64-bit libraries must load on 16 KB pages (the
+# devices with them run no 32-bit code); Apple targets are built for iOS 15
+# and macOS 10.15.
 #
 #   .github/scripts/dart-binaries.sh 3.1.0 dist aarch64-apple-ios x86_64-apple-darwin
 set -euo pipefail
@@ -21,7 +22,8 @@ for target in "$@"; do
       cargo ndk -t "$target" -P 24 build -p wse-dart --release --locked
       file=libwse_dart.so
       objdump="$(ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-objdump | head -1)"
-      if "$objdump" -p "$target_dir/$target/release/$file" | grep LOAD | grep -qv 'align 2\*\*1[4-9]'; then
+      if [[ "$target" != armv7-* ]] \
+        && "$objdump" -p "$target_dir/$target/release/$file" | grep LOAD | grep -qv 'align 2\*\*1[4-9]'; then
         echo "$target: a segment is aligned below 16 KB" >&2
         exit 1
       fi
