@@ -16,8 +16,10 @@ tarball="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 device="$2"
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 target="$(cd "$root" && mkdir -p "${CARGO_TARGET_DIR:-target}" && cd "${CARGO_TARGET_DIR:-target}" && pwd)"
-# The React Native rn-bundle-check.sh bundles for.
+# The React Native rn-bundle-check.sh bundles for, and the CLI that makes
+# the app from its template.
 rn_version="0.88.1"
+cli_version="21.0.0"
 app=dev.wse.rncheck
 
 work="$(mktemp -d)"
@@ -32,10 +34,27 @@ for _ in $(seq 1 50); do
 done
 
 cd "$work"
-npx --yes @react-native-community/cli@latest init WseRnCheck --version "$rn_version" \
-  --package-name "$app" --directory app --skip-git-init --install-pods false --pm npm > init.log 2>&1 \
-  || { tail -30 init.log >&2; exit 1; }
+npx --yes "@react-native-community/cli@$cli_version" init WseRnCheck --version "$rn_version" \
+  --package-name "$app" --directory app --skip-git-init --install-pods false --pm npm \
+  --skip-install > init.log 2>&1 || { tail -30 init.log >&2; exit 1; }
 cd app
+# The app is built and run, never linted or unit-tested: the template's lint
+# and test tools stay out, and with them their releases' breakages (a
+# typescript-eslint published without its types package stops every install).
+npm pkg delete devDependencies.eslint devDependencies.prettier devDependencies.jest \
+  devDependencies.react-test-renderer devDependencies.@react-native/eslint-config \
+  devDependencies.@react-native/jest-preset devDependencies.@types/jest \
+  devDependencies.@types/react-test-renderer
+# npm can name a version a moment before it serves it (a package being
+# published): the template's install is tried again a minute later.
+for attempt in 1 2 3; do
+  npm install --no-audit --no-fund > install.log 2>&1 && break
+  if [[ $attempt == 3 ]] || ! grep -q ETARGET install.log; then
+    tail -30 install.log >&2
+    exit 1
+  fi
+  sleep 60
+done
 npm install --no-audit --no-fund "$tarball" > /dev/null
 # The emulator reaches the host's loopback at 10.0.2.2.
 cat > wse-check.json <<JSON
