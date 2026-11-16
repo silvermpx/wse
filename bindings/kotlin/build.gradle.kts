@@ -19,7 +19,10 @@ dependencies {
 tasks.test {
     useJUnitPlatform()
     // The native library build.sh made, and the server run-tests.sh started.
-    systemProperty("jna.library.path", rootDir.resolve("../../target/debug").absolutePath)
+    systemProperty(
+        "jna.library.path",
+        System.getenv("WSE_NATIVE_LIB_DIR") ?: rootDir.resolve("../../target/debug").absolutePath,
+    )
     System.getenv("WSE_TEST_URL")?.let { environment("WSE_TEST_URL", it) }
     jvmArgs("--enable-native-access=ALL-UNNAMED")
     testLogging { events("passed", "failed", "skipped"); showStandardStreams = false }

@@ -5,6 +5,9 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
+# Cargo's target directory: CARGO_TARGET_DIR (relative to the repository), else target/.
+target="$(cd "$root" && mkdir -p "${CARGO_TARGET_DIR:-target}" && cd "${CARGO_TARGET_DIR:-target}" && pwd)"
+export CARGO_TARGET_DIR="$target"
 flutter="${FLUTTER:-flutter}"
 # The codegen runs the flutter on PATH: make it this one.
 if [[ "$flutter" == */* ]]; then
@@ -13,17 +16,17 @@ fi
 export DART_SUPPRESS_ANALYTICS=true FLUTTER_SUPPRESS_ANALYTICS=true
 cd "$here"
 "$flutter" pub get --suppress-analytics > /dev/null
-CARGO_TARGET_DIR="$root/target/frb-expand" flutter_rust_bridge_codegen generate
+CARGO_TARGET_DIR="$target/frb-expand" flutter_rust_bridge_codegen generate
 # In the workspace's own style, as cargo fmt --check wants it.
 (cd "$root" && cargo fmt -p wse-dart)
 port="${WSE_PORT:-$((20000 + RANDOM % 20000))}"
 cd "$root"
 cargo build -q -p wse-client --example server
-WSE_PORT="$port" "$root/target/debug/examples/server" > "$root/target/dart-test-server.log" 2>&1 &
+WSE_PORT="$port" "$target/debug/examples/server" > "$target/dart-test-server.log" 2>&1 &
 server=$!
 trap 'kill "$server" 2>/dev/null || true' EXIT
 for _ in $(seq 1 50); do
-  grep -q "ws://" "$root/target/dart-test-server.log" && break
+  grep -q "ws://" "$target/dart-test-server.log" && break
   sleep 0.1
 done
 export WSE_TEST_URL="ws://127.0.0.1:$port/wse"

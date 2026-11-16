@@ -10,6 +10,9 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
+# Cargo's target directory: CARGO_TARGET_DIR (relative to the repository), else target/.
+target="$(cd "$root" && mkdir -p "${CARGO_TARGET_DIR:-target}" && cd "${CARGO_TARGET_DIR:-target}" && pwd)"
+export CARGO_TARGET_DIR="$target"
 profile="${PROFILE:-release}"
 targets=(aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios)
 export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-15.0}"
@@ -18,8 +21,8 @@ cd "$root"
 
 # The bindings come from an unstripped debug build of the host library.
 cargo build -p wse-ffi --lib
-host_lib="$root/target/debug/libwse_ffi.dylib"
-gen="$root/target/swift-gen"
+host_lib="$target/debug/libwse_ffi.dylib"
+gen="$target/swift-gen"
 rm -rf "${gen:?}"
 mkdir -p "$gen/include/WseFFIC"
 cargo run -q -p wse-bindgen --bin uniffi-bindgen-swift -- "$host_lib" "$here/Sources/WseFFI" --swift-sources
@@ -32,7 +35,7 @@ flag=(--release)
 for target in "${targets[@]}"; do
   cargo rustc -p wse-ffi --lib "${flag[@]}" --locked --target "$target" --crate-type staticlib
 done
-lib() { echo "$root/target/$1/$profile/libwse_ffi.a"; }
+lib() { echo "$target/$1/$profile/libwse_ffi.a"; }
 # One slice per platform: the Mac's and the simulator's hold both architectures.
 mkdir -p "$gen/macos" "$gen/ios-simulator"
 lipo -create "$(lib aarch64-apple-darwin)" "$(lib x86_64-apple-darwin)" -output "$gen/macos/libwse_ffi.a"

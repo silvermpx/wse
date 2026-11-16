@@ -7,13 +7,16 @@ set -euo pipefail
 device="${1:?usage: run-integration-tests.sh <device id>}"
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../../.." && pwd)"
+# Cargo's target directory: CARGO_TARGET_DIR (relative to the repository), else target/.
+target="$(cd "$root" && mkdir -p "${CARGO_TARGET_DIR:-target}" && cd "${CARGO_TARGET_DIR:-target}" && pwd)"
+export CARGO_TARGET_DIR="$target"
 flutter="${FLUTTER:-flutter}"
 export DART_SUPPRESS_ANALYTICS=true FLUTTER_SUPPRESS_ANALYTICS=true
 port="${WSE_PORT:-$((20000 + RANDOM % 20000))}"
 cd "$root"
 cargo build -q -p wse-client --example server
-log="$root/target/flutter-example-server.log"
-WSE_PORT="$port" "$root/target/debug/examples/server" > "$log" 2>&1 &
+log="$target/flutter-example-server.log"
+WSE_PORT="$port" "$target/debug/examples/server" > "$log" 2>&1 &
 server=$!
 trap 'kill "$server" 2>/dev/null || true' EXIT
 for _ in $(seq 1 50); do

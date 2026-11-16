@@ -9,9 +9,12 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../../.." && pwd)"
+# Cargo's target directory: CARGO_TARGET_DIR (relative to the repository), else target/.
+target="$(cd "$root" && mkdir -p "${CARGO_TARGET_DIR:-target}" && cd "${CARGO_TARGET_DIR:-target}" && pwd)"
+export CARGO_TARGET_DIR="$target"
 abis=("$@")
 [[ ${#abis[@]} -gt 0 ]] || abis=(arm64-v8a armeabi-v7a x86_64)
-jni="$root/target/android-jniLibs"
+jni="$target/android-jniLibs"
 args=()
 for abi in "${abis[@]}"; do args+=(-t "$abi"); done
 cd "$root"
