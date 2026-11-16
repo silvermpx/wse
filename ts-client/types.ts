@@ -496,7 +496,8 @@ export interface SubscriptionInfo {
  * Where the offline queue lives: 'memory' (nothing persisted: no storage, or
  * no consumer named), 'durable' (persisted, and this client replays it),
  * 'busy' (persisted, and another client of the same scope replays it, until
- * it lets go) or 'unavailable' (the storage failed: kept in memory).
+ * it lets go) or 'unavailable' (the storage named cannot be had in this
+ * runtime, or it failed: kept in memory).
  */
 export type StorageState = 'memory' | 'durable' | 'busy' | 'unavailable';
 

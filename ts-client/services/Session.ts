@@ -442,7 +442,12 @@ export class WSESession {
         return;
       }
       if (!queue.isAvailable()) {
-        if (typeof indexedDB !== 'undefined') this.setStorageState('unavailable');
+        // The queue keeps its messages in memory. Where the runtime has no
+        // IndexedDB (Node, Electron's main process) the queue said nothing.
+        if (typeof indexedDB === 'undefined') {
+          this.ctx.emit('wseStorageError', storageErrorDetail('open', new Error('no IndexedDB in this runtime')));
+        }
+        this.setStorageState('unavailable');
       } else {
         this.offlineQueue = queue;
         this.processor.setOfflineQueue(queue);
@@ -823,6 +828,21 @@ export class WSESession {
 
   getQueueSize(): number {
     return this.ctx.queue.getState().size + (this.offlineQueue?.getStats().size ?? 0);
+  }
+
+  /** The network or the machine is back: see ConnectionManager.wake. */
+  wake(): void {
+    if (!this.destroyed) this.connection?.wake();
+  }
+
+  /**
+   * Nothing waits to go out: the queue is empty and the socket wrote what it
+   * took. What a durable offline queue holds is kept for the next session.
+   */
+  drained(): boolean {
+    const durable = this.ctx.state.getState().storageState === 'durable';
+    const offline = durable ? 0 : (this.offlineQueue?.getStats().size ?? 0);
+    return this.ctx.queue.getState().size + offline === 0 && (this.connection?.unsentBytes() ?? 0) === 0;
   }
 
   private installWindowListeners(): void {

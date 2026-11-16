@@ -41,6 +41,8 @@ client.send('order', { id: 1 });
 client.send('open_valve', { id: 7 }, { live: true });   // on this connection or not at all
 client.pause('background');                              // the connection ends, positions stay
 client.resume('background');                             // back, and what was missed comes
+client.wake();                                           // the network is back: connect now
+await client.close(2000);                                // send what it holds (2 s at most), then end
 client.signOut();                                        // the user's queue, topics and positions go
 ```
 
@@ -51,6 +53,15 @@ stops when the last is released; `subscribe(topics)` holds topics the same way, 
 storage under that name, apart for each consumer and realm (staging beside production keeps its
 own); by default it keeps them in memory. `destroy()` ends it and keeps what it stored; `signOut()`
 ends it and forgets the user.
+
+Outside a page (Node, Electron's main process, a worker) the client hears no `online` or
+visibility events: `wake()` tells it the network or the machine is back, so a client waiting out
+its backoff connects at once and a connection silent past its idle limit (the machine slept) is
+made again. `close(deadlineMs)` sends what the client holds within that time, then ends as
+`destroy()` does, for a host that quits. A storage named for the page where the runtime has none
+keeps the topics and the checkpoint in memory, and says so with a `wseStorageError` (operation
+`open`) as the client starts; the offline queue still goes to IndexedDB where the runtime has it,
+and `state.getSnapshot().storage` reads `unavailable` when it cannot.
 
 The offline queue is durable only for a part of the application named by a stable `consumer`
 (`consumer: 'checkout'`): it lives in an IndexedDB database of its own scope -- the storage name,

@@ -41,6 +41,7 @@ import {
   type ClientStorage,
 } from './context.js';
 import { generateId } from '../utils/id.js';
+import { pageLocalStorage } from '../utils/pageStorage.js';
 import type { StoreApi } from './store.js';
 import type { WSEStore } from './state/wseState.js';
 import { Delivery, checkDeliveryOptions, type DeliveryOptions, type TopicState } from './delivery.js';
@@ -130,6 +131,20 @@ export interface WSEClient {
   sendSigned(type: string, payload: unknown, options?: SignedMessageOptions): Promise<SendStatus>;
   reconnect(): void;
   /**
+   * The network or the machine is back: a client waiting out its backoff
+   * connects now, and a connection silent past its idle limit (the machine
+   * slept, and no timer ran) is made again. A page hears the browser's
+   * `online` and visibility events itself; a host without one (Node,
+   * Electron's main process) calls this.
+   */
+  wake(): void;
+  /**
+   * Send what the client holds, for at most `deadlineMs`, then end as
+   * `destroy()` does: a host that quits loses nothing that could still go.
+   * Without a running connection it ends at once.
+   */
+  close(deadlineMs: number): Promise<void>;
+  /**
    * Pause the connection for `reason` ('background', 'offline', 'manual', ...):
    * it ends while any reason holds, and shares, topics and positions stay.
    */
@@ -165,6 +180,8 @@ export interface WSEClient {
 
 // Released shares stop the client this much later: a remount in between keeps it.
 const STOP_DELAY_MS = 0;
+// How often close() looks whether what the client holds went out.
+const CLOSE_CHECK_MS = 20;
 
 function shallowSame(a: WSEClientSnapshot, b: WSEClientSnapshot): boolean {
   return (
@@ -209,6 +226,11 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
   };
   const realm = options.realm ?? options.endpoints?.[0] ?? null;
   const consumer = options.consumer && options.consumer !== '' ? options.consumer : null;
+  // A storage named for the page where there is none (Node, Electron's main
+  // process, a worker): its topics and checkpoint stay in memory, and the
+  // client says so as it starts. The offline queue goes on to IndexedDB where
+  // the runtime has it (a worker), and the state says where it lives.
+  let pageless = typeof options.storage === 'string' && pageLocalStorage() === null;
   const base: ClientStorage =
     typeof options.storage === 'string'
       ? namespacedStorage(options.storage, (operation, error) =>
@@ -231,6 +253,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     },
     leaseHolder: offlineDatabase ? generateId() : undefined,
   });
+  if (pageless && typeof indexedDB === 'undefined') ctx.state.getState().setStorageState('unavailable');
   // The queue's limits hold from the first send, before anything starts.
   const { performance } = resolveOptions(options);
   ctx.queue.getState().setCapacity(performance.maxQueueSize);
@@ -329,6 +352,14 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
 
   const start = () => {
     if (session || done || paused.length > 0) return;
+    if (pageless) {
+      // Said once, as the client starts: its listeners are on by now.
+      pageless = false;
+      emit(
+        'wseStorageError',
+        storageErrorDetail('open', new Error('no page storage in this runtime: topics and the checkpoint stay in memory')),
+      );
+    }
     session = new WSESession(
       {
         key: auth,
@@ -572,6 +603,14 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     checkpoint: () => delivery.checkpoint(),
     resync: (topics) => {
       if (!done) delivery.resync(uniqueTopics(topics));
+    },
+    wake: () => live()?.wake(),
+    close: async (deadlineMs) => {
+      const until = Date.now() + Math.max(0, deadlineMs);
+      while (!done && live() && !live()!.drained() && Date.now() < until) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(CLOSE_CHECK_MS, until - Date.now())));
+      }
+      end(false);
     },
     signOut: () => end(true),
     destroy: () => end(false),

@@ -914,6 +914,19 @@ export class ConnectionManager {
     }
   };
 
+  /**
+   * The network or the machine is back, as the application heard (a host
+   * without a page has no `online` event): what wakeUp does for the page's.
+   */
+  wake(): void {
+    this.wakeUp('woken by the application');
+  }
+
+  /** Bytes the socket took and has not written yet. */
+  unsentBytes(): number {
+    return this.ws?.bufferedAmount ?? 0;
+  }
+
   private wakeUp(reason: string): void {
     if (this.isDestroyed || !this.token) return;
     if (this.stopReason !== 'none' && this.stopReason !== 'max_attempts') return;

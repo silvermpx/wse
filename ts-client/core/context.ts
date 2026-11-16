@@ -98,6 +98,25 @@ export function memoryStorage(): ClientStorage {
 /** The page's localStorage, when there is one and it may be used. */
 const pageStorage = pageLocalStorage;
 
+/** A Storage in memory. */
+function mapStorage(): Storage {
+  const map = new Map<string, string>();
+  return {
+    get length() {
+      return map.size;
+    },
+    key: (index: number) => [...map.keys()][index] ?? null,
+    getItem: (key: string) => map.get(key) ?? null,
+    setItem: (key: string, value: string) => {
+      map.set(key, String(value));
+    },
+    removeItem: (key: string) => {
+      map.delete(key);
+    },
+    clear: () => map.clear(),
+  };
+}
+
 /** Deletes an IndexedDB database, when the environment has IndexedDB. */
 export function deleteDatabase(name: string): void {
   if (typeof indexedDB === 'undefined') return;
@@ -118,9 +137,11 @@ export function prefixedStorage(
   database: string | null,
   onError?: StorageErrorListener,
 ): ClientStorage {
+  // A runtime without page storage (a worker, Node): the keys live in memory
+  // as long as the client does, rather than going nowhere.
+  let fallback: Storage | null = null;
   const each = (operation: StorageOperation, run: (storage: Storage) => void) => {
-    const storage = pageStorage();
-    if (!storage) return;
+    const storage = pageStorage() ?? (fallback ??= mapStorage());
     try {
       run(storage);
     } catch (error) {
