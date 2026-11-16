@@ -70,7 +70,7 @@ operation and the error's name, never silent.
 Outside browsers, a `webSocket` factory makes the socket, and may send headers (a token in
 `Authorization`).
 
-## React, Vue, Svelte
+## React, Vue, Svelte, Angular
 
 ```tsx
 import { createWSEClient, WSEProvider, useWSEState, useWSETopics, useWSEMessage } from 'wse-client/react';
@@ -100,11 +100,39 @@ const state = wseState(client);
 const lastPrice = wseMessage(client, 'price_update', ['prices']);
 ```
 
+```ts
+// Angular 20+: plain functions for an injection context, no decorators
+import { provideWSEClient, injectWSEState, injectWSETopics, injectWSEMessage, createWSEClient } from 'wse-client/angular';
+
+bootstrapApplication(App, {
+  providers: [provideWSEClient(() => createWSEClient({ endpoints: ['wss://example.com/wse'] }))],
+});
+
+@Component({ selector: 'app-prices', template: '{{ state().connection }}' })
+class Prices {
+  state = injectWSEState();                            // a signal
+  topic = signal('prices');
+  constructor() {
+    injectWSETopics(() => [this.topic()]);             // a list, a signal or a computation
+    injectWSEMessage('price_update', (msg) => update(msg.p));
+  }
+}
+```
+
+`provideWSEClient` makes one client per injector (per request on a server) and destroys it with
+the injector. The `inject*` functions take the client's connection, topics and listeners after the
+first render in a browser, outside Angular's zone, and let them go with their injector; a changed
+topic list is taken before the old one is let go, so a topic in both keeps its recovery position. A
+message handler gets the client's own message object (commit it when your application has applied
+it), and its failure goes to the application's `ErrorHandler`.
+
 The provider, the composables and the stores hold the client, its topics and listeners while a
 component uses them. Effects and mount hooks do not run while rendering on a server, so server
 rendering (Next.js, Nuxt, SvelteKit) opens no socket and leaves no timer: the page shows the
 client's first state (`pending`), hydrates without a mismatch, and connects in the browser. The
-tests render React, Vue and a compiled Svelte 5 page on a server without a window and hydrate them.
+tests render React, Vue and a compiled Svelte 5 page on a server without a window and hydrate
+them, and render Angular on a server, two requests at once, each with a client of its own. On a
+server a client never uses a localStorage of the runtime's own (Node 25 has one).
 
 In the browser a client of its own follows the page: `pagehide` pauses it for the reason `page`
 (a page in the back/forward cache holds no socket), `pageshow` resumes it, and it recovers what was
@@ -647,9 +675,9 @@ Full protocol specification: [PROTOCOL.md](../docs/PROTOCOL.md)
 
 ## Requirements
 
-- React 18+
-- zustand 4+ (peer dependency)
-- A browser, or Node.js with a global `WebSocket` (Node 22+)
+- For `wse-client/core`: a browser, or Node.js with a global `WebSocket` (Node 22+)
+- For `useWSE` (the root entry): React 18+ and zustand 4+; for the adapters: React 18+, Vue 3.3+,
+  Svelte 5 or Angular 20+ (optional peer dependencies)
 
 ## License
 

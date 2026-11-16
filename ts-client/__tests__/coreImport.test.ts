@@ -1,4 +1,4 @@
-// The core entry loads without React or zustand, and reads or changes
+// The core entry loads without React, Angular or zustand, and reads or changes
 // nothing of the page on import.
 
 import { describe, expect, it, vi } from 'vitest';
@@ -12,9 +12,15 @@ vi.mock('zustand', () => {
 vi.mock('zustand/middleware', () => {
   throw new Error('wse-client/core imported zustand/middleware');
 });
+vi.mock('@angular/core', () => {
+  throw new Error('wse-client/core imported @angular/core');
+});
+vi.mock('@angular/common', () => {
+  throw new Error('wse-client/core imported @angular/common');
+});
 
 describe('wse-client/core', () => {
-  it('imports without React, zustand or the page', async () => {
+  it('imports without React, Angular, zustand or the page', async () => {
     const touched: string[] = [];
     const page = new Proxy(
       {},

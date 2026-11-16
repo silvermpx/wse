@@ -1,7 +1,7 @@
 {
   "name": "wse-client",
   "version": "3.1.0",
-  "description": "TypeScript client for WSE: a core without a framework, with React, Vue and Svelte adapters and the React hook useWSE; topics with message recovery, reconnects, an offline queue, end-to-end encryption and signed messages.",
+  "description": "TypeScript client for WSE: a core without a framework, with React, Vue, Svelte and Angular adapters and the React hook useWSE; topics with message recovery, reconnects, an offline queue, end-to-end encryption and signed messages.",
   "type": "module",
   "main": "./dist/npm/index.js",
   "types": "./dist/npm/index.d.ts",
@@ -31,6 +31,11 @@
       "import": "./dist/npm/svelte/index.js",
       "default": "./dist/npm/svelte/index.js"
     },
+    "./angular": {
+      "types": "./dist/npm/angular/index.d.ts",
+      "import": "./dist/npm/angular/index.js",
+      "default": "./dist/npm/angular/index.js"
+    },
     "./react-native": {
       "types": "./dist/npm/react-native/index.d.ts",
       "import": "./dist/npm/react-native/index.js",
@@ -51,6 +56,9 @@
       ],
       "svelte": [
         "./dist/npm/svelte/index.d.ts"
+      ],
+      "angular": [
+        "./dist/npm/angular/index.d.ts"
       ],
       "react-native": [
         "./dist/npm/react-native/index.d.ts"
@@ -81,6 +89,7 @@
     "zustand",
     "vue",
     "svelte",
+    "angular",
     "typescript",
     "react-native"
   ],
@@ -109,11 +118,19 @@
     "pako": "^3.0.3"
   },
   "peerDependencies": {
+    "@angular/common": ">=20.0.0",
+    "@angular/core": ">=20.0.0",
     "react": ">=18",
     "vue": ">=3.3",
     "zustand": ">=4"
   },
   "peerDependenciesMeta": {
+    "@angular/common": {
+      "optional": true
+    },
+    "@angular/core": {
+      "optional": true
+    },
     "react": {
       "optional": true
     },
@@ -125,6 +142,11 @@
     }
   },
   "devDependencies": {
+    "@angular/common": "^22.2.6",
+    "@angular/compiler": "^22.2.6",
+    "@angular/core": "^22.2.6",
+    "@angular/platform-browser": "^22.2.6",
+    "@angular/platform-server": "^22.2.6",
     "@testing-library/dom": "^10.4.2",
     "@testing-library/react": "^16.3.3",
     "@types/node": "^26.6.6",
@@ -133,10 +155,12 @@
     "happy-dom": "^21.0.4",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
+    "rxjs": "^7.8.2",
     "svelte": "^5.57.3",
     "typescript": "^7.0.2",
     "vitest": "^5.1.0",
     "vue": "^3.5.45",
+    "zone.js": "^0.16.3",
     "zustand": "^5.1.0"
   }
 }
