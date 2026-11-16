@@ -75,6 +75,18 @@ void main() {
     await client.close();
   });
 
+  test('a paused client ends its connection and comes back when resumed', () async {
+    final client = await WseClient.connect(wseConfig(url, topics: ['ticks']));
+    client.pause('manual');
+    final paused = await client.events().firstWhere((item) => item.kind == WseItemKind.paused);
+    expect(paused.reasons, ['manual']);
+    expect(client.status, 'paused');
+    client.resume('manual');
+    final back = await client.events().firstWhere((item) => item.kind == WseItemKind.connected);
+    expect(back.reconnected, isTrue);
+    await client.close();
+  });
+
   test('a payload must be JSON', () async {
     final client = await WseClient.connect(wseConfig(url));
     expect(() => client.trySend('x', 'not json'), throwsA(isA<WseError>()));

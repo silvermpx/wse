@@ -2,6 +2,7 @@
 //! and writes its frames, keeps it alive, and makes it again when it is
 //! lost.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use crate::config::Config;
 use crate::decode::Decoder;
 use crate::error::Error;
 use crate::frames::{self, Data};
-use crate::handler::{Event, Handler};
+use crate::handler::{Event, Handler, Paused};
 use crate::policy::{First, Lost, Next, Policy};
 use crate::security::{Keys, Sealing};
 use crate::session::{self, Outgoing, Session};
@@ -46,6 +47,9 @@ pub(crate) struct Driver<H> {
     keys: Arc<Keys>,
     session: Session<H>,
     policy: Policy,
+    /// The reasons the application paused the client for: no connection
+    /// while any holds.
+    paused: BTreeSet<String>,
 }
 
 impl<H: Handler> Driver<H> {
@@ -78,22 +82,41 @@ impl<H: Handler> Driver<H> {
             status,
             session,
             policy: Policy::default(),
+            paused: BTreeSet::new(),
         }
     }
 
     pub(crate) async fn run(mut self, mut first: First) {
         let end = loop {
+            if !self.paused.is_empty() {
+                self.status.send_replace(Status::Paused);
+                self.session.handler.event(Event::Paused(Paused {
+                    reasons: self.paused.iter().cloned().collect(),
+                }));
+                if !self.wait_paused().await {
+                    break None;
+                }
+                // Back from a pause: at once, the counts start over.
+                self.policy.connected();
+            }
             // The attempt goes on while the application asks for things; a
-            // close ends it at once.
+            // close ends it at once, a pause gives it up.
             let attempt = {
                 let opening = open_socket(&self.config, &self.shared, &self.keys);
                 tokio::pin!(opening);
                 loop {
                     tokio::select! {
-                        result = &mut opening => break Some(result),
+                        result = &mut opening => break Some(result.map_err(Some)),
                         control = self.control.recv() => match control {
                             None | Some(Control::Close) => break None,
                             Some(Control::Reconnect) => {}
+                            Some(Control::Pause(reason)) => {
+                                self.paused.insert(reason);
+                                break Some(Err(None));
+                            }
+                            Some(Control::Resume(reason)) => {
+                                self.paused.remove(&reason);
+                            }
                             Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                             Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
                         },
@@ -107,9 +130,13 @@ impl<H: Handler> Driver<H> {
             let lost = match attempt {
                 None => Lost::Shutdown,
                 Some(Ok(ws)) => self.serve(ws, &mut first).await,
-                Some(Err(error)) => Lost::Failed(error),
+                Some(Err(Some(error))) => Lost::Failed(error),
+                Some(Err(None)) => Lost::Paused,
             };
             self.session.close();
+            if matches!(lost, Lost::Paused) {
+                continue;
+            }
             // What the application sent and the lost connection did not
             // write goes out on the next one, once the server takes it.
             match self.policy.after(lost, &self.config, &mut first) {
@@ -138,7 +165,7 @@ impl<H: Handler> Driver<H> {
     }
 
     /// Waits before the next attempt, doing what the application asks
-    /// meanwhile. False when it closed the client.
+    /// meanwhile. False when it closed the client; a pause ends the wait.
     async fn wait(&mut self, delay: Duration) -> bool {
         let until = tokio::time::Instant::now() + delay;
         loop {
@@ -147,6 +174,13 @@ impl<H: Handler> Driver<H> {
                 control = self.control.recv() => match control {
                     None | Some(Control::Close) => return false,
                     Some(Control::Reconnect) => return true,
+                    Some(Control::Pause(reason)) => {
+                        self.paused.insert(reason);
+                        return true;
+                    }
+                    Some(Control::Resume(reason)) => {
+                        self.paused.remove(&reason);
+                    }
                     Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                     Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
                 },
@@ -155,6 +189,26 @@ impl<H: Handler> Driver<H> {
                 }
             }
         }
+    }
+
+    /// Waits while paused, doing what the application asks meanwhile; what
+    /// is held for a gap waits too. False when it closed the client.
+    async fn wait_paused(&mut self) -> bool {
+        while !self.paused.is_empty() {
+            match self.control.recv().await {
+                None | Some(Control::Close) => return false,
+                Some(Control::Pause(reason)) => {
+                    self.paused.insert(reason);
+                }
+                Some(Control::Resume(reason)) => {
+                    self.paused.remove(&reason);
+                }
+                Some(Control::Reconnect) => {}
+                Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
+                Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
+            }
+        }
+        true
     }
 
     /// One connection, until it ends.
@@ -274,6 +328,15 @@ impl<H: Handler> Driver<H> {
                         self.take_queued();
                         self.close(&mut ws, CloseCode::Away, "reconnecting").await;
                         return Lost::Requested;
+                    }
+                    Some(Control::Pause(reason)) => {
+                        self.paused.insert(reason);
+                        self.take_queued();
+                        self.close(&mut ws, CloseCode::Away, "paused").await;
+                        return Lost::Paused;
+                    }
+                    Some(Control::Resume(reason)) => {
+                        self.paused.remove(&reason);
                     }
                     Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                     Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),

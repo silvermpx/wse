@@ -40,7 +40,11 @@ abstract class WseNativeClient implements RustOpaqueInterface {
     required WseCancel cancel,
   });
 
+  void pause({required String reason});
+
   void reconnect();
+
+  void resume({required String reason});
 
   Future<void> send({required String kind, required String json});
 
@@ -217,6 +221,9 @@ class WseItem {
   final BigInt? retryInMs;
   final int? attempt;
 
+  /// Paused: the reasons the client is paused for.
+  final List<String> reasons;
+
   /// Subscribed: the topics taken and refused, and per topic asked for with
   /// a position what was replayed.
   final List<String> topics;
@@ -249,6 +256,7 @@ class WseItem {
     this.reason,
     this.retryInMs,
     this.attempt,
+    required this.reasons,
     required this.topics,
     required this.failed,
     required this.recoveries,
@@ -279,6 +287,7 @@ class WseItem {
       reason.hashCode ^
       retryInMs.hashCode ^
       attempt.hashCode ^
+      reasons.hashCode ^
       topics.hashCode ^
       failed.hashCode ^
       recoveries.hashCode ^
@@ -311,6 +320,7 @@ class WseItem {
           reason == other.reason &&
           retryInMs == other.retryInMs &&
           attempt == other.attempt &&
+          reasons == other.reasons &&
           topics == other.topics &&
           failed == other.failed &&
           recoveries == other.recoveries &&
@@ -324,6 +334,7 @@ enum WseItemKind {
   binary,
   connected,
   disconnected,
+  paused,
   subscribed,
   gap,
   serverError,

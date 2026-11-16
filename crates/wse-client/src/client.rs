@@ -25,6 +25,8 @@ pub enum Status {
     Connected,
     /// The connection was lost; making it again.
     Reconnecting,
+    /// Paused by the application: no connection until it resumes.
+    Paused,
     /// Stopped for good: closed by the application (`None`), or the reason.
     Closed(Option<Error>),
 }
@@ -34,6 +36,8 @@ pub(crate) enum Control {
     Subscribe(Vec<String>),
     Unsubscribe(Vec<String>),
     Reconnect,
+    Pause(String),
+    Resume(String),
     Close,
 }
 
@@ -345,6 +349,20 @@ impl Client {
             .await
             .map_err(|_| Error::Closed)?;
         Ok(n)
+    }
+
+    /// Ends the connection for `reason` (`"background"`, `"offline"`,
+    /// ...) and makes no attempt while any reason holds: topics and
+    /// positions stay, and what is queued goes out first. The last reason
+    /// cleared with [`resume`](Self::resume), the client connects at once
+    /// and recovers what it missed.
+    pub fn pause(&self, reason: impl Into<String>) -> Result<(), Error> {
+        self.control(Control::Pause(reason.into()))
+    }
+
+    /// Clears `reason`; once none is left the client connects again.
+    pub fn resume(&self, reason: impl Into<String>) -> Result<(), Error> {
+        self.control(Control::Resume(reason.into()))
     }
 
     /// Subscribes to topics, on this connection and every later one; after

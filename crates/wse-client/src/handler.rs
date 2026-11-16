@@ -74,6 +74,12 @@ pub enum Event {
     /// The connection was lost, or an attempt to make it again failed; the
     /// next attempt comes after `retry_in`.
     Disconnected(Disconnected),
+    /// The application paused the client ([`Client::pause`]): the
+    /// connection ended and no attempt is made until the last reason is
+    /// cleared; topics and positions stay.
+    ///
+    /// [`Client::pause`]: crate::Client::pause
+    Paused(Paused),
     /// The server's answer to a subscription request.
     Subscribed(Subscribed),
     /// Messages of a topic that will not come: reload what depends on them.
@@ -106,6 +112,13 @@ pub struct Disconnected {
     pub retry_in: Duration,
     /// Attempts made since the last connection the server took.
     pub attempt: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Paused {
+    /// The reasons the client is paused for.
+    pub reasons: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

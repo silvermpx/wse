@@ -21,6 +21,8 @@ pub(crate) enum Lost {
     Shutdown,
     /// The application asked for a new connection.
     Requested,
+    /// The application paused the client.
+    Paused,
     /// The connection went away.
     Closed { code: Option<u16>, reason: String },
     /// An attempt failed.
@@ -62,7 +64,7 @@ impl Policy {
             Lost::Shutdown => return Next::Stop(None),
             // Asked for: at once, whatever the reconnect settings say, and
             // the counts start over.
-            Lost::Requested => {
+            Lost::Requested | Lost::Paused => {
                 self.connected();
                 return Next::Retry(Disconnected {
                     code: None,

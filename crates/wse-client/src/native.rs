@@ -317,6 +317,11 @@ pub enum Item {
         retry_in_ms: u64,
         attempt: u32,
     },
+    /// Paused by the application: no connection until the last reason is
+    /// cleared; topics and positions stay.
+    Paused {
+        reasons: Vec<String>,
+    },
     Subscribed {
         topics: Vec<String>,
         failed: Vec<String>,
@@ -424,6 +429,7 @@ fn item_of(incoming: Incoming) -> Item {
                 retry_in_ms: u64::try_from(d.retry_in.as_millis()).unwrap_or(u64::MAX),
                 attempt: d.attempt,
             },
+            Event::Paused(p) => Item::Paused { reasons: p.reasons },
             Event::Subscribed(s) => Item::Subscribed {
                 topics: s.topics,
                 failed: s.failed,
@@ -488,6 +494,7 @@ pub enum NativeStatus {
     Connecting,
     Connected,
     Reconnecting,
+    Paused,
     Closed,
 }
 
@@ -619,11 +626,24 @@ impl NativeClient {
         Ok(self.client.reconnect()?)
     }
 
+    /// Ends the connection for `reason` (`"background"`, `"offline"`, ...)
+    /// and makes none while any reason holds: topics and positions stay.
+    pub fn pause(&self, reason: String) -> Result<(), NativeError> {
+        Ok(self.client.pause(reason)?)
+    }
+
+    /// Clears `reason`; once none is left the client connects again at once
+    /// and recovers what it missed.
+    pub fn resume(&self, reason: String) -> Result<(), NativeError> {
+        Ok(self.client.resume(reason)?)
+    }
+
     pub fn status(&self) -> NativeStatus {
         match self.client.status() {
             Status::Connecting => NativeStatus::Connecting,
             Status::Connected => NativeStatus::Connected,
             Status::Reconnecting => NativeStatus::Reconnecting,
+            Status::Paused => NativeStatus::Paused,
             _ => NativeStatus::Closed,
         }
     }

@@ -267,6 +267,11 @@ pub enum WseItem {
         retry_in_ms: u64,
         attempt: u32,
     },
+    /// Paused by the application: no connection until the last reason is
+    /// cleared; topics and positions stay.
+    Paused {
+        reasons: Vec<String>,
+    },
     Subscribed {
         topics: Vec<String>,
         failed: Vec<String>,
@@ -338,6 +343,7 @@ impl From<native::Item> for WseItem {
                 retry_in_ms,
                 attempt,
             },
+            native::Item::Paused { reasons } => Self::Paused { reasons },
             native::Item::Subscribed {
                 topics,
                 failed,
@@ -404,6 +410,8 @@ pub enum WseStatus {
     Connecting,
     Connected,
     Reconnecting,
+    /// Paused by the application: no connection until it resumes.
+    Paused,
     Closed,
 }
 
@@ -484,11 +492,24 @@ impl WseClient {
         Ok(self.0.reconnect()?)
     }
 
+    /// Ends the connection for `reason` ("background", "offline", ...) and
+    /// makes none while any reason holds: topics and positions stay.
+    pub fn pause(&self, reason: String) -> Result<(), WseError> {
+        Ok(self.0.pause(reason)?)
+    }
+
+    /// Clears `reason`; once none is left the client connects again at once
+    /// and recovers what it missed.
+    pub fn resume(&self, reason: String) -> Result<(), WseError> {
+        Ok(self.0.resume(reason)?)
+    }
+
     pub fn status(&self) -> WseStatus {
         match self.0.status() {
             native::NativeStatus::Connecting => WseStatus::Connecting,
             native::NativeStatus::Connected => WseStatus::Connected,
             native::NativeStatus::Reconnecting => WseStatus::Reconnecting,
+            native::NativeStatus::Paused => WseStatus::Paused,
             native::NativeStatus::Closed => WseStatus::Closed,
         }
     }

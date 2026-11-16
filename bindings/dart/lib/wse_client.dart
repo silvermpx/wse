@@ -135,7 +135,15 @@ class WseClient {
   void unsubscribe(List<String> topics) => _native.unsubscribe(topics: topics);
   void reconnect() => _native.reconnect();
 
-  /// connecting, connected, reconnecting or closed.
+  /// Ends the connection for [reason] ('background', 'offline', ...) and
+  /// makes none while any reason holds: topics and positions stay.
+  void pause(String reason) => _native.pause(reason: reason);
+
+  /// Clears [reason]; once none is left the client connects again at once
+  /// and recovers what it missed.
+  void resume(String reason) => _native.resume(reason: reason);
+
+  /// connecting, connected, reconnecting, paused or closed.
   String get status => _native.status();
   String? get userId => _native.userId();
 

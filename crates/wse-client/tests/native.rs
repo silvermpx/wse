@@ -325,3 +325,39 @@ async fn a_cancelled_send_does_not_go_out() {
     client.disconnect(1_000).await;
     stand.server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_client_says_so_and_comes_back() {
+    let stand = stand().await;
+    let client = NativeClient::connect(stand.config("pi"), None, &CancelToken::new())
+        .await
+        .unwrap();
+    client.pause("background".into()).unwrap();
+    let mut seen = Vec::new();
+    let mut ack = 0;
+    while !seen.iter().any(|item| matches!(item, Item::Paused { .. })) {
+        let batch = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.next_batch(ack, 64, 1 << 20, &CancelToken::new()),
+        )
+        .await
+        .expect("an item within 5 s")
+        .unwrap();
+        ack = batch.id;
+        seen.extend(batch.items);
+    }
+    assert!(seen.contains(&Item::Paused {
+        reasons: vec!["background".into()]
+    }));
+    assert_eq!(client.status(), NativeStatus::Paused);
+    client.resume("background".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client.status() != NativeStatus::Connected {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("connected again");
+    client.disconnect(1_000).await;
+    stand.server.stop().await;
+}

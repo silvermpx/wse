@@ -763,7 +763,19 @@ public protocol WseClientProtocol: AnyObject, Sendable {
      */
     func nextBatch(ack: UInt64, maxItems: UInt32, maxBytes: UInt32, cancel: WseCancel) async throws  -> WseBatch
 
+    /**
+     * Ends the connection for `reason` ("background", "offline", ...) and
+     * makes none while any reason holds: topics and positions stay.
+     */
+    func pause(reason: String) throws
+
     func reconnect() throws
+
+    /**
+     * Clears `reason`; once none is left the client connects again at once
+     * and recovers what it missed.
+     */
+    func resume(reason: String) throws
 
     /**
      * Sends `{"t": kind, "p": json}`, waiting for room in the queue;
@@ -905,10 +917,36 @@ open func nextBatch(ack: UInt64, maxItems: UInt32, maxBytes: UInt32, cancel: Wse
         )
 }
 
+    /**
+     * Ends the connection for `reason` ("background", "offline", ...) and
+     * makes none while any reason holds: topics and positions stay.
+     */
+open func pause(reason: String)throws   {try rustCallWithError(FfiConverterTypeWseError_lift) {
+        uniffiCallStatus in
+    uniffi_wse_ffi_fn_method_wseclient_pause(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(reason),uniffiCallStatus
+    )
+}
+}
+
 open func reconnect()throws   {try rustCallWithError(FfiConverterTypeWseError_lift) {
         uniffiCallStatus in
     uniffi_wse_ffi_fn_method_wseclient_reconnect(
             self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+
+    /**
+     * Clears `reason`; once none is left the client connects again at once
+     * and recovers what it missed.
+     */
+open func resume(reason: String)throws   {try rustCallWithError(FfiConverterTypeWseError_lift) {
+        uniffiCallStatus in
+    uniffi_wse_ffi_fn_method_wseclient_resume(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(reason),uniffiCallStatus
     )
 }
 }
@@ -2062,6 +2100,12 @@ public enum WseItem: Equatable, Hashable {
     )
     case disconnected(code: UInt16?, reason: String, retryInMs: UInt64, attempt: UInt32
     )
+    /**
+     * Paused by the application: no connection until the last reason is
+     * cleared; topics and positions stay.
+     */
+    case paused(reasons: [String]
+    )
     case subscribed(topics: [String], failed: [String], recovery: [WseTopicRecovery]
     )
     /**
@@ -2114,19 +2158,22 @@ public struct FfiConverterTypeWseItem: FfiConverterRustBuffer {
         case 4: return .disconnected(code: try FfiConverterOptionUInt16.read(from: &buf), reason: try FfiConverterString.read(from: &buf), retryInMs: try FfiConverterUInt64.read(from: &buf), attempt: try FfiConverterUInt32.read(from: &buf)
         )
 
-        case 5: return .subscribed(topics: try FfiConverterSequenceString.read(from: &buf), failed: try FfiConverterSequenceString.read(from: &buf), recovery: try FfiConverterSequenceTypeWseTopicRecovery.read(from: &buf)
+        case 5: return .paused(reasons: try FfiConverterSequenceString.read(from: &buf)
         )
 
-        case 6: return .gap(topic: try FfiConverterString.read(from: &buf), epoch: try FfiConverterUInt32.read(from: &buf), first: try FfiConverterOptionUInt64.read(from: &buf), last: try FfiConverterOptionUInt64.read(from: &buf), reason: try FfiConverterString.read(from: &buf)
+        case 6: return .subscribed(topics: try FfiConverterSequenceString.read(from: &buf), failed: try FfiConverterSequenceString.read(from: &buf), recovery: try FfiConverterSequenceTypeWseTopicRecovery.read(from: &buf)
         )
 
-        case 7: return .serverError(code: try FfiConverterString.read(from: &buf), text: try FfiConverterString.read(from: &buf), detailsJson: try FfiConverterString.read(from: &buf)
+        case 7: return .gap(topic: try FfiConverterString.read(from: &buf), epoch: try FfiConverterUInt32.read(from: &buf), first: try FfiConverterOptionUInt64.read(from: &buf), last: try FfiConverterOptionUInt64.read(from: &buf), reason: try FfiConverterString.read(from: &buf)
         )
 
-        case 8: return .closed(reason: try FfiConverterOptionString.read(from: &buf)
+        case 8: return .serverError(code: try FfiConverterString.read(from: &buf), text: try FfiConverterString.read(from: &buf), detailsJson: try FfiConverterString.read(from: &buf)
         )
 
-        case 9: return .unknown(name: try FfiConverterString.read(from: &buf)
+        case 9: return .closed(reason: try FfiConverterOptionString.read(from: &buf)
+        )
+
+        case 10: return .unknown(name: try FfiConverterString.read(from: &buf)
         )
 
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -2163,15 +2210,20 @@ public struct FfiConverterTypeWseItem: FfiConverterRustBuffer {
             FfiConverterUInt32.write(attempt, into: &buf)
 
 
-        case let .subscribed(topics,failed,recovery):
+        case let .paused(reasons):
             writeInt(&buf, Int32(5))
+            FfiConverterSequenceString.write(reasons, into: &buf)
+
+
+        case let .subscribed(topics,failed,recovery):
+            writeInt(&buf, Int32(6))
             FfiConverterSequenceString.write(topics, into: &buf)
             FfiConverterSequenceString.write(failed, into: &buf)
             FfiConverterSequenceTypeWseTopicRecovery.write(recovery, into: &buf)
 
 
         case let .gap(topic,epoch,first,last,reason):
-            writeInt(&buf, Int32(6))
+            writeInt(&buf, Int32(7))
             FfiConverterString.write(topic, into: &buf)
             FfiConverterUInt32.write(epoch, into: &buf)
             FfiConverterOptionUInt64.write(first, into: &buf)
@@ -2180,19 +2232,19 @@ public struct FfiConverterTypeWseItem: FfiConverterRustBuffer {
 
 
         case let .serverError(code,text,detailsJson):
-            writeInt(&buf, Int32(7))
+            writeInt(&buf, Int32(8))
             FfiConverterString.write(code, into: &buf)
             FfiConverterString.write(text, into: &buf)
             FfiConverterString.write(detailsJson, into: &buf)
 
 
         case let .closed(reason):
-            writeInt(&buf, Int32(8))
+            writeInt(&buf, Int32(9))
             FfiConverterOptionString.write(reason, into: &buf)
 
 
         case let .unknown(name):
-            writeInt(&buf, Int32(9))
+            writeInt(&buf, Int32(10))
             FfiConverterString.write(name, into: &buf)
 
         }
@@ -2222,6 +2274,10 @@ public enum WseStatus: Equatable, Hashable {
     case connecting
     case connected
     case reconnecting
+    /**
+     * Paused by the application: no connection until it resumes.
+     */
+    case paused
     case closed
 
 
@@ -2250,7 +2306,9 @@ public struct FfiConverterTypeWseStatus: FfiConverterRustBuffer {
 
         case 3: return .reconnecting
 
-        case 4: return .closed
+        case 4: return .paused
+
+        case 5: return .closed
 
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -2272,8 +2330,12 @@ public struct FfiConverterTypeWseStatus: FfiConverterRustBuffer {
             writeInt(&buf, Int32(3))
 
 
-        case .closed:
+        case .paused:
             writeInt(&buf, Int32(4))
+
+
+        case .closed:
+            writeInt(&buf, Int32(5))
 
         }
     }
@@ -2827,7 +2889,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wse_ffi_checksum_method_wseclient_next_batch() != 61381) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_wse_ffi_checksum_method_wseclient_pause() != 26287) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_wse_ffi_checksum_method_wseclient_reconnect() != 25763) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wse_ffi_checksum_method_wseclient_resume() != 28459) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_method_wseclient_send() != 38848) {

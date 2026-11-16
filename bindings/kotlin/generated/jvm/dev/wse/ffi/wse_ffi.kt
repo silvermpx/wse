@@ -716,7 +716,11 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_next_batch(
     ): Int
+    external fun uniffi_wse_ffi_checksum_method_wseclient_pause(
+    ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_reconnect(
+    ): Int
+    external fun uniffi_wse_ffi_checksum_method_wseclient_resume(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_send(
     ): Int
@@ -781,7 +785,11 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_wse_ffi_fn_method_wseclient_next_batch(`ptr`: Long,`ack`: Long,`maxItems`: Int,`maxBytes`: Int,`cancel`: Long,
     ): Long
+    external fun uniffi_wse_ffi_fn_method_wseclient_pause(`ptr`: Long,`reason`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_reconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_wse_ffi_fn_method_wseclient_resume(`ptr`: Long,`reason`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_send(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,`cancel`: Long,
     ): Long
@@ -948,7 +956,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_next_batch() and 0xFFFF) != 61381) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_pause() and 0xFFFF) != 26287) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_reconnect() and 0xFFFF) != 25763) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_resume() and 0xFFFF) != 28459) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_send() and 0xFFFF) != 38848) {
@@ -1867,7 +1881,19 @@ public interface WseClientInterface {
      */
     suspend fun `nextBatch`(`ack`: kotlin.ULong, `maxItems`: kotlin.UInt, `maxBytes`: kotlin.UInt, `cancel`: WseCancel): WseBatch
 
+    /**
+     * Ends the connection for `reason` ("background", "offline", ...) and
+     * makes none while any reason holds: topics and positions stay.
+     */
+    fun `pause`(`reason`: kotlin.String)
+
     fun `reconnect`()
+
+    /**
+     * Clears `reason`; once none is left the client connects again at once
+     * and recovers what it missed.
+     */
+    fun `resume`(`reason`: kotlin.String)
 
     /**
      * Sends `{"t": kind, "p": json}`, waiting for room in the queue;
@@ -2078,6 +2104,24 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
     }
 
 
+    /**
+     * Ends the connection for `reason` ("background", "offline", ...) and
+     * makes none while any reason holds: topics and positions stay.
+     */
+    @Throws(WseException::class)override fun `pause`(`reason`: kotlin.String)
+        =
+    callWithHandle {
+    uniffiRustCallWithError(WseException) { _status ->
+    UniffiLib.uniffi_wse_ffi_fn_method_wseclient_pause(
+        it,
+
+        FfiConverterString.lower(`reason`),_status)
+}
+    }
+
+
+
+
     @Throws(WseException::class)override fun `reconnect`()
         =
     callWithHandle {
@@ -2085,6 +2129,24 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
     UniffiLib.uniffi_wse_ffi_fn_method_wseclient_reconnect(
         it,
         _status)
+}
+    }
+
+
+
+
+    /**
+     * Clears `reason`; once none is left the client connects again at once
+     * and recovers what it missed.
+     */
+    @Throws(WseException::class)override fun `resume`(`reason`: kotlin.String)
+        =
+    callWithHandle {
+    uniffiRustCallWithError(WseException) { _status ->
+    UniffiLib.uniffi_wse_ffi_fn_method_wseclient_resume(
+        it,
+
+        FfiConverterString.lower(`reason`),_status)
 }
     }
 
@@ -3451,6 +3513,19 @@ sealed class WseItem {
         companion object
     }
 
+    /**
+     * Paused by the application: no connection until the last reason is
+     * cleared; topics and positions stay.
+     */
+    data class Paused(
+        val `reasons`: List<kotlin.String>) : WseItem()
+
+    {
+
+
+        companion object
+    }
+
     data class Subscribed(
         val `topics`: List<kotlin.String>,
         val `failed`: List<kotlin.String>,
@@ -3547,27 +3622,30 @@ public object FfiConverterTypeWseItem : FfiConverterRustBuffer<WseItem>{
                 FfiConverterULong.read(buf),
                 FfiConverterUInt.read(buf),
                 )
-            5 -> WseItem.Subscribed(
+            5 -> WseItem.Paused(
+                FfiConverterSequenceString.read(buf),
+                )
+            6 -> WseItem.Subscribed(
                 FfiConverterSequenceString.read(buf),
                 FfiConverterSequenceString.read(buf),
                 FfiConverterSequenceTypeWseTopicRecovery.read(buf),
                 )
-            6 -> WseItem.Gap(
+            7 -> WseItem.Gap(
                 FfiConverterString.read(buf),
                 FfiConverterUInt.read(buf),
                 FfiConverterOptionalULong.read(buf),
                 FfiConverterOptionalULong.read(buf),
                 FfiConverterString.read(buf),
                 )
-            7 -> WseItem.ServerError(
+            8 -> WseItem.ServerError(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            8 -> WseItem.Closed(
+            9 -> WseItem.Closed(
                 FfiConverterOptionalString.read(buf),
                 )
-            9 -> WseItem.Unknown(
+            10 -> WseItem.Unknown(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
@@ -3607,6 +3685,13 @@ public object FfiConverterTypeWseItem : FfiConverterRustBuffer<WseItem>{
                 + FfiConverterString.allocationSize(value.`reason`)
                 + FfiConverterULong.allocationSize(value.`retryInMs`)
                 + FfiConverterUInt.allocationSize(value.`attempt`)
+            )
+        }
+        is WseItem.Paused -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterSequenceString.allocationSize(value.`reasons`)
             )
         }
         is WseItem.Subscribed -> {
@@ -3682,15 +3767,20 @@ public object FfiConverterTypeWseItem : FfiConverterRustBuffer<WseItem>{
                 FfiConverterUInt.write(value.`attempt`, buf)
                 Unit
             }
-            is WseItem.Subscribed -> {
+            is WseItem.Paused -> {
                 buf.putInt(5)
+                FfiConverterSequenceString.write(value.`reasons`, buf)
+                Unit
+            }
+            is WseItem.Subscribed -> {
+                buf.putInt(6)
                 FfiConverterSequenceString.write(value.`topics`, buf)
                 FfiConverterSequenceString.write(value.`failed`, buf)
                 FfiConverterSequenceTypeWseTopicRecovery.write(value.`recovery`, buf)
                 Unit
             }
             is WseItem.Gap -> {
-                buf.putInt(6)
+                buf.putInt(7)
                 FfiConverterString.write(value.`topic`, buf)
                 FfiConverterUInt.write(value.`epoch`, buf)
                 FfiConverterOptionalULong.write(value.`first`, buf)
@@ -3699,19 +3789,19 @@ public object FfiConverterTypeWseItem : FfiConverterRustBuffer<WseItem>{
                 Unit
             }
             is WseItem.ServerError -> {
-                buf.putInt(7)
+                buf.putInt(8)
                 FfiConverterString.write(value.`code`, buf)
                 FfiConverterString.write(value.`text`, buf)
                 FfiConverterString.write(value.`detailsJson`, buf)
                 Unit
             }
             is WseItem.Closed -> {
-                buf.putInt(8)
+                buf.putInt(9)
                 FfiConverterOptionalString.write(value.`reason`, buf)
                 Unit
             }
             is WseItem.Unknown -> {
-                buf.putInt(9)
+                buf.putInt(10)
                 FfiConverterString.write(value.`name`, buf)
                 Unit
             }
@@ -3729,6 +3819,10 @@ enum class WseStatus {
     CONNECTING,
     CONNECTED,
     RECONNECTING,
+    /**
+     * Paused by the application: no connection until it resumes.
+     */
+    PAUSED,
     CLOSED;
 
 

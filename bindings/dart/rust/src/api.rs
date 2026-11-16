@@ -81,6 +81,7 @@ pub enum WseItemKind {
     Binary,
     Connected,
     Disconnected,
+    Paused,
     Subscribed,
     Gap,
     ServerError,
@@ -129,6 +130,8 @@ pub struct WseItem {
     /// Disconnected: when the next attempt is made, and attempts so far.
     pub retry_in_ms: Option<u64>,
     pub attempt: Option<u32>,
+    /// Paused: the reasons the client is paused for.
+    pub reasons: Vec<String>,
     /// Subscribed: the topics taken and refused, and per topic asked for with
     /// a position what was replayed.
     pub topics: Vec<String>,
@@ -163,6 +166,7 @@ impl WseItem {
             reason: None,
             retry_in_ms: None,
             attempt: None,
+            reasons: Vec::new(),
             topics: Vec::new(),
             failed: Vec::new(),
             recoveries: Vec::new(),
@@ -219,6 +223,10 @@ impl From<native::Item> for WseItem {
                 retry_in_ms: Some(retry_in_ms),
                 attempt: Some(attempt),
                 ..WseItem::of(WseItemKind::Disconnected)
+            },
+            native::Item::Paused { reasons } => WseItem {
+                reasons,
+                ..WseItem::of(WseItemKind::Paused)
             },
             native::Item::Subscribed {
                 topics,
@@ -361,6 +369,16 @@ impl WseNativeClient {
         Ok(self.0.reconnect()?)
     }
 
+    #[frb(sync)]
+    pub fn pause(&self, reason: String) -> Result<(), WseError> {
+        Ok(self.0.pause(reason)?)
+    }
+
+    #[frb(sync)]
+    pub fn resume(&self, reason: String) -> Result<(), WseError> {
+        Ok(self.0.resume(reason)?)
+    }
+
     /// connecting, connected, reconnecting or closed.
     #[frb(sync)]
     pub fn status(&self) -> String {
@@ -368,6 +386,7 @@ impl WseNativeClient {
             native::NativeStatus::Connecting => "connecting",
             native::NativeStatus::Connected => "connected",
             native::NativeStatus::Reconnecting => "reconnecting",
+            native::NativeStatus::Paused => "paused",
             native::NativeStatus::Closed => "closed",
         }
         .to_owned()

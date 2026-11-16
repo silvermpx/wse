@@ -1247,3 +1247,54 @@ async fn a_close_past_its_deadline_drops_a_stuck_connection() {
     assert!(!client.is_connected());
     stand.server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_client_comes_back_with_what_it_missed() {
+    let mut stand = stand().await;
+    let mut config = stand.config("paula");
+    config.topics = vec!["chat".into()];
+    let (client, mut events) = wse_client::connect(config).await.unwrap();
+    stand.connect_id().await;
+    let say = |n: u32| json!({"t": "said", "p": {"n": n}}).to_string();
+    while !matches!(next_event(&mut events).await, Event::Subscribed(_)) {}
+    stand.publisher.publish_local("chat", &say(1)).unwrap();
+    assert_eq!(
+        next_message(&mut events).await.payload_value().unwrap()["n"],
+        1
+    );
+
+    // Two reasons: the connection ends and stays down until both are gone.
+    client.pause("background").unwrap();
+    client.pause("manual").unwrap();
+    let Event::Paused(paused) = next_event(&mut events).await else {
+        panic!("paused");
+    };
+    assert_eq!(paused.reasons, ["background"]);
+    assert_eq!(client.status(), wse_client::Status::Paused);
+    assert!(!client.is_connected());
+    for n in 2..=3 {
+        stand.publisher.publish_local("chat", &say(n)).unwrap();
+    }
+    client.resume("background").unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(client.status(), wse_client::Status::Paused);
+
+    // The last reason gone: back at once, with what it missed.
+    client.resume("manual").unwrap();
+    let Event::Connected(again) = next_event(&mut events).await else {
+        panic!("connected again");
+    };
+    assert!(again.reconnected);
+    for n in 2..=3 {
+        assert_eq!(
+            next_message(&mut events).await.payload_value().unwrap()["n"],
+            n
+        );
+    }
+    let Event::Subscribed(subscribed) = next_event(&mut events).await else {
+        panic!("the subscription's answer");
+    };
+    assert!(subscribed.recovery[0].recovered);
+    client.close().await;
+    stand.server.stop().await;
+}

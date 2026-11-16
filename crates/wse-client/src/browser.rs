@@ -5,6 +5,7 @@
 //! the server takes the client by its cookie. It answers the server's
 //! protocol pings itself, so the client's heartbeat is a message.
 
+use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +23,7 @@ use crate::config::Config;
 use crate::decode::Decoder;
 use crate::error::Error;
 use crate::frames::{self, Data};
-use crate::handler::{Event, Handler};
+use crate::handler::{Event, Handler, Paused};
 use crate::policy::{First, Lost, Next, Policy};
 use crate::security::{Keys, Sealing};
 use crate::session::{self, Outgoing, Session};
@@ -216,6 +217,9 @@ pub(crate) struct Driver<H> {
     keys: Arc<Keys>,
     session: Session<H>,
     policy: Policy,
+    /// The reasons the application paused the client for: no connection
+    /// while any holds.
+    paused: BTreeSet<String>,
 }
 
 impl<H: Handler> Driver<H> {
@@ -248,17 +252,33 @@ impl<H: Handler> Driver<H> {
             status,
             session,
             policy: Policy::default(),
+            paused: BTreeSet::new(),
         }
     }
 
     pub(crate) async fn run(mut self, mut first: First) {
         let end = loop {
+            if !self.paused.is_empty() {
+                self.status.send_replace(Status::Paused);
+                self.session.handler.event(Event::Paused(Paused {
+                    reasons: self.paused.iter().cloned().collect(),
+                }));
+                if !self.wait_paused().await {
+                    break None;
+                }
+                // Back from a pause: at once, the counts start over.
+                self.policy.connected();
+            }
             let lost = match self.open().await {
                 None => Lost::Shutdown,
                 Some(Ok(socket)) => self.serve(socket, &mut first).await,
-                Some(Err(error)) => Lost::Failed(error),
+                Some(Err(Some(error))) => Lost::Failed(error),
+                Some(Err(None)) => Lost::Paused,
             };
             self.session.close();
+            if matches!(lost, Lost::Paused) {
+                continue;
+            }
             // What the application sent and the lost connection did not
             // write goes out on the next one, once the server takes it.
             match self.policy.after(lost, &self.config, &mut first) {
@@ -284,8 +304,8 @@ impl<H: Handler> Driver<H> {
     }
 
     /// Opens a socket; `None` when the application closed the client
-    /// meanwhile.
-    async fn open(&mut self) -> Option<Result<Socket, Error>> {
+    /// meanwhile, `Some(Err(None))` when it paused it.
+    async fn open(&mut self) -> Option<Result<Socket, Option<Error>>> {
         let deadline = Instant::now() + self.config.connect_timeout;
         if let Some(provider) = self.config.token_provider.clone() {
             // Asked to refresh the page's cookie; the client may close, or
@@ -298,25 +318,32 @@ impl<H: Handler> Driver<H> {
                     control = self.control.recv() => match control {
                         None | Some(Control::Close) => return None,
                         Some(Control::Reconnect) => {}
+                        Some(Control::Pause(reason)) => {
+                            self.paused.insert(reason);
+                            return Some(Err(None));
+                        }
+                        Some(Control::Resume(reason)) => {
+                            self.paused.remove(&reason);
+                        }
                         Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                         Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
                     },
                     token = &mut fetch => break token,
                     _ = sleep_until(Some(deadline)) => {
-                        return Some(Err(Error::Timeout(format!(
+                        return Some(Err(Some(Error::Timeout(format!(
                             "no token from the token provider within {:?}",
                             self.config.connect_timeout
-                        ))));
+                        )))));
                     }
                 }
             };
             if let Err(e) = fetched {
-                return Some(Err(Error::Connect(format!("token provider: {e}"))));
+                return Some(Err(Some(Error::Connect(format!("token provider: {e}")))));
             }
         }
         let mut socket = match Socket::open(&self.config.url(self.keys.e2e)) {
             Ok(socket) => socket,
-            Err(error) => return Some(Err(error)),
+            Err(error) => return Some(Err(Some(error))),
         };
         loop {
             tokio::select! {
@@ -324,6 +351,14 @@ impl<H: Handler> Driver<H> {
                 control = self.control.recv() => match control {
                     None | Some(Control::Close) => return None,
                     Some(Control::Reconnect) => {}
+                    Some(Control::Pause(reason)) => {
+                        self.paused.insert(reason);
+                        socket.close("paused");
+                        return Some(Err(None));
+                    }
+                    Some(Control::Resume(reason)) => {
+                        self.paused.remove(&reason);
+                    }
                     Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                     Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
                 },
@@ -334,26 +369,48 @@ impl<H: Handler> Driver<H> {
                 happened = socket.events.recv() => match happened {
                     Some(Happened::Open) => return Some(Ok(socket)),
                     Some(Happened::Close { code, reason }) => {
-                        return Some(Err(Error::Connect(format!(
+                        return Some(Err(Some(Error::Connect(format!(
                             "closed before it opened ({code}{}{reason})",
                             if reason.is_empty() { "" } else { ": " }
-                        ))));
+                        )))));
                     }
                     Some(_) => {}
-                    None => return Some(Err(Error::Connect("the socket is gone".to_owned()))),
+                    None => {
+                        return Some(Err(Some(Error::Connect("the socket is gone".to_owned()))));
+                    }
                 },
                 _ = sleep_until(Some(deadline)) => {
-                    return Some(Err(Error::Timeout(format!(
+                    return Some(Err(Some(Error::Timeout(format!(
                         "no upgrade within {:?}",
                         self.config.connect_timeout
-                    ))));
+                    )))));
                 }
             }
         }
     }
 
+    /// Waits while paused, doing what the application asks meanwhile; what
+    /// is held for a gap waits too. False when it closed the client.
+    async fn wait_paused(&mut self) -> bool {
+        while !self.paused.is_empty() {
+            match self.control.recv().await {
+                None | Some(Control::Close) => return false,
+                Some(Control::Pause(reason)) => {
+                    self.paused.insert(reason);
+                }
+                Some(Control::Resume(reason)) => {
+                    self.paused.remove(&reason);
+                }
+                Some(Control::Reconnect) => {}
+                Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
+                Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
+            }
+        }
+        true
+    }
+
     /// Waits before the next attempt, doing what the application asks
-    /// meanwhile. False when it closed the client.
+    /// meanwhile. False when it closed the client; a pause ends the wait.
     async fn wait(&mut self, delay: Duration) -> bool {
         let until = Instant::now() + delay;
         loop {
@@ -362,6 +419,13 @@ impl<H: Handler> Driver<H> {
                 control = self.control.recv() => match control {
                     None | Some(Control::Close) => return false,
                     Some(Control::Reconnect) => return true,
+                    Some(Control::Pause(reason)) => {
+                        self.paused.insert(reason);
+                        return true;
+                    }
+                    Some(Control::Resume(reason)) => {
+                        self.paused.remove(&reason);
+                    }
                     Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                     Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
                 },
@@ -433,6 +497,16 @@ impl<H: Handler> Driver<H> {
                         let _ = self.write(&socket);
                         socket.close("reconnecting");
                         return Lost::Requested;
+                    }
+                    Some(Control::Pause(reason)) => {
+                        self.paused.insert(reason);
+                        self.take_queued();
+                        let _ = self.write(&socket);
+                        socket.close("paused");
+                        return Lost::Paused;
+                    }
+                    Some(Control::Resume(reason)) => {
+                        self.paused.remove(&reason);
                     }
                     Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                     Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),

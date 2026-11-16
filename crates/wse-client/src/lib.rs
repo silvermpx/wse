@@ -36,8 +36,8 @@ pub use config::{Config, Format, Reconnect, TokenProvider};
 pub use error::Error;
 pub use events::{Events, Incoming, connect};
 pub use handler::{
-    Connected, Disconnected, Event, Gap, GapReason, Handler, MaybeSend, Recovery, ServerError,
-    Subscribed,
+    Connected, Disconnected, Event, Gap, GapReason, Handler, MaybeSend, Paused, Recovery,
+    ServerError, Subscribed,
 };
 pub use message::{Message, OwnedMessage, Position, Signature};
 #[cfg(feature = "aws-lc")]
