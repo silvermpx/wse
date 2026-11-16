@@ -68,6 +68,11 @@ const initialState: MessageQueueState = {
 };
 
 
+/** A queued message's size, as the queue counts it: its JSON. */
+function sizeOf(m: QueuedMessage): number {
+  return JSON.stringify(m.message ?? { t: m.type, p: m.payload })?.length ?? 0;
+}
+
 function bytesOf(messages: QueuedMessage[]): number {
   let total = 0;
   for (const m of messages) total += m.bytes ?? 0;
@@ -245,11 +250,16 @@ export const createQueueState: StateCreator<MessageQueueStore> = (set, get) => {
     set({ processing });
   },
 
-  setCapacity: (capacity) => set((s) => derive({ ...s, capacity }, s.messages)),
+  setCapacity: (capacity) => set((s) => ({ capacity, ...derive({ ...s, capacity }, s.messages) })),
 
   setMemoryLimit: (bytes) => set((s) => {
     const memoryLimit = Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
-    return { memoryLimit, ...derive({ ...s, memoryLimit }, s.messages) };
+    // Messages queued while no limit held count once one does.
+    const messages =
+      memoryLimit > 0 && s.messages.some((m) => m.bytes === undefined)
+        ? s.messages.map((m) => (m.bytes === undefined ? { ...m, bytes: sizeOf(m) } : m))
+        : s.messages;
+    return { memoryLimit, ...derive({ ...s, memoryLimit }, messages) };
   }),
 
   getByPriority: (priority) => {

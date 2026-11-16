@@ -92,6 +92,16 @@ describe('a client of its own', () => {
     window.removeEventListener('wseGap', windowEvents);
   });
 
+  it('holds its queue limits before it starts', () => {
+    // The envelope (id, timestamp) takes some 150 bytes of its own.
+    const c = client(A, { performance: { memoryLimit: 400 } });
+    expect(c.send('big', { text: 'x'.repeat(1000) })).toBe('dropped');
+    expect(c.send('small', { n: 1 })).toBe('queued');
+    const counted = client(B, { performance: { maxQueueSize: 1 } });
+    expect(counted.send('one', {})).toBe('queued');
+    expect(counted.send('two', {})).toBe('dropped');
+  });
+
   it('is ready once the server took the connection, not when the socket opens', async () => {
     const c = client(A);
     c.retain();

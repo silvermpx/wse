@@ -24,6 +24,7 @@ import {
   WSESession,
   buildMessage,
   expiryOf,
+  resolveOptions,
   uniqueTopics,
   type DataOwner,
   type UseWSEConfig,
@@ -151,6 +152,10 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
       ? namespacedStorage(options.storage)
       : (options.storage ?? memoryStorage());
   const ctx: ClientContext = createClientContext({ emit, storage });
+  // The queue's limits hold from the first send, before anything starts.
+  const { performance } = resolveOptions(options);
+  ctx.queue.getState().setCapacity(performance.maxQueueSize);
+  ctx.queue.getState().setMemoryLimit(performance.memoryLimit);
   const sequencer = new EventSequencer();
   const dataOwner: DataOwner = { auth, userId: null };
 
