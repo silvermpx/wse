@@ -58,6 +58,17 @@ cd python-client && pytest tests/
 
 # TS client
 npm test
+
+# The mobile clients, each against the Rust client's example server:
+# Swift on the Mac (SIMULATOR=1 also on an iOS simulator of its own),
+# Kotlin on the JVM, Dart with Flutter; and on an Android emulator the
+# Kotlin library, an app built with R8 and the Flutter example
+bindings/swift/run-tests.sh
+bindings/kotlin/run-tests.sh
+bindings/dart/run-tests.sh
+bindings/kotlin/android/run-emulator-tests.sh
+bindings/kotlin/android/run-consumer-check.sh
+bindings/dart/example/run-integration-tests.sh <device id>
 ```
 
 Builds are portable by default: no CPU-specific flags are committed. To

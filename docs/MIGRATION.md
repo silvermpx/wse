@@ -1,5 +1,37 @@
 # Migration Guide
 
+## Migrating from v3.0 to v3.1
+
+3.1 adds clients and recovery per stream; servers and clients of 3.0 and 3.1
+talk to each other in either combination. What can change for an
+application:
+
+### TypeScript client
+
+- The client handles its own protocol messages (`server_ready`,
+  `subscription_update`, `PONG`, snapshots, presence and the like) before the
+  application's handlers. A handler registered for one of those types runs
+  after the client's instead of replacing it, and `clearHandlers()` clears only
+  the application's.
+- `import.meta` is not read, so `VITE_LOG_LEVEL` has no effect: set
+  `WSE_LOG_LEVEL` in `process.env` or on `globalThis`, or call
+  `logger.setLevel()`.
+- The page's lifecycle: `pagehide` lets the connection go and `pageshow`
+  connects again and recovers; `beforeunload` is no longer listened to, so the
+  page can go into the back/forward cache.
+- A client of its own (`wse-client/core`) keeps its offline queue in IndexedDB
+  only for a named `consumer`; without one the queue is kept in memory. The
+  page-wide `useWSE` and its queue are as before.
+
+### Rust, Python and the server
+
+- Nothing to change. A recovery may name the client's offset in every stream
+  of a topic (`streams`), and the server says how long a quiet stream stays
+  recoverable (`features.history_ttl`); a 3.0 server ignores the first, and a
+  3.1 client without the second keeps every stream's position.
+
+---
+
 ## Migrating from v2.x to v3.0
 
 3.0 strengthens security and aligns every behaviour with the documentation. Most applications change a few lines; the list below is everything that can break.

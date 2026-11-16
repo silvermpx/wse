@@ -329,7 +329,9 @@ Stamped topic messages carry a per-message `(topic, epoch, offset)` (`tp`/`e`/`o
 Dedup and ordering are driven by the per-topic `(epoch, offset)`, which is
 authoritative and survives reconnects: a duplicate (offset already seen on the
 same epoch) is dropped and an in-order message is delivered. An epoch change
-(server restart) re-baselines the topic. Unstamped messages fall back to a
+(server restart) re-baselines the topic. A topic published on several servers of
+a cluster carries a stream (an epoch) per server; the client keeps the offset of
+each, and a recovery names every one of them. Unstamped messages fall back to a
 sliding-window id dedup (10,000-entry cache). The server's global `seq` is a
 diagnostic only - it is not used for ordering.
 

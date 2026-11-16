@@ -119,6 +119,15 @@ async fn main() -> Result<(), wse_client::Error> {
 - **Another user.** When the token provider's next token is another
   user's, what the last user queued and did not send goes nowhere, and the
   topics are subscribed again from the start.
+- **Recovery per stream.** A topic published on several servers of a
+  cluster has a stream per server; a recovery names the client's offset in
+  each, and a stream that stayed quiet on the connection for longer than the
+  server keeps one is no longer named. Time away keeps every position.
+- **Pause and close.** `pause(reason)` ends the connection, after what is
+  queued went out, and nothing connects while any reason holds;
+  `resume(reason)` for the last one connects at once and recovers what was
+  missed. `close_within(deadline)` gives what is queued the deadline to go
+  out and then stops.
 - **Back-pressure.** A handler that waits in `ready` holds the server back;
   the stream of `connect` does the same while nobody reads it.
 
@@ -169,6 +178,10 @@ is the browser's WebSocket, on the page's task: a handler need not be
   `wss://`; in the browser `wss://` is the browser's own TLS.
 - `fips`: aws-lc-rs built from its FIPS 140-3 validated module (needs CMake
   and Go).
+- `native`: the `native` module the Swift, Kotlin and Dart packages are
+  built on: plain types, one shared runtime, cancellable calls, events read
+  in bounded batches, and `wss://` checked by the system's certificate
+  verifier. Not in the browser.
 
 The protocol is documented in the
 [repository](https://github.com/silvermpx/wse/tree/main/docs).

@@ -5,6 +5,8 @@
 [![npm](https://img.shields.io/npm/v/wse-client)](https://www.npmjs.com/package/wse-client)
 [![crates.io - Server](https://img.shields.io/crates/v/wse?label=crates.io%20wse)](https://crates.io/crates/wse)
 [![crates.io - Client](https://img.shields.io/crates/v/wse-client?label=crates.io%20wse-client)](https://crates.io/crates/wse-client)
+[![pub.dev](https://img.shields.io/pub/v/wse_client)](https://pub.dev/packages/wse_client)
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.silvermpx/wse-client-android)](https://central.sonatype.com/artifact/io.github.silvermpx/wse-client-android)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/silvermpx/wse/blob/main/LICENSE)
 
 WSE is a WebSocket engine for reactive user interfaces: trading terminals, dashboards, monitoring, chats, notifications. Your backend publishes events to topics, and WSE pushes each event to every client subscribed to it, so the screen changes the moment the data does, without polling.
@@ -36,8 +38,8 @@ In the browser, the TypeScript client keeps the connection, its subscriptions an
 | [`wse-client`](https://crates.io/crates/wse-client) | `cargo add wse-client` | Interfaces in Rust (WebAssembly), and Rust services on tokio |
 | [`wse-client`](https://pypi.org/project/wse-client/) | `pip install wse-client` | Python services and scripts, with or without asyncio |
 | [`wse_client`](https://pub.dev/packages/wse_client) | `flutter pub add wse_client` | Flutter and Dart apps (Android, iOS, macOS, Linux, Windows) |
-| [Swift](bindings/swift) | the XCFramework of each release | iOS and macOS apps |
-| [Kotlin](bindings/kotlin) | the AAR of each release | Android apps |
+| [`wse-swift`](https://github.com/silvermpx/wse-swift) | Swift Package Manager: `https://github.com/silvermpx/wse-swift` | iOS and macOS apps |
+| [`wse-client-android`](https://central.sonatype.com/artifact/io.github.silvermpx/wse-client-android) | `implementation("io.github.silvermpx:wse-client-android:3.1.0")` | Android apps |
 
 ## A server in Python
 
@@ -158,7 +160,7 @@ export function Price() {
 }
 ```
 
-A browser cannot put headers on a WebSocket, so it signs in with the cookie your login endpoint sets (`access_token`); `'cookie'` tells the hook to connect. Every `useWSE()` on a page shares one connection. More in the [TypeScript client's README](https://github.com/silvermpx/wse/blob/main/ts-client/README.md).
+A browser cannot put headers on a WebSocket, so it signs in with the cookie your login endpoint sets (`access_token`); `'cookie'` tells the hook to connect. Every `useWSE()` on a page shares one connection. Without React, `createWSEClient` from `wse-client/core` makes a client of its own, which `wse-client/react`, `wse-client/vue` and `wse-client/svelte` hand to components and `wse-client/react-native` sets up for an app. More in the [TypeScript client's README](https://github.com/silvermpx/wse/blob/main/ts-client/README.md).
 
 ### Python
 
@@ -204,6 +206,36 @@ async fn main() -> Result<(), wse_client::Error> {
 ```
 
 The same crate builds for the browser (`wasm32-unknown-unknown`), for Leptos, Yew or Dioxus apps, with the same API. A `Handler` can read each message straight from its frame into your own types, without copying it. More in the [Rust client's README](https://github.com/silvermpx/wse/blob/main/crates/wse-client/README.md).
+
+### Swift, Kotlin and Flutter
+
+iOS, Android and Flutter apps use the Rust client through packages of their own: the same reconnects, recovery, end-to-end encryption and signed messages, with async calls and the events as a stream, and helpers that pause the connection while the app is in the background or offline.
+
+```swift
+let client = try await WseClient.connect(
+    WseConfig(url: "wss://example.com/wse", token: token, topics: ["prices"]))
+for try await item in client.events() {
+    if case let .message(message) = item { print(message.kind, message.json ?? "") }
+}
+```
+
+```kotlin
+val client = connectClient(WseConfig(url = "wss://example.com/wse", token = token, topics = listOf("prices")))
+client.events().asFlow().collect { item ->
+    if (item is WseItem.Message) println("${item.message.kind}: ${item.message.json}")
+}
+```
+
+```dart
+final client = await WseClient.connect(
+  wseConfig('wss://example.com/wse', token: token, topics: ['prices']),
+);
+await for (final item in client.events()) {
+  if (item.kind == WseItemKind.message) print('${item.name}: ${item.json}');
+}
+```
+
+More in the READMEs of the [Swift](https://github.com/silvermpx/wse/blob/main/bindings/swift/README.md), [Kotlin](https://github.com/silvermpx/wse/blob/main/bindings/kotlin/README.md) and [Dart](https://github.com/silvermpx/wse/blob/main/bindings/dart/README.md) packages.
 
 ## The Python server
 
@@ -422,6 +454,8 @@ The full list, with the client changes: [MIGRATION.md](https://github.com/silver
 ## Documentation
 
 - [Integration guide](https://github.com/silvermpx/wse/blob/main/docs/INTEGRATION.md): setup and the complete API
+- Clients: [TypeScript](https://github.com/silvermpx/wse/blob/main/ts-client/README.md), [Python](https://github.com/silvermpx/wse/blob/main/python-client/README.md), [Rust](https://github.com/silvermpx/wse/blob/main/crates/wse-client/README.md), [Swift](https://github.com/silvermpx/wse/blob/main/bindings/swift/README.md), [Kotlin](https://github.com/silvermpx/wse/blob/main/bindings/kotlin/README.md), [Dart](https://github.com/silvermpx/wse/blob/main/bindings/dart/README.md)
+- [Migration guide](https://github.com/silvermpx/wse/blob/main/docs/MIGRATION.md): from 2.x to 3.0, and from 3.0 to 3.1
 - [Wire protocol](https://github.com/silvermpx/wse/blob/main/docs/PROTOCOL.md): messages, close codes, end-to-end encryption
 - [Cluster protocol](https://github.com/silvermpx/wse/blob/main/docs/CLUSTER_PROTOCOL.md)
 - [Security](https://github.com/silvermpx/wse/blob/main/docs/SECURITY.md)
