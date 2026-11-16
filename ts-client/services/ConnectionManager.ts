@@ -121,6 +121,12 @@ export interface ConnectionManagerConfig {
 
   /** Called with a message accepted by trySend() whose socket vanished before it went out. */
   onUndeliverable?: (message: WSMessage) => void;
+  /**
+   * A message accepted to be sealed may still go, right before its frame is
+   * written (its user, the topics it requires): false hands it back through
+   * onUndeliverable instead.
+   */
+  mayStillGo?: (message: WSMessage) => boolean;
 
   /** Frames waiting to be encrypted, at most (default 256), and their bytes (default 16 MiB). */
   maxPendingEncrypted?: number;
@@ -1054,7 +1060,7 @@ export class ConnectionManager {
         const socketId = this.socketId;
         this.encryptedSendQueue = this.encryptedSendQueue.then(async () => {
           try {
-            if (socketId !== this.socketId || this.ws !== ws || ws.readyState !== WS_OPEN) {
+            if (socketId !== this.socketId || this.ws !== ws || ws.readyState !== WS_OPEN || !this.mayStillGo(message)) {
               this.reportUndeliverable(message);
               return;
             }
@@ -1069,7 +1075,9 @@ export class ConnectionManager {
               }
               return;
             }
-            if (socketId !== this.socketId || this.ws !== ws || ws.readyState !== WS_OPEN) {
+            // What changed while it was sealed: the connection, the user, the
+            // topics it requires.
+            if (socketId !== this.socketId || this.ws !== ws || ws.readyState !== WS_OPEN || !this.mayStillGo(message)) {
               this.reportUndeliverable(message);
               return;
             }
@@ -1112,6 +1120,15 @@ export class ConnectionManager {
   /** Boolean form of trySend() (true = handed to the socket). */
   send(message: WSMessage): boolean {
     return this.trySend(message) === 'sent';
+  }
+
+  private mayStillGo(message: WSMessage): boolean {
+    try {
+      return this.config.mayStillGo?.(message) ?? true;
+    } catch (error) {
+      logger.error('[ConnectionManager] mayStillGo callback failed:', error);
+      return true;
+    }
   }
 
   private reportUndeliverable(message: WSMessage): void {

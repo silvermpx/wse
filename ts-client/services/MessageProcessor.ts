@@ -121,6 +121,15 @@ const windowKey = (topic: string, epoch: string): string => `${topic}\u0000${epo
 /** Offline messages taken out of the database at a time to send. */
 const OFFLINE_REPLAY_BATCH = 64;
 
+/** What a message handed to the transport was queued with. */
+interface HandedOver {
+  owner: number;
+  priority: number;
+  timestamp: number;
+  expiresAt?: number;
+  requires?: readonly string[];
+}
+
 /**
  * How long past the server's history_ttl a stream that heard nothing while
  * connected is still named: the clocks of a server and a client do not tick
@@ -240,6 +249,12 @@ export class MessageProcessor {
   private destroyed = false;
   /** Messages that may go only on the socket they were made for (signed ones). */
   private readonly liveOnly = new WeakMap<WSMessage, number>();
+  /**
+   * What each message handed to the transport was queued with: checked again
+   * right before its frame is written (an encrypted one is sealed first), and
+   * kept when it comes back to the queue.
+   */
+  private readonly handedOver = new WeakMap<WSMessage, HandedOver>();
   /** The next try at removing stored messages that went, and its delay. */
   private removalRetry: ReturnType<typeof setTimeout> | null = null;
   private removalDelay = 0;
@@ -1937,6 +1952,7 @@ export class MessageProcessor {
       cm.isTransportReady() &&
       (!requires || this.continuous(requires))
     ) {
+      this.handedOver.set(message, { owner, priority, timestamp: Date.now(), expiresAt, requires });
       const result = cm.trySend(message);
       if (result === 'sent') return 'sent';
       if (result === 'error') {
@@ -1985,6 +2001,7 @@ export class MessageProcessor {
     owner: number = this.ctx.owner.current(),
     liveOn?: number,
     requires?: readonly string[],
+    timestamp: number = Date.now(),
   ): boolean {
     if (this.destroyed) return false;
     if (owner !== this.ctx.owner.current()) {
@@ -1998,7 +2015,7 @@ export class MessageProcessor {
       type: message.t,
       payload: message.p,
       priority,
-      timestamp: Date.now(),
+      timestamp,
       retries: 0,
       encrypted: message.enc,
       correlation_id: message.cid,
@@ -2024,7 +2041,12 @@ export class MessageProcessor {
     return true;
   }
 
-  /** Re-queue a message that was accepted but whose socket vanished before it went out. */
+  /**
+   * A message the transport took but did not write (its socket went, or it
+   * may not go now): back in the queue as it was queued -- its user, the
+   * topics it requires, its time to live, its place -- or dropped when it was
+   * made for the previous user or ran out of time.
+   */
   requeue(message: WSMessage, priority: number = message.pri ?? MessagePriority.NORMAL): void {
     if (this.destroyed) return;
     if (this.liveOnly.has(message)) {
@@ -2032,7 +2054,25 @@ export class MessageProcessor {
       logger.warn(`Dropping ${message.t}: its connection went before it was sent`);
       return;
     }
-    this.enqueueInMemory(message, priority);
+    const was = this.handedOver.get(message);
+    if (!was) {
+      this.enqueueInMemory(message, priority);
+      return;
+    }
+    if (isExpired(was.expiresAt, Date.now())) {
+      this.countDropped(1);
+      logger.debug(`Dropping ${message.t}: its ttl ran out before it was sent`);
+      return;
+    }
+    this.enqueueInMemory(message, was.priority, was.expiresAt, was.owner, undefined, was.requires, was.timestamp);
+  }
+
+  /** A message about to be written may still go: its user is the client's, the topics it requires continuous. */
+  mayStillGo(message: WSMessage): boolean {
+    const was = this.handedOver.get(message);
+    if (!was) return true;
+    if (was.owner !== this.ctx.owner.current() || isExpired(was.expiresAt, Date.now())) return false;
+    return !was.requires || this.continuous(was.requires);
   }
 
   /**
@@ -2158,6 +2198,13 @@ export class MessageProcessor {
           logger.warn(`Dropping ${batch[i].type}: its connection went before it was sent`);
           continue;
         }
+        this.handedOver.set(wire, {
+          owner: batch[i].owner ?? this.ctx.owner.current(),
+          priority: batch[i].priority,
+          timestamp: batch[i].timestamp,
+          expiresAt: batch[i].expiresAt,
+          requires: batch[i].requires,
+        });
         const result = cm.trySend(wire);
         if (result === 'sent') continue;
         if (result === 'error') {
@@ -2231,6 +2278,12 @@ export class MessageProcessor {
           gone.push(record.id);
           continue;
         }
+        this.handedOver.set(record.message, {
+          owner: this.ctx.owner.current(),
+          priority: record.message.pri ?? MessagePriority.NORMAL,
+          timestamp: record.timestamp,
+          expiresAt: record.expiresAt,
+        });
         const result = cm.trySend(record.message);
         if (result === 'sent') {
           sent++;
