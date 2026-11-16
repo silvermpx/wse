@@ -1,211 +1,71 @@
 # Changelog
 
-## v3.1.0 (unreleased)
+## v3.1.0 (2026-11-16)
+
+Clients for every platform: the TypeScript client without React, mobile
+clients on the Rust client, recovery per stream and an opt-in delivery that
+holds a topic until the application reloaded its state.
 
 ### Added
 
-- TypeScript client without React: `wse-client/core` makes clients of their
-  own with `createWSEClient` (no React, no zustand, nothing read from the page
-  on import; two clients on one page share nothing), and `wse-client/react`
-  (a provider and hooks), `wse-client/vue` (a plugin and composables) and
-  `wse-client/svelte` (stores) hold a client while components use it. The
-  root `wse-client` and `useWSE` are as before; React, zustand and Vue are
-  optional peer dependencies. Outside browsers a `webSocket` factory may
-  send headers. A client pauses for any number of reasons (`pause`,
-  `resume`) and catches up from its positions once none is left.
-- `wse-client/react-native`: `createReactNativeClient` sends the token as an
-  Authorization header, pauses the connection while the app is in the
-  background (after a grace period) and makes it again in the foreground,
-  and takes the app's crypto (react-native-quick-crypto) and AppState
-  instead of importing them.
-- Clients for mobile apps, on the Rust client: Swift (iOS 15+, macOS 12+;
-  an XCFramework with Apple silicon and Intel slices, async calls and the
-  events as an AsyncSequence), Kotlin (Android API 26+ and the JVM; an AAR
-  linked for 16 KB pages, suspend calls and a Flow), and Dart (`wse_client`
-  on pub.dev, Flutter 3.38+). The Dart package's build hook takes the
-  prebuilt library of the app's target from the release and uses it only
-  when its SHA-256 is the one the release listed; an app can build it from
-  source instead. The release attaches the XCFramework, the AAR and the
-  prebuilt libraries. They are built on the `wse-client` crate's `native`
-  feature: a shared runtime, cancellable calls, and events read in batches
-  of at most the items asked and about the bytes asked, which come again
-  until they are acknowledged (an item whose Kotlin collection was
-  cancelled while it was handed out comes again to the next reader). A wss:// server's
-  certificate is checked by the system's verifier (rustls-platform-verifier:
-  the Security framework on Apple platforms, Android's own through the JVM,
-  set up as the app starts), or against a private CA's certificates or the
-  Mozilla roots when the app says so; ws:// takes an explicit `insecure`
-  (development).
-- Live-only sends, for commands that must not run late (a valve, a door, an
-  order): a message sent live goes on the connection that is ready when it
-  is sent, or not at all, never held for a later connection or replayed
-  after a reconnect. TypeScript: `{ live: true }` (also dropped without a
-  ready connection whatever `offline` says); Rust: `Client::send_live` and
-  `try_send_live` (and in Swift, Kotlin and Dart); Python:
-  `send(..., live=True)`.
-- TypeScript client of its own: each topic's state (`topicStates`: the
-  server took it or refused it; its messages run on or broke off, and why,
-  with a `wseContinuity` event), and an opt-in `recover-or-resync` delivery:
-  a topic that is not continuous (a cold start, every reconnect, a break)
-  holds its messages until the application's resync handler loaded its
-  state, then hands on what the state does not have. The checkpoint is what
-  the consumer committed it applied (`commit`, `checkpoint()`), only through
-  what has no hole, bound to the realm, user, consumer and schema; recovery
-  starts from it. Sends can wait for topics to be continuous (`requires`).
-  An offset JavaScript cannot hold exactly breaks the topic off instead of
-  being rounded. A send that requires topics waits in the outgoing queue and
-  goes only while they are continuous, checked right before it goes (also
-  after a reconnect); it belongs to the user who made it (dropped when the
-  user changes), counts against `maxQueueSize` and `memoryLimit` with every
-  other send, and is never written to the offline queue. The Swift, Kotlin
-  and Dart clients have the same states and delivery (`WseDelivery`): a
-  `Resync` item asks the app for the state, `resynced(round)` hands on what
-  was held. A checkpoint is never another user's: the user changes where
-  the events show it, what was delivered to the last one is forgotten, and
-  a message of theirs committed later counts for nobody (`commit(message)`
-  takes back the user generation the message carries).
-- TypeScript client of its own: the offline queue is durable only for a
-  named `consumer`, in an IndexedDB database of its scope (the storage
-  name, the consumer and the `realm`); clients of one scope (tabs) hold a
-  lease, so one at a time replays the queue and the others are `busy`
-  until it lets go; the next one then sends what the last stored. A stored
-  message stays in the database until it went out: claimed for 30 s while
-  it is sent, it goes again (same `id`) when its sending was cut off by a
-  pause or a closed tab, so it may arrive twice but is never lost; one that
-  went and could not be removed is reported (`wseStorageError`, operation
-  `remove`), never sent again by that client, and its removal tried again.
-  What a client keeps (its checkpoint, topics and offline queue's user) is
-  apart for each consumer and realm, and signing out clears only that.
-  Where the queue lives is in the snapshot (`storage`) and
-  a `wseStorage` event; a storage that fails is a `wseStorageError` event
-  instead of being swallowed. The database moves to version 2 in one
-  transaction, its records kept; a tab holding the old version open is
-  reported, and a connection closes for another tab's upgrade.
-- TypeScript client: bounds on the work it takes on, in messages and bytes
-  (`performance.maxPendingInbound`, `maxPendingInboundBytes`,
-  `maxPendingEncrypted`, `maxPendingEncryptedBytes`). Past the inbound
-  bound the connection is dropped (a `wseOverloaded` event) and the
-  recovery brings what it would have; past the encryption bound a message
-  waits in the outgoing queue instead of growing the chain of encryptions.
-- TypeScript client: the page's lifecycle. `pagehide` lets the connection
-  go (a client of its own pauses for `page`; the page-wide `useWSE` closes
-  its socket and keeps its session), `pageshow` connects again and
-  recovers; `beforeunload` is not listened to any more, so the page can go
-  into the back/forward cache. Back on screen or online, a socket that
-  heard nothing past the idle limit (after a sleep) is replaced. Server
+- TypeScript: `wse-client/core` (`createWSEClient`, a client of its own,
+  without React or zustand) with adapters for React, Vue, Svelte and React
+  Native (`createReactNativeClient`: the token as a header, a pause in the
+  background, UTF-8 codecs where Hermes has none). The root `wse-client` and
+  `useWSE` are unchanged; React, zustand and Vue are optional peers. Server
   rendering and hydration are tested for React, Vue and Svelte 5.
-- Swift, Kotlin and Dart: `generateSigningKey()` and `signingPublicKey(key)`
-  make a device's key for signed messages and give what the server binds;
-  the Dart `wseConfig` takes the E2E identity keys, the signing key and the
-  server's signing keys. Their tests run an end-to-end encrypted session
-  and signed messages on the Mac, the JVM, an iOS simulator, an Android
-  emulator and in the Flutter example.
-- React Native: on a runtime without `TextDecoder` (Hermes before React
-  Native 0.85) or `TextEncoder`, the entry installs UTF-8 ones before the
-  MessagePack codec needs them; loading the client failed there. The
-  package's `sideEffects` names that module, so bundlers keep it.
-- Releases: the gate waits for CI to pass on the same commit; the release
-  AAR runs in an app built with R8 on an emulator (the system's TLS, an
-  encrypted echo, a signed receipt); the XCFramework's tests run in the
-  Release configuration on an iOS simulator; the Dart package's tests run
-  on its prebuilt library on Linux (x64, arm64), macOS (arm64, x64) and
-  Windows, and its example app on its prebuilt libraries on an Android
-  emulator (debug and release builds) and an iOS simulator (its release
-  build made for an iPhone); the npm
-  package is bundled by Metro and compiled by Hermes, the bundle runs
-  without TextEncoder and TextDecoder, and an app made from React Native's
-  template runs it in a release build (Hermes) on an emulator against a
-  server. A tag also publishes the Android library to Maven Central
-  (`io.github.silvermpx:wse-client-android`), the Dart package to pub.dev
-  (`wse_client`; pub.dev takes its first version by hand) and the Swift
-  package to its own repository (github.com/silvermpx/wse-swift); every dry
-  run signs the Maven bundle and asks the Central Portal about the token, and
-  builds the Swift package against its XCFramework. The system's certificate
-  verifier is
-  seen to connect where the system trusts the server's CA: on Linux, an
-  iOS simulator and an Android emulator.
-- Rust client: `pause(reason)` and `resume(reason)`, as in the TypeScript
-  core client: the connection ends (what is queued goes out first) and no
-  attempt is made while any reason holds; topics and positions stay, and
-  the last reason cleared connects at once and recovers what was missed. A
-  `Paused` event and status say so. The Swift, Kotlin and Dart clients have
-  them too, with helpers that pause a client in the background and while
-  there is no network, and make its connection again when the network
-  changes (`WseAppLifecycle`, `WseNetworkMonitor`): on iOS the whole app
-  counts, on Android the process, so a scene or an Activity closing does
-  not pause it.
-- Rust client: `Client::close_within(deadline)` gives what is queued the
-  deadline to go out and then stops the connection where it stands; a link
-  that takes nothing no longer holds a close for as long as the system
-  keeps the connection. The mobile clients' `disconnect` uses it.
-- Recovery positions per stream. A client may name, with its recovery
-  request, the last offset it holds of each stream of a topic (`streams`:
-  one per server that publishes to it); the server then replays each stream
-  from that offset. The subscription reply lists each stream the server
-  holds, with its last offset (`streams`), and `server_hello` and
-  `server_ready` say how long a quiet stream stays recoverable
-  (`features.history_ttl`). Python: `subscribe_with_recovery(positions=...)`
-  takes `streams` and returns them; Rust: `TopicPosition` and
-  `Publisher::subscribe_with_positions`.
-- Rust client: a recovery names the client's offset in every stream of the
-  topic; it starts a stream the server lists that it did not know where the
-  server was, reports per stream what a recovery that did not recover lost,
-  forgets a stream the server no longer holds, and stops naming one that
-  stayed quiet on a connection for longer than the server keeps it
-  (`history_ttl`). Silence counts only while the connection's frames show it
-  alive: time away from the server, and a close noticed only after the
-  machine slept or the app was suspended, keep every position.
-- TypeScript client: the same, and a gap in one stream of a topic no longer
-  stops another stream's gap from being recovered: each stream waits for
-  its replay in its own window (as the Rust and Python clients do), instead
-  of one window per topic.
-- Python client: the same recovery positions per stream as the Rust and
-  TypeScript clients.
+- Mobile clients on the Rust client's `native` feature: Swift (iOS 15+,
+  macOS 12+; the package at github.com/silvermpx/wse-swift), Kotlin (Android
+  API 26+ and the JVM; `io.github.silvermpx:wse-client-android` on Maven
+  Central) and Dart for Flutter (`wse_client` on pub.dev, with prebuilt
+  libraries checked by SHA-256). Async calls, events in bounded batches that
+  come again until acknowledged, pause and resume with app-lifecycle and
+  network helpers, end-to-end encryption and signed messages. wss:// is
+  checked by the system's certificate verifier, a private CA or the Mozilla
+  roots; ws:// needs `insecure`.
+- Topic states and an opt-in `recover-or-resync` delivery (TypeScript core
+  and the mobile clients): a topic that is not continuous holds its messages
+  until the application's resync handler loaded its state. The checkpoint is
+  what the consumer committed (`commit`, `checkpoint()`), bound to the realm,
+  user, consumer and schema; recovery starts from it. A send can require
+  topics to be continuous (`requires`), checked right before it goes out.
+- Recovery positions per stream: the request names the client's offset in
+  every stream of a topic and the reply lists the server's (`streams`;
+  `features.history_ttl` says how long a quiet stream stays recoverable). In
+  the Rust, TypeScript and Python clients, each stream recovering on its own.
+- Live-only sends, on the ready connection or not at all: TypeScript
+  `{ live: true }`, Rust `send_live` and `try_send_live` (and Swift, Kotlin,
+  Dart), Python `send(..., live=True)`.
+- Rust client: `pause(reason)` and `resume(reason)`, and
+  `close_within(deadline)`.
+- TypeScript: a durable offline queue per `consumer` and `realm` (IndexedDB;
+  one tab replays it at a time; a message goes at least once, with its `id`;
+  storage failures as `wseStorageError`), bounds on inbound frames and
+  pending encryptions, and `pagehide`/`pageshow` instead of `beforeunload`.
+- Releases: the gate waits for CI on the same commit; every mobile package
+  and the React Native bundle are checked in a release build on an emulator
+  or simulator; a tag also publishes to Maven Central, pub.dev and the Swift
+  repository.
 
 ### Changed
 
-- TypeScript client: it handles its own protocol messages (`server_ready`,
-  `subscription_update`, `PONG`, snapshots, presence and the like) before
-  the application's handlers; a handler registered for one of those types
-  runs after the client's instead of replacing it, so it cannot stop a
-  recovery or a resync, and `clearHandlers()` clears only the
-  application's.
-- TypeScript client: it no longer reads `import.meta` (React Native's
-  bundler cannot parse it), so `VITE_LOG_LEVEL` is not read any more; set
-  `WSE_LOG_LEVEL` in `process.env` or on `globalThis`, or call
-  `logger.setLevel()`. `setWebCrypto()` gives the client a WebCrypto where
-  the environment has none (react-native-quick-crypto's), and the endpoint
-  URL is built without `URL`, which React Native only half implements.
+- TypeScript: the client handles its own protocol messages first; an
+  application handler of the same type runs after it instead of replacing it.
+- TypeScript: `import.meta` is not read (React Native cannot parse it): set
+  `WSE_LOG_LEVEL` instead of `VITE_LOG_LEVEL`. `setWebCrypto()` gives the
+  client a WebCrypto where the environment has none.
 
 ### Fixed
 
-- Server: a message published to a topic while a client subscribes to it
-  reaches the client. The subscription reply could start after the message,
-  and the client then took it for one it had and dropped it; what was
-  published in between is now replayed ahead of the reply or, when it
-  cannot be, the reply starts earlier and the client sees a gap.
-- TypeScript client: two clients of one offline queue (two tabs of one
-  application and user) no longer both send a stored message: one claims it
-  in one IndexedDB transaction before it is sent and removes it once it
-  went out.
-- TypeScript client: `maxQueueSize` bounds the send queue; the capacity
-  was never stored.
+- Server: a message published while a client subscribes reaches it, replayed
+  ahead of the reply or reported as a gap.
 - Server: recovery from positions per stream no longer depends on the order
-  in which a node had the topic's streams. A client that moved to another
-  node of a cluster, and named its offsets, could otherwise be told
-  `recovered` while a message of another stream was missing (the old single
-  position is still read as before). The reply is `recovered: false` when
+  in which a node holds the streams; the reply says `recovered: false` when
   nothing on the node shows the client missed nothing.
-
-- Rust client: one user's queued messages and recovery positions never go
-  out on the next user's connection. When the token provider's next token
-  is another user's, what the last user queued and did not send is dropped,
-  and the topics are subscribed again from the start, as the TypeScript
-  client does.
-- Rust client: a signed message goes on the connection it was signed on or
-  not at all; one still queued when the connection was lost is dropped
-  instead of going out on the next connection, as in the TypeScript and
-  Python clients.
+- Rust and TypeScript clients: one user's queued messages, signed messages
+  and recovery positions never go out on the next user's connection.
+- TypeScript: two tabs no longer both send a stored message, and
+  `maxQueueSize` bounds the send queue.
 
 ## v3.0.1 (2026-11-15)
 
