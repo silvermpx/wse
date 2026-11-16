@@ -14,7 +14,10 @@ name: Release
 #
 # Pull requests and pushes to main that touch packaging run the same build
 # and test jobs as a dry run, and workflow_dispatch runs that dry run by hand
-# (on main right before tagging, for instance). Only a v* tag push publishes.
+# (on main right before tagging, for instance). Only a v* tag push publishes:
+# when its commit has a green dry run on main, the tag publishes that run's
+# files, the ones that were tested, and builds nothing again; without one it
+# builds and tests everything itself first.
 on:
   push:
     branches: [main]
@@ -99,10 +102,15 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      actions: read
     outputs:
       version: ${{ steps.versions.outputs.version }}
       npm-version: ${{ steps.versions.outputs.npm-version }}
       prerelease: ${{ steps.versions.outputs.prerelease }}
+      # The run whose files the gate checks and a tag publishes, and whether
+      # this run builds them.
+      source-run: ${{ steps.source.outputs.source-run }}
+      built: ${{ steps.source.outputs.built }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -122,6 +130,42 @@ jobs:
 
       - name: No CPU-specific flags in committed cargo config
         run: python3 .github/scripts/release_preflight.py cargo-config
+
+      # A tag publishes the files of the green dry run of its own commit (a
+      # push to main, or a run by hand there): what was tested goes out, and
+      # nothing is built again. Without one, or with its files expired, this
+      # run builds and tests everything itself.
+      - name: The files this run publishes
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          run=""
+          # The tag's commit, an annotated tag's too.
+          commit="$(git rev-parse HEAD)"
+          if [ "$REF_TYPE" = tag ]; then
+            run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs?head_sha=${commit}&status=success&per_page=50" \
+              --jq '[.workflow_runs[] | select(.head_branch == "main" and (.event == "push" or .event == "workflow_dispatch"))][0].id // empty')"
+            if [ -n "$run" ]; then
+              expired="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run}/artifacts?per_page=100" --jq '[.artifacts[] | select(.expired)] | length')"
+              if [ "$expired" != 0 ]; then
+                echo "::notice::The dry run ${run} of ${commit} has expired files."
+                run=""
+              fi
+            fi
+          fi
+          if [ -n "$run" ]; then
+            echo "::notice::Publishing the files of the green dry run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${run}; nothing is built again."
+            echo "source-run=${run}" >> "$GITHUB_OUTPUT"
+            echo "built=false" >> "$GITHUB_OUTPUT"
+          else
+            if [ "$REF_TYPE" = tag ]; then
+              echo "::notice::No green dry run of ${commit} on main: this run builds and tests everything."
+            fi
+            echo "source-run=${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          fi
 
       # A crate name someone else holds would fail the release after the
       # gate, with npm and PyPI not out yet.
@@ -191,6 +235,8 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     name: Build ${{ matrix.target }}
+    needs: preflight
+    if: needs.preflight.outputs.built == 'true'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -272,8 +318,8 @@ jobs:
           args: >-
             --release --locked --out dist
             ${{ steps.py312.outputs.python-path && format('-i {0}', steps.py312.outputs.python-path) || '--find-interpreter' }}
-          # No build cache for tag builds: release wheels come from clean builds.
-          sccache: ${{ runner.os != 'Windows' && !startsWith(github.ref, 'refs/tags/') }}
+          # No build cache: a dry run's wheels are the ones a tag publishes.
+          sccache: false
 
       # Free-threaded CPython cannot load abi3 wheels, so 3.14t and 3.15t get
       # version-specific wheels. The Linux build containers ship python3.14t
@@ -304,7 +350,7 @@ jobs:
           args: >-
             --release --locked --out dist -i
             ${{ runner.os == 'Linux' && 'python3.14t python3.15t' || format('{0} {1}', steps.py314t.outputs.python-path, steps.py315t.outputs.python-path) }}
-          sccache: ${{ runner.os != 'Windows' && !startsWith(github.ref, 'refs/tags/') }}
+          sccache: false
 
       - name: List wheels
         shell: bash
@@ -321,6 +367,8 @@ jobs:
   # ---------------------------------------------------------------------------
   sdist:
     name: Build sdist
+    needs: preflight
+    if: needs.preflight.outputs.built == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -499,6 +547,8 @@ jobs:
   # ---------------------------------------------------------------------------
   python-client:
     name: Python client (build, check, test)
+    needs: preflight
+    if: needs.preflight.outputs.built == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -544,6 +594,8 @@ jobs:
   # ---------------------------------------------------------------------------
   npm-package:
     name: npm package (build, test, pack)
+    needs: preflight
+    if: needs.preflight.outputs.built == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -601,6 +653,7 @@ jobs:
   crates:
     name: Rust crates (package, build, test)
     needs: preflight
+    if: needs.preflight.outputs.built == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -645,6 +698,7 @@ jobs:
   swift-package:
     name: Swift XCFramework
     needs: preflight
+    if: needs.preflight.outputs.built == 'true'
     runs-on: macos-latest
     timeout-minutes: 60  # a simulator or an emulator can hang
     permissions:
@@ -685,6 +739,7 @@ jobs:
   android-package:
     name: Android library (AAR)
     needs: preflight
+    if: needs.preflight.outputs.built == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -738,6 +793,7 @@ jobs:
   dart-binaries:
     name: Dart libraries (${{ matrix.name }})
     needs: preflight
+    if: needs.preflight.outputs.built == 'true'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -1230,8 +1286,10 @@ jobs:
       contents: read
       actions: read
     steps:
+      # A tag that publishes a dry run's files skips the jobs that built and
+      # tested them; otherwise every one of them must have run and passed.
       - name: Every release job passed
-        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || (needs.preflight.outputs.built != 'false' && contains(needs.*.result, 'skipped'))
         env:
           RESULTS: ${{ toJSON(needs.*.result) }}
         run: |
@@ -1254,9 +1312,13 @@ jobs:
         with:
           python-version: '3.12'
 
+      # By the run's id, as a tag takes a dry run's files: every dry run
+      # checks that way too.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           path: artifacts/
+          run-id: ${{ needs.preflight.outputs.source-run }}
+          github-token: ${{ github.token }}
 
       - name: Every file carries the release version
         env:
@@ -1288,6 +1350,7 @@ jobs:
       # Provenance, and npm trusted publishing (OIDC) once it is set up for
       # the package.
       id-token: write
+      actions: read
     steps:
       # npm >= 11.5.1 tries trusted publishing first and falls back to the
       # NPM_TOKEN in the .npmrc that registry-url writes.
@@ -1298,6 +1361,8 @@ jobs:
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
+          run-id: ${{ needs.preflight.outputs.source-run }}
+          github-token: ${{ github.token }}
           name: npm-package
           path: npm-dist/
 
@@ -1330,20 +1395,27 @@ jobs:
     permissions:
       # Trusted publishing (OIDC) only: no checkout, no repository write.
       id-token: write
+      actions: read
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
+          run-id: ${{ needs.preflight.outputs.source-run }}
+          github-token: ${{ github.token }}
           name: python-client-dist
           path: python-client-dist/
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
+          run-id: ${{ needs.preflight.outputs.source-run }}
+          github-token: ${{ github.token }}
           pattern: wheels-*
           path: dist/
           merge-multiple: true
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
+          run-id: ${{ needs.preflight.outputs.source-run }}
+          github-token: ${{ github.token }}
           name: sdist
           path: dist/
 
@@ -1412,9 +1484,12 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
+          run-id: ${{ needs.preflight.outputs.source-run }}
+          github-token: ${{ github.token }}
           path: release/
           merge-multiple: true
 
@@ -1437,6 +1512,7 @@ jobs:
       url: https://central.sonatype.com/artifact/io.github.silvermpx/wse-client-android
     permissions:
       contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -1444,6 +1520,8 @@ jobs:
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
+          run-id: ${{ needs.preflight.outputs.source-run }}
+          github-token: ${{ github.token }}
           name: android-package
           path: dist/
 
@@ -1471,6 +1549,7 @@ jobs:
       url: https://pub.dev/packages/wse_client
     permissions:
       id-token: write
+      actions: read
     steps:
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2  # v2.23.0
         with:
@@ -1479,6 +1558,8 @@ jobs:
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
+          run-id: ${{ needs.preflight.outputs.source-run }}
+          github-token: ${{ github.token }}
           name: dart-package
           path: dart-dist/
 
@@ -1524,6 +1605,7 @@ jobs:
       url: https://github.com/silvermpx/wse-swift
     permissions:
       contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -1531,6 +1613,8 @@ jobs:
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
+          run-id: ${{ needs.preflight.outputs.source-run }}
+          github-token: ${{ github.token }}
           name: swift-package
           path: dist/
 
