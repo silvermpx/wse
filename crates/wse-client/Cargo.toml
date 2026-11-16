@@ -40,6 +40,12 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 # The cancel tokens of the `native` module.
 tokio-util = { version = "0.7", default-features = false, optional = true }
 webpki-roots = { version = "1", optional = true }
+# The system's certificate verifier, for the `native` module.
+rustls-platform-verifier = { version = "0.7.1", optional = true }
+
+# Android's certificate verifier is reached through the JVM.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.22.4", default-features = false, optional = true }
 
 # In the browser: its WebSocket and timers.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -69,7 +75,13 @@ aws-lc = [
 fips = ["aws-lc", "wse/fips", "rustls/fips"]
 # The `native` module, for the Swift, Kotlin and Dart packages: plain types,
 # one shared runtime, events read in bounded batches. Not in the browser.
-native = ["aws-lc", "dep:tokio-util", "tokio/rt-multi-thread"]
+native = [
+    "aws-lc",
+    "dep:tokio-util",
+    "tokio/rt-multi-thread",
+    "dep:rustls-platform-verifier",
+    "dep:jni",
+]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # The server, published before this crate: its tests and examples build
@@ -77,6 +89,9 @@ native = ["aws-lc", "dep:tokio-util", "tokio/rt-multi-thread"]
 wse = { workspace = true, features = ["server"] }
 # The chat example reads the terminal.
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "io-std", "io-util"] }
+# The example server's wss:// door: a certificate authority of its own.
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws_lc_rs", "tls12"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"

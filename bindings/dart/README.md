@@ -69,6 +69,24 @@ between loses nothing, the next one gets the rest. `close()` sends what is
 queued and closes; a closed client's calls throw a `WseError` of kind
 `closed`.
 
+## Certificates
+
+A wss:// server's certificate is checked by the system's verifier (the
+default, `WseTrust.platform`): the roots the device trusts. On Android the
+package's Android part sets it up as the app starts. `WseTrust.roots([ca])`
+trusts only a private CA's certificate (PEM or DER), `WseTrust.mozilla` the
+Mozilla roots built into the library:
+
+```dart
+final ca = await rootBundle.load('assets/plant-ca.pem');
+final client = await WseClient.connect(
+  wseConfig(url, trust: WseTrust.roots([ca.buffer.asUint8List()])),
+);
+```
+
+ws:// sends everything in the clear and needs `insecure: true` (for
+development).
+
 ## Background and network
 
 `WseAppLifecycle(client)` pauses the client five seconds after the app went

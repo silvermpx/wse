@@ -20,8 +20,25 @@ class WseAndroidTest {
         InstrumentationRegistry.getArguments().getString("wseUrl") ?: "ws://10.0.2.2:5007/wse"
 
     @Test
+    fun aPrivateCaIsTrustedWhereItIsNamed(): Unit = runBlocking {
+        val arguments = InstrumentationRegistry.getArguments()
+        val tlsUrl = checkNotNull(arguments.getString("wseTlsUrl")) { "run-emulator-tests.sh passes the wss:// door" }
+        val ca = android.util.Base64.decode(arguments.getString("wseCa"), android.util.Base64.DEFAULT)
+        val client = connectClient(WseConfig(url = tlsUrl, trust = WseTrust.Roots(listOf(ca))))
+        assertEquals(WseStatus.CONNECTED, client.status())
+        client.disconnect(1_000u)
+        // Android's verifier (set up as the app started) and the Mozilla roots do not know that CA.
+        for (trust in listOf(WseTrust.Platform, WseTrust.Mozilla)) {
+            val error = assertFailsWith<WseException.Connect> {
+                connectClient(WseConfig(url = tlsUrl, reconnect = false, trust = trust))
+            }
+            assertTrue("certificate" in error.reason, "$trust: ${error.reason}")
+        }
+    }
+
+    @Test
     fun ticksComeInOrderAndEchoAnswers(): Unit = runBlocking {
-        val client = connectClient(WseConfig(url = url, topics = listOf("ticks")))
+        val client = connectClient(WseConfig(url = url, topics = listOf("ticks"), insecure = true))
         assertEquals(WseStatus.CONNECTED, client.status())
         client.send("echo", """{"text":"hallo"}""")
         val events = client.events()
@@ -41,7 +58,7 @@ class WseAndroidTest {
 
     @Test
     fun theProcessInTheBackgroundPausesTheClient(): Unit = runBlocking {
-        val client = connectClient(WseConfig(url = url))
+        val client = connectClient(WseConfig(url = url, insecure = true))
         val lifecycle = WseAppLifecycle(client, graceMillis = 0)
         val owner = ProcessLifecycleOwner.get()
         onMain { lifecycle.onStop(owner) }
@@ -53,7 +70,7 @@ class WseAndroidTest {
 
     @Test
     fun theNetworkPausesTheClientAndRenewsItsConnection(): Unit = runBlocking {
-        val client = connectClient(WseConfig(url = url))
+        val client = connectClient(WseConfig(url = url, insecure = true))
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val monitor = WseNetworkMonitor(context, client, settleMillis = 0)
         onMain {
@@ -85,7 +102,7 @@ class WseAndroidTest {
 
     @Test
     fun aPayloadMustBeJson(): Unit = runBlocking {
-        val client = connectClient(WseConfig(url = url))
+        val client = connectClient(WseConfig(url = url, insecure = true))
         assertFailsWith<WseException.Encode> { client.trySend("x", "not json") }
         client.disconnect(1_000u)
     }

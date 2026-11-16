@@ -36,6 +36,8 @@ on:
       - 'bindings/kotlin/build.sh'
       - 'bindings/kotlin/android/build-libs.sh'
       - 'bindings/kotlin/android/build.gradle.kts'
+      - 'bindings/rustls-platform-verifier.*'
+      - 'bindings/dart/android/**'
       - 'bindings/dart/pubspec.yaml'
       - 'bindings/dart/hook/**'
       - 'bindings/dart/rust/Cargo.toml'
@@ -59,6 +61,8 @@ on:
       - 'bindings/kotlin/build.sh'
       - 'bindings/kotlin/android/build-libs.sh'
       - 'bindings/kotlin/android/build.gradle.kts'
+      - 'bindings/rustls-platform-verifier.*'
+      - 'bindings/dart/android/**'
       - 'bindings/dart/pubspec.yaml'
       - 'bindings/dart/hook/**'
       - 'bindings/dart/rust/Cargo.toml'
@@ -710,6 +714,8 @@ jobs:
           mkdir -p dist
           cp bindings/kotlin/android/build/outputs/aar/*-release.aar "dist/wse-client-android-${VERSION}.aar"
           unzip -l "dist/wse-client-android-${VERSION}.aar"
+          # Android's certificate verifier: its Java part travels inside.
+          unzip -l "dist/wse-client-android-${VERSION}.aar" | grep -q 'libs/rustls-platform-verifier.jar'
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:

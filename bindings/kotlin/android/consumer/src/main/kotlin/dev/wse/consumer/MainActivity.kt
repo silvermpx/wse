@@ -1,11 +1,14 @@
-// Connects to the server the intent names, waits for a tick and logs the
-// outcome (tag WseConsumer): "ok", or what went wrong. It shows no text.
+// Connects to the server the intent names, waits for a tick, checks that
+// Android's certificate verifier turns down the wss:// door of a CA it does
+// not know, and logs the outcome (tag WseConsumer): "ok", or what went wrong.
+// It shows no text.
 package dev.wse.consumer
 
 import android.app.Activity
 import android.os.Bundle
 import android.util.Log
 import dev.wse.ffi.WseConfig
+import dev.wse.ffi.WseException
 import dev.wse.ffi.WseItem
 import dev.wse.ffi.connectClient
 import dev.wse.ffi.events
@@ -22,10 +25,18 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val url = intent.getStringExtra("url") ?: return finish()
+        val tlsUrl = intent.getStringExtra("tls_url") ?: return finish()
         scope.launch {
             val outcome = try {
                 withTimeout(30_000) {
-                    val client = connectClient(WseConfig(url = url, topics = listOf("ticks")))
+                    val refused = try {
+                        connectClient(WseConfig(url = tlsUrl, reconnect = false)).disconnect(1_000u)
+                        "connected to a CA nobody trusts"
+                    } catch (error: WseException.Connect) {
+                        if ("certificate" in error.reason) null else "the verifier said ${error.reason}"
+                    }
+                    if (refused != null) return@withTimeout refused
+                    val client = connectClient(WseConfig(url = url, topics = listOf("ticks"), insecure = true))
                     client.send("echo", """{"text":"r8"}""")
                     client.trySendLive("echo", """{"text":"live"}""")
                     val events = client.events()

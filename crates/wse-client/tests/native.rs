@@ -11,8 +11,12 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 use wse_client::native::{
-    BatchKind, CancelToken, ErrorKind, Item, NativeClient, NativeConfig, NativeStatus, TokenSource,
+    BatchKind, CancelToken, ErrorKind, Item, NativeClient, NativeConfig, NativeStatus, NativeTrust,
+    TokenSource,
 };
+
+#[path = "common/tls.rs"]
+mod tls;
 
 const SECRET: &str = "a-test-secret-of-at-least-thirty-two-bytes";
 
@@ -71,8 +75,20 @@ impl Stand {
             url: self.url.clone(),
             token: Some(self.token(user)),
             topics: vec!["prices".into()],
+            insecure: true,
             ..NativeConfig::default()
         }
+    }
+
+    /// The same server behind a wss:// door: its URL and the door's CA.
+    async fn tls(&self) -> (String, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let plain = self.url["ws://".len()..self.url.len() - "/wse".len()]
+            .parse()
+            .unwrap();
+        let ca = tls::open(listener, plain);
+        (format!("wss://localhost:{port}/wse"), ca)
     }
 }
 
@@ -212,6 +228,7 @@ async fn a_cancelled_connect_gives_up() {
     // Nothing listens there: the connect waits for its timeout.
     let config = NativeConfig {
         url: "ws://10.255.255.1:9/wse".into(),
+        insecure: true,
         ..NativeConfig::default()
     };
     let cancel = CancelToken::new();
@@ -359,5 +376,67 @@ async fn a_paused_client_says_so_and_comes_back() {
     .await
     .expect("connected again");
     client.disconnect(1_000).await;
+    stand.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_goes_in_the_clear_only_when_asked() {
+    let stand = stand().await;
+    let config = NativeConfig {
+        insecure: false,
+        ..stand.config("eve")
+    };
+    let error = NativeClient::connect(config, None, &CancelToken::new())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind, ErrorKind::Config, "{error}");
+    assert!(error.message.contains("insecure"), "{error}");
+    stand.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_private_ca_is_trusted_where_it_is_named() {
+    let stand = stand().await;
+    let (url, ca) = stand.tls().await;
+    let config = |trust| NativeConfig {
+        url: url.clone(),
+        trust,
+        insecure: false,
+        ..stand.config("fay")
+    };
+    // That CA alone: PEM, and the same certificate in DER.
+    let der = ca
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect::<String>();
+    let der = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, der).unwrap();
+    for roots in [vec![ca.clone().into_bytes()], vec![der]] {
+        let client =
+            NativeClient::connect(config(NativeTrust::Roots(roots)), None, &CancelToken::new())
+                .await
+                .expect("the CA named");
+        assert_eq!(client.user_id().as_deref(), Some("fay"));
+        client.disconnect(1_000).await;
+    }
+    // The system's verifier and the Mozilla roots do not know it.
+    for trust in [NativeTrust::Platform, NativeTrust::Mozilla] {
+        let error = NativeClient::connect(config(trust.clone()), None, &CancelToken::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, ErrorKind::Connect, "{trust:?}: {error}");
+        assert!(error.message.contains("certificate"), "{trust:?}: {error}");
+    }
+    // Roots that are no certificate: said at once.
+    let error = NativeClient::connect(
+        config(NativeTrust::Roots(vec![b"not a certificate".to_vec()])),
+        None,
+        &CancelToken::new(),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(error.kind, ErrorKind::Config, "{error}");
     stand.server.stop().await;
 }

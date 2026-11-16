@@ -3,3 +3,5 @@
 -keep class com.sun.jna.* { *; }
 -keepclassmembers class * extends com.sun.jna.* { public *; }
 -keep class dev.wse.ffi.** { *; }
+# Android's certificate verifier: the library calls its Java part through JNI.
+-keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }

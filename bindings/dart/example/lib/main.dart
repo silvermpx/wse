@@ -65,7 +65,8 @@ class _ExampleAppState extends State<ExampleApp> {
   Future<void> _connect() async {
     try {
       final client = await WseClient.connect(
-        wseConfig(serverUrl, topics: ['ticks']),
+        // The example server speaks ws:// on this machine: development only.
+        wseConfig(serverUrl, topics: ['ticks'], insecure: true),
       );
       if (!mounted) {
         await client.close();

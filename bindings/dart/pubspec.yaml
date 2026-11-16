@@ -21,3 +21,20 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
+
+# Android: a plugin that sets up Android's certificate verifier as the app
+# starts. Elsewhere there is nothing to set up.
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: dev.wse.flutter
+        pluginClass: WseClientPlugin
+      ios:
+        dartPluginClass: WseClientPlugin
+      macos:
+        dartPluginClass: WseClientPlugin
+      linux:
+        dartPluginClass: WseClientPlugin
+      windows:
+        dartPluginClass: WseClientPlugin

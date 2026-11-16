@@ -1441,6 +1441,15 @@ public struct WseConfig: Equatable, Hashable {
      */
     public let signingKey: Data?
     public let serverSigningKeys: [String]
+    /**
+     * The certificates a wss:// server's chain must lead to; none: the
+     * system's verifier.
+     */
+    public let trust: WseTrust?
+    /**
+     * Allows ws://, which sends everything in the clear: for development.
+     */
+    public let insecure: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1453,7 +1462,14 @@ public struct WseConfig: Equatable, Hashable {
          */serverIdentityKeys: [String] = [],
         /**
          * This client's ECDSA P-256 private key (PKCS#8, PEM or DER), for signed messages.
-         */signingKey: Data? = nil, serverSigningKeys: [String] = []) {
+         */signingKey: Data? = nil, serverSigningKeys: [String] = [],
+        /**
+         * The certificates a wss:// server's chain must lead to; none: the
+         * system's verifier.
+         */trust: WseTrust? = nil,
+        /**
+         * Allows ws://, which sends everything in the clear: for development.
+         */insecure: Bool = false) {
         self.url = url
         self.token = token
         self.topics = topics
@@ -1468,6 +1484,8 @@ public struct WseConfig: Equatable, Hashable {
         self.serverIdentityKeys = serverIdentityKeys
         self.signingKey = signingKey
         self.serverSigningKeys = serverSigningKeys
+        self.trust = trust
+        self.insecure = insecure
     }
 
 
@@ -1499,7 +1517,9 @@ public struct FfiConverterTypeWseConfig: FfiConverterRustBuffer {
                 recoveryTimeoutMs: FfiConverterUInt64.read(from: &buf),
                 serverIdentityKeys: FfiConverterSequenceString.read(from: &buf),
                 signingKey: FfiConverterOptionData.read(from: &buf),
-                serverSigningKeys: FfiConverterSequenceString.read(from: &buf)
+                serverSigningKeys: FfiConverterSequenceString.read(from: &buf),
+                trust: FfiConverterOptionTypeWseTrust.read(from: &buf),
+                insecure: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -1518,6 +1538,8 @@ public struct FfiConverterTypeWseConfig: FfiConverterRustBuffer {
         FfiConverterSequenceString.write(value.serverIdentityKeys, into: &buf)
         FfiConverterOptionData.write(value.signingKey, into: &buf)
         FfiConverterSequenceString.write(value.serverSigningKeys, into: &buf)
+        FfiConverterOptionTypeWseTrust.write(value.trust, into: &buf)
+        FfiConverterBool.write(value.insecure, into: &buf)
     }
 }
 
@@ -2432,6 +2454,97 @@ public func FfiConverterTypeWseTokenError_lower(_ value: WseTokenError) -> RustB
     return FfiConverterTypeWseTokenError.lower(value)
 }
 
+
+/**
+ * Which certificates a wss:// server's chain must lead to.
+ */
+
+public enum WseTrust: Equatable, Hashable {
+
+    /**
+     * The system's own verifier: the roots the device trusts and its
+     * revocation checks. On Android the library sets it up as the app
+     * starts (`WseTls.init`).
+     */
+    case platform
+    /**
+     * The Mozilla root certificates built into the library: the same on
+     * every device.
+     */
+    case mozilla
+    /**
+     * Only these CA certificates, PEM or DER: a private CA.
+     */
+    case roots(certificates: [Data]
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WseTrust: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWseTrust: FfiConverterRustBuffer {
+    typealias SwiftType = WseTrust
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseTrust {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .platform
+
+        case 2: return .mozilla
+
+        case 3: return .roots(certificates: try FfiConverterSequenceData.read(from: &buf)
+        )
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: WseTrust, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .platform:
+            writeInt(&buf, Int32(1))
+
+
+        case .mozilla:
+            writeInt(&buf, Int32(2))
+
+
+        case let .roots(certificates):
+            writeInt(&buf, Int32(3))
+            FfiConverterSequenceData.write(certificates, into: &buf)
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWseTrust_lift(_ buf: RustBuffer) throws -> WseTrust {
+    return try FfiConverterTypeWseTrust.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWseTrust_lower(_ value: WseTrust) -> RustBuffer {
+    return FfiConverterTypeWseTrust.lower(value)
+}
+
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -2603,6 +2716,30 @@ fileprivate struct FfiConverterOptionTypeWseSignature: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeWseTrust: FfiConverterRustBuffer {
+    typealias SwiftType = WseTrust?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeWseTrust.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeWseTrust.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]
 
@@ -2620,6 +2757,31 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
+    typealias SwiftType = [Data]
+
+    public static func write(_ value: [Data], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterData.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Data] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Data]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterData.read(from: &buf))
         }
         return seq
     }

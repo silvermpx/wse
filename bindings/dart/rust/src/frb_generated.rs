@@ -1029,6 +1029,18 @@ impl SseDecode for Vec<String> {
     }
 }
 
+impl SseDecode for Vec<Vec<u8>> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<Vec<u8>>::sse_decode(deserializer));
+        }
+        return ans_;
+    }
+}
+
 impl SseDecode for Vec<u8> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1190,6 +1202,9 @@ impl SseDecode for crate::api::WseConfig {
         let mut var_serverIdentityKeys = <Vec<String>>::sse_decode(deserializer);
         let mut var_signingKey = <Option<Vec<u8>>>::sse_decode(deserializer);
         let mut var_serverSigningKeys = <Vec<String>>::sse_decode(deserializer);
+        let mut var_trust = <crate::api::WseTrustKind>::sse_decode(deserializer);
+        let mut var_trustedRoots = <Vec<Vec<u8>>>::sse_decode(deserializer);
+        let mut var_insecure = <bool>::sse_decode(deserializer);
         return crate::api::WseConfig {
             url: var_url,
             token: var_token,
@@ -1204,6 +1219,9 @@ impl SseDecode for crate::api::WseConfig {
             server_identity_keys: var_serverIdentityKeys,
             signing_key: var_signingKey,
             server_signing_keys: var_serverSigningKeys,
+            trust: var_trust,
+            trusted_roots: var_trustedRoots,
+            insecure: var_insecure,
         };
     }
 }
@@ -1316,6 +1334,19 @@ impl SseDecode for crate::api::WseTopicRecovery {
     }
 }
 
+impl SseDecode for crate::api::WseTrustKind {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <i32>::sse_decode(deserializer);
+        return match inner {
+            0 => crate::api::WseTrustKind::Platform,
+            1 => crate::api::WseTrustKind::Mozilla,
+            2 => crate::api::WseTrustKind::Roots,
+            _ => unreachable!("Invalid variant for WseTrustKind: {}", inner),
+        };
+    }
+}
+
 fn pde_ffi_dispatcher_primary_impl(
     func_id: i32,
     port: flutter_rust_bridge::for_generated::MessagePort,
@@ -1424,6 +1455,9 @@ impl flutter_rust_bridge::IntoDart for crate::api::WseConfig {
             self.server_identity_keys.into_into_dart().into_dart(),
             self.signing_key.into_into_dart().into_dart(),
             self.server_signing_keys.into_into_dart().into_dart(),
+            self.trust.into_into_dart().into_dart(),
+            self.trusted_roots.into_into_dart().into_dart(),
+            self.insecure.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -1534,6 +1568,23 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::WseTopicRecovery>
         self
     }
 }
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::WseTrustKind {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            Self::Platform => 0.into_dart(),
+            Self::Mozilla => 1.into_dart(),
+            Self::Roots => 2.into_dart(),
+            _ => unreachable!(),
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::WseTrustKind {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::WseTrustKind> for crate::api::WseTrustKind {
+    fn into_into_dart(self) -> crate::api::WseTrustKind {
+        self
+    }
+}
 
 impl SseEncode for WseCancel {
     // Codec=Sse (Serialization based), see doc to use other codecs
@@ -1598,6 +1649,16 @@ impl SseEncode for Vec<String> {
         <i32>::sse_encode(self.len() as _, serializer);
         for item in self {
             <String>::sse_encode(item, serializer);
+        }
+    }
+}
+
+impl SseEncode for Vec<Vec<u8>> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <Vec<u8>>::sse_encode(item, serializer);
         }
     }
 }
@@ -1750,6 +1811,9 @@ impl SseEncode for crate::api::WseConfig {
         <Vec<String>>::sse_encode(self.server_identity_keys, serializer);
         <Option<Vec<u8>>>::sse_encode(self.signing_key, serializer);
         <Vec<String>>::sse_encode(self.server_signing_keys, serializer);
+        <crate::api::WseTrustKind>::sse_encode(self.trust, serializer);
+        <Vec<Vec<u8>>>::sse_encode(self.trusted_roots, serializer);
+        <bool>::sse_encode(self.insecure, serializer);
     }
 }
 
@@ -1824,6 +1888,23 @@ impl SseEncode for crate::api::WseTopicRecovery {
         <String>::sse_encode(self.topic, serializer);
         <bool>::sse_encode(self.recovered, serializer);
         <u64>::sse_encode(self.count, serializer);
+    }
+}
+
+impl SseEncode for crate::api::WseTrustKind {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(
+            match self {
+                crate::api::WseTrustKind::Platform => 0,
+                crate::api::WseTrustKind::Mozilla => 1,
+                crate::api::WseTrustKind::Roots => 2,
+                _ => {
+                    unimplemented!("");
+                }
+            },
+            serializer,
+        );
     }
 }
 

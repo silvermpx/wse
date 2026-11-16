@@ -18,6 +18,7 @@ dependencies {
     implementation("net.java.dev.jna:jna:5.19.1@aar")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
     implementation("androidx.lifecycle:lifecycle-process:2.11.0")
+    implementation("androidx.startup:startup-runtime:1.2.0")
 }
 ```
 
@@ -59,6 +60,17 @@ process's lifecycle: an Activity turning does not touch the connection), and
 network and makes the connection again when the network changes. Both pause
 for reasons of their own: `client.pause("manual")` stays until the app
 resumes it.
+
+A wss:// server's certificate is checked by the system's verifier (the
+default, `trust = null`): the roots the device trusts. `trust =
+WseTrust.Roots(listOf(ca))` trusts only a private CA's certificate (PEM or
+DER), `WseTrust.Mozilla` the Mozilla roots built into the library. ws://
+sends everything in the clear and needs `insecure = true` (for development).
+On Android the library sets the verifier up as the app starts (through
+androidx.startup); an app that removed that provider calls
+`WseTls.init(context)` before it connects. Android checks revocation where
+it can fetch the CA's lists, which come over http: an app whose network
+security config refuses http to them connects without that check.
 
 `events()` is the client's stream, until it closes; one reader at a time. A
 collector cancelled in between loses nothing: the next collection gets the

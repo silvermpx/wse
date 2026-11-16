@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Builds the Android libraries of wse-ffi with cargo-ndk into
 # target/android-jniLibs, one folder per ABI (default: arm64-v8a,
-# armeabi-v7a and x86_64), and checks that each loads on 16 KB pages.
+# armeabi-v7a and x86_64), and checks that each loads on 16 KB pages. Also
+# fetches the Java part of Android's certificate verifier into
+# target/android-verifier/rustls-platform-verifier.jar, for the AAR.
 # Needs ANDROID_NDK_HOME.
 #
 #   bindings/kotlin/android/build-libs.sh            # every ABI
@@ -28,3 +30,5 @@ for abi in "${abis[@]}"; do
   fi
 done
 echo "built ${abis[*]} into $jni (16 KB pages)"
+
+"$root/bindings/rustls-platform-verifier.sh" "$target/android-verifier/rustls-platform-verifier.jar"

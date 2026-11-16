@@ -48,6 +48,12 @@ again when the path moves to other interfaces (macOS too). Both pause for
 reasons of their own: `try client.pause(reason: "manual")` stays until the
 app resumes it. Keep them as long as the client.
 
+A wss:// server's certificate is checked by the system's verifier (the
+default, `trust: nil`): the roots the device trusts. `trust:
+.roots(certificates: [ca])` trusts only a private CA's certificate (PEM or
+DER), `.mozilla` the Mozilla roots built into the library. ws:// sends
+everything in the clear and needs `insecure: true` (for development).
+
 `events()` is the client's stream, until it closes; one reader at a time.
 A Task cancelled while reading loses nothing: the next read gets the rest.
 Cancelling the Task of `connect` gives up the attempt. `disconnect` sends

@@ -128,6 +128,54 @@ pub struct WseConfig {
     pub signing_key: Option<Vec<u8>>,
     #[uniffi(default = [])]
     pub server_signing_keys: Vec<String>,
+    /// The certificates a wss:// server's chain must lead to; none: the
+    /// system's verifier.
+    #[uniffi(default = None)]
+    pub trust: Option<WseTrust>,
+    /// Allows ws://, which sends everything in the clear: for development.
+    #[uniffi(default = false)]
+    pub insecure: bool,
+}
+
+/// Which certificates a wss:// server's chain must lead to.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum WseTrust {
+    /// The system's own verifier: the roots the device trusts and its
+    /// revocation checks. On Android the library sets it up as the app
+    /// starts (`WseTls.init`).
+    Platform,
+    /// The Mozilla root certificates built into the library: the same on
+    /// every device.
+    Mozilla,
+    /// Only these CA certificates, PEM or DER: a private CA.
+    Roots { certificates: Vec<Vec<u8>> },
+}
+
+impl From<WseTrust> for native::NativeTrust {
+    fn from(trust: WseTrust) -> Self {
+        match trust {
+            WseTrust::Platform => Self::Platform,
+            WseTrust::Mozilla => Self::Mozilla,
+            WseTrust::Roots { certificates } => Self::Roots(certificates),
+        }
+    }
+}
+
+/// `dev.wse.ffi.WseTls.initNative(context)`: Android's certificate verifier
+/// gets the JVM and the application's context; true once it has them.
+///
+/// # Safety
+///
+/// Called by the JVM with its JNIEnv, the class and a Context.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_wse_ffi_WseTls_initNative(
+    env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    context: *mut std::ffi::c_void,
+) -> u8 {
+    // Safety: the JVM passes its own env and a valid Context.
+    u8::from(unsafe { native::init_android(env, context) }.is_ok())
 }
 
 impl From<WseConfig> for native::NativeConfig {
@@ -147,6 +195,8 @@ impl From<WseConfig> for native::NativeConfig {
             server_identity_keys: c.server_identity_keys,
             signing_key: c.signing_key,
             server_signing_keys: c.server_signing_keys,
+            trust: c.trust.map(Into::into).unwrap_or_default(),
+            insecure: c.insecure,
         }
     }
 }

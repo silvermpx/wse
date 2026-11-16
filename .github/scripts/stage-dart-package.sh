@@ -2,7 +2,8 @@
 # Stages the Dart package as pub.dev gets it, into OUT: the committed
 # bindings/dart, its build hook listing the prebuilt libraries in BINARIES
 # with their SHA-256, its Rust crate on the published wse-client (a crate of
-# its own, with the workspace's Cargo.lock), and the license.
+# its own, with the workspace's Cargo.lock), the Java part of Android's
+# certificate verifier, and the license.
 #
 #   .github/scripts/stage-dart-package.sh 3.1.0 dart-binaries dart-package
 set -euo pipefail
@@ -28,6 +29,8 @@ rm -rf "${out:?}"
 mkdir -p "$out"
 git -C "$root" archive --format=tar HEAD bindings/dart | tar -x -C "$out" --strip-components=2
 cp "$root/LICENSE" "$out/LICENSE"
+"$root/bindings/rustls-platform-verifier.sh" "$out/android/libs/rustls-platform-verifier.jar"
+rm -f "$out"/android/libs/*.aar
 
 {
   echo "// The release's prebuilt libraries: target triple to SHA-256. The release"

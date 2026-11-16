@@ -10,7 +10,13 @@ version = 2
 # A yanked crate in the lock file fails like an advisory.
 yanked = "deny"
 # Each ignored advisory needs a reason and the condition that removes it.
-ignore = []
+ignore = [
+    # Unmaintained, not vulnerable. It comes only with UniFFI's binding
+    # generator (askama reads its settings with it), which wse-bindgen runs
+    # at build time; nothing shipped carries it. Goes once askama or
+    # uniffi_bindgen leaves it.
+    { id = "RUSTSEC-2026-0374", reason = "build-time only: UniFFI's binding generator, through askama" },
+]
 
 [licenses]
 version = 2
@@ -40,6 +46,40 @@ allow = ["OpenSSL"]
 [[licenses.exceptions]]
 crate = "webpki-roots"
 allow = ["CDLA-Permissive-2.0"]
+
+# The same certificates, for rustls-platform-verifier in the browser.
+[[licenses.exceptions]]
+crate = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
+
+# UniFFI, under which the Swift and Kotlin packages call the Rust client:
+# Mozilla Public License 2.0, a copyleft per file. Its files are used as
+# published, unchanged, and their source is on crates.io; the packages that
+# link them keep their own license.
+[[licenses.exceptions]]
+crate = "uniffi"
+allow = ["MPL-2.0"]
+[[licenses.exceptions]]
+crate = "uniffi_bindgen"
+allow = ["MPL-2.0"]
+[[licenses.exceptions]]
+crate = "uniffi_core"
+allow = ["MPL-2.0"]
+[[licenses.exceptions]]
+crate = "uniffi_internal_macros"
+allow = ["MPL-2.0"]
+[[licenses.exceptions]]
+crate = "uniffi_macros"
+allow = ["MPL-2.0"]
+[[licenses.exceptions]]
+crate = "uniffi_meta"
+allow = ["MPL-2.0"]
+[[licenses.exceptions]]
+crate = "uniffi_pipeline"
+allow = ["MPL-2.0"]
+[[licenses.exceptions]]
+crate = "uniffi_udl"
+allow = ["MPL-2.0"]
 
 [bans]
 # Two versions of one crate are reported, not refused: some come in through

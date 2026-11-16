@@ -884,6 +884,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<Uint8List> dco_decode_list_list_prim_u_8_strict(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_list_prim_u_8_strict).toList();
+  }
+
+  @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as Uint8List;
@@ -984,8 +990,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   WseConfig dco_decode_wse_config(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 13)
-      throw Exception('unexpected arr length: expect 13 but see ${arr.length}');
+    if (arr.length != 16)
+      throw Exception('unexpected arr length: expect 16 but see ${arr.length}');
     return WseConfig(
       url: dco_decode_String(arr[0]),
       token: dco_decode_opt_String(arr[1]),
@@ -1000,6 +1006,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       serverIdentityKeys: dco_decode_list_String(arr[10]),
       signingKey: dco_decode_opt_list_prim_u_8_strict(arr[11]),
       serverSigningKeys: dco_decode_list_String(arr[12]),
+      trust: dco_decode_wse_trust_kind(arr[13]),
+      trustedRoots: dco_decode_list_list_prim_u_8_strict(arr[14]),
+      insecure: dco_decode_bool(arr[15]),
     );
   }
 
@@ -1069,6 +1078,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       recovered: dco_decode_bool(arr[1]),
       count: dco_decode_u_64(arr[2]),
     );
+  }
+
+  @protected
+  WseTrustKind dco_decode_wse_trust_kind(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return WseTrustKind.values[raw as int];
   }
 
   @protected
@@ -1194,6 +1209,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var ans_ = <String>[];
     for (var idx_ = 0; idx_ < len_; ++idx_) {
       ans_.add(sse_decode_String(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
+  List<Uint8List> sse_decode_list_list_prim_u_8_strict(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <Uint8List>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_list_prim_u_8_strict(deserializer));
     }
     return ans_;
   }
@@ -1346,6 +1375,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_serverIdentityKeys = sse_decode_list_String(deserializer);
     var var_signingKey = sse_decode_opt_list_prim_u_8_strict(deserializer);
     var var_serverSigningKeys = sse_decode_list_String(deserializer);
+    var var_trust = sse_decode_wse_trust_kind(deserializer);
+    var var_trustedRoots = sse_decode_list_list_prim_u_8_strict(deserializer);
+    var var_insecure = sse_decode_bool(deserializer);
     return WseConfig(
       url: var_url,
       token: var_token,
@@ -1360,6 +1392,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       serverIdentityKeys: var_serverIdentityKeys,
       signingKey: var_signingKey,
       serverSigningKeys: var_serverSigningKeys,
+      trust: var_trust,
+      trustedRoots: var_trustedRoots,
+      insecure: var_insecure,
     );
   }
 
@@ -1450,6 +1485,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       recovered: var_recovered,
       count: var_count,
     );
+  }
+
+  @protected
+  WseTrustKind sse_decode_wse_trust_kind(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_i_32(deserializer);
+    return WseTrustKind.values[inner];
   }
 
   @protected
@@ -1581,6 +1623,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_i_32(self.length, serializer);
     for (final item in self) {
       sse_encode_String(item, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_list_list_prim_u_8_strict(
+    List<Uint8List> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_list_prim_u_8_strict(item, serializer);
     }
   }
 
@@ -1727,6 +1781,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_list_String(self.serverIdentityKeys, serializer);
     sse_encode_opt_list_prim_u_8_strict(self.signingKey, serializer);
     sse_encode_list_String(self.serverSigningKeys, serializer);
+    sse_encode_wse_trust_kind(self.trust, serializer);
+    sse_encode_list_list_prim_u_8_strict(self.trustedRoots, serializer);
+    sse_encode_bool(self.insecure, serializer);
   }
 
   @protected
@@ -1783,6 +1840,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_String(self.topic, serializer);
     sse_encode_bool(self.recovered, serializer);
     sse_encode_u_64(self.count, serializer);
+  }
+
+  @protected
+  void sse_encode_wse_trust_kind(WseTrustKind self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.index, serializer);
   }
 }
 

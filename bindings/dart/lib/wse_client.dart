@@ -3,6 +3,7 @@ library;
 
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/widgets.dart';
@@ -33,6 +34,12 @@ ExternalLibrary? _testLibrary() {
   return file != null && file.existsSync()
       ? ExternalLibrary.open(file.absolute.path)
       : null;
+}
+
+/// Flutter's plugin entry: on Android the package's Java part sets up the
+/// certificate verifier; elsewhere there is nothing to register.
+final class WseClientPlugin {
+  static void registerWith() {}
 }
 
 /// A connection to a WSE server, made again when it is lost.
@@ -196,6 +203,9 @@ class WseClient {
 }
 
 /// A configuration with the defaults for what is not given.
+///
+/// [trust] names the certificates a wss:// server's chain must lead to; ws://
+/// sends everything in the clear and takes [insecure] (for development).
 rust.WseConfig wseConfig(
   String url, {
   String? token,
@@ -203,6 +213,8 @@ rust.WseConfig wseConfig(
   bool msgpack = false,
   Map<String, String> headers = const {},
   bool reconnect = true,
+  WseTrust trust = WseTrust.platform,
+  bool insecure = false,
 }) => rust.WseConfig(
   url: url,
   token: token,
@@ -217,7 +229,30 @@ rust.WseConfig wseConfig(
   serverIdentityKeys: const [],
   signingKey: null,
   serverSigningKeys: const [],
+  trust: trust._kind,
+  trustedRoots: trust._roots,
+  insecure: insecure,
 );
+
+/// Which certificates a wss:// server's chain must lead to.
+final class WseTrust {
+  const WseTrust._(this._kind, this._roots);
+
+  /// Only these CA certificates, PEM or DER: a private CA.
+  const WseTrust.roots(List<Uint8List> certificates)
+    : this._(rust.WseTrustKind.roots, certificates);
+
+  /// The system's own verifier: the roots the device trusts and its
+  /// revocation checks.
+  static const platform = WseTrust._(rust.WseTrustKind.platform, []);
+
+  /// The Mozilla root certificates built into the library: the same on every
+  /// device.
+  static const mozilla = WseTrust._(rust.WseTrustKind.mozilla, []);
+
+  final rust.WseTrustKind _kind;
+  final List<Uint8List> _roots;
+}
 
 /// Pauses [client] [grace] after the app went to the background, and
 /// resumes it when the app comes back. It pauses for a reason of its own, so

@@ -7,9 +7,16 @@
 //!     cargo run --example server
 //!
 //! It prints its URL and the keys a client pins; `WSE_PORT` sets the port.
+//! With `WSE_TLS_PORT` it also takes wss:// on that port, with a certificate
+//! of a CA of its own made for the run (for localhost, 127.0.0.1 and
+//! 10.0.2.2), and writes the CA's certificate to the file `WSE_TLS_CA` names.
 
 #[cfg(target_arch = "wasm32")]
 fn main() {}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "../tests/common/tls.rs"]
+mod tls;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[tokio::main]
@@ -86,6 +93,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     println!("url ws://127.0.0.1:{port}/wse");
+    if let Some(tls_port) = std::env::var("WSE_TLS_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+    {
+        let door = tokio::net::TcpListener::bind(("127.0.0.1", tls_port)).await?;
+        let ca = tls::open(door, ([127, 0, 0, 1], port).into());
+        let path = std::env::var("WSE_TLS_CA").map_err(|_| "WSE_TLS_PORT needs WSE_TLS_CA")?;
+        std::fs::write(&path, ca)?;
+        println!("tls_url wss://localhost:{tls_port}/wse");
+        println!("tls_ca {path}");
+    }
     println!(
         "e2e_identity_public_key {}",
         publisher.e2e_identity_public_key().unwrap_or_default()

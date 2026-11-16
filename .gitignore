@@ -50,3 +50,6 @@ docs/internal/
 
 # The extension built before the workspace (rust/)
 rust/target/
+
+# The Java part of Android's certificate verifier, fetched by bindings/rustls-platform-verifier.sh
+bindings/dart/android/libs/

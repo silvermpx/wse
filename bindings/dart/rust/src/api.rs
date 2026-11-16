@@ -57,6 +57,42 @@ pub struct WseConfig {
     pub server_identity_keys: Vec<String>,
     pub signing_key: Option<Vec<u8>>,
     pub server_signing_keys: Vec<String>,
+    /// The certificates a wss:// server's chain must lead to.
+    pub trust: WseTrustKind,
+    /// The CA certificates (PEM or DER) of [`WseTrustKind::Roots`].
+    pub trusted_roots: Vec<Vec<u8>>,
+    /// Allows ws://, which sends everything in the clear: for development.
+    pub insecure: bool,
+}
+
+/// Which certificates a wss:// server's chain must lead to.
+pub enum WseTrustKind {
+    /// The system's own verifier: the roots the device trusts and its
+    /// revocation checks.
+    Platform,
+    /// The Mozilla root certificates built into the library.
+    Mozilla,
+    /// Only the CA certificates in `trusted_roots`: a private CA.
+    Roots,
+}
+
+/// `dev.wse.flutter.WseClientPlugin.initNative(context)`: Android's
+/// certificate verifier gets the JVM and the application's context; true once
+/// it has them.
+///
+/// # Safety
+///
+/// Called by the JVM with its JNIEnv, the class and a Context.
+#[cfg(target_os = "android")]
+#[frb(ignore)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_wse_flutter_WseClientPlugin_initNative(
+    env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    context: *mut std::ffi::c_void,
+) -> u8 {
+    // Safety: the JVM passes its own env and a valid Context.
+    u8::from(unsafe { native::init_android(env, context) }.is_ok())
 }
 
 /// Cancels the calls it is given to.
@@ -315,6 +351,12 @@ impl WseNativeClient {
             server_identity_keys: config.server_identity_keys,
             signing_key: config.signing_key,
             server_signing_keys: config.server_signing_keys,
+            trust: match config.trust {
+                WseTrustKind::Platform => native::NativeTrust::Platform,
+                WseTrustKind::Mozilla => native::NativeTrust::Mozilla,
+                WseTrustKind::Roots => native::NativeTrust::Roots(config.trusted_roots),
+            },
+            insecure: config.insecure,
             ..native::NativeConfig::default()
         };
         let client = native::NativeClient::connect(native_config, None, &cancel.0).await?;

@@ -576,23 +576,30 @@ async fn sleep_until(deadline: Option<Instant>) {
 
 /// TLS with the Mozilla root certificates, on aws-lc-rs.
 #[cfg(feature = "aws-lc")]
-fn default_tls() -> Arc<rustls::ClientConfig> {
+pub(crate) fn default_tls() -> Arc<rustls::ClientConfig> {
     use std::sync::OnceLock;
     static TLS: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
     TLS.get_or_init(|| {
         let roots = rustls::RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         };
-        #[cfg(feature = "fips")]
-        let provider = Arc::new(rustls::crypto::default_fips_provider());
-        #[cfg(not(feature = "fips"))]
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .expect("aws-lc-rs supports the default protocol versions")
+        let config = tls_builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
         Arc::new(config)
     })
     .clone()
+}
+
+/// A TLS client configuration on aws-lc-rs (its FIPS module with `fips`),
+/// the safe default versions, its verifier still to be chosen.
+#[cfg(feature = "aws-lc")]
+pub(crate) fn tls_builder() -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier> {
+    #[cfg(feature = "fips")]
+    let provider = Arc::new(rustls::crypto::default_fips_provider());
+    #[cfg(not(feature = "fips"))]
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("aws-lc-rs supports the default protocol versions")
 }

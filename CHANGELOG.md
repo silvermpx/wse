@@ -28,7 +28,12 @@
   source instead. The release attaches the XCFramework, the AAR and the
   prebuilt libraries. They are built on the `wse-client` crate's `native`
   feature: a shared runtime, cancellable calls, and events read in batches
-  that come again until they are acknowledged.
+  that come again until they are acknowledged. A wss:// server's
+  certificate is checked by the system's verifier (rustls-platform-verifier:
+  the Security framework on Apple platforms, Android's own through the JVM,
+  set up as the app starts), or against a private CA's certificates or the
+  Mozilla roots when the app says so; ws:// takes an explicit `insecure`
+  (development).
 - Live-only sends, for commands that must not run late (a valve, a door, an
   order): a message sent live goes on the connection that is ready when it
   is sent, or not at all, never held for a later connection or replayed

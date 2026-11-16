@@ -11,8 +11,42 @@ void main() {
 
   setUpAll(() async => WseClient.init());
 
+  test('ws:// goes in the clear only when asked', () async {
+    await expectLater(
+      WseClient.connect(wseConfig(url)),
+      throwsA(isA<WseError>().having((error) => error.kind, 'kind', 'config')),
+    );
+  });
+
+  test('a private CA is trusted where it is named', () async {
+    final tlsUrl = Platform.environment['WSE_TEST_TLS_URL']!;
+    final ca = File(Platform.environment['WSE_TEST_CA']!).readAsBytesSync();
+    final client = await WseClient.connect(
+      wseConfig(tlsUrl, trust: WseTrust.roots([ca])),
+    );
+    expect(client.status, 'connected');
+    await client.close();
+    // The system's verifier and the Mozilla roots do not know that CA.
+    for (final trust in [WseTrust.platform, WseTrust.mozilla]) {
+      await expectLater(
+        WseClient.connect(wseConfig(tlsUrl, reconnect: false, trust: trust)),
+        throwsA(
+          isA<WseError>()
+              .having((error) => error.kind, 'kind', 'connect')
+              .having(
+                (error) => error.message,
+                'message',
+                contains('certificate'),
+              ),
+        ),
+      );
+    }
+  });
+
   test('ticks come in order and echo answers', () async {
-    final client = await WseClient.connect(wseConfig(url, topics: ['ticks']));
+    final client = await WseClient.connect(
+      wseConfig(url, topics: ['ticks'], insecure: true),
+    );
     expect(client.status, 'connected');
     await client.send('echo', '{"text":"hallo"}');
     final ticks = <BigInt>[];
@@ -33,7 +67,9 @@ void main() {
   test(
     'the connection and the subscription say what the server keeps',
     () async {
-      final client = await WseClient.connect(wseConfig(url, topics: ['ticks']));
+      final client = await WseClient.connect(
+        wseConfig(url, topics: ['ticks'], insecure: true),
+      );
       WseItem? connected;
       WseItem? subscribed;
       await for (final item in client.events()) {
@@ -49,7 +85,9 @@ void main() {
   );
 
   test('a listener that stops in between loses nothing', () async {
-    final client = await WseClient.connect(wseConfig(url, topics: ['ticks']));
+    final client = await WseClient.connect(
+      wseConfig(url, topics: ['ticks'], insecure: true),
+    );
     final first = await client.events().first;
     final second = await client.events().first;
     expect(identical(first, second), isFalse);
@@ -57,7 +95,7 @@ void main() {
   });
 
   test('a live message goes on the ready connection', () async {
-    final client = await WseClient.connect(wseConfig(url));
+    final client = await WseClient.connect(wseConfig(url, insecure: true));
     client.trySendLive('valve', '{"open":true}');
     await client.sendLive('valve', '{"open":false}');
     expect(
@@ -71,7 +109,7 @@ void main() {
     'cancelling a listener that waits ends it, and the next one reads on',
     () async {
       // No topics: past its first items the server stays quiet.
-      final client = await WseClient.connect(wseConfig(url));
+      final client = await WseClient.connect(wseConfig(url, insecure: true));
       final waiting = client.events().listen((_) {});
       await Future<void>.delayed(const Duration(milliseconds: 300));
       await waiting.cancel().timeout(const Duration(seconds: 2));
@@ -91,7 +129,9 @@ void main() {
   test(
     'a paused client ends its connection and comes back when resumed',
     () async {
-      final client = await WseClient.connect(wseConfig(url, topics: ['ticks']));
+      final client = await WseClient.connect(
+        wseConfig(url, topics: ['ticks'], insecure: true),
+      );
       client.pause('manual');
       final paused = await client.events().firstWhere(
         (item) => item.kind == WseItemKind.paused,
@@ -108,7 +148,7 @@ void main() {
   );
 
   test('a closed client says so', () async {
-    final client = await WseClient.connect(wseConfig(url));
+    final client = await WseClient.connect(wseConfig(url, insecure: true));
     await client.close();
     expect(client.status, 'closed');
     expect(client.userId, isNull);
@@ -130,7 +170,7 @@ void main() {
     tester,
   ) async {
     final client = (await tester.runAsync(
-      () => WseClient.connect(wseConfig(url)),
+      () => WseClient.connect(wseConfig(url, insecure: true)),
     ))!;
     final lifecycle = WseAppLifecycle(
       client,
@@ -152,7 +192,7 @@ void main() {
 
   testWidgets('an app back within the grace is not paused', (tester) async {
     final client = (await tester.runAsync(
-      () => WseClient.connect(wseConfig(url)),
+      () => WseClient.connect(wseConfig(url, insecure: true)),
     ))!;
     final lifecycle = WseAppLifecycle(
       client,
@@ -172,7 +212,7 @@ void main() {
     tester,
   ) async {
     final client = (await tester.runAsync(
-      () => WseClient.connect(wseConfig(url)),
+      () => WseClient.connect(wseConfig(url, insecure: true)),
     ))!;
     final reasons = <String?>[];
     // Read in real time: the client's calls complete outside the fake one.
@@ -217,7 +257,7 @@ void main() {
 
   testWidgets('a closed client is left alone', (tester) async {
     final client = (await tester.runAsync(
-      () => WseClient.connect(wseConfig(url)),
+      () => WseClient.connect(wseConfig(url, insecure: true)),
     ))!;
     final lifecycle = WseAppLifecycle(client, grace: Duration.zero);
     final network = WseNetworkMonitor(client);
@@ -233,7 +273,7 @@ void main() {
   });
 
   test('a payload must be JSON', () async {
-    final client = await WseClient.connect(wseConfig(url));
+    final client = await WseClient.connect(wseConfig(url, insecure: true));
     expect(() => client.trySend('x', 'not json'), throwsA(isA<WseError>()));
     await client.close();
   });

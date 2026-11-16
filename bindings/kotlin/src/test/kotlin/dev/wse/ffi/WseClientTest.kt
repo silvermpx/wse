@@ -19,8 +19,29 @@ class WseClientTest {
     private val url = System.getenv("WSE_TEST_URL") ?: "ws://127.0.0.1:5007/wse"
 
     @Test
+    fun wsGoesInTheClearOnlyWhenAsked(): Unit = runBlocking {
+        assertFailsWith<WseException.Config> { connectClient(WseConfig(url = url)) }
+    }
+
+    @Test
+    fun aPrivateCaIsTrustedWhereItIsNamed(): Unit = runBlocking {
+        val tlsUrl = checkNotNull(System.getenv("WSE_TEST_TLS_URL")) { "run-tests.sh passes the wss:// door" }
+        val ca = java.io.File(System.getenv("WSE_TEST_CA")).readBytes()
+        val client = connectClient(WseConfig(url = tlsUrl, trust = WseTrust.Roots(listOf(ca))))
+        assertEquals(WseStatus.CONNECTED, client.status())
+        client.disconnect(1_000u)
+        // The system's verifier and the Mozilla roots do not know that CA.
+        for (trust in listOf(WseTrust.Platform, WseTrust.Mozilla)) {
+            val error = assertFailsWith<WseException.Connect> {
+                connectClient(WseConfig(url = tlsUrl, reconnect = false, trust = trust))
+            }
+            assertTrue("certificate" in error.reason, "$trust: ${error.reason}")
+        }
+    }
+
+    @Test
     fun ticksComeInOrderAndEchoAnswers(): Unit = runBlocking {
-        val client = connectClient(WseConfig(url = url, topics = listOf("ticks")))
+        val client = connectClient(WseConfig(url = url, topics = listOf("ticks"), insecure = true))
         assertEquals(WseStatus.CONNECTED, client.status())
         client.send("echo", """{"text":"hallo"}""")
         val events = client.events()
@@ -40,7 +61,7 @@ class WseClientTest {
 
     @Test
     fun aCollectorStoppedInTheMiddleLosesNothing(): Unit = runBlocking {
-        val client = connectClient(WseConfig(url = url, topics = listOf("ticks")))
+        val client = connectClient(WseConfig(url = url, topics = listOf("ticks"), insecure = true))
         val events = client.events()
         val first = events.asFlow().first()
         val second = events.asFlow().first()
@@ -54,14 +75,14 @@ class WseClientTest {
     fun aCancelledConnectGivesUp(): Unit = runBlocking {
         val started = System.nanoTime()
         assertFailsWith<TimeoutCancellationException> {
-            withTimeout(200) { connectClient(WseConfig(url = "ws://10.255.255.1:9/wse", connectTimeoutMs = 30_000u)) }
+            withTimeout(200) { connectClient(WseConfig(url = "ws://10.255.255.1:9/wse", connectTimeoutMs = 30_000u, insecure = true)) }
         }
         assertTrue(System.nanoTime() - started < 5_000_000_000)
     }
 
     @Test
     fun aCollectorCancelledAtAnItemLosesNotTheNext(): Unit = runBlocking {
-        val client = connectClient(WseConfig(url = url, topics = listOf("ticks")))
+        val client = connectClient(WseConfig(url = url, topics = listOf("ticks"), insecure = true))
         val events = client.events()
         // Several ticks wait in one batch.
         delay(700)
@@ -88,7 +109,7 @@ class WseClientTest {
     @Test
     fun everyCallReadsOneStreamOneReaderAtATime(): Unit = runBlocking {
         // No topics: past its first items the server stays quiet.
-        val client = connectClient(WseConfig(url = url))
+        val client = connectClient(WseConfig(url = url, insecure = true))
         val events = client.events()
         assertSame(events, client.events())
         val waiting = launch { while (events.next() != null) {} }
@@ -108,7 +129,7 @@ class WseClientTest {
 
     @Test
     fun aCancelledSendDoesNotGoOut(): Unit = runBlocking {
-        val client = connectClient(WseConfig(url = url))
+        val client = connectClient(WseConfig(url = url, insecure = true))
         val cancel = WseCancel()
         cancel.cancel()
         assertFailsWith<WseException.Cancelled> { client.send("order", "{}", cancel) }
@@ -118,7 +139,7 @@ class WseClientTest {
 
     @Test
     fun aLiveMessageGoesOnTheReadyConnection(): Unit = runBlocking {
-        val client = connectClient(WseConfig(url = url))
+        val client = connectClient(WseConfig(url = url, insecure = true))
         client.trySendLive("valve", "{\"open\":true}")
         client.sendLive("valve", "{\"open\":false}")
         client.disconnect(1_000u)
@@ -127,7 +148,7 @@ class WseClientTest {
 
     @Test
     fun aPayloadMustBeJson(): Unit = runBlocking {
-        val client = connectClient(WseConfig(url = url))
+        val client = connectClient(WseConfig(url = url, insecure = true))
         assertFailsWith<WseException.Encode> { client.trySend("x", "not json") }
         client.disconnect(1_000u)
     }

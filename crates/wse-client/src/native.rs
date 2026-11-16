@@ -193,6 +193,27 @@ pub struct NativeConfig {
     pub signing_key: Option<Vec<u8>>,
     /// The server's signing public keys the messages it signs are checked against.
     pub server_signing_keys: Vec<String>,
+    /// The certificates a wss:// server's chain must lead to.
+    pub trust: NativeTrust,
+    /// Allows ws://, which sends everything in the clear: for development.
+    pub insecure: bool,
+}
+
+/// Which certificates a wss:// server's chain must lead to.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum NativeTrust {
+    /// The system's own verifier: the roots the device trusts (with those
+    /// its owner or an administrator added, where the system counts them)
+    /// and its revocation checks. On Android it needs [`init_android`] first;
+    /// the Kotlin and Flutter packages call it as the app starts.
+    #[default]
+    Platform,
+    /// The Mozilla root certificates built into the library: the same on
+    /// every device.
+    Mozilla,
+    /// Only these CA certificates, PEM (one or more each) or DER: a private
+    /// CA.
+    Roots(Vec<Vec<u8>>),
 }
 
 /// The token for each connection attempt, asked of the application.
@@ -204,7 +225,19 @@ fn config_of(
     native: NativeConfig,
     tokens: Option<Arc<dyn TokenSource>>,
 ) -> Result<Config, NativeError> {
+    if native.url.starts_with("ws://") && !native.insecure {
+        return Err(NativeError::new(
+            ErrorKind::Config,
+            "ws:// sends everything in the clear: use wss://, or set insecure (for development)",
+        ));
+    }
+    let tls = native
+        .url
+        .starts_with("wss://")
+        .then(|| tls_of(native.trust))
+        .transpose()?;
     let mut config = Config::new(native.url);
+    config.tls = tls;
     config.token = native.token;
     if let Some(source) = tokens {
         config.token_provider = Some(TokenProvider::new(move || source.token()));
@@ -239,6 +272,114 @@ fn config_of(
     config.signing_key = native.signing_key;
     config.server_signing_keys = native.server_signing_keys;
     Ok(config)
+}
+
+/// The TLS configuration of `trust`: the system's verifier and the Mozilla
+/// roots are made once for the process.
+fn tls_of(trust: NativeTrust) -> Result<Arc<dyn std::any::Any + Send + Sync>, NativeError> {
+    let config = match trust {
+        NativeTrust::Platform => {
+            #[cfg(target_os = "android")]
+            if !ANDROID_VERIFIER.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(NativeError::new(
+                    ErrorKind::Config,
+                    "Android's certificate verifier is not set up: the Kotlin library and the \
+                     Flutter package set it up as the app starts (WseTls.init(context) by hand)",
+                ));
+            }
+            static PLATFORM: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+            match PLATFORM.get() {
+                Some(config) => config.clone(),
+                None => {
+                    let builder = crate::connection::tls_builder();
+                    let verifier =
+                        rustls_platform_verifier::Verifier::new(builder.crypto_provider().clone())
+                            .map_err(|e| {
+                                NativeError::new(
+                                    ErrorKind::Config,
+                                    format!("the system's certificate verifier: {e}"),
+                                )
+                            })?;
+                    let config = builder
+                        .dangerous()
+                        .with_custom_certificate_verifier(Arc::new(verifier))
+                        .with_no_client_auth();
+                    PLATFORM.get_or_init(|| Arc::new(config)).clone()
+                }
+            }
+        }
+        NativeTrust::Mozilla => crate::connection::default_tls(),
+        NativeTrust::Roots(certificates) => {
+            use rustls::pki_types::CertificateDer;
+            use rustls::pki_types::pem::PemObject;
+            let bad = |e: &dyn std::fmt::Display| {
+                NativeError::new(ErrorKind::Config, format!("a trusted root: {e}"))
+            };
+            let mut roots = rustls::RootCertStore::empty();
+            for certificate in certificates {
+                if memchr::memmem::find(&certificate, b"-----BEGIN").is_some() {
+                    for der in CertificateDer::pem_slice_iter(&certificate) {
+                        roots.add(der.map_err(|e| bad(&e))?).map_err(|e| bad(&e))?;
+                    }
+                } else {
+                    roots
+                        .add(CertificateDer::from(certificate))
+                        .map_err(|e| bad(&e))?;
+                }
+            }
+            if roots.is_empty() {
+                return Err(bad(&"no certificate given"));
+            }
+            Arc::new(
+                crate::connection::tls_builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            )
+        }
+    };
+    Ok(config)
+}
+
+/// Android's verifier was given the JVM and the app's context.
+#[cfg(target_os = "android")]
+static ANDROID_VERIFIER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Gives Android's certificate verifier the JVM and the application's
+/// context, once per process: [`NativeTrust::Platform`] needs it. A
+/// binding's JNI method calls it with the arguments the JVM gave it.
+///
+/// # Safety
+///
+/// `env` is the JNIEnv of the calling thread and `context` a reference to
+/// an `android.content.Context`, both valid for the call.
+#[cfg(target_os = "android")]
+pub unsafe fn init_android(
+    env: *mut std::ffi::c_void,
+    context: *mut std::ffi::c_void,
+) -> Result<(), NativeError> {
+    // Safety: the caller passes the thread's JNIEnv.
+    let mut unowned = unsafe { jni::EnvUnowned::from_raw(env.cast()) };
+    let outcome = unowned
+        .with_env(|env| -> Result<(), jni::errors::Error> {
+            // Safety: the caller passes a valid Context reference.
+            let context = unsafe { jni::objects::JObject::from_raw(env, context.cast()) };
+            rustls_platform_verifier::android::init_with_env(env, context)
+        })
+        .into_outcome();
+    match outcome {
+        jni::Outcome::Ok(()) => {
+            ANDROID_VERIFIER.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        }
+        jni::Outcome::Err(e) => Err(NativeError::new(
+            ErrorKind::Config,
+            format!("Android's certificate verifier: {e}"),
+        )),
+        jni::Outcome::Panic(_) => Err(NativeError::new(
+            ErrorKind::Internal,
+            "Android's certificate verifier panicked as it was set up",
+        )),
+    }
 }
 
 // -- cancellation ---------------------------------------------------------------

@@ -107,6 +107,15 @@ class WseConfig {
   final Uint8List? signingKey;
   final List<String> serverSigningKeys;
 
+  /// The certificates a wss:// server's chain must lead to.
+  final WseTrustKind trust;
+
+  /// The CA certificates (PEM or DER) of [`WseTrustKind::Roots`].
+  final List<Uint8List> trustedRoots;
+
+  /// Allows ws://, which sends everything in the clear: for development.
+  final bool insecure;
+
   const WseConfig({
     required this.url,
     this.token,
@@ -121,6 +130,9 @@ class WseConfig {
     required this.serverIdentityKeys,
     this.signingKey,
     required this.serverSigningKeys,
+    required this.trust,
+    required this.trustedRoots,
+    required this.insecure,
   });
 
   @override
@@ -137,7 +149,10 @@ class WseConfig {
       recoveryTimeoutMs.hashCode ^
       serverIdentityKeys.hashCode ^
       signingKey.hashCode ^
-      serverSigningKeys.hashCode;
+      serverSigningKeys.hashCode ^
+      trust.hashCode ^
+      trustedRoots.hashCode ^
+      insecure.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -156,7 +171,10 @@ class WseConfig {
           recoveryTimeoutMs == other.recoveryTimeoutMs &&
           serverIdentityKeys == other.serverIdentityKeys &&
           signingKey == other.signingKey &&
-          serverSigningKeys == other.serverSigningKeys;
+          serverSigningKeys == other.serverSigningKeys &&
+          trust == other.trust &&
+          trustedRoots == other.trustedRoots &&
+          insecure == other.insecure;
 }
 
 /// What went wrong; `kind` names it (config, connect, auth, timeout,
@@ -367,4 +385,17 @@ class WseTopicRecovery {
           topic == other.topic &&
           recovered == other.recovered &&
           count == other.count;
+}
+
+/// Which certificates a wss:// server's chain must lead to.
+enum WseTrustKind {
+  /// The system's own verifier: the roots the device trusts and its
+  /// revocation checks.
+  platform,
+
+  /// The Mozilla root certificates built into the library.
+  mozilla,
+
+  /// Only the CA certificates in `trusted_roots`: a private CA.
+  roots,
 }

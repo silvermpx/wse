@@ -15,12 +15,14 @@ abi="${ABI:-x86_64}"
 export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
 "$here/../build.sh"
 "$here/build-libs.sh" "$abi"
-export WSE_JNI_LIBS="$target/android-jniLibs"
+export WSE_JNI_LIBS="$target/android-jniLibs" WSE_ANDROID_VERIFIER="$target/android-verifier/rustls-platform-verifier.jar"
 cd "$root"
 
 port="${WSE_PORT:-$((20000 + RANDOM % 20000))}"
 cargo build -q -p wse-client --example server
-WSE_PORT="$port" "$target/debug/examples/server" > "$target/android-test-server.log" 2>&1 &
+# Its wss:// door on the next port, with a CA of its own made for the run.
+WSE_PORT="$port" WSE_TLS_PORT="$((port + 1))" WSE_TLS_CA="$target/android-test-ca.pem" \
+  "$target/debug/examples/server" > "$target/android-test-server.log" 2>&1 &
 server=$!
 if [[ -z "${ANDROID_SERIAL:-}" ]]; then
   echo no | avdmanager create avd -n wse-test -k "$image" -d pixel_6 --force > /dev/null
@@ -35,6 +37,12 @@ fi
 adb wait-for-device
 until [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == "1" ]]; do sleep 2; done
 echo "emulator up: page size $(adb shell getconf PAGE_SIZE | tr -d '\r')"
+for _ in $(seq 1 50); do
+  grep -q "tls_ca" "$target/android-test-server.log" && break
+  sleep 0.1
+done
 cd "$here"
 "${GRADLE:-gradle}" --no-daemon -q connectedDebugAndroidTest \
-  -Pandroid.testInstrumentationRunnerArguments.wseUrl="ws://10.0.2.2:$port/wse"
+  -Pandroid.testInstrumentationRunnerArguments.wseUrl="ws://10.0.2.2:$port/wse" \
+  -Pandroid.testInstrumentationRunnerArguments.wseTlsUrl="wss://10.0.2.2:$((port + 1))/wse" \
+  -Pandroid.testInstrumentationRunnerArguments.wseCa="$(base64 < "$target/android-test-ca.pem" | tr -d '\n')"

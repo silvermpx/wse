@@ -12,8 +12,43 @@ final class WseClientTests: XCTestCase {
         ProcessInfo.processInfo.environment["WSE_TEST_URL"] ?? "ws://127.0.0.1:5007/wse"
     }
 
+    /// The server's wss:// door and the file with its CA's certificate.
+    private var tls: (url: String, ca: Data)? {
+        let env = ProcessInfo.processInfo.environment
+        guard let url = env["WSE_TEST_TLS_URL"], let path = env["WSE_TEST_CA"],
+              let ca = FileManager.default.contents(atPath: path) else { return nil }
+        return (url, ca)
+    }
+
+    func testWsGoesInTheClearOnlyWhenAsked() async throws {
+        do {
+            _ = try await WseClient.connect(WseConfig(url: url))
+            XCTFail("connected over ws:// without insecure")
+        } catch let error as WseError {
+            guard case .Config = error else { return XCTFail("\(error)") }
+        }
+    }
+
+    func testAPrivateCaIsTrustedWhereItIsNamed() async throws {
+        let (tlsUrl, ca) = try XCTUnwrap(tls, "run-tests.sh passes the wss:// door")
+        let client = try await WseClient.connect(WseConfig(url: tlsUrl, trust: .roots(certificates: [ca])))
+        XCTAssertEqual(client.status(), .connected)
+        await client.disconnect(deadlineMs: 1_000)
+        // The system's verifier and the Mozilla roots do not know that CA.
+        for trust in [WseTrust.platform, .mozilla] {
+            do {
+                _ = try await WseClient.connect(WseConfig(url: tlsUrl, reconnect: false, trust: trust))
+                XCTFail("\(trust): connected")
+            } catch let error as WseError {
+                guard case let .Connect(reason) = error, reason.contains("certificate") else {
+                    return XCTFail("\(trust): \(error)")
+                }
+            }
+        }
+    }
+
     func testTicksComeInOrderAndEchoAnswers() async throws {
-        let client = try await WseClient.connect(WseConfig(url: url, topics: ["ticks"]))
+        let client = try await WseClient.connect(WseConfig(url: url, topics: ["ticks"], insecure: true))
         XCTAssertEqual(client.status(), .connected)
         var ticks: [UInt64] = []
         var echoed: String?
@@ -31,7 +66,7 @@ final class WseClientTests: XCTestCase {
     }
 
     func testDisconnectEndsTheEvents() async throws {
-        let client = try await WseClient.connect(WseConfig(url: url))
+        let client = try await WseClient.connect(WseConfig(url: url, insecure: true))
         let events = client.events()
         let reader = Task { () -> Int in
             var count = 0
@@ -47,7 +82,7 @@ final class WseClientTests: XCTestCase {
     func testACancelledConnectGivesUp() async throws {
         // Nothing answers there: the attempt waits until cancelled.
         let attempt = Task {
-            try await WseClient.connect(WseConfig(url: "ws://10.255.255.1:9/wse", connectTimeoutMs: 30_000))
+            try await WseClient.connect(WseConfig(url: "ws://10.255.255.1:9/wse", connectTimeoutMs: 30_000, insecure: true))
         }
         try await Task.sleep(nanoseconds: 100_000_000)
         attempt.cancel()
@@ -60,7 +95,7 @@ final class WseClientTests: XCTestCase {
     }
 
     func testALiveMessageGoesOnTheReadyConnection() async throws {
-        let client = try await WseClient.connect(WseConfig(url: url))
+        let client = try await WseClient.connect(WseConfig(url: url, insecure: true))
         try client.trySendLive(kind: "valve", json: #"{"open":true}"#)
         try await client.sendLive(kind: "valve", json: #"{"open":false}"#)
         await client.disconnect(deadlineMs: 1_000)
@@ -68,7 +103,7 @@ final class WseClientTests: XCTestCase {
     }
 
     func testACancelledSendDoesNotGoOut() async throws {
-        let client = try await WseClient.connect(WseConfig(url: url))
+        let client = try await WseClient.connect(WseConfig(url: url, insecure: true))
         let cancel = WseCancel()
         cancel.cancel()
         do {
@@ -90,7 +125,7 @@ final class WseClientTests: XCTestCase {
 
     func testEveryCallReadsOneStreamOneReaderAtATime() async throws {
         // No topics: past its first items the server stays quiet.
-        let client = try await WseClient.connect(WseConfig(url: url))
+        let client = try await WseClient.connect(WseConfig(url: url, insecure: true))
         let events = client.events()
         XCTAssertTrue(events === client.events())
         let waiting = Task { while try await events.next() != nil {} }
@@ -111,7 +146,7 @@ final class WseClientTests: XCTestCase {
     }
 
     func testTheNetworkPausesTheClientAndRenewsItsConnection() async throws {
-        let client = try await WseClient.connect(WseConfig(url: url))
+        let client = try await WseClient.connect(WseConfig(url: url, insecure: true))
         let monitor = WseNetworkMonitor(client: client, settle: 0, observing: false)
         monitor.update(usable: true, interfaces: ["en0"])
         monitor.update(usable: false, interfaces: [])
@@ -133,7 +168,7 @@ final class WseClientTests: XCTestCase {
 
     #if canImport(UIKit)
     func testTheAppInTheBackgroundPausesTheClient() async throws {
-        let client = try await WseClient.connect(WseConfig(url: url))
+        let client = try await WseClient.connect(WseConfig(url: url, insecure: true))
         let lifecycle = WseAppLifecycle(client: client, grace: 0)
         NotificationCenter.default.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
         try await waitFor { client.status() == .paused }
@@ -153,7 +188,7 @@ final class WseClientTests: XCTestCase {
     }
 
     func testAPayloadMustBeJson() async throws {
-        let client = try await WseClient.connect(WseConfig(url: url))
+        let client = try await WseClient.connect(WseConfig(url: url, insecure: true))
         XCTAssertThrowsError(try client.trySend(kind: "x", json: "not json"))
         await client.disconnect(deadlineMs: 1_000)
     }
