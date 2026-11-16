@@ -152,7 +152,10 @@ if [[ -z "${MAVEN_GPG_PRIVATE_KEY:-}" ]]; then
 fi
 [[ -n "$upload" ]] || exit 0
 
-auth="Authorization: Bearer $(printf '%s:%s' "${MAVEN_CENTRAL_USERNAME:?no MAVEN_CENTRAL_USERNAME}" "${MAVEN_CENTRAL_PASSWORD:?no MAVEN_CENTRAL_PASSWORD}" | base64 | tr -d '\n')"
+# The token's two parts, without the spaces or line breaks a paste can add.
+user="${MAVEN_CENTRAL_USERNAME:?no MAVEN_CENTRAL_USERNAME}"
+pass="${MAVEN_CENTRAL_PASSWORD:?no MAVEN_CENTRAL_PASSWORD}"
+auth="Authorization: Bearer $(printf '%s:%s' "${user//[[:space:]]/}" "${pass//[[:space:]]/}" | base64 | tr -d '\n')"
 if [[ "$upload" == --check ]]; then
   code="$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 -H "$auth" \
     "https://central.sonatype.com/api/v1/publisher/published?namespace=$group&name=$artifact&version=$version" || true)"

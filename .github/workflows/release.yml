@@ -897,9 +897,19 @@ jobs:
           toolchain: stable
 
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2  # v2.23.0
+        if: matrix.name != 'Linux arm64'
         with:
           flutter-version: '3.50.0'
           channel: stable
+
+      # Flutter publishes no SDK for Linux arm64: there it comes from its
+      # repository, at the same version.
+      - name: Flutter from its repository
+        if: matrix.name == 'Linux arm64'
+        run: |
+          git clone --quiet --depth 1 --branch 3.50.0 https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/flutter/bin/flutter" --version
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
@@ -1422,9 +1432,6 @@ jobs:
     permissions:
       id-token: write
     steps:
-      # Trades the job's OIDC token for pub.dev's (PUB_TOKEN).
-      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d  # v1
-
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2  # v2.23.0
         with:
           flutter-version: '3.50.0'
@@ -1435,7 +1442,8 @@ jobs:
           name: dart-package
           path: dart-dist/
 
-      - name: Publish the tested package
+      - name: The tested package, unless pub.dev has it
+        id: package
         env:
           VERSION: ${{ needs.preflight.outputs.npm-version }}
         run: |
@@ -1451,8 +1459,17 @@ jobs:
           fi
           mkdir dart-package
           tar -xzf "dart-dist/wse_client-dart-${VERSION}.tar.gz" -C dart-package
-          cd dart-package
-          flutter pub publish --force
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      # Trades the job's OIDC token for pub.dev's (PUB_TOKEN). The token lives
+      # about five minutes, so it is taken right before the upload.
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d  # v1
+        if: steps.package.outputs.publish == 'true'
+
+      - name: Publish the tested package
+        if: steps.package.outputs.publish == 'true'
+        working-directory: dart-package
+        run: flutter pub publish --force
 
   # The Swift package's repository (silvermpx/wse-swift): this version's
   # Package.swift, naming the XCFramework on the GitHub release, committed and
