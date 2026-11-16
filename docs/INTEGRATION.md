@@ -701,6 +701,19 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for Kubernetes preStop hook and rolling resta
 
 ## 12. Client SDKs
 
+### Commands that must not run late
+
+A client keeps what it could not send yet and sends it once the connection
+is back. For a command that acts on the world (open a valve, unlock a door,
+place an order) that can be wrong: it would run minutes later, after the
+person who gave it saw nothing happen. Send such commands live: a live
+message goes on the connection that is ready when it is sent, or not at
+all (TypeScript `{ live: true }`, Rust `send_live`, Swift, Kotlin and Dart
+`sendLive`, Python `send(..., live=True)`; signed messages always go this
+way). The application still gives each command its own id, a time after
+which it no longer counts, and checks on the server that the user may give
+it.
+
 ### Python Client
 
 ```bash
