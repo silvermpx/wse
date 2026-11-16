@@ -68,6 +68,15 @@ holds a topic until the application reloaded its state.
 - TypeScript: two tabs no longer both send a stored message, and
   `maxQueueSize` bounds the send queue.
 
+### Coming in v3.2
+
+Support for:
+
+- Tauri
+- Electron
+- Angular
+- Solid
+
 ## v3.0.1 (2026-11-15)
 
 ### Fixed
