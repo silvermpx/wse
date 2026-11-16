@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Runs the example app's integration test on DEVICE (a flutter device id:
-# macos, an iOS simulator's id, an Android emulator's) against the Rust
-# client's example server; the package's build hook builds the Rust library
-# for the device. FLUTTER names the flutter to run.
+# Runs the example app's integration test on DEVICE (a flutter device id: an
+# iOS simulator's, an Android emulator's) against the Rust client's example
+# server; the package's build hook builds the Rust library for the device.
+# FLUTTER names the flutter to run.
 set -euo pipefail
 device="${1:?usage: run-integration-tests.sh <device id>}"
 here="$(cd "$(dirname "$0")" && pwd)"
