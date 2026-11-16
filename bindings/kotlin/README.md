@@ -21,7 +21,9 @@ dependencies {
 ```
 
 The AAR carries consumer rules for R8 that keep what JNA and the bindings
-reach by reflection. The app needs the `INTERNET` permission.
+reach by reflection, so a release build with R8 works as it is
+(`android/run-consumer-check.sh` builds such an app and runs it on an
+emulator). The app needs the `INTERNET` permission.
 
 To build it from a checkout (Rust with the Android targets, cargo-ndk, the
 Android NDK, JDK 21 and Gradle):

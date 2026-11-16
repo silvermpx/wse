@@ -676,8 +676,9 @@ jobs:
           flutter-version: '3.50.0'
           channel: stable
 
-      # The newest NDK on the runner links for 16 KB pages.
-      - name: Kotlin, then the Flutter example, in an emulator
+      # The newest NDK on the runner links for 16 KB pages. The consumer
+      # check builds an app on the release AAR with R8 on.
+      - name: Kotlin, an app built with R8, then the Flutter example, in an emulator
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d  # v2.38.0
         with:
           api-level: 36
@@ -687,6 +688,7 @@ jobs:
           emulator-options: -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect
           script: |
             ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ANDROID_SERIAL=emulator-5554 bindings/kotlin/android/run-emulator-tests.sh
+            ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ANDROID_SERIAL=emulator-5554 bindings/kotlin/android/run-consumer-check.sh
             bindings/dart/example/run-integration-tests.sh emulator-5554
 
   dart:
