@@ -111,8 +111,9 @@ interface RecoveryWindow {
 const windowKey = (topic: string, epoch: string): string => `${topic}\u0000${epoch}`;
 
 /**
- * How long past the server's history_ttl a stream that heard nothing is
- * still named: the clocks of a server and a client do not tick together.
+ * How long past the server's history_ttl a stream that heard nothing while
+ * connected is still named: the clocks of a server and a client do not tick
+ * together.
  */
 const QUIET_MARGIN_MS = 5_000;
 
@@ -250,6 +251,12 @@ export class MessageProcessor {
   private recoveryWindows = new Map<string, RecoveryWindow>();
   /** How long the server keeps a stream that receives nothing (history_ttl), in ms. */
   private historyTtlMs: number | null = null;
+  /**
+   * Since when (ms) this connection has had each topic: from then on whatever
+   * the server publishes on it arrives, so silence then shows a quiet stream.
+   * Emptied when the connection goes: time away proves nothing.
+   */
+  private liveSince = new Map<string, number>();
   /** Topics the server could not recover, until their next message shows what was missed. */
   private unrecovered = new Map<string, { epoch: string; reported: boolean }>();
   private earlyEncryptedFrames: ArrayBuffer[] = [];
@@ -941,6 +948,7 @@ export class MessageProcessor {
     // another stream neither is a gap nor ends a recovery window.
     const previous = this.sequencer.getStreamPosition(topic, epoch);
     const verdict = this.sequencer.checkTopicStamp(topic, epoch, offset);
+    if (!this.liveSince.has(topic)) this.liveSince.set(topic, Date.now());
 
     if (verdict === 'duplicate') {
       this.recordInbound(size);
@@ -1338,18 +1346,9 @@ export class MessageProcessor {
 
   /**
    * Where the client stands in the given topics, sent with a recovery: the
-   * last delivered message (the anchor) and each stream's last offset. A
-   * stream quiet for longer than the server keeps one is not named.
+   * last delivered message (the anchor) and each stream's last offset.
    */
   getTopicPositions(topics?: string[]): Record<string, TopicPosition> {
-    if (this.historyTtlMs !== null) {
-      const before = Date.now() - this.historyTtlMs - QUIET_MARGIN_MS;
-      for (const topic of topics ?? Object.keys(this.sequencer.getTopicPositions())) {
-        this.sequencer.forgetQuietStreams(topic, before, (epoch) =>
-          this.recoveryWindows.has(windowKey(topic, epoch)),
-        );
-      }
-    }
     return this.sequencer.getTopicPositions(topics);
   }
 
@@ -1361,11 +1360,26 @@ export class MessageProcessor {
     }
     this.sequencer.clearTopics(topics);
     this.ctx.state.getState().removeRecoveryTopics(topics);
+    for (const topic of topics) this.liveSince.delete(topic);
   }
 
   /** The socket is gone: release held messages and drop undecryptable early frames. */
   handleConnectionClosed(): void {
     if (this.destroyed) return;
+    // A stream that heard nothing for longer than the server keeps one, while
+    // this connection had its topic, is gone there: naming it would fail the
+    // recovery. Silence while away shows nothing, so nothing is forgotten
+    // for it.
+    if (this.historyTtlMs !== null) {
+      const before = Date.now() - this.historyTtlMs - QUIET_MARGIN_MS;
+      for (const [topic, since] of this.liveSince) {
+        if (since > before) continue;
+        this.sequencer.forgetQuietStreams(topic, before, (epoch) =>
+          this.recoveryWindows.has(windowKey(topic, epoch)),
+        );
+      }
+    }
+    this.liveSince.clear();
     // The next connection's server names its own signing key and history.
     this.serverSigningKid = null;
     this.historyTtlMs = null;
@@ -1535,6 +1549,12 @@ export class MessageProcessor {
     const payload = message.p || {};
     const store = this.ctx.state.getState();
 
+    if (Array.isArray(payload.success_topics)) {
+      const now = Date.now();
+      for (const topic of payload.success_topics) {
+        if (typeof topic === 'string' && !this.liveSince.has(topic)) this.liveSince.set(topic, now);
+      }
+    }
     if (payload.success) {
       payload.success_topics?.forEach((topic: string) => {
         store.confirmSubscription(topic);

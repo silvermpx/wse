@@ -411,7 +411,21 @@ class TestStreams:
         c = make_client()
         c._history_ttl = 60.0
         c._on_raw_message(stamped(4, epoch=OTHER))
+        # Connected all along: OTHER heard nothing for two minutes.
         c._sequencer._seen["prices"][OTHER] -= 120
+        c._live_since["prices"] -= 120
         c._on_raw_message(stamped(1))
+        c._on_transport_close()
+        await c.subscribe(["prices"], recover=True)
+        assert recovery_requests(c)[0]["prices"]["streams"] == {EPOCH: 1}
+
+    async def test_time_away_does_not_count_as_a_quiet_stream(self):
+        c = make_client()
+        c._history_ttl = 60.0
+        c._on_raw_message(stamped(1))
+        c._on_transport_close()
+        # Away far longer than the server keeps a quiet stream: what it
+        # published meanwhile kept the stream there.
+        c._sequencer._seen["prices"][EPOCH] -= 400
         await c.subscribe(["prices"], recover=True)
         assert recovery_requests(c)[0]["prices"]["streams"] == {EPOCH: 1}

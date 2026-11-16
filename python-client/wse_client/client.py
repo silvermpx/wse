@@ -123,8 +123,9 @@ class _Request:
     named: tuple[str, ...] = ()
 
 
-#: How long past the server's history_ttl a stream that heard nothing is
-#: still named: the clocks of a server and a client do not tick together.
+#: How long past the server's history_ttl a stream that heard nothing while
+#: connected is still named: the clocks of a server and a client do not tick
+#: together.
 _QUIET_MARGIN = 5.0
 
 
@@ -425,8 +426,14 @@ class AsyncWSEClient:
         # messages are delivered, never to a server-reported head.
         self._server_recovery_enabled = False
         # How long the server keeps a stream that receives nothing
-        # (history_ttl, seconds): one quiet for longer is not named.
+        # (history_ttl, seconds): one quiet for longer while connected is
+        # not named.
         self._history_ttl: float | None = None
+        # Since when (time.time()) this connection has had each topic: from
+        # then on whatever the server publishes on it arrives, so silence
+        # then shows a quiet stream. Emptied when the connection goes: time
+        # away proves nothing.
+        self._live_since: dict[str, float] = {}
         self._recovery_timeout = recovery_timeout
         self._gaps: dict[tuple[str, str], _GapState] = {}
         # Topics with a recovery request out on this connection -> anchor sent.
@@ -1306,6 +1313,19 @@ class AsyncWSEClient:
         self._snapshot_inflight.clear()
         for gap in self._gaps.values():
             gap.request = None
+        # A stream that heard nothing for longer than the server keeps one,
+        # while this connection had its topic, is gone there: naming it would
+        # fail the recovery. Silence while away shows nothing, so nothing is
+        # forgotten for it.
+        if self._history_ttl is not None:
+            before = time.time() - self._history_ttl - _QUIET_MARGIN
+            gaps = self._gaps
+            for topic, since in self._live_since.items():
+                if since <= before:
+                    self._sequencer.forget_quiet_streams(
+                        topic, before, lambda epoch, t=topic: (t, epoch) in gaps
+                    )
+        self._live_since.clear()
 
     def _on_transport_terminal(self, error: WSEError) -> None:
         """The transport gave up for good: end the event stream with *error*."""
@@ -1573,16 +1593,7 @@ class AsyncWSEClient:
         return ok
 
     def _topic_streams(self, topic: str) -> dict[str, int]:
-        """Where the client stands in each stream of *topic*, but a stream
-        quiet for longer than the server keeps one: gone there, naming it
-        would fail the recovery."""
-        if self._history_ttl is not None:
-            gaps = self._gaps
-            self._sequencer.forget_quiet_streams(
-                topic,
-                time.time() - self._history_ttl - _QUIET_MARGIN,
-                lambda epoch: (topic, epoch) in gaps,
-            )
+        """Where the client stands in each stream of *topic*."""
         return self._sequencer.topic_streams(topic)
 
     def _subscription_payload(
@@ -1785,6 +1796,7 @@ class AsyncWSEClient:
     def _process_stamped(self, event: WSEEvent) -> None:
         topic, epoch, offset = event.topic, event.epoch, event.offset
         assert topic is not None and epoch is not None and offset is not None
+        self._live_since.setdefault(topic, time.time())
         # A hole in another stream of the topic does not hold this one.
         gap = self._gaps.get((topic, epoch))
 
@@ -2109,6 +2121,7 @@ class AsyncWSEClient:
                 self._close_gap(topic, gap)
         self._recovery_requests.pop(topic, None)
         self._unrecoverable.pop(topic, None)
+        self._live_since.pop(topic, None)
 
     # -- Internal: dispatch ---------------------------------------------------
 
@@ -2317,6 +2330,11 @@ class AsyncWSEClient:
         success_topics = p.get("success_topics")
         if success_topics:
             logger.debug("Subscribed to: %s", success_topics)
+            if isinstance(success_topics, list):
+                now = time.time()
+                for topic in success_topics:
+                    if isinstance(topic, str):
+                        self._live_since.setdefault(topic, now)
 
         recovery = p.get("recovery")
         if isinstance(recovery, dict):

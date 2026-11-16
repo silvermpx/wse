@@ -452,6 +452,26 @@ describe('positions in every stream', () => {
     await connectServer(ws2, ready);
     expect(ws2.messagesOfType('subscription_update')[0].p.recovery.prices.streams).toEqual({ [EPOCH]: 1 });
   });
+
+  it('does not count time away as a quiet stream', async () => {
+    start();
+    await tick();
+    const ready = { features: { recovery: true, encryption: false, history_ttl: 60 } };
+    const ws1 = FakeWebSocket.last();
+    await connectServer(ws1, ready);
+    await send(ws1, stamped('prices', 1));
+    // Lost at once, and away far longer than the server keeps a quiet
+    // stream: what the server published meanwhile kept the stream there.
+    ws1.serverClose(1006);
+    await tick();
+    await vi.advanceTimersByTimeAsync(400_000);
+    const ws2 = FakeWebSocket.last();
+    expect(ws2).not.toBe(ws1);
+    await connectServer(ws2, ready);
+    const request = ws2.messagesOfType('subscription_update')[0].p;
+    expect(request.recover).toBe(true);
+    expect(request.recovery.prices.streams).toEqual({ [EPOCH]: 1 });
+  });
 });
 
 describe('no age-based dropping', () => {

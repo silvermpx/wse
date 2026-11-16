@@ -53,6 +53,10 @@ struct Topic {
     /// One per stream with a gap: usually none, at most one per node that
     /// publishes on the topic.
     holes: Vec<Hole>,
+    /// Since when this connection has had the topic: from then on whatever
+    /// the server publishes on it reaches the client, so silence then shows
+    /// a quiet stream. None while away: time away proves nothing.
+    live_since: Option<Instant>,
 }
 
 /// A recovery request out. The server answers a connection's requests in
@@ -65,8 +69,9 @@ struct Request {
     named: Vec<u32>,
 }
 
-/// How long past the server's `history_ttl` a stream that heard nothing is
-/// still named: the clocks of a node and a client do not tick together.
+/// How long past the server's `history_ttl` a stream that heard nothing
+/// while connected is still named: the clocks of a node and a client do not
+/// tick together.
 const QUIET_MARGIN: Duration = Duration::from_secs(5);
 
 /// What the session asks of the connection.
@@ -124,7 +129,8 @@ pub(crate) struct Session<H> {
     /// per batch.
     pub(crate) clock: Instant,
     /// How long the server keeps a stream that receives nothing
-    /// (`history_ttl`): one quiet for longer is not named in a recovery.
+    /// (`history_ttl`): one quiet for longer while connected is not named in
+    /// a recovery.
     history_ttl: Option<Duration>,
 }
 
@@ -213,9 +219,25 @@ impl<H: Handler> Session<H> {
         self.ready = false;
         self.shared.ready.store(false, Ordering::Release);
         self.requests.clear();
+        // A stream that heard nothing for longer than the server keeps one,
+        // while this connection had its topic, is gone there: naming it would
+        // fail the recovery. Silence while away shows nothing, so nothing is
+        // forgotten for it.
+        let quiet_before = self
+            .history_ttl
+            .and_then(|ttl| self.clock.checked_sub(ttl + QUIET_MARGIN));
         for topic in self.topics.values_mut() {
             for hole in &mut topic.holes {
                 hole.request = None;
+            }
+            let since = topic.live_since.take();
+            if let Some(before) = quiet_before
+                && since.is_some_and(|since| since <= before)
+            {
+                let holes = &topic.holes;
+                topic
+                    .streams
+                    .forget_quiet(before, |epoch| holes.iter().any(|h| h.epoch == epoch));
             }
         }
     }
@@ -451,6 +473,7 @@ impl<H: Handler> Session<H> {
             Some(topic) => topic,
             None => self.topics.entry(name.into()).or_default(),
         };
+        topic.live_since.get_or_insert(self.clock);
         // A hole in another stream of the topic does not hold this one.
         let held_here = topic.holes.iter().any(|h| h.epoch == at.epoch);
         match topic.streams.check(at, self.clock) {
@@ -749,20 +772,10 @@ impl<H: Handler> Session<H> {
     fn send_subscription(&mut self, topics: &[String]) {
         let mut positions = Vec::new();
         if self.server_recovery {
-            // A stream that heard nothing for longer than the server keeps
-            // one is gone there: naming it would fail the recovery.
-            let quiet_before = self
-                .history_ttl
-                .and_then(|ttl| self.clock.checked_sub(ttl + QUIET_MARGIN));
             for topic in topics {
-                let Some(t) = self.topics.get_mut(topic.as_str()) else {
+                let Some(t) = self.topics.get(topic.as_str()) else {
                     continue;
                 };
-                if let Some(before) = quiet_before {
-                    let holes = &t.holes;
-                    t.streams
-                        .forget_quiet(before, |epoch| holes.iter().any(|h| h.epoch == epoch));
-                }
                 if let Some(at) = t.streams.position() {
                     positions.push((
                         topic.as_str(),
@@ -837,6 +850,15 @@ impl<H: Handler> Session<H> {
         };
         if !reply.failed_topics.is_empty() {
             tracing::warn!("[WSE] subscription refused for {:?}", reply.failed_topics);
+        }
+        if self.ready {
+            for name in &reply.success_topics {
+                self.topics
+                    .entry(name.as_str().into())
+                    .or_default()
+                    .live_since
+                    .get_or_insert(self.clock);
+            }
         }
         let mut recovery = Vec::with_capacity(reply.recovery.len());
         for (topic, info) in &reply.recovery {
@@ -1809,6 +1831,32 @@ mod tests {
             None,
         );
         let request = sent(&mut s);
+        assert_eq!(
+            request[0]["p"]["recovery"]["t"]["streams"],
+            serde_json::json!({E: 1})
+        );
+    }
+
+    #[test]
+    fn time_away_does_not_count_as_a_quiet_stream() {
+        let mut s = session(Duration::from_secs(3));
+        s.on_json(
+            r#"{"c":"WSE","t":"server_ready","p":{"details":{"connection_id":"c1","user_id":"u","features":{"recovery":true,"history_ttl":60}}}}"#,
+            None,
+        );
+        feed(&mut s, E, &[1]);
+        sent(&mut s);
+        // Lost at once, and away far longer than the server keeps a quiet
+        // stream: what the server published meanwhile kept the stream there.
+        s.close();
+        s.clock += Duration::from_secs(400);
+        s.open(None);
+        s.on_json(
+            r#"{"c":"WSE","t":"server_ready","p":{"details":{"connection_id":"c2","user_id":"u","features":{"recovery":true,"history_ttl":60}}}}"#,
+            None,
+        );
+        let request = sent(&mut s);
+        assert_eq!(request[0]["p"]["recover"], true);
         assert_eq!(
             request[0]["p"]["recovery"]["t"]["streams"],
             serde_json::json!({E: 1})
