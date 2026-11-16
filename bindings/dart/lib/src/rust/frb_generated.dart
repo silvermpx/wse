@@ -87,6 +87,7 @@ abstract class RustLibApi extends BaseApi {
     required String topic,
     required int epoch,
     required BigInt offset,
+    required int generation,
   });
 
   Future<WseNativeClient> crateApiWseNativeClientConnect({
@@ -292,6 +293,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     required String topic,
     required int epoch,
     required BigInt offset,
+    required int generation,
   }) {
     return handler.executeSync(
       SyncTask(
@@ -304,6 +306,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           sse_encode_String(topic, serializer);
           sse_encode_u_32(epoch, serializer);
           sse_encode_u_64(offset, serializer);
+          sse_encode_u_32(generation, serializer);
           return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 4)!;
         },
         codec: SseCodec(
@@ -311,7 +314,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: null,
         ),
         constMeta: kCrateApiWseNativeClientCommitConstMeta,
-        argValues: [that, topic, epoch, offset],
+        argValues: [that, topic, epoch, offset, generation],
         apiImpl: this,
       ),
     );
@@ -320,7 +323,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TaskConstMeta get kCrateApiWseNativeClientCommitConstMeta =>
       const TaskConstMeta(
         debugName: "WseNativeClient_commit",
-        argNames: ["that", "topic", "epoch", "offset"],
+        argNames: ["that", "topic", "epoch", "offset", "generation"],
       );
 
   @override
@@ -1327,8 +1330,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   WseItem dco_decode_wse_item(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 30)
-      throw Exception('unexpected arr length: expect 30 but see ${arr.length}');
+    if (arr.length != 31)
+      throw Exception('unexpected arr length: expect 31 but see ${arr.length}');
     return WseItem(
       kind: dco_decode_wse_item_kind(arr[0]),
       name: dco_decode_opt_String(arr[1]),
@@ -1338,28 +1341,29 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       id: dco_decode_opt_String(arr[5]),
       json: dco_decode_opt_String(arr[6]),
       payloadError: dco_decode_opt_String(arr[7]),
-      bytes: dco_decode_opt_list_prim_u_8_strict(arr[8]),
-      signedBody: dco_decode_opt_String(arr[9]),
-      signature: dco_decode_opt_String(arr[10]),
-      signatureKid: dco_decode_opt_String(arr[11]),
-      verified: dco_decode_bool(arr[12]),
-      connectionId: dco_decode_opt_String(arr[13]),
-      userId: dco_decode_opt_String(arr[14]),
-      reconnected: dco_decode_bool(arr[15]),
-      recovery: dco_decode_bool(arr[16]),
-      code: dco_decode_opt_box_autoadd_u_16(arr[17]),
-      reason: dco_decode_opt_String(arr[18]),
-      retryInMs: dco_decode_opt_box_autoadd_u_64(arr[19]),
-      attempt: dco_decode_opt_box_autoadd_u_32(arr[20]),
-      reasons: dco_decode_list_String(arr[21]),
-      topics: dco_decode_list_String(arr[22]),
-      failed: dco_decode_list_String(arr[23]),
-      recoveries: dco_decode_list_wse_topic_recovery(arr[24]),
-      first: dco_decode_opt_box_autoadd_u_64(arr[25]),
-      last: dco_decode_opt_box_autoadd_u_64(arr[26]),
-      round: dco_decode_opt_box_autoadd_u_64(arr[27]),
-      committed: dco_decode_list_wse_stream_position(arr[28]),
-      continuity: dco_decode_opt_box_autoadd_wse_continuity(arr[29]),
+      generation: dco_decode_u_32(arr[8]),
+      bytes: dco_decode_opt_list_prim_u_8_strict(arr[9]),
+      signedBody: dco_decode_opt_String(arr[10]),
+      signature: dco_decode_opt_String(arr[11]),
+      signatureKid: dco_decode_opt_String(arr[12]),
+      verified: dco_decode_bool(arr[13]),
+      connectionId: dco_decode_opt_String(arr[14]),
+      userId: dco_decode_opt_String(arr[15]),
+      reconnected: dco_decode_bool(arr[16]),
+      recovery: dco_decode_bool(arr[17]),
+      code: dco_decode_opt_box_autoadd_u_16(arr[18]),
+      reason: dco_decode_opt_String(arr[19]),
+      retryInMs: dco_decode_opt_box_autoadd_u_64(arr[20]),
+      attempt: dco_decode_opt_box_autoadd_u_32(arr[21]),
+      reasons: dco_decode_list_String(arr[22]),
+      topics: dco_decode_list_String(arr[23]),
+      failed: dco_decode_list_String(arr[24]),
+      recoveries: dco_decode_list_wse_topic_recovery(arr[25]),
+      first: dco_decode_opt_box_autoadd_u_64(arr[26]),
+      last: dco_decode_opt_box_autoadd_u_64(arr[27]),
+      round: dco_decode_opt_box_autoadd_u_64(arr[28]),
+      committed: dco_decode_list_wse_stream_position(arr[29]),
+      continuity: dco_decode_opt_box_autoadd_wse_continuity(arr[30]),
     );
   }
 
@@ -1855,6 +1859,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_id = sse_decode_opt_String(deserializer);
     var var_json = sse_decode_opt_String(deserializer);
     var var_payloadError = sse_decode_opt_String(deserializer);
+    var var_generation = sse_decode_u_32(deserializer);
     var var_bytes = sse_decode_opt_list_prim_u_8_strict(deserializer);
     var var_signedBody = sse_decode_opt_String(deserializer);
     var var_signature = sse_decode_opt_String(deserializer);
@@ -1888,6 +1893,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       id: var_id,
       json: var_json,
       payloadError: var_payloadError,
+      generation: var_generation,
       bytes: var_bytes,
       signedBody: var_signedBody,
       signature: var_signature,
@@ -2384,6 +2390,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_opt_String(self.id, serializer);
     sse_encode_opt_String(self.json, serializer);
     sse_encode_opt_String(self.payloadError, serializer);
+    sse_encode_u_32(self.generation, serializer);
     sse_encode_opt_list_prim_u_8_strict(self.bytes, serializer);
     sse_encode_opt_String(self.signedBody, serializer);
     sse_encode_opt_String(self.signature, serializer);
@@ -2510,16 +2517,19 @@ class WseNativeClientImpl extends RustOpaque implements WseNativeClient {
   String checkpoint() =>
       RustLib.instance.api.crateApiWseNativeClientCheckpoint(that: this);
 
-  /// The consumer applied the message at `epoch`, `offset` of `topic`.
+  /// The consumer applied the message at `epoch`, `offset` of `topic`,
+  /// handed out in `generation`: one of an earlier user counts for nobody.
   void commit({
     required String topic,
     required int epoch,
     required BigInt offset,
+    required int generation,
   }) => RustLib.instance.api.crateApiWseNativeClientCommit(
     that: this,
     topic: topic,
     epoch: epoch,
     offset: offset,
+    generation: generation,
   );
 
   /// Closes the client: what was sent goes out first, within `deadline_ms`;

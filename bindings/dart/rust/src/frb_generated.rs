@@ -199,6 +199,7 @@ fn wire__crate__api__WseNativeClient_commit_impl(
             let api_topic = <String>::sse_decode(&mut deserializer);
             let api_epoch = <u32>::sse_decode(&mut deserializer);
             let api_offset = <u64>::sse_decode(&mut deserializer);
+            let api_generation = <u32>::sse_decode(&mut deserializer);
             deserializer.end();
             transform_result_sse::<_, ()>((move || {
                 let mut api_that_guard = None;
@@ -221,6 +222,7 @@ fn wire__crate__api__WseNativeClient_commit_impl(
                         api_topic,
                         api_epoch,
                         api_offset,
+                        api_generation,
                     );
                 })?;
                 std::result::Result::Ok(output_ok)
@@ -1635,6 +1637,7 @@ impl SseDecode for crate::api::WseItem {
         let mut var_id = <Option<String>>::sse_decode(deserializer);
         let mut var_json = <Option<String>>::sse_decode(deserializer);
         let mut var_payloadError = <Option<String>>::sse_decode(deserializer);
+        let mut var_generation = <u32>::sse_decode(deserializer);
         let mut var_bytes = <Option<Vec<u8>>>::sse_decode(deserializer);
         let mut var_signedBody = <Option<String>>::sse_decode(deserializer);
         let mut var_signature = <Option<String>>::sse_decode(deserializer);
@@ -1666,6 +1669,7 @@ impl SseDecode for crate::api::WseItem {
             id: var_id,
             json: var_json,
             payload_error: var_payloadError,
+            generation: var_generation,
             bytes: var_bytes,
             signed_body: var_signedBody,
             signature: var_signature,
@@ -1978,6 +1982,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::WseItem {
             self.id.into_into_dart().into_dart(),
             self.json.into_into_dart().into_dart(),
             self.payload_error.into_into_dart().into_dart(),
+            self.generation.into_into_dart().into_dart(),
             self.bytes.into_into_dart().into_dart(),
             self.signed_body.into_into_dart().into_dart(),
             self.signature.into_into_dart().into_dart(),
@@ -2449,6 +2454,7 @@ impl SseEncode for crate::api::WseItem {
         <Option<String>>::sse_encode(self.id, serializer);
         <Option<String>>::sse_encode(self.json, serializer);
         <Option<String>>::sse_encode(self.payload_error, serializer);
+        <u32>::sse_encode(self.generation, serializer);
         <Option<Vec<u8>>>::sse_encode(self.bytes, serializer);
         <Option<String>>::sse_encode(self.signed_body, serializer);
         <Option<String>>::sse_encode(self.signature, serializer);

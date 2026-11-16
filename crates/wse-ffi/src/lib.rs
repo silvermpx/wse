@@ -383,6 +383,9 @@ pub struct WseMessage {
     /// Why the payload could not be decoded (msgpack JSON cannot show).
     pub payload_error: Option<String>,
     pub signature: Option<WseSignature>,
+    /// The user generation it was handed out in: a new one starts where
+    /// the events show another user. `commit` takes it back.
+    pub generation: u32,
 }
 
 #[derive(uniffi::Record)]
@@ -484,6 +487,7 @@ impl From<native::Item> for WseItem {
                         kid: s.kid,
                         verified: s.verified,
                     }),
+                    generation: m.generation,
                 },
             },
             native::Item::Binary(bytes) => Self::Binary { bytes },
@@ -713,9 +717,11 @@ impl WseClient {
             .collect()
     }
 
-    /// The consumer applied the message at `epoch`, `offset` of `topic`.
-    pub fn commit(&self, topic: String, epoch: u32, offset: u64) {
-        self.0.commit(&topic, epoch, offset);
+    /// The consumer applied the message at `epoch`, `offset` of `topic`,
+    /// handed out in `generation`: one of an earlier user counts for
+    /// nobody. `commit(message)` passes all four.
+    pub fn commit(&self, topic: String, epoch: u32, offset: u64, generation: u32) {
+        self.0.commit(&topic, epoch, offset, generation);
     }
 
     /// What the consumer committed, to save with the application's own

@@ -586,16 +586,17 @@ async fn a_reconnect_resyncs_and_recovers_from_what_was_committed() {
         .collect();
     assert_eq!(messages.len(), 4);
     let epoch = messages[0].epoch.unwrap();
+    let generation = messages[0].generation;
     let at: Vec<u64> = messages.iter().map(|m| m.offset.unwrap()).collect();
     // Nothing applied yet: nothing in the checkpoint.
     let saved: serde_json::Value = serde_json::from_str(&client.checkpoint()).unwrap();
     assert!(saved["topics"]["prices"].is_null(), "{saved}");
     // Applied out of order: the checkpoint moves only through what has no hole.
-    client.commit("prices", epoch, at[0]);
-    client.commit("prices", epoch, at[2]);
+    client.commit("prices", epoch, at[0], generation);
+    client.commit("prices", epoch, at[2], generation);
     let saved: serde_json::Value = serde_json::from_str(&client.checkpoint()).unwrap();
     assert_eq!(saved["topics"]["prices"][format!("{epoch:08x}")], at[0]);
-    client.commit("prices", epoch, at[1]);
+    client.commit("prices", epoch, at[1], generation);
     let saved: serde_json::Value = serde_json::from_str(&client.checkpoint()).unwrap();
     assert_eq!(saved["topics"]["prices"][format!("{epoch:08x}")], at[2]);
     assert_eq!(saved["user"], "hal");
@@ -625,6 +626,173 @@ async fn a_reconnect_resyncs_and_recovers_from_what_was_committed() {
     client.resynced(round);
     let items = read_until(&client, &mut ack, |i| number(i) == Some(4)).await;
     assert_eq!(numbers(&items), [4]);
+    client.disconnect(1_000).await;
+    stand.server.stop().await;
+}
+
+/// A token source the test hands to another user.
+struct Switchable(std::sync::Mutex<String>);
+
+impl TokenSource for Switchable {
+    fn token(&self) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+        let token = self.0.lock().unwrap().clone();
+        Box::pin(async move { Ok(token) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_of_the_last_user_never_moves_the_next_ones_checkpoint() {
+    let stand = stand().await;
+    let tokens = Arc::new(Switchable(std::sync::Mutex::new(stand.token("ann"))));
+    let config = NativeConfig {
+        token: None,
+        ..recover_or_resync(&stand, "ann")
+    };
+    let client = NativeClient::connect(config, Some(tokens.clone()), &CancelToken::new())
+        .await
+        .unwrap();
+    let mut ack = 0;
+    let items = read_until(&client, &mut ack, |i| matches!(i, Item::Resync { .. })).await;
+    let Some(Item::Resync { round, .. }) = items.last().cloned() else {
+        panic!("{items:?}");
+    };
+    client.resynced(round);
+
+    // Ann's message is still unread when the connection becomes Bob's.
+    publish(&stand, 1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    *tokens.0.lock().unwrap() = stand.token("bob");
+    client.reconnect().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client.user_id().as_deref() != Some("bob") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Bob's connection");
+
+    // Read one at a time, Ann's comes before the events say the user changed:
+    // applied then, it is Ann's.
+    let cancel = CancelToken::new();
+    let anns = loop {
+        let batch = client.next_batch(ack, 1, 1 << 20, &cancel).await.unwrap();
+        ack = batch.id;
+        assert!(
+            !batch
+                .items
+                .iter()
+                .any(|i| matches!(i, Item::Connected { .. })),
+            "Bob's connection before Ann's message: {:?}",
+            batch.items
+        );
+        if let Some(Item::Message(m)) = batch.items.first() {
+            break m.clone();
+        }
+    };
+    assert_eq!(anns.json.as_deref(), Some(r#"{"n":1}"#));
+    let (epoch, offset) = (anns.epoch.unwrap(), anns.offset.unwrap());
+    client.commit("prices", epoch, offset, anns.generation);
+    let saved: serde_json::Value = serde_json::from_str(&client.checkpoint()).unwrap();
+    assert_eq!(saved["user"], "ann", "{saved}");
+    assert_eq!(
+        saved["topics"]["prices"][format!("{epoch:08x}")],
+        offset,
+        "{saved}"
+    );
+
+    // Past Bob's connection: nothing of Ann's, and her message applied late
+    // does not count as his.
+    read_until(&client, &mut ack, |i| matches!(i, Item::Connected { .. })).await;
+    client.commit("prices", epoch, offset, anns.generation);
+    let saved: serde_json::Value = serde_json::from_str(&client.checkpoint()).unwrap();
+    assert_eq!(saved["user"], "bob", "{saved}");
+    assert_eq!(saved["topics"], serde_json::json!({}), "{saved}");
+    client.disconnect(1_000).await;
+    stand.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_holds_no_more_items_than_asked() {
+    let stand = stand().await;
+    let config = NativeConfig {
+        topics: vec!["prices".into(), "news".into(), "alerts".into()],
+        ..recover_or_resync(&stand, "ivy")
+    };
+    let client = NativeClient::connect(config, None, &CancelToken::new())
+        .await
+        .unwrap();
+    let cancel = CancelToken::new();
+    let mut ack = 0;
+    // The subscription brings a state per topic and a resync with it.
+    loop {
+        let batch = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.next_batch(ack, 1, 1 << 20, &cancel),
+        )
+        .await
+        .expect("a batch within 5 s")
+        .unwrap();
+        ack = batch.id;
+        assert_eq!(batch.items.len(), 1, "{:?}", batch.items);
+        if matches!(batch.items[0], Item::Resync { .. }) {
+            break;
+        }
+    }
+    client.disconnect(1_000).await;
+    stand.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_holds_about_the_bytes_asked() {
+    let stand = stand().await;
+    let client = NativeClient::connect(recover_or_resync(&stand, "joe"), None, &CancelToken::new())
+        .await
+        .unwrap();
+    let mut ack = 0;
+    let items = read_until(&client, &mut ack, |i| matches!(i, Item::Resync { .. })).await;
+    let Some(Item::Resync { round, .. }) = items.last().cloned() else {
+        panic!("{items:?}");
+    };
+    // Held until the resync: three messages of about a kilobyte each.
+    let big = "a".repeat(1_000);
+    for _ in 0..3 {
+        stand
+            .publisher
+            .publish_local("prices", &format!(r#"{{"t":"tick","p":"{big}"}}"#))
+            .unwrap();
+    }
+    // A read meanwhile takes them in (and has nothing to hand out yet).
+    let cancel = CancelToken::new();
+    let nothing = tokio::time::timeout(
+        Duration::from_millis(300),
+        client.next_batch(ack, 64, 1 << 20, &cancel),
+    )
+    .await;
+    assert!(nothing.is_err(), "{nothing:?}");
+    client.resynced(round);
+    // Asked for 64 bytes: one message a batch (one alone may be larger).
+    let mut sizes = Vec::new();
+    while sizes.len() < 3 {
+        let batch = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.next_batch(ack, 64, 64, &cancel),
+        )
+        .await
+        .expect("a batch within 5 s")
+        .unwrap();
+        ack = batch.id;
+        let messages: Vec<usize> = batch
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Message(m) => Some(m.json.as_ref().map_or(0, String::len)),
+                _ => None,
+            })
+            .collect();
+        assert!(messages.len() <= 1, "{messages:?}");
+        sizes.extend(messages);
+    }
+    assert_eq!(sizes, [1_002, 1_002, 1_002]);
     client.disconnect(1_000).await;
     stand.server.stop().await;
 }

@@ -260,6 +260,35 @@ describe('recover-or-resync', () => {
     expect(saved.topics).toEqual({});
   });
 
+  it('a message of the last user applied late counts for nobody', async () => {
+    const { answers, resync } = resyncs();
+    const c = client({ topics: ['prices'], consumer: 'board', delivery: { mode: 'recover-or-resync', resync } });
+    const heard: WSMessage[] = [];
+    c.onMessage('price_update', (m) => heard.push(m));
+    c.retain();
+    await tick();
+    const ws1 = FakeWebSocket.last();
+    await connectServer(ws1, { user_id: 'alice' });
+    await send(ws1, reply(['prices']));
+    answers[0].resolve();
+    await tick();
+    await send(ws1, stamped('prices', 5));
+    // Alice's message is still being applied when the connection becomes Bob's.
+    const alices = heard[0];
+    ws1.serverClose(1001);
+    await tick();
+    for (let i = 0; i < 60 && FakeWebSocket.last() === ws1; i++) await vi.advanceTimersByTimeAsync(500);
+    const ws2 = FakeWebSocket.last();
+    await connectServer(ws2, { user_id: 'bob' });
+    await send(ws2, reply(['prices']));
+    answers[answers.length - 1].resolve();
+    await tick();
+    await send(ws2, stamped('prices', 4));
+    c.commit(heard[1]);
+    c.commit(alices);
+    expect(JSON.parse(c.checkpoint())).toMatchObject({ user: 'bob', topics: { prices: { [EPOCH]: 4 } } });
+  });
+
   it('of one user in two realms are kept apart', async () => {
     const rejected: unknown[] = [];
     const open = async (realm: string) => {

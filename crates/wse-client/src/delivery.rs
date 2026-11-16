@@ -94,8 +94,14 @@ pub(crate) struct Delivery {
     max_held: usize,
     /// The saved checkpoint, until the first connection says whose it is.
     pending: Option<String>,
-    /// The user of the last connection, once there was one.
+    /// The user of the last connection in the order the events are read,
+    /// once there was one: what came before the events show another user
+    /// is still the last one's.
     user: Option<Option<String>>,
+    /// The user generation: a new one starts where the events show another
+    /// user. Each message handed out carries it, and a commit counts only in
+    /// the generation it was handed out in.
+    generation: u32,
     states: BTreeMap<String, State>,
     held: HashMap<String, Held>,
     progress: HashMap<String, BTreeMap<u32, Progress>>,
@@ -159,6 +165,7 @@ impl Delivery {
             max_held,
             pending,
             user: None,
+            generation: 0,
             states: BTreeMap::new(),
             held: HashMap::new(),
             progress: HashMap::new(),
@@ -188,6 +195,13 @@ impl Delivery {
     /// Items made outside the events, for the next batch.
     pub(crate) fn take_out(&mut self) -> Option<Item> {
         self.out.pop_front()
+    }
+
+    /// Items a batch had no room for: first in the next.
+    pub(crate) fn put_back(&mut self, items: Vec<Item>) {
+        for item in items.into_iter().rev() {
+            self.out.push_front(item);
+        }
     }
 
     // -- topics --------------------------------------------------------------
@@ -270,7 +284,8 @@ impl Delivery {
         }
     }
 
-    fn take_message(&mut self, message: NativeMessage, items: &mut Vec<Item>) {
+    fn take_message(&mut self, mut message: NativeMessage, items: &mut Vec<Item>) {
+        message.generation = self.generation;
         if let (Some(topic), Some(epoch), Some(offset)) =
             (&message.topic, message.epoch, message.offset)
         {
@@ -518,8 +533,12 @@ impl Delivery {
         self.out.extend(items);
     }
 
-    /// The consumer applied the message at `epoch`, `offset` of `topic`.
-    pub(crate) fn commit(&mut self, topic: &str, epoch: u32, offset: u64) {
+    /// The consumer applied the message at `epoch`, `offset` of `topic`,
+    /// handed out in `generation`: one of an earlier user counts for nobody.
+    pub(crate) fn commit(&mut self, topic: &str, epoch: u32, offset: u64, generation: u32) {
+        if generation != self.generation {
+            return;
+        }
         let Some(progress) = self
             .progress
             .get_mut(topic)
@@ -578,7 +597,15 @@ impl Delivery {
         if !self.barrier() {
             return None;
         }
-        self.user_is(user);
+        match &self.user {
+            // The first connection: nothing was read before it.
+            None => self.user_is(user),
+            // Another user's: nothing of what the last one applied. The
+            // change itself comes where the events show it, after what the
+            // last user still has to read.
+            Some(last) if last.as_deref() != user => return Some(BTreeMap::new()),
+            Some(_) => {}
+        }
         self.take_saved();
         Some(
             self.progress
@@ -602,13 +629,18 @@ impl Delivery {
         )
     }
 
-    /// A connection of `user`: what another user applied is not this one's.
+    /// A connection of `user`, where the events show it: what another user
+    /// applied, or holds, is not this one's.
     fn user_is(&mut self, user: Option<&str>) {
         let user = user.map(str::to_owned);
         if self.user.as_ref().is_some_and(|last| *last != user) {
             self.progress.clear();
             self.received.clear();
             self.again.clear();
+            for held in self.held.values_mut() {
+                *held = Held::default();
+            }
+            self.generation = self.generation.wrapping_add(1);
         }
         self.user = Some(user);
     }
@@ -705,6 +737,7 @@ mod tests {
             json: None,
             payload_error: None,
             signature: None,
+            generation: 0,
         })
     }
 
@@ -763,7 +796,10 @@ mod tests {
         resynced(&mut d, "alice");
         let mut items = Vec::new();
         d.take(message("t", 1, 99), &mut items);
-        d.commit("t", 1, 99);
+        let Some(Item::Message(alices)) = items.last().cloned() else {
+            panic!("{items:?}");
+        };
+        d.commit("t", 1, 99, alices.generation);
         assert_eq!(
             d.committed(Some("alice")).unwrap()["t"],
             [Position {
@@ -772,13 +808,19 @@ mod tests {
             }]
         );
 
-        // The next connection is Bob's: nothing of what Alice applied.
+        // The next connection is Bob's: it recovers nothing of what Alice
+        // applied.
         d.take(disconnected(), &mut items);
         let positions = d.committed(Some("bob")).unwrap();
         assert!(
             positions.get("t").is_none_or(Vec::is_empty),
             "{positions:?}"
         );
+        // Where the events show his connection, the checkpoint is his, and
+        // Alice's message applied late counts for nobody.
+        d.take(connected("bob"), &mut items);
+        d.commit("t", 1, 99, alices.generation);
+        d.commit("t", 1, 100, alices.generation);
         let saved: serde_json::Value = serde_json::from_str(&d.checkpoint()).unwrap();
         assert_eq!(saved["user"], "bob");
         assert_eq!(saved["topics"], serde_json::json!({}));

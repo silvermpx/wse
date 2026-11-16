@@ -23,6 +23,14 @@ public extension WseClient {
         WseEvents.of(self, maxItems: maxItems, maxBytes: maxBytes)
     }
 
+    /// The consumer applied `message` (one of a topic): the checkpoint moves
+    /// on through what was applied without a hole. A message handed out
+    /// before the events showed another user counts for nobody.
+    func commit(_ message: WseMessage) {
+        guard let topic = message.topic, let epoch = message.epoch, let offset = message.offset else { return }
+        commit(topic: topic, epoch: epoch, offset: offset, generation: message.generation)
+    }
+
     /// Sends `{"t": kind, "p": json}`, waiting for room in the queue.
     /// Cancelling the Task gives up the wait; a message already queued still
     /// goes.

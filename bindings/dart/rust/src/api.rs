@@ -226,6 +226,9 @@ pub struct WseItem {
     /// Message: why its payload could not be decoded (msgpack JSON cannot
     /// show).
     pub payload_error: Option<String>,
+    /// Message: the user generation it was handed out in (a new one starts
+    /// where the events show another user); `commit` takes it back.
+    pub generation: u32,
     pub bytes: Option<Vec<u8>>,
     /// Signed messages: the exact signed body, the signature, the key id.
     pub signed_body: Option<String>,
@@ -273,6 +276,7 @@ impl WseItem {
             id: None,
             json: None,
             payload_error: None,
+            generation: 0,
             bytes: None,
             signed_body: None,
             signature: None,
@@ -312,6 +316,7 @@ impl From<native::Item> for WseItem {
                     id: m.id,
                     json: m.json,
                     payload_error: m.payload_error,
+                    generation: m.generation,
                     verified: signature.as_ref().is_some_and(|s| s.verified),
                     signed_body: signature.as_ref().map(|s| s.body.clone()),
                     signature: signature.as_ref().map(|s| s.sig.clone()),
@@ -568,10 +573,11 @@ impl WseNativeClient {
             .collect()
     }
 
-    /// The consumer applied the message at `epoch`, `offset` of `topic`.
+    /// The consumer applied the message at `epoch`, `offset` of `topic`,
+    /// handed out in `generation`: one of an earlier user counts for nobody.
     #[frb(sync)]
-    pub fn commit(&self, topic: String, epoch: u32, offset: u64) {
-        self.0.commit(&topic, epoch, offset);
+    pub fn commit(&self, topic: String, epoch: u32, offset: u64, generation: u32) {
+        self.0.commit(&topic, epoch, offset, generation);
     }
 
     /// What the consumer committed, to save with the application's own

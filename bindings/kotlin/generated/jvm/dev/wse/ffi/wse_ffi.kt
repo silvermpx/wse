@@ -795,7 +795,7 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_checkpoint(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    external fun uniffi_wse_ffi_fn_method_wseclient_commit(`ptr`: Long,`topic`: RustBuffer.ByValue,`epoch`: Int,`offset`: Long,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_wse_ffi_fn_method_wseclient_commit(`ptr`: Long,`topic`: RustBuffer.ByValue,`epoch`: Int,`offset`: Long,`generation`: Int,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_connection_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
@@ -984,7 +984,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_checkpoint() and 0xFFFF) != 3771) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_commit() and 0xFFFF) != 10196) {
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_commit() and 0xFFFF) != 32229) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_connection_id() and 0xFFFF) != 49499) {
@@ -1924,9 +1924,11 @@ public interface WseClientInterface {
     fun `checkpoint`(): kotlin.String
 
     /**
-     * The consumer applied the message at `epoch`, `offset` of `topic`.
+     * The consumer applied the message at `epoch`, `offset` of `topic`,
+     * handed out in `generation`: one of an earlier user counts for
+     * nobody. `commit(message)` passes all four.
      */
-    fun `commit`(`topic`: kotlin.String, `epoch`: kotlin.UInt, `offset`: kotlin.ULong)
+    fun `commit`(`topic`: kotlin.String, `epoch`: kotlin.UInt, `offset`: kotlin.ULong, `generation`: kotlin.UInt)
 
     fun `connectionId`(): kotlin.String?
 
@@ -2133,8 +2135,10 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
 
 
     /**
-     * The consumer applied the message at `epoch`, `offset` of `topic`.
-     */override fun `commit`(`topic`: kotlin.String, `epoch`: kotlin.UInt, `offset`: kotlin.ULong)
+     * The consumer applied the message at `epoch`, `offset` of `topic`,
+     * handed out in `generation`: one of an earlier user counts for
+     * nobody. `commit(message)` passes all four.
+     */override fun `commit`(`topic`: kotlin.String, `epoch`: kotlin.UInt, `offset`: kotlin.ULong, `generation`: kotlin.UInt)
         =
     callWithHandle {
     uniffiRustCall() { _status ->
@@ -2143,7 +2147,8 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
 
         FfiConverterString.lower(`topic`),
         FfiConverterUInt.lower(`epoch`),
-        FfiConverterULong.lower(`offset`),_status)
+        FfiConverterULong.lower(`offset`),
+        FfiConverterUInt.lower(`generation`),_status)
 }
     }
 
@@ -3197,6 +3202,12 @@ data class WseMessage (
     val `payloadError`: kotlin.String?
     ,
     val `signature`: WseSignature?
+    ,
+    /**
+     * The user generation it was handed out in: a new one starts where
+     * the events show another user. `commit` takes it back.
+     */
+    val `generation`: kotlin.UInt
 
 ){
 
@@ -3221,6 +3232,7 @@ public object FfiConverterTypeWseMessage: FfiConverterRustBuffer<WseMessage> {
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalTypeWseSignature.read(buf),
+            FfiConverterUInt.read(buf),
         )
     }
 
@@ -3232,7 +3244,8 @@ public object FfiConverterTypeWseMessage: FfiConverterRustBuffer<WseMessage> {
             FfiConverterOptionalString.allocationSize(value.`id`) +
             FfiConverterOptionalString.allocationSize(value.`json`) +
             FfiConverterOptionalString.allocationSize(value.`payloadError`) +
-            FfiConverterOptionalTypeWseSignature.allocationSize(value.`signature`)
+            FfiConverterOptionalTypeWseSignature.allocationSize(value.`signature`) +
+            FfiConverterUInt.allocationSize(value.`generation`)
     )
 
     override fun write(value: WseMessage, buf: ByteBuffer) {
@@ -3244,6 +3257,7 @@ public object FfiConverterTypeWseMessage: FfiConverterRustBuffer<WseMessage> {
             FfiConverterOptionalString.write(value.`json`, buf)
             FfiConverterOptionalString.write(value.`payloadError`, buf)
             FfiConverterOptionalTypeWseSignature.write(value.`signature`, buf)
+            FfiConverterUInt.write(value.`generation`, buf)
     }
 }
 

@@ -61,9 +61,12 @@ that is not continuous -- from a cold start, after every reconnect, after a
 break -- until the app brought its state up to date: a `.resync(round:
 topics: reasons: committed:)` item asks for it, and `client.resynced(round:)`
 hands on what was held. After applying a message the app calls
-`client.commit(topic:epoch:offset:)`; `client.checkpoint()` is what to save
-with its own state and give back as `WseDelivery(checkpoint:)`, and recovery
-starts from it, so a message can come twice: apply a repeat safely.
+`client.commit(message)`; `client.checkpoint()` is what to save with its own
+state and give back as `WseDelivery(checkpoint:)`, and recovery starts from
+it, so a message can come twice: apply a repeat safely. The user changes
+where the events show the server took the connection for another user: what
+came before is the last user's, and a message of theirs committed later
+counts for nobody.
 
 `events()` is the client's stream, until it closes; one reader at a time.
 A Task cancelled while reading loses nothing: the next read gets the rest.

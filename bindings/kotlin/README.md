@@ -78,10 +78,12 @@ whether its messages run without a break. Where every fact counts,
 that is not continuous -- from a cold start, after every reconnect, after a
 break -- until the app brought its state up to date: a `WseItem.Resync` asks
 for it, and `client.resynced(item.round)` hands on what was held. After
-applying a message the app calls `client.commit(topic, epoch, offset)`;
+applying a message the app calls `client.commit(message)`;
 `client.checkpoint()` is what to save with its own state and give back as
 `WseDelivery(checkpoint = ...)`, and recovery starts from it, so a message
-can come twice: apply a repeat safely.
+can come twice: apply a repeat safely. The user changes where the events show
+the server took the connection for another user: what came before is the last
+user's, and a message of theirs committed later counts for nobody.
 
 `events()` is the client's stream, until it closes; one reader at a time. A
 collector cancelled in between loses nothing: the next collection gets the

@@ -80,7 +80,7 @@ class WseClientTest {
             val item = events.next() ?: break
             if (item is WseItem.Message && item.message.topic == "ticks") tick = item.message
         }
-        client.commit("ticks", tick!!.epoch!!, tick.offset!!)
+        client.commit(tick!!)
         assertEquals(WseContinuity.CONTINUOUS, client.topicStates().single().continuity)
         val saved = client.checkpoint()
         assertTrue("\"consumer\":\"board\"" in saved, saved)

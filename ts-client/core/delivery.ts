@@ -342,6 +342,7 @@ export class Delivery {
 
   /** A message reached the handlers: a stream first seen starts its checkpoint just before it. */
   private handedOn(topic: string, message: WSMessage): void {
+    this.generations.set(message, this.generation);
     const offset = offsetOf(message);
     if (offset === null) return;
     const epoch = String(message.e);
@@ -355,11 +356,12 @@ export class Delivery {
 
   // -- the checkpoint ------------------------------------------------------------
 
-  /** The consumer applied `message`. */
+  /** The consumer applied `message`: one handed on to an earlier user counts for nobody. */
   commit(message: WSMessage): void {
     const topic = message.tp;
     const offset = offsetOf(message);
     if (!topic || offset === null) return;
+    if ((this.generations.get(message) ?? this.generation) !== this.generation) return;
     const progress = this.progress.get(topic)?.get(String(message.e));
     if (!progress || offset <= progress.base) return;
     if (offset === progress.base + 1) {
@@ -414,11 +416,16 @@ export class Delivery {
 
   /** The user of the last connection, once there was one. */
   private lastUser: string | null | undefined = undefined;
+  /** The user generation: a new one starts with another user's connection. */
+  private generation = 0;
+  /** The generation each message was handed on in: a commit counts only in it. */
+  private readonly generations = new WeakMap<WSMessage, number>();
 
   /** A connection of `user`: what another user applied is not this one's. */
   private userIs(user: string | null): void {
     if (this.lastUser !== undefined && this.lastUser !== user) {
       this.progress.clear();
+      this.generation++;
       this.schedulePersist();
     }
     this.lastUser = user;

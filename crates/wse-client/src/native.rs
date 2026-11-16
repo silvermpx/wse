@@ -508,6 +508,10 @@ pub struct NativeMessage {
     /// (a map keyed by a number, say). None when `json` holds it.
     pub payload_error: Option<String>,
     pub signature: Option<NativeSignature>,
+    /// The user generation the message was handed out in: a new one starts
+    /// where the events show the server took the connection for another
+    /// user. [`NativeClient::commit`] takes it back.
+    pub generation: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -647,6 +651,7 @@ fn message_of(message: &OwnedMessage) -> NativeMessage {
             kid: s.kid.clone(),
             verified: s.verified,
         }),
+        generation: 0,
     }
 }
 
@@ -793,8 +798,8 @@ impl NativeClient {
 
     /// The consumer applied the message at `epoch`, `offset` of `topic`: the
     /// checkpoint moves on through what was applied without a hole.
-    pub fn commit(&self, topic: &str, epoch: u32, offset: u64) {
-        self.delivery().commit(topic, epoch, offset);
+    pub fn commit(&self, topic: &str, epoch: u32, offset: u64, generation: u32) {
+        self.delivery().commit(topic, epoch, offset, generation);
     }
 
     /// What the consumer committed, bound to the realm, the user, the
@@ -980,11 +985,17 @@ impl NativeClient {
         let id = reader.next_id;
         reader.next_id += 1;
         // What the delivery holds is safe with it; what it hands out goes into
-        // this batch before anything awaits again.
-        let mut items = Vec::new();
+        // this batch before anything awaits again, as far as the batch has
+        // room (the first item may be larger than max_bytes alone).
+        let mut batch = Room {
+            items: Vec::new(),
+            bytes: 0,
+            max_items,
+            max_bytes,
+        };
         loop {
-            self.delivery_out(&mut items, max_items);
-            if !items.is_empty() {
+            self.delivery_out(&mut batch);
+            if !batch.items.is_empty() {
                 break;
             }
             let first = tokio::select! {
@@ -1003,34 +1014,50 @@ impl NativeClient {
                 reader.pending = Some(batch.clone());
                 return Ok(batch);
             };
-            self.delivery().take(item_of(first), &mut items);
+            self.take_into(item_of(first), &mut batch);
         }
-        let mut bytes: usize = items.iter().map(Item::size).sum();
-        while items.len() < max_items && bytes < max_bytes {
+        while batch.has_room() {
             let Some(incoming) = reader.events.try_next() else {
                 break;
             };
-            let before = items.len();
-            self.delivery().take(item_of(incoming), &mut items);
-            bytes += items[before..].iter().map(Item::size).sum::<usize>();
+            self.take_into(item_of(incoming), &mut batch);
         }
         let batch = Batch {
             id,
             kind: BatchKind::Items,
-            items,
+            items: batch.items,
         };
         reader.pending = Some(batch.clone());
         Ok(batch)
     }
 
-    /// Items the delivery made outside the events, up to `max_items`.
-    fn delivery_out(&self, items: &mut Vec<Item>, max_items: usize) {
+    /// Items the delivery made outside the events, as far as `batch` has room.
+    fn delivery_out(&self, batch: &mut Room) {
         let mut delivery = self.delivery();
-        while items.len() < max_items {
+        while batch.has_room() {
             match delivery.take_out() {
-                Some(item) => items.push(item),
+                Some(item) => batch.push(item),
                 None => break,
             }
+        }
+    }
+
+    /// The items one event makes, as far as `batch` has room; the rest waits
+    /// with the delivery, first in the next batch.
+    fn take_into(&self, event: Item, batch: &mut Room) {
+        let mut delivery = self.delivery();
+        let mut made = Vec::new();
+        delivery.take(event, &mut made);
+        let mut made = made.into_iter();
+        while batch.has_room() {
+            match made.next() {
+                Some(item) => batch.push(item),
+                None => return,
+            }
+        }
+        let rest: Vec<Item> = made.collect();
+        if !rest.is_empty() {
+            delivery.put_back(rest);
         }
     }
 
@@ -1045,6 +1072,26 @@ impl NativeClient {
             Ok(())
         })
         .await;
+    }
+}
+
+/// A batch being filled, and its bounds.
+struct Room {
+    items: Vec<Item>,
+    bytes: usize,
+    max_items: usize,
+    max_bytes: usize,
+}
+
+impl Room {
+    /// Room for one more: always for the first item, else within both bounds.
+    fn has_room(&self) -> bool {
+        self.items.is_empty() || (self.items.len() < self.max_items && self.bytes < self.max_bytes)
+    }
+
+    fn push(&mut self, item: Item) {
+        self.bytes += item.size();
+        self.items.push(item);
     }
 }
 

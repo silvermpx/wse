@@ -32,11 +32,13 @@ abstract class WseNativeClient implements RustOpaqueInterface {
   /// state and give back as `WseDelivery.checkpoint`.
   String checkpoint();
 
-  /// The consumer applied the message at `epoch`, `offset` of `topic`.
+  /// The consumer applied the message at `epoch`, `offset` of `topic`,
+  /// handed out in `generation`: one of an earlier user counts for nobody.
   void commit({
     required String topic,
     required int epoch,
     required BigInt offset,
+    required int generation,
   });
 
   /// Connects, and returns once the server took the connection.
@@ -307,6 +309,10 @@ class WseItem {
   /// Message: why its payload could not be decoded (msgpack JSON cannot
   /// show).
   final String? payloadError;
+
+  /// Message: the user generation it was handed out in (a new one starts
+  /// where the events show another user); `commit` takes it back.
+  final int generation;
   final Uint8List? bytes;
 
   /// Signed messages: the exact signed body, the signature, the key id.
@@ -360,6 +366,7 @@ class WseItem {
     this.id,
     this.json,
     this.payloadError,
+    required this.generation,
     this.bytes,
     this.signedBody,
     this.signature,
@@ -394,6 +401,7 @@ class WseItem {
       id.hashCode ^
       json.hashCode ^
       payloadError.hashCode ^
+      generation.hashCode ^
       bytes.hashCode ^
       signedBody.hashCode ^
       signature.hashCode ^
@@ -430,6 +438,7 @@ class WseItem {
           id == other.id &&
           json == other.json &&
           payloadError == other.payloadError &&
+          generation == other.generation &&
           bytes == other.bytes &&
           signedBody == other.signedBody &&
           signature == other.signature &&

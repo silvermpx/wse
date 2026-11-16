@@ -100,6 +100,17 @@ private val readers = WeakHashMap<WseClient, WeakReference<WseEvents>>()
  * stream (with the limits of the first, while it is held): an item goes to one reader, and a second
  * reading at the same time gets [WseException.Busy].
  */
+/**
+ * The consumer applied [message] (one of a topic): the checkpoint moves on through what was applied
+ * without a hole. A message handed out before the events showed another user counts for nobody.
+ */
+fun WseClient.commit(message: WseMessage) {
+    val topic = message.topic ?: return
+    val epoch = message.epoch ?: return
+    val offset = message.offset ?: return
+    commit(topic, epoch, offset, message.generation)
+}
+
 fun WseClient.events(maxItems: UInt = 256u, maxBytes: UInt = 1u shl 20): WseEvents =
     synchronized(readers) {
         readers[this]?.get() ?: WseEvents(this, maxItems, maxBytes).also { readers[this] = WeakReference(it) }

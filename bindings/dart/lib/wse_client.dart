@@ -201,7 +201,8 @@ class WseClient {
       _closed ? const [] : _native.topicStates();
 
   /// The consumer applied [message] (one of a topic): the checkpoint moves
-  /// on through what was applied without a hole.
+  /// on through what was applied without a hole. A message handed out
+  /// before the events showed another user counts for nobody.
   void commit(rust.WseItem message) {
     final (topic, epoch, offset) = (
       message.topic,
@@ -209,7 +210,12 @@ class WseClient {
       message.offset,
     );
     if (topic == null || epoch == null || offset == null) return;
-    _open.commit(topic: topic, epoch: epoch, offset: offset);
+    _open.commit(
+      topic: topic,
+      epoch: epoch,
+      offset: offset,
+      generation: message.generation,
+    );
   }
 
   /// What the consumer committed, bound to the realm, the user, the consumer

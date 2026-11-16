@@ -40,9 +40,8 @@ final class WseClientTests: XCTestCase {
         try await Task.sleep(nanoseconds: 300_000_000)
         client.resynced(round: try XCTUnwrap(round))
         for try await item in client.events() {
-            if case let .message(message) = item, message.topic == "ticks",
-               let epoch = message.epoch, let offset = message.offset {
-                client.commit(topic: "ticks", epoch: epoch, offset: offset)
+            if case let .message(message) = item, message.topic == "ticks" {
+                client.commit(message)
                 break
             }
         }

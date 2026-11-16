@@ -757,9 +757,11 @@ public protocol WseClientProtocol: AnyObject, Sendable {
     func checkpoint()  -> String
 
     /**
-     * The consumer applied the message at `epoch`, `offset` of `topic`.
+     * The consumer applied the message at `epoch`, `offset` of `topic`,
+     * handed out in `generation`: one of an earlier user counts for
+     * nobody. `commit(message)` passes all four.
      */
-    func commit(topic: String, epoch: UInt32, offset: UInt64)
+    func commit(topic: String, epoch: UInt32, offset: UInt64, generation: UInt32)
 
     func connectionId()  -> String?
 
@@ -911,15 +913,18 @@ open func checkpoint() -> String  {
 }
 
     /**
-     * The consumer applied the message at `epoch`, `offset` of `topic`.
+     * The consumer applied the message at `epoch`, `offset` of `topic`,
+     * handed out in `generation`: one of an earlier user counts for
+     * nobody. `commit(message)` passes all four.
      */
-open func commit(topic: String, epoch: UInt32, offset: UInt64)  {try! rustCall() {
+open func commit(topic: String, epoch: UInt32, offset: UInt64, generation: UInt32)  {try! rustCall() {
         uniffiCallStatus in
     uniffi_wse_ffi_fn_method_wseclient_commit(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(topic),
         FfiConverterUInt32.lower(epoch),
-        FfiConverterUInt64.lower(offset),uniffiCallStatus
+        FfiConverterUInt64.lower(offset),
+        FfiConverterUInt32.lower(generation),uniffiCallStatus
     )
 }
 }
@@ -1837,6 +1842,11 @@ public struct WseMessage: Equatable, Hashable {
      */
     public let payloadError: String?
     public let signature: WseSignature?
+    /**
+     * The user generation it was handed out in: a new one starts where
+     * the events show another user. `commit` takes it back.
+     */
+    public let generation: UInt32
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1847,7 +1857,11 @@ public struct WseMessage: Equatable, Hashable {
          */json: String?,
         /**
          * Why the payload could not be decoded (msgpack JSON cannot show).
-         */payloadError: String?, signature: WseSignature?) {
+         */payloadError: String?, signature: WseSignature?,
+        /**
+         * The user generation it was handed out in: a new one starts where
+         * the events show another user. `commit` takes it back.
+         */generation: UInt32) {
         self.kind = kind
         self.topic = topic
         self.epoch = epoch
@@ -1856,6 +1870,7 @@ public struct WseMessage: Equatable, Hashable {
         self.json = json
         self.payloadError = payloadError
         self.signature = signature
+        self.generation = generation
     }
 
 
@@ -1881,7 +1896,8 @@ public struct FfiConverterTypeWseMessage: FfiConverterRustBuffer {
                 id: FfiConverterOptionString.read(from: &buf),
                 json: FfiConverterOptionString.read(from: &buf),
                 payloadError: FfiConverterOptionString.read(from: &buf),
-                signature: FfiConverterOptionTypeWseSignature.read(from: &buf)
+                signature: FfiConverterOptionTypeWseSignature.read(from: &buf),
+                generation: FfiConverterUInt32.read(from: &buf)
         )
     }
 
@@ -1894,6 +1910,7 @@ public struct FfiConverterTypeWseMessage: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.json, into: &buf)
         FfiConverterOptionString.write(value.payloadError, into: &buf)
         FfiConverterOptionTypeWseSignature.write(value.signature, into: &buf)
+        FfiConverterUInt32.write(value.generation, into: &buf)
     }
 }
 
@@ -3684,7 +3701,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wse_ffi_checksum_method_wseclient_checkpoint() != 3771) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_wse_ffi_checksum_method_wseclient_commit() != 10196) {
+    if (uniffi_wse_ffi_checksum_method_wseclient_commit() != 32229) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_method_wseclient_connection_id() != 49499) {
