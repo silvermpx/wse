@@ -718,11 +718,13 @@ export class WSESession {
       return this.processor.enqueueOutgoing(buildMessage(type, payload, options), priority, {
         ttl: options.ttl,
         liveOn: generation,
+        requires: options.requires,
       });
     }
     return this.processor.enqueueOutgoing(buildMessage(type, payload, options), priority, {
       offline: !!options.offline && this.options.offline.enabled,
       ttl: options.ttl,
+      requires: options.requires,
     });
   }
 

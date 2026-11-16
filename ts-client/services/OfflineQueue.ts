@@ -25,7 +25,7 @@ export interface OfflineQueueConfig {
 }
 
 /** What the queue was doing when its storage failed. */
-export type OfflineOperation = 'open' | 'blocked' | 'closed' | 'write' | 'read' | 'claim' | 'lease';
+export type OfflineOperation = 'open' | 'blocked' | 'closed' | 'write' | 'read' | 'claim' | 'remove' | 'lease';
 
 /** How long a lease holds without renewal: a client that stopped is replaced after it. */
 export const LEASE_TTL_MS = 15_000;
@@ -396,12 +396,17 @@ export class OfflineQueue {
   async remove(ids: string[]): Promise<void> {
     if (!this.db || ids.length === 0) return;
 
-    const tx = this.db.transaction([this.storeName], 'readwrite');
-    const store = tx.objectStore(this.storeName);
-    for (const id of ids) {
-      store.delete(id);
+    try {
+      const tx = this.db.transaction([this.storeName], 'readwrite');
+      const store = tx.objectStore(this.storeName);
+      for (const id of ids) {
+        store.delete(id);
+      }
+      await transactionDone(tx);
+    } catch (error) {
+      this.report('remove', error);
+      throw error;
     }
-    await transactionDone(tx);
     await this.refreshSize();
   }
 

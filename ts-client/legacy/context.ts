@@ -36,6 +36,7 @@ export function legacyContext(): ClientContext {
           deleteDatabase(LEGACY_OFFLINE_DATABASE);
         },
       },
+      unremoved: new Set(),
     };
   }
   return context;

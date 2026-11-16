@@ -240,6 +240,9 @@ export class MessageProcessor {
   private destroyed = false;
   /** Messages that may go only on the socket they were made for (signed ones). */
   private readonly liveOnly = new WeakMap<WSMessage, number>();
+  /** The next try at removing stored messages that went, and its delay. */
+  private removalRetry: ReturnType<typeof setTimeout> | null = null;
+  private removalDelay = 0;
   private waitForHandlersInterval: ReturnType<typeof setInterval> | null = null;
 
   // Optional sink for measured round-trip latency (ms), set by the host. The
@@ -1898,7 +1901,7 @@ export class MessageProcessor {
   enqueueOutgoing(
     message: WSMessage,
     priority: number = MessagePriority.NORMAL,
-    options: { offline?: boolean; ttl?: number; liveOn?: number } = {},
+    options: { offline?: boolean; ttl?: number; liveOn?: number; requires?: readonly string[] } = {},
   ): SendStatus {
     if (this.destroyed) return 'dropped';
     // Made for the user whose data the page holds now: once another user's
@@ -1922,10 +1925,18 @@ export class MessageProcessor {
     const cm = this.connectionManager;
     const queueEmpty = this.ctx.queue.getState().size === 0;
     const offlinePending = (this.offlineQueue?.getStats().size ?? 0) > 0;
+    const requires = options.requires && options.requires.length > 0 ? options.requires : undefined;
 
     // Fast path keeps latency low; it is skipped while anything older is
     // still waiting so the original order is preserved.
-    if (cm && queueEmpty && !offlinePending && !this.flushing && cm.isTransportReady()) {
+    if (
+      cm &&
+      queueEmpty &&
+      !offlinePending &&
+      !this.flushing &&
+      cm.isTransportReady() &&
+      (!requires || this.continuous(requires))
+    ) {
       const result = cm.trySend(message);
       if (result === 'sent') return 'sent';
       if (result === 'error') {
@@ -1934,7 +1945,15 @@ export class MessageProcessor {
       }
     }
 
-    if (options.offline && options.liveOn === undefined && this.offlineQueue?.isAvailable() && !cm?.isTransportReady()) {
+    // One that requires topics waits in memory: whether it may go is the
+    // connection's, not something a reload keeps.
+    if (
+      options.offline &&
+      options.liveOn === undefined &&
+      !requires &&
+      this.offlineQueue?.isAvailable() &&
+      !cm?.isTransportReady()
+    ) {
       const queue = this.offlineQueue;
       // Written for the user of this page's last connection (or, before any,
       // of this browser's): only that user's connection replays it.
@@ -1951,7 +1970,12 @@ export class MessageProcessor {
       return 'queued';
     }
 
-    return this.enqueueInMemory(message, priority, expiresAt, owner, options.liveOn) ? 'queued' : 'dropped';
+    return this.enqueueInMemory(message, priority, expiresAt, owner, options.liveOn, requires) ? 'queued' : 'dropped';
+  }
+
+  /** Each of `topics` is continuous now (always, for a client without delivery). */
+  private continuous(topics: readonly string[]): boolean {
+    return this.ctx.delivery?.continuous(topics) ?? true;
   }
 
   private enqueueInMemory(
@@ -1960,6 +1984,7 @@ export class MessageProcessor {
     expiresAt?: number,
     owner: number = this.ctx.owner.current(),
     liveOn?: number,
+    requires?: readonly string[],
   ): boolean {
     if (this.destroyed) return false;
     if (owner !== this.ctx.owner.current()) {
@@ -1983,6 +2008,7 @@ export class MessageProcessor {
       expiresAt,
       owner,
       liveOn,
+      requires,
     };
 
     if (!queueStore.enqueue(queued)) {
@@ -2098,11 +2124,19 @@ export class MessageProcessor {
     }
 
     const step = Math.max(1, this.batchSize);
+    // One that requires topics stays in its place until they are continuous
+    // (the queue keeps counting it); another user's or a late one comes out
+    // to be dropped.
+    const ready = (m: QueuedMessage) =>
+      !m.requires ||
+      this.continuous(m.requires) ||
+      (m.owner !== undefined && m.owner !== this.ctx.owner.current()) ||
+      isExpired(m.expiresAt, Date.now());
     while (!this.destroyed) {
       const queueStore = this.ctx.queue.getState();
       if (queueStore.size === 0) return false;
       queueStore.setProcessing(true);
-      const batch = queueStore.dequeue(step);
+      const batch = queueStore.dequeue(step, ready);
       if (batch.length === 0) return false;
 
       const nowMs = Date.now();
@@ -2145,6 +2179,12 @@ export class MessageProcessor {
   private async replayOfflineQueue(cm: ProcessorConnection): Promise<boolean> {
     const queue = this.offlineQueue;
     if (!queue) return false;
+    // What went before and stayed stored is removed first, and never sent
+    // again; until that works, nothing stored goes (the in-memory queue does).
+    const unremoved = this.ctx.unremoved;
+    if (unremoved.size > 0 && (this.removalRetry || !(await this.forgetSent(queue, [...unremoved])))) {
+      return false;
+    }
 
     let sent = 0;
     let foreign = 0;
@@ -2163,6 +2203,7 @@ export class MessageProcessor {
 
       // What went, or will never go, leaves the database.
       const gone: string[] = [];
+      const went: string[] = [];
       const nowMs = Date.now();
       const user = this.userId;
       let stopped = -1;
@@ -2186,10 +2227,15 @@ export class MessageProcessor {
           gone.push(record.id);
           continue;
         }
+        if (unremoved.has(record.id)) {
+          gone.push(record.id);
+          continue;
+        }
         const result = cm.trySend(record.message);
         if (result === 'sent') {
           sent++;
           gone.push(record.id);
+          went.push(record.id);
           continue;
         }
         if (result === 'error') {
@@ -2205,12 +2251,13 @@ export class MessageProcessor {
       }
       // Its transaction starts before anything else can run: a client
       // closed right after the sends still has it remove them.
-      const removed = this.forgetSent(queue, gone);
+      const removed = this.forgetSent(queue, gone, went);
       if (stopped >= 0) {
         await Promise.all([removed, this.putBack(queue, records.slice(stopped))]);
         return true;
       }
-      await removed;
+      // Not removed: this pass stops, and the removal is tried again later.
+      if (!(await removed)) return false;
     }
     if (foreign > 0) {
       logger.warn(`Dropped ${foreign} offline message(s) written for another user`);
@@ -2221,12 +2268,33 @@ export class MessageProcessor {
     return false;
   }
 
-  /** Offline messages that went (or never will) leave the database. */
-  private async forgetSent(queue: OfflineQueue, ids: string[]): Promise<void> {
-    if (ids.length === 0) return;
-    await queue.remove(ids).catch((error) => {
+  /**
+   * Offline messages that went (or never will) leave the database. When that
+   * fails, those that `went` are kept as sent and the removal is tried again
+   * later, a second, then twice as long each time up to 30 s.
+   */
+  private async forgetSent(queue: OfflineQueue, ids: string[], went: string[] = ids): Promise<boolean> {
+    if (ids.length === 0) return true;
+    try {
+      await queue.remove(ids);
+    } catch (error) {
       logger.error('Removing sent offline messages failed:', error);
-    });
+      for (const id of went) this.ctx.unremoved.add(id);
+      this.retryRemovalLater();
+      return false;
+    }
+    for (const id of ids) this.ctx.unremoved.delete(id);
+    this.removalDelay = 0;
+    return true;
+  }
+
+  private retryRemovalLater(): void {
+    if (this.removalRetry || this.destroyed) return;
+    this.removalDelay = Math.min(this.removalDelay > 0 ? this.removalDelay * 2 : 1_000, 30_000);
+    this.removalRetry = setTimeout(() => {
+      this.removalRetry = null;
+      this.scheduleFlush(0);
+    }, this.removalDelay);
   }
 
   /** Offline messages taken and not sent go back, in their place. */
@@ -2322,6 +2390,10 @@ export class MessageProcessor {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
+    }
+    if (this.removalRetry) {
+      clearTimeout(this.removalRetry);
+      this.removalRetry = null;
     }
 
     if (this.waitForHandlersInterval) {

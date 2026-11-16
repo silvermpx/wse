@@ -325,6 +325,8 @@ export interface QueuedMessage {
   owner?: number;
   /** The only socket it may go on (a signed message); dropped once that one is gone. */
   liveOn?: number;
+  /** Topics that must be continuous when it goes (MessageOptions.requires): it stays queued until then. */
+  requires?: readonly string[];
 }
 
 export interface MessageOptions {
@@ -350,9 +352,11 @@ export interface MessageOptions {
    */
   ttl?: number;
   /**
-   * Topics whose state the message depends on (a client of its own): it is
-   * held until each of them is continuous, as after a resync. A live message
-   * cannot wait and is dropped.
+   * Topics whose state the message depends on (a client of its own): it
+   * goes out only while each of them is continuous on the connection, and
+   * waits in the queue (counted against its limits, never written to the
+   * offline queue) until they are, as after a resync. A live message cannot
+   * wait and is dropped.
    */
   requires?: string[];
 }

@@ -53,6 +53,11 @@ export interface ClientContext {
    * queue's scope, which one client at a time holds and replays.
    */
   readonly leaseHolder?: string;
+  /**
+   * Stored messages this client sent whose removal from the offline queue
+   * failed: removed before anything else is replayed, never sent again.
+   */
+  readonly unremoved: Set<string>;
 }
 
 /** Where a client's delivery meets its services. */
@@ -61,6 +66,8 @@ export interface DeliveryGate {
   hold(message: WSMessage): boolean;
   /** Where the recovery of `topics` starts (what the application committed); null: where delivery is. */
   recoveryPositions(topics: readonly string[]): Record<string, TopicPosition> | null;
+  /** Each of `topics` is continuous now: a send that requires them may go. */
+  continuous(topics: readonly string[]): boolean;
 }
 
 export function ownerGeneration(): OwnerGeneration {
@@ -170,20 +177,30 @@ export type StorageErrorListener = (operation: StorageOperation, error: unknown)
 
 /**
  * `base` with its offline queue in `database` (null: none, kept in memory):
- * the queue's scope, a database of its own per consumer and realm. `clear`
- * deletes that database too.
+ * the queue's scope, a database of its own per consumer and realm. With a
+ * `scope` (scopeOf), what the client keeps goes under it, so clients of
+ * other consumers or realms in the same namespace never read it, and
+ * `clear` removes only that and its database; without one, every key of
+ * `base`.
  */
-export function scopedStorage(base: ClientStorage, database: string | null): ClientStorage {
+export function scopedStorage(base: ClientStorage, database: string | null, scope?: string): ClientStorage {
+  const keyOf = scope === undefined ? (key: string) => key : (key: string) => `${scope}/${key}`;
   return {
-    get: (key) => base.get(key),
-    set: (key, value) => base.set(key, value),
-    remove: (key) => base.remove(key),
+    get: (key) => base.get(keyOf(key)),
+    set: (key, value) => base.set(keyOf(key), value),
+    remove: (key) => base.remove(keyOf(key)),
     clear: () => {
-      base.clear();
+      if (scope === undefined) base.clear();
+      else for (const key of CLIENT_KEYS) base.remove(keyOf(key));
       if (database) deleteDatabase(database);
     },
     offlineDatabase: database,
   };
+}
+
+/** The scope of a client's consumer and realm, the parts kept apart (scopedStorage). */
+export function scopeOf(consumer: string | null, realm: string | null): string {
+  return `${encodeURIComponent(consumer ?? '')}@${encodeURIComponent(realm ?? '')}`;
 }
 
 export interface ContextOptions {
@@ -204,6 +221,7 @@ export function createClientContext(options: ContextOptions = {}): ClientContext
     storage: options.storage ?? memoryStorage(),
     delivery: options.delivery,
     leaseHolder: options.leaseHolder,
+    unremoved: new Set(),
   };
 }
 
@@ -215,6 +233,10 @@ export function createClientContext(options: ContextOptions = {}): ClientContext
 export const SUBSCRIPTIONS_KEY = 'subscriptions';
 /** Key of the user whose messages the offline queue holds. */
 export const OFFLINE_OWNER_KEY = 'offline_owner';
+/** Key of what the consumer committed (core/delivery.ts). */
+export const CHECKPOINT_KEY = 'checkpoint';
+/** Every key a client of its own keeps. */
+const CLIENT_KEYS = [SUBSCRIPTIONS_KEY, OFFLINE_OWNER_KEY, CHECKPOINT_KEY] as const;
 
 function topicList(value: unknown): string[] | null {
   if (!Array.isArray(value)) return null;

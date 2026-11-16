@@ -188,6 +188,132 @@ describe('a stored message being taken', () => {
   });
 });
 
+describe('clients of one namespace in two realms', () => {
+  it('keep their offline queues and their users apart', async () => {
+    const queueOf = (realm: string) => `wse:shop:alice:checkout@${realm}`;
+    await dropDb(queueOf('a'));
+    await dropDb(queueOf('b'));
+    const open = async (realm: string, user: string | null) => {
+      const c = client({ consumer: 'checkout', realm });
+      c.retain();
+      await vi.waitFor(() => expect(c.state.getSnapshot().storage).toBe('durable'));
+      if (user !== null) {
+        const ws = FakeWebSocket.last();
+        ws.serverOpen();
+        ws.serverSend(serverReadyMessage({ user_id: user }));
+        await vi.waitFor(() => expect(c.state.getSnapshot().ready).toBe(true));
+      }
+      return c;
+    };
+    try {
+      (await open('a', 'alice')).destroy();
+      (await open('b', 'bob')).destroy();
+      // Offline in realm a: the order is written for a's user, not b's.
+      const again = await open('a', null);
+      expect(again.send('order', { id: 7 }, { offline: true })).toBe('queued');
+      const stored = new OfflineQueue({ ...CONFIG, dbName: queueOf('a') });
+      await stored.initialize();
+      await vi.waitFor(async () => expect(await stored.getAll()).toHaveLength(1));
+      expect((await stored.getAll())[0].owner).toBe('alice');
+      stored.destroy();
+      const ws = FakeWebSocket.last();
+      ws.serverOpen();
+      ws.serverSend(serverReadyMessage({ user_id: 'alice' }));
+      await vi.waitFor(() => expect(ws.appTextMessages().filter((m) => m.t === 'order')).toHaveLength(1));
+    } finally {
+      await dropDb(queueOf('a'));
+      await dropDb(queueOf('b'));
+      localStorage.clear();
+    }
+  });
+});
+
+describe('a stored message that went', () => {
+  it('and could not be removed is not sent again, and the failure is said', async () => {
+    const stored = new OfflineQueue({ ...CONFIG, dbName: SCOPE });
+    await stored.initialize();
+    expect(await stored.enqueue({ t: 'order', p: { id: 1 }, id: 'order-1' } as any)).toBe(true);
+    stored.destroy();
+
+    // The transaction of its first removal is cut off.
+    let cut = false;
+    const remove = IDBObjectStore.prototype.delete;
+    vi.spyOn(IDBObjectStore.prototype, 'delete').mockImplementation(function (this: IDBObjectStore, key) {
+      const request = remove.call(this, key);
+      if (key === 'order-1' && !cut) {
+        cut = true;
+        this.transaction.abort();
+      }
+      return request;
+    });
+
+    const c = client({ consumer: 'checkout' });
+    const errors: any[] = [];
+    c.on('wseStorageError', (detail) => errors.push(detail));
+    c.retain();
+    await vi.waitFor(() => expect(c.state.getSnapshot().storage).toBe('durable'));
+    const ws = FakeWebSocket.last();
+    ws.serverOpen();
+    ws.serverSend(serverReadyMessage());
+    await vi.waitFor(() => expect(errors).toMatchObject([{ operation: 'remove' }]));
+    // Removed when tried again, a moment later; it went once.
+    await vi.waitFor(
+      async () => {
+        const check = new OfflineQueue({ ...CONFIG, dbName: SCOPE });
+        await check.initialize();
+        const left = await check.getAll();
+        check.destroy();
+        expect(left).toEqual([]);
+      },
+      { timeout: 5_000, interval: 200 },
+    );
+    expect(ws.appTextMessages().filter((m) => m.t === 'order')).toHaveLength(1);
+  });
+
+  it('and could not be removed is not sent again after a pause either', async () => {
+    const stored = new OfflineQueue({ ...CONFIG, dbName: SCOPE });
+    await stored.initialize();
+    expect(await stored.enqueue({ t: 'order', p: { id: 1 }, id: 'order-1' } as any)).toBe(true);
+    stored.destroy();
+
+    // Removal fails until the test lets it through.
+    let failing = true;
+    const remove = OfflineQueue.prototype.remove;
+    vi.spyOn(OfflineQueue.prototype, 'remove').mockImplementation(async function (this: OfflineQueue, ids: string[]) {
+      if (failing) throw new DOMException('the write was cut off', 'AbortError');
+      return remove.call(this, ids);
+    });
+
+    const c = client({ consumer: 'checkout' });
+    c.retain();
+    await vi.waitFor(() => expect(c.state.getSnapshot().storage).toBe('durable'));
+    const first = FakeWebSocket.last();
+    first.serverOpen();
+    first.serverSend(serverReadyMessage());
+    await vi.waitFor(() => expect(first.appTextMessages().filter((m) => m.t === 'order')).toHaveLength(1));
+
+    c.pause('manual');
+    c.resume('manual');
+    await vi.waitFor(() => expect(FakeWebSocket.last()).not.toBe(first));
+    const second = FakeWebSocket.last();
+    second.serverOpen();
+    second.serverSend(serverReadyMessage());
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    failing = false;
+    await vi.waitFor(
+      async () => {
+        const check = new OfflineQueue({ ...CONFIG, dbName: SCOPE });
+        await check.initialize();
+        const left = await check.getAll();
+        check.destroy();
+        expect(left).toEqual([]);
+      },
+      { timeout: 5_000, interval: 200 },
+    );
+    expect(second.appTextMessages().filter((m) => m.t === 'order')).toEqual([]);
+  });
+});
+
 describe('a storage that fails', () => {
   it('says so when the database cannot be opened', async () => {
     vi.spyOn(indexedDB, 'open').mockImplementation(() => {

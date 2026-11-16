@@ -36,6 +36,7 @@ import {
   memoryStorage,
   namespacedStorage,
   scopedStorage,
+  scopeOf,
   type ClientContext,
   type ClientStorage,
 } from './context.js';
@@ -217,13 +218,16 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
   // The durable queue's scope: the storage's namespace, the consumer and the
   // realm. Without a consumer nothing is persisted.
   const offlineDatabase = consumer && base.offlineDatabase ? `${base.offlineDatabase}:${consumer}@${realm ?? ''}` : null;
-  const storage = scopedStorage(base, offlineDatabase);
+  // What it keeps is its consumer's in its realm: another realm (staging
+  // beside production) or consumer in the same namespace keeps its own.
+  const storage = scopedStorage(base, offlineDatabase, scopeOf(consumer, realm));
   const ctx: ClientContext = createClientContext({
     emit,
     storage,
     delivery: {
       hold: (message) => delivery.hold(message),
       recoveryPositions: (topics) => delivery.recoveryPositions(topics),
+      continuous: (topics) => delivery.continuous(topics),
     },
     leaseHolder: offlineDatabase ? generateId() : undefined,
   });
@@ -242,18 +246,6 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
   const topicShares = new Map<string, number>();
   const messageListeners = new Map<string, Set<(message: WSMessage) => void>>();
   for (const topic of uniqueTopics(options.topics)) topicShares.set(topic, 1);
-  // Sends that wait for topics to be continuous (requires), in order: each
-  // of the user it was made for (the owner generation), and its size, which
-  // counts against the memory limit with what is queued.
-  const waiting: Array<{
-    type: string;
-    payload: unknown;
-    options: MessageOptions;
-    expiresAt?: number;
-    owner: number;
-    bytes: number;
-  }> = [];
-  let waitingBytes = 0;
   // The snapshot is read only once everything below exists.
   let wired = false;
 
@@ -265,7 +257,8 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     changed: () => {
       if (!wired) return;
       notifySnapshot();
-      flushWaiting();
+      // Sends that require topics may go now.
+      live()?.processor.flushSoon();
     },
     storage,
   });
@@ -435,77 +428,14 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
 
   const send = (type: string, payload: unknown, sendOptions: MessageOptions = {}): SendStatus => {
     if (done) return 'dropped';
+    // One that requires topics waits in the queue until they are continuous
+    // (the queue checks right before it goes); a live one cannot wait.
     const required = sendOptions.requires;
-    if (required && required.length > 0 && !delivery.continuous(required)) {
-      if (sendOptions.live) {
-        logger.warn(`${type} not sent: ${required.join(', ')} not continuous, and a live message cannot wait`);
-        return 'dropped';
-      }
-      dropForeignWaiting();
-      if (waiting.length >= performance.maxQueueSize) return 'dropped';
-      let bytes: number;
-      try {
-        bytes = JSON.stringify(buildMessage(type, payload, sendOptions)).length;
-      } catch (error) {
-        logger.error(`${type} not sent: it cannot be serialised:`, error);
-        return 'dropped';
-      }
-      const queue = ctx.queue.getState();
-      if (queue.memoryLimit > 0 && queue.bytes + waitingBytes + bytes > queue.memoryLimit) {
-        logger.warn(`${type} not sent: waiting, it would pass the memory limit (${queue.memoryLimit} bytes)`);
-        return 'dropped';
-      }
-      waiting.push({
-        type,
-        payload,
-        options: sendOptions,
-        expiresAt: expiryOf(sendOptions),
-        owner: ctx.owner.current(),
-        bytes,
-      });
-      waitingBytes += bytes;
-      return 'queued';
+    if (sendOptions.live && required && required.length > 0 && !delivery.continuous(required)) {
+      logger.warn(`${type} not sent: ${required.join(', ')} not continuous, and a live message cannot wait`);
+      return 'dropped';
     }
     return sendNow(type, payload, sendOptions);
-  };
-
-  /** Waiting sends of a user the client no longer has go: never out as another's. */
-  const dropForeignWaiting = () => {
-    const owner = ctx.owner.current();
-    for (let i = 0; i < waiting.length; ) {
-      if (waiting[i].owner === owner) {
-        i++;
-        continue;
-      }
-      const [entry] = waiting.splice(i, 1);
-      waitingBytes -= entry.bytes;
-      logger.warn(`${entry.type} not sent: it was made for the previous user`);
-    }
-  };
-
-  /** Sends that waited for their topics, once each topic is continuous; late ones go. */
-  const flushWaiting = () => {
-    if (waiting.length === 0 || done) return;
-    // Checked right before each one goes on: the user may have changed.
-    dropForeignWaiting();
-    const now = Date.now();
-    for (let i = 0; i < waiting.length; ) {
-      const entry = waiting[i];
-      if (entry.expiresAt !== undefined && entry.expiresAt <= now) {
-        waiting.splice(i, 1);
-        waitingBytes -= entry.bytes;
-        logger.warn(`${entry.type} not sent: it waited past its ttl`);
-        continue;
-      }
-      if (!delivery.continuous(entry.options.requires ?? [])) {
-        i++;
-        continue;
-      }
-      waiting.splice(i, 1);
-      // Its bytes move to the queue's count as it goes on.
-      waitingBytes -= entry.bytes;
-      sendNow(entry.type, entry.payload, entry.options);
-    }
   };
 
   const sendNow = (type: string, payload: unknown, sendOptions: MessageOptions): SendStatus => {
@@ -535,6 +465,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
       bytes: queue.memoryLimit > 0 ? JSON.stringify(message).length : undefined,
       expiresAt: expiryOf(sendOptions),
       owner: ctx.owner.current(),
+      requires: sendOptions.requires && sendOptions.requires.length > 0 ? sendOptions.requires : undefined,
     });
     return ok ? 'queued' : 'dropped';
   };
@@ -569,8 +500,6 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     }
     stop();
     stopListeningToPage();
-    waiting.length = 0;
-    waitingBytes = 0;
     if (clear) delivery.forget();
     delivery.close();
     ctx.state.getState().clearTimers();

@@ -19,7 +19,11 @@ import {
 export interface MessageQueueStore extends MessageQueueState {
   // Actions
   enqueue: (message: QueuedMessage) => boolean;
-  dequeue: (count?: number) => QueuedMessage[];
+  /**
+   * The first `count` messages, by priority then age, of those `eligible`
+   * takes; the others stay queued in their place.
+   */
+  dequeue: (count?: number, eligible?: (message: QueuedMessage) => boolean) => QueuedMessage[];
   /**
    * Put messages that were dequeued but could not be sent back into the
    * queue. They keep their priority and timestamp, so they come out first
@@ -154,7 +158,7 @@ export const createQueueState: StateCreator<MessageQueueStore> = (set, get) => {
     return true;
   },
 
-  dequeue: (count = 1) => {
+  dequeue: (count = 1, eligible) => {
     const state = get();
 
     const sorted = [...state.messages].sort((a, b) => {
@@ -164,8 +168,19 @@ export const createQueueState: StateCreator<MessageQueueStore> = (set, get) => {
       return a.timestamp - b.timestamp;
     });
 
-    const dequeued = sorted.slice(0, count);
-    const remaining = sorted.slice(count);
+    let dequeued: QueuedMessage[];
+    let remaining: QueuedMessage[];
+    if (eligible) {
+      dequeued = [];
+      remaining = [];
+      for (const m of sorted) {
+        if (dequeued.length < count && eligible(m)) dequeued.push(m);
+        else remaining.push(m);
+      }
+    } else {
+      dequeued = sorted.slice(0, count);
+      remaining = sorted.slice(count);
+    }
 
     if (dequeued.length > 0) {
       const now = Date.now();

@@ -23,7 +23,7 @@
 
 import type { WSMessage } from '../types.js';
 import type { TopicPosition } from '../services/EventSequencer.js';
-import type { ClientStorage } from './context.js';
+import { CHECKPOINT_KEY, type ClientStorage } from './context.js';
 import { logger } from '../utils/logger.js';
 
 export type DeliveryMode = 'best-effort' | 'recover-or-resync';
@@ -133,7 +133,6 @@ const DEFAULT_MAX_HELD = 10_000;
 const MAX_AHEAD = 10_000;
 const RETRY_FIRST_MS = 1_000;
 const RETRY_MAX_MS = 30_000;
-const CHECKPOINT_KEY = 'checkpoint';
 /** Reasons that concern what came before the topic's subscription: the coming resync covers them. */
 const BEFORE_SUBSCRIPTION: ReadonlySet<ContinuityReason> = new Set(['not_recovered', 'epoch_changed']);
 
@@ -195,7 +194,7 @@ export class Delivery {
     this.pending =
       this.options.checkpoint !== undefined
         ? this.options.checkpoint
-        : hooks.storage.get(this.storageKey());
+        : hooks.storage.get(CHECKPOINT_KEY);
   }
 
   private get barrier(): boolean {
@@ -471,9 +470,6 @@ export class Delivery {
     this.hooks.emit('wseCheckpointRejected', { reason });
   }
 
-  private storageKey(): string {
-    return `${CHECKPOINT_KEY}:${this.consumer ?? ''}`;
-  }
 
   private schedulePersist(): void {
     if (this.persistScheduled || this.closed) return;
@@ -485,7 +481,7 @@ export class Delivery {
   }
 
   private persist(): void {
-    this.hooks.storage.set(this.storageKey(), this.checkpoint());
+    this.hooks.storage.set(CHECKPOINT_KEY, this.checkpoint());
   }
 
   // -- resyncs ---------------------------------------------------------------------

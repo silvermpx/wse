@@ -260,6 +260,46 @@ describe('recover-or-resync', () => {
     expect(saved.topics).toEqual({});
   });
 
+  it('of one user in two realms are kept apart', async () => {
+    const rejected: unknown[] = [];
+    const open = async (realm: string) => {
+      const { answers, resync } = resyncs();
+      const c = client({
+        storage: 'realm-check:alice',
+        realm,
+        topics: ['prices'],
+        consumer: 'board',
+        delivery: { mode: 'recover-or-resync', resync },
+      });
+      c.on('wseCheckpointRejected', (detail) => rejected.push({ realm, detail }));
+      c.onMessage('price_update', (m) => c.commit(m));
+      c.retain();
+      await tick();
+      const ws = FakeWebSocket.last();
+      await connectServer(ws, { user_id: 'alice' });
+      await send(ws, reply(['prices']));
+      answers[0].resolve();
+      await tick();
+      return { c, ws };
+    };
+    try {
+      const production = await open('production');
+      await send(production.ws, stamped('prices', 7));
+      expect(JSON.parse(production.c.checkpoint()).topics).toEqual({ prices: { [EPOCH]: 7 } });
+      production.c.destroy();
+      const staging = await open('staging');
+      await send(staging.ws, stamped('prices', 2, '0000000b'));
+      expect(JSON.parse(staging.c.checkpoint()).topics).toEqual({ prices: { '0000000b': 2 } });
+      staging.c.destroy();
+
+      const again = await open('production');
+      expect(rejected).toEqual([]);
+      expect(JSON.parse(again.c.checkpoint()).topics).toEqual({ prices: { [EPOCH]: 7 } });
+    } finally {
+      localStorage.clear();
+    }
+  });
+
   it('a checkpoint of another consumer is refused aloud and recovers nothing', async () => {
     const { resync } = resyncs();
     const theirs = JSON.stringify({ v: 1, realm: URL, user: 'alice', consumer: 'audit', schema: null, topics: { prices: { [EPOCH]: 9 } } });
@@ -385,6 +425,61 @@ describe('sends that wait for their topics', () => {
     expect(c.state.getSnapshot().topicStates.prices.continuity).toBe('continuous');
     expect(bob.messagesOfType('order')).toEqual([]);
     expect(alice.messagesOfType('order')).toEqual([]);
+  });
+
+  it('kept in the queue wait for their topics again after a reconnect', async () => {
+    const { answers, resync } = resyncs();
+    const c = client({
+      topics: ['prices'],
+      consumer: 'board',
+      delivery: { mode: 'recover-or-resync', resync },
+      rateLimit: { capacity: 2, refillRate: 1 },
+    });
+    c.retain();
+    await tick();
+    const first = FakeWebSocket.last();
+    await connectServer(first);
+    await send(first, reply(['prices']));
+    answers[0].resolve();
+    await tick();
+    expect(c.state.getSnapshot().topicStates.prices.continuity).toBe('continuous');
+    // The rate limit is spent: the order waits in the queue.
+    c.send('note', {});
+    expect(c.send('order', { id: 1 }, { requires: ['prices'] })).toBe('queued');
+    expect(first.messagesOfType('order')).toHaveLength(0);
+
+    c.pause('manual');
+    await tick();
+    c.resume('manual');
+    await tick();
+    const second = FakeWebSocket.last();
+    expect(second).not.toBe(first);
+    await connectServer(second);
+    // The rate limit fills up again; prices is not continuous on this connection yet.
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(c.state.getSnapshot().topicStates.prices.continuity).not.toBe('continuous');
+    expect(second.messagesOfType('order')).toHaveLength(0);
+
+    await send(second, reply(['prices']));
+    answers[answers.length - 1].resolve();
+    await tick();
+    expect(second.messagesOfType('order')).toHaveLength(1);
+  });
+
+  it('share the memory limit with the other sends, whichever came first', () => {
+    const { resync } = resyncs();
+    const options = {
+      topics: ['news'],
+      consumer: 'board',
+      delivery: { mode: 'recover-or-resync' as const, resync },
+      performance: { memoryLimit: 500 },
+    };
+    const waitingFirst = client(options);
+    expect(waitingFirst.send('note', { text: 'a'.repeat(190) }, { requires: ['news'] })).toBe('queued');
+    expect(waitingFirst.send('note', { text: 'b'.repeat(190) })).toBe('dropped');
+    const ordinaryFirst = client(options);
+    expect(ordinaryFirst.send('note', { text: 'b'.repeat(190) })).toBe('queued');
+    expect(ordinaryFirst.send('note', { text: 'a'.repeat(190) }, { requires: ['news'] })).toBe('dropped');
   });
 
   it('count against the memory limit with what is queued', async () => {
