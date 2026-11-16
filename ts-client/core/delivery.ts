@@ -79,12 +79,8 @@ export interface DeliveryOptions {
    * best-effort, called after a break while messages keep coming.
    */
   resync?: (request: ResyncRequest) => Promise<ResyncResult | void> | ResyncResult | void;
-  /** The one consumer that commits, by a stable name: required by recover-or-resync. */
-  consumer?: string;
   /** The application's data schema: a checkpoint of another schema is refused. */
   schema?: string;
-  /** The server's realm (default: the first endpoint): a checkpoint of another is refused. */
-  realm?: string;
   /** The checkpoint the application saved last (client.checkpoint()); default: the client's storage. */
   checkpoint?: string | null;
   /** Messages a topic holds while it resyncs (default 10,000); more starts the resync over. */
@@ -143,8 +139,11 @@ const BEFORE_SUBSCRIPTION: ReadonlySet<ContinuityReason> = new Set(['not_recover
 
 const CONTINUOUS = Object.freeze({ subscription: 'requested', continuity: 'continuous', reason: null }) as TopicState;
 
-/** Validates the options of a client: an unknown mode, or recover-or-resync without what it needs, throws. */
-export function checkDeliveryOptions(options: DeliveryOptions | undefined): void {
+/**
+ * Validates the options of a client: an unknown mode, or recover-or-resync
+ * without a resync handler or a consumer, throws.
+ */
+export function checkDeliveryOptions(options: DeliveryOptions | undefined, consumer: string | undefined): void {
   const mode = options?.mode ?? 'best-effort';
   if (mode !== 'best-effort' && mode !== 'recover-or-resync') {
     throw new Error(`delivery.mode '${String(mode)}' is not one of 'best-effort' and 'recover-or-resync'`);
@@ -153,8 +152,8 @@ export function checkDeliveryOptions(options: DeliveryOptions | undefined): void
     if (typeof options?.resync !== 'function') {
       throw new Error("delivery.mode 'recover-or-resync' needs a delivery.resync handler");
     }
-    if (typeof options?.consumer !== 'string' || options.consumer === '') {
-      throw new Error("delivery.mode 'recover-or-resync' needs a delivery.consumer name");
+    if (typeof consumer !== 'string' || consumer === '') {
+      throw new Error("delivery.mode 'recover-or-resync' needs the client's consumer name");
     }
   }
 }
@@ -179,13 +178,20 @@ export class Delivery {
   private realm: string | null;
   private closed = false;
 
-  constructor(options: DeliveryOptions | undefined, realm: string | null, hooks: DeliveryHooks) {
-    checkDeliveryOptions(options);
+  private readonly consumer: string | null;
+
+  constructor(
+    options: DeliveryOptions | undefined,
+    scope: { consumer: string | null; realm: string | null },
+    hooks: DeliveryHooks,
+  ) {
+    checkDeliveryOptions(options, scope.consumer ?? undefined);
     this.options = options ?? {};
     this.mode = this.options.mode ?? 'best-effort';
     this.hooks = hooks;
     this.maxHeld = Math.max(1, this.options.maxHeld ?? DEFAULT_MAX_HELD);
-    this.realm = this.options.realm ?? realm;
+    this.consumer = scope.consumer;
+    this.realm = scope.realm;
     this.pending =
       this.options.checkpoint !== undefined
         ? this.options.checkpoint
@@ -379,7 +385,7 @@ export class Delivery {
       v: 1,
       realm: this.realm,
       user: this.hooks.user(),
-      consumer: this.options.consumer ?? null,
+      consumer: this.consumer,
       schema: this.options.schema ?? null,
       topics,
     };
@@ -428,7 +434,7 @@ export class Delivery {
           ? 'realm'
           : (saved.user ?? null) !== this.hooks.user()
             ? 'user'
-            : (saved.consumer ?? null) !== (this.options.consumer ?? null)
+            : (saved.consumer ?? null) !== (this.consumer)
               ? 'consumer'
               : (saved.schema ?? null) !== (this.options.schema ?? null)
                 ? 'schema'
@@ -453,7 +459,7 @@ export class Delivery {
   }
 
   private storageKey(): string {
-    return `${CHECKPOINT_KEY}:${this.options.consumer ?? ''}`;
+    return `${CHECKPOINT_KEY}:${this.consumer ?? ''}`;
   }
 
   private schedulePersist(): void {

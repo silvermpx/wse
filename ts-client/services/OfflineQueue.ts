@@ -1,6 +1,12 @@
 // =============================================================================
 // WebSocket Engine - Offline Queue (IndexedDB)
 // =============================================================================
+//
+// Messages kept while there is no connection, in one IndexedDB database per
+// scope. Clients of one scope (tabs) may all write to it; with a lease only
+// the client holding it replays it, and the others are busy until it lets go
+// or stops renewing. What fails (the database cannot be opened, a write over
+// the quota, another tab upgrading it) is reported, not swallowed.
 
 import type { WSMessage } from '../types.js';
 import { logger } from '../utils/logger.js';
@@ -12,7 +18,15 @@ export interface OfflineQueueConfig {
   persistToStorage: boolean;
   /** The IndexedDB database. Default `wse_offline_queue` (the default client's). */
   dbName?: string;
+  /** What failed, and why: the client reports it to the application. */
+  onError?: (operation: OfflineOperation, error: unknown) => void;
 }
+
+/** What the queue was doing when its storage failed. */
+export type OfflineOperation = 'open' | 'blocked' | 'closed' | 'write' | 'read' | 'claim' | 'lease';
+
+/** How long a lease holds without renewal: a client that stopped is replaced after it. */
+export const LEASE_TTL_MS = 15_000;
 
 /** One persisted message. `message` is the complete wire message (cid/enc kept). */
 export interface OfflineRecord {
@@ -66,6 +80,9 @@ function toRecord(raw: any): OfflineRecord | null {
   return null;
 }
 
+const LEASE_STORE = 'lease';
+const LEASE_KEY = 'owner';
+
 export class OfflineQueue {
   private dbName = 'wse_offline_queue';
   private storeName = 'messages';
@@ -85,24 +102,43 @@ export class OfflineQueue {
     if (!this.config.enabled || !this.config.persistToStorage) return;
     if (typeof indexedDB === 'undefined') return;
 
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open(this.dbName, 1);
+    let db: IDBDatabase;
+    try {
+      db = await new Promise<IDBDatabase>((resolve, reject) => {
+        // Version 2 adds the lease; the upgrade runs in one transaction.
+        const request = indexedDB.open(this.dbName, 2);
 
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => resolve(request.result);
+        // Another tab holds the old version open: the upgrade waits for it.
+        request.onblocked = () => this.report('blocked', request.error ?? new Error('another tab holds the database'));
 
-      request.onupgradeneeded = (event) => {
-        const upgraded = (event.target as IDBOpenDBRequest).result;
-        if (!upgraded.objectStoreNames.contains(this.storeName)) {
-          const store = upgraded.createObjectStore(this.storeName, { keyPath: 'id' });
-          store.createIndex('timestamp', 'timestamp');
-          // Kept for schema compatibility with 2.x databases; not read any more
-          // (records never carried a 'priority' field, so reading through this
-          // index returned nothing and the queue never replayed).
-          store.createIndex('priority', 'priority');
-        }
-      };
-    });
+        request.onupgradeneeded = (event) => {
+          const upgraded = (event.target as IDBOpenDBRequest).result;
+          if (!upgraded.objectStoreNames.contains(this.storeName)) {
+            const store = upgraded.createObjectStore(this.storeName, { keyPath: 'id' });
+            store.createIndex('timestamp', 'timestamp');
+            // Kept for schema compatibility with 2.x databases; not read any more
+            // (records never carried a 'priority' field, so reading through this
+            // index returned nothing and the queue never replayed).
+            store.createIndex('priority', 'priority');
+          }
+          if (!upgraded.objectStoreNames.contains(LEASE_STORE)) {
+            upgraded.createObjectStore(LEASE_STORE);
+          }
+        };
+      });
+    } catch (error) {
+      this.report('open', error);
+      throw error;
+    }
+    // Another tab upgrades the database: this connection lets it.
+    db.onversionchange = () => {
+      db.close();
+      if (this.db === db) this.db = null;
+      this.leased = false;
+      this.report('closed', new Error('another tab upgraded the database'));
+    };
 
     this.db = db;
     // What a page left behind longer ago than maxAge goes before anything
@@ -114,6 +150,74 @@ export class OfflineQueue {
   /** True when messages can be persisted (IndexedDB open and the queue enabled). */
   isAvailable(): boolean {
     return this.config.enabled && this.db !== null;
+  }
+
+  private report(operation: OfflineOperation, error: unknown): void {
+    logger.warn(`Offline queue: ${operation} failed:`, error);
+    try {
+      this.config.onError?.(operation, error);
+    } catch {
+      // the listener's own failure is its own
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // The lease: one client of the scope replays
+  // ---------------------------------------------------------------------------
+
+  /** Whether this queue replays: no lease is used, or this client holds it. */
+  private leased = false;
+  private leasing = false;
+
+  /**
+   * Take or renew the lease for `holder`, in one transaction: true when it
+   * is free, run out or this holder's. From then on only claim() of the
+   * holder takes messages out.
+   */
+  async acquire(holder: string): Promise<boolean> {
+    this.leasing = true;
+    const db = this.db;
+    if (!db) return (this.leased = false);
+    try {
+      const tx = db.transaction([LEASE_STORE], 'readwrite');
+      const store = tx.objectStore(LEASE_STORE);
+      const done = transactionDone(tx);
+      let taken = false;
+      const read = store.get(LEASE_KEY);
+      read.onsuccess = () => {
+        const lease = read.result as { holder: string; expiresAt: number } | undefined;
+        const now = Date.now();
+        if (!lease || lease.holder === holder || lease.expiresAt <= now) {
+          store.put({ holder, expiresAt: now + LEASE_TTL_MS }, LEASE_KEY);
+          taken = true;
+        }
+      };
+      await done;
+      this.leased = taken;
+    } catch (error) {
+      this.report('lease', error);
+      this.leased = false;
+    }
+    return this.leased;
+  }
+
+  /** Let the lease go, when `holder` has it. */
+  async release(holder: string): Promise<void> {
+    const db = this.db;
+    this.leased = false;
+    if (!db) return;
+    try {
+      const tx = db.transaction([LEASE_STORE], 'readwrite');
+      const store = tx.objectStore(LEASE_STORE);
+      const done = transactionDone(tx);
+      const read = store.get(LEASE_KEY);
+      read.onsuccess = () => {
+        if ((read.result as { holder?: string } | undefined)?.holder === holder) store.delete(LEASE_KEY);
+      };
+      await done;
+    } catch (error) {
+      this.report('lease', error);
+    }
   }
 
   /**
@@ -156,6 +260,9 @@ export class OfflineQueue {
       tx.oncomplete = () => resolve(written);
       tx.onerror = () => reject(tx.error);
       tx.onabort = () => reject(tx.error);
+    }).catch((error) => {
+      this.report('write', error);
+      throw error;
     });
     await this.refreshSize();
     if (!stored) logger.warn(`Offline queue full (${maxSize}), message not persisted`);
@@ -198,7 +305,17 @@ export class OfflineQueue {
    */
   async claim(limit: number): Promise<OfflineRecord[]> {
     if (!this.db) return [];
+    // Under a lease only its holder replays.
+    if (this.leasing && !this.leased) return [];
+    try {
+      return await this.take(limit);
+    } catch (error) {
+      this.report('claim', error);
+      throw error;
+    }
+  }
 
+  private async take(limit: number): Promise<OfflineRecord[]> {
     await this.cleanup();
     if (!this.db) return [];
     const tx = this.db.transaction([this.storeName], 'readwrite');

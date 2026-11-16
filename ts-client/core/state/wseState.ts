@@ -21,6 +21,7 @@ import {
   PerformanceMetrics,
   SecurityInfo,
   SubscriptionInfo,
+  StorageState,
   OfflineQueueStats,
   TopicRecoveryPosition,
 } from '../../types.js';
@@ -36,6 +37,7 @@ export interface WSEStore extends WSEState {
   // Actions - Connection
   setConnectionState: (state: ConnectionState) => void;
   setTransportReady: (ready: boolean) => void;
+  setStorageState: (state: StorageState) => void;
   setActiveEndpoint: (endpoint: string | null) => void;
   setPreferredEndpoint: (endpoint: string | null) => void;
   updateEndpoint: (endpoint: string, updates: Partial<ConnectionInfo>) => void;
@@ -196,6 +198,7 @@ const initialSubscriptions: SubscriptionInfo = {
 const initialState: WSEState = {
   // Connection
   connectionState: ConnectionState.PENDING,
+  storageState: 'memory',
   transportReady: false,
   activeEndpoint: null,
   preferredEndpoint: null,
@@ -260,6 +263,7 @@ export const createWSEState: StateCreator<WSEStore> = (set, get) => {
 
     // Connection Actions
   setTransportReady: (ready) => set((prev) => (prev.transportReady === ready ? prev : { transportReady: ready })),
+  setStorageState: (storageState) => set((prev) => (prev.storageState === storageState ? prev : { storageState })),
 
   setConnectionState: (state) => set((prev) => {
     if (prev.connectionState === state) {

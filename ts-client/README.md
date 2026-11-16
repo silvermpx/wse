@@ -47,9 +47,19 @@ client.signOut();                                        // the user's queue, to
 A client holds nothing of the page: two clients on one page share no state, and importing
 `wse-client/core` reads or changes nothing. It connects while any share (`retain()`) is held and
 stops when the last is released; `subscribe(topics)` holds topics the same way, and `onMessage` and
-`on` take any number of listeners. With `storage: 'myapp:alice'` it keeps its topics and offline
-queue in the page's storage under that name; by default it keeps them in memory. `destroy()` ends
-it and keeps what it stored; `signOut()` ends it and forgets the user.
+`on` take any number of listeners. With `storage: 'myapp:alice'` it keeps its topics in the page's
+storage under that name; by default it keeps them in memory. `destroy()` ends it and keeps what it
+stored; `signOut()` ends it and forgets the user.
+
+The offline queue is durable only for a part of the application named by a stable `consumer`
+(`consumer: 'checkout'`): it lives in an IndexedDB database of its own scope -- the storage name,
+the consumer and the realm (the first endpoint, or `realm`) -- so another server or another part of
+the application never reads it. Two clients of one scope (two tabs) may both write to it, but one at
+a time replays it: the other is `busy` until the first lets go or stops renewing its lease (15 s).
+`state.getSnapshot().storage` says where the queue lives (`memory`, `durable`, `busy`,
+`unavailable`), each change is a `wseStorage` event, and a storage that fails (a database that will
+not open, a full quota, another tab upgrading the database) is a `wseStorageError` event with the
+operation and the error's name, never silent.
 
 Outside browsers, a `webSocket` factory makes the socket, and may send headers (a token in
 `Authorization`).
@@ -430,9 +440,9 @@ until the application's handler brought its state up to date:
 const client = createWSEClient({
   endpoints: ['wss://example.com/wse'],
   storage: 'board:alice',
+  consumer: 'board',                   // the one consumer that commits
   delivery: {
     mode: 'recover-or-resync',
-    consumer: 'board',                 // the one consumer that commits
     schema: '3',                       // a checkpoint of another schema is refused
     resync: async ({ topics, reasons, committed, signal }) => {
       const state = await fetch(`/api/board?since=${JSON.stringify(committed)}`, { signal });
@@ -450,7 +460,7 @@ client.send('cancel', { id: 9 }, { requires: ['orders'] }); // goes once orders 
 ```
 
 The checkpoint is what the consumer committed, per stream only through what was applied without a
-hole. It is bound to the realm (the first endpoint, or `delivery.realm`), the user, the consumer
+hole. It is bound to the realm (the first endpoint, or `realm`), the user, the consumer
 and the schema; the client keeps it in its storage, and `client.checkpoint()` gives it to save with
 the application's own state (pass it back as `delivery.checkpoint`). A checkpoint of anything else
 is refused with a `wseCheckpointRejected` event. After a reconnect the recovery starts from it, so

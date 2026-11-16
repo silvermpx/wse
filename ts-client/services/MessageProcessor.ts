@@ -323,6 +323,11 @@ export class MessageProcessor {
     this.offlineQueue = queue;
   }
 
+  /** Something waits that can go now (the offline queue was taken over): flush. */
+  flushSoon(): void {
+    this.scheduleFlush(0);
+  }
+
   /** The server signing keys (base64) signed messages are checked against. */
   setServerSigningKeys(keys: string[] | undefined): void {
     this.serverSigningKeys = ServerSigningKeys.create(keys);

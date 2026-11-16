@@ -25,8 +25,17 @@ export {
   memoryStorage,
   namespacedStorage,
   prefixedStorage,
+  scopedStorage,
 } from './context.js';
-export type { ClientContext, ClientStorage, ContextOptions, Emit, OwnerGeneration } from './context.js';
+export type {
+  ClientContext,
+  ClientStorage,
+  ContextOptions,
+  Emit,
+  OwnerGeneration,
+  StorageErrorListener,
+  StorageOperation,
+} from './context.js';
 export type { WSEStore, InboundRecoveryPosition } from './state/wseState.js';
 export type { MessageQueueStore } from './state/queueState.js';
 

@@ -473,8 +473,18 @@ export interface SubscriptionInfo {
 // Store States
 // ---------------------------------------------------------------------------
 
+/**
+ * Where the offline queue lives: 'memory' (nothing persisted: no storage, or
+ * no consumer named), 'durable' (persisted, and this client replays it),
+ * 'busy' (persisted, and another client of the same scope replays it, until
+ * it lets go) or 'unavailable' (the storage failed: kept in memory).
+ */
+export type StorageState = 'memory' | 'durable' | 'busy' | 'unavailable';
+
 export interface WSEState {
   connectionState: ConnectionState;
+  /** Where the offline queue lives (a client of its own). */
+  storageState: StorageState;
   /**
    * The server took the connection and, when encryption is on, the keys are
    * agreed: messages go out now. False while the socket is merely open.

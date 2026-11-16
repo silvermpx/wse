@@ -48,6 +48,11 @@ export interface ClientContext {
   readonly storage: ClientStorage;
   /** A client of its own: its topics' delivery (core/delivery.ts). */
   readonly delivery?: DeliveryGate;
+  /**
+   * A client of its own with a durable queue: who it is to the lease of the
+   * queue's scope, which one client at a time holds and replays.
+   */
+  readonly leaseHolder?: string;
 }
 
 /** Where a client's delivery meets its services. */
@@ -106,28 +111,34 @@ export function deleteDatabase(name: string): void {
  * an offline database named `database` (null: none). `clear` removes the
  * keys that start with `prefix` and deletes the database.
  */
-export function prefixedStorage(prefix: string, database: string | null): ClientStorage {
-  const each = (run: (storage: Storage) => void) => {
+export function prefixedStorage(
+  prefix: string,
+  database: string | null,
+  onError?: StorageErrorListener,
+): ClientStorage {
+  const each = (operation: StorageOperation, run: (storage: Storage) => void) => {
     const storage = pageStorage();
     if (!storage) return;
     try {
       run(storage);
-    } catch {
-      // Storage full, blocked or gone: what is kept is a convenience.
+    } catch (error) {
+      // Storage full, blocked or gone: the client goes on without it, and
+      // whoever listens hears why.
+      onError?.(operation, error);
     }
   };
   return {
     get: (key) => {
       let value: string | null = null;
-      each((storage) => {
+      each('read', (storage) => {
         value = storage.getItem(prefix + key);
       });
       return value;
     },
-    set: (key, value) => each((storage) => storage.setItem(prefix + key, value)),
-    remove: (key) => each((storage) => storage.removeItem(prefix + key)),
+    set: (key, value) => each('write', (storage) => storage.setItem(prefix + key, value)),
+    remove: (key) => each('remove', (storage) => storage.removeItem(prefix + key)),
     clear: () => {
-      each((storage) => {
+      each('clear', (storage) => {
         const keys: string[] = [];
         for (let i = 0; i < storage.length; i++) {
           const key = storage.key(i);
@@ -147,14 +158,39 @@ export function prefixedStorage(prefix: string, database: string | null): Client
  * The namespace names the application and the user, so clients of other
  * users, or of the default client (`wse_` keys), are never read.
  */
-export function namespacedStorage(namespace: string): ClientStorage {
-  return prefixedStorage(`wse:${namespace}:`, `wse:${namespace}`);
+export function namespacedStorage(namespace: string, onError?: StorageErrorListener): ClientStorage {
+  return prefixedStorage(`wse:${namespace}:`, `wse:${namespace}`, onError);
+}
+
+/** What a client's storage was doing when it failed. */
+export type StorageOperation = 'read' | 'write' | 'remove' | 'clear';
+
+/** Hears a storage that failed: the client goes on without it. */
+export type StorageErrorListener = (operation: StorageOperation, error: unknown) => void;
+
+/**
+ * `base` with its offline queue in `database` (null: none, kept in memory):
+ * the queue's scope, a database of its own per consumer and realm. `clear`
+ * deletes that database too.
+ */
+export function scopedStorage(base: ClientStorage, database: string | null): ClientStorage {
+  return {
+    get: (key) => base.get(key),
+    set: (key, value) => base.set(key, value),
+    remove: (key) => base.remove(key),
+    clear: () => {
+      base.clear();
+      if (database) deleteDatabase(database);
+    },
+    offlineDatabase: database,
+  };
 }
 
 export interface ContextOptions {
   emit?: Emit;
   storage?: ClientStorage;
   delivery?: DeliveryGate;
+  leaseHolder?: string;
 }
 
 /** A context of its own: new stores, keys and owner. */
@@ -167,6 +203,7 @@ export function createClientContext(options: ContextOptions = {}): ClientContext
     emit: options.emit ?? (() => {}),
     storage: options.storage ?? memoryStorage(),
     delivery: options.delivery,
+    leaseHolder: options.leaseHolder,
   };
 }
 

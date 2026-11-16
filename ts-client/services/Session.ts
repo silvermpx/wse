@@ -20,6 +20,7 @@ import {
   ReconnectionStrategy,
   SecurityConfig,
   SendStatus,
+  StorageState,
   WSMessage,
   SignedMessageOptions,
 } from '../types.js';
@@ -39,6 +40,20 @@ import { MessageProcessor } from './MessageProcessor.js';
 import { NetworkMonitor } from './NetworkMonitor.js';
 import { AdaptiveQualityManager, QueryClientLike } from './AdaptiveQualityManager.js';
 import { OfflineQueue } from './OfflineQueue.js';
+
+/** A lease held is renewed this often (it runs out after LEASE_TTL_MS). */
+const LEASE_RENEW_MS = 5_000;
+/** A busy client asks for the lease again this often. */
+const LEASE_RETRY_MS = 2_000;
+
+/** What a client tells of a storage that failed: what it did, and the error's name. */
+export function storageErrorDetail(operation: string, error: unknown) {
+  const name = error instanceof Error || (typeof DOMException !== 'undefined' && error instanceof DOMException)
+    ? (error as Error).name
+    : 'Error';
+  const message = error instanceof Error ? error.message : String(error);
+  return { operation, name, message, quota: name === 'QuotaExceededError' };
+}
 import { EventSequencer, type TopicPosition } from './EventSequencer.js';
 import { EventHandlers } from '../handlers/EventHandlers.js';
 import { logger } from '../utils/logger.js';
@@ -400,18 +415,29 @@ export class WSESession {
 
     const offlineDatabase = this.ctx.storage.offlineDatabase;
     if (o.offline.enabled && o.offline.persistToStorage && offlineDatabase) {
-      const queue = new OfflineQueue({ ...o.offline, dbName: offlineDatabase });
+      const queue = new OfflineQueue({
+        ...o.offline,
+        dbName: offlineDatabase,
+        onError: (operation, error) => this.storageFailed(operation, error),
+      });
       try {
         await queue.initialize();
-      } catch (error) {
-        logger.warn('Offline queue unavailable:', error);
+      } catch {
+        // Reported by the queue; the messages stay in memory.
       }
       if (this.destroyed) {
         queue.destroy();
         return;
       }
-      this.offlineQueue = queue;
-      this.processor.setOfflineQueue(queue);
+      if (!queue.isAvailable()) {
+        if (typeof indexedDB !== 'undefined') this.setStorageState('unavailable');
+      } else {
+        this.offlineQueue = queue;
+        this.processor.setOfflineQueue(queue);
+        const holder = this.ctx.leaseHolder;
+        if (holder) await this.holdLease(queue, holder);
+        else this.setStorageState('durable');
+      }
     }
 
     this.networkMonitor = new NetworkMonitor(100, o.diagnostics.metricsInterval, o.diagnostics.enabled, this.ctx);
@@ -560,6 +586,40 @@ export class WSESession {
     if (!committed) return this.processor.getTopicPositions(topics);
     this.processor.rewindPositions(topics, committed);
     return committed;
+  }
+
+  // ---------------------------------------------------------------------------
+  // The durable queue's lease and storage
+  // ---------------------------------------------------------------------------
+
+  private leaseTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * Take the lease of the queue's scope and keep it, renewing it; while
+   * another client holds it this one is busy, and asks again now and then.
+   */
+  private async holdLease(queue: OfflineQueue, holder: string): Promise<void> {
+    if (this.destroyed) return;
+    const held = await queue.acquire(holder);
+    if (this.destroyed) return;
+    const before = this.ctx.state.getState().storageState;
+    this.setStorageState(held ? 'durable' : 'busy');
+    // Taken over: what waits in it goes out now.
+    if (held && before !== 'durable') this.processor.flushSoon();
+    this.leaseTimer = setTimeout(() => void this.holdLease(queue, holder), held ? LEASE_RENEW_MS : LEASE_RETRY_MS);
+  }
+
+  private setStorageState(state: StorageState): void {
+    const store = this.ctx.state.getState();
+    if (store.storageState === state) return;
+    store.setStorageState(state);
+    this.ctx.emit('wseStorage', { state });
+  }
+
+  private storageFailed(operation: string, error: unknown): void {
+    this.ctx.emit('wseStorageError', storageErrorDetail(operation, error));
+    // Another tab upgraded the database: this client cannot use it any more.
+    if (operation === 'closed' || operation === 'open') this.setStorageState('unavailable');
   }
 
   private sendSystem(type: string, payload: any, priority: MessagePriority = MessagePriority.HIGH): SendStatus {
@@ -783,7 +843,14 @@ export class WSESession {
     }
     this.networkMonitor = null;
 
+    if (this.leaseTimer) {
+      clearTimeout(this.leaseTimer);
+      this.leaseTimer = null;
+    }
     try {
+      // The lease goes first: another client of the scope takes over.
+      const holder = this.ctx.leaseHolder;
+      if (holder && this.offlineQueue) void this.offlineQueue.release(holder);
       this.offlineQueue?.destroy();
     } catch (error) {
       logger.error('Error destroying offline queue:', error);

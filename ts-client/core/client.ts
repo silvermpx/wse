@@ -14,6 +14,7 @@ import {
   MessagePriority,
   type MessageOptions,
   type SendStatus,
+  type StorageState,
   type SignedMessageOptions,
   type WSMessage,
 } from '../types.js';
@@ -25,6 +26,7 @@ import {
   buildMessage,
   expiryOf,
   resolveOptions,
+  storageErrorDetail,
   uniqueTopics,
   type DataOwner,
   type UseWSEConfig,
@@ -33,9 +35,11 @@ import {
   createClientContext,
   memoryStorage,
   namespacedStorage,
+  scopedStorage,
   type ClientContext,
   type ClientStorage,
 } from './context.js';
+import { generateId } from '../utils/id.js';
 import type { StoreApi } from './store.js';
 import type { WSEStore } from './state/wseState.js';
 import { Delivery, checkDeliveryOptions, type DeliveryOptions, type TopicState } from './delivery.js';
@@ -59,6 +63,18 @@ export interface WSEClientOptions extends UseWSEConfig {
   storage?: string | ClientStorage;
   /** Also dispatch the client's events on the page's window, as useWSE does. Default false. */
   windowEvents?: boolean;
+  /**
+   * This part of the application, by a stable name ('checkout'): what the
+   * client keeps durably is its. Without one nothing is persisted: the
+   * offline queue stays in memory. Required by recover-or-resync.
+   */
+  consumer?: string;
+  /**
+   * The server the client works with (default: the first endpoint): the
+   * durable queue and the checkpoint of another realm are never read.
+   * Name one realm for endpoints that are the same servers.
+   */
+  realm?: string;
   /**
    * How the topics' messages reach the application: 'best-effort' (default)
    * or 'recover-or-resync', where a topic that is not continuous holds its
@@ -85,6 +101,8 @@ export interface WSEClientSnapshot {
   readonly lastError: string | null;
   /** Each topic held: whether the server took it, and whether its messages run without a break. */
   readonly topicStates: Readonly<Record<string, TopicState>>;
+  /** Where the offline queue lives: memory, durable, busy (another client of the scope has it) or unavailable. */
+  readonly storage: StorageState;
 }
 
 export interface WSEClientState {
@@ -155,12 +173,13 @@ function shallowSame(a: WSEClientSnapshot, b: WSEClientSnapshot): boolean {
     a.endpoint === b.endpoint &&
     a.lastError === b.lastError &&
     a.topics === b.topics &&
-    a.topicStates === b.topicStates
+    a.topicStates === b.topicStates &&
+    a.storage === b.storage
   );
 }
 
 export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
-  checkDeliveryOptions(options.delivery);
+  checkDeliveryOptions(options.delivery, options.consumer);
   const auth = options.auth && options.auth.trim() !== '' ? options.auth : 'cookie';
   const listeners = new Map<string, Set<(detail: any) => void>>();
   // Made below; the services reach it only once the client runs.
@@ -187,10 +206,18 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     }
     if (options.windowEvents) dispatchWSEEvent(type, detail);
   };
-  const storage: ClientStorage =
+  const realm = options.realm ?? options.endpoints?.[0] ?? null;
+  const consumer = options.consumer && options.consumer !== '' ? options.consumer : null;
+  const base: ClientStorage =
     typeof options.storage === 'string'
-      ? namespacedStorage(options.storage)
+      ? namespacedStorage(options.storage, (operation, error) =>
+          emit('wseStorageError', storageErrorDetail(operation, error)),
+        )
       : (options.storage ?? memoryStorage());
+  // The durable queue's scope: the storage's namespace, the consumer and the
+  // realm. Without a consumer nothing is persisted.
+  const offlineDatabase = consumer && base.offlineDatabase ? `${base.offlineDatabase}:${consumer}@${realm ?? ''}` : null;
+  const storage = scopedStorage(base, offlineDatabase);
   const ctx: ClientContext = createClientContext({
     emit,
     storage,
@@ -198,6 +225,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
       hold: (message) => delivery.hold(message),
       recoveryPositions: (topics) => delivery.recoveryPositions(topics),
     },
+    leaseHolder: offlineDatabase ? generateId() : undefined,
   });
   // The queue's limits hold from the first send, before anything starts.
   const { performance } = resolveOptions(options);
@@ -219,7 +247,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
   // The snapshot is read only once everything below exists.
   let wired = false;
 
-  delivery = new Delivery(options.delivery, options.endpoints?.[0] ?? null, {
+  delivery = new Delivery(options.delivery, { consumer, realm }, {
     route: (message) => live()?.processor.routeHeld(message),
     received: (topic) => live()?.processor.getTopicPositions([topic])[topic]?.streams ?? {},
     user: () => dataOwner.userId,
@@ -243,6 +271,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     topics: s.activeTopics,
     lastError: s.lastError,
     topicStates: delivery.topicStates(),
+    storage: s.storageState,
   });
   let snapshot = snapshotOf(ctx.state.getState());
   const snapshotListeners = new Set<(snapshot: WSEClientSnapshot) => void>();

@@ -54,6 +54,15 @@
   being rounded. The Swift, Kotlin and Dart clients have the same states
   and delivery (`WseDelivery`): a `Resync` item asks the app for the state,
   `resynced(round)` hands on what was held.
+- TypeScript client of its own: the offline queue is durable only for a
+  named `consumer`, in an IndexedDB database of its scope (the storage
+  name, the consumer and the `realm`); clients of one scope (tabs) hold a
+  lease, so one at a time replays the queue and the others are `busy`
+  until it lets go. Where the queue lives is in the snapshot (`storage`) and
+  a `wseStorage` event; a storage that fails is a `wseStorageError` event
+  instead of being swallowed. The database moves to version 2 in one
+  transaction, its records kept; a tab holding the old version open is
+  reported, and a connection closes for another tab's upgrade.
 - Rust client: `pause(reason)` and `resume(reason)`, as in the TypeScript
   core client: the connection ends (what is queued goes out first) and no
   attempt is made while any reason holds; topics and positions stay, and

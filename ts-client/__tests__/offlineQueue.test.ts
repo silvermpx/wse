@@ -73,13 +73,61 @@ describe('OfflineQueue', () => {
     queue.destroy();
   });
 
+  it('takes a database of version 1 over, its records kept, and leases it', async () => {
+    await new Promise<void>((resolve, reject) => {
+      const open = indexedDB.open('wse_offline_queue', 1);
+      open.onupgradeneeded = () => {
+        const store = open.result.createObjectStore('messages', { keyPath: 'id' });
+        store.createIndex('timestamp', 'timestamp');
+        store.createIndex('priority', 'priority');
+      };
+      open.onsuccess = () => {
+        const db = open.result;
+        const tx = db.transaction(['messages'], 'readwrite');
+        tx.objectStore('messages').put({
+          id: 'old-1',
+          timestamp: Date.now() - 1_000,
+          retries: 0,
+          message: { id: 'old-1', t: 'chat', p: { n: 1 } },
+        });
+        tx.oncomplete = () => {
+          db.close();
+          resolve();
+        };
+        tx.onerror = () => reject(tx.error);
+      };
+      open.onerror = () => reject(open.error);
+    });
+
+    const queue = new OfflineQueue(CONFIG);
+    await queue.initialize();
+    try {
+      expect((await queue.getAll()).map((r) => r.id)).toEqual(['old-1']);
+      expect(await queue.acquire('a')).toBe(true);
+      const other = new OfflineQueue(CONFIG);
+      await other.initialize();
+      try {
+        // Held by another: this one does not replay.
+        expect(await other.acquire('b')).toBe(false);
+        expect(await other.claim(10)).toEqual([]);
+        await queue.release('a');
+        expect(await other.acquire('b')).toBe(true);
+        expect((await other.claim(10)).map((r) => r.id)).toEqual(['old-1']);
+      } finally {
+        other.destroy();
+      }
+    } finally {
+      queue.destroy();
+    }
+  });
+
   it('reads records in the 2.x layout', async () => {
     const queue = new OfflineQueue(CONFIG);
     await queue.initialize();
     queue.destroy();
 
     await new Promise<void>((resolve, reject) => {
-      const open = indexedDB.open('wse_offline_queue', 1);
+      const open = indexedDB.open('wse_offline_queue');
       open.onsuccess = () => {
         const db = open.result;
         const tx = db.transaction(['messages'], 'readwrite');
@@ -206,7 +254,7 @@ describe('the offline queue keeps its limits', () => {
 
   function putRaw(record: Record<string, unknown>): Promise<void> {
     return new Promise((resolve, reject) => {
-      const open = indexedDB.open('wse_offline_queue', 1);
+      const open = indexedDB.open('wse_offline_queue');
       open.onerror = () => reject(open.error);
       open.onsuccess = () => {
         const db = open.result;
@@ -255,7 +303,8 @@ describe('the offline queue keeps its limits', () => {
 });
 
 describe('two clients of one queue', () => {
-  const DB = 'wse:shop:alice';
+  // The scope of the queue: the storage namespace, the consumer and the realm.
+  const DB = `wse:shop:alice:checkout@${ENDPOINT}`;
 
   function dropDb(): Promise<void> {
     return new Promise((resolve) => {
@@ -276,7 +325,9 @@ describe('two clients of one queue', () => {
 
     // Two tabs of one application and user: the same storage namespace.
     const { createWSEClient } = await import('../core/index.js');
-    const tabs = [0, 1].map(() => createWSEClient({ endpoints: [ENDPOINT], storage: 'shop:alice' }));
+    const tabs = [0, 1].map(() =>
+      createWSEClient({ endpoints: [ENDPOINT], storage: 'shop:alice', consumer: 'checkout' }),
+    );
     for (const tab of tabs) tab.retain();
     await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
     const sockets = [...FakeWebSocket.instances];

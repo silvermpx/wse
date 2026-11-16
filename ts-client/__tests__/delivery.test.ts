@@ -128,16 +128,14 @@ describe('each topic', () => {
 
 describe('recover-or-resync', () => {
   it('is asked for with a resync handler and a consumer; an unknown mode is refused', () => {
-    expect(() => client({ delivery: { mode: 'recover-or-resync', consumer: 'orders' } as any })).toThrow(/resync/);
-    expect(() => client({ delivery: { mode: 'recover-or-resync', resync: async () => {} } as any })).toThrow(
-      /consumer/,
-    );
+    expect(() => client({ consumer: 'orders', delivery: { mode: 'recover-or-resync' } as any })).toThrow(/resync/);
+    expect(() => client({ delivery: { mode: 'recover-or-resync', resync: async () => {} } })).toThrow(/consumer/);
     expect(() => client({ delivery: { mode: 'strong' } as any })).toThrow(/mode/);
   });
 
   it('holds a topic from a cold start until the application resynced it', async () => {
     const { requests, answers, resync } = resyncs();
-    const c = client({ topics: ['prices'], delivery: { mode: 'recover-or-resync', consumer: 'board', resync } });
+    const c = client({ topics: ['prices'], consumer: 'board', delivery: { mode: 'recover-or-resync', resync } });
     const heard: number[] = [];
     c.onMessage('price_update', (m) => heard.push(m.p.offset));
     c.retain();
@@ -173,7 +171,7 @@ describe('recover-or-resync', () => {
 
   it('resyncs after every reconnect, recovering from what the application committed', async () => {
     const { requests, answers, resync } = resyncs();
-    const c = client({ topics: ['prices'], delivery: { mode: 'recover-or-resync', consumer: 'board', resync } });
+    const c = client({ topics: ['prices'], consumer: 'board', delivery: { mode: 'recover-or-resync', resync } });
     const heard: WSMessage[] = [];
     c.onMessage('price_update', (m) => heard.push(m));
     c.retain();
@@ -217,7 +215,7 @@ describe('recover-or-resync', () => {
 
   it('a stream from offset 0 is in the checkpoint only once something of it was applied', async () => {
     const { answers, resync } = resyncs();
-    const c = client({ topics: ['prices'], delivery: { mode: 'recover-or-resync', consumer: 'board', resync } });
+    const c = client({ topics: ['prices'], consumer: 'board', delivery: { mode: 'recover-or-resync', resync } });
     const heard: WSMessage[] = [];
     c.onMessage('price_update', (m) => heard.push(m));
     c.retain();
@@ -238,7 +236,7 @@ describe('recover-or-resync', () => {
     const theirs = JSON.stringify({ v: 1, realm: URL, user: 'alice', consumer: 'audit', schema: null, topics: { prices: { [EPOCH]: 9 } } });
     const c = client({
       topics: ['prices'],
-      delivery: { mode: 'recover-or-resync', consumer: 'board', resync, checkpoint: theirs },
+      consumer: 'board', delivery: { mode: 'recover-or-resync', resync, checkpoint: theirs },
     });
     const rejected: unknown[] = [];
     c.on('wseCheckpointRejected', (detail) => rejected.push(detail));
@@ -255,7 +253,7 @@ describe('recover-or-resync', () => {
     const ours = JSON.stringify({ v: 1, realm: URL, user: 'alice', consumer: 'board', schema: '2', topics: { prices: { [EPOCH]: 9 } } });
     const c = client({
       topics: ['prices'],
-      delivery: { mode: 'recover-or-resync', consumer: 'board', schema: '2', resync, checkpoint: ours },
+      consumer: 'board', delivery: { mode: 'recover-or-resync', schema: '2', resync, checkpoint: ours },
     });
     c.retain();
     await tick();
@@ -268,7 +266,7 @@ describe('recover-or-resync', () => {
 
   it('a send that needs a topic waits until the topic is continuous', async () => {
     const { answers, resync } = resyncs();
-    const c = client({ topics: ['prices'], delivery: { mode: 'recover-or-resync', consumer: 'board', resync } });
+    const c = client({ topics: ['prices'], consumer: 'board', delivery: { mode: 'recover-or-resync', resync } });
     c.retain();
     await tick();
     const ws = FakeWebSocket.last();
@@ -288,7 +286,7 @@ describe('recover-or-resync', () => {
     const { requests, answers, resync } = resyncs();
     const c = client({
       topics: ['prices'],
-      delivery: { mode: 'recover-or-resync', consumer: 'board', resync, maxHeld: 2 },
+      consumer: 'board', delivery: { mode: 'recover-or-resync', resync, maxHeld: 2 },
     });
     const heard: number[] = [];
     c.onMessage('price_update', (m) => heard.push(m.p.offset));
@@ -311,7 +309,7 @@ describe('recover-or-resync', () => {
 
   it('a resync that fails is tried again', async () => {
     const { requests, answers, resync } = resyncs();
-    const c = client({ topics: ['prices'], delivery: { mode: 'recover-or-resync', consumer: 'board', resync } });
+    const c = client({ topics: ['prices'], consumer: 'board', delivery: { mode: 'recover-or-resync', resync } });
     c.retain();
     await tick();
     const ws = FakeWebSocket.last();
