@@ -59,8 +59,17 @@ class WseAndroidTest {
         val client = connectClient(WseConfig(url = tlsUrl, trust = WseTrust.Roots(listOf(ca))))
         assertEquals(WseStatus.CONNECTED, client.status())
         client.disconnect(1_000u)
-        // Android's verifier (set up as the app started) and the Mozilla roots do not know that CA.
-        for (trust in listOf(WseTrust.Platform, WseTrust.Mozilla)) {
+        // Android's verifier (set up as the app started) knows that CA only where the device
+        // trusts it (run-emulator-tests.sh adds it to the CAs the owner added, which this app
+        // trusts); the Mozilla roots never do.
+        val deviceTrusts = arguments.getString("wseCaTrusted") == "1"
+        if (deviceTrusts) {
+            val trusted = connectClient(WseConfig(url = tlsUrl, reconnect = false, trust = WseTrust.Platform))
+            assertEquals(WseStatus.CONNECTED, trusted.status())
+            trusted.disconnect(1_000u)
+        }
+        val unknown = if (deviceTrusts) listOf(WseTrust.Mozilla) else listOf(WseTrust.Platform, WseTrust.Mozilla)
+        for (trust in unknown) {
             val error = assertFailsWith<WseException.Connect> {
                 connectClient(WseConfig(url = tlsUrl, reconnect = false, trust = trust))
             }

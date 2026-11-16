@@ -31,11 +31,27 @@ export WSE_TEST_IDENTITY WSE_TEST_SIGNING
 cd "$here"
 swift test
 if [[ "${SIMULATOR:-0}" == "1" ]]; then
-  device="$(xcrun simctl list devices available | grep -m1 -E 'iPhone' | sed -E 's/.*\(([0-9A-F-]{36})\).*/\1/')"
+  # A simulator of its own (an iPhone of the newest iOS installed), whose
+  # system trusts the run's CA: the system's verifier must connect there.
+  # Other simulators and the Mac's own trust are left as they are.
+  read -r kind runtime < <(xcrun simctl list devices available -j | python3 -c '
+import json, re, sys
+devices = json.load(sys.stdin)["devices"]
+version = lambda r: [int(n) for n in re.findall(r"\d+", r.rsplit(".", 1)[-1])]
+for runtime in sorted((r for r in devices if ".iOS-" in r), key=version, reverse=True):
+    for d in devices[runtime]:
+        if d.get("isAvailable") and d["name"].startswith("iPhone"):
+            print(d["deviceTypeIdentifier"], runtime)
+            sys.exit()
+sys.exit("no iPhone simulator")')
+  device="$(xcrun simctl create "WSE tests" "$kind" "$runtime")"
+  trap 'kill "$server" 2>/dev/null || true; xcrun simctl shutdown "${device:?}" 2>/dev/null || true; xcrun simctl delete "${device:?}" || true' EXIT
+  xcrun simctl boot "$device"
+  xcrun simctl keychain "$device" add-root-cert "$WSE_TEST_CA"
   # xcodebuild hands TEST_RUNNER_ variables to the tests, without the prefix.
   TEST_RUNNER_WSE_TEST_URL="$WSE_TEST_URL" TEST_RUNNER_WSE_TEST_TLS_URL="$WSE_TEST_TLS_URL" \
-    TEST_RUNNER_WSE_TEST_CA="$WSE_TEST_CA" TEST_RUNNER_WSE_TEST_IDENTITY="$WSE_TEST_IDENTITY" \
-    TEST_RUNNER_WSE_TEST_SIGNING="$WSE_TEST_SIGNING" \
+    TEST_RUNNER_WSE_TEST_CA="$WSE_TEST_CA" TEST_RUNNER_WSE_TEST_CA_TRUSTED=1 \
+    TEST_RUNNER_WSE_TEST_IDENTITY="$WSE_TEST_IDENTITY" TEST_RUNNER_WSE_TEST_SIGNING="$WSE_TEST_SIGNING" \
     xcodebuild test -scheme WseClient -destination "id=$device" -configuration "${CONFIGURATION:-Debug}" \
     ENABLE_TESTABILITY=YES
 fi

@@ -113,8 +113,16 @@ final class WseClientTests: XCTestCase {
         let client = try await WseClient.connect(WseConfig(url: tlsUrl, trust: .roots(certificates: [ca])))
         XCTAssertEqual(client.status(), .connected)
         await client.disconnect(deadlineMs: 1_000)
-        // The system's verifier and the Mozilla roots do not know that CA.
-        for trust in [WseTrust.platform, .mozilla] {
+        // The system's verifier knows that CA only where the system trusts it
+        // (run-tests.sh adds it to the simulator's trusted roots); the
+        // Mozilla roots never do.
+        let systemTrusts = ProcessInfo.processInfo.environment["WSE_TEST_CA_TRUSTED"] == "1"
+        if systemTrusts {
+            let trusted = try await WseClient.connect(WseConfig(url: tlsUrl, reconnect: false, trust: .platform))
+            XCTAssertEqual(trusted.status(), .connected)
+            await trusted.disconnect(deadlineMs: 1_000)
+        }
+        for trust in systemTrusts ? [WseTrust.mozilla] : [.platform, .mozilla] {
             do {
                 _ = try await WseClient.connect(WseConfig(url: tlsUrl, reconnect: false, trust: trust))
                 XCTFail("\(trust): connected")

@@ -401,6 +401,7 @@ jobs:
           cargo test -p wse --locked --features python
           cargo test -p wse --locked --no-default-features
           cargo test -p wse-client --locked
+          cargo test -p wse-client --locked --features native
           cargo test -p wse-client --locked --no-default-features
         env:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
