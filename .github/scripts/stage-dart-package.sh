@@ -43,7 +43,7 @@ rm -f "$out"/android/libs/*.aar
     echo "  '${triple%.*}': '$(sha256 "$library")',"
   done
   echo "};"
-} > "$out/hook/binaries.dart"
+} > "$out/lib/src/hook/binaries.dart"
 
 # The crate builds from crates.io's wse-client, outside any workspace.
 sed -i.bak -E 's|^(wse-client = \{ version = "=[^"]+"), path = "[^"]+"|\1|' "$out/rust/Cargo.toml"

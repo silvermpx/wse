@@ -8,7 +8,7 @@ import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks/hooks.dart';
 
-import '../hook/prebuilt.dart';
+import 'package:wse_client/src/hook/prebuilt.dart';
 
 void main() {
   late Directory dir;

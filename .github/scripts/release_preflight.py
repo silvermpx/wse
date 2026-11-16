@@ -328,7 +328,7 @@ def collect() -> list[Source]:
         ("python-client/wse_client/constants.py", "CLIENT_VERSION", "wse_client CLIENT_VERSION"),
         ("ts-client/constants.ts", "WS_CLIENT_VERSION", "TS WS_CLIENT_VERSION"),
         ("ts-client/index.ts", "WSE_VERSION", "TS WSE_VERSION"),
-        ("bindings/dart/hook/binaries.dart", "const version", "Dart build hook version"),
+        ("bindings/dart/lib/src/hook/binaries.dart", "const version", "Dart build hook version"),
     ):
         found = _literal(rel, name, label, required=False)
         if found is not None:
