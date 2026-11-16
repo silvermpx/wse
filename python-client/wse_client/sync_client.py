@@ -262,11 +262,12 @@ class SyncWSEClient:
         priority: int = 5,
         signed: bool = False,
         nonce: str | None = None,
+        live: bool = False,
     ) -> SendResult:
         """Send a message (blocks until sent). See :meth:`AsyncWSEClient.send`."""
         result = self._run(
             lambda c: c.send(
-                type, payload, priority=priority, signed=signed, nonce=nonce
+                type, payload, priority=priority, signed=signed, nonce=nonce, live=live
             ),
             timeout=15.0,
             default=SendResult.FAILED,

@@ -15,7 +15,7 @@ class WseClientTest {
     private val url = System.getenv("WSE_TEST_URL") ?: "ws://127.0.0.1:5007/wse"
 
     @Test
-    fun ticksComeInOrderAndEchoAnswers() = runBlocking {
+    fun ticksComeInOrderAndEchoAnswers(): Unit = runBlocking {
         val client = connectClient(WseConfig(url = url, topics = listOf("ticks")))
         assertEquals(WseStatus.CONNECTED, client.status())
         client.send("echo", """{"text":"hallo"}""")
@@ -35,7 +35,7 @@ class WseClientTest {
     }
 
     @Test
-    fun aCollectorStoppedInTheMiddleLosesNothing() = runBlocking {
+    fun aCollectorStoppedInTheMiddleLosesNothing(): Unit = runBlocking {
         val client = connectClient(WseConfig(url = url, topics = listOf("ticks")))
         val events = client.events()
         val first = events.asFlow().first()
@@ -47,7 +47,7 @@ class WseClientTest {
     }
 
     @Test
-    fun aCancelledConnectGivesUp() = runBlocking {
+    fun aCancelledConnectGivesUp(): Unit = runBlocking {
         val started = System.nanoTime()
         assertFailsWith<TimeoutCancellationException> {
             withTimeout(200) { connectClient(WseConfig(url = "ws://10.255.255.1:9/wse", connectTimeoutMs = 30_000u)) }
@@ -56,7 +56,16 @@ class WseClientTest {
     }
 
     @Test
-    fun aPayloadMustBeJson() = runBlocking {
+    fun aLiveMessageGoesOnTheReadyConnection(): Unit = runBlocking {
+        val client = connectClient(WseConfig(url = url))
+        client.trySendLive("valve", "{\"open\":true}")
+        client.sendLive("valve", "{\"open\":false}")
+        client.disconnect(1_000u)
+        assertFailsWith<WseException.Closed> { client.trySendLive("valve", "{}") }
+    }
+
+    @Test
+    fun aPayloadMustBeJson(): Unit = runBlocking {
         val client = connectClient(WseConfig(url = url))
         assertFailsWith<WseException.Encode> { client.trySend("x", "not json") }
         client.disconnect(1_000u)

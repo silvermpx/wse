@@ -148,6 +148,18 @@ describe('a client of its own', () => {
     expect(ws.messagesOfType('order').map((m) => m.p)).toEqual([{ qty: 1 }]);
   });
 
+  it('drops a live message sent before it connects: it never goes out late', async () => {
+    const c = client(A);
+    expect(c.send('open_valve', { id: 1 }, { live: true })).toBe('dropped');
+    c.retain();
+    await tick();
+    const ws = socketOf(A)[0];
+    await connectServer(ws);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(ws.messagesOfType('open_valve')).toEqual([]);
+    expect(c.send('open_valve', { id: 2 }, { live: true })).toBe('sent');
+  });
+
   it('ends for good on signOut, and forgets what it kept', async () => {
     const storage = new Map<string, string>();
     const c = client(A, {

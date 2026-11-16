@@ -430,6 +430,21 @@ class TestOfflineQueueOptIn:
         assert c._offline_queue.size == 1
 
     @pytest.mark.asyncio
+    async def test_a_live_send_is_never_queued(self):
+        c = _mock_client(offline_queue=True)
+        c._connection.is_connected = False
+        result = await c.send("open_valve", {"id": 1}, live=True)
+        assert result is SendResult.FAILED
+        assert c._offline_queue.size == 0
+        # Connected, but the write fails: not held for the next connection.
+        c._connection.is_connected = True
+        c._connection.send = AsyncMock(return_value=False)
+        assert await c.send("open_valve", {"id": 1}, live=True) is SendResult.FAILED
+        assert c._offline_queue.size == 0
+        c._connection.send = AsyncMock(return_value=True)
+        assert await c.send("open_valve", {"id": 1}, live=True) is SendResult.SENT
+
+    @pytest.mark.asyncio
     async def test_send_with_retry_never_queues_copies(self):
         c = _mock_client(offline_queue=True)
         c._connection.send = AsyncMock(return_value=False)  # connected, sends fail

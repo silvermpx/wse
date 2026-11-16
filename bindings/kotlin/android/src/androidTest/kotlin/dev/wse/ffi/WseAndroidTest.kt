@@ -16,7 +16,7 @@ class WseAndroidTest {
         InstrumentationRegistry.getArguments().getString("wseUrl") ?: "ws://10.0.2.2:5007/wse"
 
     @Test
-    fun ticksComeInOrderAndEchoAnswers() = runBlocking {
+    fun ticksComeInOrderAndEchoAnswers(): Unit = runBlocking {
         val client = connectClient(WseConfig(url = url, topics = listOf("ticks")))
         assertEquals(WseStatus.CONNECTED, client.status())
         client.send("echo", """{"text":"hallo"}""")
@@ -36,7 +36,7 @@ class WseAndroidTest {
     }
 
     @Test
-    fun aPayloadMustBeJson() = runBlocking {
+    fun aPayloadMustBeJson(): Unit = runBlocking {
         val client = connectClient(WseConfig(url = url))
         assertFailsWith<WseException.Encode> { client.trySend("x", "not json") }
         client.disconnect(1_000u)

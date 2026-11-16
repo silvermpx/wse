@@ -285,6 +285,15 @@ impl WseNativeClient {
         Ok(self.0.send(kind, json).await?)
     }
 
+    #[frb(sync)]
+    pub fn try_send_live(&self, kind: String, json: String) -> Result<(), WseError> {
+        Ok(self.0.try_send_live(&kind, &json)?)
+    }
+
+    pub async fn send_live(&self, kind: String, json: String) -> Result<(), WseError> {
+        Ok(self.0.send_live(kind, json).await?)
+    }
+
     pub async fn send_signed(
         &self,
         kind: String,

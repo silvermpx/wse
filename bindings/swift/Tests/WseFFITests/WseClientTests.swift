@@ -56,6 +56,14 @@ final class WseClientTests: XCTestCase {
         }
     }
 
+    func testALiveMessageGoesOnTheReadyConnection() async throws {
+        let client = try await WseClient.connect(WseConfig(url: url))
+        try client.trySendLive(kind: "valve", json: #"{"open":true}"#)
+        try await client.sendLive(kind: "valve", json: #"{"open":false}"#)
+        await client.disconnect(deadlineMs: 1_000)
+        XCTAssertThrowsError(try client.trySendLive(kind: "valve", json: "{}"))
+    }
+
     func testAPayloadMustBeJson() async throws {
         let client = try await WseClient.connect(WseConfig(url: url))
         XCTAssertThrowsError(try client.trySend(kind: "x", json: "not json"))

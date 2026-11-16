@@ -74,6 +74,14 @@ class WseClient {
   /// Sends at once; throws when the queue is full.
   void trySend(String kind, String json) => _native.trySend(kind: kind, json: json);
 
+  /// Sends on the connection that is ready now, or not at all: never on a
+  /// later one, for commands that must not run late. Waits for room in the
+  /// queue; throws without a ready connection.
+  Future<void> sendLive(String kind, String json) => _native.sendLive(kind: kind, json: json);
+
+  /// [sendLive] at once; throws when the queue is full.
+  void trySendLive(String kind, String json) => _native.trySendLive(kind: kind, json: json);
+
   /// Sends a signed message on this connection, or not at all; the nonce it went with.
   Future<String> sendSigned(String kind, String json, {String? nonce}) =>
       _native.sendSigned(kind: kind, json: json, nonce: nonce);

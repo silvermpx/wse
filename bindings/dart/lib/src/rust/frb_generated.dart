@@ -64,7 +64,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.13.0';
 
   @override
-  int get rustContentHash => 2118930990;
+  int get rustContentHash => 601604469;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -106,6 +106,12 @@ abstract class RustLibApi extends BaseApi {
     required String json,
   });
 
+  Future<void> crateApiWseNativeClientSendLive({
+    required WseNativeClient that,
+    required String kind,
+    required String json,
+  });
+
   Future<String> crateApiWseNativeClientSendSigned({
     required WseNativeClient that,
     required String kind,
@@ -121,6 +127,12 @@ abstract class RustLibApi extends BaseApi {
   });
 
   void crateApiWseNativeClientTrySend({
+    required WseNativeClient that,
+    required String kind,
+    required String json,
+  });
+
+  void crateApiWseNativeClientTrySendLive({
     required WseNativeClient that,
     required String kind,
     required String json,
@@ -402,6 +414,46 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  Future<void> crateApiWseNativeClientSendLive({
+    required WseNativeClient that,
+    required String kind,
+    required String json,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWseNativeClient(
+            that,
+            serializer,
+          );
+          sse_encode_String(kind, serializer);
+          sse_encode_String(json, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 8,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_wse_error,
+        ),
+        constMeta: kCrateApiWseNativeClientSendLiveConstMeta,
+        argValues: [that, kind, json],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiWseNativeClientSendLiveConstMeta =>
+      const TaskConstMeta(
+        debugName: "WseNativeClient_send_live",
+        argNames: ["that", "kind", "json"],
+      );
+
+  @override
   Future<String> crateApiWseNativeClientSendSigned({
     required WseNativeClient that,
     required String kind,
@@ -422,7 +474,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 8,
+            funcId: 9,
             port: port_,
           );
         },
@@ -453,7 +505,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             that,
             serializer,
           );
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 9)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 10)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_String,
@@ -486,7 +538,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             serializer,
           );
           sse_encode_list_String(topics, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 10)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 11)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -521,7 +573,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           );
           sse_encode_String(kind, serializer);
           sse_encode_String(json, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 11)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 12)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -541,6 +593,41 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  void crateApiWseNativeClientTrySendLive({
+    required WseNativeClient that,
+    required String kind,
+    required String json,
+  }) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWseNativeClient(
+            that,
+            serializer,
+          );
+          sse_encode_String(kind, serializer);
+          sse_encode_String(json, serializer);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 13)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_wse_error,
+        ),
+        constMeta: kCrateApiWseNativeClientTrySendLiveConstMeta,
+        argValues: [that, kind, json],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiWseNativeClientTrySendLiveConstMeta =>
+      const TaskConstMeta(
+        debugName: "WseNativeClient_try_send_live",
+        argNames: ["that", "kind", "json"],
+      );
+
+  @override
   void crateApiWseNativeClientUnsubscribe({
     required WseNativeClient that,
     required List<String> topics,
@@ -554,7 +641,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             serializer,
           );
           sse_encode_list_String(topics, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 12)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 14)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -583,7 +670,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             that,
             serializer,
           );
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 13)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 15)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_opt_String,
@@ -1603,6 +1690,11 @@ class WseNativeClientImpl extends RustOpaque implements WseNativeClient {
       .api
       .crateApiWseNativeClientSend(that: this, kind: kind, json: json);
 
+  Future<void> sendLive({required String kind, required String json}) => RustLib
+      .instance
+      .api
+      .crateApiWseNativeClientSendLive(that: this, kind: kind, json: json);
+
   Future<String> sendSigned({
     required String kind,
     required String json,
@@ -1625,6 +1717,11 @@ class WseNativeClientImpl extends RustOpaque implements WseNativeClient {
       .instance
       .api
       .crateApiWseNativeClientTrySend(that: this, kind: kind, json: json);
+
+  void trySendLive({required String kind, required String json}) => RustLib
+      .instance
+      .api
+      .crateApiWseNativeClientTrySendLive(that: this, kind: kind, json: json);
 
   void unsubscribe({required List<String> topics}) => RustLib.instance.api
       .crateApiWseNativeClientUnsubscribe(that: this, topics: topics);

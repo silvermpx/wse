@@ -137,6 +137,10 @@ The `connect(url, **kwargs)` factory returns an `AsyncWSEClient` (not connected 
 | `SendResult.QUEUED` | Held by the offline queue (`offline_queue=True`); sent once after the next reconnect - do not retry it |
 | `SendResult.FAILED` | Neither sent nor queued (not connected, rate limited); the caller decides whether to retry |
 
+`send(..., live=True)` sends only on the connection that is open now: the offline queue never holds
+it for a later one. Use it for commands that must not run late (a valve, a door, an order); signed
+messages (`signed=True`) are always sent this way.
+
 **Properties:**
 
 | Property | Type | Description |

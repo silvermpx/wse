@@ -433,6 +433,18 @@ impl WseClient {
         Ok(self.0.send(kind, json).await?)
     }
 
+    /// Sends `{"t": kind, "p": json}` on the connection that is ready now, or not at all:
+    /// never on a later one. For commands that must not run late. Fails at once when the
+    /// queue is full.
+    pub fn try_send_live(&self, kind: String, json: String) -> Result<(), WseError> {
+        Ok(self.0.try_send_live(&kind, &json)?)
+    }
+
+    /// `try_send_live`, waiting for room in the queue.
+    pub async fn send_live(&self, kind: String, json: String) -> Result<(), WseError> {
+        Ok(self.0.send_live(kind, json).await?)
+    }
+
     /// Sends a signed message on this connection, or not at all; the nonce it went with.
     pub async fn send_signed(
         &self,

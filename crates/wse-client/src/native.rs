@@ -536,6 +536,27 @@ impl NativeClient {
         .await
     }
 
+    /// Sends `{"t": kind, "p": json}` on the connection that is ready now,
+    /// or not at all: never on a later one. For commands that must not run
+    /// late. Fails at once when the queue is full.
+    pub fn try_send_live(&self, kind: &str, json: &str) -> Result<(), NativeError> {
+        let payload = raw_json(json)?;
+        Ok(self.client.try_send_live(kind, &*payload)?)
+    }
+
+    /// [`NativeClient::try_send_live`], waiting for room in the queue.
+    pub async fn send_live(&self, kind: String, json: String) -> Result<(), NativeError> {
+        let payload = raw_json(&json)?;
+        let client = self.client.clone();
+        on_runtime(async move {
+            client
+                .send_live(&kind, &*payload)
+                .await
+                .map_err(NativeError::from)
+        })
+        .await
+    }
+
     /// Sends a signed message on this connection, or not at all; the nonce
     /// it went with.
     pub async fn send_signed(

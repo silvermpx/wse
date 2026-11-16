@@ -44,6 +44,8 @@ abstract class WseNativeClient implements RustOpaqueInterface {
 
   Future<void> send({required String kind, required String json});
 
+  Future<void> sendLive({required String kind, required String json});
+
   Future<String> sendSigned({
     required String kind,
     required String json,
@@ -56,6 +58,8 @@ abstract class WseNativeClient implements RustOpaqueInterface {
   void subscribe({required List<String> topics});
 
   void trySend({required String kind, required String json});
+
+  void trySendLive({required String kind, required String json});
 
   void unsubscribe({required List<String> topics});
 

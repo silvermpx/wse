@@ -321,6 +321,13 @@ export interface MessageOptions {
   encrypted?: boolean;
   /** Persist to IndexedDB while disconnected and replay after reconnecting. */
   offline?: boolean;
+  /**
+   * Only on the connection that is ready now: never held for a later
+   * connection, persisted or replayed after a reconnect, whatever `offline`
+   * says. Without a ready connection it is dropped. For commands that must
+   * not run late (a valve, a door, an order).
+   */
+  live?: boolean;
   correlation_id?: string;
   /**
    * Milliseconds the message stays worth sending. A message still queued

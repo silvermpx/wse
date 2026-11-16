@@ -273,6 +273,7 @@ sendMessage('alert', { msg: 'critical' }, { priority: MessagePriority.CRITICAL }
 sendMessage('query', { filter: 'active' }, { correlation_id: 'req-123' });
 sendMessage('draft', { text }, { offline: true });                       // survives reloads (IndexedDB)
 sendMessage('quote_request', { symbol }, { ttl: 5000 });                  // worthless after 5 s
+sendMessage('open_valve', { id: 'v-7' }, { live: true });                 // now or never
 ```
 
 Nothing is lost because the connection was busy: a message that cannot go out at once (before
@@ -286,6 +287,10 @@ outgoing queue was full or the message cannot be sent safely (see encryption).
   connection, in memory or in IndexedDB) is dropped instead of sent late, and counted in
   `stats.messagesDropped`.
 - `offline`: persist to IndexedDB while disconnected and replay after reconnecting, also after a reload.
+- `live`: only on the connection that is ready now. It is never kept for a later connection, persisted
+  or replayed after a reconnect, whatever `offline` says; without a ready connection it is
+  `'dropped'`. For commands that must not run late (a valve, a door, an order). Signed messages
+  (`sendSigned`) are always live.
 - `encrypted`: refuse to send unless E2E encryption is on; never falls back to plaintext.
 - `correlation_id`: sent as `cid`.
 

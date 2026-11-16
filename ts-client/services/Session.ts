@@ -602,6 +602,19 @@ export class WSESession {
       return 'dropped';
     }
     const priority = options.priority ?? MessagePriority.NORMAL;
+    if (options.live) {
+      const generation = this.connection?.socketGeneration();
+      if (!this.connection?.isTransportReady() || generation === undefined) {
+        logger.warn(`${type} not sent: no live connection`);
+        const store = this.ctx.state.getState();
+        store.updateMetrics({ messagesDropped: store.metrics.messagesDropped + 1 });
+        return 'dropped';
+      }
+      return this.processor.enqueueOutgoing(buildMessage(type, payload, options), priority, {
+        ttl: options.ttl,
+        liveOn: generation,
+      });
+    }
     return this.processor.enqueueOutgoing(buildMessage(type, payload, options), priority, {
       offline: !!options.offline && this.options.offline.enabled,
       ttl: options.ttl,

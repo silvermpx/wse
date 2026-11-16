@@ -43,7 +43,7 @@ pub(crate) struct Queued {
     /// The user it was sent as ([`Shared::users`]): it goes nowhere once the
     /// server took a connection for another user.
     pub(crate) user: u64,
-    /// A signed message goes on the connection it was signed on
+    /// A signed or live message goes on the connection it was sent on
     /// ([`Shared::connections`]), or not at all.
     pub(crate) only_on: Option<u64>,
 }
@@ -51,8 +51,7 @@ pub(crate) struct Queued {
 /// The user and connection a message was sent for.
 struct SentFor {
     user: u64,
-    /// What a signed message goes on.
-    #[cfg_attr(not(feature = "aws-lc"), allow(dead_code))]
+    /// What a signed or live message goes on.
     connection: u64,
 }
 
@@ -62,6 +61,14 @@ impl SentFor {
             text,
             user: self.user,
             only_on: None,
+        }
+    }
+
+    /// For this connection only.
+    fn live(&self, text: String) -> Queued {
+        Queued {
+            only_on: Some(self.connection),
+            ..self.frame(text)
         }
     }
 }
@@ -228,6 +235,40 @@ impl Client {
             .map_err(|_| Error::Closed)
     }
 
+    /// Sends a message `{"t": kind, "p": payload}` on the connection that is
+    /// ready now, or not at all: one this connection did not write is
+    /// dropped, never sent on a later connection. For commands that must not
+    /// run late (a valve, a door, an order). Fails at once when the queue is
+    /// full.
+    pub fn try_send_live<P: Serialize + ?Sized>(
+        &self,
+        kind: &str,
+        payload: &P,
+    ) -> Result<(), Error> {
+        let for_now = self.ready()?;
+        let text = encode(kind, payload)?;
+        self.frames
+            .try_send(for_now.live(text))
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => Error::Full,
+                mpsc::error::TrySendError::Closed(_) => Error::Closed,
+            })
+    }
+
+    /// [`Client::try_send_live`], waiting for room in the queue.
+    pub async fn send_live<P: Serialize + ?Sized>(
+        &self,
+        kind: &str,
+        payload: &P,
+    ) -> Result<(), Error> {
+        let for_now = self.ready()?;
+        let text = encode(kind, payload)?;
+        self.frames
+            .send(for_now.live(text))
+            .await
+            .map_err(|_| Error::Closed)
+    }
+
     /// Sends JSON text as it is: a message the application built itself.
     pub async fn send_raw(&self, json: impl Into<String>) -> Result<(), Error> {
         let for_now = self.ready()?;
@@ -281,11 +322,10 @@ impl Client {
             .keys
             .sign(kind, &payload, &audience, &n, crate::session::now_ms())?;
         // Signed for this connection: it goes on it or not at all.
-        let frame = Queued {
-            only_on: Some(for_now.connection),
-            ..for_now.frame(text)
-        };
-        self.frames.send(frame).await.map_err(|_| Error::Closed)?;
+        self.frames
+            .send(for_now.live(text))
+            .await
+            .map_err(|_| Error::Closed)?;
         Ok(n)
     }
 

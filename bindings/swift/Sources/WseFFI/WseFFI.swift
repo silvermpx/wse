@@ -771,6 +771,11 @@ public protocol WseClientProtocol: AnyObject, Sendable {
     func send(kind: String, json: String) async throws 
     
     /**
+     * `try_send_live`, waiting for room in the queue.
+     */
+    func sendLive(kind: String, json: String) async throws 
+    
+    /**
      * Sends a signed message on this connection, or not at all; the nonce it went with.
      */
     func sendSigned(kind: String, json: String, nonce: String?) async throws  -> String
@@ -783,6 +788,13 @@ public protocol WseClientProtocol: AnyObject, Sendable {
      * Sends `{"t": kind, "p": json}`; fails at once when the queue is full.
      */
     func trySend(kind: String, json: String) throws 
+    
+    /**
+     * Sends `{"t": kind, "p": json}` on the connection that is ready now, or not at all:
+     * never on a later one. For commands that must not run late. Fails at once when the
+     * queue is full.
+     */
+    func trySendLive(kind: String, json: String) throws 
     
     func unsubscribe(topics: [String]) throws 
     
@@ -919,6 +931,25 @@ open func send(kind: String, json: String)async throws   {
 }
     
     /**
+     * `try_send_live`, waiting for room in the queue.
+     */
+open func sendLive(kind: String, json: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_wse_ffi_fn_method_wseclient_send_live(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(kind),FfiConverterString.lower(json)
+                )
+            },
+            pollFunc: ffi_wse_ffi_rust_future_poll_void,
+            completeFunc: ffi_wse_ffi_rust_future_complete_void,
+            freeFunc: ffi_wse_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeWseError_lift
+        )
+}
+    
+    /**
      * Sends a signed message on this connection, or not at all; the nonce it went with.
      */
 open func sendSigned(kind: String, json: String, nonce: String?)async throws  -> String  {
@@ -961,6 +992,21 @@ open func subscribe(topics: [String])throws   {try rustCallWithError(FfiConverte
 open func trySend(kind: String, json: String)throws   {try rustCallWithError(FfiConverterTypeWseError_lift) {
         uniffiCallStatus in
     uniffi_wse_ffi_fn_method_wseclient_try_send(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(kind),
+        FfiConverterString.lower(json),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Sends `{"t": kind, "p": json}` on the connection that is ready now, or not at all:
+     * never on a later one. For commands that must not run late. Fails at once when the
+     * queue is full.
+     */
+open func trySendLive(kind: String, json: String)throws   {try rustCallWithError(FfiConverterTypeWseError_lift) {
+        uniffiCallStatus in
+    uniffi_wse_ffi_fn_method_wseclient_try_send_live(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(kind),
         FfiConverterString.lower(json),uniffiCallStatus
@@ -2771,6 +2817,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wse_ffi_checksum_method_wseclient_send() != 29894) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_wse_ffi_checksum_method_wseclient_send_live() != 8723) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_wse_ffi_checksum_method_wseclient_send_signed() != 14514) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2781,6 +2830,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_method_wseclient_try_send() != 33752) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wse_ffi_checksum_method_wseclient_try_send_live() != 32891) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_method_wseclient_unsubscribe() != 15024) {

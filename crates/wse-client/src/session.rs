@@ -166,12 +166,13 @@ impl<H: Handler> Session<H> {
     }
 
     /// A message the application sent, for this connection's outbox: none
-    /// that was sent as another user, or signed on another connection.
+    /// that was sent as another user, or signed or sent live on another
+    /// connection.
     pub(crate) fn queue(&mut self, frame: Queued) {
         if frame.user != self.users {
             tracing::warn!("[WSE] a message sent as the previous user was dropped");
         } else if frame.only_on.is_some_and(|on| on != self.connections) {
-            tracing::warn!("[WSE] a signed message whose connection went was dropped");
+            tracing::warn!("[WSE] a message for a connection that went was dropped");
         } else {
             self.outbox.push(Outgoing::Text(frame.text));
         }

@@ -980,6 +980,40 @@ async fn an_encrypted_session_outlives_a_short_burst_over_the_rate_limit() {
     stand.server.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_writing_flat_out_hears_why_it_was_closed() {
+    let mut config = wse::Config::default();
+    config.rate_limit_capacity = 4.0;
+    config.rate_limit_refill = 2.0;
+    let stand = stand_with(config).await;
+    let mut client_config = stand.config("mira");
+    client_config.reconnect.base_delay = Duration::from_secs(30);
+    let (client, mut events) = wse_client::connect(client_config).await.unwrap();
+
+    // Writing when the server closes: its close frame still names why.
+    let flooder = client.clone();
+    let flood = tokio::spawn(async move {
+        let mut n = 0u64;
+        while flooder.send("flood", &json!({ "n": n })).await.is_ok() {
+            n += 1;
+        }
+    });
+    let disconnected = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(incoming) = events.next().await {
+            if let Incoming::Event(Event::Disconnected(disconnected)) = incoming {
+                return disconnected;
+            }
+        }
+        panic!("the events ended before the client was disconnected");
+    })
+    .await
+    .expect("closed within 15 s");
+    assert_eq!(disconnected.code, Some(4429), "{disconnected:?}");
+    flood.abort();
+    client.close().await;
+    stand.server.stop().await;
+}
+
 #[cfg(feature = "aws-lc")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_encrypted_flood_is_still_closed_for_flooding() {
@@ -991,7 +1025,7 @@ async fn an_encrypted_flood_is_still_closed_for_flooding() {
     let identity = stand.publisher.e2e_identity_public_key().unwrap();
     let mut client_config = stand.config("mira");
     client_config.encryption = Some(wse_client::Encryption::pinned([identity]));
-    client_config.reconnect.enabled = false;
+    client_config.reconnect.base_delay = Duration::from_secs(30);
     let (client, mut events) = wse_client::connect(client_config).await.unwrap();
 
     let started = std::time::Instant::now();
@@ -1005,19 +1039,23 @@ async fn an_encrypted_flood_is_still_closed_for_flooding() {
         }
     });
     // The server closes it after ten seconds over the limit, as any flood
-    // (4429), not on the first frame after a refused one (4802).
-    tokio::time::timeout(Duration::from_secs(15), async {
+    // (4429), not on the first frame after a refused one (4802); the client
+    // says so though it was writing when the server closed.
+    let disconnected = tokio::time::timeout(Duration::from_secs(15), async {
         while let Some(incoming) = events.next().await {
-            if let Incoming::Event(Event::Disconnected(_)) = incoming {
-                return;
+            if let Incoming::Event(Event::Disconnected(disconnected)) = incoming {
+                return disconnected;
             }
         }
+        panic!("the events ended before the client was disconnected");
     })
     .await
     .expect("closed within 15 s");
     let after = started.elapsed();
     assert!(after >= Duration::from_secs(9), "closed after {after:?}");
+    assert_eq!(disconnected.code, Some(4429), "{disconnected:?}");
     flood.abort();
+    client.close().await;
     stand.server.stop().await;
 }
 
@@ -1132,6 +1170,57 @@ async fn a_signed_message_goes_on_its_own_connection_or_not_at_all() {
                 break;
             }
             _ => {}
+        }
+    }
+    client.close().await;
+    stand.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_message_goes_on_its_own_connection_or_not_at_all() {
+    let mut stand = stand().await;
+    let link = Link::to(&stand.url).await;
+    let mut config = Config::new(&link.url);
+    config.token = Some(stand.token("vera"));
+    config.reconnect.base_delay = Duration::from_millis(50);
+    config.send_queue = 4;
+    let (client, mut events) = wse_client::connect(config).await.unwrap();
+    stand.connect_id().await;
+
+    // Commands for this connection back up while the network holds them.
+    link.hold(true);
+    let command = json!({ "pad": noise(64 * 1024) });
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match client.try_send_live("valve", &command) {
+            Ok(()) => {}
+            Err(Error::Full) => break,
+            Err(error) => panic!("{error}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the queue never filled"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // The network goes and comes back: none of them goes out late.
+    link.cut();
+    while !matches!(next_event(&mut events).await, Event::Disconnected(_)) {}
+    assert!(matches!(
+        client.try_send_live("valve", &command),
+        Err(Error::NotConnected)
+    ));
+    link.hold(false);
+    next_connected(&mut events).await;
+    client.send("after", &json!({})).await.unwrap();
+    loop {
+        if let Heard::Message(message) = stand.heard().await {
+            assert_eq!(
+                message["t"], "after",
+                "a command went out on the next connection"
+            );
+            break;
         }
     }
     client.close().await;

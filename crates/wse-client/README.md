@@ -112,6 +112,10 @@ async fn main() -> Result<(), wse_client::Error> {
   names the key to this client (`Encryption::bind_session`, on by default),
   and stops unless the server confirms the key. A signed message goes out
   on the connection it was signed on, or not at all.
+- **Live messages.** `Client::send_live` and `try_send_live` send on the
+  connection that is ready now, or not at all: one the connection did not
+  write is dropped, never sent on a later connection. For commands that
+  must not run late (a valve, a door, an order).
 - **Another user.** When the token provider's next token is another
   user's, what the last user queued and did not send goes nowhere, and the
   topics are subscribed again from the start.

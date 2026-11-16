@@ -36,6 +36,14 @@ void main() {
     await client.close();
   });
 
+  test('a live message goes on the ready connection', () async {
+    final client = await WseClient.connect(wseConfig(url));
+    client.trySendLive('valve', '{"open":true}');
+    await client.sendLive('valve', '{"open":false}');
+    expect(() => client.trySendLive('valve', 'not json'), throwsA(isA<WseError>()));
+    await client.close();
+  });
+
   test('a payload must be JSON', () async {
     final client = await WseClient.connect(wseConfig(url));
     expect(() => client.trySend('x', 'not json'), throwsA(isA<WseError>()));

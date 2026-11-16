@@ -301,7 +301,12 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     if (done) return 'dropped';
     const current = live();
     if (current) return current.sendMessage(type, payload, sendOptions);
-    // Not started yet: kept until the connection takes it.
+    // Not started yet: kept until the connection takes it, unless it is
+    // for the connection of now only.
+    if (sendOptions.live) {
+      logger.warn(`${type} not sent: no live connection`);
+      return 'dropped';
+    }
     if (sendOptions.encrypted) {
       logger.error(`Refusing to queue ${type}: it requires encryption and no encrypted session exists`);
       return 'dropped';

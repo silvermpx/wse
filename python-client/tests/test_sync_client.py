@@ -5,6 +5,19 @@ from wse_client.types import ConnectionQuality, ConnectionState
 
 
 class TestSyncClientInit:
+    def test_send_passes_live_through(self):
+        client = SyncWSEClient("ws://localhost:5006/wse")
+        seen = {}
+
+        class Async:
+            async def send(self, *args, **kwargs):
+                seen.update(kwargs)
+                return SendResult.SENT
+
+        client._run = lambda make, timeout, default: asyncio.run(make(Async()))
+        assert client.send("open_valve", {}, live=True) is SendResult.SENT
+        assert seen["live"] is True
+
     def test_defaults(self):
         client = SyncWSEClient("ws://localhost:5006/wse")
         assert client.state == ConnectionState.DISCONNECTED

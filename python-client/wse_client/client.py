@@ -694,6 +694,7 @@ class AsyncWSEClient:
         correlation_id: str | None = None,
         signed: bool = False,
         nonce: str | None = None,
+        live: bool = False,
     ) -> SendResult:
         """Send a message to the server.
 
@@ -709,14 +710,18 @@ class AsyncWSEClient:
             nonce: For a signed message, its unique id (an order id, say);
                 the server takes each once. Random by default. The receipt
                 and a ``SIGNATURE_REFUSED`` error carry it as ``n``.
+            live: Only on the connection that is open now: never held by the
+                offline queue for a later connection. For commands that must
+                not run late (a valve, a door, an order).
 
         Returns:
             ``SendResult.SENT`` when it went out; ``SendResult.QUEUED`` when
             it is held by the offline queue (``offline_queue=True``) for the
             next reconnect; ``SendResult.FAILED`` (falsy) when it was neither
-            sent nor queued (not connected, rate limited). A signed message is
-            never queued: it is signed for this server and valid for its
-            signature window, so without a connection it fails.
+            sent nor queued (not connected, rate limited). A signed or live
+            message is never queued: a signed one is signed for this server
+            and valid for its signature window, so without a connection it
+            fails, as a live one does.
 
         Raises:
             WSEEncryptionError: ``encryption=True`` and the key exchange of
@@ -744,7 +749,7 @@ class AsyncWSEClient:
                 correlation_id=correlation_id,
             )
         return await self._send_app_frame(
-            encoded, priority=priority, msg_type=type, allow_queue=not signed
+            encoded, priority=priority, msg_type=type, allow_queue=not (signed or live)
         )
 
     async def send_with_retry(

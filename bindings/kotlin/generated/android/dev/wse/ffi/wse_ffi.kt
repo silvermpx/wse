@@ -722,6 +722,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_send(
     ): Int
+    external fun uniffi_wse_ffi_checksum_method_wseclient_send_live(
+    ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_send_signed(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_status(
@@ -729,6 +731,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_wse_ffi_checksum_method_wseclient_subscribe(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_try_send(
+    ): Int
+    external fun uniffi_wse_ffi_checksum_method_wseclient_try_send_live(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_unsubscribe(
     ): Int
@@ -783,6 +787,8 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_send(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,
     ): Long
+    external fun uniffi_wse_ffi_fn_method_wseclient_send_live(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,
+    ): Long
     external fun uniffi_wse_ffi_fn_method_wseclient_send_signed(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,`nonce`: RustBuffer.ByValue,
     ): Long
     external fun uniffi_wse_ffi_fn_method_wseclient_status(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -790,6 +796,8 @@ internal object UniffiLib {
     external fun uniffi_wse_ffi_fn_method_wseclient_subscribe(`ptr`: Long,`topics`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_try_send(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_wse_ffi_fn_method_wseclient_try_send_live(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_unsubscribe(`ptr`: Long,`topics`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -948,6 +956,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_send() and 0xFFFF) != 29894) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_send_live() and 0xFFFF) != 8723) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_send_signed() and 0xFFFF) != 14514) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -958,6 +969,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_try_send() and 0xFFFF) != 33752) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_try_send_live() and 0xFFFF) != 32891) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_unsubscribe() and 0xFFFF) != 15024) {
@@ -1863,6 +1877,11 @@ public interface WseClientInterface {
     suspend fun `send`(`kind`: kotlin.String, `json`: kotlin.String)
     
     /**
+     * `try_send_live`, waiting for room in the queue.
+     */
+    suspend fun `sendLive`(`kind`: kotlin.String, `json`: kotlin.String)
+    
+    /**
      * Sends a signed message on this connection, or not at all; the nonce it went with.
      */
     suspend fun `sendSigned`(`kind`: kotlin.String, `json`: kotlin.String, `nonce`: kotlin.String?): kotlin.String
@@ -1875,6 +1894,13 @@ public interface WseClientInterface {
      * Sends `{"t": kind, "p": json}`; fails at once when the queue is full.
      */
     fun `trySend`(`kind`: kotlin.String, `json`: kotlin.String)
+    
+    /**
+     * Sends `{"t": kind, "p": json}` on the connection that is ready now, or not at all:
+     * never on a later one. For commands that must not run late. Fails at once when the
+     * queue is full.
+     */
+    fun `trySendLive`(`kind`: kotlin.String, `json`: kotlin.String)
     
     fun `unsubscribe`(`topics`: List<kotlin.String>)
     
@@ -2093,6 +2119,33 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
 
     
     /**
+     * `try_send_live`, waiting for room in the queue.
+     */
+    @Throws(WseException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `sendLive`(`kind`: kotlin.String, `json`: kotlin.String) {
+        return uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_wse_ffi_fn_method_wseclient_send_live(
+                uniffiHandle,
+                
+        FfiConverterString.lower(`kind`),
+        FfiConverterString.lower(`json`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_wse_ffi_rust_future_poll_void(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_wse_ffi_rust_future_complete_void(future, continuation) },
+        { future -> UniffiLib.ffi_wse_ffi_rust_future_free_void(future) },
+        // lift function
+        { },
+        
+        // Error FFI converter
+        WseException.ErrorHandler,
+    )
+    }
+
+    
+    /**
      * Sends a signed message on this connection, or not at all; the nonce it went with.
      */
     @Throws(WseException::class)
@@ -2154,6 +2207,26 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
     callWithHandle {
     uniffiRustCallWithError(WseException) { _status ->
     UniffiLib.uniffi_wse_ffi_fn_method_wseclient_try_send(
+        it,
+        
+        FfiConverterString.lower(`kind`),
+        FfiConverterString.lower(`json`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Sends `{"t": kind, "p": json}` on the connection that is ready now, or not at all:
+     * never on a later one. For commands that must not run late. Fails at once when the
+     * queue is full.
+     */
+    @Throws(WseException::class)override fun `trySendLive`(`kind`: kotlin.String, `json`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(WseException) { _status ->
+    UniffiLib.uniffi_wse_ffi_fn_method_wseclient_try_send_live(
         it,
         
         FfiConverterString.lower(`kind`),

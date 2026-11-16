@@ -269,3 +269,26 @@ async fn the_token_comes_from_the_application_and_payloads_are_json() {
     client.disconnect(1_000).await;
     stand.server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_send_goes_on_the_ready_connection_or_fails() {
+    let stand = stand().await;
+    let client = NativeClient::connect(stand.config("li"), None, &CancelToken::new())
+        .await
+        .unwrap();
+    client.try_send_live("valve", r#"{"open":true}"#).unwrap();
+    client
+        .send_live("valve".into(), r#"{"open":false}"#.into())
+        .await
+        .unwrap();
+    assert_eq!(
+        client.try_send_live("valve", "not json").unwrap_err().kind,
+        ErrorKind::Encode
+    );
+    client.disconnect(1_000).await;
+    assert_eq!(
+        client.try_send_live("valve", "{}").unwrap_err().kind,
+        ErrorKind::Closed
+    );
+    stand.server.stop().await;
+}
