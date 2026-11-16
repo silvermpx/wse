@@ -18,6 +18,24 @@
   background (after a grace period) and makes it again in the foreground,
   and takes the app's crypto (react-native-quick-crypto) and AppState
   instead of importing them.
+- Clients for mobile apps, on the Rust client: Swift (iOS 15+, macOS 12+;
+  an XCFramework with Apple silicon and Intel slices, async calls and the
+  events as an AsyncSequence), Kotlin (Android API 26+ and the JVM; an AAR
+  linked for 16 KB pages, suspend calls and a Flow), and Dart (`wse_client`
+  on pub.dev, Flutter 3.38+). The Dart package's build hook takes the
+  prebuilt library of the app's target from the release and uses it only
+  when its SHA-256 is the one the release listed; an app can build it from
+  source instead. The release attaches the XCFramework, the AAR and the
+  prebuilt libraries. They are built on the `wse-client` crate's `native`
+  feature: a shared runtime, cancellable calls, and events read in batches
+  that come again until they are acknowledged.
+- Live-only sends, for commands that must not run late (a valve, a door, an
+  order): a message sent live goes on the connection that is ready when it
+  is sent, or not at all, never held for a later connection or replayed
+  after a reconnect. TypeScript: `{ live: true }` (also dropped without a
+  ready connection whatever `offline` says); Rust: `Client::send_live` and
+  `try_send_live` (and in Swift, Kotlin and Dart); Python:
+  `send(..., live=True)`.
 
 - Recovery positions per stream. A client may name, with its recovery
   request, the last offset it holds of each stream of a topic (`streams`:

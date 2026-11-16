@@ -1,6 +1,6 @@
-# wse-client (TypeScript / React)
+# wse-client (TypeScript)
 
-TypeScript client for [WSE](https://github.com/silvermpx/wse), the WebSocket engine for reactive user interfaces: one connection per page, with a React hook, topics, message recovery, reconnects, an offline queue, end-to-end encryption and signed messages.
+TypeScript client for [WSE](https://github.com/silvermpx/wse), the WebSocket engine for reactive user interfaces: topics, message recovery, reconnects, an offline queue, end-to-end encryption and signed messages. It runs without a framework, and comes with adapters for React, Vue, Svelte and React Native.
 
 [![npm](https://img.shields.io/npm/v/wse-client)](https://www.npmjs.com/package/wse-client)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue)](https://www.typescriptlang.org/)
@@ -12,10 +12,99 @@ TypeScript client for [WSE](https://github.com/silvermpx/wse), the WebSocket eng
 npm install wse-client
 ```
 
-Peer dependencies: `react >= 18`, `zustand >= 4`.
+| Import | What it is | Needs |
+|--------|------------|-------|
+| `wse-client/core` | The client without a framework: pages, workers, Node | nothing |
+| `wse-client/react` | A provider and hooks over a core client | `react >= 18` |
+| `wse-client/vue` | A plugin and composables over a core client | `vue >= 3.3` |
+| `wse-client/svelte` | Stores over a core client | nothing (Svelte's store contract) |
+| `wse-client/react-native` | A core client for React Native apps | `react-native` |
+| `wse-client` | The page-wide `useWSE` hook (described below), as in 3.0 | `react >= 18`, `zustand >= 4` |
+
+React, Vue and zustand are optional peer dependencies: an application installs only what the
+import it uses needs.
 
 The package is ESM (`"type": "module"`, explicit `.js` import paths). It loads in bundlers
 (Vite, webpack, esbuild, Next.js) and directly in Node.js (SSR, tests, scripts) without a bundler.
+
+## A Client of Its Own (core)
+
+```ts
+import { createWSEClient } from 'wse-client/core';
+
+const client = createWSEClient({ endpoints: ['wss://example.com/wse'] });
+const lease = client.retain();                          // the first share connects
+const prices = client.subscribe(['prices']);            // held until prices.release()
+const stop = client.onMessage('price_update', (msg) => render(msg.p));
+client.state.subscribe((s) => showStatus(s.connection)); // now, then on each change
+client.send('order', { id: 1 });
+client.send('open_valve', { id: 7 }, { live: true });   // on this connection or not at all
+client.pause('background');                              // the connection ends, positions stay
+client.resume('background');                             // back, and what was missed comes
+client.signOut();                                        // the user's queue, topics and positions go
+```
+
+A client holds nothing of the page: two clients on one page share no state, and importing
+`wse-client/core` reads or changes nothing. It connects while any share (`retain()`) is held and
+stops when the last is released; `subscribe(topics)` holds topics the same way, and `onMessage` and
+`on` take any number of listeners. With `storage: 'myapp:alice'` it keeps its topics and offline
+queue in the page's storage under that name; by default it keeps them in memory. `destroy()` ends
+it and keeps what it stored; `signOut()` ends it and forgets the user.
+
+Outside browsers, a `webSocket` factory makes the socket, and may send headers (a token in
+`Authorization`).
+
+## React, Vue, Svelte
+
+```tsx
+import { createWSEClient, WSEProvider, useWSEState, useWSETopics, useWSEMessage } from 'wse-client/react';
+
+const client = createWSEClient({ endpoints: ['wss://example.com/wse'] });
+
+function Prices() {
+  const { connection } = useWSEState();               // useSyncExternalStore
+  useWSETopics(['prices']);                            // held while mounted
+  useWSEMessage('price_update', (msg) => update(msg.p));
+  return <span>{connection}</span>;
+}
+
+root.render(<WSEProvider client={client}><Prices /></WSEProvider>);
+```
+
+```ts
+// Vue 3: app.use(wsePlugin(client)), then in setup()
+import { useWSEState, useWSETopics, useWSEMessage } from 'wse-client/vue';
+const state = useWSEState();                           // a shallow ref
+useWSETopics(['prices']);
+useWSEMessage('price_update', (msg) => update(msg.p));
+
+// Svelte: stores, $-prefixed in components
+import { wseState, wseMessage } from 'wse-client/svelte';
+const state = wseState(client);
+const lastPrice = wseMessage(client, 'price_update', ['prices']);
+```
+
+The provider, the composables and the stores hold the client, its topics and listeners while a
+component uses them. Effects and mount hooks do not run while rendering on a server, so server
+rendering opens no socket.
+
+## React Native
+
+```ts
+import { AppState } from 'react-native';
+import QuickCrypto from 'react-native-quick-crypto';
+import { createReactNativeClient } from 'wse-client/react-native';
+
+const client = createReactNativeClient({
+  endpoints: ['wss://example.com/wse'],
+  token: () => auth.accessToken(),   // sent as Authorization: Bearer at each connection
+  appState: AppState,                // pauses 5 s after the app goes to the background
+  crypto: QuickCrypto,               // for end-to-end encryption and signed messages
+});
+```
+
+The client pauses while the app is in the background and reconnects in the foreground, recovering
+what it missed. Use it with the React adapter as with any core client.
 
 ## Quick Start
 
