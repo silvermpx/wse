@@ -88,6 +88,14 @@ pub enum WseItemKind {
     Unknown,
 }
 
+/// What a subscription replayed of a topic asked for with a position.
+pub struct WseTopicRecovery {
+    pub topic: String,
+    /// Every missed message was replayed.
+    pub recovered: bool,
+    pub count: u64,
+}
+
 /// One thing the client heard; the fields its kind has are set.
 pub struct WseItem {
     pub kind: WseItemKind,
@@ -97,25 +105,35 @@ pub struct WseItem {
     pub epoch: Option<u32>,
     pub offset: Option<u64>,
     pub id: Option<String>,
-    /// Message: the payload as JSON text; ServerError: its details.
+    /// Message: the payload as JSON text (None without one, absent or null,
+    /// or when it could not be decoded); ServerError: its details.
     pub json: Option<String>,
+    /// Message: why its payload could not be decoded (msgpack JSON cannot
+    /// show).
+    pub payload_error: Option<String>,
     pub bytes: Option<Vec<u8>>,
     /// Signed messages: the exact signed body, the signature, the key id.
     pub signed_body: Option<String>,
     pub signature: Option<String>,
     pub signature_kid: Option<String>,
     pub verified: bool,
-    /// Connected: the connection's id and user.
+    /// Connected: the connection's id and user, and whether the server keeps
+    /// topic histories (missed messages are replayed).
     pub connection_id: Option<String>,
     pub user_id: Option<String>,
     pub reconnected: bool,
+    pub recovery: bool,
     /// Disconnected: the close code; Gap and Closed: the reason.
     pub code: Option<u16>,
     pub reason: Option<String>,
+    /// Disconnected: when the next attempt is made, and attempts so far.
     pub retry_in_ms: Option<u64>,
-    /// Subscribed: the topics taken and refused.
+    pub attempt: Option<u32>,
+    /// Subscribed: the topics taken and refused, and per topic asked for with
+    /// a position what was replayed.
     pub topics: Vec<String>,
     pub failed: Vec<String>,
+    pub recoveries: Vec<WseTopicRecovery>,
     /// Gap: the first and last offsets missing, when known.
     pub first: Option<u64>,
     pub last: Option<u64>,
@@ -131,6 +149,7 @@ impl WseItem {
             offset: None,
             id: None,
             json: None,
+            payload_error: None,
             bytes: None,
             signed_body: None,
             signature: None,
@@ -139,11 +158,14 @@ impl WseItem {
             connection_id: None,
             user_id: None,
             reconnected: false,
+            recovery: false,
             code: None,
             reason: None,
             retry_in_ms: None,
+            attempt: None,
             topics: Vec::new(),
             failed: Vec::new(),
+            recoveries: Vec::new(),
             first: None,
             last: None,
         }
@@ -162,6 +184,7 @@ impl From<native::Item> for WseItem {
                     offset: m.offset,
                     id: m.id,
                     json: m.json,
+                    payload_error: m.payload_error,
                     verified: signature.as_ref().is_some_and(|s| s.verified),
                     signed_body: signature.as_ref().map(|s| s.body.clone()),
                     signature: signature.as_ref().map(|s| s.sig.clone()),
@@ -177,27 +200,41 @@ impl From<native::Item> for WseItem {
                 connection_id,
                 user_id,
                 reconnected,
-                ..
+                recovery,
             } => WseItem {
                 connection_id: Some(connection_id),
                 user_id,
                 reconnected,
+                recovery,
                 ..WseItem::of(WseItemKind::Connected)
             },
             native::Item::Disconnected {
                 code,
                 reason,
                 retry_in_ms,
-                ..
+                attempt,
             } => WseItem {
                 code,
                 reason: Some(reason),
                 retry_in_ms: Some(retry_in_ms),
+                attempt: Some(attempt),
                 ..WseItem::of(WseItemKind::Disconnected)
             },
-            native::Item::Subscribed { topics, failed, .. } => WseItem {
+            native::Item::Subscribed {
                 topics,
                 failed,
+                recovery,
+            } => WseItem {
+                topics,
+                failed,
+                recoveries: recovery
+                    .into_iter()
+                    .map(|r| WseTopicRecovery {
+                        topic: r.topic,
+                        recovered: r.recovered,
+                        count: r.count,
+                    })
+                    .collect(),
                 ..WseItem::of(WseItemKind::Subscribed)
             },
             native::Item::Gap {

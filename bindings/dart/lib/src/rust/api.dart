@@ -187,8 +187,13 @@ class WseItem {
   final BigInt? offset;
   final String? id;
 
-  /// Message: the payload as JSON text; ServerError: its details.
+  /// Message: the payload as JSON text (None without one, absent or null,
+  /// or when it could not be decoded); ServerError: its details.
   final String? json;
+
+  /// Message: why its payload could not be decoded (msgpack JSON cannot
+  /// show).
+  final String? payloadError;
   final Uint8List? bytes;
 
   /// Signed messages: the exact signed body, the signature, the key id.
@@ -197,19 +202,26 @@ class WseItem {
   final String? signatureKid;
   final bool verified;
 
-  /// Connected: the connection's id and user.
+  /// Connected: the connection's id and user, and whether the server keeps
+  /// topic histories (missed messages are replayed).
   final String? connectionId;
   final String? userId;
   final bool reconnected;
+  final bool recovery;
 
   /// Disconnected: the close code; Gap and Closed: the reason.
   final int? code;
   final String? reason;
-  final BigInt? retryInMs;
 
-  /// Subscribed: the topics taken and refused.
+  /// Disconnected: when the next attempt is made, and attempts so far.
+  final BigInt? retryInMs;
+  final int? attempt;
+
+  /// Subscribed: the topics taken and refused, and per topic asked for with
+  /// a position what was replayed.
   final List<String> topics;
   final List<String> failed;
+  final List<WseTopicRecovery> recoveries;
 
   /// Gap: the first and last offsets missing, when known.
   final BigInt? first;
@@ -223,6 +235,7 @@ class WseItem {
     this.offset,
     this.id,
     this.json,
+    this.payloadError,
     this.bytes,
     this.signedBody,
     this.signature,
@@ -231,11 +244,14 @@ class WseItem {
     this.connectionId,
     this.userId,
     required this.reconnected,
+    required this.recovery,
     this.code,
     this.reason,
     this.retryInMs,
+    this.attempt,
     required this.topics,
     required this.failed,
+    required this.recoveries,
     this.first,
     this.last,
   });
@@ -249,6 +265,7 @@ class WseItem {
       offset.hashCode ^
       id.hashCode ^
       json.hashCode ^
+      payloadError.hashCode ^
       bytes.hashCode ^
       signedBody.hashCode ^
       signature.hashCode ^
@@ -257,11 +274,14 @@ class WseItem {
       connectionId.hashCode ^
       userId.hashCode ^
       reconnected.hashCode ^
+      recovery.hashCode ^
       code.hashCode ^
       reason.hashCode ^
       retryInMs.hashCode ^
+      attempt.hashCode ^
       topics.hashCode ^
       failed.hashCode ^
+      recoveries.hashCode ^
       first.hashCode ^
       last.hashCode;
 
@@ -277,6 +297,7 @@ class WseItem {
           offset == other.offset &&
           id == other.id &&
           json == other.json &&
+          payloadError == other.payloadError &&
           bytes == other.bytes &&
           signedBody == other.signedBody &&
           signature == other.signature &&
@@ -285,11 +306,14 @@ class WseItem {
           connectionId == other.connectionId &&
           userId == other.userId &&
           reconnected == other.reconnected &&
+          recovery == other.recovery &&
           code == other.code &&
           reason == other.reason &&
           retryInMs == other.retryInMs &&
+          attempt == other.attempt &&
           topics == other.topics &&
           failed == other.failed &&
+          recoveries == other.recoveries &&
           first == other.first &&
           last == other.last;
 }
@@ -305,4 +329,31 @@ enum WseItemKind {
   serverError,
   closed,
   unknown,
+}
+
+/// What a subscription replayed of a topic asked for with a position.
+class WseTopicRecovery {
+  final String topic;
+
+  /// Every missed message was replayed.
+  final bool recovered;
+  final BigInt count;
+
+  const WseTopicRecovery({
+    required this.topic,
+    required this.recovered,
+    required this.count,
+  });
+
+  @override
+  int get hashCode => topic.hashCode ^ recovered.hashCode ^ count.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is WseTopicRecovery &&
+          runtimeType == other.runtimeType &&
+          topic == other.topic &&
+          recovered == other.recovered &&
+          count == other.count;
 }

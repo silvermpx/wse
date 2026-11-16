@@ -1556,23 +1556,33 @@ public struct WseMessage: Equatable, Hashable {
     public let offset: UInt64?
     public let id: String?
     /**
-     * The payload as JSON text (from msgpack too).
+     * The payload as JSON text (from msgpack too); None without one
+     * (absent or null) or when it could not be decoded.
      */
     public let json: String?
+    /**
+     * Why the payload could not be decoded (msgpack JSON cannot show).
+     */
+    public let payloadError: String?
     public let signature: WseSignature?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(kind: String, topic: String?, epoch: UInt32?, offset: UInt64?, id: String?, 
         /**
-         * The payload as JSON text (from msgpack too).
-         */json: String?, signature: WseSignature?) {
+         * The payload as JSON text (from msgpack too); None without one
+         * (absent or null) or when it could not be decoded.
+         */json: String?, 
+        /**
+         * Why the payload could not be decoded (msgpack JSON cannot show).
+         */payloadError: String?, signature: WseSignature?) {
         self.kind = kind
         self.topic = topic
         self.epoch = epoch
         self.offset = offset
         self.id = id
         self.json = json
+        self.payloadError = payloadError
         self.signature = signature
     }
 
@@ -1598,6 +1608,7 @@ public struct FfiConverterTypeWseMessage: FfiConverterRustBuffer {
                 offset: FfiConverterOptionUInt64.read(from: &buf), 
                 id: FfiConverterOptionString.read(from: &buf), 
                 json: FfiConverterOptionString.read(from: &buf), 
+                payloadError: FfiConverterOptionString.read(from: &buf), 
                 signature: FfiConverterOptionTypeWseSignature.read(from: &buf)
         )
     }
@@ -1609,6 +1620,7 @@ public struct FfiConverterTypeWseMessage: FfiConverterRustBuffer {
         FfiConverterOptionUInt64.write(value.offset, into: &buf)
         FfiConverterOptionString.write(value.id, into: &buf)
         FfiConverterOptionString.write(value.json, into: &buf)
+        FfiConverterOptionString.write(value.payloadError, into: &buf)
         FfiConverterOptionTypeWseSignature.write(value.signature, into: &buf)
     }
 }

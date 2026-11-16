@@ -231,8 +231,11 @@ pub struct WseMessage {
     pub epoch: Option<u32>,
     pub offset: Option<u64>,
     pub id: Option<String>,
-    /// The payload as JSON text (from msgpack too).
+    /// The payload as JSON text (from msgpack too); None without one
+    /// (absent or null) or when it could not be decoded.
     pub json: Option<String>,
+    /// Why the payload could not be decoded (msgpack JSON cannot show).
+    pub payload_error: Option<String>,
     pub signature: Option<WseSignature>,
 }
 
@@ -303,6 +306,7 @@ impl From<native::Item> for WseItem {
                     offset: m.offset,
                     id: m.id,
                     json: m.json,
+                    payload_error: m.payload_error,
                     signature: m.signature.map(|s| WseSignature {
                         body: s.body,
                         sig: s.sig,

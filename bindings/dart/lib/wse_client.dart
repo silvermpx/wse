@@ -8,7 +8,7 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart' show
 import 'src/rust/api.dart' as rust;
 import 'src/rust/frb_generated.dart';
 
-export 'src/rust/api.dart' show WseConfig, WseError, WseItem, WseItemKind;
+export 'src/rust/api.dart' show WseConfig, WseError, WseItem, WseItemKind, WseTopicRecovery;
 
 /// Under `flutter test` the build hook puts the library in
 /// build/native_assets/<os>/, where loading it by name does not look; a

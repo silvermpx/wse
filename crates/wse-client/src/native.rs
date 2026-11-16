@@ -283,8 +283,12 @@ pub struct NativeMessage {
     pub epoch: Option<u32>,
     pub offset: Option<u64>,
     pub id: Option<String>,
-    /// The payload as JSON text, from msgpack too; None without a payload.
+    /// The payload as JSON text, from msgpack too; None without one (absent
+    /// or null, in either format) or when it could not be decoded.
     pub json: Option<String>,
+    /// Why the payload could not be decoded: msgpack that JSON cannot show
+    /// (a map keyed by a number, say). None when `json` holds it.
+    pub payload_error: Option<String>,
     pub signature: Option<NativeSignature>,
 }
 
@@ -374,13 +378,17 @@ fn gap_reason(reason: GapReason) -> &'static str {
 
 fn message_of(message: &OwnedMessage) -> NativeMessage {
     let position = message.position();
-    let json = match message.payload_json() {
-        Some(text) => Some(text.to_owned()),
-        None => message
-            .payload_value()
-            .ok()
-            .filter(|v| !v.is_null())
-            .map(|v| v.to_string()),
+    // The same payload reads the same in either format: none (absent or
+    // null: JSON reads `"p": null` as none), or its JSON; msgpack JSON cannot
+    // show says why instead.
+    let (json, payload_error) = match message.payload_json() {
+        Some(text) => (Some(text.to_owned()), None),
+        None if !message.has_payload() => (None, None),
+        None => match message.payload_value() {
+            Ok(serde_json::Value::Null) => (None, None),
+            Ok(value) => (Some(value.to_string()), None),
+            Err(error) => (None, Some(error.to_string())),
+        },
     };
     NativeMessage {
         kind: message.kind().to_owned(),
@@ -389,6 +397,7 @@ fn message_of(message: &OwnedMessage) -> NativeMessage {
         offset: position.map(|p| p.offset),
         id: message.id().map(str::to_owned),
         json,
+        payload_error,
         signature: message.signature().map(|s| NativeSignature {
             body: s.body.clone(),
             sig: s.sig.clone(),
@@ -696,4 +705,63 @@ impl NativeClient {
 fn raw_json(json: &str) -> Result<Box<serde_json::value::RawValue>, NativeError> {
     serde_json::value::RawValue::from_string(json.to_owned())
         .map_err(|e| NativeError::new(ErrorKind::Encode, format!("the payload is not JSON: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode::{json_envelope, msgpack_envelope};
+
+    fn from_json(text: &str) -> NativeMessage {
+        message_of(&json_envelope(text).unwrap().into_message(None).to_owned())
+    }
+
+    fn from_msgpack(bytes: &[u8]) -> NativeMessage {
+        message_of(
+            &msgpack_envelope(bytes)
+                .unwrap()
+                .into_message(None)
+                .to_owned(),
+        )
+    }
+
+    fn packed(value: &serde_json::Value) -> Vec<u8> {
+        rmp_serde::to_vec_named(value).unwrap()
+    }
+
+    /// The same message in either format: its payload as the app sees it.
+    #[test]
+    fn a_payload_reads_the_same_in_json_and_msgpack() {
+        let cases = [
+            (serde_json::json!({"t": "m"}), None),
+            (serde_json::json!({"t": "m", "p": null}), None),
+            (
+                serde_json::json!({"t": "m", "p": 18446744073709551615u64}),
+                Some("18446744073709551615"),
+            ),
+            (serde_json::json!({"t": "m", "p": -2.5}), Some("-2.5")),
+            (
+                serde_json::json!({"t": "m", "p": {"a": [1, null]}}),
+                Some(r#"{"a":[1,null]}"#),
+            ),
+        ];
+        for (message, payload) in cases {
+            let text = message.to_string();
+            let json = from_json(&text);
+            let msgpack = from_msgpack(&packed(&message));
+            assert_eq!(json.json.as_deref(), payload, "json {text}");
+            assert_eq!(msgpack.json.as_deref(), payload, "msgpack {text}");
+            assert_eq!(json.payload_error, None);
+            assert_eq!(msgpack.payload_error, None);
+        }
+    }
+
+    #[test]
+    fn a_msgpack_payload_json_cannot_show_is_an_error() {
+        // {"t": "m", "p": {1: 2}}: a map keyed by a number.
+        let bytes = [0x82, 0xa1, b't', 0xa1, b'm', 0xa1, b'p', 0x81, 0x01, 0x02];
+        let message = from_msgpack(&bytes);
+        assert_eq!(message.json, None);
+        assert!(message.payload_error.is_some());
+    }
 }

@@ -959,6 +959,18 @@ impl SseDecode for Vec<crate::api::WseItem> {
     }
 }
 
+impl SseDecode for Vec<crate::api::WseTopicRecovery> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<crate::api::WseTopicRecovery>::sse_decode(deserializer));
+        }
+        return ans_;
+    }
+}
+
 impl SseDecode for Option<String> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1124,6 +1136,7 @@ impl SseDecode for crate::api::WseItem {
         let mut var_offset = <Option<u64>>::sse_decode(deserializer);
         let mut var_id = <Option<String>>::sse_decode(deserializer);
         let mut var_json = <Option<String>>::sse_decode(deserializer);
+        let mut var_payloadError = <Option<String>>::sse_decode(deserializer);
         let mut var_bytes = <Option<Vec<u8>>>::sse_decode(deserializer);
         let mut var_signedBody = <Option<String>>::sse_decode(deserializer);
         let mut var_signature = <Option<String>>::sse_decode(deserializer);
@@ -1132,11 +1145,14 @@ impl SseDecode for crate::api::WseItem {
         let mut var_connectionId = <Option<String>>::sse_decode(deserializer);
         let mut var_userId = <Option<String>>::sse_decode(deserializer);
         let mut var_reconnected = <bool>::sse_decode(deserializer);
+        let mut var_recovery = <bool>::sse_decode(deserializer);
         let mut var_code = <Option<u16>>::sse_decode(deserializer);
         let mut var_reason = <Option<String>>::sse_decode(deserializer);
         let mut var_retryInMs = <Option<u64>>::sse_decode(deserializer);
+        let mut var_attempt = <Option<u32>>::sse_decode(deserializer);
         let mut var_topics = <Vec<String>>::sse_decode(deserializer);
         let mut var_failed = <Vec<String>>::sse_decode(deserializer);
+        let mut var_recoveries = <Vec<crate::api::WseTopicRecovery>>::sse_decode(deserializer);
         let mut var_first = <Option<u64>>::sse_decode(deserializer);
         let mut var_last = <Option<u64>>::sse_decode(deserializer);
         return crate::api::WseItem {
@@ -1147,6 +1163,7 @@ impl SseDecode for crate::api::WseItem {
             offset: var_offset,
             id: var_id,
             json: var_json,
+            payload_error: var_payloadError,
             bytes: var_bytes,
             signed_body: var_signedBody,
             signature: var_signature,
@@ -1155,11 +1172,14 @@ impl SseDecode for crate::api::WseItem {
             connection_id: var_connectionId,
             user_id: var_userId,
             reconnected: var_reconnected,
+            recovery: var_recovery,
             code: var_code,
             reason: var_reason,
             retry_in_ms: var_retryInMs,
+            attempt: var_attempt,
             topics: var_topics,
             failed: var_failed,
+            recoveries: var_recoveries,
             first: var_first,
             last: var_last,
         };
@@ -1181,6 +1201,20 @@ impl SseDecode for crate::api::WseItemKind {
             7 => crate::api::WseItemKind::Closed,
             8 => crate::api::WseItemKind::Unknown,
             _ => unreachable!("Invalid variant for WseItemKind: {}", inner),
+        };
+    }
+}
+
+impl SseDecode for crate::api::WseTopicRecovery {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_topic = <String>::sse_decode(deserializer);
+        let mut var_recovered = <bool>::sse_decode(deserializer);
+        let mut var_count = <u64>::sse_decode(deserializer);
+        return crate::api::WseTopicRecovery {
+            topic: var_topic,
+            recovered: var_recovered,
+            count: var_count,
         };
     }
 }
@@ -1328,6 +1362,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::WseItem {
             self.offset.into_into_dart().into_dart(),
             self.id.into_into_dart().into_dart(),
             self.json.into_into_dart().into_dart(),
+            self.payload_error.into_into_dart().into_dart(),
             self.bytes.into_into_dart().into_dart(),
             self.signed_body.into_into_dart().into_dart(),
             self.signature.into_into_dart().into_dart(),
@@ -1336,11 +1371,14 @@ impl flutter_rust_bridge::IntoDart for crate::api::WseItem {
             self.connection_id.into_into_dart().into_dart(),
             self.user_id.into_into_dart().into_dart(),
             self.reconnected.into_into_dart().into_dart(),
+            self.recovery.into_into_dart().into_dart(),
             self.code.into_into_dart().into_dart(),
             self.reason.into_into_dart().into_dart(),
             self.retry_in_ms.into_into_dart().into_dart(),
+            self.attempt.into_into_dart().into_dart(),
             self.topics.into_into_dart().into_dart(),
             self.failed.into_into_dart().into_dart(),
+            self.recoveries.into_into_dart().into_dart(),
             self.first.into_into_dart().into_dart(),
             self.last.into_into_dart().into_dart(),
         ]
@@ -1373,6 +1411,25 @@ impl flutter_rust_bridge::IntoDart for crate::api::WseItemKind {
 impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::WseItemKind {}
 impl flutter_rust_bridge::IntoIntoDart<crate::api::WseItemKind> for crate::api::WseItemKind {
     fn into_into_dart(self) -> crate::api::WseItemKind {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::WseTopicRecovery {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.topic.into_into_dart().into_dart(),
+            self.recovered.into_into_dart().into_dart(),
+            self.count.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::WseTopicRecovery {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::WseTopicRecovery>
+    for crate::api::WseTopicRecovery
+{
+    fn into_into_dart(self) -> crate::api::WseTopicRecovery {
         self
     }
 }
@@ -1460,6 +1517,16 @@ impl SseEncode for Vec<crate::api::WseItem> {
         <i32>::sse_encode(self.len() as _, serializer);
         for item in self {
             <crate::api::WseItem>::sse_encode(item, serializer);
+        }
+    }
+}
+
+impl SseEncode for Vec<crate::api::WseTopicRecovery> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <crate::api::WseTopicRecovery>::sse_encode(item, serializer);
         }
     }
 }
@@ -1603,6 +1670,7 @@ impl SseEncode for crate::api::WseItem {
         <Option<u64>>::sse_encode(self.offset, serializer);
         <Option<String>>::sse_encode(self.id, serializer);
         <Option<String>>::sse_encode(self.json, serializer);
+        <Option<String>>::sse_encode(self.payload_error, serializer);
         <Option<Vec<u8>>>::sse_encode(self.bytes, serializer);
         <Option<String>>::sse_encode(self.signed_body, serializer);
         <Option<String>>::sse_encode(self.signature, serializer);
@@ -1611,11 +1679,14 @@ impl SseEncode for crate::api::WseItem {
         <Option<String>>::sse_encode(self.connection_id, serializer);
         <Option<String>>::sse_encode(self.user_id, serializer);
         <bool>::sse_encode(self.reconnected, serializer);
+        <bool>::sse_encode(self.recovery, serializer);
         <Option<u16>>::sse_encode(self.code, serializer);
         <Option<String>>::sse_encode(self.reason, serializer);
         <Option<u64>>::sse_encode(self.retry_in_ms, serializer);
+        <Option<u32>>::sse_encode(self.attempt, serializer);
         <Vec<String>>::sse_encode(self.topics, serializer);
         <Vec<String>>::sse_encode(self.failed, serializer);
+        <Vec<crate::api::WseTopicRecovery>>::sse_encode(self.recoveries, serializer);
         <Option<u64>>::sse_encode(self.first, serializer);
         <Option<u64>>::sse_encode(self.last, serializer);
     }
@@ -1641,6 +1712,15 @@ impl SseEncode for crate::api::WseItemKind {
             },
             serializer,
         );
+    }
+}
+
+impl SseEncode for crate::api::WseTopicRecovery {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.topic, serializer);
+        <bool>::sse_encode(self.recovered, serializer);
+        <u64>::sse_encode(self.count, serializer);
     }
 }
 

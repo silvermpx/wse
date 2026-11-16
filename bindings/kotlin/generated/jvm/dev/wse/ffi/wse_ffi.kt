@@ -2853,9 +2853,15 @@ data class WseMessage (
     val `id`: kotlin.String?
     , 
     /**
-     * The payload as JSON text (from msgpack too).
+     * The payload as JSON text (from msgpack too); None without one
+     * (absent or null) or when it could not be decoded.
      */
     val `json`: kotlin.String?
+    , 
+    /**
+     * Why the payload could not be decoded (msgpack JSON cannot show).
+     */
+    val `payloadError`: kotlin.String?
     , 
     val `signature`: WseSignature?
     
@@ -2880,6 +2886,7 @@ public object FfiConverterTypeWseMessage: FfiConverterRustBuffer<WseMessage> {
             FfiConverterOptionalULong.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
             FfiConverterOptionalTypeWseSignature.read(buf),
         )
     }
@@ -2891,6 +2898,7 @@ public object FfiConverterTypeWseMessage: FfiConverterRustBuffer<WseMessage> {
             FfiConverterOptionalULong.allocationSize(value.`offset`) +
             FfiConverterOptionalString.allocationSize(value.`id`) +
             FfiConverterOptionalString.allocationSize(value.`json`) +
+            FfiConverterOptionalString.allocationSize(value.`payloadError`) +
             FfiConverterOptionalTypeWseSignature.allocationSize(value.`signature`)
     )
 
@@ -2901,6 +2909,7 @@ public object FfiConverterTypeWseMessage: FfiConverterRustBuffer<WseMessage> {
             FfiConverterOptionalULong.write(value.`offset`, buf)
             FfiConverterOptionalString.write(value.`id`, buf)
             FfiConverterOptionalString.write(value.`json`, buf)
+            FfiConverterOptionalString.write(value.`payloadError`, buf)
             FfiConverterOptionalTypeWseSignature.write(value.`signature`, buf)
     }
 }

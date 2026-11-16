@@ -93,6 +93,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<WseItem> dco_decode_list_wse_item(dynamic raw);
 
   @protected
+  List<WseTopicRecovery> dco_decode_list_wse_topic_recovery(dynamic raw);
+
+  @protected
   String? dco_decode_opt_String(dynamic raw);
 
   @protected
@@ -139,6 +142,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   WseItemKind dco_decode_wse_item_kind(dynamic raw);
+
+  @protected
+  WseTopicRecovery dco_decode_wse_topic_recovery(dynamic raw);
 
   @protected
   WseCancel
@@ -207,6 +213,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<WseItem> sse_decode_list_wse_item(SseDeserializer deserializer);
 
   @protected
+  List<WseTopicRecovery> sse_decode_list_wse_topic_recovery(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
 
   @protected
@@ -253,6 +264,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   WseItemKind sse_decode_wse_item_kind(SseDeserializer deserializer);
+
+  @protected
+  WseTopicRecovery sse_decode_wse_topic_recovery(SseDeserializer deserializer);
 
   @protected
   void
@@ -333,6 +347,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_list_wse_item(List<WseItem> self, SseSerializer serializer);
 
   @protected
+  void sse_encode_list_wse_topic_recovery(
+    List<WseTopicRecovery> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
 
   @protected
@@ -382,6 +402,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_wse_item_kind(WseItemKind self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_wse_topic_recovery(
+    WseTopicRecovery self,
+    SseSerializer serializer,
+  );
 }
 
 // Section: wire_class

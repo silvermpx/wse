@@ -297,6 +297,12 @@ impl OwnedMessage {
         }
     }
 
+    /// The message carries a payload (`p`), whatever it is.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    pub(crate) fn has_payload(&self) -> bool {
+        !matches!(self.payload, OwnedPayload::None)
+    }
+
     fn payload_ref(&self) -> Payload<'_> {
         match &self.payload {
             OwnedPayload::None => Payload::None,

@@ -28,6 +28,21 @@ void main() {
     await client.close();
   });
 
+  test('the connection and the subscription say what the server keeps', () async {
+    final client = await WseClient.connect(wseConfig(url, topics: ['ticks']));
+    WseItem? connected;
+    WseItem? subscribed;
+    await for (final item in client.events()) {
+      if (item.kind == WseItemKind.connected) connected = item;
+      if (item.kind == WseItemKind.subscribed) subscribed = item;
+      if (connected != null && subscribed != null) break;
+    }
+    expect(connected!.recovery, isTrue);
+    expect(subscribed!.topics, contains('ticks'));
+    expect(subscribed.recoveries.map((r) => r.topic), contains('ticks'));
+    await client.close();
+  });
+
   test('a listener that stops in between loses nothing', () async {
     final client = await WseClient.connect(wseConfig(url, topics: ['ticks']));
     final first = await client.events().first;

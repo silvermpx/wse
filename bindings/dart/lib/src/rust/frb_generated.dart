@@ -820,6 +820,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<WseTopicRecovery> dco_decode_list_wse_topic_recovery(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_wse_topic_recovery).toList();
+  }
+
+  @protected
   String? dco_decode_opt_String(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_String(raw);
@@ -937,8 +943,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   WseItem dco_decode_wse_item(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 22)
-      throw Exception('unexpected arr length: expect 22 but see ${arr.length}');
+    if (arr.length != 26)
+      throw Exception('unexpected arr length: expect 26 but see ${arr.length}');
     return WseItem(
       kind: dco_decode_wse_item_kind(arr[0]),
       name: dco_decode_opt_String(arr[1]),
@@ -947,21 +953,25 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       offset: dco_decode_opt_box_autoadd_u_64(arr[4]),
       id: dco_decode_opt_String(arr[5]),
       json: dco_decode_opt_String(arr[6]),
-      bytes: dco_decode_opt_list_prim_u_8_strict(arr[7]),
-      signedBody: dco_decode_opt_String(arr[8]),
-      signature: dco_decode_opt_String(arr[9]),
-      signatureKid: dco_decode_opt_String(arr[10]),
-      verified: dco_decode_bool(arr[11]),
-      connectionId: dco_decode_opt_String(arr[12]),
-      userId: dco_decode_opt_String(arr[13]),
-      reconnected: dco_decode_bool(arr[14]),
-      code: dco_decode_opt_box_autoadd_u_16(arr[15]),
-      reason: dco_decode_opt_String(arr[16]),
-      retryInMs: dco_decode_opt_box_autoadd_u_64(arr[17]),
-      topics: dco_decode_list_String(arr[18]),
-      failed: dco_decode_list_String(arr[19]),
-      first: dco_decode_opt_box_autoadd_u_64(arr[20]),
-      last: dco_decode_opt_box_autoadd_u_64(arr[21]),
+      payloadError: dco_decode_opt_String(arr[7]),
+      bytes: dco_decode_opt_list_prim_u_8_strict(arr[8]),
+      signedBody: dco_decode_opt_String(arr[9]),
+      signature: dco_decode_opt_String(arr[10]),
+      signatureKid: dco_decode_opt_String(arr[11]),
+      verified: dco_decode_bool(arr[12]),
+      connectionId: dco_decode_opt_String(arr[13]),
+      userId: dco_decode_opt_String(arr[14]),
+      reconnected: dco_decode_bool(arr[15]),
+      recovery: dco_decode_bool(arr[16]),
+      code: dco_decode_opt_box_autoadd_u_16(arr[17]),
+      reason: dco_decode_opt_String(arr[18]),
+      retryInMs: dco_decode_opt_box_autoadd_u_64(arr[19]),
+      attempt: dco_decode_opt_box_autoadd_u_32(arr[20]),
+      topics: dco_decode_list_String(arr[21]),
+      failed: dco_decode_list_String(arr[22]),
+      recoveries: dco_decode_list_wse_topic_recovery(arr[23]),
+      first: dco_decode_opt_box_autoadd_u_64(arr[24]),
+      last: dco_decode_opt_box_autoadd_u_64(arr[25]),
     );
   }
 
@@ -969,6 +979,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   WseItemKind dco_decode_wse_item_kind(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return WseItemKind.values[raw as int];
+  }
+
+  @protected
+  WseTopicRecovery dco_decode_wse_topic_recovery(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 3)
+      throw Exception('unexpected arr length: expect 3 but see ${arr.length}');
+    return WseTopicRecovery(
+      topic: dco_decode_String(arr[0]),
+      recovered: dco_decode_bool(arr[1]),
+      count: dco_decode_u_64(arr[2]),
+    );
   }
 
   @protected
@@ -1113,6 +1136,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var ans_ = <WseItem>[];
     for (var idx_ = 0; idx_ < len_; ++idx_) {
       ans_.add(sse_decode_wse_item(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
+  List<WseTopicRecovery> sse_decode_list_wse_topic_recovery(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <WseTopicRecovery>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_wse_topic_recovery(deserializer));
     }
     return ans_;
   }
@@ -1267,6 +1304,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_offset = sse_decode_opt_box_autoadd_u_64(deserializer);
     var var_id = sse_decode_opt_String(deserializer);
     var var_json = sse_decode_opt_String(deserializer);
+    var var_payloadError = sse_decode_opt_String(deserializer);
     var var_bytes = sse_decode_opt_list_prim_u_8_strict(deserializer);
     var var_signedBody = sse_decode_opt_String(deserializer);
     var var_signature = sse_decode_opt_String(deserializer);
@@ -1275,11 +1313,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_connectionId = sse_decode_opt_String(deserializer);
     var var_userId = sse_decode_opt_String(deserializer);
     var var_reconnected = sse_decode_bool(deserializer);
+    var var_recovery = sse_decode_bool(deserializer);
     var var_code = sse_decode_opt_box_autoadd_u_16(deserializer);
     var var_reason = sse_decode_opt_String(deserializer);
     var var_retryInMs = sse_decode_opt_box_autoadd_u_64(deserializer);
+    var var_attempt = sse_decode_opt_box_autoadd_u_32(deserializer);
     var var_topics = sse_decode_list_String(deserializer);
     var var_failed = sse_decode_list_String(deserializer);
+    var var_recoveries = sse_decode_list_wse_topic_recovery(deserializer);
     var var_first = sse_decode_opt_box_autoadd_u_64(deserializer);
     var var_last = sse_decode_opt_box_autoadd_u_64(deserializer);
     return WseItem(
@@ -1290,6 +1331,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       offset: var_offset,
       id: var_id,
       json: var_json,
+      payloadError: var_payloadError,
       bytes: var_bytes,
       signedBody: var_signedBody,
       signature: var_signature,
@@ -1298,11 +1340,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       connectionId: var_connectionId,
       userId: var_userId,
       reconnected: var_reconnected,
+      recovery: var_recovery,
       code: var_code,
       reason: var_reason,
       retryInMs: var_retryInMs,
+      attempt: var_attempt,
       topics: var_topics,
       failed: var_failed,
+      recoveries: var_recoveries,
       first: var_first,
       last: var_last,
     );
@@ -1313,6 +1358,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var inner = sse_decode_i_32(deserializer);
     return WseItemKind.values[inner];
+  }
+
+  @protected
+  WseTopicRecovery sse_decode_wse_topic_recovery(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_topic = sse_decode_String(deserializer);
+    var var_recovered = sse_decode_bool(deserializer);
+    var var_count = sse_decode_u_64(deserializer);
+    return WseTopicRecovery(
+      topic: var_topic,
+      recovered: var_recovered,
+      count: var_count,
+    );
   }
 
   @protected
@@ -1467,6 +1525,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_list_wse_topic_recovery(
+    List<WseTopicRecovery> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_wse_topic_recovery(item, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
@@ -1597,6 +1667,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_opt_box_autoadd_u_64(self.offset, serializer);
     sse_encode_opt_String(self.id, serializer);
     sse_encode_opt_String(self.json, serializer);
+    sse_encode_opt_String(self.payloadError, serializer);
     sse_encode_opt_list_prim_u_8_strict(self.bytes, serializer);
     sse_encode_opt_String(self.signedBody, serializer);
     sse_encode_opt_String(self.signature, serializer);
@@ -1605,11 +1676,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_opt_String(self.connectionId, serializer);
     sse_encode_opt_String(self.userId, serializer);
     sse_encode_bool(self.reconnected, serializer);
+    sse_encode_bool(self.recovery, serializer);
     sse_encode_opt_box_autoadd_u_16(self.code, serializer);
     sse_encode_opt_String(self.reason, serializer);
     sse_encode_opt_box_autoadd_u_64(self.retryInMs, serializer);
+    sse_encode_opt_box_autoadd_u_32(self.attempt, serializer);
     sse_encode_list_String(self.topics, serializer);
     sse_encode_list_String(self.failed, serializer);
+    sse_encode_list_wse_topic_recovery(self.recoveries, serializer);
     sse_encode_opt_box_autoadd_u_64(self.first, serializer);
     sse_encode_opt_box_autoadd_u_64(self.last, serializer);
   }
@@ -1618,6 +1692,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   void sse_encode_wse_item_kind(WseItemKind self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.index, serializer);
+  }
+
+  @protected
+  void sse_encode_wse_topic_recovery(
+    WseTopicRecovery self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.topic, serializer);
+    sse_encode_bool(self.recovered, serializer);
+    sse_encode_u_64(self.count, serializer);
   }
 }
 
