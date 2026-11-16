@@ -312,14 +312,22 @@ fn a_msgpack_connection_gets_json_as_msgpack() {
     }
 }
 
-/// Wait until `h` has `len` bytes queued (its lane delivered them), then
-/// take them.
+/// Take the bytes queued for `h` until there are `len` of them (its lane
+/// delivered them), or five seconds have passed. A lane counts a frame in
+/// `pending` just before it queues it, so the count alone does not say the
+/// frame is there yet.
 async fn delivered(h: &ConnectionHandle, len: usize) -> Vec<u8> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while h.out.pending.load(Ordering::Relaxed) < len && tokio::time::Instant::now() < deadline {
+    let mut bytes = Vec::with_capacity(len);
+    loop {
+        for frame in queued(h) {
+            bytes.extend_from_slice(&frame);
+        }
+        if bytes.len() >= len || tokio::time::Instant::now() >= deadline {
+            break;
+        }
         tokio::task::yield_now().await;
     }
-    let bytes = queued(h).concat();
     h.out.pending.fetch_sub(bytes.len(), Ordering::Relaxed);
     bytes
 }
