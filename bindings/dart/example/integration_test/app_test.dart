@@ -1,6 +1,7 @@
 // On a device or simulator, against the Rust client's example server: pass
 // its URL with --dart-define=WSE_URL=..., its wss:// door with WSE_TLS_URL
 // and the door's CA certificate (PEM, in base64) with WSE_CA.
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/widgets.dart';
@@ -10,6 +11,8 @@ import 'package:wse_client/wse_client.dart';
 import 'package:wse_client_example/main.dart';
 
 const tlsUrl = String.fromEnvironment('WSE_TLS_URL');
+const identity = String.fromEnvironment('WSE_IDENTITY');
+const signing = String.fromEnvironment('WSE_SIGNING');
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
@@ -73,5 +76,48 @@ void main() {
         ),
       );
     }
+  });
+
+  test('an encrypted session and signed messages on the device', () async {
+    final sealed = await WseClient.connect(
+      wseConfig(serverUrl, insecure: true, serverIdentityKeys: [identity]),
+    );
+    await sealed.send('echo', '{"sealed":true}');
+    final echoed = await sealed.events().firstWhere(
+      (item) => item.kind == WseItemKind.message && item.name == 'echoed',
+    );
+    expect(echoed.json, '{"sealed":true}');
+    await sealed.close();
+
+    final key = generateSigningKey();
+    final client = await WseClient.connect(
+      wseConfig(
+        serverUrl,
+        insecure: true,
+        signingKey: key,
+        serverSigningKeys: [signing],
+      ),
+    );
+    final items = StreamIterator(client.events());
+    Future<WseItem> next(String kind) async {
+      while (await items.moveNext()) {
+        if (items.current.kind == WseItemKind.message &&
+            items.current.name == kind) {
+          return items.current;
+        }
+      }
+      throw StateError('no $kind');
+    }
+
+    await client.send(
+      'bind_key',
+      '{"public_key":"${signingPublicKey(key: key)}"}',
+    );
+    expect((await next('key_bound')).json, '{"bound":true}');
+    await client.sendSigned('order', '{"side":"buy"}', nonce: 'flutter-1');
+    final receipt = await next('receipt');
+    expect(receipt.verified, isTrue);
+    await items.cancel();
+    await client.close();
   });
 }

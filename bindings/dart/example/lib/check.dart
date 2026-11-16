@@ -1,8 +1,11 @@
 // The package in a release build of an app: it connects, hears a tick, trusts
 // the wss:// door of the CA it is given and finds the system's verifier
-// turning that door down. It prints "WSE_CHECK ok" or what failed, and shows
-// nothing. run-integration-tests.sh builds it with MODE=release and passes
-// the server with --dart-define (WSE_URL, WSE_TLS_URL, WSE_CA).
+// turning that door down, has an end-to-end encrypted session with the
+// pinned server echo, and gets a signed receipt for a signed message. It
+// prints "WSE_CHECK ok" or what failed, and shows nothing.
+// run-integration-tests.sh builds it with MODE=release and passes the server
+// with --dart-define (WSE_URL, WSE_TLS_URL, WSE_CA, WSE_IDENTITY,
+// WSE_SIGNING).
 import 'dart:convert';
 
 import 'package:flutter/widgets.dart';
@@ -11,6 +14,8 @@ import 'package:wse_client/wse_client.dart';
 const serverUrl = String.fromEnvironment('WSE_URL');
 const tlsUrl = String.fromEnvironment('WSE_TLS_URL');
 const caBase64 = String.fromEnvironment('WSE_CA');
+const identity = String.fromEnvironment('WSE_IDENTITY');
+const signing = String.fromEnvironment('WSE_SIGNING');
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -50,5 +55,44 @@ Future<String> check() async {
       return 'failed: ${error.kind}: ${error.message}';
     }
   }
+
+  final sealed = await WseClient.connect(
+    wseConfig(serverUrl, insecure: true, serverIdentityKeys: [identity]),
+  );
+  await sealed.send('echo', '{"sealed":true}');
+  final echoed = await sealed
+      .events()
+      .firstWhere(
+        (item) => item.kind == WseItemKind.message && item.name == 'echoed',
+      )
+      .timeout(const Duration(seconds: 20));
+  await sealed.close();
+  if (echoed.json != '{"sealed":true}') return 'failed: echo ${echoed.json}';
+
+  final key = generateSigningKey();
+  final signer = await WseClient.connect(
+    wseConfig(
+      serverUrl,
+      insecure: true,
+      signingKey: key,
+      serverSigningKeys: [signing],
+    ),
+  );
+  final items = signer.events().asBroadcastStream();
+  final bound = items.firstWhere(
+    (item) => item.kind == WseItemKind.message && item.name == 'key_bound',
+  );
+  await signer.send(
+    'bind_key',
+    '{"public_key":"${signingPublicKey(key: key)}"}',
+  );
+  await bound.timeout(const Duration(seconds: 20));
+  final receipt = items.firstWhere(
+    (item) => item.kind == WseItemKind.message && item.name == 'receipt',
+  );
+  await signer.sendSigned('order', '{"side":"buy"}', nonce: 'release-1');
+  final signed = await receipt.timeout(const Duration(seconds: 20));
+  await signer.close();
+  if (!signed.verified) return 'failed: the receipt was not verified';
   return 'ok';
 }

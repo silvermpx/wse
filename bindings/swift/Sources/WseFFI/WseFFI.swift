@@ -3627,6 +3627,29 @@ public func connect(config: WseConfig, tokens: WseTokenSource?, cancel: WseCance
             errorHandler: FfiConverterTypeWseError_lift
         )
 }
+/**
+ * A new ECDSA P-256 private key (PKCS#8 DER) for signed messages: keep it
+ * in the platform's keystore.
+ */
+public func generateSigningKey() -> Data  {
+    return try!  FfiConverterData.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_wse_ffi_fn_func_generate_signing_key(uniffiCallStatus
+    )
+})
+}
+/**
+ * The public key of a PKCS#8 private key (base64 of the uncompressed
+ * point): what the server binds to a connection for its signed messages.
+ */
+public func signingPublicKey(key: Data)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeWseError_lift) {
+        uniffiCallStatus in
+    uniffi_wse_ffi_fn_func_signing_public_key(
+        FfiConverterData.lower(key),uniffiCallStatus
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -3644,6 +3667,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_wse_ffi_checksum_func_connect() != 44227) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wse_ffi_checksum_func_generate_signing_key() != 46208) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wse_ffi_checksum_func_signing_public_key() != 19003) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_method_wsecancel_cancel() != 25563) {

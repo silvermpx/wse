@@ -18,10 +18,14 @@ WSE_PORT="$port" WSE_TLS_PORT="$((port + 1))" WSE_TLS_CA="$target/kotlin-test-ca
 server=$!
 trap 'kill "$server" 2>/dev/null || true' EXIT
 for _ in $(seq 1 50); do
-  grep -q "tls_ca" "$target/kotlin-test-server.log" && break
+  grep -q "signing_public_key" "$target/kotlin-test-server.log" && break
   sleep 0.1
 done
 export WSE_TEST_URL="ws://127.0.0.1:$port/wse" WSE_NATIVE_LIB_DIR="$target/debug"
 export WSE_TEST_TLS_URL="wss://localhost:$((port + 1))/wse" WSE_TEST_CA="$target/kotlin-test-ca.pem"
+# The keys its E2E identity and its signed messages go with.
+WSE_TEST_IDENTITY="$(sed -n 's/^e2e_identity_public_key //p' "$target/kotlin-test-server.log")"
+WSE_TEST_SIGNING="$(sed -n 's/^signing_public_key //p' "$target/kotlin-test-server.log")"
+export WSE_TEST_IDENTITY WSE_TEST_SIGNING
 cd "$here"
 "${GRADLE:-gradle}" --no-daemon -q test

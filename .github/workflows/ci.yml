@@ -72,6 +72,7 @@ jobs:
               - 'tsconfig.json'
               - 'vitest.config.ts'
               - '.github/scripts/npm-consumer-check.sh'
+              - '.github/scripts/rn-bundle-check.sh'
               - '.github/workflows/ci.yml'
             mobile:
               - 'crates/wse-client/**'
@@ -210,6 +211,7 @@ jobs:
           mkdir -p npm-dist
           npm pack --ignore-scripts --pack-destination npm-dist
           bash .github/scripts/npm-consumer-check.sh npm-dist/wse-client-*.tgz
+          bash .github/scripts/rn-bundle-check.sh npm-dist/wse-client-*.tgz
 
   # ---------------------------------------------------------------------------
   # The TypeScript client against the server of this checkout: JWT cookies, an

@@ -9,6 +9,16 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 // These functions are ignored because they are not marked as `pub`: `continuity_of`, `of`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `fmt`, `from`, `from`
 
+/// A new ECDSA P-256 private key (PKCS#8 DER) for signed messages: keep it
+/// in the platform's keystore.
+Uint8List generateSigningKey() =>
+    RustLib.instance.api.crateApiGenerateSigningKey();
+
+/// The public key of a PKCS#8 private key (base64 of the uncompressed
+/// point): what the server binds to a connection for its signed messages.
+String signingPublicKey({required List<int> key}) =>
+    RustLib.instance.api.crateApiSigningPublicKey(key: key);
+
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<WseCancel>>
 abstract class WseCancel implements RustOpaqueInterface {
   void cancel();

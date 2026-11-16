@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Builds the release AAR and an app that uses it with R8 on (consumer/), and
-# checks on the emulator ANDROID_SERIAL names that the app connects and hears
-# a tick, and that Android's certificate verifier turns down a server of an
-# unknown CA: what JNA, the bindings and the verifier reach by reflection or
-# JNI survived shrinking.
-# Needs ANDROID_HOME and ANDROID_NDK_HOME; GRADLE names the gradle; ABI the
-# emulator's (default x86_64).
+# Builds the release AAR (or takes the one WSE_AAR names) and an app that uses
+# it with R8 on (consumer/), and checks on the emulator ANDROID_SERIAL names
+# that Android's certificate verifier turns down a server of an unknown CA,
+# that the app hears a tick, that an end-to-end encrypted session echoes and
+# that a signed message gets a signed receipt: what JNA, the bindings and the
+# verifier reach by reflection or JNI survived shrinking.
+# Needs ANDROID_HOME (and, to build the AAR, ANDROID_NDK_HOME); GRADLE names
+# the gradle; ABI the emulator's (default x86_64).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../../.." && pwd)"
@@ -16,11 +17,16 @@ export PATH="$ANDROID_HOME/platform-tools:$PATH"
 : "${ANDROID_SERIAL:?the emulator to run on}"
 gradle="${GRADLE:-gradle}"
 
-"$here/../build.sh"
-"$here/build-libs.sh" "${ABI:-x86_64}"
-export WSE_JNI_LIBS="$target/android-jniLibs" WSE_ANDROID_VERIFIER="$target/android-verifier/rustls-platform-verifier.jar"
-(cd "$here" && "$gradle" --no-daemon -q assembleRelease)
-WSE_AAR="$(ls "$here"/build/outputs/aar/*-release.aar)"
+if [[ -n "${WSE_AAR:-}" ]]; then
+  # A release's AAR, as it ships.
+  WSE_AAR="$(cd "$(dirname "$WSE_AAR")" && pwd)/$(basename "$WSE_AAR")"
+else
+  "$here/../build.sh"
+  "$here/build-libs.sh" "${ABI:-x86_64}"
+  export WSE_JNI_LIBS="$target/android-jniLibs" WSE_ANDROID_VERIFIER="$target/android-verifier/rustls-platform-verifier.jar"
+  (cd "$here" && "$gradle" --no-daemon -q assembleRelease)
+  WSE_AAR="$(ls "$here"/build/outputs/aar/*-release.aar)"
+fi
 export WSE_AAR
 (cd "$here/consumer" && "$gradle" --no-daemon -q assembleRelease)
 apk="$(ls "$here"/consumer/build/outputs/apk/release/*-release.apk)"
@@ -33,14 +39,16 @@ WSE_PORT="$port" WSE_TLS_PORT="$((port + 1))" WSE_TLS_CA="$target/consumer-test-
 server=$!
 trap 'kill "$server" 2>/dev/null || true' EXIT
 for _ in $(seq 1 50); do
-  grep -q "tls_ca" "$target/consumer-test-server.log" && break
+  grep -q "signing_public_key" "$target/consumer-test-server.log" && break
   sleep 0.1
 done
 
 adb install -r "$apk" > /dev/null
 adb logcat -c
 adb shell am start -n dev.wse.consumer/.MainActivity --es url "ws://10.0.2.2:$port/wse" \
-  --es tls_url "wss://10.0.2.2:$((port + 1))/wse" > /dev/null
+  --es tls_url "wss://10.0.2.2:$((port + 1))/wse" \
+  --es identity "$(sed -n 's/^e2e_identity_public_key //p' "$target/consumer-test-server.log")" \
+  --es signing "$(sed -n 's/^signing_public_key //p' "$target/consumer-test-server.log")" > /dev/null
 outcome=""
 for _ in $(seq 1 60); do
   outcome="$(adb logcat -d -s WseConsumer:I | sed -n 's/.*WseConsumer: //p' | tail -1 | tr -d '\r')"

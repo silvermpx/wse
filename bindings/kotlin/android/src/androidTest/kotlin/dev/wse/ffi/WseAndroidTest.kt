@@ -19,6 +19,38 @@ class WseAndroidTest {
     private val url: String =
         InstrumentationRegistry.getArguments().getString("wseUrl") ?: "ws://10.0.2.2:5007/wse"
 
+    /** The next message of `kind`. */
+    private suspend fun message(events: WseEvents, kind: String): WseMessage {
+        while (true) {
+            val item = events.next() ?: error("the events ended before $kind")
+            if (item is WseItem.Message && item.message.kind == kind) return item.message
+        }
+    }
+
+    @Test
+    fun anEncryptedSessionAndSignedMessagesOnTheDevice(): Unit = runBlocking {
+        val arguments = InstrumentationRegistry.getArguments()
+        val identity = checkNotNull(arguments.getString("wseIdentity")) { "run-emulator-tests.sh passes the key" }
+        val signing = checkNotNull(arguments.getString("wseSigning")) { "run-emulator-tests.sh passes the key" }
+        val sealed = connectClient(WseConfig(url = url, serverIdentityKeys = listOf(identity), insecure = true))
+        sealed.send("echo", """{"sealed":true}""")
+        assertEquals("""{"sealed":true}""", message(sealed.events(), "echoed").json)
+        sealed.disconnect(1_000u)
+
+        val key = generateSigningKey()
+        val client = connectClient(
+            WseConfig(url = url, signingKey = key, serverSigningKeys = listOf(signing), insecure = true),
+        )
+        val events = client.events()
+        client.send("bind_key", """{"public_key":"${signingPublicKey(key)}"}""")
+        assertEquals("""{"bound":true}""", message(events, "key_bound").json)
+        client.sendSigned("order", """{"side":"buy"}""", "android-1")
+        val receipt = message(events, "receipt")
+        assertTrue(""""n":"android-1"""" in receipt.json.orEmpty(), receipt.json)
+        assertEquals(true, receipt.signature?.verified)
+        client.disconnect(1_000u)
+    }
+
     @Test
     fun aPrivateCaIsTrustedWhereItIsNamed(): Unit = runBlocking {
         val arguments = InstrumentationRegistry.getArguments()

@@ -24,7 +24,9 @@ export 'src/rust/api.dart'
         WseStreamPosition,
         WseSubscription,
         WseTopicRecovery,
-        WseTopicState;
+        WseTopicState,
+        generateSigningKey,
+        signingPublicKey;
 
 /// Under `flutter test` the build hook puts the library in
 /// build/native_assets/<os>/, where loading it by name does not look; a
@@ -246,6 +248,10 @@ class WseClient {
 ///
 /// [trust] names the certificates a wss:// server's chain must lead to; ws://
 /// sends everything in the clear and takes [insecure] (for development).
+/// [serverIdentityKeys] pin the server of an end-to-end encrypted session;
+/// [signingKey] (PKCS#8, from [generateSigningKey]) signs what
+/// [WseClient.sendSigned] sends, and [serverSigningKeys] check what the
+/// server signs.
 rust.WseConfig wseConfig(
   String url, {
   String? token,
@@ -256,6 +262,9 @@ rust.WseConfig wseConfig(
   WseTrust trust = WseTrust.platform,
   bool insecure = false,
   rust.WseDelivery? delivery,
+  List<String> serverIdentityKeys = const [],
+  Uint8List? signingKey,
+  List<String> serverSigningKeys = const [],
 }) => rust.WseConfig(
   url: url,
   token: token,
@@ -267,9 +276,9 @@ rust.WseConfig wseConfig(
   reconnect: reconnect,
   connectTimeoutMs: BigInt.zero,
   recoveryTimeoutMs: BigInt.zero,
-  serverIdentityKeys: const [],
-  signingKey: null,
-  serverSigningKeys: const [],
+  serverIdentityKeys: serverIdentityKeys,
+  signingKey: signingKey,
+  serverSigningKeys: serverSigningKeys,
   trust: trust._kind,
   trustedRoots: trust._roots,
   insecure: insecure,

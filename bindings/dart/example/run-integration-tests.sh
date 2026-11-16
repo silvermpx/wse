@@ -24,7 +24,7 @@ WSE_PORT="$port" WSE_TLS_PORT="$((port + 1))" WSE_TLS_CA="$ca" "$target/debug/ex
 server=$!
 trap 'kill "$server" 2>/dev/null || true' EXIT
 for _ in $(seq 1 50); do
-  grep -q "tls_ca" "$log" && break
+  grep -q "signing_public_key" "$log" && break
   sleep 0.1
 done
 # An Android emulator reaches the host's ports through adb.
@@ -38,6 +38,8 @@ defines=(
   --dart-define="WSE_URL=ws://127.0.0.1:$port/wse"
   --dart-define="WSE_TLS_URL=wss://127.0.0.1:$((port + 1))/wse"
   --dart-define="WSE_CA=$(base64 < "$ca" | tr -d '\n')"
+  --dart-define="WSE_IDENTITY=$(sed -n 's/^e2e_identity_public_key //p' "$log")"
+  --dart-define="WSE_SIGNING=$(sed -n 's/^signing_public_key //p' "$log")"
 )
 cd "$here"
 "$flutter" pub get --suppress-analytics > /dev/null

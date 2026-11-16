@@ -18,6 +18,45 @@ import kotlinx.coroutines.withTimeout
 class WseClientTest {
     private val url = System.getenv("WSE_TEST_URL") ?: "ws://127.0.0.1:5007/wse"
 
+    /** The next message of `kind`. */
+    private suspend fun message(events: WseEvents, kind: String): WseMessage {
+        while (true) {
+            val item = events.next() ?: error("the events ended before $kind")
+            if (item is WseItem.Message && item.message.kind == kind) return item.message
+        }
+    }
+
+    @Test
+    fun anEncryptedSessionWithThePinnedServer(): Unit = runBlocking {
+        val identity = checkNotNull(System.getenv("WSE_TEST_IDENTITY")) { "run-tests.sh passes the key" }
+        val client = connectClient(WseConfig(url = url, serverIdentityKeys = listOf(identity), insecure = true))
+        client.send("echo", """{"sealed":true}""")
+        assertEquals("""{"sealed":true}""", message(client.events(), "echoed").json)
+        client.disconnect(1_000u)
+        // Another server's key: refused.
+        val other = signingPublicKey(generateSigningKey())
+        assertFailsWith<WseException.Encryption> {
+            connectClient(WseConfig(url = url, reconnect = false, serverIdentityKeys = listOf(other), insecure = true))
+        }
+    }
+
+    @Test
+    fun signedMessagesBothWays(): Unit = runBlocking {
+        val signing = checkNotNull(System.getenv("WSE_TEST_SIGNING")) { "run-tests.sh passes the key" }
+        val key = generateSigningKey()
+        val client = connectClient(
+            WseConfig(url = url, signingKey = key, serverSigningKeys = listOf(signing), insecure = true),
+        )
+        val events = client.events()
+        client.send("bind_key", """{"public_key":"${signingPublicKey(key)}"}""")
+        assertEquals("""{"bound":true}""", message(events, "key_bound").json)
+        assertEquals("kotlin-1", client.sendSigned("order", """{"side":"buy"}""", "kotlin-1"))
+        val receipt = message(events, "receipt")
+        assertTrue(""""n":"kotlin-1"""" in receipt.json.orEmpty(), receipt.json)
+        assertEquals(true, receipt.signature?.verified)
+        client.disconnect(1_000u)
+    }
+
     @Test
     fun recoverOrResyncHoldsATopicUntilTheAppResyncedIt(): Unit = runBlocking {
         val client = connectClient(

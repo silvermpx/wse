@@ -445,6 +445,20 @@ pub unsafe fn init_android(
     }
 }
 
+// -- signing keys -------------------------------------------------------------
+
+/// A new ECDSA P-256 private key (PKCS#8 DER), for signed messages: the
+/// application keeps it in the platform's keystore.
+pub fn generate_signing_key() -> Vec<u8> {
+    crate::generate_key()
+}
+
+/// The public key of a PKCS#8 private key, base64 of the uncompressed
+/// point: what the server binds to a connection for its signed messages.
+pub fn signing_public_key(pkcs8: &[u8]) -> Result<String, NativeError> {
+    Ok(crate::public_key(pkcs8)?)
+}
+
 // -- cancellation ---------------------------------------------------------------
 
 /// Cancels the calls it is given to (connect, next_batch): a binding's own
@@ -1090,6 +1104,19 @@ mod tests {
             assert_eq!(json.payload_error, None);
             assert_eq!(msgpack.payload_error, None);
         }
+    }
+
+    #[test]
+    fn a_signing_key_and_its_public_key() {
+        let key = generate_signing_key();
+        let public = signing_public_key(&key).unwrap();
+        // base64 of 0x04 || X || Y: 65 bytes.
+        assert_eq!(public.len(), 88);
+        assert_ne!(generate_signing_key(), key);
+        assert_eq!(
+            signing_public_key(b"not a key").unwrap_err().kind,
+            ErrorKind::Config
+        );
     }
 
     #[test]

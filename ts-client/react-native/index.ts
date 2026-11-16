@@ -10,6 +10,8 @@
 // (react-native-quick-crypto). Nothing of React Native is imported here: the
 // app passes AppState and its crypto in, so a web bundle never pulls them.
 
+// First: the MessagePack codec needs TextDecoder and TextEncoder as it loads.
+import './textCodec.js';
 import { createWSEClient, type WSEClient, type WSEClientOptions } from '../core/client.js';
 import { setWebCrypto } from '../utils/webcrypto.js';
 

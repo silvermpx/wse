@@ -38,11 +38,13 @@ adb wait-for-device
 until [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == "1" ]]; do sleep 2; done
 echo "emulator up: page size $(adb shell getconf PAGE_SIZE | tr -d '\r')"
 for _ in $(seq 1 50); do
-  grep -q "tls_ca" "$target/android-test-server.log" && break
+  grep -q "signing_public_key" "$target/android-test-server.log" && break
   sleep 0.1
 done
 cd "$here"
 "${GRADLE:-gradle}" --no-daemon -q connectedDebugAndroidTest \
   -Pandroid.testInstrumentationRunnerArguments.wseUrl="ws://10.0.2.2:$port/wse" \
   -Pandroid.testInstrumentationRunnerArguments.wseTlsUrl="wss://10.0.2.2:$((port + 1))/wse" \
-  -Pandroid.testInstrumentationRunnerArguments.wseCa="$(base64 < "$target/android-test-ca.pem" | tr -d '\n')"
+  -Pandroid.testInstrumentationRunnerArguments.wseCa="$(base64 < "$target/android-test-ca.pem" | tr -d '\n')" \
+  -Pandroid.testInstrumentationRunnerArguments.wseIdentity="$(sed -n 's/^e2e_identity_public_key //p' "$target/android-test-server.log")" \
+  -Pandroid.testInstrumentationRunnerArguments.wseSigning="$(sed -n 's/^signing_public_key //p' "$target/android-test-server.log")"

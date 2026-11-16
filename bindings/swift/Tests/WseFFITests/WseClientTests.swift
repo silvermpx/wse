@@ -53,6 +53,52 @@ final class WseClientTests: XCTestCase {
         await client.disconnect(deadlineMs: 1_000)
     }
 
+    private func env(_ name: String) throws -> String {
+        try XCTUnwrap(ProcessInfo.processInfo.environment[name], "run-tests.sh passes \(name)")
+    }
+
+    /// The next message of `kind`.
+    private func message(_ client: WseClient, _ kind: String) async throws -> WseMessage {
+        for try await item in client.events() {
+            if case let .message(message) = item, message.kind == kind { return message }
+        }
+        throw WseError.Closed
+    }
+
+    func testAnEncryptedSessionWithThePinnedServer() async throws {
+        let identity = try env("WSE_TEST_IDENTITY")
+        let client = try await WseClient.connect(WseConfig(url: url, serverIdentityKeys: [identity], insecure: true))
+        try await client.send(kind: "echo", json: #"{"sealed":true}"#)
+        let echoed = try await message(client, "echoed")
+        XCTAssertEqual(echoed.json, #"{"sealed":true}"#)
+        await client.disconnect(deadlineMs: 1_000)
+        // Another server's key: refused.
+        let other = try signingPublicKey(key: generateSigningKey())
+        do {
+            _ = try await WseClient.connect(
+                WseConfig(url: url, reconnect: false, serverIdentityKeys: [other], insecure: true))
+            XCTFail("connected to a server of another key")
+        } catch let error as WseError {
+            guard case .Encryption = error else { return XCTFail("\(error)") }
+        }
+    }
+
+    func testSignedMessagesBothWays() async throws {
+        let signing = try env("WSE_TEST_SIGNING")
+        let key = generateSigningKey()
+        let client = try await WseClient.connect(
+            WseConfig(url: url, signingKey: key, serverSigningKeys: [signing], insecure: true))
+        try await client.send(kind: "bind_key", json: "{\"public_key\":\"\(try signingPublicKey(key: key))\"}")
+        let bound = try await message(client, "key_bound")
+        XCTAssertEqual(bound.json, #"{"bound":true}"#)
+        let nonce = try await client.sendSigned(kind: "order", json: #"{"side":"buy"}"#, nonce: "swift-1")
+        XCTAssertEqual(nonce, "swift-1")
+        let receipt = try await message(client, "receipt")
+        XCTAssertTrue(receipt.json?.contains(#""n":"swift-1""#) == true, receipt.json ?? "")
+        XCTAssertEqual(receipt.signature?.verified, true)
+        await client.disconnect(deadlineMs: 1_000)
+    }
+
     func testWsGoesInTheClearOnlyWhenAsked() async throws {
         do {
             _ = try await WseClient.connect(WseConfig(url: url))

@@ -253,6 +253,20 @@ pub unsafe extern "system" fn Java_dev_wse_ffi_WseTls_initNative(
     u8::from(unsafe { native::init_android(env, context) }.is_ok())
 }
 
+/// A new ECDSA P-256 private key (PKCS#8 DER) for signed messages: keep it
+/// in the platform's keystore.
+#[uniffi::export]
+pub fn generate_signing_key() -> Vec<u8> {
+    native::generate_signing_key()
+}
+
+/// The public key of a PKCS#8 private key (base64 of the uncompressed
+/// point): what the server binds to a connection for its signed messages.
+#[uniffi::export]
+pub fn signing_public_key(key: Vec<u8>) -> Result<String, WseError> {
+    Ok(native::signing_public_key(&key)?)
+}
+
 impl From<WseConfig> for native::NativeConfig {
     fn from(c: WseConfig) -> Self {
         native::NativeConfig {

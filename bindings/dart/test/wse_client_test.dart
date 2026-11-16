@@ -194,6 +194,67 @@ void main() {
     await client.close();
   });
 
+  Future<WseItem> message(StreamIterator<WseItem> items, String kind) async {
+    while (await items.moveNext()) {
+      final item = items.current;
+      if (item.kind == WseItemKind.message && item.name == kind) return item;
+    }
+    throw StateError('the events ended before $kind');
+  }
+
+  test('an encrypted session with the pinned server', () async {
+    final identity = Platform.environment['WSE_TEST_IDENTITY']!;
+    final client = await WseClient.connect(
+      wseConfig(url, insecure: true, serverIdentityKeys: [identity]),
+    );
+    final items = StreamIterator(client.events());
+    await client.send('echo', '{"sealed":true}');
+    expect((await message(items, 'echoed')).json, '{"sealed":true}');
+    await items.cancel();
+    await client.close();
+    // Another server's key: refused.
+    final other = signingPublicKey(key: generateSigningKey());
+    await expectLater(
+      WseClient.connect(
+        wseConfig(
+          url,
+          insecure: true,
+          reconnect: false,
+          serverIdentityKeys: [other],
+        ),
+      ),
+      throwsA(isA<WseError>().having((e) => e.kind, 'kind', 'encryption')),
+    );
+  });
+
+  test('signed messages both ways', () async {
+    final signing = Platform.environment['WSE_TEST_SIGNING']!;
+    final key = generateSigningKey();
+    final client = await WseClient.connect(
+      wseConfig(
+        url,
+        insecure: true,
+        signingKey: key,
+        serverSigningKeys: [signing],
+      ),
+    );
+    final items = StreamIterator(client.events());
+    await client.send(
+      'bind_key',
+      '{"public_key":"${signingPublicKey(key: key)}"}',
+    );
+    expect((await message(items, 'key_bound')).json, '{"bound":true}');
+    expect(
+      await client.sendSigned('order', '{"side":"buy"}', nonce: 'dart-1'),
+      'dart-1',
+    );
+    final receipt = await message(items, 'receipt');
+    expect(receipt.json, contains('"n":"dart-1"'));
+    expect(receipt.verified, isTrue);
+    await items.cancel();
+    await client.close();
+  });
+
   test('a closed client says so', () async {
     final client = await WseClient.connect(wseConfig(url, insecure: true));
     await client.close();

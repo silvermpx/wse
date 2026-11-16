@@ -32,10 +32,14 @@ WSE_PORT="$port" WSE_TLS_PORT="$((port + 1))" WSE_TLS_CA="$target/dart-test-ca.p
 server=$!
 trap 'kill "$server" 2>/dev/null || true' EXIT
 for _ in $(seq 1 50); do
-  grep -q "tls_ca" "$target/dart-test-server.log" && break
+  grep -q "signing_public_key" "$target/dart-test-server.log" && break
   sleep 0.1
 done
 export WSE_TEST_URL="ws://127.0.0.1:$port/wse" WSE_TEST_TLS_URL="wss://localhost:$((port + 1))/wse"
 export WSE_TEST_CA="$target/dart-test-ca.pem"
+# The keys its E2E identity and its signed messages go with.
+WSE_TEST_IDENTITY="$(sed -n 's/^e2e_identity_public_key //p' "$target/dart-test-server.log")"
+WSE_TEST_SIGNING="$(sed -n 's/^signing_public_key //p' "$target/dart-test-server.log")"
+export WSE_TEST_IDENTITY WSE_TEST_SIGNING
 cd "$here"
 "$flutter" test --suppress-analytics

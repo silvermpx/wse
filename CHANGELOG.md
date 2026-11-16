@@ -76,6 +76,21 @@
   into the back/forward cache. Back on screen or online, a socket that
   heard nothing past the idle limit (after a sleep) is replaced. Server
   rendering and hydration are tested for React, Vue and Svelte 5.
+- Swift, Kotlin and Dart: `generateSigningKey()` and `signingPublicKey(key)`
+  make a device's key for signed messages and give what the server binds;
+  the Dart `wseConfig` takes the E2E identity keys, the signing key and the
+  server's signing keys. Their tests run an end-to-end encrypted session
+  and signed messages on the Mac, the JVM, an iOS simulator, an Android
+  emulator and in the Flutter example.
+- React Native: on a runtime without `TextDecoder` (Hermes before React
+  Native 0.85) or `TextEncoder`, the entry installs UTF-8 ones before the
+  MessagePack codec needs them; loading the client failed there.
+- Releases: the gate waits for CI to pass on the same commit; the release
+  AAR runs in an app built with R8 on an emulator (the system's TLS, an
+  encrypted echo, a signed receipt); the XCFramework's tests run in the
+  Release configuration on an iOS simulator; the Dart package's tests run
+  on its prebuilt library on Linux (x64, arm64), macOS (arm64, x64) and
+  Windows; the npm package is bundled by Metro and compiled by Hermes.
 - Rust client: `pause(reason)` and `resume(reason)`, as in the TypeScript
   core client: the connection ends (what is queued goes out first) and no
   attempt is made while any reason holds; topics and positions stay, and

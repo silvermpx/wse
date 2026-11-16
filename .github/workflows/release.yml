@@ -574,6 +574,11 @@ jobs:
       - name: Consumer check (esbuild bundle, Node import)
         run: bash .github/scripts/npm-consumer-check.sh npm-dist/wse-client-*.tgz
 
+      # React Native's Metro bundles it, its Babel preset transforms it, and
+      # Hermes compiles the bundle.
+      - name: React Native check (Metro bundle, Hermes bytecode)
+        run: bash .github/scripts/rn-bundle-check.sh npm-dist/wse-client-*.tgz
+
       # The publish job's command, without uploading.
       - name: Publish dry run
         run: npm publish --dry-run --ignore-scripts --access public ./npm-dist/wse-client-*.tgz
@@ -649,9 +654,11 @@ jobs:
           toolchain: stable
           targets: x86_64-apple-darwin, aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios
 
+      # On the simulator as an app ships: the Release configuration.
       - name: Build, then the tests on the Mac and on an iOS simulator
         env:
           SIMULATOR: '1'
+          CONFIGURATION: Release
         run: bindings/swift/run-tests.sh
 
       - name: Zip, and its checksum
@@ -819,25 +826,6 @@ jobs:
           VERSION: ${{ needs.preflight.outputs.npm-version }}
         run: bash .github/scripts/stage-dart-package.sh "$VERSION" dart-binaries dart-package
 
-      # The staged package's tests, its build hook taking this runner's
-      # library from the files above and checking it against the list.
-      - name: The tests on the prebuilt library
-        run: |
-          cargo build -q --locked -p wse-client --example server
-          WSE_PORT=5019 target/debug/examples/server > server.log 2>&1 &
-          for _ in $(seq 1 100); do grep -q '^url ' server.log && break; sleep 0.1; done
-          cp -r dart-package dart-check
-          cat >> dart-check/pubspec.yaml <<'EOF'
-          hooks:
-            user_defines:
-              wse_client:
-                build: binary
-                binaries: ../dart-binaries
-          EOF
-          cd dart-check
-          flutter pub get
-          WSE_TEST_URL="$(sed -n 's/^url //p' ../server.log)" flutter test
-
       # flutter_rust_bridge's Dart and Rust halves must be one version, so
       # the package pins it and its hooks exactly, and pub warns about the
       # two pins (exit 65). Any other warning fails.
@@ -868,6 +856,117 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # The staged package's tests on each platform with a prebuilt library: the
+  # build hook takes this runner's from the release's files and checks it
+  # against the list the package carries.
+  dart-check:
+    name: Dart package on ${{ matrix.name }}
+    needs: [preflight, dart-package]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-24.04
+          - name: Linux arm64
+            runner: ubuntu-24.04-arm
+          - name: macOS arm64
+            runner: macos-latest
+          - name: macOS x64
+            runner: macos-15-intel
+          - name: Windows x64
+            runner: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2  # v2.23.0
+        with:
+          flutter-version: '3.50.0'
+          channel: stable
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: dart-binaries-*
+          path: dart-binaries/
+          merge-multiple: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: dart-package
+          path: dart-dist/
+
+      # The example server builds aws-lc; on Windows from the assembly
+      # objects it ships, without NASM.
+      - name: The tests on the prebuilt library
+        env:
+          VERSION: ${{ needs.preflight.outputs.npm-version }}
+          AWS_LC_SYS_PREBUILT_NASM: '1'
+        run: |
+          mkdir dart-package
+          tar -xzf "dart-dist/wse_client-dart-${VERSION}.tar.gz" -C dart-package
+          bash .github/scripts/dart-check.sh dart-package dart-binaries
+
+  # The release AAR in an app built with R8, on an emulator: the system's
+  # TLS, a tick, an end-to-end encrypted echo and a signed receipt.
+  android-release-app:
+    name: Android release app
+    needs: [preflight, android-package]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Let the emulator use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880  # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c  # v6.4.1
+        with:
+          gradle-version: '9.9.1'
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: android-package
+          path: dist/
+
+      - name: The app on an emulator
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d  # v2.38.0
+        env:
+          VERSION: ${{ needs.preflight.outputs.npm-version }}
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect
+          script: ANDROID_SERIAL=emulator-5554 WSE_AAR="dist/wse-client-android-${VERSION}.aar" bindings/kotlin/android/run-consumer-check.sh
+
   # ---------------------------------------------------------------------------
   # Everything built, tested and carrying the release version: the one job
   # that says whether this commit could be released. The publish jobs wait
@@ -876,13 +975,14 @@ jobs:
   # ---------------------------------------------------------------------------
   release-gate:
     name: Release gate
-    needs: [preflight, build, sdist, test, test-musllinux, sdist-install, python-client, npm-package, crates, swift-package, android-package, dart-binaries, dart-package]
+    needs: [preflight, build, sdist, test, test-musllinux, sdist-install, python-client, npm-package, crates, swift-package, android-package, android-release-app, dart-binaries, dart-package, dart-check]
     # Runs (and fails) when a job above failed: a gate skipped because of a
     # failed dependency would report success to branch protection.
     if: always()
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      actions: read
     steps:
       - name: Every release job passed
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
@@ -895,6 +995,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+
+      # Everything CI checks (the clients against servers, the mobile
+      # emulators and simulators, lint, security), passed for this commit.
+      - name: CI passed for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash .github/scripts/wait-for-ci.sh "$GITHUB_REPOSITORY" "$COMMIT"
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
