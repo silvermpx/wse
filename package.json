@@ -1,7 +1,7 @@
 {
   "name": "wse-client",
   "version": "3.1.0",
-  "description": "TypeScript client for WSE: a core without a framework, with React, Vue, Svelte and Angular adapters and the React hook useWSE; topics with message recovery, reconnects, an offline queue, end-to-end encryption and signed messages.",
+  "description": "TypeScript client for WSE: a core without a framework, with React, Vue, Svelte, Angular and Solid adapters and the React hook useWSE; topics with message recovery, reconnects, an offline queue, end-to-end encryption and signed messages.",
   "type": "module",
   "main": "./dist/npm/index.js",
   "types": "./dist/npm/index.d.ts",
@@ -36,6 +36,11 @@
       "import": "./dist/npm/angular/index.js",
       "default": "./dist/npm/angular/index.js"
     },
+    "./solid": {
+      "types": "./dist/npm/solid/index.d.ts",
+      "import": "./dist/npm/solid/index.js",
+      "default": "./dist/npm/solid/index.js"
+    },
     "./react-native": {
       "types": "./dist/npm/react-native/index.d.ts",
       "import": "./dist/npm/react-native/index.js",
@@ -59,6 +64,9 @@
       ],
       "angular": [
         "./dist/npm/angular/index.d.ts"
+      ],
+      "solid": [
+        "./dist/npm/solid/index.d.ts"
       ],
       "react-native": [
         "./dist/npm/react-native/index.d.ts"
@@ -90,6 +98,7 @@
     "vue",
     "svelte",
     "angular",
+    "solid",
     "typescript",
     "react-native"
   ],
@@ -121,6 +130,7 @@
     "@angular/common": ">=20.0.0",
     "@angular/core": ">=20.0.0",
     "react": ">=18",
+    "solid-js": "^1.9.0 || >=2.0.0-rc.23 <3",
     "vue": ">=3.3",
     "zustand": ">=4"
   },
@@ -132,6 +142,9 @@
       "optional": true
     },
     "react": {
+      "optional": true
+    },
+    "solid-js": {
       "optional": true
     },
     "vue": {
@@ -156,6 +169,8 @@
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "rxjs": "^7.8.2",
+    "solid-js": "^1.9.19",
+    "solid-js-next": "npm:solid-js@^2.0.0-rc.23",
     "svelte": "^5.57.3",
     "typescript": "^7.0.2",
     "vitest": "^5.1.0",

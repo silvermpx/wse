@@ -1,4 +1,4 @@
-// The core entry loads without React, Angular or zustand, and reads or changes
+// The core entry loads without React, Angular, Solid or zustand, and reads or changes
 // nothing of the page on import.
 
 import { describe, expect, it, vi } from 'vitest';
@@ -18,9 +18,12 @@ vi.mock('@angular/core', () => {
 vi.mock('@angular/common', () => {
   throw new Error('wse-client/core imported @angular/common');
 });
+vi.mock('solid-js', () => {
+  throw new Error('wse-client/core imported solid-js');
+});
 
 describe('wse-client/core', () => {
-  it('imports without React, Angular, zustand or the page', async () => {
+  it('imports without React, Angular, Solid, zustand or the page', async () => {
     const touched: string[] = [];
     const page = new Proxy(
       {},

@@ -70,7 +70,7 @@ operation and the error's name, never silent.
 Outside browsers, a `webSocket` factory makes the socket, and may send headers (a token in
 `Authorization`).
 
-## React, Vue, Svelte, Angular
+## React, Vue, Svelte, Angular, Solid
 
 ```tsx
 import { createWSEClient, WSEProvider, useWSEState, useWSETopics, useWSEMessage } from 'wse-client/react';
@@ -125,6 +125,26 @@ first render in a browser, outside Angular's zone, and let them go with their in
 topic list is taken before the old one is let go, so a topic in both keeps its recovery position. A
 message handler gets the client's own message object (commit it when your application has applied
 it), and its failure goes to the application's `ErrorHandler`.
+
+```tsx
+// Solid 1.9 and 2.0: functions for a component, no JSX in the library
+import { WSEContext, createWSEState, createWSETopics, onWSEMessage } from 'wse-client/solid';
+
+function Prices() {
+  const state = createWSEState();                      // an accessor
+  createWSETopics(() => [topic()]);                    // a list, or an accessor of one
+  onWSEMessage('price_update', (msg) => update(msg.p));
+  return <span>{state().connection}</span>;
+}
+
+<WSEContext.Provider value={client}><Prices /></WSEContext.Provider>  // Solid 2: <WSEContext value={client}>
+```
+
+Each function takes the client as its last argument, as an accessor of one (a new client after a
+sign-in: it is taken before the old one is let go), or from `WSEContext`. They take the client's
+connection, topics and listeners after the first render, never on a server or while hydrating, and
+let them go with their owner. The same tests run on Solid 1.9 and on 2.0, and the server render on
+Solid 1.9.
 
 The provider, the composables and the stores hold the client, its topics and listeners while a
 component uses them. Effects and mount hooks do not run while rendering on a server, so server
@@ -677,7 +697,7 @@ Full protocol specification: [PROTOCOL.md](../docs/PROTOCOL.md)
 
 - For `wse-client/core`: a browser, or Node.js with a global `WebSocket` (Node 22+)
 - For `useWSE` (the root entry): React 18+ and zustand 4+; for the adapters: React 18+, Vue 3.3+,
-  Svelte 5 or Angular 20+ (optional peer dependencies)
+  Svelte 5, Angular 20+ or Solid 1.9+ (optional peer dependencies)
 
 ## License
 
