@@ -81,6 +81,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   WseConfig dco_decode_box_autoadd_wse_config(dynamic raw);
 
   @protected
+  WseContinuity dco_decode_box_autoadd_wse_continuity(dynamic raw);
+
+  @protected
+  WseDelivery dco_decode_box_autoadd_wse_delivery(dynamic raw);
+
+  @protected
   int dco_decode_i_32(dynamic raw);
 
   @protected
@@ -96,7 +102,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<WseItem> dco_decode_list_wse_item(dynamic raw);
 
   @protected
+  List<WseStreamPosition> dco_decode_list_wse_stream_position(dynamic raw);
+
+  @protected
   List<WseTopicRecovery> dco_decode_list_wse_topic_recovery(dynamic raw);
+
+  @protected
+  List<WseTopicState> dco_decode_list_wse_topic_state(dynamic raw);
 
   @protected
   String? dco_decode_opt_String(dynamic raw);
@@ -109,6 +121,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   BigInt? dco_decode_opt_box_autoadd_u_64(dynamic raw);
+
+  @protected
+  WseContinuity? dco_decode_opt_box_autoadd_wse_continuity(dynamic raw);
+
+  @protected
+  WseDelivery? dco_decode_opt_box_autoadd_wse_delivery(dynamic raw);
 
   @protected
   Uint8List? dco_decode_opt_list_prim_u_8_strict(dynamic raw);
@@ -138,6 +156,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   WseConfig dco_decode_wse_config(dynamic raw);
 
   @protected
+  WseContinuity dco_decode_wse_continuity(dynamic raw);
+
+  @protected
+  WseDelivery dco_decode_wse_delivery(dynamic raw);
+
+  @protected
   WseError dco_decode_wse_error(dynamic raw);
 
   @protected
@@ -147,7 +171,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   WseItemKind dco_decode_wse_item_kind(dynamic raw);
 
   @protected
+  WseStreamPosition dco_decode_wse_stream_position(dynamic raw);
+
+  @protected
+  WseSubscription dco_decode_wse_subscription(dynamic raw);
+
+  @protected
   WseTopicRecovery dco_decode_wse_topic_recovery(dynamic raw);
+
+  @protected
+  WseTopicState dco_decode_wse_topic_state(dynamic raw);
 
   @protected
   WseTrustKind dco_decode_wse_trust_kind(dynamic raw);
@@ -207,6 +240,14 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   WseConfig sse_decode_box_autoadd_wse_config(SseDeserializer deserializer);
 
   @protected
+  WseContinuity sse_decode_box_autoadd_wse_continuity(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  WseDelivery sse_decode_box_autoadd_wse_delivery(SseDeserializer deserializer);
+
+  @protected
   int sse_decode_i_32(SseDeserializer deserializer);
 
   @protected
@@ -224,7 +265,17 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<WseItem> sse_decode_list_wse_item(SseDeserializer deserializer);
 
   @protected
+  List<WseStreamPosition> sse_decode_list_wse_stream_position(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   List<WseTopicRecovery> sse_decode_list_wse_topic_recovery(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  List<WseTopicState> sse_decode_list_wse_topic_state(
     SseDeserializer deserializer,
   );
 
@@ -239,6 +290,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   BigInt? sse_decode_opt_box_autoadd_u_64(SseDeserializer deserializer);
+
+  @protected
+  WseContinuity? sse_decode_opt_box_autoadd_wse_continuity(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  WseDelivery? sse_decode_opt_box_autoadd_wse_delivery(
+    SseDeserializer deserializer,
+  );
 
   @protected
   Uint8List? sse_decode_opt_list_prim_u_8_strict(SseDeserializer deserializer);
@@ -268,6 +329,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   WseConfig sse_decode_wse_config(SseDeserializer deserializer);
 
   @protected
+  WseContinuity sse_decode_wse_continuity(SseDeserializer deserializer);
+
+  @protected
+  WseDelivery sse_decode_wse_delivery(SseDeserializer deserializer);
+
+  @protected
   WseError sse_decode_wse_error(SseDeserializer deserializer);
 
   @protected
@@ -277,7 +344,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   WseItemKind sse_decode_wse_item_kind(SseDeserializer deserializer);
 
   @protected
+  WseStreamPosition sse_decode_wse_stream_position(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  WseSubscription sse_decode_wse_subscription(SseDeserializer deserializer);
+
+  @protected
   WseTopicRecovery sse_decode_wse_topic_recovery(SseDeserializer deserializer);
+
+  @protected
+  WseTopicState sse_decode_wse_topic_state(SseDeserializer deserializer);
 
   @protected
   WseTrustKind sse_decode_wse_trust_kind(SseDeserializer deserializer);
@@ -346,6 +424,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_wse_continuity(
+    WseContinuity self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_wse_delivery(
+    WseDelivery self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_i_32(int self, SseSerializer serializer);
 
   @protected
@@ -367,8 +457,20 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_list_wse_item(List<WseItem> self, SseSerializer serializer);
 
   @protected
+  void sse_encode_list_wse_stream_position(
+    List<WseStreamPosition> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_wse_topic_recovery(
     List<WseTopicRecovery> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_wse_topic_state(
+    List<WseTopicState> self,
     SseSerializer serializer,
   );
 
@@ -383,6 +485,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_opt_box_autoadd_u_64(BigInt? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_box_autoadd_wse_continuity(
+    WseContinuity? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_wse_delivery(
+    WseDelivery? self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_opt_list_prim_u_8_strict(
@@ -415,6 +529,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_wse_config(WseConfig self, SseSerializer serializer);
 
   @protected
+  void sse_encode_wse_continuity(WseContinuity self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_wse_delivery(WseDelivery self, SseSerializer serializer);
+
+  @protected
   void sse_encode_wse_error(WseError self, SseSerializer serializer);
 
   @protected
@@ -424,10 +544,25 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_wse_item_kind(WseItemKind self, SseSerializer serializer);
 
   @protected
+  void sse_encode_wse_stream_position(
+    WseStreamPosition self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_wse_subscription(
+    WseSubscription self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_wse_topic_recovery(
     WseTopicRecovery self,
     SseSerializer serializer,
   );
+
+  @protected
+  void sse_encode_wse_topic_state(WseTopicState self, SseSerializer serializer);
 
   @protected
   void sse_encode_wse_trust_kind(WseTrustKind self, SseSerializer serializer);

@@ -1,5 +1,7 @@
 // Against the Rust client's example server: run-tests.sh starts it and
 // passes its URL in WSE_TEST_URL.
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/widgets.dart';
@@ -146,6 +148,51 @@ void main() {
       await client.close();
     },
   );
+
+  test('recover-or-resync holds a topic until the app resynced it', () async {
+    final client = await WseClient.connect(
+      wseConfig(
+        url,
+        topics: ['ticks'],
+        insecure: true,
+        delivery: wseDelivery('board'),
+      ),
+    );
+    final items = StreamIterator(client.events());
+    WseItem? resync;
+    while (await items.moveNext()) {
+      final item = items.current;
+      expect(
+        item.kind == WseItemKind.message && item.topic == 'ticks',
+        isFalse,
+      );
+      if (item.kind == WseItemKind.resync) {
+        resync = item;
+        break;
+      }
+    }
+    expect(resync!.topics, ['ticks']);
+    expect(resync.reasons, ['cold_start']);
+    expect(client.topicStates.single.continuity, WseContinuity.resyncing);
+    // Ticks come meanwhile, and wait.
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    client.resynced(resync.round!);
+    WseItem? tick;
+    while (await items.moveNext()) {
+      final item = items.current;
+      if (item.kind == WseItemKind.message && item.topic == 'ticks') {
+        tick = item;
+        break;
+      }
+    }
+    expect(client.topicStates.single.continuity, WseContinuity.continuous);
+    client.commit(tick!);
+    final saved = jsonDecode(client.checkpoint()) as Map<String, dynamic>;
+    expect(saved['consumer'], 'board');
+    expect((saved['topics'] as Map)['ticks'], isNotNull);
+    await items.cancel();
+    await client.close();
+  });
 
   test('a closed client says so', () async {
     final client = await WseClient.connect(wseConfig(url, insecure: true));

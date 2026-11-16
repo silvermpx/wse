@@ -232,13 +232,14 @@ impl<H: Handler> Driver<H> {
         control: mpsc::UnboundedReceiver<Control>,
         status: watch::Sender<Status>,
     ) -> Self {
-        let session = Session::new(
+        let mut session = Session::new(
             handler,
             Arc::clone(&shared),
             Arc::clone(&keys),
             &config.topics,
             config.recovery_timeout,
         );
+        session.committed = config.committed.clone();
         Self {
             decoder: Decoder::new(
                 config.max_message_size,

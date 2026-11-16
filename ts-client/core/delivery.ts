@@ -371,8 +371,9 @@ export class Delivery {
     const topics: Record<string, Record<string, number>> = {};
     for (const [topic, streams] of this.progress) {
       const out: Record<string, number> = {};
-      for (const [epoch, progress] of streams) out[epoch] = progress.base;
-      topics[topic] = out;
+      // A stream nothing of which was applied (base -1) is left out.
+      for (const [epoch, progress] of streams) if (progress.base >= 0) out[epoch] = progress.base;
+      if (Object.keys(out).length > 0) topics[topic] = out;
     }
     const saved: Saved = {
       v: 1,
@@ -395,9 +396,10 @@ export class Delivery {
     this.takeSaved();
     const out: Record<string, TopicPosition> = {};
     for (const topic of topics) {
-      const streams = this.progress.get(topic);
-      if (!streams || streams.size === 0) continue;
-      const entries = [...streams].map(([epoch, progress]) => [epoch, progress.base] as const);
+      const entries = [...(this.progress.get(topic) ?? [])]
+        .filter(([, progress]) => progress.base >= 0)
+        .map(([epoch, progress]) => [epoch, progress.base] as const);
+      if (entries.length === 0) continue;
       const [epoch, offset] = entries[entries.length - 1];
       out[topic] = { epoch, offset, streams: Object.fromEntries(entries) };
     }
@@ -493,9 +495,9 @@ export class Delivery {
     const committed: Record<string, Record<string, number>> = {};
     for (const topic of topics) {
       reasons[topic] = this.states.get(topic)!.reason ?? 'requested';
-      const streams = this.progress.get(topic);
-      if (streams && streams.size > 0) {
-        committed[topic] = Object.fromEntries([...streams].map(([epoch, progress]) => [epoch, progress.base]));
+      const applied = [...(this.progress.get(topic) ?? [])].filter(([, progress]) => progress.base >= 0);
+      if (applied.length > 0) {
+        committed[topic] = Object.fromEntries(applied.map(([epoch, progress]) => [epoch, progress.base]));
       }
       this.runs.set(topic, run);
       this.setContinuity(topic, 'resyncing', reasons[topic], false);

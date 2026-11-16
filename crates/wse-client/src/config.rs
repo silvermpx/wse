@@ -206,6 +206,18 @@ impl fmt::Debug for TokenProvider {
     }
 }
 
+/// What the application committed it applied: asked with the user of a
+/// connection about to subscribe, each topic's position in each of its
+/// streams. A topic left out starts with none; None leaves delivery where it
+/// is.
+pub(crate) type Committed = Arc<
+    dyn Fn(
+            Option<&str>,
+        ) -> Option<std::collections::BTreeMap<String, Vec<crate::message::Position>>>
+        + Send
+        + Sync,
+>;
+
 /// What a client connects to and how it behaves. The defaults are those of
 /// the Python and TypeScript clients. Its `Debug` print leaves the token,
 /// the headers' values and the signing key out.
@@ -268,6 +280,9 @@ pub struct Config {
     /// End-to-end encryption; none by default.
     #[cfg(feature = "aws-lc")]
     pub encryption: Option<Encryption>,
+    /// Where each recovery starts when the application says so (the
+    /// `native` module's recover-or-resync); None: from where delivery is.
+    pub(crate) committed: Option<Committed>,
     /// This client's ECDSA P-256 private key (PKCS#8, PEM or DER) for
     /// [`Client::send_signed`](crate::Client::send_signed). The server
     /// learns its public key from the token's `cnf` claim or from its
@@ -358,6 +373,7 @@ impl Config {
             tls: None,
             #[cfg(feature = "aws-lc")]
             encryption: None,
+            committed: None,
             #[cfg(feature = "aws-lc")]
             signing_key: None,
             #[cfg(feature = "aws-lc")]

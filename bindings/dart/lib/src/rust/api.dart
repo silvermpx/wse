@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `of`
+// These functions are ignored because they are not marked as `pub`: `continuity_of`, `of`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `fmt`, `from`, `from`
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<WseCancel>>
@@ -18,6 +18,17 @@ abstract class WseCancel implements RustOpaqueInterface {
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<WseNativeClient>>
 abstract class WseNativeClient implements RustOpaqueInterface {
+  /// What the consumer committed, to save with the application's own
+  /// state and give back as `WseDelivery.checkpoint`.
+  String checkpoint();
+
+  /// The consumer applied the message at `epoch`, `offset` of `topic`.
+  void commit({
+    required String topic,
+    required int epoch,
+    required BigInt offset,
+  });
+
   /// Connects, and returns once the server took the connection.
   static Future<WseNativeClient> connect({
     required WseConfig config,
@@ -46,6 +57,14 @@ abstract class WseNativeClient implements RustOpaqueInterface {
 
   void resume({required String reason});
 
+  /// Bring `topics` up to date: in recover-or-resync a resync round asks
+  /// for it; in best effort the application did so itself.
+  void resync({required List<String> topics});
+
+  /// recover-or-resync: the application brought the topics of `round` up
+  /// to date; what they held comes next.
+  void resynced({required BigInt round});
+
   Future<void> send({required String kind, required String json});
 
   Future<void> sendLive({required String kind, required String json});
@@ -56,10 +75,14 @@ abstract class WseNativeClient implements RustOpaqueInterface {
     String? nonce,
   });
 
-  /// connecting, connected, reconnecting or closed.
+  /// connecting, connected, reconnecting, paused or closed.
   String status();
 
   void subscribe({required List<String> topics});
+
+  /// Each topic held: whether the server took it, and whether its
+  /// messages run without a break.
+  List<WseTopicState> topicStates();
 
   void trySend({required String kind, required String json});
 
@@ -116,6 +139,9 @@ class WseConfig {
   /// Allows ws://, which sends everything in the clear: for development.
   final bool insecure;
 
+  /// recover-or-resync; None: best effort.
+  final WseDelivery? delivery;
+
   const WseConfig({
     required this.url,
     this.token,
@@ -133,6 +159,7 @@ class WseConfig {
     required this.trust,
     required this.trustedRoots,
     required this.insecure,
+    this.delivery,
   });
 
   @override
@@ -152,7 +179,8 @@ class WseConfig {
       serverSigningKeys.hashCode ^
       trust.hashCode ^
       trustedRoots.hashCode ^
-      insecure.hashCode;
+      insecure.hashCode ^
+      delivery.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -174,7 +202,60 @@ class WseConfig {
           serverSigningKeys == other.serverSigningKeys &&
           trust == other.trust &&
           trustedRoots == other.trustedRoots &&
-          insecure == other.insecure;
+          insecure == other.insecure &&
+          delivery == other.delivery;
+}
+
+/// Whether a topic's messages run without a break.
+enum WseContinuity { continuous, resyncRequired, resyncing }
+
+/// The recover-or-resync delivery: a topic that is not continuous (a cold
+/// start, every reconnect, a break) holds its messages until the
+/// application brought its state up to date (a resync item, then
+/// `resynced(round)`); the checkpoint is what it committed it applied, and
+/// recovery starts from it.
+class WseDelivery {
+  /// The one consumer that commits, by a stable name.
+  final String consumer;
+
+  /// The application's data schema: a checkpoint of another is refused.
+  final String? schema;
+
+  /// The server's realm (default: the URL): a checkpoint of another is refused.
+  final String? realm;
+
+  /// The checkpoint the application saved last (`checkpoint()`).
+  final String? checkpoint;
+
+  /// Messages a topic holds while it resyncs (0: 10,000); more starts the resync over.
+  final int maxHeld;
+
+  const WseDelivery({
+    required this.consumer,
+    this.schema,
+    this.realm,
+    this.checkpoint,
+    required this.maxHeld,
+  });
+
+  @override
+  int get hashCode =>
+      consumer.hashCode ^
+      schema.hashCode ^
+      realm.hashCode ^
+      checkpoint.hashCode ^
+      maxHeld.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is WseDelivery &&
+          runtimeType == other.runtimeType &&
+          consumer == other.consumer &&
+          schema == other.schema &&
+          realm == other.realm &&
+          checkpoint == other.checkpoint &&
+          maxHeld == other.maxHeld;
 }
 
 /// What went wrong; `kind` names it (config, connect, auth, timeout,
@@ -252,6 +333,14 @@ class WseItem {
   final BigInt? first;
   final BigInt? last;
 
+  /// Resync: the round to say `resynced` for, and what the consumer
+  /// committed of the topics (their reasons in `reasons`).
+  final BigInt? round;
+  final List<WseStreamPosition> committed;
+
+  /// Continuity: the topic's (in `topic`), why not continuous in `reason`.
+  final WseContinuity? continuity;
+
   const WseItem({
     required this.kind,
     this.name,
@@ -280,6 +369,9 @@ class WseItem {
     required this.recoveries,
     this.first,
     this.last,
+    this.round,
+    required this.committed,
+    this.continuity,
   });
 
   @override
@@ -310,7 +402,10 @@ class WseItem {
       failed.hashCode ^
       recoveries.hashCode ^
       first.hashCode ^
-      last.hashCode;
+      last.hashCode ^
+      round.hashCode ^
+      committed.hashCode ^
+      continuity.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -343,7 +438,10 @@ class WseItem {
           failed == other.failed &&
           recoveries == other.recoveries &&
           first == other.first &&
-          last == other.last;
+          last == other.last &&
+          round == other.round &&
+          committed == other.committed &&
+          continuity == other.continuity;
 }
 
 /// The kinds of [`WseItem`].
@@ -357,8 +455,46 @@ enum WseItemKind {
   gap,
   serverError,
   closed,
+
+  /// recover-or-resync: bring the state of `topics` up to date (`reasons`
+  /// for each, `committed`), then call `resynced(round)`.
+  resync,
+
+  /// A topic's continuity changed (`topic`, `continuity`, `reason`).
+  continuity,
+
+  /// The saved checkpoint is not this client's (`reason`).
+  checkpointRejected,
   unknown,
 }
+
+/// Where a stream of a topic stands.
+class WseStreamPosition {
+  final String topic;
+  final int epoch;
+  final BigInt offset;
+
+  const WseStreamPosition({
+    required this.topic,
+    required this.epoch,
+    required this.offset,
+  });
+
+  @override
+  int get hashCode => topic.hashCode ^ epoch.hashCode ^ offset.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is WseStreamPosition &&
+          runtimeType == other.runtimeType &&
+          topic == other.topic &&
+          epoch == other.epoch &&
+          offset == other.offset;
+}
+
+/// Whether the server took a topic.
+enum WseSubscription { requested, active, denied }
 
 /// What a subscription replayed of a topic asked for with a position.
 class WseTopicRecovery {
@@ -385,6 +521,39 @@ class WseTopicRecovery {
           topic == other.topic &&
           recovered == other.recovered &&
           count == other.count;
+}
+
+class WseTopicState {
+  final String topic;
+  final WseSubscription subscription;
+  final WseContinuity continuity;
+
+  /// Why it is not continuous: cold_start, reconnected, offset_gap, ...
+  final String? reason;
+
+  const WseTopicState({
+    required this.topic,
+    required this.subscription,
+    required this.continuity,
+    this.reason,
+  });
+
+  @override
+  int get hashCode =>
+      topic.hashCode ^
+      subscription.hashCode ^
+      continuity.hashCode ^
+      reason.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is WseTopicState &&
+          runtimeType == other.runtimeType &&
+          topic == other.topic &&
+          subscription == other.subscription &&
+          continuity == other.continuity &&
+          reason == other.reason;
 }
 
 /// Which certificates a wss:// server's chain must lead to.

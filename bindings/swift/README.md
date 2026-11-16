@@ -54,6 +54,17 @@ default, `trust: nil`): the roots the device trusts. `trust:
 DER), `.mozilla` the Mozilla roots built into the library. ws:// sends
 everything in the clear and needs `insecure: true` (for development).
 
+`client.topicStates()` says of each topic whether the server took it and
+whether its messages run without a break. Where every fact counts,
+`delivery: WseDelivery(consumer: "board")` (recover-or-resync) holds a topic
+that is not continuous -- from a cold start, after every reconnect, after a
+break -- until the app brought its state up to date: a `.resync(round:
+topics: reasons: committed:)` item asks for it, and `client.resynced(round:)`
+hands on what was held. After applying a message the app calls
+`client.commit(topic:epoch:offset:)`; `client.checkpoint()` is what to save
+with its own state and give back as `WseDelivery(checkpoint:)`, and recovery
+starts from it, so a message can come twice: apply a repeat safely.
+
 `events()` is the client's stream, until it closes; one reader at a time.
 A Task cancelled while reading loses nothing: the next read gets the rest.
 Cancelling the Task of `connect` gives up the attempt. `disconnect` sends

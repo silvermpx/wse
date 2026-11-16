@@ -69,6 +69,37 @@ between loses nothing, the next one gets the rest. `close()` sends what is
 queued and closes; a closed client's calls throw a `WseError` of kind
 `closed`.
 
+## Topic states and recover-or-resync
+
+`client.topicStates` says of each topic whether the server took it and
+whether its messages run without a break. Where every fact counts, a
+recover-or-resync delivery holds a topic that is not continuous -- from a
+cold start, after every reconnect, after a break -- until the app brought
+its state up to date:
+
+```dart
+final client = await WseClient.connect(
+  wseConfig(url, topics: ['orders'], delivery: wseDelivery('board', checkpoint: saved)),
+);
+await for (final item in client.events()) {
+  switch (item.kind) {
+    case WseItemKind.resync:
+      await loadState(item.topics, item.committed);
+      client.resynced(item.round!); // what was held comes next
+    case WseItemKind.message:
+      apply(item); // safe to apply twice
+      client.commit(item);
+      save(client.checkpoint());
+    default:
+      break;
+  }
+}
+```
+
+The checkpoint is bound to the realm, the user, the consumer and the schema;
+one of anything else is refused with a `checkpointRejected` item. Recovery
+starts from it, so a message that came but was not applied comes again.
+
 ## Certificates
 
 A wss:// server's certificate is checked by the system's verifier (the

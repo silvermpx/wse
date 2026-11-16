@@ -63,6 +63,63 @@ pub struct WseConfig {
     pub trusted_roots: Vec<Vec<u8>>,
     /// Allows ws://, which sends everything in the clear: for development.
     pub insecure: bool,
+    /// recover-or-resync; None: best effort.
+    pub delivery: Option<WseDelivery>,
+}
+
+/// The recover-or-resync delivery: a topic that is not continuous (a cold
+/// start, every reconnect, a break) holds its messages until the
+/// application brought its state up to date (a resync item, then
+/// `resynced(round)`); the checkpoint is what it committed it applied, and
+/// recovery starts from it.
+pub struct WseDelivery {
+    /// The one consumer that commits, by a stable name.
+    pub consumer: String,
+    /// The application's data schema: a checkpoint of another is refused.
+    pub schema: Option<String>,
+    /// The server's realm (default: the URL): a checkpoint of another is refused.
+    pub realm: Option<String>,
+    /// The checkpoint the application saved last (`checkpoint()`).
+    pub checkpoint: Option<String>,
+    /// Messages a topic holds while it resyncs (0: 10,000); more starts the resync over.
+    pub max_held: u32,
+}
+
+/// Whether the server took a topic.
+pub enum WseSubscription {
+    Requested,
+    Active,
+    Denied,
+}
+
+/// Whether a topic's messages run without a break.
+pub enum WseContinuity {
+    Continuous,
+    ResyncRequired,
+    Resyncing,
+}
+
+pub struct WseTopicState {
+    pub topic: String,
+    pub subscription: WseSubscription,
+    pub continuity: WseContinuity,
+    /// Why it is not continuous: cold_start, reconnected, offset_gap, ...
+    pub reason: Option<String>,
+}
+
+/// Where a stream of a topic stands.
+pub struct WseStreamPosition {
+    pub topic: String,
+    pub epoch: u32,
+    pub offset: u64,
+}
+
+fn continuity_of(c: native::NativeContinuity) -> WseContinuity {
+    match c {
+        native::NativeContinuity::Continuous => WseContinuity::Continuous,
+        native::NativeContinuity::ResyncRequired => WseContinuity::ResyncRequired,
+        native::NativeContinuity::Resyncing => WseContinuity::Resyncing,
+    }
 }
 
 /// Which certificates a wss:// server's chain must lead to.
@@ -122,6 +179,13 @@ pub enum WseItemKind {
     Gap,
     ServerError,
     Closed,
+    /// recover-or-resync: bring the state of `topics` up to date (`reasons`
+    /// for each, `committed`), then call `resynced(round)`.
+    Resync,
+    /// A topic's continuity changed (`topic`, `continuity`, `reason`).
+    Continuity,
+    /// The saved checkpoint is not this client's (`reason`).
+    CheckpointRejected,
     Unknown,
 }
 
@@ -176,6 +240,12 @@ pub struct WseItem {
     /// Gap: the first and last offsets missing, when known.
     pub first: Option<u64>,
     pub last: Option<u64>,
+    /// Resync: the round to say `resynced` for, and what the consumer
+    /// committed of the topics (their reasons in `reasons`).
+    pub round: Option<u64>,
+    pub committed: Vec<WseStreamPosition>,
+    /// Continuity: the topic's (in `topic`), why not continuous in `reason`.
+    pub continuity: Option<WseContinuity>,
 }
 
 impl WseItem {
@@ -208,6 +278,9 @@ impl WseItem {
             recoveries: Vec::new(),
             first: None,
             last: None,
+            round: None,
+            committed: Vec::new(),
+            continuity: None,
         }
     }
 }
@@ -309,6 +382,39 @@ impl From<native::Item> for WseItem {
                 reason: error.map(|e| e.message),
                 ..WseItem::of(WseItemKind::Closed)
             },
+            native::Item::Resync {
+                round,
+                topics,
+                reasons,
+                committed,
+            } => WseItem {
+                round: Some(round),
+                topics,
+                reasons,
+                committed: committed
+                    .into_iter()
+                    .map(|p| WseStreamPosition {
+                        topic: p.topic,
+                        epoch: p.epoch,
+                        offset: p.offset,
+                    })
+                    .collect(),
+                ..WseItem::of(WseItemKind::Resync)
+            },
+            native::Item::Continuity {
+                topic,
+                continuity,
+                reason,
+            } => WseItem {
+                topic: Some(topic),
+                continuity: Some(continuity_of(continuity)),
+                reason,
+                ..WseItem::of(WseItemKind::Continuity)
+            },
+            native::Item::CheckpointRejected { reason } => WseItem {
+                reason: Some(reason),
+                ..WseItem::of(WseItemKind::CheckpointRejected)
+            },
             native::Item::Unknown { name } => WseItem {
                 name: Some(name),
                 ..WseItem::of(WseItemKind::Unknown)
@@ -357,6 +463,13 @@ impl WseNativeClient {
                 WseTrustKind::Roots => native::NativeTrust::Roots(config.trusted_roots),
             },
             insecure: config.insecure,
+            delivery: config.delivery.map(|d| native::NativeDelivery {
+                consumer: d.consumer,
+                schema: d.schema,
+                realm: d.realm,
+                checkpoint: d.checkpoint,
+                max_held: d.max_held,
+            }),
             ..native::NativeConfig::default()
         };
         let client = native::NativeClient::connect(native_config, None, &cancel.0).await?;
@@ -421,7 +534,54 @@ impl WseNativeClient {
         Ok(self.0.resume(reason)?)
     }
 
-    /// connecting, connected, reconnecting or closed.
+    /// Each topic held: whether the server took it, and whether its
+    /// messages run without a break.
+    #[frb(sync)]
+    pub fn topic_states(&self) -> Vec<WseTopicState> {
+        self.0
+            .topic_states()
+            .into_iter()
+            .map(|s| WseTopicState {
+                topic: s.topic,
+                subscription: match s.subscription {
+                    native::NativeSubscription::Requested => WseSubscription::Requested,
+                    native::NativeSubscription::Active => WseSubscription::Active,
+                    native::NativeSubscription::Denied => WseSubscription::Denied,
+                },
+                continuity: continuity_of(s.continuity),
+                reason: s.reason,
+            })
+            .collect()
+    }
+
+    /// The consumer applied the message at `epoch`, `offset` of `topic`.
+    #[frb(sync)]
+    pub fn commit(&self, topic: String, epoch: u32, offset: u64) {
+        self.0.commit(&topic, epoch, offset);
+    }
+
+    /// What the consumer committed, to save with the application's own
+    /// state and give back as `WseDelivery.checkpoint`.
+    #[frb(sync)]
+    pub fn checkpoint(&self) -> String {
+        self.0.checkpoint()
+    }
+
+    /// recover-or-resync: the application brought the topics of `round` up
+    /// to date; what they held comes next.
+    #[frb(sync)]
+    pub fn resynced(&self, round: u64) {
+        self.0.resynced(round);
+    }
+
+    /// Bring `topics` up to date: in recover-or-resync a resync round asks
+    /// for it; in best effort the application did so itself.
+    #[frb(sync)]
+    pub fn resync(&self, topics: Vec<String>) {
+        self.0.resync(topics);
+    }
+
+    /// connecting, connected, reconnecting, paused or closed.
     #[frb(sync)]
     pub fn status(&self) -> String {
         match self.0.status() {

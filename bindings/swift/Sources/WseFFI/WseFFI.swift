@@ -750,6 +750,17 @@ public func FfiConverterTypeWseCancel_lower(_ value: WseCancel) -> UInt64 {
 
 public protocol WseClientProtocol: AnyObject, Sendable {
 
+    /**
+     * What the consumer committed, to save with the application's own
+     * state and give back as `WseDelivery.checkpoint`.
+     */
+    func checkpoint()  -> String
+
+    /**
+     * The consumer applied the message at `epoch`, `offset` of `topic`.
+     */
+    func commit(topic: String, epoch: UInt32, offset: UInt64)
+
     func connectionId()  -> String?
 
     /**
@@ -778,6 +789,18 @@ public protocol WseClientProtocol: AnyObject, Sendable {
     func resume(reason: String) throws
 
     /**
+     * Bring `topics` up to date: in recover-or-resync a resync round asks
+     * for it; in best effort the application did so itself.
+     */
+    func resync(topics: [String])
+
+    /**
+     * recover-or-resync: the application brought the topics of `round` up
+     * to date; what they held comes next.
+     */
+    func resynced(round: UInt64)
+
+    /**
      * Sends `{"t": kind, "p": json}`, waiting for room in the queue;
      * `cancel` gives up the wait (a message already queued still goes).
      */
@@ -797,6 +820,12 @@ public protocol WseClientProtocol: AnyObject, Sendable {
     func status()  -> WseStatus
 
     func subscribe(topics: [String]) throws
+
+    /**
+     * Each topic held: whether the server took it, and whether its
+     * messages run without a break.
+     */
+    func topicStates()  -> [WseTopicState]
 
     /**
      * Sends `{"t": kind, "p": json}`; fails at once when the queue is full.
@@ -867,6 +896,33 @@ open class WseClient: WseClientProtocol, @unchecked Sendable {
 
 
 
+
+    /**
+     * What the consumer committed, to save with the application's own
+     * state and give back as `WseDelivery.checkpoint`.
+     */
+open func checkpoint() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_wse_ffi_fn_method_wseclient_checkpoint(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+
+    /**
+     * The consumer applied the message at `epoch`, `offset` of `topic`.
+     */
+open func commit(topic: String, epoch: UInt32, offset: UInt64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_wse_ffi_fn_method_wseclient_commit(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(topic),
+        FfiConverterUInt32.lower(epoch),
+        FfiConverterUInt64.lower(offset),uniffiCallStatus
+    )
+}
+}
 
 open func connectionId() -> String?  {
     return try!  FfiConverterOptionString.lift(try! rustCall() {
@@ -952,6 +1008,32 @@ open func resume(reason: String)throws   {try rustCallWithError(FfiConverterType
 }
 
     /**
+     * Bring `topics` up to date: in recover-or-resync a resync round asks
+     * for it; in best effort the application did so itself.
+     */
+open func resync(topics: [String])  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_wse_ffi_fn_method_wseclient_resync(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(topics),uniffiCallStatus
+    )
+}
+}
+
+    /**
+     * recover-or-resync: the application brought the topics of `round` up
+     * to date; what they held comes next.
+     */
+open func resynced(round: UInt64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_wse_ffi_fn_method_wseclient_resynced(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(round),uniffiCallStatus
+    )
+}
+}
+
+    /**
      * Sends `{"t": kind, "p": json}`, waiting for room in the queue;
      * `cancel` gives up the wait (a message already queued still goes).
      */
@@ -1026,6 +1108,19 @@ open func subscribe(topics: [String])throws   {try rustCallWithError(FfiConverte
         FfiConverterSequenceString.lower(topics),uniffiCallStatus
     )
 }
+}
+
+    /**
+     * Each topic held: whether the server took it, and whether its
+     * messages run without a break.
+     */
+open func topicStates() -> [WseTopicState]  {
+    return try!  FfiConverterSequenceTypeWseTopicState.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_wse_ffi_fn_method_wseclient_topic_states(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
 }
 
     /**
@@ -1450,6 +1545,10 @@ public struct WseConfig: Equatable, Hashable {
      * Allows ws://, which sends everything in the clear: for development.
      */
     public let insecure: Bool
+    /**
+     * recover-or-resync; none: best effort.
+     */
+    public let delivery: WseDelivery?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1469,7 +1568,10 @@ public struct WseConfig: Equatable, Hashable {
          */trust: WseTrust? = nil,
         /**
          * Allows ws://, which sends everything in the clear: for development.
-         */insecure: Bool = false) {
+         */insecure: Bool = false,
+        /**
+         * recover-or-resync; none: best effort.
+         */delivery: WseDelivery? = nil) {
         self.url = url
         self.token = token
         self.topics = topics
@@ -1486,6 +1588,7 @@ public struct WseConfig: Equatable, Hashable {
         self.serverSigningKeys = serverSigningKeys
         self.trust = trust
         self.insecure = insecure
+        self.delivery = delivery
     }
 
 
@@ -1519,7 +1622,8 @@ public struct FfiConverterTypeWseConfig: FfiConverterRustBuffer {
                 signingKey: FfiConverterOptionData.read(from: &buf),
                 serverSigningKeys: FfiConverterSequenceString.read(from: &buf),
                 trust: FfiConverterOptionTypeWseTrust.read(from: &buf),
-                insecure: FfiConverterBool.read(from: &buf)
+                insecure: FfiConverterBool.read(from: &buf),
+                delivery: FfiConverterOptionTypeWseDelivery.read(from: &buf)
         )
     }
 
@@ -1540,6 +1644,7 @@ public struct FfiConverterTypeWseConfig: FfiConverterRustBuffer {
         FfiConverterSequenceString.write(value.serverSigningKeys, into: &buf)
         FfiConverterOptionTypeWseTrust.write(value.trust, into: &buf)
         FfiConverterBool.write(value.insecure, into: &buf)
+        FfiConverterOptionTypeWseDelivery.write(value.delivery, into: &buf)
     }
 }
 
@@ -1556,6 +1661,109 @@ public func FfiConverterTypeWseConfig_lift(_ buf: RustBuffer) throws -> WseConfi
 #endif
 public func FfiConverterTypeWseConfig_lower(_ value: WseConfig) -> RustBuffer {
     return FfiConverterTypeWseConfig.lower(value)
+}
+
+
+/**
+ * The recover-or-resync delivery: a topic that is not continuous (a cold
+ * start, every reconnect, a break) holds its messages until the
+ * application brought its state up to date (a `Resync` item, then
+ * `resynced(round)`); the checkpoint is what it committed it applied, and
+ * recovery starts from it.
+ */
+public struct WseDelivery: Equatable, Hashable {
+    /**
+     * The one consumer that commits, by a stable name.
+     */
+    public let consumer: String
+    /**
+     * The application's data schema: a checkpoint of another is refused.
+     */
+    public let schema: String?
+    /**
+     * The server's realm (default: the URL): a checkpoint of another is refused.
+     */
+    public let realm: String?
+    /**
+     * The checkpoint the application saved last (`checkpoint()`).
+     */
+    public let checkpoint: String?
+    /**
+     * Messages a topic holds while it resyncs (0: 10,000); more starts the resync over.
+     */
+    public let maxHeld: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The one consumer that commits, by a stable name.
+         */consumer: String,
+        /**
+         * The application's data schema: a checkpoint of another is refused.
+         */schema: String? = nil,
+        /**
+         * The server's realm (default: the URL): a checkpoint of another is refused.
+         */realm: String? = nil,
+        /**
+         * The checkpoint the application saved last (`checkpoint()`).
+         */checkpoint: String? = nil,
+        /**
+         * Messages a topic holds while it resyncs (0: 10,000); more starts the resync over.
+         */maxHeld: UInt32 = UInt32(0)) {
+        self.consumer = consumer
+        self.schema = schema
+        self.realm = realm
+        self.checkpoint = checkpoint
+        self.maxHeld = maxHeld
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WseDelivery: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWseDelivery: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseDelivery {
+        return
+            try WseDelivery(
+                consumer: FfiConverterString.read(from: &buf),
+                schema: FfiConverterOptionString.read(from: &buf),
+                realm: FfiConverterOptionString.read(from: &buf),
+                checkpoint: FfiConverterOptionString.read(from: &buf),
+                maxHeld: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: WseDelivery, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.consumer, into: &buf)
+        FfiConverterOptionString.write(value.schema, into: &buf)
+        FfiConverterOptionString.write(value.realm, into: &buf)
+        FfiConverterOptionString.write(value.checkpoint, into: &buf)
+        FfiConverterUInt32.write(value.maxHeld, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWseDelivery_lift(_ buf: RustBuffer) throws -> WseDelivery {
+    return try FfiConverterTypeWseDelivery.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWseDelivery_lower(_ value: WseDelivery) -> RustBuffer {
+    return FfiConverterTypeWseDelivery.lower(value)
 }
 
 
@@ -1773,6 +1981,67 @@ public func FfiConverterTypeWseSignature_lower(_ value: WseSignature) -> RustBuf
 }
 
 
+/**
+ * Where a stream of a topic stands.
+ */
+public struct WseStreamPosition: Equatable, Hashable {
+    public let topic: String
+    public let epoch: UInt32
+    public let offset: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(topic: String, epoch: UInt32, offset: UInt64) {
+        self.topic = topic
+        self.epoch = epoch
+        self.offset = offset
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WseStreamPosition: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWseStreamPosition: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseStreamPosition {
+        return
+            try WseStreamPosition(
+                topic: FfiConverterString.read(from: &buf),
+                epoch: FfiConverterUInt32.read(from: &buf),
+                offset: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: WseStreamPosition, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.topic, into: &buf)
+        FfiConverterUInt32.write(value.epoch, into: &buf)
+        FfiConverterUInt64.write(value.offset, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWseStreamPosition_lift(_ buf: RustBuffer) throws -> WseStreamPosition {
+    return try FfiConverterTypeWseStreamPosition.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWseStreamPosition_lower(_ value: WseStreamPosition) -> RustBuffer {
+    return FfiConverterTypeWseStreamPosition.lower(value)
+}
+
+
 public struct WseTopicRecovery: Equatable, Hashable {
     public let topic: String
     public let recovered: Bool
@@ -1828,6 +2097,74 @@ public func FfiConverterTypeWseTopicRecovery_lift(_ buf: RustBuffer) throws -> W
 #endif
 public func FfiConverterTypeWseTopicRecovery_lower(_ value: WseTopicRecovery) -> RustBuffer {
     return FfiConverterTypeWseTopicRecovery.lower(value)
+}
+
+
+public struct WseTopicState: Equatable, Hashable {
+    public let topic: String
+    public let subscription: WseSubscription
+    public let continuity: WseContinuity
+    /**
+     * Why it is not continuous: cold_start, reconnected, offset_gap, ...
+     */
+    public let reason: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(topic: String, subscription: WseSubscription, continuity: WseContinuity,
+        /**
+         * Why it is not continuous: cold_start, reconnected, offset_gap, ...
+         */reason: String?) {
+        self.topic = topic
+        self.subscription = subscription
+        self.continuity = continuity
+        self.reason = reason
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WseTopicState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWseTopicState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseTopicState {
+        return
+            try WseTopicState(
+                topic: FfiConverterString.read(from: &buf),
+                subscription: FfiConverterTypeWseSubscription.read(from: &buf),
+                continuity: FfiConverterTypeWseContinuity.read(from: &buf),
+                reason: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: WseTopicState, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.topic, into: &buf)
+        FfiConverterTypeWseSubscription.write(value.subscription, into: &buf)
+        FfiConverterTypeWseContinuity.write(value.continuity, into: &buf)
+        FfiConverterOptionString.write(value.reason, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWseTopicState_lift(_ buf: RustBuffer) throws -> WseTopicState {
+    return try FfiConverterTypeWseTopicState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWseTopicState_lower(_ value: WseTopicState) -> RustBuffer {
+    return FfiConverterTypeWseTopicState.lower(value)
 }
 
 
@@ -1896,6 +2233,82 @@ public func FfiConverterTypeWseBatchKind_lift(_ buf: RustBuffer) throws -> WseBa
 #endif
 public func FfiConverterTypeWseBatchKind_lower(_ value: WseBatchKind) -> RustBuffer {
     return FfiConverterTypeWseBatchKind.lower(value)
+}
+
+
+
+/**
+ * Whether a topic's messages run without a break.
+ */
+
+public enum WseContinuity: Equatable, Hashable {
+
+    case continuous
+    case resyncRequired
+    case resyncing
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WseContinuity: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWseContinuity: FfiConverterRustBuffer {
+    typealias SwiftType = WseContinuity
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseContinuity {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .continuous
+
+        case 2: return .resyncRequired
+
+        case 3: return .resyncing
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: WseContinuity, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .continuous:
+            writeInt(&buf, Int32(1))
+
+
+        case .resyncRequired:
+            writeInt(&buf, Int32(2))
+
+
+        case .resyncing:
+            writeInt(&buf, Int32(3))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWseContinuity_lift(_ buf: RustBuffer) throws -> WseContinuity {
+    return try FfiConverterTypeWseContinuity.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWseContinuity_lower(_ value: WseContinuity) -> RustBuffer {
+    return FfiConverterTypeWseContinuity.lower(value)
 }
 
 
@@ -2143,6 +2556,24 @@ public enum WseItem: Equatable, Hashable {
     case closed(reason: String?
     )
     /**
+     * recover-or-resync: bring the state of `topics` up to date (the
+     * reason of each, what the consumer committed), then call
+     * `resynced(round)`; their messages wait till then.
+     */
+    case resync(round: UInt64, topics: [String], reasons: [String], committed: [WseStreamPosition]
+    )
+    /**
+     * A topic's continuity changed, and why it is not continuous.
+     */
+    case continuity(topic: String, continuity: WseContinuity, reason: String?
+    )
+    /**
+     * The saved checkpoint is not this client's: its realm, user,
+     * consumer, schema or version, or it is malformed.
+     */
+    case checkpointRejected(reason: String
+    )
+    /**
      * Something this version does not know.
      */
     case unknown(name: String
@@ -2195,7 +2626,16 @@ public struct FfiConverterTypeWseItem: FfiConverterRustBuffer {
         case 9: return .closed(reason: try FfiConverterOptionString.read(from: &buf)
         )
 
-        case 10: return .unknown(name: try FfiConverterString.read(from: &buf)
+        case 10: return .resync(round: try FfiConverterUInt64.read(from: &buf), topics: try FfiConverterSequenceString.read(from: &buf), reasons: try FfiConverterSequenceString.read(from: &buf), committed: try FfiConverterSequenceTypeWseStreamPosition.read(from: &buf)
+        )
+
+        case 11: return .continuity(topic: try FfiConverterString.read(from: &buf), continuity: try FfiConverterTypeWseContinuity.read(from: &buf), reason: try FfiConverterOptionString.read(from: &buf)
+        )
+
+        case 12: return .checkpointRejected(reason: try FfiConverterString.read(from: &buf)
+        )
+
+        case 13: return .unknown(name: try FfiConverterString.read(from: &buf)
         )
 
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -2265,8 +2705,28 @@ public struct FfiConverterTypeWseItem: FfiConverterRustBuffer {
             FfiConverterOptionString.write(reason, into: &buf)
 
 
-        case let .unknown(name):
+        case let .resync(round,topics,reasons,committed):
             writeInt(&buf, Int32(10))
+            FfiConverterUInt64.write(round, into: &buf)
+            FfiConverterSequenceString.write(topics, into: &buf)
+            FfiConverterSequenceString.write(reasons, into: &buf)
+            FfiConverterSequenceTypeWseStreamPosition.write(committed, into: &buf)
+
+
+        case let .continuity(topic,continuity,reason):
+            writeInt(&buf, Int32(11))
+            FfiConverterString.write(topic, into: &buf)
+            FfiConverterTypeWseContinuity.write(continuity, into: &buf)
+            FfiConverterOptionString.write(reason, into: &buf)
+
+
+        case let .checkpointRejected(reason):
+            writeInt(&buf, Int32(12))
+            FfiConverterString.write(reason, into: &buf)
+
+
+        case let .unknown(name):
+            writeInt(&buf, Int32(13))
             FfiConverterString.write(name, into: &buf)
 
         }
@@ -2376,6 +2836,82 @@ public func FfiConverterTypeWseStatus_lift(_ buf: RustBuffer) throws -> WseStatu
 #endif
 public func FfiConverterTypeWseStatus_lower(_ value: WseStatus) -> RustBuffer {
     return FfiConverterTypeWseStatus.lower(value)
+}
+
+
+
+/**
+ * Whether the server took a topic.
+ */
+
+public enum WseSubscription: Equatable, Hashable {
+
+    case requested
+    case active
+    case denied
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WseSubscription: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWseSubscription: FfiConverterRustBuffer {
+    typealias SwiftType = WseSubscription
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseSubscription {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .requested
+
+        case 2: return .active
+
+        case 3: return .denied
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: WseSubscription, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .requested:
+            writeInt(&buf, Int32(1))
+
+
+        case .active:
+            writeInt(&buf, Int32(2))
+
+
+        case .denied:
+            writeInt(&buf, Int32(3))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWseSubscription_lift(_ buf: RustBuffer) throws -> WseSubscription {
+    return try FfiConverterTypeWseSubscription.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWseSubscription_lower(_ value: WseSubscription) -> RustBuffer {
+    return FfiConverterTypeWseSubscription.lower(value)
 }
 
 
@@ -2692,6 +3228,30 @@ fileprivate struct FfiConverterOptionTypeWseTokenSource: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeWseDelivery: FfiConverterRustBuffer {
+    typealias SwiftType = WseDelivery?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeWseDelivery.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeWseDelivery.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeWseSignature: FfiConverterRustBuffer {
     typealias SwiftType = WseSignature?
 
@@ -2815,6 +3375,31 @@ fileprivate struct FfiConverterSequenceTypeWseHeader: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeWseStreamPosition: FfiConverterRustBuffer {
+    typealias SwiftType = [WseStreamPosition]
+
+    public static func write(_ value: [WseStreamPosition], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeWseStreamPosition.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [WseStreamPosition] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [WseStreamPosition]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeWseStreamPosition.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeWseTopicRecovery: FfiConverterRustBuffer {
     typealias SwiftType = [WseTopicRecovery]
 
@@ -2832,6 +3417,31 @@ fileprivate struct FfiConverterSequenceTypeWseTopicRecovery: FfiConverterRustBuf
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeWseTopicRecovery.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeWseTopicState: FfiConverterRustBuffer {
+    typealias SwiftType = [WseTopicState]
+
+    public static func write(_ value: [WseTopicState], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeWseTopicState.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [WseTopicState] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [WseTopicState]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeWseTopicState.read(from: &buf))
         }
         return seq
     }
@@ -3042,6 +3652,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wse_ffi_checksum_method_wsecancel_is_cancelled() != 13465) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_wse_ffi_checksum_method_wseclient_checkpoint() != 3771) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wse_ffi_checksum_method_wseclient_commit() != 10196) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_wse_ffi_checksum_method_wseclient_connection_id() != 49499) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3060,6 +3676,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wse_ffi_checksum_method_wseclient_resume() != 28459) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_wse_ffi_checksum_method_wseclient_resync() != 62144) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wse_ffi_checksum_method_wseclient_resynced() != 1990) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_wse_ffi_checksum_method_wseclient_send() != 38848) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3073,6 +3695,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_method_wseclient_subscribe() != 16488) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wse_ffi_checksum_method_wseclient_topic_states() != 63419) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_method_wseclient_try_send() != 33752) {

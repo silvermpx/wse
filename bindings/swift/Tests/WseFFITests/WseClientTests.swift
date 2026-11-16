@@ -20,6 +20,39 @@ final class WseClientTests: XCTestCase {
         return (url, ca)
     }
 
+    func testRecoverOrResyncHoldsATopicUntilTheAppResyncedIt() async throws {
+        let client = try await WseClient.connect(
+            WseConfig(url: url, topics: ["ticks"], insecure: true, delivery: WseDelivery(consumer: "board")))
+        var round: UInt64?
+        for try await item in client.events() {
+            if case let .message(message) = item, message.topic == "ticks" {
+                XCTFail("a tick before the resync")
+            }
+            if case let .resync(r, topics, reasons, _) = item {
+                XCTAssertEqual(topics, ["ticks"])
+                XCTAssertEqual(reasons, ["cold_start"])
+                round = r
+                break
+            }
+        }
+        XCTAssertEqual(client.topicStates().first?.continuity, .resyncing)
+        // Ticks come meanwhile, and wait.
+        try await Task.sleep(nanoseconds: 300_000_000)
+        client.resynced(round: try XCTUnwrap(round))
+        for try await item in client.events() {
+            if case let .message(message) = item, message.topic == "ticks",
+               let epoch = message.epoch, let offset = message.offset {
+                client.commit(topic: "ticks", epoch: epoch, offset: offset)
+                break
+            }
+        }
+        XCTAssertEqual(client.topicStates().first?.continuity, .continuous)
+        let saved = try JSONSerialization.jsonObject(with: Data(client.checkpoint().utf8)) as? [String: Any]
+        XCTAssertEqual(saved?["consumer"] as? String, "board")
+        XCTAssertNotNil((saved?["topics"] as? [String: Any])?["ticks"])
+        await client.disconnect(deadlineMs: 1_000)
+    }
+
     func testWsGoesInTheClearOnlyWhenAsked() async throws {
         do {
             _ = try await WseClient.connect(WseConfig(url: url))

@@ -51,7 +51,9 @@
   what has no hole, bound to the realm, user, consumer and schema; recovery
   starts from it. Sends can wait for topics to be continuous (`requires`).
   An offset JavaScript cannot hold exactly breaks the topic off instead of
-  being rounded.
+  being rounded. The Swift, Kotlin and Dart clients have the same states
+  and delivery (`WseDelivery`): a `Resync` item asks the app for the state,
+  `resynced(round)` hands on what was held.
 - Rust client: `pause(reason)` and `resume(reason)`, as in the TypeScript
   core client: the connection ends (what is queued goes out first) and no
   attempt is made while any reason holds; topics and positions stay, and

@@ -132,6 +132,8 @@ pub(crate) struct Session<H> {
     /// (`history_ttl`): one quiet for longer while connected is not named in
     /// a recovery.
     history_ttl: Option<Duration>,
+    /// What the application committed: where its recoveries start.
+    pub(crate) committed: Option<crate::config::Committed>,
 }
 
 impl<H: Handler> Session<H> {
@@ -168,6 +170,7 @@ impl<H: Handler> Session<H> {
             connections: 0,
             clock: Instant::now(),
             history_ttl: None,
+            committed: None,
         }
     }
 
@@ -739,8 +742,34 @@ impl<H: Handler> Session<H> {
             .filter(|t| self.wanted.insert(t.clone()))
             .collect();
         if self.ready && !new.is_empty() {
+            self.rewind_to_committed(&new);
             self.send_subscription(&new);
         }
+    }
+
+    /// Where the application says the recovery of `topics` starts (what it
+    /// committed it applied): delivery steps back to it, so what came after
+    /// is taken again when it is replayed.
+    fn rewind_to_committed(&mut self, topics: &[String]) {
+        let Some(committed) = self.committed.clone() else {
+            return;
+        };
+        let Some(positions) = committed(self.user_id.as_deref()) else {
+            return;
+        };
+        let now = self.clock;
+        let mut holes = 0;
+        for name in topics {
+            let topic = self.topics.entry(name.as_str().into()).or_default();
+            holes += topic.holes.len();
+            topic.holes.clear();
+            topic.streams = Streams::default();
+            for at in positions.get(name.as_str()).into_iter().flatten() {
+                topic.streams.advance(*at, now);
+            }
+        }
+        self.holes -= holes;
+        self.next_deadline = self.first_deadline();
     }
 
     /// Unsubscribes, and forgets where the client stood in the topics: a
@@ -1217,6 +1246,7 @@ impl<H: Handler> Session<H> {
         self.shared.ready.store(true, Ordering::Release);
         let topics: Vec<String> = self.wanted.iter().cloned().collect();
         if !topics.is_empty() {
+            self.rewind_to_committed(&topics);
             self.send_subscription(&topics);
         }
         tracing::info!(
@@ -1516,6 +1546,40 @@ mod tests {
         );
         feed(&mut s, E, &[1]);
         assert_eq!(s.handler.offsets, [1]);
+    }
+
+    #[test]
+    fn a_recovery_starts_where_the_application_committed() {
+        use crate::message::Position;
+        let committed: Arc<std::sync::Mutex<BTreeMap<String, Vec<Position>>>> = Arc::default();
+        let positions = Arc::clone(&committed);
+        let mut s = session(Duration::from_secs(3));
+        s.committed = Some(Arc::new(move |user: Option<&str>| {
+            assert_eq!(user, Some("u"));
+            Some(positions.lock().unwrap().clone())
+        }));
+        ready(&mut s, true);
+        sent(&mut s);
+        feed(&mut s, E, &[1, 2, 3, 4]);
+        // The application applied up to 2 when the connection went.
+        committed.lock().unwrap().insert(
+            "t".to_owned(),
+            vec![Position {
+                epoch: 0xa,
+                offset: 2,
+            }],
+        );
+        s.close();
+        s.open(None);
+        ready(&mut s, true);
+        let request = &sent(&mut s)[0];
+        assert_eq!(
+            request["p"]["recovery"]["t"]["streams"],
+            serde_json::json!({ E: 2 })
+        );
+        // 3 and 4 come again, and are taken.
+        feed(&mut s, E, &[3, 4, 5]);
+        assert_eq!(s.handler.offsets, [1, 2, 3, 4, 3, 4, 5]);
     }
 
     #[test]

@@ -72,6 +72,17 @@ androidx.startup); an app that removed that provider calls
 it can fetch the CA's lists, which come over http: an app whose network
 security config refuses http to them connects without that check.
 
+`client.topicStates()` says of each topic whether the server took it and
+whether its messages run without a break. Where every fact counts,
+`delivery = WseDelivery(consumer = "board")` (recover-or-resync) holds a topic
+that is not continuous -- from a cold start, after every reconnect, after a
+break -- until the app brought its state up to date: a `WseItem.Resync` asks
+for it, and `client.resynced(item.round)` hands on what was held. After
+applying a message the app calls `client.commit(topic, epoch, offset)`;
+`client.checkpoint()` is what to save with its own state and give back as
+`WseDelivery(checkpoint = ...)`, and recovery starts from it, so a message
+can come twice: apply a repeat safely.
+
 `events()` is the client's stream, until it closes; one reader at a time. A
 collector cancelled in between loses nothing: the next collection gets the
 rest. Cancelling the coroutine of `connectClient` gives up the attempt.

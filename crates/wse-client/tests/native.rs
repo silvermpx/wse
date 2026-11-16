@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 use wse_client::native::{
-    BatchKind, CancelToken, ErrorKind, Item, NativeClient, NativeConfig, NativeStatus, NativeTrust,
-    TokenSource,
+    BatchKind, CancelToken, ErrorKind, Item, NativeClient, NativeConfig, NativeContinuity,
+    NativeDelivery, NativeStatus, NativeSubscription, NativeTopicState, NativeTrust,
+    StreamPosition, TokenSource,
 };
 
 #[path = "common/tls.rs"]
@@ -438,5 +439,278 @@ async fn a_private_ca_is_trusted_where_it_is_named() {
     .err()
     .unwrap();
     assert_eq!(error.kind, ErrorKind::Config, "{error}");
+    stand.server.stop().await;
+}
+
+/// Reads batches, acknowledging each, until `done` says so of an item; every
+/// item read, in order.
+async fn read_until(
+    client: &NativeClient,
+    ack: &mut u64,
+    done: impl Fn(&Item) -> bool,
+) -> Vec<Item> {
+    let cancel = CancelToken::new();
+    let mut out = Vec::new();
+    loop {
+        let batch = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.next_batch(*ack, 64, 1 << 20, &cancel),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "a batch within 5 s; read so far: {out:?}; states {:?}",
+                client.topic_states()
+            )
+        })
+        .unwrap();
+        *ack = batch.id;
+        let finished = batch.items.iter().any(&done);
+        out.extend(batch.items);
+        if finished {
+            return out;
+        }
+    }
+}
+
+/// The `n` of each tick read.
+fn numbers(items: &[Item]) -> Vec<u64> {
+    items.iter().filter_map(number).collect()
+}
+
+fn number(item: &Item) -> Option<u64> {
+    match item {
+        Item::Message(m) if m.topic.as_deref() == Some("prices") => {
+            let p: serde_json::Value = serde_json::from_str(m.json.as_deref()?).ok()?;
+            p["n"].as_u64()
+        }
+        _ => None,
+    }
+}
+
+fn recover_or_resync(stand: &Stand, user: &str) -> NativeConfig {
+    NativeConfig {
+        delivery: Some(NativeDelivery {
+            consumer: "board".into(),
+            ..NativeDelivery::default()
+        }),
+        ..stand.config(user)
+    }
+}
+
+fn publish(stand: &Stand, n: u64) {
+    stand
+        .publisher
+        .publish_local("prices", &format!(r#"{{"t":"tick","p":{{"n":{n}}}}}"#))
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recover_or_resync_holds_a_topic_until_the_application_resynced_it() {
+    let stand = stand().await;
+    let client = NativeClient::connect(recover_or_resync(&stand, "gil"), None, &CancelToken::new())
+        .await
+        .unwrap();
+    let mut ack = 0;
+    let items = read_until(&client, &mut ack, |i| matches!(i, Item::Resync { .. })).await;
+    let Some(Item::Resync {
+        round,
+        topics,
+        reasons,
+        committed,
+    }) = items.last().cloned()
+    else {
+        panic!("{items:?}");
+    };
+    assert_eq!(topics, ["prices"]);
+    assert_eq!(reasons, ["cold_start"]);
+    assert!(committed.is_empty());
+    assert_eq!(
+        client.topic_states()[0].continuity,
+        NativeContinuity::Resyncing
+    );
+    assert_eq!(
+        client.topic_states()[0].subscription,
+        NativeSubscription::Active
+    );
+
+    // Published while the application loads its state: held.
+    publish(&stand, 1);
+    publish(&stand, 2);
+    let cancel = CancelToken::new();
+    let quiet = tokio::time::timeout(
+        Duration::from_millis(300),
+        client.next_batch(ack, 64, 1 << 20, &cancel),
+    )
+    .await;
+    assert!(quiet.is_err(), "nothing comes before the resync: {quiet:?}");
+    client.resynced(round);
+    let items = read_until(&client, &mut ack, |i| number(i) == Some(2)).await;
+    assert_eq!(numbers(&items), [1, 2]);
+    assert!(items.iter().any(|i| matches!(
+        i,
+        Item::Continuity {
+            continuity: NativeContinuity::Continuous,
+            ..
+        }
+    )));
+    publish(&stand, 3);
+    let items = read_until(&client, &mut ack, |i| matches!(i, Item::Message(_))).await;
+    assert_eq!(numbers(&items), [3]);
+    client.disconnect(1_000).await;
+    stand.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_resyncs_and_recovers_from_what_was_committed() {
+    let stand = stand().await;
+    let client = NativeClient::connect(recover_or_resync(&stand, "hal"), None, &CancelToken::new())
+        .await
+        .unwrap();
+    let mut ack = 0;
+    let items = read_until(&client, &mut ack, |i| matches!(i, Item::Resync { .. })).await;
+    let Some(Item::Resync { round, .. }) = items.last().cloned() else {
+        panic!("{items:?}");
+    };
+    client.resynced(round);
+    for n in 1..=4 {
+        publish(&stand, n);
+    }
+    let items = read_until(&client, &mut ack, |i| number(i) == Some(4)).await;
+    let messages: Vec<_> = items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Message(m) => Some(m.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(messages.len(), 4);
+    let epoch = messages[0].epoch.unwrap();
+    let at: Vec<u64> = messages.iter().map(|m| m.offset.unwrap()).collect();
+    // Nothing applied yet: nothing in the checkpoint.
+    let saved: serde_json::Value = serde_json::from_str(&client.checkpoint()).unwrap();
+    assert!(saved["topics"]["prices"].is_null(), "{saved}");
+    // Applied out of order: the checkpoint moves only through what has no hole.
+    client.commit("prices", epoch, at[0]);
+    client.commit("prices", epoch, at[2]);
+    let saved: serde_json::Value = serde_json::from_str(&client.checkpoint()).unwrap();
+    assert_eq!(saved["topics"]["prices"][format!("{epoch:08x}")], at[0]);
+    client.commit("prices", epoch, at[1]);
+    let saved: serde_json::Value = serde_json::from_str(&client.checkpoint()).unwrap();
+    assert_eq!(saved["topics"]["prices"][format!("{epoch:08x}")], at[2]);
+    assert_eq!(saved["user"], "hal");
+    assert_eq!(saved["consumer"], "board");
+
+    // 4 came but was not applied: after the reconnect it comes again.
+    client.reconnect().unwrap();
+    let items = read_until(&client, &mut ack, |i| matches!(i, Item::Resync { .. })).await;
+    let Some(Item::Resync {
+        round,
+        reasons,
+        committed,
+        ..
+    }) = items.last().cloned()
+    else {
+        panic!("{items:?}");
+    };
+    assert_eq!(reasons, ["reconnected"]);
+    assert_eq!(
+        committed,
+        [StreamPosition {
+            topic: "prices".into(),
+            epoch,
+            offset: at[2]
+        }]
+    );
+    client.resynced(round);
+    let items = read_until(&client, &mut ack, |i| number(i) == Some(4)).await;
+    assert_eq!(numbers(&items), [4]);
+    client.disconnect(1_000).await;
+    stand.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_checkpoint_of_another_consumer_is_refused_aloud() {
+    let stand = stand().await;
+    let mut config = recover_or_resync(&stand, "ida");
+    config.delivery.as_mut().unwrap().checkpoint = Some(format!(
+        r#"{{"v":1,"realm":"{}","user":"ida","consumer":"audit","schema":null,"topics":{{"prices":{{"0000000a":9}}}}}}"#,
+        stand.url
+    ));
+    let client = NativeClient::connect(config, None, &CancelToken::new())
+        .await
+        .unwrap();
+    let mut ack = 0;
+    let items = read_until(&client, &mut ack, |i| matches!(i, Item::Resync { .. })).await;
+    assert!(
+        items.contains(&Item::CheckpointRejected {
+            reason: "consumer".into()
+        }),
+        "{items:?}"
+    );
+    let Some(Item::Resync { committed, .. }) = items.last() else {
+        panic!("{items:?}");
+    };
+    assert!(committed.is_empty());
+    client.disconnect(1_000).await;
+    stand.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn messages_held_past_the_limit_start_the_resync_over() {
+    let stand = stand().await;
+    let mut config = recover_or_resync(&stand, "jo");
+    config.delivery.as_mut().unwrap().max_held = 2;
+    let client = NativeClient::connect(config, None, &CancelToken::new())
+        .await
+        .unwrap();
+    let mut ack = 0;
+    let items = read_until(&client, &mut ack, |i| matches!(i, Item::Resync { .. })).await;
+    let Some(Item::Resync { round, .. }) = items.last().cloned() else {
+        panic!("{items:?}");
+    };
+    for n in 1..=3 {
+        publish(&stand, n);
+    }
+    // Let the three arrive (and be held) before the resync ends.
+    let cancel = CancelToken::new();
+    let _ = tokio::time::timeout(
+        Duration::from_millis(300),
+        client.next_batch(ack, 64, 1 << 20, &cancel),
+    )
+    .await;
+    client.resynced(round);
+    let items = read_until(&client, &mut ack, |i| matches!(i, Item::Resync { .. })).await;
+    assert!(numbers(&items).is_empty(), "{items:?}");
+    let Some(Item::Resync { reasons, .. }) = items.last() else {
+        panic!("{items:?}");
+    };
+    assert_eq!(reasons, &["overflow"]);
+    client.disconnect(1_000).await;
+    stand.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn best_effort_says_what_the_server_took_and_lets_the_app_say_it_resynced() {
+    let stand = stand().await;
+    let client = NativeClient::connect(stand.config("kay"), None, &CancelToken::new())
+        .await
+        .unwrap();
+    subscribed(&client).await;
+    assert_eq!(
+        client.topic_states(),
+        [NativeTopicState {
+            topic: "prices".into(),
+            subscription: NativeSubscription::Active,
+            continuity: NativeContinuity::Continuous,
+            reason: None,
+        }]
+    );
+    client.resync(vec!["prices".into()]);
+    assert_eq!(
+        client.topic_states()[0].continuity,
+        NativeContinuity::Continuous
+    );
+    client.disconnect(1_000).await;
     stand.server.stop().await;
 }

@@ -19,6 +19,37 @@ class WseClientTest {
     private val url = System.getenv("WSE_TEST_URL") ?: "ws://127.0.0.1:5007/wse"
 
     @Test
+    fun recoverOrResyncHoldsATopicUntilTheAppResyncedIt(): Unit = runBlocking {
+        val client = connectClient(
+            WseConfig(url = url, topics = listOf("ticks"), insecure = true, delivery = WseDelivery(consumer = "board")),
+        )
+        val events = client.events()
+        var resync: WseItem.Resync? = null
+        while (resync == null) {
+            val item = events.next() ?: break
+            if (item is WseItem.Message) assertTrue(item.message.topic != "ticks", "a tick before the resync")
+            if (item is WseItem.Resync) resync = item
+        }
+        assertEquals(listOf("ticks"), resync!!.topics)
+        assertEquals(listOf("cold_start"), resync.reasons)
+        assertEquals(WseContinuity.RESYNCING, client.topicStates().single().continuity)
+        // Ticks come meanwhile, and wait.
+        delay(300)
+        client.resynced(resync.round)
+        var tick: WseMessage? = null
+        while (tick == null) {
+            val item = events.next() ?: break
+            if (item is WseItem.Message && item.message.topic == "ticks") tick = item.message
+        }
+        client.commit("ticks", tick!!.epoch!!, tick.offset!!)
+        assertEquals(WseContinuity.CONTINUOUS, client.topicStates().single().continuity)
+        val saved = client.checkpoint()
+        assertTrue("\"consumer\":\"board\"" in saved, saved)
+        assertTrue("\"ticks\"" in saved, saved)
+        client.disconnect(1_000u)
+    }
+
+    @Test
     fun wsGoesInTheClearOnlyWhenAsked(): Unit = runBlocking {
         assertFailsWith<WseException.Config> { connectClient(WseConfig(url = url)) }
     }

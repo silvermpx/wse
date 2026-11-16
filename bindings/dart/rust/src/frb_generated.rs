@@ -40,7 +40,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.13.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -389280457;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -499120092;
 
 // Section: executor
 
@@ -120,6 +120,109 @@ fn wire__crate__api__WseCancel_new_impl(
             deserializer.end();
             transform_result_sse::<_, ()>((move || {
                 let output_ok = Ok::<_, ()>(crate::api::WseCancel::new())?;
+                std::result::Result::Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__WseNativeClient_checkpoint_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "WseNativeClient_checkpoint",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<WseNativeClient>,
+            >>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let mut api_that_guard = None;
+                let decode_indices_ =
+                    flutter_rust_bridge::for_generated::lockable_compute_decode_order(vec![
+                        flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                            &api_that, 0, false,
+                        ),
+                    ]);
+                for i in decode_indices_ {
+                    match i {
+                        0 => api_that_guard = Some(api_that.lockable_decode_sync_ref()),
+                        _ => unreachable!(),
+                    }
+                }
+                let api_that_guard = api_that_guard.unwrap();
+                let output_ok =
+                    Ok::<_, ()>(crate::api::WseNativeClient::checkpoint(&*api_that_guard))?;
+                std::result::Result::Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__WseNativeClient_commit_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "WseNativeClient_commit",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<WseNativeClient>,
+            >>::sse_decode(&mut deserializer);
+            let api_topic = <String>::sse_decode(&mut deserializer);
+            let api_epoch = <u32>::sse_decode(&mut deserializer);
+            let api_offset = <u64>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let mut api_that_guard = None;
+                let decode_indices_ =
+                    flutter_rust_bridge::for_generated::lockable_compute_decode_order(vec![
+                        flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                            &api_that, 0, false,
+                        ),
+                    ]);
+                for i in decode_indices_ {
+                    match i {
+                        0 => api_that_guard = Some(api_that.lockable_decode_sync_ref()),
+                        _ => unreachable!(),
+                    }
+                }
+                let api_that_guard = api_that_guard.unwrap();
+                let output_ok = Ok::<_, ()>({
+                    crate::api::WseNativeClient::commit(
+                        &*api_that_guard,
+                        api_topic,
+                        api_epoch,
+                        api_offset,
+                    );
+                })?;
                 std::result::Result::Ok(output_ok)
             })())
         },
@@ -468,6 +571,104 @@ fn wire__crate__api__WseNativeClient_resume_impl(
         },
     )
 }
+fn wire__crate__api__WseNativeClient_resync_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "WseNativeClient_resync",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<WseNativeClient>,
+            >>::sse_decode(&mut deserializer);
+            let api_topics = <Vec<String>>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let mut api_that_guard = None;
+                let decode_indices_ =
+                    flutter_rust_bridge::for_generated::lockable_compute_decode_order(vec![
+                        flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                            &api_that, 0, false,
+                        ),
+                    ]);
+                for i in decode_indices_ {
+                    match i {
+                        0 => api_that_guard = Some(api_that.lockable_decode_sync_ref()),
+                        _ => unreachable!(),
+                    }
+                }
+                let api_that_guard = api_that_guard.unwrap();
+                let output_ok = Ok::<_, ()>({
+                    crate::api::WseNativeClient::resync(&*api_that_guard, api_topics);
+                })?;
+                std::result::Result::Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__WseNativeClient_resynced_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "WseNativeClient_resynced",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<WseNativeClient>,
+            >>::sse_decode(&mut deserializer);
+            let api_round = <u64>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let mut api_that_guard = None;
+                let decode_indices_ =
+                    flutter_rust_bridge::for_generated::lockable_compute_decode_order(vec![
+                        flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                            &api_that, 0, false,
+                        ),
+                    ]);
+                for i in decode_indices_ {
+                    match i {
+                        0 => api_that_guard = Some(api_that.lockable_decode_sync_ref()),
+                        _ => unreachable!(),
+                    }
+                }
+                let api_that_guard = api_that_guard.unwrap();
+                let output_ok = Ok::<_, ()>({
+                    crate::api::WseNativeClient::resynced(&*api_that_guard, api_round);
+                })?;
+                std::result::Result::Ok(output_ok)
+            })())
+        },
+    )
+}
 fn wire__crate__api__WseNativeClient_send_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -742,6 +943,53 @@ fn wire__crate__api__WseNativeClient_subscribe_impl(
                 let api_that_guard = api_that_guard.unwrap();
                 let output_ok =
                     crate::api::WseNativeClient::subscribe(&*api_that_guard, api_topics)?;
+                std::result::Result::Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__WseNativeClient_topic_states_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "WseNativeClient_topic_states",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<WseNativeClient>,
+            >>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let mut api_that_guard = None;
+                let decode_indices_ =
+                    flutter_rust_bridge::for_generated::lockable_compute_decode_order(vec![
+                        flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                            &api_that, 0, false,
+                        ),
+                    ]);
+                for i in decode_indices_ {
+                    match i {
+                        0 => api_that_guard = Some(api_that.lockable_decode_sync_ref()),
+                        _ => unreachable!(),
+                    }
+                }
+                let api_that_guard = api_that_guard.unwrap();
+                let output_ok =
+                    Ok::<_, ()>(crate::api::WseNativeClient::topic_states(&*api_that_guard))?;
                 std::result::Result::Ok(output_ok)
             })())
         },
@@ -1065,6 +1313,18 @@ impl SseDecode for Vec<crate::api::WseItem> {
     }
 }
 
+impl SseDecode for Vec<crate::api::WseStreamPosition> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<crate::api::WseStreamPosition>::sse_decode(deserializer));
+        }
+        return ans_;
+    }
+}
+
 impl SseDecode for Vec<crate::api::WseTopicRecovery> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1072,6 +1332,18 @@ impl SseDecode for Vec<crate::api::WseTopicRecovery> {
         let mut ans_ = Vec::with_capacity(len_ as usize);
         for idx_ in 0..len_ {
             ans_.push(<crate::api::WseTopicRecovery>::sse_decode(deserializer));
+        }
+        return ans_;
+    }
+}
+
+impl SseDecode for Vec<crate::api::WseTopicState> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<crate::api::WseTopicState>::sse_decode(deserializer));
         }
         return ans_;
     }
@@ -1115,6 +1387,28 @@ impl SseDecode for Option<u64> {
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         if (<bool>::sse_decode(deserializer)) {
             return Some(<u64>::sse_decode(deserializer));
+        } else {
+            return None;
+        }
+    }
+}
+
+impl SseDecode for Option<crate::api::WseContinuity> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        if (<bool>::sse_decode(deserializer)) {
+            return Some(<crate::api::WseContinuity>::sse_decode(deserializer));
+        } else {
+            return None;
+        }
+    }
+}
+
+impl SseDecode for Option<crate::api::WseDelivery> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        if (<bool>::sse_decode(deserializer)) {
+            return Some(<crate::api::WseDelivery>::sse_decode(deserializer));
         } else {
             return None;
         }
@@ -1205,6 +1499,7 @@ impl SseDecode for crate::api::WseConfig {
         let mut var_trust = <crate::api::WseTrustKind>::sse_decode(deserializer);
         let mut var_trustedRoots = <Vec<Vec<u8>>>::sse_decode(deserializer);
         let mut var_insecure = <bool>::sse_decode(deserializer);
+        let mut var_delivery = <Option<crate::api::WseDelivery>>::sse_decode(deserializer);
         return crate::api::WseConfig {
             url: var_url,
             token: var_token,
@@ -1222,6 +1517,38 @@ impl SseDecode for crate::api::WseConfig {
             trust: var_trust,
             trusted_roots: var_trustedRoots,
             insecure: var_insecure,
+            delivery: var_delivery,
+        };
+    }
+}
+
+impl SseDecode for crate::api::WseContinuity {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <i32>::sse_decode(deserializer);
+        return match inner {
+            0 => crate::api::WseContinuity::Continuous,
+            1 => crate::api::WseContinuity::ResyncRequired,
+            2 => crate::api::WseContinuity::Resyncing,
+            _ => unreachable!("Invalid variant for WseContinuity: {}", inner),
+        };
+    }
+}
+
+impl SseDecode for crate::api::WseDelivery {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_consumer = <String>::sse_decode(deserializer);
+        let mut var_schema = <Option<String>>::sse_decode(deserializer);
+        let mut var_realm = <Option<String>>::sse_decode(deserializer);
+        let mut var_checkpoint = <Option<String>>::sse_decode(deserializer);
+        let mut var_maxHeld = <u32>::sse_decode(deserializer);
+        return crate::api::WseDelivery {
+            consumer: var_consumer,
+            schema: var_schema,
+            realm: var_realm,
+            checkpoint: var_checkpoint,
+            max_held: var_maxHeld,
         };
     }
 }
@@ -1268,6 +1595,9 @@ impl SseDecode for crate::api::WseItem {
         let mut var_recoveries = <Vec<crate::api::WseTopicRecovery>>::sse_decode(deserializer);
         let mut var_first = <Option<u64>>::sse_decode(deserializer);
         let mut var_last = <Option<u64>>::sse_decode(deserializer);
+        let mut var_round = <Option<u64>>::sse_decode(deserializer);
+        let mut var_committed = <Vec<crate::api::WseStreamPosition>>::sse_decode(deserializer);
+        let mut var_continuity = <Option<crate::api::WseContinuity>>::sse_decode(deserializer);
         return crate::api::WseItem {
             kind: var_kind,
             name: var_name,
@@ -1296,6 +1626,9 @@ impl SseDecode for crate::api::WseItem {
             recoveries: var_recoveries,
             first: var_first,
             last: var_last,
+            round: var_round,
+            committed: var_committed,
+            continuity: var_continuity,
         };
     }
 }
@@ -1314,8 +1647,38 @@ impl SseDecode for crate::api::WseItemKind {
             6 => crate::api::WseItemKind::Gap,
             7 => crate::api::WseItemKind::ServerError,
             8 => crate::api::WseItemKind::Closed,
-            9 => crate::api::WseItemKind::Unknown,
+            9 => crate::api::WseItemKind::Resync,
+            10 => crate::api::WseItemKind::Continuity,
+            11 => crate::api::WseItemKind::CheckpointRejected,
+            12 => crate::api::WseItemKind::Unknown,
             _ => unreachable!("Invalid variant for WseItemKind: {}", inner),
+        };
+    }
+}
+
+impl SseDecode for crate::api::WseStreamPosition {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_topic = <String>::sse_decode(deserializer);
+        let mut var_epoch = <u32>::sse_decode(deserializer);
+        let mut var_offset = <u64>::sse_decode(deserializer);
+        return crate::api::WseStreamPosition {
+            topic: var_topic,
+            epoch: var_epoch,
+            offset: var_offset,
+        };
+    }
+}
+
+impl SseDecode for crate::api::WseSubscription {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <i32>::sse_decode(deserializer);
+        return match inner {
+            0 => crate::api::WseSubscription::Requested,
+            1 => crate::api::WseSubscription::Active,
+            2 => crate::api::WseSubscription::Denied,
+            _ => unreachable!("Invalid variant for WseSubscription: {}", inner),
         };
     }
 }
@@ -1330,6 +1693,22 @@ impl SseDecode for crate::api::WseTopicRecovery {
             topic: var_topic,
             recovered: var_recovered,
             count: var_count,
+        };
+    }
+}
+
+impl SseDecode for crate::api::WseTopicState {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_topic = <String>::sse_decode(deserializer);
+        let mut var_subscription = <crate::api::WseSubscription>::sse_decode(deserializer);
+        let mut var_continuity = <crate::api::WseContinuity>::sse_decode(deserializer);
+        let mut var_reason = <Option<String>>::sse_decode(deserializer);
+        return crate::api::WseTopicState {
+            topic: var_topic,
+            subscription: var_subscription,
+            continuity: var_continuity,
+            reason: var_reason,
         };
     }
 }
@@ -1356,12 +1735,12 @@ fn pde_ffi_dispatcher_primary_impl(
 ) {
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
-        3 => wire__crate__api__WseNativeClient_connect_impl(port, ptr, rust_vec_len, data_len),
-        4 => wire__crate__api__WseNativeClient_disconnect_impl(port, ptr, rust_vec_len, data_len),
-        5 => wire__crate__api__WseNativeClient_next_batch_impl(port, ptr, rust_vec_len, data_len),
-        9 => wire__crate__api__WseNativeClient_send_impl(port, ptr, rust_vec_len, data_len),
-        10 => wire__crate__api__WseNativeClient_send_live_impl(port, ptr, rust_vec_len, data_len),
-        11 => wire__crate__api__WseNativeClient_send_signed_impl(port, ptr, rust_vec_len, data_len),
+        5 => wire__crate__api__WseNativeClient_connect_impl(port, ptr, rust_vec_len, data_len),
+        6 => wire__crate__api__WseNativeClient_disconnect_impl(port, ptr, rust_vec_len, data_len),
+        7 => wire__crate__api__WseNativeClient_next_batch_impl(port, ptr, rust_vec_len, data_len),
+        13 => wire__crate__api__WseNativeClient_send_impl(port, ptr, rust_vec_len, data_len),
+        14 => wire__crate__api__WseNativeClient_send_live_impl(port, ptr, rust_vec_len, data_len),
+        15 => wire__crate__api__WseNativeClient_send_signed_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -1376,15 +1755,20 @@ fn pde_ffi_dispatcher_sync_impl(
     match func_id {
         1 => wire__crate__api__WseCancel_cancel_impl(ptr, rust_vec_len, data_len),
         2 => wire__crate__api__WseCancel_new_impl(ptr, rust_vec_len, data_len),
-        6 => wire__crate__api__WseNativeClient_pause_impl(ptr, rust_vec_len, data_len),
-        7 => wire__crate__api__WseNativeClient_reconnect_impl(ptr, rust_vec_len, data_len),
-        8 => wire__crate__api__WseNativeClient_resume_impl(ptr, rust_vec_len, data_len),
-        12 => wire__crate__api__WseNativeClient_status_impl(ptr, rust_vec_len, data_len),
-        13 => wire__crate__api__WseNativeClient_subscribe_impl(ptr, rust_vec_len, data_len),
-        14 => wire__crate__api__WseNativeClient_try_send_impl(ptr, rust_vec_len, data_len),
-        15 => wire__crate__api__WseNativeClient_try_send_live_impl(ptr, rust_vec_len, data_len),
-        16 => wire__crate__api__WseNativeClient_unsubscribe_impl(ptr, rust_vec_len, data_len),
-        17 => wire__crate__api__WseNativeClient_user_id_impl(ptr, rust_vec_len, data_len),
+        3 => wire__crate__api__WseNativeClient_checkpoint_impl(ptr, rust_vec_len, data_len),
+        4 => wire__crate__api__WseNativeClient_commit_impl(ptr, rust_vec_len, data_len),
+        8 => wire__crate__api__WseNativeClient_pause_impl(ptr, rust_vec_len, data_len),
+        9 => wire__crate__api__WseNativeClient_reconnect_impl(ptr, rust_vec_len, data_len),
+        10 => wire__crate__api__WseNativeClient_resume_impl(ptr, rust_vec_len, data_len),
+        11 => wire__crate__api__WseNativeClient_resync_impl(ptr, rust_vec_len, data_len),
+        12 => wire__crate__api__WseNativeClient_resynced_impl(ptr, rust_vec_len, data_len),
+        16 => wire__crate__api__WseNativeClient_status_impl(ptr, rust_vec_len, data_len),
+        17 => wire__crate__api__WseNativeClient_subscribe_impl(ptr, rust_vec_len, data_len),
+        18 => wire__crate__api__WseNativeClient_topic_states_impl(ptr, rust_vec_len, data_len),
+        19 => wire__crate__api__WseNativeClient_try_send_impl(ptr, rust_vec_len, data_len),
+        20 => wire__crate__api__WseNativeClient_try_send_live_impl(ptr, rust_vec_len, data_len),
+        21 => wire__crate__api__WseNativeClient_unsubscribe_impl(ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__WseNativeClient_user_id_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -1458,6 +1842,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::WseConfig {
             self.trust.into_into_dart().into_dart(),
             self.trusted_roots.into_into_dart().into_dart(),
             self.insecure.into_into_dart().into_dart(),
+            self.delivery.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -1465,6 +1850,42 @@ impl flutter_rust_bridge::IntoDart for crate::api::WseConfig {
 impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::WseConfig {}
 impl flutter_rust_bridge::IntoIntoDart<crate::api::WseConfig> for crate::api::WseConfig {
     fn into_into_dart(self) -> crate::api::WseConfig {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::WseContinuity {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            Self::Continuous => 0.into_dart(),
+            Self::ResyncRequired => 1.into_dart(),
+            Self::Resyncing => 2.into_dart(),
+            _ => unreachable!(),
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::WseContinuity {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::WseContinuity> for crate::api::WseContinuity {
+    fn into_into_dart(self) -> crate::api::WseContinuity {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::WseDelivery {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.consumer.into_into_dart().into_dart(),
+            self.schema.into_into_dart().into_dart(),
+            self.realm.into_into_dart().into_dart(),
+            self.checkpoint.into_into_dart().into_dart(),
+            self.max_held.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::WseDelivery {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::WseDelivery> for crate::api::WseDelivery {
+    fn into_into_dart(self) -> crate::api::WseDelivery {
         self
     }
 }
@@ -1515,6 +1936,9 @@ impl flutter_rust_bridge::IntoDart for crate::api::WseItem {
             self.recoveries.into_into_dart().into_dart(),
             self.first.into_into_dart().into_dart(),
             self.last.into_into_dart().into_dart(),
+            self.round.into_into_dart().into_dart(),
+            self.committed.into_into_dart().into_dart(),
+            self.continuity.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -1538,7 +1962,10 @@ impl flutter_rust_bridge::IntoDart for crate::api::WseItemKind {
             Self::Gap => 6.into_dart(),
             Self::ServerError => 7.into_dart(),
             Self::Closed => 8.into_dart(),
-            Self::Unknown => 9.into_dart(),
+            Self::Resync => 9.into_dart(),
+            Self::Continuity => 10.into_dart(),
+            Self::CheckpointRejected => 11.into_dart(),
+            Self::Unknown => 12.into_dart(),
             _ => unreachable!(),
         }
     }
@@ -1546,6 +1973,44 @@ impl flutter_rust_bridge::IntoDart for crate::api::WseItemKind {
 impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::WseItemKind {}
 impl flutter_rust_bridge::IntoIntoDart<crate::api::WseItemKind> for crate::api::WseItemKind {
     fn into_into_dart(self) -> crate::api::WseItemKind {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::WseStreamPosition {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.topic.into_into_dart().into_dart(),
+            self.epoch.into_into_dart().into_dart(),
+            self.offset.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::WseStreamPosition {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::WseStreamPosition>
+    for crate::api::WseStreamPosition
+{
+    fn into_into_dart(self) -> crate::api::WseStreamPosition {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::WseSubscription {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            Self::Requested => 0.into_dart(),
+            Self::Active => 1.into_dart(),
+            Self::Denied => 2.into_dart(),
+            _ => unreachable!(),
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::WseSubscription {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::WseSubscription>
+    for crate::api::WseSubscription
+{
+    fn into_into_dart(self) -> crate::api::WseSubscription {
         self
     }
 }
@@ -1565,6 +2030,24 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::WseTopicRecovery>
     for crate::api::WseTopicRecovery
 {
     fn into_into_dart(self) -> crate::api::WseTopicRecovery {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::WseTopicState {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.topic.into_into_dart().into_dart(),
+            self.subscription.into_into_dart().into_dart(),
+            self.continuity.into_into_dart().into_dart(),
+            self.reason.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::WseTopicState {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::WseTopicState> for crate::api::WseTopicState {
+    fn into_into_dart(self) -> crate::api::WseTopicState {
         self
     }
 }
@@ -1683,12 +2166,32 @@ impl SseEncode for Vec<crate::api::WseItem> {
     }
 }
 
+impl SseEncode for Vec<crate::api::WseStreamPosition> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <crate::api::WseStreamPosition>::sse_encode(item, serializer);
+        }
+    }
+}
+
 impl SseEncode for Vec<crate::api::WseTopicRecovery> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         <i32>::sse_encode(self.len() as _, serializer);
         for item in self {
             <crate::api::WseTopicRecovery>::sse_encode(item, serializer);
+        }
+    }
+}
+
+impl SseEncode for Vec<crate::api::WseTopicState> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <crate::api::WseTopicState>::sse_encode(item, serializer);
         }
     }
 }
@@ -1729,6 +2232,26 @@ impl SseEncode for Option<u64> {
         <bool>::sse_encode(self.is_some(), serializer);
         if let Some(value) = self {
             <u64>::sse_encode(value, serializer);
+        }
+    }
+}
+
+impl SseEncode for Option<crate::api::WseContinuity> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.is_some(), serializer);
+        if let Some(value) = self {
+            <crate::api::WseContinuity>::sse_encode(value, serializer);
+        }
+    }
+}
+
+impl SseEncode for Option<crate::api::WseDelivery> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.is_some(), serializer);
+        if let Some(value) = self {
+            <crate::api::WseDelivery>::sse_encode(value, serializer);
         }
     }
 }
@@ -1814,6 +2337,35 @@ impl SseEncode for crate::api::WseConfig {
         <crate::api::WseTrustKind>::sse_encode(self.trust, serializer);
         <Vec<Vec<u8>>>::sse_encode(self.trusted_roots, serializer);
         <bool>::sse_encode(self.insecure, serializer);
+        <Option<crate::api::WseDelivery>>::sse_encode(self.delivery, serializer);
+    }
+}
+
+impl SseEncode for crate::api::WseContinuity {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(
+            match self {
+                crate::api::WseContinuity::Continuous => 0,
+                crate::api::WseContinuity::ResyncRequired => 1,
+                crate::api::WseContinuity::Resyncing => 2,
+                _ => {
+                    unimplemented!("");
+                }
+            },
+            serializer,
+        );
+    }
+}
+
+impl SseEncode for crate::api::WseDelivery {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.consumer, serializer);
+        <Option<String>>::sse_encode(self.schema, serializer);
+        <Option<String>>::sse_encode(self.realm, serializer);
+        <Option<String>>::sse_encode(self.checkpoint, serializer);
+        <u32>::sse_encode(self.max_held, serializer);
     }
 }
 
@@ -1855,6 +2407,9 @@ impl SseEncode for crate::api::WseItem {
         <Vec<crate::api::WseTopicRecovery>>::sse_encode(self.recoveries, serializer);
         <Option<u64>>::sse_encode(self.first, serializer);
         <Option<u64>>::sse_encode(self.last, serializer);
+        <Option<u64>>::sse_encode(self.round, serializer);
+        <Vec<crate::api::WseStreamPosition>>::sse_encode(self.committed, serializer);
+        <Option<crate::api::WseContinuity>>::sse_encode(self.continuity, serializer);
     }
 }
 
@@ -1872,7 +2427,36 @@ impl SseEncode for crate::api::WseItemKind {
                 crate::api::WseItemKind::Gap => 6,
                 crate::api::WseItemKind::ServerError => 7,
                 crate::api::WseItemKind::Closed => 8,
-                crate::api::WseItemKind::Unknown => 9,
+                crate::api::WseItemKind::Resync => 9,
+                crate::api::WseItemKind::Continuity => 10,
+                crate::api::WseItemKind::CheckpointRejected => 11,
+                crate::api::WseItemKind::Unknown => 12,
+                _ => {
+                    unimplemented!("");
+                }
+            },
+            serializer,
+        );
+    }
+}
+
+impl SseEncode for crate::api::WseStreamPosition {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.topic, serializer);
+        <u32>::sse_encode(self.epoch, serializer);
+        <u64>::sse_encode(self.offset, serializer);
+    }
+}
+
+impl SseEncode for crate::api::WseSubscription {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(
+            match self {
+                crate::api::WseSubscription::Requested => 0,
+                crate::api::WseSubscription::Active => 1,
+                crate::api::WseSubscription::Denied => 2,
                 _ => {
                     unimplemented!("");
                 }
@@ -1888,6 +2472,16 @@ impl SseEncode for crate::api::WseTopicRecovery {
         <String>::sse_encode(self.topic, serializer);
         <bool>::sse_encode(self.recovered, serializer);
         <u64>::sse_encode(self.count, serializer);
+    }
+}
+
+impl SseEncode for crate::api::WseTopicState {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.topic, serializer);
+        <crate::api::WseSubscription>::sse_encode(self.subscription, serializer);
+        <crate::api::WseContinuity>::sse_encode(self.continuity, serializer);
+        <Option<String>>::sse_encode(self.reason, serializer);
     }
 }
 

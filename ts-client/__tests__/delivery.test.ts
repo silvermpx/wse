@@ -215,6 +215,24 @@ describe('recover-or-resync', () => {
     expect(heard.map((m) => m.o)).toEqual([1, 2, 3, 4, 4]);
   });
 
+  it('a stream from offset 0 is in the checkpoint only once something of it was applied', async () => {
+    const { answers, resync } = resyncs();
+    const c = client({ topics: ['prices'], delivery: { mode: 'recover-or-resync', consumer: 'board', resync } });
+    const heard: WSMessage[] = [];
+    c.onMessage('price_update', (m) => heard.push(m));
+    c.retain();
+    await tick();
+    const ws = FakeWebSocket.last();
+    await connectServer(ws, { user_id: 'alice' });
+    await send(ws, reply(['prices']));
+    answers[0].resolve();
+    await tick();
+    await send(ws, stamped('prices', 0), stamped('prices', 1));
+    expect(JSON.parse(c.checkpoint()).topics).toEqual({});
+    c.commit(heard[0]);
+    expect(JSON.parse(c.checkpoint()).topics).toEqual({ prices: { [EPOCH]: 0 } });
+  });
+
   it('a checkpoint of another consumer is refused aloud and recovers nothing', async () => {
     const { resync } = resyncs();
     const theirs = JSON.stringify({ v: 1, realm: URL, user: 'alice', consumer: 'audit', schema: null, topics: { prices: { [EPOCH]: 9 } } });

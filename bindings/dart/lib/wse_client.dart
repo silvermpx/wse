@@ -14,7 +14,17 @@ import 'src/rust/api.dart' as rust;
 import 'src/rust/frb_generated.dart';
 
 export 'src/rust/api.dart'
-    show WseConfig, WseError, WseItem, WseItemKind, WseTopicRecovery;
+    show
+        WseConfig,
+        WseContinuity,
+        WseDelivery,
+        WseError,
+        WseItem,
+        WseItemKind,
+        WseStreamPosition,
+        WseSubscription,
+        WseTopicRecovery,
+        WseTopicState;
 
 /// Under `flutter test` the build hook puts the library in
 /// build/native_assets/<os>/, where loading it by name does not look; a
@@ -183,6 +193,36 @@ class WseClient {
   /// and recovers what it missed.
   void resume(String reason) => _open.resume(reason: reason);
 
+  /// Each topic held: whether the server took it, and whether its messages
+  /// run without a break.
+  List<rust.WseTopicState> get topicStates =>
+      _closed ? const [] : _native.topicStates();
+
+  /// The consumer applied [message] (one of a topic): the checkpoint moves
+  /// on through what was applied without a hole.
+  void commit(rust.WseItem message) {
+    final (topic, epoch, offset) = (
+      message.topic,
+      message.epoch,
+      message.offset,
+    );
+    if (topic == null || epoch == null || offset == null) return;
+    _open.commit(topic: topic, epoch: epoch, offset: offset);
+  }
+
+  /// What the consumer committed, bound to the realm, the user, the consumer
+  /// and the schema: to save with the application's own state and give back
+  /// as [wseDelivery]'s checkpoint.
+  String checkpoint() => _open.checkpoint();
+
+  /// recover-or-resync: the application brought the topics of [round] (a
+  /// resync item's) up to date; what they held comes next.
+  void resynced(BigInt round) => _open.resynced(round: round);
+
+  /// Bring [topics] up to date: in recover-or-resync a resync round asks for
+  /// it; in best effort the application did so itself.
+  void resync(List<String> topics) => _open.resync(topics: topics);
+
   /// connecting, connected, reconnecting, paused or closed.
   String get status => _closed ? 'closed' : _native.status();
   String? get userId => _closed ? null : _native.userId();
@@ -215,6 +255,7 @@ rust.WseConfig wseConfig(
   bool reconnect = true,
   WseTrust trust = WseTrust.platform,
   bool insecure = false,
+  rust.WseDelivery? delivery,
 }) => rust.WseConfig(
   url: url,
   token: token,
@@ -232,6 +273,26 @@ rust.WseConfig wseConfig(
   trust: trust._kind,
   trustedRoots: trust._roots,
   insecure: insecure,
+  delivery: delivery,
+);
+
+/// The recover-or-resync delivery: a topic that is not continuous (a cold
+/// start, every reconnect, a break) holds its messages until the application
+/// brought its state up to date (a resync item, then [WseClient.resynced]);
+/// [consumer] is the one that commits, by a stable name. A [checkpoint] of
+/// another [realm] (default: the URL), user, consumer or [schema] is refused.
+rust.WseDelivery wseDelivery(
+  String consumer, {
+  String? schema,
+  String? realm,
+  String? checkpoint,
+  int maxHeld = 0,
+}) => rust.WseDelivery(
+  consumer: consumer,
+  schema: schema,
+  realm: realm,
+  checkpoint: checkpoint,
+  maxHeld: maxHeld,
 );
 
 /// Which certificates a wss:// server's chain must lead to.
