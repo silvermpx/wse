@@ -191,6 +191,53 @@ export class OfflineQueue {
     return records;
   }
 
+  /**
+   * Take up to `limit` messages out, oldest first, in one transaction: a
+   * message is handed to one taker only, however many clients (tabs) share
+   * the database. What the taker does not send it puts back (restore).
+   */
+  async claim(limit: number): Promise<OfflineRecord[]> {
+    if (!this.db) return [];
+
+    await this.cleanup();
+    if (!this.db) return [];
+    const tx = this.db.transaction([this.storeName], 'readwrite');
+    const index = tx.objectStore(this.storeName).index('timestamp');
+    const done = transactionDone(tx);
+
+    const records = await new Promise<OfflineRecord[]>((resolve, reject) => {
+      const out: OfflineRecord[] = [];
+      const request = index.openCursor();
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (cursor && out.length < limit) {
+          // An unreadable record goes too: nothing could ever send it.
+          const record = toRecord(cursor.value);
+          if (record) out.push(record);
+          cursor.delete();
+          cursor.continue();
+        } else {
+          resolve(out);
+        }
+      };
+      request.onerror = () => reject(request.error);
+    });
+    await done;
+    await this.refreshSize();
+    return records;
+  }
+
+  /** Put back messages taken with claim() and not sent: they keep their place. */
+  async restore(records: OfflineRecord[]): Promise<void> {
+    if (!this.db || records.length === 0) return;
+
+    const tx = this.db.transaction([this.storeName], 'readwrite');
+    const store = tx.objectStore(this.storeName);
+    for (const record of records) store.put(record);
+    await transactionDone(tx);
+    await this.refreshSize();
+  }
+
   /** Delete the given ids (the messages that were actually sent). */
   async remove(ids: string[]): Promise<void> {
     if (!this.db || ids.length === 0) return;

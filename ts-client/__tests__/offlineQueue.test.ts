@@ -253,3 +253,43 @@ describe('the offline queue keeps its limits', () => {
     }
   });
 });
+
+describe('two clients of one queue', () => {
+  const DB = 'wse:shop:alice';
+
+  function dropDb(): Promise<void> {
+    return new Promise((resolve) => {
+      const req = indexedDB.deleteDatabase(DB);
+      req.onsuccess = () => resolve();
+      req.onerror = () => resolve();
+      req.onblocked = () => resolve();
+    });
+  }
+
+  afterEach(dropDb);
+
+  it('send a stored message once, whichever of them connects first', async () => {
+    const stored = new OfflineQueue({ ...CONFIG, dbName: DB });
+    await stored.initialize();
+    expect(await stored.enqueue({ t: 'order', p: { id: 1 }, id: 'order-1' } as any)).toBe(true);
+    stored.destroy();
+
+    // Two tabs of one application and user: the same storage namespace.
+    const { createWSEClient } = await import('../core/index.js');
+    const tabs = [0, 1].map(() => createWSEClient({ endpoints: [ENDPOINT], storage: 'shop:alice' }));
+    for (const tab of tabs) tab.retain();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+    const sockets = [...FakeWebSocket.instances];
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    for (const ws of sockets) ws.serverOpen();
+    for (const ws of sockets) ws.serverSend(serverReadyMessage());
+    await vi.waitFor(() => {
+      const orders = sockets.flatMap((ws) => ws.appTextMessages().filter((m) => m.t === 'order'));
+      expect(orders.length).toBeGreaterThan(0);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const orders = sockets.flatMap((ws) => ws.appTextMessages().filter((m) => m.t === 'order'));
+    expect(orders).toHaveLength(1);
+    for (const tab of tabs) tab.destroy();
+  });
+});

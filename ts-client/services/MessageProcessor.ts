@@ -40,7 +40,7 @@ import {
 import { generateId } from '../utils/id.js';
 import { createClientContext, OFFLINE_OWNER_KEY, type ClientContext } from '../core/context.js';
 import type { SendResult } from './ConnectionManager.js';
-import type { OfflineQueue } from './OfflineQueue.js';
+import type { OfflineQueue, OfflineRecord } from './OfflineQueue.js';
 
 /** What the processor needs from the connection (ConnectionManager implements it). */
 export interface ProcessorConnection {
@@ -109,6 +109,9 @@ interface RecoveryWindow {
 }
 
 const windowKey = (topic: string, epoch: string): string => `${topic}\u0000${epoch}`;
+
+/** Offline messages taken out of the database at a time to send. */
+const OFFLINE_REPLAY_BATCH = 64;
 
 /**
  * How long past the server's history_ttl a stream that heard nothing while
@@ -2019,24 +2022,30 @@ export class MessageProcessor {
     const queue = this.offlineQueue;
     if (!queue) return false;
 
-    let records;
-    try {
-      records = await queue.getAll();
-    } catch (error) {
-      logger.error('Reading the offline queue failed:', error);
-      return false;
-    }
+    let sent = 0;
+    let foreign = 0;
+    for (;;) {
+      // Taken out of the database before they go: another client of the
+      // same database (another tab) never sends the same message.
+      let records: OfflineRecord[];
+      try {
+        records = await queue.claim(OFFLINE_REPLAY_BATCH);
+      } catch (error) {
+        logger.error('Reading the offline queue failed:', error);
+        return false;
+      }
+      if (records.length === 0) break;
 
-    const done: string[] = [];
-    try {
       const nowMs = Date.now();
       const user = this.userId;
-      let foreign = 0;
-      for (const record of records) {
-        if (this.destroyed || !cm.isTransportReady()) return true;
+      for (let i = 0; i < records.length; i++) {
+        const record = records[i];
+        if (this.destroyed || !cm.isTransportReady()) {
+          await this.putBack(queue, records.slice(i));
+          return true;
+        }
         if (isExpired(record.expiresAt, nowMs)) {
           this.countDropped(1);
-          done.push(record.id);
           continue;
         }
         // Written for another user: never sent on this user's connection.
@@ -2045,39 +2054,39 @@ export class MessageProcessor {
         if (user !== null && record.owner !== undefined && record.owner !== user) {
           foreign++;
           this.countDropped(1);
-          done.push(record.id);
           continue;
         }
         const result = cm.trySend(record.message);
         if (result === 'sent') {
-          done.push(record.id);
+          sent++;
           continue;
         }
         if (result === 'error') {
           this.countDropped(1);
-          done.push(record.id);
           continue;
         }
         if (result === 'rate_limited') {
           this.scheduleFlush(cm.getRetryAfterMs());
         }
+        await this.putBack(queue, records.slice(i));
         return true;
       }
-      if (foreign > 0) {
-        logger.warn(`Dropped ${foreign} offline message(s) written for another user`);
-      }
-      if (records.length > foreign) {
-        logger.info(`Replayed ${records.length - foreign} offline message(s)`);
-      }
-      return false;
-    } finally {
-      if (done.length > 0) {
-        // Only the messages that actually went out are deleted.
-        await queue.remove(done).catch((error) => {
-          logger.error('Removing sent offline messages failed:', error);
-        });
-      }
     }
+    if (foreign > 0) {
+      logger.warn(`Dropped ${foreign} offline message(s) written for another user`);
+    }
+    if (sent > 0) {
+      logger.info(`Replayed ${sent} offline message(s)`);
+    }
+    return false;
+  }
+
+  /** Offline messages taken and not sent go back, in their place. */
+  private async putBack(queue: OfflineQueue, records: OfflineRecord[]): Promise<void> {
+    if (records.length === 0) return;
+    await queue.restore(records).catch((error) => {
+      logger.error('Putting back unsent offline messages failed:', error);
+    });
   }
 
   /**
