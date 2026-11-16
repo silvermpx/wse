@@ -73,6 +73,7 @@ jobs:
               - 'vitest.config.ts'
               - '.github/scripts/npm-consumer-check.sh'
               - '.github/scripts/rn-bundle-check.sh'
+              - '.github/scripts/rn-app-check.sh'
               - '.github/workflows/ci.yml'
             mobile:
               - 'crates/wse-client/**'
@@ -696,6 +697,63 @@ jobs:
             bindings/dart/example/run-integration-tests.sh emulator-5554
             MODE=release bindings/dart/example/run-integration-tests.sh emulator-5554
 
+  # React Native: the packed npm package in an app made from React Native's
+  # template, built for release (Hermes bytecode) and run on an emulator
+  # against the Rust client's example server.
+  react-native:
+    name: React Native app (emulator)
+    needs: changes
+    if: needs.changes.outputs.ts_client == 'true'
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Let the emulator use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: ". -> target"
+          key: react-native
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880  # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: The npm package
+        run: |
+          npm ci
+          npm run build
+          mkdir -p npm-dist
+          npm pack --ignore-scripts --pack-destination npm-dist
+
+      - name: The app on an emulator
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d  # v2.38.0
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect
+          script: bash .github/scripts/rn-app-check.sh npm-dist/wse-client-*.tgz emulator-5554
+
   dart:
     name: Dart (Flutter ${{ matrix.flutter }})
     needs: changes
@@ -939,7 +997,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, checks, secrets, client, client-server, python-client, lint, rust-lint, rust-test, rust-wasm, rust-fips, rust-msrv, swift, kotlin, android, dart, flutter-ios, test, benchmarks, security]
+    needs: [changes, checks, secrets, client, client-server, python-client, lint, rust-lint, rust-test, rust-wasm, rust-fips, rust-msrv, swift, kotlin, android, react-native, dart, flutter-ios, test, benchmarks, security]
     runs-on: ubuntu-latest
     steps:
       - name: Every job passed or was skipped
