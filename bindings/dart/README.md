@@ -21,7 +21,7 @@ from the package's GitHub release and uses it only when its SHA-256 is the one
 the release listed, so the app needs no Rust toolchain. Prebuilt libraries
 exist for Android (arm64-v8a, armeabi-v7a, x86_64), iOS (devices, and
 simulators on Apple silicon and Intel), macOS (Apple silicon and Intel),
-Linux (x64, arm64) and Windows (x64).
+Linux (x64, arm64) and Windows (x64, arm64).
 
 To build the library from source instead (a Rust toolchain through rustup,
 plus Xcode for Apple targets or the Android NDK for Android), add to the
