@@ -27,6 +27,15 @@ Optional extras::
 from ._version import __version__
 from .client import AsyncWSEClient
 from .connection_pool import ConnectionPool
+from .delivery import (
+    CHECKPOINT_REJECTED_EVENT,
+    CONTINUITY_EVENT,
+    RESYNC_EVENT,
+    Continuity,
+    DeliveryConfig,
+    Subscription,
+    TopicState,
+)
 from .offline_queue import OfflineQueue
 from .signing import (
     SignatureProof,
@@ -119,4 +128,11 @@ __all__ = [
     "WSEProtocolError",
     "WSEEncryptionError",
     "WSETimeoutError",
+    "CHECKPOINT_REJECTED_EVENT",
+    "CONTINUITY_EVENT",
+    "RESYNC_EVENT",
+    "Continuity",
+    "DeliveryConfig",
+    "Subscription",
+    "TopicState",
 ]

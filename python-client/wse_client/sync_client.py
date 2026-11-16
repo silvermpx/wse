@@ -11,10 +11,12 @@ import asyncio
 import concurrent.futures
 import queue
 import threading
+from dataclasses import replace
 from typing import Any, Callable, TypeVar
 
 from ._logging import logger
 from .client import AsyncWSEClient
+from .delivery import DeliveryConfig, TopicState
 from .constants import (
     DEFAULT_MAX_MESSAGE_SIZE,
     RATE_LIMIT_REFILL_RATE,
@@ -122,8 +124,13 @@ class SyncWSEClient:
         signing_key: Any = None,
         server_signing_keys: list[str] | None = None,
         e2e_bind_session: bool = True,
+        cookie_name: str = "access_token",
+        delivery: DeliveryConfig | None = None,
     ) -> None:
         self._url = url
+        # recover-or-resync: each connect() takes up from where the last
+        # session's consumer committed, not from the checkpoint given first.
+        self._delivery = delivery
         self._token = token
         self._initial_topics = topics
         self._client_kwargs: dict[str, Any] = {
@@ -148,6 +155,8 @@ class SyncWSEClient:
             "signing_key": signing_key,
             "server_signing_keys": server_signing_keys,
             "e2e_bind_session": e2e_bind_session,
+            "cookie_name": cookie_name,
+            "delivery": delivery,
         }
         self._queue_size = queue_size
 
@@ -514,6 +523,37 @@ class SyncWSEClient:
             lambda: client.recovery_state, timeout=5.0, default={}
         )
 
+    @property
+    def topic_states(self) -> dict[str, TopicState]:
+        """Each topic held: whether the server took it, and whether its
+        messages run without a break."""
+        client = self._session_client()
+        if client is None:
+            return {}
+        return self._call_on_loop(lambda: client.topic_states, timeout=5.0, default={})
+
+    def commit(self, event: WSEEvent) -> None:
+        """The consumer applied *event*; see :meth:`AsyncWSEClient.commit`.
+        Taken in order with the calls after it."""
+        self._later(lambda client: client.commit(event))
+
+    def checkpoint(self) -> str:
+        """What the consumer committed; see :meth:`AsyncWSEClient.checkpoint`."""
+        client = self._session_client()
+        if client is None:
+            return ""
+        return self._call_on_loop(client.checkpoint, timeout=5.0, default="")
+
+    def resynced(self, round: int) -> None:
+        """recover-or-resync: the application brought the topics of *round*
+        up to date; see :meth:`AsyncWSEClient.resynced`."""
+        self._later(lambda client: client.resynced(round))
+
+    def resync(self, topics: list[str]) -> None:
+        """Bring *topics* up to date; see :meth:`AsyncWSEClient.resync`."""
+        wanted = list(topics)
+        self._later(lambda client: client.resync(wanted))
+
     def get_stats(self) -> dict[str, Any]:
         """Client statistics, read on the client's event loop (thread-safe)."""
         client = self._live_client()
@@ -522,6 +562,24 @@ class SyncWSEClient:
         return self._call_on_loop(client.get_stats, timeout=5.0, default={})
 
     # -- Internal -------------------------------------------------------------
+
+    def _session_client(self) -> AsyncWSEClient | None:
+        """The session's client, connected or not."""
+        session = self._session
+        return session.client if session is not None else None
+
+    def _later(self, call: Callable[[AsyncWSEClient], Any]) -> None:
+        """Runs *call* on the session loop, in order with what follows, without
+        waiting for it."""
+        session = self._session
+        loop = session.loop if session is not None else None
+        client = session.client if session is not None else None
+        if loop is None or client is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(call, client)
+        except RuntimeError:
+            pass  # the loop closed meanwhile
 
     def _live_client(self) -> AsyncWSEClient | None:
         session = self._session
@@ -627,6 +685,11 @@ class SyncWSEClient:
                 session.connect_error = exc
         finally:
             if client is not None:
+                if self._delivery is not None:
+                    # The next session starts from what this one committed.
+                    self._client_kwargs["delivery"] = replace(
+                        self._delivery, checkpoint=client.checkpoint()
+                    )
                 try:
                     await client.disconnect()
                 except BaseException:

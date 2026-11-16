@@ -106,6 +106,44 @@ class TestPlain:
             srv.stop()
 
 
+class TestRecoverOrResync:
+    @pytest.mark.asyncio
+    async def test_a_reconnect_recovers_from_what_was_committed(self, server_port):
+        """The delivery against the real server: the topic is held until the
+        application resynced it; after a reconnect, recovery starts from what
+        it committed, so what came but was not applied comes again."""
+        srv = start_server(server_port, recovery_enabled=True)
+        try:
+            client = client_for(
+                server_port,
+                topics=["prices"],
+                delivery=wse_client.DeliveryConfig(consumer="board"),
+            )
+            await client.connect()
+            resync = await next_of_type(client, "resync")
+            assert resync.payload["reasons"] == {"prices": "cold_start"}
+            await subscribed(srv, "prices")
+            for n in range(3):
+                publish(srv, "prices", n)
+            with pytest.raises(TimeoutError):
+                await next_of_type(client, "tick", timeout=0.3)
+            client.resynced(resync.payload["round"])
+            ticks = [await next_of_type(client, "tick") for _ in range(3)]
+            assert [t.payload["n"] for t in ticks] == [0, 1, 2]
+            # 0 and 1 applied; 2 came but was not.
+            client.commit(ticks[0])
+            client.commit(ticks[1])
+            for conn_id in srv.get_connections():
+                srv.disconnect(conn_id)
+            again = await next_of_type(client, "resync", timeout=10)
+            assert again.payload["reasons"] == {"prices": "reconnected"}
+            client.resynced(again.payload["round"])
+            assert (await next_of_type(client, "tick", timeout=10)).payload == {"n": 2}
+            await client.disconnect()
+        finally:
+            srv.stop()
+
+
 class TestMsgpack:
     @pytest.mark.asyncio
     async def test_msgpack_both_ways(self, server_port):

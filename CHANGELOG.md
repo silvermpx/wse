@@ -26,6 +26,11 @@
   `Client::topic_states`, `commit`, `checkpoint`, `resynced` and `resync`,
   through the events stream and through a handler (which may resync from
   itself). The mobile packages run on the same code now.
+- Python client: the recover-or-resync delivery, as the other clients have
+  it: `AsyncWSEClient(delivery=DeliveryConfig(consumer=...))`, `resync`,
+  `continuity` and `checkpoint_rejected` events, and `commit`, `checkpoint`,
+  `resynced`, `resync` and `topic_states`; `SyncWSEClient` takes it too, and
+  each of its connects starts from what the last one committed.
 - TypeScript: `wake()` and `close(deadlineMs)` for a client without a page
   (Node, Electron's main process, a worker): `wake()` connects at once when
   the application hears the network or the machine is back, and `close`
@@ -34,13 +39,19 @@
 ### Changed
 
 - Rust client: the events stream and a handler hear `Event::Continuity` when
-  a topic's messages break off, in best effort too.
+  a topic's messages break off, in best effort too; the Python client's
+  stream and handlers hear a `continuity` event then.
 
 ### Fixed
 
 - React: `useWSETopics` takes a changed topic list before it lets the old one
   go, so a topic in both stays subscribed with its recovery position; it was
   unsubscribed and subscribed again.
+- Python client: a connection the server took for another user than the last
+  recovered the new user's topics from where the last one's stood. It starts
+  them over now, and what the last user queued is dropped.
+- Python client: `SyncWSEClient` takes `cookie_name`, as its documentation
+  said.
 - TypeScript: a state listener that throws is logged and no longer keeps the
   others from hearing the change.
 - TypeScript: under Node 25 and newer, which has a `localStorage` of its own,

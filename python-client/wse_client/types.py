@@ -151,6 +151,10 @@ class WSEEvent:
             signature and the key id, what to keep as the proof (see
             :class:`~wse_client.signing.SignatureProof`). ``type`` and
             ``payload`` come from the signed text.
+        generation: The user generation the message was read in: a
+            :meth:`~wse_client.AsyncWSEClient.commit` of it counts in that
+            one only (a message read before another user's connection is the
+            last user's).
     """
 
     type: str
@@ -166,6 +170,7 @@ class WSEEvent:
     epoch: str | None = None
     offset: int | None = None
     signature: SignatureProof | None = None
+    generation: int = 0
 
 
 @dataclass

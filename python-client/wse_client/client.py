@@ -22,6 +22,7 @@ from ._logging import logger
 from .circuit_breaker import CircuitBreaker
 from .compression import CompressionHandler
 from .connection import ConnectionManager
+from .delivery import Delivery, DeliveryConfig, TopicState
 from .constants import (
     CLIENT_VERSION,
     DEFAULT_MAX_MESSAGE_SIZE,
@@ -303,6 +304,7 @@ class AsyncWSEClient:
         server_signing_keys: list[str] | None = None,
         e2e_bind_session: bool = True,
         cookie_name: str = "access_token",
+        delivery: DeliveryConfig | None = None,
     ) -> None:
         if wire_format not in _WIRE_FORMATS:
             raise ValueError(f"wire_format must be one of {_WIRE_FORMATS}")
@@ -322,6 +324,16 @@ class AsyncWSEClient:
         self._token = token
         self._initial_topics = list(topics) if topics else []
         self._subscribed_topics: set[str] = set()
+        # The topics' states, what was held and committed; recover-or-resync
+        # with a DeliveryConfig, best effort without.
+        self._delivery = Delivery(delivery, url, self._initial_topics)
+        # The user of the last connection, once there was one.
+        self._last_user: tuple[str | None] | None = None
+        # A dispatch is running: what the delivery makes waits for its end.
+        self._dispatching = 0
+        # A drain is handing out what the delivery made: one a handler of it
+        # starts waits, and the running one hands it out after.
+        self._draining = False
 
         # E2E encryption (optional)
         self._security: SecurityManager | None = None
@@ -892,6 +904,9 @@ class AsyncWSEClient:
         ]
         if not new_topics:
             return True
+        self._delivery.track(new_topics)
+        # recover-or-resync recovers from what the consumer committed.
+        recover = recover or self._delivery.barrier
 
         payload, recovery_info = self._subscription_payload(new_topics, recover=recover)
         msg = self._codec.encode(
@@ -930,11 +945,50 @@ class AsyncWSEClient:
         # not subscribe them again.
         self._subscribed_topics -= set(topics)
         self._resubscribe_pending -= set(topics)
+        self._delivery.untrack(list(topics))
         for t in topics:
             self._forget_topic(t)
         if ok:
             self._stats.messages_sent += 1
         return ok
+
+    @property
+    def topic_states(self) -> dict[str, TopicState]:
+        """Each topic held: whether the server took it, and whether its
+        messages run without a break."""
+        return self._delivery.topic_states()
+
+    def commit(self, event: WSEEvent) -> None:
+        """The consumer applied *event* (a topic message): the checkpoint moves
+        on through what was applied without a hole. A message read before
+        another user's connection counts for nobody."""
+        if event.topic is None or event.epoch is None or event.offset is None:
+            return
+        try:
+            epoch = int(event.epoch, 16)
+        except ValueError:
+            return
+        self._delivery.commit(event.topic, epoch, event.offset, event.generation)
+
+    def checkpoint(self) -> str:
+        """What the consumer committed, bound to the realm, the user, the
+        consumer and the schema: to save with the application's own state and
+        give back as :attr:`DeliveryConfig.checkpoint`."""
+        return self._delivery.checkpoint()
+
+    def resynced(self, round: int) -> None:
+        """recover-or-resync: the application brought the topics of *round*
+        (a ``resync`` event) up to date; what they held comes next, in order
+        (from a handler: once it returned)."""
+        self._delivery.resynced(round)
+        self._drain_soon()
+
+    def resync(self, topics: list[str]) -> None:
+        """Bring *topics* up to date: in recover-or-resync a resync round asks
+        for it; in best effort the application did so itself, and they read
+        continuous again."""
+        self._delivery.resync(list(topics))
+        self._drain_soon()
 
     async def request_snapshot(self, topics: list[str] | None = None) -> bool:
         """Request a state snapshot from the server.
@@ -1344,6 +1398,8 @@ class AsyncWSEClient:
         self._live_since.clear()
         self._last_frame_at = None
         self._frames_since = None
+        self._delivery.connection_lost()
+        self._drain_soon()
 
     def _on_transport_terminal(self, error: WSEError) -> None:
         """The transport gave up for good: end the event stream with *error*."""
@@ -1619,6 +1675,7 @@ class AsyncWSEClient:
     ) -> tuple[dict[str, Any], dict[str, tuple[tuple[str, int], dict[str, int]]]]:
         payload: dict[str, Any] = {"action": "subscribe", "topics": topics}
         info: dict[str, tuple[tuple[str, int], dict[str, int]]] = {}
+        self._rewind_to_committed(topics)
         if recover and self._server_recovery_enabled:
             for topic in topics:
                 streams = self._topic_streams(topic)
@@ -1632,6 +1689,22 @@ class AsyncWSEClient:
                     for t, (pos, streams) in info.items()
                 }
         return payload, info
+
+    def _rewind_to_committed(self, topics: list[str]) -> None:
+        """recover-or-resync: where the recovery of *topics* starts is what
+        the consumer committed it applied, so what came after is taken again
+        when it is replayed."""
+        committed = self._delivery.committed(self._codec.connection_user)
+        self._drain_soon()
+        if committed is None:
+            return
+        for topic in topics:
+            for (t, _epoch), gap in list(self._gaps.items()):
+                if t == topic:
+                    self._close_gap(topic, gap)
+            self._sequencer.clear_topic(topic)
+            for epoch, last in sorted(committed.get(topic, {}).items()):
+                self._sequencer.set_topic_position(topic, f"{epoch:08x}", last)
 
     def _note_recovery_requested(
         self,
@@ -2022,6 +2095,8 @@ class AsyncWSEClient:
         )
         self._invoke_handlers(event)
         self._enqueue(event)
+        self._delivery.broke_off(topic, reason)
+        self._drain_soon()
 
     def _on_recovery_reply(
         self, topic: str, info: dict[str, Any], listed_streams: bool = False
@@ -2136,6 +2211,23 @@ class AsyncWSEClient:
         for epoch, first, last in reports:
             self._report_gap(topic, epoch, first, last, "not_recovered")
 
+    def _forget_user(self) -> None:
+        """The server took this connection for another user than the last:
+        where the last one's topics stood, the gaps it waited on, and what it
+        queued and did not send are not this one's."""
+        for (topic, _epoch), gap in list(self._gaps.items()):
+            self._close_gap(topic, gap)
+        for topic in set(self._sequencer.topic_positions()) | self._subscribed_topics:
+            self._sequencer.clear_topic(topic)
+        self._unrecoverable.clear()
+        self._recovery_requests.clear()
+        self._live_since.clear()
+        dropped = self._offline_queue.drain()
+        if dropped:
+            logger.warning(
+                "%d messages queued as the previous user were dropped", len(dropped)
+            )
+
     def _forget_topic(self, topic: str) -> None:
         """Drop a topic's recovery state (unsubscribed)."""
         self._sequencer.clear_topic(topic)
@@ -2150,6 +2242,16 @@ class AsyncWSEClient:
 
     def _dispatch_event(self, event: WSEEvent) -> None:
         """Handle system events, invoke callbacks, enqueue for iterator."""
+        # What the delivery made comes before anything newer.
+        self._drain_delivery()
+        self._dispatching += 1
+        try:
+            self._dispatch(event)
+        finally:
+            self._dispatching -= 1
+        self._drain_delivery()
+
+    def _dispatch(self, event: WSEEvent) -> None:
         # Fast system handler lookup (O(1) dict)
         handler = self._system_handlers.get(event.type)
         if handler is not None:
@@ -2161,12 +2263,39 @@ class AsyncWSEClient:
             # Internal-only events are NOT forwarded to user queue/handlers
             if event.type in _INTERNAL_ONLY_EVENTS:
                 return
+        elif (
+            event.topic is not None
+            and event.category != "WSE"
+            and not self._delivery.message(event)
+        ):
+            # Held until the application brought the topic up to date.
+            return
 
         # Invoke registered handlers
         self._invoke_handlers(event)
 
         # Enqueue for async iterator
         self._enqueue(event)
+
+    def _drain_delivery(self) -> None:
+        """What the delivery made outside what was heard (held messages
+        handed on, a resync round, continuity, a refused checkpoint), to the
+        handlers and the stream."""
+        if self._draining:
+            return
+        self._draining = True
+        try:
+            while (made := self._delivery.take_out()) is not None:
+                self._invoke_handlers(made)
+                self._enqueue(made)
+        finally:
+            self._draining = False
+
+    def _drain_soon(self) -> None:
+        """Drains now, or where the dispatch running ends: a handler that
+        resyncs hears what was held once it returned."""
+        if not self._dispatching:
+            self._drain_delivery()
 
     def _invoke_handlers(self, event: WSEEvent) -> None:
         """Call registered handlers for this event type."""
@@ -2197,7 +2326,13 @@ class AsyncWSEClient:
                 return
         conn_id = payload.get("connection_id") or details.get("connection_id")
         user_id = details.get("user_id")
-        self._codec.connection_user = user_id if isinstance(user_id, str) else None
+        user = user_id if isinstance(user_id, str) else None
+        self._codec.connection_user = user
+        if self._last_user is not None and self._last_user[0] != user:
+            self._forget_user()
+        self._last_user = (user,)
+        self._delivery.connected(user)
+        self._codec.generation = self._delivery.generation
         self._take_signing_kid(details.get("signing"), sealed=True)
         self._connection.handle_server_ready(
             conn_id if isinstance(conn_id, str) else None
@@ -2369,6 +2504,15 @@ class AsyncWSEClient:
                         self._take_streams(
                             topic, request, listed, bool(info.get("recovered", True))
                         )
+        if p.get("action") != "unsubscribe":
+            self._delivery.subscribed(
+                [t for t in success_topics or [] if isinstance(t, str)]
+                if isinstance(success_topics, list)
+                else [],
+                [t for t in failed_topics or [] if isinstance(t, str)]
+                if isinstance(failed_topics, list)
+                else [],
+            )
         # What the server took and refused, for the application's handlers.
         self._invoke_handlers(event)
 

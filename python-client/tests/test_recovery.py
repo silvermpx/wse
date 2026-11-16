@@ -63,11 +63,14 @@ def drain(client: AsyncWSEClient) -> list[WSEEvent]:
 
 
 def offsets(events: list[WSEEvent]) -> list[object]:
+    # A topic's continuity, as it changes, is the delivery's to say (see
+    # test_delivery.py): not what these tests look at.
     return [
         ("gap", e.payload["first_missing"], e.payload["last_missing"])
         if e.type == RECOVERY_GAP_EVENT
         else e.offset
         for e in events
+        if e.type != "continuity"
     ]
 
 
@@ -326,7 +329,7 @@ class TestAnchor:
         c._on_raw_message(stamped(5))
         await c.subscribe(["prices"], recover=True)
         c._on_raw_message(reply("prices", offset=3, recovered=False, epoch="0000000b"))
-        events = drain(c)
+        events = [e for e in drain(c) if e.type != "continuity"]
         assert events[-1].type == RECOVERY_GAP_EVENT
         assert events[-1].payload["reason"] == "epoch_changed"
         assert events[-1].payload["missed"] is None

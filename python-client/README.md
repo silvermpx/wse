@@ -103,6 +103,8 @@ Handlers also hear the connection itself: `connected` (`connection_id`, `user_id
 | `wire_format` | str | `"json"` | `"msgpack"`: the server sends this connection MessagePack and the client sends in it too, except inside E2E frames (needs the `[msgpack]` extra) |
 | `signing_key` | EC key or PEM/DER bytes | None | This client's ECDSA P-256 key for `send(..., signed=True)` (needs the `[crypto]` extra) |
 | `server_signing_keys` | list[str] | None | The server's signing public keys (`signing_public_key()`, base64) its signed messages are checked against |
+| `cookie_name` | str | `"access_token"` | The cookie the token goes in at the upgrade, besides the `Authorization` header |
+| `delivery` | DeliveryConfig \| None | None | recover-or-resync (see below); None: best effort |
 
 The `connect(url, **kwargs)` factory returns an `AsyncWSEClient` (not connected yet) to use as an async context manager.
 
@@ -196,6 +198,7 @@ class WSEEvent:
     epoch: str | None = None         # Recovery stamp: buffer epoch, 8-hex ("e")
     offset: int | None = None        # Recovery stamp: per-topic offset ("o")
     signature: SignatureProof | None = None  # A server-signed message: body, sig, kid, verified
+    generation: int = 0              # The user generation it was read in (commit counts in it)
 ```
 
 ## Features
@@ -358,6 +361,44 @@ The `recovery_gap` event also reaches `on_any` handlers and the iterator. `reaso
 topic (never a server head that was not delivered). Recovery requests are sent
 as `subscription_update` messages with `recover: true`; the server application
 answers them (see `subscribe_with_recovery` in the server docs).
+
+### Where every fact counts: recover-or-resync
+
+`delivery=DeliveryConfig(consumer=...)` holds a topic that is not continuous --
+from a cold start, after every reconnect, after a break -- until the application
+brought its state of it up to date: a `resync` event asks for it, and
+`client.resynced(round)` hands on what was held, in order. After applying a
+message the application calls `client.commit(event)`; `client.checkpoint()` is
+what to save with its own state and give back as `DeliveryConfig(checkpoint=...)`,
+and recovery starts from it, so a message can come twice: apply a repeat
+safely. A checkpoint of another realm, user, consumer or schema is refused
+aloud (a `checkpoint_rejected` event), and a message read before another user's
+connection counts for nobody when it is committed.
+
+```python
+from wse_client import AsyncWSEClient, DeliveryConfig
+
+delivery = DeliveryConfig(consumer="board", checkpoint=load_saved_checkpoint())
+async with AsyncWSEClient(url, token=token, topics=["orders"], delivery=delivery) as client:
+    async for event in client:
+        if event.type == "resync":
+            await reload(event.payload["topics"])  # reasons, committed: per topic
+            client.resynced(event.payload["round"])
+        elif event.topic == "orders":
+            apply(event)
+            client.commit(event)
+            save_checkpoint(client.checkpoint())
+```
+
+A handler that calls `resynced` hears what was held once it returned.
+`continuity` events say how a topic's continuity changes and `client.topic_states`
+where each topic stands; without a delivery (best effort) nothing is held, and
+the states and the checkpoint are kept all the same. It is the delivery of the
+TypeScript, Rust, Swift, Kotlin and Dart clients; `SyncWSEClient` takes the same
+`delivery`, and each `connect()` of it starts from what the last one committed.
+When the server takes a connection for another user than the last, the client
+forgets where the last one's topics stood and drops what it queued, in either
+mode.
 
 ### Network Quality Monitoring
 

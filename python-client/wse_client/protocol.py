@@ -124,6 +124,9 @@ class MessageCodec:
         # The user the server took this connection for (server_ready): a
         # message the server signed for a user is delivered only to them.
         self.connection_user: str | None = None
+        # The user generation each message is read in (the delivery's): a
+        # commit counts in it only.
+        self.generation = 0
 
     @property
     def server_keys(self) -> ServerKeys:
@@ -340,6 +343,7 @@ class MessageCodec:
             topic=topic if isinstance(topic, str) else None,
             epoch=str(epoch) if epoch is not None else None,
             offset=int(offset) if isinstance(offset, int) else None,
+            generation=self.generation,
         )
 
     def _signed_to_event(
@@ -387,6 +391,7 @@ class MessageCodec:
             epoch=str(epoch) if epoch is not None else None,
             offset=int(offset) if isinstance(offset, int) else None,
             signature=proof,
+            generation=self.generation,
         )
 
 

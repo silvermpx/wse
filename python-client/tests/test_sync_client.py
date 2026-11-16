@@ -234,3 +234,66 @@ class TestSyncLifecycle:
             assert calls == ["wse-client"]
             assert client.subscribed_topics == set()
             client.close()
+
+
+class TestSyncDelivery:
+    def test_recover_or_resync_from_the_applications_thread(self):
+        """The delivery through the sync client: the resync event comes in
+        the stream, resynced() and commit() are called from the
+        application's thread, and the checkpoint reads what was committed."""
+        import json
+
+        from wse_client import Continuity, DeliveryConfig
+
+        async def on_message(conn, msg):
+            p = msg.get("p", {})
+            if msg.get("t") == "subscription_update" and p.get("action") == "subscribe":
+                await conn.send_json(
+                    {
+                        "c": "WSE",
+                        "t": "subscription_update",
+                        "p": {"success_topics": p["topics"]},
+                        "v": 1,
+                    }
+                )
+                # Sent while the application loads its state: held.
+                for o in (1, 2):
+                    await conn.send_json(
+                        {
+                            "c": "U",
+                            "t": "price",
+                            "tp": "prices",
+                            "e": "0000000a",
+                            "o": o,
+                            "p": {"n": o},
+                            "v": 1,
+                        }
+                    )
+
+        st = ServerThread(on_message=on_message, recovery=True)
+        with st as srv:
+            client = SyncWSEClient(
+                srv.url,
+                reconnect=FAST,
+                topics=["prices"],
+                delivery=DeliveryConfig(consumer="board"),
+            )
+            client.connect(timeout=5)
+
+            def next_of(kind: str):
+                while True:
+                    event = client.recv(timeout=5)
+                    if event.type == kind:
+                        return event
+
+            resync = next_of("resync")
+            assert client.topic_states["prices"].continuity is Continuity.RESYNCING
+            client.resynced(resync.payload["round"])
+            ticks = [next_of("price"), next_of("price")]
+            assert [t.offset for t in ticks] == [1, 2]
+            for tick in ticks:
+                client.commit(tick)
+            saved = json.loads(client.checkpoint())
+            assert saved["topics"] == {"prices": {"0000000a": 2}}
+            assert saved["consumer"] == "board"
+            client.close()
