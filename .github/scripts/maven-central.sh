@@ -21,6 +21,9 @@ aar="${2:?usage: maven-central.sh VERSION AAR OUT [--upload]}"
 out="${3:?usage: maven-central.sh VERSION AAR OUT [--upload]}"
 upload="${4:-}"
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+# Absolute: the steps below change directories.
+mkdir -p "$out"
+out="$(cd "$out" && pwd)"
 group=io.github.silvermpx
 artifact=wse-client-android
 base="$artifact-$version"

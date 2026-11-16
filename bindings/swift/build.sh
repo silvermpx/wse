@@ -32,10 +32,11 @@ cargo run -q -p wse-bindgen --bin uniffi-bindgen-swift -- "$host_lib" "$gen/incl
   --headers --modulemap --module-name WseFFIC --modulemap-filename module.modulemap \
   --link-frameworks Security --link-frameworks CoreFoundation
 
-flag=(--release)
-[[ "$profile" == "debug" ]] && flag=()
+# A string, not an array: macOS's bash 3.2 calls an empty array unbound under set -u.
+release=--release
+[[ "$profile" == "debug" ]] && release=""
 for triple in "${targets[@]}"; do
-  cargo rustc -p wse-ffi --lib "${flag[@]}" --locked --target "$triple" --crate-type staticlib
+  cargo rustc -p wse-ffi --lib ${release:+"$release"} --locked --target "$triple" --crate-type staticlib
 done
 lib() { echo "$target/$1/$profile/libwse_ffi.a"; }
 # One slice per platform: the Mac's and the simulator's hold both architectures.

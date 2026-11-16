@@ -773,7 +773,8 @@ jobs:
         run: |
           channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' bindings/dart/rust/rust-toolchain.toml)"
           read -ra targets <<< "$TARGETS"
-          rustup toolchain install "$channel" --profile minimal --target "${targets[@]}"
+          # rustup takes several targets as one comma-separated list.
+          rustup toolchain install "$channel" --profile minimal --target "$(IFS=,; echo "${targets[*]}")"
           rustup default "$channel"
 
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519  # v2.90.5

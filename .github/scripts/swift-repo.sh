@@ -18,6 +18,9 @@ zip="${2:?$usage}"
 out="${3:?$usage}"
 mode="${4:?$usage}"
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+# Absolute: the steps below change directories.
+mkdir -p "$out"
+out="$(cd "$out" && pwd)"
 remote=git@github.com:silvermpx/wse-swift.git
 checksum="$(tr -d '[:space:]' < "$zip.checksum")"
 url="https://github.com/silvermpx/wse/releases/download/v$version/$(basename "$zip")"
