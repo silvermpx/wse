@@ -170,10 +170,16 @@ id="$(curl -fsS --retry 3 -X POST -H "$auth" \
   -F "bundle=@$out/bundle.zip;type=application/octet-stream" \
   "https://central.sonatype.com/api/v1/publisher/upload?publishingType=AUTOMATIC&name=$base")"
 echo "uploaded as deployment $id"
-# Validated, then published: the Portal says when Maven Central has it.
+# Validated, then published: the Portal says when Maven Central has it, and
+# each state it passes through is printed as it comes.
+seen=""
 for _ in $(seq 1 180); do
   status="$(curl -fsS --retry 3 -X POST -H "$auth" "https://central.sonatype.com/api/v1/publisher/status?id=$id")"
   state="$(printf '%s' "$status" | python3 -c 'import json, sys; print(json.load(sys.stdin)["deploymentState"])')"
+  if [[ "$state" != "$seen" ]]; then
+    echo "$(date -u +%H:%M:%S) $state"
+    seen="$state"
+  fi
   case "$state" in
     PUBLISHED) echo "$group:$artifact:$version is published"; exit 0 ;;
     FAILED) echo "$status" >&2; exit 1 ;;

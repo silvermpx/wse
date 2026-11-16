@@ -1298,6 +1298,21 @@ jobs:
           echo "::error::A release job failed, was cancelled or was skipped: ${RESULTS}"
           exit 1
 
+      # A matrix job reports success to `needs` though one of its legs was
+      # cancelled (GitHub gave it no runner): each job of the run is read on
+      # its own, in its latest attempt.
+      - name: Every leg of every job passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          failed="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?filter=latest&per_page=100" --paginate \
+            --jq '.jobs[] | select(.name != "Release gate" and .name != "GitHub release" and (.name | startswith("Publish") | not)) | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out")) | "\(.name): \(.conclusion)"')"
+          if [ -n "$failed" ]; then
+            echo "::error::Jobs of this run that did not pass:"
+            printf '%s\n' "$failed"
+            exit 1
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
