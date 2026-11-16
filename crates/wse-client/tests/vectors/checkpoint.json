@@ -1,0 +1,128 @@
+{
+  "about": "Saved checkpoints and what every client reads from them: the recovery positions it takes, or why it refuses the checkpoint. The scope is the client's; the topics are those it holds. Read by the TypeScript, Rust and Python clients' tests.",
+  "scope": {
+    "realm": "ws://wse.test/wse",
+    "user": "ann",
+    "consumer": "board",
+    "schema": "2",
+    "topics": [
+      "news",
+      "prices"
+    ]
+  },
+  "taken": [
+    {
+      "name": "one stream",
+      "saved": "{\"v\":1,\"realm\":\"ws://wse.test/wse\",\"user\":\"ann\",\"consumer\":\"board\",\"schema\":\"2\",\"topics\":{\"prices\":{\"0000000a\":9}}}",
+      "positions": {
+        "prices": {
+          "0000000a": 9
+        }
+      }
+    },
+    {
+      "name": "two streams, one key in upper case",
+      "saved": "{\"v\":1,\"realm\":\"ws://wse.test/wse\",\"user\":\"ann\",\"consumer\":\"board\",\"schema\":\"2\",\"topics\":{\"prices\":{\"0000000A\":9,\"0000000b\":3}}}",
+      "positions": {
+        "prices": {
+          "0000000a": 9,
+          "0000000b": 3
+        }
+      }
+    },
+    {
+      "name": "a short epoch key reads as its 8 hex digits",
+      "saved": "{\"v\":1,\"realm\":\"ws://wse.test/wse\",\"user\":\"ann\",\"consumer\":\"board\",\"schema\":\"2\",\"topics\":{\"news\":{\"a\":4}}}",
+      "positions": {
+        "news": {
+          "0000000a": 4
+        }
+      }
+    },
+    {
+      "name": "a topic the client does not hold is left out",
+      "saved": "{\"v\":1,\"realm\":\"ws://wse.test/wse\",\"user\":\"ann\",\"consumer\":\"board\",\"schema\":\"2\",\"topics\":{\"orders\":{\"0000000a\":1},\"prices\":{\"0000000a\":9}}}",
+      "positions": {
+        "prices": {
+          "0000000a": 9
+        }
+      }
+    },
+    {
+      "name": "a key that is no epoch is left out",
+      "saved": "{\"v\":1,\"realm\":\"ws://wse.test/wse\",\"user\":\"ann\",\"consumer\":\"board\",\"schema\":\"2\",\"topics\":{\"prices\":{\"zz\":4,\"0000000a\":9}}}",
+      "positions": {
+        "prices": {
+          "0000000a": 9
+        }
+      }
+    },
+    {
+      "name": "nothing applied yet",
+      "saved": "{\"v\":1,\"realm\":\"ws://wse.test/wse\",\"user\":\"ann\",\"consumer\":\"board\",\"schema\":\"2\",\"topics\":{}}",
+      "positions": {}
+    }
+  ],
+  "refused": [
+    {
+      "name": "not JSON",
+      "saved": "{",
+      "reason": "malformed"
+    },
+    {
+      "name": "no topics",
+      "saved": "{\"v\":1,\"realm\":\"ws://wse.test/wse\",\"user\":\"ann\",\"consumer\":\"board\",\"schema\":\"2\"}",
+      "reason": "malformed"
+    },
+    {
+      "name": "a negative offset",
+      "saved": "{\"v\":1,\"realm\":\"ws://wse.test/wse\",\"user\":\"ann\",\"consumer\":\"board\",\"schema\":\"2\",\"topics\":{\"prices\":{\"0000000a\":-1}}}",
+      "reason": "malformed"
+    },
+    {
+      "name": "an offset that is text",
+      "saved": "{\"v\":1,\"realm\":\"ws://wse.test/wse\",\"user\":\"ann\",\"consumer\":\"board\",\"schema\":\"2\",\"topics\":{\"prices\":{\"0000000a\":\"9\"}}}",
+      "reason": "malformed"
+    },
+    {
+      "name": "an offset that is not whole",
+      "saved": "{\"v\":1,\"realm\":\"ws://wse.test/wse\",\"user\":\"ann\",\"consumer\":\"board\",\"schema\":\"2\",\"topics\":{\"prices\":{\"0000000a\":9.5}}}",
+      "reason": "malformed"
+    },
+    {
+      "name": "a topic whose streams are not an object",
+      "saved": "{\"v\":1,\"realm\":\"ws://wse.test/wse\",\"user\":\"ann\",\"consumer\":\"board\",\"schema\":\"2\",\"topics\":{\"prices\":[9]}}",
+      "reason": "malformed"
+    },
+    {
+      "name": "malformed before another consumer",
+      "saved": "{\"v\":1,\"realm\":\"ws://wse.test/wse\",\"user\":\"ann\",\"consumer\":\"other\",\"schema\":\"2\",\"topics\":{\"prices\":{\"0000000a\":-1}}}",
+      "reason": "malformed"
+    },
+    {
+      "name": "another version",
+      "saved": "{\"v\":2,\"realm\":\"ws://wse.test/wse\",\"user\":\"ann\",\"consumer\":\"board\",\"schema\":\"2\",\"topics\":{\"prices\":{\"0000000a\":9}}}",
+      "reason": "version"
+    },
+    {
+      "name": "another realm",
+      "saved": "{\"v\":1,\"realm\":\"ws://other.test/wse\",\"user\":\"ann\",\"consumer\":\"board\",\"schema\":\"2\",\"topics\":{\"prices\":{\"0000000a\":9}}}",
+      "reason": "realm"
+    },
+    {
+      "name": "another user",
+      "saved": "{\"v\":1,\"realm\":\"ws://wse.test/wse\",\"user\":\"bob\",\"consumer\":\"board\",\"schema\":\"2\",\"topics\":{\"prices\":{\"0000000a\":9}}}",
+      "reason": "user"
+    },
+    {
+      "name": "another consumer",
+      "saved": "{\"v\":1,\"realm\":\"ws://wse.test/wse\",\"user\":\"ann\",\"consumer\":\"other\",\"schema\":\"2\",\"topics\":{\"prices\":{\"0000000a\":9}}}",
+      "reason": "consumer"
+    },
+    {
+      "name": "another schema",
+      "saved": "{\"v\":1,\"realm\":\"ws://wse.test/wse\",\"user\":\"ann\",\"consumer\":\"board\",\"schema\":\"3\",\"topics\":{\"prices\":{\"0000000a\":9}}}",
+      "reason": "schema"
+    }
+  ]
+}

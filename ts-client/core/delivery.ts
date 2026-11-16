@@ -100,6 +100,11 @@ export interface DeliveryHooks {
   storage: ClientStorage;
 }
 
+/** An epoch key as the server writes epochs, 8 lowercase hex digits; null when it is none. */
+function epochKey(key: string): string | null {
+  return /^[0-9a-fA-F]{1,8}$/.test(key) ? key.toLowerCase().padStart(8, '0') : null;
+}
+
 /** Why a saved checkpoint was not taken. */
 export type CheckpointMismatch = 'malformed' | 'version' | 'realm' | 'user' | 'consumer' | 'schema';
 
@@ -446,6 +451,25 @@ export class Delivery {
       this.reject('malformed');
       return;
     }
+    // Every offset a whole number, or the checkpoint is not one: the Rust and
+    // Python clients read it so (crates/wse-client/tests/vectors/checkpoint.json).
+    const read = new Map<string, Map<string, Progress>>();
+    for (const [topic, streams] of Object.entries(saved.topics)) {
+      if (!streams || typeof streams !== 'object' || Array.isArray(streams)) {
+        this.reject('malformed');
+        return;
+      }
+      const map = new Map<string, Progress>();
+      for (const [key, base] of Object.entries(streams)) {
+        if (!Number.isSafeInteger(base) || base < 0) {
+          this.reject('malformed');
+          return;
+        }
+        const epoch = epochKey(key);
+        if (epoch !== null) map.set(epoch, { base, ahead: new Set() });
+      }
+      read.set(topic, map);
+    }
     const mismatch: CheckpointMismatch | null =
       saved.v !== 1
         ? 'version'
@@ -462,13 +486,8 @@ export class Delivery {
       this.reject(mismatch);
       return;
     }
-    for (const [topic, streams] of Object.entries(saved.topics)) {
-      if (!this.states.has(topic) || !streams || typeof streams !== 'object') continue;
-      const map = new Map<string, Progress>();
-      for (const [epoch, base] of Object.entries(streams)) {
-        if (Number.isSafeInteger(base) && base >= 0) map.set(epoch, { base, ahead: new Set() });
-      }
-      if (map.size > 0 && !this.progress.has(topic)) this.progress.set(topic, map);
+    for (const [topic, map] of read) {
+      if (this.states.has(topic) && map.size > 0 && !this.progress.has(topic)) this.progress.set(topic, map);
     }
   }
 

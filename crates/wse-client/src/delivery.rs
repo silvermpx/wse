@@ -1075,6 +1075,75 @@ mod tests {
         );
     }
 
+    /// The checkpoints every client reads alike: the positions taken, or
+    /// why one is refused (the TypeScript and Python clients read the file
+    /// too).
+    #[test]
+    fn the_shared_checkpoint_vectors() {
+        let doc: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/vectors/checkpoint.json")).unwrap();
+        let scope = &doc["scope"];
+        let topics: Vec<String> = scope["topics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap().to_owned())
+            .collect();
+        let user = scope["user"].as_str();
+        let gate_with = |saved: &str| {
+            let mut delivery = Delivery::new(scope["consumer"].as_str().unwrap());
+            delivery.schema = scope["schema"].as_str().map(str::to_owned);
+            delivery.checkpoint = Some(saved.to_owned());
+            Gate::new(Some(delivery), scope["realm"].as_str().unwrap(), &topics).unwrap()
+        };
+        let rejected = |gate: &mut Gate| -> Vec<String> {
+            out(gate)
+                .into_iter()
+                .filter_map(|i| match i {
+                    Incoming::Event(Event::CheckpointRejected(c)) => Some(c.reason),
+                    _ => None,
+                })
+                .collect()
+        };
+        for case in doc["taken"].as_array().unwrap() {
+            let mut gate = gate_with(case["saved"].as_str().unwrap());
+            let positions: BTreeMap<String, BTreeMap<String, u64>> = gate
+                .committed(user)
+                .unwrap()
+                .into_iter()
+                .filter(|(_, at)| !at.is_empty())
+                .map(|(topic, at)| {
+                    let streams = at
+                        .into_iter()
+                        .map(|p| (format!("{:08x}", p.epoch), p.offset));
+                    (topic, streams.collect())
+                })
+                .collect();
+            assert_eq!(
+                serde_json::to_value(positions).unwrap(),
+                case["positions"],
+                "{}",
+                case["name"]
+            );
+            assert!(rejected(&mut gate).is_empty(), "{}", case["name"]);
+        }
+        for case in doc["refused"].as_array().unwrap() {
+            let mut gate = gate_with(case["saved"].as_str().unwrap());
+            let positions = gate.committed(user).unwrap();
+            assert!(
+                positions.values().all(Vec::is_empty),
+                "{}: {positions:?}",
+                case["name"]
+            );
+            assert_eq!(
+                rejected(&mut gate),
+                [case["reason"].as_str().unwrap()],
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
     #[test]
     fn best_effort_holds_nothing_and_counts_commits() {
         let mut gate = Gate::new(None, "ws://x/wse", &["t".to_owned()]).unwrap();

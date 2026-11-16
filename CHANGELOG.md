@@ -52,6 +52,11 @@
   them over now, and what the last user queued is dropped.
 - Python client: `SyncWSEClient` takes `cookie_name`, as its documentation
   said.
+- TypeScript: a saved checkpoint is read as the Rust and Python clients read
+  it: an offset that is no whole number refuses it as `malformed`, before its
+  scope is compared (one such entry was skipped), and an epoch key reads as
+  its 8 hex digits. Shared vectors (`crates/wse-client/tests/vectors/`) check
+  all three.
 - TypeScript: a state listener that throws is logged and no longer keeps the
   others from hearing the change.
 - TypeScript: under Node 25 and newer, which has a `localStorage` of its own,

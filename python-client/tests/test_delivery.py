@@ -7,10 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from wse_client import Continuity, DeliveryConfig, Subscription
 from wse_client.client import AsyncWSEClient
+from wse_client.delivery import Delivery
 from wse_client.types import ConnectionState, WSEEvent
 
 EPOCH = "0000000a"
@@ -273,3 +277,66 @@ class TestBestEffort:
         c._resubscribe_pending = {"prices"}
         await c._resubscribe()
         assert sent_recovery(c) == [], "bob's topics start over: nothing of ann's"
+
+
+# The checkpoints every client reads alike (the TypeScript and Rust clients
+# read the file too); a package built without the repository skips them.
+VECTORS = (
+    Path(__file__).resolve().parents[2]
+    / "crates"
+    / "wse-client"
+    / "tests"
+    / "vectors"
+    / "checkpoint.json"
+)
+needs_vectors = pytest.mark.skipif(
+    not VECTORS.exists(), reason="no shared vectors here"
+)
+
+
+def _vector_cases(kind: str) -> list[dict]:
+    if not VECTORS.exists():
+        return []
+    return json.loads(VECTORS.read_text())[kind]
+
+
+def _gate(saved: str) -> tuple[Delivery, str]:
+    doc = json.loads(VECTORS.read_text())
+    scope = doc["scope"]
+    gate = Delivery(
+        DeliveryConfig(
+            consumer=scope["consumer"], schema=scope["schema"], checkpoint=saved
+        ),
+        scope["realm"],
+        scope["topics"],
+    )
+    return gate, scope["user"]
+
+
+def _rejected(gate: Delivery) -> list[str]:
+    reasons = []
+    while (made := gate.take_out()) is not None:
+        if made.type == "checkpoint_rejected":
+            reasons.append(made.payload["reason"])
+    return reasons
+
+
+@needs_vectors
+@pytest.mark.parametrize("case", _vector_cases("taken"), ids=lambda c: c["name"])
+def test_the_shared_checkpoint_vectors_taken(case):
+    gate, user = _gate(case["saved"])
+    positions = {
+        topic: {f"{epoch:08x}": last for epoch, last in streams.items()}
+        for topic, streams in (gate.committed(user) or {}).items()
+        if streams
+    }
+    assert positions == case["positions"]
+    assert _rejected(gate) == []
+
+
+@needs_vectors
+@pytest.mark.parametrize("case", _vector_cases("refused"), ids=lambda c: c["name"])
+def test_the_shared_checkpoint_vectors_refused(case):
+    gate, user = _gate(case["saved"])
+    assert all(not streams for streams in (gate.committed(user) or {}).values())
+    assert _rejected(gate) == [case["reason"]]

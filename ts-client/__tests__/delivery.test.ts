@@ -7,9 +7,12 @@
 // committed it applied.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { FakeWebSocket, connectServer, installFakeWebSocket, resetClientState, stamped, tick } from './helpers.js';
 import { createWSEClient, type ResyncRequest, type ResyncResult, type WSEClient } from '../core/index.js';
 import type { WSMessage } from '../types.js';
+import { Delivery } from '../core/delivery.js';
+import { memoryStorage } from '../core/context.js';
 
 const URL = 'ws://wse.test/wse';
 const EPOCH = '0000000a';
@@ -550,4 +553,50 @@ describe('the protocol’s own messages', () => {
     expect(requests).toHaveLength(2);
     news.release();
   });
+});
+
+describe('the shared checkpoint vectors', () => {
+  // The same file the Rust and Python clients read.
+  const vectors = JSON.parse(
+    readFileSync(new globalThis.URL('../../crates/wse-client/tests/vectors/checkpoint.json', import.meta.url), 'utf8'),
+  );
+  const scope = vectors.scope;
+
+  const deliveryOf = (saved: string, events: Array<[string, any]>) => {
+    const delivery = new Delivery(
+      { mode: 'recover-or-resync', schema: scope.schema, checkpoint: saved, resync: async () => {} },
+      { consumer: scope.consumer, realm: scope.realm },
+      {
+        route: () => {},
+        received: () => ({}),
+        user: () => scope.user,
+        emit: (type, detail) => events.push([type, detail]),
+        changed: () => {},
+        storage: memoryStorage(),
+      },
+    );
+    delivery.track(scope.topics);
+    return delivery;
+  };
+
+  for (const take of vectors.taken) {
+    it(`takes: ${take.name}`, () => {
+      const events: Array<[string, any]> = [];
+      const positions = deliveryOf(take.saved, events).recoveryPositions(scope.topics) ?? {};
+      const streams = Object.fromEntries(Object.entries(positions).map(([topic, p]) => [topic, p.streams]));
+      expect(streams).toEqual(take.positions);
+      expect(events.filter(([type]) => type === 'wseCheckpointRejected')).toEqual([]);
+    });
+  }
+
+  for (const refuse of vectors.refused) {
+    it(`refuses: ${refuse.name}`, () => {
+      const events: Array<[string, any]> = [];
+      const positions = deliveryOf(refuse.saved, events).recoveryPositions(scope.topics) ?? {};
+      expect(positions).toEqual({});
+      expect(events.filter(([type]) => type === 'wseCheckpointRejected').map(([, d]) => d.reason)).toEqual([
+        refuse.reason,
+      ]);
+    });
+  }
 });
