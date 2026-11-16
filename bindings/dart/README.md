@@ -6,7 +6,8 @@ hands the server's messages to the app in order. It is the Rust client
 (`wse-client` on crates.io) through flutter_rust_bridge.
 
 Platforms: Android (API 24+), iOS 15+, macOS 10.15+, Linux and Windows.
-Flutter 3.38 or newer.
+Flutter 3.38 or newer. These are the library's minimums; the app's Flutter
+may ask for more (Flutter 3.50 makes macOS apps for macOS 12 and newer).
 
 ## Install
 
@@ -121,7 +122,10 @@ development).
 ## Background and network
 
 `WseAppLifecycle(client)` pauses the client five seconds after the app went
-to the background and resumes it when the app comes back.
+to the background and resumes it when the app comes back. On a desktop a
+minimized window counts as gone to the background too, and a window that only
+lost focus does not; leave `WseAppLifecycle` out where a minimized app should
+keep receiving.
 `WseNetworkMonitor(client)` pauses it while the device has no network and
 makes the connection again when the network moves to other interfaces (Wi-Fi
 to mobile, say); the app feeds it what it sees, with connectivity_plus for
