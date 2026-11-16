@@ -586,6 +586,16 @@ export class WSESession {
     this.requestSnapshot(topics);
   }
 
+  /** The page went into the back/forward cache or away: the socket goes, the session stays. */
+  suspendForPage(): void {
+    if (!this.destroyed) this.connection?.suspend();
+  }
+
+  /** The page is back: connect again and recover what was missed. */
+  resumeForPage(): void {
+    if (!this.destroyed && this.connection?.isSuspended()) this.connection.forceReconnect();
+  }
+
   /**
    * Where the recovery of `topics` starts: what the application committed,
    * delivery set back to it, in the recover-or-resync mode; else where

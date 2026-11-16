@@ -53,3 +53,6 @@ rust/target/
 
 # The Java part of Android's certificate verifier, fetched by bindings/rustls-platform-verifier.sh
 bindings/dart/android/libs/
+
+# Svelte pages the SSR tests compile
+ts-client/__tests__/ssr/.compiled/

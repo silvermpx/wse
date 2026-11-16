@@ -96,7 +96,16 @@ const lastPrice = wseMessage(client, 'price_update', ['prices']);
 
 The provider, the composables and the stores hold the client, its topics and listeners while a
 component uses them. Effects and mount hooks do not run while rendering on a server, so server
-rendering opens no socket.
+rendering (Next.js, Nuxt, SvelteKit) opens no socket and leaves no timer: the page shows the
+client's first state (`pending`), hydrates without a mismatch, and connects in the browser. The
+tests render React, Vue and a compiled Svelte 5 page on a server without a window and hydrate them.
+
+In the browser a client of its own follows the page: `pagehide` pauses it for the reason `page`
+(a page in the back/forward cache holds no socket), `pageshow` resumes it, and it recovers what was
+missed. A page back on screen, or back online, does not trust a socket that heard nothing for longer
+than the idle limit (a machine that slept): it connects again. The page-wide `useWSE` does the same
+with `pagehide` and `pageshow`; it no longer listens to `beforeunload`, which keeps some browsers
+from caching the page.
 
 ## React Native
 

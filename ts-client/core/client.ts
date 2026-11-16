@@ -340,8 +340,27 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
 
   const live = () => (session && !session.destroyed ? session : null);
 
+  // The page's lifecycle: a page in the back/forward cache (or going away)
+  // holds no socket; back on screen, the client connects and recovers.
+  let pageListening = false;
+  const onPageHide = () => pause('page');
+  const onPageShow = () => resume('page');
+  const listenToPage = () => {
+    if (pageListening || typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+    window.addEventListener('pagehide', onPageHide);
+    window.addEventListener('pageshow', onPageShow);
+    pageListening = true;
+  };
+  const stopListeningToPage = () => {
+    if (!pageListening) return;
+    window.removeEventListener('pagehide', onPageHide);
+    window.removeEventListener('pageshow', onPageShow);
+    pageListening = false;
+  };
+
   const retain = (): Lease => {
     if (done) throw new Error('This WSE client was signed out or destroyed: make a new one');
+    listenToPage();
     shares++;
     if (stopTimer) {
       clearTimeout(stopTimer);
@@ -499,6 +518,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
       stopTimer = null;
     }
     stop();
+    stopListeningToPage();
     waiting.length = 0;
     if (clear) delivery.forget();
     delivery.close();

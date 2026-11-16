@@ -389,15 +389,23 @@ export const wseActions = Object.freeze({
   setCompression: setCompressionAction,
 });
 
-// Close the socket cleanly on page unload -- HMR-safe (replaces the previous listener).
+// The page's lifecycle -- HMR-safe (replaces the previous listeners):
+// pagehide closes the socket and keeps the session (a page in the
+// back/forward cache holds no socket; beforeunload would keep some browsers
+// from caching it), pageshow connects again and recovers what was missed.
 if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
   const g = globalThis as any;
   if (g.__wse_beforeunload_handler) {
     window.removeEventListener('beforeunload', g.__wse_beforeunload_handler);
+    g.__wse_beforeunload_handler = undefined;
   }
-  const onUnload = () => {
-    if (currentSession) destroyCurrentSession();
-  };
-  g.__wse_beforeunload_handler = onUnload;
-  window.addEventListener('beforeunload', onUnload);
+  if (g.__wse_page_handlers) {
+    window.removeEventListener('pagehide', g.__wse_page_handlers.hide);
+    window.removeEventListener('pageshow', g.__wse_page_handlers.show);
+  }
+  const hide = () => currentSession?.suspendForPage();
+  const show = () => currentSession?.resumeForPage();
+  g.__wse_page_handlers = { hide, show };
+  window.addEventListener('pagehide', hide);
+  window.addEventListener('pageshow', show);
 }

@@ -69,6 +69,13 @@
   bound the connection is dropped (a `wseOverloaded` event) and the
   recovery brings what it would have; past the encryption bound a message
   waits in the outgoing queue instead of growing the chain of encryptions.
+- TypeScript client: the page's lifecycle. `pagehide` lets the connection
+  go (a client of its own pauses for `page`; the page-wide `useWSE` closes
+  its socket and keeps its session), `pageshow` connects again and
+  recovers; `beforeunload` is not listened to any more, so the page can go
+  into the back/forward cache. Back on screen or online, a socket that
+  heard nothing past the idle limit (after a sleep) is replaced. Server
+  rendering and hydration are tested for React, Vue and Svelte 5.
 - Rust client: `pause(reason)` and `resume(reason)`, as in the TypeScript
   core client: the connection ends (what is queued goes out first) and no
   attempt is made while any reason holds; topics and positions stay, and

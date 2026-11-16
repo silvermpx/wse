@@ -154,7 +154,8 @@ function packMessage(value: unknown): ArrayBuffer {
   return frame.buffer;
 }
 
-type StopReason = 'none' | 'manual' | 'auth' | 'encryption' | 'max_attempts';
+/** 'suspended': the page went into the back/forward cache or away (pagehide). */
+type StopReason = 'none' | 'manual' | 'auth' | 'encryption' | 'max_attempts' | 'suspended';
 type EncryptionState = 'off' | 'pending' | 'ready' | 'failed';
 
 const WS_CONNECTING = 0;
@@ -910,7 +911,17 @@ export class ConnectionManager {
   private wakeUp(reason: string): void {
     if (this.isDestroyed || !this.token) return;
     if (this.stopReason !== 'none' && this.stopReason !== 'max_attempts') return;
-    if (this.ws && (this.ws.readyState === WS_OPEN || this.ws.readyState === WS_CONNECTING)) return;
+    const ws = this.ws;
+    if (ws && ws.readyState === WS_CONNECTING) return;
+    if (ws && ws.readyState === WS_OPEN) {
+      // Back from a sleep: a socket silent past the idle limit is dead,
+      // though no timer ran to say so.
+      if (Date.now() - this.lastInboundAt <= this.idleLimit()) return;
+      logger.warn(`[ConnectionManager] ${reason}: nothing heard for too long; reconnecting`);
+      this.closeQuietly(ws, 1000, 'Idle after a sleep');
+      this.teardownSocket(ws);
+      this.setState(ConnectionState.RECONNECTING);
+    }
 
     if (this.stopReason === 'max_attempts') {
       this.stopReason = 'none';
@@ -1503,7 +1514,7 @@ export class ConnectionManager {
       // The server pings every ping_interval and answers our pings, so a
       // healthy socket never stays silent this long; a half-open one does
       // (e.g. after a laptop sleep).
-      const idleLimit = Math.max(IDLE_TIMEOUT, this.serverPingInterval * 2.5);
+      const idleLimit = this.idleLimit();
       if (Date.now() - this.lastInboundAt > idleLimit) {
         logger.warn(`[ConnectionManager] No data from the server for ${idleLimit}ms; reconnecting`);
         this.handleSocketGone(ws, this.currentEndpoint ?? '', 1006, 'Idle timeout');
@@ -1517,6 +1528,34 @@ export class ConnectionManager {
         v: WS_PROTOCOL_VERSION,
       }));
     }, this.heartbeatEvery());
+  }
+
+  /**
+   * The server pings every ping_interval and answers our pings, so a healthy
+   * socket never stays silent this long; a half-open one does.
+   */
+  private idleLimit(): number {
+    return Math.max(IDLE_TIMEOUT, this.serverPingInterval * 2.5);
+  }
+
+  /**
+   * The page went into the back/forward cache or away (pagehide): the socket
+   * closes, and nothing connects until forceReconnect() (pageshow).
+   */
+  suspend(): void {
+    if (this.isDestroyed) return;
+    this.stopReason = 'suspended';
+    this.clearReconnectTimer();
+    const ws = this.ws;
+    if (ws) {
+      this.closeQuietly(ws, 1001, 'Page hidden');
+      this.teardownSocket(ws);
+    }
+    this.setState(ConnectionState.DISCONNECTED);
+  }
+
+  isSuspended(): boolean {
+    return this.stopReason === 'suspended';
   }
 
   private heartbeatEvery(): number {
