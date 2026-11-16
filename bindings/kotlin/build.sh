@@ -15,5 +15,9 @@ lib="$target/debug/libwse_ffi.so"
 cargo run -q -p wse-bindgen --bin uniffi-bindgen -- generate -l kotlin --no-format -o "$here/generated/jvm" "$lib"
 cargo run -q -p wse-bindgen --bin uniffi-bindgen -- generate -l kotlin --no-format \
   --config "$here/android/uniffi.toml" -o "$here/generated/android" "$lib"
+# UniFFI leaves spaces at line ends and blank lines at the end.
+for file in "$here"/generated/*/dev/wse/ffi/*.kt; do
+  sed -i.bak -E 's/[[:space:]]+$//' "$file" && rm -f "$file.bak"
+  printf '%s\n' "$(cat "$file")" > "$file.tmp" && mv "$file.tmp" "$file"
+done
 echo "built $lib and the Kotlin bindings"
-

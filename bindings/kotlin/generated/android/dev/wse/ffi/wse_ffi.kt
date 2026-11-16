@@ -353,7 +353,7 @@ internal inline fun<T, reified E: Throwable> uniffiTraitInterfaceCallWithError(
         }
     }
 }
-// Initial value and increment amount for handles. 
+// Initial value and increment amount for handles.
 // These ensure that Kotlin-generated handles always have the lowest bit set
 private const val UNIFFI_HANDLEMAP_INITIAL = 1.toLong()
 private const val UNIFFI_HANDLEMAP_DELTA = 2.toLong()
@@ -363,7 +363,7 @@ private const val UNIFFI_HANDLEMAP_DELTA = 2.toLong()
 // This is used pass an opaque 64-bit handle representing a foreign object to the Rust code.
 internal class UniffiHandleMap<T: Any> {
     private val map = ConcurrentHashMap<Long, T>()
-    // Start 
+    // Start
     private val counter = java.util.concurrent.atomic.AtomicLong(UNIFFI_HANDLEMAP_INITIAL)
 
     val size: Int
@@ -745,45 +745,45 @@ internal object IntegrityCheckingUniffiLib {
     external fun ffi_wse_ffi_uniffi_contract_version(
     ): Int
 
-        
+
 }
 
 internal object UniffiLib {
-    
+
     // The Cleaner for the whole library
     internal val CLEANER: UniffiCleaner by lazy {
         UniffiCleaner.create()
     }
-    
+
 
     init {
         Native.register(UniffiLib::class.java, findLibraryName(componentName = "wse_ffi"))
         uniffiCallbackInterfaceWseTokenSource.register(this)
-        
+
     }
 
     internal fun ensureInitialized() = Unit
-    external fun uniffi_wse_ffi_fn_clone_wsecancel(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_wse_ffi_fn_clone_wsecancel(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Long
-    external fun uniffi_wse_ffi_fn_free_wsecancel(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_wse_ffi_fn_free_wsecancel(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    external fun uniffi_wse_ffi_fn_constructor_wsecancel_new(uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_wse_ffi_fn_constructor_wsecancel_new(uniffi_out_err: UniffiRustCallStatus,
     ): Long
-    external fun uniffi_wse_ffi_fn_method_wsecancel_cancel(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_wse_ffi_fn_method_wsecancel_cancel(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    external fun uniffi_wse_ffi_fn_method_wsecancel_is_cancelled(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_wse_ffi_fn_method_wsecancel_is_cancelled(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Byte
-    external fun uniffi_wse_ffi_fn_clone_wseclient(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_wse_ffi_fn_clone_wseclient(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Long
-    external fun uniffi_wse_ffi_fn_free_wseclient(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_wse_ffi_fn_free_wseclient(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    external fun uniffi_wse_ffi_fn_method_wseclient_connection_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_wse_ffi_fn_method_wseclient_connection_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_wse_ffi_fn_method_wseclient_disconnect(`ptr`: Long,`deadlineMs`: Long,
     ): Long
     external fun uniffi_wse_ffi_fn_method_wseclient_next_batch(`ptr`: Long,`ack`: Long,`maxItems`: Int,`maxBytes`: Int,`cancel`: Long,
     ): Long
-    external fun uniffi_wse_ffi_fn_method_wseclient_reconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_wse_ffi_fn_method_wseclient_reconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_send(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,`cancel`: Long,
     ): Long
@@ -791,21 +791,21 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_wse_ffi_fn_method_wseclient_send_signed(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,`nonce`: RustBuffer.ByValue,`cancel`: Long,
     ): Long
-    external fun uniffi_wse_ffi_fn_method_wseclient_status(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_wse_ffi_fn_method_wseclient_status(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    external fun uniffi_wse_ffi_fn_method_wseclient_subscribe(`ptr`: Long,`topics`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_wse_ffi_fn_method_wseclient_subscribe(`ptr`: Long,`topics`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    external fun uniffi_wse_ffi_fn_method_wseclient_try_send(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_wse_ffi_fn_method_wseclient_try_send(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    external fun uniffi_wse_ffi_fn_method_wseclient_try_send_live(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_wse_ffi_fn_method_wseclient_try_send_live(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    external fun uniffi_wse_ffi_fn_method_wseclient_unsubscribe(`ptr`: Long,`topics`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_wse_ffi_fn_method_wseclient_unsubscribe(`ptr`: Long,`topics`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    external fun uniffi_wse_ffi_fn_method_wseclient_user_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_wse_ffi_fn_method_wseclient_user_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    external fun uniffi_wse_ffi_fn_clone_wsetokensource(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_wse_ffi_fn_clone_wsetokensource(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Long
-    external fun uniffi_wse_ffi_fn_free_wsetokensource(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_wse_ffi_fn_free_wsetokensource(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
     external fun uniffi_wse_ffi_fn_init_callback_vtable_wsetokensource(`vtable`: UniffiVTableCallbackInterfaceWseTokenSource,
     ): Unit
@@ -813,13 +813,13 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_wse_ffi_fn_func_connect(`config`: RustBuffer.ByValue,`tokens`: RustBuffer.ByValue,`cancel`: Long,
     ): Long
-    external fun ffi_wse_ffi_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun ffi_wse_ffi_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    external fun ffi_wse_ffi_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    external fun ffi_wse_ffi_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    external fun ffi_wse_ffi_rustbuffer_free(`buf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    external fun ffi_wse_ffi_rustbuffer_free(`buf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    external fun ffi_wse_ffi_rustbuffer_reserve(`buf`: RustBuffer.ByValue,`additional`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun ffi_wse_ffi_rustbuffer_reserve(`buf`: RustBuffer.ByValue,`additional`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun ffi_wse_ffi_rust_future_poll_u8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -827,7 +827,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_wse_ffi_rust_future_free_u8(`handle`: Long,
     ): Unit
-    external fun ffi_wse_ffi_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun ffi_wse_ffi_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Int
     external fun ffi_wse_ffi_rust_future_poll_i8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -835,7 +835,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_wse_ffi_rust_future_free_i8(`handle`: Long,
     ): Unit
-    external fun ffi_wse_ffi_rust_future_complete_i8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun ffi_wse_ffi_rust_future_complete_i8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Byte
     external fun ffi_wse_ffi_rust_future_poll_u16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -843,7 +843,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_wse_ffi_rust_future_free_u16(`handle`: Long,
     ): Unit
-    external fun ffi_wse_ffi_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun ffi_wse_ffi_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Int
     external fun ffi_wse_ffi_rust_future_poll_i16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -851,7 +851,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_wse_ffi_rust_future_free_i16(`handle`: Long,
     ): Unit
-    external fun ffi_wse_ffi_rust_future_complete_i16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun ffi_wse_ffi_rust_future_complete_i16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Short
     external fun ffi_wse_ffi_rust_future_poll_u32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -859,7 +859,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_wse_ffi_rust_future_free_u32(`handle`: Long,
     ): Unit
-    external fun ffi_wse_ffi_rust_future_complete_u32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun ffi_wse_ffi_rust_future_complete_u32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Int
     external fun ffi_wse_ffi_rust_future_poll_i32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -867,7 +867,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_wse_ffi_rust_future_free_i32(`handle`: Long,
     ): Unit
-    external fun ffi_wse_ffi_rust_future_complete_i32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun ffi_wse_ffi_rust_future_complete_i32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Int
     external fun ffi_wse_ffi_rust_future_poll_u64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -875,7 +875,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_wse_ffi_rust_future_free_u64(`handle`: Long,
     ): Unit
-    external fun ffi_wse_ffi_rust_future_complete_u64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun ffi_wse_ffi_rust_future_complete_u64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Long
     external fun ffi_wse_ffi_rust_future_poll_i64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -883,7 +883,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_wse_ffi_rust_future_free_i64(`handle`: Long,
     ): Unit
-    external fun ffi_wse_ffi_rust_future_complete_i64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun ffi_wse_ffi_rust_future_complete_i64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Long
     external fun ffi_wse_ffi_rust_future_poll_f32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -891,7 +891,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_wse_ffi_rust_future_free_f32(`handle`: Long,
     ): Unit
-    external fun ffi_wse_ffi_rust_future_complete_f32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun ffi_wse_ffi_rust_future_complete_f32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Float
     external fun ffi_wse_ffi_rust_future_poll_f64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -899,7 +899,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_wse_ffi_rust_future_free_f64(`handle`: Long,
     ): Unit
-    external fun ffi_wse_ffi_rust_future_complete_f64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun ffi_wse_ffi_rust_future_complete_f64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Double
     external fun ffi_wse_ffi_rust_future_poll_rust_buffer(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -907,7 +907,7 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_wse_ffi_rust_future_free_rust_buffer(`handle`: Long,
     ): Unit
-    external fun ffi_wse_ffi_rust_future_complete_rust_buffer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun ffi_wse_ffi_rust_future_complete_rust_buffer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun ffi_wse_ffi_rust_future_poll_void(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -915,10 +915,10 @@ internal object UniffiLib {
     ): Unit
     external fun ffi_wse_ffi_rust_future_free_void(`handle`: Long,
     ): Unit
-    external fun ffi_wse_ffi_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun ffi_wse_ffi_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
-        
+
 }
 
 private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
@@ -1190,7 +1190,7 @@ inline fun <T : Disposable?, R> T.use(block: (T) -> R) =
         }
     }
 
-/** 
+/**
  * Placeholder object used to signal that we're constructing an interface with a FFI handle.
  *
  * This is the first argument for interface constructors that input a raw handle. It exists is that
@@ -1201,7 +1201,7 @@ inline fun <T : Disposable?, R> T.use(block: (T) -> R) =
  * */
 object UniffiWithHandle
 
-/** 
+/**
  * Used to instantiate an interface without an actual pointer, for fakes in tests, mostly.
  *
  * @suppress
@@ -1575,11 +1575,11 @@ public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
  * Cancels the calls it is given to.
  */
 public interface WseCancelInterface {
-    
+
     fun `cancel`()
-    
+
     fun `isCancelled`(): kotlin.Boolean
-    
+
     companion object
 }
 
@@ -1611,10 +1611,10 @@ open class WseCancel: Disposable, AutoCloseable, WseCancelInterface
         this.cleanable = null
     }
     constructor() :
-        this(UniffiWithHandle, 
+        this(UniffiWithHandle,
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_wse_ffi_fn_constructor_wsecancel_new(
-    
+
         _status)
 }
     )
@@ -1696,7 +1696,7 @@ open class WseCancel: Disposable, AutoCloseable, WseCancelInterface
     }
 
     override fun `cancel`()
-        = 
+        =
     callWithHandle {
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_wse_ffi_fn_method_wsecancel_cancel(
@@ -1704,8 +1704,8 @@ open class WseCancel: Disposable, AutoCloseable, WseCancelInterface
         _status)
 }
     }
-    
-    
+
+
 
     override fun `isCancelled`(): kotlin.Boolean {
             return FfiConverterBoolean.lift(
@@ -1718,20 +1718,20 @@ open class WseCancel: Disposable, AutoCloseable, WseCancelInterface
     }
     )
     }
-    
-
-    
-
-    
 
 
-    
-    
+
+
+
+
+
+
+
     /**
      * @suppress
      */
     companion object
-    
+
 }
 
 
@@ -1855,59 +1855,59 @@ public object FfiConverterTypeWseCancel: FfiConverter<WseCancel, Long> {
 
 
 public interface WseClientInterface {
-    
+
     fun `connectionId`(): kotlin.String?
-    
+
     /**
      * Closes the client: what was sent goes out first, within `deadline_ms`.
      */
     suspend fun `disconnect`(`deadlineMs`: kotlin.ULong)
-    
+
     /**
      * The next batch of what the client heard: `ack` acknowledges the last
      * one (0: none yet); one not acknowledged comes again.
      */
     suspend fun `nextBatch`(`ack`: kotlin.ULong, `maxItems`: kotlin.UInt, `maxBytes`: kotlin.UInt, `cancel`: WseCancel): WseBatch
-    
+
     fun `reconnect`()
-    
+
     /**
      * Sends `{"t": kind, "p": json}`, waiting for room in the queue;
      * `cancel` gives up the wait (a message already queued still goes).
      */
     suspend fun `send`(`kind`: kotlin.String, `json`: kotlin.String, `cancel`: WseCancel)
-    
+
     /**
      * `try_send_live`, waiting for room in the queue; `cancel` gives up
      * the wait.
      */
     suspend fun `sendLive`(`kind`: kotlin.String, `json`: kotlin.String, `cancel`: WseCancel)
-    
+
     /**
      * Sends a signed message on this connection, or not at all; the nonce it went with.
      */
     suspend fun `sendSigned`(`kind`: kotlin.String, `json`: kotlin.String, `nonce`: kotlin.String?, `cancel`: WseCancel): kotlin.String
-    
+
     fun `status`(): WseStatus
-    
+
     fun `subscribe`(`topics`: List<kotlin.String>)
-    
+
     /**
      * Sends `{"t": kind, "p": json}`; fails at once when the queue is full.
      */
     fun `trySend`(`kind`: kotlin.String, `json`: kotlin.String)
-    
+
     /**
      * Sends `{"t": kind, "p": json}` on the connection that is ready now, or not at all:
      * never on a later one. For commands that must not run late. Fails at once when the
      * queue is full.
      */
     fun `trySendLive`(`kind`: kotlin.String, `json`: kotlin.String)
-    
+
     fun `unsubscribe`(`topics`: List<kotlin.String>)
-    
+
     fun `userId`(): kotlin.String?
-    
+
     companion object
 }
 
@@ -2023,9 +2023,9 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
     }
     )
     }
-    
 
-    
+
+
     /**
      * Closes the client: what was sent goes out first, within `deadline_ms`.
      */
@@ -2035,7 +2035,7 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
         callWithHandle { uniffiHandle ->
             UniffiLib.uniffi_wse_ffi_fn_method_wseclient_disconnect(
                 uniffiHandle,
-                
+
         FfiConverterULong.lower(`deadlineMs`),
             )
         },
@@ -2044,13 +2044,13 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
         { future -> UniffiLib.ffi_wse_ffi_rust_future_free_void(future) },
         // lift function
         { },
-        
+
         // Error FFI converter
         UniffiNullRustCallStatusErrorHandler,
     )
     }
 
-    
+
     /**
      * The next batch of what the client heard: `ack` acknowledges the last
      * one (0: none yet); one not acknowledged comes again.
@@ -2062,7 +2062,7 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
         callWithHandle { uniffiHandle ->
             UniffiLib.uniffi_wse_ffi_fn_method_wseclient_next_batch(
                 uniffiHandle,
-                
+
         FfiConverterULong.lower(`ack`),
         FfiConverterUInt.lower(`maxItems`),
         FfiConverterUInt.lower(`maxBytes`),
@@ -2079,9 +2079,9 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
     )
     }
 
-    
+
     @Throws(WseException::class)override fun `reconnect`()
-        = 
+        =
     callWithHandle {
     uniffiRustCallWithError(WseException) { _status ->
     UniffiLib.uniffi_wse_ffi_fn_method_wseclient_reconnect(
@@ -2089,10 +2089,10 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
         _status)
 }
     }
-    
-    
 
-    
+
+
+
     /**
      * Sends `{"t": kind, "p": json}`, waiting for room in the queue;
      * `cancel` gives up the wait (a message already queued still goes).
@@ -2104,7 +2104,7 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
         callWithHandle { uniffiHandle ->
             UniffiLib.uniffi_wse_ffi_fn_method_wseclient_send(
                 uniffiHandle,
-                
+
         FfiConverterString.lower(`kind`),
         FfiConverterString.lower(`json`),
         FfiConverterTypeWseCancel.lower(`cancel`),
@@ -2115,13 +2115,13 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
         { future -> UniffiLib.ffi_wse_ffi_rust_future_free_void(future) },
         // lift function
         { },
-        
+
         // Error FFI converter
         WseException.ErrorHandler,
     )
     }
 
-    
+
     /**
      * `try_send_live`, waiting for room in the queue; `cancel` gives up
      * the wait.
@@ -2133,7 +2133,7 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
         callWithHandle { uniffiHandle ->
             UniffiLib.uniffi_wse_ffi_fn_method_wseclient_send_live(
                 uniffiHandle,
-                
+
         FfiConverterString.lower(`kind`),
         FfiConverterString.lower(`json`),
         FfiConverterTypeWseCancel.lower(`cancel`),
@@ -2144,13 +2144,13 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
         { future -> UniffiLib.ffi_wse_ffi_rust_future_free_void(future) },
         // lift function
         { },
-        
+
         // Error FFI converter
         WseException.ErrorHandler,
     )
     }
 
-    
+
     /**
      * Sends a signed message on this connection, or not at all; the nonce it went with.
      */
@@ -2161,7 +2161,7 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
         callWithHandle { uniffiHandle ->
             UniffiLib.uniffi_wse_ffi_fn_method_wseclient_send_signed(
                 uniffiHandle,
-                
+
         FfiConverterString.lower(`kind`),
         FfiConverterString.lower(`json`),
         FfiConverterOptionalString.lower(`nonce`),
@@ -2189,73 +2189,73 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
     }
     )
     }
-    
 
-    
+
+
     @Throws(WseException::class)override fun `subscribe`(`topics`: List<kotlin.String>)
-        = 
+        =
     callWithHandle {
     uniffiRustCallWithError(WseException) { _status ->
     UniffiLib.uniffi_wse_ffi_fn_method_wseclient_subscribe(
         it,
-        
+
         FfiConverterSequenceString.lower(`topics`),_status)
 }
     }
-    
-    
 
-    
+
+
+
     /**
      * Sends `{"t": kind, "p": json}`; fails at once when the queue is full.
      */
     @Throws(WseException::class)override fun `trySend`(`kind`: kotlin.String, `json`: kotlin.String)
-        = 
+        =
     callWithHandle {
     uniffiRustCallWithError(WseException) { _status ->
     UniffiLib.uniffi_wse_ffi_fn_method_wseclient_try_send(
         it,
-        
+
         FfiConverterString.lower(`kind`),
         FfiConverterString.lower(`json`),_status)
 }
     }
-    
-    
 
-    
+
+
+
     /**
      * Sends `{"t": kind, "p": json}` on the connection that is ready now, or not at all:
      * never on a later one. For commands that must not run late. Fails at once when the
      * queue is full.
      */
     @Throws(WseException::class)override fun `trySendLive`(`kind`: kotlin.String, `json`: kotlin.String)
-        = 
+        =
     callWithHandle {
     uniffiRustCallWithError(WseException) { _status ->
     UniffiLib.uniffi_wse_ffi_fn_method_wseclient_try_send_live(
         it,
-        
+
         FfiConverterString.lower(`kind`),
         FfiConverterString.lower(`json`),_status)
 }
     }
-    
-    
 
-    
+
+
+
     @Throws(WseException::class)override fun `unsubscribe`(`topics`: List<kotlin.String>)
-        = 
+        =
     callWithHandle {
     uniffiRustCallWithError(WseException) { _status ->
     UniffiLib.uniffi_wse_ffi_fn_method_wseclient_unsubscribe(
         it,
-        
+
         FfiConverterSequenceString.lower(`topics`),_status)
 }
     }
-    
-    
+
+
 
     override fun `userId`(): kotlin.String? {
             return FfiConverterOptionalString.lift(
@@ -2268,20 +2268,20 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
     }
     )
     }
-    
-
-    
-
-    
 
 
-    
-    
+
+
+
+
+
+
+
     /**
      * @suppress
      */
     companion object
-    
+
 }
 
 
@@ -2408,9 +2408,9 @@ public object FfiConverterTypeWseClient: FfiConverter<WseClient, Long> {
  * Asked for the token before each connection attempt.
  */
 public interface WseTokenSource {
-    
+
     suspend fun `token`(): kotlin.String
-    
+
     companion object
 }
 
@@ -2518,7 +2518,7 @@ open class WseTokenSourceImpl: Disposable, AutoCloseable, WseTokenSource
         }
     }
 
-    
+
     @Throws(WseTokenException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
     override suspend fun `token`() : kotlin.String {
@@ -2526,7 +2526,7 @@ open class WseTokenSourceImpl: Disposable, AutoCloseable, WseTokenSource
         callWithHandle { uniffiHandle ->
             UniffiLib.uniffi_wse_ffi_fn_method_wsetokensource_token(
                 uniffiHandle,
-                
+
             )
         },
         { future, callback, continuation -> UniffiLib.ffi_wse_ffi_rust_future_poll_rust_buffer(future, callback, continuation) },
@@ -2539,18 +2539,18 @@ open class WseTokenSourceImpl: Disposable, AutoCloseable, WseTokenSource
     )
     }
 
-    
-
-    
 
 
-    
-    
+
+
+
+
+
     /**
      * @suppress
      */
     companion object
-    
+
 }
 
 
@@ -2661,17 +2661,17 @@ data class WseBatch (
      * Acknowledge it with the next call; until then it comes again.
      */
     val `id`: kotlin.ULong
-    , 
+    ,
     val `kind`: WseBatchKind
-    , 
+    ,
     val `items`: List<WseItem>
-    
+
 ){
-    
 
-    
 
-    
+
+
+
     companion object
 }
 
@@ -2710,45 +2710,45 @@ data class WseConfig (
      * ws://host:port/wse or wss://...
      */
     val `url`: kotlin.String
-    , 
-    val `token`: kotlin.String? = null 
-    , 
-    val `topics`: List<kotlin.String> = listOf() 
-    , 
-    val `msgpack`: kotlin.Boolean = false 
-    , 
-    val `headers`: List<WseHeader> = listOf() 
-    , 
-    val `sendQueue`: kotlin.UInt = 0u 
-    , 
-    val `reconnect`: kotlin.Boolean = true 
-    , 
-    val `connectTimeoutMs`: kotlin.ULong = 0uL 
-    , 
-    val `readyTimeoutMs`: kotlin.ULong = 0uL 
-    , 
-    val `idleTimeoutMs`: kotlin.ULong = 0uL 
-    , 
-    val `recoveryTimeoutMs`: kotlin.ULong = 0uL 
-    , 
+    ,
+    val `token`: kotlin.String? = null
+    ,
+    val `topics`: List<kotlin.String> = listOf()
+    ,
+    val `msgpack`: kotlin.Boolean = false
+    ,
+    val `headers`: List<WseHeader> = listOf()
+    ,
+    val `sendQueue`: kotlin.UInt = 0u
+    ,
+    val `reconnect`: kotlin.Boolean = true
+    ,
+    val `connectTimeoutMs`: kotlin.ULong = 0uL
+    ,
+    val `readyTimeoutMs`: kotlin.ULong = 0uL
+    ,
+    val `idleTimeoutMs`: kotlin.ULong = 0uL
+    ,
+    val `recoveryTimeoutMs`: kotlin.ULong = 0uL
+    ,
     /**
      * End-to-end encryption pinned to these server identity keys (base64).
      */
-    val `serverIdentityKeys`: List<kotlin.String> = listOf() 
-    , 
+    val `serverIdentityKeys`: List<kotlin.String> = listOf()
+    ,
     /**
      * This client's ECDSA P-256 private key (PKCS#8, PEM or DER), for signed messages.
      */
-    val `signingKey`: kotlin.ByteArray? = null 
-    , 
-    val `serverSigningKeys`: List<kotlin.String> = listOf() 
-    
+    val `signingKey`: kotlin.ByteArray? = null
+    ,
+    val `serverSigningKeys`: List<kotlin.String> = listOf()
+
 ){
-    
 
-    
 
-    
+
+
+
     companion object
 }
 
@@ -2814,15 +2814,15 @@ public object FfiConverterTypeWseConfig: FfiConverterRustBuffer<WseConfig> {
 
 data class WseHeader (
     val `name`: kotlin.String
-    , 
+    ,
     val `value`: kotlin.String
-    
+
 ){
-    
 
-    
 
-    
+
+
+
     companion object
 }
 
@@ -2852,34 +2852,34 @@ public object FfiConverterTypeWseHeader: FfiConverterRustBuffer<WseHeader> {
 
 data class WseMessage (
     val `kind`: kotlin.String
-    , 
+    ,
     val `topic`: kotlin.String?
-    , 
+    ,
     val `epoch`: kotlin.UInt?
-    , 
+    ,
     val `offset`: kotlin.ULong?
-    , 
+    ,
     val `id`: kotlin.String?
-    , 
+    ,
     /**
      * The payload as JSON text (from msgpack too); None without one
      * (absent or null) or when it could not be decoded.
      */
     val `json`: kotlin.String?
-    , 
+    ,
     /**
      * Why the payload could not be decoded (msgpack JSON cannot show).
      */
     val `payloadError`: kotlin.String?
-    , 
+    ,
     val `signature`: WseSignature?
-    
+
 ){
-    
 
-    
 
-    
+
+
+
     companion object
 }
 
@@ -2930,19 +2930,19 @@ data class WseSignature (
      * The exact text that was signed: keep it as it is.
      */
     val `body`: kotlin.String
-    , 
+    ,
     val `sig`: kotlin.String
-    , 
+    ,
     val `kid`: kotlin.String
-    , 
+    ,
     val `verified`: kotlin.Boolean
-    
+
 ){
-    
 
-    
 
-    
+
+
+
     companion object
 }
 
@@ -2978,17 +2978,17 @@ public object FfiConverterTypeWseSignature: FfiConverterRustBuffer<WseSignature>
 
 data class WseTopicRecovery (
     val `topic`: kotlin.String
-    , 
+    ,
     val `recovered`: kotlin.Boolean
-    , 
+    ,
     val `count`: kotlin.ULong
-    
+
 ){
-    
 
-    
 
-    
+
+
+
     companion object
 }
 
@@ -3021,14 +3021,14 @@ public object FfiConverterTypeWseTopicRecovery: FfiConverterRustBuffer<WseTopicR
 
 
 enum class WseBatchKind {
-    
+
     ITEMS,
     /**
      * Nothing more will come: the client closed.
      */
     END;
 
-    
+
 
 
     companion object
@@ -3062,134 +3062,134 @@ public object FfiConverterTypeWseBatchKind: FfiConverterRustBuffer<WseBatchKind>
  * What went wrong. A kind added later reads as `Unknown`.
  */
 sealed class WseException: kotlin.Exception() {
-    
+
     class Config(
-        
+
         val `reason`: kotlin.String
         ) : WseException() {
         override val message
             get() = "reason=${ `reason` }"
     }
-    
+
     class Connect(
-        
+
         val `reason`: kotlin.String
         ) : WseException() {
         override val message
             get() = "reason=${ `reason` }"
     }
-    
+
     class Auth(
-        
+
         val `reason`: kotlin.String
         ) : WseException() {
         override val message
             get() = "reason=${ `reason` }"
     }
-    
+
     class Timeout(
-        
+
         val `reason`: kotlin.String
         ) : WseException() {
         override val message
             get() = "reason=${ `reason` }"
     }
-    
+
     class Encryption(
-        
+
         val `reason`: kotlin.String
         ) : WseException() {
         override val message
             get() = "reason=${ `reason` }"
     }
-    
+
     class Signing(
-        
+
         val `reason`: kotlin.String
         ) : WseException() {
         override val message
             get() = "reason=${ `reason` }"
     }
-    
+
     class GaveUp(
-        
+
         val `reason`: kotlin.String
         ) : WseException() {
         override val message
             get() = "reason=${ `reason` }"
     }
-    
+
     class NotConnected(
         ) : WseException() {
         override val message
             get() = ""
     }
-    
+
     class Full(
         ) : WseException() {
         override val message
             get() = ""
     }
-    
+
     class Closed(
         ) : WseException() {
         override val message
             get() = ""
     }
-    
+
     class Encode(
-        
+
         val `reason`: kotlin.String
         ) : WseException() {
         override val message
             get() = "reason=${ `reason` }"
     }
-    
+
     class Decode(
-        
+
         val `reason`: kotlin.String
         ) : WseException() {
         override val message
             get() = "reason=${ `reason` }"
     }
-    
+
     class Cancelled(
         ) : WseException() {
         override val message
             get() = ""
     }
-    
+
     class Busy(
         ) : WseException() {
         override val message
             get() = ""
     }
-    
-    class Internal(
-        
-        val `reason`: kotlin.String
-        ) : WseException() {
-        override val message
-            get() = "reason=${ `reason` }"
-    }
-    
-    class Unknown(
-        
-        val `reason`: kotlin.String
-        ) : WseException() {
-        override val message
-            get() = "reason=${ `reason` }"
-    }
-    
 
-    
+    class Internal(
+
+        val `reason`: kotlin.String
+        ) : WseException() {
+        override val message
+            get() = "reason=${ `reason` }"
+    }
+
+    class Unknown(
+
+        val `reason`: kotlin.String
+        ) : WseException() {
+        override val message
+            get() = "reason=${ `reason` }"
+    }
+
+
+
 
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<WseException> {
         override fun lift(error_buf: RustBuffer.ByValue): WseException = FfiConverterTypeWseError.lift(error_buf)
     }
 
-    
+
 }
 
 /**
@@ -3197,7 +3197,7 @@ sealed class WseException: kotlin.Exception() {
  */
 public object FfiConverterTypeWseError : FfiConverterRustBuffer<WseException> {
     override fun read(buf: ByteBuffer): WseException {
-        
+
 
         return when(buf.getInt()) {
             1 -> WseException.Config(
@@ -3410,116 +3410,116 @@ public object FfiConverterTypeWseError : FfiConverterRustBuffer<WseException> {
  * One thing the client heard, in order.
  */
 sealed class WseItem {
-    
+
     data class Message(
         val `message`: dev.wse.ffi.WseMessage) : WseItem()
-        
+
     {
-        
+
 
         companion object
     }
-    
+
     data class Binary(
         val `bytes`: kotlin.ByteArray) : WseItem()
-        
+
     {
-        
+
 
         companion object
     }
-    
+
     data class Connected(
-        val `connectionId`: kotlin.String, 
-        val `userId`: kotlin.String?, 
-        val `reconnected`: kotlin.Boolean, 
+        val `connectionId`: kotlin.String,
+        val `userId`: kotlin.String?,
+        val `reconnected`: kotlin.Boolean,
         val `recovery`: kotlin.Boolean) : WseItem()
-        
+
     {
-        
+
 
         companion object
     }
-    
+
     data class Disconnected(
-        val `code`: kotlin.UShort?, 
-        val `reason`: kotlin.String, 
-        val `retryInMs`: kotlin.ULong, 
+        val `code`: kotlin.UShort?,
+        val `reason`: kotlin.String,
+        val `retryInMs`: kotlin.ULong,
         val `attempt`: kotlin.UInt) : WseItem()
-        
+
     {
-        
+
 
         companion object
     }
-    
+
     data class Subscribed(
-        val `topics`: List<kotlin.String>, 
-        val `failed`: List<kotlin.String>, 
+        val `topics`: List<kotlin.String>,
+        val `failed`: List<kotlin.String>,
         val `recovery`: List<dev.wse.ffi.WseTopicRecovery>) : WseItem()
-        
+
     {
-        
+
 
         companion object
     }
-    
+
     /**
      * Messages of a topic that will not come: reload what depends on them.
      */
     data class Gap(
-        val `topic`: kotlin.String, 
-        val `epoch`: kotlin.UInt, 
-        val `first`: kotlin.ULong?, 
-        val `last`: kotlin.ULong?, 
+        val `topic`: kotlin.String,
+        val `epoch`: kotlin.UInt,
+        val `first`: kotlin.ULong?,
+        val `last`: kotlin.ULong?,
         val `reason`: kotlin.String) : WseItem()
-        
+
     {
-        
+
 
         companion object
     }
-    
+
     data class ServerError(
-        val `code`: kotlin.String, 
-        val `text`: kotlin.String, 
+        val `code`: kotlin.String,
+        val `text`: kotlin.String,
         val `detailsJson`: kotlin.String) : WseItem()
-        
+
     {
-        
+
 
         companion object
     }
-    
+
     /**
      * The client stopped for good; `reason` when it was not closed by the application.
      */
     data class Closed(
         val `reason`: kotlin.String?) : WseItem()
-        
+
     {
-        
+
 
         companion object
     }
-    
+
     /**
      * Something this version does not know.
      */
     data class Unknown(
         val `name`: kotlin.String) : WseItem()
-        
+
     {
-        
+
 
         companion object
     }
-    
 
-    
 
-    
-    
+
+
+
+
 
 
     companion object
@@ -3727,13 +3727,13 @@ public object FfiConverterTypeWseItem : FfiConverterRustBuffer<WseItem>{
 
 
 enum class WseStatus {
-    
+
     CONNECTING,
     CONNECTED,
     RECONNECTING,
     CLOSED;
 
-    
+
 
 
     companion object
@@ -3764,24 +3764,24 @@ public object FfiConverterTypeWseStatus: FfiConverterRustBuffer<WseStatus> {
 
 
 sealed class WseTokenException: kotlin.Exception() {
-    
+
     class Failed(
-        
+
         val `reason`: kotlin.String
         ) : WseTokenException() {
         override val message
             get() = "reason=${ `reason` }"
     }
-    
 
-    
+
+
 
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<WseTokenException> {
         override fun lift(error_buf: RustBuffer.ByValue): WseTokenException = FfiConverterTypeWseTokenError.lift(error_buf)
     }
 
-    
+
 }
 
 /**
@@ -3789,7 +3789,7 @@ sealed class WseTokenException: kotlin.Exception() {
  */
 public object FfiConverterTypeWseTokenError : FfiConverterRustBuffer<WseTokenException> {
     override fun read(buf: ByteBuffer): WseTokenException {
-        
+
 
         return when(buf.getInt()) {
             1 -> WseTokenException.Failed(
@@ -4185,5 +4185,3 @@ public object FfiConverterSequenceTypeWseItem: FfiConverterRustBuffer<List<WseIt
         WseException.ErrorHandler,
     )
     }
-
-

@@ -785,4 +785,3 @@ export class WSESession {
     this.ctx.state.getState().setConnectionState(ConnectionState.DISCONNECTED);
   }
 }
-

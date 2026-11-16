@@ -398,7 +398,7 @@ private func uniffiTraitInterfaceCallWithError<T, E>(
         callStatus.pointee.errorBuf = FfiConverterString.lower(String(describing: error))
     }
 }
-// Initial value and increment amount for handles. 
+// Initial value and increment amount for handles.
 // These ensure that SWIFT handles always have the lowest bit set
 fileprivate let UNIFFI_HANDLEMAP_INITIAL: UInt64 = 1
 fileprivate let UNIFFI_HANDLEMAP_DELTA: UInt64 = 2
@@ -611,11 +611,11 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
  * Cancels the calls it is given to.
  */
 public protocol WseCancelProtocol: AnyObject, Sendable {
-    
-    func cancel() 
-    
+
+    func cancel()
+
     func isCancelled()  -> Bool
-    
+
 }
 /**
  * Cancels the calls it is given to.
@@ -678,9 +678,9 @@ public convenience init() {
         try! rustCall { uniffi_wse_ffi_fn_free_wsecancel(handle, $0) }
     }
 
-    
 
-    
+
+
 open func cancel()  {try! rustCall() {
         uniffiCallStatus in
     uniffi_wse_ffi_fn_method_wsecancel_cancel(
@@ -688,7 +688,7 @@ open func cancel()  {try! rustCall() {
     )
 }
 }
-    
+
 open func isCancelled() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
         uniffiCallStatus in
@@ -697,9 +697,9 @@ open func isCancelled() -> Bool  {
     )
 })
 }
-    
 
-    
+
+
 }
 
 
@@ -749,59 +749,59 @@ public func FfiConverterTypeWseCancel_lower(_ value: WseCancel) -> UInt64 {
 
 
 public protocol WseClientProtocol: AnyObject, Sendable {
-    
+
     func connectionId()  -> String?
-    
+
     /**
      * Closes the client: what was sent goes out first, within `deadline_ms`.
      */
-    func disconnect(deadlineMs: UInt64) async 
-    
+    func disconnect(deadlineMs: UInt64) async
+
     /**
      * The next batch of what the client heard: `ack` acknowledges the last
      * one (0: none yet); one not acknowledged comes again.
      */
     func nextBatch(ack: UInt64, maxItems: UInt32, maxBytes: UInt32, cancel: WseCancel) async throws  -> WseBatch
-    
-    func reconnect() throws 
-    
+
+    func reconnect() throws
+
     /**
      * Sends `{"t": kind, "p": json}`, waiting for room in the queue;
      * `cancel` gives up the wait (a message already queued still goes).
      */
-    func send(kind: String, json: String, cancel: WseCancel) async throws 
-    
+    func send(kind: String, json: String, cancel: WseCancel) async throws
+
     /**
      * `try_send_live`, waiting for room in the queue; `cancel` gives up
      * the wait.
      */
-    func sendLive(kind: String, json: String, cancel: WseCancel) async throws 
-    
+    func sendLive(kind: String, json: String, cancel: WseCancel) async throws
+
     /**
      * Sends a signed message on this connection, or not at all; the nonce it went with.
      */
     func sendSigned(kind: String, json: String, nonce: String?, cancel: WseCancel) async throws  -> String
-    
+
     func status()  -> WseStatus
-    
-    func subscribe(topics: [String]) throws 
-    
+
+    func subscribe(topics: [String]) throws
+
     /**
      * Sends `{"t": kind, "p": json}`; fails at once when the queue is full.
      */
-    func trySend(kind: String, json: String) throws 
-    
+    func trySend(kind: String, json: String) throws
+
     /**
      * Sends `{"t": kind, "p": json}` on the connection that is ready now, or not at all:
      * never on a later one. For commands that must not run late. Fails at once when the
      * queue is full.
      */
-    func trySendLive(kind: String, json: String) throws 
-    
-    func unsubscribe(topics: [String]) throws 
-    
+    func trySendLive(kind: String, json: String) throws
+
+    func unsubscribe(topics: [String]) throws
+
     func userId()  -> String?
-    
+
 }
 open class WseClient: WseClientProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -853,9 +853,9 @@ open class WseClient: WseClientProtocol, @unchecked Sendable {
         try! rustCall { uniffi_wse_ffi_fn_free_wseclient(handle, $0) }
     }
 
-    
 
-    
+
+
 open func connectionId() -> String?  {
     return try!  FfiConverterOptionString.lift(try! rustCall() {
         uniffiCallStatus in
@@ -864,7 +864,7 @@ open func connectionId() -> String?  {
     )
 })
 }
-    
+
     /**
      * Closes the client: what was sent goes out first, within `deadline_ms`.
      */
@@ -881,10 +881,10 @@ open func disconnect(deadlineMs: UInt64)async   {
             freeFunc: ffi_wse_ffi_rust_future_free_void,
             liftFunc: { $0 },
             errorHandler: nil
-            
+
         )
 }
-    
+
     /**
      * The next batch of what the client heard: `ack` acknowledges the last
      * one (0: none yet); one not acknowledged comes again.
@@ -904,7 +904,7 @@ open func nextBatch(ack: UInt64, maxItems: UInt32, maxBytes: UInt32, cancel: Wse
             errorHandler: FfiConverterTypeWseError_lift
         )
 }
-    
+
 open func reconnect()throws   {try rustCallWithError(FfiConverterTypeWseError_lift) {
         uniffiCallStatus in
     uniffi_wse_ffi_fn_method_wseclient_reconnect(
@@ -912,7 +912,7 @@ open func reconnect()throws   {try rustCallWithError(FfiConverterTypeWseError_li
     )
 }
 }
-    
+
     /**
      * Sends `{"t": kind, "p": json}`, waiting for room in the queue;
      * `cancel` gives up the wait (a message already queued still goes).
@@ -932,7 +932,7 @@ open func send(kind: String, json: String, cancel: WseCancel)async throws   {
             errorHandler: FfiConverterTypeWseError_lift
         )
 }
-    
+
     /**
      * `try_send_live`, waiting for room in the queue; `cancel` gives up
      * the wait.
@@ -952,7 +952,7 @@ open func sendLive(kind: String, json: String, cancel: WseCancel)async throws   
             errorHandler: FfiConverterTypeWseError_lift
         )
 }
-    
+
     /**
      * Sends a signed message on this connection, or not at all; the nonce it went with.
      */
@@ -971,7 +971,7 @@ open func sendSigned(kind: String, json: String, nonce: String?, cancel: WseCanc
             errorHandler: FfiConverterTypeWseError_lift
         )
 }
-    
+
 open func status() -> WseStatus  {
     return try!  FfiConverterTypeWseStatus_lift(try! rustCall() {
         uniffiCallStatus in
@@ -980,7 +980,7 @@ open func status() -> WseStatus  {
     )
 })
 }
-    
+
 open func subscribe(topics: [String])throws   {try rustCallWithError(FfiConverterTypeWseError_lift) {
         uniffiCallStatus in
     uniffi_wse_ffi_fn_method_wseclient_subscribe(
@@ -989,7 +989,7 @@ open func subscribe(topics: [String])throws   {try rustCallWithError(FfiConverte
     )
 }
 }
-    
+
     /**
      * Sends `{"t": kind, "p": json}`; fails at once when the queue is full.
      */
@@ -1002,7 +1002,7 @@ open func trySend(kind: String, json: String)throws   {try rustCallWithError(Ffi
     )
 }
 }
-    
+
     /**
      * Sends `{"t": kind, "p": json}` on the connection that is ready now, or not at all:
      * never on a later one. For commands that must not run late. Fails at once when the
@@ -1017,7 +1017,7 @@ open func trySendLive(kind: String, json: String)throws   {try rustCallWithError
     )
 }
 }
-    
+
 open func unsubscribe(topics: [String])throws   {try rustCallWithError(FfiConverterTypeWseError_lift) {
         uniffiCallStatus in
     uniffi_wse_ffi_fn_method_wseclient_unsubscribe(
@@ -1026,7 +1026,7 @@ open func unsubscribe(topics: [String])throws   {try rustCallWithError(FfiConver
     )
 }
 }
-    
+
 open func userId() -> String?  {
     return try!  FfiConverterOptionString.lift(try! rustCall() {
         uniffiCallStatus in
@@ -1035,9 +1035,9 @@ open func userId() -> String?  {
     )
 })
 }
-    
 
-    
+
+
 }
 
 
@@ -1090,9 +1090,9 @@ public func FfiConverterTypeWseClient_lower(_ value: WseClient) -> UInt64 {
  * Asked for the token before each connection attempt.
  */
 public protocol WseTokenSource: AnyObject, Sendable {
-    
+
     func token() async throws  -> String
-    
+
 }
 /**
  * Asked for the token before each connection attempt.
@@ -1147,9 +1147,9 @@ open class WseTokenSourceImpl: WseTokenSource, @unchecked Sendable {
         try! rustCall { uniffi_wse_ffi_fn_free_wsetokensource(handle, $0) }
     }
 
-    
 
-    
+
+
 open func token()async throws  -> String  {
     return
         try  await uniffiRustCallAsync(
@@ -1165,9 +1165,9 @@ open func token()async throws  -> String  {
             errorHandler: FfiConverterTypeWseTokenError_lift
         )
 }
-    
 
-    
+
+
 }
 
 
@@ -1331,9 +1331,9 @@ public struct WseBatch: Equatable, Hashable {
         self.items = items
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1347,8 +1347,8 @@ public struct FfiConverterTypeWseBatch: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseBatch {
         return
             try WseBatch(
-                id: FfiConverterUInt64.read(from: &buf), 
-                kind: FfiConverterTypeWseBatchKind.read(from: &buf), 
+                id: FfiConverterUInt64.read(from: &buf),
+                kind: FfiConverterTypeWseBatchKind.read(from: &buf),
                 items: FfiConverterSequenceTypeWseItem.read(from: &buf)
         )
     }
@@ -1409,10 +1409,10 @@ public struct WseConfig: Equatable, Hashable {
     public init(
         /**
          * ws://host:port/wse or wss://...
-         */url: String, token: String? = nil, topics: [String] = [], msgpack: Bool = false, headers: [WseHeader] = [], sendQueue: UInt32 = UInt32(0), reconnect: Bool = true, connectTimeoutMs: UInt64 = UInt64(0), readyTimeoutMs: UInt64 = UInt64(0), idleTimeoutMs: UInt64 = UInt64(0), recoveryTimeoutMs: UInt64 = UInt64(0), 
+         */url: String, token: String? = nil, topics: [String] = [], msgpack: Bool = false, headers: [WseHeader] = [], sendQueue: UInt32 = UInt32(0), reconnect: Bool = true, connectTimeoutMs: UInt64 = UInt64(0), readyTimeoutMs: UInt64 = UInt64(0), idleTimeoutMs: UInt64 = UInt64(0), recoveryTimeoutMs: UInt64 = UInt64(0),
         /**
          * End-to-end encryption pinned to these server identity keys (base64).
-         */serverIdentityKeys: [String] = [], 
+         */serverIdentityKeys: [String] = [],
         /**
          * This client's ECDSA P-256 private key (PKCS#8, PEM or DER), for signed messages.
          */signingKey: Data? = nil, serverSigningKeys: [String] = []) {
@@ -1432,9 +1432,9 @@ public struct WseConfig: Equatable, Hashable {
         self.serverSigningKeys = serverSigningKeys
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1448,19 +1448,19 @@ public struct FfiConverterTypeWseConfig: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseConfig {
         return
             try WseConfig(
-                url: FfiConverterString.read(from: &buf), 
-                token: FfiConverterOptionString.read(from: &buf), 
-                topics: FfiConverterSequenceString.read(from: &buf), 
-                msgpack: FfiConverterBool.read(from: &buf), 
-                headers: FfiConverterSequenceTypeWseHeader.read(from: &buf), 
-                sendQueue: FfiConverterUInt32.read(from: &buf), 
-                reconnect: FfiConverterBool.read(from: &buf), 
-                connectTimeoutMs: FfiConverterUInt64.read(from: &buf), 
-                readyTimeoutMs: FfiConverterUInt64.read(from: &buf), 
-                idleTimeoutMs: FfiConverterUInt64.read(from: &buf), 
-                recoveryTimeoutMs: FfiConverterUInt64.read(from: &buf), 
-                serverIdentityKeys: FfiConverterSequenceString.read(from: &buf), 
-                signingKey: FfiConverterOptionData.read(from: &buf), 
+                url: FfiConverterString.read(from: &buf),
+                token: FfiConverterOptionString.read(from: &buf),
+                topics: FfiConverterSequenceString.read(from: &buf),
+                msgpack: FfiConverterBool.read(from: &buf),
+                headers: FfiConverterSequenceTypeWseHeader.read(from: &buf),
+                sendQueue: FfiConverterUInt32.read(from: &buf),
+                reconnect: FfiConverterBool.read(from: &buf),
+                connectTimeoutMs: FfiConverterUInt64.read(from: &buf),
+                readyTimeoutMs: FfiConverterUInt64.read(from: &buf),
+                idleTimeoutMs: FfiConverterUInt64.read(from: &buf),
+                recoveryTimeoutMs: FfiConverterUInt64.read(from: &buf),
+                serverIdentityKeys: FfiConverterSequenceString.read(from: &buf),
+                signingKey: FfiConverterOptionData.read(from: &buf),
                 serverSigningKeys: FfiConverterSequenceString.read(from: &buf)
         )
     }
@@ -1510,9 +1510,9 @@ public struct WseHeader: Equatable, Hashable {
         self.value = value
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1526,7 +1526,7 @@ public struct FfiConverterTypeWseHeader: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseHeader {
         return
             try WseHeader(
-                name: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf),
                 value: FfiConverterString.read(from: &buf)
         )
     }
@@ -1572,11 +1572,11 @@ public struct WseMessage: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(kind: String, topic: String?, epoch: UInt32?, offset: UInt64?, id: String?, 
+    public init(kind: String, topic: String?, epoch: UInt32?, offset: UInt64?, id: String?,
         /**
          * The payload as JSON text (from msgpack too); None without one
          * (absent or null) or when it could not be decoded.
-         */json: String?, 
+         */json: String?,
         /**
          * Why the payload could not be decoded (msgpack JSON cannot show).
          */payloadError: String?, signature: WseSignature?) {
@@ -1590,9 +1590,9 @@ public struct WseMessage: Equatable, Hashable {
         self.signature = signature
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1606,13 +1606,13 @@ public struct FfiConverterTypeWseMessage: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseMessage {
         return
             try WseMessage(
-                kind: FfiConverterString.read(from: &buf), 
-                topic: FfiConverterOptionString.read(from: &buf), 
-                epoch: FfiConverterOptionUInt32.read(from: &buf), 
-                offset: FfiConverterOptionUInt64.read(from: &buf), 
-                id: FfiConverterOptionString.read(from: &buf), 
-                json: FfiConverterOptionString.read(from: &buf), 
-                payloadError: FfiConverterOptionString.read(from: &buf), 
+                kind: FfiConverterString.read(from: &buf),
+                topic: FfiConverterOptionString.read(from: &buf),
+                epoch: FfiConverterOptionUInt32.read(from: &buf),
+                offset: FfiConverterOptionUInt64.read(from: &buf),
+                id: FfiConverterOptionString.read(from: &buf),
+                json: FfiConverterOptionString.read(from: &buf),
+                payloadError: FfiConverterOptionString.read(from: &buf),
                 signature: FfiConverterOptionTypeWseSignature.read(from: &buf)
         )
     }
@@ -1666,9 +1666,9 @@ public struct WseSignature: Equatable, Hashable {
         self.verified = verified
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1682,9 +1682,9 @@ public struct FfiConverterTypeWseSignature: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseSignature {
         return
             try WseSignature(
-                body: FfiConverterString.read(from: &buf), 
-                sig: FfiConverterString.read(from: &buf), 
-                kid: FfiConverterString.read(from: &buf), 
+                body: FfiConverterString.read(from: &buf),
+                sig: FfiConverterString.read(from: &buf),
+                kid: FfiConverterString.read(from: &buf),
                 verified: FfiConverterBool.read(from: &buf)
         )
     }
@@ -1726,9 +1726,9 @@ public struct WseTopicRecovery: Equatable, Hashable {
         self.count = count
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1742,8 +1742,8 @@ public struct FfiConverterTypeWseTopicRecovery: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseTopicRecovery {
         return
             try WseTopicRecovery(
-                topic: FfiConverterString.read(from: &buf), 
-                recovered: FfiConverterBool.read(from: &buf), 
+                topic: FfiConverterString.read(from: &buf),
+                recovered: FfiConverterBool.read(from: &buf),
                 count: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -1773,7 +1773,7 @@ public func FfiConverterTypeWseTopicRecovery_lower(_ value: WseTopicRecovery) ->
 
 
 public enum WseBatchKind: Equatable, Hashable {
-    
+
     case items
     /**
      * Nothing more will come: the client closed.
@@ -1799,26 +1799,26 @@ public struct FfiConverterTypeWseBatchKind: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseBatchKind {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-        
+
         case 1: return .items
-        
+
         case 2: return .end
-        
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: WseBatchKind, into buf: inout [UInt8]) {
         switch value {
-        
-        
+
+
         case .items:
             writeInt(&buf, Int32(1))
-        
-        
+
+
         case .end:
             writeInt(&buf, Int32(2))
-        
+
         }
     }
 }
@@ -1843,11 +1843,11 @@ public func FfiConverterTypeWseBatchKind_lower(_ value: WseBatchKind) -> RustBuf
 /**
  * What went wrong. A kind added later reads as `Unknown`.
  */
-public 
+public
 enum WseError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
-    
-    
+
+
     case Config(reason: String
     )
     case Connect(reason: String
@@ -1876,15 +1876,15 @@ enum WseError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
     case Unknown(reason: String
     )
 
-    
 
-    
 
-    
+
+
+
     public var errorDescription: String? {
         String(reflecting: self)
     }
-    
+
 }
 
 #if compiler(>=6)
@@ -1901,9 +1901,9 @@ public struct FfiConverterTypeWseError: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
 
-        
 
-        
+
+
         case 1: return .Config(
             reason: try FfiConverterString.read(from: &buf)
             )
@@ -1950,84 +1950,84 @@ public struct FfiConverterTypeWseError: FfiConverterRustBuffer {
     public static func write(_ value: WseError, into buf: inout [UInt8]) {
         switch value {
 
-        
 
-        
-        
+
+
+
         case let .Config(reason):
             writeInt(&buf, Int32(1))
             FfiConverterString.write(reason, into: &buf)
-            
-        
+
+
         case let .Connect(reason):
             writeInt(&buf, Int32(2))
             FfiConverterString.write(reason, into: &buf)
-            
-        
+
+
         case let .Auth(reason):
             writeInt(&buf, Int32(3))
             FfiConverterString.write(reason, into: &buf)
-            
-        
+
+
         case let .Timeout(reason):
             writeInt(&buf, Int32(4))
             FfiConverterString.write(reason, into: &buf)
-            
-        
+
+
         case let .Encryption(reason):
             writeInt(&buf, Int32(5))
             FfiConverterString.write(reason, into: &buf)
-            
-        
+
+
         case let .Signing(reason):
             writeInt(&buf, Int32(6))
             FfiConverterString.write(reason, into: &buf)
-            
-        
+
+
         case let .GaveUp(reason):
             writeInt(&buf, Int32(7))
             FfiConverterString.write(reason, into: &buf)
-            
-        
+
+
         case .NotConnected:
             writeInt(&buf, Int32(8))
-        
-        
+
+
         case .Full:
             writeInt(&buf, Int32(9))
-        
-        
+
+
         case .Closed:
             writeInt(&buf, Int32(10))
-        
-        
+
+
         case let .Encode(reason):
             writeInt(&buf, Int32(11))
             FfiConverterString.write(reason, into: &buf)
-            
-        
+
+
         case let .Decode(reason):
             writeInt(&buf, Int32(12))
             FfiConverterString.write(reason, into: &buf)
-            
-        
+
+
         case .Cancelled:
             writeInt(&buf, Int32(13))
-        
-        
+
+
         case .Busy:
             writeInt(&buf, Int32(14))
-        
-        
+
+
         case let .Internal(reason):
             writeInt(&buf, Int32(15))
             FfiConverterString.write(reason, into: &buf)
-            
-        
+
+
         case let .Unknown(reason):
             writeInt(&buf, Int32(16))
             FfiConverterString.write(reason, into: &buf)
-            
+
         }
     }
 }
@@ -2053,7 +2053,7 @@ public func FfiConverterTypeWseError_lower(_ value: WseError) -> RustBuffer {
  */
 
 public enum WseItem: Equatable, Hashable {
-    
+
     case message(message: WseMessage
     )
     case binary(bytes: Data
@@ -2101,75 +2101,75 @@ public struct FfiConverterTypeWseItem: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseItem {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-        
+
         case 1: return .message(message: try FfiConverterTypeWseMessage.read(from: &buf)
         )
-        
+
         case 2: return .binary(bytes: try FfiConverterData.read(from: &buf)
         )
-        
+
         case 3: return .connected(connectionId: try FfiConverterString.read(from: &buf), userId: try FfiConverterOptionString.read(from: &buf), reconnected: try FfiConverterBool.read(from: &buf), recovery: try FfiConverterBool.read(from: &buf)
         )
-        
+
         case 4: return .disconnected(code: try FfiConverterOptionUInt16.read(from: &buf), reason: try FfiConverterString.read(from: &buf), retryInMs: try FfiConverterUInt64.read(from: &buf), attempt: try FfiConverterUInt32.read(from: &buf)
         )
-        
+
         case 5: return .subscribed(topics: try FfiConverterSequenceString.read(from: &buf), failed: try FfiConverterSequenceString.read(from: &buf), recovery: try FfiConverterSequenceTypeWseTopicRecovery.read(from: &buf)
         )
-        
+
         case 6: return .gap(topic: try FfiConverterString.read(from: &buf), epoch: try FfiConverterUInt32.read(from: &buf), first: try FfiConverterOptionUInt64.read(from: &buf), last: try FfiConverterOptionUInt64.read(from: &buf), reason: try FfiConverterString.read(from: &buf)
         )
-        
+
         case 7: return .serverError(code: try FfiConverterString.read(from: &buf), text: try FfiConverterString.read(from: &buf), detailsJson: try FfiConverterString.read(from: &buf)
         )
-        
+
         case 8: return .closed(reason: try FfiConverterOptionString.read(from: &buf)
         )
-        
+
         case 9: return .unknown(name: try FfiConverterString.read(from: &buf)
         )
-        
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: WseItem, into buf: inout [UInt8]) {
         switch value {
-        
-        
+
+
         case let .message(message):
             writeInt(&buf, Int32(1))
             FfiConverterTypeWseMessage.write(message, into: &buf)
-            
-        
+
+
         case let .binary(bytes):
             writeInt(&buf, Int32(2))
             FfiConverterData.write(bytes, into: &buf)
-            
-        
+
+
         case let .connected(connectionId,userId,reconnected,recovery):
             writeInt(&buf, Int32(3))
             FfiConverterString.write(connectionId, into: &buf)
             FfiConverterOptionString.write(userId, into: &buf)
             FfiConverterBool.write(reconnected, into: &buf)
             FfiConverterBool.write(recovery, into: &buf)
-            
-        
+
+
         case let .disconnected(code,reason,retryInMs,attempt):
             writeInt(&buf, Int32(4))
             FfiConverterOptionUInt16.write(code, into: &buf)
             FfiConverterString.write(reason, into: &buf)
             FfiConverterUInt64.write(retryInMs, into: &buf)
             FfiConverterUInt32.write(attempt, into: &buf)
-            
-        
+
+
         case let .subscribed(topics,failed,recovery):
             writeInt(&buf, Int32(5))
             FfiConverterSequenceString.write(topics, into: &buf)
             FfiConverterSequenceString.write(failed, into: &buf)
             FfiConverterSequenceTypeWseTopicRecovery.write(recovery, into: &buf)
-            
-        
+
+
         case let .gap(topic,epoch,first,last,reason):
             writeInt(&buf, Int32(6))
             FfiConverterString.write(topic, into: &buf)
@@ -2177,24 +2177,24 @@ public struct FfiConverterTypeWseItem: FfiConverterRustBuffer {
             FfiConverterOptionUInt64.write(first, into: &buf)
             FfiConverterOptionUInt64.write(last, into: &buf)
             FfiConverterString.write(reason, into: &buf)
-            
-        
+
+
         case let .serverError(code,text,detailsJson):
             writeInt(&buf, Int32(7))
             FfiConverterString.write(code, into: &buf)
             FfiConverterString.write(text, into: &buf)
             FfiConverterString.write(detailsJson, into: &buf)
-            
-        
+
+
         case let .closed(reason):
             writeInt(&buf, Int32(8))
             FfiConverterOptionString.write(reason, into: &buf)
-            
-        
+
+
         case let .unknown(name):
             writeInt(&buf, Int32(9))
             FfiConverterString.write(name, into: &buf)
-            
+
         }
     }
 }
@@ -2218,7 +2218,7 @@ public func FfiConverterTypeWseItem_lower(_ value: WseItem) -> RustBuffer {
 
 
 public enum WseStatus: Equatable, Hashable {
-    
+
     case connecting
     case connected
     case reconnecting
@@ -2243,38 +2243,38 @@ public struct FfiConverterTypeWseStatus: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseStatus {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-        
+
         case 1: return .connecting
-        
+
         case 2: return .connected
-        
+
         case 3: return .reconnecting
-        
+
         case 4: return .closed
-        
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: WseStatus, into buf: inout [UInt8]) {
         switch value {
-        
-        
+
+
         case .connecting:
             writeInt(&buf, Int32(1))
-        
-        
+
+
         case .connected:
             writeInt(&buf, Int32(2))
-        
-        
+
+
         case .reconnecting:
             writeInt(&buf, Int32(3))
-        
-        
+
+
         case .closed:
             writeInt(&buf, Int32(4))
-        
+
         }
     }
 }
@@ -2296,23 +2296,23 @@ public func FfiConverterTypeWseStatus_lower(_ value: WseStatus) -> RustBuffer {
 
 
 
-public 
+public
 enum WseTokenError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
-    
-    
+
+
     case Failed(reason: String
     )
 
-    
 
-    
 
-    
+
+
+
     public var errorDescription: String? {
         String(reflecting: self)
     }
-    
+
 }
 
 #if compiler(>=6)
@@ -2329,9 +2329,9 @@ public struct FfiConverterTypeWseTokenError: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
 
-        
 
-        
+
+
         case 1: return .Failed(
             reason: try FfiConverterString.read(from: &buf)
             )
@@ -2343,14 +2343,14 @@ public struct FfiConverterTypeWseTokenError: FfiConverterRustBuffer {
     public static func write(_ value: WseTokenError, into buf: inout [UInt8]) {
         switch value {
 
-        
 
-        
-        
+
+
+
         case let .Failed(reason):
             writeInt(&buf, Int32(1))
             FfiConverterString.write(reason, into: &buf)
-            
+
         }
     }
 }

@@ -26,6 +26,8 @@ gen="$target/swift-gen"
 rm -rf "${gen:?}"
 mkdir -p "$gen/include/WseFFIC"
 cargo run -q -p wse-bindgen --bin uniffi-bindgen-swift -- "$host_lib" "$here/Sources/WseFFI" --swift-sources
+# UniFFI leaves spaces at line ends.
+sed -i.bak -E 's/[[:space:]]+$//' "$here/Sources/WseFFI/WseFFI.swift" && rm -f "$here/Sources/WseFFI/WseFFI.swift.bak"
 cargo run -q -p wse-bindgen --bin uniffi-bindgen-swift -- "$host_lib" "$gen/include/WseFFIC" \
   --headers --modulemap --module-name WseFFIC --modulemap-filename module.modulemap \
   --link-frameworks Security --link-frameworks CoreFoundation
