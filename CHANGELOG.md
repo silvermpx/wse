@@ -99,7 +99,14 @@
   encrypted echo, a signed receipt); the XCFramework's tests run in the
   Release configuration on an iOS simulator; the Dart package's tests run
   on its prebuilt library on Linux (x64, arm64), macOS (arm64, x64) and
-  Windows; the npm package is bundled by Metro and compiled by Hermes.
+  Windows, and its example app on its prebuilt libraries on an Android
+  emulator (debug and release builds) and an iOS simulator; the npm
+  package is bundled by Metro and compiled by Hermes, the bundle runs
+  without TextEncoder and TextDecoder, and an app made from React Native's
+  template runs it in a release build (Hermes) on an emulator against a
+  server. The system's certificate verifier is
+  seen to connect where the system trusts the server's CA: on Linux, an
+  iOS simulator and an Android emulator.
 - Rust client: `pause(reason)` and `resume(reason)`, as in the TypeScript
   core client: the connection ends (what is queued goes out first) and no
   attempt is made while any reason holds; topics and positions stay, and
