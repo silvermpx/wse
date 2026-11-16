@@ -76,6 +76,7 @@ Support for:
 - Electron
 - Angular
 - Solid
+- Java and Kotlin on the JVM (servers and desktop apps)
 
 ## v3.0.1 (2026-11-15)
 
