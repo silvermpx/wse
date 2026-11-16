@@ -85,6 +85,28 @@ final class WseClientTests: XCTestCase {
         await client.disconnect(deadlineMs: 1_000)
     }
 
+    func testEveryCallReadsOneStreamOneReaderAtATime() async throws {
+        // No topics: past its first items the server stays quiet.
+        let client = try await WseClient.connect(WseConfig(url: url))
+        let events = client.events()
+        XCTAssertTrue(events === client.events())
+        let waiting = Task { while try await events.next() != nil {} }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        do {
+            _ = try await client.events().next()
+            XCTFail("a second reader read at the same time")
+        } catch WseError.Busy {}
+        waiting.cancel()
+        _ = try? await waiting.value
+        try await client.send(kind: "echo", json: #"{"text":"after"}"#)
+        var echoed: String?
+        while echoed == nil, let item = try await events.next() {
+            if case let .message(message) = item, message.kind == "echoed" { echoed = message.json }
+        }
+        XCTAssertEqual(echoed, #"{"text":"after"}"#)
+        await client.disconnect(deadlineMs: 1_000)
+    }
+
     func testAPayloadMustBeJson() async throws {
         let client = try await WseClient.connect(WseConfig(url: url))
         XCTAssertThrowsError(try client.trySend(kind: "x", json: "not json"))

@@ -88,6 +88,9 @@ pub(crate) struct Shared {
     pub(crate) token: Mutex<Option<String>>,
     /// The server's signing key: what signed messages are for.
     pub(crate) server_kid: Mutex<Option<String>>,
+    /// Stops the connection's task where it stands: a close past its
+    /// deadline.
+    stop: Mutex<Option<futures_util::future::AbortHandle>>,
 }
 
 impl Shared {
@@ -99,6 +102,7 @@ impl Shared {
             connection: Mutex::new(None),
             token: Mutex::new(token),
             server_kid: Mutex::new(None),
+            stop: Mutex::new(None),
         }
     }
 }
@@ -184,20 +188,34 @@ impl Client {
         let handler = make(for_handler);
         let (first_tx, first_rx) = oneshot::channel();
         let ended = (Arc::clone(&shared), status_tx.clone());
+        let (stop, stopped) = futures_util::future::AbortHandle::new_pair();
+        if let Ok(mut slot) = shared.stop.lock() {
+            *slot = Some(stop);
+        }
         let driver = Driver::new(
             config, handler, shared, keys, frames_rx, control_rx, status_tx,
         );
         let run = async move {
             use futures_util::FutureExt;
-            // A handler that panics ends the client, which says so.
-            if std::panic::AssertUnwindSafe(driver.run(Some(first_tx)))
-                .catch_unwind()
-                .await
-                .is_err()
-            {
-                let (shared, status) = ended;
-                shared.ready.store(false, Ordering::Release);
-                status.send_replace(Status::Closed(Some(Error::Panicked)));
+            let driven = futures_util::future::Abortable::new(
+                std::panic::AssertUnwindSafe(driver.run(Some(first_tx))).catch_unwind(),
+                stopped,
+            )
+            .await;
+            let (shared, status) = ended;
+            match driven {
+                Ok(Ok(())) => {}
+                // A handler that panics ends the client, which says so.
+                Ok(Err(_)) => {
+                    shared.ready.store(false, Ordering::Release);
+                    status.send_replace(Status::Closed(Some(Error::Panicked)));
+                }
+                // Stopped by a close past its deadline: the connection went
+                // with the task.
+                Err(_) => {
+                    shared.ready.store(false, Ordering::Release);
+                    status.send_replace(Status::Closed(None));
+                }
             }
         };
         #[cfg(not(target_arch = "wasm32"))]
@@ -366,6 +384,21 @@ impl Client {
     pub async fn close(&self) {
         let _ = self.control.send(Control::Close);
         self.closed().await;
+    }
+
+    /// Closes the client, giving what is queued `deadline` to go out: past
+    /// it the connection is dropped where it stands (a link that takes
+    /// nothing holds a close for as long as the system keeps the
+    /// connection).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn close_within(&self, deadline: std::time::Duration) {
+        let _ = self.control.send(Control::Close);
+        if tokio::time::timeout(deadline, self.closed()).await.is_err() {
+            if let Some(stop) = self.shared.stop.lock().ok().and_then(|slot| slot.clone()) {
+                stop.abort();
+            }
+            self.closed().await;
+        }
     }
 
     /// Waits until the client stops for good; the reason, unless the

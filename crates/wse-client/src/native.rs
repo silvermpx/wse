@@ -716,7 +716,7 @@ impl NativeClient {
         let client = self.client.clone();
         let deadline = Duration::from_millis(deadline_ms.max(1));
         let _ = on_runtime(async move {
-            let _ = tokio::time::timeout(deadline, client.close()).await;
+            client.close_within(deadline).await;
             Ok(())
         })
         .await;

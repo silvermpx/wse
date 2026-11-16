@@ -1226,3 +1226,24 @@ async fn a_live_message_goes_on_its_own_connection_or_not_at_all() {
     client.close().await;
     stand.server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_close_past_its_deadline_drops_a_stuck_connection() {
+    let mut stand = stand().await;
+    let link = Link::to(&stand.url).await;
+    let mut config = Config::new(&link.url);
+    config.token = Some(stand.token("dee"));
+    config.send_queue = 4;
+    let (client, _events) = wse_client::connect(config).await.unwrap();
+    stand.connect_id().await;
+    // The network takes nothing: what is queued cannot go out.
+    link.hold(true);
+    fill_queue(&client, "stuck", &json!({ "pad": noise(64 * 1024) }));
+    let started = std::time::Instant::now();
+    client.close_within(Duration::from_millis(300)).await;
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(2), "closed after {took:?}");
+    assert!(matches!(client.status(), wse_client::Status::Closed(_)));
+    assert!(!client.is_connected());
+    stand.server.stop().await;
+}

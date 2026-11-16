@@ -15,10 +15,12 @@ public extension WseClient {
         }
     }
 
-    /// What the server sends, in order, until the client closes. One reader
-    /// at a time: a second gets `WseError.Busy`.
+    /// What the server sends, in order, until the client closes. Every call
+    /// reads the client's one stream (with the limits of the first, while it
+    /// is held): an item goes to one reader, and a second reading at the
+    /// same time gets `WseError.Busy`.
     func events(maxItems: UInt32 = 256, maxBytes: UInt32 = 1 << 20) -> WseEvents {
-        WseEvents(client: self, maxItems: maxItems, maxBytes: maxBytes)
+        WseEvents.of(self, maxItems: maxItems, maxBytes: maxBytes)
     }
 
     /// Sends `{"t": kind, "p": json}`, waiting for room in the queue.
@@ -57,6 +59,19 @@ private func cancellable<T>(_ call: (WseCancel) async throws -> T) async throws 
 public final class WseEvents: AsyncSequence, @unchecked Sendable {
     public typealias Element = WseItem
 
+    /// Each client's reader while one is held.
+    private static let readers = NSMapTable<WseClient, WseEvents>.weakToWeakObjects()
+    private static let readersLock = NSLock()
+
+    static func of(_ client: WseClient, maxItems: UInt32, maxBytes: UInt32) -> WseEvents {
+        readersLock.lock()
+        defer { readersLock.unlock() }
+        if let reader = readers.object(forKey: client) { return reader }
+        let reader = WseEvents(client: client, maxItems: maxItems, maxBytes: maxBytes)
+        readers.setObject(reader, forKey: client)
+        return reader
+    }
+
     private let client: WseClient
     private let maxItems: UInt32
     private let maxBytes: UInt32
@@ -64,8 +79,10 @@ public final class WseEvents: AsyncSequence, @unchecked Sendable {
     private var index = 0
     private var acknowledged: UInt64 = 0
     private var ended = false
+    private let lock = NSLock()
+    private var reading = false
 
-    init(client: WseClient, maxItems: UInt32, maxBytes: UInt32) {
+    private init(client: WseClient, maxItems: UInt32, maxBytes: UInt32) {
         self.client = client
         self.maxItems = maxItems
         self.maxBytes = maxBytes
@@ -84,6 +101,18 @@ public final class WseEvents: AsyncSequence, @unchecked Sendable {
     }
 
     func next() async throws -> WseItem? {
+        lock.lock()
+        if reading {
+            lock.unlock()
+            throw WseError.Busy
+        }
+        reading = true
+        lock.unlock()
+        defer {
+            lock.lock()
+            reading = false
+            lock.unlock()
+        }
         while true {
             if let batch, index < batch.items.count {
                 index += 1

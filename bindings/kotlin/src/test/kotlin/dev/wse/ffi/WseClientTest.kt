@@ -5,6 +5,7 @@ package dev.wse.ffi
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
@@ -81,6 +82,27 @@ class WseClientTest {
             if (item is WseItem.Message && item.message.topic == "ticks") next = item.message.offset
         }
         assertEquals(first!! + 1u, next)
+        client.disconnect(1_000u)
+    }
+
+    @Test
+    fun everyCallReadsOneStreamOneReaderAtATime(): Unit = runBlocking {
+        // No topics: past its first items the server stays quiet.
+        val client = connectClient(WseConfig(url = url))
+        val events = client.events()
+        assertSame(events, client.events())
+        val waiting = launch { while (events.next() != null) {} }
+        delay(300)
+        assertFailsWith<WseException.Busy> { client.events().next() }
+        waiting.cancel()
+        waiting.join()
+        client.send("echo", "{\"text\":\"after\"}")
+        var echoed: String? = null
+        while (echoed == null) {
+            val item = events.next() ?: break
+            if (item is WseItem.Message && item.message.kind == "echoed") echoed = item.message.json
+        }
+        assertEquals("{\"text\":\"after\"}", echoed)
         client.disconnect(1_000u)
     }
 
