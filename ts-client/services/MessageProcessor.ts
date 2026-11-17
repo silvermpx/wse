@@ -2233,6 +2233,17 @@ export class MessageProcessor {
     this.enqueueInMemory(message, was.priority, was.expiresAt, was.owner, undefined, was.requires, was.timestamp);
   }
 
+  /**
+   * A message that could not be sealed: one of the outbox waits there, for a
+   * later connection (and is never taken for one written); any other is
+   * dropped, as it would fail again.
+   */
+  unsealed(message: WSMessage): void {
+    if (this.ctx.outbox.current?.has(message)) return;
+    this.countDropped(1);
+    logger.warn(`Dropping ${message.t}: it could not be sealed`);
+  }
+
   /** A message about to be written may still go: its user is the client's, the topics it requires continuous. */
   mayStillGo(message: WSMessage): boolean {
     const was = this.handedOver.get(message);

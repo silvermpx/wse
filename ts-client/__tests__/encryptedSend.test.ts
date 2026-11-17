@@ -237,3 +237,30 @@ it('goes on sealing what comes after a sealed frame the socket would not take, a
   expect(open.sealing).toBe(0);
   manager.destroy();
 });
+
+it('says one outcome of each send to a server that does not answer, when an earlier one could not be sealed', async () => {
+  const original = SecurityManager.prototype.encryptForTransport;
+  const spy = vi
+    .spyOn(SecurityManager.prototype, 'encryptForTransport')
+    .mockImplementation(async function (this: SecurityManager, data: string) {
+      if (data.includes('fails-first')) throw new Error('a local encryption failure');
+      return original.call(this, data);
+    });
+  try {
+    const c = client({ offline: { enabled: true } });
+    const delivered: string[] = [];
+    c.on('wseDelivered', (d: { ids: string[] }) => delivered.push(...d.ids));
+    c.retain();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const socket = await open(c, 'u');
+    c.send('order', { n: 1 }, { id: 'fails-first' });
+    c.send('order', { n: 2 }, { id: 'second' });
+    await settle();
+    // Only the second went: it alone is delivered, the first waits.
+    expect(await socket.orders()).toEqual([{ n: 2 }]);
+    expect(delivered).toEqual(['second']);
+    expect(c.kept()).toBe(1);
+  } finally {
+    spy.mockRestore();
+  }
+});

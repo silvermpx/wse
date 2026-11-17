@@ -776,18 +776,22 @@ export class Outbox {
       }
     }
     if (at < 0) return outcomes;
-    let taken = 0;
-    while (this.head <= at) {
-      const record = this.records[this.head];
-      this.records[this.head] = undefined as unknown as Kept;
+    // It alone is taken: one handed before it and not written (it could not
+    // be sealed, or could not go then) was handed back, and waits.
+    const record = this.records[at];
+    this.count--;
+    this.bytes -= record.size;
+    deliver(outcomes, record.id, record.tag);
+    if (at === this.head) {
+      this.records[at] = undefined as unknown as Kept;
       this.head++;
-      this.count--;
-      this.bytes -= record.size;
-      deliver(outcomes, record.id, record.tag);
-      taken = record.s;
+      this.compact();
+      this.put({ ack: record.s });
+    } else {
+      this.records.splice(at, 1);
+      this.cursor--;
+      this.put({ drop: [record.s] });
     }
-    this.compact();
-    this.put({ ack: taken });
     return outcomes;
   }
 

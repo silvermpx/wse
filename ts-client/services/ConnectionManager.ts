@@ -124,6 +124,8 @@ export interface ConnectionManagerConfig {
 
   /** Called with a message accepted by trySend() whose socket vanished before it went out. */
   onUndeliverable?: (message: WSMessage) => void;
+  /** Called with a message accepted by trySend() that could not be sealed: it was not written. */
+  onUnsealed?: (message: WSMessage) => void;
   /**
    * A message accepted to be sealed may still go, right before its frame is
    * written (its user, the topics it requires): false hands it back through
@@ -1109,7 +1111,10 @@ export class ConnectionManager {
               if (socketId !== this.socketId) {
                 this.reportUndeliverable(message);
               } else {
-                logger.error('[ConnectionManager] Encryption failed, message dropped:', errorMessage(error));
+                // Not sealed, so not written: it is said so, never taken
+                // for one that went.
+                logger.error('[ConnectionManager] Encryption failed:', errorMessage(error));
+                this.config.onUnsealed?.(message);
               }
               return;
             }

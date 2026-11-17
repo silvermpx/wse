@@ -528,6 +528,7 @@ export class WSESession {
           this.processor.handleConnectionClosed();
         },
         onUndeliverable: (message) => this.processor.requeue(message),
+        onUnsealed: (message) => this.processor.unsealed(message),
         mayStillGo: (message) => this.processor.mayStillGo(message),
         maxPendingEncrypted: o.performance.maxPendingEncrypted,
         maxPendingEncryptedBytes: o.performance.maxPendingEncryptedBytes,
