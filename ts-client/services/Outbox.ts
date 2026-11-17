@@ -233,6 +233,8 @@ export class Outbox {
   /** A write of the store failed: it is written anew, at most once a second. */
   private owedRewrite = false;
   private healAt = 0;
+  /** The rewrite owed, once the second after the last one is over. */
+  private healTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly store: OutboxStore | null;
   private readonly report: (operation: string, error: unknown) => void;
   private readonly onOpen?: (durable: boolean) => void;
@@ -332,7 +334,8 @@ export class Outbox {
   private letGo(): void {
     const log = this.log;
     if (!log) return;
-    this.flushNow();
+    // A rewrite owed goes now: the store is not this outbox's after this.
+    this.flushNow(true);
     this.log = null;
     log.close();
   }
@@ -412,11 +415,13 @@ export class Outbox {
     };
   }
 
-  /** Its timer stops: the client ended. */
+  /** Its timers stop: the client ended. */
   dispose(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     this.timerAt = Infinity;
+    if (this.healTimer) clearTimeout(this.healTimer);
+    this.healTimer = null;
   }
 
   /** The timer, for the first message not written yet to run out. */
@@ -760,9 +765,11 @@ export class Outbox {
   /**
    * Hands the batch to the store; writes it anew instead once what went
    * outweighs what is kept, or after a write failed (the batch is in what is
-   * written anew).
+   * written anew): at most once a second, the next one on a timer of its own
+   * so that it comes with no further change, and at once when the store is
+   * let go (`closing`).
    */
-  private flushNow(): void {
+  private flushNow(closing = false): void {
     const log = this.log;
     if (!log) return;
     if (this.written > this.loggedWritten) {
@@ -772,12 +779,23 @@ export class Outbox {
     if (log.takeBroken()) this.owedRewrite = true;
     if (this.owedRewrite) {
       const now = monotonic();
-      if (now >= this.healAt) {
+      if (closing || now >= this.healAt) {
         this.owedRewrite = false;
         this.healAt = now + 1000;
+        if (this.healTimer) clearTimeout(this.healTimer);
+        this.healTimer = null;
         log.rewrite(this.state());
       } else {
         log.forget();
+        if (!this.healTimer) {
+          const timer = setTimeout(() => {
+            this.healTimer = null;
+            this.flushNow();
+          }, this.healAt - now);
+          // A process that ends writes its store as it goes (the file's exit).
+          (timer as { unref?: () => void }).unref?.();
+          this.healTimer = timer;
+        }
       }
     } else if (log.lines > 2 * this.count + 64) {
       log.rewrite(this.state());

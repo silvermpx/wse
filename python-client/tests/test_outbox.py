@@ -260,6 +260,14 @@ class TestTheFileFormat:
         assert read.user == damaged["user"]
 
 
+def until(test, within: float = 5.0) -> None:
+    """Waits until *test* holds, or fails after *within* seconds."""
+    deadline = time.monotonic() + within
+    while not test():
+        assert time.monotonic() < deadline, "not within the time"
+        time.sleep(0.01)
+
+
 class TestTheOutboxInAFile:
     @staticmethod
     def offline(tmp_path) -> Offline:
@@ -344,6 +352,43 @@ class TestTheOutboxInAFile:
         assert again.size == 0
         assert add(again, "next") == 301
         again.close_file()
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="a directory that takes no file",
+    )
+    def test_a_rewrite_owed_within_the_second_comes_when_woken(self, tmp_path):
+        offline = self.offline(tmp_path)
+        said: list[str] = []
+        outbox = Outbox(offline, report=lambda op, why: said.append(op))
+        woken: list[float] = []
+        outbox.wake = woken.append
+        answering(outbox)
+        tmp_path.chmod(0o500)
+        try:
+            # Enough went to write the file anew: that fails (the folder
+            # takes no file), and so does the rewrite at once after it.
+            for i in range(100):
+                s = add(outbox, f"m{i}")
+                outbox.due(0, Outcomes())
+                outbox.acked(s)
+            until(lambda: said == ["write"])
+            add(outbox, "a")
+            outbox.due(0, Outcomes())
+            time.sleep(0.2)
+        finally:
+            tmp_path.chmod(0o700)
+        # Within the second after that rewrite: none yet, a wake asked for.
+        woken.clear()
+        add(outbox, "b")
+        outbox.due(0, Outcomes())
+        assert len(woken) == 1 and 0 < woken[0] <= 1.0
+        time.sleep(woken[0])
+        outbox.flush()
+        # The file holds both, with no close and no further change.
+        until(lambda: '"b"' in (tmp_path / "queue").read_text())
+        assert '"a"' in (tmp_path / "queue").read_text()
+        outbox.close_file()
 
     @pytest.mark.skipif(
         sys.platform == "win32" or os.geteuid() == 0,

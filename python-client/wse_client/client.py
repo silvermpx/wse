@@ -447,9 +447,12 @@ class AsyncWSEClient:
         self._loop_seen: asyncio.AbstractEventLoop | None = None
         self._storage_failures: list[tuple[str, str]] = []
         self._outbox: Outbox | None = None
+        # The rewrite of the outbox's file owed after a failed write.
+        self._outbox_heal: asyncio.TimerHandle | None = None
         if offline is not None:
             # The outbox of the client it goes on from (SyncWSEClient's).
             self._outbox = _outbox or Outbox(offline, report=self._outbox_report)
+            self._outbox.wake = self._outbox_wake
         self._outbox_timer: asyncio.TimerHandle | None = None
         self._outbox_writing = False
         self._outbox_again = False
@@ -935,6 +938,22 @@ class AsyncWSEClient:
             self._outbox_timer.cancel()
         delay = max(0.0, at - time.time())
         self._outbox_timer = loop.call_later(delay, self._outbox_expired)
+
+    def _outbox_wake(self, delay: float) -> None:
+        """A rewrite of the outbox's file is owed in *delay* seconds: the
+        loop makes it then, whether or not anything else changes."""
+        if self._outbox_heal is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._outbox_heal = loop.call_later(max(0.0, delay), self._outbox_healed)
+
+    def _outbox_healed(self) -> None:
+        self._outbox_heal = None
+        if self._outbox is not None:
+            self._outbox.flush()
 
     def _outbox_expired(self) -> None:
         self._outbox_timer = None

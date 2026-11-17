@@ -182,4 +182,42 @@ describe('the outbox in the app storage (React Native)', () => {
     await vi.waitFor(() => expect(messages(storage)).toEqual([1, 2]));
     outbox.close();
   });
+
+  /** An outbox whose storage failed twice in a row, the second time on
+   * the rewrite: a third message comes within the second after it. */
+  async function failedTwice() {
+    const storage = asyncStorage();
+    const said: string[] = [];
+    const outbox = new Outbox(limits, {
+      store: storageOutbox(storage),
+      onStorageError: (operation) => said.push(operation),
+    });
+    await outbox.opened;
+    const multiSet = storage.multiSet!;
+    storage.multiSet = async () => {
+      throw new Error('full');
+    };
+    add(outbox, 'a');
+    await vi.waitFor(() => expect(said).toEqual(['write']));
+    // The rewrite, at once, fails too.
+    add(outbox, 'b');
+    await settled();
+    storage.multiSet = multiSet;
+    add(outbox, 'c');
+    await settled();
+    return { storage, outbox };
+  }
+
+  it('writes it whole once the second is over, with no more change to wait for', async () => {
+    const { storage, outbox } = await failedTwice();
+    await vi.waitFor(() => expect(messages(storage)).toEqual([1, 2, 3]), { timeout: 2_000 });
+    outbox.close();
+  });
+
+  it('writes it whole when it closes within the second', async () => {
+    const { storage, outbox } = await failedTwice();
+    outbox.close();
+    await settled();
+    expect(messages(storage)).toEqual([1, 2, 3]);
+  });
 });

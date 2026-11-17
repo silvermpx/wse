@@ -969,13 +969,14 @@ impl<H: Handler> Session<H> {
     }
 
     /// Messages of the outbox that waited too long to be sent go, and the
-    /// application hears of them.
+    /// application hears of them; a rewrite of its store owed goes.
     pub(crate) fn expire_outbox(&mut self, now: Instant) {
         if let Some(outbox) = &mut self.outbox
             && outbox.deadline().is_some_and(|at| at <= now)
         {
             let mut outcomes = crate::outbox::Outcomes::default();
             outbox.expire(crate::outbox::now_ms(), &mut outcomes);
+            outbox.heal(now);
             self.report_outcomes(outcomes);
         }
     }

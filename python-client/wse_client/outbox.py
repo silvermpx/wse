@@ -167,6 +167,10 @@ class Outbox:
         self._log: _Log | None = None
         self._owed = False
         self._heal_at = 0.0
+        # Called with the seconds until a rewrite owed can go (one a second
+        # at most): the client's loop calls flush() then, whether or not
+        # anything changes meanwhile.
+        self.wake: Callable[[float], None] | None = None
         if offline.path is not None:
             try:
                 self._log, read = _Log.open(offline.path, self._report)
@@ -512,6 +516,8 @@ class Outbox:
                 self._rewrite()
             else:
                 log.forget()
+                if self.wake is not None:
+                    self.wake(self._heal_at - now)
         elif log.lines > 2 * self._count + 64:
             self._rewrite()
         else:

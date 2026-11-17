@@ -332,6 +332,9 @@ pub(crate) struct Outbox {
     /// second (`heal_at`, ms since the epoch), and when the outbox goes.
     owed: bool,
     heal_at: u64,
+    /// When a rewrite owed within that second can go: the driver wakes for
+    /// it ([`Outbox::deadline`]), whether or not anything changes meanwhile.
+    heal: Option<Instant>,
     report: Report,
 }
 
@@ -417,6 +420,7 @@ impl Outbox {
             database: offline.database.clone(),
             owed: false,
             heal_at: 0,
+            heal: None,
             report,
         };
         #[cfg(not(target_arch = "wasm32"))]
@@ -486,9 +490,21 @@ impl Outbox {
         self.records.len()
     }
 
-    /// When the first message not written yet runs out.
+    /// When the driver is to wake for the outbox: the first message not
+    /// written yet runs out, or a rewrite owed can go.
     pub(crate) fn deadline(&self) -> Option<Instant> {
-        self.deadline
+        match (self.deadline, self.heal) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// A rewrite owed whose time came goes.
+    pub(crate) fn heal(&mut self, now: Instant) {
+        if self.heal.is_some_and(|at| at <= now) {
+            self.heal = None;
+            self.flush();
+        }
     }
 
     /// Keeps a message the application sent, `text` a JSON object after
@@ -838,9 +854,11 @@ impl Outbox {
                 if now >= self.heal_at {
                     self.owed = false;
                     self.heal_at = now.saturating_add(1000);
+                    self.heal = None;
                     self.rewrite();
                 } else {
                     log.forget();
+                    self.heal = Some(Instant::now() + Duration::from_millis(self.heal_at - now));
                 }
             } else if log.lines > 2 * self.records.len() + 64 {
                 self.rewrite();
@@ -2099,6 +2117,71 @@ mod tests {
                     }
                 }
             }
+        }
+
+        /// A rewrite owed within the second after the last one comes on the
+        /// outbox's deadline, with no further change to wait for.
+        #[cfg(unix)]
+        #[test]
+        fn a_rewrite_owed_within_the_second_comes_on_the_deadline() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = dir();
+            let path = dir.join("queue");
+            let said = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = Arc::clone(&said);
+            let report: Report = Arc::new(move |operation, why| {
+                seen.lock().unwrap().push((operation, why));
+            });
+            let offline = Offline::in_file(&path);
+            let mut outbox = Outbox::open(&offline, Arc::new(Room::new(&offline)), report);
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+            if std::fs::write(dir.join("probe"), b"").is_ok() {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+                drop(outbox);
+                std::fs::remove_dir_all(&dir).unwrap();
+                return;
+            }
+            answering(&mut outbox, 0);
+            let mut outcomes = Outcomes::default();
+            // Enough went to write the file anew: that fails (the folder
+            // takes no file), and so does the rewrite at once after it.
+            for round in 0..100 {
+                let s = add(&mut outbox, &format!("m{round}"));
+                due(&mut outbox, 0, &mut outcomes);
+                outbox.acked(s);
+            }
+            for _ in 0..250 {
+                if !said.lock().unwrap().is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            add(&mut outbox, "a");
+            due(&mut outbox, 0, &mut outcomes);
+            std::thread::sleep(Duration::from_millis(200));
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            // Within the second after that rewrite: none yet, a deadline for it.
+            add(&mut outbox, "b");
+            due(&mut outbox, 0, &mut outcomes);
+            let at = outbox.deadline().expect("a deadline for the rewrite owed");
+            assert!(at <= Instant::now() + Duration::from_secs(1));
+            std::thread::sleep(at.saturating_duration_since(Instant::now()));
+            outbox.heal(Instant::now());
+            // On disk with no further change: its file holds both.
+            let mut both = false;
+            for _ in 0..250 {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                if text.contains(r#""id":"a""#) && text.contains(r#""id":"b""#) {
+                    both = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(both, "the file written anew with a and b");
+            assert_eq!(outbox.heal, None, "nothing owed any more");
+            drop(outbox);
+            std::fs::remove_dir_all(&dir).unwrap();
         }
 
         /// A file that cannot be written anew says so once, and is written
