@@ -704,6 +704,33 @@ fn a_full_command_queue_refuses_the_applications_sends() {
 }
 
 #[test]
+fn an_event_refused_for_a_full_queue_goes_when_sent_again() {
+    let shared = Arc::new(Config::default().into_state().unwrap());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let queued = Arc::new(AtomicUsize::new(state::COMMAND_QUEUE));
+    shared
+        .commands
+        .store(Some(Arc::new(Commands::new(tx, Arc::clone(&queued)))));
+    shared
+        .conn_last_activity
+        .insert("c".to_owned(), Arc::new(state::Activity::default()));
+    let publisher = Publisher::new(Arc::clone(&shared));
+    let event = || {
+        serde_json::json!({"t": "price", "id": "e1", "p": {}})
+            .as_object()
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(publisher.send_event("c", event(), 0), Err(Error::Full));
+    // With room again, the event the queue refused goes, once.
+    queued.store(0, Ordering::Relaxed);
+    assert!(publisher.send_event("c", event(), 0).unwrap() > 0);
+    assert_eq!(publisher.send_event("c", event(), 0), Ok(0));
+    assert!(rx.try_recv().is_ok());
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn a_message_published_while_a_connection_subscribes_reaches_it() {
     let state = Config {
         recovery: Some(RecoverySettings::default()),

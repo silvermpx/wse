@@ -322,21 +322,49 @@ impl Publisher {
             return Ok(0);
         }
         // Once to each connection: the same id to another connection is a
-        // send of its own.
-        if let Some(id) = event.get("id").and_then(serde_json::Value::as_str) {
-            let key = format!("{conn_id}\0{id}");
-            let mut dedup = shared.dedup.lock().unwrap_or_else(|e| e.into_inner());
-            if !dedup.seen.insert(key.clone()) {
-                return Ok(0);
+        // send of its own. Its place is taken now, so that two sends of it at
+        // once go once, and given back when it does not go.
+        let taken = match event.get("id").and_then(serde_json::Value::as_str) {
+            Some(id) => {
+                let key = format!("{conn_id}\0{id}");
+                let mut dedup = shared.dedup.lock().unwrap_or_else(|e| e.into_inner());
+                if !dedup.seen.insert(key.clone()) {
+                    return Ok(0);
+                }
+                dedup.queue.push_back(key.clone());
+                while dedup.queue.len() > dedup.max_entries {
+                    if let Some(old) = dedup.queue.pop_front() {
+                        dedup.seen.remove(&old);
+                    }
+                }
+                Some(key)
             }
-            dedup.queue.push_back(key);
-            while dedup.queue.len() > dedup.max_entries {
-                if let Some(old) = dedup.queue.pop_front() {
-                    dedup.seen.remove(&old);
+            None => None,
+        };
+        let sent = self.queue_event(conn_id, event, compression_threshold);
+        if sent.is_err()
+            && let Some(key) = taken
+        {
+            let mut dedup = shared.dedup.lock().unwrap_or_else(|e| e.into_inner());
+            if dedup.seen.remove(&key) {
+                if dedup.queue.back() == Some(&key) {
+                    dedup.queue.pop_back();
+                } else {
+                    dedup.queue.retain(|k| *k != key);
                 }
             }
         }
+        sent
+    }
 
+    /// The event in its envelope, in the connection's format, queued.
+    fn queue_event(
+        &self,
+        conn_id: &str,
+        event: serde_json::Map<String, serde_json::Value>,
+        compression_threshold: usize,
+    ) -> Result<usize, Error> {
+        let shared = &self.shared;
         // c first, t second, v last.
         let msg_type = event
             .get("t")
