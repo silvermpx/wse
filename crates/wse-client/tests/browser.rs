@@ -18,7 +18,9 @@ use serde_json::json;
 use wasm_bindgen_test::wasm_bindgen_test;
 #[cfg(feature = "aws-lc")]
 use wse_client::Encryption;
-use wse_client::{Config, Continuity, Delivery, Event, Events, Incoming, OwnedMessage, Resync};
+use wse_client::{
+    Config, Continuity, Delivery, Event, Events, Incoming, Offline, OwnedMessage, Resync,
+};
 
 const URL: Option<&str> = option_env!("WSE_TEST_URL");
 #[cfg(feature = "aws-lc")]
@@ -258,5 +260,197 @@ async fn signed_messages_from_the_browser() {
     let receipt = message(&mut events, "receipt").await;
     assert_eq!(receipt.payload_value().unwrap()["n"], "web-1");
     assert!(receipt.signature().unwrap().verified);
+    client.close().await;
+}
+
+// -- The outbox in IndexedDB ---------------------------------------------------
+//
+// Node has neither IndexedDB nor Web Locks: fake-indexeddb (the
+// repository's development dependency: `npm ci` first) stands for the one,
+// and locks kept as a browser keeps them for the other.
+
+/// IndexedDB and Web Locks in this Node, once.
+fn browser_storage() {
+    let install = js_sys::Function::new_with_args(
+        "root",
+        r#"
+        if (!globalThis.indexedDB) {
+          const { createRequire } = process.getBuiltinModule('node:module');
+          createRequire(root)('fake-indexeddb/auto');
+        }
+        if (globalThis.navigator.locks) return;
+        const held = new Set();
+        const waiting = new Map();
+        const locks = {
+          async request(name, options, callback) {
+            if (typeof options === 'function') { callback = options; options = {}; }
+            if (held.has(name)) {
+              if (options.ifAvailable) return callback(null);
+              await new Promise((resolve) => waiting.set(name, [...(waiting.get(name) ?? []), resolve]));
+            }
+            held.add(name);
+            try { return await callback({ name, mode: 'exclusive' }); }
+            finally { held.delete(name); waiting.get(name)?.shift()?.(); }
+          },
+        };
+        Object.defineProperty(globalThis.navigator, 'locks', { value: locks, configurable: true });
+        "#,
+    );
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../package.json");
+    install
+        .call1(&wasm_bindgen::JsValue::NULL, &root.into())
+        .expect("fake-indexeddb from the repository's node_modules");
+}
+
+/// Each producer in the database `name` and the ids of its messages.
+async fn stored(name: &str) -> Vec<Vec<String>> {
+    let read = js_sys::Function::new_with_args(
+        "name",
+        r#"
+        return new Promise((resolve, reject) => {
+          const open = indexedDB.open(name);
+          open.onerror = () => reject(open.error);
+          open.onsuccess = () => {
+            const db = open.result;
+            if (!db.objectStoreNames.contains('outbox')) { db.close(); resolve([]); return; }
+            const all = db.transaction(['outbox']).objectStore('outbox').getAll();
+            all.onerror = () => reject(all.error);
+            all.onsuccess = () => {
+              db.close();
+              const by = new Map();
+              for (const row of all.result) by.set(row.producer, [...(by.get(row.producer) ?? []), row.id]);
+              resolve([...by.values()]);
+            };
+          };
+        });
+        "#,
+    );
+    let promise: js_sys::Promise = read
+        .call1(&wasm_bindgen::JsValue::NULL, &name.into())
+        .unwrap()
+        .into();
+    let rows = wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+    js_sys::Array::from(&rows)
+        .iter()
+        .map(|ids| {
+            js_sys::Array::from(&ids)
+                .iter()
+                .filter_map(|id| id.as_string())
+                .collect()
+        })
+        .collect()
+}
+
+async fn paused(client: &wse_client::Client) {
+    client.pause("test").unwrap();
+    while client.is_connected() {
+        gloo_timers::future::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[wasm_bindgen_test]
+async fn what_waits_in_indexed_db_goes_with_the_next_client_once() {
+    browser_storage();
+    let mut config = Config::new(given(URL, "WSE_TEST_URL"));
+    config.offline = Some(Offline::in_indexed_db("wse-test-outbox-next"));
+    let (first, _events) = wse_client::connect(config.clone()).await.unwrap();
+    paused(&first).await;
+    let id = first
+        .send_with("echo", &json!({"n": 41}), &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(first.kept(), 1);
+    first.close().await;
+    for _ in 0..250 {
+        if stored("wse-test-outbox-next").await == vec![vec![id.clone()]] {
+            break;
+        }
+        gloo_timers::future::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(stored("wse-test-outbox-next").await, vec![vec![id.clone()]]);
+
+    // The next client takes the producer over: the server takes it once.
+    let (second, mut events) = wse_client::connect(config).await.unwrap();
+    let echoed = message(&mut events, "echoed").await;
+    assert_eq!(echoed.payload_value().unwrap()["n"], 41);
+    for _ in 0..250 {
+        if second.kept() == 0
+            && stored("wse-test-outbox-next")
+                .await
+                .iter()
+                .all(Vec::is_empty)
+        {
+            break;
+        }
+        gloo_timers::future::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(second.kept(), 0);
+    assert!(
+        stored("wse-test-outbox-next")
+            .await
+            .iter()
+            .all(Vec::is_empty)
+    );
+    second.close().await;
+}
+
+#[wasm_bindgen_test]
+async fn two_clients_of_one_database_keep_a_producer_each() {
+    browser_storage();
+    let mut config = Config::new(given(URL, "WSE_TEST_URL"));
+    config.offline = Some(Offline::in_indexed_db("wse-test-outbox-two"));
+    let (a, _a_events) = wse_client::connect(config.clone()).await.unwrap();
+    let (b, _b_events) = wse_client::connect(config).await.unwrap();
+    paused(&a).await;
+    paused(&b).await;
+    let from_a = a
+        .send_with("echo", &json!({"n": 1}), &Default::default())
+        .await
+        .unwrap();
+    let from_b = b
+        .send_with("echo", &json!({"n": 2}), &Default::default())
+        .await
+        .unwrap();
+    a.close().await;
+    b.close().await;
+    let mut held = Vec::new();
+    for _ in 0..250 {
+        held = stored("wse-test-outbox-two").await;
+        held.sort();
+        if held.len() == 2 {
+            break;
+        }
+        gloo_timers::future::sleep(Duration::from_millis(20)).await;
+    }
+    let mut expected = vec![vec![from_a], vec![from_b]];
+    expected.sort();
+    assert_eq!(held, expected);
+}
+
+#[wasm_bindgen_test]
+async fn without_web_locks_the_outbox_stays_in_memory_and_says_so() {
+    browser_storage();
+    let navigator = js_sys::Reflect::get(&js_sys::global(), &"navigator".into()).unwrap();
+    let locks = js_sys::Reflect::get(&navigator, &"locks".into()).unwrap();
+    js_sys::Reflect::delete_property(&navigator.clone().into(), &"locks".into()).unwrap();
+    let mut config = Config::new(given(URL, "WSE_TEST_URL"));
+    config.offline = Some(Offline::in_indexed_db("wse-test-outbox-nolocks"));
+    let connected = wse_client::connect(config).await;
+    let restore = js_sys::Object::new();
+    js_sys::Reflect::set(&restore, &"value".into(), &locks).unwrap();
+    js_sys::Reflect::set(&restore, &"configurable".into(), &true.into()).unwrap();
+    js_sys::Object::define_property(&navigator.into(), &"locks".into(), &restore);
+    let (client, mut events) = connected.unwrap();
+    let failed = loop {
+        if let Incoming::Event(Event::StorageFailed(failed)) = next(&mut events).await {
+            break failed;
+        }
+    };
+    assert_eq!(failed.operation, "open");
+    assert!(failed.message.contains("Web Locks"), "{}", failed.message);
+    // In memory, as before.
+    client.send("echo", &json!({"n": 7})).await.unwrap();
+    let echoed = message(&mut events, "echoed").await;
+    assert_eq!(echoed.payload_value().unwrap()["n"], 7);
     client.close().await;
 }

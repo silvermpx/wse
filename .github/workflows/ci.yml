@@ -487,10 +487,14 @@ jobs:
           workspaces: ". -> target"
           key: wasm
 
-      # Node 22 has the WebSocket the browser has.
+      # Node 22 has the WebSocket the browser has; IndexedDB comes from
+      # fake-indexeddb, a development dependency of the repository.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: '22'
+
+      - name: Node modules (fake-indexeddb for the outbox's tests)
+        run: npm ci --ignore-scripts
 
       - name: wasm-bindgen test runner (the version in Cargo.lock)
         run: |

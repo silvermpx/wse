@@ -272,9 +272,16 @@ to the first that does not check, the lines of a batch are written at once
 and synced to the disk by a thread of its own, and the file is written
 anew once what went outweighs what is kept. A file that cannot be opened
 or written is an `Event::StorageFailed`: the outbox goes on in memory. In
-the browser the outbox is in memory. `config.offline = None` has no
-outbox: a message goes on the connection that is ready, or the send fails
-with `Error::NotConnected`, as before 3.2.
+the browser, `Offline::in_indexed_db(name)` keeps it in the IndexedDB
+database `name`, so that it outlives the page: each tab keeps a producer of
+its own there, held by a Web Lock while the tab lives, and sends on its own
+connection; a page that opens takes over what a closed or crashed tab left,
+under that tab's producer, so the server still takes each message once. It
+is the database the TypeScript client keeps. Web Locks need a secure
+context (HTTPS, or localhost): without them, or without IndexedDB, it is an
+`Event::StorageFailed` and the outbox stays in memory. `config.offline =
+None` has no outbox: a message goes on the connection that is ready, or the
+send fails with `Error::NotConnected`, as before 3.2.
 
 With a server older than 3.2, which does not answer, a message is gone
 once written, as before.

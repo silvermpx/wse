@@ -115,6 +115,11 @@
   macOS and the BSDs, an exclusive open on Windows, an abstract socket on
   Linux); a file that cannot be opened or written is a `wseStorageError`
   event.
+- Rust client in the browser: `Offline::in_indexed_db(name)` keeps the
+  outbox in that IndexedDB database, as the TypeScript client keeps it: a
+  producer for each tab, held by a Web Lock, and what a closed tab left
+  taken over by the next page that opens. Without Web Locks it is an
+  `Event::StorageFailed` and the outbox stays in memory.
 - TypeScript, in a browser: the outbox outlives the page in IndexedDB for a
   durable scope (a storage and a `consumer` named, as the offline queue
   was). Each tab keeps a producer of its own, held by a Web Lock, and sends

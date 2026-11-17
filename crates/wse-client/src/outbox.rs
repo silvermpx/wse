@@ -56,6 +56,12 @@ pub struct Offline {
     /// client's life.
     #[cfg(not(target_arch = "wasm32"))]
     pub path: Option<std::path::PathBuf>,
+    /// The IndexedDB database they wait in, so that they outlive the page
+    /// (in the browser): each tab keeps a producer of its own there, held
+    /// by a Web Lock, and a page that opens takes over what a closed tab
+    /// left. None keeps them in memory, for the client's life.
+    #[cfg(target_arch = "wasm32")]
+    pub database: Option<String>,
     /// How many wait at most (100,000), those written and not answered yet
     /// included: past it [`Client::send`](crate::Client::send) waits for
     /// room, and [`Client::try_send`](crate::Client::try_send) fails with
@@ -77,6 +83,8 @@ impl Offline {
         Self {
             #[cfg(not(target_arch = "wasm32"))]
             path: None,
+            #[cfg(target_arch = "wasm32")]
+            database: None,
             max_messages: MAX_MESSAGES,
             max_bytes: MAX_BYTES,
             max_age: MAX_AGE,
@@ -88,6 +96,17 @@ impl Offline {
     pub fn in_file(path: impl Into<std::path::PathBuf>) -> Self {
         Self {
             path: Some(path.into()),
+            ..Self::in_memory()
+        }
+    }
+
+    /// Kept in the IndexedDB database `name`, past the page's end (in the
+    /// browser). Without IndexedDB or Web Locks (a page without HTTPS) the
+    /// outbox stays in memory, and the client says so.
+    #[cfg(target_arch = "wasm32")]
+    pub fn in_indexed_db(name: impl Into<String>) -> Self {
+        Self {
+            database: Some(name.into()),
             ..Self::in_memory()
         }
     }
@@ -303,34 +322,52 @@ pub(crate) struct Outbox {
     deadline: Option<Instant>,
     max_age_ms: u64,
     room: Arc<Room>,
-    #[cfg(not(target_arch = "wasm32"))]
-    file: Option<file::Log>,
-    /// A write of the file failed: it is written anew, at most once a
+    /// Where what waits outlives the client: a file, or IndexedDB in the
+    /// browser.
+    log: Option<Log>,
+    /// The IndexedDB database to open before the first connection.
+    #[cfg(target_arch = "wasm32")]
+    database: Option<String>,
+    /// A write of the store failed: it is written anew, at most once a
     /// second (`heal_at`, ms since the epoch), and when the outbox goes.
-    #[cfg(not(target_arch = "wasm32"))]
     owed: bool,
-    #[cfg(not(target_arch = "wasm32"))]
     heal_at: u64,
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     report: Report,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+use file::Log;
+#[cfg(target_arch = "wasm32")]
+use idb::Log;
+
+#[cfg(target_arch = "wasm32")]
+mod idb;
+
 impl Drop for Outbox {
     fn drop(&mut self) {
-        if self.owed || self.file.as_ref().is_some_and(file::Log::take_broken) {
+        if self.owed || self.log.as_ref().is_some_and(Log::take_broken) {
             self.rewrite();
-        } else if let Some(log) = &mut self.file {
+        } else if let Some(log) = &mut self.log {
             log.flush();
         }
     }
+}
+
+/// What a store held when it was opened.
+struct Read {
+    producer: Box<str>,
+    node: Option<Box<str>>,
+    written: u64,
+    /// Above every number it names.
+    next: u64,
+    user: Option<String>,
+    records: VecDeque<Record>,
 }
 
 /// Lines of the file but a message kept, as written: borrowed, nothing
 /// copied.
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 enum LineRef<'a> {
     Written(u64),
     Ack(u64),
@@ -375,11 +412,10 @@ impl Outbox {
             deadline: None,
             max_age_ms,
             room,
-            #[cfg(not(target_arch = "wasm32"))]
-            file: None,
-            #[cfg(not(target_arch = "wasm32"))]
+            log: None,
+            #[cfg(target_arch = "wasm32")]
+            database: offline.database.clone(),
             owed: false,
-            #[cfg(not(target_arch = "wasm32"))]
             heal_at: 0,
             report,
         };
@@ -390,7 +426,7 @@ impl Outbox {
                     if let Some(read) = read {
                         outbox.restore(read);
                     }
-                    outbox.file = Some(log);
+                    outbox.log = Some(log);
                     outbox.rewrite();
                 }
                 Err(why) => (outbox.report)("open", why),
@@ -399,9 +435,26 @@ impl Outbox {
         outbox
     }
 
-    /// Takes up what the file held.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn restore(&mut self, read: file::Read) {
+    /// Opens the IndexedDB database the outbox is kept in, before the first
+    /// connection (it opens in its own time): takes over a producer it holds
+    /// that no tab holds, else makes one, and takes up what it holds. One
+    /// that cannot be opened is said, and the outbox kept in memory.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn open_store(&mut self) {
+        let Some(name) = self.database.take() else {
+            return;
+        };
+        match idb::open(&name, Arc::clone(&self.report)).await {
+            Ok((log, read)) => {
+                self.restore(read);
+                self.log = Some(log);
+            }
+            Err(why) => (self.report)("open", why),
+        }
+    }
+
+    /// Takes up what the store held.
+    fn restore(&mut self, read: Read) {
         self.producer = read.producer;
         self.node = read.node;
         self.written = read.written;
@@ -467,8 +520,7 @@ impl Outbox {
             self.earliest = record.until;
             self.set_deadline(now);
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(log) = &mut self.file {
+        if let Some(log) = &mut self.log {
             log.push_add(&record);
         }
         self.records.push_back(record);
@@ -642,11 +694,7 @@ impl Outbox {
     /// waits for the next client.
     pub(crate) fn close(&mut self) -> Outcomes {
         let mut outcomes = self.disconnected();
-        #[cfg(not(target_arch = "wasm32"))]
-        let in_file = self.file.is_some();
-        #[cfg(target_arch = "wasm32")]
-        let in_file = false;
-        if !in_file {
+        if self.log.is_none() {
             let (count, mut bytes) = (self.records.len(), 0);
             for record in self.records.drain(..) {
                 bytes += record.size;
@@ -763,15 +811,11 @@ impl Outbox {
         }
     }
 
-    /// Puts `line` in the file's batch.
-    #[cfg_attr(target_arch = "wasm32", allow(clippy::unused_self))]
+    /// Puts `line` in the store's batch.
     fn put(&mut self, line: &LineRef<'_>) {
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(log) = &mut self.file {
+        if let Some(log) = &mut self.log {
             log.push(line);
         }
-        #[cfg(target_arch = "wasm32")]
-        let _ = line;
     }
 
     /// Something changed: with no connection, the file gets it now; with
@@ -786,10 +830,8 @@ impl Outbox {
     /// Hands the batch's lines to the file's thread; writes the file anew
     /// instead once what went outweighs what is kept, or after a write
     /// failed (the lines are in what is written anew).
-    #[cfg_attr(target_arch = "wasm32", allow(clippy::unused_self))]
     pub(crate) fn flush(&mut self) {
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(log) = &mut self.file {
+        if let Some(log) = &mut self.log {
             self.owed |= log.take_broken();
             if self.owed {
                 let now = now_ms();
@@ -811,7 +853,7 @@ impl Outbox {
     /// Writes the file anew, with what is kept now alone, under a new salt.
     #[cfg(not(target_arch = "wasm32"))]
     fn rewrite(&mut self) {
-        let Some(log) = &mut self.file else {
+        let Some(log) = &mut self.log else {
             return;
         };
         let salt = new_id();
@@ -848,6 +890,25 @@ impl Outbox {
             lines += 1;
         }
         log.rewrite(out, salt, lines);
+    }
+
+    /// Writes the database anew, with what is kept now alone.
+    #[cfg(target_arch = "wasm32")]
+    fn rewrite(&mut self) {
+        let Some(log) = &mut self.log else {
+            return;
+        };
+        let user = match &self.user {
+            Some(Some(user)) => Some(user.as_str()),
+            _ => None,
+        };
+        log.rewrite(
+            self.next,
+            self.written,
+            self.node.as_deref(),
+            user,
+            &self.records,
+        );
     }
 }
 
@@ -1025,7 +1086,7 @@ mod file {
     use serde::{Deserialize, Serialize};
     use serde_json::value::RawValue;
 
-    use super::{Head, LineRef, Record, Report, crc32};
+    use super::{Head, LineRef, Read, Record, Report, crc32};
 
     /// A message kept, as read: its text as it was written.
     #[derive(Deserialize)]
@@ -1051,17 +1112,6 @@ mod file {
         Drop(Vec<u64>),
         User(Option<String>),
         Node(String),
-    }
-
-    /// What a file held when it was opened.
-    pub(super) struct Read {
-        pub(super) producer: Box<str>,
-        pub(super) node: Option<Box<str>>,
-        pub(super) written: u64,
-        /// Above every number the file names.
-        pub(super) next: u64,
-        pub(super) user: Option<String>,
-        pub(super) records: VecDeque<Record>,
     }
 
     /// What the file's thread is handed, in order.

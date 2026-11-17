@@ -258,6 +258,11 @@ impl<H: Handler> Driver<H> {
     }
 
     pub(crate) async fn run(mut self, mut first: First) {
+        // The outbox's database opens in its own time: what it holds waits
+        // for the first connection, and what is sent meanwhile after it.
+        if let Some(outbox) = &mut self.session.outbox {
+            outbox.open_store().await;
+        }
         let end = loop {
             if !self.paused.is_empty() {
                 self.status.send_replace(Status::Paused);
