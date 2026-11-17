@@ -289,8 +289,10 @@ life. `Offline::in_file(path)` keeps it in a file, so that it outlives the
 application: the file is the client's alone while it runs (`<path>.lock`
 beside it says so), each line is checked (a CRC-32 and a salt) and read up
 to the first that does not check, the lines of a batch are written at once
-and synced to the disk by a thread of its own, and the file is written
-anew once what went outweighs what is kept. A file that cannot be opened
+and synced to the disk by a thread of its own, a message goes on the
+connection once the file holds it (so that after a crash its number is
+never another message's), and the file is written anew once what went
+outweighs what is kept. A file that cannot be opened
 or written is an `Event::StorageFailed`: the outbox goes on in memory. In
 the browser, `Offline::in_indexed_db(name)` keeps it in the IndexedDB
 database `name`, so that it outlives the page: each tab keeps a producer of

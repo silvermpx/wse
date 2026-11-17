@@ -622,7 +622,9 @@ const client = createWSEClient({
 It is the file the Rust and Python clients write: each line checked with a CRC-32 and a salt, read
 up to the first that does not check. The event loop never waits for the disk: a batch of lines goes
 to the file and to the disk once per turn of the loop, the next batch taking what came meanwhile,
-and the file is written anew once what went outweighs what is kept. When the process ends, what is
+and the file is written anew once what went outweighs what is kept. A message goes on the
+connection once the file holds it, and that it may have gone, so that after a crash its number is
+never another message's (IndexedDB and the React Native storage alike). When the process ends, what is
 not written yet is written at once. The file is the client's alone while the process runs: the
 system holds it for the process (a lock on `wse-outbox.lock` on macOS, the file opened for this
 process alone on Windows, an abstract socket named after the file on Linux) and lets go when the
