@@ -229,6 +229,24 @@ describe('a client of its own', () => {
     }
   });
 
+  it('never displaces a send that holds its place in the outbox for one of higher priority', () => {
+    const c = client(A, {
+      topics: ['prices'],
+      consumer: 'board',
+      offline: { enabled: true, maxSize: 2 },
+      performance: { maxQueueSize: 1 },
+    });
+    const outcomes: unknown[] = [];
+    c.on('wseNotDelivered', (d: unknown) => outcomes.push(d));
+    expect(c.send('order', {}, { id: 'low', priority: 1, requires: ['prices'] })).toBe('queued');
+    // No room in the queue: the new one is refused, the one taken stays.
+    expect(c.send('order', {}, { id: 'high', priority: 10, requires: ['prices'] })).toBe('dropped');
+    // The outbox has the place the first one did not take.
+    expect(c.send('order', {}, { id: 'ordinary' })).toBe('queued');
+    expect(outcomes).toEqual([]);
+    expect(c.kept()).toBe(1);
+  });
+
   it('drops a live message sent before it connects: it never goes out late', async () => {
     const c = client(A);
     expect(c.send('open_valve', { id: 1 }, { live: true })).toBe('dropped');

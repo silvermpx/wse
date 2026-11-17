@@ -116,7 +116,9 @@ function derive(
 
 /**
  * Messages to evict so `incoming` fits, or null when it cannot fit: only
- * messages of strictly lower priority are candidates, lowest and oldest first.
+ * messages of strictly lower priority are candidates, lowest and oldest
+ * first, and never one that holds its place in the outbox (it was taken to
+ * be delivered, and goes only with its outcome).
  */
 function evictionsFor(state: MessageQueueState, incoming: QueuedMessage): Set<string> | null {
   const incomingBytes = incoming.bytes ?? 0;
@@ -129,7 +131,7 @@ function evictionsFor(state: MessageQueueState, incoming: QueuedMessage): Set<st
   if (fits()) return new Set();
 
   const candidates = state.messages
-    .filter(m => m.priority < incoming.priority)
+    .filter(m => m.priority < incoming.priority && m.held === undefined)
     .sort((a, b) => (a.priority - b.priority) || (a.timestamp - b.timestamp));
   const evicted = new Set<string>();
   for (const m of candidates) {
