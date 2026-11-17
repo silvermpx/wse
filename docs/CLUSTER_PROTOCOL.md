@@ -223,16 +223,18 @@ PRODUCER_QUERY: [header: type=0x0F, payload_len=N]
 [2 bytes: user length (little-endian u16), 0xFFFF for none] [user]
 [2 bytes: producer length (little-endian u16)] [producer]
 
-PRODUCER_STATE: [header: type=0x10, payload_len=19 + 17 × refusals]
+PRODUCER_STATE: [header: type=0x10, payload_len=35 + 17 × refusals]
 [8 bytes: question id (little-endian u64)]
 [1 byte: 1 when the node knew the producer, else 0]
 [8 bytes: the highest message it decided, taken or refused (little-endian u64)]
+[8 bytes: up to here refusals were let go for the bound (LE u64), 0 for none]
+[8 bytes: a message whose handler never ended (LE u64), 0 for none]
 [2 bytes: refusals (little-endian u16), at most 1024]
 per refusal: [8 bytes: first (LE u64)] [8 bytes: last (LE u64)]
              [1 byte: why: 1 busy, 2 rate_limited, 3 missing, 4 not_ready]
 ```
 
-A client that reconnects to another node names the node it was on and the highest message it wrote there without an answer ([the client's outbox](PROTOCOL.md#the-clients-outbox)). When the new node links to that node with CAP_PRODUCERS, it asks once: the asked node hands the producer over (its connections still reading for it take nothing more, and close with 4409) and answers the highest message it decided, with the refusals behind it its client may not have heard of. The new node confirms the rest up to that number, refuses a repeat of a refused one again, tells the client of the refusals in its `outbox` answer, and takes only what came after; without an answer within 2 seconds it takes the messages but marks them as possible repeats.
+A client that reconnects to another node names the node it was on and the highest message it wrote there without an answer ([the client's outbox](PROTOCOL.md#the-clients-outbox)). When the new node links to that node with CAP_PRODUCERS, it asks once: the asked node hands the producer over (its connections still reading for it take nothing more, and close with 4409) and answers the highest message it decided, with the refusals behind it its client may not have heard of and what it could not tell: refusals let go because it held 1024 runs of them, and a message whose handler never ended. The new node confirms the rest up to that number, refuses a repeat of a refused one again, tells the client of the refusals in its `outbox` answer, and takes only what came after; what the asked node could not tell, it cannot either: the client sends it again and the application gets it marked as a possible repeat, as it does without an answer within 2 seconds.
 
 ## Interest-Based Routing
 

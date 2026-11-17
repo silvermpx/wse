@@ -159,6 +159,48 @@ fn test_incompressible_payload_falls_back_to_uncompressed() {
 }
 
 #[test]
+fn a_producer_state_says_what_the_peer_could_not_tell() {
+    use crate::server::{Decided, Hole, Refusal};
+    let decided = Decided {
+        mark: 9,
+        holes: vec![Hole {
+            from: 4,
+            to: 5,
+            why: Refusal::Busy,
+        }],
+        forgot: 2,
+        undecided: Some(9),
+    };
+    let mut buf = BytesMut::new();
+    protocol::encode_producer_state(&mut buf, 7, Some(&decided));
+    assert_eq!(
+        decode_frame(buf).unwrap(),
+        ClusterFrame::ProducerState {
+            id: 7,
+            decided: Some(decided),
+        }
+    );
+    let mut buf = BytesMut::new();
+    protocol::encode_producer_state(&mut buf, 8, None);
+    assert_eq!(
+        decode_frame(buf).unwrap(),
+        ClusterFrame::ProducerState {
+            id: 8,
+            decided: None,
+        }
+    );
+    // A bound past the mark is no answer.
+    let bad = Decided {
+        mark: 3,
+        forgot: 4,
+        ..Decided::default()
+    };
+    let mut buf = BytesMut::new();
+    protocol::encode_producer_state(&mut buf, 9, Some(&bad));
+    assert_eq!(decode_frame(buf), None);
+}
+
+#[test]
 fn test_encode_decode_ping_pong() {
     let mut buf = BytesMut::new();
     encode_ping(&mut buf);

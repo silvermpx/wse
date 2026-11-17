@@ -87,6 +87,21 @@ pub(crate) struct Hole {
     pub(crate) why: Refusal,
 }
 
+/// What a node decided of a producer, for the node that takes it over:
+/// what it knows, and what it cannot tell.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Decided {
+    /// The highest message decided.
+    pub(crate) mark: u64,
+    /// The refusals behind it its client may not have heard of.
+    pub(crate) holes: Vec<Hole>,
+    /// Up to here refusals were let go for the bound: one of these is not
+    /// known as taken.
+    pub(crate) forgot: u64,
+    /// A message whose handler never ended: it may have done its work.
+    pub(crate) undecided: Option<u64>,
+}
+
 /// One producer on this node. Its lock is held while a message of it is
 /// decided, the application's handler included: a connection that comes
 /// back meanwhile is answered once the decision is in, never halfway.
@@ -195,6 +210,20 @@ impl SlotState {
             .map_or(self.mark, |s| self.mark.min(s.saturating_sub(1)))
     }
 
+    /// What a client that comes back waiting from `from` on is told was
+    /// decided: [`acked`](Self::acked), but short of the first one it waits
+    /// for whose refusal may have been let go for the bound: that one and
+    /// those after it come again, and are answered as they were (or handed
+    /// on marked, when the server cannot tell).
+    fn decided_for(&self, from: u64) -> u64 {
+        let from = from.max(1);
+        if from <= self.forgot {
+            self.acked().min(from - 1)
+        } else {
+            self.acked()
+        }
+    }
+
     fn refusal_of(&self, s: u64) -> Option<Refusal> {
         let at = self.holes.partition_point(|h| h.to < s);
         self.holes.get(at).filter(|h| h.from <= s).map(|h| h.why)
@@ -208,14 +237,20 @@ impl SlotState {
         self.holes.iter().copied().collect()
     }
 
-    /// What another node decided of the producer counts here too.
-    fn advance(&mut self, to: u64, holes: &[Hole]) {
+    /// What another node decided of the producer counts here too, and so
+    /// does what it could not tell.
+    fn advance(&mut self, decided: &Decided) {
+        let to = decided.mark;
         if self.moved || to <= self.mark {
             return;
         }
         let mark = self.mark;
-        for hole in holes.iter().filter(|h| h.from > mark && h.to <= to) {
+        for hole in decided.holes.iter().filter(|h| h.from > mark && h.to <= to) {
             self.refuse(hole.from, hole.to, hole.why);
+        }
+        self.forgot = self.forgot.max(decided.forgot.min(to));
+        if let Some(s) = decided.undecided.filter(|s| *s > mark && *s <= to) {
+            self.deciding = Some(s);
         }
         self.mark = to;
     }
@@ -246,12 +281,17 @@ impl Slot {
         self.state.lock()
     }
 
-    /// Another node takes the producer over: what was decided here; from
-    /// now on nothing more is.
-    fn hand_over(&self) -> (u64, Vec<Hole>) {
+    /// Another node takes the producer over: what was decided here, and
+    /// what could not be told; from now on nothing more is.
+    fn hand_over(&self) -> Decided {
         let mut state = self.state.lock();
         state.moved = true;
-        (state.acked(), state.holes.iter().copied().collect())
+        Decided {
+            mark: state.mark,
+            holes: state.holes.iter().copied().collect(),
+            forgot: state.forgot,
+            undecided: state.deciding,
+        }
     }
 
     fn moved(&self) -> bool {
@@ -298,7 +338,7 @@ impl Producers {
 
     /// A peer asks for `user`'s `producer`, which went on there: what was
     /// decided here, and nothing more is. None: nothing is known of it here.
-    pub(crate) fn hand_over(&self, user: Option<&str>, producer: &str) -> Option<(u64, Vec<Hole>)> {
+    pub(crate) fn hand_over(&self, user: Option<&str>, producer: &str) -> Option<Decided> {
         let key = (user.map(Box::from), Box::from(producer));
         let slot = self.slots.get(&key).map(|slot| Arc::clone(&slot))?;
         Some(slot.hand_over())
@@ -312,7 +352,7 @@ impl Producers {
         if known && here {
             let (start, told) = {
                 let mut state = slot.lock();
-                (state.acked(), state.told_from(hello.from))
+                (state.decided_for(hello.from), state.told_from(hello.from))
             };
             let link = Link {
                 slot,
@@ -336,16 +376,16 @@ impl Producers {
         &self,
         user: Option<&str>,
         hello: &Hello,
-        decided: Option<(u64, Vec<Hole>)>,
+        decided: Option<Decided>,
         now: u64,
     ) -> (Link, Vec<Hole>) {
         let (slot, _) = self.attach(user, &hello.producer, now);
         match decided {
-            Some((mark, holes)) => {
+            Some(decided) => {
                 let (start, told) = {
                     let mut state = slot.lock();
-                    state.advance(mark, &holes);
-                    (state.acked(), state.told_from(hello.from))
+                    state.advance(&decided);
+                    (state.decided_for(hello.from), state.told_from(hello.from))
                 };
                 let link = Link {
                     slot,
@@ -676,14 +716,15 @@ mod tests {
         );
         assert_eq!(
             slot.hand_over(),
-            (
-                3,
-                vec![Hole {
+            Decided {
+                mark: 3,
+                holes: vec![Hole {
                     from: 2,
                     to: 2,
                     why: Refusal::Missing
-                }]
-            )
+                }],
+                ..Decided::default()
+            }
         );
         assert_eq!(claim(&slot, 4), Claim::Moved);
         assert_eq!(slot.lock().mark(), 3);
@@ -813,9 +854,9 @@ mod tests {
         assert_eq!(bob.lock().mark(), 0);
         // Handed over to another node: what comes back here starts over.
         let handed = producers.hand_over(Some("ann"), "p1").unwrap();
-        assert_eq!(handed.0, 5);
+        assert_eq!(handed.mark, 5);
         assert_eq!(
-            handed.1,
+            handed.holes,
             [Hole {
                 from: 1,
                 to: 4,
@@ -931,12 +972,12 @@ mod tests {
             to: 7,
             why: Refusal::Busy,
         }];
-        let (link, told) = producers.taken_over(
-            Some("ann"),
-            &hello("other", 12),
-            Some((10, holes.clone())),
-            0,
-        );
+        let decided = Decided {
+            mark: 10,
+            holes: holes.clone(),
+            ..Decided::default()
+        };
+        let (link, told) = producers.taken_over(Some("ann"), &hello("other", 12), Some(decided), 0);
         assert_eq!((link.start, link.unsure_until), (10, 0));
         assert_eq!(told, holes);
         assert_eq!(claim(&link.slot, 10), Claim::Repeat);
@@ -946,6 +987,79 @@ mod tests {
         let (link, told) = producers.taken_over(Some("bob"), &hello("other", 12), None, 0);
         assert_eq!((link.start, link.unsure_until), (0, 12));
         assert!(told.is_empty());
+    }
+
+    /// Refused and taken in turn, past the bound: the first refusal is let
+    /// go.
+    fn past_the_bound(state: &mut SlotState) -> u64 {
+        for n in 0..(MAX_HOLES as u64 + 1) {
+            let refused = 2 * n + 1;
+            state.claim(refused, Refusal::Missing);
+            state.refuse(refused, refused, Refusal::Busy);
+            state.claim(refused + 1, Refusal::Missing);
+        }
+        2 * MAX_HOLES as u64 + 2
+    }
+
+    #[test]
+    fn a_client_waiting_for_a_refusal_let_go_is_not_told_it_was_taken() {
+        let producers = Producers::default();
+        let (link, _) = producers.link(Some("ann"), &hello("here", 0), true, 0);
+        let last = past_the_bound(&mut link.slot.lock());
+        let comes_back = |from| Hello {
+            from,
+            ..hello("here", last)
+        };
+        // Waiting from 1 on: 1 may have been refused, and comes again.
+        let (link, told) = producers.link(Some("ann"), &comes_back(1), true, 0);
+        assert_eq!(link.start, 0);
+        assert_eq!(told.len(), MAX_HOLES);
+        assert_eq!(claim(&link.slot, 1), Claim::Unsure);
+        // A client that heard of 1 is told everything as it stands.
+        let (link, _) = producers.link(Some("ann"), &comes_back(2), true, 0);
+        assert_eq!(link.start, last);
+    }
+
+    #[test]
+    fn what_the_last_node_could_not_tell_it_cannot_tell_here_either() {
+        let a = Producers::default();
+        let (link, _) = a.link(Some("ann"), &hello("a", 0), true, 0);
+        let last = {
+            let mut state = link.slot.lock();
+            let last = past_the_bound(&mut state);
+            // The handler of the next one never ended.
+            state.claim(last + 1, Refusal::Missing);
+            state.deciding(last + 1);
+            last
+        };
+        let decided = a.hand_over(Some("ann"), "p").unwrap();
+        assert_eq!((decided.forgot, decided.undecided), (1, Some(last + 1)));
+
+        let b = Producers::default();
+        let comes = Hello {
+            from: 1,
+            ..hello("a", last + 1)
+        };
+        let (link, told) = b.taken_over(Some("ann"), &comes, Some(decided.clone()), 0);
+        assert_eq!(link.start, 0, "1 may have been refused");
+        assert_eq!(told.len(), MAX_HOLES);
+        assert_eq!(claim(&link.slot, 1), Claim::Unsure);
+        assert_eq!(claim(&link.slot, 2), Claim::Repeat);
+        assert_eq!(
+            claim(&link.slot, last + 1),
+            Claim::Unsure,
+            "may have done its work"
+        );
+
+        // A client that heard of all but the last is told up to before it.
+        let c = Producers::default();
+        let comes = Hello {
+            from: last + 1,
+            ..hello("a", last + 1)
+        };
+        let (link, _) = c.taken_over(Some("ann"), &comes, Some(decided), 0);
+        assert_eq!(link.start, last);
+        assert_eq!(claim(&link.slot, last + 1), Claim::Unsure);
     }
 
     #[test]

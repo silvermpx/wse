@@ -12,10 +12,10 @@ use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot};
 
 use super::protocol::encode_producer_query;
-use crate::server::Hole;
+use crate::server::Decided;
 
-/// What a peer decided of a producer, and the refusals behind it.
-type Decided = Option<(u64, Vec<Hole>)>;
+/// What a peer decided of a producer: None when it knows nothing of it.
+type Answer = Option<Decided>;
 
 /// The links to the peers that answer for producers, and the questions out.
 #[derive(Default)]
@@ -24,7 +24,7 @@ pub(crate) struct ProducerLinks {
     /// link's end removes only its own entry.
     routes: DashMap<String, (mpsc::Sender<Bytes>, u64)>,
     next: AtomicU64,
-    waiting: DashMap<u64, oneshot::Sender<Decided>>,
+    waiting: DashMap<u64, oneshot::Sender<Answer>>,
 }
 
 /// A question out, taken off the waiting ones when it ends.
@@ -64,7 +64,7 @@ impl ProducerLinks {
         user: Option<&str>,
         producer: &str,
         within: Duration,
-    ) -> Decided {
+    ) -> Answer {
         let tx = self.routes.get(peer).map(|route| route.0.clone())?;
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (answer, answered) = oneshot::channel();
@@ -87,7 +87,7 @@ impl ProducerLinks {
     }
 
     /// A peer's answer to question `id`.
-    pub(crate) fn answer(&self, id: u64, decided: Decided) {
+    pub(crate) fn answer(&self, id: u64, decided: Answer) {
         if let Some((_, waiting)) = self.waiting.remove(&id) {
             let _ = waiting.send(decided);
         }

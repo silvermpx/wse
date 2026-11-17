@@ -229,6 +229,40 @@ async fn acked(ws: &mut Client, s: u64) {
     }
 }
 
+/// Reads until the server closes the connection.
+async fn closed(ws: &mut Client) {
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("closed within 5 s");
+        if matches!(frame, Some(Ok(Message::Close(_))) | None | Some(Err(_))) {
+            return;
+        }
+    }
+}
+
+/// More runs of refusals than a producer keeps (1024): refused and taken in
+/// turn, so that the first refusal is let go. The highest number sent.
+async fn refuse_past_the_bound(node: &mut Node, ws: &mut Client) -> u64 {
+    const RUNS: u64 = 1025;
+    for n in 0..RUNS {
+        send(ws, "refuse", 2 * n + 1).await;
+        send(ws, "m", 2 * n + 2).await;
+    }
+    for n in 0..RUNS {
+        assert_eq!(node.took().await, taken("m", 2 * n + 2));
+    }
+    2 * RUNS
+}
+
+fn marked(kind: &str, s: u64) -> Taken {
+    Taken {
+        kind: kind.to_owned(),
+        s,
+        possible_repeat: true,
+    }
+}
+
 fn taken(kind: &str, s: u64) -> Taken {
     Taken {
         kind: kind.to_owned(),
@@ -646,14 +680,7 @@ async fn a_message_whose_handler_panicked_comes_again_marked() {
     acked(&mut ws, 1).await;
     send(&mut ws, "explode", 2).await;
     // Its handler panicked: the connection closes.
-    loop {
-        let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
-            .await
-            .expect("closed within 5 s");
-        if matches!(frame, Some(Ok(Message::Close(_))) | None | Some(Err(_))) {
-            break;
-        }
-    }
+    closed(&mut ws).await;
     let (mut ws, acked_at, _) = node
         .client(
             "ann",
@@ -672,4 +699,81 @@ async fn a_message_whose_handler_panicked_comes_again_marked() {
     );
     acked(&mut ws, 2).await;
     node.server.stop().await;
+}
+
+/// A refusal let go for the bound cannot be told from a take: a client that
+/// comes back still waiting for it is not told it was taken, sends it
+/// again, and the application gets it marked as a possible repeat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_let_go_for_the_bound_is_never_told_taken() {
+    let mut node = node().await;
+    let (mut ws, _, name) = node
+        .client("ann", serde_json::json!({"producer": "p10"}))
+        .await;
+    let last = refuse_past_the_bound(&mut node, &mut ws).await;
+    // Gone before the answers came: back, waiting for all of them.
+    drop(ws);
+    let outbox = serde_json::json!({"producer": "p10", "node": name, "written": last, "from": 1});
+    let (mut ws, reply) = node.answered("ann", outbox).await;
+    assert_eq!(reply["acked"], 0, "the first one may have been refused");
+    send(&mut ws, "m", 1).await;
+    assert_eq!(node.took().await, marked("m", 1));
+    // One the server still knows of is answered as before.
+    send(&mut ws, "m", 3).await;
+    let nack = next_of(&mut ws, "nack").await;
+    assert_eq!(
+        (nack["p"]["s"].as_u64(), nack["p"]["code"].as_str()),
+        (Some(3), Some("busy"))
+    );
+    node.took_nothing().await;
+    node.server.stop().await;
+}
+
+/// The same on another node: what the first let go goes with the client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_let_go_for_the_bound_is_never_told_taken_on_another_node() {
+    let mut a = node().await;
+    let mut b = node().await;
+    link(&a, &b).await;
+    let (mut on_a, _, name_a) = a
+        .client("ann", serde_json::json!({"producer": "p11"}))
+        .await;
+    let last = refuse_past_the_bound(&mut a, &mut on_a).await;
+    let outbox = serde_json::json!({"producer": "p11", "node": name_a, "written": last, "from": 1});
+    let (mut on_b, reply) = b.answered("ann", outbox).await;
+    assert_eq!(reply["acked"], 0, "the first one may have been refused");
+    send(&mut on_b, "m", 1).await;
+    assert_eq!(b.took().await, marked("m", 1));
+    send(&mut on_b, "m", 2).await;
+    acked(&mut on_b, 2).await;
+    b.took_nothing().await;
+    a.server.stop().await;
+    b.server.stop().await;
+}
+
+/// A message whose handler panicked may have done its work: on the node the
+/// client moves to, it comes marked as a possible repeat, never as a first
+/// delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_whose_handler_panicked_comes_marked_on_another_node() {
+    let mut a = node().await;
+    let mut b = node().await;
+    link(&a, &b).await;
+    let (mut on_a, _, name_a) = a
+        .client("ann", serde_json::json!({"producer": "p12"}))
+        .await;
+    send(&mut on_a, "m", 1).await;
+    assert_eq!(a.took().await, taken("m", 1));
+    acked(&mut on_a, 1).await;
+    send(&mut on_a, "explode", 2).await;
+    closed(&mut on_a).await;
+    let outbox = serde_json::json!({"producer": "p12", "node": name_a, "written": 2, "from": 2});
+    let (mut on_b, acked_at, _) = b.client("ann", outbox).await;
+    assert_eq!(acked_at, 1, "2 was never decided");
+    // Sent again; the server knows it by its number.
+    send(&mut on_b, "m", 2).await;
+    assert_eq!(b.took().await, marked("m", 2));
+    acked(&mut on_b, 2).await;
+    a.server.stop().await;
+    b.server.stop().await;
 }
