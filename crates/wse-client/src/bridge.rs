@@ -253,7 +253,10 @@ impl Owner {
             limits: options.limits,
             allow_sign: options.allow_sign,
             encrypts: config.encryption.is_some(),
-            realm: config.url.clone(),
+            // What windows bind their checkpoints to: the endpoint without
+            // what it carries of credentials (a user, a password, a token in
+            // its query).
+            realm: bare(&config.url).unwrap_or_default(),
             runtime,
         });
         let client = Client::start(

@@ -415,3 +415,19 @@ async fn a_window_signs_every_window_out() {
     assert!(owner.client().closed().await.is_none());
     stand.server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_never_hears_the_credentials_of_the_endpoint() {
+    let mut config = Config::new("ws://ann:password@127.0.0.1:9/wse?access_token=secret");
+    config.reconnect.jitter = false;
+    let owner = Owner::start(config, Options::default()).await.unwrap();
+    let mut window = TestWindow::new(&owner);
+    window
+        .until("welcome", |w| w.has_frame(|f| f["k"] == "welcome"))
+        .await;
+    let heard = serde_json::to_string(&window.frames).unwrap();
+    for secret in ["password", "access_token", "secret", "ann:"] {
+        assert!(!heard.contains(secret), "{secret} in {heard}");
+    }
+    owner.close().await;
+}

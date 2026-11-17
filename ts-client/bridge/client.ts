@@ -90,8 +90,11 @@ export function createBridgeClient(
   const received = new Map<string, Record<string, number>>();
   /** The window's sends the owner did not say the outcome of yet, by id. */
   const pending = new Set<string>();
-  /** Sends waiting for the topics they require to be continuous. */
-  let waiting: Array<{ type: string; payload: unknown; options: MessageOptions }> = [];
+  /**
+   * Sends waiting for the topics they require to be continuous, each with
+   * the time it may wait (ms since the epoch), counted from its send.
+   */
+  let waiting: Array<{ type: string; payload: unknown; options: MessageOptions; until?: number }> = [];
   const signs = new Map<number, (status: SendStatus) => void>();
   let port: WindowChannel | null = null;
   let early: WindowFrame[] = [];
@@ -199,10 +202,15 @@ export function createBridgeClient(
 
   // -- the owner's frames -------------------------------------------------------
 
+  /** The window was let go (refused, signed out, its owner gone): nothing more is handed on. */
+  const over = () => phase === 'refused' || phase === 'revoked' || phase === 'closed';
+
   const end = (next: BridgePhase, why: string | null) => {
-    if (phase === 'refused' || phase === 'revoked' || phase === 'closed') return;
+    if (over()) return;
     phase = next;
     reason = why;
+    // What it held paused is the last connection's: never handed on.
+    pausedBatches = [];
     for (const resolve of signs.values()) resolve('dropped');
     signs.clear();
     // The connection is gone for good: what the window holds is not current.
@@ -213,6 +221,22 @@ export function createBridgeClient(
   const take = (item: BridgeItem) => {
     if ('m' in item) {
       const message = item.m;
+      if (message.tp && typeof message.o === 'number' && (!Number.isSafeInteger(message.o) || message.o < 0)) {
+        // JavaScript cannot hold it exactly: ordering and dedup by it would be
+        // wrong, so the message is refused and the topic breaks off, as a
+        // client of its own does.
+        const detail = {
+          topic: message.tp,
+          epoch: String(message.e),
+          fromOffset: null,
+          toOffset: null,
+          missed: null,
+          reason: 'unsafe_offset' as const,
+        };
+        delivery.brokeOff(message.tp, 'unsafe_offset');
+        emit('wseGap', detail);
+        return;
+      }
       if (message.tp && message.e !== undefined && typeof message.o === 'number') {
         const streams = received.get(message.tp) ?? {};
         streams[String(message.e)] = message.o;
@@ -234,6 +258,11 @@ export function createBridgeClient(
         refresh();
         return;
       case 'subscribed':
+        // The checkpoint the window was given is taken here, as a client of
+        // its own takes it when it subscribes: for the topics it holds, once
+        // the connection named its user, checked against that user, the
+        // realm, the consumer and the schema.
+        delivery.recoveryPositions(item.taken);
         delivery.subscribed(item.taken, item.refused);
         return;
       case 'gap':
@@ -256,6 +285,7 @@ export function createBridgeClient(
   };
 
   const batch = (s: number, items: BridgeItem[]) => {
+    if (over()) return;
     for (const item of items) take(item);
     took = s;
     post({ k: 'ack', s });
@@ -278,6 +308,7 @@ export function createBridgeClient(
         refresh();
         return;
       case 'b':
+        if (over()) return;
         if (f.s !== took + pausedBatches.length + 1) {
           logger.error(`[bridge] batch ${f.s} after ${took + pausedBatches.length}: the window stops`);
           end('revoked', 'protocol');
@@ -349,15 +380,20 @@ export function createBridgeClient(
   /** Sends whose topics are continuous now go. */
   const release = () => {
     if (waiting.length === 0) return;
+    const now = Date.now();
     const still: typeof waiting = [];
+    const late: string[] = [];
     for (const w of waiting) {
-      if (delivery.continuous(w.options.requires ?? [])) go(w.type, w.payload, w.options);
+      if (w.until !== undefined && w.until <= now) late.push(w.options.id!);
+      else if (delivery.continuous(w.options.requires ?? [])) go(w.type, w.payload, w.options, w.until);
       else still.push(w);
     }
     waiting = still;
+    // Its time ran out while it waited: it does not go, and the window hears so.
+    if (late.length > 0) emit('wseNotDelivered', { reason: 'expired', ids: late });
   };
 
-  const go = (type: string, payload: unknown, sendOptions: MessageOptions): string => {
+  const go = (type: string, payload: unknown, sendOptions: MessageOptions, until?: number): string => {
     const id = sendOptions.id ?? generateId();
     if (!sendOptions.live) pending.add(id);
     post({
@@ -368,7 +404,8 @@ export function createBridgeClient(
       o: {
         id,
         priority: sendOptions.priority,
-        ttl: sendOptions.ttl,
+        // What is left of its time: it counts from its send.
+        ttl: until !== undefined ? Math.max(0, until - Date.now()) : sendOptions.ttl,
         live: sendOptions.live,
         encrypted: sendOptions.encrypted,
         correlation_id: sendOptions.correlation_id,
@@ -492,7 +529,13 @@ export function createBridgeClient(
         if (sendOptions.requires?.length && !delivery.continuous(sendOptions.requires)) return 'dropped';
       } else if (sendOptions.requires?.length && !delivery.continuous(sendOptions.requires)) {
         // It goes once its topics are continuous in this window.
-        waiting.push({ type, payload, options: { ...sendOptions, id: sendOptions.id ?? generateId() } });
+        const ttl = sendOptions.ttl;
+        waiting.push({
+          type,
+          payload,
+          options: { ...sendOptions, id: sendOptions.id ?? generateId() },
+          until: ttl !== undefined && Number.isFinite(ttl) && ttl >= 0 ? Date.now() + ttl : undefined,
+        });
         return 'queued';
       }
       go(type, payload, sendOptions);

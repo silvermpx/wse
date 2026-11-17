@@ -17,6 +17,7 @@ import type { OwnerChannel } from './channel.js';
 import {
   BRIDGE_PROTOCOL,
   DEFAULT_BRIDGE_LIMITS,
+  isWindowFrame,
   type BridgeItem,
   type BridgeLimits,
   type ConnState,
@@ -138,7 +139,9 @@ export function createBridgeOwner(options: BridgeOwnerOptions = {}): BridgeOwner
   };
 
   const client = createWSEClient({ ...clientOptions, onEveryMessage: route });
-  const realm = clientOptions.realm ?? clientOptions.endpoints?.[0] ?? null;
+  // What windows bind their checkpoints to: the endpoint without what it
+  // carries of credentials (a user, a password, a token in its query).
+  const realm = clientOptions.realm ?? bare(clientOptions.endpoints?.[0] ?? null);
   let conn = connOf(client.state.getSnapshot());
 
   const toAll = (item: BridgeItem) => {
@@ -414,7 +417,23 @@ export function createBridgeOwner(options: BridgeOwnerOptions = {}): BridgeOwner
         lastReconnect: 0,
       };
       attachments.set(a.att, a);
-      channel.listen({ frame: (f) => frame(a, f), close: () => detach(a) });
+      channel.listen({
+        // What is not a frame, or a frame that fails, lets go of its window
+        // alone: the others, and the process, go on.
+        frame: (f) => {
+          if (!isWindowFrame(f)) {
+            revoke(a, 'protocol', 'not a frame');
+            return;
+          }
+          try {
+            frame(a, f);
+          } catch (error) {
+            logger.error('[bridge] a window frame failed:', error);
+            revoke(a, 'protocol', 'a frame that failed');
+          }
+        },
+        close: () => detach(a),
+      });
       return () => detach(a);
     },
     signOut() {

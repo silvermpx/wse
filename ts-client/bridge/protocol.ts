@@ -83,6 +83,52 @@ export type WindowFrame =
   | { k: 'signOut' }
   | { k: 'bye' };
 
+const isNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+const isNames = (v: unknown): v is string[] => Array.isArray(v) && v.every((t) => typeof t === 'string');
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/**
+ * `f` is a frame of a window as the protocol has them: what crosses a port or
+ * IPC is checked here before the owner reads it.
+ */
+export function isWindowFrame(f: unknown): f is WindowFrame {
+  if (!isObject(f) || typeof f.k !== 'string') return false;
+  switch (f.k) {
+    case 'hello':
+      return isNumber(f.v) && typeof f.agent === 'string';
+    case 'share':
+      return typeof f.on === 'boolean';
+    case 'hold':
+    case 'drop':
+      return isNames(f.topics);
+    case 'listen':
+    case 'unlisten':
+      return isNames(f.types);
+    case 'ack':
+      return isNumber(f.s);
+    case 'send':
+      return (
+        isNumber(f.n) &&
+        typeof f.t === 'string' &&
+        isNumber(f.c) &&
+        isNumber(f.a) &&
+        isObject(f.o) &&
+        typeof f.o.id === 'string' &&
+        (f.o.ttl === undefined || isNumber(f.o.ttl)) &&
+        (f.o.priority === undefined || isNumber(f.o.priority))
+      );
+    case 'sign':
+      return isNumber(f.n) && typeof f.t === 'string' && isNumber(f.a) && isObject(f.o);
+    case 'reconnect':
+    case 'wake':
+    case 'signOut':
+    case 'bye':
+      return true;
+    default:
+      return false;
+  }
+}
+
 /** What the owner tells a window. */
 export type OwnerFrame =
   | {

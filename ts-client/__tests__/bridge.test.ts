@@ -247,3 +247,140 @@ describe('the window bridge', () => {
     expect(o.attached).toBe(0);
   });
 });
+
+describe('a window, its owner’s frames given by hand', () => {
+  const conn = { connection: 'connected', ready: true, paused: [], endpoint: 'ws://localhost/', lastError: null, storage: 'memory' };
+
+  /** A window whose owner's frames the test gives: welcomed as ann's. */
+  function byHand(options: Parameters<typeof createBridgeClient>[1] = {}) {
+    let sink: { frame(f: unknown): void; close(): void } | undefined;
+    const posted: WindowFrame[] = [];
+    const client = createBridgeClient(
+      {
+        listen: (s) => {
+          sink = s as never;
+        },
+        post: (f) => posted.push(f),
+        close: () => {},
+      },
+      options,
+    );
+    windows.push(client);
+    const feed = (f: unknown) => sink!.frame(f);
+    feed({ k: 'welcome', v: 1, att: 1, limits: {}, realm: 'test', account: { epoch: 0, user: 'ann' }, conn, gen: 1 });
+    return { client, feed, posted };
+  }
+
+  const price = (o: number, secret = 'x') => ({ m: { t: 'price', p: { secret }, tp: 'prices', e: '0000000a', o } });
+
+  it('hands on nothing it held paused once the window was signed out', () => {
+    const { client, feed } = byHand();
+    const heard: WSMessage[] = [];
+    client.subscribe(['prices']);
+    client.onMessage('price', (m) => heard.push(m));
+    client.pause('hidden');
+    feed({ k: 'b', s: 1, items: [price(1, 'the last user’s')] });
+    feed({ k: 'revoked', reason: 'signed_out' });
+    client.resume('hidden');
+    feed({ k: 'b', s: 2, items: [price(2, 'late')] });
+    expect(heard).toEqual([]);
+  });
+
+  it('starts the recovery from the checkpoint it was given', async () => {
+    const requests: ResyncRequest[] = [];
+    const checkpoint = JSON.stringify({
+      v: 1,
+      realm: 'test',
+      user: 'ann',
+      consumer: 'window',
+      schema: null,
+      topics: { prices: { '0000000a': 42 } },
+    });
+    const { client, feed } = byHand({
+      consumer: 'window',
+      realm: 'test',
+      delivery: { mode: 'recover-or-resync', checkpoint, resync: async (r) => void requests.push(r) },
+    });
+    client.subscribe(['prices']);
+    feed({ k: 'b', s: 1, items: [{ ev: 'subscribed', taken: ['prices'], refused: [] }] });
+    await settle();
+    expect(requests[0].committed).toEqual({ prices: { '0000000a': 42 } });
+  });
+
+  it('refuses a checkpoint of another user', async () => {
+    const rejected: unknown[] = [];
+    const checkpoint = JSON.stringify({ v: 1, realm: 'test', user: 'bob', consumer: 'window', schema: null, topics: { prices: { '0000000a': 7 } } });
+    const requests: ResyncRequest[] = [];
+    const { client, feed } = byHand({
+      consumer: 'window',
+      realm: 'test',
+      delivery: { mode: 'recover-or-resync', checkpoint, resync: async (r) => void requests.push(r) },
+    });
+    client.on('wseCheckpointRejected', (detail) => rejected.push(detail));
+    client.subscribe(['prices']);
+    feed({ k: 'b', s: 1, items: [{ ev: 'subscribed', taken: ['prices'], refused: [] }] });
+    await settle();
+    expect(rejected).toHaveLength(1);
+    expect(requests[0].committed).toEqual({});
+  });
+
+  it('breaks a topic off on an offset JavaScript cannot hold, as a client of its own does', () => {
+    const { client, feed } = byHand();
+    const gaps: Array<{ reason: string }> = [];
+    const heard: WSMessage[] = [];
+    client.subscribe(['prices']);
+    client.on('wseGap', (detail) => gaps.push(detail));
+    client.onMessage('price', (m) => heard.push(m));
+    feed(JSON.parse('{"k":"b","s":1,"items":[{"m":{"t":"price","p":{},"tp":"prices","e":"0000000a","o":9007199254740993}}]}'));
+    expect(heard).toEqual([]);
+    expect(gaps.map((g) => g.reason)).toEqual(['unsafe_offset']);
+  });
+
+  it('counts the time of a send that waits for its topics from the send', async () => {
+    let resynced!: () => void;
+    const { client, feed, posted } = byHand({
+      consumer: 'window',
+      delivery: { mode: 'recover-or-resync', resync: () => new Promise<void>((resolve) => (resynced = resolve)) },
+    });
+    const notDelivered: Array<{ reason: string; ids: string[] }> = [];
+    client.on('wseNotDelivered', (detail) => notDelivered.push(detail));
+    client.subscribe(['prices']);
+    feed({ k: 'b', s: 1, items: [{ ev: 'subscribed', taken: ['prices'], refused: [] }] });
+    await settle();
+    client.send('buy', { quantity: 1 }, { requires: ['prices'], ttl: 1, id: 'late' });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    resynced();
+    await settle();
+    expect(posted.filter((f) => f.k === 'send')).toEqual([]);
+    expect(notDelivered).toEqual([{ reason: 'expired', ids: ['late'] }]);
+  });
+});
+
+describe('the owner, at its windows’ edge', () => {
+  it('never hands a window the credentials of its endpoint', async () => {
+    const o = createBridgeOwner({ endpoints: ['ws://ann:password@localhost/wse?access_token=secret'], offline: { enabled: false } });
+    owners.push(o);
+    const frames: unknown[] = [];
+    let sink: { frame(f: unknown): void } | undefined;
+    o.attach({ post: (f) => frames.push(f), listen: (s) => (sink = s as never), close: () => {} });
+    sink!.frame({ k: 'hello', v: 1, agent: 'test' });
+    await settle();
+    expect(JSON.stringify(frames)).not.toMatch(/password|access_token|secret/);
+  });
+
+  it('lets go of a window that sends what is not a frame, and goes on with the others', () => {
+    const o = createBridgeOwner({ offline: { enabled: false } });
+    owners.push(o);
+    const sinks: Array<{ frame(f: unknown): void }> = [];
+    const closed: number[] = [];
+    for (const n of [1, 2]) {
+      o.attach({ post: () => {}, listen: (s) => void sinks.push(s as never), close: () => void closed.push(n) });
+      sinks[n - 1].frame({ k: 'hello', v: 1, agent: 'test' });
+    }
+    for (const bad of [null, 7, 'x', [], { k: 'send' }, { k: 'hold', topics: 'prices' }]) {
+      expect(() => sinks[0].frame(bad)).not.toThrow();
+    }
+    expect(closed).toEqual([1]);
+    expect(o.attached).toBe(1);
+  });
+});
