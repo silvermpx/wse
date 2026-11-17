@@ -25,6 +25,8 @@ struct App {
     taken: mpsc::UnboundedSender<Taken>,
     connected: mpsc::UnboundedSender<String>,
     pace: Duration,
+    /// The first message of type `explode` panics in the handler.
+    exploded: std::sync::atomic::AtomicBool,
 }
 
 impl wse::Handler for App {
@@ -43,6 +45,13 @@ impl wse::Handler for App {
             std::thread::sleep(self.pace);
         }
         let kind = value["t"].as_str().unwrap_or_default().to_owned();
+        if kind == "explode"
+            && !self
+                .exploded
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("the application's handler panics");
+        }
         if kind == "refuse" {
             return false;
         }
@@ -92,6 +101,7 @@ async fn node_paced(config: wse::Config, pace: Duration) -> Node {
                 taken: taken_tx,
                 connected: connected_tx,
                 pace,
+                exploded: std::sync::atomic::AtomicBool::new(false),
             },
         )
         .unwrap();
@@ -557,4 +567,46 @@ async fn a_drain_answers_a_client_that_keeps_sending() {
         "taken up to {last_taken}, confirmed up to {highest}"
     );
     drained.await.unwrap().stop().await;
+}
+
+/// A message whose handler panicked is not said taken: the client sends it
+/// again on its next connection, and the application gets it marked as a
+/// possible repeat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_whose_handler_panicked_comes_again_marked() {
+    let mut node = node().await;
+    let (mut ws, _, _) = node
+        .client("ann", serde_json::json!({"producer": "p7"}))
+        .await;
+    send(&mut ws, "m", 1).await;
+    assert_eq!(node.took().await, taken("m", 1));
+    acked(&mut ws, 1).await;
+    send(&mut ws, "explode", 2).await;
+    // Its handler panicked: the connection closes.
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("closed within 5 s");
+        if matches!(frame, Some(Ok(Message::Close(_))) | None | Some(Err(_))) {
+            break;
+        }
+    }
+    let (mut ws, acked_at, _) = node
+        .client(
+            "ann",
+            serde_json::json!({"producer": "p7", "written": 2, "from": 2}),
+        )
+        .await;
+    assert_eq!(acked_at, 1, "2 was never decided");
+    send(&mut ws, "explode", 2).await;
+    assert_eq!(
+        node.took().await,
+        Taken {
+            kind: "explode".to_owned(),
+            s: 2,
+            possible_repeat: true,
+        }
+    );
+    acked(&mut ws, 2).await;
+    node.server.stop().await;
 }

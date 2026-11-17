@@ -106,6 +106,12 @@ pub(crate) struct SlotState {
     /// The refusals behind the mark, in order, until the client heard of
     /// them.
     holes: VecDeque<Hole>,
+    /// Up to here refusals were let go for the bound before the client
+    /// heard of them: one of these that comes again is not known as taken.
+    forgot: u64,
+    /// A message being decided: its handler runs. One whose handler never
+    /// ended (it panicked) stays undecided.
+    deciding: Option<u64>,
 }
 
 /// Whether a message is handed on.
@@ -118,6 +124,10 @@ pub(crate) enum Claim {
     Repeat,
     /// Refused already: refused again.
     Refused(Refusal),
+    /// Behind the mark, and the server cannot tell whether it was taken (a
+    /// refusal let go for the bound, or a decision whose handler never
+    /// ended): handed on marked as a possible repeat.
+    Unsure,
     /// Another node took the producer over.
     Moved,
 }
@@ -130,7 +140,13 @@ impl SlotState {
             return Claim::Moved;
         }
         if s <= self.mark {
-            return self.refusal_of(s).map_or(Claim::Repeat, Claim::Refused);
+            if let Some(why) = self.refusal_of(s) {
+                return Claim::Refused(why);
+            }
+            if self.deciding == Some(s) || s <= self.forgot {
+                return Claim::Unsure;
+            }
+            return Claim::Repeat;
         }
         let gap = (s > self.mark + 1).then(|| (self.mark + 1, s - 1));
         if let Some((from, to)) = gap {
@@ -149,10 +165,34 @@ impl SlotState {
             last.to = to;
             return;
         }
-        if self.holes.len() == MAX_HOLES {
-            self.holes.pop_front();
+        if self.holes.len() == MAX_HOLES
+            && let Some(gone) = self.holes.pop_front()
+        {
+            self.forgot = self.forgot.max(gone.to);
         }
-        self.holes.push_back(Hole { from, to, why });
+        // In order: one decided again behind the mark (it was unsure) goes
+        // in its place.
+        let at = self.holes.partition_point(|h| h.to < from);
+        self.holes.insert(at, Hole { from, to, why });
+    }
+
+    /// Message `s` is being decided: its handler runs.
+    pub(crate) fn deciding(&mut self, s: u64) {
+        self.deciding = Some(s);
+    }
+
+    /// Message `s` is decided: its handler ended.
+    pub(crate) fn decided(&mut self, s: u64) {
+        if self.deciding == Some(s) {
+            self.deciding = None;
+        }
+    }
+
+    /// What a client that comes back is told was decided: up to the mark,
+    /// but not a message whose handler never ended.
+    pub(crate) fn acked(&self) -> u64 {
+        self.deciding
+            .map_or(self.mark, |s| self.mark.min(s.saturating_sub(1)))
     }
 
     fn refusal_of(&self, s: u64) -> Option<Refusal> {
@@ -194,6 +234,8 @@ impl Slot {
                 mark: 0,
                 moved: false,
                 holes: VecDeque::new(),
+                forgot: 0,
+                deciding: None,
             }),
             seen: AtomicU64::new(now),
         }
@@ -209,7 +251,7 @@ impl Slot {
     fn hand_over(&self) -> (u64, Vec<Hole>) {
         let mut state = self.state.lock();
         state.moved = true;
-        (state.mark, state.holes.iter().copied().collect())
+        (state.acked(), state.holes.iter().copied().collect())
     }
 
     fn moved(&self) -> bool {
@@ -270,7 +312,7 @@ impl Producers {
         if known && here {
             let (start, told) = {
                 let mut state = slot.lock();
-                (state.mark, state.told_from(hello.from))
+                (state.acked(), state.told_from(hello.from))
             };
             let link = Link {
                 slot,
@@ -303,7 +345,7 @@ impl Producers {
                 let (start, told) = {
                     let mut state = slot.lock();
                     state.advance(mark, &holes);
-                    (state.mark, state.told_from(hello.from))
+                    (state.acked(), state.told_from(hello.from))
                 };
                 let link = Link {
                     slot,
@@ -645,6 +687,78 @@ mod tests {
         // The client waits for nothing before 3: it heard of them.
         assert!(state.told_from(3).is_empty());
         assert_eq!(state.claim(1, Refusal::Missing), Claim::Repeat);
+    }
+
+    #[test]
+    fn a_refusal_forgotten_past_the_bound_is_never_taken_for_a_take() {
+        let slot = Slot::new(0);
+        let mut state = slot.lock();
+        // Taken and refused in turn: one run of refusals each.
+        for n in 0..(MAX_HOLES as u64 + 1) {
+            let refused = 2 * n + 1;
+            state.claim(refused, Refusal::Missing);
+            state.refuse(refused, refused, Refusal::Busy);
+            state.claim(refused + 1, Refusal::Missing);
+        }
+        assert_eq!(state.holes.len(), MAX_HOLES);
+        // The first refusal is gone: the server cannot tell it from a take.
+        assert_eq!(state.claim(1, Refusal::Missing), Claim::Unsure);
+        // Those it still knows are answered as before.
+        assert_eq!(
+            state.claim(3, Refusal::Missing),
+            Claim::Refused(Refusal::Busy)
+        );
+        // Taken after what was let go: known as taken.
+        assert_eq!(state.claim(2, Refusal::Missing), Claim::Repeat);
+        let last = 2 * MAX_HOLES as u64 + 2;
+        assert_eq!(state.claim(last, Refusal::Missing), Claim::Repeat);
+    }
+
+    #[test]
+    fn a_decision_whose_handler_never_ended_is_not_said_taken() {
+        let slot = Slot::new(0);
+        let mut state = slot.lock();
+        assert_eq!(state.claim(1, Refusal::Missing), Claim::First { gap: None });
+        state.deciding(1);
+        state.decided(1);
+        assert_eq!(state.claim(2, Refusal::Missing), Claim::First { gap: None });
+        // Its handler panicked: 2 was never decided.
+        state.deciding(2);
+        assert_eq!(state.acked(), 1, "a client that comes back is told 1");
+        assert_eq!(state.claim(2, Refusal::Missing), Claim::Unsure);
+        state.deciding(2);
+        state.decided(2);
+        assert_eq!(state.acked(), 2);
+        assert_eq!(state.claim(2, Refusal::Missing), Claim::Repeat);
+    }
+
+    #[test]
+    fn a_refusal_of_one_the_server_could_not_tell_keeps_its_place() {
+        let slot = Slot::new(0);
+        let mut state = slot.lock();
+        for n in 0..(MAX_HOLES as u64 + 1) {
+            let refused = 2 * n + 1;
+            state.claim(refused, Refusal::Missing);
+            state.refuse(refused, refused, Refusal::Busy);
+            state.claim(refused + 1, Refusal::Missing);
+        }
+        assert_eq!(state.claim(1, Refusal::Missing), Claim::Unsure);
+        // Handed on again, and refused this time: said again as refused.
+        state.refuse(1, 1, Refusal::NotReady);
+        assert_eq!(
+            state.claim(1, Refusal::Missing),
+            Claim::Refused(Refusal::NotReady)
+        );
+        // The ones after it are found as before.
+        assert_eq!(
+            state.claim(5, Refusal::Missing),
+            Claim::Refused(Refusal::Busy)
+        );
+        let last = 2 * MAX_HOLES as u64 + 1;
+        assert_eq!(
+            state.claim(last, Refusal::Missing),
+            Claim::Refused(Refusal::Busy)
+        );
     }
 
     #[test]

@@ -1109,12 +1109,16 @@ fn deliver_json<H: Handler>(
     // of the same client that comes meanwhile hears the decision.
     let mut slot = link.slot.lock();
     let skipped = pending.skipped();
+    // Handed on marked as a possible repeat: the server cannot tell whether
+    // it took it already.
+    let mut unsure = s <= link.unsure_until;
     match slot.claim(s, skipped) {
         acks::Claim::First { gap } => {
             if let Some((from, to)) = gap {
                 pending.refuse(from, to, skipped);
             }
         }
+        acks::Claim::Unsure => unsure = true,
         acks::Claim::Repeat => {
             pending.taken(s);
             return;
@@ -1136,11 +1140,12 @@ fn deliver_json<H: Handler>(
             return;
         }
     }
-    if s <= link.unsure_until
-        && let Some(fields) = val.as_object_mut()
-    {
+    if unsure && let Some(fields) = val.as_object_mut() {
         fields.insert("possible_repeat".to_owned(), serde_json::Value::Bool(true));
     }
+    // Decided once its handler ends: a handler that panics leaves it
+    // undecided, and a client that comes back sends it again.
+    slot.deciding(s);
     let refused = if app.is_none() {
         Some(Declined::NotReady)
     } else if deliver(handler, app, Inbound::Json(val), size) {
@@ -1148,6 +1153,7 @@ fn deliver_json<H: Handler>(
     } else {
         Some(Declined::Busy)
     };
+    slot.decided(s);
     match refused {
         None => pending.taken(s),
         Some(why) => {
@@ -1173,6 +1179,11 @@ fn refuse_dropped(conn: &Conn<'_>, pending: &mut acks::Pending, frame: &[u8]) {
             if let Some((from, to)) = gap {
                 pending.refuse(from, to, skipped);
             }
+            slot.refuse(s, s, Declined::RateLimited);
+            pending.refuse(s, s, Declined::RateLimited);
+        }
+        // One the server could not tell of, dropped: refused now.
+        acks::Claim::Unsure => {
             slot.refuse(s, s, Declined::RateLimited);
             pending.refuse(s, s, Declined::RateLimited);
         }
