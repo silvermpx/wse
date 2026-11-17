@@ -66,6 +66,12 @@ default, `trust: nil`): the roots the device trusts. `trust:
 DER), `.mozilla` the Mozilla roots built into the library. ws:// sends
 everything in the clear and needs `insecure: true` (for development).
 
+A lost connection is made again: the first attempt after
+`reconnectBaseDelayMs` (a second), each next one `reconnectFactor` (1.5)
+times later, up to `reconnectMaxDelayMs` (30 s), spread by ±10% unless
+`reconnectJitter: false`; after `reconnectMaxAttempts` in a row (never by
+default) the client gives up and closes. `reconnect: false` never tries.
+
 `client.topicStates()` says of each topic whether the server took it and
 whether its messages run without a break. Where every fact counts,
 `delivery: WseDelivery(consumer: "board")` (recover-or-resync) holds a topic

@@ -1426,6 +1426,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  double dco_decode_f_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as double;
+  }
+
+  @protected
   int dco_decode_i_32(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as int;
@@ -1586,8 +1592,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   WseConfig dco_decode_wse_config(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 18)
-      throw Exception('unexpected arr length: expect 18 but see ${arr.length}');
+    if (arr.length != 23)
+      throw Exception('unexpected arr length: expect 23 but see ${arr.length}');
     return WseConfig(
       url: dco_decode_String(arr[0]),
       token: dco_decode_opt_String(arr[1]),
@@ -1597,16 +1603,21 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       headerValues: dco_decode_list_String(arr[5]),
       sendQueue: dco_decode_u_32(arr[6]),
       reconnect: dco_decode_bool(arr[7]),
-      connectTimeoutMs: dco_decode_u_64(arr[8]),
-      recoveryTimeoutMs: dco_decode_u_64(arr[9]),
-      serverIdentityKeys: dco_decode_list_String(arr[10]),
-      signingKey: dco_decode_opt_list_prim_u_8_strict(arr[11]),
-      serverSigningKeys: dco_decode_list_String(arr[12]),
-      trust: dco_decode_wse_trust_kind(arr[13]),
-      trustedRoots: dco_decode_list_list_prim_u_8_strict(arr[14]),
-      insecure: dco_decode_bool(arr[15]),
-      delivery: dco_decode_opt_box_autoadd_wse_delivery(arr[16]),
-      offline: dco_decode_opt_box_autoadd_wse_offline(arr[17]),
+      reconnectBaseDelayMs: dco_decode_u_64(arr[8]),
+      reconnectMaxDelayMs: dco_decode_u_64(arr[9]),
+      reconnectFactor: dco_decode_f_64(arr[10]),
+      reconnectJitter: dco_decode_bool(arr[11]),
+      reconnectMaxAttempts: dco_decode_u_32(arr[12]),
+      connectTimeoutMs: dco_decode_u_64(arr[13]),
+      recoveryTimeoutMs: dco_decode_u_64(arr[14]),
+      serverIdentityKeys: dco_decode_list_String(arr[15]),
+      signingKey: dco_decode_opt_list_prim_u_8_strict(arr[16]),
+      serverSigningKeys: dco_decode_list_String(arr[17]),
+      trust: dco_decode_wse_trust_kind(arr[18]),
+      trustedRoots: dco_decode_list_list_prim_u_8_strict(arr[19]),
+      insecure: dco_decode_bool(arr[20]),
+      delivery: dco_decode_opt_box_autoadd_wse_delivery(arr[21]),
+      offline: dco_decode_opt_box_autoadd_wse_offline(arr[22]),
     );
   }
 
@@ -1923,6 +1934,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  double sse_decode_f_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getFloat64();
+  }
+
+  @protected
   int sse_decode_i_32(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getInt32();
@@ -2182,6 +2199,11 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_headerValues = sse_decode_list_String(deserializer);
     var var_sendQueue = sse_decode_u_32(deserializer);
     var var_reconnect = sse_decode_bool(deserializer);
+    var var_reconnectBaseDelayMs = sse_decode_u_64(deserializer);
+    var var_reconnectMaxDelayMs = sse_decode_u_64(deserializer);
+    var var_reconnectFactor = sse_decode_f_64(deserializer);
+    var var_reconnectJitter = sse_decode_bool(deserializer);
+    var var_reconnectMaxAttempts = sse_decode_u_32(deserializer);
     var var_connectTimeoutMs = sse_decode_u_64(deserializer);
     var var_recoveryTimeoutMs = sse_decode_u_64(deserializer);
     var var_serverIdentityKeys = sse_decode_list_String(deserializer);
@@ -2201,6 +2223,11 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       headerValues: var_headerValues,
       sendQueue: var_sendQueue,
       reconnect: var_reconnect,
+      reconnectBaseDelayMs: var_reconnectBaseDelayMs,
+      reconnectMaxDelayMs: var_reconnectMaxDelayMs,
+      reconnectFactor: var_reconnectFactor,
+      reconnectJitter: var_reconnectJitter,
+      reconnectMaxAttempts: var_reconnectMaxAttempts,
       connectTimeoutMs: var_connectTimeoutMs,
       recoveryTimeoutMs: var_recoveryTimeoutMs,
       serverIdentityKeys: var_serverIdentityKeys,
@@ -2585,6 +2612,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_f_64(double self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putFloat64(self);
+  }
+
+  @protected
   void sse_encode_i_32(int self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     serializer.buffer.putInt32(self);
@@ -2834,6 +2867,11 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_list_String(self.headerValues, serializer);
     sse_encode_u_32(self.sendQueue, serializer);
     sse_encode_bool(self.reconnect, serializer);
+    sse_encode_u_64(self.reconnectBaseDelayMs, serializer);
+    sse_encode_u_64(self.reconnectMaxDelayMs, serializer);
+    sse_encode_f_64(self.reconnectFactor, serializer);
+    sse_encode_bool(self.reconnectJitter, serializer);
+    sse_encode_u_32(self.reconnectMaxAttempts, serializer);
     sse_encode_u_64(self.connectTimeoutMs, serializer);
     sse_encode_u_64(self.recoveryTimeoutMs, serializer);
     sse_encode_list_String(self.serverIdentityKeys, serializer);

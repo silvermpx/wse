@@ -112,6 +112,22 @@ pub struct WseConfig {
     pub send_queue: u32,
     #[uniffi(default = true)]
     pub reconnect: bool,
+    /// The wait before the first reconnect attempt, in milliseconds (0: a second).
+    #[uniffi(default = 0)]
+    pub reconnect_base_delay_ms: u64,
+    /// The longest wait between attempts, in milliseconds (0: 30 s).
+    #[uniffi(default = 0)]
+    pub reconnect_max_delay_ms: u64,
+    /// Each attempt waits this many times longer than the one before (0: 1.5).
+    #[uniffi(default = 0.0)]
+    pub reconnect_factor: f64,
+    /// Spread the waits by ±10%, so clients of a restarted server do not all come
+    /// back at once.
+    #[uniffi(default = true)]
+    pub reconnect_jitter: bool,
+    /// Attempts in a row before giving up (0: never).
+    #[uniffi(default = 0)]
+    pub reconnect_max_attempts: u32,
     #[uniffi(default = 0)]
     pub connect_timeout_ms: u64,
     #[uniffi(default = 0)]
@@ -348,6 +364,11 @@ impl From<WseConfig> for native::NativeConfig {
             headers: c.headers.into_iter().map(|h| (h.name, h.value)).collect(),
             send_queue: c.send_queue,
             reconnect: Some(c.reconnect),
+            reconnect_base_delay_ms: c.reconnect_base_delay_ms,
+            reconnect_max_delay_ms: c.reconnect_max_delay_ms,
+            reconnect_factor: c.reconnect_factor,
+            reconnect_jitter: Some(c.reconnect_jitter),
+            reconnect_max_attempts: c.reconnect_max_attempts,
             connect_timeout_ms: c.connect_timeout_ms,
             ready_timeout_ms: c.ready_timeout_ms,
             idle_timeout_ms: c.idle_timeout_ms,

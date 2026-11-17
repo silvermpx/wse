@@ -1683,6 +1683,13 @@ impl SseDecode for bool {
     }
 }
 
+impl SseDecode for f64 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        deserializer.cursor.read_f64::<NativeEndian>().unwrap()
+    }
+}
+
 impl SseDecode for i32 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1938,6 +1945,11 @@ impl SseDecode for crate::api::WseConfig {
         let mut var_headerValues = <Vec<String>>::sse_decode(deserializer);
         let mut var_sendQueue = <u32>::sse_decode(deserializer);
         let mut var_reconnect = <bool>::sse_decode(deserializer);
+        let mut var_reconnectBaseDelayMs = <u64>::sse_decode(deserializer);
+        let mut var_reconnectMaxDelayMs = <u64>::sse_decode(deserializer);
+        let mut var_reconnectFactor = <f64>::sse_decode(deserializer);
+        let mut var_reconnectJitter = <bool>::sse_decode(deserializer);
+        let mut var_reconnectMaxAttempts = <u32>::sse_decode(deserializer);
         let mut var_connectTimeoutMs = <u64>::sse_decode(deserializer);
         let mut var_recoveryTimeoutMs = <u64>::sse_decode(deserializer);
         let mut var_serverIdentityKeys = <Vec<String>>::sse_decode(deserializer);
@@ -1957,6 +1969,11 @@ impl SseDecode for crate::api::WseConfig {
             header_values: var_headerValues,
             send_queue: var_sendQueue,
             reconnect: var_reconnect,
+            reconnect_base_delay_ms: var_reconnectBaseDelayMs,
+            reconnect_max_delay_ms: var_reconnectMaxDelayMs,
+            reconnect_factor: var_reconnectFactor,
+            reconnect_jitter: var_reconnectJitter,
+            reconnect_max_attempts: var_reconnectMaxAttempts,
             connect_timeout_ms: var_connectTimeoutMs,
             recovery_timeout_ms: var_recoveryTimeoutMs,
             server_identity_keys: var_serverIdentityKeys,
@@ -2347,6 +2364,11 @@ impl flutter_rust_bridge::IntoDart for crate::api::WseConfig {
             self.header_values.into_into_dart().into_dart(),
             self.send_queue.into_into_dart().into_dart(),
             self.reconnect.into_into_dart().into_dart(),
+            self.reconnect_base_delay_ms.into_into_dart().into_dart(),
+            self.reconnect_max_delay_ms.into_into_dart().into_dart(),
+            self.reconnect_factor.into_into_dart().into_dart(),
+            self.reconnect_jitter.into_into_dart().into_dart(),
+            self.reconnect_max_attempts.into_into_dart().into_dart(),
             self.connect_timeout_ms.into_into_dart().into_dart(),
             self.recovery_timeout_ms.into_into_dart().into_dart(),
             self.server_identity_keys.into_into_dart().into_dart(),
@@ -2680,6 +2702,13 @@ impl SseEncode for bool {
     }
 }
 
+impl SseEncode for f64 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        serializer.cursor.write_f64::<NativeEndian>(self).unwrap();
+    }
+}
+
 impl SseEncode for i32 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -2910,6 +2939,11 @@ impl SseEncode for crate::api::WseConfig {
         <Vec<String>>::sse_encode(self.header_values, serializer);
         <u32>::sse_encode(self.send_queue, serializer);
         <bool>::sse_encode(self.reconnect, serializer);
+        <u64>::sse_encode(self.reconnect_base_delay_ms, serializer);
+        <u64>::sse_encode(self.reconnect_max_delay_ms, serializer);
+        <f64>::sse_encode(self.reconnect_factor, serializer);
+        <bool>::sse_encode(self.reconnect_jitter, serializer);
+        <u32>::sse_encode(self.reconnect_max_attempts, serializer);
         <u64>::sse_encode(self.connect_timeout_ms, serializer);
         <u64>::sse_encode(self.recovery_timeout_ms, serializer);
         <Vec<String>>::sse_encode(self.server_identity_keys, serializer);

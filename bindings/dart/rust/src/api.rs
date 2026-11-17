@@ -52,6 +52,17 @@ pub struct WseConfig {
     pub header_values: Vec<String>,
     pub send_queue: u32,
     pub reconnect: bool,
+    /// The wait before the first reconnect attempt (0: a second).
+    pub reconnect_base_delay_ms: u64,
+    /// The longest wait between attempts (0: 30 s).
+    pub reconnect_max_delay_ms: u64,
+    /// Each attempt waits this many times longer than the one before (0: 1.5).
+    pub reconnect_factor: f64,
+    /// Spread the waits by ±10%, so clients of a restarted server do not
+    /// all come back at once.
+    pub reconnect_jitter: bool,
+    /// Attempts in a row before giving up (0: never).
+    pub reconnect_max_attempts: u32,
     pub connect_timeout_ms: u64,
     pub recovery_timeout_ms: u64,
     pub server_identity_keys: Vec<String>,
@@ -561,6 +572,11 @@ fn native_config(config: WseConfig) -> native::NativeConfig {
         headers,
         send_queue: config.send_queue,
         reconnect: Some(config.reconnect),
+        reconnect_base_delay_ms: config.reconnect_base_delay_ms,
+        reconnect_max_delay_ms: config.reconnect_max_delay_ms,
+        reconnect_factor: config.reconnect_factor,
+        reconnect_jitter: Some(config.reconnect_jitter),
+        reconnect_max_attempts: config.reconnect_max_attempts,
         connect_timeout_ms: config.connect_timeout_ms,
         recovery_timeout_ms: config.recovery_timeout_ms,
         server_identity_keys: config.server_identity_keys,

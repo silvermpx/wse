@@ -353,6 +353,11 @@ class WseClient {
 /// [WseClient.sendSigned] sends, and [serverSigningKeys] check what the
 /// server signs. [offline] tunes the outbox, where every message waits until
 /// the server answers for it (in memory by default; [wseOffline]).
+/// [reconnect] makes a lost connection again: the first attempt after
+/// [reconnectDelay] (a second), each next one [reconnectFactor] (1.5) times
+/// later, up to [reconnectMaxDelay] (30 s), spread by ±10% unless
+/// [reconnectJitter] is false; after [reconnectMaxAttempts] in a row (never
+/// by default) the client gives up.
 rust.WseConfig wseConfig(
   String url, {
   String? token,
@@ -360,6 +365,11 @@ rust.WseConfig wseConfig(
   bool msgpack = false,
   Map<String, String> headers = const {},
   bool reconnect = true,
+  Duration reconnectDelay = Duration.zero,
+  Duration reconnectMaxDelay = Duration.zero,
+  double reconnectFactor = 0,
+  bool reconnectJitter = true,
+  int reconnectMaxAttempts = 0,
   WseTrust trust = WseTrust.platform,
   bool insecure = false,
   rust.WseDelivery? delivery,
@@ -376,6 +386,11 @@ rust.WseConfig wseConfig(
   headerValues: headers.values.toList(),
   sendQueue: 0,
   reconnect: reconnect,
+  reconnectBaseDelayMs: BigInt.from(reconnectDelay.inMilliseconds),
+  reconnectMaxDelayMs: BigInt.from(reconnectMaxDelay.inMilliseconds),
+  reconnectFactor: reconnectFactor,
+  reconnectJitter: reconnectJitter,
+  reconnectMaxAttempts: reconnectMaxAttempts,
   connectTimeoutMs: BigInt.zero,
   recoveryTimeoutMs: BigInt.zero,
   serverIdentityKeys: serverIdentityKeys,

@@ -114,7 +114,12 @@ default, `trust = null`): the roots the device trusts. `trust =
 WseTrust.Roots(listOf(ca))` trusts only a private CA's certificate (PEM or
 DER), `WseTrust.Mozilla` the Mozilla roots built into the library. ws://
 sends everything in the clear and needs `insecure = true` (for development).
-On Android the library sets the verifier up as the app starts (through
+A lost connection is made again: the first attempt after
+`reconnectBaseDelayMs` (a second), each next one `reconnectFactor` (1.5) times
+later, up to `reconnectMaxDelayMs` (30 s), spread by ±10% unless
+`reconnectJitter = false`; after `reconnectMaxAttempts` in a row (never by
+default) the client gives up and closes (from Java: `Wse.config(url)
+.reconnectDelay(...)` and the like). On Android the library sets the verifier up as the app starts (through
 androidx.startup); an app that removed that provider calls
 `WseTls.init(context)` before it connects. Android checks revocation where
 it can fetch the CA's lists, which come over http: an app whose network

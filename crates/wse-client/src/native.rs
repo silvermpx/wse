@@ -181,6 +181,17 @@ pub struct NativeConfig {
     pub send_queue: u32,
     /// Reconnect after a lost connection (default true).
     pub reconnect: Option<bool>,
+    /// The wait before the first reconnect attempt (0: a second).
+    pub reconnect_base_delay_ms: u64,
+    /// The longest wait between attempts (0: 30 s).
+    pub reconnect_max_delay_ms: u64,
+    /// Each attempt waits this many times longer than the one before (0: 1.5).
+    pub reconnect_factor: f64,
+    /// Spread the waits by ±10%, so clients of a restarted server do not all
+    /// come back at once (default true).
+    pub reconnect_jitter: Option<bool>,
+    /// Attempts in a row before giving up (0: never).
+    pub reconnect_max_attempts: u32,
     pub connect_timeout_ms: u64,
     pub ready_timeout_ms: u64,
     pub idle_timeout_ms: u64,
@@ -384,9 +395,6 @@ fn config_of(
     if native.send_queue > 0 {
         config.send_queue = native.send_queue as usize;
     }
-    if let Some(reconnect) = native.reconnect {
-        config.reconnect.enabled = reconnect;
-    }
     let ms = |value: u64, default: Duration| {
         if value == 0 {
             default
@@ -394,6 +402,20 @@ fn config_of(
             Duration::from_millis(value)
         }
     };
+    if let Some(reconnect) = native.reconnect {
+        config.reconnect.enabled = reconnect;
+    }
+    config.reconnect.base_delay = ms(native.reconnect_base_delay_ms, config.reconnect.base_delay);
+    config.reconnect.max_delay = ms(native.reconnect_max_delay_ms, config.reconnect.max_delay);
+    if native.reconnect_factor.is_finite() && native.reconnect_factor > 0.0 {
+        config.reconnect.factor = native.reconnect_factor;
+    }
+    if let Some(jitter) = native.reconnect_jitter {
+        config.reconnect.jitter = jitter;
+    }
+    if native.reconnect_max_attempts > 0 {
+        config.reconnect.max_attempts = Some(native.reconnect_max_attempts);
+    }
     config.connect_timeout = ms(native.connect_timeout_ms, config.connect_timeout);
     config.ready_timeout = ms(native.ready_timeout_ms, config.ready_timeout);
     config.idle_timeout = ms(native.idle_timeout_ms, config.idle_timeout);

@@ -1516,6 +1516,29 @@ public object FfiConverterULong: FfiConverter<ULong, Long> {
 /**
  * @suppress
  */
+public object FfiConverterDouble: FfiConverter<Double, Double> {
+    override fun lift(value: Double): Double {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Double {
+        return buf.getDouble()
+    }
+
+    override fun lower(value: Double): Double {
+        return value
+    }
+
+    override fun allocationSize(value: Double) = 8UL
+
+    override fun write(value: Double, buf: ByteBuffer) {
+        buf.putDouble(value)
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
     override fun lift(value: Byte): Boolean {
         return value.toInt() != 0
@@ -3206,6 +3229,32 @@ data class WseConfig (
     ,
     val `reconnect`: kotlin.Boolean = true
     ,
+    /**
+     * The wait before the first reconnect attempt, in milliseconds (0: a second).
+     */
+    val `reconnectBaseDelayMs`: kotlin.ULong = 0uL
+    ,
+    /**
+     * The longest wait between attempts, in milliseconds (0: 30 s).
+     */
+    val `reconnectMaxDelayMs`: kotlin.ULong = 0uL
+    ,
+    /**
+     * Each attempt waits this many times longer than the one before (0: 1.5).
+     */
+    val `reconnectFactor`: kotlin.Double = 0.0
+    ,
+    /**
+     * Spread the waits by ±10%, so clients of a restarted server do not all come
+     * back at once.
+     */
+    val `reconnectJitter`: kotlin.Boolean = true
+    ,
+    /**
+     * Attempts in a row before giving up (0: never).
+     */
+    val `reconnectMaxAttempts`: kotlin.UInt = 0u
+    ,
     val `connectTimeoutMs`: kotlin.ULong = 0uL
     ,
     val `readyTimeoutMs`: kotlin.ULong = 0uL
@@ -3272,6 +3321,11 @@ public object FfiConverterTypeWseConfig: FfiConverterRustBuffer<WseConfig> {
             FfiConverterBoolean.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
+            FfiConverterDouble.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterSequenceString.read(buf),
@@ -3292,6 +3346,11 @@ public object FfiConverterTypeWseConfig: FfiConverterRustBuffer<WseConfig> {
             FfiConverterSequenceTypeWseHeader.allocationSize(value.`headers`) +
             FfiConverterUInt.allocationSize(value.`sendQueue`) +
             FfiConverterBoolean.allocationSize(value.`reconnect`) +
+            FfiConverterULong.allocationSize(value.`reconnectBaseDelayMs`) +
+            FfiConverterULong.allocationSize(value.`reconnectMaxDelayMs`) +
+            FfiConverterDouble.allocationSize(value.`reconnectFactor`) +
+            FfiConverterBoolean.allocationSize(value.`reconnectJitter`) +
+            FfiConverterUInt.allocationSize(value.`reconnectMaxAttempts`) +
             FfiConverterULong.allocationSize(value.`connectTimeoutMs`) +
             FfiConverterULong.allocationSize(value.`readyTimeoutMs`) +
             FfiConverterULong.allocationSize(value.`idleTimeoutMs`) +
@@ -3313,6 +3372,11 @@ public object FfiConverterTypeWseConfig: FfiConverterRustBuffer<WseConfig> {
             FfiConverterSequenceTypeWseHeader.write(value.`headers`, buf)
             FfiConverterUInt.write(value.`sendQueue`, buf)
             FfiConverterBoolean.write(value.`reconnect`, buf)
+            FfiConverterULong.write(value.`reconnectBaseDelayMs`, buf)
+            FfiConverterULong.write(value.`reconnectMaxDelayMs`, buf)
+            FfiConverterDouble.write(value.`reconnectFactor`, buf)
+            FfiConverterBoolean.write(value.`reconnectJitter`, buf)
+            FfiConverterUInt.write(value.`reconnectMaxAttempts`, buf)
             FfiConverterULong.write(value.`connectTimeoutMs`, buf)
             FfiConverterULong.write(value.`readyTimeoutMs`, buf)
             FfiConverterULong.write(value.`idleTimeoutMs`, buf)

@@ -535,6 +535,22 @@ fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
+    typealias FfiType = Double
+    typealias SwiftType = Double
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Double {
+        return try lift(readDouble(&buf))
+    }
+
+    public static func write(_ value: Double, into buf: inout [UInt8]) {
+        writeDouble(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -1684,6 +1700,27 @@ public struct WseConfig: Equatable, Hashable {
     public let headers: [WseHeader]
     public let sendQueue: UInt32
     public let reconnect: Bool
+    /**
+     * The wait before the first reconnect attempt, in milliseconds (0: a second).
+     */
+    public let reconnectBaseDelayMs: UInt64
+    /**
+     * The longest wait between attempts, in milliseconds (0: 30 s).
+     */
+    public let reconnectMaxDelayMs: UInt64
+    /**
+     * Each attempt waits this many times longer than the one before (0: 1.5).
+     */
+    public let reconnectFactor: Double
+    /**
+     * Spread the waits by ±10%, so clients of a restarted server do not all come
+     * back at once.
+     */
+    public let reconnectJitter: Bool
+    /**
+     * Attempts in a row before giving up (0: never).
+     */
+    public let reconnectMaxAttempts: UInt32
     public let connectTimeoutMs: UInt64
     public let readyTimeoutMs: UInt64
     public let idleTimeoutMs: UInt64
@@ -1721,7 +1758,23 @@ public struct WseConfig: Equatable, Hashable {
     public init(
         /**
          * ws://host:port/wse or wss://...
-         */url: String, token: String? = nil, topics: [String] = [], msgpack: Bool = false, headers: [WseHeader] = [], sendQueue: UInt32 = UInt32(0), reconnect: Bool = true, connectTimeoutMs: UInt64 = UInt64(0), readyTimeoutMs: UInt64 = UInt64(0), idleTimeoutMs: UInt64 = UInt64(0), recoveryTimeoutMs: UInt64 = UInt64(0),
+         */url: String, token: String? = nil, topics: [String] = [], msgpack: Bool = false, headers: [WseHeader] = [], sendQueue: UInt32 = UInt32(0), reconnect: Bool = true,
+        /**
+         * The wait before the first reconnect attempt, in milliseconds (0: a second).
+         */reconnectBaseDelayMs: UInt64 = UInt64(0),
+        /**
+         * The longest wait between attempts, in milliseconds (0: 30 s).
+         */reconnectMaxDelayMs: UInt64 = UInt64(0),
+        /**
+         * Each attempt waits this many times longer than the one before (0: 1.5).
+         */reconnectFactor: Double = Double(0.0),
+        /**
+         * Spread the waits by ±10%, so clients of a restarted server do not all come
+         * back at once.
+         */reconnectJitter: Bool = true,
+        /**
+         * Attempts in a row before giving up (0: never).
+         */reconnectMaxAttempts: UInt32 = UInt32(0), connectTimeoutMs: UInt64 = UInt64(0), readyTimeoutMs: UInt64 = UInt64(0), idleTimeoutMs: UInt64 = UInt64(0), recoveryTimeoutMs: UInt64 = UInt64(0),
         /**
          * End-to-end encryption pinned to these server identity keys (base64).
          */serverIdentityKeys: [String] = [],
@@ -1749,6 +1802,11 @@ public struct WseConfig: Equatable, Hashable {
         self.headers = headers
         self.sendQueue = sendQueue
         self.reconnect = reconnect
+        self.reconnectBaseDelayMs = reconnectBaseDelayMs
+        self.reconnectMaxDelayMs = reconnectMaxDelayMs
+        self.reconnectFactor = reconnectFactor
+        self.reconnectJitter = reconnectJitter
+        self.reconnectMaxAttempts = reconnectMaxAttempts
         self.connectTimeoutMs = connectTimeoutMs
         self.readyTimeoutMs = readyTimeoutMs
         self.idleTimeoutMs = idleTimeoutMs
@@ -1785,6 +1843,11 @@ public struct FfiConverterTypeWseConfig: FfiConverterRustBuffer {
                 headers: FfiConverterSequenceTypeWseHeader.read(from: &buf),
                 sendQueue: FfiConverterUInt32.read(from: &buf),
                 reconnect: FfiConverterBool.read(from: &buf),
+                reconnectBaseDelayMs: FfiConverterUInt64.read(from: &buf),
+                reconnectMaxDelayMs: FfiConverterUInt64.read(from: &buf),
+                reconnectFactor: FfiConverterDouble.read(from: &buf),
+                reconnectJitter: FfiConverterBool.read(from: &buf),
+                reconnectMaxAttempts: FfiConverterUInt32.read(from: &buf),
                 connectTimeoutMs: FfiConverterUInt64.read(from: &buf),
                 readyTimeoutMs: FfiConverterUInt64.read(from: &buf),
                 idleTimeoutMs: FfiConverterUInt64.read(from: &buf),
@@ -1807,6 +1870,11 @@ public struct FfiConverterTypeWseConfig: FfiConverterRustBuffer {
         FfiConverterSequenceTypeWseHeader.write(value.headers, into: &buf)
         FfiConverterUInt32.write(value.sendQueue, into: &buf)
         FfiConverterBool.write(value.reconnect, into: &buf)
+        FfiConverterUInt64.write(value.reconnectBaseDelayMs, into: &buf)
+        FfiConverterUInt64.write(value.reconnectMaxDelayMs, into: &buf)
+        FfiConverterDouble.write(value.reconnectFactor, into: &buf)
+        FfiConverterBool.write(value.reconnectJitter, into: &buf)
+        FfiConverterUInt32.write(value.reconnectMaxAttempts, into: &buf)
         FfiConverterUInt64.write(value.connectTimeoutMs, into: &buf)
         FfiConverterUInt64.write(value.readyTimeoutMs, into: &buf)
         FfiConverterUInt64.write(value.idleTimeoutMs, into: &buf)

@@ -25,6 +25,9 @@
   adapters take as they take any. Only the top frame of a served window,
   at a URL the application allows (by default its own pages, never the
   web's), gets a port.
+- Swift, Kotlin and Dart: the reconnect settings the other clients have:
+  the first wait, the longest, the factor, the jitter, and the attempts
+  in a row before the client gives up.
 - The conformance cases run through the Swift, Kotlin (on the JVM) and
   Dart packages too (agents `swift`, `kotlin`, `dart`), each in its own
   test run beside the conformance server; all pass every case.

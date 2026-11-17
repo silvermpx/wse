@@ -158,6 +158,9 @@ class Run {
       token: (begun['tokens'] as Map)[user] as String?,
       topics: ((step['topics'] as List?) ?? const []).cast<String>(),
       msgpack: step['format'] == 'msgpack',
+      reconnectDelay: const Duration(milliseconds: 50),
+      reconnectMaxDelay: const Duration(milliseconds: 300),
+      reconnectJitter: false,
       insecure: true,
       serverIdentityKeys: step['e2e'] == true
           ? [begun['identity_key'] as String]

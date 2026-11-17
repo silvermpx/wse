@@ -316,6 +316,24 @@ final class WseClientTests: XCTestCase {
         await client.disconnect(deadlineMs: 1_000)
     }
 
+    func testAClientGivesUpAfterItsAttemptsAsSoonAsItsDelaysSay() async throws {
+        let began = Date()
+        let client = try await WseClient.start(
+            WseConfig(
+                url: "ws://127.0.0.1:9/wse", reconnectBaseDelayMs: 20, reconnectMaxDelayMs: 40,
+                reconnectJitter: false, reconnectMaxAttempts: 3, insecure: true))
+        var reason: String?
+        for try await item in client.events() {
+            if case let .closed(why) = item {
+                reason = why
+                break
+            }
+        }
+        XCTAssertTrue(reason?.hasPrefix("gave up reconnecting") == true, reason ?? "no reason")
+        // Three attempts at 20 and 40 ms, not at a second and more.
+        XCTAssertLessThan(Date().timeIntervalSince(began), 3)
+    }
+
     func testALoopLeftLeavesTheRestToTheNext() async throws {
         let client = try await WseClient.connect(WseConfig(url: url, insecure: true))
         try await client.send(kind: "echo", json: #"{"n":1}"#)

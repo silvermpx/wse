@@ -299,6 +299,30 @@ void main() {
     },
   );
 
+  test(
+    'a client gives up after its attempts, as soon as its delays say',
+    () async {
+      final watch = Stopwatch()..start();
+      final client = await WseClient.start(
+        wseConfig(
+          'ws://127.0.0.1:9/wse',
+          insecure: true,
+          reconnectDelay: const Duration(milliseconds: 20),
+          reconnectMaxDelay: const Duration(milliseconds: 40),
+          reconnectJitter: false,
+          reconnectMaxAttempts: 3,
+        ),
+      );
+      final closed = await client.events().firstWhere(
+        (item) => item.kind == WseItemKind.closed,
+      );
+      expect(closed.reason, startsWith('gave up reconnecting'));
+      // Three attempts at 20 and 40 ms, not at a second and more.
+      expect(watch.elapsed, lessThan(const Duration(seconds: 3)));
+      await client.close();
+    },
+  );
+
   test('a send that requires a topic waits for its resync', () async {
     final client = await WseClient.connect(
       wseConfig(

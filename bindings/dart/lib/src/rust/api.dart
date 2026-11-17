@@ -183,6 +183,22 @@ class WseConfig {
   final List<String> headerValues;
   final int sendQueue;
   final bool reconnect;
+
+  /// The wait before the first reconnect attempt (0: a second).
+  final BigInt reconnectBaseDelayMs;
+
+  /// The longest wait between attempts (0: 30 s).
+  final BigInt reconnectMaxDelayMs;
+
+  /// Each attempt waits this many times longer than the one before (0: 1.5).
+  final double reconnectFactor;
+
+  /// Spread the waits by ±10%, so clients of a restarted server do not
+  /// all come back at once.
+  final bool reconnectJitter;
+
+  /// Attempts in a row before giving up (0: never).
+  final int reconnectMaxAttempts;
   final BigInt connectTimeoutMs;
   final BigInt recoveryTimeoutMs;
   final List<String> serverIdentityKeys;
@@ -214,6 +230,11 @@ class WseConfig {
     required this.headerValues,
     required this.sendQueue,
     required this.reconnect,
+    required this.reconnectBaseDelayMs,
+    required this.reconnectMaxDelayMs,
+    required this.reconnectFactor,
+    required this.reconnectJitter,
+    required this.reconnectMaxAttempts,
     required this.connectTimeoutMs,
     required this.recoveryTimeoutMs,
     required this.serverIdentityKeys,
@@ -236,6 +257,11 @@ class WseConfig {
       headerValues.hashCode ^
       sendQueue.hashCode ^
       reconnect.hashCode ^
+      reconnectBaseDelayMs.hashCode ^
+      reconnectMaxDelayMs.hashCode ^
+      reconnectFactor.hashCode ^
+      reconnectJitter.hashCode ^
+      reconnectMaxAttempts.hashCode ^
       connectTimeoutMs.hashCode ^
       recoveryTimeoutMs.hashCode ^
       serverIdentityKeys.hashCode ^
@@ -260,6 +286,11 @@ class WseConfig {
           headerValues == other.headerValues &&
           sendQueue == other.sendQueue &&
           reconnect == other.reconnect &&
+          reconnectBaseDelayMs == other.reconnectBaseDelayMs &&
+          reconnectMaxDelayMs == other.reconnectMaxDelayMs &&
+          reconnectFactor == other.reconnectFactor &&
+          reconnectJitter == other.reconnectJitter &&
+          reconnectMaxAttempts == other.reconnectMaxAttempts &&
           connectTimeoutMs == other.connectTimeoutMs &&
           recoveryTimeoutMs == other.recoveryTimeoutMs &&
           serverIdentityKeys == other.serverIdentityKeys &&

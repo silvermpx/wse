@@ -162,6 +162,12 @@ final client = await WseClient.connect(
 ws:// sends everything in the clear and needs `insecure: true` (for
 development).
 
+A lost connection is made again: the first attempt after `reconnectDelay`
+(a second), each next one `reconnectFactor` (1.5) times later, up to
+`reconnectMaxDelay` (30 s), spread by ±10% unless `reconnectJitter: false`;
+after `reconnectMaxAttempts` in a row (never by default) the client gives up
+and closes. `reconnect: false` never tries.
+
 ## Background and network
 
 `WseAppLifecycle(client)` pauses the client five seconds after the app went

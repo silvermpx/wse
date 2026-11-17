@@ -195,6 +195,11 @@ class WseConfigBuilder internal constructor(private val url: String) {
     private val headers = mutableListOf<WseHeader>()
     private var sendQueue = 0u
     private var reconnect = true
+    private var reconnectDelay = 0uL
+    private var reconnectMaxDelay = 0uL
+    private var reconnectFactor = 0.0
+    private var reconnectJitter = true
+    private var reconnectMaxAttempts = 0u
     private var connectTimeout = 0uL
     private var readyTimeout = 0uL
     private var idleTimeout = 0uL
@@ -227,6 +232,21 @@ class WseConfigBuilder internal constructor(private val url: String) {
 
     /** Whether a lost connection is made again (true by default). */
     fun reconnect(reconnect: Boolean): WseConfigBuilder = apply { this.reconnect = reconnect }
+
+    /** The wait before the first reconnect attempt (zero: a second). */
+    fun reconnectDelay(delay: Duration): WseConfigBuilder = apply { reconnectDelay = millis(delay) }
+
+    /** The longest wait between reconnect attempts (zero: 30 s). */
+    fun reconnectMaxDelay(delay: Duration): WseConfigBuilder = apply { reconnectMaxDelay = millis(delay) }
+
+    /** Each attempt waits this many times longer than the one before (zero: 1.5). */
+    fun reconnectFactor(factor: Double): WseConfigBuilder = apply { reconnectFactor = factor }
+
+    /** Spread the waits by ±10%, so clients of a restarted server do not all come back at once (true by default). */
+    fun reconnectJitter(jitter: Boolean): WseConfigBuilder = apply { reconnectJitter = jitter }
+
+    /** Attempts in a row before giving up (zero: never). */
+    fun reconnectMaxAttempts(attempts: Int): WseConfigBuilder = apply { reconnectMaxAttempts = count(attempts) }
 
     /** For the socket, TLS and the upgrade (zero: 10 s). */
     fun connectTimeout(timeout: Duration): WseConfigBuilder = apply { connectTimeout = millis(timeout) }
@@ -276,6 +296,11 @@ class WseConfigBuilder internal constructor(private val url: String) {
             headers = headers.toList(),
             sendQueue = sendQueue,
             reconnect = reconnect,
+            reconnectBaseDelayMs = reconnectDelay,
+            reconnectMaxDelayMs = reconnectMaxDelay,
+            reconnectFactor = reconnectFactor,
+            reconnectJitter = reconnectJitter,
+            reconnectMaxAttempts = reconnectMaxAttempts,
             connectTimeoutMs = connectTimeout,
             readyTimeoutMs = readyTimeout,
             idleTimeoutMs = idleTimeout,
