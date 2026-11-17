@@ -541,13 +541,21 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     const tag = (sendOptions as { [OUTBOX_TAG]?: number })[OUTBOX_TAG];
     // Kept in the outbox, numbered now, for the next connection; one that
     // requires topics waits in the queue until they are continuous.
-    const outbox = sendOptions.requires?.length ? null : ensureOutbox(ctx, resolveOptions(options).offline);
-    if (outbox) {
-      if (outbox.add(message, JSON.stringify(message), sendOptions.ttl, Date.now(), undefined, tag) === 0) {
+    const requires = sendOptions.requires && sendOptions.requires.length > 0 ? sendOptions.requires : undefined;
+    const outbox = ensureOutbox(ctx, resolveOptions(options).offline);
+    const json = JSON.stringify(message);
+    if (outbox && !requires) {
+      if (outbox.add(message, json, sendOptions.ttl, Date.now(), undefined, tag) === 0) {
         logger.warn(`The outbox is full; message ${type} dropped`);
         return 'dropped';
       }
       return 'queued';
+    }
+    // One that waits for its topics holds its place in the outbox from now on.
+    const held = outbox && requires ? json.length : undefined;
+    if (outbox && held !== undefined && !outbox.hold(held)) {
+      logger.warn(`The outbox is full; message ${type} dropped`);
+      return 'dropped';
     }
     const queue = ctx.queue.getState();
     const ok = queue.enqueue({
@@ -559,12 +567,14 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
       retries: 0,
       correlation_id: message.cid,
       message,
-      bytes: queue.memoryLimit > 0 ? JSON.stringify(message).length : undefined,
+      bytes: queue.memoryLimit > 0 ? json.length : undefined,
       expiresAt: expiryOf(sendOptions),
       owner: ctx.owner.current(),
-      requires: sendOptions.requires && sendOptions.requires.length > 0 ? sendOptions.requires : undefined,
+      requires,
       tag,
+      held,
     });
+    if (!ok && held !== undefined) outbox?.unhold(held);
     return ok ? 'queued' : 'dropped';
   };
 

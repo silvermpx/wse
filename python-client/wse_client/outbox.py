@@ -169,6 +169,10 @@ class Outbox:
         self._plain = False
         self._count = 0
         self._bytes = 0
+        # Places held for sends that wait for their topics: each joins the
+        # outbox once they are continuous, its place taken from its send on.
+        self._held = 0
+        self._held_bytes = 0
         # When the first message not written yet runs out (time.time()).
         self._earliest = float("inf")
         # The file, when there is one, and whether a write of it failed (it
@@ -249,6 +253,23 @@ class Outbox:
 
     # -- What the application and the connection do ----------------------------
 
+    def hold(self, size: int) -> bool:
+        """Holds a place for a message of *size* the client keeps later (a
+        send that waits for its topics); False when there is none."""
+        if (
+            self._count + self._held + 1 > self._limits.max_messages
+            or self._bytes + self._held_bytes + size > self._limits.max_bytes
+        ):
+            return False
+        self._held += 1
+        self._held_bytes += size
+        return True
+
+    def unhold(self, size: int) -> None:
+        """A place held for a message of *size* is not needed any more."""
+        self._held -= 1
+        self._held_bytes -= size
+
     def add(
         self,
         message_id: str,
@@ -256,14 +277,18 @@ class Outbox:
         ttl: float | None,
         now: float,
         requires: tuple[str, ...] | None = None,
+        held: bool = False,
     ) -> int:
         """Keeps a message (its JSON object): its number, or 0 when full.
         One that requires topics goes, each time, only while they are
-        continuous (:meth:`due`)."""
+        continuous (:meth:`due`). *held*: its place was held (:meth:`hold`),
+        and it takes it."""
         size = len(text)
-        if (
-            self._count + 1 > self._limits.max_messages
-            or self._bytes + size > self._limits.max_bytes
+        if held:
+            self.unhold(size)
+        elif (
+            self._count + self._held + 1 > self._limits.max_messages
+            or self._bytes + self._held_bytes + size > self._limits.max_bytes
         ):
             return 0
         s = self._next

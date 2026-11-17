@@ -276,6 +276,9 @@ export class Outbox {
   private plain = false;
   private count = 0;
   private bytes = 0;
+  /** Places held for sends that wait for their topics ([hold]). */
+  private held = 0;
+  private heldBytes = 0;
   /** The messages it took: one a vanished socket hands back waits here already. */
   private taken = new WeakSet<WSMessage>();
   /** When the first message not written yet runs out (epoch ms); Infinity: none. */
@@ -544,8 +547,37 @@ export class Outbox {
   }
 
   /**
+   * Holds a place for a message of `size` the client keeps later (a send
+   * that waits for its topics): false when there is none.
+   */
+  hold(size: number): boolean {
+    if (
+      this.count + this.held + 1 > this.limits.maxMessages ||
+      this.bytes + this.heldBytes + size > this.limits.maxBytes
+    ) {
+      return false;
+    }
+    this.held++;
+    this.heldBytes += size;
+    return true;
+  }
+
+  /** A place held for a message of `size` is not needed any more. */
+  unhold(size: number): void {
+    this.held--;
+    this.heldBytes -= size;
+  }
+
+  /** No place is held any more (the sends that waited went, another user's). */
+  unholdAll(): void {
+    this.held = 0;
+    this.heldBytes = 0;
+  }
+
+  /**
    * Keeps a message the application sent, with its JSON: its number, or 0
-   * when the outbox is full (or the message larger than it holds).
+   * when the outbox is full (or the message larger than it holds). `held`:
+   * the size of the place it held ([hold]), which it takes.
    */
   add(
     message: WSMessage,
@@ -554,9 +586,17 @@ export class Outbox {
     now: number,
     requires?: readonly string[],
     tag?: number,
+    held?: number,
   ): number {
     const size = json.length;
-    if (this.count + 1 > this.limits.maxMessages || this.bytes + size > this.limits.maxBytes) return 0;
+    if (held !== undefined) {
+      this.unhold(held);
+    } else if (
+      this.count + this.held + 1 > this.limits.maxMessages ||
+      this.bytes + this.heldBytes + size > this.limits.maxBytes
+    ) {
+      return 0;
+    }
     const s = this.next++;
     const wait = ttl !== undefined && Number.isFinite(ttl) && ttl >= 0 ? ttl : this.limits.maxAge;
     // Whole ms, as a store writes them.

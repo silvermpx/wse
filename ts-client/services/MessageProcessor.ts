@@ -2018,16 +2018,24 @@ export class MessageProcessor {
    * A message for the outbox: numbered, kept until the server answers for
    * it, and out at once when the connection takes it.
    */
-  private keep(outbox: Outbox, message: WSMessage, ttl?: number, requires?: readonly string[], tag?: number): SendStatus {
+  private keep(
+    outbox: Outbox,
+    message: WSMessage,
+    ttl?: number,
+    requires?: readonly string[],
+    tag?: number,
+    held?: number,
+  ): SendStatus {
     let json: string;
     try {
       json = JSON.stringify(message);
     } catch (error) {
+      if (held !== undefined) outbox.unhold(held);
       this.countDropped(1);
       logger.error(`Dropping message ${message.t}: it cannot be serialised`, error);
       return 'dropped';
     }
-    if (outbox.add(message, json, ttl, Date.now(), requires, tag) === 0) {
+    if (outbox.add(message, json, ttl, Date.now(), requires, tag, held) === 0) {
       this.countDropped(1);
       logger.warn(`The outbox is full; message ${message.t} dropped`);
       return 'dropped';
@@ -2151,6 +2159,18 @@ export class MessageProcessor {
       return false;
     }
     const queueStore = this.ctx.queue.getState();
+    // One that waits for its topics holds its place in the outbox from now
+    // on: a full outbox refuses it at once, not once they are continuous.
+    const outbox = this.ctx.outbox.current;
+    let held: number | undefined;
+    if (requires && requires.length > 0 && outbox && liveOn === undefined) {
+      held = estimateBytes(message);
+      if (!outbox.hold(held)) {
+        this.countDropped(1);
+        logger.warn(`The outbox is full; message ${message.t} dropped`);
+        return false;
+      }
+    }
     const queued: QueuedMessage = {
       id: message.id || generateId(),
       type: message.t,
@@ -2168,9 +2188,11 @@ export class MessageProcessor {
       liveOn,
       requires,
       tag,
+      held,
     };
 
     if (!queueStore.enqueue(queued)) {
+      if (held !== undefined) outbox?.unhold(held);
       this.countDropped(1);
       logger.warn(`Outgoing queue full; message ${message.t} dropped`);
       return false;
@@ -2323,7 +2345,13 @@ export class MessageProcessor {
 
       const nowMs = Date.now();
       for (let i = 0; i < batch.length; i++) {
+        const held = batch[i].held;
+        // One that goes without joining the outbox gives the place it held back.
+        const letGo = () => {
+          if (held !== undefined) this.ctx.outbox.current?.unhold(held);
+        };
         if (isExpired(batch[i].expiresAt, nowMs)) {
+          letGo();
           this.countDropped(1);
           logger.debug(`Dropping ${batch[i].type}: its ttl ran out while it was queued`);
           // With the outbox's outcomes on, the application hears of it, as
@@ -2337,12 +2365,14 @@ export class MessageProcessor {
         }
         const wire = this.toWire(batch[i]);
         if (batch[i].owner !== undefined && batch[i].owner !== this.ctx.owner.current()) {
+          letGo();
           this.countDropped(1);
           logger.warn(`Dropping ${batch[i].type}: it was made for the previous user`);
           continue;
         }
         const liveOn = batch[i].liveOn ?? this.liveOnly.get(wire);
         if (liveOn !== undefined && liveOn !== cm.socketGeneration()) {
+          letGo();
           this.countDropped(1);
           logger.warn(`Dropping ${batch[i].type}: its connection went before it was sent`);
           continue;
@@ -2353,7 +2383,14 @@ export class MessageProcessor {
         const outbox = this.ctx.outbox.current;
         if (outbox && liveOn === undefined && !this.system.has(wire)) {
           const left = batch[i].expiresAt;
-          this.keep(outbox, wire, left !== undefined ? Math.max(0, left - nowMs) : undefined, batch[i].requires, batch[i].tag);
+          this.keep(
+            outbox,
+            wire,
+            left !== undefined ? Math.max(0, left - nowMs) : undefined,
+            batch[i].requires,
+            batch[i].tag,
+            held,
+          );
           continue;
         }
         this.handedOver.set(wire, {

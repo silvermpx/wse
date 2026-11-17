@@ -351,6 +351,8 @@ export interface QueuedMessage {
   requires?: readonly string[];
   /** Its outbox tag (a bridge owner's name of the window that sent it). */
   tag?: number;
+  /** The size of the place it holds in the outbox, which it takes when it joins it. */
+  held?: number;
 }
 
 export interface MessageOptions {

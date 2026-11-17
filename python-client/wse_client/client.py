@@ -135,6 +135,8 @@ class _Waiting:
     message_id: str = ""
     # Until when it may wait to go first (time.time()), from its send on.
     until: float | None = None
+    # It holds its place in the outbox (Outbox.hold) from its send on.
+    held: bool = False
 
 
 #: The outbox by default: in memory, with its limits.
@@ -749,6 +751,7 @@ class AsyncWSEClient:
         current connection."""
         outcomes = Outcomes()
         waited = [w.message_id for w in self._waiting if w.message_id]
+        self._let_go_waiting(list(self._waiting))
         self._waiting.clear()
         if waited:
             outcomes.not_delivered["cleared"] = waited
@@ -801,9 +804,11 @@ class AsyncWSEClient:
         *,
         limited: bool = True,
         requires: tuple[str, ...] | None = None,
+        held: bool = False,
     ) -> SendResult:
         """A message for the outbox: numbered, kept until the server answers
-        for it, and written at once when the connection takes it."""
+        for it, and written at once when the connection takes it; *held*,
+        in the place it held from its send on."""
         if self._encryption_error is not None:
             raise self._encryption_error
         outbox = self._outbox
@@ -815,7 +820,9 @@ class AsyncWSEClient:
         ):
             self._note_rate_limited(msg_type)
             return SendResult.FAILED
-        s = outbox.add(message_id, encoded, ttl, time.time(), requires=requires)
+        s = outbox.add(
+            message_id, encoded, ttl, time.time(), requires=requires, held=held
+        )
         if s == 0:
             logger.warning("The outbox is full; '%s' not sent", msg_type)
             return SendResult.FAILED
@@ -1001,11 +1008,22 @@ class AsyncWSEClient:
             return
         for item in late:
             self._waiting.remove(item)
+        self._let_go_waiting(late)
         ids = [w.message_id for w in late if w.message_id]
         if ids:
             outcomes = Outcomes()
             outcomes.not_delivered["expired"] = ids
             self._report(outcomes)
+
+    def _let_go_waiting(self, items: list[_Waiting]) -> None:
+        """Sends that leave the waiting line without joining the outbox give
+        the places they held back."""
+        outbox = self._outbox
+        if outbox is None:
+            return
+        for item in items:
+            if item.held:
+                outbox.unhold(len(item.encoded))
 
     def set_token(self, token: str | None) -> None:
         """Use *token* for the next connect / reconnect.
@@ -2112,8 +2130,14 @@ class AsyncWSEClient:
         if self._rate_limiter is not None and not self._rate_limiter.try_consume():
             self._note_rate_limited(msg_type)
             return SendResult.FAILED
+        # Its place in the outbox, taken now: it joins it once its topics are
+        # continuous, and a full outbox refuses it at once, not then.
+        held = self._outbox is not None
+        if held and not self._outbox.hold(len(encoded)):
+            logger.warning("The outbox is full; '%s' not sent", msg_type)
+            return SendResult.FAILED
         until = time.time() + ttl if ttl is not None and ttl >= 0 else None
-        self._waiting.append(_Waiting(encoded, topics, message_id, until))
+        self._waiting.append(_Waiting(encoded, topics, message_id, until, held))
         self._arm_outbox_timer()
         self._release_soon()
         return SendResult.QUEUED
@@ -2163,6 +2187,7 @@ class AsyncWSEClient:
                             left,
                             limited=False,
                             requires=item.topics,
+                            held=item.held,
                         )
                         continue
                     if not await self._transmit(item.encoded):
@@ -2774,6 +2799,7 @@ class AsyncWSEClient:
         self._live_since.clear()
         dropped = len(self._offline_queue.drain()) + len(self._waiting)
         waited = [w.message_id for w in self._waiting if w.message_id]
+        self._let_go_waiting(list(self._waiting))
         self._waiting.clear()
         if waited:
             outcomes = Outcomes()

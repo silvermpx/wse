@@ -564,6 +564,54 @@ describe('sends that wait for their topics', () => {
     expect(notDelivered).toEqual([{ reason: 'expired', ids: ['late'] }]);
   });
 
+  it('hold their place in the outbox from their send on: a full one refuses them at once', async () => {
+    const { answers, resync } = resyncs();
+    const c = client({
+      topics: ['prices'],
+      consumer: 'board',
+      offline: { enabled: true, maxSize: 2 },
+      delivery: { mode: 'recover-or-resync', resync },
+    });
+    const notDelivered: Array<{ reason: string; ids: string[] }> = [];
+    c.on('wseNotDelivered', (detail) => notDelivered.push(detail));
+    c.retain();
+    await tick();
+    const ws = FakeWebSocket.last();
+    await connectServer(ws, { user_id: 'alice', features: { acks: true } });
+    await send(ws, { c: 'WSE', t: 'outbox', p: { acked: 0, node: 'n1' }, v: 1 }, reply(['prices']));
+    expect(c.send('order', { id: 1 }, { requires: ['prices'], id: 'waiter' })).toBe('queued');
+    expect(c.send('note', { n: 1 }, { id: 'first' })).not.toBe('dropped');
+    // Two places, both taken: one waits for its topics, one went.
+    expect(c.send('note', { n: 2 }, { id: 'third' })).toBe('dropped');
+    expect(c.send('order', { id: 2 }, { requires: ['prices'], id: 'second-waiter' })).toBe('dropped');
+    answers[0].resolve();
+    await tick();
+    expect(ws.messagesOfType('order').map((m) => m.id)).toEqual(['waiter']);
+    expect(notDelivered).toEqual([]);
+  });
+
+  it('give their place back when they run out of time', async () => {
+    const { answers, resync } = resyncs();
+    const c = client({
+      topics: ['prices'],
+      consumer: 'board',
+      offline: { enabled: true, maxSize: 1 },
+      delivery: { mode: 'recover-or-resync', resync },
+    });
+    c.retain();
+    await tick();
+    const ws = FakeWebSocket.last();
+    await connectServer(ws, { user_id: 'alice', features: { acks: true } });
+    await send(ws, { c: 'WSE', t: 'outbox', p: { acked: 0, node: 'n1' }, v: 1 }, reply(['prices']));
+    expect(c.send('order', { id: 1 }, { requires: ['prices'], ttl: 5, id: 'late' })).toBe('queued');
+    expect(c.send('note', { n: 1 }, { id: 'refused' })).toBe('dropped');
+    await vi.advanceTimersByTimeAsync(20);
+    // The queue looks again (the resync is done): the late one goes, and its place with it.
+    answers[0].resolve();
+    await tick();
+    expect(c.send('note', { n: 2 }, { id: 'fits' })).not.toBe('dropped');
+  });
+
   it('share the memory limit with the other sends, whichever came first', () => {
     const { resync } = resyncs();
     const options = {

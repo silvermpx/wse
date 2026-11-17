@@ -758,6 +758,53 @@ class TestOutbox:
         assert '"id":"mine-1"' in (tmp_path / "queue").read_text()
         c._outbox.close_file()
 
+    @staticmethod
+    def _waiting_client(max_messages: int):
+        """A client with no connection, whose topics are not continuous."""
+        c = _mock_client(offline=Offline(max_messages=max_messages), rate_limit=None)
+        c._connection.is_connected = False
+        c._delivery = MagicMock()
+        c._delivery.continuous.return_value = False
+        c._transmit = AsyncMock(return_value=True)
+        return c
+
+    @pytest.mark.asyncio
+    async def test_a_send_that_waits_for_its_topics_takes_its_place_at_once(self):
+        c = self._waiting_client(2)
+        outcomes: list[dict] = []
+        c.on("not_delivered")(lambda e: outcomes.append(e.payload))
+        assert await c.send("first", {}, id="first") is SendResult.QUEUED
+        waiter = await c.send("second", {}, id="waiter", requires=["prices"])
+        assert waiter is SendResult.QUEUED
+        # Its place is taken: a third does not fit.
+        assert await c.send("third", {}, id="third") is SendResult.FAILED
+        c._connection.is_connected = True
+        c._delivery.continuous.return_value = True
+        await c._release_waiting()
+        kept = [r.id for r in c._outbox._records if r is not None]
+        assert kept == ["first", "waiter"]
+        assert outcomes == []
+
+    @pytest.mark.asyncio
+    async def test_a_send_that_waits_for_its_topics_fails_at_once_with_no_place(self):
+        c = self._waiting_client(1)
+        assert await c.send("first", {}, id="full") is SendResult.QUEUED
+        waiter = await c.send("second", {}, id="waiter", requires=["prices"])
+        assert waiter is SendResult.FAILED
+        assert len(c._waiting) == 0
+
+    @pytest.mark.asyncio
+    async def test_a_send_that_ran_out_waiting_gives_its_place_back(self):
+        c = self._waiting_client(1)
+        outcomes: list[dict] = []
+        c.on("not_delivered")(lambda e: outcomes.append(e.payload))
+        waiter = await c.send("first", {}, id="late", requires=["prices"], ttl=0.01)
+        assert waiter is SendResult.QUEUED
+        await asyncio.sleep(0.05)
+        c._expire_waiting(time.time())
+        assert outcomes == [{"reason": "expired", "ids": ["late"]}]
+        assert await c.send("next", {}, id="next") is SendResult.QUEUED
+
     @pytest.mark.asyncio
     async def test_a_clear_while_a_batch_goes_stops_what_is_left_of_it(self):
         c = _mock_client(offline=Offline())

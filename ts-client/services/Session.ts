@@ -566,6 +566,9 @@ export class WSESession {
     logger.warn(`The server took this connection for ${next}, not ${previous}: ${previous}'s queue, topics and positions are dropped`);
     this.ctx.owner.next();
     this.ctx.queue.getState().clearQueue();
+    // The sends that waited for their topics went with the queue: the places
+    // they held in the outbox too.
+    this.ctx.outbox.current?.unholdAll();
     const store = this.ctx.state.getState();
     this.processor.forgetTopics(store.activeTopics);
     this.sequencer.reset();
