@@ -16,7 +16,7 @@
 // turn of the event loop, and is written anew once what went outweighs what
 // is kept.
 
-import type { WSMessage } from '../types.js';
+import type { QueuedMessage, WSMessage } from '../types.js';
 import { generateId } from '../utils/id.js';
 
 /**
@@ -58,6 +58,15 @@ export function reportOutcomes(
   if (outcomes.delivered.length > 0) emit('wseDelivered', { ids: outcomes.delivered });
   for (const [reason, ids] of outcomes.notDelivered) emit('wseNotDelivered', { reason, ids });
   if (tagged && outcomes.tagged.length > 0) tagged(outcomes.tagged);
+}
+
+/**
+ * Sends taken out of the queue that waited for their topics, each holding
+ * its place in the outbox: not delivered, for `why`.
+ */
+export function refuseHeld(held: readonly QueuedMessage[], why: string, outcomes: Outcomes = noOutcomes()): Outcomes {
+  for (const m of held) refuse(outcomes, why, m.id, m.tag ?? 0);
+  return outcomes;
 }
 
 function deliver(outcomes: Outcomes, id: string, tag = 0): void {

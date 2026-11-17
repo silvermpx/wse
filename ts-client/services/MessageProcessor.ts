@@ -42,7 +42,7 @@ import { generateId } from '../utils/id.js';
 import { createClientContext, type ClientContext } from '../core/context.js';
 import type { SendResult } from './ConnectionManager.js';
 import type { OfflineQueue } from './OfflineQueue.js';
-import { noOutcomes, refuse, reportOutcomes, type Outbox, type Outcomes } from './Outbox.js';
+import { noOutcomes, refuse, refuseHeld, reportOutcomes, type Outbox, type Outcomes } from './Outbox.js';
 
 /** What the processor needs from the connection (ConnectionManager implements it). */
 export interface ProcessorConnection {
@@ -2394,6 +2394,8 @@ export class MessageProcessor {
           letGo();
           this.countDropped(1);
           logger.warn(`Dropping ${batch[i].type}: it was made for the previous user`);
+          // One that held a place in the outbox: the application hears of it.
+          if (held !== undefined) this.report(refuseHeld([batch[i]], 'user_changed'));
           continue;
         }
         const liveOn = batch[i].liveOn ?? this.liveOnly.get(wire);

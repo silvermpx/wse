@@ -41,7 +41,7 @@ import { NetworkMonitor } from './NetworkMonitor.js';
 import { AdaptiveQualityManager, QueryClientLike } from './AdaptiveQualityManager.js';
 import type { OfflineQueue } from './OfflineQueue.js';
 import { indexedDbOutbox } from './IndexedDbOutbox.js';
-import { OUTBOX_TAG, Outbox, reportOutcomes, type OutboxStore } from './Outbox.js';
+import { OUTBOX_TAG, Outbox, refuseHeld, reportOutcomes, type OutboxStore } from './Outbox.js';
 
 /** What a client tells of a storage that failed: what it did, and the error's name. */
 export function storageErrorDetail(operation: string, error: unknown) {
@@ -566,10 +566,12 @@ export class WSESession {
   private forgetPreviousUser(previous: string, next: string): void {
     logger.warn(`The server took this connection for ${next}, not ${previous}: ${previous}'s queue, topics and positions are dropped`);
     this.ctx.owner.next();
+    // The sends that waited for their topics go with the queue, and the
+    // places they held in the outbox: the application hears of each.
+    const held = this.ctx.queue.getState().takeHeld();
     this.ctx.queue.getState().clearQueue();
-    // The sends that waited for their topics went with the queue: the places
-    // they held in the outbox too.
     this.ctx.outbox.current?.unholdAll();
+    reportOutcomes(this.ctx.emit, refuseHeld(held, 'user_changed'), this.ctx.tagged);
     const store = this.ctx.state.getState();
     this.processor.forgetTopics(store.activeTopics);
     this.sequencer.reset();
@@ -826,10 +828,13 @@ export class WSESession {
     });
   }
 
-  /** What waits in the outbox goes, not delivered (`cleared`). */
+  /** What waits in the outbox goes, not delivered (`cleared`), the sends that hold a place in it too. */
   async clearOfflineQueue(): Promise<void> {
     const outbox = this.ctx.outbox.current;
-    if (outbox) reportOutcomes(this.ctx.emit, outbox.clear(), this.ctx.tagged);
+    if (!outbox) return;
+    const held = this.ctx.queue.getState().takeHeld();
+    outbox.unholdAll();
+    reportOutcomes(this.ctx.emit, refuseHeld(held, 'cleared', outbox.clear()), this.ctx.tagged);
   }
 
   /** How many messages wait in the outbox for the server's answer. */

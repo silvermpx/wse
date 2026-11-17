@@ -214,6 +214,21 @@ describe('a client of its own', () => {
     expect(c.send('order', { qty: 2 })).toBe('sent');
   });
 
+  it('says what became of a send that waited for its topics before the client started', async () => {
+    for (const [close, reason] of [
+      [(c: WSEClient) => c.signOut(), 'cleared'],
+      [(c: WSEClient) => c.destroy(), 'closed'],
+    ] as const) {
+      const c = client(A, { offline: { enabled: true } });
+      const outcomes: Array<{ reason: string; ids: string[] }> = [];
+      c.on('wseNotDelivered', (d: { reason: string; ids: string[] }) => outcomes.push(d));
+      c.on('wseDelivered', (d: { ids: string[] }) => outcomes.push({ reason: 'delivered', ids: d.ids }));
+      expect(c.send('order', { qty: 1 }, { requires: ['prices'], id: 'waits' })).toBe('queued');
+      close(c);
+      expect(outcomes).toEqual([{ reason, ids: ['waits'] }]);
+    }
+  });
+
   it('drops a live message sent before it connects: it never goes out late', async () => {
     const c = client(A);
     expect(c.send('open_valve', { id: 1 }, { live: true })).toBe('dropped');

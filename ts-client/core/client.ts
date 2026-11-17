@@ -9,7 +9,7 @@
 // are its own: two clients on one page share nothing. Frameworks hold it
 // through their adapters (wse-client/react, /vue, /svelte).
 
-import { OUTBOX_TAG, reportOutcomes, type TaggedOutcome } from '../services/Outbox.js';
+import { OUTBOX_TAG, refuseHeld, reportOutcomes, type TaggedOutcome } from '../services/Outbox.js';
 import {
   ConnectionState,
   MessagePriority,
@@ -624,6 +624,10 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     // and the application hears of each.
     const outbox = ctx.outbox.current;
     if (outbox) {
+      // The sends that waited for their topics, each holding its place.
+      const held = ctx.queue.getState().takeHeld();
+      outbox.unholdAll();
+      reportOutcomes(emit, refuseHeld(held, clear ? 'cleared' : 'closed'), ctx.tagged);
       if (clear) reportOutcomes(emit, outbox.clear(), ctx.tagged);
       reportOutcomes(emit, outbox.close(), ctx.tagged);
       outbox.dispose();

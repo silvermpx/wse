@@ -31,6 +31,8 @@ export interface MessageQueueStore extends MessageQueueState {
    */
   requeue: (messages: QueuedMessage[]) => void;
   removeMessage: (id: string) => void;
+  /** Takes out the sends that wait for their topics holding a place in the outbox, and returns them. */
+  takeHeld: () => QueuedMessage[];
   clearQueue: () => void;
   updateStats: () => void;
   setProcessing: (processing: boolean) => void;
@@ -215,6 +217,12 @@ export const createQueueState: StateCreator<MessageQueueStore> = (set, get) => {
 
   removeMessage: (id) => {
     set((s) => derive(s, s.messages.filter(m => m.id !== id)));
+  },
+
+  takeHeld: () => {
+    const held = get().messages.filter((m) => m.held !== undefined);
+    if (held.length > 0) set((s) => derive(s, s.messages.filter((m) => m.held === undefined)));
+    return held;
   },
 
   clearQueue: () => {
