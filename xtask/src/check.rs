@@ -85,8 +85,10 @@ npx tsc --noEmit
 npx vitest run",
     },
     Lane {
-        // The Angular and Solid adapters in applications, built against the
-        // packed client (Angular 22 needs Node 22.22 or newer).
+        // Applications built against the packed client: Angular and Solid
+        // (Angular 22 needs Node 22.22 or newer), and Electron and Tauri with
+        // two windows on one connection (Tauri's from the crates as crates.io
+        // will give them; on Linux each needs its display and webview).
         name: "frameworks",
         needs: &[tool("node"), tool("npm"), tool("cargo")],
         only_on: None,
@@ -98,7 +100,23 @@ rm -rf \"${CARGO_TARGET_DIR:?}/npm-dist\" && mkdir -p \"$CARGO_TARGET_DIR/npm-di
 npm pack --ignore-scripts --pack-destination \"$CARGO_TARGET_DIR/npm-dist\" > /dev/null
 for fixture in angular20 angular21 angular22 solid1 solid2; do
   .github/scripts/framework-consumer-check.sh \"$CARGO_TARGET_DIR\"/npm-dist/wse-client-*.tgz \"$fixture\"
-done",
+done
+if [ \"$(uname)\" != Linux ] || [ -n \"${DISPLAY:-}\" ] || command -v xvfb-run > /dev/null; then
+  .github/scripts/electron-consumer-check.sh \"$CARGO_TARGET_DIR\"/npm-dist/wse-client-*.tgz
+else
+  echo 'skip: the Electron application needs a display or xvfb-run'
+fi
+if [ \"$(uname)\" != Linux ] || pkg-config --exists webkit2gtk-4.1 2> /dev/null; then
+  cargo package -q --locked --no-verify -p wse -p wse-client
+  (cd bindings/tauri && cargo package -q --locked --no-verify -p tauri-plugin-wse \\
+    --config 'patch.crates-io.wse-client.path=\"../../crates/wse-client\"' --config 'patch.crates-io.wse.path=\"../../crates/wse\"')
+  version=\"$(sed -n 's/^version = \"\\(.*\\)\"$/\\1/p' Cargo.toml | head -1)\"
+  crates=\"$(mktemp -d \"$CARGO_TARGET_DIR/crates.XXXXXX\")\"
+  for crate in wse wse-client tauri-plugin-wse; do cp \"$CARGO_TARGET_DIR/package/$crate-$version.crate\" \"$crates/\"; done
+  .github/scripts/tauri-consumer-check.sh \"$CARGO_TARGET_DIR\"/npm-dist/wse-client-*.tgz \"$crates\"
+else
+  echo 'skip: the Tauri application needs WebKitGTK 4.1 on Linux'
+fi",
     },
     Lane {
         name: "python-client",

@@ -1,0 +1,18 @@
+# A Tauri application with tauri-plugin-wse as an application takes it: the
+# check's script patches the crates to the packages it unpacked.
+[package]
+name = "wse-tauri-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tauri = { version = "=2.12.6", features = ["wry", "common-controls-v6", "x11"], default-features = false }
+tauri-plugin-wse = "3"
+wse-client = "3"
+
+[build-dependencies]
+tauri-build = { version = "=2.7.5", features = [] }
+
+# An application of its own, not a member of the repository's workspace.
+[workspace]

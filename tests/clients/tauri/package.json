@@ -1,0 +1,18 @@
+{
+  "name": "wse-tauri-check",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && vite build && node -e \"require('node:fs').copyFileSync('index.html', 'dist/index.html')\""
+  },
+  "dependencies": {
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "^19",
+    "typescript": "6.0.3",
+    "vite": "8.3.8"
+  }
+}

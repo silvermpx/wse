@@ -700,6 +700,71 @@ jobs:
           FIXTURE: ${{ matrix.fixture }}
         run: bash .github/scripts/framework-consumer-check.sh npm-dist/wse-client-*.tgz "$FIXTURE"
 
+  # Electron and Tauri applications built against the release's packages,
+  # on each system: the npm package as an application installs it, and for
+  # Tauri the crates as crates.io will give them (packaged here, at the
+  # tag). Two windows on one connection; one closes, the other goes on.
+  desktop-check:
+    name: ${{ matrix.app }} application (${{ matrix.os }})
+    needs: [preflight, npm-package]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+        app: [electron, tauri]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '22'
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: npm-package
+          path: npm-dist/
+
+      # Tauri builds against WebKitGTK on Linux; Ubuntu keeps unprivileged
+      # user namespaces from applications without an AppArmor profile, and
+      # Electron's and WebKitGTK's sandboxes need them.
+      - name: The webview's libraries on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev xvfb
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: The Electron application
+        if: matrix.app == 'electron'
+        run: bash .github/scripts/electron-consumer-check.sh npm-dist/wse-client-*.tgz
+
+      - name: The Tauri application
+        if: matrix.app == 'tauri'
+        env:
+          # Software rendering in a virtual display.
+          WEBKIT_DISABLE_DMABUF_RENDERER: '1'
+        run: |
+          cargo package --locked --no-verify -p wse -p wse-client
+          (cd bindings/tauri && cargo package --locked --no-verify -p tauri-plugin-wse \
+            --config 'patch.crates-io.wse-client.path="../../crates/wse-client"' \
+            --config 'patch.crates-io.wse.path="../../crates/wse"')
+          mkdir -p crates
+          cp target/package/wse-*.crate bindings/tauri/target/package/tauri-plugin-wse-*.crate crates/
+          bash .github/scripts/tauri-consumer-check.sh npm-dist/wse-client-*.tgz crates
+
   # ---------------------------------------------------------------------------
   # The Rust crates: packaged, and each built from its package as crates.io
   # builds it, the ones it depends on taken from the packages beside it;
@@ -1574,7 +1639,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release-gate:
     name: Release gate
-    needs: [preflight, build, sdist, test, test-musllinux, sdist-install, python-client, npm-package, framework-check, crates, tauri-plugin, swift-package, android-package, jvm-natives, jvm-package, jvm-check, android-release-app, react-native-app, maven-central, swift-repo, dart-binaries, dart-package, dart-check, dart-mobile]
+    needs: [preflight, build, sdist, test, test-musllinux, sdist-install, python-client, npm-package, framework-check, desktop-check, crates, tauri-plugin, swift-package, android-package, jvm-natives, jvm-package, jvm-check, android-release-app, react-native-app, maven-central, swift-repo, dart-binaries, dart-package, dart-check, dart-mobile]
     # Runs (and fails) when a job above failed: a gate skipped because of a
     # failed dependency would report success to branch protection.
     if: always()

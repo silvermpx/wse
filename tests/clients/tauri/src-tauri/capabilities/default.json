@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "The check's windows: Tauri's core, and the WSE plugin.",
+  "windows": ["window-1", "window-2"],
+  "permissions": ["core:default", "wse:default"]
+}

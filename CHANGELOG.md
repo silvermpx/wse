@@ -41,6 +41,12 @@
   outbox keeps the order messages were sent in. A conformance case
   (`send.correlation`) checks it for every client: the server's
   application takes both, kept or live, and the reply names the id back.
+- Electron and Tauri applications built against the packed packages, as
+  an application installs them, outside the checkout (the npm package's
+  archive; for Tauri the crates as crates.io will give them): two windows
+  rendered with `wse-client/react`'s hooks as they are, on one connection;
+  one closes, the other goes on. In the local frameworks lane, in CI on
+  Linux, macOS and Windows, and in the release on the release's packages.
 - Example applications for Electron (`bindings/electron/example`) and
   Tauri (`bindings/tauri/example`): two windows on one connection, the
   connection's state, the ticks of a topic and echoes, each window able to

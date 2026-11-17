@@ -115,6 +115,8 @@ jobs:
               - 'package-lock.json'
               - 'bindings/electron/**'
               - 'bindings/example-ui/**'
+              - 'tests/clients/electron/**'
+              - '.github/scripts/electron-consumer-check.sh'
               - 'crates/wse-client/examples/**'
               - 'tests/conformance/**'
               - '.github/workflows/ci.yml'
@@ -129,6 +131,8 @@ jobs:
               - 'package-lock.json'
               - 'bindings/tauri/**'
               - 'bindings/example-ui/**'
+              - 'tests/clients/tauri/**'
+              - '.github/scripts/tauri-consumer-check.sh'
               - 'tests/conformance/**'
               - '.github/workflows/ci.yml'
 
@@ -493,6 +497,12 @@ jobs:
           if [ "$RUNNER_OS" = Linux ]; then display='xvfb-run -a'; fi
           WSE_URL=ws://127.0.0.1:5917/wse WSE_EXAMPLE_CHECK=1 $display bindings/electron/node_modules/.bin/electron bindings/electron/example/out/main.mjs
 
+      - name: The packed package in an Electron application
+        run: |
+          npm run build
+          npm pack --ignore-scripts --pack-destination npm-dist
+          bash .github/scripts/electron-consumer-check.sh npm-dist/wse-client-*.tgz
+
       - name: The reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
@@ -590,6 +600,22 @@ jobs:
           display=
           if [ "$RUNNER_OS" = Linux ]; then display='xvfb-run -a'; fi
           WSE_URL=ws://127.0.0.1:5918/wse WSE_EXAMPLE_CHECK=1 $display bindings/tauri/target/debug/wse-tauri-example
+
+      # The npm package as an application installs it, and the crates as
+      # crates.io will give them (packaged here, nothing of the sources).
+      - name: The packed packages in a Tauri application
+        env:
+          WEBKIT_DISABLE_DMABUF_RENDERER: '1'
+        run: |
+          npm run build
+          npm pack --ignore-scripts --pack-destination npm-dist
+          cargo package --locked --no-verify -p wse -p wse-client
+          (cd bindings/tauri && cargo package --locked --no-verify -p tauri-plugin-wse \
+            --config 'patch.crates-io.wse-client.path="../../crates/wse-client"' \
+            --config 'patch.crates-io.wse.path="../../crates/wse"')
+          mkdir -p crates
+          cp target/package/wse-*.crate bindings/tauri/target/package/tauri-plugin-wse-*.crate crates/
+          bash .github/scripts/tauri-consumer-check.sh npm-dist/wse-client-*.tgz crates
 
       - name: The reports
         if: always()
