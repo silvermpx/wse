@@ -288,6 +288,13 @@ pub struct Config {
     /// recovery starts from what it committed. None: best effort, where the
     /// topics' states and the checkpoint are kept all the same.
     pub delivery: Option<crate::Delivery>,
+    /// Messages sent while there is no connection wait for the next one of
+    /// the same user: in memory, or in a file that outlives the application
+    /// ([`Offline::in_file`](crate::Offline::in_file)). They go right after
+    /// the topics are subscribed again, before what is sent then. A live or
+    /// signed message is never kept. None: a send without a connection
+    /// fails with [`Error::NotConnected`](crate::Error::NotConnected).
+    pub offline: Option<crate::Offline>,
     /// Where each recovery starts: what the application committed, as the
     /// delivery keeps it.
     pub(crate) committed: Option<Committed>,
@@ -335,7 +342,8 @@ impl fmt::Debug for Config {
             .field("reconnect", &self.reconnect)
             .field("headers", &headers)
             .field("send_queue", &self.send_queue)
-            .field("delivery", &self.delivery);
+            .field("delivery", &self.delivery)
+            .field("offline", &self.offline);
         #[cfg(all(feature = "aws-lc", not(target_arch = "wasm32")))]
         f.field(
             "tls",
@@ -383,6 +391,7 @@ impl Config {
             #[cfg(feature = "aws-lc")]
             encryption: None,
             delivery: None,
+            offline: None,
             committed: None,
             #[cfg(feature = "aws-lc")]
             signing_key: None,

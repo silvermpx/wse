@@ -84,8 +84,17 @@ of the topics is continuous on the connection, checked right before it goes
 past it, and once the server takes a connection for another user it goes
 nowhere.
 
+With `offline: WseOffline(path: path)` (a file in the app's own storage) what
+is sent while there is no connection waits for the next connection of the
+same user and goes right after the topics are subscribed again; the file
+outlives the app. Without a path it waits in memory. At most `maxMessages`
+(1,000) wait, for at most `maxAgeMs` (an hour); `client.kept()` says how many
+wait. A live or signed message is never kept, and a file that cannot be
+written is a `.storageFailed` item.
+
 `events()` is the client's stream, until it closes; one reader at a time.
-A Task cancelled while reading loses nothing: the next read gets the rest.
+A Task cancelled while reading loses nothing: the next read gets the rest;
+a loop left and a new one go on from the same place.
 Cancelling the Task of `connect` gives up the attempt. `disconnect` sends
 what is queued and closes.
 

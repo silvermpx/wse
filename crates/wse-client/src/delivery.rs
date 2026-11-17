@@ -319,6 +319,12 @@ impl Gate {
         })
     }
 
+    /// `event` goes to the application with what the gate makes: something
+    /// outside the connection said it (the offline queue's file).
+    pub(crate) fn tell(&mut self, event: Event) {
+        self.out.push_back(Incoming::Event(event));
+    }
+
     /// What the gate made outside what the application hears, next.
     pub(crate) fn take_out(&mut self) -> Option<Incoming> {
         self.out.pop_front()

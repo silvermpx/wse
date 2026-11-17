@@ -46,6 +46,17 @@ object Wse {
     fun delivery(consumer: String): WseDeliveryBuilder = WseDeliveryBuilder(consumer)
 
     /**
+     * The offline queue: messages sent with no connection wait for the next one of the same user, in
+     * memory or in a file ([WseOfflineBuilder.path]) that outlives the app.
+     */
+    @JvmStatic
+    fun offline(): WseOfflineBuilder = WseOfflineBuilder()
+
+    /** How many messages the offline queue keeps for the next connection. */
+    @JvmStatic
+    fun kept(client: WseClient): Int = client.kept().coerceAtMost(Int.MAX_VALUE.toUInt()).toInt()
+
+    /**
      * Tokens from Java: [supplier] is asked before each connection attempt and returns the token's
      * future. A future that fails is a [WseTokenException.Failed] with its message.
      */
@@ -173,6 +184,7 @@ class WseConfigBuilder internal constructor(private val url: String) {
     private var trust: WseTrust? = null
     private var insecure = false
     private var delivery: WseDelivery? = null
+    private var offline: WseOffline? = null
 
     /** The token for the handshake's Authorization header (a token source gives each attempt's instead). */
     fun token(token: String?): WseConfigBuilder = apply { this.token = token }
@@ -231,6 +243,9 @@ class WseConfigBuilder internal constructor(private val url: String) {
     /** The recover-or-resync delivery ([Wse.delivery]); null: best effort. */
     fun delivery(delivery: WseDelivery?): WseConfigBuilder = apply { this.delivery = delivery }
 
+    /** The offline queue ([Wse.offline]); null: a send with no connection fails. */
+    fun offline(offline: WseOffline?): WseConfigBuilder = apply { this.offline = offline }
+
     fun build(): WseConfig =
         WseConfig(
             url = url,
@@ -250,7 +265,26 @@ class WseConfigBuilder internal constructor(private val url: String) {
             trust = trust,
             insecure = insecure,
             delivery = delivery,
+            offline = offline,
         )
+}
+
+/** A [WseOffline] for Java, field by field. */
+class WseOfflineBuilder internal constructor() {
+    private var path: String? = null
+    private var maxMessages = 0u
+    private var maxAge = 0uL
+
+    /** The file the messages are kept in, so that they outlive the app (in its own storage); null: memory. */
+    fun path(path: String?): WseOfflineBuilder = apply { this.path = path }
+
+    /** How many are kept at most (0: 1,000); past it a send fails as `Full`. */
+    fun maxMessages(messages: Int): WseOfflineBuilder = apply { maxMessages = count(messages) }
+
+    /** How long one is kept (zero: an hour); an older one is dropped. */
+    fun maxAge(age: Duration): WseOfflineBuilder = apply { maxAge = millis(age) }
+
+    fun build(): WseOffline = WseOffline(path, maxMessages, maxAge)
 }
 
 /** A [WseDelivery] for Java, field by field. */

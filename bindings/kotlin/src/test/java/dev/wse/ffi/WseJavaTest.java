@@ -111,6 +111,25 @@ class WseJavaTest {
     }
 
     @Test
+    void anOfflineQueueFromJava() throws Exception {
+        WseConfig config = Wse.config(url)
+            .insecure(true)
+            .offline(Wse.offline().maxMessages(10).maxAge(Duration.ofMinutes(5)).build())
+            .build();
+        WseClient client = Wse.connect(config).get(10, SECONDS);
+        WseEventReader events = Wse.events(client);
+        client.pause("test");
+        while (client.status() == WseStatus.CONNECTED) {
+            Thread.sleep(20);
+        }
+        Wse.send(client, "echo", "{\"n\":1}").get(10, SECONDS);
+        assertEquals(1, Wse.kept(client));
+        client.resume("test");
+        assertEquals("{\"n\":1}", message(events, "echoed").getJson());
+        Wse.disconnect(client, Duration.ofSeconds(1)).get(10, SECONDS);
+    }
+
+    @Test
     void recoverOrResyncFromJava() throws Exception {
         WseConfig config = Wse.config(url)
             .topics(List.of("ticks"))

@@ -202,6 +202,29 @@ void main() {
     throw StateError('the events ended before $kind');
   }
 
+  test('what is sent with no connection goes on the next', () async {
+    final dir = Directory.systemTemp.createTempSync('wse-offline');
+    final client = await WseClient.connect(
+      wseConfig(
+        url,
+        insecure: true,
+        offline: wseOffline(path: '${dir.path}/queue'),
+      ),
+    );
+    final items = StreamIterator(client.events());
+    client.pause('test');
+    while (client.status == 'connected') {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    await client.send('echo', '{"n":1}');
+    expect(client.kept, 1);
+    client.resume('test');
+    expect((await message(items, 'echoed')).json, '{"n":1}');
+    await items.cancel();
+    await client.close();
+    dir.deleteSync(recursive: true);
+  });
+
   test('a send that requires a topic waits for its resync', () async {
     final client = await WseClient.connect(
       wseConfig(

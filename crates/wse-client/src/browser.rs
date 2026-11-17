@@ -632,10 +632,22 @@ impl<H: Handler> Driver<H> {
     /// open. On a connection with a session nothing goes in plaintext but
     /// the handshake.
     fn write(&mut self, socket: &Socket) -> Result<(), Lost> {
+        let mut went: Vec<Box<str>> = Vec::new();
+        let written = self.write_out(socket, &mut went);
+        if let Some(store) = &self.shared.store {
+            store.sent(&went);
+        }
+        written
+    }
+
+    /// Hands what the session queued to the socket; the kept ones handed
+    /// over go into `went`.
+    fn write_out(&mut self, socket: &Socket, went: &mut Vec<Box<str>>) -> Result<(), Lost> {
         for outgoing in self.session.outbox.drain(..) {
-            let (text, handshake) = match outgoing {
-                Outgoing::Text(text) => (text, false),
-                Outgoing::Handshake(text) => (text, true),
+            let (text, handshake, kept) = match outgoing {
+                Outgoing::Text(text) => (text, false, None),
+                Outgoing::Handshake(text) => (text, true, None),
+                Outgoing::Kept { id, text } => (text, false, Some(id)),
             };
             let frame = match self.session.sealing.as_mut() {
                 Some(sealing) => match sealing.seal(&text) {
@@ -654,6 +666,7 @@ impl<H: Handler> Driver<H> {
                 code: None,
                 reason: e.to_string(),
             })?;
+            went.extend(kept);
         }
         Ok(())
     }

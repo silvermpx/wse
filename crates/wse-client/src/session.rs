@@ -83,6 +83,8 @@ pub(crate) enum Outgoing {
     /// The handshake's own (client_hello, the answer to a ping): as it is
     /// before the session opens, sealed after.
     Handshake(String),
+    /// A message the offline queue kept: it leaves the queue once written.
+    Kept { id: Box<str>, text: String },
 }
 
 pub(crate) struct Session<H> {
@@ -288,6 +290,10 @@ impl<H: Handler> Session<H> {
         self.sealing = None;
         self.ready = false;
         self.shared.ready.store(false, Ordering::Release);
+        // What is sent from now on is kept for the next one.
+        if let Some(store) = &self.shared.store {
+            store.release();
+        }
         self.requests.clear();
         // A stream that heard nothing for longer than the server keeps one,
         // while this connection had its topic, is gone there: naming it would
@@ -1324,6 +1330,13 @@ impl<H: Handler> Session<H> {
             self.rewind_to_committed(&topics);
             self.send_subscription(&topics);
         }
+        // What was sent with no connection goes next, before what is sent
+        // from now on.
+        if let Some(store) = &self.shared.store {
+            for (id, text) in store.take_for(user_id.as_deref()) {
+                self.outbox.push(Outgoing::Kept { id, text });
+            }
+        }
         tracing::info!(
             "[WSE] connected as {connection_id} (recovery: {})",
             self.server_recovery
@@ -1562,7 +1575,7 @@ mod tests {
     }
 
     fn session(recovery_timeout: Duration) -> Session<Seen> {
-        let shared = Arc::new(Shared::new(None));
+        let shared = Arc::new(Shared::new(None, None));
         let keys = Arc::new(Keys::from_config(&crate::Config::new("ws://x")).unwrap());
         let mut session = Session::new(
             Delivered::passing(Seen::default()),
@@ -1613,9 +1626,13 @@ mod tests {
         session
             .outbox
             .drain(..)
-            .map(|(Outgoing::Text(text) | Outgoing::Handshake(text))| {
-                serde_json::from_str(text.as_str()).unwrap()
-            })
+            .map(
+                |(Outgoing::Text(text)
+                 | Outgoing::Handshake(text)
+                 | Outgoing::Kept { text, .. })| {
+                    serde_json::from_str(text.as_str()).unwrap()
+                },
+            )
             .collect()
     }
 
@@ -2271,7 +2288,7 @@ mod tests {
                 )
             })
             .collect();
-        let shared = Arc::new(Shared::new(None));
+        let shared = Arc::new(Shared::new(None, None));
         let keys = Arc::new(Keys::from_config(&crate::Config::new("ws://x")).unwrap());
         let mut s = Session::new(
             Delivered::passing(Decode(0.0)),

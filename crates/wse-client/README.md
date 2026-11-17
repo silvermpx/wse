@@ -116,6 +116,11 @@ async fn main() -> Result<(), wse_client::Error> {
   connection that is ready now, or not at all: one the connection did not
   write is dropped, never sent on a later connection. For commands that
   must not run late (a valve, a door, an order).
+- **With no connection.** With `Config::offline`, what is sent while
+  there is no connection waits for the next one of the same user, in
+  memory or in a file that outlives the application (see below). Every
+  message carries an `id` (a UUID), as from the TypeScript and Python
+  clients.
 - **Another user.** When the token provider's next token is another
   user's, what the last user queued and did not send goes nowhere, and the
   topics are subscribed again from the start.
@@ -206,6 +211,37 @@ checked right before it goes, so after a reconnect it waits for the resync,
 while sends that require nothing go past it. It is the user's who sent it and
 goes nowhere once the server takes a connection for another; at most
 `send_queue` of them wait.
+
+## With no connection
+
+```rust,no_run
+# async fn run() -> Result<(), wse_client::Error> {
+let mut config = wse_client::Config::new("wss://example.com/wse");
+config.offline = Some(wse_client::Offline::in_file("/path/in/the/app/queue"));
+let (client, _events) = wse_client::connect(config).await?;
+// With no connection: kept, and sent once the next connection is ready.
+client.send("order", &serde_json::json!({"id": 1})).await?;
+println!("{} message(s) wait", client.kept());
+# Ok(())
+# }
+```
+
+What is sent while there is no connection goes on the next connection of
+the same user, right after the topics are subscribed again and before what
+is sent then. `Offline::in_file(path)` keeps it in a file, so that it
+outlives the application: the file is the client's alone while it runs
+(`<path>.lock` beside it says so), a message is written to it as it is
+kept and synced to the disk right after by a thread of its own, and the
+file is written over without what went once that outweighs what is kept.
+`Offline::in_memory()` keeps it for the client's life. At most
+`max_messages` (1,000) wait, for at most `max_age` (an hour); past the
+first a send fails with `Error::Full`, past the second a message is
+dropped. A message kept while one user was connected goes nowhere once
+another user's connection comes. A message leaves the queue once the
+connection wrote it. A live or signed message is never kept, and a send
+that requires topics waits in memory. A file that cannot be written is an
+`Event::StorageFailed`: what is kept stays in memory then. In the browser
+the queue is in memory.
 
 ## In the browser
 

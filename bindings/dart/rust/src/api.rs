@@ -65,6 +65,23 @@ pub struct WseConfig {
     pub insecure: bool,
     /// recover-or-resync; None: best effort.
     pub delivery: Option<WseDelivery>,
+    /// Messages sent with no connection wait for the next one of the same
+    /// user; None: such a send fails.
+    pub offline: Option<WseOffline>,
+}
+
+/// Messages sent with no connection, kept for the next one of the same
+/// user. They go right after the topics are subscribed again; a live or
+/// signed message is never kept.
+pub struct WseOffline {
+    /// The file they are kept in, so that they outlive the app (in its own
+    /// storage); the client's alone while it runs. None keeps them in memory.
+    pub path: Option<String>,
+    /// How many are kept at most (0: 1,000); past it a send fails as `full`.
+    pub max_messages: u32,
+    /// How long one is kept, in milliseconds (0: an hour); an older one is
+    /// dropped.
+    pub max_age_ms: u64,
 }
 
 /// The recover-or-resync delivery: a topic that is not continuous (a cold
@@ -200,6 +217,10 @@ pub enum WseItemKind {
     Continuity,
     /// The saved checkpoint is not this client's (`reason`).
     CheckpointRejected,
+    /// The offline queue's file could not be written (`name`: what failed,
+    /// `reason`: why): what is kept stays in memory, and may not outlive the
+    /// app.
+    StorageFailed,
     Unknown,
 }
 
@@ -434,6 +455,11 @@ impl From<native::Item> for WseItem {
                 reason: Some(reason),
                 ..WseItem::of(WseItemKind::CheckpointRejected)
             },
+            native::Item::StorageFailed { operation, message } => WseItem {
+                name: Some(operation),
+                reason: Some(message),
+                ..WseItem::of(WseItemKind::StorageFailed)
+            },
             native::Item::Unknown { name } => WseItem {
                 name: Some(name),
                 ..WseItem::of(WseItemKind::Unknown)
@@ -488,6 +514,11 @@ impl WseNativeClient {
                 realm: d.realm,
                 checkpoint: d.checkpoint,
                 max_held: d.max_held,
+            }),
+            offline: config.offline.map(|o| native::NativeOffline {
+                path: o.path,
+                max_messages: o.max_messages,
+                max_age_ms: o.max_age_ms,
             }),
             ..native::NativeConfig::default()
         };
@@ -611,6 +642,12 @@ impl WseNativeClient {
     #[frb(sync)]
     pub fn checkpoint(&self) -> String {
         self.0.checkpoint()
+    }
+
+    #[frb(sync)]
+    /// How many messages the offline queue keeps for the next connection.
+    pub fn kept(&self) -> u32 {
+        self.0.kept()
     }
 
     /// recover-or-resync: the application brought the topics of `round` up

@@ -771,6 +771,11 @@ public protocol WseClientProtocol: AnyObject, Sendable {
     func disconnect(deadlineMs: UInt64) async
 
     /**
+     * How many messages the offline queue keeps for the next connection.
+     */
+    func kept()  -> UInt32
+
+    /**
      * The next batch of what the client heard: `ack` acknowledges the last
      * one (0: none yet); one not acknowledged comes again.
      */
@@ -971,6 +976,18 @@ open func disconnect(deadlineMs: UInt64)async   {
             errorHandler: nil
 
         )
+}
+
+    /**
+     * How many messages the offline queue keeps for the next connection.
+     */
+open func kept() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_wse_ffi_fn_method_wseclient_kept(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
 }
 
     /**
@@ -1607,6 +1624,11 @@ public struct WseConfig: Equatable, Hashable {
      * recover-or-resync; none: best effort.
      */
     public let delivery: WseDelivery?
+    /**
+     * Messages sent with no connection wait for the next one of the same user; none: such a
+     * send fails.
+     */
+    public let offline: WseOffline?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1629,7 +1651,11 @@ public struct WseConfig: Equatable, Hashable {
          */insecure: Bool = false,
         /**
          * recover-or-resync; none: best effort.
-         */delivery: WseDelivery? = nil) {
+         */delivery: WseDelivery? = nil,
+        /**
+         * Messages sent with no connection wait for the next one of the same user; none: such a
+         * send fails.
+         */offline: WseOffline? = nil) {
         self.url = url
         self.token = token
         self.topics = topics
@@ -1647,6 +1673,7 @@ public struct WseConfig: Equatable, Hashable {
         self.trust = trust
         self.insecure = insecure
         self.delivery = delivery
+        self.offline = offline
     }
 
 
@@ -1681,7 +1708,8 @@ public struct FfiConverterTypeWseConfig: FfiConverterRustBuffer {
                 serverSigningKeys: FfiConverterSequenceString.read(from: &buf),
                 trust: FfiConverterOptionTypeWseTrust.read(from: &buf),
                 insecure: FfiConverterBool.read(from: &buf),
-                delivery: FfiConverterOptionTypeWseDelivery.read(from: &buf)
+                delivery: FfiConverterOptionTypeWseDelivery.read(from: &buf),
+                offline: FfiConverterOptionTypeWseOffline.read(from: &buf)
         )
     }
 
@@ -1703,6 +1731,7 @@ public struct FfiConverterTypeWseConfig: FfiConverterRustBuffer {
         FfiConverterOptionTypeWseTrust.write(value.trust, into: &buf)
         FfiConverterBool.write(value.insecure, into: &buf)
         FfiConverterOptionTypeWseDelivery.write(value.delivery, into: &buf)
+        FfiConverterOptionTypeWseOffline.write(value.offline, into: &buf)
     }
 }
 
@@ -1980,6 +2009,88 @@ public func FfiConverterTypeWseMessage_lift(_ buf: RustBuffer) throws -> WseMess
 #endif
 public func FfiConverterTypeWseMessage_lower(_ value: WseMessage) -> RustBuffer {
     return FfiConverterTypeWseMessage.lower(value)
+}
+
+
+/**
+ * Messages sent with no connection, kept for the next one of the same user. They go right
+ * after the topics are subscribed again; a live or signed message is never kept.
+ */
+public struct WseOffline: Equatable, Hashable {
+    /**
+     * The file they are kept in, so that they outlive the app (in its own storage); the
+     * client's alone while it runs. None keeps them in memory.
+     */
+    public let path: String?
+    /**
+     * How many are kept at most (0: 1,000); past it a send fails as `Full`.
+     */
+    public let maxMessages: UInt32
+    /**
+     * How long one is kept, in milliseconds (0: an hour); an older one is dropped.
+     */
+    public let maxAgeMs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The file they are kept in, so that they outlive the app (in its own storage); the
+         * client's alone while it runs. None keeps them in memory.
+         */path: String? = nil,
+        /**
+         * How many are kept at most (0: 1,000); past it a send fails as `Full`.
+         */maxMessages: UInt32 = UInt32(0),
+        /**
+         * How long one is kept, in milliseconds (0: an hour); an older one is dropped.
+         */maxAgeMs: UInt64 = UInt64(0)) {
+        self.path = path
+        self.maxMessages = maxMessages
+        self.maxAgeMs = maxAgeMs
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WseOffline: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWseOffline: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseOffline {
+        return
+            try WseOffline(
+                path: FfiConverterOptionString.read(from: &buf),
+                maxMessages: FfiConverterUInt32.read(from: &buf),
+                maxAgeMs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: WseOffline, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.path, into: &buf)
+        FfiConverterUInt32.write(value.maxMessages, into: &buf)
+        FfiConverterUInt64.write(value.maxAgeMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWseOffline_lift(_ buf: RustBuffer) throws -> WseOffline {
+    return try FfiConverterTypeWseOffline.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWseOffline_lower(_ value: WseOffline) -> RustBuffer {
+    return FfiConverterTypeWseOffline.lower(value)
 }
 
 
@@ -2646,6 +2757,12 @@ public enum WseItem: Equatable, Hashable {
     case checkpointRejected(reason: String
     )
     /**
+     * The offline queue's file could not be written (`operation`): what is kept stays in
+     * memory, and may not outlive the app.
+     */
+    case storageFailed(operation: String, message: String
+    )
+    /**
      * Something this version does not know.
      */
     case unknown(name: String
@@ -2707,7 +2824,10 @@ public struct FfiConverterTypeWseItem: FfiConverterRustBuffer {
         case 12: return .checkpointRejected(reason: try FfiConverterString.read(from: &buf)
         )
 
-        case 13: return .unknown(name: try FfiConverterString.read(from: &buf)
+        case 13: return .storageFailed(operation: try FfiConverterString.read(from: &buf), message: try FfiConverterString.read(from: &buf)
+        )
+
+        case 14: return .unknown(name: try FfiConverterString.read(from: &buf)
         )
 
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -2797,8 +2917,14 @@ public struct FfiConverterTypeWseItem: FfiConverterRustBuffer {
             FfiConverterString.write(reason, into: &buf)
 
 
-        case let .unknown(name):
+        case let .storageFailed(operation,message):
             writeInt(&buf, Int32(13))
+            FfiConverterString.write(operation, into: &buf)
+            FfiConverterString.write(message, into: &buf)
+
+
+        case let .unknown(name):
+            writeInt(&buf, Int32(14))
             FfiConverterString.write(name, into: &buf)
 
         }
@@ -3324,6 +3450,30 @@ fileprivate struct FfiConverterOptionTypeWseDelivery: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeWseOffline: FfiConverterRustBuffer {
+    typealias SwiftType = WseOffline?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeWseOffline.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeWseOffline.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeWseSignature: FfiConverterRustBuffer {
     typealias SwiftType = WseSignature?
 
@@ -3763,6 +3913,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_method_wseclient_disconnect() != 49284) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wse_ffi_checksum_method_wseclient_kept() != 54727) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_method_wseclient_next_batch() != 61381) {

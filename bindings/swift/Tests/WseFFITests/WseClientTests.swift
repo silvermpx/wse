@@ -238,6 +238,30 @@ final class WseClientTests: XCTestCase {
         await client.disconnect(deadlineMs: 1_000)
     }
 
+    func testWhatIsSentWithNoConnectionGoesOnTheNext() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wse-offline-\(UUID().uuidString)").path
+        let client = try await WseClient.connect(
+            WseConfig(url: url, insecure: true, offline: WseOffline(path: path)))
+        let events = client.events()
+        try client.pause(reason: "test")
+        while client.status() == .connected { try await Task.sleep(nanoseconds: 20_000_000) }
+        try await client.send(kind: "echo", json: #"{"n":1}"#)
+        XCTAssertEqual(client.kept(), 1)
+        try client.resume(reason: "test")
+        var echoed: String?
+        for try await item in events {
+            if case let .message(message) = item, message.kind == "echoed" {
+                echoed = message.json
+                break
+            }
+        }
+        XCTAssertEqual(echoed, #"{"n":1}"#)
+        await client.disconnect(deadlineMs: 1_000)
+        try? FileManager.default.removeItem(atPath: path)
+        try? FileManager.default.removeItem(atPath: path + ".lock")
+    }
+
     func testALoopLeftLeavesTheRestToTheNext() async throws {
         let client = try await WseClient.connect(WseConfig(url: url, insecure: true))
         try await client.send(kind: "echo", json: #"{"n":1}"#)

@@ -87,6 +87,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   WseDelivery dco_decode_box_autoadd_wse_delivery(dynamic raw);
 
   @protected
+  WseOffline dco_decode_box_autoadd_wse_offline(dynamic raw);
+
+  @protected
   int dco_decode_i_32(dynamic raw);
 
   @protected
@@ -132,6 +135,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   WseDelivery? dco_decode_opt_box_autoadd_wse_delivery(dynamic raw);
 
   @protected
+  WseOffline? dco_decode_opt_box_autoadd_wse_offline(dynamic raw);
+
+  @protected
   Uint8List? dco_decode_opt_list_prim_u_8_strict(dynamic raw);
 
   @protected
@@ -172,6 +178,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   WseItemKind dco_decode_wse_item_kind(dynamic raw);
+
+  @protected
+  WseOffline dco_decode_wse_offline(dynamic raw);
 
   @protected
   WseStreamPosition dco_decode_wse_stream_position(dynamic raw);
@@ -251,6 +260,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   WseDelivery sse_decode_box_autoadd_wse_delivery(SseDeserializer deserializer);
 
   @protected
+  WseOffline sse_decode_box_autoadd_wse_offline(SseDeserializer deserializer);
+
+  @protected
   int sse_decode_i_32(SseDeserializer deserializer);
 
   @protected
@@ -308,6 +320,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  WseOffline? sse_decode_opt_box_autoadd_wse_offline(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   Uint8List? sse_decode_opt_list_prim_u_8_strict(SseDeserializer deserializer);
 
   @protected
@@ -348,6 +365,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   WseItemKind sse_decode_wse_item_kind(SseDeserializer deserializer);
+
+  @protected
+  WseOffline sse_decode_wse_offline(SseDeserializer deserializer);
 
   @protected
   WseStreamPosition sse_decode_wse_stream_position(
@@ -442,6 +462,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_wse_offline(
+    WseOffline self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_i_32(int self, SseSerializer serializer);
 
   @protected
@@ -508,6 +534,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_wse_offline(
+    WseOffline? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_list_prim_u_8_strict(
     Uint8List? self,
     SseSerializer serializer,
@@ -551,6 +583,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_wse_item_kind(WseItemKind self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_wse_offline(WseOffline self, SseSerializer serializer);
 
   @protected
   void sse_encode_wse_stream_position(

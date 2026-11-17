@@ -238,6 +238,10 @@ class WseClient {
   /// as [wseDelivery]'s checkpoint.
   String checkpoint() => _open.checkpoint();
 
+  /// How many messages the offline queue keeps for the next connection
+  /// ([wseOffline]).
+  int get kept => _open.kept();
+
   /// recover-or-resync: the application brought the topics of [round] (a
   /// resync item's) up to date; what they held comes next.
   void resynced(BigInt round) => _open.resynced(round: round);
@@ -272,7 +276,8 @@ class WseClient {
 /// [serverIdentityKeys] pin the server of an end-to-end encrypted session;
 /// [signingKey] (PKCS#8, from [generateSigningKey]) signs what
 /// [WseClient.sendSigned] sends, and [serverSigningKeys] check what the
-/// server signs.
+/// server signs. With [offline], what is sent with no connection waits for
+/// the next one of the same user; without it, such a send fails.
 rust.WseConfig wseConfig(
   String url, {
   String? token,
@@ -283,6 +288,7 @@ rust.WseConfig wseConfig(
   WseTrust trust = WseTrust.platform,
   bool insecure = false,
   rust.WseDelivery? delivery,
+  rust.WseOffline? offline,
   List<String> serverIdentityKeys = const [],
   Uint8List? signingKey,
   List<String> serverSigningKeys = const [],
@@ -304,6 +310,22 @@ rust.WseConfig wseConfig(
   trustedRoots: trust._roots,
   insecure: insecure,
   delivery: delivery,
+  offline: offline,
+);
+
+/// Messages sent with no connection, kept for the next one of the same user:
+/// in the file at [path] (in the app's own storage), so that they outlive
+/// the app, or in memory without one. They go right after the topics are
+/// subscribed again; a live or signed message is never kept. At most
+/// [maxMessages] (1,000) for at most [maxAge] (an hour).
+rust.WseOffline wseOffline({
+  String? path,
+  int maxMessages = 0,
+  Duration maxAge = Duration.zero,
+}) => rust.WseOffline(
+  path: path,
+  maxMessages: maxMessages,
+  maxAgeMs: BigInt.from(maxAge.inMilliseconds),
 );
 
 /// The recover-or-resync delivery: a topic that is not continuous (a cold

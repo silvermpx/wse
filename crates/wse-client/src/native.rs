@@ -197,6 +197,22 @@ pub struct NativeConfig {
     pub insecure: bool,
     /// recover-or-resync; None: best effort.
     pub delivery: Option<NativeDelivery>,
+    /// Messages sent with no connection wait for the next one; None: such a
+    /// send fails.
+    pub offline: Option<NativeOffline>,
+}
+
+/// Messages sent with no connection, kept for the next one of the same user
+/// ([`crate::Offline`]).
+#[derive(Clone, Debug, Default)]
+pub struct NativeOffline {
+    /// The file they are kept in, so that they outlive the app (in its own
+    /// storage); None keeps them in memory.
+    pub path: Option<String>,
+    /// How many are kept at most (0: 1,000).
+    pub max_messages: u32,
+    /// How long one is kept, in milliseconds (0: an hour).
+    pub max_age_ms: u64,
 }
 
 /// The recover-or-resync delivery: a topic that is not continuous (a cold
@@ -299,6 +315,19 @@ fn config_of(
         delivery.checkpoint = native.checkpoint;
         delivery.max_held = native.max_held as usize;
         delivery
+    });
+    config.offline = native.offline.map(|native| {
+        let mut offline = match native.path {
+            Some(path) => crate::Offline::in_file(path),
+            None => crate::Offline::in_memory(),
+        };
+        if native.max_messages > 0 {
+            offline.max_messages = native.max_messages as usize;
+        }
+        if native.max_age_ms > 0 {
+            offline.max_age = Duration::from_millis(native.max_age_ms);
+        }
+        offline
     });
     config.token = native.token;
     if let Some(source) = tokens {
@@ -585,6 +614,12 @@ pub enum Item {
     CheckpointRejected {
         reason: String,
     },
+    /// The offline queue's file could not be written (`operation`): what is
+    /// kept stays in memory, and may not outlive the app.
+    StorageFailed {
+        operation: String,
+        message: String,
+    },
     /// Something this version does not know.
     Unknown {
         name: String,
@@ -721,6 +756,10 @@ fn item_of(incoming: Incoming) -> Item {
                 reason: c.reason,
             },
             Event::CheckpointRejected(c) => Item::CheckpointRejected { reason: c.reason },
+            Event::StorageFailed(s) => Item::StorageFailed {
+                operation: s.operation,
+                message: s.message,
+            },
             Event::Closed(error) => Item::Closed {
                 error: error.map(NativeError::from),
             },
@@ -825,6 +864,11 @@ impl NativeClient {
     /// give back as [`NativeDelivery::checkpoint`].
     pub fn checkpoint(&self) -> String {
         self.client.checkpoint()
+    }
+
+    /// How many messages the offline queue keeps for the next connection.
+    pub fn kept(&self) -> u32 {
+        u32::try_from(self.client.kept()).unwrap_or(u32::MAX)
     }
 
     /// recover-or-resync: the application brought the topics of `round` up

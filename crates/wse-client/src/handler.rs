@@ -102,6 +102,12 @@ pub enum Event {
     /// realm, user, consumer or schema differs), or not one at all: recovery
     /// starts without it.
     CheckpointRejected(CheckpointRejected),
+    /// The file of the offline queue ([`Config::offline`]) could not be
+    /// written: what is kept stays in memory, and may not outlive the
+    /// application.
+    ///
+    /// [`Config::offline`]: crate::Config::offline
+    StorageFailed(StorageFailed),
     /// The client stopped for good: closed by the application (`None`), or
     /// the reason.
     Closed(Option<Error>),
@@ -131,6 +137,14 @@ pub struct TopicContinuity {
     pub continuity: Continuity,
     /// Why it is not continuous.
     pub reason: Option<String>,
+}
+
+/// What failed in the offline queue's file (`operation`: `write`), and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StorageFailed {
+    pub operation: String,
+    pub message: String,
 }
 
 /// Why the delivery's checkpoint was not taken: `malformed`, `version`,

@@ -23,6 +23,7 @@ mod handler;
 mod message;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub mod native;
+mod offline;
 mod policy;
 mod scan;
 mod security;
@@ -38,8 +39,9 @@ pub use error::Error;
 pub use events::{Events, Incoming, connect};
 pub use handler::{
     CheckpointRejected, Connected, Disconnected, Event, Gap, GapReason, Handler, MaybeSend, Paused,
-    Recovery, Resync, ServerError, Subscribed, TopicContinuity,
+    Recovery, Resync, ServerError, StorageFailed, Subscribed, TopicContinuity,
 };
 pub use message::{Message, OwnedMessage, Position, Signature};
+pub use offline::Offline;
 #[cfg(feature = "aws-lc")]
 pub use security::with_crypto::{generate_key, public_key, public_key_jwk};

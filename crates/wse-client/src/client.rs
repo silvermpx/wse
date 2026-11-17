@@ -13,8 +13,9 @@ use crate::config::Config;
 use crate::connection::Driver;
 use crate::delivery::{self, Gate, TopicState};
 use crate::error::Error;
-use crate::handler::Handler;
+use crate::handler::{Event, Handler, StorageFailed};
 use crate::message::Message;
+use crate::offline;
 use crate::security::Keys;
 
 /// Where the client stands.
@@ -75,6 +76,8 @@ struct SentFor {
     user: u64,
     /// What a signed or live message goes on.
     connection: u64,
+    /// The server took the current connection.
+    ready: bool,
 }
 
 impl SentFor {
@@ -122,10 +125,13 @@ pub(crate) struct Shared {
     /// Stops the connection's task where it stands: a close past its
     /// deadline.
     stop: Mutex<Option<futures_util::future::AbortHandle>>,
+    /// Messages sent with no connection, for the next one
+    /// ([`Config::offline`]).
+    pub(crate) store: Option<offline::Store>,
 }
 
 impl Shared {
-    pub(crate) fn new(token: Option<String>) -> Self {
+    pub(crate) fn new(token: Option<String>, store: Option<offline::Store>) -> Self {
         Self {
             ready: AtomicBool::new(false),
             users: AtomicU64::new(0),
@@ -134,6 +140,7 @@ impl Shared {
             token: Mutex::new(token),
             server_kid: Mutex::new(None),
             stop: Mutex::new(None),
+            store,
         }
     }
 }
@@ -219,6 +226,14 @@ impl Client {
             delivery::lock(&committed).committed(user)
         }));
         let before_handler = reader.is_none();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let store = match &config.offline {
+            Some(offline) => Some(offline::Store::open(
+                offline,
+                storage_report(&gate, &control_tx, reader.clone()),
+            )?),
+            None => None,
+        };
         let wake = match reader {
             Some(reader) => Wake::Reader(reader),
             None => Wake::Session,
@@ -229,9 +244,8 @@ impl Client {
         if let Some(mut key) = config.signing_key.take() {
             zeroize::Zeroize::zeroize(&mut key);
         }
-        let shared = Arc::new(Shared::new(config.token.clone()));
+        let shared = Arc::new(Shared::new(config.token.clone(), store));
         let (frames_tx, frames_rx) = mpsc::channel(config.send_queue);
-        let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (status_tx, status_rx) = watch::channel(Status::Connecting);
         let for_handler = Client {
             shared: Arc::clone(&shared),
@@ -295,25 +309,27 @@ impl Client {
     /// Sends a message `{"t": kind, "p": payload}`; fails at once when the
     /// queue is full.
     pub fn try_send<P: Serialize + ?Sized>(&self, kind: &str, payload: &P) -> Result<(), Error> {
-        let for_now = self.ready()?;
-        let text = encode(kind, payload)?;
-        self.frames
-            .try_send(for_now.frame(text))
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => Error::Full,
-                mpsc::error::TrySendError::Closed(_) => Error::Closed,
-            })
+        let id = message_id();
+        let text = encode(kind, payload, &id)?;
+        let Some(frame) = self.plain(&id, text)? else {
+            return Ok(());
+        };
+        self.frames.try_send(frame).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => Error::Full,
+            mpsc::error::TrySendError::Closed(_) => Error::Closed,
+        })
     }
 
     /// Sends a message `{"t": kind, "p": payload}`, waiting for room in the
-    /// queue.
+    /// queue. With no connection it is kept for the next one, when
+    /// [`Config::offline`] says so.
     pub async fn send<P: Serialize + ?Sized>(&self, kind: &str, payload: &P) -> Result<(), Error> {
-        let for_now = self.ready()?;
-        let text = encode(kind, payload)?;
-        self.frames
-            .send(for_now.frame(text))
-            .await
-            .map_err(|_| Error::Closed)
+        let id = message_id();
+        let text = encode(kind, payload, &id)?;
+        let Some(frame) = self.plain(&id, text)? else {
+            return Ok(());
+        };
+        self.frames.send(frame).await.map_err(|_| Error::Closed)
     }
 
     /// Sends a message `{"t": kind, "p": payload}` on the connection that is
@@ -327,7 +343,7 @@ impl Client {
         payload: &P,
     ) -> Result<(), Error> {
         let for_now = self.ready()?;
-        let text = encode(kind, payload)?;
+        let text = encode(kind, payload, &message_id())?;
         self.frames
             .try_send(for_now.live(text))
             .map_err(|e| match e {
@@ -343,7 +359,7 @@ impl Client {
         payload: &P,
     ) -> Result<(), Error> {
         let for_now = self.ready()?;
-        let text = encode(kind, payload)?;
+        let text = encode(kind, payload, &message_id())?;
         self.frames
             .send(for_now.live(text))
             .await
@@ -369,8 +385,8 @@ impl Client {
         I: IntoIterator<Item = T>,
         T: Into<String>,
     {
-        let for_now = self.ready()?;
-        let text = encode(kind, payload)?;
+        let for_now = self.waiting_allowed()?;
+        let text = encode(kind, payload, &message_id())?;
         let topics: Box<[String]> = topics.into_iter().map(Into::into).collect();
         self.frames
             .send(for_now.requiring(text, topics))
@@ -390,8 +406,8 @@ impl Client {
         I: IntoIterator<Item = T>,
         T: Into<String>,
     {
-        let for_now = self.ready()?;
-        let text = encode(kind, payload)?;
+        let for_now = self.waiting_allowed()?;
+        let text = encode(kind, payload, &message_id())?;
         let topics: Box<[String]> = topics.into_iter().map(Into::into).collect();
         self.frames
             .try_send(for_now.requiring(text, topics))
@@ -402,12 +418,13 @@ impl Client {
     }
 
     /// Sends JSON text as it is: a message the application built itself.
+    /// With no connection it is kept for the next one, when
+    /// [`Config::offline`] says so.
     pub async fn send_raw(&self, json: impl Into<String>) -> Result<(), Error> {
-        let for_now = self.ready()?;
-        self.frames
-            .send(for_now.frame(json.into()))
-            .await
-            .map_err(|_| Error::Closed)
+        let Some(frame) = self.plain(&message_id(), json.into())? else {
+            return Ok(());
+        };
+        self.frames.send(frame).await.map_err(|_| Error::Closed)
     }
 
     /// Sends a signed message `{"t": kind, "p": payload}`: signed with
@@ -496,6 +513,12 @@ impl Client {
         let topics: Vec<String> = topics.into_iter().map(Into::into).collect();
         delivery::lock(&self.gate).untrack(&topics);
         self.control(Control::Unsubscribe(topics))
+    }
+
+    /// How many messages the offline queue keeps for the next connection
+    /// ([`Config::offline`]).
+    pub fn kept(&self) -> usize {
+        self.shared.store.as_ref().map_or(0, offline::Store::len)
     }
 
     /// Each topic held: whether the server took it, and whether its
@@ -627,17 +650,51 @@ impl Client {
     /// The user and connection a message is sent for, read before the flag:
     /// one taken in between leaves the message with those before it, which
     /// it does not go out for.
-    fn ready(&self) -> Result<SentFor, Error> {
+    /// Who and what a message is sent for now; the client is not closed.
+    fn sent_for(&self) -> Result<SentFor, Error> {
         let sent_for = SentFor {
             user: self.shared.users.load(Ordering::Acquire),
             connection: self.shared.connections.load(Ordering::Acquire),
+            ready: self.shared.ready.load(Ordering::Acquire),
         };
-        if self.shared.ready.load(Ordering::Acquire) {
+        if !sent_for.ready && matches!(*self.status.borrow(), Status::Closed(_)) {
+            return Err(Error::Closed);
+        }
+        Ok(sent_for)
+    }
+
+    /// [`Client::sent_for`] on a connection the server took.
+    fn ready(&self) -> Result<SentFor, Error> {
+        let sent_for = self.sent_for()?;
+        if sent_for.ready {
             Ok(sent_for)
-        } else if matches!(*self.status.borrow(), Status::Closed(_)) {
-            Err(Error::Closed)
         } else {
             Err(Error::NotConnected)
+        }
+    }
+
+    /// [`Client::sent_for`] for a message that may wait for the next
+    /// connection in memory: with one, or with an offline queue.
+    fn waiting_allowed(&self) -> Result<SentFor, Error> {
+        let sent_for = self.sent_for()?;
+        if sent_for.ready || self.shared.store.is_some() {
+            Ok(sent_for)
+        } else {
+            Err(Error::NotConnected)
+        }
+    }
+
+    /// A plain message: for the connection's queue (`Some`), or kept for
+    /// the next connection while there is none ([`Config::offline`]).
+    fn plain(&self, id: &str, text: String) -> Result<Option<Queued>, Error> {
+        let for_now = self.sent_for()?;
+        if for_now.ready {
+            return Ok(Some(for_now.frame(text)));
+        }
+        match &self.shared.store {
+            // Given back: a connection takes messages now.
+            Some(store) => Ok(store.keep(id, text)?.map(|text| for_now.frame(text))),
+            None => Err(Error::NotConnected),
         }
     }
 
@@ -655,16 +712,78 @@ impl std::fmt::Debug for Client {
     }
 }
 
-/// `{"t": kind, "p": payload}` in one pass.
-fn encode<P: Serialize + ?Sized>(kind: &str, payload: &P) -> Result<String, Error> {
+/// `{"t": kind, "p": payload, "id": id}` in one pass.
+fn encode<P: Serialize + ?Sized>(kind: &str, payload: &P, id: &str) -> Result<String, Error> {
     #[derive(Serialize)]
     struct Out<'a, P: ?Sized> {
         t: &'a str,
         p: &'a P,
+        id: &'a str,
     }
     serde_json::to_string(&Out {
         t: kind,
         p: payload,
+        id,
     })
     .map_err(|e| Error::Encode(e.to_string()))
+}
+
+/// A message's id: a random UUID (version 4), as the TypeScript and Python
+/// clients give theirs.
+pub(crate) fn message_id() -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let (hi, lo) = random_pair();
+    // Version 4, variant 10.
+    let hi = (hi & 0xffff_ffff_ffff_0fff) | 0x0000_0000_0000_4000;
+    let lo = (lo & 0x3fff_ffff_ffff_ffff) | 0x8000_0000_0000_0000;
+    let bytes = ((u128::from(hi) << 64) | u128::from(lo)).to_be_bytes();
+    let mut out = [0u8; 36];
+    let mut at = 0;
+    for (i, byte) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out[at] = b'-';
+            at += 1;
+        }
+        out[at] = HEX[usize::from(byte >> 4)];
+        out[at + 1] = HEX[usize::from(byte & 0x0f)];
+        at += 2;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn random_pair() -> (u64, u64) {
+    (fastrand::u64(..), fastrand::u64(..))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn random_pair() -> (u64, u64) {
+    // 52 random bits a call: four calls fill both.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let bits = || (js_sys::Math::random() * (1u64 << 52) as f64) as u64;
+    (bits() << 32 ^ bits(), bits() << 32 ^ bits())
+}
+
+/// What the offline queue's file says goes to the application as an
+/// [`Event::StorageFailed`], with what the delivery's gate makes.
+fn storage_report(
+    gate: &delivery::Shared,
+    control: &mpsc::UnboundedSender<Control>,
+    reader: Option<mpsc::UnboundedSender<()>>,
+) -> offline::Report {
+    let gate = Arc::clone(gate);
+    let control = control.downgrade();
+    Box::new(move |operation, message| {
+        tracing::error!("[WSE] the offline queue: {operation} failed: {message}");
+        delivery::lock(&gate).tell(Event::StorageFailed(StorageFailed {
+            operation: operation.to_owned(),
+            message,
+        }));
+        if let Some(reader) = &reader {
+            let _ = reader.send(());
+        }
+        if let Some(control) = control.upgrade() {
+            let _ = control.send(Control::Drain);
+        }
+    })
 }

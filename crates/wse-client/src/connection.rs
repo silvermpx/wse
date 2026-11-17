@@ -461,10 +461,12 @@ impl<H: Handler> Driver<H> {
             code: None,
             reason: e.to_string(),
         };
+        let mut went: Vec<Box<str>> = Vec::new();
         for outgoing in self.session.outbox.drain(..) {
-            let (text, handshake) = match outgoing {
-                Outgoing::Text(text) => (text, false),
-                Outgoing::Handshake(text) => (text, true),
+            let (text, handshake, kept) = match outgoing {
+                Outgoing::Text(text) => (text, false, None),
+                Outgoing::Handshake(text) => (text, true, None),
+                Outgoing::Kept { id, text } => (text, false, Some(id)),
             };
             let frame = match self.session.sealing.as_mut() {
                 Some(sealing) => match sealing.seal(&text) {
@@ -480,8 +482,13 @@ impl<H: Handler> Driver<H> {
                 None => Frame::Text(text.into()),
             };
             ws.feed(frame).await.map_err(lost)?;
+            went.extend(kept);
         }
-        ws.flush().await.map_err(lost)
+        ws.flush().await.map_err(lost)?;
+        if let Some(store) = &self.shared.store {
+            store.sent(&went);
+        }
+        Ok(())
     }
 
     /// Closes the connection on the client's side, with what is queued

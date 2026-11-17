@@ -138,6 +138,26 @@ pub struct WseConfig {
     /// recover-or-resync; none: best effort.
     #[uniffi(default = None)]
     pub delivery: Option<WseDelivery>,
+    /// Messages sent with no connection wait for the next one of the same user; none: such a
+    /// send fails.
+    #[uniffi(default = None)]
+    pub offline: Option<WseOffline>,
+}
+
+/// Messages sent with no connection, kept for the next one of the same user. They go right
+/// after the topics are subscribed again; a live or signed message is never kept.
+#[derive(uniffi::Record)]
+pub struct WseOffline {
+    /// The file they are kept in, so that they outlive the app (in its own storage); the
+    /// client's alone while it runs. None keeps them in memory.
+    #[uniffi(default = None)]
+    pub path: Option<String>,
+    /// How many are kept at most (0: 1,000); past it a send fails as `Full`.
+    #[uniffi(default = 0)]
+    pub max_messages: u32,
+    /// How long one is kept, in milliseconds (0: an hour); an older one is dropped.
+    #[uniffi(default = 0)]
+    pub max_age_ms: u64,
 }
 
 /// The recover-or-resync delivery: a topic that is not continuous (a cold
@@ -293,6 +313,11 @@ impl From<WseConfig> for native::NativeConfig {
                 realm: d.realm,
                 checkpoint: d.checkpoint,
                 max_held: d.max_held,
+            }),
+            offline: c.offline.map(|o| native::NativeOffline {
+                path: o.path,
+                max_messages: o.max_messages,
+                max_age_ms: o.max_age_ms,
             }),
         }
     }
@@ -464,6 +489,12 @@ pub enum WseItem {
     CheckpointRejected {
         reason: String,
     },
+    /// The offline queue's file could not be written (`operation`): what is kept stays in
+    /// memory, and may not outlive the app.
+    StorageFailed {
+        operation: String,
+        message: String,
+    },
     /// Something this version does not know.
     Unknown {
         name: String,
@@ -584,6 +615,9 @@ impl From<native::Item> for WseItem {
                 reason,
             },
             native::Item::CheckpointRejected { reason } => Self::CheckpointRejected { reason },
+            native::Item::StorageFailed { operation, message } => {
+                Self::StorageFailed { operation, message }
+            }
             native::Item::Unknown { name } => Self::Unknown { name },
         }
     }
@@ -755,6 +789,11 @@ impl WseClient {
     /// state and give back as `WseDelivery.checkpoint`.
     pub fn checkpoint(&self) -> String {
         self.0.checkpoint()
+    }
+
+    /// How many messages the offline queue keeps for the next connection.
+    pub fn kept(&self) -> u32 {
+        self.0.kept()
     }
 
     /// recover-or-resync: the application brought the topics of `round` up

@@ -724,6 +724,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_disconnect(
     ): Int
+    external fun uniffi_wse_ffi_checksum_method_wseclient_kept(
+    ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_next_batch(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_pause(
@@ -807,6 +809,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_wse_ffi_fn_method_wseclient_disconnect(`ptr`: Long,`deadlineMs`: Long,
     ): Long
+    external fun uniffi_wse_ffi_fn_method_wseclient_kept(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Int
     external fun uniffi_wse_ffi_fn_method_wseclient_next_batch(`ptr`: Long,`ack`: Long,`maxItems`: Int,`maxBytes`: Int,`cancel`: Long,
     ): Long
     external fun uniffi_wse_ffi_fn_method_wseclient_pause(`ptr`: Long,`reason`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -1001,6 +1005,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_disconnect() and 0xFFFF) != 49284) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_kept() and 0xFFFF) != 54727) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_next_batch() and 0xFFFF) != 61381) {
@@ -1954,6 +1961,11 @@ public interface WseClientInterface {
     suspend fun `disconnect`(`deadlineMs`: kotlin.ULong)
 
     /**
+     * How many messages the offline queue keeps for the next connection.
+     */
+    fun `kept`(): kotlin.UInt
+
+    /**
      * The next batch of what the client heard: `ack` acknowledges the last
      * one (0: none yet); one not acknowledged comes again.
      */
@@ -2222,6 +2234,22 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
         UniffiNullRustCallStatusErrorHandler,
     )
     }
+
+
+    /**
+     * How many messages the offline queue keeps for the next connection.
+     */override fun `kept`(): kotlin.UInt {
+            return FfiConverterUInt.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_wse_ffi_fn_method_wseclient_kept(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
 
 
     /**
@@ -3071,6 +3099,12 @@ data class WseConfig (
      * recover-or-resync; none: best effort.
      */
     val `delivery`: WseDelivery? = null
+    ,
+    /**
+     * Messages sent with no connection wait for the next one of the same user; none: such a
+     * send fails.
+     */
+    val `offline`: WseOffline? = null
 
 ){
 
@@ -3104,6 +3138,7 @@ public object FfiConverterTypeWseConfig: FfiConverterRustBuffer<WseConfig> {
             FfiConverterOptionalTypeWseTrust.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterOptionalTypeWseDelivery.read(buf),
+            FfiConverterOptionalTypeWseOffline.read(buf),
         )
     }
 
@@ -3124,7 +3159,8 @@ public object FfiConverterTypeWseConfig: FfiConverterRustBuffer<WseConfig> {
             FfiConverterSequenceString.allocationSize(value.`serverSigningKeys`) +
             FfiConverterOptionalTypeWseTrust.allocationSize(value.`trust`) +
             FfiConverterBoolean.allocationSize(value.`insecure`) +
-            FfiConverterOptionalTypeWseDelivery.allocationSize(value.`delivery`)
+            FfiConverterOptionalTypeWseDelivery.allocationSize(value.`delivery`) +
+            FfiConverterOptionalTypeWseOffline.allocationSize(value.`offline`)
     )
 
     override fun write(value: WseConfig, buf: ByteBuffer) {
@@ -3145,6 +3181,7 @@ public object FfiConverterTypeWseConfig: FfiConverterRustBuffer<WseConfig> {
             FfiConverterOptionalTypeWseTrust.write(value.`trust`, buf)
             FfiConverterBoolean.write(value.`insecure`, buf)
             FfiConverterOptionalTypeWseDelivery.write(value.`delivery`, buf)
+            FfiConverterOptionalTypeWseOffline.write(value.`offline`, buf)
     }
 }
 
@@ -3342,6 +3379,63 @@ public object FfiConverterTypeWseMessage: FfiConverterRustBuffer<WseMessage> {
             FfiConverterOptionalString.write(value.`payloadError`, buf)
             FfiConverterOptionalTypeWseSignature.write(value.`signature`, buf)
             FfiConverterUInt.write(value.`generation`, buf)
+    }
+}
+
+
+
+/**
+ * Messages sent with no connection, kept for the next one of the same user. They go right
+ * after the topics are subscribed again; a live or signed message is never kept.
+ */
+data class WseOffline (
+    /**
+     * The file they are kept in, so that they outlive the app (in its own storage); the
+     * client's alone while it runs. None keeps them in memory.
+     */
+    val `path`: kotlin.String? = null
+    ,
+    /**
+     * How many are kept at most (0: 1,000); past it a send fails as `Full`.
+     */
+    val `maxMessages`: kotlin.UInt = 0u
+    ,
+    /**
+     * How long one is kept, in milliseconds (0: an hour); an older one is dropped.
+     */
+    val `maxAgeMs`: kotlin.ULong = 0uL
+
+){
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeWseOffline: FfiConverterRustBuffer<WseOffline> {
+    override fun read(buf: ByteBuffer): WseOffline {
+        return WseOffline(
+            FfiConverterOptionalString.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: WseOffline) = (
+            FfiConverterOptionalString.allocationSize(value.`path`) +
+            FfiConverterUInt.allocationSize(value.`maxMessages`) +
+            FfiConverterULong.allocationSize(value.`maxAgeMs`)
+    )
+
+    override fun write(value: WseOffline, buf: ByteBuffer) {
+            FfiConverterOptionalString.write(value.`path`, buf)
+            FfiConverterUInt.write(value.`maxMessages`, buf)
+            FfiConverterULong.write(value.`maxAgeMs`, buf)
     }
 }
 
@@ -4119,6 +4213,20 @@ sealed class WseItem {
     }
 
     /**
+     * The offline queue's file could not be written (`operation`): what is kept stays in
+     * memory, and may not outlive the app.
+     */
+    data class StorageFailed(
+        val `operation`: kotlin.String,
+        val `message`: kotlin.String) : WseItem()
+
+    {
+
+
+        companion object
+    }
+
+    /**
      * Something this version does not know.
      */
     data class Unknown(
@@ -4201,7 +4309,11 @@ public object FfiConverterTypeWseItem : FfiConverterRustBuffer<WseItem>{
             12 -> WseItem.CheckpointRejected(
                 FfiConverterString.read(buf),
                 )
-            13 -> WseItem.Unknown(
+            13 -> WseItem.StorageFailed(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                )
+            14 -> WseItem.Unknown(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
@@ -4312,6 +4424,14 @@ public object FfiConverterTypeWseItem : FfiConverterRustBuffer<WseItem>{
                 + FfiConverterString.allocationSize(value.`reason`)
             )
         }
+        is WseItem.StorageFailed -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`operation`)
+                + FfiConverterString.allocationSize(value.`message`)
+            )
+        }
         is WseItem.Unknown -> {
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
@@ -4402,8 +4522,14 @@ public object FfiConverterTypeWseItem : FfiConverterRustBuffer<WseItem>{
                 FfiConverterString.write(value.`reason`, buf)
                 Unit
             }
-            is WseItem.Unknown -> {
+            is WseItem.StorageFailed -> {
                 buf.putInt(13)
+                FfiConverterString.write(value.`operation`, buf)
+                FfiConverterString.write(value.`message`, buf)
+                Unit
+            }
+            is WseItem.Unknown -> {
+                buf.putInt(14)
                 FfiConverterString.write(value.`name`, buf)
                 Unit
             }
@@ -4875,6 +5001,38 @@ public object FfiConverterOptionalTypeWseDelivery: FfiConverterRustBuffer<WseDel
         } else {
             buf.put(1)
             FfiConverterTypeWseDelivery.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeWseOffline: FfiConverterRustBuffer<WseOffline?> {
+    override fun read(buf: ByteBuffer): WseOffline? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeWseOffline.read(buf)
+    }
+
+    override fun allocationSize(value: WseOffline?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeWseOffline.allocationSize(value)
+        }
+    }
+
+    override fun write(value: WseOffline?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeWseOffline.write(value, buf)
         }
     }
 }

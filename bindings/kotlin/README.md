@@ -137,7 +137,16 @@ topics is continuous on the connection, checked right before it goes (after a
 reconnect it waits for the resync); sends that require nothing go past it, and
 once the server takes a connection for another user it goes nowhere.
 
+With `offline = WseOffline(path = path)` (a file in the app's own storage)
+what is sent while there is no connection waits for the next connection of
+the same user and goes right after the topics are subscribed again; the file
+outlives the app. Without a path it waits in memory. At most `maxMessages`
+(1,000) wait, for at most `maxAgeMs` (an hour); `client.kept()` says how many
+wait. A live or signed message is never kept, and a file that cannot be
+written is a `WseItem.StorageFailed`.
+
 `events()` is the client's stream, until it closes; one reader at a time. A
+reader let go and a new one go on from the same place. A
 collector cancelled in between loses nothing: the next collection gets the
 rest, and an item whose collection was cancelled while it was handed out
 (behind `cancellable()` or `buffer()`, say) comes again, so it may be seen
@@ -177,7 +186,9 @@ changes comes from `Wse.tokens(() -> fetchToken())`, a supplier of a
 recover-or-resync delivery is `Wse.config(url).delivery(Wse.delivery("board").checkpoint(saved).build())`;
 `Wse.resynced(client, resync)` and `Wse.commit(client, message)` answer its
 items, and `Wse.sendRequiring(client, kind, json, List.of("orders"))` sends
-once the topics are continuous. Signed messages: `Wse.generateSigningKey()`, `Wse.signingPublicKey(key)`
+once the topics are continuous. The offline queue is
+`Wse.config(url).offline(Wse.offline().path(file).build())`, and
+`Wse.kept(client)` says how many messages wait in it. Signed messages: `Wse.generateSigningKey()`, `Wse.signingPublicKey(key)`
 and `Wse.sendSigned(...)`. Kotlin's unsigned numbers are hidden from Java:
 `Wse.retryInMillis(...)`, `Wse.attempt(...)` and `Wse.closeCode(...)` give a
 `Disconnected` item's as plain numbers.

@@ -36,6 +36,15 @@
   `sendRequiring` in Swift, Kotlin, Java and Dart, `send(requires=...)` in
   Python. It goes once each topic is continuous on the connection, checked
   right before it goes, and is the sending user's.
+- An offline queue in the Rust client (`Config::offline`) and the Swift,
+  Kotlin, Java and Dart packages (`offline`): what is sent while there is no
+  connection waits for the next connection of the same user and goes right
+  after the topics are subscribed again. In a file (`Offline::in_file`) it
+  outlives the application: a line written as the message is kept, synced to
+  the disk by a thread of its own, the file the client's alone while it runs.
+  At most `max_messages` (1,000) for at most `max_age` (an hour); `kept()`
+  says how many wait, and a file that cannot be written is an
+  `Event::StorageFailed`. In the browser the queue is in memory.
 - TypeScript: `wake()` and `close(deadlineMs)` for a client without a page
   (Node, Electron's main process, a worker): `wake()` connects at once when
   the application hears the network or the machine is back, and `close`
@@ -43,6 +52,8 @@
 
 ### Changed
 
+- Rust client (and Swift, Kotlin, Dart): every message carries an `id`, a
+  random UUID, as from the TypeScript and Python clients.
 - Rust client: the events stream and a handler hear `Event::Continuity` when
   a topic's messages break off, in best effort too; the Python client's
   stream and handlers hear a `continuity` event then.

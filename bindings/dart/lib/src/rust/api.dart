@@ -54,6 +54,9 @@ abstract class WseNativeClient implements RustOpaqueInterface {
   /// a waiting next_batch gets the end.
   Future<void> disconnect({required BigInt deadlineMs});
 
+  /// How many messages the offline queue keeps for the next connection.
+  int kept();
+
   /// The next batch: `ack` acknowledges the last one (0: none yet); one not
   /// acknowledged comes again.
   Future<WseBatch> nextBatch({
@@ -170,6 +173,10 @@ class WseConfig {
   /// recover-or-resync; None: best effort.
   final WseDelivery? delivery;
 
+  /// Messages sent with no connection wait for the next one of the same
+  /// user; None: such a send fails.
+  final WseOffline? offline;
+
   const WseConfig({
     required this.url,
     this.token,
@@ -188,6 +195,7 @@ class WseConfig {
     required this.trustedRoots,
     required this.insecure,
     this.delivery,
+    this.offline,
   });
 
   @override
@@ -208,7 +216,8 @@ class WseConfig {
       trust.hashCode ^
       trustedRoots.hashCode ^
       insecure.hashCode ^
-      delivery.hashCode;
+      delivery.hashCode ^
+      offline.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -231,7 +240,8 @@ class WseConfig {
           trust == other.trust &&
           trustedRoots == other.trustedRoots &&
           insecure == other.insecure &&
-          delivery == other.delivery;
+          delivery == other.delivery &&
+          offline == other.offline;
 }
 
 /// Whether a topic's messages run without a break.
@@ -500,7 +510,46 @@ enum WseItemKind {
 
   /// The saved checkpoint is not this client's (`reason`).
   checkpointRejected,
+
+  /// The offline queue's file could not be written (`name`: what failed,
+  /// `reason`: why): what is kept stays in memory, and may not outlive the
+  /// app.
+  storageFailed,
   unknown,
+}
+
+/// Messages sent with no connection, kept for the next one of the same
+/// user. They go right after the topics are subscribed again; a live or
+/// signed message is never kept.
+class WseOffline {
+  /// The file they are kept in, so that they outlive the app (in its own
+  /// storage); the client's alone while it runs. None keeps them in memory.
+  final String? path;
+
+  /// How many are kept at most (0: 1,000); past it a send fails as `full`.
+  final int maxMessages;
+
+  /// How long one is kept, in milliseconds (0: an hour); an older one is
+  /// dropped.
+  final BigInt maxAgeMs;
+
+  const WseOffline({
+    this.path,
+    required this.maxMessages,
+    required this.maxAgeMs,
+  });
+
+  @override
+  int get hashCode => path.hashCode ^ maxMessages.hashCode ^ maxAgeMs.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is WseOffline &&
+          runtimeType == other.runtimeType &&
+          path == other.path &&
+          maxMessages == other.maxMessages &&
+          maxAgeMs == other.maxAgeMs;
 }
 
 /// Where a stream of a topic stands.

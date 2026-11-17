@@ -113,6 +113,22 @@ class WseClientTest {
     }
 
     @Test
+    fun whatIsSentWithNoConnectionGoesOnTheNext(): Unit = runBlocking {
+        val path = kotlin.io.path.createTempDirectory("wse-offline").resolve("queue").toString()
+        val client = connectClient(
+            WseConfig(url = url, insecure = true, offline = WseOffline(path = path)),
+        )
+        val events = client.events()
+        client.pause("test")
+        while (client.status() == WseStatus.CONNECTED) delay(20)
+        client.send("echo", """{"n":1}""")
+        assertEquals(1u, client.kept())
+        client.resume("test")
+        assertEquals("""{"n":1}""", message(events, "echoed").json)
+        client.disconnect(1_000u)
+    }
+
+    @Test
     fun wsGoesInTheClearOnlyWhenAsked(): Unit = runBlocking {
         assertFailsWith<WseException.Config> { connectClient(WseConfig(url = url)) }
     }

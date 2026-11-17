@@ -70,6 +70,14 @@ between loses nothing, the next one gets the rest. `close()` sends what is
 queued and closes; a closed client's calls throw a `WseError` of kind
 `closed`.
 
+With `offline: wseOffline(path: file)` (a file in the app's own storage)
+what is sent while there is no connection waits for the next connection of
+the same user and goes right after the topics are subscribed again; the file
+outlives the app. Without a path it waits in memory. At most `maxMessages`
+(1,000) wait, for at most `maxAge` (an hour); `client.kept` says how many
+wait. A live or signed message is never kept, and a file that cannot be
+written is a `storageFailed` item (`name`: what failed, `reason`: why).
+
 ## Topic states and recover-or-resync
 
 `client.topicStates` says of each topic whether the server took it and
