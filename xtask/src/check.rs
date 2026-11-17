@@ -154,7 +154,15 @@ trap 'kill $server 2> /dev/null' EXIT
 for _ in $(seq 1 100); do grep -q '\"ready\"' \"$out/serve.log\" && break; sleep 0.1; done
 control=\"$(sed -n 's/.*\"control\":\"\\([^\"]*\\)\".*/\\1/p' \"$out/serve.log\")\"
 $display bindings/electron/node_modules/.bin/electron bindings/electron/conformance/out/main.mjs \"$control\"
-\"$CARGO_TARGET_DIR/debug/wse-conformance\" check --manifest tests/conformance/electron.json --reports \"$out\"",
+\"$CARGO_TARGET_DIR/debug/wse-conformance\" check --manifest tests/conformance/electron.json --reports \"$out\"
+node bindings/electron/example/build.mjs
+cargo build --locked -p wse-client --example server
+port=$((20000 + RANDOM % 20000))
+WSE_PORT=$port \"$CARGO_TARGET_DIR/debug/examples/server\" > \"$out/example-server.log\" 2>&1 &
+example=$!
+trap 'kill $server $example 2> /dev/null' EXIT
+for _ in $(seq 1 100); do grep -q '^signing_public_key' \"$out/example-server.log\" && break; sleep 0.1; done
+WSE_URL=\"ws://127.0.0.1:$port/wse\" WSE_EXAMPLE_CHECK=1 $display bindings/electron/node_modules/.bin/electron bindings/electron/example/out/main.mjs",
     },
     Lane {
         // Tauri's plugin (bindings/tauri, a workspace of its own): its lints and
@@ -172,9 +180,11 @@ if [ \"$(uname)\" = Linux ]; then
     display='xvfb-run -a'
   fi
 fi
+npx tsc -p bindings/tauri/tsconfig.json
 node bindings/tauri/conformance/build.mjs
+node bindings/tauri/example/build.mjs
 (cd bindings/tauri && cargo fmt --all --check && cargo clippy --locked --all-targets -- -D warnings \\
-  && cargo test --locked -p tauri-plugin-wse && cargo build --locked -p wse-tauri-conformance)
+  && cargo test --locked -p tauri-plugin-wse && cargo build --locked -p wse-tauri-conformance -p wse-tauri-example)
 cargo build --locked -p wse-conformance
 out=\"$(mktemp -d \"$CARGO_TARGET_DIR/tauri.XXXXXX\")\"
 \"$CARGO_TARGET_DIR/debug/wse-conformance\" serve --out \"$out\" > \"$out/serve.log\" 2>&1 &
@@ -183,7 +193,14 @@ trap 'kill $server 2> /dev/null' EXIT
 for _ in $(seq 1 100); do grep -q '\"ready\"' \"$out/serve.log\" && break; sleep 0.1; done
 control=\"$(sed -n 's/.*\"control\":\"\\([^\"]*\\)\".*/\\1/p' \"$out/serve.log\")\"
 $display \"$CARGO_TARGET_DIR/debug/wse-tauri-conformance\" \"$control\"
-\"$CARGO_TARGET_DIR/debug/wse-conformance\" check --manifest tests/conformance/tauri.json --reports \"$out\"",
+\"$CARGO_TARGET_DIR/debug/wse-conformance\" check --manifest tests/conformance/tauri.json --reports \"$out\"
+cargo build --locked -p wse-client --example server
+port=$((20000 + RANDOM % 20000))
+WSE_PORT=$port \"$CARGO_TARGET_DIR/debug/examples/server\" > \"$out/example-server.log\" 2>&1 &
+example=$!
+trap 'kill $server $example 2> /dev/null' EXIT
+for _ in $(seq 1 100); do grep -q '^signing_public_key' \"$out/example-server.log\" && break; sleep 0.1; done
+WSE_URL=\"ws://127.0.0.1:$port/wse\" WSE_EXAMPLE_CHECK=1 $display \"$CARGO_TARGET_DIR/debug/wse-tauri-example\"",
     },
     Lane {
         // The tests on the JVM, then the JVM package as an application gets it.

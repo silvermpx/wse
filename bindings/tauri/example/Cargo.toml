@@ -1,0 +1,17 @@
+[package]
+name = "wse-tauri-example"
+description = "The example application of Tauri's plugin: two windows on one connection, held in the application's Rust code"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+tauri = { workspace = true, features = ["wry", "common-controls-v6", "x11"] }
+tauri-plugin-wse = { path = "../plugin" }
+wse-client = { workspace = true }
+
+[build-dependencies]
+tauri-build = { version = "2.7.5", features = [] }

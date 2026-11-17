@@ -73,6 +73,12 @@ The client has the `WSEClient` interface: the adapters for React, Vue, Svelte, A
 take it as they take a client of their own. A page that reloads, or a window that closes, lets its
 share of the connection go.
 
+## An example
+
+[bindings/tauri/example](https://github.com/silvermpx/wse/tree/main/bindings/tauri/example) is an
+application with two windows on one connection; its `main.rs` says how to run it against the
+example server.
+
 ## License
 
 MIT

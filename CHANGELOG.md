@@ -25,6 +25,11 @@
   adapters take as they take any. Only the top frame of a served window,
   at a URL the application allows (by default its own pages, never the
   web's), gets a port.
+- Example applications for Electron (`bindings/electron/example`) and
+  Tauri (`bindings/tauri/example`): two windows on one connection, the
+  connection's state, the ticks of a topic and echoes, each window able to
+  pause itself; every word in German and in English. CI runs each against
+  the example server, on Linux, macOS and Windows.
 - Tauri: `tauri-plugin-wse` (crates.io), one connection for every window
   of a Tauri application, held on the Rust side (an owner of
   `wse_client::bridge`, with the token, the keys and the outbox):

@@ -4,5 +4,5 @@
     "noEmit": true,
     "rootDir": "../.."
   },
-  "include": ["conformance/*.ts"]
+  "include": ["conformance/*.ts", "example/*.ts", "../example-ui/*.ts"]
 }

@@ -4,7 +4,7 @@
 # against a webview's system libraries (GTK and WebKitGTK on Linux), which
 # the main workspace never asks for.
 [workspace]
-members = ["plugin", "conformance"]
+members = ["plugin", "conformance", "example"]
 resolver = "3"
 
 [workspace.package]

@@ -282,6 +282,10 @@ window out and forgets what the client kept for the user; the next user gets a n
 process connects with Node's WebSocket (Node 22 and newer); with an older Electron, pass a
 `webSocket` factory.
 
+An example application, two windows on one connection, is in
+[bindings/electron/example](https://github.com/silvermpx/wse/tree/main/bindings/electron/example);
+its `main.ts` says how to run it against the example server.
+
 ## Tauri
 
 The connection lives on the Rust side, in the `tauri-plugin-wse` crate (an owner of
@@ -319,7 +323,8 @@ gives the same with `withGlobalTauri`). The page's frames go one command at a ti
 of one turn together; the owner's come on a Channel. A page that reloads, or a window that closes,
 lets its share go; `app.wse().start(config)` again (another user) lets the last connection's pages
 go, and `app.wse().sign_out()` lets every page go and forgets what the connection kept for the
-user.
+user. An example application is in
+[bindings/tauri/example](https://github.com/silvermpx/wse/tree/main/bindings/tauri/example).
 
 ## Quick Start
 
