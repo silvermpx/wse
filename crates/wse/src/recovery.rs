@@ -1160,8 +1160,7 @@ impl RecoveryManager {
             }
         }
         for key in &foreign_to_remove {
-            if let Some((_, removed)) = self.foreign_buffers.remove(key) {
-                self.forget_foreign(key, removed.epoch);
+            if let Some(removed) = self.remove_foreign(key) {
                 self.note_removed(foreign_topic(key), removed.last_seq());
                 let _ = self
                     .total_bytes
@@ -1209,8 +1208,7 @@ impl RecoveryManager {
                             |cur| Some(cur.saturating_sub(removed.footprint())),
                         );
                     }
-                } else if let Some((_, removed)) = self.foreign_buffers.remove(&key) {
-                    self.forget_foreign(&key, removed.epoch);
+                } else if let Some(removed) = self.remove_foreign(&key) {
                     self.note_removed(foreign_topic(&key), removed.last_seq());
                     let _ =
                         self.total_bytes
@@ -1267,6 +1265,20 @@ impl RecoveryManager {
         Duration::from_secs(self.config.history_ttl_secs.min(MAX_LINGER_SECS))
     }
 
+    /// Removes the foreign buffer `key` (`topic\0epoch`) and its epoch from
+    /// its topic's streams at once: a relay that makes the buffer anew
+    /// meanwhile waits for both, then names the stream again. The buffer's
+    /// lock is taken before the streams', as a relay takes them.
+    fn remove_foreign(&self, key: &str) -> Option<ForeignRecoveryBuffer> {
+        let (_, removed) = self.foreign_buffers.remove_if(key, |key, removed| {
+            #[cfg(test)]
+            REMOVING.with_borrow(|hook| hook.as_ref().map(|hook| hook()));
+            self.forget_foreign(key, removed.epoch);
+            true
+        })?;
+        Some(removed)
+    }
+
     /// A foreign buffer (`topic\0epoch`) is gone: its topic no longer
     /// recovers from that epoch.
     fn forget_foreign(&self, key: &str, epoch: u32) {
@@ -1312,8 +1324,52 @@ impl RecoveryManager {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+thread_local! {
+    /// Runs as a foreign buffer is removed: a test does there what another
+    /// worker may do at that point.
+    static REMOVING: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_foreign_stream_made_again_as_cleanup_removes_it_is_still_recovered() {
+        let mgr = std::sync::Arc::new(RecoveryManager::new(RecoveryConfig {
+            history_ttl_secs: 0, // immediate expiry
+            ..RecoveryConfig::default()
+        }));
+        mgr.interest_began("topic");
+        mgr.push_foreign("topic", make_data("old"), 77, 0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // As cleanup removes the stream's buffer, a relay of the stream comes
+        // on another worker.
+        let pushing = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (relay, slot) = (std::sync::Arc::clone(&mgr), std::sync::Arc::clone(&pushing));
+        REMOVING.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                let relay = std::sync::Arc::clone(&relay);
+                let pushed = std::thread::spawn(move || {
+                    relay.push_foreign("topic", make_data("new"), 77, 1);
+                    relay.push_foreign("topic", make_data("later"), 77, 2);
+                });
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                *slot.lock().unwrap() = Some(pushed);
+            }));
+        });
+        mgr.cleanup();
+        REMOVING.with_borrow_mut(|hook| *hook = None);
+        let pushed = pushing
+            .lock()
+            .unwrap()
+            .take()
+            .expect("cleanup removed the buffer");
+        pushed.join().unwrap();
+        // The new buffer is one of the topic's streams: a client that asks
+        // from before it is told what it holds, never that nothing came.
+        assert_eq!(mgr.streams("topic"), vec![(77, 2)]);
+    }
 
     fn make_data(s: &str) -> Bytes {
         Bytes::from(s.to_owned())
