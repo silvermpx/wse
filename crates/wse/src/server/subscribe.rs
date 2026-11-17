@@ -10,6 +10,7 @@ use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 use super::control::TopicPosition;
+use super::fanout::{stamp_prefix, stamped_position};
 use super::handler::Presence;
 use super::{
     ConnectionHandle, QueueGroup, ServerCommand, SharedState, format_presence_msg, is_pattern,
@@ -507,8 +508,8 @@ impl SharedState {
             } => {
                 let total = publications.len();
                 let mut queued = 0;
-                for payload in publications {
-                    let Ok(text) = Utf8Bytes::try_from(payload) else {
+                for payload in &publications {
+                    let Ok(text) = Utf8Bytes::try_from(payload.clone()) else {
                         break;
                     };
                     if !handle.send_one(
@@ -520,12 +521,23 @@ impl SharedState {
                     }
                     queued += 1;
                 }
+                // Cut short: the client has the stream of its last message up
+                // to the last of it replayed (the replay holds the topic's
+                // other streams too).
+                let replayed_to = || {
+                    let prefix = stamp_prefix(topic);
+                    publications[..queued]
+                        .iter()
+                        .rev()
+                        .find_map(|p| stamped_position(p, &prefix).filter(|(e, _)| *e == epoch))
+                        .map_or(after, |(_, o)| o)
+                };
                 TopicRecovery {
                     epoch: Some(epoch),
                     offset: if queued == total {
                         offset
                     } else {
-                        after + queued as u64
+                        replayed_to()
                     },
                     recovered: queued == total,
                     recoverable: true,
@@ -819,9 +831,7 @@ pub(crate) fn answer_subscription_request(
         },
         "v": 1,
     });
-    handle.send_one(
-        Message::Text(reply.to_string().into()),
-        state.max_outbound_queue_bytes,
-        state.slow_consumer_drops.shard(usize::from(handle.lane)),
-    );
+    // The client waits for it, however much of the replay the outbound
+    // budget took.
+    handle.send_owed(Message::Text(reply.to_string().into()));
 }

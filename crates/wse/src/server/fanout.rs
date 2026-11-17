@@ -247,6 +247,14 @@ impl ConnectionHandle {
             slow_drops.fetch_add(1, Ordering::Relaxed);
             return false;
         }
+        self.send_owed(msg)
+    }
+
+    /// [`send_one`](Self::send_one) of a message the client waits for (the
+    /// answer to its request): never dropped for the outbound budget. One
+    /// for each request it made; a connection that stays over its budget is
+    /// closed as too slow to read.
+    pub(crate) fn send_owed(&self, msg: Message) -> bool {
         // JSON text in msgpack, for a connection that asked for msgpack.
         let msg = match msg {
             Message::Text(text) if self.msgpack => match to_msgpack(text.as_bytes()) {
@@ -1038,6 +1046,25 @@ pub(crate) fn unstamped(payload: &Bytes) -> Bytes {
     out.push('{');
     out.push_str(body);
     Bytes::from(out)
+}
+
+/// What a message of `topic` stamped by [`stamp_recovery_fields`] begins
+/// with, up to its epoch's hex digits.
+pub(crate) fn stamp_prefix(topic: &str) -> Vec<u8> {
+    let topic_json = serde_json::to_string(topic).unwrap_or_else(|_| "\"\"".to_string());
+    format!("{{\"tp\":{topic_json},\"e\":\"").into_bytes()
+}
+
+/// The (epoch, offset) a message stamped by [`stamp_recovery_fields`] carries,
+/// `prefix` its topic's [`stamp_prefix`].
+pub(crate) fn stamped_position(message: &[u8], prefix: &[u8]) -> Option<(u32, u64)> {
+    let rest = message.strip_prefix(prefix)?;
+    let hex = std::str::from_utf8(rest.get(..8)?).ok()?;
+    let epoch = u32::from_str_radix(hex, 16).ok()?;
+    let rest = rest.get(8..)?.strip_prefix(b"\",\"o\":")?;
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    let offset = std::str::from_utf8(&rest[..digits]).ok()?.parse().ok()?;
+    Some((epoch, offset))
 }
 
 /// Weave this message's recovery coordinates -- topic (`tp`), epoch (`e`, as an

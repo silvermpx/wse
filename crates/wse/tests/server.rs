@@ -622,6 +622,114 @@ async fn a_member_of_a_queue_group_that_unsubscribes_is_no_longer_present() {
     server.stop().await;
 }
 
+/// Takes every connection.
+struct Everyone;
+
+impl wse::Handler for Everyone {
+    type Connection = ();
+
+    fn connect(&self, _connect: &wse::Connect<'_>) -> Option<()> {
+        Some(())
+    }
+
+    fn message(&self, _conn: &mut (), _message: wse::Inbound, _size: usize) -> bool {
+        true
+    }
+
+    fn signed(&self, _conn: &mut (), _message: serde_json::Value, _size: usize) -> bool {
+        false
+    }
+
+    fn disconnect(&self, _conn: ()) {}
+}
+
+/// A client of `addr` the application took, past its server_ready.
+async fn accepted(addr: std::net::SocketAddr, publisher: &wse::Publisher) -> Client {
+    let before = publisher.connections();
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/wse"))
+        .await
+        .unwrap();
+    let conn_id = loop {
+        if let Some(id) = publisher
+            .connections()
+            .into_iter()
+            .find(|id| !before.contains(id))
+        {
+            break id;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(publisher.accept(&conn_id, "ann").unwrap());
+    assert!(next_text(&mut ws).await.contains("server_ready"));
+    ws
+}
+
+/// The next server message of type `kind`, what comes before it counted.
+async fn next_of(ws: &mut Client, kind: &str) -> (serde_json::Value, usize) {
+    let mut before = 0;
+    loop {
+        let value: serde_json::Value = serde_json::from_str(&next_text(ws).await).unwrap();
+        if value["t"] == kind {
+            return (value, before);
+        }
+        before += 1;
+    }
+}
+
+/// A replay longer than the connection's outbound budget is cut short, and
+/// the client still gets the subscription's answer, which says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replay_cut_short_by_the_outbound_budget_is_still_answered() {
+    let mut config = wse::Config::default();
+    config.client_subscriptions = true;
+    let mut recovery = wse::RecoverySettings::default();
+    recovery.buffer_size = 1024;
+    config.recovery = Some(recovery);
+    config.max_outbound_queue_bytes = 2048;
+    let server = wse::Server::new(config).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    server.start(listener, Everyone).unwrap();
+    let publisher = server.publisher();
+
+    let mut first = accepted(addr, &publisher).await;
+    let subscribe = serde_json::json!({"t": "subscription_update",
+        "p": {"action": "subscribe", "topics": ["news"]}});
+    first
+        .send(Message::Text(subscribe.to_string().into()))
+        .await
+        .unwrap();
+    next_of(&mut first, "subscription_update").await;
+    publisher
+        .publish_local("news", r#"{"t":"news","p":{"n":0}}"#)
+        .unwrap();
+    let (last, _) = next_of(&mut first, "news").await;
+    drop(first);
+    let filler = "x".repeat(300);
+    for n in 1..=400 {
+        let message = serde_json::json!({"t": "news", "p": {"n": n, "filler": filler}});
+        publisher
+            .publish_local("news", &message.to_string())
+            .unwrap();
+    }
+
+    let mut back = accepted(addr, &publisher).await;
+    let recover = serde_json::json!({"t": "subscription_update", "p": {
+        "action": "subscribe", "topics": ["news"], "recover": true,
+        "recovery": {"news": {"epoch": last["e"], "offset": last["o"]}}}});
+    back.send(Message::Text(recover.to_string().into()))
+        .await
+        .unwrap();
+    let (reply, replayed) = next_of(&mut back, "subscription_update").await;
+    let news = &reply["p"]["recovery"]["news"];
+    assert_eq!(news["recovered"], false, "{reply}");
+    let count = news["count"].as_u64().unwrap();
+    assert!(count < 400);
+    assert_eq!(replayed as u64, count);
+    assert_eq!(news["offset"], last["o"].as_u64().unwrap() + count);
+    server.stop().await;
+}
+
 /// A stop given up while it waits leaves the run to the next stop, which
 /// waits for it: the server does not start again over a run still ending.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

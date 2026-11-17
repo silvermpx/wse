@@ -24,6 +24,26 @@ fn stamp_recovery_fields_injects_tp_e_o_and_preserves_payload() {
 }
 
 #[test]
+fn a_stamped_message_says_its_position() {
+    let stamped = stamp_recovery_fields(r#"{"c":"U","t":"x","p":{}}"#, "ro\"om", 0xab, 41);
+    let prefix = super::fanout::stamp_prefix("ro\"om");
+    assert_eq!(
+        super::fanout::stamped_position(stamped.as_bytes(), &prefix),
+        Some((0xab, 41))
+    );
+    // Another topic's, or one not stamped: none.
+    let other = super::fanout::stamp_prefix("room");
+    assert_eq!(
+        super::fanout::stamped_position(stamped.as_bytes(), &other),
+        None
+    );
+    assert_eq!(
+        super::fanout::stamped_position(b"{\"t\":\"x\"}", &prefix),
+        None
+    );
+}
+
+#[test]
 fn stamp_recovery_fields_handles_empty_object_escape_and_non_object() {
     // Empty object -> no dangling comma.
     let s = stamp_recovery_fields("{}", "t", 1, 2);
