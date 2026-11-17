@@ -180,6 +180,68 @@ class TestStop:
         assert wait_for(lambda: _try_start(srv), timeout=10)
         srv.stop()
 
+    def test_a_start_after_a_stop_from_a_callback_waits_for_the_old_run(self, server_port):
+        srv = jwt_server(server_port)
+        connected = threading.Event()
+        stopped = threading.Event()
+
+        def on_message(conn_id, data):
+            srv.stop()
+            stopped.set()
+
+        srv.set_callbacks(lambda *a: connected.set(), on_message, lambda *a: None)
+        srv.start()
+        # A client that never answers the close: the old run ends late.
+        ghost = raw_upgrade(server_port, make_token("ghost"))
+        try:
+            assert connected.wait(2)
+
+            async def trigger():
+                async with await connect(server_port, make_token("trigger")) as ws:
+                    await ws.send(json.dumps({"t": "stop"}))
+                    await asyncio.sleep(0.02)
+
+            with contextlib.suppress(websockets.ConnectionClosed):
+                asyncio.run(trigger())
+            assert stopped.wait(2)
+            # At once, from this thread: it waits for the old run to end.
+            srv.start()
+            assert srv.is_running()
+            # What the old run does as it ends is done: the new one runs on.
+            time.sleep(2.5)
+            assert srv.is_running()
+        finally:
+            ghost.close()
+            srv.stop()
+
+    def test_a_callback_of_a_stopping_run_cannot_start_it_again(self, server_port):
+        srv = jwt_server(server_port)
+        refused = []
+        done = threading.Event()
+
+        def on_message(conn_id, data):
+            srv.stop()
+            try:
+                srv.start()
+            except RuntimeError as exc:
+                refused.append(str(exc))
+            done.set()
+
+        srv.set_callbacks(lambda *a: None, on_message, lambda *a: None)
+        srv.start()
+
+        async def run():
+            async with await connect(server_port, make_token()) as ws:
+                await ws.send(json.dumps({"t": "stop"}))
+                await asyncio.sleep(0.2)
+
+        with contextlib.suppress(websockets.ConnectionClosed):
+            asyncio.run(run())
+        assert done.wait(5)
+        assert refused and "still stopping" in refused[0]
+        assert wait_for(lambda: _try_start(srv), timeout=10)
+        srv.stop()
+
 
 def _try_start(srv) -> bool:
     try:

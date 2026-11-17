@@ -54,6 +54,10 @@ pub struct RustWSEServer {
     lifecycle: std::sync::Mutex<Option<thread::JoinHandle<()>>>,
     running: Arc<AtomicBool>,
     rt_handle: parking_lot::RwLock<Option<tokio::runtime::Handle>>,
+    /// The runtime of a run stopped from one of its own callbacks, while its
+    /// thread may still be ending: a start() waits for it, and one of its
+    /// callbacks cannot.
+    stopping: parking_lot::Mutex<Option<tokio::runtime::Id>>,
     /// Callback mode's callbacks (`set_callbacks()`), shared with the handler.
     callbacks: Arc<handler::PyCallbacks>,
 }
@@ -223,6 +227,7 @@ impl RustWSEServer {
             lifecycle: std::sync::Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
             rt_handle: parking_lot::RwLock::new(None),
+            stopping: parking_lot::Mutex::new(None),
             callbacks: Arc::default(),
         })
     }

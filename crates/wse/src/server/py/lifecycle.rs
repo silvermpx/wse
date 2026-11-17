@@ -68,13 +68,26 @@ impl RustWSEServer {
             .as_ref()
             .is_some_and(|handle| !handle.is_finished())
         {
-            return Err(PyRuntimeError::new_err("Server is already running"));
+            if self.running.load(Ordering::SeqCst) {
+                return Err(PyRuntimeError::new_err("Server is already running"));
+            }
+            // Stopped from one of its callbacks, the run still ends: a
+            // callback of that run cannot wait for it.
+            let here = tokio::runtime::Handle::try_current().ok().map(|h| h.id());
+            if here.is_some() && here == *self.stopping.lock() {
+                return Err(PyRuntimeError::new_err(
+                    "the server is still stopping: a callback of the run that stops \
+                     cannot start it again (start it from another thread)",
+                ));
+            }
         }
-        // A server thread that ended by itself (it could not bind) is reaped
-        // here; it has finished, so the join returns at once.
+        // The last run's thread is waited for, detached, whether it ended by
+        // itself (it could not bind) or still ends (stopped from a callback):
+        // nothing it does as it ends reaches the new run.
         if let Some(handle) = server_thread.take() {
-            let _ = handle.join();
+            let _ = py.detach(move || handle.join());
         }
+        *self.stopping.lock() = None;
         // The engine's log targets start with its crate name, `wse`.
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
@@ -199,9 +212,11 @@ impl RustWSEServer {
         }
         self.running.store(false, Ordering::SeqCst);
         // From a callback the server thread is not joined: it waits for its
-        // callbacks, this one included. It stops by itself.
+        // callbacks, this one included. It stops by itself, and the next
+        // start() (or stop() from another thread) waits for it.
         let panicked = if on_own_runtime {
-            drop(handle);
+            *self.stopping.lock() = self.runtime().map(|h| h.id());
+            *server_thread = Some(handle);
             false
         } else {
             // Detached while the server closes its connections (up to three
