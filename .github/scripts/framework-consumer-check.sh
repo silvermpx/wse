@@ -66,6 +66,7 @@ program="$target/debug/examples/server"
 (
   cd "$root/tests/clients/harness"
   npm ci --no-audit --no-fund --loglevel=error
-  npx playwright install chromium > /dev/null
+  # Quiet when it works; what it said when it does not (on standard output).
+  out="$(npx playwright install chromium 2>&1)" || { printf '%s\n' "$out" >&2; exit 1; }
 )
 node "$root/tests/clients/harness/page.mjs" "$kind" "$work" "$program"
