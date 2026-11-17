@@ -15,6 +15,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use js_sys::{Array, Function, Object, Promise, Reflect};
 use wasm_bindgen::closure::Closure;
@@ -25,7 +26,7 @@ use web_sys::{
     IdbTransactionMode,
 };
 
-use super::{LineRef, Read, Record, Report, new_id, numbered, unnumbered};
+use super::{LineRef, Read, Record, Report, Wake, new_id, numbered, unnumbered};
 
 const VERSION: u32 = 3;
 const PRODUCERS: &str = "producers";
@@ -410,13 +411,13 @@ async fn take_over(db: &IdbDatabase, name: &str) -> Result<(Meta, Function, Read
 }
 
 /// Opens the database `name` for this tab: its log, and what it holds.
-pub(super) async fn open(name: &str, report: Report) -> Result<(Log, Read), String> {
+pub(super) async fn open(name: &str, report: Report, wake: Wake) -> Result<(Log, Read), String> {
     if locks().is_none() {
         return Err(no_locks());
     }
     let db = open_database(name).await?;
     match take_over(&db, name).await {
-        Ok((meta, release, read)) => Ok((Log::new(db, meta, release, report), read)),
+        Ok((meta, release, read)) => Ok((Log::new(db, meta, release, report, wake), read)),
         Err(why) => {
             db.close();
             Err(why)
@@ -448,6 +449,10 @@ struct Inner {
     stale: bool,
     failing: bool,
     closed: bool,
+    /// The highest mark the database holds (that messages up to it may have
+    /// gone), and who hears it rose.
+    written: u64,
+    wake: Wake,
     release: Function,
     report: Report,
     _versionchange: Option<Closure<dyn FnMut(web_sys::Event)>>,
@@ -505,6 +510,8 @@ fn commit(shared: &Rc<RefCell<Inner>>) {
     if inner.stale && !rewrites {
         return;
     }
+    // The producer's row goes with each transaction: its mark with it.
+    let mark = inner.meta.written;
     let tx = match inner.transaction(&ops) {
         Ok(tx) => tx,
         Err(why) => {
@@ -519,17 +526,25 @@ fn commit(shared: &Rc<RefCell<Inner>>) {
         let outcome = committed(&tx).await;
         let mut inner = shared.borrow_mut();
         inner.busy = false;
+        let mut rose = false;
         match outcome {
             Ok(()) => {
                 if rewrites {
                     inner.stale = false;
                 }
                 inner.failing = false;
+                rose = mark > inner.written;
+                inner.written = inner.written.max(mark);
             }
             Err(why) => inner.fail(why),
         }
         let closed = inner.closed;
+        let wake = Arc::clone(&inner.wake);
         drop(inner);
+        // In the database: what waited for the mark may go.
+        if rose {
+            wake();
+        }
         if !closed {
             commit(&shared);
         }
@@ -545,7 +560,8 @@ pub(super) struct Log {
 }
 
 impl Log {
-    fn new(db: IdbDatabase, meta: Meta, release: Function, report: Report) -> Self {
+    fn new(db: IdbDatabase, meta: Meta, release: Function, report: Report, wake: Wake) -> Self {
+        let written = meta.written;
         let inner = Rc::new(RefCell::new(Inner {
             db: db.clone(),
             meta,
@@ -558,6 +574,8 @@ impl Log {
             stale: false,
             failing: false,
             closed: false,
+            written,
+            wake,
             release,
             report,
             _versionchange: None,
@@ -607,7 +625,8 @@ impl Log {
         }
     }
 
-    pub(super) fn flush(&mut self) {
+    /// Hands the batch to a transaction; its mark is the producer's row's.
+    pub(super) fn flush(&mut self, _mark: u64) {
         let mut inner = self.inner.borrow_mut();
         if inner.ops.is_empty() && !inner.meta_changed {
             return;
@@ -629,6 +648,17 @@ impl Log {
 
     pub(super) fn take_broken(&self) -> bool {
         std::mem::take(&mut self.inner.borrow_mut().broken)
+    }
+
+    /// The highest mark the database holds.
+    pub(super) fn written(&self) -> u64 {
+        self.inner.borrow().written
+    }
+
+    /// The database is behind: it lacks what a failed transaction held, and
+    /// messages do not wait for it until it is written anew.
+    pub(super) fn behind(&self) -> bool {
+        self.inner.borrow().stale
     }
 
     /// Writes the database anew, with what is kept now alone.

@@ -346,7 +346,8 @@ impl Client {
             Some(offline) => {
                 let room = Arc::new(Room::new(offline));
                 let report = storage_report(&gate, &control_tx, reader.clone());
-                let outbox = Outbox::open(offline, Arc::clone(&room), report);
+                let outbox =
+                    Outbox::open(offline, Arc::clone(&room), report, outbox_wake(&control_tx));
                 (Some(room), Some(outbox))
             }
             None => (None, None),
@@ -1084,6 +1085,17 @@ pub(crate) fn random_pair() -> (u64, u64) {
 
 /// What the offline queue's file says goes to the application as an
 /// [`Event::StorageFailed`], with what the delivery's gate makes.
+/// Wakes the connection's task once the outbox's store wrote what messages
+/// waited for: they go.
+fn outbox_wake(control: &mpsc::UnboundedSender<Control>) -> crate::outbox::Wake {
+    let control = control.downgrade();
+    Arc::new(move || {
+        if let Some(control) = control.upgrade() {
+            let _ = control.send(Control::Drain);
+        }
+    })
+}
+
 fn storage_report(
     gate: &delivery::Shared,
     control: &mpsc::UnboundedSender<Control>,

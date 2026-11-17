@@ -2682,6 +2682,7 @@ mod tests {
             &offline,
             Arc::clone(&room),
             Arc::new(|_, _| {}),
+            Arc::new(|| {}),
         ));
         let ready = r#"{"t":"server_ready","p":{"details":{"user_id":"ann","features":{"acks":true,"recovery":true}}}}"#;
         let answered = r#"{"t":"outbox","p":{"acked":0,"node":"n"}}"#;

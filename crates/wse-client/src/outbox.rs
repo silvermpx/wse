@@ -126,6 +126,9 @@ pub(crate) const HEADROOM: usize = 25;
 /// Says what failed in the file: the operation and why.
 pub(crate) type Report = Arc<dyn Fn(&'static str, String) + Send + Sync>;
 
+/// Wakes the connection's task: the store wrote what messages waited for.
+pub(crate) type Wake = Arc<dyn Fn() + Send + Sync>;
+
 /// The outbox's room, shared with the client's handles: a send takes its
 /// place before it is queued, so a full outbox refuses it at once, or the
 /// send waits until a place is given back.
@@ -350,6 +353,11 @@ pub(crate) struct Outbox {
     /// The highest number handed to a connection: one above it never
     /// reached a server.
     written: u64,
+    /// Written ahead: the highest number the store was handed the mark of
+    /// (that up to it, messages may have gone). A numbered message goes once
+    /// the store wrote its mark ([`Log::written`]), so that after a crash
+    /// its number is never another's.
+    promised: u64,
     /// The highest number written to the current connection's socket.
     flushed: u64,
     /// The user of the last connection, once there was one.
@@ -387,6 +395,7 @@ pub(crate) struct Outbox {
     /// it ([`Outbox::deadline`]), whether or not anything changes meanwhile.
     heal: Option<Instant>,
     report: Report,
+    wake: Wake,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -402,7 +411,7 @@ impl Drop for Outbox {
         if self.owed || self.log.as_ref().is_some_and(Log::take_broken) {
             self.rewrite();
         } else if let Some(log) = &mut self.log {
-            log.flush();
+            log.flush(self.promised);
         }
     }
 }
@@ -445,8 +454,9 @@ struct Head<'a> {
 impl Outbox {
     /// The outbox `offline` names, with `room` shared with the client's
     /// handles. A file that cannot be opened is said (`report`) and the
-    /// outbox kept in memory.
-    pub(crate) fn open(offline: &Offline, room: Arc<Room>, report: Report) -> Self {
+    /// outbox kept in memory; `wake` is called once the store wrote what
+    /// messages waited for.
+    pub(crate) fn open(offline: &Offline, room: Arc<Room>, report: Report, wake: Wake) -> Self {
         let max_age_ms = u64::try_from(offline.max_age.as_millis()).unwrap_or(u64::MAX);
         #[allow(unused_mut)]
         let mut outbox = Self {
@@ -456,6 +466,7 @@ impl Outbox {
             producer: new_id().into(),
             node: None,
             written: 0,
+            promised: 0,
             flushed: 0,
             user: None,
             ready: false,
@@ -473,10 +484,11 @@ impl Outbox {
             heal_at: 0,
             heal: None,
             report,
+            wake,
         };
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(path) = &offline.path {
-            match file::Log::open(path, Arc::clone(&outbox.report)) {
+            match file::Log::open(path, Arc::clone(&outbox.report), Arc::clone(&outbox.wake)) {
                 Ok((log, read)) => {
                     if let Some(read) = read {
                         outbox.restore(read);
@@ -499,7 +511,7 @@ impl Outbox {
         let Some(name) = self.database.take() else {
             return;
         };
-        match idb::open(&name, Arc::clone(&self.report)).await {
+        match idb::open(&name, Arc::clone(&self.report), Arc::clone(&self.wake)).await {
             Ok((log, read)) => {
                 self.restore(read);
                 self.log = Some(log);
@@ -513,6 +525,7 @@ impl Outbox {
         self.producer = read.producer;
         self.node = read.node;
         self.written = read.written;
+        self.promised = read.written;
         self.user = read.user.map(Some);
         self.next = read.next;
         for record in read.records {
@@ -709,6 +722,14 @@ impl Outbox {
             }
             if self.cursor < self.records.len() {
                 let numbered = self.answered;
+                // What the store wrote that messages up to may have gone;
+                // None: no store to wait for (none, or one that fails).
+                let stored = self
+                    .log
+                    .as_ref()
+                    .filter(|log| numbered && !log.behind())
+                    .map(Log::written);
+                let mut ahead = false;
                 let mut last = 0;
                 for record in self.records.range(self.cursor..) {
                     // Its topics not continuous on this connection (a
@@ -719,6 +740,11 @@ impl Outbox {
                         .as_deref()
                         .is_some_and(|t| !continuous(t, record.tag))
                     {
+                        break;
+                    }
+                    // Written ahead: it goes once the store wrote the mark.
+                    if stored.is_some_and(|stored| record.s > stored) {
+                        ahead = true;
                         break;
                     }
                     let text = if numbered {
@@ -732,7 +758,13 @@ impl Outbox {
                 }
                 if numbered && last > self.written {
                     self.written = last;
-                    self.put(&LineRef::Written(last));
+                }
+                // The mark for every message kept now, in this batch: they
+                // go once the store wrote it.
+                let kept = self.records.back().map_or(0, |r| r.s);
+                if ahead && kept > self.promised {
+                    self.promised = kept;
+                    self.put(&LineRef::Written(kept));
                 }
             }
         }
@@ -937,7 +969,7 @@ impl Outbox {
             } else if log.lines > 2 * self.records.len() + 64 {
                 self.rewrite();
             } else {
-                log.flush();
+                log.flush(self.promised);
             }
         }
     }
@@ -969,8 +1001,11 @@ impl Outbox {
             file::encode(&mut out, salted, &LineRef::Node(node));
             lines += 1;
         }
-        if self.written > 0 {
-            file::encode(&mut out, salted, &LineRef::Written(self.written));
+        // What went meanwhile, while the store failed, is in it.
+        let mark = self.written.max(self.promised);
+        self.promised = mark;
+        if mark > 0 {
+            file::encode(&mut out, salted, &LineRef::Written(mark));
             lines += 1;
         }
         if let Some(Some(user)) = &self.user {
@@ -981,7 +1016,7 @@ impl Outbox {
             file::encode_add(&mut out, salted, record);
             lines += 1;
         }
-        log.rewrite(out, salt, lines);
+        log.rewrite(out, salt, lines, mark);
     }
 
     /// Writes the database anew, with what is kept now alone.
@@ -994,13 +1029,10 @@ impl Outbox {
             Some(Some(user)) => Some(user.as_str()),
             _ => None,
         };
-        log.rewrite(
-            self.next,
-            self.written,
-            self.node.as_deref(),
-            user,
-            &self.records,
-        );
+        // What went meanwhile, while the store failed, is in it.
+        let mark = self.written.max(self.promised);
+        self.promised = mark;
+        log.rewrite(self.next, mark, self.node.as_deref(), user, &self.records);
     }
 }
 
@@ -1172,13 +1204,13 @@ mod file {
     use std::fs::{File, OpenOptions, TryLockError};
     use std::io::Write;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, mpsc};
 
     use serde::{Deserialize, Serialize};
     use serde_json::value::RawValue;
 
-    use super::{Head, LineRef, Read, Record, Report, crc32};
+    use super::{Head, LineRef, Read, Record, Report, Wake, crc32};
 
     /// A message kept, as read: its text as it was written.
     #[derive(Deserialize)]
@@ -1208,10 +1240,11 @@ mod file {
         Node(String),
     }
 
-    /// What the file's thread is handed, in order.
+    /// What the file's thread is handed, in order, each with the mark it
+    /// holds (that messages up to it may have gone).
     enum Job {
-        Append(Vec<u8>),
-        Rewrite(Vec<u8>),
+        Append(Vec<u8>, u64),
+        Rewrite(Vec<u8>, u64),
     }
 
     /// The file, as the connection's task sees it: a batch of lines, handed
@@ -1226,12 +1259,20 @@ mod file {
         pub(super) lines: usize,
         /// A write failed: the file is to be written anew.
         broken: Arc<AtomicBool>,
+        /// The highest mark the file holds, past a crash of the process.
+        written: Arc<AtomicU64>,
+        /// A write failed: what is appended waits for the file anew.
+        behind: Arc<AtomicBool>,
     }
 
     impl Log {
         /// Opens the file at `path`, the client's alone from now on, and
         /// what it holds (None: a new file, or not one of this format).
-        pub(super) fn open(path: &Path, report: Report) -> Result<(Self, Option<Read>), String> {
+        pub(super) fn open(
+            path: &Path,
+            report: Report,
+            wake: Wake,
+        ) -> Result<(Self, Option<Read>), String> {
             let fail = |what: &str, e: std::io::Error| format!("{}: {what}: {e}", path.display());
             let mut lock_path = path.as_os_str().to_owned();
             lock_path.push(".lock");
@@ -1257,6 +1298,8 @@ mod file {
             let mut tmp = path.as_os_str().to_owned();
             tmp.push(".tmp");
             let broken = Arc::new(AtomicBool::new(false));
+            let written = Arc::new(AtomicU64::new(read.as_ref().map_or(0, |r| r.written)));
+            let behind = Arc::new(AtomicBool::new(false));
             let writer = Writer {
                 path: path.to_owned(),
                 tmp: PathBuf::from(tmp),
@@ -1264,7 +1307,9 @@ mod file {
                 _lock: lock,
                 report,
                 broken: Arc::clone(&broken),
-                skipping: false,
+                written: Arc::clone(&written),
+                wake,
+                skipping: Arc::clone(&behind),
                 failing: false,
             };
             let (jobs, taken) = mpsc::channel();
@@ -1279,6 +1324,8 @@ mod file {
                 batch: Vec::new(),
                 lines: 0,
                 broken,
+                written,
+                behind,
             };
             Ok((log, read))
         }
@@ -1295,16 +1342,28 @@ mod file {
             self.lines += 1;
         }
 
-        /// Hands the batch to the thread.
-        pub(super) fn flush(&mut self) {
+        /// Hands the batch to the thread, with `mark`, the highest mark in
+        /// the file once it is written.
+        pub(super) fn flush(&mut self, mark: u64) {
             if self.batch.is_empty() {
                 return;
             }
             let capacity = self.batch.capacity().min(64 * 1024);
             let batch = std::mem::replace(&mut self.batch, Vec::with_capacity(capacity));
             if let Some(jobs) = &self.jobs {
-                let _ = jobs.send(Job::Append(batch));
+                let _ = jobs.send(Job::Append(batch, mark));
             }
+        }
+
+        /// The highest mark the file holds, past a crash of the process.
+        pub(super) fn written(&self) -> u64 {
+            self.written.load(Ordering::Acquire)
+        }
+
+        /// The file is behind: a write failed, and messages do not wait for
+        /// it until it is written anew.
+        pub(super) fn behind(&self) -> bool {
+            self.behind.load(Ordering::Acquire)
         }
 
         /// The batch is in what is written anew.
@@ -1318,13 +1377,14 @@ mod file {
             self.broken.swap(false, Ordering::AcqRel)
         }
 
-        /// The file anew: `bytes`, `lines` lines under `salt`.
-        pub(super) fn rewrite(&mut self, bytes: Vec<u8>, salt: String, lines: usize) {
+        /// The file anew: `bytes`, `lines` lines under `salt`, `mark` the
+        /// highest mark in it.
+        pub(super) fn rewrite(&mut self, bytes: Vec<u8>, salt: String, lines: usize, mark: u64) {
             self.batch.clear();
             self.salt = salt;
             self.lines = lines;
             if let Some(jobs) = &self.jobs {
-                let _ = jobs.send(Job::Rewrite(bytes));
+                let _ = jobs.send(Job::Rewrite(bytes, mark));
             }
         }
     }
@@ -1350,8 +1410,11 @@ mod file {
         _lock: File,
         report: Report,
         broken: Arc<AtomicBool>,
+        /// The highest mark written, and who hears it rose.
+        written: Arc<AtomicU64>,
+        wake: Wake,
         /// A write failed: what is appended waits for the file anew.
-        skipping: bool,
+        skipping: Arc<AtomicBool>,
         /// The last failure was said; the next is said after a success.
         failing: bool,
     }
@@ -1361,9 +1424,15 @@ mod file {
         /// at once.
         fn run(mut self, jobs: &mpsc::Receiver<Job>) {
             while let Ok(job) = jobs.recv() {
-                let mut dirty = self.take(job);
+                let mut mark = 0;
+                let mut dirty = self.take(job, &mut mark);
                 while let Ok(job) = jobs.try_recv() {
-                    dirty |= self.take(job);
+                    dirty |= self.take(job, &mut mark);
+                }
+                // Written, past a crash of the process: what waited for the
+                // mark may go; the disk has it once synced, at once after.
+                if mark > self.written.fetch_max(mark, Ordering::AcqRel) {
+                    (self.wake)();
                 }
                 if dirty
                     && let Some(file) = &self.file
@@ -1374,11 +1443,12 @@ mod file {
             }
         }
 
-        /// True: appended, to be synced.
-        fn take(&mut self, job: Job) -> bool {
+        /// True: appended, to be synced. `mark` takes the mark of what was
+        /// written.
+        fn take(&mut self, job: Job, mark: &mut u64) -> bool {
             match job {
-                Job::Append(lines) => {
-                    if self.skipping {
+                Job::Append(lines, holds) => {
+                    if self.skipping.load(Ordering::Acquire) {
                         return false;
                     }
                     let written = match &mut self.file {
@@ -1386,17 +1456,22 @@ mod file {
                         None => Err(std::io::Error::other("no file")),
                     };
                     match written {
-                        Ok(()) => true,
+                        Ok(()) => {
+                            *mark = (*mark).max(holds);
+                            true
+                        }
                         Err(e) => {
                             self.fail(&format!("cannot write it: {e}"));
                             false
                         }
                     }
                 }
-                Job::Rewrite(bytes) => {
+                Job::Rewrite(bytes, holds) => {
                     match self.rewrite(&bytes) {
                         Ok(()) => {
-                            self.skipping = false;
+                            // Synced as it was written.
+                            *mark = (*mark).max(holds);
+                            self.skipping.store(false, Ordering::Release);
                             self.failing = false;
                         }
                         Err(e) => self.fail(&format!("cannot write it anew: {e}")),
@@ -1408,7 +1483,7 @@ mod file {
 
         /// The file is behind: written anew at the next change, said once.
         fn fail(&mut self, why: &str) {
-            self.skipping = true;
+            self.skipping.store(true, Ordering::Release);
             self.broken.store(true, Ordering::Release);
             if !std::mem::replace(&mut self.failing, true) {
                 (self.report)("write", format!("{}: {why}", self.path.display()));
@@ -1651,7 +1726,12 @@ mod tests {
     }
 
     fn outbox(offline: &Offline) -> Outbox {
-        Outbox::open(offline, Arc::new(Room::new(offline)), quiet())
+        Outbox::open(
+            offline,
+            Arc::new(Room::new(offline)),
+            quiet(),
+            Arc::new(|| {}),
+        )
     }
 
     /// `json` as the client keeps it: after the room for its number.
@@ -2007,6 +2087,40 @@ mod tests {
         }
 
         #[test]
+        fn a_numbered_message_goes_once_the_file_holds_it_and_the_mark_that_it_may_have() {
+            let dir = dir();
+            let path = dir.join("outbox");
+            let mut outbox = outbox(&Offline::in_file(&path));
+            answering(&mut outbox, 0);
+            add(&mut outbox, "a");
+            let mut outcomes = Outcomes::default();
+            let mut went = Vec::new();
+            for _ in 0..1000 {
+                outbox.due(
+                    0,
+                    &mut outcomes,
+                    |_, _| true,
+                    |s, _| {
+                        let file = std::fs::read_to_string(&path).unwrap();
+                        assert!(
+                            file.contains(&format!(r#"{{"written":{s}}}"#))
+                                && file.contains(&format!(r#"{{"add":{{"s":{s},"#)),
+                            "it went before the file held it: {file}"
+                        );
+                        went.push(s);
+                    },
+                );
+                if !went.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(went, [1]);
+            drop(outbox);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
         fn what_is_kept_outlives_the_client_until_the_server_took_it() {
             let dir = dir();
             let offline = Offline::in_file(dir.join("queue"));
@@ -2097,7 +2211,12 @@ mod tests {
             let report: Report = Arc::new(move |operation, why| {
                 seen.lock().unwrap().push((operation, why));
             });
-            let mut second = Outbox::open(&offline, Arc::new(Room::new(&offline)), report);
+            let mut second = Outbox::open(
+                &offline,
+                Arc::new(Room::new(&offline)),
+                report,
+                Arc::new(|| {}),
+            );
             {
                 let said = said.lock().unwrap();
                 assert_eq!(said.len(), 1, "{said:?}");
@@ -2279,7 +2398,12 @@ mod tests {
                 seen.lock().unwrap().push((operation, why));
             });
             let offline = Offline::in_file(&path);
-            let mut outbox = Outbox::open(&offline, Arc::new(Room::new(&offline)), report);
+            let mut outbox = Outbox::open(
+                &offline,
+                Arc::new(Room::new(&offline)),
+                report,
+                Arc::new(|| {}),
+            );
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
             if std::fs::write(dir.join("probe"), b"").is_ok() {
                 std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2344,7 +2468,12 @@ mod tests {
                 seen.lock().unwrap().push((operation, why));
             });
             let offline = Offline::in_file(&path);
-            let mut outbox = Outbox::open(&offline, Arc::new(Room::new(&offline)), report);
+            let mut outbox = Outbox::open(
+                &offline,
+                Arc::new(Room::new(&offline)),
+                report,
+                Arc::new(|| {}),
+            );
             // The directory takes no new file: writing the file anew fails
             // (not for root, who writes anywhere).
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
