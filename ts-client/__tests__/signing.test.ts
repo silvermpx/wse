@@ -4,8 +4,17 @@
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { ENDPOINT, FakeWebSocket, connectServer, installFakeWebSocket, resetClientState, tick } from './helpers.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createWSEClient } from '../core/client.js';
+import {
+  ENDPOINT,
+  FakeWebSocket,
+  connectServer,
+  installFakeWebSocket,
+  resetClientState,
+  serverReadyMessage,
+  tick,
+} from './helpers.js';
 import { acquireSession, getCurrentSession, makeSessionKey, releaseSession, wseActions } from '../services/WSESession.js';
 import type { UseWSEConfig } from '../services/WSESession.js';
 import type { WSMessage } from '../types.js';
@@ -296,5 +305,63 @@ describe('signed messages go on the live connection or not at all', () => {
     processor.requeue(message);
     await tick(6);
     expect(ws.appTextMessages().filter((m) => m.id === 'live-1')).toHaveLength(0);
+  });
+});
+
+describe('a signed message whose check ends after the session did', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    resetClientState();
+  });
+
+  it('reaches no one once the user signed out meanwhile', async () => {
+    installFakeWebSocket();
+    let finish: ((opened: unknown) => void) | undefined;
+    vi.spyOn(ServerSigningKeys.prototype, 'open').mockImplementation(
+      () => new Promise((resolve) => (finish = resolve as (opened: unknown) => void)),
+    );
+    const tapped: WSMessage[] = [];
+    const caught: WSMessage[] = [];
+    const c = createWSEClient({ endpoints: [ENDPOINT] });
+    c.on('wseMessage', (m: WSMessage) => caught.push(m));
+    c.retain();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const ws = FakeWebSocket.last();
+    ws.serverOpen();
+    ws.serverSend(serverReadyMessage({ user_id: 'alice' }));
+    await vi.waitFor(() => expect(c.state.getSnapshot().ready).toBe(true));
+    c.onMessage('private', (m) => tapped.push(m));
+    ws.serverSend({ t: 'signed', p: {} });
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    c.signOut();
+    finish!({ message: { t: 'private', p: { secret: 'alice' }, to: 'alice' }, proof: {} });
+    await tick(10);
+    expect(tapped).toEqual([]);
+    expect(caught).toEqual([]);
+  });
+
+  it('reaches no one once the client ended meanwhile, its owner’s forwarding neither', async () => {
+    installFakeWebSocket();
+    let finish: ((opened: unknown) => void) | undefined;
+    vi.spyOn(ServerSigningKeys.prototype, 'open').mockImplementation(
+      () => new Promise((resolve) => (finish = resolve as (opened: unknown) => void)),
+    );
+    const forwarded: WSMessage[] = [];
+    const caught: WSMessage[] = [];
+    const c = createWSEClient({ endpoints: [ENDPOINT], onEveryMessage: (m) => forwarded.push(m) } as never);
+    c.on('wseMessage', (m: WSMessage) => caught.push(m));
+    c.retain();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const ws = FakeWebSocket.last();
+    ws.serverOpen();
+    ws.serverSend(serverReadyMessage({ user_id: 'alice' }));
+    await vi.waitFor(() => expect(c.state.getSnapshot().ready).toBe(true));
+    ws.serverSend({ t: 'signed', p: {} });
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    c.destroy();
+    finish!({ message: { t: 'private', p: { secret: 'alice' } }, proof: {} });
+    await tick(10);
+    expect(forwarded).toEqual([]);
+    expect(caught).toEqual([]);
   });
 });

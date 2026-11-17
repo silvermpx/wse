@@ -652,6 +652,9 @@ export class MessageProcessor {
   }
 
   private async deliver(message: WSMessage): Promise<void> {
+    // The client ended (or its user signed out) while the message was opened
+    // or checked: it goes nowhere.
+    if (this.destroyed) return;
     const consumed = await this.runProtocolHook(message);
     if (consumed) return;
     this.routeMessage(message);
@@ -1545,6 +1548,8 @@ export class MessageProcessor {
   }
 
   private routeMessage(message: WSMessage, released = false): void {
+    // Nothing reaches the application from a client that ended.
+    if (this.destroyed) return;
     if (!released && message.tp && this.ctx.delivery?.hold(message)) return;
     const type = message.t;
     if (this.ctx.tap && !isSystemType(type)) {
