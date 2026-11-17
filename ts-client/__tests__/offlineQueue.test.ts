@@ -1,7 +1,6 @@
-// IndexedDB offline queue: messages persisted while disconnected are
-// replayed after the next server_ready, oldest first, and only the ones that
-// actually went out are deleted. Records written by 2.x (WSMessage + 'pri',
-// no 'priority' field) are replayed too.
+// The IndexedDB offline queue of 3.1, as a class of its own: the client no
+// longer uses it (its outbox keeps what waits, in IndexedDB too, and takes
+// what this queue kept over). Records written by 2.x are read too.
 
 import 'fake-indexeddb/auto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -150,105 +149,6 @@ describe('OfflineQueue', () => {
   });
 });
 
-describe('offline replay through the session', () => {
-  it('persists {offline: true} sends while disconnected and replays them after server_ready', async () => {
-    acquireSession({
-      key: makeSessionKey('cookie', [ENDPOINT]),
-      auth: 'cookie',
-      initialTopics: [],
-      config: { endpoints: [ENDPOINT] },
-    });
-    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
-    await vi.waitFor(() => expect(getCurrentSession()!.offlineQueue?.isAvailable()).toBe(true));
-
-    expect(wseActions.sendMessage('chat', { n: 1 }, { offline: true, correlation_id: 'k1' })).toBe('queued');
-    expect(wseActions.sendMessage('chat', { n: 2 }, { offline: true })).toBe('queued');
-    await vi.waitFor(() => expect(getCurrentSession()!.getQueueSize()).toBe(2));
-
-    const ws = FakeWebSocket.last();
-    ws.serverOpen();
-    ws.serverSend(serverReadyMessage());
-
-    await vi.waitFor(() => {
-      const chats = ws.appTextMessages().filter((m) => m.t === 'chat');
-      expect(chats.map((m) => m.p.n)).toEqual([1, 2]);
-      expect(chats[0].cid).toBe('k1');
-    });
-    await vi.waitFor(() => expect(getCurrentSession()!.offlineQueue!.getStats().size).toBe(0));
-    expect(await getCurrentSession()!.offlineQueue!.getAll()).toEqual([]);
-  });
-});
-
-describe('offline messages belong to their user', () => {
-  function start() {
-    acquireSession({
-      key: makeSessionKey('cookie', [ENDPOINT]),
-      auth: 'cookie',
-      initialTopics: [],
-      config: { endpoints: [ENDPOINT] },
-    });
-  }
-
-  it("never replays one user's messages on another user's connection", async () => {
-    // Alice connects once, then goes offline and sends.
-    start();
-    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
-    await vi.waitFor(() => expect(getCurrentSession()!.offlineQueue?.isAvailable()).toBe(true));
-    const first = FakeWebSocket.last();
-    first.serverOpen();
-    first.serverSend(serverReadyMessage({ user_id: 'alice' }));
-    await vi.waitFor(() => expect(useWSEStore.getState().connectionState).toBe(ConnectionState.CONNECTED));
-    first.serverClose(1006);
-    await vi.waitFor(() => expect(useWSEStore.getState().connectionState).not.toBe(ConnectionState.CONNECTED));
-    expect(wseActions.sendMessage('transfer', { to: 'mallory' }, { offline: true })).toBe('queued');
-    await vi.waitFor(() => expect(getCurrentSession()!.getQueueSize()).toBe(1));
-
-    // A page reload: the module state is gone, IndexedDB and storage stay.
-    destroyCurrentSession({ clearUserData: false });
-    FakeWebSocket.reset();
-
-    // Bob's connection on the same browser does not send it.
-    start();
-    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
-    const bob = FakeWebSocket.last();
-    bob.serverOpen();
-    bob.serverSend(serverReadyMessage({ user_id: 'bob' }));
-    await vi.waitFor(() => expect(getCurrentSession()!.offlineQueue!.getStats().size).toBe(0));
-    expect(bob.appTextMessages().filter((m) => m.t === 'transfer')).toEqual([]);
-  });
-
-  it("never sends one user's message that a full queue handed back after another took the connection", async () => {
-    acquireSession({
-      key: makeSessionKey('cookie', [ENDPOINT]),
-      auth: 'cookie',
-      initialTopics: [],
-      config: { endpoints: [ENDPOINT], offline: { enabled: true, maxSize: 1 } },
-    });
-    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
-    await vi.waitFor(() => expect(getCurrentSession()!.offlineQueue?.isAvailable()).toBe(true));
-    const first = FakeWebSocket.last();
-    first.serverOpen();
-    first.serverSend(serverReadyMessage({ user_id: 'alice' }));
-    await vi.waitFor(() => expect(useWSEStore.getState().connectionState).toBe(ConnectionState.CONNECTED));
-    first.serverClose(1006);
-    await vi.waitFor(() => expect(useWSEStore.getState().connectionState).not.toBe(ConnectionState.CONNECTED));
-    // Alice fills the queue while offline.
-    expect(wseActions.sendMessage('transfer', { n: 1 }, { offline: true })).toBe('queued');
-    await vi.waitFor(() => expect(getCurrentSession()!.offlineQueue!.getStats().size).toBe(1));
-
-    // The next connection opens; Alice sends once more, and the server takes
-    // the connection for Bob before her write is refused by the full queue.
-    await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThan(1), { timeout: 5_000 });
-    const bob = FakeWebSocket.last();
-    bob.serverOpen();
-    expect(wseActions.sendMessage('transfer', { n: 2 }, { offline: true })).toBe('queued');
-    bob.serverSend(serverReadyMessage({ user_id: 'bob' }));
-
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    expect(bob.appTextMessages().filter((m) => m.t === 'transfer')).toEqual([]);
-  });
-});
-
 describe('the offline queue keeps its limits', () => {
   const message = (id: string) => ({ t: 'order', id, p: {}, v: 1 }) as any;
 
@@ -302,45 +202,3 @@ describe('the offline queue keeps its limits', () => {
   });
 });
 
-describe('two clients of one queue', () => {
-  // The scope of the queue: the storage namespace, the consumer and the realm.
-  const DB = `wse:shop:alice:checkout@${ENDPOINT}`;
-
-  function dropDb(): Promise<void> {
-    return new Promise((resolve) => {
-      const req = indexedDB.deleteDatabase(DB);
-      req.onsuccess = () => resolve();
-      req.onerror = () => resolve();
-      req.onblocked = () => resolve();
-    });
-  }
-
-  afterEach(dropDb);
-
-  it('send a stored message once, whichever of them connects first', async () => {
-    const stored = new OfflineQueue({ ...CONFIG, dbName: DB });
-    await stored.initialize();
-    expect(await stored.enqueue({ t: 'order', p: { id: 1 }, id: 'order-1' } as any)).toBe(true);
-    stored.destroy();
-
-    // Two tabs of one application and user: the same storage namespace.
-    const { createWSEClient } = await import('../core/index.js');
-    const tabs = [0, 1].map(() =>
-      createWSEClient({ endpoints: [ENDPOINT], storage: 'shop:alice', consumer: 'checkout' }),
-    );
-    for (const tab of tabs) tab.retain();
-    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
-    const sockets = [...FakeWebSocket.instances];
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    for (const ws of sockets) ws.serverOpen();
-    for (const ws of sockets) ws.serverSend(serverReadyMessage());
-    await vi.waitFor(() => {
-      const orders = sockets.flatMap((ws) => ws.appTextMessages().filter((m) => m.t === 'order'));
-      expect(orders.length).toBeGreaterThan(0);
-    });
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    const orders = sockets.flatMap((ws) => ws.appTextMessages().filter((m) => m.t === 'order'));
-    expect(orders).toHaveLength(1);
-    for (const tab of tabs) tab.destroy();
-  });
-});

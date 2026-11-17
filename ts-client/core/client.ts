@@ -26,6 +26,7 @@ import {
   WSESession,
   buildMessage,
   ensureOutbox,
+  outboxStoreFor,
   expiryOf,
   resolveOptions,
   storageErrorDetail,
@@ -260,9 +261,9 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
   if (pageless && typeof indexedDB === 'undefined') ctx.state.getState().setStorageState('unavailable');
   // The queue's limits hold from the first send, before anything starts.
   const { performance, offline } = resolveOptions(options);
-  // An outbox in a store is opened at once: what the last process left waits
-  // in it from the start, and its expiry runs.
-  if (offline.store) ensureOutbox(ctx, offline);
+  // An outbox in a store is opened at once: what the last process or page
+  // left waits in it from the start, and its expiry runs.
+  if (outboxStoreFor(ctx, offline)) ensureOutbox(ctx, offline);
   ctx.queue.getState().setCapacity(performance.maxQueueSize);
   ctx.queue.getState().setMemoryLimit(performance.memoryLimit);
   const sequencer = new EventSequencer();
@@ -395,8 +396,16 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
   // The page's lifecycle: a page in the back/forward cache (or going away)
   // holds no socket; back on screen, the client connects and recovers.
   let pageListening = false;
-  const onPageHide = () => pause('page');
-  const onPageShow = () => resume('page');
+  // The outbox's store goes with the page (another page may take what waits)
+  // and is read again when it is back.
+  const onPageHide = () => {
+    pause('page');
+    ctx.outbox.current?.suspend();
+  };
+  const onPageShow = () => {
+    ctx.outbox.current?.resume();
+    resume('page');
+  };
   const listenToPage = () => {
     if (pageListening || typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
     window.addEventListener('pagehide', onPageHide);

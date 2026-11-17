@@ -39,9 +39,9 @@ import {
   OFFLINE_OWNER_STORAGE_KEY,
 } from '../constants.js';
 import { generateId } from '../utils/id.js';
-import { createClientContext, OFFLINE_OWNER_KEY, type ClientContext } from '../core/context.js';
+import { createClientContext, type ClientContext } from '../core/context.js';
 import type { SendResult } from './ConnectionManager.js';
-import type { OfflineQueue, OfflineRecord } from './OfflineQueue.js';
+import type { OfflineQueue } from './OfflineQueue.js';
 import { noOutcomes, reportOutcomes, type Outbox, type Outcomes } from './Outbox.js';
 
 /** What the processor needs from the connection (ConnectionManager implements it). */
@@ -76,7 +76,7 @@ export interface MessageProcessorOptions {
   eventThrottleMs?: number;
   /** Shared sequencer (keeps dedup/recovery positions across sessions). */
   sequencer?: EventSequencer;
-  /** IndexedDB queue replayed when the connection becomes ready. */
+  /** Ignored since 3.2: the outbox keeps what waits, in IndexedDB too. */
   offlineQueue?: OfflineQueue | null;
   /**
    * Share of handled messages (0..1) whose handler run time is measured into
@@ -256,9 +256,6 @@ export class MessageProcessor {
    * kept when it comes back to the queue.
    */
   private readonly handedOver = new WeakMap<WSMessage, HandedOver>();
-  /** The next try at removing stored messages that went, and its delay. */
-  private removalRetry: ReturnType<typeof setTimeout> | null = null;
-  private removalDelay = 0;
   private waitForHandlersInterval: ReturnType<typeof setInterval> | null = null;
 
   // Optional sink for measured round-trip latency (ms), set by the host. The
@@ -319,7 +316,6 @@ export class MessageProcessor {
   private unhandledTypesLogged = new Set<string>();
 
   // Outbound
-  private offlineQueue: OfflineQueue | null;
   private flushing = false;
   private flushRequested = false;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -355,7 +351,6 @@ export class MessageProcessor {
     this.maxPendingInboundBytes = options.maxPendingInboundBytes ?? 64 * 1024 * 1024;
     const rate = options.handlerSampleRate ?? 0;
     this.handlerSampleRate = Number.isFinite(rate) ? Math.min(Math.max(rate, 0), 1) : 0;
-    this.offlineQueue = options.offlineQueue ?? null;
     this.messageHandlers = new Map();
 
     this.registerDefaultHandlers();
@@ -374,8 +369,8 @@ export class MessageProcessor {
     this.connectionManager = manager;
   }
 
-  setOfflineQueue(queue: OfflineQueue | null): void {
-    this.offlineQueue = queue;
+  setOfflineQueue(_queue: OfflineQueue | null): void {
+    // Ignored since 3.2: the outbox keeps what waits, in IndexedDB too.
   }
 
   /** Something waits that can go now (the offline queue was taken over): flush. */
@@ -759,22 +754,6 @@ export class MessageProcessor {
     return kid;
   }
 
-  /** The user of this client's last connection, kept across page loads. */
-  private storedOwner(): string | undefined {
-    try {
-      return this.ctx.storage.get(OFFLINE_OWNER_KEY) ?? undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
-  private storeOwner(user: string): void {
-    try {
-      this.ctx.storage.set(OFFLINE_OWNER_KEY, user);
-    } catch {
-      // no storage: owners come from this page's connections only
-    }
-  }
 
   /** The server's history_ttl (seconds), when it names one. */
   private takeHistoryTtl(value: unknown): void {
@@ -794,7 +773,6 @@ export class MessageProcessor {
     this.connectionUser = typeof details.user_id === 'string' ? details.user_id : null;
     if (typeof details.user_id === 'string' && details.user_id) {
       this.userId = details.user_id;
-      this.storeOwner(details.user_id);
     }
     // The outbox: another user's messages go, and the rest goes once the
     // server said what it took (at once, to a server that does not answer).
@@ -1945,8 +1923,7 @@ export class MessageProcessor {
   ): SendStatus {
     if (this.destroyed) return 'dropped';
     // Made for the user whose data the page holds now: once another user's
-    // takes its place, it does not go out (not even from a write to the
-    // offline queue that ends after that).
+    // takes its place, it does not go out.
     const owner = this.ctx.owner.current();
     // Only for the socket it was made on (a signed message): dropped once
     // that one is gone, never sent on a later connection.
@@ -1964,19 +1941,12 @@ export class MessageProcessor {
 
     const cm = this.connectionManager;
     const queueEmpty = this.ctx.queue.getState().size === 0;
-    const offlinePending = (this.offlineQueue?.getStats().size ?? 0) > 0;
     const requires = options.requires && options.requires.length > 0 ? options.requires : undefined;
 
     // The outbox takes every message but a live one and one that requires
-    // topics (that one waits in the queue until they are continuous); with no
-    // connection, one asked to outlive the page goes to IndexedDB.
+    // topics (that one waits in the queue until they are continuous).
     const outbox = this.ctx.outbox.current;
-    if (
-      outbox &&
-      options.liveOn === undefined &&
-      !requires &&
-      !(options.offline && this.offlineQueue?.isAvailable() && !cm?.isTransportReady())
-    ) {
+    if (outbox && options.liveOn === undefined && !requires) {
       return this.keep(outbox, message, options.ttl);
     }
 
@@ -1985,7 +1955,6 @@ export class MessageProcessor {
     if (
       cm &&
       queueEmpty &&
-      !offlinePending &&
       !this.flushing &&
       cm.isTransportReady() &&
       (!requires || this.continuous(requires))
@@ -1997,31 +1966,6 @@ export class MessageProcessor {
         this.countDropped(1);
         return 'dropped';
       }
-    }
-
-    // One that requires topics waits in memory: whether it may go is the
-    // connection's, not something a reload keeps.
-    if (
-      options.offline &&
-      options.liveOn === undefined &&
-      !requires &&
-      this.offlineQueue?.isAvailable() &&
-      !cm?.isTransportReady()
-    ) {
-      const queue = this.offlineQueue;
-      // Written for the user of this page's last connection (or, before any,
-      // of this browser's): only that user's connection replays it.
-      queue.enqueue(message, expiresAt, this.userId ?? this.storedOwner()).then(
-        (stored) => {
-          if (!stored) this.enqueueInMemory(message, priority, expiresAt, owner);
-          else this.scheduleFlush(0);
-        },
-        (error) => {
-          logger.error('Failed to persist offline message, keeping it in memory:', error);
-          this.enqueueInMemory(message, priority, expiresAt, owner);
-        },
-      );
-      return 'queued';
     }
 
     return this.enqueueInMemory(message, priority, expiresAt, owner, options.liveOn, requires) ? 'queued' : 'dropped';
@@ -2291,10 +2235,6 @@ export class MessageProcessor {
     const cm = this.connectionManager;
     if (!cm || !cm.isTransportReady()) return true;
 
-    if (this.offlineQueue && this.offlineQueue.getStats().size > 0) {
-      const stalled = await this.replayOfflineQueue(cm);
-      if (stalled) return true;
-    }
     // The outbox, in the order of sending, before what waits in the queue.
     if (!this.flushOutbox()) return true;
 
@@ -2365,141 +2305,6 @@ export class MessageProcessor {
       }
     }
     return true;
-  }
-
-  private async replayOfflineQueue(cm: ProcessorConnection): Promise<boolean> {
-    const queue = this.offlineQueue;
-    if (!queue) return false;
-    // What went before and stayed stored is removed first, and never sent
-    // again; until that works, nothing stored goes (the in-memory queue does).
-    const unremoved = this.ctx.unremoved;
-    if (unremoved.size > 0 && (this.removalRetry || !(await this.forgetSent(queue, [...unremoved])))) {
-      return false;
-    }
-
-    let sent = 0;
-    let foreign = 0;
-    for (;;) {
-      // Taken (marked as this client's, still stored) before they go:
-      // another client of the same database (another tab) never sends the
-      // same message, and one that stops before it went loses nothing.
-      let records: OfflineRecord[];
-      try {
-        records = await queue.claim(OFFLINE_REPLAY_BATCH);
-      } catch (error) {
-        logger.error('Reading the offline queue failed:', error);
-        return false;
-      }
-      if (records.length === 0) break;
-
-      // What went, or will never go, leaves the database.
-      const gone: string[] = [];
-      const went: string[] = [];
-      const nowMs = Date.now();
-      const user = this.userId;
-      let stopped = -1;
-      for (let i = 0; i < records.length; i++) {
-        const record = records[i];
-        if (this.destroyed || !cm.isTransportReady()) {
-          stopped = i;
-          break;
-        }
-        if (isExpired(record.expiresAt, nowMs)) {
-          this.countDropped(1);
-          gone.push(record.id);
-          continue;
-        }
-        // Written for another user: never sent on this user's connection.
-        // (A record without an owner was written before this browser ever
-        // connected, or by 2.x.)
-        if (user !== null && record.owner !== undefined && record.owner !== user) {
-          foreign++;
-          this.countDropped(1);
-          gone.push(record.id);
-          continue;
-        }
-        if (unremoved.has(record.id)) {
-          gone.push(record.id);
-          continue;
-        }
-        this.handedOver.set(record.message, {
-          owner: this.ctx.owner.current(),
-          priority: record.message.pri ?? MessagePriority.NORMAL,
-          timestamp: record.timestamp,
-          expiresAt: record.expiresAt,
-        });
-        const result = cm.trySend(record.message);
-        if (result === 'sent') {
-          sent++;
-          gone.push(record.id);
-          went.push(record.id);
-          continue;
-        }
-        if (result === 'error') {
-          this.countDropped(1);
-          gone.push(record.id);
-          continue;
-        }
-        if (result === 'rate_limited') {
-          this.scheduleFlush(cm.getRetryAfterMs());
-        }
-        stopped = i;
-        break;
-      }
-      // Its transaction starts before anything else can run: a client
-      // closed right after the sends still has it remove them.
-      const removed = this.forgetSent(queue, gone, went);
-      if (stopped >= 0) {
-        await Promise.all([removed, this.putBack(queue, records.slice(stopped))]);
-        return true;
-      }
-      // Not removed: this pass stops, and the removal is tried again later.
-      if (!(await removed)) return false;
-    }
-    if (foreign > 0) {
-      logger.warn(`Dropped ${foreign} offline message(s) written for another user`);
-    }
-    if (sent > 0) {
-      logger.info(`Replayed ${sent} offline message(s)`);
-    }
-    return false;
-  }
-
-  /**
-   * Offline messages that went (or never will) leave the database. When that
-   * fails, those that `went` are kept as sent and the removal is tried again
-   * later, a second, then twice as long each time up to 30 s.
-   */
-  private async forgetSent(queue: OfflineQueue, ids: string[], went: string[] = ids): Promise<boolean> {
-    if (ids.length === 0) return true;
-    try {
-      await queue.remove(ids);
-    } catch (error) {
-      logger.error('Removing sent offline messages failed:', error);
-      for (const id of went) this.ctx.unremoved.add(id);
-      this.retryRemovalLater();
-      return false;
-    }
-    for (const id of ids) this.ctx.unremoved.delete(id);
-    this.removalDelay = 0;
-    return true;
-  }
-
-  private retryRemovalLater(): void {
-    if (this.removalRetry || this.destroyed) return;
-    this.removalDelay = Math.min(this.removalDelay > 0 ? this.removalDelay * 2 : 1_000, 30_000);
-    this.removalRetry = setTimeout(() => {
-      this.removalRetry = null;
-      this.scheduleFlush(0);
-    }, this.removalDelay);
-  }
-
-  /** Offline messages taken and not sent go back, in their place. */
-  private async putBack(queue: OfflineQueue, records: OfflineRecord[]): Promise<void> {
-    if (records.length === 0) return;
-    await queue.restore(records).catch((error) => {
-      logger.error('Putting back unsent offline messages failed:', error);
-    });
   }
 
   /**
@@ -2587,11 +2392,6 @@ export class MessageProcessor {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
-    }
-
-    if (this.removalRetry) {
-      clearTimeout(this.removalRetry);
-      this.removalRetry = null;
     }
 
     if (this.waitForHandlersInterval) {

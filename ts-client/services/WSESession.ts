@@ -321,7 +321,15 @@ export function collectDiagnostics(): Record<string, unknown> {
     circuitBreaker: store.circuitBreaker,
     queue: {
       message: useMessageQueueStore.getState().stats,
-      offline: session?.offlineQueue?.getStats() ?? null,
+      // The outbox: what waits for the server's answer, and where it is kept.
+      offline: session
+        ? {
+            size: session.kept(),
+            capacity: session.options.offline.maxSize,
+            enabled: session.options.offline.enabled,
+            persistToStorage: store.storageState === 'durable',
+          }
+        : null,
     },
     activeTopics: store.activeTopics,
     recoveryState: store.subscriptions.recoveryState,

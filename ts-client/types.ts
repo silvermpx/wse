@@ -364,7 +364,10 @@ export interface MessageOptions {
    * enabled (security.encryptionEnabled). It never falls back to plaintext.
    */
   encrypted?: boolean;
-  /** Persist to IndexedDB while disconnected and replay after reconnecting. */
+  /**
+   * Ignored since 3.2: every message but a live one waits in the outbox, in
+   * the client's store when it has one (IndexedDB for a durable scope).
+   */
   offline?: boolean;
   /**
    * Only on the connection that is ready now: never held for a later

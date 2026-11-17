@@ -1,14 +1,21 @@
 // @vitest-environment happy-dom
 //
-// What a client of its own keeps: the offline queue is durable only for a
-// consumer the application names, in a database of its own scope (the
-// storage namespace, the consumer and the server's realm); two clients of
-// one scope never both replay it -- the second is busy until the first lets
-// go -- and a storage that fails says so.
+// What a client of its own keeps: its outbox is durable only for a consumer
+// the application names, in an IndexedDB database of its own scope (the
+// storage namespace, the consumer and the server's realm). Each tab keeps a
+// producer of its own, held by a Web Lock; a page that opens takes over what
+// a closed tab left. A storage that fails says so.
 
 import 'fake-indexeddb/auto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ENDPOINT, FakeWebSocket, installFakeWebSocket, resetClientState, serverReadyMessage } from './helpers.js';
+import {
+  ENDPOINT,
+  FakeWebSocket,
+  installFakeLocks,
+  installFakeWebSocket,
+  resetClientState,
+  serverReadyMessage,
+} from './helpers.js';
 import { OfflineQueue } from '../services/OfflineQueue.js';
 import { createWSEClient, type WSEClient } from '../core/index.js';
 
@@ -32,8 +39,41 @@ function dropDb(name: string): Promise<void> {
   });
 }
 
+/** What the scope's database holds: each producer's messages, by id. */
+async function stored(name = SCOPE): Promise<Record<string, string[]>> {
+  const db = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open(name);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  try {
+    if (!db.objectStoreNames.contains('outbox')) return {};
+    const rows = await new Promise<any[]>((resolve, reject) => {
+      const request = db.transaction(['outbox']).objectStore('outbox').getAll();
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const out: Record<string, string[]> = {};
+    for (const row of rows) (out[row.producer] ??= []).push(row.id);
+    return out;
+  } finally {
+    db.close();
+  }
+}
+
+/** The server of 3.2 took the connection, answers for numbered messages, and holds nothing of this producer yet. */
+function answering(ws: FakeWebSocket, user = 'user-1', acked = 0): void {
+  ws.serverOpen();
+  ws.serverSend(serverReadyMessage({ user_id: user, features: { recovery: true, encryption: false, acks: true } }));
+  ws.serverSend({ c: 'WSE', t: 'outbox', p: { acked, node: 'n1' } });
+}
+
+const orders = (ws: FakeWebSocket) => ws.appTextMessages().filter((m) => m.t === 'order');
+const producerOf = (ws: FakeWebSocket) => ws.messagesOfType('client_hello')[0]?.p?.outbox?.producer as string;
+
 beforeEach(async () => {
   installFakeWebSocket();
+  installFakeLocks();
   resetClientState();
   await dropDb(SCOPE);
 });
@@ -46,7 +86,7 @@ afterEach(async () => {
   await dropDb(SCOPE);
 });
 
-describe('the durable queue', () => {
+describe('the durable outbox', () => {
   it('stays in memory without a consumer, and says so', async () => {
     const c = client();
     c.retain();
@@ -55,262 +95,143 @@ describe('the durable queue', () => {
     expect(c.state.getSnapshot().storage).toBe('memory');
   });
 
-  it('is durable for a named consumer, in a database of its scope', async () => {
-    const c = client({ consumer: 'checkout' });
-    c.retain();
-    await vi.waitFor(() => expect(c.state.getSnapshot().storage).toBe('durable'));
-    expect(c.send('order', { id: 1 }, { offline: true })).toBe('queued');
-    const queue = new OfflineQueue({ ...CONFIG, dbName: SCOPE });
-    await queue.initialize();
-    try {
-      await vi.waitFor(async () => expect((await queue.getAll()).map((r) => r.message.t)).toEqual(['order']));
-    } finally {
-      queue.destroy();
-    }
+  it('keeps what was sent for the next client of the scope, until the server took it', async () => {
+    const first = client({ consumer: 'checkout' });
+    await vi.waitFor(() => expect(first.state.getSnapshot().storage).toBe('durable'));
+    expect(first.send('order', { n: 1 }, { id: 'order-1' })).toBe('queued');
+    await vi.waitFor(async () => expect(Object.values(await stored())).toEqual([['order-1']]));
+    first.destroy();
+
+    const second = client({ consumer: 'checkout' });
+    await vi.waitFor(() => expect(second.kept()).toBe(1));
+    expect(second.state.getSnapshot().storage).toBe('durable');
+    const delivered: string[] = [];
+    second.on('wseDelivered', (detail) => delivered.push(...detail.ids));
+    second.retain();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const ws = FakeWebSocket.last();
+    answering(ws);
+    await vi.waitFor(() => expect(orders(ws)).toHaveLength(1));
+    expect(orders(ws)[0]).toMatchObject({ s: 1, id: 'order-1' });
+    expect(Object.keys(await stored())).toEqual([producerOf(ws)]);
+    ws.serverSend({ c: 'WSE', t: 'ack', p: { s: 1 } });
+    await vi.waitFor(() => expect(delivered).toEqual(['order-1']));
+    await vi.waitFor(async () => expect(await stored()).toEqual({}));
+    expect(second.kept()).toBe(0);
   });
 
-  it('of one scope is replayed by one client; the other is busy until it lets go', async () => {
-    const stored = new OfflineQueue({ ...CONFIG, dbName: SCOPE });
-    await stored.initialize();
-    expect(await stored.enqueue({ t: 'order', p: { id: 1 }, id: 'order-1' } as any)).toBe(true);
-    stored.destroy();
-
-    const first = client({ consumer: 'checkout' });
-    first.retain();
-    await vi.waitFor(() => expect(first.state.getSnapshot().storage).toBe('durable'));
-    const second = client({ consumer: 'checkout' });
-    const busy: unknown[] = [];
-    second.on('wseStorage', (detail) => busy.push(detail));
-    second.retain();
-    await vi.waitFor(() => expect(second.state.getSnapshot().storage).toBe('busy'));
-    expect(busy).toContainEqual({ state: 'busy' });
-
+  it('of one scope keeps a producer for each client, and each sends its own on its connection', async () => {
+    const a = client({ consumer: 'checkout' });
+    const b = client({ consumer: 'checkout' });
+    await vi.waitFor(() => expect([a, b].map((c) => c.state.getSnapshot().storage)).toEqual(['durable', 'durable']));
+    a.send('order', { n: 1 }, { id: 'from-a' });
+    b.send('order', { n: 2 }, { id: 'from-b' });
+    a.retain();
+    b.retain();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
     const sockets = [...FakeWebSocket.instances];
-    for (const ws of sockets) ws.serverOpen();
-    for (const ws of sockets) ws.serverSend(serverReadyMessage());
-    await vi.waitFor(() => {
-      const orders = sockets.flatMap((ws) => ws.appTextMessages().filter((m) => m.t === 'order'));
-      expect(orders).toHaveLength(1);
-    });
-    expect(sockets[0].appTextMessages().filter((m) => m.t === 'order')).toHaveLength(1);
-
-    // The first lets go: the second takes the queue over.
-    first.destroy();
-    await vi.waitFor(() => expect(second.state.getSnapshot().storage).toBe('durable'), { timeout: 5_000 });
+    for (const ws of sockets) answering(ws);
+    await vi.waitFor(() => expect(sockets.map((ws) => orders(ws).length)).toEqual([1, 1]));
+    expect(new Set(sockets.map(producerOf)).size).toBe(2);
+    expect(sockets.flatMap((ws) => orders(ws).map((m) => m.id)).sort()).toEqual(['from-a', 'from-b']);
+    // In the database, each under the producer whose connection sent it.
+    const rows = await stored();
+    for (const ws of sockets) expect(rows[producerOf(ws)]).toEqual([orders(ws)[0].id]);
   });
-});
 
-describe('the lease of a scope', () => {
-  const orders = (ws: FakeWebSocket) => ws.appTextMessages().filter((m) => m.t === 'order');
-
-  it('taken over, finds what the last holder stored', async () => {
-    const first = client({ consumer: 'checkout' });
-    first.retain();
-    await vi.waitFor(() => expect(first.state.getSnapshot().storage).toBe('durable'));
-    const second = client({ consumer: 'checkout' });
-    second.retain();
-    await vi.waitFor(() => expect(second.state.getSnapshot().storage).toBe('busy'));
-    const [, socket] = FakeWebSocket.instances;
-    socket.serverOpen();
-    socket.serverSend(serverReadyMessage());
-
-    // The holder stores an order while it has no connection, then goes.
-    expect(first.send('order', { id: 1 }, { offline: true })).toBe('queued');
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    first.destroy();
-    await vi.waitFor(() => expect(second.state.getSnapshot().storage).toBe('durable'), { timeout: 5_000 });
-    await vi.waitFor(() => expect(orders(socket)).toHaveLength(1), { timeout: 5_000 });
-  }, 20_000);
-
-  it('held, finds what another client of the scope stored meanwhile', async () => {
-    const holder = client({ consumer: 'checkout' });
-    holder.retain();
-    await vi.waitFor(() => expect(holder.state.getSnapshot().storage).toBe('durable'));
-    const socket = FakeWebSocket.last();
-    socket.serverOpen();
-    socket.serverSend(serverReadyMessage());
-    const other = client({ consumer: 'checkout' });
-    other.retain();
-    await vi.waitFor(() => expect(other.state.getSnapshot().storage).toBe('busy'));
-    expect(other.send('order', { id: 2 }, { offline: true })).toBe('queued');
-    await vi.waitFor(() => expect(orders(socket)).toHaveLength(1), { timeout: 8_000 });
-  }, 20_000);
-});
-
-describe('a stored message being taken', () => {
-  it('survives a pause in the middle, and goes once after it', async () => {
-    const stored = new OfflineQueue({ ...CONFIG, dbName: SCOPE });
-    await stored.initialize();
-    expect(await stored.enqueue({ t: 'order', p: { id: 1 }, id: 'order-1' } as any)).toBe(true);
-    stored.destroy();
-
-    // The taking is held up, after its transaction, until the client paused.
-    let go!: () => void;
-    const held = new Promise<void>((resolve) => (go = resolve));
-    const claim = OfflineQueue.prototype.claim;
-    const taking = vi.spyOn(OfflineQueue.prototype, 'claim').mockImplementation(async function (
-      this: OfflineQueue,
-      limit: number,
-    ) {
-      const records = await claim.call(this, limit);
-      if (records.length > 0) await held;
-      return records;
-    });
-
-    const c = client({ consumer: 'checkout' });
-    c.retain();
-    await vi.waitFor(() => expect(c.state.getSnapshot().storage).toBe('durable'));
-    const first = FakeWebSocket.last();
-    first.serverOpen();
-    first.serverSend(serverReadyMessage());
-    await vi.waitFor(() => expect(taking).toHaveBeenCalled());
-    c.pause('manual');
-    go();
+  it('a client that stays open does not take what another left; the next to open does', async () => {
+    const open = client({ consumer: 'checkout' });
+    await vi.waitFor(() => expect(open.state.getSnapshot().storage).toBe('durable'));
+    const gone = client({ consumer: 'checkout' });
+    await vi.waitFor(() => expect(gone.state.getSnapshot().storage).toBe('durable'));
+    gone.send('order', { n: 1 }, { id: 'left' });
+    gone.destroy();
     await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(first.appTextMessages().filter((m) => m.t === 'order')).toEqual([]);
-    taking.mockRestore();
-
-    // Still stored.
-    const check = new OfflineQueue({ ...CONFIG, dbName: SCOPE });
-    await check.initialize();
-    expect((await check.getAll()).map((r) => r.id)).toEqual(['order-1']);
-    check.destroy();
-
-    // Back: it goes, once.
-    c.resume('manual');
-    await vi.waitFor(() => expect(FakeWebSocket.last()).not.toBe(first));
-    const second = FakeWebSocket.last();
-    second.serverOpen();
-    second.serverSend(serverReadyMessage());
-    await vi.waitFor(() => expect(second.appTextMessages().filter((m) => m.t === 'order')).toHaveLength(1));
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(second.appTextMessages().filter((m) => m.t === 'order')).toHaveLength(1);
+    expect(open.kept()).toBe(0);
+    const next = client({ consumer: 'checkout' });
+    await vi.waitFor(() => expect(next.kept()).toBe(1));
   });
-});
 
-describe('clients of one namespace in two realms', () => {
-  it('keep their offline queues and their users apart', async () => {
-    const queueOf = (realm: string) => `wse:shop:alice:checkout@${realm}`;
-    await dropDb(queueOf('a'));
-    await dropDb(queueOf('b'));
-    const open = async (realm: string, user: string | null) => {
-      const c = client({ consumer: 'checkout', realm });
-      c.retain();
-      await vi.waitFor(() => expect(c.state.getSnapshot().storage).toBe('durable'));
-      if (user !== null) {
-        const ws = FakeWebSocket.last();
-        ws.serverOpen();
-        ws.serverSend(serverReadyMessage({ user_id: user }));
-        await vi.waitFor(() => expect(c.state.getSnapshot().ready).toBe(true));
-      }
-      return c;
-    };
+  it('goes with the page and reads the database again when the page is back', async () => {
+    const page = client({ consumer: 'checkout' });
+    page.retain();
+    await vi.waitFor(() => expect(page.state.getSnapshot().storage).toBe('durable'));
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const before = FakeWebSocket.last();
+    page.send('order', { n: 1 }, { id: 'kept' });
+    await vi.waitFor(async () => expect(Object.values(await stored())).toEqual([['kept']]));
+
+    // Into the back/forward cache: its producer is free, and another page takes it over.
+    window.dispatchEvent(new Event('pagehide'));
+    const other = client({ consumer: 'checkout' });
+    await vi.waitFor(() => expect(other.kept()).toBe(1));
+
+    // Back: the order is the other page's now, and goes on its connection only.
+    window.dispatchEvent(new Event('pageshow'));
+    await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThan(1));
+    const after = FakeWebSocket.last();
+    expect(after).not.toBe(before);
+    answering(after);
+    await vi.waitFor(() => expect(page.state.getSnapshot().ready).toBe(true));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(page.kept()).toBe(0);
+    expect(orders(after)).toEqual([]);
+    expect(producerOf(after)).not.toBe(producerOf(before));
+  });
+
+  it('drops another user’s messages, and keeps two realms apart', async () => {
+    const scopeOf = (realm: string) => `wse:shop:alice:checkout@${realm}`;
+    await dropDb(scopeOf('a'));
+    await dropDb(scopeOf('b'));
     try {
-      (await open('a', 'alice')).destroy();
-      (await open('b', 'bob')).destroy();
-      // Offline in realm a: the order is written for a's user, not b's.
-      const again = await open('a', null);
-      expect(again.send('order', { id: 7 }, { offline: true })).toBe('queued');
-      const stored = new OfflineQueue({ ...CONFIG, dbName: queueOf('a') });
-      await stored.initialize();
-      await vi.waitFor(async () => expect(await stored.getAll()).toHaveLength(1));
-      expect((await stored.getAll())[0].owner).toBe('alice');
-      stored.destroy();
+      const alice = client({ consumer: 'checkout', realm: 'a' });
+      alice.retain();
+      await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+      answering(FakeWebSocket.last(), 'alice');
+      await vi.waitFor(() => expect(alice.state.getSnapshot().ready).toBe(true));
+      alice.pause('manual');
+      await vi.waitFor(() => expect(alice.state.getSnapshot().ready).toBe(false));
+      alice.send('order', { n: 1 }, { id: 'alices' });
+      const elsewhere = client({ consumer: 'checkout', realm: 'b' });
+      await vi.waitFor(() => expect(elsewhere.state.getSnapshot().storage).toBe('durable'));
+      elsewhere.send('order', { n: 2 }, { id: 'in-b' });
+      await vi.waitFor(async () => expect(Object.values(await stored(scopeOf('a')))).toEqual([['alices']]));
+      await vi.waitFor(async () => expect(Object.values(await stored(scopeOf('b')))).toEqual([['in-b']]));
+      alice.destroy();
+
+      // Bob's page in realm a: alice's order is not his to send.
+      const bob = client({ consumer: 'checkout', realm: 'a' });
+      const dropped: unknown[] = [];
+      bob.on('wseNotDelivered', (detail) => dropped.push(detail));
+      await vi.waitFor(() => expect(bob.kept()).toBe(1));
+      bob.retain();
+      await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
       const ws = FakeWebSocket.last();
-      ws.serverOpen();
-      ws.serverSend(serverReadyMessage({ user_id: 'alice' }));
-      await vi.waitFor(() => expect(ws.appTextMessages().filter((m) => m.t === 'order')).toHaveLength(1));
+      answering(ws, 'bob');
+      await vi.waitFor(() => expect(dropped).toEqual([{ reason: 'user_changed', ids: ['alices'] }]));
+      expect(orders(ws)).toEqual([]);
+      await vi.waitFor(async () => expect(await stored(scopeOf('a'))).toEqual({}));
     } finally {
-      await dropDb(queueOf('a'));
-      await dropDb(queueOf('b'));
+      await dropDb(scopeOf('a'));
+      await dropDb(scopeOf('b'));
       localStorage.clear();
     }
   });
-});
 
-describe('a stored message that went', () => {
-  it('and could not be removed is not sent again, and the failure is said', async () => {
-    const stored = new OfflineQueue({ ...CONFIG, dbName: SCOPE });
-    await stored.initialize();
-    expect(await stored.enqueue({ t: 'order', p: { id: 1 }, id: 'order-1' } as any)).toBe(true);
-    stored.destroy();
-
-    // The transaction of its first removal is cut off.
-    let cut = false;
-    const remove = IDBObjectStore.prototype.delete;
-    vi.spyOn(IDBObjectStore.prototype, 'delete').mockImplementation(function (this: IDBObjectStore, key) {
-      const request = remove.call(this, key);
-      if (key === 'order-1' && !cut) {
-        cut = true;
-        this.transaction.abort();
-      }
-      return request;
-    });
+  it('takes over what the queue of 3.1 kept, its user’s alone', async () => {
+    const old = new OfflineQueue({ ...CONFIG, dbName: SCOPE });
+    await old.initialize();
+    expect(await old.enqueue({ t: 'order', p: { n: 1 }, id: 'from-3.1' } as any, undefined, 'user-1')).toBe(true);
+    old.destroy();
 
     const c = client({ consumer: 'checkout' });
-    const errors: any[] = [];
-    c.on('wseStorageError', (detail) => errors.push(detail));
+    await vi.waitFor(() => expect(c.kept()).toBe(1));
     c.retain();
-    await vi.waitFor(() => expect(c.state.getSnapshot().storage).toBe('durable'));
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
     const ws = FakeWebSocket.last();
-    ws.serverOpen();
-    ws.serverSend(serverReadyMessage());
-    await vi.waitFor(() => expect(errors).toMatchObject([{ operation: 'remove' }]));
-    // Removed when tried again, a moment later; it went once.
-    await vi.waitFor(
-      async () => {
-        const check = new OfflineQueue({ ...CONFIG, dbName: SCOPE });
-        await check.initialize();
-        const left = await check.getAll();
-        check.destroy();
-        expect(left).toEqual([]);
-      },
-      { timeout: 5_000, interval: 200 },
-    );
-    expect(ws.appTextMessages().filter((m) => m.t === 'order')).toHaveLength(1);
-  });
-
-  it('and could not be removed is not sent again after a pause either', async () => {
-    const stored = new OfflineQueue({ ...CONFIG, dbName: SCOPE });
-    await stored.initialize();
-    expect(await stored.enqueue({ t: 'order', p: { id: 1 }, id: 'order-1' } as any)).toBe(true);
-    stored.destroy();
-
-    // Removal fails until the test lets it through.
-    let failing = true;
-    const remove = OfflineQueue.prototype.remove;
-    vi.spyOn(OfflineQueue.prototype, 'remove').mockImplementation(async function (this: OfflineQueue, ids: string[]) {
-      if (failing) throw new DOMException('the write was cut off', 'AbortError');
-      return remove.call(this, ids);
-    });
-
-    const c = client({ consumer: 'checkout' });
-    c.retain();
-    await vi.waitFor(() => expect(c.state.getSnapshot().storage).toBe('durable'));
-    const first = FakeWebSocket.last();
-    first.serverOpen();
-    first.serverSend(serverReadyMessage());
-    await vi.waitFor(() => expect(first.appTextMessages().filter((m) => m.t === 'order')).toHaveLength(1));
-
-    c.pause('manual');
-    c.resume('manual');
-    await vi.waitFor(() => expect(FakeWebSocket.last()).not.toBe(first));
-    const second = FakeWebSocket.last();
-    second.serverOpen();
-    second.serverSend(serverReadyMessage());
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    failing = false;
-    await vi.waitFor(
-      async () => {
-        const check = new OfflineQueue({ ...CONFIG, dbName: SCOPE });
-        await check.initialize();
-        const left = await check.getAll();
-        check.destroy();
-        expect(left).toEqual([]);
-      },
-      { timeout: 5_000, interval: 200 },
-    );
-    expect(second.appTextMessages().filter((m) => m.t === 'order')).toEqual([]);
+    answering(ws, 'user-1');
+    await vi.waitFor(() => expect(orders(ws)).toHaveLength(1));
+    expect(orders(ws)[0]).toMatchObject({ s: 1, id: 'from-3.1', p: { n: 1 } });
   });
 });
 
@@ -325,6 +246,41 @@ describe('a storage that fails', () => {
     c.retain();
     await vi.waitFor(() => expect(c.state.getSnapshot().storage).toBe('unavailable'));
     expect(errors).toMatchObject([{ operation: 'open', name: 'InvalidStateError', quota: false }]);
+    // In memory, as before.
+    expect(c.send('order', { n: 1 })).toBe('queued');
+    expect(c.kept()).toBe(1);
+  });
+
+  it('says so without Web Locks (a page without HTTPS), and keeps what waits in memory', async () => {
+    vi.stubGlobal('navigator', {});
+    const c = client({ consumer: 'checkout' });
+    const errors: any[] = [];
+    c.on('wseStorageError', (detail) => errors.push(detail));
+    await vi.waitFor(() => expect(c.state.getSnapshot().storage).toBe('unavailable'));
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ operation: 'open' });
+    expect(String(errors[0].message)).toContain('Web Locks');
+  });
+
+  it('says so when the database is full, and writes it whole once it can', async () => {
+    const c = client({ consumer: 'checkout' });
+    const errors: any[] = [];
+    c.on('wseStorageError', (detail) => errors.push(detail));
+    await vi.waitFor(() => expect(c.state.getSnapshot().storage).toBe('durable'));
+    const put = IDBObjectStore.prototype.put;
+    const full = vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (this: IDBObjectStore, ...args) {
+      if (this.name === 'outbox') throw new DOMException('full', 'QuotaExceededError');
+      return put.apply(this, args as Parameters<typeof put>);
+    });
+    c.send('order', { n: 1 }, { id: 'first' });
+    await vi.waitFor(() => expect(errors).toMatchObject([{ operation: 'write', quota: true }]));
+    full.mockRestore();
+    // A second later the outbox writes the database anew, with both.
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    c.send('order', { n: 2 }, { id: 'second' });
+    await vi.waitFor(async () => expect(Object.values(await stored())).toEqual([['first', 'second']]), {
+      timeout: 3_000,
+    });
   });
 
   it('says so when the page storage is full', async () => {

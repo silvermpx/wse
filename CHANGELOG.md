@@ -115,6 +115,16 @@
   macOS and the BSDs, an exclusive open on Windows, an abstract socket on
   Linux); a file that cannot be opened or written is a `wseStorageError`
   event.
+- TypeScript, in a browser: the outbox outlives the page in IndexedDB for a
+  durable scope (a storage and a `consumer` named, as the offline queue
+  was). Each tab keeps a producer of its own, held by a Web Lock, and sends
+  on its own connection as its own user; a page that opens takes over what
+  a closed or crashed tab left, under its producer, so the server still
+  takes each message once. The page that goes lets its producer go, so the
+  back/forward cache can keep it, and reads the database again when it is
+  back. What the queue of 3.1 kept is taken over, each message for its
+  user. Without Web Locks (no HTTPS) the outbox stays in memory and says
+  so.
 - TypeScript: `wake()` and `close(deadlineMs)` for a client without a page
   (Node, Electron's main process, a worker): `wake()` connects at once when
   the application hears the network or the machine is back, and `close`
@@ -127,6 +137,14 @@
   instead of failing (`NotConnected`, `SendResult.FAILED`) or waiting in
   an outgoing queue; `Config::offline = None` (`disabled` in the packages),
   `offline=None` and `offline: { enabled: false }` keep that.
+- TypeScript: the offline queue of 3.1 is replaced by the outbox. The lease
+  between tabs (15 s) and the claim of a message being sent (30 s) are gone,
+  and with them the `busy` storage state, the `remove` storage errors and
+  the sends that a closed tab left claimed and another tab sent again. A
+  message's `offline: true` changes nothing any more: every message but a
+  live one waits in the outbox, durable when the client has a store.
+  `clearOfflineQueue()` clears the outbox. The `OfflineQueue` class stays
+  exported, unused by the client.
 - Rust client (and Swift, Kotlin, Dart): every message carries an `id`, a
   random UUID, as from the TypeScript and Python clients.
 - Rust client: the events stream and a handler hear `Event::Continuity` when

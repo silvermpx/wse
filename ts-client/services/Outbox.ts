@@ -120,21 +120,31 @@ export interface OutboxLog {
   close(): void;
 }
 
+/** A store, opened: what it held and its log. */
+export interface OpenedStore {
+  /**
+   * What it held, the producer to go on with included; null: nothing (a new
+   * file), the outbox goes on with its own.
+   */
+  read: ReadOutbox | null;
+  log: OutboxLog;
+}
+
 /**
- * Where an outbox keeps what it holds, so that it outlives the process:
- * `fileOutbox(path)` of `wse-client/node`.
+ * Where an outbox keeps what it holds, so that it outlives the process or
+ * the page: `fileOutbox(path)` of `wse-client/node`, `indexedDbOutbox(name)`.
  */
 export interface OutboxStore {
   /**
-   * Opens it, the outbox's alone from now on: what it held (null: nothing,
-   * or not of this format) and its log. `state` says what the outbox holds
-   * whenever the store must write it anew (the process ends); `report` hears
-   * of a write that failed. Throws when it cannot be had.
+   * Opens it, the outbox's alone from now on (a promise for a store that
+   * opens in its own time). `state` says what the outbox holds whenever the
+   * store must write it anew (the process ends); `report` hears of a write
+   * that failed. Throws, or rejects, when it cannot be had.
    */
   open(
     state: () => StoredOutbox,
     report: (operation: string, error: unknown) => void,
-  ): { read: ReadOutbox | null; log: OutboxLog };
+  ): OpenedStore | Promise<OpenedStore>;
 }
 
 /** The message with its number first: `{"s":N,` before the rest. */
@@ -181,6 +191,8 @@ export interface OutboxOptions {
   store?: OutboxStore;
   /** The store could not be opened (`open`) or written (`write`): what waits stays in memory. */
   onStorageError?: (operation: string, error: unknown) => void;
+  /** The store opened (true) or could not be (false): after each open. */
+  onOpen?: (durable: boolean) => void;
 }
 
 export class Outbox {
@@ -221,6 +233,19 @@ export class Outbox {
   /** A write of the store failed: it is written anew, at most once a second. */
   private owedRewrite = false;
   private healAt = 0;
+  private readonly store: OutboxStore | null;
+  private readonly report: (operation: string, error: unknown) => void;
+  private readonly onOpen?: (durable: boolean) => void;
+  /** The store opens: what is sent meanwhile waits, numbered after what it holds once it opened. */
+  private opening: Promise<void> | null = null;
+  /** Sent while no store was open (it opens, or the page went away): its log gets them once it opens. */
+  private unlogged: Kept[] = [];
+  /** The page went away: the store was let go, and is opened again when it is back. */
+  private suspended = false;
+  private suspendOnOpen = false;
+  /** The user signed out before the store opened: it is cleared once it did. */
+  private clearOnOpen = false;
+  private closed = false;
 
   constructor(
     private readonly limits: OutboxLimits,
@@ -228,18 +253,111 @@ export class Outbox {
   ) {
     this.producerId = options.producer ?? newProducer();
     this.onExpired = options.onExpired;
-    if (options.store) {
-      const report = options.onStorageError ?? (() => {});
-      try {
-        const { read, log } = options.store.open(() => this.state(), report);
-        this.log = log;
-        if (read) this.restore(read);
-        // Written anew at once: a tail a crash left goes, under a new salt.
-        log.rewrite(this.state());
-      } catch (error) {
-        report('open', error);
-      }
+    this.store = options.store ?? null;
+    this.report = options.onStorageError ?? (() => {});
+    this.onOpen = options.onOpen;
+    if (this.store) this.open(this.store);
+  }
+
+  /** Settled once the store opened, or could not be: the connection waits for it. */
+  get opened(): Promise<void> {
+    return this.opening ?? Promise.resolve();
+  }
+
+  private open(store: OutboxStore): void {
+    let opened: OpenedStore | Promise<OpenedStore>;
+    try {
+      opened = store.open(() => this.state(), this.report);
+    } catch (error) {
+      this.report('open', error);
+      this.onOpen?.(false);
+      return;
     }
+    if (!(opened instanceof Promise)) {
+      this.take(opened);
+      return;
+    }
+    const opening: Promise<void> = opened.then(
+      (o) => {
+        if (this.opening === opening) this.opening = null;
+        this.take(o);
+        if (this.closed) this.letGo();
+        else if (this.suspendOnOpen) this.suspend();
+      },
+      (error) => {
+        if (this.opening === opening) this.opening = null;
+        this.report('open', error);
+        this.onOpen?.(false);
+      },
+    );
+    this.opening = opening;
+  }
+
+  /**
+   * The store opened: what it holds is what waits (what this outbox logged
+   * before the page went away is in it, or another page's now), and what was
+   * sent meanwhile is numbered after it.
+   */
+  private take({ read, log }: OpenedStore): void {
+    const unlogged = this.unlogged;
+    this.unlogged = [];
+    if (read) {
+      this.records = [];
+      this.head = 0;
+      this.cursor = 0;
+      this.count = 0;
+      this.bytes = 0;
+      this.restore(read);
+      for (const record of unlogged) {
+        record.s = this.next++;
+        this.records.push(record);
+        this.count++;
+        this.bytes += record.size;
+        if (record.until < this.earliestMs) this.earliestMs = record.until;
+      }
+      this.arm();
+    }
+    this.log = log;
+    for (const record of unlogged) log.add(record);
+    if (this.clearOnOpen) {
+      // Said when the user signed out; what the store held goes with it.
+      this.clearOnOpen = false;
+      this.clear();
+    }
+    this.flush();
+    this.onOpen?.(true);
+  }
+
+  /** The store is let go as it stands: its log writes what it was handed. */
+  private letGo(): void {
+    const log = this.log;
+    if (!log) return;
+    this.flushNow();
+    this.log = null;
+    log.close();
+  }
+
+  /**
+   * The page went away (into the back/forward cache, or for good): the store
+   * gets what changed and is let go, for another page to take what waits.
+   */
+  suspend(): void {
+    if (!this.store || this.closed) return;
+    if (this.opening) {
+      this.suspendOnOpen = true;
+      return;
+    }
+    if (!this.log) return;
+    this.letGo();
+    this.suspended = true;
+  }
+
+  /** The page is back: the store is opened again, and read again. */
+  resume(): void {
+    this.suspendOnOpen = false;
+    if (!this.suspended || !this.store || this.closed) return;
+    this.suspended = false;
+    this.open(this.store);
   }
 
   /** The producer's id: the hello names it. */
@@ -384,6 +502,8 @@ export class Outbox {
     if (this.log) {
       this.log.add(record);
       this.flush();
+    } else if (this.store && (this.opening || this.suspended)) {
+      this.unlogged.push(record);
     }
     return s;
   }
@@ -472,7 +592,7 @@ export class Outbox {
     outcomes: Outcomes,
     write: (message: WSMessage, s: number | undefined, json: string) => boolean,
   ): void {
-    if (!this.ready || !(this.answered || this.plain)) return;
+    if (!this.ready || !(this.answered || this.plain) || this.opening) return;
     if (this.earliestMs <= now) this.expire(now, outcomes);
     const numbered = this.answered;
     let taken = 0;
@@ -525,15 +645,15 @@ export class Outbox {
    */
   close(): Outcomes {
     const outcomes = this.disconnected();
-    const log = this.log;
-    if (log) {
-      this.flushNow();
-      this.log = null;
-      log.close();
-    } else {
+    this.closed = true;
+    // In a store (or one that opens: what waits goes to it once it did).
+    const kept = this.log !== null || this.opening !== null || this.suspended;
+    if (this.log) {
+      this.letGo();
+    } else if (!kept) {
       for (let i = this.head; i < this.records.length; i++) refuse(outcomes, 'closed', this.records[i].id);
     }
-    this.reset();
+    if (!this.opening) this.reset();
     return outcomes;
   }
 
@@ -552,9 +672,15 @@ export class Outbox {
       else refuse(outcomes, 'cleared', record.id);
     }
     this.reset();
+    this.unlogged = [];
     if (numbers.length > 0) this.put({ drop: numbers });
     this.user = undefined;
     this.put({ user: null });
+    if (this.store && !this.log && (this.opening || this.suspended)) {
+      // What the store holds goes too, once it is open.
+      this.clearOnOpen = true;
+      if (this.suspended && !this.closed) this.resume();
+    }
     return outcomes;
   }
 

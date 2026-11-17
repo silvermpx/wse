@@ -547,7 +547,10 @@ export function fileOutbox(path: string): OutboxStore {
         }
         const read = data === null ? null : readOutbox(data);
         const fd = openSync(path, APPEND, 0o600);
-        return { read, log: new FileLog(path, fd, lock, state, report) };
+        const log = new FileLog(path, fd, lock, state, report);
+        // Written anew at once: a tail a crash left goes, under a new salt.
+        log.rewrite(read ?? state());
+        return { read, log };
       } catch (error) {
         lock.release();
         throw error;

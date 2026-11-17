@@ -1,6 +1,6 @@
 # wse-client (TypeScript)
 
-TypeScript client for [WSE](https://github.com/silvermpx/wse), the WebSocket engine for reactive user interfaces: topics, message recovery, reconnects, an offline queue, end-to-end encryption and signed messages. It runs without a framework, and comes with adapters for React, Vue, Svelte and React Native.
+TypeScript client for [WSE](https://github.com/silvermpx/wse), the WebSocket engine for reactive user interfaces: topics, message recovery, reconnects, an outbox that sends each message once (offline too), end-to-end encryption and signed messages. It runs without a framework, and comes with adapters for React, Vue, Svelte and React Native.
 
 [![npm](https://img.shields.io/npm/v/wse-client)](https://www.npmjs.com/package/wse-client)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue)](https://www.typescriptlang.org/)
@@ -60,23 +60,25 @@ its backoff connects at once and a connection silent past its idle limit (the ma
 made again. `close(deadlineMs)` sends what the client holds within that time, then ends as
 `destroy()` does, for a host that quits. A storage named for the page where the runtime has none
 keeps the topics and the checkpoint in memory, and says so with a `wseStorageError` (operation
-`open`) as the client starts; the offline queue still goes to IndexedDB where the runtime has it,
-and `state.getSnapshot().storage` reads `unavailable` when it cannot.
+`open`) as the client starts; the outbox still goes to IndexedDB where the runtime has it, and
+`state.getSnapshot().storage` reads `unavailable` when it cannot.
 
-The offline queue is durable only for a part of the application named by a stable `consumer`
-(`consumer: 'checkout'`): it lives in an IndexedDB database of its own scope -- the storage name,
-the consumer and the realm (the first endpoint, or `realm`) -- so another server or another part of
-the application never reads it. Two clients of one scope (two tabs) may both write to it, but one at
-a time replays it: the other is `busy` until the first lets go or stops renewing its lease (15 s),
-and then sends what the first stored. A stored message stays in the database until it went out:
-the client claims it for 30 s while sending it, so one whose sending was cut off (the tab paused or
-closed in between) goes again later, with the same `id`, and may arrive twice. When a message that
-went cannot be removed, a `wseStorageError` (operation `remove`) says so: this client never sends it
-again, and tries the removal again a second later, then twice as long each time up to 30 s.
-`state.getSnapshot().storage` says where the queue lives (`memory`, `durable`, `busy`,
-`unavailable`), each change is a `wseStorage` event, and a storage that fails (a database that will
-not open, a full quota, another tab upgrading the database) is a `wseStorageError` event with the
-operation and the error's name, never silent.
+The outbox (see [Sending Messages](#sending-messages)) outlives the page only for a part of the application named by a
+stable `consumer` (`consumer: 'checkout'`): it lives in an IndexedDB database of its own scope -- the
+storage name, the consumer and the realm (the first endpoint, or `realm`) -- so another server or
+another part of the application never reads it. Each client of the scope (each tab) keeps a producer
+of its own there, held by a Web Lock while the tab lives, and sends what it holds on its own
+connection, as its own user. A page that opens takes over what a closed or crashed tab of the scope
+left (or the page it reloads), and sends it under that tab's producer, so the server still takes each
+message once; another user's connection drops it (`user_changed`). The changes of a turn of the event
+loop go to the database in one transaction. The page that goes (`pagehide`) lets its producer go, so
+the back/forward cache can keep it, and reads the database again when it is back. Web Locks need a
+secure context (HTTPS, or localhost): without them the outbox stays in memory. What the queue of 3.1
+kept in the database is taken over and sent, each message for its user only.
+`state.getSnapshot().storage` says where the outbox lives (`memory`, `durable`, `unavailable`), each
+change is a `wseStorage` event, and a storage that fails (a database that will not open, a full
+quota, another page deleting the database) is a `wseStorageError` event with the operation and the
+error's name, never silent; the outbox goes on in memory and writes the database anew once it can.
 
 Outside browsers, a `webSocket` factory makes the socket, and may send headers (a token in
 `Authorization`).
@@ -233,7 +235,7 @@ sends the first argument of `useWSE` anywhere; it is the auth *mode*:
 | Value | Meaning |
 |-------|---------|
 | `'cookie'` | Connect; the browser sends its cookies on the upgrade. Also enables the periodic `refreshAuthToken` call. Use it for a server without `jwt_secret` too. |
-| `undefined` / `''` | Signed out: close the connection and clear per-user data (outgoing queues, IndexedDB offline queue, recovery positions, saved subscriptions, the opt-in error log). |
+| `undefined` / `''` | Signed out: close the connection and clear per-user data (outgoing queues, the outbox and its IndexedDB database, recovery positions, saved subscriptions, the opt-in error log). |
 | any other string | Connect like `'cookie'`; a change from one non-empty value to another is treated as a different user (reconnect and clear per-user data). Do not pass a rotating JWT here - it is not sent, and each rotation would reset the session. A JWT-shaped value logs a warning. |
 
 When the server rejects the credentials (close code 4401/4403, or an `AUTH_FAILED` error before the
@@ -295,8 +297,8 @@ const {
   diagnostics,        // NetworkDiagnostics | null (only with diagnostics.enabled)
 
   downloadDiagnostics,// () => void
-  clearOfflineQueue,  // () => Promise<void>
-  getQueueSize,       // () => number (in-memory + IndexedDB)
+  clearOfflineQueue,  // () => Promise<void> - what waits in the outbox goes ('cleared')
+  getQueueSize,       // () => number (the outgoing queue and the outbox)
   requestSnapshot,    // (topics?) => void - sends a sync_request
   debugHandlers,      // () => void
   setCompression,     // (enabled) => void - ask the server to compress what it sends (or not)
@@ -352,7 +354,7 @@ useWSE('cookie', ['notifications'], {
     maxSize: 100000,                          // messages that wait at most, those not answered yet included
     maxBytes: 16 * 1024 * 1024,               // bytes of messages that wait at most
     maxAge: 3600000,                          // ms a message may wait to be written first
-    persistToStorage: true,                   // { offline: true } sends outlive the page (IndexedDB)
+    persistToStorage: true,                   // with a consumer named, the outbox outlives the page (IndexedDB)
     // store: fileOutbox(path),               // Node, Electron's main process: the outbox in a file
   },
 
@@ -450,7 +452,6 @@ sendMessage('chat_message', { text: 'Hello' });                          // 'sen
 sendMessage('order', { item: 'tea' }, { id: 'order-17' });              // its outcome names it
 sendMessage('alert', { msg: 'critical' }, { priority: MessagePriority.CRITICAL });
 sendMessage('query', { filter: 'active' }, { correlation_id: 'req-123' });
-sendMessage('draft', { text }, { offline: true });                       // survives reloads (IndexedDB)
 sendMessage('quote_request', { symbol }, { ttl: 5000 });                  // worthless after 5 s
 sendMessage('open_valve', { id: 'v-7' }, { live: true });                 // now or never
 ```
@@ -501,9 +502,10 @@ holds it. `destroy()` leaves what waits in the file for the next client, `signOu
 - `ttl`: milliseconds the message stays worth sending. One not written within it (waiting for the
   connection, in the outbox or in IndexedDB) is dropped instead of sent late (`wseNotDelivered`,
   `expired`); once written it waits for the server's answer.
-- `offline`: persist to IndexedDB while disconnected and replay after reconnecting, also after a reload.
+- `offline`: ignored since 3.2. Every message but a live one waits in the outbox, which outlives the
+  page when the client has a store (IndexedDB for a durable scope).
 - `live`: only on the connection that is ready now. It is never kept for a later connection, persisted
-  or replayed after a reconnect, whatever `offline` says; without a ready connection it is
+  or replayed after a reconnect; without a ready connection it is
   `'dropped'`. For commands that must not run late (a valve, a door, an order). Signed messages
   (`sendSigned`) are always live.
 - `encrypted`: refuse to send unless E2E encryption is on; never falls back to plaintext.
@@ -586,7 +588,7 @@ committed later. A send that requires topics waits in the outgoing queue, in its
 only while each of them is continuous on the connection: checked right before it goes, so one kept
 behind the rate limit does not go after a reconnect before the resync. It belongs to the user who
 made it (dropped when the user changes, never sent as the next one), counts against
-`maxQueueSize` and `memoryLimit` with every other send, and is never written to the offline queue.
+`maxQueueSize` and `memoryLimit` with every other send, and is never kept in the outbox.
 Messages held past `maxHeld` (10,000), or a break during the resync, start the resync over; a
 handler that fails is called again (1 s, then twice as long, up to 30 s). Offsets JavaScript cannot
 hold exactly (above 2^53 - 1) are refused and break the topic off.
@@ -683,7 +685,7 @@ The logger defaults to `WARN` in production and `INFO` in development (`process.
 | Feature | Description |
 |---------|-------------|
 | **Auto-reconnection** | Exponential, linear, fibonacci or adaptive backoff with jitter, infinite by default |
-| **Offline queue** | `{ offline: true }` messages persist in IndexedDB and replay after reconnecting |
+| **Outbox** | Every message waits until the server answers for it and goes again after a reconnect, taken once; in IndexedDB or a file it outlives the page or the process |
 | **E2E encryption** | Sessions with a pinned server identity via Web Crypto; fails closed |
 | **Compression** | Inflates `C:` (zlib) frames from the server with a size limit |
 | **MessagePack** | `wireFormat: 'msgpack'`: msgpack both ways via `@msgpack/msgpack` (24-41% fewer bytes than JSON) |

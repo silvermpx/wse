@@ -348,3 +348,41 @@ export async function sessionServer(offer: any, connectionId: string, identity: 
     },
   };
 }
+
+/**
+ * Web Locks as a browser keeps them, for the pages of one test: a lock is
+ * one holder's until its callback's promise settles; `ifAvailable` gets
+ * null while another holds it, and a request without it waits its turn.
+ */
+export function installFakeLocks(): void {
+  const held = new Set<string>();
+  const waiting = new Map<string, Array<() => void>>();
+  const locks = {
+    async request(name: string, optionsOrCallback: any, maybeCallback?: any): Promise<unknown> {
+      const options = typeof optionsOrCallback === 'function' ? {} : (optionsOrCallback ?? {});
+      const callback = typeof optionsOrCallback === 'function' ? optionsOrCallback : maybeCallback;
+      if (held.has(name)) {
+        if (options.ifAvailable) return callback(null);
+        await new Promise<void>((resolve) => {
+          const queue = waiting.get(name) ?? [];
+          queue.push(resolve);
+          waiting.set(name, queue);
+        });
+      }
+      held.add(name);
+      try {
+        return await callback({ name, mode: 'exclusive' });
+      } finally {
+        held.delete(name);
+        waiting.get(name)?.shift()?.();
+      }
+    },
+    async query() {
+      return { held: [...held].map((name) => ({ name, mode: 'exclusive' })), pending: [] };
+    },
+  };
+  // The environment's navigator, with these locks over whatever it has.
+  const page = Object.create((globalThis.navigator as object | undefined) ?? null);
+  Object.defineProperty(page, 'locks', { value: locks, configurable: true });
+  vi.stubGlobal('navigator', page);
+}

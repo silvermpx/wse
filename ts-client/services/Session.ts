@@ -39,16 +39,9 @@ import { ConnectionManager } from './ConnectionManager.js';
 import { MessageProcessor } from './MessageProcessor.js';
 import { NetworkMonitor } from './NetworkMonitor.js';
 import { AdaptiveQualityManager, QueryClientLike } from './AdaptiveQualityManager.js';
-import { OfflineQueue } from './OfflineQueue.js';
-import { Outbox, reportOutcomes } from './Outbox.js';
-
-/** The page-wide client's name to the offline queue: one per page load. */
-const PAGE_HOLDER = generateId();
-
-/** A lease held is renewed this often (it runs out after LEASE_TTL_MS). */
-const LEASE_RENEW_MS = 5_000;
-/** A busy client asks for the lease again this often. */
-const LEASE_RETRY_MS = 2_000;
+import type { OfflineQueue } from './OfflineQueue.js';
+import { indexedDbOutbox } from './IndexedDbOutbox.js';
+import { Outbox, reportOutcomes, type OutboxStore } from './Outbox.js';
 
 /** What a client tells of a storage that failed: what it did, and the error's name. */
 export function storageErrorDetail(operation: string, error: unknown) {
@@ -241,6 +234,18 @@ export function resolveOptions(config: UseWSEConfig | undefined): ResolvedWSEOpt
  * The client's outbox, made with `offline`'s limits the first time; null
  * when `offline.enabled` is false.
  */
+/**
+ * Where the client's outbox keeps what waits: the store the application
+ * named, else IndexedDB for a durable scope (a storage and a consumer
+ * named), else memory (null).
+ */
+export function outboxStoreFor(ctx: ClientContext, offline: OfflineConfig): OutboxStore | null {
+  if (!offline.enabled) return null;
+  if (offline.store) return offline.store;
+  const database = ctx.storage.offlineDatabase;
+  return offline.persistToStorage && database ? indexedDbOutbox(database) : null;
+}
+
 export function ensureOutbox(ctx: ClientContext, offline: OfflineConfig): Outbox | null {
   if (!offline.enabled) return null;
   if (ctx.outbox.current) return ctx.outbox.current;
@@ -253,23 +258,22 @@ export function ensureOutbox(ctx: ClientContext, offline: OfflineConfig): Outbox
     {
       // What runs out on its own timer is said, with a connection or without.
       onExpired: (outcomes) => reportOutcomes(ctx.emit, outcomes),
-      store: offline.store,
+      store: outboxStoreFor(ctx, offline) ?? undefined,
       // Said after this turn: a store is opened as the client is made,
       // before the application listens.
       onStorageError: (operation, error) =>
         queueMicrotask(() => ctx.emit('wseStorageError', storageErrorDetail(operation, error))),
+      // Where what waits lives: in the store, or in memory when it failed.
+      onOpen: (durable) => {
+        const state = durable ? 'durable' : 'unavailable';
+        const store = ctx.state.getState();
+        if (store.storageState === state) return;
+        store.setStorageState(state);
+        queueMicrotask(() => ctx.emit('wseStorage', { state }));
+      },
     },
   );
   ctx.outbox.current = outbox;
-  if (offline.store) {
-    // Where what waits lives: in the store, or in memory when it failed.
-    const state = outbox.durable ? 'durable' : 'unavailable';
-    const store = ctx.state.getState();
-    if (store.storageState !== state) {
-      store.setStorageState(state);
-      queueMicrotask(() => ctx.emit('wseStorage', { state }));
-    }
-  }
   return outbox;
 }
 
@@ -342,7 +346,8 @@ export class WSESession {
   connection: ConnectionManager | null = null;
   networkMonitor: NetworkMonitor | null = null;
   quality: AdaptiveQualityManager | null = null;
-  offlineQueue: OfflineQueue | null = null;
+  /** Always null since 3.2: the outbox keeps what waits, in IndexedDB too. */
+  readonly offlineQueue: OfflineQueue | null = null;
   refCount = 0;
   destroyed = false;
 
@@ -462,40 +467,10 @@ export class WSESession {
     }
     if (this.destroyed) return;
 
-    const offlineDatabase = this.ctx.storage.offlineDatabase;
-    if (o.offline.enabled && o.offline.persistToStorage && offlineDatabase) {
-      const queue = new OfflineQueue({
-        ...o.offline,
-        dbName: offlineDatabase,
-        onError: (operation, error) => this.storageFailed(operation, error),
-        // Every session of this client takes as one: what one took and did
-        // not send, the next takes again at once.
-        holder: this.ctx.leaseHolder ?? PAGE_HOLDER,
-      });
-      try {
-        await queue.initialize();
-      } catch {
-        // Reported by the queue; the messages stay in memory.
-      }
-      if (this.destroyed) {
-        queue.destroy();
-        return;
-      }
-      if (!queue.isAvailable()) {
-        // The queue keeps its messages in memory. Where the runtime has no
-        // IndexedDB (Node, Electron's main process) the queue said nothing.
-        if (typeof indexedDB === 'undefined') {
-          this.ctx.emit('wseStorageError', storageErrorDetail('open', new Error('no IndexedDB in this runtime')));
-        }
-        this.setStorageState('unavailable');
-      } else {
-        this.offlineQueue = queue;
-        this.processor.setOfflineQueue(queue);
-        const holder = this.ctx.leaseHolder;
-        if (holder) await this.holdLease(queue, holder);
-        else this.setStorageState('durable');
-      }
-    }
+    // The outbox's store opens in its own time (IndexedDB): the connection
+    // waits for what it holds.
+    await this.ctx.outbox.current?.opened;
+    if (this.destroyed) return;
 
     this.networkMonitor = new NetworkMonitor(100, o.diagnostics.metricsInterval, o.diagnostics.enabled, this.ctx);
     // Quality tracking runs when something consumes it: a QueryClient to
@@ -640,14 +615,29 @@ export class WSESession {
     this.requestSnapshot(topics);
   }
 
-  /** The page went into the back/forward cache or away: the socket goes, the session stays. */
+  /**
+   * The page went into the back/forward cache or away: the socket goes, the
+   * session stays; the outbox's store goes with the page (another page may
+   * take what waits).
+   */
   suspendForPage(): void {
-    if (!this.destroyed) this.connection?.suspend();
+    if (this.destroyed) return;
+    this.connection?.suspend();
+    this.ctx.outbox.current?.suspend();
   }
 
-  /** The page is back: connect again and recover what was missed. */
+  /**
+   * The page is back: the outbox reads its store again (another page may
+   * have taken what waited), then the session connects again and recovers
+   * what was missed.
+   */
   resumeForPage(): void {
-    if (!this.destroyed && this.connection?.isSuspended()) this.connection.forceReconnect();
+    if (this.destroyed || !this.connection?.isSuspended()) return;
+    const outbox = this.ctx.outbox.current;
+    outbox?.resume();
+    void (outbox?.opened ?? Promise.resolve()).then(() => {
+      if (!this.destroyed && this.connection?.isSuspended()) this.connection.forceReconnect();
+    });
   }
 
   /**
@@ -660,41 +650,6 @@ export class WSESession {
     if (!committed) return this.processor.getTopicPositions(topics);
     this.processor.rewindPositions(topics, committed);
     return committed;
-  }
-
-  // ---------------------------------------------------------------------------
-  // The durable queue's lease and storage
-  // ---------------------------------------------------------------------------
-
-  private leaseTimer: ReturnType<typeof setTimeout> | null = null;
-
-  /**
-   * Take the lease of the queue's scope and keep it, renewing it; while
-   * another client holds it this one is busy, and asks again now and then.
-   */
-  private async holdLease(queue: OfflineQueue, holder: string): Promise<void> {
-    if (this.destroyed) return;
-    const held = await queue.acquire(holder);
-    if (this.destroyed) return;
-    const before = this.ctx.state.getState().storageState;
-    this.setStorageState(held ? 'durable' : 'busy');
-    // Taken over, or something waits in it (stored by another client of the
-    // scope meanwhile): it goes out now.
-    if (held && (before !== 'durable' || queue.getStats().size > 0)) this.processor.flushSoon();
-    this.leaseTimer = setTimeout(() => void this.holdLease(queue, holder), held ? LEASE_RENEW_MS : LEASE_RETRY_MS);
-  }
-
-  private setStorageState(state: StorageState): void {
-    const store = this.ctx.state.getState();
-    if (store.storageState === state) return;
-    store.setStorageState(state);
-    this.ctx.emit('wseStorage', { state });
-  }
-
-  private storageFailed(operation: string, error: unknown): void {
-    this.ctx.emit('wseStorageError', storageErrorDetail(operation, error));
-    // Another tab upgraded the database: this client cannot use it any more.
-    if (operation === 'closed' || operation === 'open') this.setStorageState('unavailable');
   }
 
   private sendSystem(type: string, payload: any, priority: MessagePriority = MessagePriority.HIGH): SendStatus {
@@ -864,16 +819,19 @@ export class WSESession {
     });
   }
 
+  /** What waits in the outbox goes, not delivered (`cleared`). */
   async clearOfflineQueue(): Promise<void> {
-    await this.offlineQueue?.clear();
+    const outbox = this.ctx.outbox.current;
+    if (outbox) reportOutcomes(this.ctx.emit, outbox.clear());
+  }
+
+  /** How many messages wait in the outbox for the server's answer. */
+  kept(): number {
+    return this.ctx.outbox.current?.size ?? 0;
   }
 
   getQueueSize(): number {
-    return (
-      this.ctx.queue.getState().size +
-      (this.offlineQueue?.getStats().size ?? 0) +
-      (this.ctx.outbox.current?.size ?? 0)
-    );
+    return this.ctx.queue.getState().size + (this.ctx.outbox.current?.size ?? 0);
   }
 
   /** The network or the machine is back: see ConnectionManager.wake. */
@@ -882,16 +840,13 @@ export class WSESession {
   }
 
   /**
-   * Nothing waits to go out: the queue is empty and the socket wrote what it
-   * took. What a durable offline queue holds is kept for the next session.
+   * Nothing waits to go out: the queue is empty, the server answered for
+   * what the outbox held, and the socket wrote what it took.
    */
   drained(): boolean {
-    const durable = this.ctx.state.getState().storageState === 'durable';
-    const offline = durable ? 0 : (this.offlineQueue?.getStats().size ?? 0);
-    // The outbox's messages, until the server answered for them.
     const unanswered = this.ctx.outbox.current?.size ?? 0;
     return (
-      this.ctx.queue.getState().size + offline + unanswered === 0 &&
+      this.ctx.queue.getState().size + unanswered === 0 &&
       (this.connection?.unsentBytes() ?? 0) === 0
     );
   }
@@ -943,20 +898,6 @@ export class WSESession {
       logger.error('Error destroying network monitor:', error);
     }
     this.networkMonitor = null;
-
-    if (this.leaseTimer) {
-      clearTimeout(this.leaseTimer);
-      this.leaseTimer = null;
-    }
-    try {
-      // The lease goes first: another client of the scope takes over.
-      const holder = this.ctx.leaseHolder;
-      if (holder && this.offlineQueue) void this.offlineQueue.release(holder);
-      this.offlineQueue?.destroy();
-    } catch (error) {
-      logger.error('Error destroying offline queue:', error);
-    }
-    this.offlineQueue = null;
 
     try {
       this.ctx.security.destroy();
