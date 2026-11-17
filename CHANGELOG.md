@@ -2,321 +2,127 @@
 
 ## v3.2.0 (unreleased)
 
+Desktop applications and an outbox in every client: Electron and Tauri with
+one connection for every window, Angular and Solid adapters, Java and Kotlin
+on the JVM, messages kept until the server has taken each once, and a
+conformance server every client is checked against.
+
 ### Added
 
-- TypeScript: `wse-client/bridge`, one connection for every window of an
-  application. An owner (`createBridgeOwner`) holds the connection, the
-  token, the keys and the outbox; each window holds a client with the
-  `WSEClient` interface (`createBridgeClient`) over a channel to it (a
-  MessagePort, `messagePortChannel`), and the framework adapters take it
-  unchanged. The owner subscribes the union of the windows' topics once,
-  hands each window its stream in batches it acknowledges (two in hand at
-  most: a slow window holds back only itself, and one past its limits hears
-  its topics broke off), sends the windows' messages through its outbox and
-  routes each outcome to the window that sent it. The delivery's barrier,
-  resync, commit and checkpoint stay in each window.
-- TypeScript: `wse-client/electron`, the connection in Electron's main
-  process for every window. `createWSEOwner` holds it there, with the
-  token (sent as a bearer, never to a window) and the outbox (in a file
-  with `fileOutbox`); `owner.serve(webContents)` lets a window's page attach
-  through the preload (`wsePreloadPath`, or `wse-client/electron/preload`
-  imported by the application's own), and `createElectronClient` (from
-  `wse-client/electron/renderer`) is the page's client, which the framework
-  adapters take as they take any. Only the top frame of a served window,
-  at a URL the application allows (by default its own pages, never the
-  web's), gets a port.
-- Swift, Kotlin and Dart: the reconnect settings the other clients have:
-  the first wait, the longest, the factor, the jitter, and the attempts
-  in a row before the client gives up.
-- The conformance cases run through the Rust client built for the
-  browser too (agent `rust-browser`, its browser connection on Node's
-  WebSocket), and pass.
-- The conformance cases run through the Swift, Kotlin (on the JVM) and
-  Dart packages too (agents `swift`, `kotlin`, `dart`), each in its own
-  test run beside the conformance server; all pass every case.
-- Rust, Swift, Kotlin and Dart: a send names its correlation id (`cid`)
-  and priority (`pri`), as the TypeScript and Python clients' do, and a
-  live one goes through the same options (`live`), with its id too; a
-  received message gives its correlation id, priority and time. The
-  outbox keeps the order messages were sent in. A conformance case
-  (`send.correlation`) checks it for every client: the server's
-  application takes both, kept or live, and the reply names the id back.
-- Electron and Tauri applications built against the packed packages, as
-  an application installs them, outside the checkout (the npm package's
-  archive; for Tauri the crates as crates.io will give them): two windows
-  rendered with `wse-client/react`'s hooks as they are, on one connection;
-  one closes, the other goes on. In the local frameworks lane, in CI on
-  Linux, macOS and Windows, and in the release on the release's packages.
-- Example applications for Electron (`bindings/electron/example`) and
-  Tauri (`bindings/tauri/example`): two windows on one connection, the
-  connection's state, the ticks of a topic and echoes, each window able to
-  pause itself; every word in German and in English. CI runs each against
-  the example server, on Linux, macOS and Windows.
-- Tauri: `tauri-plugin-wse` (crates.io), one connection for every window
-  of a Tauri application, held on the Rust side (an owner of
-  `wse_client::bridge`, with the token, the keys and the outbox):
-  `app.wse().start(config)` starts it, the pages attach through the
-  plugin's commands (permission `wse:default`), and a page that reloads or
-  a window that closes lets its share go. Starting it again (another user)
-  lets the last connection's pages go; `sign_out` lets every page go. The
-  conformance cases run in a real Tauri webview (agent `tauri`), in CI on
-  Linux, macOS and Windows.
-- TypeScript: `wse-client/tauri`, a Tauri window's client
-  (`createTauriClient({ invoke, Channel })`) over the Rust side's
-  connection: frames go to the plugin's commands one call at a time, in
-  order, those of one turn together, and come back on a Channel. Tauri's
-  API is passed in, so the package depends on no version of it.
-- Rust: `wse_client::bridge` (feature `bridge`), the window bridge's owner
-  in Rust, for Tauri's webviews among others: one connection for every
-  window, the same protocol as the TypeScript owner, so each window holds
-  a client of `wse-client/bridge`. It connects while a window or the
-  application (`Owner::retain`) shares the connection, and keeps the
-  token, the keys and the outbox. The conformance cases run through it
-  too (agent `rust-bridge`), a TypeScript window over a WebSocket.
-- TypeScript: the bridge's owner sends a window the connection's state
-  beside the batches (`conn` frames), so a window that holds its batches,
-  paused or behind, still shows it.
-- The conformance cases run in a real Electron window (agent
-  `electron`): the case's client a page's, through the package's preload
-  and ports, the owner in the main process; in CI on Linux, macOS and
-  Windows.
-- TypeScript: an Electron owner that ends takes its listener off each
-  window it served, so an application that makes an owner per user
-  leaves nothing on its windows.
-- TypeScript: a bridge window that pauses gives its share of the
-  connection back: the connection ends when no other window holds one, as
-  a client of its own does; what came meanwhile waits for it at the owner.
-- The conformance server runs the TypeScript cases through the bridge too
-  (agent `ts-bridge`): an owner holds the connection and the cases drive a
-  window's client.
-- TypeScript: `wseConnected` (`{ connectionId, user, reconnected, recovery }`)
-  when the server took a connection, as the Rust and Python clients say it.
-- The conformance server (`crates/wse-conformance`, not published): each
-  case on a WSE server of its own, its steps for the client and the server
-  in one list, and one judge that holds what a client recorded to the
-  case's rules (order, no silent loss, no repeat, each message taken once
-  and said delivered, a live message never late, a held topic until its
-  resync, back soon after a cut). The TypeScript, Rust and Python clients
-  pass its 14 cases; `cargo xtask check conformance` and the CI job
-  `conformance` run them, and `wse-conformance check` fails a release
-  whose required clients did not all pass (`tests/conformance/agents.json`).
-- Python: `pause(reason)` and `resume(reason)`, as in the TypeScript and
-  Rust clients: the connection ends while any reason holds, and topics,
-  positions and the outbox stay. `start()` connects in the background, a
-  failed first attempt made again as any later one, for an application that
-  may start without a network (`connect()` fails when the first attempt
-  does). `SyncWSEClient` has the three too.
+- One connection for every window: `wse-client/bridge`. An owner holds the
+  connection, the token, the keys and the outbox; each window holds a client
+  with the `WSEClient` interface over a channel, which the adapters for
+  React, Vue, Svelte, Angular and Solid take unchanged. The owner subscribes
+  the windows' topics once, hands each window its stream in batches it
+  acknowledges (a slow window holds back only itself; past its limits its
+  topics break off) and routes each send's outcome to its window; the
+  delivery's barrier, resync, commit and checkpoint stay in the window, and
+  a window that pauses gives its share back. The owner is in TypeScript and
+  in Rust (`wse_client::bridge`, feature `bridge`).
+- Electron: `wse-client/electron`. `createWSEOwner` in the main process (the
+  token as a bearer at each attempt, never in a window; the outbox in a file
+  with `fileOutbox` from `wse-client/node`), `owner.serve(webContents)`, the
+  preload (`wsePreloadPath`, or `wse-client/electron/preload` in the
+  application's own preload), and `createElectronClient` in a page
+  (`wse-client/electron/renderer`). Only the top frame of a served window,
+  at a URL the application allows (its own pages by default, never the
+  web's), gets a port; an owner that ends lets go of the windows it served.
+- Tauri: `tauri-plugin-wse` on crates.io, with `wse-client/tauri`. The
+  connection is on the Rust side (`app.wse().start(config)`; the windows get
+  the permission `wse:default`); each page's client goes through the
+  plugin's commands (`createTauriClient({ invoke, Channel })`). A page that
+  reloads, or a window that closes, lets its share go; `sign_out` lets
+  every page go.
 - Angular: `wse-client/angular`, for Angular 20 and newer:
-  `provideWSEClient`, `injectWSEState`, `injectWSETopics`, `injectWSEMessage`
-  and `injectWSEEvent`, signals that take the client's connection, topics and
-  listeners after the first render in a browser, outside Angular's zone, and
-  let them go with their injector. On a server they take nothing.
+  `provideWSEClient`, `injectWSEState`, `injectWSETopics`,
+  `injectWSEMessage` and `injectWSEEvent`; signals that take the
+  connection in a browser only, outside Angular's zone, and let it go with
+  their injector.
 - Solid: `wse-client/solid`, for Solid 1.9 and 2.0: `createWSEState`,
-  `createWSETopics`, `onWSEMessage`, `onWSEEvent` and `WSEContext`, with the
-  client given, as an accessor (a new client after a sign-in) or from the
-  context. On a server and while hydrating they take nothing.
-- The JVM: `io.github.silvermpx:wse-client-jvm` on Maven Central, for Java and
-  Kotlin on Java 17 and newer. The JAR carries the Rust library for Linux (x64
-  and arm64, glibc and musl), macOS and Windows (x64 and arm64), so it needs
-  no Rust. `Wse` is the client for Java, on the JVM and on Android: futures
-  for the calls that wait, builders for the configuration, the events read
-  one at a time, and plain numbers where the Kotlin API has unsigned ones.
-- Rust client: the recover-or-resync delivery for every Rust application,
-  natively and in the browser; it was the Swift, Kotlin and Dart packages'
-  only. `Config::delivery` with a `Delivery`, `Event::Resync`,
-  `Event::Continuity` and `Event::CheckpointRejected`, and
-  `Client::topic_states`, `commit`, `checkpoint`, `resynced` and `resync`,
-  through the events stream and through a handler (which may resync from
-  itself). The mobile packages run on the same code now.
-- Python client: the recover-or-resync delivery, as the other clients have
-  it: `AsyncWSEClient(delivery=DeliveryConfig(consumer=...))`, `resync`,
-  `continuity` and `checkpoint_rejected` events, and `commit`, `checkpoint`,
-  `resynced`, `resync` and `topic_states`; `SyncWSEClient` takes it too, and
-  each of its connects starts from what the last one committed.
-- A send that waits for its topics, as the TypeScript client's `requires`,
-  in every client: `send_requiring` in Rust (natively and in the browser),
-  `sendRequiring` in Swift, Kotlin, Java and Dart, `send(requires=...)` in
-  Python. It goes once each topic is continuous on the connection, checked
-  right before it goes, and is the sending user's.
-- Server (Rust and Python): it answers a client's outbox. A message the
-  client numbers in it (`s`, first in the object) is confirmed (`ack`) once
-  the application took it, one `ack` per batch of up to 256 frames; a repeat
-  is confirmed again and not handed on; a refused one is said (`nack`:
-  `busy`, `rate_limited`, `missing`, `not_ready`), and refused again when it
-  comes again. One the rate limit drops is refused at once, its number read
-  from the frame's first bytes. The answers are never dropped for the
-  outbound budget. Per user and producer the server keeps the highest
-  message it decided and the refusals behind it the client may not have
-  heard of, for a day; a client that comes back is told both (`refused` in
-  the `outbox` answer, `from` in the hello). One producer's messages are
-  decided one at a time, so a connection that comes back meanwhile is
-  answered once the decision is in. A client that comes to another node of a
-  cluster names its last node, which hands the producer over with its
-  refusals (cluster `PRODUCER_QUERY` and `PRODUCER_STATE`, capability bit
-  5); what the server cannot tell reaches the application marked
-  `possible_repeat`. A planned stop (`drain`, stop, `disconnect`) answers
-  what was taken before it closes. A stale connection of a producer that
-  moved closes with 4409. A number counts only on a connection whose client
-  named its outbox: elsewhere `s` is the application's own field. The
-  protocol is in docs/PROTOCOL.md, "The client's outbox".
-- An outbox in the Rust client (`Config::offline`, in memory by default)
-  and the Swift, Kotlin, Java and Dart packages (`offline`; `sendWith`,
-  `clear`, the `Delivered` and `NotDelivered` items):
-  every message sent, except a live or signed one, waits until the server
-  answers for it and goes again after a reconnect, numbered, so a server of
-  3.2 takes each once. `Event::Delivered` and `Event::NotDelivered` (`busy`,
-  `rate_limited`, `missing`, `not_ready`, `expired`, `user_changed`,
-  `cleared`, `closed`) say what became of each by its id; `send_with` sends
-  with the application's own id, a `ttl` and topics it requires
-  (`SendOptions`) and returns the id; `clear()` empties it when the user
-  signs out. In a file (`Offline::in_file`) it outlives the application:
-  lines checked by a CRC-32 and a salt, read up to the first that does not
-  check, written a batch at once and synced by a thread of its own; a file
-  that cannot be opened or written is an `Event::StorageFailed`, and the
-  outbox goes on in memory. At most `max_messages` (100,000) and `max_bytes`
-  (16 MiB) wait: `send` waits for room, `try_send` fails with `Error::Full`.
-  A message waits at most `max_age` (an hour), or its `ttl`, to be written
-  first. A close waits up to a second for the server's answers. A message
-  is never copied for its number, and a batch goes to the socket at once:
-  200,000 messages to a local server go as fast with it as without it. With
-  a server older than 3.2 a message is gone once written, as before.
-- Python: the outbox, as in the Rust client (`offline=Offline()`, on by
-  default): every message sent, except a live or signed one, waits until
-  the server answers for it, numbered, and goes again after a reconnect; a
-  3.2 server takes each once. The handlers of `delivered` and
-  `not_delivered` hear what became of each by its id (`send(..., id=...)`),
-  never on the stream `recv()` reads. `send(..., ttl=...)`, `clear()` and
-  `kept`; at most `Offline.max_messages` (100,000) and `max_bytes` (16 MiB)
-  wait. `disconnect()` waits up to a second for the server's answers and
-  keeps what waits for the next `connect()`; `SyncWSEClient` keeps one
-  outbox across its connects. `Offline(path=...)` keeps it in a file that
-  outlives the process, in the Rust client's format (a shared vector,
-  crates/wse-client/tests/vectors/outbox.json, holds it for every client),
-  locked as the Rust client locks it; a file that cannot be opened or
-  written is a `storage_failed` event.
-- The outbox's file, in every client: a line of a kind a later version
-  writes is skipped, and a line whose value is not of its kind ends the
-  reading, as a line that does not check does (the Python client failed to
-  open such a file). Acks and drops are read in one pass, so a file with a
-  long drop line opens at once.
-- TypeScript: the outbox, as in the Rust client (`offline.enabled`, on by
-  default): every message sent, except a live or signed one, waits until
-  the server answers for it, numbered, and goes again after a reconnect; a
-  3.2 server takes each once. `wseDelivered` (`{ ids }`) and
-  `wseNotDelivered` (`{ reason, ids }`) say what became of each by its id,
-  the application's own with `{ id }`. At most `offline.maxSize` (100,000)
-  and `offline.maxBytes` (16 MiB) wait; one not written within its `ttl`
-  or `offline.maxAge` runs out on the outbox's own timer, with a connection
-  or without. It sends in the order of sending, whatever the priority;
-  `close(deadlineMs)` waits for the server's answers, `signOut()` clears it,
-  `kept()` says how many wait. In Node and Electron's main process
-  `offline.store: fileOutbox(path)` (`wse-client/node`) keeps it in a file
-  that outlives the process, in the Rust client's format; the event loop
-  never waits for the disk, and what is not written yet is written as the
-  process ends. The system holds the file for the process (a lock on
-  macOS and the BSDs, an exclusive open on Windows, an abstract socket on
-  Linux); a file that cannot be opened or written is a `wseStorageError`
-  event.
-- Rust client (and Swift, Kotlin, Java, Dart): `start`, beside `connect`,
-  returns at once: the connection is made in the background, a failed first
-  attempt made again as any later one, and what is sent meanwhile waits in
-  the outbox. An app that started without a network could not have a
-  client before (`connect` fails when the first attempt does).
-- React Native: `storageOutbox(storage)` (`wse-client/react-native`) keeps
-  the outbox in the app's storage, AsyncStorage (or one with its API) or
-  MMKV, which the app passes in: what waits outlives the app being closed
-  or killed. A message is a key of its own; the changes of a turn go in one
-  batch, removals first.
-- Rust client in the browser: `Offline::in_indexed_db(name)` keeps the
-  outbox in that IndexedDB database, as the TypeScript client keeps it: a
-  producer for each tab, held by a Web Lock, and what a closed tab left
-  taken over by the next page that opens. Without Web Locks it is an
-  `Event::StorageFailed` and the outbox stays in memory.
-- TypeScript, in a browser: the outbox outlives the page in IndexedDB for a
-  durable scope (a storage and a `consumer` named, as the offline queue
-  was). Each tab keeps a producer of its own, held by a Web Lock, and sends
-  on its own connection as its own user; a page that opens takes over what
-  a closed or crashed tab left, under its producer, so the server still
-  takes each message once. The page that goes lets its producer go, so the
-  back/forward cache can keep it, and reads the database again when it is
-  back. What the queue of 3.1 kept is taken over, each message for its
-  user. Without Web Locks (no HTTPS) the outbox stays in memory and says
-  so.
-- TypeScript: `wake()` and `close(deadlineMs)` for a client without a page
-  (Node, Electron's main process, a worker): `wake()` connects at once when
-  the application hears the network or the machine is back, and `close`
-  sends what the client holds within the deadline before it ends.
+  `createWSETopics`, `onWSEMessage`, `onWSEEvent` and `WSEContext`; nothing
+  is taken on a server or while hydrating.
+- The JVM: `io.github.silvermpx:wse-client-jvm` on Maven Central, for Java
+  and Kotlin on Java 17 and newer, with the Rust library for Linux (x64 and
+  arm64, glibc and musl), macOS and Windows (x64 and arm64). `Wse` is the
+  client for Java on the JVM and on Android: futures, configuration
+  builders, events read one at a time, plain numbers where Kotlin has
+  unsigned ones.
+- An outbox in every client, which a 3.2 server answers for: every message
+  sent, except a live or signed one, waits until the server confirms it,
+  numbered, and goes again after a reconnect, in the order it was sent; the
+  server takes each once (a repeat is confirmed and dropped, a refusal
+  said: `busy`, `rate_limited`, `missing`, `not_ready`). The application
+  hears what became of each message by its id (`delivered`,
+  `not_delivered`: also `expired`, `user_changed`, `cleared`, `closed`). In
+  memory by default; durable in a file, one format for the Rust client (and
+  Swift, Kotlin, Java, Dart), Python and Node or Electron's main process
+  (`fileOutbox`); in IndexedDB in browsers (TypeScript, and Rust in the
+  browser), a producer for each tab held by a Web Lock; in the app's
+  storage in React Native (`storageOutbox`). At most 100,000 messages and
+  16 MiB wait; one not sent within an hour, or its `ttl`, runs out. The
+  Rust and Python servers, clusters too, keep each producer's state for a
+  day; the protocol is in docs/PROTOCOL.md.
+- `start` beside `connect` in the Rust client (and Swift, Kotlin, Java,
+  Dart) and Python: it returns at once and connects in the background.
+- Recover-or-resync in every client: the Rust client (natively and in the
+  browser) and Python get it, as TypeScript and the mobile packages had it.
+  A send can wait for its topics in every client (`send_requiring`,
+  `sendRequiring`, `send(requires=...)`).
+- Rust, Swift, Kotlin and Dart send a correlation id (`cid`) and a
+  priority (`pri`), as TypeScript and Python do, live or not, and give
+  them, with the time, on what they receive. Swift, Kotlin and Dart get
+  the reconnect settings (delays, factor, jitter, attempts).
+- Python: `pause(reason)` and `resume(reason)`. TypeScript: `wake()`,
+  `close(deadlineMs)` and the `wseConnected` event.
+- The conformance server (`crates/wse-conformance`, not published): 15
+  cases, each on a server of its own, and one judge of what a client
+  recorded (order, no silent loss, no repeat, each message taken once, a
+  live message never late, a held topic until its resync, back soon after a
+  cut). Every client passes them: TypeScript (on its own, through both
+  bridges, in Electron and in Tauri), Rust (natively and in the browser),
+  Python, Swift, Kotlin and Dart; the release checks the reports.
+- Example applications for Electron and Tauri: two windows on one
+  connection, in German and English. Applications built against the packed
+  packages run in CI and in the release: Angular 20 to 22 and Solid 1.9 and
+  2.0 on Linux; Electron and Tauri, React's hooks in two windows, on Linux,
+  macOS and Windows.
 
 ### Changed
 
-- Rust client (and Swift, Kotlin, Java, Dart), Python and TypeScript: a
-  send with no connection waits in the outbox (in memory by default)
-  instead of failing (`NotConnected`, `SendResult.FAILED`) or waiting in
-  an outgoing queue; `Config::offline = None` (`disabled` in the packages),
-  `offline=None` and `offline: { enabled: false }` keep that.
-- TypeScript: the offline queue of 3.1 is replaced by the outbox. The lease
-  between tabs (15 s) and the claim of a message being sent (30 s) are gone,
-  and with them the `busy` storage state, the `remove` storage errors and
-  the sends that a closed tab left claimed and another tab sent again. A
-  message's `offline: true` changes nothing any more: every message but a
-  live one waits in the outbox, durable when the client has a store.
-  `clearOfflineQueue()` clears the outbox. The `OfflineQueue` class stays
-  exported, unused by the client.
+- A send with no connection waits in the outbox instead of failing or
+  waiting in an outgoing queue (the Rust client and its packages, Python,
+  TypeScript); a disabled outbox keeps the old behaviour.
+- TypeScript: the offline queue of 3.1 is replaced by the outbox, which
+  takes over what it kept; `clearOfflineQueue()` clears the outbox, a
+  message's `offline: true` changes nothing, and the `OfflineQueue` class
+  stays exported, unused.
 - Rust client (and Swift, Kotlin, Dart): every message carries an `id`, a
   random UUID, as from the TypeScript and Python clients.
-- Rust client: the events stream and a handler hear `Event::Continuity` when
-  a topic's messages break off, in best effort too; the Python client's
-  stream and handlers hear a `continuity` event then.
+- Rust client: the events hear `Event::Continuity` when a topic's messages
+  break off in best effort too; Python's stream and handlers hear
+  `continuity`.
 
 ### Fixed
 
-- Rust in the browser: a connection attempt that failed before it opened
-  ended only at the connect timeout (10 s) where the WebSocket said so with
-  an error and no close after (Node's does): it ends at once now, and the
-  next attempt follows as the backoff says.
 - Server: `Server::stop` lets its port go as soon as it takes no more
-  connections, not after every connection's cleanup. Held, it took
-  connections nobody served: a client coming back during a restart waited
-  for its connect timeout (10 s) instead of being refused and trying again
-  at once. Found by the conformance server.
-- TypeScript: the client's own messages (subscriptions, sync requests, the
-  compression setting) went through the outbox: the application heard
-  `wseDelivered` and `wseNotDelivered` of messages it never sent, and the
-  server refused some as `missing`. They go as before 3.2, made again for
-  each connection. Found by the conformance server.
-- TypeScript: in Node and Electron's main process an attempt the server
-  refused waited for the connect timeout (10 s) before the next: Node's
-  WebSocket says the failure with an error alone, and the client waited for
-  a close. The attempt is over at its error now. Found by the conformance
-  server.
-- React: `useWSETopics` takes a changed topic list before it lets the old one
-  go, so a topic in both stays subscribed with its recovery position; it was
-  unsubscribed and subscribed again.
-- Python client: a connection the server took for another user than the last
-  recovered the new user's topics from where the last one's stood. It starts
-  them over now, and what the last user queued is dropped.
-- Python client: `SyncWSEClient` takes `cookie_name`, as its documentation
-  said.
-- TypeScript: a saved checkpoint is read as the Rust and Python clients read
-  it: an offset that is no whole number refuses it as `malformed`, before its
-  scope is compared (one such entry was skipped), and an epoch key reads as
-  its 8 hex digits. Shared vectors (`crates/wse-client/tests/vectors/`) check
-  all three.
-- TypeScript: a state listener that throws is logged and no longer keeps the
-  others from hearing the change.
-- TypeScript: under Node 25 and newer, which has a `localStorage` of its own,
-  server rendering no longer takes it for a page's.
-- TypeScript: a storage named for the page in a runtime without one wrote
-  into nothing, and the topics and the checkpoint went unsaid. They stay in
-  memory now, and a `wseStorageError` says so; an offline queue without
-  IndexedDB reads `unavailable`.
+  connections; a client coming back during a restart waited 10 s.
+- TypeScript in Node and Electron's main process, and Rust in the browser:
+  an attempt the WebSocket reported failed with no close after (Node's) is
+  over at its error; it waited for the connect timeout (10 s).
+- React: `useWSETopics` keeps a topic that stays in a changed list
+  subscribed, with its recovery position.
+- TypeScript: a state listener that throws no longer keeps the others from
+  hearing; Node 25's `localStorage` is not taken for a page's; a storage
+  named for a page where there is none keeps memory and says so
+  (`wseStorageError`); a saved checkpoint reads as the Rust and Python
+  clients read it.
+- Python: a connection for another user starts the topics over and drops
+  the last user's queue; `SyncWSEClient` takes `cookie_name`.
 - Rust client (and Swift, Kotlin, Dart): a connection that died while the
   device slept is made again at the first heartbeat after waking (15 s at
-  most), not when the server's silence runs out (40 s).
-- Swift and Kotlin: a new reader of `events()` after the last one was let go
-  (a loop left with `break`, a reader collected) started again at the batch
-  the last one was in, so its items came twice. Where the reading stands is
-  the client's now, for as long as it lives, as in Dart.
+  most, not 40 s).
+- Swift and Kotlin: a new reader of `events()` no longer gets the last
+  reader's batch again.
 
 ## v3.1.0 (2026-11-16)
 
