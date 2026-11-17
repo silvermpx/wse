@@ -191,6 +191,18 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
             Some(ClusterFrame::Hello { .. }) => {
                 // Unexpected HELLO after handshake, ignore
             }
+            Some(ClusterFrame::ProducerQuery { id, user, producer }) => {
+                last_activity.store(epoch_ms(), Ordering::Relaxed);
+                // The client went on on the asking node: handed over.
+                let taken = ctx.producers.hand_over(user.as_deref(), &producer);
+                let mut frame = BytesMut::new();
+                super::protocol::encode_producer_state(&mut frame, id, taken);
+                let _ = peer_write_tx.try_send(frame.freeze());
+            }
+            Some(ClusterFrame::ProducerState { id, taken }) => {
+                last_activity.store(epoch_ms(), Ordering::Relaxed);
+                ctx.producer_links.answer(id, taken);
+            }
             Some(ClusterFrame::Unknown { msg_type }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
                 ctx.metrics
@@ -789,6 +801,10 @@ where
     }
 
     let (peer_write_tx, peer_write_rx) = mpsc::channel::<Bytes>(10_000);
+    if peer_caps & super::CAP_PRODUCERS != 0 {
+        ctx.producer_links
+            .register(&peer_instance_id, peer_write_tx.clone(), session_gen);
+    }
 
     let (dispatch_tx, dispatch_rx) = mpsc::channel::<DispatchItem>(PEER_DISPATCH_QUEUE_CAP);
     let dispatch_handle = tokio::spawn(peer_dispatch_task(
@@ -845,6 +861,7 @@ where
     });
     ctx.metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
     ctx.metrics.peer_info.remove(peer_addr);
+    ctx.producer_links.release(&peer_instance_id, session_gen);
     release_link(&ctx.links, &peer_instance_id, session_gen);
     tell_disconnected(ctx, peer_addr.to_owned(), session_gen, global_cancel).await;
     tracing::info!("[WSE-Cluster] Disconnected from {peer_addr}");

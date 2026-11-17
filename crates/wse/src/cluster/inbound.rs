@@ -361,6 +361,10 @@ async fn handle_cluster_inbound_generic<S>(
     );
 
     let (write_tx, write_rx) = mpsc::channel::<Bytes>(10_000);
+    if peer_caps & super::CAP_PRODUCERS != 0 {
+        ctx.producer_links
+            .register(&peer_instance_id, write_tx.clone(), session_gen);
+    }
 
     let (dispatch_tx, dispatch_rx) = mpsc::channel::<DispatchItem>(PEER_DISPATCH_QUEUE_CAP);
 
@@ -413,6 +417,7 @@ async fn handle_cluster_inbound_generic<S>(
     let _ = peer_reg_tx.send(PeerRegistration::Deregister {
         peer_addr: peer_addr_str.clone(),
     });
+    ctx.producer_links.release(&peer_instance_id, session_gen);
     release_link(&ctx.links, &peer_instance_id, session_gen);
     ctx.metrics.connected_peers.fetch_sub(1, Ordering::Relaxed);
     ctx.metrics.peer_info.remove(&peer_addr_str);

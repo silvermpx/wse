@@ -177,6 +177,10 @@ pub(crate) struct ClusterContext {
     pub recovery: Option<Arc<crate::recovery::RecoveryManager>>,
     pub topic_message_counts: Arc<DashMap<String, AtomicU64>>,
     pub queue_groups: Arc<DashMap<String, DashMap<String, crate::server::QueueGroup>>>,
+    /// The clients' producers on this node, for a peer that asks.
+    pub producers: Arc<crate::server::Producers>,
+    /// The links that answer for producers, and the questions out.
+    pub producer_links: Arc<super::ProducerLinks>,
 }
 
 // ---------------------------------------------------------------------------

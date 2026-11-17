@@ -29,6 +29,10 @@ pub(crate) enum MsgType {
     PresenceFull = 0x0C,
     Drain = 0x0D,
     Resume = 0x0E,
+    /// What the peer took of a client's producer; the peer hands it over.
+    ProducerQuery = 0x0F,
+    /// The answer to a PRODUCER_QUERY.
+    ProducerState = 0x10,
 }
 
 impl MsgType {
@@ -48,6 +52,8 @@ impl MsgType {
             0x0C => Some(Self::PresenceFull),
             0x0D => Some(Self::Drain),
             0x0E => Some(Self::Resume),
+            0x0F => Some(Self::ProducerQuery),
+            0x10 => Some(Self::ProducerState),
             _ => None,
         }
     }
@@ -224,6 +230,52 @@ pub(crate) fn encode_shutdown(buf: &mut BytesMut) {
 
 /// Encode a DRAIN frame. Header-only, 8 bytes (like Shutdown).
 /// Tells peers this node is entering lame-duck mode.
+/// No user: a client of a server without JWT accepted for none.
+const NO_USER: u16 = u16::MAX;
+
+/// Encode a PRODUCER_QUERY: what the peer took of `user`'s `producer`.
+/// Format: [header, payload_len][u64 LE id][u16 LE user_len, 0xFFFF for none][user][u16 LE producer_len][producer]
+pub(crate) fn encode_producer_query(
+    buf: &mut BytesMut,
+    id: u64,
+    user: Option<&str>,
+    producer: &str,
+) {
+    // Users and producers are short ids; anything longer is cut, and the
+    // peer then knows nothing of it.
+    let user = user.map(|u| &u.as_bytes()[..u.len().min(usize::from(NO_USER) - 1)]);
+    let producer = &producer.as_bytes()[..producer.len().min(usize::from(u16::MAX))];
+    let payload_len = 8 + 2 + user.map_or(0, <[u8]>::len) + 2 + producer.len();
+    buf.reserve(8 + payload_len);
+    buf.put_u8(MsgType::ProducerQuery as u8);
+    buf.put_u8(0);
+    buf.put_u16_le(0);
+    buf.put_u32_le(payload_len as u32);
+    buf.put_u64_le(id);
+    match user {
+        Some(user) => {
+            buf.put_u16_le(user.len() as u16);
+            buf.put_slice(user);
+        }
+        None => buf.put_u16_le(NO_USER),
+    }
+    buf.put_u16_le(producer.len() as u16);
+    buf.put_slice(producer);
+}
+
+/// Encode a PRODUCER_STATE: the answer to question `id`.
+/// Format: [header, payload_len=17][u64 LE id][u8 known][u64 LE taken]
+pub(crate) fn encode_producer_state(buf: &mut BytesMut, id: u64, taken: Option<u64>) {
+    buf.reserve(8 + 17);
+    buf.put_u8(MsgType::ProducerState as u8);
+    buf.put_u8(0);
+    buf.put_u16_le(0);
+    buf.put_u32_le(17);
+    buf.put_u64_le(id);
+    buf.put_u8(u8::from(taken.is_some()));
+    buf.put_u64_le(taken.unwrap_or(0));
+}
+
 pub(crate) fn encode_drain(buf: &mut BytesMut) {
     buf.reserve(8);
     buf.put_u8(MsgType::Drain as u8);
@@ -606,6 +658,17 @@ pub(crate) enum ClusterFrame {
         payload: Bytes,
         position: (u32, u64),
     },
+    /// What a peer took of a client's producer (`server::acks`).
+    ProducerQuery {
+        id: u64,
+        user: Option<String>,
+        producer: String,
+    },
+    /// The answer: None when the peer knows nothing of it.
+    ProducerState {
+        id: u64,
+        taken: Option<u64>,
+    },
     Unknown {
         msg_type: u8,
     },
@@ -840,6 +903,44 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             }
             let entries = String::from_utf8(data.split_to(payload_len).to_vec()).ok()?;
             Some(ClusterFrame::PresenceFull { entries, flags })
+        }
+        Some(MsgType::ProducerQuery) => {
+            if data.remaining() < payload_len || payload_len < 12 {
+                return None;
+            }
+            let mut payload = data.split_to(payload_len);
+            let id = payload.get_u64_le();
+            let user_len = payload.get_u16_le();
+            let user = if user_len == NO_USER {
+                None
+            } else {
+                let user_len = usize::from(user_len);
+                if payload.remaining() < user_len {
+                    return None;
+                }
+                Some(String::from_utf8(payload.split_to(user_len).to_vec()).ok()?)
+            };
+            if payload.remaining() < 2 {
+                return None;
+            }
+            let producer_len = usize::from(payload.get_u16_le());
+            if payload.remaining() < producer_len {
+                return None;
+            }
+            let producer = String::from_utf8(payload.split_to(producer_len).to_vec()).ok()?;
+            Some(ClusterFrame::ProducerQuery { id, user, producer })
+        }
+        Some(MsgType::ProducerState) => {
+            if data.remaining() < payload_len || payload_len < 17 {
+                return None;
+            }
+            let id = data.get_u64_le();
+            let known = data.get_u8() != 0;
+            let taken = data.get_u64_le();
+            Some(ClusterFrame::ProducerState {
+                id,
+                taken: known.then_some(taken),
+            })
         }
         None => {
             // Unknown message type from a newer peer -- safe to skip

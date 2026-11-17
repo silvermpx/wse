@@ -26,6 +26,7 @@ pub(crate) const CLOSE_TRY_AGAIN_LATER: u16 = 1013; // too slow to read, or the 
 pub(crate) const CLOSE_AUTH_FAILED: u16 = 4401; // the token, or the proof of its key, was refused
 pub(crate) const CLOSE_TOKEN_EXPIRED: u16 = 4403; // the JWT the connection opened with expired
 pub(crate) const CLOSE_IDLE: u16 = 4408; // nothing received within idle_timeout
+pub(crate) const CLOSE_MOVED: u16 = 4409; // the client's outbox went on on another node
 pub(crate) const CLOSE_RATE_LIMITED: u16 = 4429; // kept sending past the rate limit
 pub(crate) const CLOSE_E2E_UNSUPPORTED: u16 = 4800; // no end-to-end encryption in common
 pub(crate) const CLOSE_E2E_BAD_FRAME: u16 = 4802; // an E2E frame out of order, forged, or in plaintext
@@ -48,7 +49,21 @@ pub(crate) struct Closer {
     /// They poll these with every message: an `Abortable` costs an atomic
     /// load where the token takes a lock.
     stops: Arc<std::sync::Mutex<Vec<futures_util::future::AbortHandle>>>,
+    /// A close the server asks the read loop for: it answers the client's
+    /// outbox first, then closes (`ConnectionHandle::finish`).
+    finish: Arc<Finish>,
 }
+
+/// A close asked of the read loop, and its wake-up.
+#[derive(Default)]
+pub(crate) struct Finish {
+    close: std::sync::Mutex<Option<(u16, String)>>,
+    asked: tokio::sync::Notify,
+}
+
+/// How long a close asked of the read loop waits before it is made without
+/// it: one that keeps reading frames is closed all the same.
+const FINISH_WITHIN: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl Closer {
     pub(crate) fn new() -> Self {
@@ -56,7 +71,22 @@ impl Closer {
             token: tokio_util::sync::CancellationToken::new(),
             closing: Arc::new(AtomicBool::new(false)),
             stops: Arc::new(std::sync::Mutex::new(Vec::new())),
+            finish: Arc::default(),
         }
+    }
+
+    /// Woken once the server asks the read loop to close.
+    pub(crate) async fn asked_to_close(&self) {
+        self.finish.asked.notified().await;
+    }
+
+    /// The close the server asked of the read loop, taken once.
+    pub(crate) fn asked_close(&self) -> Option<(u16, String)> {
+        self.finish
+            .close
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// What one of the connection's loops is wrapped in (`Abortable`), so it
@@ -164,6 +194,8 @@ pub(crate) struct Outbox {
     pub(crate) frames: parking_lot::Mutex<BroadcastQueue>,
     /// Wakes the write task when frames are queued on an empty queue.
     pub(crate) notify: tokio::sync::Notify,
+    /// The client's outbox: its hello, and its producer once admitted.
+    pub(crate) acks: super::acks::Holder,
 }
 
 /// Marks the outbox closed when the write task ends, however it ends.
@@ -189,6 +221,30 @@ impl ConnectionHandle {
     /// See `Closer::close`.
     pub(crate) fn close(&self, code: u16, reason: &str) {
         self.closer.close(&self.tx, &self.out.pending, code, reason);
+    }
+
+    /// A close the server chose (stop, drain, `disconnect`): the read loop
+    /// stops taking messages, answers what it took of the client's outbox,
+    /// then closes, so a client hears of every message taken before it goes.
+    /// One that does not get to it within `FINISH_WITHIN` is closed all the
+    /// same. Runs on the tokio runtime.
+    pub(crate) fn finish(&self, code: u16, reason: &str) {
+        if self.closer.is_closing() {
+            return;
+        }
+        *self
+            .closer
+            .finish
+            .close
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((code, reason.to_owned()));
+        self.closer.finish.asked.notify_one();
+        let handle = self.clone();
+        let reason = reason.to_owned();
+        tokio::spawn(async move {
+            tokio::time::sleep(FINISH_WITHIN).await;
+            handle.close(code, &reason);
+        });
     }
 }
 
@@ -705,6 +761,13 @@ pub(crate) struct SharedState {
     pub(crate) started_at: parking_lot::Mutex<Option<std::time::Instant>>,
     // send_event: the (connection, id) pairs sent lately, each sent once.
     pub(crate) dedup: std::sync::Mutex<DeduplicationState>,
+    /// The clients' producers: the highest message taken of each.
+    pub(crate) producers: Arc<super::acks::Producers>,
+    /// The cluster links that answer for producers, and the questions out.
+    pub(crate) producer_links: Arc<crate::cluster::ProducerLinks>,
+    /// The name this node goes by, for the life of the process: a client
+    /// names it when it comes back, on this node or another.
+    pub(crate) node_id: Box<str>,
     // Per-topic message delivery counts (for top-N Prometheus metrics)
     pub(crate) topic_message_counts: Arc<DashMap<String, AtomicU64>>,
 }
@@ -936,6 +999,9 @@ impl SharedState {
                 max_entries: 50_000,
             }),
             topic_message_counts: Arc::new(DashMap::new()),
+            producers: Arc::default(),
+            producer_links: Arc::default(),
+            node_id: uuid::Uuid::now_v7().to_string().into(),
         }
     }
 

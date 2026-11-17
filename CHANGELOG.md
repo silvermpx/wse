@@ -36,6 +36,18 @@
   `sendRequiring` in Swift, Kotlin, Java and Dart, `send(requires=...)` in
   Python. It goes once each topic is continuous on the connection, checked
   right before it goes, and is the sending user's.
+- Server (Rust and Python): it answers a client's outbox. A message the
+  client numbers in it (`s`) is confirmed (`ack`) once the application took
+  it, one `ack` per batch of frames; a repeat is confirmed again and not
+  handed on; a refused one is said (`nack`: `busy`, `rate_limited`,
+  `missing`, `not_ready`). It is kept per user and producer, one number each,
+  for a day. A client that comes to another node of a cluster names its last
+  node, which hands the producer over (cluster `PRODUCER_QUERY` and
+  `PRODUCER_STATE`, capability bit 5); what the server cannot tell reaches
+  the application marked `possible_repeat`. A planned stop (`drain`, stop,
+  `disconnect`) answers what was taken before it closes. A stale connection
+  of a producer that moved closes with 4409. The protocol is in
+  docs/PROTOCOL.md, "The client's outbox".
 - An offline queue in the Rust client (`Config::offline`) and the Swift,
   Kotlin, Java and Dart packages (`offline`): what is sent while there is no
   connection waits for the next connection of the same user and goes right

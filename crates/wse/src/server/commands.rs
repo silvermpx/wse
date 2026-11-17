@@ -73,6 +73,9 @@ pub(super) async fn process_commands(
                         state.slow_consumer_drops.shard(usize::from(h.lane)),
                     );
                     state.topics.join(&conn_id, h);
+                    // Its outbox, when its hello came already.
+                    let user = state.conn_user.get(&conn_id).map(|user| user.clone());
+                    super::acks::start(&state, h, user.as_deref());
                 }
             }
             ServerCommand::SendBytes { conn_id, data } => {
@@ -173,7 +176,7 @@ pub(super) async fn process_commands(
             ServerCommand::Disconnect { conn_id } => {
                 let guard = state.connections.read();
                 if let Some(h) = guard.get(&conn_id) {
-                    h.close(CLOSE_NORMAL, "");
+                    h.finish(CLOSE_NORMAL, "");
                 }
             }
             ServerCommand::Drain {
@@ -194,7 +197,7 @@ pub(super) async fn process_commands(
                 let guard = state.connections.read();
                 let n = guard.len();
                 for h in guard.values() {
-                    h.close(close_code, &close_reason);
+                    h.finish(close_code, &close_reason);
                 }
                 drop(guard);
                 tracing::info!("[WSE] Drain: sent close to {n} connections");
@@ -210,7 +213,7 @@ pub(super) async fn process_commands(
                 // outlive the runtime.
                 state.draining.store(true, Ordering::SeqCst);
                 for h in state.connections.read().values() {
-                    h.close(CLOSE_GOING_AWAY, "server shutting down");
+                    h.finish(CLOSE_GOING_AWAY, "server shutting down");
                 }
                 // Up to two seconds for the clients to answer, then the rest
                 // are dropped. Either way every connection's cleanup runs

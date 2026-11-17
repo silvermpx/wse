@@ -221,7 +221,8 @@ pub(super) fn build_server_hello(
                 "priority_queue": true,
                 "msgpack": true,
                 "encryption": encryption_enabled,
-                "signing": state.signer.is_some()
+                "signing": state.signer.is_some(),
+                "acks": true
             },
             "limits": {
                 "max_message_size": state.max_message_size,
@@ -287,7 +288,8 @@ pub(super) fn build_server_ready(
                     "circuit_breaker": true,
                     "rust_transport": true,
                     "rust_jwt": true,
-                    "recovery": recovery_enabled
+                    "recovery": recovery_enabled,
+                    "acks": true
                 },
                 "connection_id": conn_id,
                 "server_time": ts,

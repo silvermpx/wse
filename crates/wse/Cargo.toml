@@ -118,6 +118,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(wse_rustcrypto)"] }
 name = "server"
 required-features = ["server"]
 
+[[test]]
+name = "acks"
+required-features = ["server"]
+
 [[example]]
 name = "chat"
 required-features = ["server"]

@@ -196,7 +196,9 @@ pub(crate) fn connect(
         mpsc::channel::<cluster::InterestUpdate>(cluster::MANAGER_QUEUE_CAP);
     *shared.cluster_main_port.write().unwrap() = main_port_tx;
 
-    let instance_id = uuid::Uuid::now_v7().to_string();
+    // The name clients know this node by: one coming from it to another
+    // node names it, and that node asks it what it took.
+    let instance_id = shared.node_id.to_string();
     *shared.cluster_instance_id.lock().unwrap() = Some(instance_id.clone());
     let dlq = shared.cluster_dlq.clone();
 
@@ -222,6 +224,8 @@ pub(crate) fn connect(
         recovery: shared.recovery.clone(),
         topic_message_counts: shared.topic_message_counts.clone(),
         queue_groups: shared.queue_groups.clone(),
+        producers: Arc::clone(&shared.producers),
+        producer_links: Arc::clone(&shared.producer_links),
     };
 
     tokio::spawn(cluster::cluster_manager(

@@ -196,9 +196,14 @@ server.broadcast(t, d)       -> Local fan-out + ClusterCommand::Publish to peers
 Client WebSocket frame
   -> tokio read task
   -> Parse: JSON text / msgpack binary / raw text / binary
+  -> A numbered message of the client's outbox (`s`): claimed on its
+     producer's mark (one compare-and-swap); a repeat is confirmed again
+     and not handed on
   -> Push InboundEvent to crossbeam channel
   -> Python: drain_inbound(256, 50)
   -> Returns list of (event_type, conn_id, payload) tuples
+  -> Once nothing more waits on the socket (or 64 frames on): refusals
+     (`nack`), then one `ack` for what was taken
 ```
 
 ### Outbound (Server to Client)
@@ -540,6 +545,8 @@ The Rust binary uses mimalloc as the global allocator. This provides better perf
 ### Deduplication
 
 `send_event()` maintains an `AHashSet` with a 50,000-entry FIFO eviction window. Events with duplicate IDs are dropped before serialization, preventing redundant work and bandwidth waste in multi-path delivery scenarios.
+
+What clients send is kept apart per producer (a client's outbox) and user: one number per producer, the highest message the application took, not a window of ids. A repeat is confirmed and not handed on, at the cost of an atomic compare-and-swap per message and about a hundred bytes per producer, whatever the message rate. A producer silent for a day is forgotten. A client that moves to another node names its last node, which hands the producer over (cluster `PRODUCER_QUERY`); see [the client's outbox](PROTOCOL.md#the-clients-outbox).
 
 ### Rate Limiting
 

@@ -21,12 +21,14 @@
 mod inbound;
 mod manager;
 mod peer;
+mod producers;
 mod protocol;
 mod tls;
 mod types;
 
 pub(crate) use inbound::InboundLinks;
 pub(crate) use manager::cluster_manager;
+pub(crate) use producers::ProducerLinks;
 #[cfg(test)]
 pub(crate) use protocol::encode_presence_full;
 pub(crate) use protocol::{
@@ -113,10 +115,13 @@ pub(crate) const CAP_RECOVERY: u32 = 1 << 3; // Cross-node recovery
 /// other publishes (RESUME), and gets what it missed before anything live.
 /// Offered by a node that keeps recovery buffers.
 pub(crate) const CAP_RESUME: u32 = 1 << 4;
+/// A node asks another what it took of a client's producer, when the client
+/// comes to it from that node (PRODUCER_QUERY / PRODUCER_STATE).
+pub(crate) const CAP_PRODUCERS: u32 = 1 << 5;
 
 /// Our capabilities bitmask
 pub(crate) const LOCAL_CAPABILITIES: u32 =
-    CAP_INTEREST_ROUTING | CAP_COMPRESSION | CAP_PRESENCE | CAP_RECOVERY;
+    CAP_INTEREST_ROUTING | CAP_COMPRESSION | CAP_PRESENCE | CAP_RECOVERY | CAP_PRODUCERS;
 
 /// What this node offers in its HELLO: catch-up too when it keeps recovery
 /// buffers (both nodes need them, one to say where it stands and the other

@@ -418,6 +418,7 @@ Applications send their own codes in the same shape.
 | 4401 | Authentication failed: at the upgrade, or the session's proof of the token's key | stop (a client with a token provider retries with a new token) |
 | 4403 | The token the connection opened with expired | stop (a client with a token provider retries with a new token) |
 | 4408 | Nothing received from the client for `idle_timeout` seconds; or a connection that announced an E2E session did not open it, and prove its key, within 10 seconds | reconnect |
+| 4409 | The client's outbox went on on another node (a stale connection) | reconnect |
 | 4429 | The client kept sending past the rate limit for 10 seconds | reconnect |
 | 4800 | No E2E suite in common, or a first-design client on a server with `e2e_legacy=False` (after an `E2E_UNSUPPORTED` error) | stop, with an encryption error |
 | 4802 | An E2E frame from the client out of order, forged, or plaintext inside a session | reconnect (a new session) |
@@ -477,6 +478,7 @@ Sent by the client right after the connection opens (without E2E the TypeScript 
 | `compression_threshold` | `int` | From which size the client wants messages compressed |
 | `e2e` | `object` | The E2E offer, see [End-to-End Encryption](#end-to-end-encryption) |
 | `encryption_public_key` | `string` | Instead of `e2e`: the first design's ECDH public key |
+| `outbox` | `object` | The client's outbox (3.2): `producer`, `node`, `written`, see [The client's outbox](#the-clients-outbox) |
 
 ### Server Hello
 
@@ -517,7 +519,7 @@ Sent by the server in response to `client_hello`:
 |-------|------|-------------|
 | `server_version` | `string` | WSE server version |
 | `protocol_version` | `int` | Negotiated protocol version (minimum of client and server) |
-| `features` | `object` | `compression`, `recovery`, `cluster`, `msgpack` and `encryption` describe this server; `batching` and `priority_queue` are always `true`, kept for older clients. With recovery, `history_ttl` is how many seconds a stream that receives nothing stays recoverable here (from 3.1; also in `server_ready`): a client forgets a stream it heard nothing of for longer while the connection's frames showed it alive, instead of naming it |
+| `features` | `object` | `compression`, `recovery`, `cluster`, `msgpack` and `encryption` describe this server; `acks` (3.2, also in `server_ready`) says it answers the client's outbox; `batching` and `priority_queue` are always `true`, kept for older clients. With recovery, `history_ttl` is how many seconds a stream that receives nothing stays recoverable here (from 3.1; also in `server_ready`): a client forgets a stream it heard nothing of for longer while the connection's frames showed it alive, instead of naming it |
 | `limits` | `object` | Server-enforced limits for this connection |
 | `ping_interval` | `int` | Server ping interval in milliseconds |
 | `connection_id` | `string` | Unique connection identifier |
@@ -526,6 +528,47 @@ Sent by the server in response to `client_hello`:
 | `encryption_public_key` | `string` | Instead of `e2e`: the first design's ECDH public key |
 
 The negotiated protocol version is the minimum of both sides.
+
+## The client's outbox
+
+From 3.2 a client keeps each message it sends, except one sent live, until the server answers for it, and sends what was not answered again after a reconnect. The server confirms what its application took, drops a repeat of a message it took already and says what it refused, so the application takes each message once.
+
+**Numbers.** Each outbox is a producer with a random id, and each of its messages carries its number, `s`, from 1 up: `{"t":"order","p":{...},"id":"...","s":42}`. A client sends its messages in the order of their numbers; a number may be skipped (a message that expired before it was sent).
+
+**Hello.** The client names its outbox in `client_hello`:
+
+```json
+{"c":"WSE","t":"client_hello","p":{ "...": "...",
+  "outbox": {"producer": "q3Jf...", "node": "019c53c4-...", "written": 41}
+},"v":1}
+```
+
+| Field | Description |
+|-------|-------------|
+| `producer` | The outbox's id, up to 64 characters |
+| `node` | The node the client was connected to last, as that node named itself (`null` the first time) |
+| `written` | The highest number the client wrote on an earlier connection without an answer |
+
+Once the connection is admitted (`server_ready`), the server answers what it took of that producer and names itself; the client drops every message up to `acked` and sends the rest, in order, before anything new:
+
+```json
+{"c":"WSE","t":"outbox","p":{"acked": 39, "node": "019c53d0-..."},"v":1}
+```
+
+A producer is kept per user: another user's connection cannot reach it.
+
+**Answers.** The server answers after its application took a message (a Rust `Handler::message` returned, or the Python server queued it for `drain_inbound` or its callback), one `ack` for a batch of frames read, refusals first:
+
+```json
+{"c":"WSE","t":"ack","p":{"s":42},"v":1}
+{"c":"WSE","t":"nack","p":{"from":43,"s":44,"code":"rate_limited"},"v":1}
+```
+
+`ack` confirms every message up to and with `s`; `nack` refuses `s` (or `from` to `s`) for good, and the client tells its application. The codes: `busy` (the application had no room for it), `rate_limited` (dropped by the client's rate limit), `missing` (a number skipped on the connection), `not_ready` (before the application took the connection). A repeat of a message taken already is confirmed again and not handed on.
+
+**What the server cannot tell.** A client that comes to another node names its last node: the new node asks it once what it took (the cluster's `PRODUCER_QUERY`), and that node stops taking messages of the producer. When the server cannot tell (the last node is gone or did not answer within 2 seconds, or the producer was silent for more than a day), the messages up to `written` reach the application with `"possible_repeat": true`, and the application checks the message's `id` against what it applied. That is the only case in which an application can see a message twice.
+
+**A planned stop.** On `drain`, stop and `disconnect`, each connection stops taking messages, answers what it took and only then closes.
 
 ## End-to-End Encryption
 

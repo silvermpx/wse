@@ -70,6 +70,7 @@
 //! - `RustWSEServer::build` (`py/mod.rs`) validates the JWT keys and builds the
 //!   `SharedState` configuration, reporting errors as Python exceptions.
 
+mod acks;
 pub(crate) mod cluster_link;
 mod commands;
 pub(crate) mod config;
@@ -95,6 +96,7 @@ pub(crate) mod subscribe;
 #[cfg(feature = "python")]
 pub use py::RustWSEServer;
 
+pub(crate) use acks::Producers;
 pub use cluster_link::{ClusterPeer, ClusterSettings, ClusterTls, DeadLetter};
 pub use config::{Config, ConfigError, JwtSettings, PresenceSettings, RecoverySettings};
 pub use control::{JwtKeys, Member, Recovered, Subscribe, TopicPosition};
@@ -113,7 +115,7 @@ pub use metrics::Health;
 pub use publisher::{Error, Publisher};
 pub(crate) use state::{
     CLOSE_AUTH_FAILED, CLOSE_E2E_BAD_FRAME, CLOSE_E2E_EXHAUSTED, CLOSE_E2E_UNSUPPORTED,
-    CLOSE_GOING_AWAY, CLOSE_GRACE, CLOSE_IDLE, CLOSE_INTERNAL_ERROR, CLOSE_NORMAL,
+    CLOSE_GOING_AWAY, CLOSE_GRACE, CLOSE_IDLE, CLOSE_INTERNAL_ERROR, CLOSE_MOVED, CLOSE_NORMAL,
     CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED, CLOSE_TRY_AGAIN_LATER, Closer, Commands,
     ConnectionHandle, QueueGroup, ServerCommand, SharedState, Tally,
 };

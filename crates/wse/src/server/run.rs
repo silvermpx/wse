@@ -133,6 +133,17 @@ pub(crate) async fn serve<H: Handler>(
             }
         });
     }
+    // The clients' producers: one silent for a day is forgotten.
+    {
+        let producers_state = shared.clone();
+        let stop = stop.clone();
+        tasks.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            while tick(&mut interval, &stop).await {
+                producers_state.producers.sweep(super::acks::now_ms());
+            }
+        });
+    }
     // Presence TTL sweep (every 30 seconds)
     if let Some(ref pm) = shared.presence {
         let sweep_pm = pm.clone();

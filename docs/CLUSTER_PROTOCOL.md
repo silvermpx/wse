@@ -21,7 +21,7 @@ On the wire every frame follows a 4-byte big-endian length (u32), the length of 
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
-| 0 | 1 | type | Message type (0x01 - 0x0E) |
+| 0 | 1 | type | Message type (0x01 - 0x10) |
 | 1 | 1 | flags | Per type: MSG bit 0 compressed (zstd), bit 1 recovery trailer, bit 2 replayed; RESYNC bit 0 continuation; RESUME bit 0 last; PresenceFull bits 0-2 sync round; otherwise 0 |
 | 2 | 2 | topic_len | Topic field length (little-endian u16) |
 | 4 | 4 | payload_len | Payload field length (little-endian u32) |
@@ -80,6 +80,9 @@ The magic bytes `WSE\x00` prevent accidental connections from non-WSE services. 
 | 2 | CAP_PRESENCE | Presence sync support |
 | 3 | CAP_RECOVERY | MSG frames carry the origin's recovery position |
 | 4 | CAP_RESUME | Catch-up after a lost link (RESUME); offered by a node with recovery on |
+| 5 | CAP_PRODUCERS | A node asks another what it took of a client's outbox (PRODUCER_QUERY / PRODUCER_STATE) |
+
+The instance id is the name the node gives its clients in the `outbox` answer: a client that comes to another node names it, and that node asks it (see [PRODUCER_QUERY](#producer_query-0x0f-and-producer_state-0x10---a-clients-outbox-moves)).
 
 Negotiated capabilities are the bitwise AND of both peers. A feature is only active when both sides advertise support for it.
 
@@ -211,6 +214,22 @@ Where the sender stands in every stream other nodes relay to it: for each foreig
 When CAP_RESUME is negotiated, each node sends its request right after HELLO and reads the other's. Then it hands the link to its cluster manager and, once the manager routes publishes to it, sends the peer every message of its own streams the request names after the offset given (from the oldest still kept when some are gone) as MSG frames marked replayed, before anything live: what was published before the manager took the link is in this catch-up, what after it follows it, and a message in both is delivered once. Streams of other origins or of an earlier epoch (the node restarted) are skipped. A peer that does not send its whole request within 5 seconds is dropped, and redials.
 
 So a link that drops and comes back loses nothing the origin still holds: the receiving node's subscribers get the missed messages in order, followed by the live ones, and its recovery buffers have no hole. A message shed on a full link is filled in the same way the next time the link comes up.
+
+### PRODUCER_QUERY (0x0F) and PRODUCER_STATE (0x10) - A Client's Outbox Moves
+
+```
+PRODUCER_QUERY: [header: type=0x0F, payload_len=N]
+[8 bytes: question id (little-endian u64)]
+[2 bytes: user length (little-endian u16), 0xFFFF for none] [user]
+[2 bytes: producer length (little-endian u16)] [producer]
+
+PRODUCER_STATE: [header: type=0x10, payload_len=17]
+[8 bytes: question id (little-endian u64)]
+[1 byte: 1 when the node knew the producer, else 0]
+[8 bytes: the highest message it took (little-endian u64)]
+```
+
+A client that reconnects to another node names the node it was on and the highest message it wrote there without an answer ([the client's outbox](PROTOCOL.md#the-clients-outbox)). When the new node links to that node with CAP_PRODUCERS, it asks once: the asked node hands the producer over (its connections still reading for it take nothing more, and close with 4409) and answers the highest message it took. The new node confirms everything up to that number and takes only what came after; without an answer within 2 seconds it takes the messages but marks them as possible repeats.
 
 ## Interest-Based Routing
 

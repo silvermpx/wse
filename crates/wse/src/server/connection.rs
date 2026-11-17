@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -19,6 +19,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketConfig};
 use uuid::Uuid;
 
+use super::acks;
 use super::e2e::{decrypt_inbound, derive_connection_key};
 use super::e2e_session::{self, RecvState, SendState};
 use super::fanout::BEHIND_BYTES;
@@ -35,8 +36,8 @@ use super::state::{Activity, Bind, CloseOutbox, Outbox, Seal};
 use super::subscribe::{answer_subscription_request, requested_compression};
 use super::{
     CLOSE_AUTH_FAILED, CLOSE_E2E_BAD_FRAME, CLOSE_E2E_EXHAUSTED, CLOSE_E2E_UNSUPPORTED,
-    CLOSE_GRACE, CLOSE_IDLE, CLOSE_INTERNAL_ERROR, CLOSE_RATE_LIMITED, CLOSE_TOKEN_EXPIRED,
-    CLOSE_TRY_AGAIN_LATER, Closer, ConnectionHandle, SharedState, WsFrame,
+    CLOSE_GRACE, CLOSE_IDLE, CLOSE_INTERNAL_ERROR, CLOSE_MOVED, CLOSE_RATE_LIMITED,
+    CLOSE_TOKEN_EXPIRED, CLOSE_TRY_AGAIN_LATER, Closer, ConnectionHandle, SharedState, WsFrame,
 };
 use crate::jwt::{self, parse_cookie_value};
 use crate::msgpack::{decode_msgpack_guarded, rmpv_to_serde_json};
@@ -84,7 +85,7 @@ fn warn_refused(what: std::fmt::Arguments<'_>) {
 /// compression wish, a subscription request when the server takes them),
 /// whatever form it came in: sealed or in msgpack. True when `val` was one.
 fn answer_protocol_message(
-    state: &SharedState,
+    state: &Arc<SharedState>,
     conn_id: &str,
     handle: &ConnectionHandle,
     max_pending: usize,
@@ -95,7 +96,15 @@ fn answer_protocol_message(
             queue_reply(handle, max_pending, Message::Text(pong_for(val).into()));
             Protocol::Answered
         }
-        Some("pong" | "PONG" | "client_hello") => Protocol::Answered,
+        Some("pong" | "PONG") => Protocol::Answered,
+        Some("client_hello") => {
+            handle.out.acks.hello(val.get("p"));
+            if handle.out.admitted.load(Ordering::Acquire) {
+                let user = connection_user(state, conn_id, None);
+                acks::start(state, handle, user.as_deref());
+            }
+            Protocol::Answered
+        }
         Some("client_config") => {
             apply_client_config(state, conn_id, val.get("p"));
             Protocol::Answered
@@ -188,9 +197,13 @@ fn admit_after_session<H: Handler>(
         handle.send_control(Message::Text(ready.into()));
         handle.out.admitted.store(true, Ordering::Release);
         state.topics.join(conn_id, handle);
+        acks::start(state, handle, Some(user));
     }
     tell_application(state, conn_id, handle, user_id, cookies, handler)
 }
+
+/// Frames read in a row before the answers owed to the client's outbox go.
+const ACK_BATCH: usize = 64;
 
 /// What the read loop's paths need of their connection.
 #[derive(Clone, Copy)]
@@ -359,6 +372,7 @@ fn admit_bound(conn: &Conn<'_>, user_id: &str, point: &[u8]) {
     handle.send_control(Message::Text(ready.into()));
     handle.out.admitted.store(true, Ordering::Release);
     state.topics.join(conn_id, handle);
+    acks::start(state, handle, Some(user_id));
 }
 
 /// The client's hello, once a connection: compression, then an E2E session
@@ -1013,11 +1027,10 @@ struct Reader<'a, H: Handler> {
     /// When the last frame came: the read loop checks its deadlines
     /// against it.
     last_frame_at: Instant,
+    /// What the connection has to answer of the client's outbox.
+    acks: acks::Pending,
 }
 
-/// Hand a client's message to the application; false when it has no room
-/// for it (or has not heard of the connection).
-#[inline]
 /// One of the client's messages against its rate limit: false when it is
 /// not taken (refused, and the client told at most once a second; or the
 /// connection closed for flooding).
@@ -1060,6 +1073,9 @@ fn within_rate(conn: &Conn<'_>, limit: &mut InboundLimit, now: Instant) -> bool 
     }
 }
 
+/// Hand a client's message to the application; false when it has no room
+/// for it (or has not heard of the connection).
+#[inline]
 fn deliver<H: Handler>(
     handler: &H,
     app: &mut Option<H::Connection>,
@@ -1070,7 +1086,79 @@ fn deliver<H: Handler>(
         .is_some_and(|app| handler.message(app, message, size))
 }
 
+/// A client's JSON message to the application. One numbered in its
+/// outbox (`s`) is handed on once per producer: a repeat is confirmed
+/// again, one the server cannot tell about is marked `possible_repeat`, and
+/// one the application has no room for is refused, so the client hears what
+/// became of each.
+fn deliver_json<H: Handler>(
+    handler: &H,
+    app: &mut Option<H::Connection>,
+    conn: &Conn<'_>,
+    pending: &mut acks::Pending,
+    mut val: serde_json::Value,
+    size: usize,
+) {
+    let Some(s) = acks::seq_of(&val) else {
+        deliver(handler, app, Inbound::Json(val), size);
+        return;
+    };
+    let link = conn.handle.out.acks.link.get();
+    pending.came(s, link.map_or(0, |link| link.start));
+    if let Some(link) = link {
+        match link.slot.claim(s) {
+            acks::Claim::First => {}
+            acks::Claim::Repeat => {
+                pending.taken(s);
+                return;
+            }
+            // Another node took the client's outbox over: this connection
+            // is a stale one.
+            acks::Claim::Moved => {
+                conn.closer.close(
+                    conn.tx,
+                    &conn.handle.out.pending,
+                    CLOSE_MOVED,
+                    "went on on another node",
+                );
+                return;
+            }
+        }
+        if s <= link.unsure_until
+            && let Some(fields) = val.as_object_mut()
+        {
+            fields.insert("possible_repeat".to_owned(), serde_json::Value::Bool(true));
+        }
+    }
+    if app.is_none() {
+        pending.refuse(s, "not_ready");
+    } else if deliver(handler, app, Inbound::Json(val), size) {
+        pending.taken(s);
+    } else {
+        pending.refuse(s, "busy");
+    }
+}
+
+/// The user a connection is admitted for: its token's, or the one the
+/// application accepted it for.
+fn connection_user(state: &SharedState, conn_id: &str, token_user: Option<&str>) -> Option<String> {
+    token_user
+        .map(str::to_owned)
+        .or_else(|| state.conn_user.get(conn_id).map(|user| user.clone()))
+}
+
 impl<H: Handler> Reader<'_, H> {
+    /// What is owed of the client's outbox goes: refusals, then one `ack`.
+    fn answer(&mut self) {
+        let conn = self.conn;
+        for answer in self.acks.answers() {
+            queue_reply(conn.handle, conn.max_pending, Message::Text(answer.into()));
+        }
+        if let Some(link) = conn.handle.out.acks.link.get() {
+            link.slot.touch(acks::now_ms());
+        }
+    }
+
     /// One frame from the client.
     fn on_frame(&mut self, msg: Message) -> Flow {
         let conn = self.conn;
@@ -1097,6 +1185,7 @@ impl<H: Handler> Reader<'_, H> {
         let app = &mut self.app;
         let inbound_limit = &mut self.inbound_limit;
         let frame_errors = &mut self.frame_errors;
+        let pending = &mut self.acks;
         // After the server queued a close, the client's further messages are
         // not delivered: only its close frame, or the grace period, ends this.
         if closer.is_closing() && !matches!(msg, Message::Close(_)) {
@@ -1139,6 +1228,7 @@ impl<H: Handler> Reader<'_, H> {
             && matches!(msg, Message::Text(_) | Message::Binary(_))
             && !within_rate(&conn, inbound_limit, now)
         {
+            pending.dropped();
             return Flow::Next;
         }
         match msg {
@@ -1184,6 +1274,14 @@ impl<H: Handler> Reader<'_, H> {
                                             cookies: cookie_str,
                                         },
                                     );
+                                    // Its outbox: answered once the connection
+                                    // is admitted, now or later.
+                                    out.acks.hello(val.get("p"));
+                                    if out.admitted.load(Ordering::Acquire) {
+                                        let user =
+                                            connection_user(state, conn_id, rust_auth_user_id);
+                                        acks::start(state, own_handle, user.as_deref());
+                                    }
                                 }
                                 return Flow::Next;
                             }
@@ -1218,7 +1316,7 @@ impl<H: Handler> Reader<'_, H> {
                         let val = normalize_json_keys(val);
 
                         // Drain mode: push serde_json::Value to queue (zero GIL)
-                        deliver(handler, app, Inbound::Json(val), text.len());
+                        deliver_json(handler, app, &conn, pending, val, text.len());
                     }
                     Err(_) => {
                         // JSON parse failed — pass raw string
@@ -1239,6 +1337,7 @@ impl<H: Handler> Reader<'_, H> {
                             // only within the rate limit.
                             Ok(Some(plaintext)) => {
                                 if !within_rate(&conn, inbound_limit, now) {
+                                    pending.dropped();
                                     return Flow::Next;
                                 }
                                 Some(Ok(plaintext))
@@ -1335,7 +1434,7 @@ impl<H: Handler> Reader<'_, H> {
                                             }
                                             Protocol::Application => {}
                                         }
-                                        deliver(handler, app, Inbound::Json(val), text.len());
+                                        deliver_json(handler, app, &conn, pending, val, text.len());
                                     }
                                 }
                             }
@@ -1376,11 +1475,12 @@ impl<H: Handler> Reader<'_, H> {
                     }
                 }
 
-                let message = match decoded {
-                    Some(value) => Inbound::Json(value),
-                    None => Inbound::Binary(data.to_vec()),
-                };
-                deliver(handler, app, message, data.len());
+                match decoded {
+                    Some(value) => deliver_json(handler, app, &conn, pending, value, data.len()),
+                    None => {
+                        deliver(handler, app, Inbound::Binary(data.to_vec()), data.len());
+                    }
+                }
             }
             Message::Ping(payload) => {
                 queue_reply(own_handle, max_pending, Message::Pong(payload));
@@ -1914,6 +2014,7 @@ pub(crate) async fn handle_connection<H: Handler>(
         proof_pending: false,
         app,
         last_frame_at: Instant::now(),
+        acks: acks::Pending::default(),
     };
 
     // A connection whose token expires is closed (4403): the clients come
@@ -1955,26 +2056,56 @@ pub(crate) async fn handle_connection<H: Handler>(
         }
     };
     let read_loop = async {
+        // Frames read in a row while answers are owed: what already came is
+        // read before the answers go, so one `ack` covers a batch.
+        let mut batched = 0usize;
         loop {
-            let msg = tokio::select! {
-                biased;
-                // A frame that is there comes first: the timers are polled
-                // (a waker registered each time) only while none is, and a
-                // busy connection's deadlines are checked against its frames
-                // below.
-                next = read_half.next() => match next {
-                    Some(Ok(msg)) => msg,
-                    _ => break,
-                },
-                () = async { if let Some(sleep) = expiry.as_mut() { sleep.await } }, if expiry.is_some() => {
-                    expiry = None;
-                    closer.close(&tx, &out.pending, CLOSE_TOKEN_EXPIRED, "token expired");
-                    continue;
+            let ready = if reader.acks.due() && batched < ACK_BATCH {
+                read_half.next().now_or_never()
+            } else {
+                None
+            };
+            let msg = match ready {
+                Some(Some(Ok(msg))) => {
+                    batched += 1;
+                    msg
                 }
-                () = async { if let Some(sleep) = admission_due.as_mut() { sleep.await } }, if admission_due.is_some() => {
-                    admission_due = None;
-                    admission_over(&reader);
-                    continue;
+                Some(_) => break,
+                None => {
+                    if reader.acks.due() {
+                        reader.answer();
+                    }
+                    batched = 0;
+                    tokio::select! {
+                        biased;
+                        // A frame that is there comes first: the timers are polled
+                        // (a waker registered each time) only while none is, and a
+                        // busy connection's deadlines are checked against its frames
+                        // below.
+                        next = read_half.next() => match next {
+                            Some(Ok(msg)) => msg,
+                            _ => break,
+                        },
+                        () = async { if let Some(sleep) = expiry.as_mut() { sleep.await } }, if expiry.is_some() => {
+                            expiry = None;
+                            closer.close(&tx, &out.pending, CLOSE_TOKEN_EXPIRED, "token expired");
+                            continue;
+                        }
+                        () = async { if let Some(sleep) = admission_due.as_mut() { sleep.await } }, if admission_due.is_some() => {
+                            admission_due = None;
+                            admission_over(&reader);
+                            continue;
+                        }
+                        // The server closes it: what was taken is answered
+                        // first.
+                        () = closer.asked_to_close() => {
+                            if let Some((code, reason)) = closer.asked_close() {
+                                reader.answer();
+                                closer.close(&tx, &out.pending, code, &reason);
+                            }
+                            continue;
+                        }
+                    }
                 }
             };
             // A panic in a handler call, or in the frame's own handling,
