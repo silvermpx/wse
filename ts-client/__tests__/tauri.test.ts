@@ -142,3 +142,42 @@ describe('Tauri', () => {
     expect(commands.some((c) => c.command === 'plugin:wse|detach')).toBe(true);
   });
 });
+
+describe('Tauri, its commands in flight', () => {
+  it('lets the window go only after the frames it sent, a sign-out among them, went through', async () => {
+    const calls: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let handler: { onmessage: (message: any) => void } | null = null;
+    class Channel {
+      onmessage: (message: any) => void = () => {};
+      constructor() {
+        handler = this;
+      }
+    }
+    const conn = { connection: 'connected', ready: true, paused: [], endpoint: 'ws://localhost/', lastError: null, storage: 'memory' };
+    const core: TauriCore = {
+      Channel,
+      invoke: async <T,>(command: string, args: Record<string, any> = {}): Promise<T> => {
+        const frames = (args.frames ?? []) as WindowFrame[];
+        calls.push(command.endsWith('|frames') ? `frames:${frames.map((f) => f.k).join(',')}` : command.split('|')[1]);
+        if (command.endsWith('|attach')) return 1 as T;
+        if (frames.some((f) => f.k === 'hello')) {
+          handler!.onmessage({ k: 'welcome', v: 1, att: 1, limits: {}, realm: 'test', account: { epoch: 0, user: 'ann' }, conn, gen: 1 });
+        }
+        if (frames.some((f) => f.k === 'signOut')) await held;
+        return undefined as T;
+      },
+    };
+    const client = createTauriClient(core);
+    await vi.waitFor(() => expect(client.bridge.phase).toBe('attached'));
+    client.signOut();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(calls).not.toContain('detach');
+    release();
+    await vi.waitFor(() => expect(calls).toContain('detach'));
+    const signOut = calls.findIndex((c) => c.includes('signOut'));
+    expect(signOut).toBeGreaterThanOrEqual(0);
+    expect(calls.indexOf('detach')).toBeGreaterThan(signOut);
+  });
+});

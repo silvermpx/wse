@@ -156,6 +156,17 @@ describe('Electron', () => {
     expect(o.attached).toBe(1);
   });
 
+  it('signs every window out before it lets them go: each forgets what it kept for the user', async () => {
+    const o = owner();
+    const win = new Window();
+    o.serve(win.contents);
+    const client = track(win.client());
+    await vi.waitFor(() => expect(client.bridge.phase).toBe('attached'));
+    o.signOut();
+    await vi.waitFor(() => expect(client.bridge.phase).toBe('revoked'));
+    expect(client.bridge.reason).toBe('signed_out');
+  });
+
   it('sends the token from the main process alone, a refreshed one at each attempt', async () => {
     let token = 'first';
     const o = owner({ token: () => token });

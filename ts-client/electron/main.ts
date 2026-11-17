@@ -212,13 +212,15 @@ export function createWSEOwner(options: WSEOwnerOptions): WSEOwner {
       contents.on('destroyed', gone);
       return gone;
     },
+    // The windows hear first (revoked: owner_closed, signed_out), and forget
+    // what they kept for the user; then they are let go.
     destroy() {
-      end();
       destroy();
+      end();
     },
     signOut() {
-      end();
       signOut();
+      end();
     },
   });
 }

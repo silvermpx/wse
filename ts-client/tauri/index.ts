@@ -43,6 +43,8 @@ async function attach(tauri: TauriCore, plugin: string): Promise<WindowChannel> 
   const att = await tauri.invoke<number>(`plugin:${plugin}|attach`, { onFrame: channel });
   let pending: WindowFrame[] = [];
   let sending = false;
+  /** The frames command in flight: what follows waits for it. */
+  let inFlight: Promise<unknown> = Promise.resolve();
   const gone = (error: unknown) => {
     if (closed) return;
     closed = true;
@@ -54,7 +56,9 @@ async function attach(tauri: TauriCore, plugin: string): Promise<WindowChannel> 
     sending = true;
     const frames = pending;
     pending = [];
-    tauri.invoke(`plugin:${plugin}|frames`, { att, frames }).then(
+    const call = tauri.invoke(`plugin:${plugin}|frames`, { att, frames });
+    inFlight = call.catch(() => {});
+    call.then(
       () => {
         sending = false;
         flush();
@@ -79,13 +83,16 @@ async function attach(tauri: TauriCore, plugin: string): Promise<WindowChannel> 
     },
     close() {
       if (closed) return;
-      // What was posted goes first (a bye among it), then the window is let go.
+      // In order: the frames in flight (a sign-out, say), then what was
+      // posted since (a bye among it), then the window is let go.
       const last = pending;
       pending = [];
       closed = true;
-      const detach = () => tauri.invoke(`plugin:${plugin}|detach`, { att }).catch(() => {});
-      if (last.length > 0) void tauri.invoke(`plugin:${plugin}|frames`, { att, frames: last }).finally(detach);
-      else void detach();
+      void inFlight
+        .then(() => (last.length > 0 ? tauri.invoke(`plugin:${plugin}|frames`, { att, frames: last }) : undefined))
+        .catch(() => {})
+        .then(() => tauri.invoke(`plugin:${plugin}|detach`, { att }))
+        .catch(() => {});
     },
   };
 }
