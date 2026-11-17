@@ -500,6 +500,7 @@ jobs:
       - name: The packed package in an Electron application
         run: |
           npm run build
+          mkdir -p npm-dist
           npm pack --ignore-scripts --pack-destination npm-dist
           bash .github/scripts/electron-consumer-check.sh npm-dist/wse-client-*.tgz
 
@@ -608,6 +609,7 @@ jobs:
           WEBKIT_DISABLE_DMABUF_RENDERER: '1'
         run: |
           npm run build
+          mkdir -p npm-dist
           npm pack --ignore-scripts --pack-destination npm-dist
           cargo package --locked --no-verify -p wse -p wse-client
           (cd bindings/tauri && cargo package --locked --no-verify -p tauri-plugin-wse \
