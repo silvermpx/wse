@@ -51,6 +51,11 @@
       "import": "./dist/npm/node/index.js",
       "default": "./dist/npm/node/index.js"
     },
+    "./bridge": {
+      "types": "./dist/npm/bridge/index.d.ts",
+      "import": "./dist/npm/bridge/index.js",
+      "default": "./dist/npm/bridge/index.js"
+    },
     "./package.json": "./package.json"
   },
   "typesVersions": {
@@ -78,6 +83,9 @@
       ],
       "node": [
         "./dist/npm/node/index.d.ts"
+      ],
+      "bridge": [
+        "./dist/npm/bridge/index.d.ts"
       ]
     }
   },

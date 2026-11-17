@@ -87,6 +87,11 @@ export interface WSEClientOptions extends UseWSEConfig {
    * date (see core/delivery.ts).
    */
   delivery?: DeliveryOptions;
+  /**
+   * Hears every message the client hands the application, of every type and
+   * topic, before its listeners: what a bridge owner forwards to its windows.
+   */
+  onEveryMessage?: (message: WSMessage) => void;
 }
 
 /** A share of a client (or of its topics), released once. */
@@ -257,6 +262,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
       continuous: (topics) => delivery.continuous(topics),
     },
     leaseHolder: offlineDatabase ? generateId() : undefined,
+    tap: options.onEveryMessage,
   });
   if (pageless && typeof indexedDB === 'undefined') ctx.state.getState().setStorageState('unavailable');
   // The queue's limits hold from the first send, before anything starts.

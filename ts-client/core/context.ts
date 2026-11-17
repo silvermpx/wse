@@ -50,6 +50,8 @@ export interface ClientContext {
   readonly state: StoreApi<WSEStore>;
   /** The client's outbox, kept across its sessions; none when `offline.enabled` is false. */
   readonly outbox: OutboxSlot;
+  /** Hears every message the client hands the application (a bridge owner forwards them). */
+  readonly tap?: (message: WSMessage) => void;
   readonly queue: StoreApi<MessageQueueStore>;
   readonly security: SecurityManager;
   readonly owner: OwnerGeneration;
@@ -232,6 +234,7 @@ export interface ContextOptions {
   storage?: ClientStorage;
   delivery?: DeliveryGate;
   leaseHolder?: string;
+  tap?: (message: WSMessage) => void;
 }
 
 /** A context of its own: new stores, keys and owner. */
@@ -247,6 +250,7 @@ export function createClientContext(options: ContextOptions = {}): ClientContext
     leaseHolder: options.leaseHolder,
     unremoved: new Set(),
     outbox: { current: null },
+    tap: options.tap,
   };
 }
 

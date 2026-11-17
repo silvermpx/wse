@@ -258,6 +258,8 @@ export class MessageProcessor {
   private readonly handedOver = new WeakMap<WSMessage, HandedOver>();
   /** The client's own messages: never the outbox's. */
   private readonly system = new WeakSet<WSMessage>();
+  /** A connection of this session reached server_ready before. */
+  private readyBefore = false;
   private waitForHandlersInterval: ReturnType<typeof setInterval> | null = null;
 
   // Optional sink for measured round-trip latency (ms), set by the host. The
@@ -783,6 +785,14 @@ export class MessageProcessor {
       this.report(outbox.connected(this.connectionUser, Date.now()));
       outbox.serverAnswers(features.acks === true);
     }
+    const reconnected = this.readyBefore;
+    this.readyBefore = true;
+    this.ctx.emit('wseConnected', {
+      connectionId: typeof details.connection_id === 'string' ? details.connection_id : null,
+      user: this.connectionUser,
+      reconnected,
+      recovery: features.recovery === true,
+    });
     this.connectionManager?.handleServerReady(details);
   }
 
@@ -1537,6 +1547,13 @@ export class MessageProcessor {
   private routeMessage(message: WSMessage, released = false): void {
     if (!released && message.tp && this.ctx.delivery?.hold(message)) return;
     const type = message.t;
+    if (this.ctx.tap && !isSystemType(type)) {
+      try {
+        this.ctx.tap(message);
+      } catch (error) {
+        logger.error('The message tap failed:', error);
+      }
+    }
 
     if (this.eventThrottleMs > 0 && !isSystemType(type)) {
       const now = Date.now();

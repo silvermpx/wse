@@ -19,6 +19,8 @@ npm install wse-client
 | `wse-client/vue` | A plugin and composables over a core client | `vue >= 3.3` |
 | `wse-client/svelte` | Stores over a core client | nothing (Svelte's store contract) |
 | `wse-client/react-native` | A core client for React Native apps | `react-native` |
+| `wse-client/node` | The outbox in a file, for Node and Electron's main process | Node |
+| `wse-client/bridge` | One connection for every window: an owner and the windows' clients | nothing |
 | `wse-client` | The page-wide `useWSE` hook (described below), as in 3.0 | `react >= 18`, `zustand >= 4` |
 
 React, Vue and zustand are optional peer dependencies: an application installs only what the
@@ -201,6 +203,38 @@ the changes of a turn of the event loop go in one batch (`multiRemove`, then `mu
 killed in between loses nothing it kept before and keeps nothing that went. A storage that fails is a
 `wseStorageError` event, and the outbox goes on in memory. Nothing of React Native is imported: the
 app passes the storage, as it passes `AppState`.
+
+## One Connection for Every Window (bridge)
+
+An application of several windows (Electron, Tauri, a page and its workers) keeps one connection:
+an owner holds it, with the token, the keys and the outbox, and each window holds a client with
+the `WSEClient` interface over a channel to the owner. The adapters for React, Vue, Svelte, Angular
+and Solid take a window's client as they take a client of their own.
+
+```ts
+import { createBridgeClient, createBridgeOwner, messagePortChannel } from 'wse-client/bridge';
+
+// Where the connection lives (Electron's main process, a worker):
+const owner = createBridgeOwner({ endpoints: ['wss://example.com/wse'] });
+const { port1, port2 } = new MessageChannel();
+owner.attach(messagePortChannel(port1));
+
+// In a window, with the other port:
+const client = createBridgeClient(messagePortChannel(port2));
+client.retain();
+client.subscribe(['prices']);
+client.onMessage('price_update', (message) => render(message.p));
+```
+
+The owner subscribes the union of the windows' topics once each, and hands each window what it
+holds and listens to, in batches it acknowledges as it takes them: at most two in hand, so a window
+that falls behind holds back only its own queue, and one past 10,000 messages (or 64 MiB) loses its
+queue and hears its topics broke off (`wseOverloaded`; a recover-or-resync window resyncs them).
+A window's sends go through the owner's outbox, and what became of each (`wseDelivered`,
+`wseNotDelivered`) reaches that window alone. What depends on the application stays in the window:
+its listeners, the delivery's barrier, resync, commit and checkpoint, the sends that wait for their
+topics. A window's `pause` holds back only its own stream; `signOut` signs every window out. No frame
+carries a token, a key or a cookie.
 
 ## Quick Start
 

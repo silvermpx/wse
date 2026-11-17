@@ -4,6 +4,19 @@
 
 ### Added
 
+- TypeScript: `wse-client/bridge`, one connection for every window of an
+  application. An owner (`createBridgeOwner`) holds the connection, the
+  token, the keys and the outbox; each window holds a client with the
+  `WSEClient` interface (`createBridgeClient`) over a channel to it (a
+  MessagePort, `messagePortChannel`), and the framework adapters take it
+  unchanged. The owner subscribes the union of the windows' topics once,
+  hands each window its stream in batches it acknowledges (two in hand at
+  most: a slow window holds back only itself, and one past its limits hears
+  its topics broke off), sends the windows' messages through its outbox and
+  routes each outcome to the window that sent it. The delivery's barrier,
+  resync, commit and checkpoint stay in each window.
+- TypeScript: `wseConnected` (`{ connectionId, user, reconnected, recovery }`)
+  when the server took a connection, as the Rust and Python clients say it.
 - The conformance server (`crates/wse-conformance`, not published): each
   case on a WSE server of its own, its steps for the client and the server
   in one list, and one judge that holds what a client recorded to the
