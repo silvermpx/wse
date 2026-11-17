@@ -555,3 +555,41 @@ class TestDisconnectWhileConnecting:
             await until(
                 lambda: all(conn.closed.is_set() for conn in server.connections)
             )
+
+
+class TestTheStreamsEnd:
+    async def test_the_stream_ends_after_what_it_holds(self):
+        """A reader behind at the disconnect gets every event that came,
+        then the end."""
+        async with FakeWSEServer() as server:
+            client = make_client(server.url, queue_size=1)
+            heard: list[int] = []
+            client.on("sample")(lambda e: heard.append(e.payload["n"]))
+            await client.connect()
+            # Reading, and behind: the stream holds one event.
+            with pytest.raises(asyncio.TimeoutError):
+                while True:
+                    await client.recv(timeout=0.05)
+            for n in (1, 2):
+                await server.connections[0].send_json(
+                    {"t": "sample", "p": {"n": n}, "v": 1}
+                )
+            await until(lambda: heard == [1, 2])
+            await client.disconnect()
+            read: list[int] = []
+            with pytest.raises(WSEConnectionError):
+                while True:
+                    read.append((await client.recv(timeout=0.5)).payload["n"])
+            assert read == [1, 2]
+
+    async def test_a_connect_made_while_one_is_on_its_way_gets_its_outcome(self):
+        async with FakeWSEServer(upgrade_delay=lambda _index: 0.25) as server:
+            client = make_client(server.url)
+            first = asyncio.create_task(client.connect())
+            await asyncio.sleep(0.05)
+            await client.connect()
+            # Both returned once the connection was made.
+            assert client.is_ready
+            assert first.done()
+            await first
+            await client.disconnect()

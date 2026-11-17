@@ -316,6 +316,41 @@ class TestSyncOutbox:
             assert client.kept == 0
             client.close()
 
+    def test_every_outcome_reaches_the_handlers_when_the_reader_is_behind(self):
+        st = ServerThread()
+        with st as srv:
+            client = SyncWSEClient(srv.url, reconnect=FAST, queue_size=1)
+            delivered: list[str] = []
+            client.on("delivered")(lambda e: delivered.extend(e.payload["ids"]))
+            client.connect(timeout=5)
+            # Reading, and behind: the stream holds one item.
+            with pytest.raises(WSETimeoutError):
+                while True:
+                    client.recv(timeout=0.05)
+            client.send("order", {"n": 1}, id="one")
+            client.send("order", {"n": 2}, id="two")
+            deadline = time.monotonic() + 5
+            while sorted(delivered) != ["one", "two"] and time.monotonic() < deadline:
+                with pytest.raises(WSETimeoutError):
+                    client.recv(timeout=0.05)
+            assert sorted(delivered) == ["one", "two"]
+            assert client.kept == 0
+            client.close()
+
+    def test_a_connect_made_while_one_is_on_its_way_gets_its_outcome(self):
+        st = ServerThread(upgrade_delay=lambda _index: 0.25)
+        with st as srv:
+            client = SyncWSEClient(srv.url, reconnect=FAST)
+            first = threading.Thread(target=client.connect, kwargs={"timeout": 5})
+            first.start()
+            time.sleep(0.05)
+            client.connect(timeout=5)
+            # Returned once the connection was made, as the first does.
+            assert client.is_connected
+            first.join(timeout=5)
+            assert not first.is_alive()
+            client.close()
+
     def test_a_clear_with_no_connection_tells_the_handlers(self):
         client = SyncWSEClient("ws://localhost:5006/wse")
         cleared: list[dict] = []

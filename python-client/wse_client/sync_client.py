@@ -59,6 +59,30 @@ class _Outcome:
     event: WSEEvent
 
 
+class _Stream(queue.Queue):  # type: ignore[type-arg]
+    """What recv() and run_forever() read: bounded for the server's events;
+    an outcome and the end are never dropped, nor held back."""
+
+    def put_always(self, item: WSEEvent | _StreamEnd | _Outcome) -> None:
+        with self.not_full:
+            self._put(item)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+
+    def put_dropping(self, item: WSEEvent | _StreamEnd | _Outcome) -> None:
+        """A full stream lets its oldest event go for *item*, never an
+        outcome or the end."""
+        with self.not_full:
+            if 0 < self.maxsize <= self._qsize():
+                for i, old in enumerate(self.queue):
+                    if not isinstance(old, (_Outcome, _StreamEnd)):
+                        del self.queue[i]
+                        break
+            self._put(item)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+
+
 class _Session:
     """One connect() attempt: its own thread, event loop and client.
 
@@ -176,9 +200,7 @@ class SyncWSEClient:
         }
         self._queue_size = queue_size
 
-        self._event_queue: queue.Queue[WSEEvent | _StreamEnd | _Outcome] = queue.Queue(
-            maxsize=queue_size
-        )
+        self._event_queue = _Stream(maxsize=queue_size)
         self._handlers: dict[str, list[Callable[[WSEEvent], Any]]] = {}
         self._wildcard_handlers: list[Callable[[WSEEvent], Any]] = []
         # What one session did not get answered goes on the next.
@@ -222,34 +244,50 @@ class SyncWSEClient:
 
     def _open(self, *, wait: bool, timeout: float) -> None:
         with self._lock:
-            if self._running and self._session is not None:
-                return
-            session = _Session()
-            session.wait = wait
-            self._session = session
-            self._running = True
-            self._generation += 1
-            self._background_error = None
-            self._purge_end_markers()
-            thread = threading.Thread(
-                target=self._run_session,
-                args=(session,),
-                daemon=True,
-                name="wse-client",
-            )
-            session.thread = thread
-        thread.start()
+            running = self._session if self._running else None
+            if running is None:
+                session = self._new_session(wait)
+        if running is not None:
+            # Another connect() is on its way: its outcome is this one's.
+            if wait:
+                self._outcome_of(running, timeout, abandon=False)
+            return
+        session.thread.start()  # type: ignore[union-attr]
+        self._outcome_of(session, timeout, abandon=True)
 
+    def _outcome_of(self, session: _Session, timeout: float, *, abandon: bool) -> None:
+        """Waits for *session* to connect (or start): raises what it failed
+        with; *abandon* lets go a session that does not make it."""
         if not session.ready.wait(timeout=timeout):
-            self._abandon(session)
+            if abandon:
+                self._abandon(session)
             raise WSETimeoutError(f"Connection timed out after {timeout}s")
 
         err = session.connect_error
         if err is not None or not session.connected:
-            self._abandon(session)
+            if abandon:
+                self._abandon(session)
             if isinstance(err, WSEError):
                 raise err
             raise WSEConnectionError(f"Connection failed: {err}") from err
+
+    def _new_session(self, wait: bool) -> _Session:
+        """A session, made the current one, its thread not started yet
+        (under the lock)."""
+        session = _Session()
+        session.wait = wait
+        self._session = session
+        self._running = True
+        self._generation += 1
+        self._background_error = None
+        self._purge_end_markers()
+        session.thread = threading.Thread(
+            target=self._run_session,
+            args=(session,),
+            daemon=True,
+            name="wse-client",
+        )
+        return session
 
     def set_error_handler(self, handler: Callable[[Exception], Any]) -> None:
         """Set a callback for the error that ends the client after connect().
@@ -829,32 +867,19 @@ class SyncWSEClient:
                     return
                 await asyncio.sleep(0.005)
 
-    def _put_event(self, event: WSEEvent) -> None:
-        try:
-            self._event_queue.put_nowait(event)
-        except queue.Full:
-            # Drop oldest
-            try:
-                self._event_queue.get_nowait()
-                self._event_queue.put_nowait(event)
-            except (queue.Empty, queue.Full):
-                pass
+    def _put_event(self, event: WSEEvent | _Outcome) -> None:
+        if isinstance(event, _Outcome):
+            self._event_queue.put_always(event)
+        else:
+            # Nobody reads yet: the oldest event goes.
+            self._event_queue.put_dropping(event)
 
     def _put_end_marker(self, end: _StreamEnd) -> None:
-        try:
-            self._event_queue.put_nowait(end)
-        except queue.Full:
-            try:
-                self._event_queue.get_nowait()
-                self._event_queue.put_nowait(end)
-            except (queue.Empty, queue.Full):
-                pass
+        # After what the stream holds: a reader gets all of it, then the end.
+        self._event_queue.put_always(end)
 
     def _requeue_end(self, end: _StreamEnd) -> None:
-        try:
-            self._event_queue.put_nowait(end)
-        except queue.Full:
-            pass
+        self._event_queue.put_always(end)
 
     def _pending_unseen_error(self) -> bool:
         """An error end marker is queued that no consumer has got yet."""

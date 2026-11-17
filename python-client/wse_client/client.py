@@ -538,6 +538,8 @@ class AsyncWSEClient:
         # behind, what comes next waits here and the socket is not read.
         self._reading = False
         self._overflow: deque[WSEEvent | _StreamEnd] = deque()
+        # A connect() on its way: another one waits for its outcome.
+        self._connecting: asyncio.Future[None] | None = None
         self._room: asyncio.Event | None = None
 
         # Reconnect config for later use
@@ -668,9 +670,32 @@ class AsyncWSEClient:
             WSETimeoutError: Opening the connection timed out.
         """
         self._begin()
+        on_its_way = self._connecting
+        if on_its_way is not None:
+            # Another connect() is on its way: its outcome is this one's.
+            await asyncio.shield(on_its_way)
+            return
         state = self._connection.state
         if state in (ConnectionState.CONNECTING, ConnectionState.RECONNECTING):
             return  # already connecting in the background
+        outcome: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._connecting = outcome
+        try:
+            await self._connect_now(state)
+        except BaseException as exc:
+            failed = exc
+            if isinstance(exc, asyncio.CancelledError):
+                failed = WSEConnectionError("connect() was cancelled")
+            outcome.set_exception(failed)
+            # Retrieved here: one with no other caller waiting is no warning.
+            outcome.exception()
+            raise
+        else:
+            outcome.set_result(None)
+        finally:
+            self._connecting = None
+
+    async def _connect_now(self, state: ConnectionState) -> None:
         if state != ConnectionState.CONNECTED:
             self._reset_stream()
             await self._connection.connect()
@@ -1731,16 +1756,23 @@ class AsyncWSEClient:
             await room.wait()
 
     def _push_stream_end(self, end: _StreamEnd) -> None:
-        # The end is never held back: the oldest event makes room for it.
+        # After what the stream holds and what waits for room in it: a reader
+        # gets every event that came, then the end.
         queue = self._event_queue
         if queue is None:
             return
-        self._overflow.clear()
         if self._room is not None:
             self._room.set()
+        if self._overflow:
+            self._overflow.append(end)
+            return
         try:
             queue.put_nowait(end)
         except asyncio.QueueFull:
+            if self._reading:
+                self._overflow.append(end)
+                return
+            # Nobody reads the stream (handlers only): the oldest goes.
             try:
                 queue.get_nowait()
                 queue.put_nowait(end)
@@ -1769,6 +1801,10 @@ class AsyncWSEClient:
         for item in kept:
             if not isinstance(item, _StreamEnd):
                 queue.put_nowait(item)
+        if any(isinstance(item, _StreamEnd) for item in self._overflow):
+            self._overflow = deque(
+                item for item in self._overflow if not isinstance(item, _StreamEnd)
+            )
 
     # -- Internal: transport callbacks ----------------------------------------
 
