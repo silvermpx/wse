@@ -430,16 +430,24 @@ async fn two_clients_of_one_database_keep_a_producer_each() {
 #[wasm_bindgen_test]
 async fn without_web_locks_the_outbox_stays_in_memory_and_says_so() {
     browser_storage();
-    let navigator = js_sys::Reflect::get(&js_sys::global(), &"navigator".into()).unwrap();
-    let locks = js_sys::Reflect::get(&navigator, &"locks".into()).unwrap();
-    js_sys::Reflect::delete_property(&navigator.clone().into(), &"locks".into()).unwrap();
+    let navigator =
+        js_sys::Object::from(js_sys::Reflect::get(&js_sys::global(), &"navigator".into()).unwrap());
+    // Hidden by a property of its own that says there are none, whether the
+    // runtime's are the object's own or its prototype's (Node 24's), and
+    // afterwards back as they were.
+    let own = js_sys::Object::get_own_property_descriptor(&navigator, &"locks".into());
+    let none = js_sys::Object::new();
+    js_sys::Reflect::set(&none, &"value".into(), &wasm_bindgen::JsValue::UNDEFINED).unwrap();
+    js_sys::Reflect::set(&none, &"configurable".into(), &true.into()).unwrap();
+    js_sys::Object::define_property(&navigator, &"locks".into(), &none);
     let mut config = Config::new(given(URL, "WSE_TEST_URL"));
     config.offline = Some(Offline::in_indexed_db("wse-test-outbox-nolocks"));
     let connected = wse_client::connect(config).await;
-    let restore = js_sys::Object::new();
-    js_sys::Reflect::set(&restore, &"value".into(), &locks).unwrap();
-    js_sys::Reflect::set(&restore, &"configurable".into(), &true.into()).unwrap();
-    js_sys::Object::define_property(&navigator.into(), &"locks".into(), &restore);
+    if own.is_undefined() {
+        js_sys::Reflect::delete_property(&navigator, &"locks".into()).unwrap();
+    } else {
+        js_sys::Object::define_property(&navigator, &"locks".into(), &own.into());
+    }
     let (client, mut events) = connected.unwrap();
     let failed = loop {
         if let Incoming::Event(Event::StorageFailed(failed)) = next(&mut events).await {

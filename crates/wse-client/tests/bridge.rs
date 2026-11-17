@@ -328,12 +328,17 @@ async fn a_window_that_falls_behind_loses_its_queue_alone() {
     slow.until("taken", |w| w.subscribed("prices")).await;
     quick.until("taken", |w| w.subscribed("prices")).await;
     slow.holding = true;
-    for n in 1..=60 {
-        stand.publish("prices", n);
+    // In tens, each taken by the quick window before the next: its queue
+    // stays below its limit however slowly the machine runs it.
+    for ten in 0..6 {
+        for n in ten * 10 + 1..=ten * 10 + 10 {
+            stand.publish("prices", n);
+        }
+        let seen = usize::try_from(ten * 10 + 10).unwrap();
+        quick
+            .until("each ten", |w| w.messages("prices").len() == seen)
+            .await;
     }
-    quick
-        .until("all of it", |w| w.messages("prices").len() == 60)
-        .await;
     assert_eq!(quick.messages("prices"), (1..=60).collect::<Vec<_>>());
     slow.settle(200).await;
     // Two batches in hand, the rest past its limit: dropped, and said so.

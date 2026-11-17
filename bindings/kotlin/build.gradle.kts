@@ -51,4 +51,8 @@ tasks.test {
     System.getenv("WSE_TEST_URL")?.let { environment("WSE_TEST_URL", it) }
     jvmArgs("--enable-native-access=ALL-UNNAMED")
     testLogging { events("passed", "failed", "skipped"); showStandardStreams = false }
+    // What the tests run against, the native library and the servers, is
+    // outside Gradle's inputs: they run each time, never taken as done.
+    outputs.upToDateWhen { false }
+    outputs.cacheIf { false }
 }
