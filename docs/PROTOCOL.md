@@ -547,7 +547,7 @@ From 3.2 a client keeps each message it sends, except one sent live, until the s
 |-------|-------------|
 | `producer` | The outbox's id, up to 64 characters |
 | `node` | The node the client was connected to last, as that node named itself (`null` the first time) |
-| `written` | The highest number the client wrote on an earlier connection without an answer |
+| `written` | The highest number the client may have written on an earlier connection without an answer: a client writes a message only once its store holds that it may have gone |
 | `from` | The first number the client still waits to hear of: it heard of every refusal before it, and the server forgets those |
 
 Once the connection is admitted (`server_ready`), the server answers what it decided of that producer and names itself. Every message up to `acked` was taken or refused; `refused` lists the refusals among them the client may not have heard of (its connection went before their `nack`), in the form of a `nack`'s payload. The client tells its application of each, and sends the rest, in order, before anything new:

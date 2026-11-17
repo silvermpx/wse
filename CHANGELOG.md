@@ -59,8 +59,10 @@ conformance server every client is checked against.
   Swift, Kotlin, Java, Dart), Python and Node or Electron's main process
   (`fileOutbox`); in IndexedDB in browsers (TypeScript, and Rust in the
   browser), a producer for each tab held by a Web Lock; in the app's
-  storage in React Native (`storageOutbox`). At most 100,000 messages and
-  16 MiB wait; one not sent within an hour, or its `ttl`, runs out. The
+  storage in React Native (`storageOutbox`); a message goes once its store
+  holds it, so that after a crash its number is never another's. At most
+  100,000 messages and 16 MiB wait; one not sent within an hour, or its
+  `ttl`, runs out. The
   Rust and Python servers, clusters too, keep each producer's state for a
   day; the protocol is in docs/PROTOCOL.md.
 - `start` beside `connect` in the Rust client (and Swift, Kotlin, Java,
