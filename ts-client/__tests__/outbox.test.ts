@@ -89,6 +89,20 @@ describe('Outbox', () => {
     expect(outbox.size).toBe(1);
   });
 
+  it('never sends a message again as another user than the one it was written as', () => {
+    const outbox = new Outbox(limits);
+    add(outbox, 'before any');
+    answering(outbox);
+    expect(due(outbox)).toEqual([[1, 'before any']]);
+    // Lost before its answer; the next connection is bob's.
+    outbox.disconnected();
+    const outcomes = outbox.connected('bob', 0);
+    expect([...outcomes.notDelivered]).toEqual([['user_changed', ['before any']]]);
+    outbox.serverAnswers(true);
+    outbox.answeredWith(0, [], 'n1');
+    expect(due(outbox)).toEqual([]);
+  });
+
   it('drops one not written within its time, and not one written', () => {
     const outbox = new Outbox(limits);
     add(outbox, 'late', 5, 0);

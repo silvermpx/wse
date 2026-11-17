@@ -552,8 +552,14 @@ impl Outbox {
         if let Some(last) = &self.user
             && last.as_deref() != user
         {
-            // What was sent before any connection goes on any.
-            self.remove_where("user_changed", &mut outcomes, |_, r| r.owned);
+            // What was sent before any connection goes on any, until a
+            // connection wrote it: then it was that connection's user's (the
+            // server may have taken it as theirs), and it never goes as
+            // another's.
+            let written = self.written;
+            self.remove_where("user_changed", &mut outcomes, |_, r| {
+                r.owned || r.s <= written
+            });
             self.user = Some(user.map(str::to_owned));
             self.put(&LineRef::User(user));
         } else if self.user.is_none() {
@@ -1667,6 +1673,25 @@ mod tests {
         assert_eq!(ids(&outbox.wrote(1).delivered), ["a"]);
         assert_eq!(outbox.len(), 0);
         assert_eq!(outbox.hello()["written"], 0);
+    }
+
+    #[test]
+    fn a_message_never_goes_again_as_another_user_than_it_was_written_as() {
+        let mut outbox = outbox(&Offline::in_memory());
+        add(&mut outbox, "before any");
+        answering(&mut outbox, 0);
+        let mut outcomes = Outcomes::default();
+        assert_eq!(numbers(&due(&mut outbox, 0, &mut outcomes)), [1]);
+        // Lost before its answer; the next connection is bob's.
+        outbox.disconnected();
+        let outcomes = outbox.connected(Some("bob"), 0);
+        assert_eq!(
+            outcomes.not_delivered,
+            [("user_changed".to_owned(), vec!["before any".to_owned()])]
+        );
+        outbox.server_answers(true);
+        outbox.answered(0, &[], "n1");
+        assert!(due(&mut outbox, 0, &mut Outcomes::default()).is_empty());
     }
 
     #[test]

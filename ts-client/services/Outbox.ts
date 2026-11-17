@@ -518,8 +518,12 @@ export class Outbox {
     const outcomes = noOutcomes();
     this.ready = true;
     if (this.user === undefined || this.user !== user) {
-      // What was sent before any connection goes on any.
-      if (this.user !== undefined) this.removeWhere('user_changed', outcomes, (_, r) => r.owned);
+      // What was sent before any connection goes on any, until a connection
+      // wrote it: then it was that connection's user's (the server may have
+      // taken it as theirs), and it never goes as another's.
+      if (this.user !== undefined) {
+        this.removeWhere('user_changed', outcomes, (_, r) => r.owned || r.s <= this.written);
+      }
       this.user = user;
       this.put({ user });
     }

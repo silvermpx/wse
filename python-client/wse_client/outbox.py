@@ -265,8 +265,14 @@ class Outbox:
         self._ready = True
         if self._user is _NONE or self._user != user:
             if self._user is not _NONE:
-                # What was sent before any connection goes on any.
-                self._remove_where("user_changed", outcomes, lambda _, r: r.owned)
+                # What was sent before any connection goes on any, until a
+                # connection wrote it: then it was that connection's user's
+                # (the server may have taken it as theirs), and it never goes
+                # as another's.
+                written = self._written
+                self._remove_where(
+                    "user_changed", outcomes, lambda _, r: r.owned or r.s <= written
+                )
             self._user = user
             self._put({"user": user})
         if self._earliest <= now:

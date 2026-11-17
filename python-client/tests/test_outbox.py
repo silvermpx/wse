@@ -94,6 +94,19 @@ class TestOutbox:
         assert outcomes.not_delivered == {"user_changed": ["anns"]}
         assert outbox.size == 1
 
+    def test_a_message_never_goes_again_as_another_user_than_it_was_written_as(self):
+        outbox = Outbox(LIMITS)
+        add(outbox, "before any")
+        answering(outbox)
+        assert numbers(outbox.due(0, Outcomes())) == [1]
+        # Lost before its answer; the next connection is bob's.
+        outbox.disconnected()
+        outcomes = outbox.connected("bob", 0)
+        assert outcomes.not_delivered == {"user_changed": ["before any"]}
+        outbox.server_answers(True)
+        outbox.answered(0, [], "n1")
+        assert outbox.due(0, Outcomes()) == []
+
     def test_one_not_written_in_its_time_runs_out_and_one_written_waits(self):
         outbox = Outbox(LIMITS)
         add(outbox, "late", ttl=5, now=0)
