@@ -25,6 +25,11 @@
   adapters take as they take any. Only the top frame of a served window,
   at a URL the application allows (by default its own pages, never the
   web's), gets a port.
+- TypeScript: `wse-client/tauri`, a Tauri window's client
+  (`createTauriClient({ invoke, Channel })`) over the Rust side's
+  connection: frames go to the plugin's commands one call at a time, in
+  order, those of one turn together, and come back on a Channel. Tauri's
+  API is passed in, so the package depends on no version of it.
 - Rust: `wse_client::bridge` (feature `bridge`), the window bridge's owner
   in Rust, for Tauri's webviews among others: one connection for every
   window, the same protocol as the TypeScript owner, so each window holds

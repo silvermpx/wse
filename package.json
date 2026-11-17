@@ -67,6 +67,11 @@
       "default": "./dist/npm/electron/renderer.js"
     },
     "./electron/preload": "./dist/npm/electron/preload.cjs",
+    "./tauri": {
+      "types": "./dist/npm/tauri/index.d.ts",
+      "import": "./dist/npm/tauri/index.js",
+      "default": "./dist/npm/tauri/index.js"
+    },
     "./package.json": "./package.json"
   },
   "typesVersions": {
@@ -103,6 +108,9 @@
       ],
       "electron/renderer": [
         "./dist/npm/electron/renderer.d.ts"
+      ],
+      "tauri": [
+        "./dist/npm/tauri/index.d.ts"
       ]
     }
   },
@@ -134,7 +142,8 @@
     "solid",
     "typescript",
     "react-native",
-    "electron"
+    "electron",
+    "tauri"
   ],
   "author": "silvermpx",
   "license": "MIT",

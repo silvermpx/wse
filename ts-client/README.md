@@ -22,6 +22,7 @@ npm install wse-client
 | `wse-client/node` | The outbox in a file, for Node and Electron's main process | Node |
 | `wse-client/bridge` | One connection for every window: an owner and the windows' clients | nothing |
 | `wse-client/electron` | Electron: the connection in the main process, a client in each window | Electron |
+| `wse-client/tauri` | Tauri: a window's client over the Rust side's connection (`tauri-plugin-wse`) | Tauri 2 |
 | `wse-client` | The page-wide `useWSE` hook (described below), as in 3.0 | `react >= 18`, `zustand >= 4` |
 
 React, Vue and zustand are optional peer dependencies: an application installs only what the
@@ -280,6 +281,26 @@ lets its share go, and a window that closes lets all of its pages go. `owner.sig
 window out and forgets what the client kept for the user; the next user gets a new owner. The main
 process connects with Node's WebSocket (Node 22 and newer); with an older Electron, pass a
 `webSocket` factory.
+
+## Tauri
+
+The connection lives on the Rust side, in the `tauri-plugin-wse` crate (an owner of
+`wse_client::bridge`, with the token and the outbox), and each window's page holds a client through
+the plugin's commands:
+
+```ts
+import { invoke, Channel } from '@tauri-apps/api/core';
+import { createTauriClient } from 'wse-client/tauri';
+
+const client = createTauriClient({ invoke, Channel });   // a WSEClient, as any
+client.retain();
+client.subscribe(['prices']);
+```
+
+Tauri's own API is passed in, so the package depends on no version of it (`window.__TAURI__.core`
+gives the same with `withGlobalTauri`). The page's frames go one command at a time, in order, those
+of one turn together; the owner's come on a Channel. Which windows may use the plugin is the
+application's capabilities' to say, as for any plugin.
 
 ## Quick Start
 
