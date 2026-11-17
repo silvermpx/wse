@@ -14,7 +14,7 @@ import {
   serverHelloMessage,
   tick,
 } from './helpers.js';
-import { acquireSession, makeSessionKey, releaseSession, wseActions, getCurrentSession } from '../services/WSESession.js';
+import { acquireSession, makeSessionKey, releaseSession, signOut, wseActions, getCurrentSession } from '../services/WSESession.js';
 import type { UseWSEConfig } from '../services/WSESession.js';
 import { useWSEStore } from '../stores/useWSEStore.js';
 import { ConnectionState } from '../types.js';
@@ -625,6 +625,25 @@ describe("one user's data never reaches the next user", () => {
     expect(seen.orders).toHaveLength(0);
     expect(seen.topics).not.toContain('alice-private');
     expect(JSON.stringify(seen.recovery)).not.toContain('alice-private');
+  });
+
+  it('a sign-out takes what the outbox kept with the user, the next session keeps none of it', async () => {
+    vi.useFakeTimers();
+    const notDelivered = recordEvents('wseNotDelivered');
+    const config = { endpoints: [ENDPOINT], offline: { enabled: true, persistToStorage: false } };
+    const alice = acquireSession({ key: makeSessionKey('cookie', [ENDPOINT]), auth: 'cookie', initialTopics: [], config });
+    alice.sendMessage('order', { secret: 'alice' });
+    releaseSession(alice);
+    signOut();
+    expect(notDelivered).toEqual([{ reason: 'cleared', ids: [expect.any(String)] }]);
+
+    // Signed in again on the same page, with the same auth, as bob.
+    acquireSession({ key: makeSessionKey('cookie', [ENDPOINT]), auth: 'cookie', initialTopics: [], config });
+    await tick();
+    const bob = FakeWebSocket.last();
+    await connectServer(bob, { user_id: 'bob' });
+    await tick(6);
+    expect(bob.messagesOfType('order')).toHaveLength(0);
   });
 
   it('keeps an explicitly empty topic list empty for the next user', async () => {

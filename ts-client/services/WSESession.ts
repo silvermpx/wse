@@ -22,6 +22,7 @@ import { EventSequencer } from './EventSequencer.js';
 import { logger } from '../utils/logger.js';
 import { deleteDatabase } from '../core/context.js';
 import { LEGACY_OFFLINE_DATABASE, legacyContext } from '../legacy/context.js';
+import { reportOutcomes } from './Outbox.js';
 import {
   WSESession,
   buildMessage,
@@ -73,9 +74,19 @@ function clearUserData(): void {
   dataOwner = null;
   nextOwnerEpoch();
   sharedSequencer.reset();
+  // What the user's sends left in the outbox goes with them, said not
+  // delivered (`cleared`), and its store is let go before it is deleted:
+  // the next session keeps an outbox of its own.
+  const ctx = legacyContext();
+  const outbox = ctx.outbox.current;
+  if (outbox) {
+    ctx.outbox.current = null;
+    reportOutcomes(ctx.emit, outbox.clear());
+    reportOutcomes(ctx.emit, outbox.close());
+  }
   useWSEStore.getState().reset();
   useMessageQueueStore.getState().clearQueue();
-  legacyContext().storage.clear();
+  ctx.storage.clear();
 }
 
 function destroySession(session: WSESession, clear: boolean): void {
