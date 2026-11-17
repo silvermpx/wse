@@ -188,3 +188,189 @@ class TestOutbox:
         assert numbered(7, '{"t":"x"}') == '{"s":7,"t":"x"}'
         assert numbered(7, "{}") == '{"s":7}'
         assert json.loads(numbered(12, ' { "t": 1}')) == {"s": 12, "t": 1}
+
+
+# -- The file ------------------------------------------------------------------
+
+import os  # noqa: E402
+import pathlib  # noqa: E402
+import sys  # noqa: E402
+import time  # noqa: E402
+
+import pytest  # noqa: E402
+
+from wse_client import outbox as outbox_module  # noqa: E402
+
+VECTOR = json.loads(
+    (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "crates/wse-client/tests/vectors/outbox.json"
+    ).read_text(encoding="utf-8")
+)
+
+
+class TestTheFileFormat:
+    """The file of the Rust client's, line by line (tests/vectors/outbox.json)."""
+
+    def test_lines_are_written_byte_for_byte_as_the_vector_has_them(self):
+        salt = VECTOR["salt"].encode()
+        for line in VECTOR["lines"]:
+            body = line["json"]
+            if line["kind"] == "head":
+                written = outbox_module._line(b"", body)
+            elif line["kind"] == "add":
+                add = json.loads(body)["add"]
+                record = outbox_module._record(body, add)
+                assert record is not None
+                written = outbox_module._line(salt, outbox_module._add_json(record))
+            else:
+                written = outbox_module._line(
+                    salt, outbox_module._dumps(json.loads(body))
+                )
+            assert written == (line["line"] + "\n").encode()
+
+    def test_the_file_reads_to_the_state_the_vector_has(self):
+        data = "".join(line["line"] + "\n" for line in VECTOR["lines"]).encode()
+        read = outbox_module._read(data)
+        state = VECTOR["state"]
+        assert read is not None
+        assert (read.producer, read.node, read.written, read.next, read.user) == (
+            state["producer"],
+            state["node"],
+            state["written"],
+            state["next"],
+            state["user"],
+        )
+        assert [
+            (r.s, r.id, round(r.at * 1000), round(r.until * 1000), r.owned, r.text)
+            for r in read.records
+        ] == [
+            (r["s"], r["id"], r["at"], r["until"], r["owned"], r["text"])
+            for r in state["records"]
+        ]
+
+    @pytest.mark.parametrize("damaged", VECTOR["damaged"], ids=lambda d: d["why"])
+    def test_a_damaged_file_is_read_up_to_where_it_checks(self, damaged):
+        read = outbox_module._read(damaged["file"].encode())
+        if damaged["records"] is None:
+            assert read is None
+            return
+        assert read is not None
+        assert [r.id for r in read.records] == damaged["records"]
+        assert read.user == damaged["user"]
+
+
+class TestTheOutboxInAFile:
+    @staticmethod
+    def offline(tmp_path) -> Offline:
+        return Offline(path=str(tmp_path / "queue"))
+
+    def test_what_is_kept_outlives_the_client_until_the_server_took_it(self, tmp_path):
+        offline = self.offline(tmp_path)
+        first = Outbox(offline)
+        answering(first)
+        for message_id in ("a", "b", "c"):
+            add(first, message_id)
+        first.due(0, Outcomes())
+        first.acked(1)
+        first.close_file()
+
+        again = Outbox(offline)
+        assert again.producer == first.producer
+        assert again.size == 2
+        assert again.hello() == {
+            "producer": first.producer,
+            "node": "n1",
+            "written": 3,
+            "from": 2,
+        }
+        answering(again, 1)
+        out = again.due(0, Outcomes())
+        assert numbers(out) == [2, 3]
+        assert json.loads(out[0][1])["id"] == "b"
+        assert add(again, "d") == 4
+        again.close_file()
+
+    def test_a_number_is_never_used_twice(self, tmp_path):
+        offline = self.offline(tmp_path)
+        first = Outbox(offline)
+        add(first, "a")
+        add(first, "b")
+        first.clear()
+        first.close_file()
+        again = Outbox(offline)
+        assert again.size == 0
+        assert add(again, "c") == 3
+        again.close_file()
+
+    def test_a_tail_that_does_not_check_is_not_read(self, tmp_path):
+        offline = self.offline(tmp_path)
+        first = Outbox(offline)
+        add(first, "a")
+        add(first, "b")
+        first.close_file()
+        path = tmp_path / "queue"
+        data = path.read_bytes()
+        path.write_bytes(data[:-5] + b"\xff\xfe\x00\n")
+        again = Outbox(offline)
+        assert again.size == 1
+        again.close_file()
+
+    def test_a_file_another_client_has_is_said_and_kept_in_memory(self, tmp_path):
+        offline = self.offline(tmp_path)
+        first = Outbox(offline)
+        said: list[tuple[str, str]] = []
+        second = Outbox(offline, report=lambda op, why: said.append((op, why)))
+        assert len(said) == 1 and said[0][0] == "open"
+        assert "another client's" in said[0][1]
+        add(second, "a")
+        assert second.size == 1
+        first.close_file()
+
+    def test_the_file_is_written_anew_once_what_went_outweighs_what_is_kept(
+        self, tmp_path
+    ):
+        offline = self.offline(tmp_path)
+        outbox = Outbox(offline)
+        answering(outbox)
+        for i in range(300):
+            s = add(outbox, f"m{i}")
+            outbox.due(0, Outcomes())
+            outbox.acked(s)
+        outbox.close_file()
+        lines = (tmp_path / "queue").read_text().splitlines()
+        assert len(lines) < 80
+        again = Outbox(offline)
+        assert again.size == 0
+        assert add(again, "next") == 301
+        again.close_file()
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="a directory that takes no file",
+    )
+    def test_a_file_that_cannot_be_written_says_so_and_heals(self, tmp_path):
+        offline = self.offline(tmp_path)
+        said: list[tuple[str, str]] = []
+        outbox = Outbox(offline, report=lambda op, why: said.append((op, why)))
+        answering(outbox)
+        tmp_path.chmod(0o500)
+        try:
+            for i in range(100):
+                s = add(outbox, f"m{i}")
+                outbox.due(0, Outcomes())
+                outbox.acked(s)
+            add(outbox, "kept")
+            outbox.due(0, Outcomes())
+            deadline = time.monotonic() + 5
+            while not said and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert [op for op, _ in said] == ["write"]
+        finally:
+            tmp_path.chmod(0o700)
+        outbox.disconnected()
+        add(outbox, "after")
+        outbox.close_file()
+        again = Outbox(offline)
+        assert again.size == 2
+        again.close_file()

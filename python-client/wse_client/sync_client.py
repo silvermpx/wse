@@ -160,9 +160,9 @@ class SyncWSEClient:
             "rate_limit_burst": rate_limit_burst,
             "offline_queue": offline_queue,
             "offline": offline,
-            # One outbox across the sessions of connect(): what one did not
-            # get answered goes on the next.
-            "_outbox": Outbox(offline) if offline is not None else None,
+            # One outbox across the sessions of connect() (made below, once the
+            # stream its failures go to is there).
+            "_outbox": None,
             "max_message_size": max_message_size,
             "recovery_timeout": recovery_timeout,
             "wire_format": wire_format,
@@ -179,6 +179,11 @@ class SyncWSEClient:
         )
         self._handlers: dict[str, list[Callable[[WSEEvent], Any]]] = {}
         self._wildcard_handlers: list[Callable[[WSEEvent], Any]] = []
+        # What one session did not get answered goes on the next.
+        if offline is not None:
+            self._client_kwargs["_outbox"] = Outbox(
+                offline, report=self._storage_report
+            )
 
         self._lock = threading.Lock()
         self._session: _Session | None = None
@@ -847,6 +852,20 @@ class SyncWSEClient:
         for item in kept:
             if not isinstance(item, _StreamEnd):
                 self._event_queue.put_nowait(item)
+
+    def _storage_report(self, operation: str, why: str) -> None:
+        """The outbox's file could not be opened or written: said to the
+        handlers of ``storage_failed`` (from any thread)."""
+        logger.error("The outbox's file: %s failed: %s", operation, why)
+        self._put_event(
+            _Outcome(
+                WSEEvent(
+                    type="storage_failed",
+                    payload={"operation": operation, "message": why},
+                    category="WSE",
+                )
+            )
+        )
 
     def _outcome(self, event: WSEEvent) -> None:
         """An outcome of the outbox, for the handlers (on the session's

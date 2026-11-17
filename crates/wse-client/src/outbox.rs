@@ -1901,6 +1901,124 @@ mod tests {
             std::fs::remove_dir_all(&dir).unwrap();
         }
 
+        /// The file format all clients share: each line written byte for
+        /// byte as the vector has it, and the file read to its state.
+        #[test]
+        fn the_shared_vector_is_written_and_read_alike() {
+            let vector: serde_json::Value =
+                serde_json::from_str(include_str!("../tests/vectors/outbox.json")).unwrap();
+            let salt = vector["salt"].as_str().unwrap().as_bytes();
+            let mut whole = Vec::new();
+            for line in vector["lines"].as_array().unwrap() {
+                let json = line["json"].as_str().unwrap();
+                let value: serde_json::Value = serde_json::from_str(json).unwrap();
+                let mut out = Vec::new();
+                match line["kind"].as_str().unwrap() {
+                    "head" => {
+                        let head = Head {
+                            wse_outbox: 1,
+                            salt: value["salt"].as_str().unwrap().into(),
+                            producer: value["producer"].as_str().unwrap().into(),
+                            next: value["next"].as_u64().unwrap(),
+                        };
+                        file::encode(&mut out, b"", &head);
+                    }
+                    "add" => {
+                        let add = &value["add"];
+                        let text = json
+                            .split_once(",\"text\":")
+                            .and_then(|(_, rest)| rest.strip_suffix("}}"))
+                            .unwrap();
+                        let record = Record {
+                            s: add["s"].as_u64().unwrap(),
+                            id: add["id"].as_str().unwrap().into(),
+                            at: add["at"].as_u64().unwrap(),
+                            until: add["until"].as_u64().unwrap(),
+                            owned: add["owned"].as_bool().unwrap(),
+                            text: text.into(),
+                            size: 0,
+                        };
+                        file::encode_add(&mut out, salt, &record);
+                    }
+                    "node" => file::encode(
+                        &mut out,
+                        salt,
+                        &LineRef::Node(value["node"].as_str().unwrap()),
+                    ),
+                    "written" => {
+                        file::encode(
+                            &mut out,
+                            salt,
+                            &LineRef::Written(value["written"].as_u64().unwrap()),
+                        );
+                    }
+                    "user" => file::encode(&mut out, salt, &LineRef::User(value["user"].as_str())),
+                    "ack" => file::encode(
+                        &mut out,
+                        salt,
+                        &LineRef::Ack(value["ack"].as_u64().unwrap()),
+                    ),
+                    "drop" => {
+                        let numbers: Vec<u64> = value["drop"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|n| n.as_u64().unwrap())
+                            .collect();
+                        file::encode(&mut out, salt, &LineRef::Drop(&numbers));
+                    }
+                    kind => panic!("a line of kind {kind}"),
+                }
+                let expected = format!("{}\n", line["line"].as_str().unwrap());
+                assert_eq!(String::from_utf8(out.clone()).unwrap(), expected);
+                whole.extend_from_slice(&out);
+            }
+
+            let read = file::read(&whole).unwrap();
+            let state = &vector["state"];
+            assert_eq!(&*read.producer, state["producer"].as_str().unwrap());
+            assert_eq!(read.node.as_deref(), state["node"].as_str());
+            assert_eq!(read.written, state["written"].as_u64().unwrap());
+            assert_eq!(read.next, state["next"].as_u64().unwrap());
+            assert_eq!(read.user.as_deref(), state["user"].as_str());
+            let records: Vec<(u64, &str, u64, u64, bool, &str)> = read
+                .records
+                .iter()
+                .map(|r| (r.s, &*r.id, r.at, r.until, r.owned, &*r.text))
+                .collect();
+            let expected: Vec<(u64, &str, u64, u64, bool, &str)> = state["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    (
+                        r["s"].as_u64().unwrap(),
+                        r["id"].as_str().unwrap(),
+                        r["at"].as_u64().unwrap(),
+                        r["until"].as_u64().unwrap(),
+                        r["owned"].as_bool().unwrap(),
+                        r["text"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(records, expected);
+
+            for damaged in vector["damaged"].as_array().unwrap() {
+                let read = file::read(damaged["file"].as_str().unwrap().as_bytes());
+                let why = damaged["why"].as_str().unwrap();
+                match damaged["records"].as_array() {
+                    None => assert!(read.is_none(), "{why}"),
+                    Some(ids) => {
+                        let read = read.unwrap();
+                        let got: Vec<&str> = read.records.iter().map(|r| &*r.id).collect();
+                        let want: Vec<&str> = ids.iter().map(|id| id.as_str().unwrap()).collect();
+                        assert_eq!(got, want, "{why}");
+                        assert_eq!(read.user.as_deref(), damaged["user"].as_str(), "{why}");
+                    }
+                }
+            }
+        }
+
         /// A file that cannot be written anew says so once, and is written
         /// anew with all that is kept once it can.
         #[cfg(unix)]

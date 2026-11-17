@@ -215,6 +215,45 @@ class TestOutbox:
             srv.stop()
 
 
+class TestOutboxInAFile:
+    @pytest.mark.asyncio
+    async def test_what_waits_in_a_file_outlives_the_client(self, server_port, tmp_path):
+        """Sent with no server, kept in the file; the process ends, and the
+        next client sends it, taken once."""
+        offline = wse_client.Offline(path=str(tmp_path / "queue"))
+        first = client_for(server_port, offline=offline)
+        assert await first.send("order", {"n": 1}, id="kept") is (
+            wse_client.SendResult.QUEUED
+        )
+        assert first.kept == 1
+        first._outbox.close_file()  # as the process ends
+
+        srv = start_server(server_port)
+        try:
+            second = client_for(server_port, offline=offline)
+            delivered: list[str] = []
+            second.on("delivered")(lambda e: delivered.extend(e.payload["ids"]))
+            await second.connect()
+            (taken,) = await taken_messages(srv, 1)
+            assert (taken["id"], taken["t"]) == ("kept", "order")
+            async with asyncio.timeout(5):
+                while "kept" not in delivered:
+                    await asyncio.sleep(0.02)
+            await second.disconnect()
+            second._outbox.close_file()
+
+            # Nothing goes twice.
+            third = client_for(server_port, offline=offline)
+            assert third.kept == 0
+            await third.connect()
+            await asyncio.sleep(0.3)
+            assert [e for e in srv.drain_inbound(64, 0) if e[0] == "msg"] == []
+            await third.disconnect()
+            third._outbox.close_file()
+        finally:
+            srv.stop()
+
+
 class TestMsgpack:
     @pytest.mark.asyncio
     async def test_msgpack_both_ways(self, server_port):

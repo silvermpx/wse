@@ -87,7 +87,11 @@
   `kept`; at most `Offline.max_messages` (100,000) and `max_bytes` (16 MiB)
   wait. `disconnect()` waits up to a second for the server's answers and
   keeps what waits for the next `connect()`; `SyncWSEClient` keeps one
-  outbox across its connects.
+  outbox across its connects. `Offline(path=...)` keeps it in a file that
+  outlives the process, in the Rust client's format (a shared vector,
+  crates/wse-client/tests/vectors/outbox.json, holds it for every client),
+  locked as the Rust client locks it; a file that cannot be opened or
+  written is a `storage_failed` event.
 - TypeScript: the outbox, as in the Rust client (`offline.enabled`, on by
   default): every message sent, except a live or signed one, waits until
   the server answers for it, numbered, and goes again after a reconnect; a

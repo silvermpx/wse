@@ -440,10 +440,14 @@ class AsyncWSEClient:
         )
         # The outbox: every message but a live or signed one waits in it until
         # the server answers for it.
-        self._outbox: Outbox | None = Outbox(offline) if offline is not None else None
-        if offline is not None and _outbox is not None:
+        # Failures of the outbox's file, said to the handlers of
+        # storage_failed on the client's loop (from connect() on).
+        self._loop_seen: asyncio.AbstractEventLoop | None = None
+        self._storage_failures: list[tuple[str, str]] = []
+        self._outbox: Outbox | None = None
+        if offline is not None:
             # The outbox of the client it goes on from (SyncWSEClient's).
-            self._outbox = _outbox
+            self._outbox = _outbox or Outbox(offline, report=self._outbox_report)
         self._outbox_timer: asyncio.TimerHandle | None = None
         self._outbox_writing = False
         self._outbox_again = False
@@ -654,6 +658,12 @@ class AsyncWSEClient:
                 server closed it during the handshake.
             WSETimeoutError: Opening the connection timed out.
         """
+        # The loop the outbox's file says its failures on, and those it had
+        # before (opening it).
+        self._loop_seen = asyncio.get_running_loop()
+        for operation, why in self._storage_failures:
+            self._storage_failed(operation, why)
+        self._storage_failures.clear()
         self._ensure_primitives()
         state = self._connection.state
         if state in (ConnectionState.CONNECTING, ConnectionState.RECONNECTING):
@@ -727,6 +737,29 @@ class AsyncWSEClient:
         return self._offline_queue.size
 
     # -- The outbox -------------------------------------------------------------
+
+    def _outbox_report(self, operation: str, why: str) -> None:
+        """The outbox's file could not be opened or written: what waits
+        stays in memory. Said to the handlers of ``storage_failed``, on the
+        client's loop (it may come from the file's own thread)."""
+        logger.error("The outbox's file: %s failed: %s", operation, why)
+        loop = self._loop_seen
+        if loop is None or loop.is_closed():
+            self._storage_failures.append((operation, why))
+            return
+        try:
+            loop.call_soon_threadsafe(self._storage_failed, operation, why)
+        except RuntimeError:  # the loop closed meanwhile
+            pass
+
+    def _storage_failed(self, operation: str, why: str) -> None:
+        self._invoke_handlers(
+            WSEEvent(
+                type="storage_failed",
+                payload={"operation": operation, "message": why},
+                category="WSE",
+            )
+        )
 
     def _outbox_hello(self) -> dict[str, object] | None:
         """What the client's hello says of the outbox."""
