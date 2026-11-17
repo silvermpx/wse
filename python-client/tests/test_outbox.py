@@ -310,6 +310,19 @@ def until(test, within: float = 5.0) -> None:
         time.sleep(0.01)
 
 
+def due_written(outbox: Outbox, continuous=None) -> list[int]:
+    """The numbers handed to the connection, once the file holds that they
+    may have gone."""
+    went: list[int] = []
+
+    def due() -> bool:
+        went.extend(numbers(outbox.due(0, Outcomes(), continuous)))
+        return bool(went)
+
+    until(due)
+    return went
+
+
 class TestTheOutboxInAFile:
     @staticmethod
     def offline(tmp_path) -> Offline:
@@ -340,6 +353,27 @@ class TestTheOutboxInAFile:
         assert json.loads(out[0][1])["id"] == "b"
         assert add(again, "d") == 4
         again.close_file()
+
+    def test_a_numbered_message_goes_once_the_file_holds_it(self, tmp_path):
+        offline = self.offline(tmp_path)
+        outbox = Outbox(offline)
+        answering(outbox)
+        add(outbox, "a")
+        # Not before the file holds it, and the mark that it may have gone.
+        assert outbox.due(0, Outcomes()) == []
+        went: list[int] = []
+
+        def due() -> bool:
+            for s, _ in outbox.due(0, Outcomes()):
+                held = (tmp_path / "queue").read_text()
+                assert '{"written":%d}' % s in held, held
+                assert '{"add":{"s":%d,' % s in held, held
+                went.append(s)
+            return bool(went)
+
+        until(due)
+        assert went == [1]
+        outbox.close_file()
 
     def test_a_number_is_never_used_twice(self, tmp_path):
         offline = self.offline(tmp_path)
@@ -387,7 +421,7 @@ class TestTheOutboxInAFile:
         assert (
             again.due(0, Outcomes(), lambda topics: topics != ("prices", "news")) == []
         )
-        assert numbers(again.due(0, Outcomes(), lambda topics: True)) == [1]
+        assert due_written(again, lambda topics: True) == [1]
         again.close_file()
 
     def test_the_file_is_written_anew_once_what_went_outweighs_what_is_kept(

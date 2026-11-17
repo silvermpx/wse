@@ -454,6 +454,7 @@ class AsyncWSEClient:
             # The outbox of the client it goes on from (SyncWSEClient's).
             self._outbox = _outbox or Outbox(offline, report=self._outbox_report)
             self._outbox.wake = self._outbox_wake
+            self._outbox.writable = self._outbox_writable
         self._outbox_timer: asyncio.TimerHandle | None = None
         self._outbox_writing = False
         self._outbox_again = False
@@ -953,6 +954,17 @@ class AsyncWSEClient:
             self._outbox_timer.cancel()
         delay = max(0.0, at - time.time())
         self._outbox_timer = loop.call_later(delay, self._outbox_expired)
+
+    def _outbox_writable(self) -> None:
+        """The outbox's file wrote what messages waited for (said from its
+        own thread): they go, on the client's loop."""
+        loop = self._loop_seen
+        if loop is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(self._write_outbox_soon)
+        except RuntimeError:  # the loop closed meanwhile
+            pass
 
     def _outbox_wake(self, delay: float) -> None:
         """A rewrite of the outbox's file is owed in *delay* seconds: the

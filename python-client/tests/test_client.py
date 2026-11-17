@@ -743,6 +743,22 @@ class TestOutbox:
         assert c.kept == 0
 
     @pytest.mark.asyncio
+    async def test_a_message_kept_in_a_file_goes_once_the_file_holds_it(self, tmp_path):
+        c = _mock_client(offline=Offline(path=str(tmp_path / "queue")))
+        c._begin()
+        await self._ready(c)
+        c._handle_outbox_answer(_system("outbox", {"acked": 0, "node": "n1"}))
+        assert await c.send("order", {"n": 1}, id="mine-1") is SendResult.QUEUED
+        # The file's thread wrote it, and said so: it goes on the client's loop.
+        for _ in range(500):
+            if self._written(c):
+                break
+            await asyncio.sleep(0.01)
+        assert [m["id"] for m in self._written(c)] == ["mine-1"]
+        assert '"id":"mine-1"' in (tmp_path / "queue").read_text()
+        c._outbox.close_file()
+
+    @pytest.mark.asyncio
     async def test_a_clear_while_a_batch_goes_stops_what_is_left_of_it(self):
         c = _mock_client(offline=Offline())
         heard = await self._ready(c)

@@ -153,6 +153,11 @@ class Outbox:
         # The highest number handed to a connection: one above it never
         # reached a server.
         self._written = 0
+        # Written ahead: the highest number the file was handed the mark of
+        # (that up to it, messages may have gone). A numbered message goes
+        # once the file wrote its mark, so that after a crash its number is
+        # never another's.
+        self._promised = 0
         # The highest number written to this connection's socket.
         self._flushed = 0
         # Written on this connection and cleared before the server answered.
@@ -175,11 +180,14 @@ class Outbox:
         # at most): the client's loop calls flush() then, whether or not
         # anything changes meanwhile.
         self.wake: Callable[[float], None] | None = None
+        # Called, from the file's own thread, once the file wrote what
+        # messages waited for: the client's loop writes the outbox then.
+        self.writable: Callable[[], None] | None = None
         # Counts the clears: a batch handed out before one goes no further.
         self.generation = 0
         if offline.path is not None:
             try:
-                self._log, read = _Log.open(offline.path, self._report)
+                self._log, read = _Log.open(offline.path, self._report, self._wrote)
             except OSError as exc:
                 self._report("open", f"{offline.path}: {exc}")
             else:
@@ -187,10 +195,16 @@ class Outbox:
                     self._restore(read)
                 self._rewrite()
 
+    def _wrote(self) -> None:
+        writable = self.writable
+        if writable is not None:
+            writable()
+
     def _restore(self, read: _Read) -> None:
         self.producer = read.producer
         self._node = read.node
         self._written = read.written
+        self._promised = read.written
         self._next = read.next
         self._user = read.user if read.user is not None else _NONE
         for record in read.records:
@@ -360,6 +374,11 @@ class Outbox:
                 self.expire(now, outcomes)
             records = self._records
             numbered_now = self._answered
+            # What the file wrote that messages up to may have gone; None:
+            # no file to wait for (none, or one that fails).
+            log = self._log
+            stored = log.written if numbered_now and log and not log.behind else None
+            ahead = False
             for i in range(self._cursor, len(records)):
                 record = records[i]
                 assert record is not None
@@ -369,12 +388,21 @@ class Outbox:
                     and not continuous(record.requires)
                 ):
                     break
+                # Written ahead: it goes once the file wrote the mark.
+                if stored is not None and record.s > stored:
+                    ahead = True
+                    break
                 text = record.text if numbered_now else unnumbered(record.text)
                 out.append((record.s, text))
                 self._cursor = i + 1
             if out and numbered_now and out[-1][0] > self._written:
                 self._written = out[-1][0]
-                self._put({"written": self._written})
+            # The mark for every message kept now, in this batch: they go
+            # once the file wrote it.
+            last = records[-1] if records else None
+            if ahead and last is not None and last.s > self._promised:
+                self._promised = last.s
+                self._put({"written": last.s})
         self.flush()
         return out
 
@@ -564,7 +592,7 @@ class Outbox:
         elif log.lines > 2 * self._count + 64:
             self._rewrite()
         else:
-            log.flush()
+            log.flush(self._promised)
 
     def _rewrite(self) -> None:
         """Writes the file anew, with what is kept now alone, under a new
@@ -585,14 +613,17 @@ class Outbox:
         salted = salt.encode()
         if self._node is not None:
             lines.append(_line(salted, _dumps({"node": self._node})))
-        if self._written > 0:
-            lines.append(_line(salted, _dumps({"written": self._written})))
+        # What went meanwhile, while the file failed, is in it.
+        mark = max(self._written, self._promised)
+        self._promised = mark
+        if mark > 0:
+            lines.append(_line(salted, _dumps({"written": mark})))
         if isinstance(self._user, str):
             lines.append(_line(salted, _dumps({"user": self._user})))
         for record in self._records[self._head :]:
             assert record is not None
             lines.append(_line(salted, _add_json(record)))
-        log.rewrite(b"".join(lines), salt, len(lines))
+        log.rewrite(b"".join(lines), salt, len(lines), mark)
 
 
 class _NoneYet:
@@ -819,16 +850,25 @@ class _Log:
     """The file, as the client's loop sees it: a batch of lines, handed to
     the thread that writes them."""
 
-    def __init__(self, path: str, lock_fd: int, report: Report) -> None:
+    def __init__(
+        self, path: str, lock_fd: int, report: Report, wrote: Callable[[], None]
+    ) -> None:
         self.path = path
         self._salt = b""
         self._batch: list[bytes] = []
         # Lines in the file, the batch's included.
         self.lines = 0
         self._broken = threading.Event()
-        self._jobs: queue.SimpleQueue[tuple[str, bytes] | None] = queue.SimpleQueue()
+        # The highest mark the file holds, past a crash of the process; and
+        # whether it is behind (a write failed: messages do not wait for it
+        # until it is written anew). The file's thread sets both.
+        self.written = 0
+        self.behind = False
+        self._jobs: queue.SimpleQueue[tuple[str, bytes, int] | None] = (
+            queue.SimpleQueue()
+        )
         self._thread = threading.Thread(
-            target=_Writer(path, lock_fd, report, self._broken).run,
+            target=_Writer(path, lock_fd, report, self._broken, self, wrote).run,
             args=(self._jobs,),
             name="wse-outbox",
             daemon=True,
@@ -839,7 +879,9 @@ class _Log:
         self._closed = False
 
     @staticmethod
-    def open(path: str, report: Report) -> tuple[_Log, _Read | None]:
+    def open(
+        path: str, report: Report, wrote: Callable[[], None]
+    ) -> tuple[_Log, _Read | None]:
         """The file at *path*, the client's alone from now on, and what it
         holds (None: a new file, or not one of this format)."""
         lock_fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
@@ -852,7 +894,9 @@ class _Log:
                     read = _read(f.read())
             except FileNotFoundError:
                 read = None
-            return _Log(path, lock_fd, report), read
+            log = _Log(path, lock_fd, report, wrote)
+            log.written = read.written if read is not None else 0
+            return log, read
         except OSError:
             os.close(lock_fd)
             raise
@@ -865,9 +909,11 @@ class _Log:
         self._batch.append(_line(self._salt, _add_json(record)))
         self.lines += 1
 
-    def flush(self) -> None:
+    def flush(self, mark: int = 0) -> None:
+        """Hands the batch to the thread, with *mark*, the highest mark in
+        the file once it is written."""
         if self._batch:
-            self._jobs.put(("append", b"".join(self._batch)))
+            self._jobs.put(("append", b"".join(self._batch), mark))
             self._batch = []
 
     def forget(self) -> None:
@@ -879,11 +925,11 @@ class _Log:
         self._broken.clear()
         return broken
 
-    def rewrite(self, data: bytes, salt: str, lines: int) -> None:
+    def rewrite(self, data: bytes, salt: str, lines: int, mark: int) -> None:
         self._batch = []
         self._salt = salt.encode()
         self.lines = lines
-        self._jobs.put(("rewrite", data))
+        self._jobs.put(("rewrite", data, mark))
 
     def close(self) -> None:
         """The thread writes what it was handed and lets the file go."""
@@ -900,13 +946,22 @@ class _Writer:
     """The thread that writes the file."""
 
     def __init__(
-        self, path: str, lock_fd: int, report: Report, broken: threading.Event
+        self,
+        path: str,
+        lock_fd: int,
+        report: Report,
+        broken: threading.Event,
+        log: _Log,
+        wrote: Callable[[], None],
     ) -> None:
         self.path = path
         self.tmp = path + ".tmp"
         self.lock_fd = lock_fd
         self.report = report
         self.broken = broken
+        # The log whose mark it raises, and who hears it rose.
+        self.log = log
+        self.wrote = wrote
         self.fd: int | None = os.open(
             path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600
         )
@@ -915,12 +970,15 @@ class _Writer:
         # The last failure was said; the next is said after a success.
         self.failing = False
 
-    def run(self, jobs: queue.SimpleQueue[tuple[str, bytes] | None]) -> None:
+    def run(self, jobs: queue.SimpleQueue[tuple[str, bytes, int] | None]) -> None:
         try:
             while True:
                 job = jobs.get()
                 done = job is None
-                dirty = False if done else self.take(job)
+                mark = 0
+                dirty = False
+                if job is not None:
+                    dirty, mark = self.take(job, mark)
                 while not done:
                     try:
                         job = jobs.get_nowait()
@@ -929,7 +987,13 @@ class _Writer:
                     if job is None:
                         done = True
                     else:
-                        dirty = self.take(job) or dirty
+                        appended, mark = self.take(job, mark)
+                        dirty = appended or dirty
+                # Written, past a crash of the process: what waited for the
+                # mark may go; the disk has it once synced, at once after.
+                if mark > self.log.written:
+                    self.log.written = mark
+                    self.wrote()
                 if dirty and self.fd is not None:
                     try:
                         _sync(self.fd)
@@ -942,31 +1006,35 @@ class _Writer:
                 os.close(self.fd)
             os.close(self.lock_fd)
 
-    def take(self, job: tuple[str, bytes]) -> bool:
-        """True: appended, to be synced."""
-        kind, data = job
+    def take(self, job: tuple[str, bytes, int], mark: int) -> tuple[bool, int]:
+        """Whether it appended (to be synced), and the mark of what was
+        written."""
+        kind, data, holds = job
         if kind == "append":
             if self.skipping:
-                return False
+                return False, mark
             try:
                 if self.fd is None:
                     raise OSError("no file")
                 os.write(self.fd, data)
             except OSError as exc:
                 self.fail(f"cannot write it: {exc}")
-                return False
-            return True
+                return False, mark
+            return True, max(mark, holds)
         try:
             self.rewrite(data)
         except OSError as exc:
             self.fail(f"cannot write it anew: {exc}")
-        else:
-            self.skipping = False
-            self.failing = False
-        return False
+            return False, mark
+        # Synced as it was written.
+        self.skipping = False
+        self.failing = False
+        self.log.behind = False
+        return False, max(mark, holds)
 
     def fail(self, why: str) -> None:
         self.skipping = True
+        self.log.behind = True
         self.broken.set()
         if not self.failing:
             self.failing = True
