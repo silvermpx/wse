@@ -353,6 +353,11 @@ pub(crate) async fn serve<H: Handler>(
             }
         }
     }
+    // No more connections: the port goes now, not after the cleanup below.
+    // Held, it would take connections nobody serves (a client coming back
+    // at once would wait for its connect timeout); closed, a client is
+    // refused, and comes back as soon as a server is there again.
+    drop(listener);
     let _ = cmd_handle.await;
     // The command task closed every connection: the periodic tasks end, and
     // the connections finish their cleanup.

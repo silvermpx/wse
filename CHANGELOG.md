@@ -168,6 +168,11 @@
 
 ### Fixed
 
+- Server: `Server::stop` lets its port go as soon as it takes no more
+  connections, not after every connection's cleanup. Held, it took
+  connections nobody served: a client coming back during a restart waited
+  for its connect timeout (10 s) instead of being refused and trying again
+  at once. Found by the conformance server.
 - React: `useWSETopics` takes a changed topic list before it lets the old one
   go, so a topic in both stays subscribed with its recovery position; it was
   unsubscribed and subscribed again.
