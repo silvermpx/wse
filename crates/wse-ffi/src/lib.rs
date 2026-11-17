@@ -717,6 +717,19 @@ pub async fn connect(
     Ok(Arc::new(WseClient(client)))
 }
 
+/// Starts, and returns at once: the connection is made in the background, a
+/// failed first attempt made again as any later one. What is sent meanwhile
+/// waits in the outbox: for an app that may start without a network.
+#[uniffi::export]
+pub async fn start(
+    config: WseConfig,
+    tokens: Option<Arc<dyn WseTokenSource>>,
+) -> Result<Arc<WseClient>, WseError> {
+    let tokens = tokens.map(|source| Arc::new(Tokens(source)) as Arc<dyn native::TokenSource>);
+    let client = native::NativeClient::start(config.into(), tokens).await?;
+    Ok(Arc::new(WseClient(client)))
+}
+
 #[uniffi::export]
 impl WseClient {
     /// Sends `{"t": kind, "p": json}`; fails at once when the outbox or the queue is

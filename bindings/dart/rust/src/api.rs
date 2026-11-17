@@ -522,6 +522,50 @@ pub struct WseBatch {
     pub items: Vec<WseItem>,
 }
 
+/// The native client's settings for `config`.
+fn native_config(config: WseConfig) -> native::NativeConfig {
+    let headers = config
+        .header_names
+        .into_iter()
+        .zip(config.header_values)
+        .collect();
+    native::NativeConfig {
+        url: config.url,
+        token: config.token,
+        topics: config.topics,
+        msgpack: config.msgpack,
+        headers,
+        send_queue: config.send_queue,
+        reconnect: Some(config.reconnect),
+        connect_timeout_ms: config.connect_timeout_ms,
+        recovery_timeout_ms: config.recovery_timeout_ms,
+        server_identity_keys: config.server_identity_keys,
+        signing_key: config.signing_key,
+        server_signing_keys: config.server_signing_keys,
+        trust: match config.trust {
+            WseTrustKind::Platform => native::NativeTrust::Platform,
+            WseTrustKind::Mozilla => native::NativeTrust::Mozilla,
+            WseTrustKind::Roots => native::NativeTrust::Roots(config.trusted_roots),
+        },
+        insecure: config.insecure,
+        delivery: config.delivery.map(|d| native::NativeDelivery {
+            consumer: d.consumer,
+            schema: d.schema,
+            realm: d.realm,
+            checkpoint: d.checkpoint,
+            max_held: d.max_held,
+        }),
+        offline: config.offline.map(|o| native::NativeOffline {
+            disabled: o.disabled,
+            path: o.path,
+            max_messages: o.max_messages,
+            max_bytes: o.max_bytes,
+            max_age_ms: o.max_age_ms,
+        }),
+        ..native::NativeConfig::default()
+    }
+}
+
 #[frb(opaque)]
 pub struct WseNativeClient(native::NativeClient);
 
@@ -531,47 +575,16 @@ impl WseNativeClient {
         config: WseConfig,
         cancel: &WseCancel,
     ) -> Result<WseNativeClient, WseError> {
-        let headers = config
-            .header_names
-            .into_iter()
-            .zip(config.header_values)
-            .collect();
-        let native_config = native::NativeConfig {
-            url: config.url,
-            token: config.token,
-            topics: config.topics,
-            msgpack: config.msgpack,
-            headers,
-            send_queue: config.send_queue,
-            reconnect: Some(config.reconnect),
-            connect_timeout_ms: config.connect_timeout_ms,
-            recovery_timeout_ms: config.recovery_timeout_ms,
-            server_identity_keys: config.server_identity_keys,
-            signing_key: config.signing_key,
-            server_signing_keys: config.server_signing_keys,
-            trust: match config.trust {
-                WseTrustKind::Platform => native::NativeTrust::Platform,
-                WseTrustKind::Mozilla => native::NativeTrust::Mozilla,
-                WseTrustKind::Roots => native::NativeTrust::Roots(config.trusted_roots),
-            },
-            insecure: config.insecure,
-            delivery: config.delivery.map(|d| native::NativeDelivery {
-                consumer: d.consumer,
-                schema: d.schema,
-                realm: d.realm,
-                checkpoint: d.checkpoint,
-                max_held: d.max_held,
-            }),
-            offline: config.offline.map(|o| native::NativeOffline {
-                disabled: o.disabled,
-                path: o.path,
-                max_messages: o.max_messages,
-                max_bytes: o.max_bytes,
-                max_age_ms: o.max_age_ms,
-            }),
-            ..native::NativeConfig::default()
-        };
-        let client = native::NativeClient::connect(native_config, None, &cancel.0).await?;
+        let client = native::NativeClient::connect(native_config(config), None, &cancel.0).await?;
+        Ok(WseNativeClient(client))
+    }
+
+    /// Starts, and returns at once: the connection is made in the
+    /// background, a failed first attempt made again as any later one. What
+    /// is sent meanwhile waits in the outbox: for an app that may start
+    /// without a network.
+    pub async fn start(config: WseConfig) -> Result<WseNativeClient, WseError> {
+        let client = native::NativeClient::start(native_config(config), None).await?;
         Ok(WseNativeClient(client))
     }
 

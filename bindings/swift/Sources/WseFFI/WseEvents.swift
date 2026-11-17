@@ -15,6 +15,14 @@ public extension WseClient {
         }
     }
 
+    /// Starts, and returns at once: the connection is made in the
+    /// background, a failed first attempt made again as any later one. What
+    /// is sent meanwhile waits in the outbox: for an app that may start
+    /// without a network.
+    static func start(_ config: WseConfig, tokens: WseTokenSource? = nil) async throws -> WseClient {
+        try await WseFFI.start(config: config, tokens: tokens)
+    }
+
     /// What the server sends, in order, until the client closes. Every call
     /// reads the client's one stream (with the limits of the first): an item
     /// goes to one reader, a loop left and a new one go on from the same

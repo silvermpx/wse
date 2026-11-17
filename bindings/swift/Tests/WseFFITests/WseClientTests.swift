@@ -238,6 +238,23 @@ final class WseClientTests: XCTestCase {
         await client.disconnect(deadlineMs: 1_000)
     }
 
+    func testAClientStartedWithNoServerKeepsWhatItSends() async throws {
+        // Nobody answers on port 9: it starts at once all the same.
+        let client = try await WseClient.start(WseConfig(url: "ws://127.0.0.1:9/wse", insecure: true))
+        XCTAssertNotEqual(client.status(), .connected)
+        try client.trySend(kind: "echo", json: #"{"n":1}"#)
+        XCTAssertEqual(client.kept(), 1)
+        await client.disconnect(deadlineMs: 0)
+    }
+
+    func testAStartedClientGetsInOnItsOwn() async throws {
+        let client = try await WseClient.start(WseConfig(url: url, insecure: true))
+        try await client.send(kind: "echo", json: #"{"n":3}"#)
+        let echoed = try await message(client, "echoed")
+        XCTAssertEqual(echoed.json, #"{"n":3}"#)
+        await client.disconnect(deadlineMs: 1_000)
+    }
+
     func testWhatIsSentWithNoConnectionGoesOnTheNext() async throws {
         let path = FileManager.default.temporaryDirectory
             .appendingPathComponent("wse-offline-\(UUID().uuidString)").path

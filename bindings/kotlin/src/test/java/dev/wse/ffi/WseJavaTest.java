@@ -55,6 +55,16 @@ class WseJavaTest {
     }
 
     @Test
+    void aClientStartedWithNoServerKeepsWhatItSends() throws Exception {
+        // Nobody answers on port 9: it starts at once all the same.
+        WseClient client = Wse.start(Wse.config("ws://127.0.0.1:9/wse").insecure(true).build()).get(2, SECONDS);
+        assertNotEquals(WseStatus.CONNECTED, client.status());
+        client.trySend("echo", "{\"n\":1}");
+        assertEquals(1, Wse.kept(client));
+        Wse.disconnect(client, Duration.ZERO).get(10, SECONDS);
+    }
+
+    @Test
     void nothingInTimeIsATimeoutAndLosesNothing() throws Exception {
         WseClient client = Wse.connect(Wse.config(url).insecure(true).build()).get(10, SECONDS);
         WseEventReader events = Wse.events(client);

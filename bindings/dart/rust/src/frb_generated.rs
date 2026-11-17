@@ -40,7 +40,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.13.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1873176362;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 52924063;
 
 // Section: executor
 
@@ -1068,6 +1068,42 @@ fn wire__crate__api__WseNativeClient_send_with_impl(
                             api_options,
                         )
                         .await?;
+                        std::result::Result::Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__WseNativeClient_start_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "WseNativeClient_start",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_config = <crate::api::WseConfig>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, crate::api::WseError>(
+                    (move || async move {
+                        let output_ok = crate::api::WseNativeClient::start(api_config).await?;
                         std::result::Result::Ok(output_ok)
                     })()
                     .await,
@@ -2186,6 +2222,7 @@ fn pde_ffi_dispatcher_primary_impl(
         }
         18 => wire__crate__api__WseNativeClient_send_signed_impl(port, ptr, rust_vec_len, data_len),
         19 => wire__crate__api__WseNativeClient_send_with_impl(port, ptr, rust_vec_len, data_len),
+        20 => wire__crate__api__WseNativeClient_start_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -2209,19 +2246,19 @@ fn pde_ffi_dispatcher_sync_impl(
         12 => wire__crate__api__WseNativeClient_resume_impl(ptr, rust_vec_len, data_len),
         13 => wire__crate__api__WseNativeClient_resync_impl(ptr, rust_vec_len, data_len),
         14 => wire__crate__api__WseNativeClient_resynced_impl(ptr, rust_vec_len, data_len),
-        20 => wire__crate__api__WseNativeClient_status_impl(ptr, rust_vec_len, data_len),
-        21 => wire__crate__api__WseNativeClient_subscribe_impl(ptr, rust_vec_len, data_len),
-        22 => wire__crate__api__WseNativeClient_topic_states_impl(ptr, rust_vec_len, data_len),
-        23 => wire__crate__api__WseNativeClient_try_send_impl(ptr, rust_vec_len, data_len),
-        24 => wire__crate__api__WseNativeClient_try_send_live_impl(ptr, rust_vec_len, data_len),
-        25 => {
+        21 => wire__crate__api__WseNativeClient_status_impl(ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__WseNativeClient_subscribe_impl(ptr, rust_vec_len, data_len),
+        23 => wire__crate__api__WseNativeClient_topic_states_impl(ptr, rust_vec_len, data_len),
+        24 => wire__crate__api__WseNativeClient_try_send_impl(ptr, rust_vec_len, data_len),
+        25 => wire__crate__api__WseNativeClient_try_send_live_impl(ptr, rust_vec_len, data_len),
+        26 => {
             wire__crate__api__WseNativeClient_try_send_requiring_impl(ptr, rust_vec_len, data_len)
         }
-        26 => wire__crate__api__WseNativeClient_try_send_with_impl(ptr, rust_vec_len, data_len),
-        27 => wire__crate__api__WseNativeClient_unsubscribe_impl(ptr, rust_vec_len, data_len),
-        28 => wire__crate__api__WseNativeClient_user_id_impl(ptr, rust_vec_len, data_len),
-        29 => wire__crate__api__generate_signing_key_impl(ptr, rust_vec_len, data_len),
-        30 => wire__crate__api__signing_public_key_impl(ptr, rust_vec_len, data_len),
+        27 => wire__crate__api__WseNativeClient_try_send_with_impl(ptr, rust_vec_len, data_len),
+        28 => wire__crate__api__WseNativeClient_unsubscribe_impl(ptr, rust_vec_len, data_len),
+        29 => wire__crate__api__WseNativeClient_user_id_impl(ptr, rust_vec_len, data_len),
+        30 => wire__crate__api__generate_signing_key_impl(ptr, rust_vec_len, data_len),
+        31 => wire__crate__api__signing_public_key_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }

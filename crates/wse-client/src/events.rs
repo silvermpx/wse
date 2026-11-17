@@ -132,6 +132,17 @@ const QUEUE: usize = 1024;
 /// Connects, and returns the client with the stream of what the server
 /// sends. See [`Client::connect`].
 pub async fn connect(config: Config) -> Result<(Client, Events), Error> {
+    with_events(config, true).await
+}
+
+/// Starts, and returns at once the client with the stream of what the
+/// server sends: the connection is made in the background. See
+/// [`Client::start`].
+pub async fn start(config: Config) -> Result<(Client, Events), Error> {
+    with_events(config, false).await
+}
+
+async fn with_events(config: Config, wait: bool) -> Result<(Client, Events), Error> {
     #[cfg(not(target_arch = "wasm32"))]
     let (tx, rx) = mpsc::channel(QUEUE);
     #[cfg(target_arch = "wasm32")]
@@ -141,7 +152,7 @@ pub async fn connect(config: Config) -> Result<(Client, Events), Error> {
         waiting: VecDeque::new(),
     };
     let (wake_tx, wake) = mpsc::unbounded_channel();
-    let (client, gate) = Client::start(config, |_| queue, Some(wake_tx)).await?;
+    let (client, gate) = Client::launch(config, |_| queue, Some(wake_tx), wait).await?;
     Ok((client, Events { rx, gate, wake }))
 }
 

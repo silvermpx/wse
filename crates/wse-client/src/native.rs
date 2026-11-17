@@ -876,7 +876,26 @@ impl NativeClient {
             }
         })
         .await?;
-        Ok(Self {
+        Ok(Self::of(client, events))
+    }
+
+    /// Starts, and returns at once: the connection is made in the
+    /// background, a failed first attempt made again as any later one. What
+    /// is sent meanwhile waits in the outbox: for an app that may start
+    /// without a network.
+    pub async fn start(
+        config: NativeConfig,
+        tokens: Option<Arc<dyn TokenSource>>,
+    ) -> Result<Self, NativeError> {
+        let config = config_of(config, tokens)?;
+        let (client, events) =
+            on_runtime(async move { crate::start(config).await.map_err(NativeError::from) })
+                .await?;
+        Ok(Self::of(client, events))
+    }
+
+    fn of(client: crate::Client, events: crate::Events) -> Self {
+        Self {
             client,
             reader: Mutex::new(Reader {
                 events,
@@ -885,7 +904,7 @@ impl NativeClient {
                 ended: false,
             }),
             closing: CancellationToken::new(),
-        })
+        }
     }
 
     /// Each topic held: whether the server took it, and whether its

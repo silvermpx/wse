@@ -97,6 +97,12 @@ opened or written is a `storageFailed` item (`name`: what failed,
 `reason`: why), and the outbox goes on in memory. `wseOffline(disabled:
 true)` has no outbox: a send with no connection fails, as before 3.2.
 
+`WseClient.connect` completes once the server took the connection, and
+fails when the first attempt does. For an app that may start without a
+network, `WseClient.start` completes at once: the connection is made in the
+background, a failed first attempt made again as any later one, and what is
+sent meanwhile waits in the outbox.
+
 ## Topic states and recover-or-resync
 
 `client.topicStates` says of each topic whether the server took it and

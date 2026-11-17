@@ -16,6 +16,14 @@ suspend fun connectClient(config: WseConfig, tokens: WseTokenSource? = null): Ws
     connect(config, tokens, WseCancel())
 
 /**
+ * Starts, and returns at once: the connection is made in the background, a failed first attempt
+ * made again as any later one. What is sent meanwhile waits in the outbox: for an app that may
+ * start without a network.
+ */
+suspend fun startClient(config: WseConfig, tokens: WseTokenSource? = null): WseClient =
+    start(config, tokens)
+
+/**
  * Where the reading of a client's events stands, for as long as the client lives: the readers
  * made of it one after another go on from one place. It holds no client, so it goes with it.
  */

@@ -264,6 +264,14 @@ and `try_send` fails at once with `Error::Full`. `kept()` says how many
 wait. A send that requires topics waits in memory until they are
 continuous, and joins the outbox then.
 
+`wse_client::connect` (and `Client::connect`) returns once the server took
+the connection, and fails when the first attempt does. For an application
+that may start without a network, `wse_client::start` (and `Client::start`)
+returns at once: the connection is made in the background, a failed first
+attempt made again as any later one (`Config::reconnect`), and what is
+sent meanwhile waits in the outbox; a client that gives up says so in
+`closed()`.
+
 `Offline::in_memory()` (the default) keeps the outbox for the client's
 life. `Offline::in_file(path)` keeps it in a file, so that it outlives the
 application: the file is the client's alone while it runs (`<path>.lock`

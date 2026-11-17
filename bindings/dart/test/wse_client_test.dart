@@ -202,6 +202,26 @@ void main() {
     throw StateError('the events ended before $kind');
   }
 
+  test('a client started with no server keeps what it sends', () async {
+    // Nobody answers on port 9: it starts at once all the same.
+    final client = await WseClient.start(
+      wseConfig('ws://127.0.0.1:9/wse', insecure: true),
+    ).timeout(const Duration(seconds: 2));
+    expect(client.status, isNot('connected'));
+    client.trySend('echo', '{"n":1}');
+    expect(client.kept, 1);
+    await client.close(deadline: Duration.zero);
+  });
+
+  test('a started client gets in on its own', () async {
+    final client = await WseClient.start(wseConfig(url, insecure: true));
+    final items = StreamIterator(client.events());
+    await client.send('echo', '{"n":3}');
+    expect((await message(items, 'echoed')).json, '{"n":3}');
+    await items.cancel();
+    await client.close();
+  });
+
   test('what is sent with no connection goes on the next', () async {
     final dir = Directory.systemTemp.createTempSync('wse-offline');
     final client = await WseClient.connect(

@@ -106,6 +106,12 @@ or written is a `.storageFailed` item, and the outbox goes on in memory.
 `WseOffline(disabled: true)` has no outbox: a send with no connection
 fails, as before 3.2.
 
+`WseClient.connect` returns once the server took the connection, and fails
+when the first attempt does. For an app that may start without a network,
+`WseClient.start` returns at once: the connection is made in the
+background, a failed first attempt made again as any later one, and what
+is sent meanwhile waits in the outbox.
+
 `events()` is the client's stream, until it closes; one reader at a time.
 A Task cancelled while reading loses nothing: the next read gets the rest;
 a loop left and a new one go on from the same place.

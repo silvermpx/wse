@@ -74,6 +74,15 @@ object Wse {
         calls.future { connectClient(config, tokens) }
 
     /**
+     * Starts; the future completes at once, the connection made in the background (a failed
+     * first attempt made again as any later one). What is sent meanwhile waits in the outbox.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun start(config: WseConfig, tokens: WseTokenSource? = null): CompletableFuture<WseClient> =
+        calls.future { startClient(config, tokens) }
+
+    /**
      * Sends `{"t": kind, "p": json}`, waiting for room; a message already queued still goes. It
      * waits in the outbox until the server answers for it.
      */

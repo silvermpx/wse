@@ -6,7 +6,7 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `continuity_of`, `of`
+// These functions are ignored because they are not marked as `pub`: `continuity_of`, `native_config`, `of`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `fmt`, `from`, `from`, `from`
 
 /// A new ECDSA P-256 private key (PKCS#8 DER) for signed messages: keep it
@@ -108,6 +108,13 @@ abstract class WseNativeClient implements RustOpaqueInterface {
     required String json,
     required WseSendOptions options,
   });
+
+  /// Starts, and returns at once: the connection is made in the
+  /// background, a failed first attempt made again as any later one. What
+  /// is sent meanwhile waits in the outbox: for an app that may start
+  /// without a network.
+  static Future<WseNativeClient> start({required WseConfig config}) =>
+      RustLib.instance.api.crateApiWseNativeClientStart(config: config);
 
   /// connecting, connected, reconnecting, paused or closed.
   String status();

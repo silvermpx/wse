@@ -36,7 +36,7 @@ pub use config::Encryption;
 pub use config::{Config, Format, Reconnect, TokenProvider};
 pub use delivery::{Continuity, Delivery, StreamPosition, Subscription, TopicState};
 pub use error::Error;
-pub use events::{Events, Incoming, connect};
+pub use events::{Events, Incoming, connect, start};
 pub use handler::{
     CheckpointRejected, Connected, Disconnected, Event, Gap, GapReason, Handler, MaybeSend,
     NotDelivered, Paused, Recovery, Resync, ServerError, StorageFailed, Subscribed,

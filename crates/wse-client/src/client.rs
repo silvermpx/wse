@@ -242,18 +242,41 @@ impl Client {
         H: Handler,
         F: FnOnce(Client) -> H,
     {
-        Self::start(config, make, None)
+        Self::launch(config, make, None, true)
             .await
             .map(|(client, _)| client)
     }
 
-    /// Connects. The delivery's gate stands before the handler, or, with
-    /// `reader` (the [`Events`](crate::Events) stream's wake), where the
-    /// stream is read: it is returned for it.
-    pub(crate) async fn start<H, F>(
+    /// Starts, and returns at once: the connection is made in the
+    /// background, a failed first attempt made again as any later one
+    /// ([`Config::reconnect`]). What is sent meanwhile waits in the outbox.
+    /// For an application that may start without a network; a client that
+    /// gives up says so in [`Client::closed`].
+    pub async fn start<H: Handler>(config: Config, handler: H) -> Result<Self, Error> {
+        Self::start_with(config, |_| handler).await
+    }
+
+    /// [`start`](Self::start) with a handler that is given the client, to
+    /// send from it.
+    pub async fn start_with<H, F>(config: Config, make: F) -> Result<Self, Error>
+    where
+        H: Handler,
+        F: FnOnce(Client) -> H,
+    {
+        Self::launch(config, make, None, false)
+            .await
+            .map(|(client, _)| client)
+    }
+
+    /// Starts the client, and returns once the server took the first
+    /// connection (`wait`) or at once. The delivery's gate stands before the
+    /// handler, or, with `reader` (the [`Events`](crate::Events) stream's
+    /// wake), where the stream is read: it is returned for it.
+    pub(crate) async fn launch<H, F>(
         mut config: Config,
         make: F,
         reader: Option<mpsc::UnboundedSender<()>>,
+        wait: bool,
     ) -> Result<(Self, delivery::Shared), Error>
     where
         H: Handler,
@@ -306,7 +329,9 @@ impl Client {
             ..for_handler.clone()
         };
         let handler = make(for_handler);
+        // Connect waits for the first connection's answer; start retries it.
         let (first_tx, first_rx) = oneshot::channel();
+        let first = wait.then_some(first_tx);
         let ended = (Arc::clone(&shared), status_tx.clone());
         let (stop, stopped) = futures_util::future::AbortHandle::new_pair();
         if let Ok(mut slot) = shared.stop.lock() {
@@ -320,7 +345,7 @@ impl Client {
         let run = async move {
             use futures_util::FutureExt;
             let driven = futures_util::future::Abortable::new(
-                std::panic::AssertUnwindSafe(driver.run(Some(first_tx))).catch_unwind(),
+                std::panic::AssertUnwindSafe(driver.run(first)).catch_unwind(),
                 stopped,
             )
             .await;
@@ -344,6 +369,9 @@ impl Client {
         tokio::spawn(run);
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(run);
+        if !wait {
+            return Ok((client, gate));
+        }
         match first_rx.await {
             Ok(Ok(())) => Ok((client, gate)),
             Ok(Err(error)) => Err(error),

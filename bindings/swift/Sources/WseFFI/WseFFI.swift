@@ -4081,6 +4081,25 @@ public func signingPublicKey(key: Data)throws  -> String  {
     )
 })
 }
+/**
+ * Starts, and returns at once: the connection is made in the background, a
+ * failed first attempt made again as any later one. What is sent meanwhile
+ * waits in the outbox: for an app that may start without a network.
+ */
+public func start(config: WseConfig, tokens: WseTokenSource?)async throws  -> WseClient  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_wse_ffi_fn_func_start(FfiConverterTypeWseConfig_lower(config),FfiConverterOptionTypeWseTokenSource.lower(tokens)
+                )
+            },
+            pollFunc: ffi_wse_ffi_rust_future_poll_u64,
+            completeFunc: ffi_wse_ffi_rust_future_complete_u64,
+            freeFunc: ffi_wse_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterTypeWseClient_lift,
+            errorHandler: FfiConverterTypeWseError_lift
+        )
+}
 
 private enum InitializationResult {
     case ok
@@ -4104,6 +4123,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_func_signing_public_key() != 19003) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wse_ffi_checksum_func_start() != 53172) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_method_wsecancel_cancel() != 25563) {

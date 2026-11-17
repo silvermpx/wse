@@ -492,3 +492,61 @@ async fn a_server_that_does_not_answer_takes_what_was_written() {
     assert_eq!(delivered(&mut events).await, [id]);
     client.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_started_with_no_server_sends_once_one_comes() {
+    // The server's port is taken, but nobody answers on it yet.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = wse::Config::default();
+    config.jwt = Some(wse::JwtSettings::new(SECRET));
+    let server = wse::Server::new(config).unwrap();
+    let mut client_config = Config::new(format!("ws://{}/wse", listener.local_addr().unwrap()));
+    client_config.token = Some(
+        server
+            .publisher()
+            .issue_token("ann", Duration::from_secs(600), serde_json::Map::new())
+            .unwrap(),
+    );
+    client_config.connect_timeout = Duration::from_millis(200);
+    client_config.reconnect.base_delay = Duration::from_millis(50);
+    client_config.reconnect.max_delay = Duration::from_millis(200);
+
+    // It starts at once, with no connection, and what it sends waits.
+    let (client, mut events) =
+        tokio::time::timeout(Duration::from_secs(1), wse_client::start(client_config))
+            .await
+            .expect("started at once")
+            .unwrap();
+    assert!(!client.is_connected());
+    let id = client
+        .send_with(
+            "order",
+            &serde_json::json!({"n": 1}),
+            &SendOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(client.kept(), 1);
+
+    // The server comes: the client gets in, and its application takes the
+    // message once.
+    let (took_tx, mut took) = mpsc::unbounded_channel();
+    server.start(listener, App { took: took_tx }).unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), took.recv())
+        .await
+        .expect("taken within 5 s")
+        .unwrap();
+    assert_eq!(
+        (first.kind.as_str(), first.id.as_deref()),
+        ("order", Some(id.as_str()))
+    );
+    assert_eq!(delivered(&mut events).await, vec![id]);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), took.recv())
+            .await
+            .is_err(),
+        "taken once"
+    );
+    client.close().await;
+    server.stop().await;
+}

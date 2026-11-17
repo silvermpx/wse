@@ -86,6 +86,13 @@ class WseClient {
     ),
   );
 
+  /// Starts, and completes at once: the connection is made in the
+  /// background, a failed first attempt made again as any later one. What is
+  /// sent meanwhile waits in the outbox: for an app that may start without a
+  /// network.
+  static Future<WseClient> start(rust.WseConfig config) async =>
+      WseClient._(await rust.WseNativeClient.start(config: config));
+
   /// What the server sends, in order, until the client closes. A batch is
   /// acknowledged only once all of it was handed out, so a listener that
   /// stops in between gets the rest from the next one; one reader at a time.

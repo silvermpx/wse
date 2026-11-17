@@ -710,6 +710,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_wse_ffi_checksum_func_signing_public_key(
     ): Int
+    external fun uniffi_wse_ffi_checksum_func_start(
+    ): Int
     external fun uniffi_wse_ffi_checksum_method_wsecancel_cancel(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wsecancel_is_cancelled(
@@ -871,6 +873,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_wse_ffi_fn_func_signing_public_key(`key`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+    external fun uniffi_wse_ffi_fn_func_start(`config`: RustBuffer.ByValue,`tokens`: RustBuffer.ByValue,
+    ): Long
     external fun ffi_wse_ffi_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun ffi_wse_ffi_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -997,6 +1001,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_func_signing_public_key() and 0xFFFF) != 19003) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_wse_ffi_checksum_func_start() and 0xFFFF) != 53172) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_method_wsecancel_cancel() and 0xFFFF) != 25563) {
@@ -5597,5 +5604,28 @@ public object FfiConverterSequenceTypeWseItem: FfiConverterRustBuffer<List<WseIt
 
         FfiConverterByteArray.lower(`key`),_status)
 }
+    )
+    }
+
+
+        /**
+         * Starts, and returns at once: the connection is made in the background, a
+         * failed first attempt made again as any later one. What is sent meanwhile
+         * waits in the outbox: for an app that may start without a network.
+         */
+    @Throws(WseException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+     suspend fun `start`(`config`: WseConfig, `tokens`: WseTokenSource?) : WseClient {
+        return uniffiRustCallAsync(
+        UniffiLib.uniffi_wse_ffi_fn_func_start(
+        FfiConverterTypeWseConfig.lower(`config`),
+        FfiConverterOptionalTypeWseTokenSource.lower(`tokens`),),
+        { future, callback, continuation -> UniffiLib.ffi_wse_ffi_rust_future_poll_u64(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_wse_ffi_rust_future_complete_u64(future, continuation) },
+        { future -> UniffiLib.ffi_wse_ffi_rust_future_free_u64(future) },
+        // lift function
+        { FfiConverterTypeWseClient.lift(it) },
+        // Error FFI converter
+        WseException.ErrorHandler,
     )
     }

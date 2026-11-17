@@ -129,6 +129,25 @@ class WseClientTest {
     }
 
     @Test
+    fun aClientStartedWithNoServerKeepsWhatItSends(): Unit = runBlocking {
+        // Nobody answers on port 9: it starts at once all the same.
+        val client = withTimeout(2_000) { startClient(WseConfig(url = "ws://127.0.0.1:9/wse", insecure = true)) }
+        assertTrue(client.status() != WseStatus.CONNECTED)
+        client.trySend("echo", """{"n":1}""")
+        assertEquals(1u, client.kept())
+        client.disconnect(0u)
+    }
+
+    @Test
+    fun aStartedClientGetsInOnItsOwn(): Unit = runBlocking {
+        val client = startClient(WseConfig(url = url, insecure = true))
+        val events = client.events()
+        client.send("echo", """{"n":3}""")
+        assertEquals("""{"n":3}""", message(events, "echoed").json)
+        client.disconnect(1_000u)
+    }
+
+    @Test
     fun aMessageTheServerTookIsSaidDeliveredByItsId(): Unit = runBlocking {
         val client = connectClient(WseConfig(url = url, insecure = true))
         val events = client.events()

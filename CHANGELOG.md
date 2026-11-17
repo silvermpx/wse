@@ -115,6 +115,11 @@
   macOS and the BSDs, an exclusive open on Windows, an abstract socket on
   Linux); a file that cannot be opened or written is a `wseStorageError`
   event.
+- Rust client (and Swift, Kotlin, Java, Dart): `start`, beside `connect`,
+  returns at once: the connection is made in the background, a failed first
+  attempt made again as any later one, and what is sent meanwhile waits in
+  the outbox. An app that started without a network could not have a
+  client before (`connect` fails when the first attempt does).
 - React Native: `storageOutbox(storage)` (`wse-client/react-native`) keeps
   the outbox in the app's storage, AsyncStorage (or one with its API) or
   MMKV, which the app passes in: what waits outlives the app being closed
