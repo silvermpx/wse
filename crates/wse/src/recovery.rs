@@ -610,6 +610,9 @@ impl RecoveryManager {
             None if self.total_bytes.load(Ordering::Relaxed)
                 >= self.config.global_memory_budget =>
             {
+                // Not kept: a client whose last message of the topic came
+                // before it cannot be told it missed nothing.
+                self.note_removed(topic, self.arrival.fetch_add(1, Ordering::Relaxed));
                 return None;
             }
             None => self.buffers.entry(topic.to_owned()).or_insert_with(|| {
@@ -690,10 +693,16 @@ impl RecoveryManager {
             // Over the memory budget no new buffer is made: each one
             // allocates its slots up front, and a peer can name any number of
             // fresh (topic, epoch) pairs between two cleanups. The message is
-            // still delivered live; only its recovery copy is skipped.
+            // still delivered live; only its recovery copy is skipped, and a
+            // client whose last message came before it cannot be told it
+            // missed nothing.
             None if self.total_bytes.load(Ordering::Relaxed)
                 >= self.config.global_memory_budget =>
             {
+                self.note_removed(
+                    foreign_topic(key),
+                    self.arrival.fetch_add(1, Ordering::Relaxed),
+                );
                 return true;
             }
             None => self
@@ -830,6 +839,13 @@ impl RecoveryManager {
             epoch,
             offset: head,
         };
+        // A history of the topic removed, or a message not kept, from after
+        // the client's last message: what it missed there is gone.
+        if let Some(removed) = self.removed_through.get(topic).map(|r| *r)
+            && anchor_seq.is_none_or(|seq| removed > seq)
+        {
+            return not_recovered;
+        }
         let Some(mut publications) = own else {
             return not_recovered;
         };
@@ -1234,9 +1250,14 @@ impl RecoveryManager {
         }
     }
 
-    /// A buffer of `topic` was removed with messages up to arrival `seq`.
+    /// Messages of `topic` up to arrival `seq` are not held here (a buffer
+    /// removed, or a message with no room to keep it).
     fn note_removed(&self, topic: &str, seq: u64) {
         if seq == 0 {
+            return;
+        }
+        if let Some(mut through) = self.removed_through.get_mut(topic) {
+            *through = (*through).max(seq);
             return;
         }
         let mut through = self.removed_through.entry(topic.to_owned()).or_insert(0);
@@ -1764,10 +1785,10 @@ mod tests {
         assert!(mgr.foreign_buffers.len() < 10_000);
         // An existing buffer still takes messages.
         mgr.push_foreign("t", make_data("y"), 0, 1);
-        assert!(matches!(
-            mgr.recover("t", 0, 0),
-            RecoveryResult::Recovered { .. }
-        ));
+        assert!(mgr.streams("t").contains(&(0, 1)));
+        // What came past the budget is not kept: a client from before it is
+        // not told it missed nothing.
+        assert!(not_recovered(&mgr.recover("t", 0, 0)));
     }
 
     #[test]
@@ -2021,6 +2042,78 @@ mod tests {
         assert!(!mgr.streams("room").iter().any(|(epoch, _)| *epoch == 0xc));
         assert_eq!(
             replayed(mgr.recover_streams("room", (0xa, 0), &[(0xa, 0)])),
+            None
+        );
+    }
+
+    /// The same manager with its memory budget at `budget`.
+    fn with_budget(mgr: RecoveryManager, budget: usize) -> RecoveryManager {
+        RecoveryManager {
+            config: RecoveryConfig {
+                global_memory_budget: budget,
+                ..RecoveryConfig::default()
+            },
+            ..mgr
+        }
+    }
+
+    fn not_recovered(result: &RecoveryResult) -> bool {
+        matches!(result, RecoveryResult::NotRecovered { .. })
+    }
+
+    #[test]
+    fn a_client_with_one_position_is_not_told_a_removed_stream_was_replayed() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.interest_began("room");
+        // The client's last message, this node's own; then another node's,
+        // then this node's again.
+        mgr.push("room", make_data("l0"));
+        let (local, _) = mgr.get_position("room").unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        mgr.push_foreign("room", make_data("f0"), 0xf, 0);
+        std::thread::sleep(Duration::from_millis(2));
+        mgr.push("room", make_data("l1"));
+        // Over the budget the oldest buffer goes: the other node's.
+        let budget = mgr.total_bytes() - 1;
+        let mgr = with_budget(mgr, budget);
+        mgr.cleanup();
+        assert!(mgr.streams("room").iter().all(|(epoch, _)| *epoch == local));
+        // A client before 3.1 names its last message only: f0 is gone.
+        assert!(not_recovered(&mgr.recover("room", local, 0)));
+    }
+
+    #[test]
+    fn a_relayed_message_with_no_room_to_keep_it_is_never_recovered_as_nothing() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.interest_began("room");
+        mgr.push("room", make_data("l0"));
+        let (local, _) = mgr.get_position("room").unwrap();
+        // Over the budget: another node's new stream gets no buffer, and its
+        // message goes out live only.
+        let budget = mgr.total_bytes();
+        let mgr = with_budget(mgr, budget);
+        assert!(mgr.push_foreign("room", make_data("f0"), 0xf, 0));
+        assert!(mgr.streams("room").iter().all(|(epoch, _)| *epoch == local));
+        // A client whose last message came before it may have missed it.
+        assert!(not_recovered(&mgr.recover("room", local, 0)));
+        assert_eq!(
+            replayed(mgr.recover_streams("room", (local, 0), &[(local, 0)])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_message_published_with_no_room_to_keep_it_is_never_recovered_as_nothing() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.interest_began("room");
+        mgr.push_foreign("room", make_data("f0"), 0xf, 0);
+        let budget = mgr.total_bytes();
+        let mgr = with_budget(mgr, budget);
+        // This node's new stream gets no buffer: the message goes unstamped.
+        assert!(mgr.push_stamped("room", |_, _| make_data("l0")).is_none());
+        assert!(not_recovered(&mgr.recover("room", 0xf, 0)));
+        assert_eq!(
+            replayed(mgr.recover_streams("room", (0xf, 0), &[(0xf, 0)])),
             None
         );
     }
