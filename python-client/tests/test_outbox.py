@@ -375,6 +375,50 @@ class TestTheOutboxInAFile:
         assert went == [1]
         outbox.close_file()
 
+    @staticmethod
+    def short_writes(monkeypatch, marker: bytes) -> None:
+        """The first write of data with *marker* in it takes half of it, as a
+        write may."""
+        real = os.write
+        taken = {"short": False}
+
+        def write(fd, data):
+            if not taken["short"] and marker in bytes(data):
+                taken["short"] = True
+                return real(fd, bytes(data)[: len(data) // 2])
+            return real(fd, data)
+
+        monkeypatch.setattr(outbox_module.os, "write", write)
+
+    def test_an_append_that_took_part_of_its_lines_is_finished(
+        self, tmp_path, monkeypatch
+    ):
+        offline = self.offline(tmp_path)
+        self.short_writes(monkeypatch, b"persist-me")
+        box = Outbox(offline)
+        box.add("persist-me", '{"t":"command"}', None, time.time())
+        box.close_file()
+        monkeypatch.undo()
+        again = Outbox(offline)
+        assert again.size == 1
+        again.close_file()
+
+    def test_a_rewrite_that_took_part_of_the_file_is_finished(
+        self, tmp_path, monkeypatch
+    ):
+        offline = self.offline(tmp_path)
+        box = Outbox(offline)
+        box.add("persist-me", '{"t":"command"}', None, time.time())
+        box.close_file()
+        self.short_writes(monkeypatch, b"persist-me")
+        # Opened, the file is written anew.
+        again = Outbox(offline)
+        again.close_file()
+        monkeypatch.undo()
+        last = Outbox(offline)
+        assert last.size == 1
+        last.close_file()
+
     def test_a_number_is_never_used_twice(self, tmp_path):
         offline = self.offline(tmp_path)
         first = Outbox(offline)

@@ -855,6 +855,16 @@ def _sync(fd: int) -> None:
         os.fsync(fd)
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    """Writes all of *data*: one write may take only part of it."""
+    view = memoryview(data)
+    while view:
+        taken = os.write(fd, view)
+        if taken <= 0:
+            raise OSError("the write took nothing")
+        view = view[taken:]
+
+
 def _lock(fd: int) -> bool:
     """The file the client's alone; False when another client has it."""
     try:
@@ -1041,7 +1051,7 @@ class _Writer:
             try:
                 if self.fd is None:
                     raise OSError("no file")
-                os.write(self.fd, data)
+                _write_all(self.fd, data)
             except OSError as exc:
                 self.fail(f"cannot write it: {exc}")
                 return False, mark
@@ -1070,7 +1080,7 @@ class _Writer:
         try:
             fd = os.open(self.tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             try:
-                os.write(fd, data)
+                _write_all(fd, data)
                 _sync(fd)
             finally:
                 os.close(fd)
