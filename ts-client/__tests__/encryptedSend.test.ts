@@ -103,6 +103,32 @@ it('a send that requires topics waits when they stop being continuous while it i
   await vi.waitFor(async () => expect(await socket.orders()).toEqual([{ id: 42 }]));
 });
 
+it('a kept send that requires topics waits when they stop being continuous while it is sealed, and what follows waits behind it', async () => {
+  const { resync, later } = resyncs();
+  const c = client({
+    topics: ['prices'],
+    consumer: 'board',
+    offline: { enabled: true },
+    delivery: { mode: 'recover-or-resync', resync },
+  });
+  c.retain();
+  await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+  const socket = await open(c, 'alice');
+  socket.ws.serverSend({ c: 'WSE', t: 'outbox', p: { acked: 0, node: 'n1' }, v: 1 });
+  subscribed(socket.ws);
+  await vi.waitFor(() => expect(c.state.getSnapshot().topicStates.prices.continuity).toBe('continuous'));
+
+  c.send('order', { id: 42 }, { requires: ['prices'] });
+  c.send('order', { id: 43 });
+  c.resync(['prices']);
+  await settle();
+  expect(await socket.orders()).toEqual([]);
+
+  // Resynced: both go, in order, once.
+  later.forEach((resolve) => resolve());
+  await vi.waitFor(async () => expect(await socket.orders()).toEqual([{ id: 42 }, { id: 43 }]));
+});
+
 it('a send that requires topics, cut off by a reconnect while it is sealed, waits for them there', async () => {
   const { resync, later } = resyncs();
   const c = client({ topics: ['prices'], consumer: 'board', delivery: { mode: 'recover-or-resync', resync } });

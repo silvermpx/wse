@@ -280,7 +280,7 @@ export class Outbox {
   private held = 0;
   private heldBytes = 0;
   /** The messages it took: one a vanished socket hands back waits here already. */
-  private taken = new WeakSet<WSMessage>();
+  private taken = new WeakMap<WSMessage, Kept>();
   /** When the first message not written yet runs out (epoch ms); Infinity: none. */
   private earliestMs = Infinity;
   /** Its timer, with or without a connection, when someone hears what ran out. */
@@ -467,7 +467,7 @@ export class Outbox {
       this.records.push(record);
       this.count++;
       this.bytes += record.size;
-      this.taken.add(record.message);
+      this.taken.set(record.message, record);
       if (record.s > this.written && record.until < earliest) earliest = record.until;
     }
     this.earliestMs = earliest;
@@ -533,6 +533,42 @@ export class Outbox {
   /** `message` is one of the outbox's. */
   has(message: WSMessage): boolean {
     return this.taken.has(message);
+  }
+
+  /**
+   * A message handed to be written later (it is sealed meanwhile), right
+   * before it is: its record while it may still go (kept, handed on this
+   * connection and not taken back); null when it may not; undefined when it
+   * is not this outbox's.
+   */
+  handed(message: WSMessage): Kept | null | undefined {
+    const record = this.taken.get(message);
+    if (!record) return undefined;
+    const at = this.handedAt(record.s);
+    return at >= 0 && this.records[at] === record ? record : null;
+  }
+
+  /**
+   * A message handed to be written later cannot go now (the topics it
+   * requires broke off while it was sealed): it and those handed after it
+   * are taken back, and go again in order, so the server sees no gap.
+   */
+  takeBack(message: WSMessage): void {
+    const record = this.taken.get(message);
+    const at = record ? this.handedAt(record.s) : -1;
+    if (at >= 0 && this.records[at] === record) this.cursor = at;
+  }
+
+  /** Where the record numbered `s` is among those handed on this connection, or -1. */
+  private handedAt(s: number): number {
+    let low = this.head;
+    let high = this.cursor;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (this.records[mid].s < s) low = mid + 1;
+      else high = mid;
+    }
+    return low < this.cursor && this.records[low].s === s ? low : -1;
   }
 
   /** What the client's hello says of it. */
@@ -616,7 +652,7 @@ export class Outbox {
     this.records.push(record);
     this.count++;
     this.bytes += size;
-    this.taken.add(message);
+    this.taken.set(message, record);
     if (until < this.earliestMs) {
       this.earliestMs = until;
       this.arm();

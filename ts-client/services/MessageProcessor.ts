@@ -2244,8 +2244,21 @@ export class MessageProcessor {
     logger.warn(`Dropping ${message.t}: it could not be sealed`);
   }
 
-  /** A message about to be written may still go: its user is the client's, the topics it requires continuous. */
+  /**
+   * A message about to be written may still go: its user is the client's,
+   * the topics it requires continuous; one of the outbox was not taken back
+   * since it was handed.
+   */
   mayStillGo(message: WSMessage): boolean {
+    const outbox = this.ctx.outbox.current;
+    const kept = outbox?.handed(message);
+    if (kept === null) return false;
+    if (kept) {
+      if (!kept.requires || this.continuous(kept.requires)) return true;
+      // It waits in the outbox, and what was handed after it waits behind it.
+      outbox!.takeBack(message);
+      return false;
+    }
     const was = this.handedOver.get(message);
     if (!was) return true;
     if (was.owner !== this.ctx.owner.current() || isExpired(was.expiresAt, Date.now())) return false;
