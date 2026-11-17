@@ -137,9 +137,10 @@ function portChannel(port: MessagePortMainLike, gone: () => void): OwnerChannel 
   };
 }
 
-/** A window served: the pages attached in it, and the asks answered. */
+/** A window served: the pages attached in it (by their ask), and how it stops being served. */
 interface Served {
   attached: Map<string, () => void>;
+  unserve: () => void;
 }
 
 export function createWSEOwner(options: WSEOwnerOptions): WSEOwner {
@@ -189,23 +190,25 @@ export function createWSEOwner(options: WSEOwnerOptions): WSEOwner {
   };
   const end = () => {
     electron.ipcMain.removeListener('wse:attach', attach);
-    for (const window of served.values()) letGo(window);
-    served.clear();
+    // Each window let go, and its listener taken off: an application that
+    // makes an owner per user leaves nothing on its windows.
+    for (const window of [...served.values()]) window.unserve();
   };
   const destroy = owner.destroy.bind(owner);
   const signOut = owner.signOut.bind(owner);
 
   return Object.assign(owner, {
     serve(contents: WebContentsLike) {
-      if (served.has(contents.id)) return () => {};
-      const window: Served = { attached: new Map() };
-      served.set(contents.id, window);
+      const known = served.get(contents.id);
+      if (known) return known.unserve;
       const gone = () => {
         contents.removeListener('destroyed', gone);
         if (served.get(contents.id) !== window) return;
         served.delete(contents.id);
         letGo(window);
       };
+      const window: Served = { attached: new Map(), unserve: gone };
+      served.set(contents.id, window);
       contents.on('destroyed', gone);
       return gone;
     },

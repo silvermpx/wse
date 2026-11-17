@@ -40,6 +40,13 @@
 - TypeScript: the bridge's owner sends a window the connection's state
   beside the batches (`conn` frames), so a window that holds its batches,
   paused or behind, still shows it.
+- The conformance cases run in a real Electron window (agent
+  `electron`): the case's client a page's, through the package's preload
+  and ports, the owner in the main process; in CI on Linux, macOS and
+  Windows.
+- TypeScript: an Electron owner that ends takes its listener off each
+  window it served, so an application that makes an owner per user
+  leaves nothing on its windows.
 - TypeScript: a bridge window that pauses gives its share of the
   connection back: the connection ends when no other window holds one, as
   a client of its own does; what came meanwhile waits for it at the owner.

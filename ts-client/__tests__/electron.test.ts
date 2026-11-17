@@ -214,6 +214,17 @@ describe('Electron', () => {
     await vi.waitFor(() => expect(second.bridge.phase).toBe('closed'));
   });
 
+  it('leaves nothing on a window when its owner ends, as one owner a user does', async () => {
+    const win = new Window();
+    for (let user = 0; user < 15; user++) {
+      const o = owner();
+      o.serve(win.contents);
+      o.destroy();
+    }
+    expect(win.contents.listenerCount('destroyed')).toBe(0);
+    expect(ipcMain.listenerCount('wse:attach')).toBe(0);
+  });
+
   it('ships its preload beside the main process’s module', () => {
     expect(wsePreloadPath.endsWith('preload.cjs')).toBe(true);
     expect(readFileSync(wsePreloadPath, 'utf8')).toBe(PRELOAD);

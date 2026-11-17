@@ -1,0 +1,9 @@
+{
+  "name": "wse-electron-checks",
+  "private": true,
+  "description": "The Electron package (wse-client/electron) in a real Electron: the conformance cases in a window, and the example application.",
+  "type": "module",
+  "devDependencies": {
+    "electron": "45.3.3"
+  }
+}

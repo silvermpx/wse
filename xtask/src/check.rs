@@ -132,6 +132,31 @@ uvx --quiet --from pytest --with-editable './python-client[all,dev]' pytest pyth
 \"$CARGO_TARGET_DIR/debug/wse-conformance\" check --manifest tests/conformance/agents.json --reports \"$out\"",
     },
     Lane {
+        // The Electron package in a real Electron: every case with its client
+        // in a window's page and the owner in the main process.
+        name: "electron",
+        needs: &[tool("cargo"), tool("node"), tool("npm")],
+        only_on: None,
+        script: "[ -d node_modules ] || { echo 'npm ci first: no node_modules'; exit 1; }
+display=
+if [ \"$(uname)\" = Linux ] && [ -z \"${DISPLAY:-}\" ]; then
+  command -v xvfb-run > /dev/null || { echo 'skip: Electron on Linux needs a display or xvfb-run'; exit 3; }
+  display='xvfb-run -a'
+fi
+(cd bindings/electron && { [ -d node_modules ] || npm ci --no-audit --no-fund; } && npx install-electron > /dev/null)
+npx tsc -p bindings/electron/tsconfig.json
+node bindings/electron/conformance/build.mjs
+cargo build --locked -p wse-conformance
+out=\"$(mktemp -d \"$CARGO_TARGET_DIR/electron.XXXXXX\")\"
+\"$CARGO_TARGET_DIR/debug/wse-conformance\" serve --out \"$out\" > \"$out/serve.log\" 2>&1 &
+server=$!
+trap 'kill $server 2> /dev/null' EXIT
+for _ in $(seq 1 100); do grep -q '\"ready\"' \"$out/serve.log\" && break; sleep 0.1; done
+control=\"$(sed -n 's/.*\"control\":\"\\([^\"]*\\)\".*/\\1/p' \"$out/serve.log\")\"
+$display bindings/electron/node_modules/.bin/electron bindings/electron/conformance/out/main.mjs \"$control\"
+\"$CARGO_TARGET_DIR/debug/wse-conformance\" check --manifest tests/conformance/electron.json --reports \"$out\"",
+    },
+    Lane {
         // The tests on the JVM, then the JVM package as an application gets it.
         name: "kotlin-jvm",
         needs: &[tool("java"), tool_or("gradle", "GRADLE"), tool("cargo")],
