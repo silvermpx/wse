@@ -21,6 +21,7 @@ import type {
   StoredMessage,
   StoredOutbox,
 } from '../services/Outbox.js';
+import { newProducer } from '../services/Outbox.js';
 
 /** AsyncStorage, as far as the outbox uses it. */
 export interface AsyncStorageLike {
@@ -115,12 +116,6 @@ function topicsOf(value: unknown): string[] | undefined {
   return Array.isArray(value) && value.length > 0 && value.every((t) => typeof t === 'string' && t.length > 0)
     ? (value as string[])
     : undefined;
-}
-
-function newProducer(): string {
-  const bytes = new Uint8Array(16);
-  globalThis.crypto.getRandomValues(bytes);
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 const isCount = (value: unknown): value is number =>

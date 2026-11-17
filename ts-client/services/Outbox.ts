@@ -17,6 +17,7 @@
 // is kept.
 
 import type { WSMessage } from '../types.js';
+import { generateId } from '../utils/id.js';
 
 /** What became of messages: delivered, or not and why (the reason, the ids). */
 export interface Outcomes {
@@ -172,11 +173,12 @@ interface Kept extends StoredMessage {
   size: number;
 }
 
-/** A random id: a producer's, 128 bits as 32 hex digits. */
-function newProducer(): string {
-  const bytes = new Uint8Array(16);
-  globalThis.crypto.getRandomValues(bytes);
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+/**
+ * A random id: a producer's, as 32 hex digits, from the WebCrypto the client
+ * uses (the one given with setWebCrypto in React Native).
+ */
+export function newProducer(): string {
+  return generateId().replace(/-/g, '');
 }
 
 /** Monotonic ms, for how often a broken store is written anew. */

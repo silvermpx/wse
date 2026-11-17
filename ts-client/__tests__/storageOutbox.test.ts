@@ -4,6 +4,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { noOutcomes, Outbox } from '../services/Outbox';
 import { storageOutbox, type AsyncStorageLike, type MMKVLike } from '../react-native/storageOutbox';
+import { setWebCrypto } from '../utils/webcrypto';
 
 type Data = { data: Map<string, string> };
 
@@ -105,6 +106,28 @@ describe('the outbox in the app storage (React Native)', () => {
     again.close();
     await settled();
     expect([...storage.data.keys()]).toEqual(['wse-outbox:wse']);
+  });
+
+  it('makes its producer with the WebCrypto the client was given, the environment having none', async () => {
+    vi.stubGlobal('crypto', undefined);
+    const given = {
+      getRandomValues: <T extends ArrayBufferView>(array: T) => {
+        new Uint8Array(array.buffer, array.byteOffset, array.byteLength).fill(0xab);
+        return array;
+      },
+    } as unknown as Crypto;
+    setWebCrypto(given);
+    try {
+      expect(new Outbox(limits).producer.startsWith('abababababab')).toBe(true);
+      const kept = new Outbox(limits, { store: storageOutbox(asyncStorage()) });
+      await kept.opened;
+      expect(kept.durable).toBe(true);
+      expect(kept.producer.startsWith('abababababab')).toBe(true);
+      kept.close();
+    } finally {
+      setWebCrypto(null);
+      vi.unstubAllGlobals();
+    }
   });
 
   it('is one client’s while it runs', async () => {

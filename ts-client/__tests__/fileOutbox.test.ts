@@ -262,9 +262,9 @@ describe('the outbox in a file', () => {
 
     beforeEach(async () => {
       built = join(dir, 'built');
-      // The two modules as JavaScript, for a Node of its own.
+      // The modules as JavaScript, for a Node of its own.
       const sources = new URL('../', import.meta.url);
-      for (const file of ['services/Outbox.ts', 'node/fileOutbox.ts']) {
+      for (const file of ['services/Outbox.ts', 'node/fileOutbox.ts', 'utils/id.ts', 'utils/webcrypto.ts']) {
         const { code } = await transformWithOxc(readFileSync(new URL(file, sources), 'utf8'), file, { lang: 'ts' });
         const out = join(built, file.replace(/\.ts$/, '.js'));
         mkdirSync(join(out, '..'), { recursive: true });

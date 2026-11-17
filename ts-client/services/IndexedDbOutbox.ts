@@ -29,6 +29,7 @@ import type {
   StoredMessage,
   StoredOutbox,
 } from './Outbox.js';
+import { newProducer } from './Outbox.js';
 
 const VERSION = 3;
 const PRODUCERS = 'producers';
@@ -80,12 +81,6 @@ function committed(tx: IDBTransaction): Promise<void> {
 /** Every message of `producer`. */
 function rangeOf(producer: string): IDBKeyRange {
   return IDBKeyRange.bound([producer, 0], [producer, Infinity]);
-}
-
-function newProducer(): string {
-  const bytes = new Uint8Array(16);
-  globalThis.crypto.getRandomValues(bytes);
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 /** A Web Lock taken at once, held until released; null: another holds it. */
