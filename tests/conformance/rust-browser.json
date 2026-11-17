@@ -1,0 +1,6 @@
+{
+  "about": "The Rust client built for the browser (lane rust-browser, and CI's browser job): its browser connection, on Node's WebSocket.",
+  "agents": {
+    "rust-browser": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] }
+  }
+}

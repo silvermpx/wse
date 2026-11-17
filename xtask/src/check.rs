@@ -64,7 +64,17 @@ WSE_TEST_URL=\"$(sed -n 's/^url //p' \"$log\")\" \\
 WSE_TEST_IDENTITY=\"$(sed -n 's/^e2e_identity_public_key //p' \"$log\")\" \\
 WSE_TEST_SIGNING=\"$(sed -n 's/^signing_public_key //p' \"$log\")\" \\
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \\
-  cargo test -p wse-client --locked --target wasm32-unknown-unknown --test browser",
+  cargo test -p wse-client --locked --target wasm32-unknown-unknown --test browser
+cargo build -q --locked -p wse-conformance
+out=\"$(mktemp -d \"$CARGO_TARGET_DIR/rust-browser.XXXXXX\")\"
+\"$CARGO_TARGET_DIR/debug/wse-conformance\" serve --out \"$out\" > \"$out/serve.log\" 2>&1 &
+judge=$!
+trap 'kill $server $judge 2> /dev/null' EXIT
+for _ in $(seq 1 100); do grep -q '\"ready\"' \"$out/serve.log\" && break; sleep 0.1; done
+WSE_CONFORMANCE=\"$(sed -n 's/.*\"control\":\"\\([^\"]*\\)\".*/\\1/p' \"$out/serve.log\")\" WSE_CONFORMANCE_REQUIRED=1 \\
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \\
+  cargo test -p wse-client --locked --target wasm32-unknown-unknown --test conformance_browser
+\"$CARGO_TARGET_DIR/debug/wse-conformance\" check --manifest tests/conformance/rust-browser.json --reports \"$out\"",
     },
     Lane {
         name: "typescript",

@@ -28,6 +28,9 @@
 - Swift, Kotlin and Dart: the reconnect settings the other clients have:
   the first wait, the longest, the factor, the jitter, and the attempts
   in a row before the client gives up.
+- The conformance cases run through the Rust client built for the
+  browser too (agent `rust-browser`, its browser connection on Node's
+  WebSocket), and pass.
 - The conformance cases run through the Swift, Kotlin (on the JVM) and
   Dart packages too (agents `swift`, `kotlin`, `dart`), each in its own
   test run beside the conformance server; all pass every case.
@@ -261,6 +264,10 @@
 
 ### Fixed
 
+- Rust in the browser: a connection attempt that failed before it opened
+  ended only at the connect timeout (10 s) where the WebSocket said so with
+  an error and no close after (Node's does): it ends at once now, and the
+  next attempt follows as the backoff says.
 - Server: `Server::stop` lets its port go as soon as it takes no more
   connections, not after every connection's cleanup. Held, it took
   connections nobody served: a client coming back during a restart waited

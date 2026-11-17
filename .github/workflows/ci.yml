@@ -800,6 +800,18 @@ jobs:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
             cargo test -p wse-client --locked --target wasm32-unknown-unknown --test browser
 
+      - name: The conformance cases, through the browser's client
+        run: |
+          cargo build -p wse-conformance --locked
+          out="$RUNNER_TEMP/rust-browser"
+          mkdir -p "$out"
+          target/debug/wse-conformance serve --out "$out" > conformance.log 2>&1 &
+          for _ in $(seq 1 100); do grep -q '"ready"' conformance.log && break; sleep 0.1; done
+          WSE_CONFORMANCE="$(sed -n 's/.*"control":"\([^"]*\)".*/\1/p' conformance.log)" WSE_CONFORMANCE_REQUIRED=1 \
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+            cargo test -p wse-client --locked --target wasm32-unknown-unknown --test conformance_browser
+          target/debug/wse-conformance check --manifest tests/conformance/rust-browser.json --reports "$out"
+
       - name: The pure-Rust crypto, natively
         env:
           RUSTFLAGS: --cfg wse_rustcrypto

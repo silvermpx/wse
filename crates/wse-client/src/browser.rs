@@ -399,6 +399,13 @@ impl<H: Handler> Driver<H> {
                             if reason.is_empty() { "" } else { ": " }
                         )))));
                     }
+                    // An attempt that failed: a WebSocket that says so with
+                    // no close after (Node's) is not waited out.
+                    Some(Happened::Error) => {
+                        return Some(Err(Some(Error::Connect(
+                            "the connection failed before it opened".to_owned(),
+                        ))));
+                    }
                     Some(_) => {}
                     None => {
                         return Some(Err(Some(Error::Connect("the socket is gone".to_owned()))));
