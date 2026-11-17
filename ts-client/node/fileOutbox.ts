@@ -30,6 +30,7 @@ import {
   fsyncSync,
   open,
   openSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -351,6 +352,11 @@ class FileLog implements OutboxLog {
   private failing = false;
   private closed = false;
   private fd: number;
+  /**
+   * The file anew is written beside it under a name of this log's own: a
+   * write that runs on once the log was let go never touches the next one's.
+   */
+  private readonly tmp: string;
 
   constructor(
     private readonly path: string,
@@ -360,6 +366,7 @@ class FileLog implements OutboxLog {
     private readonly report: (operation: string, error: unknown) => void,
   ) {
     this.fd = fd;
+    this.tmp = `${path}${TMP}${randomBytes(8).toString('hex')}`;
     openLogs.add(this);
     hookExit();
   }
@@ -474,7 +481,7 @@ class FileLog implements OutboxLog {
 
   /** The new file beside the old, on the disk, then in its place. */
   private writeAnew(data: string): void {
-    const tmp = `${this.path}.tmp`;
+    const tmp = this.tmp;
     const bytes = Buffer.from(data, 'utf8');
     const done = (error: Error | null): void => {
       this.busy = null;
@@ -548,7 +555,7 @@ class FileLog implements OutboxLog {
       if (this.stale || this.busy || this.rewriteQueued !== null) {
         // What runs is behind what the outbox holds: the file anew, at once.
         const { data } = encodeOutbox(this.state(), randomBytes(16).toString('hex'));
-        const tmp = `${this.path}.tmp-closing`;
+        const tmp = `${this.tmp}-closing`;
         const fd = openSync(tmp, 'w', 0o600);
         try {
           writeAllSync(fd, Buffer.from(data, 'utf8'));
@@ -585,6 +592,31 @@ class FileLog implements OutboxLog {
  * file is the client's alone while the process runs; one another client has
  * is a `wseStorageError` event (`open`), and the outbox goes on in memory.
  */
+/** What a log's file anew is named beside it: the file's name, this, and the log's own part. */
+const TMP = '.tmp-';
+
+/**
+ * The files anew that logs let go without finishing (a crash, or a write
+ * that ran on past the close): gone, once the lock is this log's.
+ */
+function removeLeftovers(path: string): void {
+  const prefix = `${basename(path)}${TMP}`;
+  let names: string[];
+  try {
+    names = readdirSync(dirname(path));
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue;
+    try {
+      unlinkSync(join(dirname(path), name));
+    } catch {
+      // Gone already.
+    }
+  }
+}
+
 export function fileOutbox(path: string): OutboxStore {
   return {
     open(state, report) {
@@ -597,6 +629,7 @@ export function fileOutbox(path: string): OutboxStore {
           if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
         }
         const read = data === null ? null : readOutbox(data);
+        removeLeftovers(path);
         const fd = openSync(path, APPEND, 0o600);
         const log = new FileLog(path, fd, lock, state, report);
         // Written anew at once: a tail a crash left goes, under a new salt.

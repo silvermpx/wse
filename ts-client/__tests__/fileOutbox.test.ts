@@ -38,6 +38,8 @@ const vector: Vector = JSON.parse(
 
 const limits = { maxMessages: 100, maxBytes: 1 << 20, maxAge: 3_600_000 };
 
+const later = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 function add(outbox: Outbox, id: string): number {
   const message = { t: 'm', p: {}, id };
   return outbox.add(message, JSON.stringify(message), undefined, 0);
@@ -175,6 +177,26 @@ describe('the outbox in a file', () => {
     );
     expect(seen).toBe(1);
     log.close();
+  });
+
+  it('leaves the next log its own file when it is let go while it writes the file anew', async () => {
+    const failed: unknown[] = [];
+    const state = (next: number) => ({ producer: 'p', written: 0, next, user: null, node: null, records: [] });
+    const report = (_: string, error: unknown) => failed.push(error);
+    for (let i = 0; i < 10; i++) {
+      const first = fileOutbox(path).open(() => state(2), report).log;
+      if (!first) throw new Error('no log');
+      // A write of the file anew runs as the log is let go.
+      first.rewrite(state(2));
+      first.close();
+      const next = fileOutbox(path).open(() => state(3), report).log;
+      if (!next) throw new Error('no second log');
+      await new Promise<void>((resolve) => next.rewrite(state(3), resolve));
+      await later(20);
+      next.close();
+    }
+    expect(failed).toEqual([]);
+    expect(readOutbox(readFileSync(path, 'utf8')).next).toBe(3);
   });
 
   it('keeps what waits for the next client, until the server took it', async () => {
