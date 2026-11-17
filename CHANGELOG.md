@@ -15,6 +15,22 @@
   its topics broke off), sends the windows' messages through its outbox and
   routes each outcome to the window that sent it. The delivery's barrier,
   resync, commit and checkpoint stay in each window.
+- TypeScript: `wse-client/electron`, the connection in Electron's main
+  process for every window. `createWSEOwner` holds it there, with the
+  token (sent as a bearer, never to a window) and the outbox (in a file
+  with `fileOutbox`); `owner.serve(webContents)` lets a window's page attach
+  through the preload (`wsePreloadPath`, or `wse-client/electron/preload`
+  imported by the application's own), and `createElectronClient` (from
+  `wse-client/electron/renderer`) is the page's client, which the framework
+  adapters take as they take any. Only the top frame of a served window,
+  at a URL the application allows (by default its own pages, never the
+  web's), gets a port.
+- TypeScript: a bridge window that pauses gives its share of the
+  connection back: the connection ends when no other window holds one, as
+  a client of its own does; what came meanwhile waits for it at the owner.
+- The conformance server runs the TypeScript cases through the bridge too
+  (agent `ts-bridge`): an owner holds the connection and the cases drive a
+  window's client.
 - TypeScript: `wseConnected` (`{ connectionId, user, reconnected, recovery }`)
   when the server took a connection, as the Rust and Python clients say it.
 - The conformance server (`crates/wse-conformance`, not published): each

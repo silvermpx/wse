@@ -21,6 +21,7 @@ npm install wse-client
 | `wse-client/react-native` | A core client for React Native apps | `react-native` |
 | `wse-client/node` | The outbox in a file, for Node and Electron's main process | Node |
 | `wse-client/bridge` | One connection for every window: an owner and the windows' clients | nothing |
+| `wse-client/electron` | Electron: the connection in the main process, a client in each window | Electron |
 | `wse-client` | The page-wide `useWSE` hook (described below), as in 3.0 | `react >= 18`, `zustand >= 4` |
 
 React, Vue and zustand are optional peer dependencies: an application installs only what the
@@ -233,8 +234,52 @@ queue and hears its topics broke off (`wseOverloaded`; a recover-or-resync windo
 A window's sends go through the owner's outbox, and what became of each (`wseDelivered`,
 `wseNotDelivered`) reaches that window alone. What depends on the application stays in the window:
 its listeners, the delivery's barrier, resync, commit and checkpoint, the sends that wait for their
-topics. A window's `pause` holds back only its own stream; `signOut` signs every window out. No frame
-carries a token, a key or a cookie.
+topics. A window's `pause` holds back its stream and gives its share of the connection back, so the
+connection ends when no one else holds one, as a client of its own does; `signOut` signs every
+window out. No frame carries a token, a key or a cookie.
+
+## Electron
+
+The connection lives in the main process, with the token and the outbox, and each window's page
+holds a client over a port the preload hands it:
+
+```ts
+// The main process.
+import { app, BrowserWindow, ipcMain, MessageChannelMain } from 'electron';
+import { createWSEOwner, wsePreloadPath } from 'wse-client/electron';
+import { fileOutbox } from 'wse-client/node';
+
+const owner = createWSEOwner({
+  electron: { ipcMain, MessageChannelMain },
+  endpoints: ['wss://example.com/wse'],
+  token: () => currentToken(),            // Authorization: Bearer, asked at each attempt; never in a window
+  offline: { store: fileOutbox(path.join(app.getPath('userData'), 'wse-outbox')) },
+});
+
+const win = new BrowserWindow({ webPreferences: { preload: wsePreloadPath } });
+owner.serve(win.webContents);
+await win.loadFile('index.html');
+```
+
+```ts
+// A window's page.
+import { createElectronClient } from 'wse-client/electron/renderer';
+
+const client = createElectronClient();   // a WSEClient: <WSEProvider client={client}> and the other adapters take it
+client.retain();
+client.subscribe(['prices']);
+```
+
+An application with a preload of its own imports `wse-client/electron/preload` there instead of
+giving the window `wsePreloadPath` (a main process the application bundles does the same). The
+preload needs nothing but Electron's `ipcRenderer`, and runs in a sandboxed renderer. A page gets a
+port only from the top frame of a window the owner serves, at a URL the application allows: by
+default its own pages (a file, a scheme of its own such as `app://`, or a development server on
+`localhost`), never a page of the web; `allow: (url) => ...` decides otherwise. A page that goes
+lets its share go, and a window that closes lets all of its pages go. `owner.signOut()` signs every
+window out and forgets what the client kept for the user; the next user gets a new owner. The main
+process connects with Node's WebSocket (Node 22 and newer); with an older Electron, pass a
+`webSocket` factory.
 
 ## Quick Start
 
@@ -792,6 +837,7 @@ Full protocol specification: [PROTOCOL.md](../docs/PROTOCOL.md)
 ## Requirements
 
 - For `wse-client/core`: a browser, or Node.js with a global `WebSocket` (Node 22+)
+- For `wse-client/electron`: Electron with Node 22 or newer in its main process, or a `webSocket` factory
 - For `useWSE` (the root entry): React 18+ and zustand 4+; for the adapters: React 18+, Vue 3.3+,
   Svelte 5, Angular 20+ or Solid 1.9+ (optional peer dependencies)
 

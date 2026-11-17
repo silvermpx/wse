@@ -143,6 +143,7 @@ describe('the window bridge', () => {
     slow.onMessage('price_update', () => heard.slow++);
     quick.onMessage('price_update', () => heard.quick++);
     slow.retain();
+    quick.retain();
     slow.subscribe(['prices']);
     quick.subscribe(['prices']);
     await settle();
@@ -162,6 +163,34 @@ describe('the window bridge', () => {
     await vi.waitFor(() => expect(overloaded).toEqual([{ topics: ['prices'] }]));
     expect(slow.state.getSnapshot().topicStates.prices.continuity).not.toBe('continuous');
     expect(quick.state.getSnapshot().topicStates.prices.continuity).toBe('continuous');
+  });
+
+  it('ends the connection when the window that held the last share pauses, and makes it again on resume', async () => {
+    const o = owner();
+    const w = window(o);
+    const heard: number[] = [];
+    w.onMessage('price_update', (m) => heard.push(m.p.n));
+    w.retain();
+    w.subscribe(['prices']);
+    await settle();
+    const first = FakeWebSocket.last();
+    await serve(first);
+    first.serverSend(reply(['prices']));
+    first.serverSend(stamped('prices', 1, '0000000a', { n: 1 }));
+    await vi.waitFor(() => expect(heard).toEqual([1]));
+    w.pause('background');
+    expect(w.state.getSnapshot()).toMatchObject({ ready: false, paused: ['background'] });
+    await vi.waitFor(() => expect(first.closeCalls.length).toBeGreaterThan(0));
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    w.resume('background');
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+    const second = FakeWebSocket.last();
+    await serve(second);
+    // The topic is asked for again from where the owner was.
+    const resubscribe = second.messagesOfType('subscription_update')[0];
+    expect(resubscribe.p.topics).toEqual(['prices']);
+    expect(resubscribe.p.recovery).toMatchObject({ prices: { offset: 1 } });
+    await vi.waitFor(() => expect(w.state.getSnapshot().ready).toBe(true));
   });
 
   it('holds a recover-or-resync window’s topic until its own resync, as a client of its own', async () => {

@@ -5,14 +5,20 @@
 //
 //   cargo run -p wse-conformance -- serve        # prints the control URL
 //   WSE_CONFORMANCE=ws://127.0.0.1:P/control npx vitest run --project client ts-client/__tests__/conformance.test.ts
+//
+// With WSE_CONFORMANCE_BRIDGE=1 it runs them as the window of a bridge (agent
+// ts-bridge): an owner holds the connection, and the client the cases drive
+// is a window's, over a MessageChannel.
 
 import { describe, expect, it } from 'vitest';
-import { createWSEClient, type WSEClient } from '../core/client.js';
+import { createWSEClient, type WSEClient, type WSEClientOptions } from '../core/client.js';
+import { createBridgeClient, createBridgeOwner, messagePortChannel, type BridgeOwner } from '../bridge/index.js';
 import type { ResyncRequest } from '../core/delivery.js';
 import { logger, LogLevel } from '../utils/logger.js';
 import { generateSigningKey, type SigningKey } from '../utils/signing.js';
 
 const CONTROL = process.env.WSE_CONFORMANCE;
+const BRIDGE = process.env.WSE_CONFORMANCE_BRIDGE === '1';
 if (process.env.WSE_CONFORMANCE_REQUIRED === '1' && !CONTROL) {
   throw new Error('WSE_CONFORMANCE_REQUIRED is set, but WSE_CONFORMANCE is not');
 }
@@ -60,6 +66,7 @@ class Control {
 class Run {
   readonly trace: any[] = [];
   private client: WSEClient | null = null;
+  private owner: BridgeOwner | null = null;
   private release: Array<() => void> = [];
   private ready = false;
   private readonly published = new Map<string, number[]>();
@@ -159,7 +166,9 @@ class Run {
       case 'ready':
         return this.ready;
       case 'not_ready':
-        return !this.ready;
+        // A window is not ready once paused; the connection, its owner's,
+        // ends a moment later, when its share was the last.
+        return !this.ready && !this.owner?.client.state.getSnapshot().ready;
       case 'messages':
         return this.messages((e) => e.topic === step.topic).length >= step.count;
       case 'message':
@@ -199,7 +208,7 @@ class Run {
       security.bindSession = false;
     }
     const rr = !!step.recover_or_resync;
-    const client = createWSEClient({
+    const connection: WSEClientOptions = {
       endpoints: [this.begun.url],
       auth: 'token',
       // Node's WebSocket takes headers: the token goes as the bearer.
@@ -207,16 +216,27 @@ class Run {
       reconnection: { baseDelay: 50, maxDelay: 300, jitter: false },
       wireFormat: step.format === 'msgpack' ? 'msgpack' : 'json',
       security: security as any,
-      ...(rr
-        ? {
-            consumer: 'conformance',
-            delivery: {
-              mode: 'recover-or-resync' as const,
-              resync: (request: ResyncRequest) => this.resync(request),
-            },
-          }
-        : {}),
-    });
+    };
+    const application = rr
+      ? {
+          consumer: 'conformance',
+          delivery: {
+            mode: 'recover-or-resync' as const,
+            resync: (request: ResyncRequest) => this.resync(request),
+          },
+        }
+      : {};
+    let client: WSEClient;
+    if (BRIDGE) {
+      // The connection is the owner's; the client the case drives is a window's.
+      const owner = createBridgeOwner(connection);
+      const { port1, port2 } = new MessageChannel();
+      owner.attach(messagePortChannel(port1 as never));
+      client = createBridgeClient(messagePortChannel(port2 as never), application);
+      this.owner = owner;
+    } else {
+      client = createWSEClient({ ...connection, ...application });
+    }
     this.client = client;
     this.release.push(
       client.state.listen((snapshot) => {
@@ -300,6 +320,8 @@ class Run {
     for (const release of this.release.splice(0).reverse()) release();
     this.client?.destroy();
     this.client = null;
+    this.owner?.destroy();
+    this.owner = null;
     this.ready = false;
   }
 }
@@ -309,7 +331,7 @@ describe.skipIf(!CONTROL)('conformance', () => {
     logger.setLevel(process.env.WSE_CONFORMANCE_DEBUG === '1' ? LogLevel.DEBUG : LogLevel.ERROR);
     const control = await Control.open(CONTROL!);
     const { cases } = await control.call('hello', {
-      agent: 'ts-core',
+      agent: BRIDGE ? 'ts-bridge' : 'ts-core',
       version: '3.2.0',
       runtime: `node ${process.versions.node}`,
       os: process.platform,

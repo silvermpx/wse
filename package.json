@@ -56,6 +56,17 @@
       "import": "./dist/npm/bridge/index.js",
       "default": "./dist/npm/bridge/index.js"
     },
+    "./electron": {
+      "types": "./dist/npm/electron/main.d.ts",
+      "import": "./dist/npm/electron/main.js",
+      "default": "./dist/npm/electron/main.js"
+    },
+    "./electron/renderer": {
+      "types": "./dist/npm/electron/renderer.d.ts",
+      "import": "./dist/npm/electron/renderer.js",
+      "default": "./dist/npm/electron/renderer.js"
+    },
+    "./electron/preload": "./dist/npm/electron/preload.cjs",
     "./package.json": "./package.json"
   },
   "typesVersions": {
@@ -86,6 +97,12 @@
       ],
       "bridge": [
         "./dist/npm/bridge/index.d.ts"
+      ],
+      "electron": [
+        "./dist/npm/electron/main.d.ts"
+      ],
+      "electron/renderer": [
+        "./dist/npm/electron/renderer.d.ts"
       ]
     }
   },
@@ -94,7 +111,7 @@
   ],
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist/npm', { recursive: true, force: true })\"",
-    "build": "npm run clean && tsc",
+    "build": "npm run clean && tsc && node -e \"require('node:fs').copyFileSync('ts-client/electron/preload.cjs', 'dist/npm/electron/preload.cjs')\"",
     "lint": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -116,7 +133,8 @@
     "angular",
     "solid",
     "typescript",
-    "react-native"
+    "react-native",
+    "electron"
   ],
   "author": "silvermpx",
   "license": "MIT",

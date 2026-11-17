@@ -33,8 +33,12 @@ export class FakeWebSocket {
   onerror: ((ev: any) => void) | null = null;
   onclose: ((ev: any) => void) | null = null;
 
-  constructor(url: string) {
+  /** What the client passed besides the URL (Node's WebSocket takes headers there). */
+  readonly init: unknown;
+
+  constructor(url: string, init?: unknown) {
     this.url = url;
+    this.init = init;
     FakeWebSocket.instances.push(this);
   }
 

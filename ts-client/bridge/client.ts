@@ -102,6 +102,8 @@ export function createBridgeClient(
   let gen = 0;
   let took = 0;
   let shares = 0;
+  /** What the owner was told: the window holds a share and is not paused. */
+  let sharing = false;
   let shareTimer: ReturnType<typeof setTimeout> | null = null;
   let nextSend = 1;
   const paused: string[] = [];
@@ -203,7 +205,8 @@ export function createBridgeClient(
     reason = why;
     for (const resolve of signs.values()) resolve('dropped');
     signs.clear();
-    if (paused.length === 0) delivery.connectionLost();
+    // The connection is gone for good: what the window holds is not current.
+    if (!done) delivery.connectionLost();
     refresh();
   };
 
@@ -330,6 +333,19 @@ export function createBridgeClient(
 
   // -- the window's doings ------------------------------------------------------
 
+  /**
+   * The window's share of the connection, as the owner counts it: held while
+   * a lease is and the window is not paused. A paused window gives its share
+   * back, so the connection ends when no one else holds one, as a client of
+   * its own does; what comes meanwhile waits for it at the owner.
+   */
+  const share = () => {
+    const want = shares > 0 && paused.length === 0 && !done;
+    if (want === sharing) return;
+    sharing = want;
+    post({ k: 'share', on: want });
+  };
+
   /** Sends whose topics are continuous now go. */
   const release = () => {
     if (waiting.length === 0) return;
@@ -369,9 +385,8 @@ export function createBridgeClient(
     if (shareTimer) {
       clearTimeout(shareTimer);
       shareTimer = null;
-    } else if (shares === 1) {
-      post({ k: 'share', on: true });
     }
+    share();
     let held = true;
     return {
       release: () => {
@@ -382,7 +397,7 @@ export function createBridgeClient(
         // A release and a retain in one turn (React's Strict Mode) leave the share as it was.
         shareTimer = setTimeout(() => {
           shareTimer = null;
-          if (shares === 0) post({ k: 'share', on: false });
+          share();
         }, 0);
       },
     };
@@ -502,9 +517,9 @@ export function createBridgeClient(
       client.destroy();
     },
     pause: (why) => {
-      if (paused.includes(why)) return;
+      if (done || paused.includes(why)) return;
       paused.push(why);
-      if (paused.length === 1) delivery.connectionLost();
+      share();
       refresh();
     },
     resume: (why) => {
@@ -515,14 +530,12 @@ export function createBridgeClient(
         refresh();
         return;
       }
-      // What came meanwhile, in order; the owner held the rest.
+      // What came meanwhile, in order (the connection's end among it, when
+      // the window's share was the last); the owner held the rest.
       const held = pausedBatches;
       pausedBatches = [];
       for (const b of held) batch(b.s, b.items);
-      if (conn.ready && phase === 'attached') {
-        // As after a reconnect of its own: what it holds is asked for again.
-        delivery.subscribed([...topicShares.keys()].filter((t) => delivery.topicStates()[t]?.subscription !== 'denied'), []);
-      }
+      share();
       refresh();
     },
     commit: (message) => delivery.commit(message),
