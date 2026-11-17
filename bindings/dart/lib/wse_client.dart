@@ -96,12 +96,13 @@ class WseClient {
   static Future<WseClient> start(rust.WseConfig config) async =>
       WseClient._(await rust.WseNativeClient.start(config: config));
 
-  /// What the server sends, in order, until the client closes. A batch is
-  /// acknowledged only once all of it was handed out, so a listener that
-  /// stops in between gets the rest from the next one. One reader at a time:
-  /// a stream listened to while another listens, paused or not, gets a
-  /// `busy` WseError and ends. Cancelling a listener that waits for the
-  /// server ends the wait.
+  /// What the server sends, in order; once the client closed, what the
+  /// close said (the messages it will not deliver, the close itself), then
+  /// the end. A batch is acknowledged only once all of it was handed out, so
+  /// a listener that stops in between gets the rest from the next one. One
+  /// reader at a time: a stream listened to while another listens, paused or
+  /// not, gets a `busy` WseError and ends. Cancelling a listener that waits
+  /// for the server ends the wait.
   Stream<rust.WseItem> events({int maxItems = 256, int maxBytes = 1 << 20}) {
     late final StreamController<rust.WseItem> controller;
     Future<void>? pumping;
@@ -140,6 +141,8 @@ class WseClient {
           if (next.end) {
             _ended = true;
             _batch = null;
+            // Read to the end: the native client goes once it is closed too.
+            if (_closed) _native.dispose();
             break;
           }
           _batch = next;
@@ -356,10 +359,10 @@ class WseClient {
 
   Future<void> _close(Duration deadline) async {
     await _native.disconnect(deadlineMs: BigInt.from(deadline.inMilliseconds));
-    // The events end after what was read already.
-    _ended = true;
     _closed = true;
-    _native.dispose();
+    // The events go on to what the close said, then end: the native client
+    // goes once they ended (else with this object).
+    if (_ended) _native.dispose();
   }
 }
 

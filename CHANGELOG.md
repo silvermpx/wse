@@ -129,6 +129,9 @@ conformance server every client is checked against.
   most, not 40 s).
 - Swift and Kotlin: a new reader of `events()` no longer gets the last
   reader's batch again.
+- Swift, Kotlin and Dart: once the client is closed, the events end with
+  what the close said (the messages it will not deliver, the close itself);
+  a reader waiting at the close no longer gets its end before them.
 
 ## v3.1.0 (2026-11-16)
 

@@ -168,7 +168,7 @@ async fn a_batch_comes_again_until_it_is_acknowledged() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn one_reader_at_a_time_and_disconnect_ends_the_wait() {
+async fn one_reader_at_a_time_and_disconnect_wakes_the_wait() {
     let stand = stand().await;
     let client = Arc::new(
         NativeClient::connect(stand.config("bo"), None, &CancelToken::new())
@@ -190,12 +190,21 @@ async fn one_reader_at_a_time_and_disconnect_ends_the_wait() {
         .await;
     assert_eq!(second.unwrap_err().kind, ErrorKind::Busy);
     client.disconnect(1_000).await;
-    let ended = tokio::time::timeout(Duration::from_secs(5), waiting)
+    let mut batch = tokio::time::timeout(Duration::from_secs(5), waiting)
         .await
         .expect("the waiting reader wakes")
         .unwrap()
         .unwrap();
-    assert_eq!(ended.kind, BatchKind::End);
+    // It hears the close, then the end.
+    let mut closed = false;
+    while batch.kind != BatchKind::End {
+        closed |= batch.items.iter().any(|i| matches!(i, Item::Closed { .. }));
+        batch = client
+            .next_batch(batch.id, 64, 1 << 20, &CancelToken::new())
+            .await
+            .unwrap();
+    }
+    assert!(closed);
     stand.server.stop().await;
 }
 
@@ -880,5 +889,56 @@ async fn best_effort_says_what_the_server_took_and_lets_the_app_say_it_resynced(
         NativeContinuity::Continuous
     );
     client.disconnect(1_000).await;
+    stand.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_hears_what_the_close_said_before_the_end() {
+    let stand = stand().await;
+    let client = Arc::new(
+        NativeClient::connect(stand.config("cy"), None, &CancelToken::new())
+            .await
+            .unwrap(),
+    );
+    let ack = subscribed(&client).await;
+    // Paused, the message waits in the outbox, in memory: the close refuses it.
+    client.pause("manual".into()).unwrap();
+    for _ in 0..250 {
+        if client.status() == NativeStatus::Paused {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(client.status(), NativeStatus::Paused);
+    let id = client
+        .try_send_with("edit", "{}", Default::default())
+        .unwrap();
+    let reader = Arc::clone(&client);
+    let reading = tokio::spawn(async move {
+        let cancel = CancelToken::new();
+        let mut ack = ack;
+        let mut refused = Vec::new();
+        loop {
+            let batch = reader.next_batch(ack, 64, 1 << 20, &cancel).await.unwrap();
+            ack = batch.id;
+            if batch.kind == BatchKind::End {
+                return refused;
+            }
+            for item in batch.items {
+                if let Item::NotDelivered { ids, reason } = item {
+                    refused.push((ids, reason));
+                }
+            }
+        }
+    });
+    // The reader waits in next_batch when the client closes.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(client.kept(), 1);
+    client.disconnect(25).await;
+    let refused = tokio::time::timeout(Duration::from_secs(5), reading)
+        .await
+        .expect("the end within 5 s")
+        .unwrap();
+    assert_eq!(refused, [(vec![id], "closed".to_owned())]);
     stand.server.stop().await;
 }

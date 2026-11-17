@@ -896,7 +896,6 @@ pub enum NativeStatus {
 pub struct NativeClient {
     client: crate::Client,
     reader: Mutex<Reader>,
-    closing: CancellationToken,
 }
 
 impl NativeClient {
@@ -943,7 +942,6 @@ impl NativeClient {
                 next_id: 1,
                 ended: false,
             }),
-            closing: CancellationToken::new(),
         }
     }
 
@@ -1199,8 +1197,9 @@ impl NativeClient {
     /// acknowledged (0: none yet), the one handed out and not acknowledged is
     /// handed out again. Waits for at least one item (or the end), then takes
     /// what came with it, up to `max_items` and about `max_bytes`. One
-    /// reader at a time; `cancel` (or [`disconnect`](Self::disconnect)) ends
-    /// the wait.
+    /// reader at a time; `cancel` ends the wait. Once the client closed, the
+    /// reader hears what the close said (the messages it will not deliver,
+    /// the close itself), then the end.
     pub async fn next_batch(
         &self,
         ack: u64,
@@ -1242,7 +1241,6 @@ impl NativeClient {
         let first = tokio::select! {
             first = reader.events.next() => first,
             () = cancel.0.cancelled() => return Err(NativeError::new(ErrorKind::Cancelled, "next_batch was cancelled")),
-            () = self.closing.cancelled() => None,
         };
         let Some(first) = first else {
             reader.ended = true;
@@ -1271,9 +1269,9 @@ impl NativeClient {
     }
 
     /// Closes the client: what was sent goes out first, within `deadline_ms`;
-    /// a reader waiting in [`next_batch`](Self::next_batch) gets the end.
+    /// a reader in [`next_batch`](Self::next_batch) hears what the close
+    /// said, then the end.
     pub async fn disconnect(&self, deadline_ms: u64) {
-        self.closing.cancel();
         let client = self.client.clone();
         let deadline = Duration::from_millis(deadline_ms.max(1));
         let _ = on_runtime(async move {

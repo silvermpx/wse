@@ -244,6 +244,27 @@ void main() {
     await client.close(deadline: Duration.zero);
   });
 
+  test('the events say what the close did not deliver, then end', () async {
+    final client = await WseClient.connect(wseConfig(url, insecure: true));
+    final items = StreamIterator(client.events());
+    client.pause('test');
+    while (client.status == 'connected') {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    // Paused, it waits in the outbox, in memory: the close refuses it.
+    await client.sendWith('echo', '{"n":4}', id: 'left-behind');
+    expect(client.kept, 1);
+    await client.close(deadline: const Duration(milliseconds: 25));
+    final refused = <String>[];
+    while (await items.moveNext()) {
+      final item = items.current;
+      if (item.kind == WseItemKind.notDelivered) {
+        refused.add('${item.reason}: ${item.ids.join(',')}');
+      }
+    }
+    expect(refused, ['closed: left-behind']);
+  });
+
   test('a started client gets in on its own', () async {
     final client = await WseClient.start(wseConfig(url, insecure: true));
     final items = StreamIterator(client.events());
@@ -449,6 +470,9 @@ void main() {
     expect(() => client.trySend('echo', '{}'), closed);
     await expectLater(client.send('echo', '{}'), closed);
     await expectLater(client.sendLive('echo', '{}'), closed);
+    // What was not read yet, ending with the close; then nothing more.
+    final items = await client.events().toList();
+    expect(items.last.kind, WseItemKind.closed);
     await expectLater(client.events().toList(), completion(isEmpty));
     await client.close();
   });
