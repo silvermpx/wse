@@ -323,10 +323,14 @@ impl Producers {
         }
     }
 
-    /// Drops the producers silent for longer than [`KEPT_FOR_MS`].
+    /// Drops the producers silent for longer than [`KEPT_FOR_MS`]. One that
+    /// a connection holds (its `Link`) stays, however long it is silent: a
+    /// new connection of it finds what this one decided.
     pub(crate) fn sweep(&self, now: u64) {
-        self.slots
-            .retain(|_, slot| now.saturating_sub(slot.seen.load(Ordering::Relaxed)) < KEPT_FOR_MS);
+        self.slots.retain(|_, slot| {
+            Arc::strong_count(slot) > 1
+                || now.saturating_sub(slot.seen.load(Ordering::Relaxed)) < KEPT_FOR_MS
+        });
     }
 }
 
@@ -379,6 +383,13 @@ pub(crate) struct Link {
     /// Up to this message the server cannot tell whether one was taken (on
     /// a node that is gone): handed on marked as a possible repeat.
     pub(crate) unsure_until: u64,
+}
+
+/// The connection ends: its producer is kept for a day from now.
+impl Drop for Link {
+    fn drop(&mut self) {
+        self.slot.touch(now_ms());
+    }
 }
 
 /// A connection's outbox: its hello, and its producer once the connection
@@ -673,6 +684,32 @@ mod tests {
         let (back, known) = producers.attach(Some("ann"), "p1", 0);
         assert!(!known);
         assert_eq!(back.lock().mark(), 0);
+    }
+
+    #[test]
+    fn a_producer_whose_connection_is_open_is_kept_however_long_it_is_silent() {
+        let producers = Producers::default();
+        let (slot, _) = producers.attach(None, "p", 0);
+        let link = Link {
+            slot,
+            start: 0,
+            unsure_until: 0,
+        };
+        producers.sweep(3 * KEPT_FOR_MS);
+        let (again, known) = producers.attach(None, "p", 3 * KEPT_FOR_MS);
+        assert!(known);
+        assert!(Arc::ptr_eq(&link.slot, &again));
+        // Its connection ends: the day counts from then.
+        drop(again);
+        let before = now_ms();
+        drop(link);
+        let slot = producers
+            .slots
+            .iter()
+            .next()
+            .map(|e| Arc::clone(e.value()))
+            .unwrap();
+        assert!(slot.seen.load(Ordering::Relaxed) >= before);
     }
 
     #[test]
