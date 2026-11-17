@@ -559,6 +559,45 @@ async fn stop_returns_once_every_disconnect_was_heard() {
     }
 }
 
+/// A stop given up while it waits leaves the run to the next stop, which
+/// waits for it: the server does not start again over a run still ending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_given_up_leaves_the_next_one_to_wait() {
+    let server = wse::Server::new(wse::Config::default()).unwrap();
+    let said = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handler = SlowGoodbye {
+        said: std::sync::Arc::clone(&said),
+    };
+    server.start(listener, handler).unwrap();
+    let mut clients = Vec::new();
+    for _ in 0..3 {
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/wse"))
+            .await
+            .unwrap();
+        clients.push(ws);
+    }
+    while server.connection_count() < 3 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Each goodbye takes 200 ms: given up long before the run ends.
+    let given_up = tokio::time::timeout(Duration::from_millis(50), server.stop()).await;
+    assert!(given_up.is_err());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let again = SlowGoodbye {
+        said: std::sync::Arc::clone(&said),
+    };
+    assert!(matches!(server.start(listener, again), Err(wse::Error::Running)));
+    server.stop().await;
+    assert_eq!(said.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(server.connection_count(), 0);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let after = SlowGoodbye { said };
+    server.start(listener, after).unwrap();
+    server.stop().await;
+}
+
 #[test]
 fn keys_stay_out_of_debug_prints() {
     let key = b"-----BEGIN PRIVATE KEY----- not a real one".to_vec();

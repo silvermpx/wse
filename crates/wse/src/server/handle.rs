@@ -90,11 +90,14 @@ impl Server {
     /// calls are made, before this returns.
     pub async fn stop(&self) {
         let mut task = self.task.lock().await;
-        let Some(running) = task.take() else {
+        let Some(running) = task.as_mut() else {
             return;
         };
         self.shut_down();
+        // Awaited in its place: a stop given up while it waits leaves the
+        // run to the next one, and `start` refuses until it ended.
         let _ = running.await;
+        *task = None;
         // The run cleans up after itself; this covers one that panicked.
         run::stopped(&self.shared);
     }
