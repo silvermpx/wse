@@ -27,6 +27,18 @@ pub(crate) struct ProducerLinks {
     waiting: DashMap<u64, oneshot::Sender<Decided>>,
 }
 
+/// A question out, taken off the waiting ones when it ends.
+struct Question<'a> {
+    links: &'a ProducerLinks,
+    id: u64,
+}
+
+impl Drop for Question<'_> {
+    fn drop(&mut self) {
+        self.links.waiting.remove(&self.id);
+    }
+}
+
 impl ProducerLinks {
     /// The link of session `session` to `peer` answers from now on.
     pub(crate) fn register(&self, peer: &str, tx: mpsc::Sender<Bytes>, session: u64) {
@@ -57,20 +69,21 @@ impl ProducerLinks {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (answer, answered) = oneshot::channel();
         self.waiting.insert(id, answer);
+        // Let go however this ends: answered, too late, or dropped with the
+        // future that asked.
+        let _question = Question { links: self, id };
         // The link's writer frames what it sends.
         let mut frame = BytesMut::new();
         encode_producer_query(&mut frame, id, user, producer);
-        let taken = if tx.send(frame.freeze()).await.is_ok() {
-            tokio::time::timeout(within, answered)
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .flatten()
-        } else {
-            None
-        };
-        self.waiting.remove(&id);
-        taken
+        // One deadline for the asking and the answer: a peer whose queue is
+        // full is not waited for longer than one that does not answer.
+        tokio::time::timeout(within, async {
+            tx.send(frame.freeze()).await.ok()?;
+            answered.await.ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// A peer's answer to question `id`.
@@ -78,5 +91,38 @@ impl ProducerLinks {
         if let Some((_, waiting)) = self.waiting.remove(&id) {
             let _ = waiting.send(decided);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_peer_whose_queue_is_full_is_not_waited_for_past_the_deadline() {
+        let links = ProducerLinks::default();
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(Bytes::from_static(b"full")).unwrap();
+        links.register("peer", tx, 1);
+        let asked = links.ask("peer", None, "p", Duration::from_millis(5));
+        let decided = tokio::time::timeout(Duration::from_secs(2), asked)
+            .await
+            .expect("not waited for past its deadline");
+        assert!(decided.is_none());
+        assert!(links.waiting.is_empty(), "the question is let go");
+    }
+
+    #[tokio::test]
+    async fn a_question_dropped_while_it_waits_is_let_go() {
+        let links = ProducerLinks::default();
+        let (tx, _rx) = mpsc::channel(4);
+        links.register("peer", tx, 1);
+        let asked = links.ask("peer", None, "p", Duration::from_secs(60));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), asked)
+                .await
+                .is_err()
+        );
+        assert!(links.waiting.is_empty(), "the question is let go");
     }
 }
