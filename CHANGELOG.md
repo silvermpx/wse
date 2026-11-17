@@ -98,7 +98,8 @@ conformance server every client is checked against.
   waiting in an outgoing queue (the Rust client and its packages, Python,
   TypeScript); a disabled outbox keeps the old behaviour.
 - TypeScript: the offline queue of 3.1 is replaced by the outbox, which
-  takes over what it kept; `clearOfflineQueue()` clears the outbox, a
+  takes over what it kept, the messages 2.x left in it included, in the
+  order they were queued; `clearOfflineQueue()` clears the outbox, a
   message's `offline: true` changes nothing, and the `OfflineQueue` class
   stays exported, unused.
 - Rust client (and Swift, Kotlin, Dart): every message carries an `id`, a

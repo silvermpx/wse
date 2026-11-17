@@ -102,6 +102,30 @@ function tryLock(name: string): Promise<(() => void) | null> {
   });
 }
 
+/** A row of 3.1's queue, as 3.1 read it. */
+interface LegacyRecord {
+  id: string;
+  message: object;
+  timestamp?: unknown;
+  expiresAt?: unknown;
+  owner?: unknown;
+}
+
+/**
+ * A row of 3.1's queue: its own (the message under `message`), or one 2.x
+ * wrote (the message itself, with its `timestamp` and `retries`), which 3.1
+ * kept and read; null: neither.
+ */
+function legacyRecord(raw: any): LegacyRecord | null {
+  if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string') return null;
+  if (raw.message && typeof raw.message === 'object' && typeof raw.message.t === 'string') return raw;
+  if (typeof raw.t === 'string') {
+    const { timestamp, retries: _, ...message } = raw;
+    return { id: raw.id, message, timestamp };
+  }
+  return null;
+}
+
 /**
  * 3.1's queue: its messages go into producers of their own, one per user,
  * for pages to take over; its stores go.
@@ -111,9 +135,13 @@ function migrate(db: IDBDatabase, tx: IDBTransaction): void {
   const read = legacy.getAll();
   read.onsuccess = () => {
     const groups = new Map<string | null, Row[]>();
-    const records = (read.result as any[])
-      .filter((r) => r && typeof r.id === 'string' && r.message && typeof r.message.t === 'string')
-      .sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));
+    const records: LegacyRecord[] = [];
+    for (const raw of read.result as unknown[]) {
+      const record = legacyRecord(raw);
+      if (record) records.push(record);
+    }
+    const time = (r: LegacyRecord) => (typeof r.timestamp === 'number' ? r.timestamp : 0);
+    records.sort((a, b) => time(a) - time(b));
     const producers = new Map<string | null, string>();
     for (const record of records) {
       const user = typeof record.owner === 'string' ? record.owner : null;
@@ -124,7 +152,7 @@ function migrate(db: IDBDatabase, tx: IDBTransaction): void {
         groups.set(user, []);
       }
       const rows = groups.get(user)!;
-      const at = typeof record.timestamp === 'number' ? Math.round(record.timestamp) : 0;
+      const at = Math.round(time(record));
       rows.push({
         producer,
         s: rows.length + 1,
