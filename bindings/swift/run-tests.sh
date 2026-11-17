@@ -17,11 +17,22 @@ cargo build -q -p wse-client --example server
 WSE_PORT="$port" WSE_TLS_PORT="$((port + 1))" WSE_TLS_CA="$target/swift-test-ca.pem" \
   "$target/debug/examples/server" > "$target/swift-test-server.log" 2>&1 &
 server=$!
-trap 'kill "$server" 2>/dev/null || true' EXIT
+# The conformance server, each case on a server of its own.
+cargo build -q -p wse-conformance
+conformance="$(mktemp -d "$target/swift-conformance.XXXXXX")"
+"$target/debug/wse-conformance" serve --out "$conformance" > "$conformance/serve.log" 2>&1 &
+judge=$!
+trap 'kill "$server" "$judge" 2>/dev/null || true' EXIT
 for _ in $(seq 1 50); do
   grep -q "signing_public_key" "$target/swift-test-server.log" && break
   sleep 0.1
 done
+for _ in $(seq 1 100); do
+  grep -q '"ready"' "$conformance/serve.log" && break
+  sleep 0.1
+done
+WSE_CONFORMANCE="$(sed -n 's/.*"control":"\([^"]*\)".*/\1/p' "$conformance/serve.log")"
+export WSE_CONFORMANCE WSE_CONFORMANCE_REQUIRED=1
 export WSE_TEST_URL="ws://127.0.0.1:$port/wse" WSE_TEST_TLS_URL="wss://localhost:$((port + 1))/wse"
 export WSE_TEST_CA="$target/swift-test-ca.pem"
 # The keys its E2E identity and its signed messages go with.
@@ -30,6 +41,7 @@ WSE_TEST_SIGNING="$(sed -n 's/^signing_public_key //p' "$target/swift-test-serve
 export WSE_TEST_IDENTITY WSE_TEST_SIGNING
 cd "$here"
 swift test
+"$target/debug/wse-conformance" check --manifest "$root/tests/conformance/swift.json" --reports "$conformance"
 if [[ "${SIMULATOR:-0}" == "1" ]]; then
   # A simulator of its own (an iPhone of the newest iOS installed), whose
   # system trusts the run's CA: the system's verifier must connect there.
@@ -45,7 +57,7 @@ for runtime in sorted((r for r in devices if ".iOS-" in r), key=version, reverse
             sys.exit()
 sys.exit("no iPhone simulator")')
   device="$(xcrun simctl create "WSE tests" "$kind" "$runtime")"
-  trap 'kill "$server" 2>/dev/null || true; xcrun simctl shutdown "${device:?}" 2>/dev/null || true; xcrun simctl delete "${device:?}" || true' EXIT
+  trap 'kill "$server" "$judge" 2>/dev/null || true; xcrun simctl shutdown "${device:?}" 2>/dev/null || true; xcrun simctl delete "${device:?}" || true' EXIT
   xcrun simctl boot "$device"
   xcrun simctl keychain "$device" add-root-cert "$WSE_TEST_CA"
   # xcodebuild hands TEST_RUNNER_ variables to the tests, without the prefix.

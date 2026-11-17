@@ -1,0 +1,6 @@
+{
+  "about": "The Kotlin package on the JVM (bindings/kotlin, run-tests.sh): its client on the Rust client's native layer.",
+  "agents": {
+    "kotlin": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] }
+  }
+}

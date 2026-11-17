@@ -28,6 +28,8 @@ dependencies {
     implementation("net.java.dev.jna:jna:5.19.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
     testImplementation(kotlin("test"))
+    // The conformance driver's JSON.
+    testImplementation("com.google.code.gson:gson:2.11.0")
 }
 
 base { archivesName.set("wse-client-jvm") }

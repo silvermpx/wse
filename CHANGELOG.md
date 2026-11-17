@@ -25,6 +25,9 @@
   adapters take as they take any. Only the top frame of a served window,
   at a URL the application allows (by default its own pages, never the
   web's), gets a port.
+- The conformance cases run through the Swift, Kotlin (on the JVM) and
+  Dart packages too (agents `swift`, `kotlin`, `dart`), each in its own
+  test run beside the conformance server; all pass every case.
 - Rust, Swift, Kotlin and Dart: a send names its correlation id (`cid`)
   and priority (`pri`), as the TypeScript and Python clients' do, and a
   live one goes through the same options (`live`), with its id too; a

@@ -81,9 +81,12 @@ jobs:
               - 'tests/clients/**'
               - '.github/workflows/ci.yml'
             mobile:
+              - 'crates/wse/**'
               - 'crates/wse-client/**'
               - 'crates/wse-ffi/**'
               - 'crates/wse-bindgen/**'
+              - 'crates/wse-conformance/**'
+              - 'tests/conformance/**'
               - 'bindings/**'
               - 'Cargo.toml'
               - 'Cargo.lock'

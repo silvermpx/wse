@@ -1,0 +1,6 @@
+{
+  "about": "The Dart package (bindings/dart, run-tests.sh): its client on the Rust client's native layer.",
+  "agents": {
+    "dart": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] }
+  }
+}

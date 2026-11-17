@@ -1,0 +1,6 @@
+{
+  "about": "The Swift package on the Mac (bindings/swift, run-tests.sh): its client on the Rust client's native layer.",
+  "agents": {
+    "swift": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] }
+  }
+}
