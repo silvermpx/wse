@@ -559,7 +559,7 @@ Once the connection is admitted (`server_ready`), the server answers what it dec
 
 `refused` is left out when there is none. A producer is kept per user: another user's connection cannot reach it. The server decides one producer's messages one at a time, its application's handler included, so a connection that comes back while a message is being decided is answered once the decision is in.
 
-**Answers.** The server answers after its application took a message (a Rust `Handler::message` returned, or the Python server queued it for `drain_inbound` or its callback), one `ack` for a batch of frames read, refusals first:
+**Answers.** The server answers after its application took a message (a Rust `Handler::message` returned, or the Python server queued it for `drain_inbound` or its callback; a Python server with neither refuses it, `busy`), one `ack` for a batch of frames read, refusals first:
 
 ```json
 {"c":"WSE","t":"ack","p":{"s":42},"v":1}

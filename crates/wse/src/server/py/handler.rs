@@ -191,8 +191,10 @@ impl Handler for PyHandler {
                 on_message,
                 ..
             } => {
+                // Neither drain mode nor on_message: nobody takes it, and
+                // a client that numbered it hears so (`busy`).
                 let Some(callback) = on_message else {
-                    return true;
+                    return false;
                 };
                 let callback = Arc::clone(callback);
                 let conn_id = Arc::clone(conn_id);

@@ -101,3 +101,26 @@ async def test_what_the_server_cannot_tell_is_marked(server_port):
         await ws.close()
     finally:
         srv.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_server_that_queues_nothing_refuses_what_it_did_not_take(server_port):
+    """Neither drain mode nor on_message: a numbered message reaches nobody,
+    and the client is told so, never that it was taken."""
+    srv = RustWSEServer(
+        "127.0.0.1",
+        server_port,
+        jwt_secret=JWT_SECRET,
+        jwt_issuer=JWT_ISSUER,
+        jwt_audience=JWT_AUDIENCE,
+    )
+    srv.start()
+    try:
+        ws, answer = await outbox_client(server_port, "ann", {"producer": "p9"})
+        assert answer["acked"] == 0
+        await send(ws, "order", 1)
+        nack = await next_of(ws, "nack")
+        assert (nack["p"]["s"], nack["p"]["code"]) == (1, "busy")
+        await ws.close()
+    finally:
+        srv.stop()
