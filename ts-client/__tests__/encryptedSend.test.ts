@@ -20,6 +20,8 @@ import {
 } from './helpers.js';
 import { createWSEClient, type WSEClient } from '../core/index.js';
 import { SecurityManager } from '../utils/security.js';
+import { ConnectionManager } from '../services/ConnectionManager.js';
+import { createClientContext } from '../core/context.js';
 
 let clients: WSEClient[] = [];
 
@@ -200,4 +202,38 @@ it('to a server that does not answer, a kept message is delivered once written, 
     release();
     spy.mockRestore();
   }
+});
+
+it('goes on sealing what comes after a sealed frame the socket would not take, and says that one undelivered', async () => {
+  const ctx = createClientContext();
+  const undelivered: string[] = [];
+  const manager = new ConnectionManager(['ws://test'], {} as never, () => {}, () => {}, undefined, {
+    context: ctx,
+    encryptionRequired: true,
+    e2e: { legacy: true },
+    onUndeliverable: (message) => undelivered.push(message.t),
+  });
+  const sent: unknown[] = [];
+  let fail = true;
+  const ws = {
+    readyState: 1,
+    send: (frame: unknown) => {
+      if (fail) {
+        fail = false;
+        throw new Error('a write error');
+      }
+      sent.push(frame);
+    },
+    close: () => {},
+  };
+  const open = manager as unknown as { ws: unknown; isTransportReady: () => boolean; sealing: number };
+  open.ws = ws;
+  open.isTransportReady = () => true;
+  ctx.security.encryptForTransport = async () => new ArrayBuffer(2);
+  expect(manager.trySend({ t: 'first', p: {} })).toBe('sent');
+  await vi.waitFor(() => expect(undelivered).toEqual(['first']));
+  expect(manager.trySend({ t: 'second', p: {} })).toBe('sent');
+  await vi.waitFor(() => expect(sent).toHaveLength(1));
+  expect(open.sealing).toBe(0);
+  manager.destroy();
 });

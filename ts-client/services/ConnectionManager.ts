@@ -1096,7 +1096,7 @@ export class ConnectionManager {
         this.sealing++;
         this.sealingBytes += size;
         const socketId = this.socketId;
-        this.encryptedSendQueue = this.encryptedSendQueue.then(async () => {
+        const step = this.encryptedSendQueue.then(async () => {
           try {
             if (socketId !== this.socketId || this.ws !== ws || ws.readyState !== WS_OPEN || !this.mayStillGo(message)) {
               this.reportUndeliverable(message);
@@ -1119,11 +1119,23 @@ export class ConnectionManager {
               this.reportUndeliverable(message);
               return;
             }
-            ws.send(frame);
+            try {
+              ws.send(frame);
+            } catch (error) {
+              // Not taken: it goes on a later connection, as one this
+              // socket never wrote.
+              logger.error('[ConnectionManager] Failed to send a sealed message:', errorMessage(error));
+              this.reportUndeliverable(message);
+              return;
+            }
             written?.();
           } finally {
             this.sealed(size, socketId);
           }
+        });
+        // The chain never stays failed: what comes after goes on.
+        this.encryptedSendQueue = step.catch((error) => {
+          logger.error('[ConnectionManager] A sealed send failed:', errorMessage(error));
         });
       } else if (this.msgpack) {
         // The JSON value as msgpack, so both formats carry the same message.
