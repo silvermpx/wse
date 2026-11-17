@@ -148,7 +148,7 @@ class Runner:
                         emit({"event": "key_registered"})
                     elif t == "echo":
                         s.send(cid, json.dumps({"c": "U", "t": "echo_reply", "p": p, "v": 1}))
-                        emit({"event": "echo", "payload": p})
+                        emit({"event": "echo", "payload": p, "s": data.get("s")})
                     else:
                         emit({"event": "msg", "t": t})
                 elif kind == "signed" and isinstance(data, dict):

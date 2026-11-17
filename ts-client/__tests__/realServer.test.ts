@@ -16,6 +16,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { createWSEClient } from '../core/client.js';
 import {
   acquireSession,
   destroyCurrentSession,
@@ -279,6 +280,33 @@ describe.skipIf(!PYTHON || typeof WebSocket === 'undefined')('real RustWSEServer
     await vi.waitFor(() => expect(transportReady()).toBe(true), { timeout: 10_000 });
     expect(wseActions.sendMessage('echo', { n: 7 })).toBe('sent');
     await vi.waitFor(() => expect(echoes.some((p) => p.n === 7)).toBe(true), { timeout: 5_000 });
+  }, 30_000);
+
+  it('keeps a message in the outbox until the server confirms it, by its id', async () => {
+    destroyCurrentSession({ clearUserData: true });
+    const delivered: string[] = [];
+    const echoes: any[] = [];
+    const client = createWSEClient({ endpoints: [endpoint], reconnection: { baseDelay: 100, maxDelay: 300 } });
+    client.on('wseDelivered', (detail) => delivered.push(...detail.ids));
+    client.onMessage('echo_reply', (message) => echoes.push(message.p));
+    const lease = client.retain();
+    await vi.waitFor(() => expect(client.state.getSnapshot().ready).toBe(true), { timeout: 10_000 });
+
+    const before = events.filter((e) => e.event === 'echo').length;
+    expect(client.send('echo', { n: 1 }, { id: 'mine-1' })).not.toBe('dropped');
+    await vi.waitFor(() => expect(delivered).toContain('mine-1'), { timeout: 5_000 });
+    const echo = events.filter((e) => e.event === 'echo')[before];
+    expect(typeof echo.s).toBe('number');
+
+    // Sent with no connection: it waits, and goes on the next one.
+    client.pause('test');
+    await vi.waitFor(() => expect(client.state.getSnapshot().ready).toBe(false), { timeout: 5_000 });
+    expect(client.send('echo', { n: 2 }, { id: 'mine-2' })).toBe('queued');
+    client.resume('test');
+    await vi.waitFor(() => expect(delivered).toContain('mine-2'), { timeout: 10_000 });
+    await vi.waitFor(() => expect(echoes.some((p) => p.n === 2)).toBe(true), { timeout: 5_000 });
+    lease.release();
+    client.destroy();
   }, 30_000);
 
   it('speaks msgpack with the server both ways', async () => {

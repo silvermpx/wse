@@ -42,10 +42,11 @@ import { generateId } from '../utils/id.js';
 import { createClientContext, OFFLINE_OWNER_KEY, type ClientContext } from '../core/context.js';
 import type { SendResult } from './ConnectionManager.js';
 import type { OfflineQueue, OfflineRecord } from './OfflineQueue.js';
+import { noOutcomes, reportOutcomes, type Outbox, type Outcomes } from './Outbox.js';
 
 /** What the processor needs from the connection (ConnectionManager implements it). */
 export interface ProcessorConnection {
-  trySend(message: WSMessage): SendResult;
+  trySend(message: WSMessage, s?: number, json?: string): SendResult;
   sendControl(data: string | ArrayBuffer): boolean;
   isTransportReady(): boolean;
   /** Which socket is current: a new number for each one opened. */
@@ -323,6 +324,7 @@ export class MessageProcessor {
   private flushRequested = false;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private flushDue = 0;
+
 
   // Message types logged at debug level (kept for API compatibility)
   private highFrequencyTypes: Set<string> = new Set([
@@ -685,6 +687,19 @@ export class MessageProcessor {
       case 'batch':
         await this.processBatchMessage(message);
         return true;
+      // The server's answers to the outbox: never an application's.
+      case 'outbox':
+        if (message.c !== 'WSE') return false;
+        this.processOutboxAnswer(message);
+        return true;
+      case 'ack':
+        if (message.c !== 'WSE') return false;
+        this.processAck(message);
+        return true;
+      case 'nack':
+        if (message.c !== 'WSE') return false;
+        this.processNack(message);
+        return true;
       default:
         return false;
     }
@@ -780,6 +795,13 @@ export class MessageProcessor {
     if (typeof details.user_id === 'string' && details.user_id) {
       this.userId = details.user_id;
       this.storeOwner(details.user_id);
+    }
+    // The outbox: another user's messages go, and the rest goes once the
+    // server said what it took (at once, to a server that does not answer).
+    const outbox = this.ctx.outbox.current;
+    if (outbox) {
+      this.report(outbox.connected(this.connectionUser, Date.now()));
+      outbox.serverAnswers(features.acks === true);
     }
     this.connectionManager?.handleServerReady(details);
   }
@@ -1474,6 +1496,9 @@ export class MessageProcessor {
   /** The socket is gone: release held messages and drop undecryptable early frames. */
   handleConnectionClosed(): void {
     if (this.destroyed) return;
+    // What the outbox holds goes on the next connection.
+    const outbox = this.ctx.outbox.current;
+    if (outbox) this.report(outbox.disconnected());
     // A stream that heard nothing for longer than the server keeps one, while
     // this connection had its topic, is gone there: naming it would fail the
     // recovery. Silence counts only within the run of frames read up to the
@@ -1942,6 +1967,19 @@ export class MessageProcessor {
     const offlinePending = (this.offlineQueue?.getStats().size ?? 0) > 0;
     const requires = options.requires && options.requires.length > 0 ? options.requires : undefined;
 
+    // The outbox takes every message but a live one and one that requires
+    // topics (that one waits in the queue until they are continuous); with no
+    // connection, one asked to outlive the page goes to IndexedDB.
+    const outbox = this.ctx.outbox.current;
+    if (
+      outbox &&
+      options.liveOn === undefined &&
+      !requires &&
+      !(options.offline && this.offlineQueue?.isAvailable() && !cm?.isTransportReady())
+    ) {
+      return this.keep(outbox, message, options.ttl);
+    }
+
     // Fast path keeps latency low; it is skipped while anything older is
     // still waiting so the original order is preserved.
     if (
@@ -1987,6 +2025,99 @@ export class MessageProcessor {
     }
 
     return this.enqueueInMemory(message, priority, expiresAt, owner, options.liveOn, requires) ? 'queued' : 'dropped';
+  }
+
+  /**
+   * A message for the outbox: numbered, kept until the server answers for
+   * it, and out at once when the connection takes it.
+   */
+  private keep(outbox: Outbox, message: WSMessage, ttl?: number): SendStatus {
+    let json: string;
+    try {
+      json = JSON.stringify(message);
+    } catch (error) {
+      this.countDropped(1);
+      logger.error(`Dropping message ${message.t}: it cannot be serialised`, error);
+      return 'dropped';
+    }
+    if (outbox.add(message, json, ttl, Date.now()) === 0) {
+      this.countDropped(1);
+      logger.warn(`The outbox is full; message ${message.t} dropped`);
+      return 'dropped';
+    }
+    this.ctx.state.getState().incrementMetric('messagesQueued');
+    return this.flushOutbox() ? 'sent' : 'queued';
+  }
+
+  /** Hands the connection what the outbox has for it: true when all of it went. */
+  private flushOutbox(): boolean {
+    const outbox = this.ctx.outbox.current;
+    const cm = this.connectionManager;
+    if (!outbox) return true;
+    if (!cm || !cm.isTransportReady()) return false;
+    const outcomes = noOutcomes();
+    let all = true;
+    outbox.due(Date.now(), outcomes, (message, s, json) => {
+      const result = cm.trySend(message, s, json);
+      if (result === 'sent') return true;
+      all = false;
+      if (result === 'rate_limited') this.scheduleFlush(cm.getRetryAfterMs());
+      return false;
+    });
+    this.report(outcomes);
+    return all;
+  }
+
+  /** What became of the outbox's messages, to the application. */
+  private report(outcomes: Outcomes): void {
+    reportOutcomes(this.ctx.emit, outcomes);
+  }
+
+  /**
+   * Messages can go on this connection. A server that did not say it took it
+   * (one before 3.0) does not answer the outbox either: a message it got is
+   * gone once written.
+   */
+  transportReady(): void {
+    const outbox = this.ctx.outbox.current;
+    if (outbox && !outbox.connectionReady) {
+      this.report(outbox.connected(this.connectionUser, Date.now()));
+      outbox.serverAnswers(false);
+    }
+  }
+
+  /** The server's answer to the outbox's hello: what it decided, its refusals, its name. */
+  private processOutboxAnswer(message: WSMessage): void {
+    const outbox = this.ctx.outbox.current;
+    if (!outbox) return;
+    const p = message.p || {};
+    const refused: Array<[number, number, string]> = [];
+    if (Array.isArray(p.refused)) {
+      for (const r of p.refused) {
+        if (typeof r?.s !== 'number') continue;
+        const from = typeof r.from === 'number' ? r.from : r.s;
+        refused.push([from, r.s, typeof r.code === 'string' ? r.code : 'refused']);
+      }
+    }
+    const acked = typeof p.acked === 'number' ? p.acked : 0;
+    this.report(outbox.answeredWith(acked, refused, typeof p.node === 'string' ? p.node : ''));
+    this.scheduleFlush(0);
+  }
+
+  /** The server took every message of the outbox up to and with `s`. */
+  private processAck(message: WSMessage): void {
+    const outbox = this.ctx.outbox.current;
+    const s = message.p?.s;
+    if (outbox && typeof s === 'number') this.report(outbox.acked(s));
+  }
+
+  /** The server refused messages of the outbox for good. */
+  private processNack(message: WSMessage): void {
+    const outbox = this.ctx.outbox.current;
+    const p = message.p || {};
+    if (!outbox || typeof p.s !== 'number') return;
+    const from = typeof p.from === 'number' ? p.from : p.s;
+    this.report(outbox.refused(from, p.s, typeof p.code === 'string' ? p.code : 'refused'));
   }
 
   /** Each of `topics` is continuous now (always, for a client without delivery). */
@@ -2049,6 +2180,8 @@ export class MessageProcessor {
    */
   requeue(message: WSMessage, priority: number = message.pri ?? MessagePriority.NORMAL): void {
     if (this.destroyed) return;
+    // The outbox's: it waits there already.
+    if (this.ctx.outbox.current?.has(message)) return;
     if (this.liveOnly.has(message)) {
       this.countDropped(1);
       logger.warn(`Dropping ${message.t}: its connection went before it was sent`);
@@ -2162,6 +2295,8 @@ export class MessageProcessor {
       const stalled = await this.replayOfflineQueue(cm);
       if (stalled) return true;
     }
+    // The outbox, in the order of sending, before what waits in the queue.
+    if (!this.flushOutbox()) return true;
 
     const step = Math.max(1, this.batchSize);
     // One that requires topics stays in its place until they are continuous
@@ -2196,6 +2331,15 @@ export class MessageProcessor {
         if (liveOn !== undefined && liveOn !== cm.socketGeneration()) {
           this.countDropped(1);
           logger.warn(`Dropping ${batch[i].type}: its connection went before it was sent`);
+          continue;
+        }
+        // Not a live one (one whose topics are continuous now, or one sent
+        // before a session took the client): it joins the outbox, after what
+        // waits there, numbered then.
+        const outbox = this.ctx.outbox.current;
+        if (outbox && liveOn === undefined) {
+          const left = batch[i].expiresAt;
+          this.keep(outbox, wire, left !== undefined ? Math.max(0, left - nowMs) : undefined);
           continue;
         }
         this.handedOver.set(wire, {
@@ -2444,6 +2588,7 @@ export class MessageProcessor {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
+
     if (this.removalRetry) {
       clearTimeout(this.removalRetry);
       this.removalRetry = null;

@@ -158,10 +158,22 @@ export interface PerformanceConfig {
 }
 
 export interface OfflineConfig {
+  /**
+   * The outbox: every message sent, except a live or signed one, waits until
+   * the server answers for it (a `wseDelivered` or `wseNotDelivered` event
+   * names it) and goes again after a reconnect. Default true; false sends a
+   * message on the connection that is ready, or keeps it in the outgoing
+   * queue, as before 3.2.
+   */
   enabled: boolean;
+  /** How many messages wait at most, those not answered yet included (default 100,000). */
   maxSize: number;
+  /** How long a message waits to be written first, in ms (default an hour). */
   maxAge: number;
+  /** Persist what is sent with no connection to IndexedDB, so that it outlives the page. */
   persistToStorage: boolean;
+  /** How many bytes of messages (their JSON) wait at most (default 16 MiB). */
+  maxBytes?: number;
 }
 
 export interface DiagnosticsConfig {
@@ -330,6 +342,12 @@ export interface QueuedMessage {
 }
 
 export interface MessageOptions {
+  /**
+   * The message's id: the application's own (one it keeps itself, say), or
+   * a random UUID. The `wseDelivered` and `wseNotDelivered` events name it.
+   */
+  id?: string;
+  /** Orders the outgoing queue; the outbox sends in the order of sending. */
   priority?: MessagePriority;
   /**
    * Refuse to send this message unless the session has E2E encryption

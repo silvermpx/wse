@@ -8,6 +8,7 @@
 // share nothing. The default client (useWSE) gets the page's: the zustand
 // stores, the window's events and the `wse_` keys of localStorage.
 
+import type { Outbox } from '../services/Outbox.js';
 import { createStore, type StoreApi } from './store.js';
 import { createWSEState, type WSEStore } from './state/wseState.js';
 import { createQueueState, type MessageQueueStore } from './state/queueState.js';
@@ -40,8 +41,15 @@ export interface ClientStorage {
 /** An event of a client: `wseGap`, `wseMessage`, `wseEncryptionFailed`, ... */
 export type Emit = (type: string, detail?: unknown) => void;
 
+/** Where a client keeps its outbox: made by its first session, with its limits. */
+export interface OutboxSlot {
+  current: Outbox | null;
+}
+
 export interface ClientContext {
   readonly state: StoreApi<WSEStore>;
+  /** The client's outbox, kept across its sessions; none when `offline.enabled` is false. */
+  readonly outbox: OutboxSlot;
   readonly queue: StoreApi<MessageQueueStore>;
   readonly security: SecurityManager;
   readonly owner: OwnerGeneration;
@@ -238,6 +246,7 @@ export function createClientContext(options: ContextOptions = {}): ClientContext
     delivery: options.delivery,
     leaseHolder: options.leaseHolder,
     unremoved: new Set(),
+    outbox: { current: null },
   };
 }
 

@@ -107,6 +107,9 @@ export interface ConnectionManagerConfig {
   /** Proceed without server_ready after this many ms (0 = wait forever). */
   serverReadyTimeout?: number;
 
+  /** What client_hello says of the client's outbox (null: none). */
+  outboxHello?: () => Record<string, unknown> | null;
+
   /** Fail closed when the server's key does not arrive within this many ms. */
   encryptionHandshakeTimeout?: number;
 
@@ -1026,7 +1029,7 @@ export class ConnectionManager {
    * required; never drops silently -- the caller re-queues on anything but
    * 'sent'/'error'.
    */
-  trySend(message: WSMessage): SendResult {
+  trySend(message: WSMessage, s?: number, json?: string): SendResult {
     if (!this.isTransportReady()) {
       return 'not_ready';
     }
@@ -1050,7 +1053,16 @@ export class ConnectionManager {
       } else if (msgType === 'sync_request' || msgType.startsWith('request_')) {
         category = 'S';
       }
-      data = JSON.stringify({ c: category, ...message });
+      if (s !== undefined && json !== undefined && json.length > 2) {
+        // The outbox's number first, before the message as it was made.
+        data = `{"s":${s},"c":"${category}",${json.slice(1)}`;
+      } else if (s !== undefined) {
+        data = JSON.stringify({ s, c: category, ...message });
+      } else if (json !== undefined && json.length > 2) {
+        data = `{"c":"${category}",${json.slice(1)}`;
+      } else {
+        data = JSON.stringify({ c: category, ...message });
+      }
     } catch (error) {
       logger.error('[ConnectionManager] Cannot serialise message:', errorMessage(error));
       return 'error';
@@ -1404,6 +1416,10 @@ export class ConnectionManager {
     }
     if (e2eOffer) {
       payload.e2e = e2eOffer;
+    }
+    const outbox = this.config.outboxHello?.();
+    if (outbox) {
+      payload.outbox = outbox;
     }
 
     const message: WSMessage = {

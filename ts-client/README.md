@@ -348,10 +348,11 @@ useWSE('cookie', ['notifications'], {
   },
 
   offline: {
-    enabled: true,                            // allow { offline: true } sends
-    maxSize: 1000,
-    maxAge: 3600000,                          // ms
-    persistToStorage: true,                   // IndexedDB
+    enabled: true,                            // the outbox: every message waits for the server's answer
+    maxSize: 100000,                          // messages that wait at most, those not answered yet included
+    maxBytes: 16 * 1024 * 1024,               // bytes of messages that wait at most
+    maxAge: 3600000,                          // ms a message may wait to be written first
+    persistToStorage: true,                   // { offline: true } sends outlive the page (IndexedDB)
   },
 
   diagnostics: {
@@ -445,6 +446,7 @@ Other window events the client dispatches:
 const { sendMessage } = useWSE('cookie', topics, config);
 
 sendMessage('chat_message', { text: 'Hello' });                          // 'sent' | 'queued' | 'dropped'
+sendMessage('order', { item: 'tea' }, { id: 'order-17' });              // its outcome names it
 sendMessage('alert', { msg: 'critical' }, { priority: MessagePriority.CRITICAL });
 sendMessage('query', { filter: 'active' }, { correlation_id: 'req-123' });
 sendMessage('draft', { text }, { offline: true });                       // survives reloads (IndexedDB)
@@ -452,16 +454,27 @@ sendMessage('quote_request', { symbol }, { ttl: 5000 });                  // wor
 sendMessage('open_valve', { id: 'v-7' }, { live: true });                 // now or never
 ```
 
-Nothing is lost because the connection was busy: a message that cannot go out at once (before
-`server_ready`, while reconnecting, before the encryption key exists, or over the rate limit) is kept
-and sent automatically, in priority then FIFO order, as soon as possible. `'dropped'` means the
-outgoing queue was full or the message cannot be sent safely (see encryption).
+Every message, except a live or signed one, waits in the outbox until the server answers for it,
+goes again after a reconnect, and reaches the server's application once: it is numbered, and a
+server of 3.2 drops a repeat. The client says what became of each, by its id: `wseDelivered`
+(`{ ids }`) once the server took it, `wseNotDelivered` (`{ reason, ids }`) when it will not:
+the server refused it (`busy`, `rate_limited`, `missing`, `not_ready`), it was not written within
+its time (`expired`), it was the last user's (`user_changed`), the user signed out (`cleared`), or
+the client ended with it (`closed`). The outbox sends in the order of sending, whatever the
+priority. `close(deadlineMs)` waits for the server's answers too. With a server older than 3.2 a
+message is gone once written, as before. `offline: { enabled: false }` has no outbox: a message
+that cannot go out at once waits in the outgoing queue, in priority then FIFO order.
+
+`'dropped'` means the outbox (or the outgoing queue) was full or the message cannot be sent safely
+(see encryption).
 
 - `priority`: when the outgoing queue is full (by `maxQueueSize` or by `memoryLimit`), a message can
   push out only messages of lower priority; otherwise it is dropped.
-- `ttl`: milliseconds the message stays worth sending. One still queued after that (waiting for the
-  connection, in memory or in IndexedDB) is dropped instead of sent late, and counted in
-  `stats.messagesDropped`.
+- `id`: the message's id, the application's own (one it keeps itself, say); by default a random
+  UUID. The outcome events name it.
+- `ttl`: milliseconds the message stays worth sending. One not written within it (waiting for the
+  connection, in the outbox or in IndexedDB) is dropped instead of sent late (`wseNotDelivered`,
+  `expired`); once written it waits for the server's answer.
 - `offline`: persist to IndexedDB while disconnected and replay after reconnecting, also after a reload.
 - `live`: only on the connection that is ready now. It is never kept for a later connection, persisted
   or replayed after a reconnect, whatever `offline` says; without a ready connection it is

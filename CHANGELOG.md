@@ -78,6 +78,16 @@
   is never copied for its number, and a batch goes to the socket at once:
   200,000 messages to a local server go as fast with it as without it. With
   a server older than 3.2 a message is gone once written, as before.
+- TypeScript: the outbox, as in the Rust client (`offline.enabled`, on by
+  default): every message sent, except a live or signed one, waits until
+  the server answers for it, numbered, and goes again after a reconnect; a
+  3.2 server takes each once. `wseDelivered` (`{ ids }`) and
+  `wseNotDelivered` (`{ reason, ids }`) say what became of each by its id,
+  the application's own with `{ id }`. At most `offline.maxSize` (100,000)
+  and `offline.maxBytes` (16 MiB) wait; one not written within its `ttl`
+  or `offline.maxAge` runs out on the outbox's own timer, with a connection
+  or without. It sends in the order of sending, whatever the priority;
+  `close(deadlineMs)` waits for the server's answers, `signOut()` clears it.
 - TypeScript: `wake()` and `close(deadlineMs)` for a client without a page
   (Node, Electron's main process, a worker): `wake()` connects at once when
   the application hears the network or the machine is back, and `close`

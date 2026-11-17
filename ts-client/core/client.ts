@@ -9,6 +9,7 @@
 // are its own: two clients on one page share nothing. Frameworks hold it
 // through their adapters (wse-client/react, /vue, /svelte).
 
+import { reportOutcomes } from '../services/Outbox.js';
 import {
   ConnectionState,
   MessagePriority,
@@ -24,6 +25,7 @@ import { EventSequencer } from '../services/EventSequencer.js';
 import {
   WSESession,
   buildMessage,
+  ensureOutbox,
   expiryOf,
   resolveOptions,
   storageErrorDetail,
@@ -494,6 +496,16 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
       return 'dropped';
     }
     const message = buildMessage(type, payload, sendOptions);
+    // Kept in the outbox, numbered now, for the next connection; one that
+    // requires topics waits in the queue until they are continuous.
+    const outbox = sendOptions.requires?.length ? null : ensureOutbox(ctx, resolveOptions(options).offline);
+    if (outbox) {
+      if (outbox.add(message, JSON.stringify(message), sendOptions.ttl, Date.now()) === 0) {
+        logger.warn(`The outbox is full; message ${type} dropped`);
+        return 'dropped';
+      }
+      return 'queued';
+    }
     const queue = ctx.queue.getState();
     const ok = queue.enqueue({
       id: message.id!,
@@ -542,6 +554,14 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     }
     stop();
     stopListeningToPage();
+    // The outbox: what waits goes with the client (or the user, signed out),
+    // and the application hears of each.
+    const outbox = ctx.outbox.current;
+    if (outbox) {
+      if (clear) reportOutcomes(emit, outbox.clear());
+      reportOutcomes(emit, outbox.close());
+      outbox.dispose();
+    }
     if (clear) delivery.forget();
     delivery.close();
     ctx.state.getState().clearTimers();

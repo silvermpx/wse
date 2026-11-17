@@ -40,6 +40,7 @@ import { MessageProcessor } from './MessageProcessor.js';
 import { NetworkMonitor } from './NetworkMonitor.js';
 import { AdaptiveQualityManager, QueryClientLike } from './AdaptiveQualityManager.js';
 import { OfflineQueue } from './OfflineQueue.js';
+import { Outbox, reportOutcomes } from './Outbox.js';
 
 /** The page-wide client's name to the offline queue: one per page load. */
 const PAGE_HOLDER = generateId();
@@ -207,9 +208,10 @@ export function resolveOptions(config: UseWSEConfig | undefined): ResolvedWSEOpt
     },
     offline: {
       enabled: true,
-      maxSize: 1000,
+      maxSize: 100_000,
       maxAge: 3600000,
       persistToStorage: true,
+      maxBytes: 16 * 1024 * 1024,
       ...config?.offline,
     },
     diagnostics: {
@@ -235,6 +237,25 @@ export function resolveOptions(config: UseWSEConfig | undefined): ResolvedWSEOpt
   };
 }
 
+/**
+ * The client's outbox, made with `offline`'s limits the first time; null
+ * when `offline.enabled` is false.
+ */
+export function ensureOutbox(ctx: ClientContext, offline: OfflineConfig): Outbox | null {
+  if (!offline.enabled) return null;
+  // What runs out on its own timer is said, with a connection or without.
+  ctx.outbox.current ??= new Outbox(
+    {
+      maxMessages: offline.maxSize,
+      maxBytes: offline.maxBytes ?? 16 * 1024 * 1024,
+      maxAge: offline.maxAge,
+    },
+    undefined,
+    (outcomes) => reportOutcomes(ctx.emit, outcomes),
+  );
+  return ctx.outbox.current;
+}
+
 export function uniqueTopics(topics: unknown): string[] {
   if (!Array.isArray(topics)) return [];
   return [...new Set(topics.filter((t): t is string => typeof t === 'string' && t.length > 0))];
@@ -244,7 +265,7 @@ export function buildMessage(type: string, payload: any, options: MessageOptions
   const message: WSMessage = {
     t: type,
     p: payload,
-    id: generateId(),
+    id: options.id || generateId(),
     ts: new Date().toISOString(),
     v: WS_PROTOCOL_VERSION,
   };
@@ -395,6 +416,8 @@ export class WSESession {
     this.ctx.state.getState().updateConfig({ maxReconnectAttempts: o.reconnection.maxAttempts });
     this.ctx.queue.getState().setCapacity(o.performance.maxQueueSize);
     this.ctx.queue.getState().setMemoryLimit(o.performance.memoryLimit);
+    // The client's outbox: made once, kept across its sessions.
+    ensureOutbox(this.ctx, o.offline);
 
     if (o.criticalHandlers.length > 0) {
       const missing = o.criticalHandlers.filter(h => !this.processor.isHandlerRegistered(h));
@@ -500,8 +523,10 @@ export class WSESession {
         },
         rateLimit: o.rateLimit,
         serverReadyTimeout: o.serverReadyTimeout,
+        outboxHello: () => this.ctx.outbox.current?.hello() ?? null,
         onTransportReady: () => {
           this.ctx.state.getState().setTransportReady(true);
+          this.processor.transportReady();
           void this.processor.flush();
         },
         onSocketClosed: () => {
@@ -827,7 +852,11 @@ export class WSESession {
   }
 
   getQueueSize(): number {
-    return this.ctx.queue.getState().size + (this.offlineQueue?.getStats().size ?? 0);
+    return (
+      this.ctx.queue.getState().size +
+      (this.offlineQueue?.getStats().size ?? 0) +
+      (this.ctx.outbox.current?.size ?? 0)
+    );
   }
 
   /** The network or the machine is back: see ConnectionManager.wake. */
@@ -842,7 +871,12 @@ export class WSESession {
   drained(): boolean {
     const durable = this.ctx.state.getState().storageState === 'durable';
     const offline = durable ? 0 : (this.offlineQueue?.getStats().size ?? 0);
-    return this.ctx.queue.getState().size + offline === 0 && (this.connection?.unsentBytes() ?? 0) === 0;
+    // The outbox's messages, until the server answered for them.
+    const unanswered = this.ctx.outbox.current?.size ?? 0;
+    return (
+      this.ctx.queue.getState().size + offline + unanswered === 0 &&
+      (this.connection?.unsentBytes() ?? 0) === 0
+    );
   }
 
   private installWindowListeners(): void {

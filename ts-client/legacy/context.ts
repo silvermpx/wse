@@ -37,6 +37,7 @@ export function legacyContext(): ClientContext {
         },
       },
       unremoved: new Set(),
+      outbox: { current: null },
     };
   }
   return context;
