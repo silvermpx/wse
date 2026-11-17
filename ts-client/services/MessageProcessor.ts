@@ -256,6 +256,8 @@ export class MessageProcessor {
    * kept when it comes back to the queue.
    */
   private readonly handedOver = new WeakMap<WSMessage, HandedOver>();
+  /** The client's own messages: never the outbox's. */
+  private readonly system = new WeakSet<WSMessage>();
   private waitForHandlersInterval: ReturnType<typeof setInterval> | null = null;
 
   // Optional sink for measured round-trip latency (ms), set by the host. The
@@ -1919,7 +1921,7 @@ export class MessageProcessor {
   enqueueOutgoing(
     message: WSMessage,
     priority: number = MessagePriority.NORMAL,
-    options: { offline?: boolean; ttl?: number; liveOn?: number; requires?: readonly string[] } = {},
+    options: { offline?: boolean; ttl?: number; liveOn?: number; requires?: readonly string[]; system?: boolean } = {},
   ): SendStatus {
     if (this.destroyed) return 'dropped';
     // Made for the user whose data the page holds now: once another user's
@@ -1943,10 +1945,14 @@ export class MessageProcessor {
     const queueEmpty = this.ctx.queue.getState().size === 0;
     const requires = options.requires && options.requires.length > 0 ? options.requires : undefined;
 
-    // The outbox takes every message but a live one and one that requires
-    // topics (that one waits in the queue until they are continuous).
+    // The outbox takes every message of the application's but a live one and
+    // one that requires topics (that one waits in the queue until they are
+    // continuous). The client's own (a subscription, a sync request) go as
+    // before 3.2: they are made again for each connection, and the
+    // application hears of none of them.
+    if (options.system) this.system.add(message);
     const outbox = this.ctx.outbox.current;
-    if (outbox && options.liveOn === undefined && !requires) {
+    if (outbox && options.liveOn === undefined && !requires && !options.system) {
       return this.keep(outbox, message, options.ttl);
     }
 
@@ -2277,7 +2283,7 @@ export class MessageProcessor {
         // before a session took the client): it joins the outbox, after what
         // waits there, numbered then.
         const outbox = this.ctx.outbox.current;
-        if (outbox && liveOn === undefined) {
+        if (outbox && liveOn === undefined && !this.system.has(wire)) {
           const left = batch[i].expiresAt;
           this.keep(outbox, wire, left !== undefined ? Math.max(0, left - nowMs) : undefined);
           continue;

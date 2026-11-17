@@ -459,6 +459,15 @@ export class ConnectionManager {
       ws.onerror = () => {
         if (socketId !== this.socketId) return;
         logger.warn(`[ConnectionManager] WebSocket error on ${endpoint}`);
+        // An attempt that failed before the socket opened is over now, not
+        // at the connect timeout: Node's WebSocket (Electron's main process
+        // too) says so with an error alone, no close after it. A close that
+        // does follow (a browser's) finds the socket's handlers gone.
+        if (ws.readyState !== WS_OPEN) {
+          this.clearConnectTimeout();
+          settle(new Error('Connection failed'));
+          this.handleSocketGone(ws, endpoint, 1006, 'Connection failed');
+        }
       };
 
       ws.onclose = (event: CloseEvent) => {

@@ -173,6 +173,16 @@
   connections nobody served: a client coming back during a restart waited
   for its connect timeout (10 s) instead of being refused and trying again
   at once. Found by the conformance server.
+- TypeScript: the client's own messages (subscriptions, sync requests, the
+  compression setting) went through the outbox: the application heard
+  `wseDelivered` and `wseNotDelivered` of messages it never sent, and the
+  server refused some as `missing`. They go as before 3.2, made again for
+  each connection. Found by the conformance server.
+- TypeScript: in Node and Electron's main process an attempt the server
+  refused waited for the connect timeout (10 s) before the next: Node's
+  WebSocket says the failure with an error alone, and the client waited for
+  a close. The attempt is over at its error now. Found by the conformance
+  server.
 - React: `useWSETopics` takes a changed topic list before it lets the old one
   go, so a topic in both stays subscribed with its recovery position; it was
   unsubscribed and subscribed again.

@@ -654,7 +654,7 @@ export class WSESession {
 
   private sendSystem(type: string, payload: any, priority: MessagePriority = MessagePriority.HIGH): SendStatus {
     if (this.destroyed) return 'dropped';
-    return this.processor.enqueueOutgoing(buildMessage(type, payload, { priority }), priority);
+    return this.processor.enqueueOutgoing(buildMessage(type, payload, { priority }), priority, { system: true });
   }
 
   // ---------------------------------------------------------------------------

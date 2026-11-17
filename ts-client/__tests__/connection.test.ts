@@ -94,6 +94,25 @@ describe('reconnection policy', () => {
     expect(useWSEStore.getState().metrics.reconnectCount).toBe(0);
   });
 
+  it('ends an attempt that fails before opening at its error, with no close after it (Node)', async () => {
+    vi.useFakeTimers();
+    start({ reconnection: { baseDelay: 100, maxDelay: 100, jitter: false } });
+    await tick();
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    // Refused: Node's WebSocket says so with an error alone.
+    FakeWebSocket.last().serverError();
+    await tick();
+    expect(state()).toBe(ConnectionState.RECONNECTING);
+    await vi.advanceTimersByTimeAsync(150);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    // A browser's close after its error changes nothing.
+    FakeWebSocket.instances[0].serverClose(1006);
+    await vi.advanceTimersByTimeAsync(150);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    await connectServer(FakeWebSocket.last());
+    expect(state()).toBe(ConnectionState.CONNECTED);
+  });
+
   it('caps the backoff at maxDelay instead of growing a second, longer delay', async () => {
     vi.useFakeTimers();
     start({ reconnection: { baseDelay: 1000, maxDelay: 5000, jitter: false } });
