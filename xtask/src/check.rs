@@ -111,6 +111,25 @@ VIRTUAL_ENV=\"$venv\" \"$venv/bin/maturin\" develop --release --locked
 WSE_E2E_PYTHON=\"$venv/bin/python\" WSE_E2E_REQUIRED=1 npx vitest run --project client ts-client/__tests__/realServer.test.ts",
     },
     Lane {
+        // Every client against the conformance server, one case at a time,
+        // each on a server of its own; then the check of their reports.
+        name: "conformance",
+        needs: &[tool("cargo"), tool("node"), tool("npx"), tool("uvx")],
+        only_on: None,
+        script: "[ -d node_modules ] || { echo 'npm ci first: no node_modules'; exit 1; }
+cargo build --locked -p wse-conformance
+out=\"$(mktemp -d \"$CARGO_TARGET_DIR/conformance.XXXXXX\")\"
+\"$CARGO_TARGET_DIR/debug/wse-conformance\" serve --out \"$out\" > \"$out/serve.log\" 2>&1 &
+server=$!
+trap 'kill $server 2> /dev/null' EXIT
+for _ in $(seq 1 100); do grep -q '\"ready\"' \"$out/serve.log\" && break; sleep 0.1; done
+export WSE_CONFORMANCE=\"$(sed -n 's/.*\"control\":\"\\([^\"]*\\)\".*/\\1/p' \"$out/serve.log\")\" WSE_CONFORMANCE_REQUIRED=1
+npx vitest run --project client ts-client/__tests__/conformance.test.ts
+cargo test --locked -p wse-client --test conformance
+uvx --quiet --from pytest --with-editable './python-client[all,dev]' pytest python-client/tests/test_conformance.py -q -p no:cacheprovider
+\"$CARGO_TARGET_DIR/debug/wse-conformance\" check --manifest tests/conformance/agents.json --reports \"$out\"",
+    },
+    Lane {
         // The tests on the JVM, then the JVM package as an application gets it.
         name: "kotlin-jvm",
         needs: &[tool("java"), tool_or("gradle", "GRADLE"), tool("cargo")],

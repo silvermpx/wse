@@ -3576,6 +3576,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wse-conformance"
+version = "3.1.0"
+dependencies = [
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "wse",
+]
+
+[[package]]
 name = "wse-dart"
 version = "3.1.0"
 dependencies = [

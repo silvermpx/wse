@@ -1,0 +1,8 @@
+{
+  "about": "The clients a release needs checked, and the features each must claim: a driver that stops claiming one fails the check, and every case those features reach must pass.",
+  "agents": {
+    "ts-core": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] },
+    "rust-client": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] },
+    "python": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] }
+  }
+}

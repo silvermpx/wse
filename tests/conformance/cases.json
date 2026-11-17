@@ -1,0 +1,839 @@
+{
+  "about": "What every WSE client is checked against. A case runs on a server of its own (a topic's messages carry the topic, its stream and its place only where the server keeps a history of the topic: `recovery`); its steps are the client's (a driver does them) and the server's (the driver asks for them, in their place among the client's). A driver records what its client saw and does; the rules judge that against what the server published and took. A case a driver lacks a feature for is not applicable to it.",
+  "cases": [
+    {
+      "case": "connect.plain",
+      "about": "The client gets in, the server takes the connection once, the client ends.",
+      "steps": [
+        {
+          "client": "connect"
+        },
+        {
+          "client": "wait",
+          "for": "ready"
+        },
+        {
+          "client": "close"
+        }
+      ],
+      "rules": [
+        {
+          "rule": "connections",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "case": "send.echo",
+      "about": "A message goes and the server's answer comes, words of every script intact.",
+      "steps": [
+        {
+          "client": "connect"
+        },
+        {
+          "client": "wait",
+          "for": "ready"
+        },
+        {
+          "client": "send",
+          "type": "echo",
+          "payload": {
+            "text": "Grüße, hello"
+          }
+        },
+        {
+          "client": "wait",
+          "for": "message",
+          "type": "echoed"
+        },
+        {
+          "client": "close"
+        }
+      ],
+      "rules": [
+        {
+          "rule": "echoed",
+          "payload": {
+            "text": "Grüße, hello"
+          }
+        }
+      ]
+    },
+    {
+      "case": "topics.receive",
+      "about": "Ten messages of a topic come in order, each once.",
+      "server": {
+        "recovery": 128
+      },
+      "steps": [
+        {
+          "client": "connect",
+          "topics": [
+            "prices"
+          ]
+        },
+        {
+          "client": "wait",
+          "for": "ready"
+        },
+        {
+          "server": "await_subscribers",
+          "topic": "prices"
+        },
+        {
+          "server": "publish",
+          "topic": "prices",
+          "count": 10
+        },
+        {
+          "client": "wait",
+          "for": "messages",
+          "topic": "prices",
+          "count": 10
+        },
+        {
+          "client": "close"
+        }
+      ],
+      "rules": [
+        {
+          "rule": "order",
+          "topic": "prices"
+        },
+        {
+          "rule": "no_duplicates",
+          "topic": "prices"
+        },
+        {
+          "rule": "all_published_delivered",
+          "topic": "prices"
+        }
+      ]
+    },
+    {
+      "case": "recovery.kick",
+      "about": "The server cuts the connection; what it published meanwhile comes after the reconnect, in order, once, with no break said.",
+      "server": {
+        "recovery": 128
+      },
+      "steps": [
+        {
+          "client": "connect",
+          "topics": [
+            "prices"
+          ]
+        },
+        {
+          "client": "wait",
+          "for": "ready"
+        },
+        {
+          "server": "await_subscribers",
+          "topic": "prices"
+        },
+        {
+          "server": "publish",
+          "topic": "prices",
+          "count": 5
+        },
+        {
+          "client": "wait",
+          "for": "messages",
+          "topic": "prices",
+          "count": 5
+        },
+        {
+          "server": "kick"
+        },
+        {
+          "server": "publish",
+          "topic": "prices",
+          "count": 5
+        },
+        {
+          "client": "wait",
+          "for": "messages",
+          "topic": "prices",
+          "count": 10
+        },
+        {
+          "client": "close"
+        }
+      ],
+      "rules": [
+        {
+          "rule": "order",
+          "topic": "prices"
+        },
+        {
+          "rule": "no_duplicates",
+          "topic": "prices"
+        },
+        {
+          "rule": "all_published_delivered",
+          "topic": "prices"
+        },
+        {
+          "rule": "no_break",
+          "topic": "prices"
+        },
+        {
+          "rule": "back_within",
+          "count": 3000
+        }
+      ]
+    },
+    {
+      "case": "recovery.restart_epoch",
+      "about": "The server restarts and its history is gone: the client says the topic broke off, then goes on with what comes.",
+      "server": {
+        "recovery": 128
+      },
+      "steps": [
+        {
+          "client": "connect",
+          "topics": [
+            "prices"
+          ]
+        },
+        {
+          "client": "wait",
+          "for": "ready"
+        },
+        {
+          "server": "await_subscribers",
+          "topic": "prices"
+        },
+        {
+          "server": "publish",
+          "topic": "prices",
+          "count": 5
+        },
+        {
+          "client": "wait",
+          "for": "messages",
+          "topic": "prices",
+          "count": 5
+        },
+        {
+          "server": "restart"
+        },
+        {
+          "server": "await_subscribers",
+          "topic": "prices"
+        },
+        {
+          "server": "publish",
+          "topic": "prices",
+          "count": 5
+        },
+        {
+          "client": "wait",
+          "for": "messages",
+          "topic": "prices",
+          "count": 10
+        },
+        {
+          "client": "close"
+        }
+      ],
+      "rules": [
+        {
+          "rule": "order",
+          "topic": "prices"
+        },
+        {
+          "rule": "no_duplicates",
+          "topic": "prices"
+        },
+        {
+          "rule": "no_silent_loss",
+          "topic": "prices"
+        },
+        {
+          "rule": "break_said",
+          "topic": "prices"
+        },
+        {
+          "rule": "back_within",
+          "count": 3000
+        }
+      ]
+    },
+    {
+      "case": "recovery.expired_history",
+      "about": "Away longer than the history holds: what is gone is said, never lost in silence, and what comes after goes on.",
+      "server": {
+        "recovery": 16
+      },
+      "steps": [
+        {
+          "client": "connect",
+          "topics": [
+            "prices"
+          ]
+        },
+        {
+          "client": "wait",
+          "for": "ready"
+        },
+        {
+          "server": "await_subscribers",
+          "topic": "prices"
+        },
+        {
+          "server": "publish",
+          "topic": "prices",
+          "count": 3
+        },
+        {
+          "client": "wait",
+          "for": "messages",
+          "topic": "prices",
+          "count": 3
+        },
+        {
+          "client": "pause"
+        },
+        {
+          "client": "wait",
+          "for": "not_ready"
+        },
+        {
+          "server": "publish",
+          "topic": "prices",
+          "count": 40
+        },
+        {
+          "client": "resume"
+        },
+        {
+          "client": "wait",
+          "for": "ready"
+        },
+        {
+          "client": "wait",
+          "for": "break",
+          "topic": "prices"
+        },
+        {
+          "server": "await_subscribers",
+          "topic": "prices"
+        },
+        {
+          "server": "publish",
+          "topic": "prices",
+          "count": 3
+        },
+        {
+          "client": "wait",
+          "for": "published",
+          "topic": "prices",
+          "last": 3
+        },
+        {
+          "client": "close"
+        }
+      ],
+      "rules": [
+        {
+          "rule": "order",
+          "topic": "prices"
+        },
+        {
+          "rule": "no_duplicates",
+          "topic": "prices"
+        },
+        {
+          "rule": "no_silent_loss",
+          "topic": "prices"
+        },
+        {
+          "rule": "break_said",
+          "topic": "prices"
+        }
+      ]
+    },
+    {
+      "case": "outbox.offline",
+      "about": "Sent with no connection: each goes once the client is back, in order, taken once, and said delivered by its id.",
+      "needs": [
+        "outbox"
+      ],
+      "steps": [
+        {
+          "client": "connect"
+        },
+        {
+          "client": "wait",
+          "for": "ready"
+        },
+        {
+          "client": "pause"
+        },
+        {
+          "client": "wait",
+          "for": "not_ready"
+        },
+        {
+          "client": "send",
+          "type": "order",
+          "payload": {
+            "n": 1
+          },
+          "id": "order-1"
+        },
+        {
+          "client": "send",
+          "type": "order",
+          "payload": {
+            "n": 2
+          },
+          "id": "order-2"
+        },
+        {
+          "client": "send",
+          "type": "order",
+          "payload": {
+            "n": 3
+          },
+          "id": "order-3"
+        },
+        {
+          "client": "resume"
+        },
+        {
+          "client": "wait",
+          "for": "delivered",
+          "ids": [
+            "order-1",
+            "order-2",
+            "order-3"
+          ]
+        },
+        {
+          "client": "close"
+        }
+      ],
+      "rules": [
+        {
+          "rule": "taken_once",
+          "type": "order"
+        },
+        {
+          "rule": "taken_in_order",
+          "type": "order"
+        },
+        {
+          "rule": "delivered_all",
+          "type": "order"
+        }
+      ]
+    },
+    {
+      "case": "outbox.cut_in_flight",
+      "about": "The connection is cut while messages are on their way: after the reconnect each is taken once, none lost, and each said delivered.",
+      "needs": [
+        "outbox"
+      ],
+      "steps": [
+        {
+          "client": "connect"
+        },
+        {
+          "client": "wait",
+          "for": "ready"
+        },
+        {
+          "client": "send",
+          "type": "order",
+          "count": 50
+        },
+        {
+          "server": "kick"
+        },
+        {
+          "client": "wait",
+          "for": "delivered",
+          "all": true,
+          "timeout_ms": 15000
+        },
+        {
+          "client": "close"
+        }
+      ],
+      "rules": [
+        {
+          "rule": "taken_once",
+          "type": "order"
+        },
+        {
+          "rule": "taken_in_order",
+          "type": "order"
+        },
+        {
+          "rule": "delivered_all",
+          "type": "order"
+        }
+      ]
+    },
+    {
+      "case": "outbox.start_offline",
+      "about": "The client starts with no server: what it sends waits, and goes once the server is there.",
+      "needs": [
+        "outbox",
+        "start"
+      ],
+      "steps": [
+        {
+          "server": "stop"
+        },
+        {
+          "client": "connect",
+          "start": true
+        },
+        {
+          "client": "send",
+          "type": "order",
+          "payload": {
+            "n": 1
+          },
+          "id": "early-1"
+        },
+        {
+          "server": "restart"
+        },
+        {
+          "client": "wait",
+          "for": "delivered",
+          "ids": [
+            "early-1"
+          ],
+          "timeout_ms": 15000
+        },
+        {
+          "client": "close"
+        }
+      ],
+      "rules": [
+        {
+          "rule": "taken_once",
+          "type": "order"
+        },
+        {
+          "rule": "delivered_all",
+          "type": "order"
+        }
+      ]
+    },
+    {
+      "case": "send.live_not_late",
+      "about": "A live message sent with no connection never goes on a later one.",
+      "needs": [
+        "live"
+      ],
+      "steps": [
+        {
+          "client": "connect"
+        },
+        {
+          "client": "wait",
+          "for": "ready"
+        },
+        {
+          "client": "pause"
+        },
+        {
+          "client": "wait",
+          "for": "not_ready"
+        },
+        {
+          "client": "send",
+          "type": "valve",
+          "payload": {
+            "open": true
+          },
+          "live": true
+        },
+        {
+          "client": "resume"
+        },
+        {
+          "client": "wait",
+          "for": "ready"
+        },
+        {
+          "client": "send",
+          "type": "echo",
+          "payload": {
+            "after": true
+          }
+        },
+        {
+          "client": "wait",
+          "for": "message",
+          "type": "echoed"
+        },
+        {
+          "client": "close"
+        }
+      ],
+      "rules": [
+        {
+          "rule": "never_taken",
+          "type": "valve"
+        }
+      ]
+    },
+    {
+      "case": "format.msgpack",
+      "about": "MessagePack both ways: a topic's messages and an answer come as in JSON.",
+      "needs": [
+        "msgpack"
+      ],
+      "server": {
+        "recovery": 128
+      },
+      "steps": [
+        {
+          "client": "connect",
+          "topics": [
+            "prices"
+          ],
+          "format": "msgpack"
+        },
+        {
+          "client": "wait",
+          "for": "ready"
+        },
+        {
+          "server": "await_subscribers",
+          "topic": "prices"
+        },
+        {
+          "server": "publish",
+          "topic": "prices",
+          "count": 3
+        },
+        {
+          "client": "wait",
+          "for": "messages",
+          "topic": "prices",
+          "count": 3
+        },
+        {
+          "client": "send",
+          "type": "echo",
+          "payload": {
+            "text": "packed"
+          }
+        },
+        {
+          "client": "wait",
+          "for": "message",
+          "type": "echoed"
+        },
+        {
+          "client": "close"
+        }
+      ],
+      "rules": [
+        {
+          "rule": "all_published_delivered",
+          "topic": "prices"
+        },
+        {
+          "rule": "echoed",
+          "payload": {
+            "text": "packed"
+          }
+        }
+      ]
+    },
+    {
+      "case": "e2e.pinned",
+      "about": "End-to-end encryption with the server's pinned key: the message and its answer go sealed.",
+      "needs": [
+        "e2e"
+      ],
+      "server": {
+        "e2e": true
+      },
+      "steps": [
+        {
+          "client": "connect",
+          "e2e": true
+        },
+        {
+          "client": "wait",
+          "for": "ready"
+        },
+        {
+          "client": "send",
+          "type": "echo",
+          "payload": {
+            "sealed": true
+          }
+        },
+        {
+          "client": "wait",
+          "for": "message",
+          "type": "echoed"
+        },
+        {
+          "client": "close"
+        }
+      ],
+      "rules": [
+        {
+          "rule": "echoed",
+          "payload": {
+            "sealed": true
+          }
+        }
+      ]
+    },
+    {
+      "case": "send.signed",
+      "about": "A signed message passes the server's checks once.",
+      "needs": [
+        "signing"
+      ],
+      "server": {
+        "signing": true
+      },
+      "steps": [
+        {
+          "client": "connect",
+          "signing": true
+        },
+        {
+          "client": "wait",
+          "for": "ready"
+        },
+        {
+          "client": "send",
+          "type": "order",
+          "payload": {
+            "n": 7
+          },
+          "signed": true
+        },
+        {
+          "client": "wait",
+          "for": "message",
+          "type": "signed_taken"
+        },
+        {
+          "client": "close"
+        }
+      ],
+      "rules": [
+        {
+          "rule": "signed_taken",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "case": "rr.reconnect_barrier",
+      "about": "Recover-or-resync: a topic that broke off holds its messages until the application says it resynced, then they come.",
+      "needs": [
+        "recover_or_resync"
+      ],
+      "server": {
+        "recovery": 16
+      },
+      "steps": [
+        {
+          "client": "connect",
+          "topics": [
+            "prices"
+          ],
+          "recover_or_resync": true
+        },
+        {
+          "client": "wait",
+          "for": "ready"
+        },
+        {
+          "server": "await_subscribers",
+          "topic": "prices"
+        },
+        {
+          "server": "publish",
+          "topic": "prices",
+          "count": 3
+        },
+        {
+          "client": "wait",
+          "for": "messages",
+          "topic": "prices",
+          "count": 3
+        },
+        {
+          "client": "pause"
+        },
+        {
+          "client": "wait",
+          "for": "not_ready"
+        },
+        {
+          "server": "publish",
+          "topic": "prices",
+          "count": 40
+        },
+        {
+          "client": "resume"
+        },
+        {
+          "client": "wait",
+          "for": "resync",
+          "topic": "prices"
+        },
+        {
+          "server": "await_subscribers",
+          "topic": "prices"
+        },
+        {
+          "server": "publish",
+          "topic": "prices",
+          "count": 2
+        },
+        {
+          "client": "sleep",
+          "ms": 300
+        },
+        {
+          "client": "resynced",
+          "topics": [
+            "prices"
+          ]
+        },
+        {
+          "client": "wait",
+          "for": "published",
+          "topic": "prices",
+          "last": 2
+        },
+        {
+          "client": "close"
+        }
+      ],
+      "rules": [
+        {
+          "rule": "held_until_resynced",
+          "topic": "prices"
+        },
+        {
+          "rule": "no_silent_loss",
+          "topic": "prices"
+        },
+        {
+          "rule": "order",
+          "topic": "prices"
+        }
+      ]
+    }
+  ]
+}

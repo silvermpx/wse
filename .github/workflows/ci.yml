@@ -37,6 +37,7 @@ jobs:
       ts_client: ${{ steps.filter.outputs.ts_client }}
       mobile: ${{ steps.filter.outputs.mobile }}
       benchmarks: ${{ steps.filter.outputs.benchmarks }}
+      conformance: ${{ steps.filter.outputs.conformance }}
     steps:
       # Credentials stay: on a push the filter fetches the previous commit.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -88,6 +89,16 @@ jobs:
               - '.github/workflows/ci.yml'
             benchmarks:
               - 'benchmarks/**'
+              - '.github/workflows/ci.yml'
+            conformance:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'ts-client/**'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'python-client/**'
+              - 'tests/conformance/**'
               - '.github/workflows/ci.yml'
 
   # ---------------------------------------------------------------------------
@@ -321,6 +332,62 @@ jobs:
   # ---------------------------------------------------------------------------
   # Python client: lint + tests
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Every client against the conformance server, and the check of the reports
+  # ---------------------------------------------------------------------------
+  conformance:
+    name: Conformance (TypeScript, Rust, Python)
+    needs: changes
+    if: needs.changes.outputs.conformance == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: ". -> target"
+          key: conformance
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install
+        run: |
+          npm ci --ignore-scripts
+          pip install -e "python-client[all,dev]"
+
+      - name: The clients, each case on a server of its own
+        run: |
+          cargo build --locked -p wse-conformance
+          out="$RUNNER_TEMP/conformance"
+          target/debug/wse-conformance serve --out "$out" > serve.log 2>&1 &
+          for _ in $(seq 1 100); do grep -q '"ready"' serve.log && break; sleep 0.1; done
+          export WSE_CONFORMANCE="$(sed -n 's/.*"control":"\([^"]*\)".*/\1/p' serve.log)" WSE_CONFORMANCE_REQUIRED=1
+          npx vitest run --project client ts-client/__tests__/conformance.test.ts
+          cargo test --locked -p wse-client --test conformance
+          pytest python-client/tests/test_conformance.py -q
+          target/debug/wse-conformance check --manifest tests/conformance/agents.json --reports "$out"
+
+      - name: The reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: conformance-reports
+          path: ${{ runner.temp }}/conformance
+          if-no-files-found: ignore
+
   python-client:
     name: Python Client (Python ${{ matrix.python }})
     needs: changes
@@ -1103,7 +1170,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, checks, secrets, client, frameworks, client-server, python-client, lint, rust-lint, rust-test, rust-wasm, rust-fips, rust-msrv, swift, kotlin, android, react-native, dart, flutter-ios, test, benchmarks, security]
+    needs: [changes, checks, secrets, client, frameworks, client-server, conformance, python-client, lint, rust-lint, rust-test, rust-wasm, rust-fips, rust-msrv, swift, kotlin, android, react-native, dart, flutter-ios, test, benchmarks, security]
     runs-on: ubuntu-latest
     steps:
       - name: Every job passed or was skipped

@@ -1,0 +1,21 @@
+[package]
+name = "wse-conformance"
+description = "The server every WSE client is checked against: a server of its own for each case, and one judge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "wse-conformance"
+path = "src/main.rs"
+
+[dependencies]
+wse = { workspace = true, features = ["server"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

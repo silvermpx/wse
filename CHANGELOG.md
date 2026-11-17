@@ -4,6 +4,15 @@
 
 ### Added
 
+- The conformance server (`crates/wse-conformance`, not published): each
+  case on a WSE server of its own, its steps for the client and the server
+  in one list, and one judge that holds what a client recorded to the
+  case's rules (order, no silent loss, no repeat, each message taken once
+  and said delivered, a live message never late, a held topic until its
+  resync, back soon after a cut). The TypeScript, Rust and Python clients
+  pass its 14 cases; `cargo xtask check conformance` and the CI job
+  `conformance` run them, and `wse-conformance check` fails a release
+  whose required clients did not all pass (`tests/conformance/agents.json`).
 - Python: `pause(reason)` and `resume(reason)`, as in the TypeScript and
   Rust clients: the connection ends while any reason holds, and topics,
   positions and the outbox stay. `start()` connects in the background, a
