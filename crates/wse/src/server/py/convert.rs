@@ -29,10 +29,18 @@ fn to_json(obj: &Bound<'_, PyAny>, path: &mut Vec<usize>) -> PyResult<serde_json
     {
         return Ok(serde_json::Value::Bool(b));
     }
-    if obj.is_instance_of::<PyInt>()
-        && let Ok(i) = obj.extract::<i64>()
-    {
-        return Ok(serde_json::Value::Number(i.into()));
+    if obj.is_instance_of::<PyInt>() {
+        if let Ok(i) = obj.extract::<i64>() {
+            return Ok(serde_json::Value::Number(i.into()));
+        }
+        // Up to 2**64 - 1 a JSON number holds it exactly; past that no
+        // number here does, and it is not sent as anything else.
+        return match obj.extract::<u64>() {
+            Ok(u) => Ok(serde_json::Value::Number(u.into())),
+            Err(_) => Err(pyo3::exceptions::PyOverflowError::new_err(
+                "an int past -2**63 .. 2**64 - 1 is no JSON number here",
+            )),
+        };
     }
     if obj.is_instance_of::<PyFloat>()
         && let Ok(f) = obj.extract::<f64>()
@@ -117,6 +125,8 @@ pub(in crate::server) fn json_to_pyobj(py: Python<'_>, val: &serde_json::Value) 
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 i.into_pyobject(py).unwrap().into_any().unbind()
+            } else if let Some(u) = n.as_u64() {
+                u.into_pyobject(py).unwrap().into_any().unbind()
             } else if let Some(f) = n.as_f64() {
                 f.into_pyobject(py).unwrap().into_any().unbind()
             } else {

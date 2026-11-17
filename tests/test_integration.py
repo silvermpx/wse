@@ -192,6 +192,38 @@ class TestMessaging:
             assert ev[2]["p"]["text"] == "hello"
 
     @pytest.mark.asyncio
+    async def test_unsigned_64_bit_numbers_keep_their_value_and_type(self, server, server_port):
+        """Numbers past a signed 64-bit integer, up to 2**64 - 1, come in as
+        Python ints and go out as JSON numbers, exactly."""
+        token = make_token()
+        big = 2**63 + 1
+        top = 2**64 - 1
+        async with await connect(server_port, token) as ws:
+            await asyncio.wait_for(ws.recv(), timeout=2.0)
+            drain_until(server, "auth_connect")
+            await ws.send(json.dumps({"c": "WSE", "t": "chat", "p": {"n": big}}))
+            ev = drain_until(server, "msg")
+            assert ev[2]["p"]["n"] == big
+            assert type(ev[2]["p"]["n"]) is int
+            conn_id = server.get_connections()[0]
+            server.send_event(conn_id, {"t": "numbers", "p": {"big": big, "top": top}})
+            msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            got = json.loads(msg)
+            assert got["p"] == {"big": big, "top": top}
+
+    @pytest.mark.asyncio
+    async def test_an_int_past_64_bits_is_refused(self, server, server_port):
+        """No JSON number here holds it: the send says so, never sends a
+        string instead."""
+        token = make_token()
+        async with await connect(server_port, token) as ws:
+            await asyncio.wait_for(ws.recv(), timeout=2.0)
+            drain_until(server, "auth_connect")
+            conn_id = server.get_connections()[0]
+            with pytest.raises(OverflowError):
+                server.send_event(conn_id, {"t": "numbers", "p": {"n": 2**64}})
+
+    @pytest.mark.asyncio
     async def test_client_to_server_raw_text(self, server, server_port):
         """Non-JSON text goes through as raw event."""
         token = make_token()
