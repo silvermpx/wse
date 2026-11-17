@@ -214,4 +214,8 @@ for _ in $(seq 1 180); do
   esac
   sleep 20
 done
-echo "the Portal still says $state after an hour; it publishes on its own once validated" >&2
+# Not published in that time: the job fails. The Portal goes on with the
+# deployment by itself; it is looked at there before the job runs again.
+echo "deployment $id: the Portal still says $state after an hour; not published yet." >&2
+echo "It goes on by itself once validated: look at it on https://central.sonatype.com/publishing/deployments before running this job again." >&2
+exit 1
