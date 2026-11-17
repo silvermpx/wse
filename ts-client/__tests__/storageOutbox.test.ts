@@ -130,6 +130,61 @@ describe('the outbox in the app storage (React Native)', () => {
     }
   });
 
+  it('a removal that failed is done again when the storage is written anew', async () => {
+    const storage = asyncStorage();
+    const first = new Outbox(limits, { store: storageOutbox(storage) });
+    await first.opened;
+    add(first, 'a'); // before any connection: anyone's
+    await settled();
+    expect(messages(storage)).toEqual([1]);
+    const multiRemove = storage.multiRemove!;
+    let fails = true;
+    storage.multiRemove = async (keys) => {
+      if (fails) {
+        fails = false;
+        throw new Error('busy');
+      }
+      return multiRemove(keys);
+    };
+    // The user signs out; the removal fails, and the store is written anew
+    // as the client ends.
+    first.clear();
+    await settled();
+    first.close();
+    await settled();
+    expect(messages(storage)).toEqual([]);
+    const again = new Outbox(limits, { store: storageOutbox(storage) });
+    await again.opened;
+    expect(again.size).toBe(0);
+    again.close();
+  });
+
+  it('one that opens waits for the last client’s writes to end', async () => {
+    const storage = asyncStorage();
+    const first = new Outbox(limits, { store: storageOutbox(storage) });
+    await first.opened;
+    const multiSet = storage.multiSet!;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    storage.multiSet = async (pairs) => {
+      await held;
+      return multiSet(pairs);
+    };
+    add(first, 'a');
+    await settled();
+    first.close();
+    const second = new Outbox(limits, { store: storageOutbox(storage) });
+    await settled();
+    storage.multiSet = multiSet;
+    release();
+    await second.opened;
+    expect(second.size).toBe(1);
+    expect(add(second, 'b')).toBe(2);
+    second.close();
+    await settled();
+    expect(messages(storage)).toEqual([1, 2]);
+  });
+
   it('is one client’s while it runs', async () => {
     const storage = asyncStorage();
     const first = new Outbox(limits, { store: storageOutbox(storage) });

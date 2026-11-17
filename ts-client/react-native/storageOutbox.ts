@@ -123,12 +123,24 @@ const isCount = (value: unknown): value is number =>
 
 /** The names of this process's open outboxes: each is one client's. */
 const open = new Set<string>();
+/**
+ * An outbox that closes, until its last write ended: one that opens under its
+ * name waits for it, so it reads what that one wrote and never writes over it.
+ */
+const closing = new Map<string, Promise<void>>();
 
 class StorageLog implements OutboxLog {
   /** The storage keeps a key for each message: no lines to count. */
   readonly lines = 0;
   /** The numbers the storage holds a message of, none of them below `low`. */
   private readonly held: Set<number>;
+  /**
+   * Numbers removed whose removal the storage has not done yet: written anew,
+   * the storage is told to remove them again, until a batch did.
+   */
+  private readonly doomed = new Set<number>();
+  /** Called once the outbox closed and its last write ended. */
+  private released: (() => void) | null = null;
   private low = 1;
   private sets = new Map<string, string>();
   private removes = new Set<string>();
@@ -175,6 +187,7 @@ class StorageLog implements OutboxLog {
   private remove(s: number): void {
     const key = this.key(s);
     this.held.delete(s);
+    this.doomed.add(s);
     this.sets.delete(key);
     this.removes.add(key);
   }
@@ -233,9 +246,10 @@ class StorageLog implements OutboxLog {
     this.meta.written = state.written;
     this.meta.node = state.node;
     this.meta.user = state.user;
-    // Every key it holds goes, but the ones written again.
+    // Every key it holds goes, and those whose removal is not done yet, but
+    // the ones written again.
     const sets = new Map<string, string>([[this.name, JSON.stringify(this.meta)]]);
-    const removes = new Set<string>([...this.held].map((s) => this.key(s)));
+    const removes = new Set<string>([...this.held, ...this.doomed].map((s) => this.key(s)));
     this.held.clear();
     for (const record of state.records) {
       const key = this.key(record.s);
@@ -274,14 +288,25 @@ class StorageLog implements OutboxLog {
         this.busy = false;
         if (whole) this.stale = false;
         this.failing = false;
+        for (const key of batch.removes) this.doomed.delete(Number(key.slice(this.prefix.length)));
         this.kick();
+        this.settle();
       },
       (error) => {
         this.busy = false;
         this.fail(error);
         this.kick();
+        this.settle();
       },
     );
+  }
+
+  /** Closed, and nothing written any more: the name is let go. */
+  private settle(): void {
+    if (!this.closed || this.busy || this.waiting) return;
+    open.delete(this.name);
+    this.released?.();
+    this.released = null;
   }
 
   private fail(error: unknown): void {
@@ -296,7 +321,20 @@ class StorageLog implements OutboxLog {
     if (this.closed) return;
     this.closed = true;
     this.flush();
-    open.delete(this.name);
+    if (!this.busy && !this.waiting) {
+      open.delete(this.name);
+      return;
+    }
+    // Its last writes run: one that opens under its name waits for them.
+    closing.set(
+      this.name,
+      new Promise<void>((resolve) => {
+        this.released = () => {
+          closing.delete(this.name);
+          resolve();
+        };
+      }),
+    );
   }
 }
 
@@ -314,6 +352,7 @@ export function storageOutbox(storage: AsyncStorageLike | MMKVLike, name = 'wse'
   const prefix = `${metaKey}:`;
   return {
     async open(_state, report): Promise<OpenedStore> {
+      await closing.get(metaKey);
       if (open.has(metaKey)) throw new Error(`the outbox ${name} is another client's`);
       open.add(metaKey);
       try {
