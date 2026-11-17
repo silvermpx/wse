@@ -154,6 +154,30 @@ async fn a_server_starts_once_and_again_after_stop() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_ends_the_run_while_connections_keep_coming() {
+    let server = wse::Server::new(wse::Config::default()).unwrap();
+    let (tx, _events) = mpsc::unbounded_channel();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    server.start(listener, Recorder { events: tx }).unwrap();
+    // A connection every few milliseconds, never a pause of a tenth of a
+    // second: the stop does not wait for them to stop coming.
+    let knocking = tokio::spawn(async move {
+        loop {
+            let _ = tokio::net::TcpStream::connect(addr).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let stopped = tokio::time::timeout(Duration::from_secs(2), server.stop()).await;
+    knocking.abort();
+    assert!(
+        stopped.is_ok(),
+        "the stop waited for the connections to stop coming"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_drained_server_takes_no_one_once_drain_returns() {
     for _ in 0..10 {
         let server = wse::Server::new(wse::Config::default()).unwrap();

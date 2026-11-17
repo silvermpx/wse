@@ -248,7 +248,16 @@ pub(crate) async fn serve<H: Handler>(
     let mut refused_handshakes: u64 = 0;
     let mut last_refused_log = tokio::time::Instant::now() - Duration::from_secs(1);
     let mut accept_pause = Duration::ZERO;
+    // How soon a stop is seen with no connection coming: one timer for the
+    // whole loop, which a connection does not set back.
+    let mut stopping = tokio::time::interval(Duration::from_millis(100));
+    stopping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        // Seen before each connection is taken: connections that keep coming
+        // never hold a stop back.
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
         tokio::select! {
             res = listener.accept() => {
                 match res {
@@ -348,9 +357,7 @@ pub(crate) async fn serve<H: Handler>(
                     }
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                if !running.load(Ordering::SeqCst) { break; }
-            }
+            _ = stopping.tick() => {}
         }
     }
     // No more connections: the port goes now, not after the cleanup below.
