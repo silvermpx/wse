@@ -559,6 +559,67 @@ async fn stop_returns_once_every_disconnect_was_heard() {
     }
 }
 
+/// Puts every connection on `room` in a queue group, with presence.
+struct PresentInGroup {
+    connected: mpsc::UnboundedSender<String>,
+}
+
+impl wse::Handler for PresentInGroup {
+    type Connection = ();
+
+    fn connect(&self, connect: &wse::Connect<'_>) -> Option<()> {
+        let mut options = wse::Subscribe::queue_group("workers");
+        options.presence = Some(serde_json::json!({"status": "here"}));
+        connect.subscribe(vec!["room".into()], &options).ok()?;
+        let _ = self.connected.send((**connect.conn_id).clone());
+        Some(())
+    }
+
+    fn message(&self, _conn: &mut (), _message: wse::Inbound, _size: usize) -> bool {
+        true
+    }
+
+    fn signed(&self, _conn: &mut (), _message: serde_json::Value, _size: usize) -> bool {
+        false
+    }
+
+    fn disconnect(&self, _conn: ()) {}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_of_a_queue_group_that_unsubscribes_is_no_longer_present() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let mut config = wse::Config::default();
+    config.jwt = Some(wse::JwtSettings::new(
+        "a-secret-of-at-least-thirty-two-bytes",
+    ));
+    config.presence = Some(wse::PresenceSettings::default());
+    let server = wse::Server::new(config).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut connected) = mpsc::unbounded_channel();
+    server.start(listener, PresentInGroup { connected: tx }).unwrap();
+    let publisher = server.publisher();
+    let token = publisher
+        .issue_token("alice", Duration::from_secs(60), serde_json::Map::new())
+        .unwrap();
+    let mut request = format!("ws://{addr}/wse").into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    assert!(next_text(&mut ws).await.contains("server_ready"));
+    let conn_id = tokio::time::timeout(Duration::from_secs(5), connected.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(publisher.presence("room").len(), 1);
+    publisher.unsubscribe(&conn_id, Some(&["room".to_owned()]));
+    assert!(publisher.presence("room").is_empty());
+    server.stop().await;
+}
+
 /// A stop given up while it waits leaves the run to the next stop, which
 /// waits for it: the server does not start again over a run still ending.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

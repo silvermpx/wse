@@ -275,7 +275,18 @@ impl SharedState {
         self.remove_local_interest(&left_groups);
 
         if let Some(ref pm) = self.presence {
-            self.announce_untracked(pm.untrack_topics(conn_id, &removed));
+            // Present on a topic it held through a queue group too.
+            if left_groups.iter().all(|topic| removed.contains(topic)) {
+                self.announce_untracked(pm.untrack_topics(conn_id, &removed));
+            } else {
+                let mut left = removed.clone();
+                for topic in &left_groups {
+                    if !left.contains(topic) {
+                        left.push(topic.clone());
+                    }
+                }
+                self.announce_untracked(pm.untrack_topics(conn_id, &left));
+            }
         }
         self.remove_local_interest(&removed);
         removed
