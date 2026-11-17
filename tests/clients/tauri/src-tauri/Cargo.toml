@@ -9,7 +9,6 @@ publish = false
 [dependencies]
 tauri = { version = "=2.12.6", features = ["wry", "common-controls-v6", "x11"], default-features = false }
 tauri-plugin-wse = "3"
-wse-client = "3"
 
 [build-dependencies]
 tauri-build = { version = "=2.7.5", features = [] }

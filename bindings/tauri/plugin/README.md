@@ -15,18 +15,19 @@ tauri-plugin-wse = "3"
 ```
 
 ```rust,ignore
-use tauri_plugin_wse::WseExt;
+use tauri::Manager;
+use tauri_plugin_wse::{WseExt, wse_client};
 
 tauri::Builder::default()
     .plugin(tauri_plugin_wse::init())
     .setup(|app| {
         let mut config = wse_client::Config::new("wss://example.com/wse");
-        config.token = Some(token);
+        config.token = Some(token); // the signed-in user's
         config.offline = Some(wse_client::Offline::in_file(
             app.path().app_data_dir()?.join("wse-outbox"),
         ));
-        let app = app.handle().clone();
-        tauri::async_runtime::spawn(async move { app.wse().start(config).await });
+        // It returns at once: the connection is made in the background.
+        tauri::async_runtime::block_on(app.wse().start(config))?;
         Ok(())
     })
     .run(tauri::generate_context!())
@@ -34,8 +35,8 @@ tauri::Builder::default()
 ```
 
 The connection is made while a page (or the application, `Owner::retain`) shares it. The plugin
-re-exports `wse_client`; `app.wse().owner()` is the owner, whose `client()` the Rust side sends on as
-on any client.
+re-exports `wse_client`, at the version it is built with; `app.wse().owner()` is the owner, whose
+`client()` the Rust side sends on as on any client.
 
 - `app.wse().start(config)` again, for another user, closes the last connection and lets its
   pages go.

@@ -9,7 +9,7 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder, Window};
-use tauri_plugin_wse::WseExt;
+use tauri_plugin_wse::{WseExt, wse_client};
 
 /// What each window last said it saw: its connection, and the ticks it took.
 #[derive(Default)]
@@ -42,12 +42,16 @@ fn until(what: &str, within: Duration, test: impl Fn() -> bool) -> Result<(), St
 fn check(app: &AppHandle) -> Result<(), String> {
     let seen = app.state::<Seen>();
     let attached = || app.wse().owner().map_or(0, |owner| owner.attached());
-    until("both windows connected, taking ticks", Duration::from_secs(30), || {
-        ["window-1", "window-2"].iter().all(|label| {
-            let (connection, ticks) = seen.of(label);
-            connection == "connected" && ticks >= 3
-        })
-    })?;
+    until(
+        "both windows connected, taking ticks",
+        Duration::from_secs(30),
+        || {
+            ["window-1", "window-2"].iter().all(|label| {
+                let (connection, ticks) = seen.of(label);
+                connection == "connected" && ticks >= 3
+            })
+        },
+    )?;
     if attached() != 2 {
         return Err(format!("{} windows attached, not 2", attached()));
     }
@@ -61,7 +65,9 @@ fn check(app: &AppHandle) -> Result<(), String> {
         let (connection, ticks) = seen.of("window-2");
         connection == "connected" && ticks >= before + 5
     })?;
-    until("the closed window let go", Duration::from_secs(5), || attached() == 1)
+    until("the closed window let go", Duration::from_secs(5), || {
+        attached() == 1
+    })
 }
 
 fn main() {
@@ -78,16 +84,22 @@ fn main() {
             config.offline = Some(wse_client::Offline::in_file(dir.join("wse-outbox")));
             tauri::async_runtime::block_on(app.wse().start(config))?;
             for n in 1..=2 {
-                WebviewWindowBuilder::new(app, format!("window-{n}"), WebviewUrl::App("index.html".into()))
-                    .title("WSE")
-                    .visible(false)
-                    .initialization_script(format!("window.__WSE_CHECK__ = {{ window: {n} }};"))
-                    .build()?;
+                WebviewWindowBuilder::new(
+                    app,
+                    format!("window-{n}"),
+                    WebviewUrl::App("index.html".into()),
+                )
+                .title("WSE")
+                .visible(false)
+                .initialization_script(format!("window.__WSE_CHECK__ = {{ window: {n} }};"))
+                .build()?;
             }
             let app = app.handle().clone();
             std::thread::spawn(move || match check(&app) {
                 Ok(()) => {
-                    println!("tauri check: two windows on one connection, one closed, the other went on");
+                    println!(
+                        "tauri check: two windows on one connection, one closed, the other went on"
+                    );
                     app.exit(0);
                 }
                 Err(why) => {
