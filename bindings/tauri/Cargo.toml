@@ -8,7 +8,7 @@ members = ["plugin", "conformance", "example"]
 resolver = "3"
 
 [workspace.package]
-version = "3.1.0"
+version = "3.2.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.95"
@@ -16,6 +16,6 @@ repository = "https://github.com/silvermpx/wse"
 
 [workspace.dependencies]
 tauri = { version = "2.12.6", default-features = false }
-wse-client = { version = "=3.1.0", path = "../../crates/wse-client", features = ["bridge"] }
+wse-client = { version = "=3.2.0", path = "../../crates/wse-client", features = ["bridge"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }

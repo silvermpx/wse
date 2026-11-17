@@ -10,7 +10,7 @@
 #            SWIFT_REPO_DEPLOY_KEY (a deploy key that may write); a version
 #            tagged there already is left alone.
 #
-#   .github/scripts/swift-repo.sh 3.1.0 dist/WseFFIC-3.1.0.xcframework.zip out --check
+#   .github/scripts/swift-repo.sh 3.2.0 dist/WseFFIC-3.2.0.xcframework.zip out --check
 set -euo pipefail
 usage="usage: swift-repo.sh VERSION XCFRAMEWORK_ZIP OUT --check|--push"
 version="${1:?$usage}"

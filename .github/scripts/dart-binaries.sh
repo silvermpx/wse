@@ -6,7 +6,7 @@
 # devices with them run no 32-bit code); Apple targets are built for iOS 15
 # and macOS 10.15.
 #
-#   .github/scripts/dart-binaries.sh 3.1.0 dist aarch64-apple-ios x86_64-apple-darwin
+#   .github/scripts/dart-binaries.sh 3.2.0 dist aarch64-apple-ios x86_64-apple-darwin
 set -euo pipefail
 version="${1:?usage: dart-binaries.sh VERSION OUT TARGET...}"
 out="${2:?usage: dart-binaries.sh VERSION OUT TARGET...}"

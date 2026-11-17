@@ -4012,7 +4012,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-wse"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5283,7 +5283,7 @@ dependencies = [
 
 [[package]]
 name = "wse"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -5323,7 +5323,7 @@ dependencies = [
 
 [[package]]
 name = "wse-client"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -5354,7 +5354,7 @@ dependencies = [
 
 [[package]]
 name = "wse-tauri-conformance"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5366,7 +5366,7 @@ dependencies = [
 
 [[package]]
 name = "wse-tauri-example"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "tauri",
  "tauri-build",

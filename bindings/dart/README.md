@@ -13,7 +13,7 @@ may ask for more (Flutter 3.50 makes macOS apps for macOS 12 and newer).
 
 ```yaml
 dependencies:
-  wse_client: ^3.1.0
+  wse_client: ^3.2.0
 ```
 
 The package's build hook takes the prebuilt Rust library of the app's target

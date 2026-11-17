@@ -1,7 +1,7 @@
 [package]
 name = "wse-dart"
 description = "The WSE client for Dart and Flutter, through flutter_rust_bridge."
-version = "3.1.0"
+version = "3.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/silvermpx/wse"
@@ -13,7 +13,7 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 flutter_rust_bridge = "=2.13.0"
-wse-client = { version = "=3.1.0", path = "../../../crates/wse-client", features = ["native"] }
+wse-client = { version = "=3.2.0", path = "../../../crates/wse-client", features = ["native"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }

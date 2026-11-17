@@ -5,7 +5,7 @@
 # its own, with the workspace's Cargo.lock), the Java part of Android's
 # certificate verifier, and the license.
 #
-#   .github/scripts/stage-dart-package.sh 3.1.0 dart-binaries dart-package
+#   .github/scripts/stage-dart-package.sh 3.2.0 dart-binaries dart-package
 set -euo pipefail
 version="${1:?usage: stage-dart-package.sh VERSION BINARIES OUT}"
 binaries="${2:?usage: stage-dart-package.sh VERSION BINARIES OUT}"

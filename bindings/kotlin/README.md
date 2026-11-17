@@ -14,7 +14,7 @@ pages; what it uses (JNA, kotlinx-coroutines, AndroidX) comes with it.
 
 ```kotlin
 dependencies {
-    implementation("io.github.silvermpx:wse-client-android:3.1.0")
+    implementation("io.github.silvermpx:wse-client-android:3.2.0")
 }
 ```
 
@@ -23,7 +23,7 @@ that adds the file itself adds the libraries it uses too:
 
 ```kotlin
 dependencies {
-    implementation(files("libs/wse-client-android-3.1.0.aar"))
+    implementation(files("libs/wse-client-android-3.2.0.aar"))
     implementation("net.java.dev.jna:jna:5.19.1@aar")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
     implementation("androidx.lifecycle:lifecycle-process:2.11.0")

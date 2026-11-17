@@ -40,7 +40,7 @@ In the browser, the TypeScript client keeps the connection, its subscriptions an
 | [`wse-client`](https://pypi.org/project/wse-client/) | `pip install wse-client` | Python services and scripts, with or without asyncio |
 | [`wse_client`](https://pub.dev/packages/wse_client) | `flutter pub add wse_client` | Flutter and Dart apps (Android, iOS, macOS, Linux, Windows) |
 | [`wse-swift`](https://github.com/silvermpx/wse-swift) | Swift Package Manager: `https://github.com/silvermpx/wse-swift` | iOS and macOS apps |
-| [`wse-client-android`](https://central.sonatype.com/artifact/io.github.silvermpx/wse-client-android) | `implementation("io.github.silvermpx:wse-client-android:3.1.0")` | Android apps |
+| [`wse-client-android`](https://central.sonatype.com/artifact/io.github.silvermpx/wse-client-android) | `implementation("io.github.silvermpx:wse-client-android:3.2.0")` | Android apps |
 | [`wse-client-jvm`](https://central.sonatype.com/artifact/io.github.silvermpx/wse-client-jvm) | `implementation("io.github.silvermpx:wse-client-jvm:3.2.0")` | Java and Kotlin services and desktop apps on the JVM (Linux, macOS, Windows) |
 
 ## A server in Python

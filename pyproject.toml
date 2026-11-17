@@ -5,7 +5,7 @@ build-backend = "maturin"
 
 [project]
 name = "wse-server"
-version = "3.1.0"
+version = "3.2.0"
 description = "WebSocket engine for reactive user interfaces, with a Rust core: topics with message recovery, presence, clustering without a broker, JWT authentication, end-to-end encryption and signed messages."
 readme = "README.md"
 # PEP 639: an SPDX expression (core metadata License-Expression). The table

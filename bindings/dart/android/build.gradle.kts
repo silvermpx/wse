@@ -1,7 +1,7 @@
 // The package's Android part: it sets up Android's certificate verifier as the
 // app starts. The app's Android Gradle plugin builds it.
 group = "dev.wse.flutter"
-version = "3.1.0"
+version = "3.2.0"
 
 plugins {
     id("com.android.library")

@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "io.github.silvermpx"
-version = "3.1.0"
+version = "3.2.0"
 
 // The JAR runs on Java 17 and newer, whichever JDK (17 or newer) builds it.
 kotlin {

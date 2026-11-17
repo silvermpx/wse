@@ -10,7 +10,7 @@ missed, and hands the server's messages to the app in order.
 The Swift package lives in its own repository, which each release writes:
 
 ```swift
-.package(url: "https://github.com/silvermpx/wse-swift", from: "3.1.0")
+.package(url: "https://github.com/silvermpx/wse-swift", from: "3.2.0")
 ```
 
 with the product `WseFFI` in the target's dependencies. It downloads the

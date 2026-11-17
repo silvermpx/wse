@@ -6,7 +6,7 @@
 # the answer to an echo, and logs the outcome (ReactNativeJS: "WSE_RN ok", or
 # what went wrong). It shows no text. Needs ANDROID_HOME and a JDK.
 #
-#   .github/scripts/rn-app-check.sh npm-dist/wse-client-3.1.0.tgz emulator-5554
+#   .github/scripts/rn-app-check.sh npm-dist/wse-client-3.2.0.tgz emulator-5554
 set -euo pipefail
 if [[ $# -ne 2 || ! -f "$1" ]]; then
   echo "usage: $0 path/to/wse-client-X.Y.Z.tgz DEVICE" >&2
