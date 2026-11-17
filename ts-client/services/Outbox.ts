@@ -535,6 +535,11 @@ export class Outbox {
     return this.taken.has(message);
   }
 
+  /** Every message it keeps was handed to be written on this connection. */
+  allHanded(): boolean {
+    return this.cursor >= this.records.length;
+  }
+
   /**
    * A message handed to be written later (it is sealed meanwhile), right
    * before it is: its record while it may still go (kept, handed on this

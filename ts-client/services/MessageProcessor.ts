@@ -2073,7 +2073,9 @@ export class MessageProcessor {
       return false;
     });
     this.report(outcomes);
-    return all;
+    // What waits for the server's first answer, or for the store to hold
+    // its mark, was not handed.
+    return all && outbox.allHanded();
   }
 
   /** What became of the outbox's messages, to the application. */

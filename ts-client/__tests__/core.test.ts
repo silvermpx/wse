@@ -199,6 +199,21 @@ describe('a client of its own', () => {
     expect(ws.messagesOfType('order').map((m) => m.p)).toEqual([{ qty: 1 }]);
   });
 
+  it('says a kept message queued while the server has not answered for the outbox yet', async () => {
+    const c = client(A, { offline: { enabled: true } });
+    c.retain();
+    await tick();
+    const ws = socketOf(A)[0];
+    await connectServer(ws, { features: { recovery: true, encryption: false, acks: true } });
+    // The connection is taken; the server's answer for the outbox is not in.
+    expect(c.send('order', { qty: 1 })).toBe('queued');
+    expect(ws.messagesOfType('order')).toEqual([]);
+    ws.serverSend({ c: 'WSE', t: 'outbox', p: { acked: 0, node: 'n1' }, v: 1 });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(ws.messagesOfType('order').map((m) => m.p)).toEqual([{ qty: 1 }]);
+    expect(c.send('order', { qty: 2 })).toBe('sent');
+  });
+
   it('drops a live message sent before it connects: it never goes out late', async () => {
     const c = client(A);
     expect(c.send('open_valve', { id: 1 }, { live: true })).toBe('dropped');
