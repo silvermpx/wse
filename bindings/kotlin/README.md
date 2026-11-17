@@ -219,9 +219,16 @@ once the topics are continuous. The outbox in a file is
 says how many messages wait in it, and `Wse.sendWith(client, kind, json,
 Wse.sendOptions().id("order-17").build())` sends with the app's own id
 (`.correlationId(...)`, `.priority(...)` and `.live(true)` too). Signed messages: `Wse.generateSigningKey()`, `Wse.signingPublicKey(key)`
-and `Wse.sendSigned(...)`. Kotlin's unsigned numbers are hidden from Java:
-`Wse.retryInMillis(...)`, `Wse.attempt(...)` and `Wse.closeCode(...)` give a
-`Disconnected` item's as plain numbers.
+and `Wse.sendSigned(...)`. Kotlin's unsigned numbers are hidden from Java,
+and `Wse` gives them as plain numbers: a `Disconnected` item's with
+`Wse.retryInMillis(...)`, `Wse.attempt(...)` and `Wse.closeCode(...)`; a
+message's with `Wse.epoch(message)`, `Wse.offset(message)`,
+`Wse.priority(message)` and `Wse.generation(message)`; a checkpoint's or a
+recovery's position with `Wse.epoch(position)` and `Wse.offset(position)`; a
+gap's with `Wse.epoch(gap)`, `Wse.first(gap)` and `Wse.last(gap)`; and
+`Wse.count(recovery)` and `Wse.round(resync)`. An offset is unsigned 64-bit:
+its bits come as a `long`, which `Long.toUnsignedString` and
+`Long.compareUnsigned` read whole; one a message of no topic lacks is `null`.
 
 ## Tests
 

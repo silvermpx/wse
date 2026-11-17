@@ -55,6 +55,30 @@ class WseJavaTest {
     }
 
     @Test
+    void theNumbersOfAMessageAndOfAPositionReadFromJava() throws Exception {
+        WseClient client = Wse.connect(Wse.config(url).topics("ticks").insecure(true).build()).get(10, SECONDS);
+        WseEventReader events = Wse.events(client);
+        WseMessage tick;
+        while (true) {
+            if (next(events) instanceof WseItem.Message m && "ticks".equals(m.getMessage().getTopic())) {
+                tick = m.getMessage();
+                break;
+            }
+        }
+        Long epoch = Wse.epoch(tick);
+        Long offset = Wse.offset(tick);
+        assertNotNull(epoch);
+        assertNotNull(offset);
+        assertTrue(Long.compareUnsigned(offset, 0) >= 0);
+        assertTrue(Wse.generation(tick) >= 0);
+        // A position of a checkpoint or a recovery reads the same way.
+        for (WseStreamPosition position : List.<WseStreamPosition>of()) {
+            assertTrue(Wse.epoch(position) >= 0 && Long.compareUnsigned(Wse.offset(position), 0) >= 0);
+        }
+        Wse.disconnect(client, Duration.ofSeconds(1)).get(10, SECONDS);
+    }
+
+    @Test
     void aClientStartedWithNoServerKeepsWhatItSends() throws Exception {
         // Nobody answers on port 9: it starts at once all the same.
         WseClient client = Wse.start(Wse.config("ws://127.0.0.1:9/wse").insecure(true).build()).get(2, SECONDS);

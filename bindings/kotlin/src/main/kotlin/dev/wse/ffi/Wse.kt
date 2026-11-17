@@ -163,6 +163,53 @@ object Wse {
     /** The close code, or -1 when the connection was cut or never made. */
     @JvmStatic
     fun closeCode(disconnected: WseItem.Disconnected): Int = disconnected.code?.toInt() ?: -1
+
+    // The numbers Kotlin has unsigned, for Java. An offset is a u64: its 64 bits come as a long,
+    // which Long.toUnsignedString and Long.compareUnsigned read whole.
+
+    /** The epoch of [message]'s stream; null for a message of no topic. */
+    @JvmStatic
+    fun epoch(message: WseMessage): Long? = message.epoch?.toLong()
+
+    /** [message]'s offset in its stream (unsigned, in a long); null for a message of no topic. */
+    @JvmStatic
+    fun offset(message: WseMessage): Long? = message.offset?.toLong()
+
+    /** How urgent [message]'s sender said it is (0 to 255); null when it did not say. */
+    @JvmStatic
+    fun priority(message: WseMessage): Int? = message.priority?.toInt()
+
+    /** The user generation [message] came in; see [commit]. */
+    @JvmStatic
+    fun generation(message: WseMessage): Long = message.generation.toLong()
+
+    /** The epoch of the stream of [position] (a checkpoint's, a recovery's). */
+    @JvmStatic
+    fun epoch(position: WseStreamPosition): Long = position.epoch.toLong()
+
+    /** The offset of [position] (unsigned, in a long). */
+    @JvmStatic
+    fun offset(position: WseStreamPosition): Long = position.offset.toLong()
+
+    /** How many messages the recovery of a topic replayed. */
+    @JvmStatic
+    fun count(recovery: WseTopicRecovery): Long = recovery.count.toLong()
+
+    /** The epoch of the stream [gap] is in. */
+    @JvmStatic
+    fun epoch(gap: WseItem.Gap): Long = gap.epoch.toLong()
+
+    /** The first offset [gap] missed (unsigned, in a long); null when not known. */
+    @JvmStatic
+    fun first(gap: WseItem.Gap): Long? = gap.first?.toLong()
+
+    /** The last offset [gap] missed (unsigned, in a long); null when not known. */
+    @JvmStatic
+    fun last(gap: WseItem.Gap): Long? = gap.last?.toLong()
+
+    /** The round of [resync], as [resynced] takes it. */
+    @JvmStatic
+    fun round(resync: WseItem.Resync): Long = resync.round.toLong()
 }
 
 /**
