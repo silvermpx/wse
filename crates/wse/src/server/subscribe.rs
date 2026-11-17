@@ -342,25 +342,27 @@ impl SharedState {
         };
         let cluster_tx = self.cluster_cmd_tx.load_full();
         for topic in topics {
-            let TrackResult::FirstJoin {
-                user_id,
-                data: join_data,
-            } = pm.track(conn_id, topic, data)
-            else {
-                continue;
+            // The user's first connection: new here, or present on another
+            // node already, when only the peers hear of it.
+            let (user_id, join_data, new) = match pm.track(conn_id, topic, data) {
+                TrackResult::FirstJoin { user_id, data } => (user_id, data, true),
+                TrackResult::FirstLocalJoin { user_id, data } => (user_id, data, false),
+                _ => continue,
             };
-            self.tell_presence(Presence::Join {
-                topic: topic.clone(),
-                user_id: user_id.clone(),
-                data: join_data.clone(),
-            });
-            if let Some(tx) = &*self.commands.load() {
-                let _ = tx.send(ServerCommand::BroadcastLocal {
+            if new {
+                self.tell_presence(Presence::Join {
                     topic: topic.clone(),
-                    data: format_presence_msg("presence_join", &user_id, &join_data),
-                    skip_recovery: true,
-                    publish: false,
+                    user_id: user_id.clone(),
+                    data: join_data.clone(),
                 });
+                if let Some(tx) = &*self.commands.load() {
+                    let _ = tx.send(ServerCommand::BroadcastLocal {
+                        topic: topic.clone(),
+                        data: format_presence_msg("presence_join", &user_id, &join_data),
+                        skip_recovery: true,
+                        publish: false,
+                    });
+                }
             }
             if let Some(ref ctx) = cluster_tx {
                 let _ = ctx.send(ClusterCommand::PresenceUpdate {

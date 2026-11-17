@@ -70,6 +70,13 @@ pub(crate) enum TrackResult {
         user_id: String,
         data: serde_json::Value,
     },
+    /// The user's first connection on this node, while other nodes report
+    /// the user: peers must hear the join, local subscribers must not (the
+    /// user was present).
+    FirstLocalJoin {
+        user_id: String,
+        data: serde_json::Value,
+    },
     /// Additional connection for existing user (no event needed).
     ExistingUser,
     /// Topic at max capacity or data too large, tracking skipped.
@@ -235,12 +242,15 @@ impl PresenceManager {
             stats.num_connections.fetch_add(1, Ordering::Relaxed);
         }
 
-        if is_first {
-            // Only increment num_users if no remote sentinel exists
-            // (merge_remote_join already counted this user)
-            if !has_remote_sentinel {
-                stats.num_users.fetch_add(1, Ordering::Relaxed);
+        if is_first && has_remote_sentinel {
+            // Present on another node already (merge_remote_join counted the
+            // user): a join for the peers alone.
+            TrackResult::FirstLocalJoin {
+                user_id,
+                data: data.clone(),
             }
+        } else if is_first {
+            stats.num_users.fetch_add(1, Ordering::Relaxed);
             TrackResult::FirstJoin {
                 user_id,
                 data: data.clone(),
@@ -554,6 +564,21 @@ impl PresenceManager {
         updated_at: u64,
         origin: &str,
     ) -> bool {
+        self.merge_remote(topic, user_id, data, updated_at, updated_at, origin)
+    }
+
+    /// [`merge_remote_join`](Self::merge_remote_join), the user's data as of
+    /// `updated_at` (whichever node's clock last set it) and `origin`'s own
+    /// membership as of `joined_at` (its clock: its leaves compare with it).
+    fn merge_remote(
+        &self,
+        topic: &str,
+        user_id: &str,
+        data: &serde_json::Value,
+        updated_at: u64,
+        joined_at: u64,
+        origin: &str,
+    ) -> bool {
         // Validate remote data size (same limit as local track)
         let data_str = data.to_string();
         if data_str.len() > self.max_data_size {
@@ -602,11 +627,11 @@ impl PresenceManager {
         // second sentinel so the user survives the first peer leaving.
         let sentinel = remote_sentinel(origin, user_id);
         match entry.connections.iter_mut().find(|c| c.conn_id == sentinel) {
-            Some(existing) => existing.joined_at = existing.joined_at.max(updated_at),
+            Some(existing) => existing.joined_at = existing.joined_at.max(joined_at),
             None => {
                 entry.connections.push(ConnMeta {
                     conn_id: sentinel,
-                    joined_at: updated_at,
+                    joined_at,
                 });
                 let stats = self
                     .topic_presence_stats
@@ -763,12 +788,18 @@ impl PresenceManager {
                     .get("updated_at")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
+                // The sender's membership on its own clock (a peer of an
+                // earlier version names none: the data's time).
+                let joined_at = entry_val
+                    .get("joined_at")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(updated_at);
                 if let Some(held) = held.as_deref_mut() {
                     held.entry(topic.clone())
                         .or_default()
                         .insert(user_id.clone());
                 }
-                if self.merge_remote_join(topic, user_id, &data, updated_at, origin) {
+                if self.merge_remote(topic, user_id, &data, updated_at, joined_at, origin) {
                     joined.push((topic.clone(), user_id.clone(), data));
                 }
             }
@@ -890,16 +921,21 @@ impl PresenceManager {
             for user_entry in topic_map.iter() {
                 let entry = user_entry.value();
                 // Only local entries (don't re-sync remote sentinels).
-                if !entry
+                // Their membership on this node's own clock: the data's time
+                // may be another node's.
+                let Some(joined_at) = entry
                     .connections
                     .iter()
-                    .any(|c| !c.conn_id.starts_with(REMOTE_PREFIX))
-                {
+                    .filter(|c| !c.conn_id.starts_with(REMOTE_PREFIX))
+                    .map(|c| c.joined_at)
+                    .max()
+                else {
                     continue;
-                }
+                };
                 let value = serde_json::json!({
                     "data": entry.data,
                     "updated_at": entry.updated_at,
+                    "joined_at": joined_at,
                 });
                 // Conservative per-user contribution: topic key + user key + value
                 // + JSON punctuation/quotes/nested braces.
@@ -940,6 +976,42 @@ impl PresenceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_leave_after_a_snapshot_counts_on_the_clock_of_the_node_that_sent_it() {
+        let a = PresenceManager::new(4096, 0);
+        a.register_connection("alice-a", "alice");
+        a.track("alice-a", "room", &serde_json::json!({"where": "a"}));
+        let now = epoch_ms();
+        // B's clock is a minute ahead: its join wins the user's data on A.
+        a.merge_remote_join(
+            "room",
+            "alice",
+            &serde_json::json!({"where": "b"}),
+            now + 60_000,
+            "B",
+        );
+        let c = PresenceManager::new(4096, 0);
+        for frame in a.serialize_full_state_chunked(1_000_000) {
+            c.merge_full_state(&frame, "A");
+        }
+        // A's last local connection leaves, on A's own clock.
+        a.remove_connection("alice-a");
+        let left = c.merge_remote_leave("room", "alice", epoch_ms(), "A");
+        assert!(left.is_some(), "C took A's leave");
+        assert!(c.query("room").is_empty());
+    }
+
+    #[test]
+    fn a_first_local_connection_of_a_user_present_elsewhere_is_no_new_join() {
+        let pm = PresenceManager::new(4096, 0);
+        pm.merge_remote_join("room", "alice", &serde_json::json!({}), epoch_ms(), "B");
+        pm.register_connection("alice-a", "alice");
+        let result = pm.track("alice-a", "room", &serde_json::json!({}));
+        // Peers hear of it, local subscribers do not: Alice was present.
+        assert!(matches!(result, TrackResult::FirstLocalJoin { .. }));
+        assert_eq!(pm.stats("room").0, 1);
+    }
 
     fn data() -> serde_json::Value {
         serde_json::json!({"status": "online"})
