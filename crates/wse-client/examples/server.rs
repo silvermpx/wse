@@ -54,6 +54,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let _ = self.publisher.send(conn, echoed.to_string());
                 }
+                // `n` messages at once, each its own frame: more than a
+                // client takes in one batch.
+                Some("burst") => {
+                    let count = message["p"]["n"].as_u64().unwrap_or(0).min(10_000);
+                    for n in 1..=count {
+                        let item = json!({"t": "burst_item", "p": {"n": n}});
+                        let _ = self.publisher.send(conn, item.to_string());
+                    }
+                }
                 Some("bind_key") => {
                     let key = message["p"]["public_key"].as_str();
                     let bound = self.publisher.set_client_key(conn, key).unwrap_or(false);

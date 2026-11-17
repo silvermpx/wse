@@ -302,7 +302,8 @@ impl<H: Handler> Driver<H> {
                     self.session.clock = now;
                     let mut frame = frame;
                     let mut alive = false;
-                    for _ in 0..READ_BATCH {
+                    let mut taken = 1;
+                    loop {
                         match frame {
                             Some(Ok(Frame::Close(close))) => {
                                 // tungstenite queued the answer: send it.
@@ -336,8 +337,16 @@ impl<H: Handler> Driver<H> {
                         {
                             break;
                         }
+                        // A batch at most: the next frame is read only to be
+                        // taken, never read and left.
+                        if taken == READ_BATCH {
+                            break;
+                        }
                         match poll_once(read(&mut self.session.handler, &mut ws, gate)).await {
-                            Some(next) => frame = next,
+                            Some(next) => {
+                                frame = next;
+                                taken += 1;
+                            }
                             None => break,
                         }
                     }

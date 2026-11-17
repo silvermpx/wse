@@ -263,6 +263,20 @@ async fn signed_messages_from_the_browser() {
     client.close().await;
 }
 
+#[wasm_bindgen_test]
+async fn a_burst_longer_than_a_batch_reaches_the_application_whole() {
+    let config = Config::new(given(URL, "WSE_TEST_URL"));
+    let (client, mut events) = wse_client::connect(config).await.unwrap();
+    client.send("burst", &json!({"n": 90})).await.unwrap();
+    let mut got = Vec::new();
+    while got.len() < 90 {
+        let item = message(&mut events, "burst_item").await;
+        got.push(item.payload_value().unwrap()["n"].as_u64().unwrap());
+    }
+    assert_eq!(got, (1..=90).collect::<Vec<_>>());
+    client.close().await;
+}
+
 // -- The outbox in IndexedDB ---------------------------------------------------
 //
 // Node has neither IndexedDB nor Web Locks: fake-indexeddb (the

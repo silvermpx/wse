@@ -567,7 +567,8 @@ impl<H: Handler> Driver<H> {
                     self.session.clock = now;
                     let mut happened = happened;
                     let mut alive = false;
-                    for _ in 0..READ_BATCH {
+                    let mut taken = 1;
+                    loop {
                         match happened {
                             Some(Happened::Text(text)) => {
                                 alive |= frames::on_data(
@@ -601,8 +602,16 @@ impl<H: Handler> Driver<H> {
                         {
                             break;
                         }
+                        // A batch at most: the next event is taken off the
+                        // channel only to be handled, never taken and left.
+                        if taken == READ_BATCH {
+                            break;
+                        }
                         match socket.events.try_recv() {
-                            Ok(next) => happened = Some(next),
+                            Ok(next) => {
+                                happened = Some(next);
+                                taken += 1;
+                            }
                             Err(_) => break,
                         }
                     }

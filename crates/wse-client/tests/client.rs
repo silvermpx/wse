@@ -1427,3 +1427,67 @@ async fn a_send_that_waits_for_its_topics_runs_out_in_its_time() {
     assert_eq!(client.kept(), 0);
     client.close().await;
 }
+
+/// Keeps the numbers of the messages that came.
+struct Numbers {
+    seen: Arc<Mutex<Vec<u64>>>,
+}
+
+impl wse_client::Handler for Numbers {
+    fn message(&mut self, message: &wse_client::Message<'_>) {
+        if let Some(n) = message.payload_value().ok().and_then(|p| p["n"].as_u64()) {
+            self.seen.lock().unwrap().push(n);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_burst_longer_than_a_read_batch_reaches_the_handler_whole() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as Frame;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/wse", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+        while let Some(Ok(frame)) = ws.next().await {
+            let Frame::Text(text) = frame else {
+                continue;
+            };
+            if !text.contains("client_hello") {
+                continue;
+            }
+            let ready = json!({"c": "WSE", "t": "server_ready", "v": 1,
+                "p": {"connection_id": "c1", "details": {"user_id": "ann", "features": {}}}});
+            ws.send(Frame::Text(ready.to_string().into()))
+                .await
+                .unwrap();
+            // Ninety messages, written at once: more than a batch is there
+            // to read.
+            for n in 1..=90 {
+                let said = json!({"t": "said", "p": {"n": n}}).to_string();
+                ws.feed(Frame::Text(said.into())).await.unwrap();
+            }
+            ws.flush().await.unwrap();
+        }
+    });
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut config = Config::new(url);
+    config.offline = None;
+    let client = wse_client::Client::start(
+        config,
+        Numbers {
+            seen: Arc::clone(&seen),
+        },
+    )
+    .await
+    .unwrap();
+    for _ in 0..250 {
+        if seen.lock().unwrap().len() >= 90 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(*seen.lock().unwrap(), (1..=90).collect::<Vec<_>>());
+    client.close().await;
+}
