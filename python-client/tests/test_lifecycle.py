@@ -89,6 +89,63 @@ class TestServerInitiatedClose:
             await client.disconnect()
 
 
+class TestPause:
+    """The application pauses the client: no connection until the last
+    reason is cleared, and what it keeps stays."""
+
+    async def test_paused_it_stays_away_and_resumed_it_comes_back(self):
+        async with FakeWSEServer() as srv:
+            client = make_client(srv.url)
+            heard = []
+            client.on("paused")(heard.append)
+            await client.connect()
+            await client.pause("background")
+            await client.pause("offline")
+            assert not client.is_connected
+            assert client.paused == ["background", "offline"]
+            assert [e.payload["reasons"] for e in heard] == [
+                ["background"],
+                ["background", "offline"],
+            ]
+            # No attempt while any reason holds, however long.
+            await asyncio.sleep(0.4)
+            assert len(srv.connections) == 1
+            await client.resume("background")
+            await asyncio.sleep(0.3)
+            assert len(srv.connections) == 1
+            assert await client.send("order", {"n": 1}, id="kept") is SendResult.QUEUED
+            await client.resume("offline")
+            await until(lambda: len(srv.connections) == 2 and client.is_ready)
+            assert client.paused == []
+            await push_event(srv.connections[1], "back")
+            assert (await next_event(client)).type == "back"
+            await client.disconnect()
+
+
+class TestStart:
+    """A client that may start without a network."""
+
+    async def test_started_with_no_server_it_keeps_what_it_sends_and_gets_in_once_one_comes(
+        self,
+    ):
+        async with FakeWSEServer() as srv:
+            port = srv.port
+            await srv.stop()
+            client = make_client(f"ws://127.0.0.1:{port}/wse", topics=["prices"])
+            await asyncio.wait_for(client.start(), timeout=1.0)
+            assert not client.is_connected
+            assert await client.send("order", {"n": 1}, id="early") is SendResult.QUEUED
+            assert client.kept == 1
+            await asyncio.sleep(0.3)
+            await srv.start(port=port)
+            await until(lambda: len(srv.connections) == 1 and client.is_ready)
+            # The initial topics, subscribed on the connection it got.
+            await until(lambda: "prices" in client.subscribed_topics)
+            await push_event(srv.connections[0], "hello")
+            assert (await next_event(client)).type == "hello"
+            await client.disconnect()
+
+
 class TestFailedReconnectAttempts:
     async def test_failed_attempts_do_not_end_the_stream(self):
         """A failed reconnect attempt used to set ERROR, end `async for`

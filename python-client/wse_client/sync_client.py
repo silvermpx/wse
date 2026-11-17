@@ -75,6 +75,8 @@ class _Session:
         self.ready = threading.Event()
         self.connected = False
         self.connect_error: BaseException | None = None
+        # connect() waits for the first connection; start() does not.
+        self.wait = True
 
 
 class SyncWSEClient:
@@ -210,10 +212,20 @@ class SyncWSEClient:
             WSEAuthError / WSEEncryptionError: As from ``AsyncWSEClient.connect()``.
             WSEConnectionError: Any other connection failure.
         """
+        self._open(wait=True, timeout=timeout)
+
+    def start(self) -> None:
+        """Start in a background thread, and return at once: the connection
+        is made there, a failed first attempt made again as any later one.
+        What is sent meanwhile waits in the outbox."""
+        self._open(wait=False, timeout=15.0)
+
+    def _open(self, *, wait: bool, timeout: float) -> None:
         with self._lock:
             if self._running and self._session is not None:
                 return
             session = _Session()
+            session.wait = wait
             self._session = session
             self._running = True
             self._generation += 1
@@ -377,6 +389,15 @@ class SyncWSEClient:
     def force_reconnect(self) -> None:
         """Force a reconnection."""
         self._run(lambda c: c.force_reconnect(), timeout=15.0, default=None)
+
+    def pause(self, reason: str) -> None:
+        """Pause the connection for *reason*: it ends while any reason holds,
+        and topics, positions and what waits in the outbox stay."""
+        self._run(lambda c: c.pause(reason), timeout=15.0, default=None)
+
+    def resume(self, reason: str) -> None:
+        """Clear *reason*; once none is left the client connects again."""
+        self._run(lambda c: c.resume(reason), timeout=15.0, default=None)
 
     def change_endpoint(self, new_url: str) -> None:
         """Change endpoint and reconnect."""
@@ -711,7 +732,10 @@ class SyncWSEClient:
             # order with the stream.
             client.on("delivered")(self._outcome)
             client.on("not_delivered")(self._outcome)
-            await client.connect()
+            if session.wait:
+                await client.connect()
+            else:
+                await client.start()
             session.connected = True
             session.ready.set()
 

@@ -205,6 +205,8 @@ class ConnectionManager:
         # Bumped by disconnect(), destroy() and abort(): an attempt that
         # started before one of them is void, and its socket is closed.
         self._attempt_gen = 0
+        # The application paused the client: no connection until resume().
+        self._paused = False
         # True while the client itself is closing (disconnect / abort): a
         # close it causes is never reconnected.
         self._intentional_close = False
@@ -443,6 +445,46 @@ class ConnectionManager:
         self._recv_task = asyncio.create_task(self._recv_loop(ws))
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
         await self._send_client_hello(ws)
+
+    def start(self) -> None:
+        """Connects in the background: a failed attempt is made again as a
+        lost connection is, so nobody waits for the first."""
+        if self._destroyed or self.is_connected or self._is_connecting:
+            return
+        self._intentional_close = False
+        self._reconnect_armed = True
+        self._reconnect_attempts = 0
+        self._auth_failures = 0
+        self._last_error = None
+        self._cancel_reconnect()
+        self._set_state(ConnectionState.CONNECTING)
+        self._reconnect_task = asyncio.ensure_future(self._reconnect_after(0))
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    async def pause(self) -> None:
+        """The application paused the client: the connection ends, and no
+        attempt is made until :meth:`resume`. What the client keeps stays."""
+        if self._destroyed or self._paused:
+            return
+        self._paused = True
+        self._attempt_gen += 1
+        self._cancel_reconnect()
+        await self._teardown(WS_CLOSE_NORMAL, "Paused")
+        self._set_state(ConnectionState.DISCONNECTED)
+
+    def resume(self) -> None:
+        """The pause is over: an attempt at once, the counts started over."""
+        if self._destroyed or not self._paused:
+            return
+        self._paused = False
+        self._reconnect_attempts = 0
+        self._auth_failures = 0
+        self._reconnect_armed = True
+        self._cancel_reconnect()
+        self._reconnect_task = asyncio.ensure_future(self._reconnect_after(0))
 
     async def disconnect(self) -> None:
         """Graceful, final shutdown: nothing reconnects afterwards, and a
@@ -949,7 +991,7 @@ class ConnectionManager:
 
     def _schedule_reconnect(self) -> None:
         """Schedule a reconnection attempt with backoff."""
-        if self._destroyed or self._intentional_close:
+        if self._destroyed or self._intentional_close or self._paused:
             return
 
         cfg = self._reconnect_cfg
@@ -981,7 +1023,12 @@ class ConnectionManager:
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
             return
-        if self._destroyed or self._intentional_close or self.is_connected:
+        if (
+            self._destroyed
+            or self._intentional_close
+            or self._paused
+            or self.is_connected
+        ):
             return
 
         self._reconnect_attempts += 1

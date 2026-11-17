@@ -356,6 +356,8 @@ class AsyncWSEClient:
         self._token = token
         self._initial_topics = list(topics) if topics else []
         self._subscribed_topics: set[str] = set()
+        # The reasons the application paused the client for (none: not paused).
+        self._paused: set[str] = set()
         # The topics' states, what was held and committed; recover-or-resync
         # with a DeliveryConfig, best effort without.
         self._delivery = Delivery(delivery, url, self._initial_topics)
@@ -658,13 +660,7 @@ class AsyncWSEClient:
                 server closed it during the handshake.
             WSETimeoutError: Opening the connection timed out.
         """
-        # The loop the outbox's file says its failures on, and those it had
-        # before (opening it).
-        self._loop_seen = asyncio.get_running_loop()
-        for operation, why in self._storage_failures:
-            self._storage_failed(operation, why)
-        self._storage_failures.clear()
-        self._ensure_primitives()
+        self._begin()
         state = self._connection.state
         if state in (ConnectionState.CONNECTING, ConnectionState.RECONNECTING):
             return  # already connecting in the background
@@ -678,6 +674,32 @@ class AsyncWSEClient:
         # after the handshake, the next connection subscribes them.
         if self._initial_topics and not await self.subscribe(self._initial_topics):
             self._subscribed_topics.update(self._initial_topics)
+
+    async def start(self) -> None:
+        """Starts, and returns at once: the connection is made in the
+        background, a failed first attempt made again as any later one
+        (``reconnect``), and the initial *topics* subscribed once the server
+        took it. What is sent meanwhile waits in the outbox: for an
+        application that may start without a network. A client that gives
+        up ends its stream with the error."""
+        self._begin()
+        if self._connection.is_connected or self._connection.state in (
+            ConnectionState.CONNECTING,
+            ConnectionState.RECONNECTING,
+        ):
+            return
+        self._reset_stream()
+        self._subscribed_topics.update(self._initial_topics)
+        self._connection.start()
+
+    def _begin(self) -> None:
+        """The loop the outbox's file says its failures on (and those it had
+        before, opening it), and the client's primitives on it."""
+        self._loop_seen = asyncio.get_running_loop()
+        for operation, why in self._storage_failures:
+            self._storage_failed(operation, why)
+        self._storage_failures.clear()
+        self._ensure_primitives()
 
     async def disconnect(self) -> None:
         """Disconnect gracefully. Iteration ends after the queued events;
@@ -1410,6 +1432,31 @@ class AsyncWSEClient:
                 raise item.error
             raise WSEConnectionError("Connection closed")
         return item
+
+    async def pause(self, reason: str) -> None:
+        """Pause the connection for *reason* (``background``, ``offline``,
+        ``manual``, ...): it ends while any reason holds, and topics, positions
+        and what waits in the outbox stay. Handlers hear a ``paused`` event
+        with the reasons."""
+        first = not self._paused
+        self._paused.add(reason)
+        if first:
+            await self._connection.pause()
+        self._invoke_handlers(
+            WSEEvent(type="paused", payload={"reasons": sorted(self._paused)})
+        )
+
+    async def resume(self, reason: str) -> None:
+        """Clear *reason*; once none is left the client connects again at
+        once and recovers what it missed."""
+        self._paused.discard(reason)
+        if not self._paused:
+            self._connection.resume()
+
+    @property
+    def paused(self) -> list[str]:
+        """The reasons the client is paused for; none: it is not."""
+        return sorted(self._paused)
 
     async def force_reconnect(self) -> None:
         """Force a reconnection (e.g. after detecting degraded quality).

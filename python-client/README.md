@@ -116,6 +116,8 @@ The `connect(url, **kwargs)` factory returns an `AsyncWSEClient` (not connected 
 | Method | Description |
 |--------|-------------|
 | `connect()` | Open the connection and complete the handshake (raises on failure, see [Error Handling](#error-handling)) |
+| `start()` | Return at once and connect in the background: a failed first attempt is made again as any later one, the initial topics are subscribed once the server took the connection, and what is sent meanwhile waits in the outbox (for an application that may start without a network) |
+| `pause(reason)` / `resume(reason)` | End the connection while any reason holds (`background`, `offline`, ...) and connect again at once when the last is cleared; topics, positions and the outbox stay. Handlers hear `paused` with the reasons; `paused` (the property) lists them |
 | `disconnect()` / `close()` | Close the connection; iteration ends after the queued events |
 | `send(type, payload, priority=NORMAL, correlation_id=None)` | Send a message; returns a `SendResult` |
 | `send_with_retry(type, payload, priority=NORMAL, correlation_id=None, max_retries=5)` | Send with exponential backoff; one message id across all attempts |

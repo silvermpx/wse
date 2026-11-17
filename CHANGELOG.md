@@ -4,6 +4,12 @@
 
 ### Added
 
+- Python: `pause(reason)` and `resume(reason)`, as in the TypeScript and
+  Rust clients: the connection ends while any reason holds, and topics,
+  positions and the outbox stay. `start()` connects in the background, a
+  failed first attempt made again as any later one, for an application that
+  may start without a network (`connect()` fails when the first attempt
+  does). `SyncWSEClient` has the three too.
 - Angular: `wse-client/angular`, for Angular 20 and newer:
   `provideWSEClient`, `injectWSEState`, `injectWSETopics`, `injectWSEMessage`
   and `injectWSEEvent`, signals that take the client's connection, topics and
