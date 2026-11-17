@@ -19,10 +19,12 @@ struct Taken {
     possible_repeat: bool,
 }
 
-/// Takes every message, refuses those of type `refuse` (no room).
+/// Takes every message, refuses those of type `refuse` (no room); each
+/// takes it `pace` (a slow application).
 struct App {
     taken: mpsc::UnboundedSender<Taken>,
     connected: mpsc::UnboundedSender<String>,
+    pace: Duration,
 }
 
 impl wse::Handler for App {
@@ -37,6 +39,9 @@ impl wse::Handler for App {
         let wse::Inbound::Json(value) = message else {
             return true;
         };
+        if !self.pace.is_zero() {
+            std::thread::sleep(self.pace);
+        }
         let kind = value["t"].as_str().unwrap_or_default().to_owned();
         if kind == "refuse" {
             return false;
@@ -71,6 +76,10 @@ async fn node() -> Node {
 }
 
 async fn node_with(config: wse::Config) -> Node {
+    node_paced(config, Duration::ZERO).await
+}
+
+async fn node_paced(config: wse::Config, pace: Duration) -> Node {
     let server = wse::Server::new(config).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -82,6 +91,7 @@ async fn node_with(config: wse::Config) -> Node {
             App {
                 taken: taken_tx,
                 connected: connected_tx,
+                pace,
             },
         )
         .unwrap();
@@ -480,6 +490,71 @@ async fn a_drain_answers_what_was_taken_before_the_close() {
     assert_eq!(
         highest, 50,
         "every message taken was confirmed before the close"
+    );
+    drained.await.unwrap().stop().await;
+}
+
+/// A drained server stops taking the messages of a client that keeps
+/// sending, and answers what it took: the client hears of each one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drain_answers_a_client_that_keeps_sending() {
+    // An application slower than the client: frames wait for it.
+    let mut node = node_paced(wse::Config::default(), Duration::from_micros(20)).await;
+    let (ws, _, _) = node
+        .client("ann", serde_json::json!({"producer": "p6"}))
+        .await;
+    let (mut sink, mut stream) = ws.split();
+    // It sends with no pause until its connection goes, 64 at a time: the
+    // server always has a frame waiting.
+    let sender = tokio::spawn(async move {
+        for s in 1u64.. {
+            let message = format!(r#"{{"s":{s},"t":"m","p":{{}},"id":"m{s}"}}"#);
+            let sent = if s % 64 == 0 {
+                sink.send(Message::Text(message.into())).await
+            } else {
+                sink.feed(Message::Text(message.into())).await
+            };
+            if sent.is_err() {
+                return;
+            }
+        }
+    });
+    let mut last_taken = 0;
+    while last_taken < 200 {
+        last_taken = node.took().await.s;
+    }
+    let server = node.server;
+    let drained = tokio::spawn(async move {
+        let _ = server.drain(4300, "draining", Duration::from_secs(5)).await;
+        server
+    });
+    let mut highest = 0;
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("a frame within 5 s");
+        match frame {
+            Some(Ok(Message::Text(text))) => {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["t"] == "ack" {
+                    highest = highest.max(value["p"]["s"].as_u64().unwrap());
+                }
+            }
+            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+            Some(Ok(_)) => {}
+        }
+    }
+    sender.abort();
+    let _ = sender.await;
+    drop(stream);
+    while let Ok(Some(taken)) =
+        tokio::time::timeout(Duration::from_millis(300), node.taken.recv()).await
+    {
+        last_taken = last_taken.max(taken.s);
+    }
+    assert!(
+        highest >= last_taken,
+        "taken up to {last_taken}, confirmed up to {highest}"
     );
     drained.await.unwrap().stop().await;
 }

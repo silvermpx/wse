@@ -59,6 +59,9 @@ pub(crate) struct Closer {
 pub(crate) struct Finish {
     close: std::sync::Mutex<Option<(u16, String)>>,
     asked: tokio::sync::Notify,
+    /// Set with `close`: the read loop looks at it after each frame, so one
+    /// whose client keeps sending sees the close too.
+    pending: AtomicBool,
 }
 
 /// How long a close asked of the read loop waits before it is made without
@@ -82,11 +85,17 @@ impl Closer {
 
     /// The close the server asked of the read loop, taken once.
     pub(crate) fn asked_close(&self) -> Option<(u16, String)> {
+        self.finish.pending.store(false, Ordering::Relaxed);
         self.finish
             .close
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
+    }
+
+    /// The server asked the read loop to close (an atomic load).
+    pub(crate) fn close_asked(&self) -> bool {
+        self.finish.pending.load(Ordering::Acquire)
     }
 
     /// What one of the connection's loops is wrapped in (`Abortable`), so it
@@ -238,6 +247,7 @@ impl ConnectionHandle {
             .close
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some((code, reason.to_owned()));
+        self.closer.finish.pending.store(true, Ordering::Release);
         self.closer.finish.asked.notify_one();
         let handle = self.clone();
         let reason = reason.to_owned();

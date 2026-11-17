@@ -2173,6 +2173,14 @@ pub(crate) async fn handle_connection<H: Handler>(
                     closer.close(&tx, &out.pending, CLOSE_INTERNAL_ERROR, "internal error");
                 }
             }
+            // A close the server asked while frames kept coming: what was
+            // taken is answered, and nothing more is taken.
+            if closer.close_asked()
+                && let Some((code, reason)) = closer.asked_close()
+            {
+                reader.answer();
+                closer.close(&tx, &out.pending, code, &reason);
+            }
             // The deadlines a connection reached while its frames kept coming.
             let at = reader.last_frame_at;
             if expiry
