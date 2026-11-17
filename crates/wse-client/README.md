@@ -312,6 +312,36 @@ is the browser's WebSocket, on the page's task: a handler need not be
 - End-to-end encryption and signed messages run on RustCrypto there,
   checked against the same vectors as aws-lc-rs.
 
+## One connection for every window
+
+With the `bridge` feature, `bridge::Owner` holds one connection for the
+windows of an application (a Tauri application's webviews, say), each of
+which holds a client of the TypeScript package's `wse-client/bridge` over a
+channel the application carries. The owner subscribes the union of the
+windows' topics, hands each window what it holds and listens to in batches
+it acknowledges (a window that falls behind holds back only itself, and
+past its limits hears its topics broke off), sends the windows' messages
+through its outbox, and routes each outcome to the window that sent it. It
+connects while a window, or the application (`Owner::retain`), shares the
+connection. The token, the keys and the outbox stay with the owner; no frame
+carries them.
+
+```rust,ignore
+use wse_client::bridge::{Options, Owner, Window};
+
+struct Webview; // the application's channel to one window
+impl Window for Webview {
+    fn post(&self, frame: String) { /* hand the JSON frame to the window */ }
+    fn close(&self) {}
+}
+
+let mut config = wse_client::Config::new("wss://example.com/wse");
+config.token = Some("...".to_owned());
+let owner = Owner::start(config, Options::default()).await?;
+let window = owner.attach(Webview);
+owner.frame(window, r#"{"k":"hello","v":1,"agent":"main"}"#); // each frame the window sends
+```
+
 ## Features
 
 - `aws-lc` (default): `wss://` with rustls and the Mozilla root
@@ -321,6 +351,8 @@ is the browser's WebSocket, on the page's task: a handler need not be
   `wss://`; in the browser `wss://` is the browser's own TLS.
 - `fips`: aws-lc-rs built from its FIPS 140-3 validated module (needs CMake
   and Go).
+- `bridge`: the `bridge` module, one connection for every window of an
+  application (with `aws-lc`).
 - `native`: the `native` module the Swift, Kotlin and Dart packages are
   built on: plain types, one shared runtime, cancellable calls, events read
   in bounded batches, and `wss://` checked by the system's certificate

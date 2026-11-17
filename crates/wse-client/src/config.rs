@@ -298,6 +298,9 @@ pub struct Config {
     /// Where each recovery starts: what the application committed, as the
     /// delivery keeps it.
     pub(crate) committed: Option<Committed>,
+    /// The reasons the client starts paused for: no connection is made until
+    /// they are cleared (the bridge's owner, until a window shares it).
+    pub(crate) paused: Vec<String>,
     /// This client's ECDSA P-256 private key (PKCS#8, PEM or DER) for
     /// [`Client::send_signed`](crate::Client::send_signed). The server
     /// learns its public key from the token's `cnf` claim or from its
@@ -393,6 +396,7 @@ impl Config {
             delivery: None,
             offline: Some(crate::Offline::in_memory()),
             committed: None,
+            paused: Vec::new(),
             #[cfg(feature = "aws-lc")]
             signing_key: None,
             #[cfg(feature = "aws-lc")]

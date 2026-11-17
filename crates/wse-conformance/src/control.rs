@@ -3,7 +3,8 @@
 //! it is (`hello`), then runs each case it can: `begin` (the case's server,
 //! its steps), `act` (a server step, in its place), `trace` (what its
 //! client saw, in pieces), `end` (the verdict). `bye`, or the channel
-//! closing, writes its report.
+//! closing, writes its report. A window of the bridge's Rust owner connects
+//! at `/bridge` instead (see `bridge.rs`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,6 +37,8 @@ struct Session {
 }
 
 /// Serves drivers on `listener` until the process ends.
+// The handshake's callback answers with tungstenite's own error response.
+#[allow(clippy::result_large_err)]
 pub async fn serve(listener: TcpListener, catalog: Arc<Catalog>, out: PathBuf) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -44,17 +47,32 @@ pub async fn serve(listener: TcpListener, catalog: Arc<Catalog>, out: PathBuf) {
         let catalog = Arc::clone(&catalog);
         let out = out.clone();
         tokio::spawn(async move {
-            if let Err(why) = session(stream, catalog, out).await {
+            let mut path = String::new();
+            let accepted = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
+                    request.uri().path().clone_into(&mut path);
+                    Ok(response)
+                },
+            )
+            .await;
+            let served = match accepted {
+                Ok(ws) if path == "/bridge" => crate::bridge::host(ws).await,
+                Ok(ws) => session(ws, catalog, out).await,
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(why) = served {
                 eprintln!("wse-conformance: a driver's channel: {why}");
             }
         });
     }
 }
 
-async fn session(stream: TcpStream, catalog: Arc<Catalog>, out: PathBuf) -> Result<(), String> {
-    let mut ws = tokio_tungstenite::accept_async(stream)
-        .await
-        .map_err(|e| e.to_string())?;
+async fn session(
+    mut ws: tokio_tungstenite::WebSocketStream<TcpStream>,
+    catalog: Arc<Catalog>,
+    out: PathBuf,
+) -> Result<(), String> {
     let mut session = Session {
         catalog,
         out,

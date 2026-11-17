@@ -8,6 +8,8 @@ compile_error!("the fips feature needs aws-lc-rs, which does not build for the b
 #[cfg(all(target_arch = "wasm32", not(target_os = "unknown")))]
 compile_error!("wse-client runs natively, or in the browser (wasm32-unknown-unknown)");
 
+#[cfg(all(feature = "bridge", not(target_arch = "wasm32")))]
+pub mod bridge;
 #[cfg(target_arch = "wasm32")]
 mod browser;
 mod client;

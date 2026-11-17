@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 wse = { workspace = true, features = ["server"] }
+wse-client = { path = "../wse-client", features = ["bridge"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }

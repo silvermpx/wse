@@ -126,6 +126,7 @@ for _ in $(seq 1 100); do grep -q '\"ready\"' \"$out/serve.log\" && break; sleep
 export WSE_CONFORMANCE=\"$(sed -n 's/.*\"control\":\"\\([^\"]*\\)\".*/\\1/p' \"$out/serve.log\")\" WSE_CONFORMANCE_REQUIRED=1
 npx vitest run --project client ts-client/__tests__/conformance.test.ts
 WSE_CONFORMANCE_BRIDGE=1 npx vitest run --project client ts-client/__tests__/conformance.test.ts
+WSE_CONFORMANCE_BRIDGE=rust npx vitest run --project client ts-client/__tests__/conformance.test.ts
 cargo test --locked -p wse-client --test conformance
 uvx --quiet --from pytest --with-editable './python-client[all,dev]' pytest python-client/tests/test_conformance.py -q -p no:cacheprovider
 \"$CARGO_TARGET_DIR/debug/wse-conformance\" check --manifest tests/conformance/agents.json --reports \"$out\"",

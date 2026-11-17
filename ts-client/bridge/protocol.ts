@@ -98,6 +98,11 @@ export type OwnerFrame =
       gen: number;
     }
   | { k: 'refused'; reason: 'version' | 'closing'; detail?: string }
+  /**
+   * The owner's connection as it is now: at once, beside the batches, so a
+   * window that holds its batches (paused, or behind) still shows it.
+   */
+  | { k: 'conn'; state: ConnState }
   /** A batch: messages and events, in the order the owner had them. */
   | { k: 'b'; s: number; items: BridgeItem[] }
   /** What became of a send (`n`): its id, and a signed one's nonce. */
@@ -109,7 +114,6 @@ export type OwnerFrame =
 export type BridgeItem =
   /** A message, as the owner's client hands it to its application. */
   | { m: WSMessage }
-  | { ev: 'conn'; state: ConnState }
   /** The server took connection `gen`, of `user`. */
   | { ev: 'connected'; gen: number; user: string | null }
   /** The connection went. */

@@ -223,10 +223,6 @@ export function createBridgeClient(
       return;
     }
     switch (item.ev) {
-      case 'conn':
-        conn = item.state;
-        refresh();
-        return;
       case 'connected':
         gen = item.gen;
         user = item.user;
@@ -276,6 +272,10 @@ export function createBridgeClient(
         return;
       case 'refused':
         end('refused', `the owner refused the window: ${f.reason}${f.detail ? ` (${f.detail})` : ''}`);
+        return;
+      case 'conn':
+        conn = f.state;
+        refresh();
         return;
       case 'b':
         if (f.s !== took + pausedBatches.length + 1) {

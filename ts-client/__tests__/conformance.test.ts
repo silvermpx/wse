@@ -6,19 +6,28 @@
 //   cargo run -p wse-conformance -- serve        # prints the control URL
 //   WSE_CONFORMANCE=ws://127.0.0.1:P/control npx vitest run --project client ts-client/__tests__/conformance.test.ts
 //
-// With WSE_CONFORMANCE_BRIDGE=1 it runs them as the window of a bridge (agent
-// ts-bridge): an owner holds the connection, and the client the cases drive
-// is a window's, over a MessageChannel.
+// With WSE_CONFORMANCE_BRIDGE it runs them as the window of a bridge: the
+// owner holds the connection, and the client the cases drive is a window's.
+// `1`: a TypeScript owner, over a MessageChannel (agent ts-bridge); `rust`:
+// the conformance server's Rust owner, over a WebSocket, as a Tauri
+// application's Rust side holds it (agent rust-bridge).
 
 import { describe, expect, it } from 'vitest';
 import { createWSEClient, type WSEClient, type WSEClientOptions } from '../core/client.js';
-import { createBridgeClient, createBridgeOwner, messagePortChannel, type BridgeOwner } from '../bridge/index.js';
+import {
+  createBridgeClient,
+  createBridgeOwner,
+  messagePortChannel,
+  type BridgeOwner,
+  type WindowChannel,
+} from '../bridge/index.js';
 import type { ResyncRequest } from '../core/delivery.js';
 import { logger, LogLevel } from '../utils/logger.js';
 import { generateSigningKey, type SigningKey } from '../utils/signing.js';
 
 const CONTROL = process.env.WSE_CONFORMANCE;
-const BRIDGE = process.env.WSE_CONFORMANCE_BRIDGE === '1';
+const BRIDGE = process.env.WSE_CONFORMANCE_BRIDGE ?? '';
+const AGENT = BRIDGE === 'rust' ? 'rust-bridge' : BRIDGE ? 'ts-bridge' : 'ts-core';
 if (process.env.WSE_CONFORMANCE_REQUIRED === '1' && !CONTROL) {
   throw new Error('WSE_CONFORMANCE_REQUIRED is set, but WSE_CONFORMANCE is not');
 }
@@ -27,6 +36,53 @@ if (process.env.WSE_CONFORMANCE_REQUIRED === '1' && !CONTROL) {
 const FEATURES = ['outbox', 'start', 'live', 'msgpack', 'e2e', 'signing', 'recover_or_resync'];
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** A window's channel over a WebSocket: one frame a message, JSON text. */
+function socketChannel(ws: WebSocket): WindowChannel {
+  let closed = false;
+  let sink: { frame(frame: any): void; close(): void } | null = null;
+  ws.onmessage = (event) => {
+    if (!closed) sink?.frame(JSON.parse(String(event.data)));
+  };
+  ws.onclose = () => {
+    if (closed) return;
+    closed = true;
+    sink?.close();
+  };
+  return {
+    post: (frame) => {
+      if (!closed) ws.send(JSON.stringify(frame));
+    },
+    listen: (next) => {
+      sink = next;
+    },
+    close: () => {
+      if (closed) return;
+      closed = true;
+      ws.close();
+    },
+  };
+}
+
+/**
+ * A window of the conformance server's Rust owner, which holds the
+ * connection to the case's server as `owner` names it: the window's channel,
+ * and the owner's signing key's public key when it was asked for one.
+ */
+async function rustOwner(owner: Record<string, unknown>): Promise<{ channel: WindowChannel; publicKey: string | null }> {
+  const ws = new WebSocket(CONTROL!.replace(/\/control$/, '/bridge'));
+  await new Promise<void>((resolve, reject) => {
+    ws.onopen = () => resolve();
+    ws.onerror = () => reject(new Error('no bridge host beside the conformance server'));
+  });
+  const answer = new Promise<any>((resolve) => {
+    ws.onmessage = (event) => resolve(JSON.parse(String(event.data)));
+  });
+  ws.send(JSON.stringify(owner));
+  const ready = await answer;
+  if (!ready.ready) throw new Error(`the bridge host: ${ready.error}`);
+  return { channel: socketChannel(ws), publicKey: ready.public_key ?? null };
+}
 
 /** The control channel: requests and their answers, by id. */
 class Control {
@@ -72,6 +128,8 @@ class Run {
   private readonly published = new Map<string, number[]>();
   private readonly resyncs: Array<{ topics: string[]; done: () => void }> = [];
   private signing: SigningKey | null = null;
+  /** The public key the server binds (bind_key): the signing key's, wherever it is. */
+  private publicKey: string | null = null;
   private bound = false;
 
   constructor(
@@ -168,7 +226,7 @@ class Run {
       case 'not_ready':
         // A window is not ready once paused; the connection, its owner's,
         // ends a moment later, when its share was the last.
-        return !this.ready && !this.owner?.client.state.getSnapshot().ready;
+        return !this.ready && (!BRIDGE || this.client?.state.getSnapshot().connection !== 'connected');
       case 'messages':
         return this.messages((e) => e.topic === step.topic).length >= step.count;
       case 'message':
@@ -202,6 +260,7 @@ class Run {
     if (step.e2e) security.serverKeys = [this.begun.identity_key];
     if (step.signing) {
       this.signing = await generateSigningKey();
+      this.publicKey = this.signing.publicKey;
       security.signingKey = this.signing.keyPair;
       security.serverSigningKeys = [this.begun.signing_key];
       // The application binds the key (bind_key): the token names none.
@@ -227,7 +286,18 @@ class Run {
         }
       : {};
     let client: WSEClient;
-    if (BRIDGE) {
+    if (BRIDGE === 'rust') {
+      const { channel, publicKey } = await rustOwner({
+        url: this.begun.url,
+        token,
+        format: step.format ?? 'json',
+        e2e_key: step.e2e ? this.begun.identity_key : null,
+        signing: !!step.signing,
+        server_signing_key: this.begun.signing_key ?? null,
+      });
+      client = createBridgeClient(channel, application);
+      if (step.signing) this.publicKey = publicKey;
+    } else if (BRIDGE) {
       // The connection is the owner's; the client the case drives is a window's.
       const owner = createBridgeOwner(connection);
       const { port1, port2 } = new MessageChannel();
@@ -300,7 +370,7 @@ class Run {
       const payload = step.payload ?? { n: k };
       if (step.signed) {
         if (!this.bound) {
-          const bind = client.send('bind_key', { public_key: this.signing!.publicKey }, { id: 'bind-key' });
+          const bind = client.send('bind_key', { public_key: this.publicKey }, { id: 'bind-key' });
           this.record({ ev: 'sent', id: 'bind-key', type: 'bind_key', live: false, ok: bind !== 'dropped' });
           if (!(await this.until(() => this.messages((e) => e.type === 'key_bound').length > 0, 10_000))) {
             throw new Error('the server never bound the key');
@@ -331,7 +401,7 @@ describe.skipIf(!CONTROL)('conformance', () => {
     logger.setLevel(process.env.WSE_CONFORMANCE_DEBUG === '1' ? LogLevel.DEBUG : LogLevel.ERROR);
     const control = await Control.open(CONTROL!);
     const { cases } = await control.call('hello', {
-      agent: BRIDGE ? 'ts-bridge' : 'ts-core',
+      agent: AGENT,
       version: '3.2.0',
       runtime: `node ${process.versions.node}`,
       os: process.platform,

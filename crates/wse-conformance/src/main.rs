@@ -10,7 +10,11 @@
 //!
 //! fails (exit 1) unless every agent the manifest names passed every case
 //! its features reach. `wse-conformance cases` prints the built-in catalog.
+//!
+//! Beside the control channel, `/bridge` serves a window of the bridge's
+//! Rust owner: the TypeScript driver runs the cases through it.
 
+mod bridge;
 mod cases;
 mod control;
 mod oracle;

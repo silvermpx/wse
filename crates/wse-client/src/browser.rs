@@ -240,6 +240,7 @@ impl<H: Handler> Driver<H> {
             config.idle_timeout,
         );
         session.committed = config.committed.clone();
+        let paused = config.paused.iter().cloned().collect();
         Self {
             decoder: Decoder::new(
                 config.max_message_size,
@@ -253,7 +254,7 @@ impl<H: Handler> Driver<H> {
             status,
             session,
             policy: Policy::default(),
-            paused: BTreeSet::new(),
+            paused,
         }
     }
 

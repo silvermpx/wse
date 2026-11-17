@@ -25,6 +25,16 @@
   adapters take as they take any. Only the top frame of a served window,
   at a URL the application allows (by default its own pages, never the
   web's), gets a port.
+- Rust: `wse_client::bridge` (feature `bridge`), the window bridge's owner
+  in Rust, for Tauri's webviews among others: one connection for every
+  window, the same protocol as the TypeScript owner, so each window holds
+  a client of `wse-client/bridge`. It connects while a window or the
+  application (`Owner::retain`) shares the connection, and keeps the
+  token, the keys and the outbox. The conformance cases run through it
+  too (agent `rust-bridge`), a TypeScript window over a WebSocket.
+- TypeScript: the bridge's owner sends a window the connection's state
+  beside the batches (`conn` frames), so a window that holds its batches,
+  paused or behind, still shows it.
 - TypeScript: a bridge window that pauses gives its share of the
   connection back: the connection ends when no other window holds one, as
   a client of its own does; what came meanwhile waits for it at the owner.

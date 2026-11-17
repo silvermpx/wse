@@ -152,10 +152,7 @@ export function createBridgeOwner(options: BridgeOwnerOptions = {}): BridgeOwner
       // The window fell behind past its limits: its queue goes, and what it
       // holds broke off; the connection and the other windows go on.
       logger.warn(`[bridge] window ${a.att} fell behind: its queue of ${a.queue.length} dropped`);
-      a.queue = [
-        { item: { ev: 'overflow', topics: [...a.holds] }, bytes: 0 },
-        { item: { ev: 'conn', state: conn }, bytes: 0 },
-      ];
+      a.queue = [{ item: { ev: 'overflow', topics: [...a.holds] }, bytes: 0 }];
       a.queueBytes = 0;
       const active = activeOf(a);
       if (active.length > 0) a.queue.push({ item: { ev: 'subscribed', taken: active, refused: [] }, bytes: 0 });
@@ -346,7 +343,8 @@ export function createBridgeOwner(options: BridgeOwnerOptions = {}): BridgeOwner
       ready = false;
       toAll({ ev: 'lost' });
     }
-    if (changed) toAll({ ev: 'conn', state: conn });
+    if (!changed) return;
+    for (const a of attachments.values()) if (a.welcomed && !a.closed) a.channel.post({ k: 'conn', state: conn });
   });
   client.on('wseConnected', (detail: { user: string | null }) => {
     gen++;

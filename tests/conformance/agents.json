@@ -3,6 +3,7 @@
   "agents": {
     "ts-core": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] },
     "ts-bridge": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] },
+    "rust-bridge": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] },
     "rust-client": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] },
     "python": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] }
   }

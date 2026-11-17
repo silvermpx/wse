@@ -77,6 +77,9 @@ aws-lc = [
 ]
 # aws-lc-rs built from its FIPS 140-3 validated module (needs CMake and Go).
 fips = ["aws-lc", "wse/fips", "rustls/fips"]
+# The `bridge` module: one connection for every window of an application
+# (Tauri's webviews), the owner of the TypeScript client's window bridge.
+bridge = ["aws-lc"]
 # The `native` module, for the Swift, Kotlin and Dart packages: plain types,
 # one shared runtime, events read in bounded batches. Not in the browser.
 native = [
@@ -104,6 +107,10 @@ fastrand = "2"
 [package.metadata.docs.rs]
 # The crypto library's own build is the slow part: one target is enough.
 targets = ["x86_64-unknown-linux-gnu"]
+
+[[test]]
+name = "bridge"
+required-features = ["bridge"]
 
 [[test]]
 name = "native"

@@ -376,6 +376,8 @@ jobs:
           for _ in $(seq 1 100); do grep -q '"ready"' serve.log && break; sleep 0.1; done
           export WSE_CONFORMANCE="$(sed -n 's/.*"control":"\([^"]*\)".*/\1/p' serve.log)" WSE_CONFORMANCE_REQUIRED=1
           npx vitest run --project client ts-client/__tests__/conformance.test.ts
+          WSE_CONFORMANCE_BRIDGE=1 npx vitest run --project client ts-client/__tests__/conformance.test.ts
+          WSE_CONFORMANCE_BRIDGE=rust npx vitest run --project client ts-client/__tests__/conformance.test.ts
           cargo test --locked -p wse-client --test conformance
           pytest python-client/tests/test_conformance.py -q
           target/debug/wse-conformance check --manifest tests/conformance/agents.json --reports "$out"
@@ -524,6 +526,7 @@ jobs:
           cargo test -p wse --locked --no-default-features
           cargo test -p wse-client --locked
           cargo test -p wse-client --locked --features native
+          cargo test -p wse-client --locked --features bridge --test bridge
           cargo test -p wse-client --locked --no-default-features
         env:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
