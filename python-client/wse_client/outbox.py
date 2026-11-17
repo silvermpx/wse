@@ -21,10 +21,13 @@
 from __future__ import annotations
 
 import atexit
+import errno
+import hashlib
 import json
 import os
 import queue
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -881,12 +884,44 @@ def _lock(fd: int) -> bool:
     return True
 
 
+def _lock_name(path: str) -> str:
+    """The name of the lock every client takes of the file at *path* on
+    Linux: ``wse-outbox-`` and 40 hex digits of the SHA-256 of its path,
+    its directory's resolved."""
+    where = os.path.join(
+        os.path.realpath(os.path.dirname(path) or "."), os.path.basename(path)
+    )
+    return "wse-outbox-" + hashlib.sha256(os.fsencode(where)).hexdigest()[:40]
+
+
+def _named_lock(path: str) -> socket.socket | None:
+    """On Linux, the lock beside the lock file that the TypeScript client
+    in Node takes (it has no file locks): a socket in the abstract namespace,
+    named for the file, gone with the process. None elsewhere."""
+    if not (sys.platform.startswith("linux") or sys.platform == "android"):
+        return None
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.bind("\0" + _lock_name(path))
+    except OSError as exc:
+        sock.close()
+        if exc.errno == errno.EADDRINUSE:
+            raise OSError("it is another client's") from None
+        raise
+    return sock
+
+
 class _Log:
     """The file, as the client's loop sees it: a batch of lines, handed to
     the thread that writes them."""
 
     def __init__(
-        self, path: str, lock_fd: int, report: Report, wrote: Callable[[], None]
+        self,
+        path: str,
+        lock_fd: int,
+        report: Report,
+        wrote: Callable[[], None],
+        named: socket.socket | None = None,
     ) -> None:
         self.path = path
         self._salt = b""
@@ -903,7 +938,7 @@ class _Log:
             queue.SimpleQueue()
         )
         self._thread = threading.Thread(
-            target=_Writer(path, lock_fd, report, self._broken, self, wrote).run,
+            target=_Writer(path, lock_fd, report, self._broken, self, wrote, named).run,
             args=(self._jobs,),
             name="wse-outbox",
             daemon=True,
@@ -923,16 +958,20 @@ class _Log:
         if not _lock(lock_fd):
             os.close(lock_fd)
             raise OSError("it is another client's")
+        named: socket.socket | None = None
         try:
+            named = _named_lock(path)
             try:
                 with open(path, "rb") as f:
                     read = _read(f.read())
             except FileNotFoundError:
                 read = None
-            log = _Log(path, lock_fd, report, wrote)
+            log = _Log(path, lock_fd, report, wrote, named)
             log.written = read.written if read is not None else 0
             return log, read
         except OSError:
+            if named is not None:
+                named.close()
             os.close(lock_fd)
             raise
 
@@ -988,10 +1027,12 @@ class _Writer:
         broken: threading.Event,
         log: _Log,
         wrote: Callable[[], None],
+        named: socket.socket | None = None,
     ) -> None:
         self.path = path
         self.tmp = path + ".tmp"
         self.lock_fd = lock_fd
+        self.named = named
         self.report = report
         self.broken = broken
         # The log whose mark it raises, and who hears it rose.
@@ -1040,6 +1081,8 @@ class _Writer:
             if self.fd is not None:
                 os.close(self.fd)
             os.close(self.lock_fd)
+            if self.named is not None:
+                self.named.close()
 
     def take(self, job: tuple[str, bytes, int], mark: int) -> tuple[bool, int]:
         """Whether it appended (to be synced), and the mark of what was

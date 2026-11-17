@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { transformWithOxc } from 'vite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createWSEClient } from '../core/client';
-import { addBody, encodeLine, encodeOutbox, fileOutbox, readOutbox, saltSeed } from '../node/fileOutbox';
+import { addBody, encodeLine, encodeOutbox, fileOutbox, lockName, readOutbox, saltSeed } from '../node/fileOutbox';
 import { noOutcomes, numbered, Outbox, unnumbered } from '../services/Outbox';
 
 interface VectorLine {
@@ -197,6 +197,10 @@ describe('the outbox in a file', () => {
     }
     expect(failed).toEqual([]);
     expect(readOutbox(readFileSync(path, 'utf8')).next).toBe(3);
+  });
+
+  it('names its lock on Linux as the Rust and Python clients do', () => {
+    expect(lockName('/wse-outbox-test-queue')).toBe('wse-outbox-0bd17a84322f83203c373a9c2d09c16e9474d9c6');
   });
 
   it('keeps what waits for the next client, until the server took it', async () => {

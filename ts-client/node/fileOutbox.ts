@@ -253,11 +253,21 @@ function anotherClients(path: string): Error {
 }
 
 /** The file, this process's alone until it lets go or ends. */
+/**
+ * The name of the lock every client takes of the file at `path` on Linux,
+ * a socket in the abstract namespace beside the lock file the Rust and
+ * Python clients lock too: `wse-outbox-` and 40 hex digits of the SHA-256 of
+ * its path, its directory's resolved.
+ */
+export function lockName(path: string): string {
+  const where = join(realpathSync(dirname(path)), basename(path));
+  return `wse-outbox-${createHash('sha256').update(where).digest('hex').slice(0, 40)}`;
+}
+
 function takeLock(path: string): Lock {
   const platform = process.platform;
   if (platform === 'linux' || platform === 'android') {
-    const where = join(realpathSync(dirname(path)), basename(path));
-    const name = `\0wse-outbox-${createHash('sha256').update(where).digest('hex').slice(0, 40)}`;
+    const name = `\0${lockName(path)}`;
     const server = createServer();
     server.on('error', () => {});
     // Bound at once, or not: exclusive, so a cluster worker binds it itself.

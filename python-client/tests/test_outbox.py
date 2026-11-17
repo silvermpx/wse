@@ -552,3 +552,35 @@ class TestTheOutboxInAFile:
         again = Outbox(offline)
         assert again.size == 2
         again.close_file()
+
+
+def test_the_lock_is_named_as_the_other_clients_name_it():
+    from wse_client.outbox import _lock_name
+
+    assert _lock_name("/wse-outbox-test-queue") == (
+        "wse-outbox-0bd17a84322f83203c373a9c2d09c16e9474d9c6"
+    )
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux's lock")
+def test_a_file_node_holds_on_linux_is_another_clients(tmp_path):
+    import socket
+
+    from wse_client.outbox import _lock_name, _Log
+
+    path = str(tmp_path / "queue")
+    # Held as the TypeScript client in Node holds it.
+    held = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    held.bind("\0" + _lock_name(path))
+    try:
+        with pytest.raises(OSError, match="another client"):
+            _Log.open(path, lambda *_: None, lambda: None)
+    finally:
+        held.close()
+    log, _ = _Log.open(path, lambda *_: None, lambda: None)
+    # And one that holds it keeps Node out.
+    taken = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    with pytest.raises(OSError):
+        taken.bind("\0" + _lock_name(path))
+    taken.close()
+    log.close()

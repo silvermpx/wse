@@ -1200,6 +1200,65 @@ fn crc32(parts: &[&[u8]]) -> u32 {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod file {
+    /// The lock every client takes of an outbox's file on Linux beside the
+    /// lock file: a socket in the abstract namespace, named for the file,
+    /// the one Node can take (it has no file locks); it goes with the
+    /// process.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    mod linux {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixListener};
+        use std::path::Path;
+
+        use sha2::{Digest, Sha256};
+
+        /// `\0wse-outbox-` and 40 hex digits of the SHA-256 of the file's
+        /// path, its directory's resolved.
+        pub(super) fn name(path: &Path) -> std::io::Result<String> {
+            let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+            let dir = std::fs::canonicalize(dir.unwrap_or(Path::new(".")))?;
+            let file = path.file_name().unwrap_or_default();
+            let full = dir.join(file);
+            let digest = Sha256::digest(full.as_os_str().as_encoded_bytes());
+            let mut name = String::from("wse-outbox-");
+            for byte in &digest[..20] {
+                use std::fmt::Write;
+                let _ = write!(name, "{byte:02x}");
+            }
+            Ok(name)
+        }
+
+        #[cfg(test)]
+        #[test]
+        fn the_lock_is_named_as_the_other_clients_name_it() {
+            assert_eq!(
+                name(Path::new("/wse-outbox-test-queue")).unwrap(),
+                "wse-outbox-0bd17a84322f83203c373a9c2d09c16e9474d9c6"
+            );
+        }
+
+        #[cfg(test)]
+        #[test]
+        fn a_file_another_process_holds_on_linux_is_another_clients() {
+            let dir = std::env::temp_dir().join(format!("wse-lock-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("queue");
+            let held = named_lock(&path).unwrap();
+            assert!(matches!(named_lock(&path), Err(None)));
+            drop(held);
+            assert!(named_lock(&path).is_ok());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// The lock, or None in the error when another process has it.
+        pub(super) fn named_lock(path: &Path) -> Result<UnixListener, Option<std::io::Error>> {
+            let name = name(path).map_err(Some)?;
+            let addr = SocketAddr::from_abstract_name(name.as_bytes()).map_err(Some)?;
+            UnixListener::bind_addr(&addr)
+                .map_err(|e| (e.kind() != std::io::ErrorKind::AddrInUse).then_some(e))
+        }
+    }
+
     use std::collections::VecDeque;
     use std::fs::{File, OpenOptions, TryLockError};
     use std::io::Write;
@@ -1289,6 +1348,11 @@ mod file {
                 }
                 Err(TryLockError::Error(e)) => return Err(fail("cannot lock it", e)),
             }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let named = linux::named_lock(path).map_err(|e| match e {
+                Some(e) => fail("cannot lock it", e),
+                None => format!("{} is another client's", path.display()),
+            })?;
             let read = match std::fs::read(path) {
                 Ok(bytes) => read(&bytes),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -1305,6 +1369,8 @@ mod file {
                 tmp: PathBuf::from(tmp),
                 file: Some(file),
                 _lock: lock,
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                _named: named,
                 report,
                 broken: Arc::clone(&broken),
                 written: Arc::clone(&written),
@@ -1408,6 +1474,9 @@ mod file {
         file: Option<File>,
         /// Held while the client runs: the file is its alone.
         _lock: File,
+        /// The same, as the TypeScript client in Node takes it on Linux.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        _named: std::os::unix::net::UnixListener,
         report: Report,
         broken: Arc<AtomicBool>,
         /// The highest mark written, and who hears it rose.
