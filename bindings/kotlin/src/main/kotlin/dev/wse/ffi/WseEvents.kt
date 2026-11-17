@@ -130,6 +130,15 @@ fun WseClient.events(maxItems: UInt = 256u, maxBytes: UInt = 1u shl 20): WseEven
  */
 suspend fun WseClient.send(kind: String, json: String) = send(kind, json, WseCancel())
 
+/**
+ * Sends once each of [topics] is continuous on the connection (see `topicStates()`),
+ * waiting for room in the queue; until then it waits, in order with the others that
+ * wait. Cancelling the coroutine gives up the wait for room; a message already queued
+ * still goes.
+ */
+suspend fun WseClient.sendRequiring(kind: String, json: String, topics: List<String>) =
+    sendRequiring(kind, json, topics, WseCancel())
+
 /** Sends on the connection that is ready now, or not at all, waiting for room in the queue. */
 suspend fun WseClient.sendLive(kind: String, json: String) = sendLive(kind, json, WseCancel())
 

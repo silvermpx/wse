@@ -469,6 +469,7 @@ impl<H: Handler> Driver<H> {
                 socket.close("client error");
                 return Lost::Fatal(error);
             }
+            self.session.release_waiting();
             if let Err(lost) = self.write(&socket) {
                 return lost;
             }
@@ -568,7 +569,7 @@ impl<H: Handler> Driver<H> {
                         self.session.alive_at(now);
                     }
                 }
-                Some(frame) = self.frames.recv(), if self.session.ready && room => {
+                Some(frame) = self.frames.recv(), if self.takes_frames() && room => {
                     self.session.queue(frame);
                     for _ in 1..SEND_BATCH {
                         match self.frames.try_recv() {
@@ -610,6 +611,12 @@ impl<H: Handler> Driver<H> {
                 }
             }
         }
+    }
+
+    /// Sends are taken from the queue: the connection is ready, and the sends
+    /// that wait for their topics leave room (they count against the queue).
+    fn takes_frames(&self) -> bool {
+        self.session.ready && self.session.waiting() < self.config.send_queue
     }
 
     /// What the application sent before it closed goes out first.

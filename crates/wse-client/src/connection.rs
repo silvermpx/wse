@@ -243,6 +243,7 @@ impl<H: Handler> Driver<H> {
                 self.close(&mut ws, CloseCode::Normal, "client error").await;
                 return Lost::Fatal(error);
             }
+            self.session.release_waiting();
             if !self.session.outbox.is_empty() || flush {
                 flush = false;
                 if let Err(lost) = self.write_in_time(&mut ws).await {
@@ -316,7 +317,7 @@ impl<H: Handler> Driver<H> {
                         self.session.alive_at(now);
                     }
                 }
-                Some(frame) = self.frames.recv(), if self.session.ready => {
+                Some(frame) = self.frames.recv(), if self.takes_frames() => {
                     self.session.queue(frame);
                     for _ in 1..SEND_BATCH {
                         match self.frames.try_recv() {
@@ -418,6 +419,12 @@ impl<H: Handler> Driver<H> {
             _ => return self.session.sealing.is_none(),
         };
         frames::on_data(&mut self.decoder, &mut self.session, data)
+    }
+
+    /// Sends are taken from the queue: the connection is ready, and the sends
+    /// that wait for their topics leave room (they count against the queue).
+    fn takes_frames(&self) -> bool {
+        self.session.ready && self.session.waiting() < self.config.send_queue
     }
 
     /// What the application sent before it closed goes out first.

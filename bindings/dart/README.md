@@ -100,6 +100,11 @@ await for (final item in client.events()) {
 The checkpoint is bound to the realm, the user, the consumer and the schema;
 one of anything else is refused with a `checkpointRejected` item. Recovery
 starts from it, so a message that came but was not applied comes again.
+`await client.sendRequiring('cancel', json, ['orders'])` sends once each of
+the topics is continuous on the connection, checked right before it goes
+(after a reconnect it waits for the resync); sends that require nothing go
+past it, and once the server takes a connection for another user it goes
+nowhere.
 
 ## Certificates
 

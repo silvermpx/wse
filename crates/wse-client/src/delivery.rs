@@ -310,6 +310,15 @@ impl Gate {
             .collect()
     }
 
+    /// Each of `topics` held and continuous: a send that requires them may go.
+    pub(crate) fn continuous(&self, topics: &[String]) -> bool {
+        topics.iter().all(|topic| {
+            self.states
+                .get(topic)
+                .is_some_and(|state| state.continuity == Continuity::Continuous)
+        })
+    }
+
     /// What the gate made outside what the application hears, next.
     pub(crate) fn take_out(&mut self) -> Option<Incoming> {
         self.out.pop_front()
@@ -843,27 +852,44 @@ fn continuity_event(topic: &str, state: &State) -> Incoming {
 
 /// The application's handler behind the gate, for a client made with one:
 /// what the session hands out passes the gate in the order the handler hears
-/// it. Without a gate (the [`Events`](crate::Events) stream's queue, read
-/// behind one of its own) everything passes as it is.
+/// it. Not `before` the handler (the [`Events`](crate::Events) stream's
+/// queue, read behind the gate) everything passes as it is.
 pub(crate) struct Delivered<H> {
     pub(crate) inner: H,
-    gate: Option<Shared>,
+    gate: Shared,
+    before: bool,
 }
 
 impl<H: Handler> Delivered<H> {
-    pub(crate) fn new(inner: H, gate: Option<Shared>) -> Self {
-        Self { inner, gate }
+    pub(crate) fn new(inner: H, gate: Shared, before: bool) -> Self {
+        Self {
+            inner,
+            gate,
+            before,
+        }
+    }
+
+    /// `inner` with a gate of its own that it does not stand behind.
+    #[cfg(test)]
+    pub(crate) fn passing(inner: H) -> Self {
+        let gate = Gate::new(None, "ws://x", &[]).expect("best effort");
+        Self::new(inner, Arc::new(Mutex::new(gate)), false)
+    }
+
+    /// The delivery's gate, wherever it stands.
+    pub(crate) fn gate(&self) -> &Shared {
+        &self.gate
     }
 
     /// What the gate made outside the session's hand-out (held messages
     /// handed on, a refused checkpoint, what an event led to), to the handler
     /// now, the gate let go while it runs.
     pub(crate) fn drain(&mut self) {
-        let Some(gate) = &self.gate else {
+        if !self.before {
             return;
-        };
+        }
         loop {
-            let next = lock(gate).take_out();
+            let next = lock(&self.gate).take_out();
             match next {
                 Some(Incoming::Message(message)) => self.inner.message(&message.as_message()),
                 Some(Incoming::Event(event)) => self.inner.event(event),
@@ -876,12 +902,12 @@ impl<H: Handler> Delivered<H> {
 
 impl<H: Handler> Handler for Delivered<H> {
     fn message(&mut self, message: &Message<'_>) {
-        let Some(gate) = &self.gate else {
+        if !self.before {
             self.inner.message(message);
             return;
-        };
+        }
         // The gate is let go before the handler runs: it may commit.
-        let generation = lock(gate).message(message);
+        let generation = lock(&self.gate).message(message);
         match generation {
             Some(generation) if generation == message.generation => self.inner.message(message),
             Some(generation) => {
@@ -895,8 +921,8 @@ impl<H: Handler> Handler for Delivered<H> {
     }
 
     fn event(&mut self, event: Event) {
-        if let Some(gate) = &self.gate {
-            lock(gate).event(&event);
+        if self.before {
+            lock(&self.gate).event(&event);
         }
         self.inner.event(event);
         self.drain();

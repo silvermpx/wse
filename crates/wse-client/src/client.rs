@@ -65,6 +65,9 @@ pub(crate) struct Queued {
     /// A signed or live message goes on the connection it was sent on
     /// ([`Shared::connections`]), or not at all.
     pub(crate) only_on: Option<u64>,
+    /// Topics that must each be continuous when it goes: until then it
+    /// waits, in order with the others that wait.
+    pub(crate) requires: Option<Box<[String]>>,
 }
 
 /// The user and connection a message was sent for.
@@ -80,6 +83,15 @@ impl SentFor {
             text,
             user: self.user,
             only_on: None,
+            requires: None,
+        }
+    }
+
+    /// For when each of `topics` is continuous.
+    fn requiring(&self, text: String, topics: Box<[String]>) -> Queued {
+        Queued {
+            requires: Some(topics),
+            ..self.frame(text)
         }
     }
 
@@ -206,9 +218,10 @@ impl Client {
         config.committed = Some(Arc::new(move |user| {
             delivery::lock(&committed).committed(user)
         }));
-        let (wake, in_session) = match reader {
-            Some(reader) => (Wake::Reader(reader), None),
-            None => (Wake::Session, Some(Arc::clone(&gate))),
+        let before_handler = reader.is_none();
+        let wake = match reader {
+            Some(reader) => Wake::Reader(reader),
+            None => Wake::Session,
         };
         let keys = Arc::new(Keys::from_config(&config)?);
         // Read into the keys: the bytes of this copy go.
@@ -241,7 +254,7 @@ impl Client {
         if let Ok(mut slot) = shared.stop.lock() {
             *slot = Some(stop);
         }
-        let handler = crate::delivery::Delivered::new(handler, in_session);
+        let handler = crate::delivery::Delivered::new(handler, Arc::clone(&gate), before_handler);
         let driver = Driver::new(
             config, handler, shared, keys, frames_rx, control_rx, status_tx,
         );
@@ -335,6 +348,57 @@ impl Client {
             .send(for_now.live(text))
             .await
             .map_err(|_| Error::Closed)
+    }
+
+    /// Sends a message `{"t": kind, "p": payload}` once each of `topics` is
+    /// continuous on the connection (the delivery's
+    /// [`TopicState`](crate::TopicState)): until then it waits, in order with
+    /// the others that wait, while sends that require nothing go past it.
+    /// It is checked as it is taken to go out, so one waiting does not go
+    /// after a reconnect before the resync; it is the user's who made it, and
+    /// goes nowhere once the server takes a connection for another. Waits
+    /// for room in the queue.
+    pub async fn send_requiring<P, I, T>(
+        &self,
+        kind: &str,
+        payload: &P,
+        topics: I,
+    ) -> Result<(), Error>
+    where
+        P: Serialize + ?Sized,
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        let for_now = self.ready()?;
+        let text = encode(kind, payload)?;
+        let topics: Box<[String]> = topics.into_iter().map(Into::into).collect();
+        self.frames
+            .send(for_now.requiring(text, topics))
+            .await
+            .map_err(|_| Error::Closed)
+    }
+
+    /// [`Client::send_requiring`], failing at once when the queue is full.
+    pub fn try_send_requiring<P, I, T>(
+        &self,
+        kind: &str,
+        payload: &P,
+        topics: I,
+    ) -> Result<(), Error>
+    where
+        P: Serialize + ?Sized,
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        let for_now = self.ready()?;
+        let text = encode(kind, payload)?;
+        let topics: Box<[String]> = topics.into_iter().map(Into::into).collect();
+        self.frames
+            .try_send(for_now.requiring(text, topics))
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => Error::Full,
+                mpsc::error::TrySendError::Closed(_) => Error::Closed,
+            })
     }
 
     /// Sends JSON text as it is: a message the application built itself.
@@ -482,16 +546,14 @@ impl Client {
         self.wake()
     }
 
-    /// What the gate made goes to the application.
+    /// What the gate made goes to the application, and the sends that wait
+    /// for their topics are looked at again.
     fn wake(&self) -> Result<(), Error> {
-        match &self.wake {
-            Wake::Session => self.control(Control::Drain),
+        if let Wake::Reader(reader) = &self.wake {
             // A stream nobody reads any more has nobody to tell.
-            Wake::Reader(reader) => {
-                let _ = reader.send(());
-                Ok(())
-            }
+            let _ = reader.send(());
         }
+        self.control(Control::Drain)
     }
 
     /// Drops the connection and makes it again at once.

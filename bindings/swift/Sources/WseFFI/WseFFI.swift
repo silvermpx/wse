@@ -815,6 +815,12 @@ public protocol WseClientProtocol: AnyObject, Sendable {
     func sendLive(kind: String, json: String, cancel: WseCancel) async throws
 
     /**
+     * `try_send_requiring`, waiting for room in the queue; `cancel` gives up the wait (a
+     * message already queued still goes).
+     */
+    func sendRequiring(kind: String, json: String, topics: [String], cancel: WseCancel) async throws
+
+    /**
      * Sends a signed message on this connection, or not at all; the nonce it went with.
      */
     func sendSigned(kind: String, json: String, nonce: String?, cancel: WseCancel) async throws  -> String
@@ -840,6 +846,15 @@ public protocol WseClientProtocol: AnyObject, Sendable {
      * queue is full.
      */
     func trySendLive(kind: String, json: String) throws
+
+    /**
+     * Sends `{"t": kind, "p": json}` once each of `topics` is continuous on the connection
+     * (see `topic_states`); until then it waits, in order with the others that wait, while
+     * sends that require nothing go past it. It belongs to the user who sent it and goes
+     * nowhere once the server takes a connection for another. Fails at once when the queue
+     * is full.
+     */
+    func trySendRequiring(kind: String, json: String, topics: [String]) throws
 
     func unsubscribe(topics: [String]) throws
 
@@ -1079,6 +1094,26 @@ open func sendLive(kind: String, json: String, cancel: WseCancel)async throws   
 }
 
     /**
+     * `try_send_requiring`, waiting for room in the queue; `cancel` gives up the wait (a
+     * message already queued still goes).
+     */
+open func sendRequiring(kind: String, json: String, topics: [String], cancel: WseCancel)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_wse_ffi_fn_method_wseclient_send_requiring(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(kind),FfiConverterString.lower(json),FfiConverterSequenceString.lower(topics),FfiConverterTypeWseCancel_lower(cancel)
+                )
+            },
+            pollFunc: ffi_wse_ffi_rust_future_poll_void,
+            completeFunc: ffi_wse_ffi_rust_future_complete_void,
+            freeFunc: ffi_wse_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeWseError_lift
+        )
+}
+
+    /**
      * Sends a signed message on this connection, or not at all; the nonce it went with.
      */
 open func sendSigned(kind: String, json: String, nonce: String?, cancel: WseCancel)async throws  -> String  {
@@ -1152,6 +1187,24 @@ open func trySendLive(kind: String, json: String)throws   {try rustCallWithError
             self.uniffiCloneHandle(),
         FfiConverterString.lower(kind),
         FfiConverterString.lower(json),uniffiCallStatus
+    )
+}
+}
+
+    /**
+     * Sends `{"t": kind, "p": json}` once each of `topics` is continuous on the connection
+     * (see `topic_states`); until then it waits, in order with the others that wait, while
+     * sends that require nothing go past it. It belongs to the user who sent it and goes
+     * nowhere once the server takes a connection for another. Fails at once when the queue
+     * is full.
+     */
+open func trySendRequiring(kind: String, json: String, topics: [String])throws   {try rustCallWithError(FfiConverterTypeWseError_lift) {
+        uniffiCallStatus in
+    uniffi_wse_ffi_fn_method_wseclient_try_send_requiring(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(kind),
+        FfiConverterString.lower(json),
+        FfiConverterSequenceString.lower(topics),uniffiCallStatus
     )
 }
 }
@@ -2122,7 +2175,8 @@ public struct WseTopicState: Equatable, Hashable {
     public let subscription: WseSubscription
     public let continuity: WseContinuity
     /**
-     * Why it is not continuous: cold_start, reconnected, offset_gap, ...
+     * Why it is not continuous: cold_start, reconnected, requested, overflow, or the reason
+     * of the gap (timeout, not_recovered, epoch_changed, ...).
      */
     public let reason: String?
 
@@ -2130,7 +2184,8 @@ public struct WseTopicState: Equatable, Hashable {
     // declare one manually.
     public init(topic: String, subscription: WseSubscription, continuity: WseContinuity,
         /**
-         * Why it is not continuous: cold_start, reconnected, offset_gap, ...
+         * Why it is not continuous: cold_start, reconnected, requested, overflow, or the reason
+         * of the gap (timeout, not_recovered, epoch_changed, ...).
          */reason: String?) {
         self.topic = topic
         self.subscription = subscription
@@ -3734,6 +3789,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wse_ffi_checksum_method_wseclient_send_live() != 56021) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_wse_ffi_checksum_method_wseclient_send_requiring() != 22404) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_wse_ffi_checksum_method_wseclient_send_signed() != 57399) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3750,6 +3808,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_method_wseclient_try_send_live() != 32891) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wse_ffi_checksum_method_wseclient_try_send_requiring() != 1439) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_method_wseclient_unsubscribe() != 15024) {

@@ -167,6 +167,20 @@ class WseClient {
   void trySend(String kind, String json) =>
       _open.trySend(kind: kind, json: json);
 
+  /// Sends once each of [topics] is continuous on the connection (see
+  /// [topicStates]); until then it waits, in order with the others that
+  /// wait, while sends that require nothing go past it. It is the user's who
+  /// sent it: once the server takes a connection for another, it goes
+  /// nowhere. Waits for room in the queue.
+  Future<void> sendRequiring(String kind, String json, List<String> topics) =>
+      _closed
+      ? Future.error(_closedError)
+      : _native.sendRequiring(kind: kind, json: json, topics: topics);
+
+  /// [sendRequiring] at once; throws when the queue is full.
+  void trySendRequiring(String kind, String json, List<String> topics) =>
+      _open.trySendRequiring(kind: kind, json: json, topics: topics);
+
   /// Sends on the connection that is ready now, or not at all: never on a
   /// later one, for commands that must not run late. Waits for room in the
   /// queue; throws without a ready connection.

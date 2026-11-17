@@ -264,7 +264,10 @@ pub struct Config {
     pub headers: Vec<(String, String)>,
     /// Messages waiting to be sent at most; past it `try_send` fails and
     /// `send` waits (1024). What a lost connection did not write goes out
-    /// on the next one, once the server takes it.
+    /// on the next one, once the server takes it. Sends that wait for their
+    /// topics ([`Client::send_requiring`](crate::Client::send_requiring))
+    /// are held besides, as many at most: while that many wait, so does the
+    /// queue.
     pub send_queue: usize,
     /// The TLS configuration for `wss://`: an `Arc` of a
     /// `rustls::ClientConfig` of rustls 0.23, which this crate builds on,

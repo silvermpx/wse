@@ -66,6 +66,17 @@ object Wse {
             null
         }
 
+    /**
+     * Sends once each of [topics] is continuous on the connection, waiting for room in the
+     * queue; until then it waits, in order with the others that wait.
+     */
+    @JvmStatic
+    fun sendRequiring(client: WseClient, kind: String, json: String, topics: List<String>): CompletableFuture<Void?> =
+        calls.future {
+            client.sendRequiring(kind, json, topics)
+            null
+        }
+
     /** Sends on the connection that is ready now, or not at all, waiting for room in the queue. */
     @JvmStatic
     fun sendLive(client: WseClient, kind: String, json: String): CompletableFuture<Void?> =

@@ -184,7 +184,8 @@ pub struct WseTopicState {
     pub topic: String,
     pub subscription: WseSubscription,
     pub continuity: WseContinuity,
-    /// Why it is not continuous: cold_start, reconnected, offset_gap, ...
+    /// Why it is not continuous: cold_start, reconnected, requested, overflow, or the reason
+    /// of the gap (timeout, not_recovered, epoch_changed, ...).
     pub reason: Option<String>,
 }
 
@@ -647,6 +648,32 @@ impl WseClient {
         cancel: Arc<WseCancel>,
     ) -> Result<(), WseError> {
         Ok(self.0.send(kind, json, &cancel.0).await?)
+    }
+
+    /// Sends `{"t": kind, "p": json}` once each of `topics` is continuous on the connection
+    /// (see `topic_states`); until then it waits, in order with the others that wait, while
+    /// sends that require nothing go past it. It belongs to the user who sent it and goes
+    /// nowhere once the server takes a connection for another. Fails at once when the queue
+    /// is full.
+    pub fn try_send_requiring(
+        &self,
+        kind: String,
+        json: String,
+        topics: Vec<String>,
+    ) -> Result<(), WseError> {
+        Ok(self.0.try_send_requiring(&kind, &json, topics)?)
+    }
+
+    /// `try_send_requiring`, waiting for room in the queue; `cancel` gives up the wait (a
+    /// message already queued still goes).
+    pub async fn send_requiring(
+        &self,
+        kind: String,
+        json: String,
+        topics: Vec<String>,
+        cancel: Arc<WseCancel>,
+    ) -> Result<(), WseError> {
+        Ok(self.0.send_requiring(kind, json, topics, &cancel.0).await?)
     }
 
     /// Sends `{"t": kind, "p": json}` on the connection that is ready now, or not at all:

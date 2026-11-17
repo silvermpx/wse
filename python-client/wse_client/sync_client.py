@@ -272,11 +272,19 @@ class SyncWSEClient:
         signed: bool = False,
         nonce: str | None = None,
         live: bool = False,
+        requires: list[str] | tuple[str, ...] | None = None,
     ) -> SendResult:
-        """Send a message (blocks until sent). See :meth:`AsyncWSEClient.send`."""
+        """Send a message (blocks until sent, or until it waits for the
+        topics it requires). See :meth:`AsyncWSEClient.send`."""
         result = self._run(
             lambda c: c.send(
-                type, payload, priority=priority, signed=signed, nonce=nonce, live=live
+                type,
+                payload,
+                priority=priority,
+                signed=signed,
+                nonce=nonce,
+                live=live,
+                requires=requires,
             ),
             timeout=15.0,
             default=SendResult.FAILED,

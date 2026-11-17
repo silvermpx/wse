@@ -52,6 +52,35 @@ final class WseClientTests: XCTestCase {
         await client.disconnect(deadlineMs: 1_000)
     }
 
+    func testASendThatRequiresATopicWaitsForItsResync() async throws {
+        let client = try await WseClient.connect(
+            WseConfig(url: url, topics: ["ticks"], insecure: true, delivery: WseDelivery(consumer: "board")))
+        // One sequence, held across the reads.
+        let events = client.events()
+        var round: UInt64?
+        for try await item in events {
+            if case let .resync(r, _, _, _) = item {
+                round = r
+                break
+            }
+        }
+        func echoed() async throws -> String? {
+            for try await item in events {
+                if case let .message(message) = item, message.kind == "echoed" { return message.json }
+            }
+            return nil
+        }
+        try await client.sendRequiring(kind: "echo", json: #"{"n":1}"#, topics: ["ticks"])
+        try await client.send(kind: "echo", json: #"{"n":2}"#)
+        // The one that requires nothing goes past it.
+        let first = try await echoed()
+        XCTAssertEqual(first, #"{"n":2}"#)
+        client.resynced(round: try XCTUnwrap(round))
+        let second = try await echoed()
+        XCTAssertEqual(second, #"{"n":1}"#)
+        await client.disconnect(deadlineMs: 1_000)
+    }
+
     private func env(_ name: String) throws -> String {
         try XCTUnwrap(ProcessInfo.processInfo.environment[name], "run-tests.sh passes \(name)")
     }

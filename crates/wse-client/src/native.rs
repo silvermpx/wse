@@ -867,6 +867,42 @@ impl NativeClient {
         .await
     }
 
+    /// Sends `{"t": kind, "p": json}` once each of `topics` is continuous
+    /// on the connection; until then it waits, in order with the others
+    /// that wait. Fails at once when the queue is full. See
+    /// [`Client::send_requiring`].
+    pub fn try_send_requiring(
+        &self,
+        kind: &str,
+        json: &str,
+        topics: Vec<String>,
+    ) -> Result<(), NativeError> {
+        let payload = raw_json(json)?;
+        Ok(self.client.try_send_requiring(kind, &*payload, topics)?)
+    }
+
+    /// [`NativeClient::try_send_requiring`], waiting for room in the queue;
+    /// `cancel` gives up the wait (a message already queued still goes).
+    pub async fn send_requiring(
+        &self,
+        kind: String,
+        json: String,
+        topics: Vec<String>,
+        cancel: &CancelToken,
+    ) -> Result<(), NativeError> {
+        let payload = raw_json(&json)?;
+        let client = self.client.clone();
+        let cancel = cancel.0.clone();
+        on_runtime(async move {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(cancelled("send_requiring")),
+                sent = client.send_requiring(&kind, &*payload, topics) => sent.map_err(NativeError::from),
+            }
+        })
+        .await
+    }
+
     /// Sends `{"t": kind, "p": json}` on the connection that is ready now,
     /// or not at all: never on a later one. For commands that must not run
     /// late. Fails at once when the queue is full.

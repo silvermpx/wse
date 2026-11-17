@@ -92,6 +92,26 @@ class WseClientTest {
     }
 
     @Test
+    fun aSendThatRequiresATopicWaitsForItsResync(): Unit = runBlocking {
+        val client = connectClient(
+            WseConfig(url = url, topics = listOf("ticks"), insecure = true, delivery = WseDelivery(consumer = "board")),
+        )
+        val events = client.events()
+        var resync: WseItem.Resync? = null
+        while (resync == null) {
+            val item = events.next() ?: break
+            if (item is WseItem.Resync) resync = item
+        }
+        client.sendRequiring("echo", """{"n":1}""", listOf("ticks"))
+        client.send("echo", """{"n":2}""")
+        // The one that requires nothing goes past it.
+        assertEquals("""{"n":2}""", message(events, "echoed").json)
+        client.resynced(resync!!.round)
+        assertEquals("""{"n":1}""", message(events, "echoed").json)
+        client.disconnect(1_000u)
+    }
+
+    @Test
     fun wsGoesInTheClearOnlyWhenAsked(): Unit = runBlocking {
         assertFailsWith<WseException.Config> { connectClient(WseConfig(url = url)) }
     }

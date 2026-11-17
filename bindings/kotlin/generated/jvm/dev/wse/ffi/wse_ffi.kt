@@ -738,6 +738,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_send_live(
     ): Int
+    external fun uniffi_wse_ffi_checksum_method_wseclient_send_requiring(
+    ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_send_signed(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_status(
@@ -749,6 +751,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_wse_ffi_checksum_method_wseclient_try_send(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_try_send_live(
+    ): Int
+    external fun uniffi_wse_ffi_checksum_method_wseclient_try_send_requiring(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_unsubscribe(
     ): Int
@@ -817,6 +821,8 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_wse_ffi_fn_method_wseclient_send_live(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,`cancel`: Long,
     ): Long
+    external fun uniffi_wse_ffi_fn_method_wseclient_send_requiring(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,`topics`: RustBuffer.ByValue,`cancel`: Long,
+    ): Long
     external fun uniffi_wse_ffi_fn_method_wseclient_send_signed(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,`nonce`: RustBuffer.ByValue,`cancel`: Long,
     ): Long
     external fun uniffi_wse_ffi_fn_method_wseclient_status(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
@@ -828,6 +834,8 @@ internal object UniffiLib {
     external fun uniffi_wse_ffi_fn_method_wseclient_try_send(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_try_send_live(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_wse_ffi_fn_method_wseclient_try_send_requiring(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,`topics`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_unsubscribe(`ptr`: Long,`topics`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
@@ -1017,6 +1025,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_send_live() and 0xFFFF) != 56021) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_send_requiring() and 0xFFFF) != 22404) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_send_signed() and 0xFFFF) != 57399) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1033,6 +1044,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_try_send_live() and 0xFFFF) != 32891) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_try_send_requiring() and 0xFFFF) != 1439) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_unsubscribe() and 0xFFFF) != 15024) {
@@ -1982,6 +1996,12 @@ public interface WseClientInterface {
     suspend fun `sendLive`(`kind`: kotlin.String, `json`: kotlin.String, `cancel`: WseCancel)
 
     /**
+     * `try_send_requiring`, waiting for room in the queue; `cancel` gives up the wait (a
+     * message already queued still goes).
+     */
+    suspend fun `sendRequiring`(`kind`: kotlin.String, `json`: kotlin.String, `topics`: List<kotlin.String>, `cancel`: WseCancel)
+
+    /**
      * Sends a signed message on this connection, or not at all; the nonce it went with.
      */
     suspend fun `sendSigned`(`kind`: kotlin.String, `json`: kotlin.String, `nonce`: kotlin.String?, `cancel`: WseCancel): kotlin.String
@@ -2007,6 +2027,15 @@ public interface WseClientInterface {
      * queue is full.
      */
     fun `trySendLive`(`kind`: kotlin.String, `json`: kotlin.String)
+
+    /**
+     * Sends `{"t": kind, "p": json}` once each of `topics` is continuous on the connection
+     * (see `topic_states`); until then it waits, in order with the others that wait, while
+     * sends that require nothing go past it. It belongs to the user who sent it and goes
+     * nowhere once the server takes a connection for another. Fails at once when the queue
+     * is full.
+     */
+    fun `trySendRequiring`(`kind`: kotlin.String, `json`: kotlin.String, `topics`: List<kotlin.String>)
 
     fun `unsubscribe`(`topics`: List<kotlin.String>)
 
@@ -2364,6 +2393,36 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
 
 
     /**
+     * `try_send_requiring`, waiting for room in the queue; `cancel` gives up the wait (a
+     * message already queued still goes).
+     */
+    @Throws(WseException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `sendRequiring`(`kind`: kotlin.String, `json`: kotlin.String, `topics`: List<kotlin.String>, `cancel`: WseCancel) {
+        return uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_wse_ffi_fn_method_wseclient_send_requiring(
+                uniffiHandle,
+
+        FfiConverterString.lower(`kind`),
+        FfiConverterString.lower(`json`),
+        FfiConverterSequenceString.lower(`topics`),
+        FfiConverterTypeWseCancel.lower(`cancel`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_wse_ffi_rust_future_poll_void(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_wse_ffi_rust_future_complete_void(future, continuation) },
+        { future -> UniffiLib.ffi_wse_ffi_rust_future_free_void(future) },
+        // lift function
+        { },
+
+        // Error FFI converter
+        WseException.ErrorHandler,
+    )
+    }
+
+
+    /**
      * Sends a signed message on this connection, or not at all; the nonce it went with.
      */
     @Throws(WseException::class)
@@ -2467,6 +2526,29 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
 
         FfiConverterString.lower(`kind`),
         FfiConverterString.lower(`json`),_status)
+}
+    }
+
+
+
+
+    /**
+     * Sends `{"t": kind, "p": json}` once each of `topics` is continuous on the connection
+     * (see `topic_states`); until then it waits, in order with the others that wait, while
+     * sends that require nothing go past it. It belongs to the user who sent it and goes
+     * nowhere once the server takes a connection for another. Fails at once when the queue
+     * is full.
+     */
+    @Throws(WseException::class)override fun `trySendRequiring`(`kind`: kotlin.String, `json`: kotlin.String, `topics`: List<kotlin.String>)
+        =
+    callWithHandle {
+    uniffiRustCallWithError(WseException) { _status ->
+    UniffiLib.uniffi_wse_ffi_fn_method_wseclient_try_send_requiring(
+        it,
+
+        FfiConverterString.lower(`kind`),
+        FfiConverterString.lower(`json`),
+        FfiConverterSequenceString.lower(`topics`),_status)
 }
     }
 
@@ -3411,7 +3493,8 @@ data class WseTopicState (
     val `continuity`: WseContinuity
     ,
     /**
-     * Why it is not continuous: cold_start, reconnected, offset_gap, ...
+     * Why it is not continuous: cold_start, reconnected, requested, overflow, or the reason
+     * of the gap (timeout, not_recovered, epoch_changed, ...).
      */
     val `reason`: kotlin.String?
 

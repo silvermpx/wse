@@ -38,6 +38,14 @@ public extension WseClient {
         try await cancellable { try await self.send(kind: kind, json: json, cancel: $0) }
     }
 
+    /// Sends once each of `topics` is continuous on the connection (see
+    /// `topicStates()`), waiting for room in the queue; until then it waits,
+    /// in order with the others that wait. Cancelling the Task gives up the
+    /// wait for room; a message already queued still goes.
+    func sendRequiring(kind: String, json: String, topics: [String]) async throws {
+        try await cancellable { try await self.sendRequiring(kind: kind, json: json, topics: topics, cancel: $0) }
+    }
+
     /// Sends on the connection that is ready now, or not at all, waiting for
     /// room in the queue. Cancelling the Task gives up the wait.
     func sendLive(kind: String, json: String) async throws {

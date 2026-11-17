@@ -15,7 +15,7 @@ import pytest
 from wse_client import Continuity, DeliveryConfig, Subscription
 from wse_client.client import AsyncWSEClient
 from wse_client.delivery import Delivery
-from wse_client.types import ConnectionState, WSEEvent
+from wse_client.types import ConnectionState, SendResult, WSEEvent
 
 EPOCH = "0000000a"
 URL = "ws://localhost:5006/wse"
@@ -340,3 +340,91 @@ def test_the_shared_checkpoint_vectors_refused(case):
     gate, user = _gate(case["saved"])
     assert all(not streams for streams in (gate.committed(user) or {}).values())
     assert _rejected(gate) == [case["reason"]]
+
+
+def sent_types(client: AsyncWSEClient) -> list[str]:
+    return [
+        json.loads(call[0][0])["t"] for call in client._connection.send.call_args_list
+    ]
+
+
+async def settle() -> None:
+    """The releases scheduled so far run."""
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+class TestRequires:
+    async def test_a_send_that_requires_a_topic_waits_for_its_resync(self):
+        c = make_client()
+        round_ = await connected(c)
+        c._connection.send.reset_mock()
+        assert (
+            await c.send("cancel", {"id": 1}, requires=["prices"]) is SendResult.QUEUED
+        )
+        assert await c.send("note", {}) is SendResult.SENT
+        await settle()
+        assert sent_types(c) == ["note"], "the one that requires nothing goes past it"
+        c.resynced(round_["round"])
+        await settle()
+        assert sent_types(c) == ["note", "cancel"]
+
+    async def test_it_waits_again_after_a_reconnect(self):
+        c = make_client()
+        c.resynced((await connected(c))["round"])
+        c._on_transport_close()
+        c._connection.send.reset_mock()
+        await c.send("cancel", {"id": 1}, requires=["prices"])
+        # The connection is back, the topic not resynced yet.
+        c._on_raw_message(server_ready("ann"))
+        c._resubscribe_pending = {"prices"}
+        await c._resubscribe()
+        c._on_raw_message(taken("prices"))
+        round_ = resync_of(drain(c))
+        c._release_soon()
+        await settle()
+        assert "cancel" not in sent_types(c)
+        c.resynced(round_["round"])
+        await settle()
+        assert sent_types(c)[-1] == "cancel"
+
+    async def test_one_sent_as_the_last_user_goes_nowhere(self):
+        c = make_client(None)
+        c._on_raw_message(server_ready("ann"))
+        await c.send("cancel", {"id": 1}, requires=["orders"])
+        c._on_transport_close()
+        c._on_raw_message(server_ready("bob"))
+        c._connection.send.reset_mock()
+        await c.subscribe(["orders"])  # held in best effort: continuous
+        await settle()
+        assert "cancel" not in sent_types(c)
+        assert not c._waiting
+
+    async def test_in_best_effort_it_goes_while_the_topic_is_continuous(self):
+        c = make_client(None)
+        c._on_raw_message(server_ready("lee"))
+        await c.subscribe(["prices"])
+        c._connection.send.reset_mock()
+        assert await c.send("cancel", {}, requires=["prices"]) is SendResult.SENT
+        c._report_gap("prices", EPOCH, 2, 3, "timeout")
+        assert await c.send("cancel", {}, requires=["prices"]) is SendResult.QUEUED
+        await settle()
+        assert sent_types(c) == ["cancel"]
+        c.resync(["prices"])
+        await settle()
+        assert sent_types(c) == ["cancel", "cancel"]
+
+    async def test_it_does_not_go_with_signed_or_live(self):
+        c = make_client()
+        try:
+            await c.send("x", {}, requires=["prices"], live=True)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("requires with live is refused")
+        try:
+            await c.send("x", {}, requires="prices")  # type: ignore[arg-type]
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("a bare string is not a list of topics")

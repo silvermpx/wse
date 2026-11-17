@@ -130,7 +130,13 @@ class WseJavaTest {
             }
         }
         assertEquals(List.of("ticks"), resync.getTopics());
+        // A send that requires the topic waits for the resync; one that
+        // requires nothing goes past it.
+        Wse.sendRequiring(client, "echo", "{\"n\":1}", List.of("ticks")).get(10, SECONDS);
+        Wse.send(client, "echo", "{\"n\":2}").get(10, SECONDS);
+        assertEquals("{\"n\":2}", message(events, "echoed").getJson());
         Wse.resynced(client, resync);
+        assertEquals("{\"n\":1}", message(events, "echoed").getJson());
         WseMessage tick = null;
         while (tick == null) {
             if (next(events) instanceof WseItem.Message m && "ticks".equals(m.getMessage().getTopic())) {

@@ -132,6 +132,10 @@ applying a message the app calls `client.commit(message)`;
 can come twice: apply a repeat safely. The user changes where the events show
 the server took the connection for another user: what came before is the last
 user's, and a message of theirs committed later counts for nobody.
+`client.sendRequiring(kind, json, listOf("orders"))` sends once each of the
+topics is continuous on the connection, checked right before it goes (after a
+reconnect it waits for the resync); sends that require nothing go past it, and
+once the server takes a connection for another user it goes nowhere.
 
 `events()` is the client's stream, until it closes; one reader at a time. A
 collector cancelled in between loses nothing: the next collection gets the
@@ -172,7 +176,8 @@ changes comes from `Wse.tokens(() -> fetchToken())`, a supplier of a
 `CompletionStage<String>` asked before each connection attempt. The
 recover-or-resync delivery is `Wse.config(url).delivery(Wse.delivery("board").checkpoint(saved).build())`;
 `Wse.resynced(client, resync)` and `Wse.commit(client, message)` answer its
-items. Signed messages: `Wse.generateSigningKey()`, `Wse.signingPublicKey(key)`
+items, and `Wse.sendRequiring(client, kind, json, List.of("orders"))` sends
+once the topics are continuous. Signed messages: `Wse.generateSigningKey()`, `Wse.signingPublicKey(key)`
 and `Wse.sendSigned(...)`. Kotlin's unsigned numbers are hidden from Java:
 `Wse.retryInMillis(...)`, `Wse.attempt(...)` and `Wse.closeCode(...)` give a
 `Disconnected` item's as plain numbers.

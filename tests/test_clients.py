@@ -55,6 +55,20 @@ async def subscribed(srv: RustWSEServer, topic: str) -> None:
             await asyncio.sleep(0.02)
 
 
+async def inbound_types(srv: RustWSEServer) -> list[str]:
+    """The types of the messages clients sent, once some came."""
+    async with asyncio.timeout(5):
+        while True:
+            got = [e[2]["t"] for e in srv.drain_inbound(64, 0) if e[0] == "msg"]
+            if got:
+                # What comes with them in the next moment, too.
+                await asyncio.sleep(0.2)
+                got += [e[2]["t"] for e in srv.drain_inbound(64, 0) if e[0] == "msg"]
+                return got
+            # The client's own tasks run meanwhile.
+            await asyncio.sleep(0.02)
+
+
 def publish(srv: RustWSEServer, topic: str, n: int) -> None:
     srv.broadcast_local(topic, json.dumps({"t": "tick", "p": {"n": n}}))
 
@@ -122,12 +136,19 @@ class TestRecoverOrResync:
             await client.connect()
             resync = await next_of_type(client, "resync")
             assert resync.payload["reasons"] == {"prices": "cold_start"}
+            # A send that requires the topic waits for the resync; one that
+            # requires nothing goes past it.
+            queued = await client.send("cancel", {"id": 1}, requires=["prices"])
+            assert queued is wse_client.SendResult.QUEUED
+            assert await client.send("note", {}) is wse_client.SendResult.SENT
+            assert await inbound_types(srv) == ["note"]
             await subscribed(srv, "prices")
             for n in range(3):
                 publish(srv, "prices", n)
             with pytest.raises(TimeoutError):
                 await next_of_type(client, "tick", timeout=0.3)
             client.resynced(resync.payload["round"])
+            assert await inbound_types(srv) == ["cancel"]
             ticks = [await next_of_type(client, "tick") for _ in range(3)]
             assert [t.payload["n"] for t in ticks] == [0, 1, 2]
             # 0 and 1 applied; 2 came but was not.

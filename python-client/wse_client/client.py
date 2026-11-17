@@ -125,6 +125,18 @@ class _Request:
     named: tuple[str, ...] = ()
 
 
+@dataclass(eq=False, slots=True)
+class _Waiting:
+    """A send that waits until each topic it requires is continuous."""
+
+    encoded: str
+    topics: tuple[str, ...]
+
+
+#: Sends that wait for their topics at most; past it a send that requires
+#: topics fails.
+_MAX_WAITING = 1000
+
 #: How long past the server's history_ttl a stream that heard nothing while
 #: connected is still named: the clocks of a server and a client do not tick
 #: together.
@@ -406,6 +418,11 @@ class AsyncWSEClient:
         self._offline_queue = OfflineQueue(
             max_size=1000, max_age=3600.0, enabled=offline_queue
         )
+        # Sends that wait for their topics (send(requires=...)), in the order
+        # they were sent, and whether a release runs or is asked for again.
+        self._waiting: deque[_Waiting] = deque()
+        self._releasing = False
+        self._release_again = False
 
         # Event queue for async iteration (created lazily in connect() to avoid
         # RuntimeError when instantiated outside a running event loop)
@@ -722,6 +739,7 @@ class AsyncWSEClient:
         signed: bool = False,
         nonce: str | None = None,
         live: bool = False,
+        requires: list[str] | tuple[str, ...] | None = None,
     ) -> SendResult:
         """Send a message to the server.
 
@@ -740,22 +758,43 @@ class AsyncWSEClient:
             live: Only on the connection that is open now: never held by the
                 offline queue for a later connection. For commands that must
                 not run late (a valve, a door, an order).
+            requires: Topics that must each be continuous (``topic_states``)
+                when it goes: until then it waits in memory, in order with the
+                others that wait, while sends that require nothing go past
+                it. It is checked right before it goes, so after a reconnect
+                it waits for the resync. It is the user's who sent it: once
+                the server takes a connection for another, it goes nowhere.
+                Never in the offline queue; at most 1,000 wait.
 
         Returns:
             ``SendResult.SENT`` when it went out; ``SendResult.QUEUED`` when
             it is held by the offline queue (``offline_queue=True``) for the
-            next reconnect; ``SendResult.FAILED`` (falsy) when it was neither
-            sent nor queued (not connected, rate limited). A signed or live
-            message is never queued: a signed one is signed for this server
-            and valid for its signature window, so without a connection it
-            fails, as a live one does.
+            next reconnect, or waits for the topics it requires;
+            ``SendResult.FAILED`` (falsy) when it was neither sent nor queued
+            (not connected, rate limited). A signed or live message is never
+            queued: a signed one is signed for this server and valid for its
+            signature window, so without a connection it fails, as a live one
+            does.
 
         Raises:
             WSEEncryptionError: ``encryption=True`` and the key exchange of
                 the current connection failed; nothing was sent.
             WSEError: ``signed=True`` without ``signing_key``, or before the
                 server's ``server_hello`` named its signing key.
+            ValueError: ``requires`` with ``signed`` or ``live``, which never
+                wait.
         """
+        if requires is not None:
+            if isinstance(requires, str):
+                raise TypeError("requires takes a list of topics")
+            if signed or live:
+                raise ValueError(
+                    "requires does not go with signed or live: they never wait"
+                )
+            encoded = self._codec.encode(
+                type, payload or {}, priority=priority, correlation_id=correlation_id
+            )
+            return await self._send_requiring(encoded, tuple(requires), priority, type)
         if signed:
             if self._signer is None:
                 raise WSEError("signed=True needs AsyncWSEClient(signing_key=...)")
@@ -921,6 +960,8 @@ class AsyncWSEClient:
         if ok:
             self._note_recovery_requested(recovery_info)
             self._stats.messages_sent += 1
+        # In best effort a topic held is continuous: what waits for it goes.
+        self._release_soon()
         return ok
 
     async def unsubscribe(self, topics: list[str]) -> bool:
@@ -982,6 +1023,7 @@ class AsyncWSEClient:
         (from a handler: once it returned)."""
         self._delivery.resynced(round)
         self._drain_soon()
+        self._release_soon()
 
     def resync(self, topics: list[str]) -> None:
         """Bring *topics* up to date: in recover-or-resync a resync round asks
@@ -989,6 +1031,7 @@ class AsyncWSEClient:
         continuous again."""
         self._delivery.resync(list(topics))
         self._drain_soon()
+        self._release_soon()
 
     async def request_snapshot(self, topics: list[str] | None = None) -> bool:
         """Request a state snapshot from the server.
@@ -1470,6 +1513,7 @@ class AsyncWSEClient:
         await self._resubscribe()
         if self._offline_queue.size > 0:
             await self._flush_offline_queue()
+        self._release_soon()
 
     def _handshake_failure(self) -> WSEError | None:
         """Why a handshake that timed out failed; None for a server that
@@ -1628,6 +1672,71 @@ class AsyncWSEClient:
             self._stats.bytes_sent += len(encoded.encode("utf-8"))
             return SendResult.SENT
         return self._queue_or_fail(encoded, priority, msg_type, allow_queue)
+
+    async def _send_requiring(
+        self, encoded: str, topics: tuple[str, ...], priority: int, msg_type: str
+    ) -> SendResult:
+        """A send that waits until each of *topics* is continuous."""
+        if self._encryption_error is not None:
+            raise self._encryption_error
+        if (
+            not self._waiting
+            and self._connection.is_connected
+            and self._delivery.continuous(topics)
+        ):
+            return await self._send_app_frame(
+                encoded, priority=priority, msg_type=msg_type, allow_queue=False
+            )
+        if len(self._waiting) >= _MAX_WAITING:
+            logger.warning(
+                "%d sends wait for their topics; '%s' not sent", _MAX_WAITING, msg_type
+            )
+            return SendResult.FAILED
+        if self._rate_limiter is not None and not self._rate_limiter.try_consume():
+            self._note_rate_limited(msg_type)
+            return SendResult.FAILED
+        self._waiting.append(_Waiting(encoded, topics))
+        self._release_soon()
+        return SendResult.QUEUED
+
+    def _release_soon(self) -> None:
+        """The sends whose topics are continuous go, once the loop runs."""
+        if not self._waiting or not self._connection.is_connected:
+            return
+        if self._releasing:
+            self._release_again = True
+            return
+        self._releasing = True
+        try:
+            self._fire_task(self._release_waiting())
+        except RuntimeError:  # no running loop
+            self._releasing = False
+
+    async def _release_waiting(self) -> None:
+        """The sends whose topics are continuous go, in the order they were
+        sent, each checked right before it goes; the others keep their
+        place."""
+        try:
+            while True:
+                self._release_again = False
+                for item in list(self._waiting):
+                    if not self._connection.is_connected:
+                        return
+                    if not self._delivery.continuous(item.topics):
+                        continue
+                    if not await self._transmit(item.encoded):
+                        # The connection went: it goes on a later one.
+                        return
+                    try:
+                        self._waiting.remove(item)
+                    except ValueError:
+                        pass  # dropped meanwhile (another user's connection)
+                    self._stats.messages_sent += 1
+                    self._stats.bytes_sent += len(item.encoded.encode("utf-8"))
+                if not self._release_again:
+                    return
+        finally:
+            self._releasing = False
 
     def _queue_or_fail(
         self, encoded: str, priority: int, msg_type: str, allow_queue: bool
@@ -2222,10 +2331,11 @@ class AsyncWSEClient:
         self._unrecoverable.clear()
         self._recovery_requests.clear()
         self._live_since.clear()
-        dropped = self._offline_queue.drain()
+        dropped = len(self._offline_queue.drain()) + len(self._waiting)
+        self._waiting.clear()
         if dropped:
             logger.warning(
-                "%d messages queued as the previous user were dropped", len(dropped)
+                "%d messages queued as the previous user were dropped", dropped
             )
 
     def _forget_topic(self, topic: str) -> None:

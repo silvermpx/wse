@@ -202,6 +202,33 @@ void main() {
     throw StateError('the events ended before $kind');
   }
 
+  test('a send that requires a topic waits for its resync', () async {
+    final client = await WseClient.connect(
+      wseConfig(
+        url,
+        topics: ['ticks'],
+        insecure: true,
+        delivery: wseDelivery('board'),
+      ),
+    );
+    final items = StreamIterator(client.events());
+    WseItem? resync;
+    while (await items.moveNext()) {
+      if (items.current.kind == WseItemKind.resync) {
+        resync = items.current;
+        break;
+      }
+    }
+    await client.sendRequiring('echo', '{"n":1}', ['ticks']);
+    await client.send('echo', '{"n":2}');
+    // The one that requires nothing goes past it.
+    expect((await message(items, 'echoed')).json, '{"n":2}');
+    client.resynced(resync!.round!);
+    expect((await message(items, 'echoed')).json, '{"n":1}');
+    await items.cancel();
+    await client.close();
+  });
+
   test('an encrypted session with the pinned server', () async {
     final identity = Platform.environment['WSE_TEST_IDENTITY']!;
     final client = await WseClient.connect(

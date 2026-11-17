@@ -103,7 +103,8 @@ class SendResult(IntEnum):
 
     Truthy when the message was accepted: ``SENT`` went out on the socket,
     ``QUEUED`` is held by the opt-in offline queue (``offline_queue=True``) and
-    goes out once after the next reconnect. ``FAILED`` (falsy) was neither sent
+    goes out once after the next reconnect, or waits for the topics it requires
+    (``send(requires=...)``). ``FAILED`` (falsy) was neither sent
     nor queued -- not connected, rate limited, or the connection dropped -- so
     the caller decides whether to retry.
     """

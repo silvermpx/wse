@@ -31,6 +31,11 @@
   `continuity` and `checkpoint_rejected` events, and `commit`, `checkpoint`,
   `resynced`, `resync` and `topic_states`; `SyncWSEClient` takes it too, and
   each of its connects starts from what the last one committed.
+- A send that waits for its topics, as the TypeScript client's `requires`,
+  in every client: `send_requiring` in Rust (natively and in the browser),
+  `sendRequiring` in Swift, Kotlin, Java and Dart, `send(requires=...)` in
+  Python. It goes once each topic is continuous on the connection, checked
+  right before it goes, and is the sending user's.
 - TypeScript: `wake()` and `close(deadlineMs)` for a client without a page
   (Node, Electron's main process, a worker): `wake()` connects at once when
   the application hears the network or the machine is back, and `close`
@@ -97,8 +102,9 @@ holds a topic until the application reloaded its state.
   and the mobile clients): a topic that is not continuous holds its messages
   until the application's resync handler loaded its state. The checkpoint is
   what the consumer committed (`commit`, `checkpoint()`), bound to the realm,
-  user, consumer and schema; recovery starts from it. A send can require
-  topics to be continuous (`requires`), checked right before it goes out.
+  user, consumer and schema; recovery starts from it. A TypeScript send can
+  require topics to be continuous (`requires`), checked right before it goes
+  out.
 - Recovery positions per stream: the request names the client's offset in
   every stream of a topic and the reply lists the server's (`streams`;
   `features.history_ttl` says how long a quiet stream stays recoverable). In

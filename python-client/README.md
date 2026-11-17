@@ -400,6 +400,13 @@ When the server takes a connection for another user than the last, the client
 forgets where the last one's topics stood and drops what it queued, in either
 mode.
 
+`await client.send("cancel", {"id": 9}, requires=["orders"])` waits in memory
+until each topic it requires is continuous on the connection (it returns
+`SendResult.QUEUED`), checked right before it goes, so after a reconnect it
+waits for the resync; sends that require nothing go past it. It is the user's
+who sent it: once the server takes a connection for another, it goes nowhere.
+It is never put in the offline queue, and at most 1,000 wait.
+
 ### Network Quality Monitoring
 
 Real-time network quality assessment based on PING/PONG round-trip measurements:

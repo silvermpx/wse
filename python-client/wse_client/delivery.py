@@ -199,6 +199,15 @@ class Delivery:
     def take_out(self) -> WSEEvent | None:
         return self._out.popleft() if self._out else None
 
+    def continuous(self, topics: tuple[str, ...]) -> bool:
+        """Each of *topics* held and continuous: a send that requires them
+        may go."""
+        for topic in topics:
+            state = self._states.get(topic)
+            if state is None or state.continuity is not Continuity.CONTINUOUS:
+                return False
+        return True
+
     # -- topics ----------------------------------------------------------------
 
     def track(self, topics: list[str]) -> None:

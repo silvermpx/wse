@@ -14,7 +14,7 @@ use web_time::Instant;
 
 use crate::client::{Queued, Shared};
 use crate::decode::{self, Envelope, epoch_of};
-use crate::delivery::Delivered;
+use crate::delivery::{self, Delivered};
 use crate::error::Error;
 use crate::handler::{
     Connected, Event, Gap, GapReason, Handler, Recovery, ServerError, Subscribed,
@@ -105,6 +105,9 @@ pub(crate) struct Session<H> {
     next_deadline: Option<Instant>,
     /// What to send.
     pub(crate) outbox: Vec<Outgoing>,
+    /// Sends that wait until each topic they require is continuous, in the
+    /// order they were sent: on every connection, the last user's dropped.
+    waiting: VecDeque<Queued>,
 
     keys: Arc<Keys>,
 
@@ -173,6 +176,7 @@ impl<H: Handler> Session<H> {
             holes: 0,
             next_deadline: None,
             outbox: Vec::new(),
+            waiting: VecDeque::new(),
             ready: false,
             became_ready: false,
             connected_before: false,
@@ -203,15 +207,49 @@ impl<H: Handler> Session<H> {
 
     /// A message the application sent, for this connection's outbox: none
     /// that was sent as another user, or signed or sent live on another
-    /// connection.
+    /// connection; one that requires topics not continuous waits for them.
     pub(crate) fn queue(&mut self, frame: Queued) {
         if frame.user != self.users {
             tracing::warn!("[WSE] a message sent as the previous user was dropped");
         } else if frame.only_on.is_some_and(|on| on != self.connections) {
             tracing::warn!("[WSE] a message for a connection that went was dropped");
+        } else if frame
+            .requires
+            .as_deref()
+            .is_some_and(|topics| !delivery::lock(self.handler.gate()).continuous(topics))
+        {
+            self.waiting.push_back(frame);
         } else {
             self.outbox.push(Outgoing::Text(frame.text));
         }
+    }
+
+    /// Sends waiting for their topics.
+    pub(crate) fn waiting(&self) -> usize {
+        self.waiting.len()
+    }
+
+    /// The sends whose topics are continuous now go, in the order they were
+    /// sent, right before the outbox is written; one sent as the last user
+    /// goes nowhere.
+    pub(crate) fn release_waiting(&mut self) {
+        if self.waiting.is_empty() || !self.ready {
+            return;
+        }
+        let gate = delivery::lock(self.handler.gate());
+        let users = self.users;
+        self.waiting.retain_mut(|frame| {
+            if frame.user != users {
+                tracing::warn!("[WSE] a message sent as the previous user was dropped");
+                false
+            } else if gate.continuous(frame.requires.as_deref().unwrap_or_default()) {
+                self.outbox
+                    .push(Outgoing::Text(std::mem::take(&mut frame.text)));
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// A new connection: nothing of the last one carries over but the
@@ -1527,7 +1565,7 @@ mod tests {
         let shared = Arc::new(Shared::new(None));
         let keys = Arc::new(Keys::from_config(&crate::Config::new("ws://x")).unwrap());
         let mut session = Session::new(
-            Delivered::new(Seen::default(), None),
+            Delivered::passing(Seen::default()),
             shared,
             keys,
             &["t".to_owned()],
@@ -1854,6 +1892,50 @@ mod tests {
             panic!("connected");
         };
         assert!(again.reconnected);
+    }
+
+    /// A send that requires topics waits until each is continuous, while
+    /// the others go past it; one sent as the last user goes nowhere.
+    #[test]
+    fn a_send_that_requires_topics_waits_for_them_and_is_its_users() {
+        let mut s = session(Duration::from_secs(3));
+        ready(&mut s, true);
+        sent(&mut s);
+        let frame = |s: &Session<Seen>, kind: &str, requires: &[&str]| Queued {
+            text: format!(r#"{{"t":"{kind}","p":{{}}}}"#),
+            user: s.users,
+            only_on: None,
+            requires: (!requires.is_empty())
+                .then(|| requires.iter().map(|t| (*t).to_owned()).collect()),
+        };
+        let kinds = |s: &mut Session<Seen>| -> Vec<String> {
+            s.release_waiting();
+            sent(s)
+                .into_iter()
+                .map(|m| m["t"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        // Neither `a` nor `b` is held: not continuous.
+        s.queue(frame(&s, "first", &["a"]));
+        s.queue(frame(&s, "second", &["a", "b"]));
+        s.queue(frame(&s, "plain", &[]));
+        assert_eq!(kinds(&mut s), ["plain"]);
+        assert_eq!(s.waiting(), 2);
+        // Held in best effort, `a` is continuous: the first goes.
+        delivery::lock(s.handler.gate()).track(&["a".to_owned()]);
+        assert_eq!(kinds(&mut s), ["first"]);
+        delivery::lock(s.handler.gate()).track(&["b".to_owned()]);
+        assert_eq!(kinds(&mut s), ["second"]);
+
+        // Sent as the last user, it is not the next one's.
+        s.queue(frame(&s, "last users", &["c"]));
+        s.close();
+        s.open(None);
+        ready_as(&mut s, "someone else", true);
+        sent(&mut s);
+        delivery::lock(s.handler.gate()).track(&["c".to_owned()]);
+        assert!(kinds(&mut s).is_empty());
+        assert_eq!(s.waiting(), 0);
     }
 
     #[test]
@@ -2192,7 +2274,7 @@ mod tests {
         let shared = Arc::new(Shared::new(None));
         let keys = Arc::new(Keys::from_config(&crate::Config::new("ws://x")).unwrap());
         let mut s = Session::new(
-            Delivered::new(Decode(0.0), None),
+            Delivered::passing(Decode(0.0)),
             shared,
             keys,
             &[],

@@ -78,7 +78,11 @@ state and give back as `WseDelivery(checkpoint:)`, and recovery starts from
 it, so a message can come twice: apply a repeat safely. The user changes
 where the events show the server took the connection for another user: what
 came before is the last user's, and a message of theirs committed later
-counts for nobody.
+counts for nobody. `client.sendRequiring(kind:json:topics:)` sends once each
+of the topics is continuous on the connection, checked right before it goes
+(after a reconnect it waits for the resync); sends that require nothing go
+past it, and once the server takes a connection for another user it goes
+nowhere.
 
 `events()` is the client's stream, until it closes; one reader at a time.
 A Task cancelled while reading loses nothing: the next read gets the rest.

@@ -16,7 +16,10 @@ use wse_client::{
 
 const SECRET: &str = "a-test-secret-of-at-least-thirty-two-bytes";
 
-struct App;
+/// Says the type of each message a client sends.
+struct App {
+    inbound: mpsc::UnboundedSender<String>,
+}
 
 impl wse::Handler for App {
     type Connection = ();
@@ -25,7 +28,12 @@ impl wse::Handler for App {
         Some(())
     }
 
-    fn message(&self, _conn: &mut (), _message: wse::Inbound, _size: usize) -> bool {
+    fn message(&self, _conn: &mut (), message: wse::Inbound, _size: usize) -> bool {
+        if let wse::Inbound::Json(message) = message
+            && let Some(kind) = message["t"].as_str()
+        {
+            let _ = self.inbound.send(kind.to_owned());
+        }
         true
     }
 
@@ -40,6 +48,7 @@ struct Stand {
     server: wse::Server,
     publisher: wse::Publisher,
     url: String,
+    inbound: mpsc::UnboundedReceiver<String>,
 }
 
 async fn stand() -> Stand {
@@ -50,12 +59,21 @@ async fn stand() -> Stand {
     let server = wse::Server::new(config).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/wse", listener.local_addr().unwrap());
-    server.start(listener, App).unwrap();
+    let (inbound_tx, inbound) = mpsc::unbounded_channel();
+    server
+        .start(
+            listener,
+            App {
+                inbound: inbound_tx,
+            },
+        )
+        .unwrap();
     let publisher = server.publisher();
     Stand {
         server,
         publisher,
         url,
+        inbound,
     }
 }
 
@@ -70,6 +88,20 @@ impl Stand {
         config.topics = vec!["prices".into()];
         config.delivery = delivery;
         config
+    }
+
+    /// The type of the next message a client sent.
+    async fn next_inbound(&mut self) -> String {
+        tokio::time::timeout(Duration::from_secs(5), self.inbound.recv())
+            .await
+            .expect("a message within 5 s")
+            .expect("the server lives")
+    }
+
+    /// No client sends anything for 300 ms.
+    async fn quiet(&mut self) {
+        let got = tokio::time::timeout(Duration::from_millis(300), self.inbound.recv()).await;
+        assert!(got.is_err(), "nothing sent: {got:?}");
     }
 
     fn publish(&self, n: u64) {
@@ -357,6 +389,62 @@ async fn best_effort_says_what_the_server_took_and_lets_the_app_say_it_resynced(
     stand.publish(1);
     let items = read_until(&mut events, |i| number(i).is_some()).await;
     assert_eq!(numbers(&items), [1]);
+    client.close().await;
+    stand.server.stop().await;
+}
+
+/// A send that requires a topic goes once the application resynced it, on
+/// this connection and after a reconnect; one that requires nothing goes past
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_that_requires_a_topic_waits_for_its_resync() {
+    let mut stand = stand().await;
+    let (client, mut events) = wse_client::connect(stand.config("kai", board()))
+        .await
+        .unwrap();
+    let resync = resync_of(&read_until(&mut events, is_resync).await);
+    let cancel = serde_json::json!({"id": 1});
+    client
+        .send_requiring("cancel", &cancel, ["prices"])
+        .await
+        .unwrap();
+    client.send("note", &serde_json::json!({})).await.unwrap();
+    assert_eq!(stand.next_inbound().await, "note");
+    stand.quiet().await;
+    client.resynced(resync.round).unwrap();
+    assert_eq!(stand.next_inbound().await, "cancel");
+
+    client.reconnect().unwrap();
+    let resync = resync_of(&read_until(&mut events, is_resync).await);
+    client
+        .try_send_requiring("cancel", &cancel, ["prices"])
+        .unwrap();
+    stand.quiet().await;
+    client.resynced(resync.round).unwrap();
+    assert_eq!(stand.next_inbound().await, "cancel");
+    client.close().await;
+    stand.server.stop().await;
+}
+
+/// The same behind a handler, where the gate stands in the connection's
+/// task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_behind_a_handler_waits_for_the_resync_too() {
+    let mut stand = stand().await;
+    let (client, mut heard) = board_client(&stand, "lou", false).await;
+    let round: u64 = next(&mut heard)
+        .await
+        .strip_prefix("round ")
+        .expect("a resync round")
+        .parse()
+        .unwrap();
+    client
+        .send_requiring("cancel", &serde_json::json!({"id": 1}), ["prices"])
+        .await
+        .unwrap();
+    stand.quiet().await;
+    client.resynced(round).unwrap();
+    assert_eq!(stand.next_inbound().await, "cancel");
     client.close().await;
     stand.server.stop().await;
 }

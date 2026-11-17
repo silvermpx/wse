@@ -504,6 +504,32 @@ impl WseNativeClient {
         Ok(self.0.send(kind, json, &native::CancelToken::new()).await?)
     }
 
+    /// Sends `{"t": kind, "p": json}` once each of `topics` is continuous on the
+    /// connection; until then it waits, in order with the others that wait.
+    /// Fails at once when the queue is full.
+    #[frb(sync)]
+    pub fn try_send_requiring(
+        &self,
+        kind: String,
+        json: String,
+        topics: Vec<String>,
+    ) -> Result<(), WseError> {
+        Ok(self.0.try_send_requiring(&kind, &json, topics)?)
+    }
+
+    /// `try_send_requiring`, waiting for room in the queue.
+    pub async fn send_requiring(
+        &self,
+        kind: String,
+        json: String,
+        topics: Vec<String>,
+    ) -> Result<(), WseError> {
+        Ok(self
+            .0
+            .send_requiring(kind, json, topics, &native::CancelToken::new())
+            .await?)
+    }
+
     #[frb(sync)]
     pub fn try_send_live(&self, kind: String, json: String) -> Result<(), WseError> {
         Ok(self.0.try_send_live(&kind, &json)?)

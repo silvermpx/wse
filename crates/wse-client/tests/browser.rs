@@ -107,6 +107,32 @@ async fn recover_or_resync_in_the_browser() {
     client.close().await;
 }
 
+/// A send that requires a topic waits for its resync; one that requires
+/// nothing goes past it.
+#[wasm_bindgen_test]
+async fn a_send_in_the_browser_waits_for_its_topic() {
+    let url = given(URL, "WSE_TEST_URL");
+    let mut config = Config::new(url);
+    config.topics = vec!["ticks".into()];
+    config.delivery = Some(Delivery::new("board"));
+    let (client, mut events) = wse_client::connect(config).await.unwrap();
+    let cold = resync(&mut events).await;
+    client
+        .send_requiring("echo", &serde_json::json!({"n": 1}), ["ticks"])
+        .await
+        .unwrap();
+    client
+        .send("echo", &serde_json::json!({"n": 2}))
+        .await
+        .unwrap();
+    let first = message(&mut events, "echoed").await;
+    assert_eq!(first.payload_value().unwrap()["n"], 2);
+    client.resynced(cold.round).unwrap();
+    let second = message(&mut events, "echoed").await;
+    assert_eq!(second.payload_value().unwrap()["n"], 1);
+    client.close().await;
+}
+
 #[wasm_bindgen_test]
 async fn a_browser_client_hears_its_topic_and_is_heard() {
     let url = given(URL, "WSE_TEST_URL");

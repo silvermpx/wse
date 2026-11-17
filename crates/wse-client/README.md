@@ -200,6 +200,13 @@ effort) nothing is held, and the states and the checkpoint are kept all the
 same. It is the delivery of the TypeScript client and of the Swift, Kotlin
 and Dart packages, natively and in the browser.
 
+A send can wait for its topics: `client.send_requiring("cancel", &order,
+["orders"])` goes once each of them is continuous on the connection. It is
+checked right before it goes, so after a reconnect it waits for the resync,
+while sends that require nothing go past it. It is the user's who sent it and
+goes nowhere once the server takes a connection for another; at most
+`send_queue` of them wait.
+
 ## In the browser
 
 The same crate builds for `wasm32-unknown-unknown`, for applications in

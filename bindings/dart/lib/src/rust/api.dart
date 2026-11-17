@@ -81,6 +81,13 @@ abstract class WseNativeClient implements RustOpaqueInterface {
 
   Future<void> sendLive({required String kind, required String json});
 
+  /// `try_send_requiring`, waiting for room in the queue.
+  Future<void> sendRequiring({
+    required String kind,
+    required String json,
+    required List<String> topics,
+  });
+
   Future<String> sendSigned({
     required String kind,
     required String json,
@@ -99,6 +106,15 @@ abstract class WseNativeClient implements RustOpaqueInterface {
   void trySend({required String kind, required String json});
 
   void trySendLive({required String kind, required String json});
+
+  /// Sends `{"t": kind, "p": json}` once each of `topics` is continuous on the
+  /// connection; until then it waits, in order with the others that wait.
+  /// Fails at once when the queue is full.
+  void trySendRequiring({
+    required String kind,
+    required String json,
+    required List<String> topics,
+  });
 
   void unsubscribe({required List<String> topics});
 
