@@ -78,6 +78,16 @@
   is never copied for its number, and a batch goes to the socket at once:
   200,000 messages to a local server go as fast with it as without it. With
   a server older than 3.2 a message is gone once written, as before.
+- Python: the outbox, as in the Rust client (`offline=Offline()`, on by
+  default): every message sent, except a live or signed one, waits until
+  the server answers for it, numbered, and goes again after a reconnect; a
+  3.2 server takes each once. The handlers of `delivered` and
+  `not_delivered` hear what became of each by its id (`send(..., id=...)`),
+  never on the stream `recv()` reads. `send(..., ttl=...)`, `clear()` and
+  `kept`; at most `Offline.max_messages` (100,000) and `max_bytes` (16 MiB)
+  wait. `disconnect()` waits up to a second for the server's answers and
+  keeps what waits for the next `connect()`; `SyncWSEClient` keeps one
+  outbox across its connects.
 - TypeScript: the outbox, as in the Rust client (`offline.enabled`, on by
   default): every message sent, except a live or signed one, waits until
   the server answers for it, numbered, and goes again after a reconnect; a
@@ -95,10 +105,11 @@
 
 ### Changed
 
-- Rust client (and Swift, Kotlin, Java, Dart): a send with no connection
-  waits in the outbox (in memory by default) instead of failing with
-  `NotConnected`; `Config::offline = None` (`disabled` in the packages)
-  keeps that.
+- Rust client (and Swift, Kotlin, Java, Dart), Python and TypeScript: a
+  send with no connection waits in the outbox (in memory by default)
+  instead of failing (`NotConnected`, `SendResult.FAILED`) or waiting in
+  an outgoing queue; `Config::offline = None` (`disabled` in the packages),
+  `offline=None` and `offline: { enabled: false }` keep that.
 - Rust client (and Swift, Kotlin, Dart): every message carries an `id`, a
   random UUID, as from the TypeScript and Python clients.
 - Rust client: the events stream and a handler hear `Event::Continuity` when

@@ -165,6 +165,56 @@ class TestRecoverOrResync:
             srv.stop()
 
 
+async def taken_messages(srv: RustWSEServer, count: int) -> list[dict]:
+    """The next *count* messages clients sent, as the application took them."""
+    out: list[dict] = []
+    async with asyncio.timeout(5):
+        while len(out) < count:
+            out += [e[2] for e in srv.drain_inbound(64, 0) if e[0] == "msg"]
+            if len(out) < count:
+                await asyncio.sleep(0.02)
+    return out
+
+
+class TestOutbox:
+    @pytest.mark.asyncio
+    async def test_a_message_waits_in_the_outbox_until_the_server_confirms_it(
+        self, server_port
+    ):
+        """Numbered, said delivered by its id; sent with no connection, it
+        goes on the next."""
+        srv = start_server(server_port)
+        try:
+            client = client_for(server_port)
+            delivered: list[str] = []
+            client.on("delivered")(lambda e: delivered.extend(e.payload["ids"]))
+            await client.connect()
+            await client.send("order", {"n": 1}, id="mine-1")
+            (taken,) = await taken_messages(srv, 1)
+            assert isinstance(taken["s"], int) and taken["id"] == "mine-1"
+            async with asyncio.timeout(5):
+                while "mine-1" not in delivered:
+                    await asyncio.sleep(0.02)
+            assert client.kept == 0
+
+            # The connection goes: what is sent meanwhile waits, and goes on
+            # the next one, numbered on.
+            for conn_id in srv.get_connections():
+                srv.disconnect(conn_id)
+            async with asyncio.timeout(5):
+                while client.is_connected:
+                    await asyncio.sleep(0.01)
+            await client.send("order", {"n": 2}, id="mine-2")
+            (again,) = await taken_messages(srv, 1)
+            assert (again["id"], again["s"]) == ("mine-2", taken["s"] + 1)
+            async with asyncio.timeout(5):
+                while "mine-2" not in delivered:
+                    await asyncio.sleep(0.02)
+            await client.disconnect()
+        finally:
+            srv.stop()
+
+
 class TestMsgpack:
     @pytest.mark.asyncio
     async def test_msgpack_both_ways(self, server_port):

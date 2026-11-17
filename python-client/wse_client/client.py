@@ -46,6 +46,7 @@ from .errors import WSEAuthError, WSEConnectionError, WSEEncryptionError, WSEErr
 from .event_sequencer import EventSequencer
 from .network_monitor import NetworkMonitor
 from .offline_queue import OfflineQueue
+from .outbox import Offline, Outbox, Outcomes
 from .protocol import MessageCodec, _json_loads
 from .rate_limiter import TokenBucketRateLimiter
 from .signing import MAX_NONCE_LEN, ClientSigner, ServerKeys
@@ -131,6 +132,18 @@ class _Waiting:
 
     encoded: str
     topics: tuple[str, ...]
+    message_id: str = ""
+    ttl: float | None = None
+
+
+#: The outbox by default: in memory, with its limits.
+_IN_MEMORY = Offline()
+
+#: The server's answers to the outbox: never an application's.
+_OUTBOX_ANSWERS = frozenset({"outbox", "ack", "nack"})
+
+#: Seconds a disconnect waits for the server's answers to the outbox.
+_ANSWERS_WITHIN = 1.0
 
 
 #: Sends that wait for their topics at most; past it a send that requires
@@ -237,10 +250,15 @@ class AsyncWSEClient:
             subscriptions, recovery requests) are never limited.
         rate_limit_burst: Messages that may go out at once before the rate
             applies (default 10 x *rate_limit*).
-        offline_queue: Hold messages sent while disconnected and send them
-            once after the next reconnect (``send()`` returns
-            ``SendResult.QUEUED``). Off by default: a send that cannot go out
-            returns ``SendResult.FAILED`` and is not replayed.
+        offline: The outbox (:class:`~wse_client.outbox.Offline`, in memory
+            by default): every message sent, except a live or signed one,
+            waits in it until the server answers for it, goes again after a
+            reconnect, and reaches the server's application once. The
+            ``delivered`` and ``not_delivered`` events say what became of
+            each, by its id. ``None``: no outbox, as before 3.2.
+        offline_queue: Without an outbox (``offline=None``): hold messages
+            sent while disconnected and send them once after the next
+            reconnect. The outbox does this and more.
         max_message_size: Largest inbound message in bytes, checked on the
             frame and while inflating compressed frames (default 16 MiB).
             ``None`` disables the limit.
@@ -309,6 +327,7 @@ class AsyncWSEClient:
         rate_limit: float | None = RATE_LIMIT_REFILL_RATE,
         rate_limit_burst: int | None = None,
         offline_queue: bool = False,
+        offline: Offline | None = _IN_MEMORY,
         max_message_size: int | None = DEFAULT_MAX_MESSAGE_SIZE,
         recovery_timeout: float = RECOVERY_TIMEOUT,
         wire_format: str = "json",
@@ -317,6 +336,7 @@ class AsyncWSEClient:
         e2e_bind_session: bool = True,
         cookie_name: str = "access_token",
         delivery: DeliveryConfig | None = None,
+        _outbox: Outbox | None = None,
     ) -> None:
         if wire_format not in _WIRE_FORMATS:
             raise ValueError(f"wire_format must be one of {_WIRE_FORMATS}")
@@ -416,8 +436,17 @@ class AsyncWSEClient:
         self._sequencer = EventSequencer()
         self._network_monitor = NetworkMonitor()
         self._offline_queue = OfflineQueue(
-            max_size=1000, max_age=3600.0, enabled=offline_queue
+            max_size=1000, max_age=3600.0, enabled=offline_queue and offline is None
         )
+        # The outbox: every message but a live or signed one waits in it until
+        # the server answers for it.
+        self._outbox: Outbox | None = Outbox(offline) if offline is not None else None
+        if offline is not None and _outbox is not None:
+            # The outbox of the client it goes on from (SyncWSEClient's).
+            self._outbox = _outbox
+        self._outbox_timer: asyncio.TimerHandle | None = None
+        self._outbox_writing = False
+        self._outbox_again = False
         # Sends that wait for their topics (send(requires=...)), in the order
         # they were sent, and whether a release runs or is asked for again.
         self._waiting: deque[_Waiting] = deque()
@@ -534,11 +563,15 @@ class AsyncWSEClient:
         self._connection._on_close = self._on_transport_close
         self._connection._on_terminal = self._on_transport_terminal
         self._connection._before_read = self._event_room
+        self._connection._outbox_hello = self._outbox_hello
 
         # System handler dispatch table (dict lookup = O(1))
         self._system_handlers: dict[str, Callable[[WSEEvent], None]] = {
             "server_ready": self._handle_server_ready,
             "server_hello": self._handle_server_hello,
+            "outbox": self._handle_outbox_answer,
+            "ack": self._handle_ack,
+            "nack": self._handle_nack,
             "subscription_update": self._handle_subscription_update,
             "error": self._handle_error,
             "health_check": self._handle_health_check,
@@ -642,6 +675,14 @@ class AsyncWSEClient:
         # Never cancel the calling task: an async handler (a background task)
         # may await disconnect() itself, and cancelling it would abort the
         # teardown half way and leave the socket open.
+        # What the server owes the outbox comes first, within a second: what it
+        # has in hand is answered, and the application hears of it. What
+        # waits stays for a later connect().
+        outbox = self._outbox
+        if outbox is not None and self._connection.is_connected:
+            until = time.monotonic() + _ANSWERS_WITHIN
+            while outbox.owed() and time.monotonic() < until:
+                await asyncio.sleep(0.01)
         current = asyncio.current_task()
         for task in list(self._background_tasks):
             if task is not current:
@@ -663,6 +704,192 @@ class AsyncWSEClient:
     async def close(self) -> None:
         """Alias for disconnect."""
         await self.disconnect()
+
+    def clear(self) -> None:
+        """The user signs out: every message in the outbox, and every send
+        that waits for its topics, goes (``not_delivered``, ``cleared``). One
+        the server has in hand already is delivered if it confirms it on the
+        current connection."""
+        outcomes = Outcomes()
+        waited = [w.message_id for w in self._waiting if w.message_id]
+        self._waiting.clear()
+        if waited:
+            outcomes.not_delivered["cleared"] = waited
+        if self._outbox is not None:
+            outcomes.merge(self._outbox.clear())
+        self._report(outcomes)
+
+    @property
+    def kept(self) -> int:
+        """How many messages wait in the outbox for the server's answer."""
+        if self._outbox is not None:
+            return self._outbox.size
+        return self._offline_queue.size
+
+    # -- The outbox -------------------------------------------------------------
+
+    def _outbox_hello(self) -> dict[str, object] | None:
+        """What the client's hello says of the outbox."""
+        return self._outbox.hello() if self._outbox is not None else None
+
+    async def _keep(
+        self,
+        encoded: str,
+        message_id: str,
+        msg_type: str,
+        ttl: float | None,
+        *,
+        limited: bool = True,
+    ) -> SendResult:
+        """A message for the outbox: numbered, kept until the server answers
+        for it, and written at once when the connection takes it."""
+        if self._encryption_error is not None:
+            raise self._encryption_error
+        outbox = self._outbox
+        assert outbox is not None
+        if (
+            limited
+            and self._rate_limiter is not None
+            and not self._rate_limiter.try_consume()
+        ):
+            self._note_rate_limited(msg_type)
+            return SendResult.FAILED
+        s = outbox.add(message_id, encoded, ttl, time.time())
+        if s == 0:
+            logger.warning("The outbox is full; '%s' not sent", msg_type)
+            return SendResult.FAILED
+        self._arm_outbox_timer()
+        await self._write_outbox()
+        return SendResult.SENT if outbox.flushed >= s else SendResult.QUEUED
+
+    def _write_outbox_soon(self) -> None:
+        """What the outbox has for the connection goes, once the loop runs."""
+        if self._outbox is None:
+            return
+        try:
+            self._fire_task(self._write_outbox())
+        except RuntimeError:  # no running loop
+            pass
+
+    async def _write_outbox(self) -> None:
+        """Writes what the outbox has for this connection, in order: one
+        writer at a time, so no number overtakes another."""
+        outbox = self._outbox
+        if outbox is None:
+            return
+        if self._outbox_writing:
+            self._outbox_again = True
+            return
+        self._outbox_writing = True
+        try:
+            while True:
+                self._outbox_again = False
+                outcomes = Outcomes()
+                batch = outbox.due(time.time(), outcomes)
+                self._report(outcomes)
+                last = 0
+                for s, text in batch:
+                    if not await self._transmit(text, strict=True):
+                        # The connection went: the rest goes on the next.
+                        break
+                    last = s
+                    self._stats.messages_sent += 1
+                    self._stats.bytes_sent += len(text)
+                if last:
+                    self._report(outbox.wrote(last))
+                if not self._outbox_again:
+                    return
+        finally:
+            self._outbox_writing = False
+
+    def _handle_outbox_answer(self, event: WSEEvent) -> None:
+        """The server's answer to the outbox's hello: what it decided, its
+        refusals, its name."""
+        outbox = self._outbox
+        if outbox is None or event.category != "WSE":
+            return
+        p = event.payload
+        refused: list[tuple[int, int, str]] = []
+        for r in p.get("refused") or []:
+            if isinstance(r, dict) and isinstance(r.get("s"), int):
+                start = r.get("from") if isinstance(r.get("from"), int) else r["s"]
+                why = r.get("code") if isinstance(r.get("code"), str) else "refused"
+                refused.append((start, r["s"], why))
+        acked = p.get("acked") if isinstance(p.get("acked"), int) else 0
+        node = p.get("node") if isinstance(p.get("node"), str) else ""
+        self._report(outbox.answered(acked, refused, node))
+        self._write_outbox_soon()
+
+    def _handle_ack(self, event: WSEEvent) -> None:
+        """The server took every message of the outbox up to and with ``s``."""
+        s = event.payload.get("s")
+        if self._outbox is not None and event.category == "WSE" and isinstance(s, int):
+            self._report(self._outbox.acked(s))
+
+    def _handle_nack(self, event: WSEEvent) -> None:
+        """The server refused messages of the outbox for good."""
+        p = event.payload
+        s = p.get("s")
+        if self._outbox is None or event.category != "WSE" or not isinstance(s, int):
+            return
+        start = p.get("from") if isinstance(p.get("from"), int) else s
+        why = p.get("code") if isinstance(p.get("code"), str) else "refused"
+        self._report(self._outbox.refused(start, s, why))
+
+    def _report(self, outcomes: Outcomes) -> None:
+        """What became of the outbox's messages, to the application's
+        handlers of ``delivered`` and ``not_delivered`` (as ``connected`` and
+        ``disconnected``, never on the stream of messages)."""
+        if not outcomes or not (
+            self._wildcard_handlers
+            or "delivered" in self._handlers
+            or "not_delivered" in self._handlers
+        ):
+            return
+        if outcomes.delivered:
+            self._invoke_handlers(
+                WSEEvent(
+                    type="delivered",
+                    payload={"ids": outcomes.delivered},
+                    category="WSE",
+                )
+            )
+        for reason, ids in outcomes.not_delivered.items():
+            self._invoke_handlers(
+                WSEEvent(
+                    type="not_delivered",
+                    payload={"reason": reason, "ids": ids},
+                    category="WSE",
+                )
+            )
+
+    def _arm_outbox_timer(self) -> None:
+        """A timer for the outbox's first message not written yet to run
+        out, with a connection or without."""
+        outbox = self._outbox
+        at = outbox.deadline() if outbox is not None else None
+        if at is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._outbox_timer is not None:
+            if self._outbox_timer.when() - loop.time() <= at - time.time():
+                return
+            self._outbox_timer.cancel()
+        delay = max(0.0, at - time.time())
+        self._outbox_timer = loop.call_later(delay, self._outbox_expired)
+
+    def _outbox_expired(self) -> None:
+        self._outbox_timer = None
+        outbox = self._outbox
+        if outbox is None:
+            return
+        outcomes = Outcomes()
+        outbox.expire(time.time(), outcomes)
+        self._report(outcomes)
+        self._arm_outbox_timer()
 
     def set_token(self, token: str | None) -> None:
         """Use *token* for the next connect / reconnect.
@@ -740,8 +967,15 @@ class AsyncWSEClient:
         nonce: str | None = None,
         live: bool = False,
         requires: list[str] | tuple[str, ...] | None = None,
+        id: str | None = None,
+        ttl: float | None = None,
     ) -> SendResult:
         """Send a message to the server.
+
+        With the outbox (``offline``, on by default) every message but a live
+        or signed one waits in it until the server answers for it, and goes
+        again after a reconnect; the ``delivered`` and ``not_delivered``
+        events name it by its id.
 
         Args:
             type: Event type string, e.g. ``"update_settings"``.
@@ -764,7 +998,13 @@ class AsyncWSEClient:
                 it. It is checked right before it goes, so after a reconnect
                 it waits for the resync. It is the user's who sent it: once
                 the server takes a connection for another, it goes nowhere.
-                Never in the offline queue; at most 1,000 wait.
+                It joins the outbox once they are continuous; at most 1,000
+                wait.
+            id: The message's id: the application's own (one it keeps
+                itself, say), or a random UUID. The outcome events name it.
+            ttl: Seconds the message may wait to be written first (the
+                outbox's ``max_age`` without one); past it, it is dropped
+                (``not_delivered``, ``expired``).
 
         Returns:
             ``SendResult.SENT`` when it went out; ``SendResult.QUEUED`` when
@@ -791,10 +1031,17 @@ class AsyncWSEClient:
                 raise ValueError(
                     "requires does not go with signed or live: they never wait"
                 )
+            message_id = id or str(uuid4())
             encoded = self._codec.encode(
-                type, payload or {}, priority=priority, correlation_id=correlation_id
+                type,
+                payload or {},
+                priority=priority,
+                correlation_id=correlation_id,
+                message_id=message_id,
             )
-            return await self._send_requiring(encoded, tuple(requires), priority, type)
+            return await self._send_requiring(
+                encoded, tuple(requires), priority, type, message_id, ttl
+            )
         if signed:
             if self._signer is None:
                 raise WSEError("signed=True needs AsyncWSEClient(signing_key=...)")
@@ -808,12 +1055,16 @@ class AsyncWSEClient:
                 type, payload or {}, self._server_signing_kid, nonce=nonce
             )
         else:
+            message_id = id or str(uuid4())
             encoded = self._codec.encode(
                 type,
                 payload or {},
                 priority=priority,
                 correlation_id=correlation_id,
+                message_id=message_id,
             )
+            if self._outbox is not None and not live:
+                return await self._keep(encoded, message_id, type, ttl)
         return await self._send_app_frame(
             encoded, priority=priority, msg_type=type, allow_queue=not (signed or live)
         )
@@ -845,6 +1096,11 @@ class AsyncWSEClient:
             ``SENT`` within the retry budget, ``QUEUED`` (see above), or
             ``FAILED``.
         """
+        if self._outbox is not None:
+            # The outbox sends it again until the server answers for it.
+            return await self.send(
+                type, payload, priority=priority, correlation_id=correlation_id
+            )
         encoded = self._codec.encode(
             type, payload or {}, priority=priority, correlation_id=correlation_id
         )
@@ -1414,6 +1670,9 @@ class AsyncWSEClient:
             )
         if self._server_ready_event is not None:
             self._server_ready_event.clear()
+        # What the outbox holds goes on the next connection.
+        if self._outbox is not None:
+            self._report(self._outbox.disconnected())
         # Sends waiting for this connection's key give up (and may queue).
         _reject(self._key_ready, WSEConnectionError("Connection lost"))
         self._recovery_requests.clear()
@@ -1560,6 +1819,13 @@ class AsyncWSEClient:
             return
         fut.set_result(None)
         self._connection.mark_handshake_complete()
+        # A server that did not say it took the connection (before 3.0) does
+        # not answer the outbox either: a message it got is gone once written.
+        outbox = self._outbox
+        if outbox is not None and not outbox.connection_ready:
+            self._report(outbox.connected(self._codec.connection_user, time.time()))
+            outbox.server_answers(False)
+        self._write_outbox_soon()
         reconnected = self._connected_before
         self._connected_before = True
         self._invoke_handlers(
@@ -1674,7 +1940,13 @@ class AsyncWSEClient:
         return self._queue_or_fail(encoded, priority, msg_type, allow_queue)
 
     async def _send_requiring(
-        self, encoded: str, topics: tuple[str, ...], priority: int, msg_type: str
+        self,
+        encoded: str,
+        topics: tuple[str, ...],
+        priority: int,
+        msg_type: str,
+        message_id: str = "",
+        ttl: float | None = None,
     ) -> SendResult:
         """A send that waits until each of *topics* is continuous."""
         if self._encryption_error is not None:
@@ -1684,6 +1956,8 @@ class AsyncWSEClient:
             and self._connection.is_connected
             and self._delivery.continuous(topics)
         ):
+            if self._outbox is not None:
+                return await self._keep(encoded, message_id, msg_type, ttl)
             return await self._send_app_frame(
                 encoded, priority=priority, msg_type=msg_type, allow_queue=False
             )
@@ -1695,7 +1969,7 @@ class AsyncWSEClient:
         if self._rate_limiter is not None and not self._rate_limiter.try_consume():
             self._note_rate_limited(msg_type)
             return SendResult.FAILED
-        self._waiting.append(_Waiting(encoded, topics))
+        self._waiting.append(_Waiting(encoded, topics, message_id, ttl))
         self._release_soon()
         return SendResult.QUEUED
 
@@ -1723,6 +1997,13 @@ class AsyncWSEClient:
                     if not self._connection.is_connected:
                         return
                     if not self._delivery.continuous(item.topics):
+                        continue
+                    if self._outbox is not None:
+                        # Its topics are continuous: it joins the outbox.
+                        self._waiting.remove(item)
+                        await self._keep(
+                            item.encoded, item.message_id, "", item.ttl, limited=False
+                        )
                         continue
                     if not await self._transmit(item.encoded):
                         # The connection went: it goes on a later one.
@@ -2332,7 +2613,12 @@ class AsyncWSEClient:
         self._recovery_requests.clear()
         self._live_since.clear()
         dropped = len(self._offline_queue.drain()) + len(self._waiting)
+        waited = [w.message_id for w in self._waiting if w.message_id]
         self._waiting.clear()
+        if waited:
+            outcomes = Outcomes()
+            outcomes.not_delivered["user_changed"] = waited
+            self._report(outcomes)
         if dropped:
             logger.warning(
                 "%d messages queued as the previous user were dropped", dropped
@@ -2371,7 +2657,9 @@ class AsyncWSEClient:
                 # A malformed system payload is dropped, never fatal.
                 logger.warning("Malformed '%s' message ignored: %s", event.type, exc)
             # Internal-only events are NOT forwarded to user queue/handlers
-            if event.type in _INTERNAL_ONLY_EVENTS:
+            if event.type in _INTERNAL_ONLY_EVENTS or (
+                event.type in _OUTBOX_ANSWERS and event.category == "WSE"
+            ):
                 return
         elif (
             event.topic is not None
@@ -2441,6 +2729,14 @@ class AsyncWSEClient:
         if self._last_user is not None and self._last_user[0] != user:
             self._forget_user()
         self._last_user = (user,)
+        # The outbox: another user's messages go, and the rest goes once the
+        # server said what it took (at once, to a server that does not answer).
+        if self._outbox is not None:
+            features_seen = details.get("features")
+            self._report(self._outbox.connected(user, time.time()))
+            self._outbox.server_answers(
+                isinstance(features_seen, dict) and features_seen.get("acks") is True
+            )
         self._delivery.connected(user)
         self._codec.generation = self._delivery.generation
         self._take_signing_kid(details.get("signing"), sealed=True)

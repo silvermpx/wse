@@ -1,11 +1,13 @@
 """Tests for AsyncWSEClient (unit tests with mocked WebSocket)."""
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from wse_client.client import AsyncWSEClient, _INTERNAL_ONLY_EVENTS
+from wse_client.outbox import Offline
 from wse_client.types import (
     ConnectionQuality,
     ConnectionState,
@@ -21,7 +23,8 @@ def client():
     """Create a client with mocked connection manager."""
     import asyncio
 
-    c = AsyncWSEClient("ws://localhost:5006/wse", token="test-jwt")
+    # The send path without an outbox (TestOutbox has its own).
+    c = AsyncWSEClient("ws://localhost:5006/wse", token="test-jwt", offline=None)
     # Initialize lazy asyncio primitives (normally done in connect())
     c._event_queue = asyncio.Queue(maxsize=c._queue_size)
     c._server_ready_event = asyncio.Event()
@@ -393,9 +396,11 @@ class TestChangeEndpoint:
 
 
 def _mock_client(**kwargs):
-    """A client whose transport is a mock (connected unless told otherwise)."""
+    """A client whose transport is a mock (connected unless told otherwise),
+    without an outbox unless given one."""
     import asyncio
 
+    kwargs.setdefault("offline", None)
     c = AsyncWSEClient("ws://localhost:5006/wse", **kwargs)
     c._event_queue = asyncio.Queue(maxsize=c._queue_size)
     c._server_ready_event = asyncio.Event()
@@ -690,3 +695,104 @@ class TestReconnectPause:
             AsyncWSEClient(
                 "ws://x/wse", reconnect=ReconnectConfig(circuit_breaker_threshold=-1)
             )
+
+
+def _system(kind: str, payload: dict) -> WSEEvent:
+    return WSEEvent(type=kind, payload=payload, category="WSE")
+
+
+class TestOutbox:
+    """Every message waits in the outbox until the server answers for it."""
+
+    async def _ready(self, c, *, acks: bool = True) -> list[WSEEvent]:
+        """The server takes the connection; what the client says of its
+        outbox's messages, as it says it."""
+        heard: list[WSEEvent] = []
+        c.on("delivered")(heard.append)
+        c.on("not_delivered")(heard.append)
+        c._transmit = AsyncMock(return_value=True)
+        features = {"acks": True} if acks else {}
+        c._handle_server_ready(
+            _system(
+                "server_ready", {"details": {"user_id": "ann", "features": features}}
+            )
+        )
+        return heard
+
+    @staticmethod
+    def _written(c) -> list[dict]:
+        return [json.loads(call.args[0]) for call in c._transmit.call_args_list]
+
+    @pytest.mark.asyncio
+    async def test_a_message_waits_for_the_answer_and_is_said_delivered(self):
+        c = _mock_client(offline=Offline())
+        heard = await self._ready(c)
+        assert await c.send("order", {"n": 1}, id="mine-1") is SendResult.QUEUED
+        assert c.kept == 1
+        c._handle_outbox_answer(_system("outbox", {"acked": 0, "node": "n1"}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        written = self._written(c)
+        assert [(list(m)[0], m["s"], m["id"]) for m in written] == [("s", 1, "mine-1")]
+        assert await c.send("order", {"n": 2}, id="mine-2") is SendResult.SENT
+        c._handle_ack(_system("ack", {"s": 2}))
+        assert [(e.type, e.payload) for e in heard] == [
+            ("delivered", {"ids": ["mine-1", "mine-2"]})
+        ]
+        assert c.kept == 0
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_is_said(self):
+        c = _mock_client(offline=Offline())
+        heard = await self._ready(c)
+        c._handle_outbox_answer(_system("outbox", {"acked": 0, "node": "n1"}))
+        await c.send("order", {}, id="a")
+        c._handle_nack(_system("nack", {"s": 1, "code": "busy"}))
+        assert [(e.type, e.payload) for e in heard] == [
+            ("not_delivered", {"reason": "busy", "ids": ["a"]})
+        ]
+
+    @pytest.mark.asyncio
+    async def test_an_application_message_named_ack_reaches_the_application(self):
+        c = _mock_client(offline=Offline())
+        await self._ready(c)
+        mine: list[WSEEvent] = []
+        c.on("ack")(mine.append)
+        c._dispatch_event(WSEEvent(type="ack", payload={"s": 1}, category="U"))
+        assert len(mine) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_server_without_answers_takes_what_was_written(self):
+        c = _mock_client(offline=Offline())
+        heard = await self._ready(c, acks=False)
+        assert await c.send("order", {}, id="a") is SendResult.SENT
+        assert "s" not in self._written(c)[0]
+        assert [(e.type, e.payload) for e in heard] == [("delivered", {"ids": ["a"]})]
+
+    @pytest.mark.asyncio
+    async def test_one_not_written_in_its_time_runs_out(self):
+        c = _mock_client(offline=Offline())
+        heard: list[WSEEvent] = []
+        c.on("not_delivered")(heard.append)
+        c._connection.is_connected = False
+        assert await c.send("order", {}, id="late", ttl=0.02) is SendResult.QUEUED
+        for _ in range(50):
+            if heard:
+                break
+            await asyncio.sleep(0.01)
+        assert [(e.type, e.payload) for e in heard] == [
+            ("not_delivered", {"reason": "expired", "ids": ["late"]})
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_clear_says_what_waited(self):
+        c = _mock_client(offline=Offline())
+        heard: list[WSEEvent] = []
+        c.on("not_delivered")(heard.append)
+        c._connection.is_connected = False
+        await c.send("order", {}, id="a")
+        c.clear()
+        assert [(e.type, e.payload) for e in heard] == [
+            ("not_delivered", {"reason": "cleared", "ids": ["a"]})
+        ]
+        assert c.kept == 0

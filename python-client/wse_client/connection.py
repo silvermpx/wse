@@ -182,6 +182,8 @@ class ConnectionManager:
         # Awaited before each next frame is read: while the application is
         # behind, the socket is not read.
         self._before_read: Callable[[], Any] | None = None
+        # What the client's hello says of its outbox.
+        self._outbox_hello: Callable[[], dict[str, Any] | None] | None = None
         # The server took this connection (server_ready): heartbeats go out
         # only then, after whatever the handshake sends first.
         self._handshake_done = False
@@ -766,6 +768,9 @@ class ConnectionManager:
             "connection_id": self._connection_id,
         }
         p.update(key_exchange)
+        outbox = self._outbox_hello() if self._outbox_hello is not None else None
+        if outbox is not None:
+            p["outbox"] = outbox
 
         msg = {
             "c": "WSE",

@@ -11,11 +11,12 @@ import asyncio
 import concurrent.futures
 import queue
 import threading
-from dataclasses import replace
+import time
+from dataclasses import dataclass, replace
 from typing import Any, Callable, TypeVar
 
 from ._logging import logger
-from .client import AsyncWSEClient
+from .client import _IN_MEMORY, AsyncWSEClient
 from .delivery import DeliveryConfig, TopicState
 from .constants import (
     DEFAULT_MAX_MESSAGE_SIZE,
@@ -23,6 +24,7 @@ from .constants import (
     RECOVERY_TIMEOUT,
 )
 from .errors import WSEConnectionError, WSEError, WSETimeoutError
+from .outbox import Offline, Outbox
 from .types import (
     ConnectionQuality,
     ConnectionState,
@@ -48,6 +50,13 @@ class _StreamEnd:
     def __init__(self, error: BaseException | None) -> None:
         self.error = error
         self.seen = False
+
+
+@dataclass(eq=False, slots=True)
+class _Outcome:
+    """What became of the outbox's messages: for the handlers alone."""
+
+    event: WSEEvent
 
 
 class _Session:
@@ -118,6 +127,7 @@ class SyncWSEClient:
         rate_limit: float | None = RATE_LIMIT_REFILL_RATE,
         rate_limit_burst: int | None = None,
         offline_queue: bool = False,
+        offline: Offline | None = _IN_MEMORY,
         max_message_size: int | None = DEFAULT_MAX_MESSAGE_SIZE,
         recovery_timeout: float = RECOVERY_TIMEOUT,
         wire_format: str = "json",
@@ -149,6 +159,10 @@ class SyncWSEClient:
             "rate_limit": rate_limit,
             "rate_limit_burst": rate_limit_burst,
             "offline_queue": offline_queue,
+            "offline": offline,
+            # One outbox across the sessions of connect(): what one did not
+            # get answered goes on the next.
+            "_outbox": Outbox(offline) if offline is not None else None,
             "max_message_size": max_message_size,
             "recovery_timeout": recovery_timeout,
             "wire_format": wire_format,
@@ -160,7 +174,7 @@ class SyncWSEClient:
         }
         self._queue_size = queue_size
 
-        self._event_queue: queue.Queue[WSEEvent | _StreamEnd] = queue.Queue(
+        self._event_queue: queue.Queue[WSEEvent | _StreamEnd | _Outcome] = queue.Queue(
             maxsize=queue_size
         )
         self._handlers: dict[str, list[Callable[[WSEEvent], Any]]] = {}
@@ -273,9 +287,12 @@ class SyncWSEClient:
         nonce: str | None = None,
         live: bool = False,
         requires: list[str] | tuple[str, ...] | None = None,
+        id: str | None = None,
+        ttl: float | None = None,
     ) -> SendResult:
-        """Send a message (blocks until sent, or until it waits for the
-        topics it requires). See :meth:`AsyncWSEClient.send`."""
+        """Send a message (blocks until sent, or until it waits in the
+        outbox or for the topics it requires). See
+        :meth:`AsyncWSEClient.send`."""
         result = self._run(
             lambda c: c.send(
                 type,
@@ -285,6 +302,8 @@ class SyncWSEClient:
                 nonce=nonce,
                 live=live,
                 requires=requires,
+                id=id,
+                ttl=ttl,
             ),
             timeout=15.0,
             default=SendResult.FAILED,
@@ -376,11 +395,18 @@ class SyncWSEClient:
             WSEConnectionError: The client was closed (or failed).
             WSEAuthError / WSEEncryptionError: Why the client ended for good.
         """
-        try:
-            self._reading = True
-            item = self._event_queue.get(timeout=timeout)
-        except queue.Empty:
-            raise WSETimeoutError("recv() timed out")
+        until = None if timeout is None else time.monotonic() + timeout
+        while True:
+            try:
+                self._reading = True
+                left = None if until is None else max(0.0, until - time.monotonic())
+                item = self._event_queue.get(timeout=left)
+            except queue.Empty:
+                raise WSETimeoutError("recv() timed out")
+            if not isinstance(item, _Outcome):
+                break
+            # For the handlers alone: never what recv() returns.
+            self._dispatch_to_handlers(item.event)
 
         if isinstance(item, _StreamEnd):
             item.seen = True
@@ -452,7 +478,9 @@ class SyncWSEClient:
                     ) from item.error
                 return
 
-            self._dispatch_to_handlers(item)
+            self._dispatch_to_handlers(
+                item.event if isinstance(item, _Outcome) else item
+            )
 
     # -- Handler management ---------------------------------------------------
 
@@ -674,6 +702,10 @@ class SyncWSEClient:
         try:
             client = AsyncWSEClient(self._url, **self._client_kwargs)
             session.client = client
+            # What became of the outbox's messages reaches the handlers, in
+            # order with the stream.
+            client.on("delivered")(self._outcome)
+            client.on("not_delivered")(self._outcome)
             await client.connect()
             session.connected = True
             session.ready.set()
@@ -815,6 +847,37 @@ class SyncWSEClient:
         for item in kept:
             if not isinstance(item, _StreamEnd):
                 self._event_queue.put_nowait(item)
+
+    def _outcome(self, event: WSEEvent) -> None:
+        """An outcome of the outbox, for the handlers (on the session's
+        thread)."""
+        self._put_event(_Outcome(event))
+
+    def clear(self) -> None:
+        """The user signs out: see :meth:`AsyncWSEClient.clear`."""
+        client = self._session_client()
+        if client is not None:
+            self._later(lambda c: c.clear())
+            return
+        outbox = self._client_kwargs.get("_outbox")
+        if outbox is not None:
+            outcomes = outbox.clear()
+            for reason, ids in outcomes.not_delivered.items():
+                self._put_event(
+                    _Outcome(
+                        WSEEvent(
+                            type="not_delivered",
+                            payload={"reason": reason, "ids": ids},
+                            category="WSE",
+                        )
+                    )
+                )
+
+    @property
+    def kept(self) -> int:
+        """How many messages wait in the outbox for the server's answer."""
+        outbox = self._client_kwargs.get("_outbox")
+        return outbox.size if outbox is not None else 0
 
     def _dispatch_to_handlers(self, event: WSEEvent) -> None:
         """Call sync handlers for the event."""

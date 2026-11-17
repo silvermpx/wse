@@ -158,8 +158,10 @@ class MessageCodec:
         priority: int | None = None,
         correlation_id: str | None = None,
         category: str | None = None,
+        message_id: str | None = None,
     ) -> str:
-        """Encode an outgoing message as JSON with category field.
+        """Encode an outgoing message as JSON with category field (its id
+        *message_id*, a random UUID without one).
 
         Category is auto-detected from message type if not specified:
         - WSE for system messages (client_hello, subscription_update, etc.)
@@ -178,7 +180,7 @@ class MessageCodec:
             "c": category,
             "t": type,
             "p": payload,
-            "id": str(uuid4()),
+            "id": message_id or str(uuid4()),
             "seq": self._sequence,
             "ts": datetime.now(UTC).isoformat(),
             "v": PROTOCOL_VERSION,

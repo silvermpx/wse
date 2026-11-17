@@ -27,6 +27,7 @@ Optional extras::
 from ._version import __version__
 from .client import AsyncWSEClient
 from .connection_pool import ConnectionPool
+from .outbox import Offline
 from .delivery import (
     CHECKPOINT_REJECTED_EVENT,
     CONTINUITY_EVENT,
@@ -133,6 +134,7 @@ __all__ = [
     "RESYNC_EVENT",
     "Continuity",
     "DeliveryConfig",
+    "Offline",
     "Subscription",
     "TopicState",
 ]

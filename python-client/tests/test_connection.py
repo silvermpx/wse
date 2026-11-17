@@ -248,7 +248,8 @@ class TestUrl:
         msgpack = pytest.importorskip("msgpack")
         from wse_client import AsyncWSEClient
 
-        client = AsyncWSEClient("ws://x/wse", wire_format="msgpack")
+        # The send path itself, without an outbox waiting for server_ready.
+        client = AsyncWSEClient("ws://x/wse", wire_format="msgpack", offline=None)
         ws = FakeWS()
         client._connection._ws = ws
         client._connection._state = ConnectionState.CONNECTED

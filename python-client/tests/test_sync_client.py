@@ -297,3 +297,34 @@ class TestSyncDelivery:
             assert saved["topics"] == {"prices": {"0000000a": 2}}
             assert saved["consumer"] == "board"
             client.close()
+
+
+class TestSyncOutbox:
+    def test_the_handlers_hear_what_became_of_a_message(self):
+        st = ServerThread()
+        with st as srv:
+            client = SyncWSEClient(srv.url, reconnect=FAST)
+            delivered: list[str] = []
+            client.on("delivered")(lambda e: delivered.extend(e.payload["ids"]))
+            client.connect(timeout=5)
+            sent = client.send("order", {}, id="mine-1")
+            assert sent in (SendResult.SENT, SendResult.QUEUED)
+            # The outcome reaches the handler; recv() never returns it.
+            with pytest.raises(WSETimeoutError):
+                client.recv(timeout=0.5)
+            assert delivered == ["mine-1"]
+            assert client.kept == 0
+            client.close()
+
+    def test_a_clear_with_no_connection_tells_the_handlers(self):
+        client = SyncWSEClient("ws://localhost:5006/wse")
+        cleared: list[dict] = []
+        client.on("not_delivered")(lambda e: cleared.append(e.payload))
+        outbox = client._client_kwargs["_outbox"]
+        outbox.add("a", '{"t":"m","p":{},"id":"a"}', None, time.time())
+        assert client.kept == 1
+        client.clear()
+        with pytest.raises(WSETimeoutError):
+            client.recv(timeout=0.2)
+        assert cleared == [{"reason": "cleared", "ids": ["a"]}]
+        assert client.kept == 0

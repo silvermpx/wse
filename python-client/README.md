@@ -97,7 +97,8 @@ Handlers also hear the connection itself: `connected` (`connection_id`, `user_id
 | `load_balancing` | LoadBalancingStrategy | WEIGHTED_RANDOM | Endpoint selection strategy when `endpoints` is set |
 | `rate_limit` | float \| None | 100 | Outbound limit for `send()` / `send_with_retry()` / `send_batch()` in messages per second; `None` disables it |
 | `rate_limit_burst` | int | 10 x `rate_limit` | Messages that may go out at once before the rate applies |
-| `offline_queue` | bool | False | Hold messages sent while disconnected and send them once after the next reconnect |
+| `offline` | Offline \| None | `Offline()` | The outbox: every message but a live or signed one waits until the server answers for it (see [The outbox](#the-outbox)); `None` has none, as before 3.2 |
+| `offline_queue` | bool | False | Without an outbox (`offline=None`): hold messages sent while disconnected and send them once after the next reconnect |
 | `max_message_size` | int \| None | 16 MiB | Largest inbound message, checked on the frame and while inflating compressed frames; `None` disables it |
 | `recovery_timeout` | float | 3.0 | Seconds a topic waits for a recovery replay after an offset gap (`0` never waits) |
 | `wire_format` | str | `"json"` | `"msgpack"`: the server sends this connection MessagePack and the client sends in it too, except inside E2E frames (needs the `[msgpack]` extra) |
@@ -135,9 +136,9 @@ The `connect(url, **kwargs)` factory returns an `AsyncWSEClient` (not connected 
 
 | Value | Meaning |
 |-------|---------|
-| `SendResult.SENT` | Written to the socket |
-| `SendResult.QUEUED` | Held by the offline queue (`offline_queue=True`); sent once after the next reconnect - do not retry it |
-| `SendResult.FAILED` | Neither sent nor queued (not connected, rate limited); the caller decides whether to retry |
+| `SendResult.SENT` | Written to the socket; with the outbox, the `delivered` event says when the server took it |
+| `SendResult.QUEUED` | Waits in the outbox (or the offline queue), and goes on its own - do not retry it |
+| `SendResult.FAILED` | Neither sent nor kept (the outbox full, rate limited; without an outbox, not connected); the caller decides whether to retry |
 
 `send(..., live=True)` sends only on the connection that is open now: the offline queue never holds
 it for a later one. Use it for commands that must not run late (a valve, a door, an order); signed
@@ -262,9 +263,23 @@ await client.send("metric", {"cpu": 42}, priority=MessagePriority.LOW)          
 await client.send("log", {"msg": "debug"}, priority=MessagePriority.BACKGROUND)         # 1
 ```
 
-### Offline Queue
+### The outbox
 
-Off by default. With `offline_queue=True`, `send()` called while disconnected returns `SendResult.QUEUED` and the message goes out once after the next reconnect (highest priority first, up to 1000 messages, dropped after 1 hour). Rate-limited sends are never queued, and `send_with_retry()` never queues its failed attempts.
+Every message sent, except a live or signed one, waits in the outbox until the server answers for it, goes again after a reconnect, and reaches the server's application once: it is numbered, and a 3.2 server drops a repeat. The handlers of `delivered` (`{"ids": [...]}`) and `not_delivered` (`{"reason": ..., "ids": [...]}`) hear what became of each, by its id - the application's own with `send(..., id=...)`, a random UUID without one. They are handlers' events, as `connected` is, never on the stream `recv()` reads.
+
+```python
+@client.on("delivered")
+def delivered(event):
+    print("the server took", event.payload["ids"])
+
+@client.on("not_delivered")
+def not_delivered(event):
+    print(event.payload["reason"], event.payload["ids"])
+
+await client.send("order", {"item": "tea"}, id="order-17", ttl=60)
+```
+
+A message is not delivered when the server refused it (`busy`, `rate_limited`, `missing`, `not_ready`), when it was not written within its `ttl` or `Offline.max_age` (`expired`, an hour by default; once written it waits for the answer whatever its age), when it was the last user's (`user_changed`), or when the application cleared the outbox (`cleared`: `client.clear()` on sign-out). At most `Offline.max_messages` (100,000) and `Offline.max_bytes` (16 MiB) wait, the ones not answered yet included; past either `send()` returns `SendResult.FAILED`. `client.kept` says how many wait. `disconnect()` waits up to a second for the server's answers; what waits stays for the next `connect()`. It sends in the order of sending, whatever the priority. With a server older than 3.2 a message is gone once written, as before. `send_with_retry()` is `send()` with an outbox: the outbox retries.
 
 ### Compression
 
