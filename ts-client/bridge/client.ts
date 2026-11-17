@@ -88,8 +88,24 @@ export function createBridgeClient(
   const topicShares = new Map<string, number>();
   /** The last offset received of each stream of each topic. */
   const received = new Map<string, Record<string, number>>();
-  /** The window's sends the owner did not say the outcome of yet, by id. */
-  const pending = new Set<string>();
+  /**
+   * The window's sends the owner did not say the outcome of yet: how many
+   * of each id (an application may give two the same).
+   */
+  const pending = new Map<string, number>();
+  let pendingCount = 0;
+  const pend = (id: string) => {
+    pending.set(id, (pending.get(id) ?? 0) + 1);
+    pendingCount++;
+  };
+  /** The owner said the outcome of one send of `id`. */
+  const settled = (id: string) => {
+    const n = pending.get(id);
+    if (n === undefined) return;
+    if (n > 1) pending.set(id, n - 1);
+    else pending.delete(id);
+    pendingCount--;
+  };
   /**
    * Sends waiting for the topics they require to be continuous, each with
    * the time it may wait (ms since the epoch), counted from its send.
@@ -178,8 +194,10 @@ export function createBridgeClient(
   const refresh = () => {
     const next = snapshotOf();
     if (shallowSame(next, snapshot)) return;
+    const topicsChanged = next.topics !== snapshot.topics;
     snapshot = next;
     store.getState().setConnectionState(snapshot.connection);
+    if (topicsChanged) store.getState().setActiveTopics([...snapshot.topics]);
     for (const listener of [...stateListeners]) {
       try {
         listener(snapshot);
@@ -230,6 +248,12 @@ export function createBridgeClient(
     pausedBatches = [];
     for (const resolve of signs.values()) resolve('dropped');
     signs.clear();
+    // What waited for its topics never reached the owner: it goes.
+    if (waiting.length > 0) {
+      const ids = waiting.map((w) => w.options.id!);
+      waiting = [];
+      emit('wseNotDelivered', { reason: 'closed', ids });
+    }
     // The connection is gone for good: what the window holds is not current.
     if (!done) delivery.connectionLost();
     refresh();
@@ -294,7 +318,7 @@ export function createBridgeClient(
       case 'event': {
         const detail = item.detail as { ids?: string[] } | null;
         if ((item.name === 'wseDelivered' || item.name === 'wseNotDelivered') && detail?.ids) {
-          for (const id of detail.ids) pending.delete(id);
+          for (const id of detail.ids) settled(id);
         }
         emit(item.name, item.detail);
         return;
@@ -345,7 +369,7 @@ export function createBridgeClient(
           return;
         }
         if (f.status === 'dropped' && f.id) {
-          pending.delete(f.id);
+          settled(f.id);
           emit('wseNotDelivered', { reason: 'dropped', ids: [f.id] });
         }
         return;
@@ -414,7 +438,7 @@ export function createBridgeClient(
 
   const go = (type: string, payload: unknown, sendOptions: MessageOptions, until?: number): string => {
     const id = sendOptions.id ?? generateId();
-    if (!sendOptions.live) pending.add(id);
+    if (!sendOptions.live) pend(id);
     post({
       k: 'send',
       n: nextSend++,
@@ -544,7 +568,8 @@ export function createBridgeClient(
     },
     subscribe,
     send: (type, payload, sendOptions = {}) => {
-      if (done) return 'dropped';
+      // Let go for good (refused, signed out, its owner gone): nothing more goes.
+      if (done || over()) return 'dropped';
       if (sendOptions.live) {
         if (!snapshot.ready) return 'dropped';
         if (sendOptions.requires?.length && !delivery.continuous(sendOptions.requires)) return 'dropped';
@@ -570,12 +595,12 @@ export function createBridgeClient(
         post({ k: 'sign', n, t: type, p: payload, o: signOptions, a: 0 });
       });
     },
-    kept: () => pending.size + waiting.length,
+    kept: () => pendingCount + waiting.length,
     reconnect: () => post({ k: 'reconnect' }),
     wake: () => post({ k: 'wake' }),
     close: async (deadlineMs: number) => {
       const until = Date.now() + Math.max(0, deadlineMs);
-      while (!done && pending.size + waiting.length > 0 && Date.now() < until) {
+      while (!done && pendingCount + waiting.length > 0 && Date.now() < until) {
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
       client.destroy();

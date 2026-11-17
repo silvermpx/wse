@@ -540,3 +540,49 @@ describe('the outcomes and topics of the windows’ sends', () => {
     await vi.waitFor(() => expect(second.messagesOfType('cancel')).toHaveLength(1));
   });
 });
+
+describe('a window, as its application reads it', () => {
+  it('refuses a send once its owner is gone for good', async () => {
+    const o = owner();
+    const w = window(o);
+    await vi.waitFor(() => expect(w.bridge.phase).toBe('attached'));
+    o.destroy();
+    await vi.waitFor(() => expect(['closed', 'revoked']).toContain(w.bridge.phase));
+    expect(w.send('save', { n: 1 }, { id: 'after-close' })).toBe('dropped');
+    expect(w.kept()).toBe(0);
+  });
+
+  it('keeps each of two sends of one id until the owner heard of it', async () => {
+    const o = owner();
+    const w = window(o);
+    w.retain();
+    await settle();
+    const ws = FakeWebSocket.last();
+    await serve(ws);
+    await vi.waitFor(() => expect(w.state.getSnapshot().ready).toBe(true));
+    w.send('save', { n: 1 }, { id: 'document' });
+    w.send('save', { n: 2 }, { id: 'document' });
+    await vi.waitFor(() => expect(ws.appTextMessages().length).toBe(2));
+    expect(w.kept()).toBe(2);
+    ws.serverSend({ c: 'WSE', t: 'ack', p: { s: 1 } });
+    await vi.waitFor(() => expect(o.client.kept()).toBe(1));
+    await settle();
+    expect(w.kept()).toBe(1);
+  });
+
+  it('shows the topics it holds in its store as in its snapshot', async () => {
+    const o = owner();
+    const w = window(o);
+    w.retain();
+    await settle();
+    const ws = FakeWebSocket.last();
+    await serve(ws);
+    const lease = w.subscribe(['prices']);
+    await vi.waitFor(() => expect(ws.messagesOfType('subscription_update').length).toBeGreaterThan(0));
+    ws.serverSend(reply(['prices']));
+    await vi.waitFor(() => expect(w.state.getSnapshot().topicStates.prices.subscription).toBe('active'));
+    expect(w.store.getState().activeTopics).toEqual(['prices']);
+    lease.release();
+    await vi.waitFor(() => expect(w.store.getState().activeTopics).toEqual([]));
+  });
+});
