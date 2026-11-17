@@ -42,14 +42,18 @@ fn main() -> ExitCode {
         Some("commits") => run_commits(&root, args.get(1).map(String::as_str)),
         Some("fast") => run_fast(&root),
         Some("hooks") => run_hooks(&root),
-        // Without a lane, CI's Rust lint first, as CI runs it before the tests.
-        Some("check") => match args.get(1) {
-            Some(lane) => check::run(&root, Some(lane)),
-            None => run_fast(&root) && check::run(&root, None),
-        },
+        // Without lanes, CI's Rust lint first, as CI runs it before the tests.
+        Some("check") => {
+            let lanes: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+            if lanes.is_empty() {
+                run_fast(&root) && check::run(&root, &[])
+            } else {
+                check::run(&root, &lanes)
+            }
+        }
         _ => {
             eprintln!(
-                "usage: cargo xtask <comments | arch | names | lint | commits [RANGE] | fast | hooks | check [LANE]>"
+                "usage: cargo xtask <comments | arch | names | lint | commits [RANGE] | fast | hooks | check [LANE...]>"
             );
             return ExitCode::from(2);
         }

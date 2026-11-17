@@ -222,20 +222,27 @@ fn run_lane(root: &Path, lane: &Lane, dir: &Path) -> Outcome {
     }
 }
 
-pub fn run(root: &Path, only: Option<&str>) -> bool {
-    let lanes: Vec<&Lane> = LANES
+/// Runs the lanes named in `only` side by side, every lane when it is
+/// empty; a name that is no lane runs nothing.
+pub fn run(root: &Path, only: &[&str]) -> bool {
+    let unknown: Vec<&str> = only
         .iter()
-        .filter(|l| only.is_none_or(|o| o == l.name))
+        .copied()
+        .filter(|o| !LANES.iter().any(|l| l.name == *o))
         .collect();
-    if lanes.is_empty() {
+    if !unknown.is_empty() {
         let names: Vec<&str> = LANES.iter().map(|l| l.name).collect();
         eprintln!(
             "check: no lane {}; the lanes: {}",
-            only.unwrap_or(""),
+            unknown.join(", "),
             names.join(", ")
         );
         return false;
     }
+    let lanes: Vec<&Lane> = LANES
+        .iter()
+        .filter(|l| only.is_empty() || only.contains(&l.name))
+        .collect();
     let dir: PathBuf = root.join("target/xtask-check");
     let started = Instant::now();
     let results: Vec<(&str, Outcome)> = thread::scope(|scope| {

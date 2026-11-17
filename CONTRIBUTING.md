@@ -85,7 +85,7 @@ cargo xtask hooks     # once: the gate before every push (hooks/pre-push)
 cargo xtask fast      # CI's Rust lint: rustfmt, clippy for each build, then the checks below
 cargo xtask lint      # comments, version-free names and the engine boundary
 cargo xtask commits   # commit messages of your branch (origin/main..HEAD)
-cargo xtask check     # fast, then CI's jobs on this machine side by side (check LANE: one)
+cargo xtask check     # fast, then CI's jobs on this machine side by side (check LANE...: those)
 ```
 
 The gate before a push checks the pushed commit in a worktree of its own
@@ -101,7 +101,8 @@ A lane this machine has no tools for is skipped with the reason (Swift needs
 a Mac; a Linux desktop app needs GTK 3 and xvfb), so a Mac and a Linux
 machine between them cover CI. `FLUTTER=` and `GRADLE=` name those tools when
 they are not on PATH. Each lane builds under `target/xtask-check/<lane>/` and
-logs to `target/xtask-check/<lane>.log`.
+logs to `target/xtask-check/<lane>.log`. `cargo xtask check swift dart` runs
+only the lanes named, side by side, without `fast`.
 
 - **Comments** say why the code is the way it is, in plain English, for the
   next reader. Issue, ticket and audit numbers, plan or wave numbers and the
