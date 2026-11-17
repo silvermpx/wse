@@ -45,6 +45,30 @@ void main() {
     expectMenu(tester, ['Deutsch', 'Quit WSE Demo']);
   });
 
+  test('the status follows the connection, in German and English', () {
+    expect(statusOf(WseItemKind.connected), 'connected');
+    expect(statusOf(WseItemKind.disconnected), 'reconnecting');
+    expect(statusOf(WseItemKind.paused), 'paused');
+    expect(statusOf(WseItemKind.closed), 'closed');
+    expect(statusOf(WseItemKind.message), isNull);
+    const statuses = [
+      'connecting',
+      'connected',
+      'reconnecting',
+      'paused',
+      'closed',
+      'failed',
+    ];
+    for (final status in statuses) {
+      final german = textOf(Language.de, status);
+      final english = textOf(Language.en, status);
+      expect(german, isNotEmpty);
+      expect(english, isNotEmpty);
+    }
+    expect(textOf(Language.de, 'reconnecting'), 'wird wiederhergestellt');
+    expect(textOf(Language.en, 'reconnecting'), 'reconnecting');
+  });
+
   test('a direct client hears the ticks too', () async {
     final client = await WseClient.connect(
       wseConfig(serverUrl, topics: ['ticks'], insecure: true),

@@ -21,6 +21,9 @@ const _texts = {
     'status': 'Verbindung',
     'connecting': 'wird aufgebaut',
     'connected': 'verbunden',
+    'reconnecting': 'wird wiederhergestellt',
+    'paused': 'pausiert',
+    'closed': 'geschlossen',
     'failed': 'fehlgeschlagen',
     'tick': 'Letzter Tick',
     'none': 'noch keiner',
@@ -32,12 +35,28 @@ const _texts = {
     'status': 'Connection',
     'connecting': 'connecting',
     'connected': 'connected',
+    'reconnecting': 'reconnecting',
+    'paused': 'paused',
+    'closed': 'closed',
     'failed': 'failed',
     'tick': 'Last tick',
     'none': 'none yet',
     'switch': 'Deutsch',
     'quit': 'Quit WSE Demo',
   },
+};
+
+/// A word of the screen in `language`.
+String textOf(Language language, String key) => _texts[language]![key]!;
+
+/// The status an event of the connection shows: it follows the connection
+/// as it goes and comes back; null for an event that changes nothing of it.
+String? statusOf(WseItemKind kind) => switch (kind) {
+  WseItemKind.connected => 'connected',
+  WseItemKind.disconnected => 'reconnecting',
+  WseItemKind.paused => 'paused',
+  WseItemKind.closed => 'closed',
+  _ => null,
 };
 
 const _ink = Color(0xFF1F2328);
@@ -61,7 +80,7 @@ class _ExampleAppState extends State<ExampleApp> {
   String? _tick;
   WseClient? _client;
 
-  String t(String key) => _texts[_language]![key]!;
+  String t(String key) => textOf(_language, key);
 
   void _switchLanguage() => setState(
     () => _language = _language == Language.de ? Language.en : Language.de,
@@ -89,10 +108,15 @@ class _ExampleAppState extends State<ExampleApp> {
       });
       await for (final item in client.events()) {
         if (!mounted) break;
-        if (item.kind == WseItemKind.message && item.topic == 'ticks') {
+        final status = statusOf(item.kind);
+        if (status != null) {
+          setState(() => _status = status);
+        } else if (item.kind == WseItemKind.message && item.topic == 'ticks') {
           setState(() => _tick = '${item.offset}');
         }
       }
+      // The events end with the client.
+      if (mounted) setState(() => _status = 'closed');
     } catch (_) {
       if (mounted) setState(() => _status = 'failed');
     }
