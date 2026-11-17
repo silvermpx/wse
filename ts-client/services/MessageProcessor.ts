@@ -1962,15 +1962,21 @@ export class MessageProcessor {
     const queueEmpty = this.ctx.queue.getState().size === 0;
     const requires = options.requires && options.requires.length > 0 ? options.requires : undefined;
 
-    // The outbox takes every message of the application's but a live one and
-    // one that requires topics (that one waits in the queue until they are
-    // continuous). The client's own (a subscription, a sync request) go as
-    // before 3.2: they are made again for each connection, and the
-    // application hears of none of them.
+    // The outbox takes every message of the application's but a live one,
+    // one that requires topics not continuous now among them (that one waits
+    // in the queue until they are, then joins it): it keeps the topics, and
+    // each time it goes they are continuous. The client's own (a
+    // subscription, a sync request) go as before 3.2: they are made again
+    // for each connection, and the application hears of none of them.
     if (options.system) this.system.add(message);
     const outbox = this.ctx.outbox.current;
-    if (outbox && options.liveOn === undefined && !requires && !options.system) {
-      return this.keep(outbox, message, options.ttl);
+    if (
+      outbox &&
+      options.liveOn === undefined &&
+      !options.system &&
+      (!requires || (cm?.isTransportReady() && this.continuous(requires)))
+    ) {
+      return this.keep(outbox, message, options.ttl, requires);
     }
 
     // Fast path keeps latency low; it is skipped while anything older is
@@ -1998,7 +2004,7 @@ export class MessageProcessor {
    * A message for the outbox: numbered, kept until the server answers for
    * it, and out at once when the connection takes it.
    */
-  private keep(outbox: Outbox, message: WSMessage, ttl?: number): SendStatus {
+  private keep(outbox: Outbox, message: WSMessage, ttl?: number, requires?: readonly string[]): SendStatus {
     let json: string;
     try {
       json = JSON.stringify(message);
@@ -2007,7 +2013,7 @@ export class MessageProcessor {
       logger.error(`Dropping message ${message.t}: it cannot be serialised`, error);
       return 'dropped';
     }
-    if (outbox.add(message, json, ttl, Date.now()) === 0) {
+    if (outbox.add(message, json, ttl, Date.now(), requires) === 0) {
       this.countDropped(1);
       logger.warn(`The outbox is full; message ${message.t} dropped`);
       return 'dropped';
@@ -2024,7 +2030,10 @@ export class MessageProcessor {
     if (!cm || !cm.isTransportReady()) return false;
     const outcomes = noOutcomes();
     let all = true;
-    outbox.due(Date.now(), outcomes, (message, s, json) => {
+    outbox.due(Date.now(), outcomes, (message, s, json, requires) => {
+      // Its topics not continuous on this connection (a reconnect's resync
+      // not done): it waits in its place, and what comes after it with it.
+      if (requires && this.holdsBack(requires)) return false;
       const result = cm.trySend(message, s, json);
       if (result === 'sent') return true;
       all = false;
@@ -2090,6 +2099,11 @@ export class MessageProcessor {
   /** Each of `topics` is continuous now (always, for a client without delivery). */
   private continuous(topics: readonly string[]): boolean {
     return this.ctx.delivery?.continuous(topics) ?? true;
+  }
+
+  /** A topic of `topics` the client holds is not continuous. */
+  private holdsBack(topics: readonly string[]): boolean {
+    return this.ctx.delivery?.holdsBack(topics) ?? false;
   }
 
   private enqueueInMemory(
@@ -2302,7 +2316,7 @@ export class MessageProcessor {
         const outbox = this.ctx.outbox.current;
         if (outbox && liveOn === undefined && !this.system.has(wire)) {
           const left = batch[i].expiresAt;
-          this.keep(outbox, wire, left !== undefined ? Math.max(0, left - nowMs) : undefined);
+          this.keep(outbox, wire, left !== undefined ? Math.max(0, left - nowMs) : undefined, batch[i].requires);
           continue;
         }
         this.handedOver.set(wire, {

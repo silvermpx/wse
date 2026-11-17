@@ -55,6 +55,13 @@ interface Row extends StoredMessage {
 
 type Report = (operation: string, error: unknown) => void;
 
+/** Topics a kept message requires, as the database holds them; anything else is none. */
+function topicsOf(value: unknown): string[] | undefined {
+  return Array.isArray(value) && value.length > 0 && value.every((t) => typeof t === 'string' && t.length > 0)
+    ? (value as string[])
+    : undefined;
+}
+
 function done<T>(request: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
     request.onsuccess = () => resolve(request.result);
@@ -183,6 +190,7 @@ async function readProducer(db: IDBDatabase, meta: Meta): Promise<ReadOutbox> {
       at: row.at,
       until: row.until,
       owned: row.owned,
+      requires: topicsOf(row.requires),
       json: row.json,
       message,
     });
@@ -231,6 +239,7 @@ class IdbLog implements OutboxLog {
       at: record.at,
       until: record.until,
       owned: record.owned,
+      ...(record.requires ? { requires: record.requires } : {}),
       json: record.json,
     };
   }

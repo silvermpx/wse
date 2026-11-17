@@ -79,6 +79,8 @@ export interface DeliveryGate {
   recoveryPositions(topics: readonly string[]): Record<string, TopicPosition> | null;
   /** Each of `topics` is continuous now: a send that requires them may go. */
   continuous(topics: readonly string[]): boolean;
+  /** One of `topics` the client holds is not continuous: a kept send that requires them waits. */
+  holdsBack(topics: readonly string[]): boolean;
 }
 
 export function ownerGeneration(): OwnerGeneration {

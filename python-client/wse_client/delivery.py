@@ -199,6 +199,16 @@ class Delivery:
     def take_out(self) -> WSEEvent | None:
         return self._out.popleft() if self._out else None
 
+    def holds_back(self, topics: tuple[str, ...]) -> bool:
+        """One of *topics* the client holds is not continuous: a kept send
+        that requires them waits (one the client let go of holds nothing
+        back)."""
+        for topic in topics:
+            state = self._states.get(topic)
+            if state is not None and state.continuity is not Continuity.CONTINUOUS:
+                return True
+        return False
+
     def continuous(self, topics: tuple[str, ...]) -> bool:
         """Each of *topics* held and continuous: a send that requires them
         may go."""

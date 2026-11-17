@@ -498,6 +498,49 @@ describe('sends that wait for their topics', () => {
     expect(second.messagesOfType('order')).toHaveLength(1);
   });
 
+  it('kept in the outbox wait for their topics again after a reconnect, one that went at once too', async () => {
+    const { answers, resync } = resyncs();
+    const c = client({
+      topics: ['prices'],
+      consumer: 'board',
+      offline: { enabled: true },
+      delivery: { mode: 'recover-or-resync', resync },
+    });
+    c.retain();
+    await tick();
+    const first = FakeWebSocket.last();
+    await connectServer(first, { user_id: 'alice', features: { acks: true } });
+    await send(first, { c: 'WSE', t: 'outbox', p: { acked: 0, node: 'n1' }, v: 1 }, reply(['prices']));
+    // It waits for the resync, then goes numbered, kept until its answer.
+    c.send('order', { id: 1 }, { requires: ['prices'] });
+    expect(first.messagesOfType('order')).toHaveLength(0);
+    answers[0].resolve();
+    await tick();
+    expect(first.messagesOfType('order').map((m) => m.s)).toEqual([1]);
+    // Continuous now: it goes at once, numbered and kept as well.
+    c.send('order', { id: 2 }, { requires: ['prices'] });
+    expect(first.messagesOfType('order').map((m) => m.s)).toEqual([1, 2]);
+    expect(c.kept()).toBe(2);
+
+    // The connection goes before either is answered; on the next one prices
+    // is not continuous until its resync, and neither goes before it.
+    c.pause('manual');
+    await tick();
+    c.resume('manual');
+    await tick();
+    const second = FakeWebSocket.last();
+    expect(second).not.toBe(first);
+    await connectServer(second, { user_id: 'alice', features: { acks: true } });
+    await send(second, { c: 'WSE', t: 'outbox', p: { acked: 0, node: 'n1' }, v: 1 });
+    expect(c.state.getSnapshot().topicStates.prices.continuity).not.toBe('continuous');
+    expect(second.messagesOfType('order')).toHaveLength(0);
+
+    await send(second, reply(['prices']));
+    answers[answers.length - 1].resolve();
+    await tick();
+    expect(second.messagesOfType('order').map((m) => m.s)).toEqual([1, 2]);
+  });
+
   it('share the memory limit with the other sends, whichever came first', () => {
     const { resync } = resyncs();
     const options = {

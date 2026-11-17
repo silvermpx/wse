@@ -74,9 +74,10 @@ pub(crate) struct Queued {
     /// Its id: the application's own, or a random one; what its outcome
     /// names.
     pub(crate) id: Box<str>,
-    /// How long it may wait before it is first sent; None: the outbox's
-    /// `max_age`.
-    pub(crate) ttl: Option<std::time::Duration>,
+    /// Until when it may wait before it is first sent, in milliseconds
+    /// since the Unix epoch, from its send on (waiting for its topics
+    /// included); None: the outbox's `max_age`.
+    pub(crate) until: Option<u64>,
     /// It took a place in the outbox's room, given back when it goes.
     pub(crate) counted: bool,
     /// The outbox's clears before it ([`Shared::clears`]): it goes nowhere
@@ -114,7 +115,7 @@ impl SentFor {
             only_on: None,
             requires: None,
             id,
-            ttl: None,
+            until: None,
             counted: false,
             clears: self.clears,
         }
@@ -862,7 +863,10 @@ impl Client {
             encode_after(room, kind, payload, &id, extra)?
         };
         let mut frame = self.queued(id.into_boxed_str(), text)?;
-        frame.ttl = options.ttl;
+        frame.until = options.ttl.map(|ttl| {
+            crate::outbox::now_ms()
+                .saturating_add(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX))
+        });
         if !options.requires.is_empty() {
             frame.requires = Some(options.requires.iter().cloned().collect());
         }
@@ -905,18 +909,32 @@ impl Client {
     }
 
     /// Queues `frame`, waiting for a place in the outbox and room in the
-    /// queue.
+    /// queue. A send dropped while it waits (its future cancelled) gives its
+    /// place back.
     async fn put(&self, frame: Queued) -> Result<(), Error> {
-        let room = self.shared.room.as_ref().filter(|_| frame.counted);
+        /// A place taken in the room, given back unless the frame got into
+        /// the queue.
+        struct Taken<'a> {
+            room: Option<&'a crate::outbox::Room>,
+            size: usize,
+        }
+        impl Drop for Taken<'_> {
+            fn drop(&mut self) {
+                if let Some(room) = self.room {
+                    room.give_back(self.size);
+                }
+            }
+        }
+        let room = self.shared.room.as_deref().filter(|_| frame.counted);
         let size = frame.size();
         if let Some(room) = room {
             room.wait_take(size).await?;
         }
+        let mut taken = Taken { room, size };
         let sent = self.frames.send(frame).await;
-        if sent.is_err()
-            && let Some(room) = room
-        {
-            room.give_back(size);
+        if sent.is_ok() {
+            // The session gives it back when the message goes.
+            taken.room = None;
         }
         sent.map_err(|_| Error::Closed)
     }

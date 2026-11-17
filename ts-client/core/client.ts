@@ -260,6 +260,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
       hold: (message) => delivery.hold(message),
       recoveryPositions: (topics) => delivery.recoveryPositions(topics),
       continuous: (topics) => delivery.continuous(topics),
+      holdsBack: (topics) => delivery.holdsBack(topics),
     },
     leaseHolder: offlineDatabase ? generateId() : undefined,
     tap: options.onEveryMessage,

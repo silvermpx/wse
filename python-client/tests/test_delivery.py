@@ -388,6 +388,55 @@ class TestRequires:
         await settle()
         assert sent_types(c)[-1] == "cancel"
 
+    async def test_one_kept_waits_for_its_topics_again_after_a_reconnect(self):
+        c = make_client()
+        ready = json.dumps(
+            {
+                "c": "WSE",
+                "t": "server_ready",
+                "p": {"details": {"user_id": "ann", "features": {"acks": True}}},
+            }
+        )
+        answer = json.dumps(
+            {"c": "WSE", "t": "outbox", "p": {"acked": 0, "node": "n1"}}
+        )
+        c._on_raw_message(ready)
+        c._on_raw_message(answer)
+        await c.subscribe(["prices"])
+        c._on_raw_message(taken("prices"))
+        c.resynced(resync_of(drain(c))["round"])
+        c._connection.send.reset_mock()
+        assert await c.send("cancel", {"id": 1}, requires=["prices"]) is SendResult.SENT
+        assert sent_types(c) == ["cancel"]
+        # The connection goes before its answer; on the next one prices is
+        # not continuous until its resync.
+        c._on_transport_close()
+        c._connection.send.reset_mock()
+        c._on_raw_message(ready)
+        c._on_raw_message(answer)
+        c._resubscribe_pending = {"prices"}
+        await c._resubscribe()
+        c._on_raw_message(taken("prices"))
+        round_ = resync_of(drain(c))
+        await settle()
+        assert "cancel" not in sent_types(c)
+        c.resynced(round_["round"])
+        await settle()
+        assert sent_types(c)[-1] == "cancel"
+
+    async def test_one_runs_out_in_its_time_while_it_waits(self):
+        c = make_client()
+        await connected(c)
+        heard: list[WSEEvent] = []
+        c.on("not_delivered")(heard.append)
+        sent = await c.send("cancel", {}, requires=["prices"], id="late", ttl=0.02)
+        assert sent is SendResult.QUEUED
+        await asyncio.sleep(0.1)
+        assert [(e.type, e.payload) for e in heard] == [
+            ("not_delivered", {"reason": "expired", "ids": ["late"]})
+        ]
+        assert not c._waiting
+
     async def test_one_sent_as_the_last_user_goes_nowhere(self):
         c = make_client(None)
         c._on_raw_message(server_ready("ann"))

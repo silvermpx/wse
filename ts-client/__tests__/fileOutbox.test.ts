@@ -22,6 +22,7 @@ interface VectorRecord {
   at: number;
   until: number;
   owned: boolean;
+  requires?: string[];
   text: string;
 }
 interface Vector {
@@ -90,10 +91,10 @@ describe('the file of every client (tests/vectors/outbox.json)', () => {
       ...byKind('node'),
       ...byKind('written'),
       byKind('user')[0],
-      ...vector.lines.filter((l) => l.kind === 'add' && l.json.includes('"id":"c"')),
+      ...vector.lines.filter((l) => l.kind === 'add' && /"id":"[cd]"/.test(l.json)),
     ];
     expect(data).toBe(expected.map((l) => `${l.line}\n`).join(''));
-    expect(lines).toBe(5);
+    expect(lines).toBe(6);
   });
 
   it('reads the file to the state the vector has', () => {
@@ -107,7 +108,15 @@ describe('the file of every client (tests/vectors/outbox.json)', () => {
       state.user,
     ]);
     expect(
-      read.records.map((r) => ({ s: r.s, id: r.id, at: r.at, until: r.until, owned: r.owned, text: numbered(r.s, r.json) })),
+      read.records.map((r) => ({
+        s: r.s,
+        id: r.id,
+        at: r.at,
+        until: r.until,
+        owned: r.owned,
+        ...(r.requires ? { requires: r.requires } : {}),
+        text: numbered(r.s, r.json),
+      })),
     ).toEqual(state.records);
     expect(read.records[0].message).toEqual({ t: 'm', p: {}, id: 'c' });
   });

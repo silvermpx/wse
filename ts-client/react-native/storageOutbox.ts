@@ -98,7 +98,23 @@ interface Item {
   at: number;
   until: number;
   owned: boolean;
+  /** Topics it requires each time it goes. */
+  requires?: string[];
   json: string;
+}
+
+/** A kept message as the storage keeps it. */
+function itemOf(record: StoredMessage): Item {
+  const item: Item = { id: record.id, at: record.at, until: record.until, owned: record.owned, json: record.json };
+  if (record.requires && record.requires.length > 0) item.requires = record.requires;
+  return item;
+}
+
+/** Topics a kept message requires, as the storage holds them; anything else is none. */
+function topicsOf(value: unknown): string[] | undefined {
+  return Array.isArray(value) && value.length > 0 && value.every((t) => typeof t === 'string' && t.length > 0)
+    ? (value as string[])
+    : undefined;
 }
 
 function newProducer(): string {
@@ -151,7 +167,7 @@ class StorageLog implements OutboxLog {
 
   add(record: StoredMessage): void {
     const key = this.key(record.s);
-    const item: Item = { id: record.id, at: record.at, until: record.until, owned: record.owned, json: record.json };
+    const item = itemOf(record);
     this.removes.delete(key);
     this.sets.set(key, JSON.stringify(item));
     this.held.add(record.s);
@@ -228,7 +244,7 @@ class StorageLog implements OutboxLog {
     this.held.clear();
     for (const record of state.records) {
       const key = this.key(record.s);
-      const item: Item = { id: record.id, at: record.at, until: record.until, owned: record.owned, json: record.json };
+      const item = itemOf(record);
       removes.delete(key);
       sets.set(key, JSON.stringify(item));
       this.held.add(record.s);
@@ -342,7 +358,16 @@ export function storageOutbox(storage: AsyncStorageLike | MMKVLike, name = 'wse'
           } catch {
             continue;
           }
-          records.push({ s, id: item.id, at: item.at, until: item.until, owned: item.owned, json: item.json, message });
+          records.push({
+            s,
+            id: item.id,
+            at: item.at,
+            until: item.until,
+            owned: item.owned,
+            requires: topicsOf(item.requires),
+            json: item.json,
+            message,
+          });
         }
         records.sort((a, b) => a.s - b.s);
         // Messages without their producer: written before it, or a producer

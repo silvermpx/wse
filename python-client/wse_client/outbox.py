@@ -85,7 +85,7 @@ Report = Callable[[str, str], None]
 class _Kept:
     """A message kept."""
 
-    __slots__ = ("at", "id", "owned", "s", "size", "text", "until")
+    __slots__ = ("at", "id", "owned", "requires", "s", "size", "text", "until")
 
     def __init__(
         self,
@@ -96,6 +96,7 @@ class _Kept:
         until: float,
         owned: bool,
         size: int | None = None,
+        requires: tuple[str, ...] | None = None,
     ) -> None:
         self.s = s
         self.id = message_id
@@ -104,6 +105,9 @@ class _Kept:
         self.at = at
         self.until = until
         self.owned = owned
+        # Topics each continuous right before it goes, every time it goes:
+        # once more after a reconnect too.
+        self.requires = requires
         # Its place in the room: the size of the message as it was sent.
         self.size = len(text) if size is None else size
 
@@ -171,6 +175,8 @@ class Outbox:
         # at most): the client's loop calls flush() then, whether or not
         # anything changes meanwhile.
         self.wake: Callable[[float], None] | None = None
+        # Counts the clears: a batch handed out before one goes no further.
+        self.generation = 0
         if offline.path is not None:
             try:
                 self._log, read = _Log.open(offline.path, self._report)
@@ -229,8 +235,17 @@ class Outbox:
 
     # -- What the application and the connection do ----------------------------
 
-    def add(self, message_id: str, text: str, ttl: float | None, now: float) -> int:
-        """Keeps a message (its JSON object): its number, or 0 when full."""
+    def add(
+        self,
+        message_id: str,
+        text: str,
+        ttl: float | None,
+        now: float,
+        requires: tuple[str, ...] | None = None,
+    ) -> int:
+        """Keeps a message (its JSON object): its number, or 0 when full.
+        One that requires topics goes, each time, only while they are
+        continuous (:meth:`due`)."""
         size = len(text)
         if (
             self._count + 1 > self._limits.max_messages
@@ -248,6 +263,7 @@ class Outbox:
             now + wait,
             owned=isinstance(self._user, str),
             size=size,
+            requires=requires or None,
         )
         self._records.append(record)
         self._count += 1
@@ -326,11 +342,18 @@ class Outbox:
         self._changed()
         return outcomes
 
-    def due(self, now: float, outcomes: Outcomes) -> list[tuple[int, str]]:
+    def due(
+        self,
+        now: float,
+        outcomes: Outcomes,
+        continuous: Callable[[tuple[str, ...]], bool] | None = None,
+    ) -> list[tuple[int, str]]:
         """The messages for this connection's writer, in order, each with its
         number and its text as it goes: all it did not take yet, once the
-        server took the connection and its mode is known; then the file gets
-        the batch's lines. What waited too long to be sent goes instead."""
+        server took the connection and its mode is known, up to one whose
+        topics are not *continuous* now (it waits in its place, and what
+        comes after it with it); then the file gets the batch's lines. What
+        waited too long to be sent goes instead."""
         out: list[tuple[int, str]] = []
         if self._ready and (self._answered or self._plain):
             if self._earliest <= now:
@@ -340,14 +363,26 @@ class Outbox:
             for i in range(self._cursor, len(records)):
                 record = records[i]
                 assert record is not None
+                if (
+                    record.requires
+                    and continuous is not None
+                    and not continuous(record.requires)
+                ):
+                    break
                 text = record.text if numbered_now else unnumbered(record.text)
                 out.append((record.s, text))
-            self._cursor = len(records)
+                self._cursor = i + 1
             if out and numbered_now and out[-1][0] > self._written:
                 self._written = out[-1][0]
                 self._put({"written": self._written})
         self.flush()
         return out
+
+    def writing(self, s: int) -> None:
+        """The connection hands message *s* to the server now: a clear from
+        here on waits for its answer (or, from a server that does not
+        answer, for its write)."""
+        self._flushed = max(self._flushed, s)
 
     def wrote(self, last: int) -> Outcomes:
         """The connection wrote the messages up to and with *last*. A server
@@ -408,7 +443,9 @@ class Outbox:
         on this connection is delivered when it confirms it on it, and not
         when the connection ends first."""
         outcomes = Outcomes()
-        in_hand = self._flushed if self._answered else 0
+        # A batch the connection's writer holds goes no further.
+        self.generation += 1
+        in_hand = self._flushed
         numbers = []
         for record in self._records[self._head :]:
             assert record is not None
@@ -579,16 +616,36 @@ def _line(salt: bytes, body: str) -> bytes:
     return b"%08x %s\n" % (zlib.crc32(data, zlib.crc32(salt)) & 0xFFFFFFFF, data)
 
 
+def _add_prefix(
+    s: int,
+    message_id: str,
+    at: int,
+    until: int,
+    owned: bool,
+    requires: tuple[str, ...] | None,
+) -> str:
+    """A kept message's line up to its text, as every client writes it."""
+    return '{"add":{"s":%d,"id":%s,"at":%d,"until":%d,"owned":%s,%s"text":' % (
+        s,
+        _dumps(message_id),
+        at,
+        until,
+        "true" if owned else "false",
+        '"requires":%s,' % _dumps(list(requires)) if requires else "",
+    )
+
+
 def _add_json(record: _Kept) -> str:
     """A message kept, its text as it is (a JSON object)."""
-    return '{"add":{"s":%d,"id":%s,"at":%d,"until":%d,"owned":%s,"text":%s}}' % (
+    prefix = _add_prefix(
         record.s,
-        _dumps(record.id),
+        record.id,
         round(record.at * 1000),
         min(round(record.until * 1000), 2**63 - 1),
-        "true" if record.owned else "false",
-        record.text,
+        record.owned,
+        record.requires,
     )
+    return "%s%s}}" % (prefix, record.text)
 
 
 @dataclass
@@ -708,18 +765,28 @@ def _record(body: str, value: object) -> _Kept | None:
         at, until, owned = _number(value["at"]), _number(value["until"]), value["owned"]
         if not isinstance(owned, bool) or not isinstance(value["text"], dict):
             return None
+        topics = value.get("requires")
+        if topics is not None and not (
+            isinstance(topics, list)
+            and topics
+            and all(isinstance(t, str) and t for t in topics)
+        ):
+            return None
+        requires = tuple(topics) if topics else None
     except (KeyError, TypeError, ValueError):
         return None
-    prefix = '{"add":{"s":%d,"id":%s,"at":%d,"until":%d,"owned":%s,"text":' % (
-        s,
-        _dumps(message_id),
-        at,
-        until,
-        "true" if owned else "false",
-    )
+    prefix = _add_prefix(s, message_id, at, until, owned, requires)
     if not (body.startswith(prefix) and body.endswith("}}")):
         return None
-    return _Kept(s, message_id, body[len(prefix) : -2], at / 1000, until / 1000, owned)
+    return _Kept(
+        s,
+        message_id,
+        body[len(prefix) : -2],
+        at / 1000,
+        until / 1000,
+        owned,
+        requires=requires,
+    )
 
 
 def _sync(fd: int) -> None:

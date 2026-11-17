@@ -84,6 +84,19 @@ class TestOutbox:
         assert outbox.size == 0
         assert outbox.hello()["written"] == 0
 
+    def test_one_that_requires_topics_waits_in_its_place_each_time_it_goes(self):
+        outbox = Outbox(LIMITS)
+        outbox.add("a", text("a"), None, 0, requires=("prices",))
+        add(outbox, "b")
+        answering(outbox)
+        assert outbox.due(0, Outcomes(), lambda topics: False) == []
+        assert numbers(outbox.due(0, Outcomes(), lambda topics: True)) == [1, 2]
+        # Lost before its answer: on the next connection it waits again.
+        outbox.disconnected()
+        answering(outbox)
+        assert outbox.due(0, Outcomes(), lambda topics: False) == []
+        assert numbers(outbox.due(0, Outcomes(), lambda topics: True)) == [1, 2]
+
     def test_another_users_messages_go(self):
         outbox = Outbox(LIMITS)
         add(outbox, "before any")
@@ -255,10 +268,26 @@ class TestTheFileFormat:
             state["user"],
         )
         assert [
-            (r.s, r.id, round(r.at * 1000), round(r.until * 1000), r.owned, r.text)
+            (
+                r.s,
+                r.id,
+                round(r.at * 1000),
+                round(r.until * 1000),
+                r.owned,
+                r.requires,
+                r.text,
+            )
             for r in read.records
         ] == [
-            (r["s"], r["id"], r["at"], r["until"], r["owned"], r["text"])
+            (
+                r["s"],
+                r["id"],
+                r["at"],
+                r["until"],
+                r["owned"],
+                tuple(r["requires"]) if "requires" in r else None,
+                r["text"],
+            )
             for r in state["records"]
         ]
 
@@ -347,6 +376,19 @@ class TestTheOutboxInAFile:
         add(second, "a")
         assert second.size == 1
         first.close_file()
+
+    def test_what_a_message_requires_outlives_the_client(self, tmp_path):
+        offline = self.offline(tmp_path)
+        first = Outbox(offline)
+        first.add("a", text("a"), None, 0, requires=("prices", "news"))
+        first.close_file()
+        again = Outbox(offline)
+        answering(again)
+        assert (
+            again.due(0, Outcomes(), lambda topics: topics != ("prices", "news")) == []
+        )
+        assert numbers(again.due(0, Outcomes(), lambda topics: True)) == [1]
+        again.close_file()
 
     def test_the_file_is_written_anew_once_what_went_outweighs_what_is_kept(
         self, tmp_path

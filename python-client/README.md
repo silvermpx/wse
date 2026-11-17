@@ -421,10 +421,13 @@ mode.
 
 `await client.send("cancel", {"id": 9}, requires=["orders"])` waits in memory
 until each topic it requires is continuous on the connection (it returns
-`SendResult.QUEUED`), checked right before it goes, so after a reconnect it
-waits for the resync; sends that require nothing go past it. It is the user's
-who sent it: once the server takes a connection for another, it goes nowhere.
-It is never put in the offline queue, and at most 1,000 wait.
+`SendResult.QUEUED`), and then joins the outbox with them: each time it goes,
+after a reconnect too, they are checked right before it goes, so it waits for
+the resync, and what was sent after it waits in its place with it. Sends that
+require nothing go past one still waiting in memory. Its `ttl` counts from the
+send: one that runs out while it waits is `not_delivered` (`expired`). It is
+the user's who sent it: once the server takes a connection for another, it
+goes nowhere. At most 1,000 wait in memory.
 
 ### Network Quality Monitoring
 

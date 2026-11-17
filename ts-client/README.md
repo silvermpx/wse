@@ -720,11 +720,13 @@ the application's own state (pass it back as `delivery.checkpoint`). A checkpoin
 is refused with a `wseCheckpointRejected` event. After a reconnect the recovery starts from it, so
 a message that came but was not applied comes again: the application applies repeats safely. A
 message handed on before the connection became another user's counts for nobody when it is
-committed later. A send that requires topics waits in the outgoing queue, in its place, and goes
-only while each of them is continuous on the connection: checked right before it goes, so one kept
-behind the rate limit does not go after a reconnect before the resync. It belongs to the user who
-made it (dropped when the user changes, never sent as the next one), counts against
-`maxQueueSize` and `memoryLimit` with every other send, and is never kept in the outbox.
+committed later. A send that requires topics waits in the outgoing queue, in its place, until each
+of them is continuous on the connection, and then joins the outbox with them: each time it goes,
+after a reconnect too, they are checked right before it goes, so it does not go before the resync,
+and while a topic the client holds is not continuous it waits in its place with what was sent
+after it. Its `ttl` counts from the send. It belongs to the user who made it (dropped when the user
+changes, never sent as the next one), and while it waits in the queue it counts against
+`maxQueueSize` and `memoryLimit` with every other send.
 Messages held past `maxHeld` (10,000), or a break during the resync, start the resync over; a
 handler that fails is called again (1 s, then twice as long, up to 30 s). Offsets JavaScript cannot
 hold exactly (above 2^53 - 1) are refused and break the topic off.

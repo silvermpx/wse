@@ -252,6 +252,9 @@ struct Record {
     /// nowhere once the server takes a connection for another. False: sent
     /// before any connection, or after one without a user; it goes on any.
     owned: bool,
+    /// Topics each continuous right before it goes (`requires`), every time
+    /// it goes: once more after a reconnect too.
+    requires: Option<Box<[String]>>,
     /// The message as it goes, numbered: `{"s":N,` before the rest. Shared
     /// with the writer, not copied.
     text: ByteString,
@@ -517,6 +520,7 @@ impl Outbox {
         size: usize,
         ttl: Option<Duration>,
         now: u64,
+        requires: Option<Box<[String]>>,
     ) -> u64 {
         let s = self.next;
         self.next += 1;
@@ -529,6 +533,7 @@ impl Outbox {
             at: now,
             until: now.saturating_add(wait),
             owned: matches!(self.user, Some(Some(_))),
+            requires,
             text: number_in_place(s, text),
             size,
         };
@@ -644,6 +649,7 @@ impl Outbox {
         &mut self,
         now: u64,
         outcomes: &mut Outcomes,
+        continuous: impl Fn(&[String]) -> bool,
         mut out: impl FnMut(u64, ByteString),
     ) {
         if self.ready && (self.answered || self.plain) {
@@ -652,16 +658,23 @@ impl Outbox {
             }
             if self.cursor < self.records.len() {
                 let numbered = self.answered;
+                let mut last = 0;
                 for record in self.records.range(self.cursor..) {
+                    // Its topics not continuous on this connection (a
+                    // reconnect's resync not done): it waits in its place,
+                    // and what comes after it with it.
+                    if record.requires.as_deref().is_some_and(|t| !continuous(t)) {
+                        break;
+                    }
                     let text = if numbered {
                         record.text.clone()
                     } else {
                         unnumbered(&record.text).into()
                     };
                     out(record.s, text);
+                    last = record.s;
+                    self.cursor += 1;
                 }
-                self.cursor = self.records.len();
-                let last = self.records.back().map_or(0, |r| r.s);
                 if numbered && last > self.written {
                     self.written = last;
                     self.put(&LineRef::Written(last));
@@ -1121,6 +1134,8 @@ mod file {
         until: u64,
         #[serde(default)]
         owned: bool,
+        #[serde(default)]
+        requires: Option<Vec<String>>,
         #[serde(borrow)]
         text: &'a RawValue,
     }
@@ -1411,10 +1426,15 @@ mod file {
         out.extend_from_slice(b",\"until\":");
         number(out, record.until);
         out.extend_from_slice(if record.owned {
-            b",\"owned\":true,\"text\":"
+            b",\"owned\":true"
         } else {
-            b",\"owned\":false,\"text\":"
+            b",\"owned\":false"
         });
+        if let Some(requires) = &record.requires {
+            out.extend_from_slice(b",\"requires\":");
+            let _ = serde_json::to_writer(&mut *out, requires);
+        }
+        out.extend_from_slice(b",\"text\":");
         out.extend_from_slice(record.text.as_bytes());
         out.extend_from_slice(b"}}");
         end(out, start, salt);
@@ -1509,7 +1529,21 @@ mod file {
             match line {
                 Line::Add(record) => {
                     let text = record.text.get();
-                    // A message is a JSON object.
+                    // A message is a JSON object; what it requires, topics.
+                    let requires = match record.requires {
+                        None => None,
+                        Some(topics)
+                            if !topics.is_empty() && topics.iter().all(|t| !t.is_empty()) =>
+                        {
+                            Some(topics.into_boxed_slice())
+                        }
+                        Some(_) => {
+                            tracing::warn!(
+                                "[WSE] the outbox's file ends in a line that does not check"
+                            );
+                            break;
+                        }
+                    };
                     if !text.starts_with('{') {
                         tracing::warn!(
                             "[WSE] the outbox's file ends in a line that does not check"
@@ -1523,6 +1557,7 @@ mod file {
                         at: record.at,
                         until: record.until,
                         owned: record.owned,
+                        requires,
                         size: super::unnumbered(text).len(),
                         text: text.into(),
                     });
@@ -1571,13 +1606,18 @@ mod tests {
     fn add(outbox: &mut Outbox, id: &str) -> u64 {
         let json = format!(r#"{{"t":"m","p":{{}},"id":"{id}"}}"#);
         assert!(outbox.room.take(json.len()));
-        outbox.add(id.into(), kept(&json), json.len(), None, 0)
+        outbox.add(id.into(), kept(&json), json.len(), None, 0, None)
     }
 
     /// What goes to the connection's writer now.
     fn due(outbox: &mut Outbox, now: u64, outcomes: &mut Outcomes) -> Vec<(u64, String)> {
         let mut out = Vec::new();
-        outbox.due(now, outcomes, |s, text| out.push((s, text.to_string())));
+        outbox.due(
+            now,
+            outcomes,
+            |_| true,
+            |s, text| out.push((s, text.to_string())),
+        );
         out
     }
 
@@ -1724,6 +1764,7 @@ mod tests {
             2,
             Some(Duration::from_millis(5)),
             0,
+            None,
         );
         add(&mut outbox, "on time");
         assert!(outbox.deadline().is_some(), "a timer for the late one");
@@ -1785,7 +1826,14 @@ mod tests {
         let mut outbox = outbox(&Offline::in_memory());
         answering(&mut outbox, 0);
         assert!(outbox.room.take(2));
-        outbox.add("a".into(), kept("{}"), 2, Some(Duration::from_millis(5)), 0);
+        outbox.add(
+            "a".into(),
+            kept("{}"),
+            2,
+            Some(Duration::from_millis(5)),
+            0,
+            None,
+        );
         let mut outcomes = Outcomes::default();
         assert_eq!(numbers(&due(&mut outbox, 0, &mut outcomes)), [1]);
         outbox.disconnected();
@@ -2060,6 +2108,12 @@ mod tests {
                             at: add["at"].as_u64().unwrap(),
                             until: add["until"].as_u64().unwrap(),
                             owned: add["owned"].as_bool().unwrap(),
+                            requires: add["requires"].as_array().map(|topics| {
+                                topics
+                                    .iter()
+                                    .map(|t| t.as_str().unwrap().to_owned())
+                                    .collect()
+                            }),
                             text: text.into(),
                             size: 0,
                         };
@@ -2106,12 +2160,16 @@ mod tests {
             assert_eq!(read.written, state["written"].as_u64().unwrap());
             assert_eq!(read.next, state["next"].as_u64().unwrap());
             assert_eq!(read.user.as_deref(), state["user"].as_str());
-            let records: Vec<(u64, &str, u64, u64, bool, &str)> = read
+            type Row<'a> = (u64, &'a str, u64, u64, bool, Option<Vec<String>>, &'a str);
+            let records: Vec<Row<'_>> = read
                 .records
                 .iter()
-                .map(|r| (r.s, &*r.id, r.at, r.until, r.owned, &*r.text))
+                .map(|r| {
+                    let requires = r.requires.as_ref().map(|t| t.to_vec());
+                    (r.s, &*r.id, r.at, r.until, r.owned, requires, &*r.text)
+                })
                 .collect();
-            let expected: Vec<(u64, &str, u64, u64, bool, &str)> = state["records"]
+            let expected: Vec<Row<'_>> = state["records"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -2122,6 +2180,9 @@ mod tests {
                         r["at"].as_u64().unwrap(),
                         r["until"].as_u64().unwrap(),
                         r["owned"].as_bool().unwrap(),
+                        r["requires"]
+                            .as_array()
+                            .map(|t| t.iter().map(|t| t.as_str().unwrap().to_owned()).collect()),
                         r["text"].as_str().unwrap(),
                     )
                 })

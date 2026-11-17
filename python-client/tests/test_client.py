@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -740,6 +741,39 @@ class TestOutbox:
             ("delivered", {"ids": ["mine-1", "mine-2"]})
         ]
         assert c.kept == 0
+
+    @pytest.mark.asyncio
+    async def test_a_clear_while_a_batch_goes_stops_what_is_left_of_it(self):
+        c = _mock_client(offline=Offline())
+        heard = await self._ready(c)
+        c._handle_outbox_answer(_system("outbox", {"acked": 0, "node": "n1"}))
+        for n in ("0", "1"):
+            c._outbox.add(
+                n, json.dumps({"t": "order", "p": {}, "id": n}), None, time.time()
+            )
+        entered, release = asyncio.Event(), asyncio.Event()
+        sent: list[str] = []
+
+        async def slow(text: str, strict: bool = False) -> bool:
+            sent.append(json.loads(text)["id"])
+            if len(sent) == 1:
+                entered.set()
+                await release.wait()
+            return True
+
+        c._transmit = slow
+        writing = asyncio.create_task(c._write_outbox())
+        await entered.wait()
+        c.clear()
+        release.set()
+        await writing
+        assert sent == ["0"], "what the clear took does not go"
+        assert [(e.type, e.payload) for e in heard] == [
+            ("not_delivered", {"reason": "cleared", "ids": ["1"]})
+        ]
+        # The one written was in the server's hand: delivered once it says so.
+        c._handle_ack(_system("ack", {"s": 1}))
+        assert heard[-1].payload == {"ids": ["0"]}
 
     @pytest.mark.asyncio
     async def test_a_refusal_is_said(self):

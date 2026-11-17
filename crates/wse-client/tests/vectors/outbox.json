@@ -4,8 +4,8 @@
   "lines": [
     {
       "kind": "head",
-      "json": "{\"wse_outbox\":1,\"salt\":\"0123456789abcdef0123456789abcdef\",\"producer\":\"producer-1\",\"next\":4}",
-      "line": "867f5eda {\"wse_outbox\":1,\"salt\":\"0123456789abcdef0123456789abcdef\",\"producer\":\"producer-1\",\"next\":4}"
+      "json": "{\"wse_outbox\":1,\"salt\":\"0123456789abcdef0123456789abcdef\",\"producer\":\"producer-1\",\"next\":5}",
+      "line": "9f646f9b {\"wse_outbox\":1,\"salt\":\"0123456789abcdef0123456789abcdef\",\"producer\":\"producer-1\",\"next\":5}"
     },
     {
       "kind": "node",
@@ -51,13 +51,18 @@
       "kind": "user",
       "json": "{\"user\":\"ann\"}",
       "line": "dbd0a8aa {\"user\":\"ann\"}"
+    },
+    {
+      "kind": "add",
+      "json": "{\"add\":{\"s\":4,\"id\":\"d\",\"at\":3000,\"until\":3603000,\"owned\":true,\"requires\":[\"prices\",\"caf\u00e9\"],\"text\":{\"s\":4,\"t\":\"m\",\"p\":{},\"id\":\"d\"}}}",
+      "line": "feea2c7d {\"add\":{\"s\":4,\"id\":\"d\",\"at\":3000,\"until\":3603000,\"owned\":true,\"requires\":[\"prices\",\"caf\u00e9\"],\"text\":{\"s\":4,\"t\":\"m\",\"p\":{},\"id\":\"d\"}}}"
     }
   ],
   "state": {
     "producer": "producer-1",
     "node": "n1",
     "written": 2,
-    "next": 4,
+    "next": 5,
     "user": "ann",
     "records": [
       {
@@ -67,6 +72,18 @@
         "until": 3602000,
         "owned": true,
         "text": "{\"s\":3,\"t\":\"m\",\"p\":{},\"id\":\"c\"}"
+      },
+      {
+        "s": 4,
+        "id": "d",
+        "at": 3000,
+        "until": 3603000,
+        "owned": true,
+        "requires": [
+          "prices",
+          "caf\u00e9"
+        ],
+        "text": "{\"s\":4,\"t\":\"m\",\"p\":{},\"id\":\"d\"}"
       }
     ]
   },

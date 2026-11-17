@@ -49,9 +49,10 @@ conformance server every client is checked against.
   unsigned ones.
 - An outbox in every client, which a 3.2 server answers for: every message
   sent, except a live or signed one, waits until the server confirms it,
-  numbered, and goes again after a reconnect, in the order it was sent; the
-  server takes each once (a repeat is confirmed and dropped, a refusal
-  said: `busy`, `rate_limited`, `missing`, `not_ready`). The application
+  numbered, and goes again after a reconnect, in the order it was sent, only
+  ever as the user whose connection first wrote it; the server takes each
+  once (a repeat is confirmed and dropped, a refusal said: `busy`,
+  `rate_limited`, `missing`, `not_ready`). The application
   hears what became of each message by its id (`delivered`,
   `not_delivered`: also `expired`, `user_changed`, `cleared`, `closed`). In
   memory by default; durable in a file, one format for the Rust client (and
@@ -67,7 +68,9 @@ conformance server every client is checked against.
 - Recover-or-resync in every client: the Rust client (natively and in the
   browser) and Python get it, as TypeScript and the mobile packages had it.
   A send can wait for its topics in every client (`send_requiring`,
-  `sendRequiring`, `send(requires=...)`).
+  `sendRequiring`, `send(requires=...)`): it joins the outbox once they are
+  continuous, with them, and they are checked again each time it goes, after
+  a reconnect too; its `ttl` counts from the send.
 - Rust, Swift, Kotlin and Dart send a correlation id (`cid`) and a
   priority (`pri`), as TypeScript and Python do, live or not, and give
   them, with the time, on what they receive. Swift, Kotlin and Dart get

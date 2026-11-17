@@ -66,6 +66,11 @@ export interface StoredMessage {
   until: number;
   /** Sent after a connection of the last user: that user's alone. */
   owned: boolean;
+  /**
+   * Topics each continuous right before it goes (`requires`), every time it
+   * goes: once more after a reconnect too.
+   */
+  requires?: string[];
   /** Its JSON as the client made it, without its number. */
   json: string;
 }
@@ -389,6 +394,7 @@ export class Outbox {
         at: r.at,
         until: r.until,
         owned: r.owned,
+        requires: r.requires,
         json: r.json,
         message: r.message,
         size: r.json.length,
@@ -479,7 +485,13 @@ export class Outbox {
    * Keeps a message the application sent, with its JSON: its number, or 0
    * when the outbox is full (or the message larger than it holds).
    */
-  add(message: WSMessage, json: string, ttl: number | undefined, now: number): number {
+  add(
+    message: WSMessage,
+    json: string,
+    ttl: number | undefined,
+    now: number,
+    requires?: readonly string[],
+  ): number {
     const size = json.length;
     if (this.count + 1 > this.limits.maxMessages || this.bytes + size > this.limits.maxBytes) return 0;
     const s = this.next++;
@@ -492,6 +504,7 @@ export class Outbox {
       at: Math.round(now),
       until,
       owned: typeof this.user === 'string',
+      requires: requires && requires.length > 0 ? [...requires] : undefined,
       json,
       message,
       size,
@@ -592,14 +605,15 @@ export class Outbox {
 
   /**
    * Hands the connection's writer the messages it did not take yet, in
-   * order, each with its number, once the server took the connection and its
-   * mode is known; the writer says whether it took each (false: stop, the
-   * rest waits). What waited too long to be sent goes instead.
+   * order, each with its number and the topics it requires, once the server
+   * took the connection and its mode is known; the writer says whether it
+   * took each (false: stop, the rest waits). What waited too long to be sent
+   * goes instead.
    */
   due(
     now: number,
     outcomes: Outcomes,
-    write: (message: WSMessage, s: number | undefined, json: string) => boolean,
+    write: (message: WSMessage, s: number | undefined, json: string, requires?: readonly string[]) => boolean,
   ): void {
     if (!this.ready || !(this.answered || this.plain) || this.opening) return;
     if (this.earliestMs <= now) this.expire(now, outcomes);
@@ -607,7 +621,7 @@ export class Outbox {
     let taken = 0;
     while (this.cursor < this.records.length) {
       const record = this.records[this.cursor];
-      if (!write(record.message, numbered ? record.s : undefined, record.json)) break;
+      if (!write(record.message, numbered ? record.s : undefined, record.json, record.requires)) break;
       this.cursor++;
       if (numbered) {
         if (record.s > this.written) this.written = record.s;

@@ -207,11 +207,14 @@ same. It is the delivery of the TypeScript client and of the Swift, Kotlin
 and Dart packages, natively and in the browser.
 
 A send can wait for its topics: `client.send_requiring("cancel", &order,
-["orders"])` goes once each of them is continuous on the connection. It is
-checked right before it goes, so after a reconnect it waits for the resync,
-while sends that require nothing go past it. It is the user's who sent it and
-goes nowhere once the server takes a connection for another; at most
-`send_queue` of them wait.
+["orders"])` goes once each of them is continuous on the connection, and
+joins the outbox with them: each time it goes, after a reconnect too, they
+are checked right before it goes, so it waits for the resync, and what was
+sent after it waits in its place with it. Sends that require nothing go past
+one that has not joined the outbox yet. Its `ttl` counts from the send: one
+that runs out while it waits is `NotDelivered` (`expired`). It is the user's
+who sent it and goes nowhere once the server takes a connection for another;
+at most `send_queue` of them wait.
 
 ## The outbox
 
@@ -262,7 +265,8 @@ At most `max_messages` (100,000) and `max_bytes` (16 MiB) wait, the ones
 written and not answered yet included: past either `send` waits for room,
 and `try_send` fails at once with `Error::Full`. `kept()` says how many
 wait. A send that requires topics waits in memory until they are
-continuous, and joins the outbox then.
+continuous, and joins the outbox then, with them: they are in its file too,
+and checked again each time it goes.
 
 `SendOptions` also names a request's `correlation_id` (`cid`), which the
 server application's reply names back (`Message::correlation_id`), and its

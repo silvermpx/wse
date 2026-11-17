@@ -311,6 +311,16 @@ impl Gate {
     }
 
     /// Each of `topics` held and continuous: a send that requires them may go.
+    /// One of `topics` the client holds is not continuous: a kept send that
+    /// requires them waits (one the client let go of holds nothing back).
+    pub(crate) fn holds_back(&self, topics: &[String]) -> bool {
+        topics.iter().any(|topic| {
+            self.states
+                .get(topic)
+                .is_some_and(|state| state.continuity != Continuity::Continuous)
+        })
+    }
+
     pub(crate) fn continuous(&self, topics: &[String]) -> bool {
         topics.iter().all(|topic| {
             self.states

@@ -114,6 +114,9 @@ pub(crate) struct Session<H> {
     /// Sends that wait until each topic they require is continuous, in the
     /// order they were sent: on every connection, the last user's dropped.
     waiting: VecDeque<Queued>,
+    /// The earliest of their deadlines (ms since the epoch): one that runs
+    /// out while it waits goes, `expired`.
+    waiting_until: u64,
     /// The outbox: every message sent but a live or signed one, until the
     /// server answers for it (`Config::offline`).
     pub(crate) outbox: Option<crate::outbox::Outbox>,
@@ -190,6 +193,7 @@ impl<H: Handler> Session<H> {
             next_deadline: None,
             to_write: Vec::new(),
             waiting: VecDeque::new(),
+            waiting_until: u64::MAX,
             outbox: None,
             server_answers: false,
             clears: 0,
@@ -240,6 +244,7 @@ impl<H: Handler> Session<H> {
         } else if frame.requires.as_deref().is_some_and(|topics| {
             !self.ready || !delivery::lock(self.handler.gate()).continuous(topics)
         }) {
+            self.waiting_until = self.waiting_until.min(frame.until.unwrap_or(u64::MAX));
             self.waiting.push_back(frame);
         } else {
             self.keep(frame);
@@ -253,13 +258,12 @@ impl<H: Handler> Session<H> {
         match &mut self.outbox {
             Some(outbox) => {
                 let size = frame.size();
-                outbox.add(
-                    frame.id,
-                    frame.text,
-                    size,
-                    frame.ttl,
-                    crate::outbox::now_ms(),
-                );
+                let now = crate::outbox::now_ms();
+                // What is left of its time: it counts from its send.
+                let ttl = frame
+                    .until
+                    .map(|until| Duration::from_millis(until.saturating_sub(now)));
+                outbox.add(frame.id, frame.text, size, ttl, now, frame.requires);
             }
             None => self.to_write.push(Outgoing::Text(frame.text)),
         }
@@ -295,9 +299,13 @@ impl<H: Handler> Session<H> {
         };
         let mut outcomes = crate::outbox::Outcomes::default();
         let to_write = &mut self.to_write;
-        outbox.due(crate::outbox::now_ms(), &mut outcomes, |s, text| {
-            to_write.push(Outgoing::Kept { s, text });
-        });
+        let gate = self.handler.gate();
+        outbox.due(
+            crate::outbox::now_ms(),
+            &mut outcomes,
+            |topics| !delivery::lock(gate).holds_back(topics),
+            |s, text| to_write.push(Outgoing::Kept { s, text }),
+        );
         self.report_outcomes(outcomes);
     }
 
@@ -333,6 +341,7 @@ impl<H: Handler> Session<H> {
         self.to_write
             .retain(|outgoing| !matches!(outgoing, Outgoing::Kept { .. }));
         let waiting: Vec<Queued> = self.waiting.drain(..).collect();
+        self.waiting_until = u64::MAX;
         for frame in &waiting {
             self.dropped(frame, "cleared");
         }
@@ -376,17 +385,23 @@ impl<H: Handler> Session<H> {
             return;
         }
         let users = self.users;
+        let now = crate::outbox::now_ms();
         let mut released = Vec::new();
         let mut stale = Vec::new();
+        let mut late = Vec::new();
         {
             let gate = delivery::lock(self.handler.gate());
             let mut kept = VecDeque::with_capacity(self.waiting.len());
+            self.waiting_until = u64::MAX;
             for frame in self.waiting.drain(..) {
                 if frame.user != users {
                     stale.push(frame);
+                } else if frame.until.is_some_and(|until| until <= now) {
+                    late.push(frame);
                 } else if gate.continuous(frame.requires.as_deref().unwrap_or_default()) {
                     released.push(frame);
                 } else {
+                    self.waiting_until = self.waiting_until.min(frame.until.unwrap_or(u64::MAX));
                     kept.push_back(frame);
                 }
             }
@@ -396,8 +411,34 @@ impl<H: Handler> Session<H> {
             tracing::warn!("[WSE] a message sent as the previous user was dropped");
             self.dropped(frame, "user_changed");
         }
+        for frame in &late {
+            self.dropped(frame, "expired");
+        }
         for frame in released {
             self.keep(frame);
+        }
+    }
+
+    /// Sends that ran out of time while they waited for their topics go,
+    /// `expired`, with a connection or without.
+    fn expire_waiting(&mut self, now: u64) {
+        if self.waiting_until > now {
+            return;
+        }
+        let mut late = Vec::new();
+        let mut kept = VecDeque::with_capacity(self.waiting.len());
+        self.waiting_until = u64::MAX;
+        for frame in self.waiting.drain(..) {
+            if frame.until.is_some_and(|until| until <= now) {
+                late.push(frame);
+            } else {
+                self.waiting_until = self.waiting_until.min(frame.until.unwrap_or(u64::MAX));
+                kept.push_back(frame);
+            }
+        }
+        self.waiting = kept;
+        for frame in &late {
+            self.dropped(frame, "expired");
         }
     }
 
@@ -961,15 +1002,26 @@ impl<H: Handler> Session<H> {
         }
     }
 
-    /// When the first message of the outbox not written yet runs out.
+    /// When the first message of the outbox not written yet runs out (or a
+    /// rewrite of its store owed can go), or a send waiting for its topics.
     pub(crate) fn outbox_deadline(&self) -> Option<Instant> {
-        self.outbox
+        let outbox = self
+            .outbox
             .as_ref()
-            .and_then(crate::outbox::Outbox::deadline)
+            .and_then(crate::outbox::Outbox::deadline);
+        let waiting = (self.waiting_until != u64::MAX).then(|| {
+            let left = self.waiting_until.saturating_sub(crate::outbox::now_ms());
+            Instant::now() + Duration::from_millis(left)
+        });
+        match (outbox, waiting) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Messages of the outbox that waited too long to be sent go, and the
-    /// application hears of them; a rewrite of its store owed goes.
+    /// application hears of them; a rewrite of its store owed goes; sends
+    /// that ran out of time waiting for their topics go.
     pub(crate) fn expire_outbox(&mut self, now: Instant) {
         if let Some(outbox) = &mut self.outbox
             && outbox.deadline().is_some_and(|at| at <= now)
@@ -979,6 +1031,7 @@ impl<H: Handler> Session<H> {
             outbox.heal(now);
             self.report_outcomes(outcomes);
         }
+        self.expire_waiting(crate::outbox::now_ms());
     }
 
     /// Holes whose wait is over give up; messages of the outbox that waited
@@ -2183,7 +2236,7 @@ mod tests {
             requires: (!requires.is_empty())
                 .then(|| requires.iter().map(|t| (*t).to_owned()).collect()),
             id: kind.into(),
-            ttl: None,
+            until: None,
             counted: false,
             clears: 0,
         };
@@ -2584,5 +2637,88 @@ mod tests {
             "per message: session {all:.0} ns (envelope {envelope:.0} ns); a serde_json::Value {value:.0} ns [{kinds} {}]",
             s.handler.inner.0
         );
+    }
+
+    #[test]
+    fn a_kept_send_that_requires_topics_waits_for_them_again_after_a_reconnect() {
+        use crate::outbox::{Offline, Outbox, Room};
+        let topics = vec!["t".to_owned()];
+        let gate = Arc::new(std::sync::Mutex::new(
+            delivery::Gate::new(Some(crate::Delivery::new("consumer")), "ws://x", &topics).unwrap(),
+        ));
+        let offline = Offline::in_memory();
+        let room = Arc::new(Room::new(&offline));
+        let shared = Arc::new(Shared::new(None, Some(Arc::clone(&room))));
+        let keys = Arc::new(Keys::from_config(&crate::Config::new("ws://x")).unwrap());
+        let mut s = Session::new(
+            Delivered::new(Seen::default(), Arc::clone(&gate), true),
+            shared,
+            keys,
+            &topics,
+            Duration::from_secs(3),
+            Duration::from_secs(40),
+        );
+        s.outbox = Some(Outbox::open(
+            &offline,
+            Arc::clone(&room),
+            Arc::new(|_, _| {}),
+        ));
+        let ready = r#"{"t":"server_ready","p":{"details":{"user_id":"ann","features":{"acks":true,"recovery":true}}}}"#;
+        let answered = r#"{"t":"outbox","p":{"acked":0,"node":"n"}}"#;
+        let kept = |s: &Session<Seen>| {
+            s.to_write
+                .iter()
+                .any(|o| matches!(o, Outgoing::Kept { .. }))
+        };
+        s.open(None);
+        s.on_json(ready, None);
+        s.on_json(answered, None);
+        s.on_json(
+            r#"{"t":"subscription_update","p":{"success_topics":["t"]}}"#,
+            None,
+        );
+        delivery::lock(&gate).resynced(1);
+        s.to_write.clear();
+        let text = format!(
+            "{}{}",
+            " ".repeat(crate::outbox::HEADROOM),
+            r#"{"t":"order","id":"needs-t"}"#
+        );
+        assert!(room.take(text.len() - crate::outbox::HEADROOM));
+        s.queue(Queued {
+            text,
+            user: 0,
+            only_on: None,
+            requires: Some(topics.clone().into_boxed_slice()),
+            id: "needs-t".into(),
+            until: None,
+            counted: true,
+            clears: 0,
+        });
+        s.before_write();
+        assert!(kept(&s), "continuous: it goes");
+        s.wrote(Some(1));
+        // The connection goes before its answer; on the next one the topic is
+        // not continuous until its resync.
+        s.close();
+        s.handler.event(Event::Disconnected(crate::Disconnected {
+            code: None,
+            reason: "cut".into(),
+            retry_in: Duration::ZERO,
+            attempt: 1,
+        }));
+        s.open(None);
+        s.on_json(ready, None);
+        s.on_json(answered, None);
+        assert!(!delivery::lock(&gate).continuous(&topics));
+        s.before_write();
+        assert!(!kept(&s), "not before its topic is continuous again");
+        s.on_json(
+            r#"{"t":"subscription_update","p":{"success_topics":["t"]}}"#,
+            None,
+        );
+        delivery::lock(&gate).resynced(2);
+        s.before_write();
+        assert!(kept(&s), "once it is, in its place");
     }
 }

@@ -215,6 +215,17 @@ export class Delivery {
     return topics.every((topic) => this.states.get(topic)?.continuity === 'continuous');
   }
 
+  /**
+   * One of `topics` the client holds is not continuous: a kept send that
+   * requires them waits (one the client let go of holds nothing back).
+   */
+  holdsBack(topics: readonly string[]): boolean {
+    return topics.some((topic) => {
+      const state = this.states.get(topic);
+      return state !== undefined && state.continuity !== 'continuous';
+    });
+  }
+
   // -- topics ------------------------------------------------------------------
 
   /** The client holds `topics` now. */

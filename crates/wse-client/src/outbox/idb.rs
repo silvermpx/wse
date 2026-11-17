@@ -207,8 +207,29 @@ fn row(producer: &str, record: &Record) -> JsValue {
     set("at", &number(record.at));
     set("until", &number(record.until));
     set("owned", &JsValue::from_bool(record.owned));
+    if let Some(requires) = &record.requires {
+        let topics = Array::new();
+        for topic in requires {
+            topics.push(&JsValue::from_str(topic));
+        }
+        set("requires", &topics);
+    }
     set("json", &JsValue::from_str(&unnumbered(&record.text)));
     row.into()
+}
+
+/// The topics a kept message requires: Some(None) when it says none; None
+/// when what it says is not topics (the row is not taken).
+fn requires_of(row: &JsValue) -> Option<Option<Box<[String]>>> {
+    let value = Reflect::get(row, &JsValue::from_str("requires")).ok()?;
+    if value.is_undefined() || value.is_null() {
+        return Some(None);
+    }
+    let topics: Vec<String> = Array::from(&value)
+        .iter()
+        .map(|t| t.as_string().filter(|t| !t.is_empty()))
+        .collect::<Option<_>>()?;
+    (!topics.is_empty()).then(|| Some(topics.into_boxed_slice()))
 }
 
 /// A message kept, as read: numbered again as it goes.
@@ -226,6 +247,7 @@ fn record_of(row: &JsValue) -> Option<Record> {
         owned: Reflect::get(row, &JsValue::from_str("owned"))
             .ok()?
             .as_bool()?,
+        requires: requires_of(row)?,
         size: json.len(),
         text: numbered(s, &json).into(),
     })

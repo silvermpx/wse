@@ -133,7 +133,8 @@ class _Waiting:
     encoded: str
     topics: tuple[str, ...]
     message_id: str = ""
-    ttl: float | None = None
+    # Until when it may wait to go first (time.time()), from its send on.
+    until: float | None = None
 
 
 #: The outbox by default: in memory, with its limits.
@@ -798,6 +799,7 @@ class AsyncWSEClient:
         ttl: float | None,
         *,
         limited: bool = True,
+        requires: tuple[str, ...] | None = None,
     ) -> SendResult:
         """A message for the outbox: numbered, kept until the server answers
         for it, and written at once when the connection takes it."""
@@ -812,7 +814,7 @@ class AsyncWSEClient:
         ):
             self._note_rate_limited(msg_type)
             return SendResult.FAILED
-        s = outbox.add(message_id, encoded, ttl, time.time())
+        s = outbox.add(message_id, encoded, ttl, time.time(), requires=requires)
         if s == 0:
             logger.warning("The outbox is full; '%s' not sent", msg_type)
             return SendResult.FAILED
@@ -843,18 +845,27 @@ class AsyncWSEClient:
             while True:
                 self._outbox_again = False
                 outcomes = Outcomes()
-                batch = outbox.due(time.time(), outcomes)
+                batch = outbox.due(
+                    time.time(),
+                    outcomes,
+                    lambda topics: not self._delivery.holds_back(topics),
+                )
                 self._report(outcomes)
-                last = 0
+                generation = outbox.generation
                 for s, text in batch:
+                    # Cleared meanwhile (the user signed out): what is left of
+                    # the batch does not go.
+                    if outbox.generation != generation:
+                        break
+                    outbox.writing(s)
                     if not await self._transmit(text, strict=True):
                         # The connection went: the rest goes on the next.
                         break
-                    last = s
                     self._stats.messages_sent += 1
                     self._stats.bytes_sent += len(text)
-                if last:
-                    self._report(outbox.wrote(last))
+                    # Written: one the user clears from now on is in the
+                    # server's hand.
+                    self._report(outbox.wrote(s))
                 if not self._outbox_again:
                     return
         finally:
@@ -923,9 +934,13 @@ class AsyncWSEClient:
 
     def _arm_outbox_timer(self) -> None:
         """A timer for the outbox's first message not written yet to run
-        out, with a connection or without."""
+        out, or a send waiting for its topics, with a connection or
+        without."""
         outbox = self._outbox
         at = outbox.deadline() if outbox is not None else None
+        waiting = [w.until for w in self._waiting if w.until is not None]
+        if waiting:
+            at = min(waiting) if at is None else min(at, min(waiting))
         if at is None:
             return
         try:
@@ -958,12 +973,27 @@ class AsyncWSEClient:
     def _outbox_expired(self) -> None:
         self._outbox_timer = None
         outbox = self._outbox
-        if outbox is None:
-            return
-        outcomes = Outcomes()
-        outbox.expire(time.time(), outcomes)
-        self._report(outcomes)
+        now = time.time()
+        if outbox is not None:
+            outcomes = Outcomes()
+            outbox.expire(now, outcomes)
+            self._report(outcomes)
+        self._expire_waiting(now)
         self._arm_outbox_timer()
+
+    def _expire_waiting(self, now: float) -> None:
+        """Sends that ran out of time while they waited for their topics go,
+        and the application hears so (``not_delivered``, ``expired``)."""
+        late = [w for w in self._waiting if w.until is not None and w.until <= now]
+        if not late:
+            return
+        for item in late:
+            self._waiting.remove(item)
+        ids = [w.message_id for w in late if w.message_id]
+        if ids:
+            outcomes = Outcomes()
+            outcomes.not_delivered["expired"] = ids
+            self._report(outcomes)
 
     def set_token(self, token: str | None) -> None:
         """Use *token* for the next connect / reconnect.
@@ -2056,7 +2086,9 @@ class AsyncWSEClient:
             and self._delivery.continuous(topics)
         ):
             if self._outbox is not None:
-                return await self._keep(encoded, message_id, msg_type, ttl)
+                return await self._keep(
+                    encoded, message_id, msg_type, ttl, requires=topics
+                )
             return await self._send_app_frame(
                 encoded, priority=priority, msg_type=msg_type, allow_queue=False
             )
@@ -2068,12 +2100,17 @@ class AsyncWSEClient:
         if self._rate_limiter is not None and not self._rate_limiter.try_consume():
             self._note_rate_limited(msg_type)
             return SendResult.FAILED
-        self._waiting.append(_Waiting(encoded, topics, message_id, ttl))
+        until = time.time() + ttl if ttl is not None and ttl >= 0 else None
+        self._waiting.append(_Waiting(encoded, topics, message_id, until))
+        self._arm_outbox_timer()
         self._release_soon()
         return SendResult.QUEUED
 
     def _release_soon(self) -> None:
-        """The sends whose topics are continuous go, once the loop runs."""
+        """The sends whose topics are continuous go, once the loop runs; the
+        outbox's, kept ones that wait for their topics among them, too."""
+        if self._outbox is not None and self._connection.is_connected:
+            self._write_outbox_soon()
         if not self._waiting or not self._connection.is_connected:
             return
         if self._releasing:
@@ -2092,16 +2129,28 @@ class AsyncWSEClient:
         try:
             while True:
                 self._release_again = False
+                self._expire_waiting(time.time())
                 for item in list(self._waiting):
                     if not self._connection.is_connected:
                         return
                     if not self._delivery.continuous(item.topics):
                         continue
                     if self._outbox is not None:
-                        # Its topics are continuous: it joins the outbox.
+                        # Its topics are continuous: it joins the outbox,
+                        # keeping them, with what is left of its time.
                         self._waiting.remove(item)
+                        left = (
+                            max(0.0, item.until - time.time())
+                            if item.until is not None
+                            else None
+                        )
                         await self._keep(
-                            item.encoded, item.message_id, "", item.ttl, limited=False
+                            item.encoded,
+                            item.message_id,
+                            "",
+                            left,
+                            limited=False,
+                            requires=item.topics,
                         )
                         continue
                     if not await self._transmit(item.encoded):

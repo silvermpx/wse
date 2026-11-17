@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 use wse_client::{
-    Config, Error, Event, Events, Format, Incoming, OwnedMessage, SendOptions, Status,
+    Config, Error, Event, Events, Format, Incoming, Offline, OwnedMessage, SendOptions, Status,
     TokenProvider,
 };
 
@@ -1355,4 +1355,75 @@ async fn a_paused_client_comes_back_with_what_it_missed() {
     assert!(subscribed.recovery[0].recovered);
     client.close().await;
     stand.server.stop().await;
+}
+
+/// A client whose first connection never comes: its token never does.
+fn never_connected() -> Config {
+    let mut config = Config::new("ws://127.0.0.1:9/wse");
+    config.token_provider = Some(TokenProvider::new(|| {
+        std::future::pending::<Result<String, String>>()
+    }));
+    config
+}
+
+/// A send cancelled while it waits for room in the queue gives back the
+/// place it took in the outbox.
+#[tokio::test]
+async fn a_send_cancelled_while_it_waits_gives_its_place_back() {
+    let mut config = never_connected();
+    config.send_queue = 1;
+    let mut offline = Offline::in_memory();
+    offline.max_messages = 2;
+    config.offline = Some(offline);
+    let (client, _events) = wse_client::start(config).await.unwrap();
+    // One thread: the driver has not taken the first yet, the queue is full.
+    client.try_send("first", &()).unwrap();
+    {
+        let send = client.send("cancelled", &());
+        tokio::pin!(send);
+        std::future::poll_fn(|cx| {
+            assert!(send.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(client.kept(), 2);
+    }
+    client.clear().unwrap();
+    for _ in 0..100 {
+        if client.kept() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(client.kept(), 0, "nothing kept for the cancelled send");
+    client.close().await;
+}
+
+/// A send that waits for its topics counts its time from its send: it runs
+/// out while it waits, and the application hears so.
+#[tokio::test]
+async fn a_send_that_waits_for_its_topics_runs_out_in_its_time() {
+    let mut config = never_connected();
+    config.offline = Some(Offline::in_memory());
+    let (client, mut events) = wse_client::start(config).await.unwrap();
+    let mut options = SendOptions::default();
+    options.id = Some("late-order".into());
+    options.requires = vec!["prices".into()];
+    options.ttl = Some(Duration::from_millis(5));
+    client.send_with("order", &(), &options).await.unwrap();
+    let expired = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(Incoming::Event(Event::NotDelivered(n))) = events.next().await {
+                return n;
+            }
+        }
+    })
+    .await
+    .expect("not delivered within 5 s");
+    assert_eq!(
+        (expired.reason.as_str(), expired.ids.as_slice()),
+        ("expired", &["late-order".to_owned()][..])
+    );
+    assert_eq!(client.kept(), 0);
+    client.close().await;
 }

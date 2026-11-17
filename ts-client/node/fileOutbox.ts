@@ -83,9 +83,15 @@ export function encodeLine(seed: number, body: string): string {
 
 /** A message kept, its text as it goes (a JSON object, numbered). */
 export function addBody(record: StoredMessage): string {
+  return `${addPrefix(record)}${numbered(record.s, record.json)}}}`;
+}
+
+/** A kept message's line up to its text, as every client writes it. */
+function addPrefix(record: Omit<StoredMessage, 'json'>): string {
+  const requires = record.requires && record.requires.length > 0 ? `"requires":${JSON.stringify(record.requires)},` : '';
   return (
     `{"add":{"s":${record.s},"id":${JSON.stringify(record.id)},"at":${record.at},"until":${record.until},` +
-    `"owned":${record.owned},"text":${numbered(record.s, record.json)}}}`
+    `"owned":${record.owned},${requires}"text":`
   );
 }
 
@@ -123,6 +129,11 @@ function isCount(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
+/** Topics a kept message requires: a list of names, none empty. */
+function isTopics(value: unknown): value is string[] {
+  return Array.isArray(value) && value.length > 0 && value.every((t) => typeof t === 'string' && t.length > 0);
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -130,10 +141,11 @@ function isObject(value: unknown): value is Record<string, unknown> {
 /** A message kept, as read: its text taken as it was written. */
 function readAdd(body: string, add: unknown): (StoredMessage & { message: WSMessage }) | null {
   if (!isObject(add)) return null;
-  const { s, id, at, until, owned, text } = add;
+  const { s, id, at, until, owned, requires, text } = add;
   if (!isCount(s) || typeof id !== 'string' || !isCount(at) || !isCount(until)) return null;
   if (typeof owned !== 'boolean' || !isObject(text)) return null;
-  const prefix = `{"add":{"s":${s},"id":${JSON.stringify(id)},"at":${at},"until":${until},"owned":${owned},"text":`;
+  if (requires !== undefined && !isTopics(requires)) return null;
+  const prefix = addPrefix({ s, id, at, until, owned, requires });
   if (!body.startsWith(prefix) || !body.endsWith('}}')) return null;
   const { s: _number, ...message } = text;
   return {
@@ -142,6 +154,7 @@ function readAdd(body: string, add: unknown): (StoredMessage & { message: WSMess
     at,
     until,
     owned,
+    requires,
     json: unnumbered(body.slice(prefix.length, -2)),
     message: message as unknown as WSMessage,
   };
