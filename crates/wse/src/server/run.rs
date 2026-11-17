@@ -399,6 +399,10 @@ async fn tick(interval: &mut tokio::time::Interval, stop: &CancellationToken) ->
 
 /// What a stopped server leaves: no lanes, no command queue, no cluster.
 pub(crate) fn stopped(shared: &SharedState) {
+    // In no cluster any more: what other nodes had present goes with it.
+    if let Some(pm) = &shared.presence {
+        pm.purge_remote();
+    }
     *shared.started_at.lock() = None;
     shared.commands.store(None);
     shared.presence_events.store(None);

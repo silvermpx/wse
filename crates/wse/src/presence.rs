@@ -813,7 +813,13 @@ impl PresenceManager {
     /// "ghost" members present forever and drift membership counts upward.
     /// Returns (topic, user_id, data) of the users gone with it.
     pub fn purge_origin(&self, origin: &str) -> Vec<(String, String, serde_json::Value)> {
-        self.drop_origin_where(origin, |_, _| true)
+        self.drop_where(&remote_origin_prefix(origin), |_, _| true)
+    }
+
+    /// Remove every peer's sentinels: this node is in no cluster any more.
+    /// Returns (topic, user_id, data) of the users gone with them.
+    pub fn purge_remote(&self) -> Vec<(String, String, serde_json::Value)> {
+        self.drop_where(REMOTE_PREFIX, |_, _| true)
     }
 
     /// The end of a sync round from `origin`: drop its sentinels of every
@@ -825,19 +831,20 @@ impl PresenceManager {
         origin: &str,
         held: &HashMap<String, HashSet<String>>,
     ) -> Vec<(String, String, serde_json::Value)> {
-        self.drop_origin_where(origin, |topic, user| {
+        self.drop_where(&remote_origin_prefix(origin), |topic, user| {
             !held.get(topic).is_some_and(|users| users.contains(user))
         })
     }
 
     /// Drop the sentinels of `origin` for the users `gone(topic, user)`
     /// names; users left with no connection are removed and returned.
-    fn drop_origin_where(
+    /// Drops the sentinels whose ids start with `prefix`, of the users
+    /// `gone_user` names.
+    fn drop_where(
         &self,
-        origin: &str,
+        prefix: &str,
         gone_user: impl Fn(&str, &str) -> bool,
     ) -> Vec<(String, String, serde_json::Value)> {
-        let prefix = remote_origin_prefix(origin);
         let mut thinned_topics: Vec<String> = Vec::new();
         let mut gone = Vec::new();
         for topic_entry in self.topic_presence.iter() {
@@ -853,7 +860,7 @@ impl PresenceManager {
                 let before = user_entry.connections.len();
                 user_entry
                     .connections
-                    .retain(|c| !c.conn_id.starts_with(&prefix));
+                    .retain(|c| !c.conn_id.starts_with(prefix));
                 let removed = before - user_entry.connections.len();
                 if removed > 0 {
                     conns_removed += removed;
@@ -1140,6 +1147,23 @@ mod tests {
         let stats = mgr.topic_presence_stats.get("room").expect("stats exist");
         assert_eq!(stats.num_users.load(Ordering::Relaxed), 1);
         assert_eq!(stats.num_connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn out_of_the_cluster_only_this_nodes_members_stay() {
+        let mgr = PresenceManager::new(4096, 0);
+        mgr.merge_remote_join("room", "alice", &data(), 10, "peerA");
+        mgr.merge_remote_join("room", "bob", &data(), 10, "peerB");
+        mgr.register_connection("c1", "carol");
+        mgr.track("c1", "room", &data());
+
+        let mut gone: Vec<String> = mgr.purge_remote().into_iter().map(|(_, u, _)| u).collect();
+        gone.sort();
+        assert_eq!(gone, ["alice", "bob"]);
+        let members: Vec<String> = mgr.query("room").into_iter().map(|(u, _, _)| u).collect();
+        assert_eq!(members, ["carol"]);
+        let stats = mgr.topic_presence_stats.get("room").expect("stats exist");
+        assert_eq!(stats.num_users.load(Ordering::Relaxed), 1);
     }
 
     // A user present on two peers survives purge of one of them.

@@ -723,6 +723,44 @@ def test_the_application_hears_of_a_user_who_joins_and_leaves_on_another_node(no
     assert heard == [("presence_join", "alice"), ("presence_leave", "alice")]
 
 
+def test_a_node_started_again_without_its_peers_lists_none_of_their_users(nodes):
+    websockets = pytest.importorskip("websockets")
+    from tests.conftest import JWT_AUDIENCE, JWT_ISSUER, JWT_SECRET, make_token
+
+    options = {
+        "presence_enabled": True,
+        "jwt_secret": JWT_SECRET,
+        "jwt_issuer": JWT_ISSUER,
+        "jwt_audience": JWT_AUDIENCE,
+    }
+    a, b = nodes(**options), nodes(**options)
+    a.join(b)
+    b.join(a)
+    assert wait_for(lambda: a.peers == 1 and b.peers == 1)
+
+    async def scenario():
+        ws = await websockets.connect(
+            f"ws://127.0.0.1:{b.port}/wse",
+            additional_headers={"Authorization": f"Bearer {make_token('alice')}"},
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            joined = [e for e in b.server.drain_inbound(16, 50) if e[0] == "auth_connect"]
+            if joined:
+                b.server.subscribe_connection(joined[0][1], ["room"], {"here": True})
+                break
+            await asyncio.sleep(0.05)
+        assert await asyncio.to_thread(wait_for, lambda: "alice" in a.server.presence("room"))
+        # Started again, in no cluster: only its own users are present.
+        a.server.stop()
+        a.server.start()
+        listed = "alice" in a.server.presence("room")
+        await ws.close()
+        return listed
+
+    assert asyncio.run(scenario()) is False
+
+
 def test_a_user_who_left_every_node_is_gone_from_all(nodes):
     websockets = pytest.importorskip("websockets")
     from tests.conftest import JWT_AUDIENCE, JWT_ISSUER, JWT_SECRET, make_token

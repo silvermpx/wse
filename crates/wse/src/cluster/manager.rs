@@ -781,6 +781,12 @@ pub(crate) async fn cluster_manager(
     for (_, task) in dialing {
         let _ = task.await;
     }
+    // Out of the cluster: the users other nodes had present are gone here.
+    if let Some(pm) = &presence {
+        for (topic, user_id, data) in pm.purge_remote() {
+            tell_presence(&server_cmd_tx, "presence_leave", topic, &user_id, &data);
+        }
+    }
     tracing::info!("[WSE-Cluster] Manager stopped");
 }
 
