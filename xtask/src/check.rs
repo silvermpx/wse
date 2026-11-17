@@ -157,6 +157,35 @@ $display bindings/electron/node_modules/.bin/electron bindings/electron/conforma
 \"$CARGO_TARGET_DIR/debug/wse-conformance\" check --manifest tests/conformance/electron.json --reports \"$out\"",
     },
     Lane {
+        // Tauri's plugin (bindings/tauri, a workspace of its own): its lints and
+        // tests, then every case in a real Tauri webview, its client a page's
+        // and the owner on the Rust side.
+        name: "tauri",
+        needs: &[tool("cargo"), tool("node")],
+        only_on: None,
+        script: "[ -d node_modules ] || { echo 'npm ci first: no node_modules'; exit 1; }
+display=
+if [ \"$(uname)\" = Linux ]; then
+  pkg-config --exists webkit2gtk-4.1 2> /dev/null || { echo 'skip: Tauri on Linux needs WebKitGTK 4.1 (libwebkit2gtk-4.1-dev)'; exit 3; }
+  if [ -z \"${DISPLAY:-}\" ]; then
+    command -v xvfb-run > /dev/null || { echo 'skip: Tauri on Linux needs a display or xvfb-run'; exit 3; }
+    display='xvfb-run -a'
+  fi
+fi
+node bindings/tauri/conformance/build.mjs
+(cd bindings/tauri && cargo fmt --all --check && cargo clippy --locked --all-targets -- -D warnings \\
+  && cargo test --locked -p tauri-plugin-wse && cargo build --locked -p wse-tauri-conformance)
+cargo build --locked -p wse-conformance
+out=\"$(mktemp -d \"$CARGO_TARGET_DIR/tauri.XXXXXX\")\"
+\"$CARGO_TARGET_DIR/debug/wse-conformance\" serve --out \"$out\" > \"$out/serve.log\" 2>&1 &
+server=$!
+trap 'kill $server 2> /dev/null' EXIT
+for _ in $(seq 1 100); do grep -q '\"ready\"' \"$out/serve.log\" && break; sleep 0.1; done
+control=\"$(sed -n 's/.*\"control\":\"\\([^\"]*\\)\".*/\\1/p' \"$out/serve.log\")\"
+$display \"$CARGO_TARGET_DIR/debug/wse-tauri-conformance\" \"$control\"
+\"$CARGO_TARGET_DIR/debug/wse-conformance\" check --manifest tests/conformance/tauri.json --reports \"$out\"",
+    },
+    Lane {
         // The tests on the JVM, then the JVM package as an application gets it.
         name: "kotlin-jvm",
         needs: &[tool("java"), tool_or("gradle", "GRADLE"), tool("cargo")],

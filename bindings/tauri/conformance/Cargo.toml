@@ -1,0 +1,19 @@
+[package]
+name = "wse-tauri-conformance"
+description = "The conformance cases in a real Tauri webview: each case's client a page's, the owner on the Rust side"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+tauri = { workspace = true, features = ["wry", "common-controls-v6", "x11"] }
+tauri-plugin-wse = { path = "../plugin" }
+wse-client = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+tauri-build = { version = "2.7.5", features = [] }

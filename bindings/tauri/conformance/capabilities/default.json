@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "The window of the conformance cases: Tauri's core, and the WSE plugin.",
+  "windows": ["main"],
+  "permissions": ["core:default", "wse:default"]
+}

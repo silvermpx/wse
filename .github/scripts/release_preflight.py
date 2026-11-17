@@ -251,6 +251,44 @@ def collect() -> list[Source]:
             )
         )
 
+    # Tauri's plugin: a workspace of its own (bindings/tauri), at the
+    # release's version, requiring the wse-client of the release.
+    tauri = _toml("bindings/tauri/Cargo.toml")["workspace"]
+    sources.append(
+        Source(
+            "tauri-plugin-wse version (bindings/tauri's workspace)",
+            "bindings/tauri/Cargo.toml",
+            str(tauri["package"]["version"]),
+            line_of(ROOT / "bindings/tauri/Cargo.toml", r"^version\s*="),
+            semver=True,
+        )
+    )
+    sources.append(
+        Source(
+            "wse-client, as tauri-plugin-wse requires it (=version)",
+            "bindings/tauri/Cargo.toml",
+            str(tauri["dependencies"]["wse-client"]["version"]).removeprefix("="),
+            line_of(ROOT / "bindings/tauri/Cargo.toml", r"^wse-client\s*="),
+            semver=True,
+        )
+    )
+    tauri_lock = _toml("bindings/tauri/Cargo.lock").get("package", [])
+    for crate in ("tauri-plugin-wse", "wse-client"):
+        locked = [p for p in tauri_lock if p.get("name") == crate]
+        if len(locked) != 1:
+            raise CheckError(
+                f"bindings/tauri/Cargo.lock: expected one [[package]] named {crate}, found {len(locked)}"
+            )
+        sources.append(
+            Source(
+                f"{crate} version in bindings/tauri/Cargo.lock",
+                "bindings/tauri/Cargo.lock",
+                str(locked[0]["version"]),
+                line_of(ROOT / "bindings/tauri/Cargo.lock", rf'^name = "{re.escape(crate)}"'),
+                semver=True,
+            )
+        )
+
     sources.append(
         _project_version(
             "python-client/pyproject.toml",

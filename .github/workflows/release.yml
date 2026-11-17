@@ -186,7 +186,7 @@ jobs:
           OWNER: ${{ github.repository_owner }}
         run: |
           failed=0
-          for crate in wse wse-client; do
+          for crate in wse wse-client tauri-plugin-wse; do
             code="$(curl -sS -o owners.json -w '%{http_code}' --retry 3 \
               -A 'wse-release (github.com/silvermpx/wse)' \
               "https://crates.io/api/v1/crates/${crate}/owners" || true)"
@@ -230,7 +230,7 @@ jobs:
             *) echo "::error::npm answered HTTP ${code} for wse-client ${NPM_VERSION}"; failed=1 ;;
           esac
           # crates.io asks API clients to name themselves.
-          for crate in wse wse-client; do
+          for crate in wse wse-client tauri-plugin-wse; do
             code="$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 \
               -A 'wse-release (github.com/silvermpx/wse)' \
               "https://crates.io/api/v1/crates/${crate}/${NPM_VERSION}" || true)"
@@ -742,6 +742,41 @@ jobs:
 
       - name: The client in the browser (wasm32)
         run: cargo check --locked -p wse-client --target wasm32-unknown-unknown
+
+  # Tauri's plugin (bindings/tauri, a workspace of its own): its tests and
+  # lints, on macOS, whose webview needs no system libraries to build. It is
+  # packaged when it is published, once the wse-client it requires is on
+  # crates.io.
+  tauri-plugin:
+    name: Tauri plugin (build, test)
+    needs: preflight
+    if: needs.preflight.outputs.built == 'true'
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: bindings/tauri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: "bindings/tauri -> target"
+          key: tauri-plugin
+
+      - name: The plugin's tests
+        run: cargo test --locked -p tauri-plugin-wse
+
+      - name: Clippy
+        run: cargo clippy --locked -p tauri-plugin-wse --all-targets -- -D warnings
 
   # ---------------------------------------------------------------------------
   # The mobile packages, attached to the GitHub release: the Swift
@@ -1539,7 +1574,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release-gate:
     name: Release gate
-    needs: [preflight, build, sdist, test, test-musllinux, sdist-install, python-client, npm-package, framework-check, crates, swift-package, android-package, jvm-natives, jvm-package, jvm-check, android-release-app, react-native-app, maven-central, swift-repo, dart-binaries, dart-package, dart-check, dart-mobile]
+    needs: [preflight, build, sdist, test, test-musllinux, sdist-install, python-client, npm-package, framework-check, crates, tauri-plugin, swift-package, android-package, jvm-natives, jvm-package, jvm-check, android-release-app, react-native-app, maven-central, swift-repo, dart-binaries, dart-package, dart-check, dart-mobile]
     # Runs (and fails) when a job above failed: a gate skipped because of a
     # failed dependency would report success to branch protection.
     if: always()
@@ -1756,6 +1791,28 @@ jobs:
           fi
           # In dependency order, each built from its package before upload.
           cargo publish --locked "${packages[@]}"
+
+      # Tauri builds against WebKitGTK on Linux: the plugin's package is
+      # built from crates.io's wse-client before it is uploaded.
+      - name: The webview's libraries, for Tauri's plugin
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev
+
+      - name: Publish Tauri's plugin, once wse-client is on crates.io
+        working-directory: bindings/tauri
+        env:
+          VERSION: ${{ needs.preflight.outputs.npm-version }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          code="$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 \
+            -A 'wse-release (github.com/silvermpx/wse)' \
+            "https://crates.io/api/v1/crates/tauri-plugin-wse/${VERSION}" || true)"
+          if [ "$code" = 200 ]; then
+            echo "tauri-plugin-wse ${VERSION} is on crates.io already (an earlier attempt)."
+            exit 0
+          fi
+          cargo publish --locked -p tauri-plugin-wse
 
   github-release:
     name: GitHub release

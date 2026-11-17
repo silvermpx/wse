@@ -25,6 +25,15 @@
   adapters take as they take any. Only the top frame of a served window,
   at a URL the application allows (by default its own pages, never the
   web's), gets a port.
+- Tauri: `tauri-plugin-wse` (crates.io), one connection for every window
+  of a Tauri application, held on the Rust side (an owner of
+  `wse_client::bridge`, with the token, the keys and the outbox):
+  `app.wse().start(config)` starts it, the pages attach through the
+  plugin's commands (permission `wse:default`), and a page that reloads or
+  a window that closes lets its share go. Starting it again (another user)
+  lets the last connection's pages go; `sign_out` lets every page go. The
+  conformance cases run in a real Tauri webview (agent `tauri`), in CI on
+  Linux, macOS and Windows.
 - TypeScript: `wse-client/tauri`, a Tauri window's client
   (`createTauriClient({ invoke, Channel })`) over the Rust side's
   connection: frames go to the plugin's commands one call at a time, in

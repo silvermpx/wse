@@ -1,0 +1,5 @@
+"$schema" = "schemas/schema.json"
+
+[default]
+description = "Lets a window's page use the application's WSE connection: attach to it, send its frames, let it go."
+permissions = ["allow-attach", "allow-frames", "allow-detach"]

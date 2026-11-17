@@ -1,0 +1,25 @@
+[package]
+name = "tauri-plugin-wse"
+description = "One WSE connection for every window of a Tauri application: the Rust side holds it, each page's client (wse-client/tauri) talks to it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords = ["tauri", "tauri-plugin", "websocket", "realtime", "pubsub"]
+categories = ["gui", "network-programming"]
+# Tells the application's build where the plugin's permissions are.
+links = "tauri-plugin-wse"
+
+[dependencies]
+tauri = { workspace = true }
+wse-client = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+wse = { path = "../../../crates/wse", features = ["server"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+
+[build-dependencies]
+tauri-plugin = { version = "2.7.3", features = ["build"] }

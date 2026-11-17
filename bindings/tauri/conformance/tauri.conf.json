@@ -1,0 +1,12 @@
+{
+  "productName": "WSE",
+  "identifier": "dev.wse.conformance",
+  "build": { "frontendDist": "out" },
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost ws://127.0.0.1:*"
+    }
+  },
+  "bundle": { "active": false, "icon": ["icons/icon.png", "icons/icon.ico"] }
+}

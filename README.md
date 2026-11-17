@@ -34,8 +34,9 @@ In the browser, the TypeScript client keeps the connection, its subscriptions an
 |---------|---------|------------|
 | [`wse-server`](https://pypi.org/project/wse-server/) | `pip install wse-server` | The server, run from Python |
 | [`wse`](https://crates.io/crates/wse) | `cargo add wse` | The server, inside a Rust application (tokio) |
-| [`wse-client`](https://www.npmjs.com/package/wse-client) | `npm install wse-client` | Web interfaces in TypeScript: without a framework, React, Vue, Svelte, Angular, Solid; React Native apps |
+| [`wse-client`](https://www.npmjs.com/package/wse-client) | `npm install wse-client` | Web interfaces in TypeScript: without a framework, React, Vue, Svelte, Angular, Solid; React Native apps; Electron apps, one connection for every window |
 | [`wse-client`](https://crates.io/crates/wse-client) | `cargo add wse-client` | Interfaces in Rust (WebAssembly), and Rust services on tokio |
+| [`tauri-plugin-wse`](https://crates.io/crates/tauri-plugin-wse) | `cargo add tauri-plugin-wse` | Tauri apps: one connection for every window, on the Rust side (`wse-client/tauri` in the pages) |
 | [`wse-client`](https://pypi.org/project/wse-client/) | `pip install wse-client` | Python services and scripts, with or without asyncio |
 | [`wse_client`](https://pub.dev/packages/wse_client) | `flutter pub add wse_client` | Flutter and Dart apps (Android, iOS, macOS, Linux, Windows) |
 | [`wse-swift`](https://github.com/silvermpx/wse-swift) | Swift Package Manager: `https://github.com/silvermpx/wse-swift` | iOS and macOS apps |

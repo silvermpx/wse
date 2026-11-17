@@ -288,6 +288,23 @@ The connection lives on the Rust side, in the `tauri-plugin-wse` crate (an owner
 `wse_client::bridge`, with the token and the outbox), and each window's page holds a client through
 the plugin's commands:
 
+```rust
+use tauri_plugin_wse::WseExt;
+
+tauri::Builder::default()
+    .plugin(tauri_plugin_wse::init())
+    .setup(|app| {
+        let mut config = wse_client::Config::new("wss://example.com/wse");
+        config.token = Some(token);
+        let app = app.handle().clone();
+        tauri::async_runtime::spawn(async move { app.wse().start(config).await });
+        Ok(())
+    })
+```
+
+The windows that may use it get the plugin's permission, `wse:default`, in their capabilities. Then
+in a page:
+
 ```ts
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { createTauriClient } from 'wse-client/tauri';
@@ -299,8 +316,10 @@ client.subscribe(['prices']);
 
 Tauri's own API is passed in, so the package depends on no version of it (`window.__TAURI__.core`
 gives the same with `withGlobalTauri`). The page's frames go one command at a time, in order, those
-of one turn together; the owner's come on a Channel. Which windows may use the plugin is the
-application's capabilities' to say, as for any plugin.
+of one turn together; the owner's come on a Channel. A page that reloads, or a window that closes,
+lets its share go; `app.wse().start(config)` again (another user) lets the last connection's pages
+go, and `app.wse().sign_out()` lets every page go and forgets what the connection kept for the
+user.
 
 ## Quick Start
 

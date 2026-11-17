@@ -39,6 +39,7 @@ jobs:
       benchmarks: ${{ steps.filter.outputs.benchmarks }}
       conformance: ${{ steps.filter.outputs.conformance }}
       electron: ${{ steps.filter.outputs.electron }}
+      tauri: ${{ steps.filter.outputs.tauri }}
     steps:
       # Credentials stay: on a push the filter fetches the previous commit.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -110,6 +111,18 @@ jobs:
               - 'package.json'
               - 'package-lock.json'
               - 'bindings/electron/**'
+              - 'tests/conformance/**'
+              - '.github/workflows/ci.yml'
+            tauri:
+              - 'crates/wse/**'
+              - 'crates/wse-client/**'
+              - 'crates/wse-conformance/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'ts-client/**'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'bindings/tauri/**'
               - 'tests/conformance/**'
               - '.github/workflows/ci.yml'
 
@@ -470,6 +483,88 @@ jobs:
         with:
           name: electron-reports-${{ matrix.os }}
           path: ${{ runner.temp }}/electron
+          if-no-files-found: ignore
+
+  # Tauri's plugin (bindings/tauri, a workspace of its own) on each system:
+  # its lints and tests, then every conformance case in a real Tauri
+  # webview, its client a page's and the owner on the Rust side.
+  tauri:
+    name: Tauri (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.tauri == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          workspaces: |
+            . -> target
+            bindings/tauri -> target
+          key: tauri
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '22'
+
+      # Tauri builds against WebKitGTK on Linux; Ubuntu keeps unprivileged
+      # user namespaces from applications without an AppArmor profile, and
+      # WebKitGTK's sandbox needs them.
+      - name: The webview's libraries on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev xvfb
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      - name: The plugin's lints and tests
+        working-directory: bindings/tauri
+        run: |
+          cargo fmt --all --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked -p tauri-plugin-wse
+
+      - name: Every case in a real Tauri webview
+        env:
+          # Software rendering in a virtual display.
+          WEBKIT_DISABLE_DMABUF_RENDERER: '1'
+        run: |
+          node bindings/tauri/conformance/build.mjs
+          (cd bindings/tauri && cargo build --locked -p wse-tauri-conformance)
+          cargo build --locked -p wse-conformance
+          out="$RUNNER_TEMP/tauri"
+          mkdir -p "$out"
+          target/debug/wse-conformance serve --out "$out" > serve.log 2>&1 &
+          for _ in $(seq 1 100); do grep -q '"ready"' serve.log && break; sleep 0.1; done
+          control="$(sed -n 's/.*"control":"\([^"]*\)".*/\1/p' serve.log)"
+          display=
+          if [ "$RUNNER_OS" = Linux ]; then display='xvfb-run -a'; fi
+          $display bindings/tauri/target/debug/wse-tauri-conformance "$control"
+          target/debug/wse-conformance check --manifest tests/conformance/tauri.json --reports "$out"
+
+      - name: The reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: tauri-reports-${{ matrix.os }}
+          path: ${{ runner.temp }}/tauri
           if-no-files-found: ignore
 
   python-client:
@@ -1255,7 +1350,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, checks, secrets, client, frameworks, client-server, conformance, electron, python-client, lint, rust-lint, rust-test, rust-wasm, rust-fips, rust-msrv, swift, kotlin, android, react-native, dart, flutter-ios, test, benchmarks, security]
+    needs: [changes, checks, secrets, client, frameworks, client-server, conformance, electron, tauri, python-client, lint, rust-lint, rust-test, rust-wasm, rust-fips, rust-msrv, swift, kotlin, android, react-native, dart, flutter-ios, test, benchmarks, security]
     runs-on: ubuntu-latest
     steps:
       - name: Every job passed or was skipped
