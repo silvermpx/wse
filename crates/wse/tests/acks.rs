@@ -130,9 +130,25 @@ impl Node {
         user: &str,
         outbox: serde_json::Value,
     ) -> (Client, serde_json::Value) {
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/wse", self.addr))
-            .await
-            .unwrap();
+        self.answered_at(user, outbox, "").await
+    }
+
+    /// A client of `user` that asks for msgpack (`?format=msgpack`), as a
+    /// client sending in it does.
+    async fn packed_client(&mut self, user: &str, outbox: serde_json::Value) -> Client {
+        self.answered_at(user, outbox, "?format=msgpack").await.0
+    }
+
+    async fn answered_at(
+        &mut self,
+        user: &str,
+        outbox: serde_json::Value,
+        query: &str,
+    ) -> (Client, serde_json::Value) {
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://{}/wse{query}", self.addr))
+                .await
+                .unwrap();
         let hello = serde_json::json!({"t": "client_hello", "p": {"protocol_version": 2, "outbox": outbox}});
         ws.send(Message::Text(hello.to_string().into()))
             .await
@@ -181,6 +197,27 @@ async fn next_of(ws: &mut Client, kind: &str) -> serde_json::Value {
 async fn send(ws: &mut Client, kind: &str, s: u64) {
     let message = format!(r#"{{"s":{s},"t":"{kind}","p":{{}},"id":"m{s}"}}"#);
     ws.send(Message::Text(message.into())).await.unwrap();
+}
+
+/// Sends message `s` of the client's outbox in msgpack, as a client does:
+/// `M:` and a map whose first key is its number.
+async fn send_packed(ws: &mut Client, kind: &str, s: u64) {
+    fn text(out: &mut Vec<u8>, value: &str) {
+        out.push(0xa0 | u8::try_from(value.len()).unwrap());
+        out.extend_from_slice(value.as_bytes());
+    }
+    let mut frame = b"M:".to_vec();
+    frame.push(0x84);
+    text(&mut frame, "s");
+    frame.push(0xcf);
+    frame.extend_from_slice(&s.to_be_bytes());
+    text(&mut frame, "t");
+    text(&mut frame, kind);
+    text(&mut frame, "p");
+    frame.push(0x80);
+    text(&mut frame, "id");
+    text(&mut frame, &format!("m{s}"));
+    ws.send(Message::Binary(frame.into())).await.unwrap();
 }
 
 /// Reads acks until one confirms `s`.
@@ -329,6 +366,32 @@ async fn a_refusal_the_client_did_not_hear_of_is_told_when_it_comes_back() {
     let (_ws, reply) = node.answered("ann", outbox).await;
     assert_eq!(reply["acked"], 3);
     assert!(reply.get("refused").is_none(), "{reply}");
+    node.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_msgpack_message_over_the_rate_limit_is_refused_at_once() {
+    let mut config = wse::Config::default();
+    config.rate_limit_capacity = 2.0;
+    config.rate_limit_refill = 0.01;
+    let mut node = node_with(config).await;
+    let mut ws = node
+        .packed_client("ann", serde_json::json!({"producer": "p9"}))
+        .await;
+    for s in 1..=4 {
+        send_packed(&mut ws, "m", s).await;
+    }
+    // Nothing comes after 4: its refusal does not wait for a later message.
+    let mut refused = Vec::new();
+    while refused.last() != Some(&4) {
+        let nack = next_of(&mut ws, "nack").await;
+        assert_eq!(nack["p"]["code"], "rate_limited", "{nack}");
+        let to = nack["p"]["s"].as_u64().unwrap();
+        let from = nack["p"]["from"].as_u64().unwrap_or(to);
+        refused.extend(from..=to);
+    }
+    let first = refused[0];
+    assert_eq!(refused, (first..=4).collect::<Vec<_>>());
     node.server.stop().await;
 }
 

@@ -545,6 +545,9 @@ pub(crate) fn seq_of(val: &serde_json::Value) -> Option<u64> {
 /// parsing it: a client puts the number first (`{"s":N,`). For a frame the
 /// rate limit drops, which is not parsed.
 pub(crate) fn number_in(frame: &[u8]) -> Option<u64> {
+    if let Some(packed) = frame.strip_prefix(b"M:") {
+        return number_in_msgpack(packed);
+    }
     let frame = frame
         .strip_prefix(b"WSE")
         .or_else(|| frame.strip_prefix(b"S"))
@@ -556,6 +559,31 @@ pub(crate) fn number_in(frame: &[u8]) -> Option<u64> {
         return None;
     }
     let s: u64 = std::str::from_utf8(&digits[..end]).ok()?.parse().ok()?;
+    (s > 0).then_some(s)
+}
+
+/// The number of a msgpack message of a client's outbox, read off its first
+/// bytes as a client writes them: a map whose first key is `s`. None for
+/// any other, which is not decoded: a frame the rate limit dropped costs
+/// nothing more.
+fn number_in_msgpack(map: &[u8]) -> Option<u64> {
+    let (&head, rest) = map.split_first()?;
+    let rest = match head {
+        0x81..=0x8f => rest,
+        0xde => rest.get(2..)?,
+        0xdf => rest.get(4..)?,
+        _ => return None,
+    };
+    let rest = rest.strip_prefix(&[0xa1, b's'])?;
+    let (&tag, value) = rest.split_first()?;
+    let s = match tag {
+        0x00..=0x7f => u64::from(tag),
+        0xcc => u64::from(*value.first()?),
+        0xcd => u64::from(u16::from_be_bytes(value.get(..2)?.try_into().ok()?)),
+        0xce => u64::from(u32::from_be_bytes(value.get(..4)?.try_into().ok()?)),
+        0xcf => u64::from_be_bytes(value.get(..8)?.try_into().ok()?),
+        _ => return None,
+    };
     (s > 0).then_some(s)
 }
 
@@ -969,6 +997,21 @@ mod tests {
         assert_eq!(number_in(br#"{"s":17"#), None, "cut short");
         assert_eq!(number_in(br#"{"s":99999999999999999999,"t":"m"}"#), None);
         assert_eq!(number_in(b""), None);
+        // In msgpack: `M:` and a map whose first key is `s`, its number in
+        // each width.
+        assert_eq!(number_in(b"M:\x82\xa1s\x11\xa1t\xa1m"), Some(17));
+        assert_eq!(number_in(b"M:\x81\xa1s\xcc\xc8"), Some(200));
+        assert_eq!(number_in(b"M:\x81\xa1s\xcd\x01\x00"), Some(256));
+        assert_eq!(number_in(b"M:\x81\xa1s\xce\x00\x01\x00\x00"), Some(65_536));
+        let mut wide = b"M:\x81\xa1s\xcf".to_vec();
+        wide.extend_from_slice(&(1u64 << 40).to_be_bytes());
+        assert_eq!(number_in(&wide), Some(1 << 40));
+        assert_eq!(number_in(b"M:\xde\x00\x01\xa1s\x05"), Some(5));
+        assert_eq!(number_in(b"M:\x82\xa1t\xa1m\xa1s\x11"), None, "not first");
+        assert_eq!(number_in(b"M:\x81\xa1s\x00"), None);
+        assert_eq!(number_in(b"M:\x81\xa1s\xce\x00\x01"), None, "cut short");
+        assert_eq!(number_in(b"M:\x81\xa1s\xa1x"), None, "not a number");
+        assert_eq!(number_in(b"M:\x80"), None);
     }
 
     #[test]
