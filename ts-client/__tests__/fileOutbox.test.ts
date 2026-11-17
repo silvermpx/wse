@@ -155,6 +155,28 @@ describe('the outbox in a file', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('says a mark is written once the file holds it, when it was handed behind a rewrite', async () => {
+    const state = { producer: 'p', written: 0, next: 1, user: null, node: null, records: [] };
+    const { log } = fileOutbox(path).open(
+      () => state,
+      (_, error) => {
+        throw error;
+      },
+    );
+    if (!log) throw new Error('no log');
+    await new Promise<void>((resolve) => log.flush(resolve));
+    // An append runs, a rewrite waits behind it, and the mark is handed after both.
+    log.put({ node: 'one' });
+    log.flush();
+    log.rewrite(state);
+    log.put({ written: 1 });
+    const seen = await new Promise<number>((resolve) =>
+      log.flush(() => resolve(readOutbox(readFileSync(path, 'utf8')).written)),
+    );
+    expect(seen).toBe(1);
+    log.close();
+  });
+
   it('keeps what waits for the next client, until the server took it', async () => {
     const first = new Outbox(limits, { store: fileOutbox(path) });
     expect(first.durable).toBe(true);

@@ -380,9 +380,10 @@ class FileLog implements OutboxLog {
       this.batch = [];
     }
     if (written) {
-      // With what is handed last: what waits, else the write that runs.
-      if (this.rewriteQueued !== null) this.rewriteWritten.push(written);
-      else if (this.queued.length > 0) this.queuedWritten.push(written);
+      // With what is handed last: the appends go after a rewrite that
+      // waits, and that after the write that runs.
+      if (this.queued.length > 0) this.queuedWritten.push(written);
+      else if (this.rewriteQueued !== null) this.rewriteWritten.push(written);
       else if (this.busy && this.running) this.running.push(written);
       else written();
     }
