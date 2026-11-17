@@ -1,0 +1,185 @@
+// The outbox in the app's storage (React Native): AsyncStorage, one with
+// its API but no multi-calls, and MMKV.
+
+import { describe, expect, it, vi } from 'vitest';
+import { noOutcomes, Outbox } from '../services/Outbox';
+import { storageOutbox, type AsyncStorageLike, type MMKVLike } from '../react-native/storageOutbox';
+
+type Data = { data: Map<string, string> };
+
+function asyncStorage(multi = true): AsyncStorageLike & Data {
+  const data = new Map<string, string>();
+  const storage: AsyncStorageLike & Data = {
+    data,
+    getItem: async (key) => data.get(key) ?? null,
+    setItem: async (key, value) => {
+      data.set(key, value);
+    },
+    removeItem: async (key) => {
+      data.delete(key);
+    },
+    getAllKeys: async () => [...data.keys()],
+  };
+  if (multi) {
+    storage.multiGet = async (keys) => keys.map((key) => [key, data.get(key) ?? null] as const);
+    storage.multiSet = async (pairs) => {
+      for (const [key, value] of pairs) data.set(key, value);
+    };
+    storage.multiRemove = async (keys) => {
+      for (const key of keys) data.delete(key);
+    };
+  }
+  return storage;
+}
+
+function mmkv(): MMKVLike & Data {
+  const data = new Map<string, string>();
+  return {
+    data,
+    getString: (key) => data.get(key),
+    set: (key, value) => {
+      data.set(key, value);
+    },
+    delete: (key) => {
+      data.delete(key);
+    },
+    getAllKeys: () => [...data.keys()],
+  };
+}
+
+const limits = { maxMessages: 100, maxBytes: 1 << 20, maxAge: 3_600_000 };
+
+function add(outbox: Outbox, id: string): number {
+  const message = { t: 'm', p: {}, id };
+  return outbox.add(message, JSON.stringify(message), undefined, 0);
+}
+
+function answering(outbox: Outbox, acked = 0): void {
+  outbox.connected('ann', 0);
+  outbox.serverAnswers(true);
+  outbox.answeredWith(acked, [], 'n1');
+}
+
+function due(outbox: Outbox): number[] {
+  const out: number[] = [];
+  outbox.due(0, noOutcomes(), (_message, s) => {
+    out.push(s!);
+    return true;
+  });
+  return out;
+}
+
+/** What the storage holds of the messages, by number. */
+const messages = (storage: Data) =>
+  [...storage.data.keys()].filter((key) => key.startsWith('wse-outbox:wse:')).map((key) => Number(key.slice(15))).sort();
+
+const settled = () => new Promise((resolve) => setTimeout(resolve, 10));
+
+describe('the outbox in the app storage (React Native)', () => {
+  it.each([
+    ['AsyncStorage', () => asyncStorage()],
+    ['a storage with its API but no multi-calls', () => asyncStorage(false)],
+    ['MMKV', () => mmkv()],
+  ])('in %s keeps what waits for the next start, until the server took it', async (_kind, make) => {
+    const storage = make();
+    const first = new Outbox(limits, { store: storageOutbox(storage) });
+    await first.opened;
+    expect(first.durable).toBe(true);
+    answering(first);
+    for (const id of ['a', 'b', 'c']) add(first, id);
+    expect(due(first)).toEqual([1, 2, 3]);
+    first.acked(1);
+    first.close();
+    await settled();
+    expect(messages(storage)).toEqual([2, 3]);
+
+    const again = new Outbox(limits, { store: storageOutbox(storage) });
+    await again.opened;
+    expect(again.producer).toBe(first.producer);
+    expect(again.size).toBe(2);
+    expect(again.hello()).toEqual({ producer: first.producer, node: 'n1', written: 3, from: 2 });
+    answering(again, 1);
+    expect(due(again)).toEqual([2, 3]);
+    expect(add(again, 'd')).toBe(4);
+    again.acked(4);
+    again.close();
+    await settled();
+    expect([...storage.data.keys()]).toEqual(['wse-outbox:wse']);
+  });
+
+  it('is one client’s while it runs', async () => {
+    const storage = asyncStorage();
+    const first = new Outbox(limits, { store: storageOutbox(storage) });
+    await first.opened;
+    const said: Array<[string, string]> = [];
+    const second = new Outbox(limits, {
+      store: storageOutbox(storage),
+      onStorageError: (operation, error) => said.push([operation, String(error)]),
+    });
+    await second.opened;
+    expect(second.durable).toBe(false);
+    expect(said).toHaveLength(1);
+    expect(said[0][1]).toContain("another client's");
+    first.close();
+    const third = new Outbox(limits, { store: storageOutbox(storage) });
+    await third.opened;
+    expect(third.durable).toBe(true);
+    third.close();
+  });
+
+  it('keeps sends made before it opened, numbered after what it held', async () => {
+    const storage = asyncStorage();
+    const first = new Outbox(limits, { store: storageOutbox(storage) });
+    await first.opened;
+    add(first, 'a');
+    first.close();
+    await settled();
+    const again = new Outbox(limits, { store: storageOutbox(storage) });
+    // Sent at once, before the storage answered.
+    add(again, 'b');
+    await again.opened;
+    expect(again.size).toBe(2);
+    answering(again);
+    expect(due(again)).toEqual([1, 2]);
+    again.close();
+    await settled();
+    expect(messages(storage)).toEqual([1, 2]);
+  });
+
+  it('lets what a sign-out cleared go before the user is forgotten', async () => {
+    const storage = asyncStorage();
+    const outbox = new Outbox(limits, { store: storageOutbox(storage) });
+    await outbox.opened;
+    outbox.connected('ann', 0);
+    add(outbox, 'a');
+    await settled();
+    expect(messages(storage)).toEqual([1]);
+    outbox.clear();
+    outbox.close();
+    await settled();
+    expect(messages(storage)).toEqual([]);
+    expect(JSON.parse(storage.data.get('wse-outbox:wse')!).user).toBeNull();
+  });
+
+  it('says a storage that fails, and writes it whole once it can', async () => {
+    const storage = asyncStorage();
+    const said: string[] = [];
+    const outbox = new Outbox(limits, {
+      store: storageOutbox(storage),
+      onStorageError: (operation) => said.push(operation),
+    });
+    await outbox.opened;
+    const multiSet = storage.multiSet!;
+    storage.multiSet = async () => {
+      throw new Error('full');
+    };
+    add(outbox, 'a');
+    await vi.waitFor(() => expect(said).toEqual(['write']));
+    storage.multiSet = multiSet;
+    // A second later the outbox writes it anew, with both.
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    add(outbox, 'b');
+    await vi.waitFor(() => expect(messages(storage)).toEqual([1, 2]));
+    outbox.close();
+  });
+});

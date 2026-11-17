@@ -16,6 +16,8 @@ import { createWSEClient, type WSEClient, type WSEClientOptions } from '../core/
 import { setWebCrypto } from '../utils/webcrypto.js';
 
 export * from '../react/index.js';
+export { storageOutbox } from './storageOutbox.js';
+export type { AsyncStorageLike, MMKVLike } from './storageOutbox.js';
 
 /** React Native's AppState, as far as the client uses it. */
 export interface AppStateLike {

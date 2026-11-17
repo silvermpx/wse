@@ -115,6 +115,11 @@
   macOS and the BSDs, an exclusive open on Windows, an abstract socket on
   Linux); a file that cannot be opened or written is a `wseStorageError`
   event.
+- React Native: `storageOutbox(storage)` (`wse-client/react-native`) keeps
+  the outbox in the app's storage, AsyncStorage (or one with its API) or
+  MMKV, which the app passes in: what waits outlives the app being closed
+  or killed. A message is a key of its own; the changes of a turn go in one
+  batch, removals first.
 - Rust client in the browser: `Offline::in_indexed_db(name)` keeps the
   outbox in that IndexedDB database, as the TypeScript client keeps it: a
   producer for each tab, held by a Web Lock, and what a closed tab left

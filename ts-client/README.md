@@ -178,19 +178,29 @@ from caching the page.
 
 ```ts
 import { AppState } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import QuickCrypto from 'react-native-quick-crypto';
-import { createReactNativeClient } from 'wse-client/react-native';
+import { createReactNativeClient, storageOutbox } from 'wse-client/react-native';
 
 const client = createReactNativeClient({
   endpoints: ['wss://example.com/wse'],
   token: () => auth.accessToken(),   // sent as Authorization: Bearer at each connection
   appState: AppState,                // pauses 5 s after the app goes to the background
   crypto: QuickCrypto,               // for end-to-end encryption and signed messages
+  offline: { store: storageOutbox(AsyncStorage) },  // what waits outlives the app
 });
 ```
 
 The client pauses while the app is in the background and reconnects in the foreground, recovering
 what it missed. Use it with the React adapter as with any core client.
+
+`storageOutbox(storage, name?)` keeps the outbox in the app's storage, so that what waits outlives
+the app being closed or killed: AsyncStorage, a storage with its API (expo-sqlite's kv-store), or an
+MMKV instance. Each message is a key of its own (`wse-outbox:wse:<number>`), the producer one more;
+the changes of a turn of the event loop go in one batch (`multiRemove`, then `multiSet`), so an app
+killed in between loses nothing it kept before and keeps nothing that went. A storage that fails is a
+`wseStorageError` event, and the outbox goes on in memory. Nothing of React Native is imported: the
+app passes the storage, as it passes `AppState`.
 
 ## Quick Start
 
