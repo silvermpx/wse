@@ -541,6 +541,29 @@ describe('sends that wait for their topics', () => {
     expect(second.messagesOfType('order').map((m) => m.s)).toEqual([1, 2]);
   });
 
+  it('that run out of time while they wait are said not delivered, as every client says it', async () => {
+    const { answers, resync } = resyncs();
+    const c = client({
+      topics: ['prices'],
+      consumer: 'board',
+      offline: { enabled: true },
+      delivery: { mode: 'recover-or-resync', resync },
+    });
+    const notDelivered: Array<{ reason: string; ids: string[] }> = [];
+    c.on('wseNotDelivered', (detail) => notDelivered.push(detail));
+    c.retain();
+    await tick();
+    const ws = FakeWebSocket.last();
+    await connectServer(ws, { user_id: 'alice', features: { acks: true } });
+    await send(ws, { c: 'WSE', t: 'outbox', p: { acked: 0, node: 'n1' }, v: 1 }, reply(['prices']));
+    c.send('order', { id: 1 }, { requires: ['prices'], ttl: 5, id: 'late' });
+    await vi.advanceTimersByTimeAsync(20);
+    answers[0].resolve();
+    await tick();
+    expect(ws.messagesOfType('order')).toHaveLength(0);
+    expect(notDelivered).toEqual([{ reason: 'expired', ids: ['late'] }]);
+  });
+
   it('share the memory limit with the other sends, whichever came first', () => {
     const { resync } = resyncs();
     const options = {

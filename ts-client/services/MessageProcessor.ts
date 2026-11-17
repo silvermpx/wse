@@ -2306,6 +2306,11 @@ export class MessageProcessor {
         if (isExpired(batch[i].expiresAt, nowMs)) {
           this.countDropped(1);
           logger.debug(`Dropping ${batch[i].type}: its ttl ran out while it was queued`);
+          // With the outbox's outcomes on, the application hears of it, as
+          // of one that ran out in the outbox.
+          if (this.ctx.outbox.current && batch[i].id) {
+            this.ctx.emit('wseNotDelivered', { reason: 'expired', ids: [batch[i].id] });
+          }
           continue;
         }
         const wire = this.toWire(batch[i]);
