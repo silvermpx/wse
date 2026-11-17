@@ -8,15 +8,15 @@
 //! (`wse:default`) in their capabilities:
 //!
 //! ```ignore
-//! use tauri_plugin_wse::WseExt;
+//! use tauri_plugin_wse::{WseExt, wse_client};
 //!
 //! tauri::Builder::default()
 //!     .plugin(tauri_plugin_wse::init())
 //!     .setup(|app| {
 //!         let mut config = wse_client::Config::new("wss://example.com/wse");
 //!         config.token = Some("...".to_owned());
-//!         let app = app.handle().clone();
-//!         tauri::async_runtime::spawn(async move { app.wse().start(config).await });
+//!         // It returns at once: the connection is made in the background.
+//!         tauri::async_runtime::block_on(app.wse().start(config))?;
 //!         Ok(())
 //!     })
 //!     .run(tauri::generate_context!())

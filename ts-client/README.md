@@ -247,14 +247,16 @@ holds a client over a port the preload hands it:
 ```ts
 // The main process.
 import { app, BrowserWindow, ipcMain, MessageChannelMain } from 'electron';
+import { join } from 'node:path';
 import { createWSEOwner, wsePreloadPath } from 'wse-client/electron';
 import { fileOutbox } from 'wse-client/node';
 
+await app.whenReady();
 const owner = createWSEOwner({
   electron: { ipcMain, MessageChannelMain },
   endpoints: ['wss://example.com/wse'],
   token: () => currentToken(),            // Authorization: Bearer, asked at each attempt; never in a window
-  offline: { store: fileOutbox(path.join(app.getPath('userData'), 'wse-outbox')) },
+  offline: { store: fileOutbox(join(app.getPath('userData'), 'wse-outbox')) },
 });
 
 const win = new BrowserWindow({ webPreferences: { preload: wsePreloadPath } });
@@ -293,15 +295,15 @@ The connection lives on the Rust side, in the `tauri-plugin-wse` crate (an owner
 the plugin's commands:
 
 ```rust
-use tauri_plugin_wse::WseExt;
+use tauri_plugin_wse::{WseExt, wse_client};
 
 tauri::Builder::default()
     .plugin(tauri_plugin_wse::init())
     .setup(|app| {
         let mut config = wse_client::Config::new("wss://example.com/wse");
-        config.token = Some(token);
-        let app = app.handle().clone();
-        tauri::async_runtime::spawn(async move { app.wse().start(config).await });
+        config.token = Some(token); // the signed-in user's
+        // It returns at once: the connection is made in the background.
+        tauri::async_runtime::block_on(app.wse().start(config))?;
         Ok(())
     })
 ```
