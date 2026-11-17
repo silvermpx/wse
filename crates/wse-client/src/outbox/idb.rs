@@ -298,14 +298,29 @@ fn readwrite(db: &IdbDatabase, stores: &[&str]) -> Result<IdbTransaction, String
         .map_err(|e| describe(&e))
 }
 
-/// What the database holds of `meta`'s producer.
-async fn read(db: &IdbDatabase, meta: &Meta) -> Result<Read, String> {
-    let tx = db.transaction_with_str(OUTBOX).map_err(|e| describe(&e))?;
-    let store = tx.object_store(OUTBOX).map_err(|e| describe(&e))?;
-    let all = store
-        .get_all_with_key(&range(&meta.producer, 0.0, f64::INFINITY)?.into())
+/// What the database holds of `producer` now, its row and its messages
+/// read at once; None when it is gone.
+async fn read(db: &IdbDatabase, producer: &str) -> Result<Option<(Meta, Read)>, String> {
+    let names = Array::new();
+    names.push(&JsValue::from_str(PRODUCERS));
+    names.push(&JsValue::from_str(OUTBOX));
+    let tx = db
+        .transaction_with_str_sequence(&names)
         .map_err(|e| describe(&e))?;
+    let row = tx
+        .object_store(PRODUCERS)
+        .and_then(|store| store.get(&JsValue::from_str(producer)))
+        .map_err(|e| describe(&e))?;
+    let all = tx
+        .object_store(OUTBOX)
+        .map_err(|e| describe(&e))?
+        .get_all_with_key(&range(producer, 0.0, f64::INFINITY)?.into())
+        .map_err(|e| describe(&e))?;
+    let row = result(&row).await?;
     let rows: Array = result(&all).await?.unchecked_into();
+    let Some(meta) = Meta::of(&row) else {
+        return Ok(None);
+    };
     let mut next = meta.next.max(meta.written + 1).max(1);
     let mut records = VecDeque::with_capacity(rows.length() as usize);
     for row in rows.iter() {
@@ -315,14 +330,15 @@ async fn read(db: &IdbDatabase, meta: &Meta) -> Result<Read, String> {
         next = next.max(record.s + 1);
         records.push_back(record);
     }
-    Ok(Read {
+    let read = Read {
         producer: meta.producer.as_str().into(),
         node: meta.node.as_deref().map(Into::into),
         written: meta.written,
         next,
         user: meta.user.clone(),
         records,
-    })
+    };
+    Ok(Some((meta, read)))
 }
 
 /// Takes over a producer no tab holds and which holds messages (one that
@@ -337,14 +353,20 @@ async fn take_over(db: &IdbDatabase, name: &str) -> Result<(Meta, Function, Read
         .map_err(|e| describe(&e))?;
     let metas: Array = result(&all).await?.unchecked_into();
     for value in metas.iter() {
-        let Some(meta) = Meta::of(&value) else {
+        let Some(listed) = Meta::of(&value) else {
             continue;
         };
-        let Some(release) = try_lock(&lock_name(name, &meta.producer)).await? else {
+        let Some(release) = try_lock(&lock_name(name, &listed.producer)).await? else {
             continue;
         };
-        let read = match read(db, &meta).await {
-            Ok(read) => read,
+        // Read again now that it is this tab's: the tab that held it may
+        // have used it meanwhile (its user named, a message written).
+        let (meta, read) = match read(db, &listed.producer).await {
+            Ok(Some(taken)) => taken,
+            Ok(None) => {
+                let _ = release.call0(&JsValue::NULL);
+                continue;
+            }
             Err(why) => {
                 let _ = release.call0(&JsValue::NULL);
                 return Err(why);
@@ -708,5 +730,100 @@ impl Drop for Log {
         let _ = inner.release.call0(&JsValue::NULL);
         // Closes once its transactions are done.
         inner.db.close();
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// IndexedDB in this Node (fake-indexeddb, the repository's development
+    /// dependency: `npm ci` first), and its Web Locks, each lock asked for
+    /// held while `globalThis.__wseGate` is a promise.
+    fn storage() {
+        let install = Function::new_with_args(
+            "root",
+            r#"
+            if (!globalThis.indexedDB) {
+              const { createRequire } = process.getBuiltinModule('node:module');
+              createRequire(root)('fake-indexeddb/auto');
+            }
+            const held = new Set();
+            const waiting = new Map();
+            const locks = {
+              async request(name, options, callback) {
+                if (typeof options === 'function') { callback = options; options = {}; }
+                if (globalThis.__wseGate) { globalThis.__wseGateHit = true; await globalThis.__wseGate; }
+                if (held.has(name)) {
+                  if (options.ifAvailable) return callback(null);
+                  await new Promise((resolve) => waiting.set(name, [...(waiting.get(name) ?? []), resolve]));
+                }
+                held.add(name);
+                try { return await callback({ name, mode: 'exclusive' }); }
+                finally { held.delete(name); waiting.get(name)?.shift()?.(); }
+              },
+            };
+            Object.defineProperty(globalThis.navigator, 'locks', { value: locks, configurable: true });
+            "#,
+        );
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../package.json");
+        install
+            .call1(&JsValue::NULL, &root.into())
+            .expect("fake-indexeddb from the repository's node_modules");
+    }
+
+    fn global(name: &str) -> JsValue {
+        Reflect::get(&js_sys::global(), &name.into()).unwrap_or(JsValue::UNDEFINED)
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_producer_is_taken_over_as_it_stands_once_its_lock_is_held() {
+        storage();
+        let name = format!("wse-test-takeover-{}", fastrand::u64(..));
+        let quiet: Report = Arc::new(|_, _| {});
+        let (mut first, _) = open(&name, Arc::clone(&quiet), Arc::new(|| {}))
+            .await
+            .unwrap();
+        let json = r#"{"t":"order","p":{},"id":"alice-command"}"#;
+        first.push_add(&Record {
+            s: 1,
+            id: "alice-command".into(),
+            at: 0,
+            until: u64::MAX,
+            owned: false,
+            requires: None,
+            text: numbered(1, json).into(),
+            size: json.len(),
+            tag: 0,
+        });
+        first.flush(0);
+        gloo_timers::future::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The next tab lists the producers, and asks for this one's lock
+        // while this tab holds it still.
+        let mut opened = None;
+        let gate = js_sys::Promise::new(&mut |resolve, _| opened = Some(resolve));
+        Reflect::set(&js_sys::global(), &"__wseGate".into(), &gate).unwrap();
+        let next = open(&name, Arc::clone(&quiet), Arc::new(|| {}));
+        let meanwhile = async {
+            while global("__wseGateHit").is_undefined() {
+                gloo_timers::future::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            // Meanwhile this tab's connection names Alice, writes the message,
+            // and the tab goes.
+            first.push(&LineRef::User(Some("alice")));
+            first.push(&LineRef::Written(1));
+            first.flush(1);
+            drop(first);
+            Reflect::delete_property(&js_sys::global(), &"__wseGate".into()).unwrap();
+            opened.take().unwrap().call0(&JsValue::NULL).unwrap();
+        };
+        let (taken, ()) = futures_util::future::join(next, meanwhile).await;
+        let (_second, read) = taken.unwrap();
+        assert_eq!(read.records.len(), 1);
+        // Alice's, written: a connection of another user drops it.
+        assert_eq!(read.user.as_deref(), Some("alice"));
+        assert_eq!(read.written, 1);
     }
 }

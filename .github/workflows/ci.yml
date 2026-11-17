@@ -826,7 +826,7 @@ jobs:
           WSE_TEST_IDENTITY="$(sed -n 's/^e2e_identity_public_key //p' server.log)" \
           WSE_TEST_SIGNING="$(sed -n 's/^signing_public_key //p' server.log)" \
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
-            cargo test -p wse-client --locked --target wasm32-unknown-unknown --test browser
+            cargo test -p wse-client --locked --target wasm32-unknown-unknown --lib --test browser
 
       - name: The conformance cases, through the browser's client
         run: |

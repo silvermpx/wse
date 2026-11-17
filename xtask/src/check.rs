@@ -64,7 +64,7 @@ WSE_TEST_URL=\"$(sed -n 's/^url //p' \"$log\")\" \\
 WSE_TEST_IDENTITY=\"$(sed -n 's/^e2e_identity_public_key //p' \"$log\")\" \\
 WSE_TEST_SIGNING=\"$(sed -n 's/^signing_public_key //p' \"$log\")\" \\
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \\
-  cargo test -p wse-client --locked --target wasm32-unknown-unknown --test browser
+  cargo test -p wse-client --locked --target wasm32-unknown-unknown --lib --test browser
 cargo build -q --locked -p wse-conformance
 out=\"$(mktemp -d \"$CARGO_TARGET_DIR/rust-browser.XXXXXX\")\"
 \"$CARGO_TARGET_DIR/debug/wse-conformance\" serve --out \"$out\" > \"$out/serve.log\" 2>&1 &

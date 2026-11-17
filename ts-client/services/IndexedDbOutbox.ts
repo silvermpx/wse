@@ -166,9 +166,17 @@ function openDatabase(name: string, report: Report): Promise<IDBDatabase> {
 }
 
 /** What the database holds of `meta`'s producer, each message as read too. */
-async function readProducer(db: IDBDatabase, meta: Meta): Promise<ReadOutbox> {
-  const tx = db.transaction([OUTBOX], 'readonly');
-  const rows = (await done(tx.objectStore(OUTBOX).getAll(rangeOf(meta.producer)))) as Row[];
+/**
+ * What `producer` holds now, its row and its messages read at once; null
+ * when it is gone.
+ */
+async function readProducer(db: IDBDatabase, producer: string): Promise<{ meta: Meta; read: ReadOutbox } | null> {
+  const tx = db.transaction([PRODUCERS, OUTBOX], 'readonly');
+  const [meta, rows] = (await Promise.all([
+    done(tx.objectStore(PRODUCERS).get(producer)),
+    done(tx.objectStore(OUTBOX).getAll(rangeOf(producer))),
+  ])) as [Meta | undefined, Row[]];
+  if (!meta) return null;
   let next = Math.max(1, meta.next, meta.written + 1);
   const records: ReadOutbox['records'] = [];
   for (const row of rows) {
@@ -190,7 +198,7 @@ async function readProducer(db: IDBDatabase, meta: Meta): Promise<ReadOutbox> {
       message,
     });
   }
-  return { producer: meta.producer, node: meta.node, written: meta.written, next, user: meta.user, records };
+  return { meta, read: { producer: meta.producer, node: meta.node, written: meta.written, next, user: meta.user, records } };
 }
 
 /** A step of a batch. */
@@ -400,10 +408,20 @@ export function indexedDbOutbox(name: string): OutboxStore {
       try {
         const metas = (await done(db.transaction([PRODUCERS], 'readonly').objectStore(PRODUCERS).getAll())) as Meta[];
         if (mine) metas.sort((a, b) => Number(b.producer === mine) - Number(a.producer === mine));
-        for (const meta of metas) {
-          const release = await tryLock(`wse-outbox:${name}:${meta.producer}`);
+        for (const listed of metas) {
+          const release = await tryLock(`wse-outbox:${name}:${listed.producer}`);
           if (!release) continue;
-          const read = await readProducer(db, meta);
+          // Read again now that it is this page's: the page that held it
+          // may have used it meanwhile (its user named, a message sent).
+          const taken = await readProducer(db, listed.producer).catch((error) => {
+            release();
+            throw error;
+          });
+          if (!taken) {
+            release();
+            continue;
+          }
+          const { meta, read } = taken;
           if (read.records.length === 0 && meta.producer !== mine) {
             // A producer nobody holds and nothing waits in: it goes.
             const tx = db.transaction([PRODUCERS, OUTBOX], 'readwrite');
