@@ -116,11 +116,12 @@ async fn main() -> Result<(), wse_client::Error> {
   connection that is ready now, or not at all: one the connection did not
   write is dropped, never sent on a later connection. For commands that
   must not run late (a valve, a door, an order).
-- **With no connection.** With `Config::offline`, what is sent while
-  there is no connection waits for the next one of the same user, in
-  memory or in a file that outlives the application (see below). Every
-  message carries an `id` (a UUID), as from the TypeScript and Python
-  clients.
+- **The outbox.** Every message sent waits until the server answers for
+  it, goes again after a reconnect, and reaches the server's application
+  once; the application hears what became of each. In memory, or in a file
+  that outlives the application (see below). Every message carries an
+  `id` (a UUID, or the application's own), as from the TypeScript and
+  Python clients.
 - **Another user.** When the token provider's next token is another
   user's, what the last user queued and did not send goes nowhere, and the
   topics are subscribed again from the start.
@@ -212,36 +213,71 @@ while sends that require nothing go past it. It is the user's who sent it and
 goes nowhere once the server takes a connection for another; at most
 `send_queue` of them wait.
 
-## With no connection
+## The outbox
 
 ```rust,no_run
 # async fn run() -> Result<(), wse_client::Error> {
+use wse_client::{Event, Incoming, SendOptions};
+
 let mut config = wse_client::Config::new("wss://example.com/wse");
 config.offline = Some(wse_client::Offline::in_file("/path/in/the/app/queue"));
-let (client, _events) = wse_client::connect(config).await?;
-// With no connection: kept, and sent once the next connection is ready.
-client.send("order", &serde_json::json!({"id": 1})).await?;
-println!("{} message(s) wait", client.kept());
+let (client, mut events) = wse_client::connect(config).await?;
+// With a connection or without: it waits until the server answers for it.
+let mut options = SendOptions::default();
+options.id = Some("order-17".to_owned());
+client
+    .send_with("order", &serde_json::json!({"item": "tea"}), &options)
+    .await?;
+while let Some(incoming) = events.next().await {
+    match incoming {
+        Incoming::Event(Event::Delivered(ids)) => println!("delivered: {ids:?}"),
+        Incoming::Event(Event::NotDelivered(not)) => {
+            println!("not delivered ({}): {:?}", not.reason, not.ids);
+        }
+        _ => {}
+    }
+}
 # Ok(())
 # }
 ```
 
-What is sent while there is no connection goes on the next connection of
-the same user, right after the topics are subscribed again and before what
-is sent then. `Offline::in_file(path)` keeps it in a file, so that it
-outlives the application: the file is the client's alone while it runs
-(`<path>.lock` beside it says so), a message is written to it as it is
-kept and synced to the disk right after by a thread of its own, and the
-file is written over without what went once that outweighs what is kept.
-`Offline::in_memory()` keeps it for the client's life. At most
-`max_messages` (1,000) wait, for at most `max_age` (an hour); past the
-first a send fails with `Error::Full`, past the second a message is
-dropped. A message kept while one user was connected goes nowhere once
-another user's connection comes. A message leaves the queue once the
-connection wrote it. A live or signed message is never kept, and a send
-that requires topics waits in memory. A file that cannot be written is an
-`Event::StorageFailed`: what is kept stays in memory then. In the browser
-the queue is in memory.
+Every message sent, except a live or signed one, waits in the outbox until
+the server answers for it. It goes numbered and in order; after a reconnect
+what was not answered goes again, before anything new, and a 3.2 server
+drops a repeat, so its application takes each message once. What the
+server cannot tell (the client comes from a node of a cluster that is gone)
+reaches its application marked `possible_repeat`, and the application
+checks the message's `id`.
+
+The application hears what became of each message by its id:
+`Event::Delivered`, or `Event::NotDelivered` and why: the server refused it
+(`busy`, `rate_limited`, `missing`, `not_ready`), it was not written within
+its time (`expired`: `max_age`, an hour, or the `ttl` it was sent with), it
+was the last user's (`user_changed`), the application cleared the outbox
+(`cleared`: `client.clear()`, for a sign-out), or the client closed with it
+in memory (`closed`). A close waits up to a second for the server's answers
+first.
+
+At most `max_messages` (100,000) and `max_bytes` (16 MiB) wait, the ones
+written and not answered yet included: past either `send` waits for room,
+and `try_send` fails at once with `Error::Full`. `kept()` says how many
+wait. A send that requires topics waits in memory until they are
+continuous, and joins the outbox then.
+
+`Offline::in_memory()` (the default) keeps the outbox for the client's
+life. `Offline::in_file(path)` keeps it in a file, so that it outlives the
+application: the file is the client's alone while it runs (`<path>.lock`
+beside it says so), each line is checked (a CRC-32 and a salt) and read up
+to the first that does not check, the lines of a batch are written at once
+and synced to the disk by a thread of its own, and the file is written
+anew once what went outweighs what is kept. A file that cannot be opened
+or written is an `Event::StorageFailed`: the outbox goes on in memory. In
+the browser the outbox is in memory. `config.offline = None` has no
+outbox: a message goes on the connection that is ready, or the send fails
+with `Error::NotConnected`, as before 3.2.
+
+With a server older than 3.2, which does not answer, a message is gone
+once written, as before.
 
 ## In the browser
 

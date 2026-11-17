@@ -1,6 +1,6 @@
 //! The protocol on one client: what the server's messages mean, which reach
 //! the application, the topics subscribed and where each stands, and the
-//! gaps being recovered. No I/O: what it sends goes in its outbox.
+//! gaps being recovered. No I/O: what it sends goes in its write queue.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -17,7 +17,7 @@ use crate::decode::{self, Envelope, epoch_of};
 use crate::delivery::{self, Delivered};
 use crate::error::Error;
 use crate::handler::{
-    Connected, Event, Gap, GapReason, Handler, Recovery, ServerError, Subscribed,
+    Connected, Event, Gap, GapReason, Handler, NotDelivered, Recovery, ServerError, Subscribed,
 };
 use crate::message::{Message, OwnedMessage, Payload, Position, Signature};
 use crate::security::{Keys, Sealing};
@@ -83,8 +83,12 @@ pub(crate) enum Outgoing {
     /// The handshake's own (client_hello, the answer to a ping): as it is
     /// before the session opens, sealed after.
     Handshake(String),
-    /// A message the offline queue kept: it leaves the queue once written.
-    Kept { id: Box<str>, text: String },
+    /// A message of the outbox, its number with it: a server that does not
+    /// answer takes it once it is written.
+    Kept {
+        s: u64,
+        text: bytestring::ByteString,
+    },
 }
 
 pub(crate) struct Session<H> {
@@ -106,10 +110,17 @@ pub(crate) struct Session<H> {
     holes: usize,
     next_deadline: Option<Instant>,
     /// What to send.
-    pub(crate) outbox: Vec<Outgoing>,
+    pub(crate) to_write: Vec<Outgoing>,
     /// Sends that wait until each topic they require is continuous, in the
     /// order they were sent: on every connection, the last user's dropped.
     waiting: VecDeque<Queued>,
+    /// The outbox: every message sent but a live or signed one, until the
+    /// server answers for it (`Config::offline`).
+    pub(crate) outbox: Option<crate::outbox::Outbox>,
+    /// The server of this connection answers the outbox (`acks`).
+    server_answers: bool,
+    /// The outbox's clears this session made ([`Shared::clears`]).
+    clears: u64,
 
     keys: Arc<Keys>,
 
@@ -177,8 +188,11 @@ impl<H: Handler> Session<H> {
             unanswered: 0,
             holes: 0,
             next_deadline: None,
-            outbox: Vec::new(),
+            to_write: Vec::new(),
             waiting: VecDeque::new(),
+            outbox: None,
+            server_answers: false,
+            clears: 0,
             ready: false,
             became_ready: false,
             connected_before: false,
@@ -207,23 +221,146 @@ impl<H: Handler> Session<H> {
         self.last_alive = Some(now);
     }
 
-    /// A message the application sent, for this connection's outbox: none
+    /// A message the application sent, for this connection's write queue: none
     /// that was sent as another user, or signed or sent live on another
     /// connection; one that requires topics not continuous waits for them.
     pub(crate) fn queue(&mut self, frame: Queued) {
-        if frame.user != self.users {
+        self.catch_up_clears();
+        if frame.clears != self.clears {
+            self.dropped(&frame, "cleared");
+        } else if frame.user != self.users {
             tracing::warn!("[WSE] a message sent as the previous user was dropped");
-        } else if frame.only_on.is_some_and(|on| on != self.connections) {
-            tracing::warn!("[WSE] a message for a connection that went was dropped");
-        } else if frame
-            .requires
-            .as_deref()
-            .is_some_and(|topics| !delivery::lock(self.handler.gate()).continuous(topics))
-        {
+            self.dropped(&frame, "user_changed");
+        } else if let Some(on) = frame.only_on {
+            if self.ready && on == self.connections {
+                self.to_write.push(Outgoing::Text(frame.text));
+            } else {
+                tracing::warn!("[WSE] a message for a connection that went was dropped");
+            }
+        } else if frame.requires.as_deref().is_some_and(|topics| {
+            !self.ready || !delivery::lock(self.handler.gate()).continuous(topics)
+        }) {
             self.waiting.push_back(frame);
         } else {
-            self.outbox.push(Outgoing::Text(frame.text));
+            self.keep(frame);
         }
+    }
+
+    /// A message for the outbox, which hands it to the writer before the
+    /// next write ([`Session::before_write`]); without an outbox, for this
+    /// connection.
+    fn keep(&mut self, frame: Queued) {
+        match &mut self.outbox {
+            Some(outbox) => {
+                let size = frame.size();
+                outbox.add(
+                    frame.id,
+                    frame.text,
+                    size,
+                    frame.ttl,
+                    crate::outbox::now_ms(),
+                );
+            }
+            None => self.to_write.push(Outgoing::Text(frame.text)),
+        }
+    }
+
+    /// Right before the write queue is written: the sends whose topics are
+    /// continuous now, and what the outbox has for the connection, go in it,
+    /// in one batch.
+    pub(crate) fn before_write(&mut self) {
+        self.release_waiting();
+        self.write_outbox();
+    }
+
+    /// A message dropped before it reached the outbox: its place given back,
+    /// and the application told.
+    fn dropped(&mut self, frame: &Queued, why: &str) {
+        if !frame.counted {
+            return;
+        }
+        if let Some(room) = &self.shared.room {
+            room.give_back(frame.size());
+        }
+        self.handler.event(Event::NotDelivered(NotDelivered {
+            reason: why.to_owned(),
+            ids: vec![frame.id.to_string()],
+        }));
+    }
+
+    /// What the outbox has to write on this connection goes in its turn.
+    fn write_outbox(&mut self) {
+        let Some(outbox) = &mut self.outbox else {
+            return;
+        };
+        let mut outcomes = crate::outbox::Outcomes::default();
+        let to_write = &mut self.to_write;
+        outbox.due(crate::outbox::now_ms(), &mut outcomes, |s, text| {
+            to_write.push(Outgoing::Kept { s, text });
+        });
+        self.report_outcomes(outcomes);
+    }
+
+    /// What became of messages of the outbox, to the application.
+    fn report_outcomes(&mut self, outcomes: crate::outbox::Outcomes) {
+        if !outcomes.delivered.is_empty() {
+            self.handler.event(Event::Delivered(outcomes.delivered));
+        }
+        for (reason, ids) in outcomes.not_delivered {
+            self.handler
+                .event(Event::NotDelivered(NotDelivered { reason, ids }));
+        }
+    }
+
+    /// The connection wrote the outbox's messages up to and with `last`: a
+    /// server that does not answer took them.
+    pub(crate) fn wrote(&mut self, last: Option<u64>) {
+        if let (Some(last), Some(outbox)) = (last, &mut self.outbox) {
+            let outcomes = outbox.wrote(last);
+            self.report_outcomes(outcomes);
+        }
+    }
+
+    /// The application cleared the outbox (the user signed out): what was
+    /// sent before goes.
+    pub(crate) fn catch_up_clears(&mut self) {
+        let clears = self.shared.clears.load(Ordering::Acquire);
+        if clears == self.clears {
+            return;
+        }
+        self.clears = clears;
+        // Not written yet: it is not.
+        self.to_write
+            .retain(|outgoing| !matches!(outgoing, Outgoing::Kept { .. }));
+        let waiting: Vec<Queued> = self.waiting.drain(..).collect();
+        for frame in &waiting {
+            self.dropped(frame, "cleared");
+        }
+        if let Some(outbox) = &mut self.outbox {
+            let outcomes = outbox.clear();
+            self.report_outcomes(outcomes);
+        }
+    }
+
+    /// The server owes the outbox an answer on this connection (for the
+    /// messages it has in hand, or to the hello while messages wait): a
+    /// close waits for it, within its own time, and what the answer lets go
+    /// out goes first.
+    pub(crate) fn awaits_answers(&self) -> bool {
+        self.outbox
+            .as_ref()
+            .is_some_and(crate::outbox::Outbox::owed)
+    }
+
+    /// The outbox's hello, for the connection's `client_hello`.
+    pub(crate) fn outbox_hello(&self) -> Option<serde_json::Value> {
+        self.outbox.as_ref().map(crate::outbox::Outbox::hello)
+    }
+
+    /// Whether the connection's task takes messages while there is no
+    /// connection: the outbox keeps them.
+    pub(crate) fn keeps(&self) -> bool {
+        self.outbox.is_some()
     }
 
     /// Sends waiting for their topics.
@@ -232,26 +369,36 @@ impl<H: Handler> Session<H> {
     }
 
     /// The sends whose topics are continuous now go, in the order they were
-    /// sent, right before the outbox is written; one sent as the last user
+    /// sent, right before the write queue is written; one sent as the last user
     /// goes nowhere.
     pub(crate) fn release_waiting(&mut self) {
         if self.waiting.is_empty() || !self.ready {
             return;
         }
-        let gate = delivery::lock(self.handler.gate());
         let users = self.users;
-        self.waiting.retain_mut(|frame| {
-            if frame.user != users {
-                tracing::warn!("[WSE] a message sent as the previous user was dropped");
-                false
-            } else if gate.continuous(frame.requires.as_deref().unwrap_or_default()) {
-                self.outbox
-                    .push(Outgoing::Text(std::mem::take(&mut frame.text)));
-                false
-            } else {
-                true
+        let mut released = Vec::new();
+        let mut stale = Vec::new();
+        {
+            let gate = delivery::lock(self.handler.gate());
+            let mut kept = VecDeque::with_capacity(self.waiting.len());
+            for frame in self.waiting.drain(..) {
+                if frame.user != users {
+                    stale.push(frame);
+                } else if gate.continuous(frame.requires.as_deref().unwrap_or_default()) {
+                    released.push(frame);
+                } else {
+                    kept.push_back(frame);
+                }
             }
-        });
+            self.waiting = kept;
+        }
+        for frame in &stale {
+            tracing::warn!("[WSE] a message sent as the previous user was dropped");
+            self.dropped(frame, "user_changed");
+        }
+        for frame in released {
+            self.keep(frame);
+        }
     }
 
     /// A new connection: nothing of the last one carries over but the
@@ -260,6 +407,7 @@ impl<H: Handler> Session<H> {
         self.sealing = sealing;
         self.fatal = None;
         self.ready = false;
+        self.server_answers = false;
         self.became_ready = false;
         self.server_recovery = false;
         self.history_ttl = None;
@@ -269,7 +417,7 @@ impl<H: Handler> Session<H> {
         self.requests.clear();
         self.unrecoverable.clear();
         self.unanswered = 0;
-        self.outbox.clear();
+        self.to_write.clear();
         for topic in self.topics.values_mut() {
             for hole in &mut topic.holes {
                 hole.request = None;
@@ -290,9 +438,10 @@ impl<H: Handler> Session<H> {
         self.sealing = None;
         self.ready = false;
         self.shared.ready.store(false, Ordering::Release);
-        // What is sent from now on is kept for the next one.
-        if let Some(store) = &self.shared.store {
-            store.release();
+        // What waits goes on the next one.
+        if let Some(outbox) = &mut self.outbox {
+            let outcomes = outbox.disconnected();
+            self.report_outcomes(outcomes);
         }
         self.requests.clear();
         // A stream that heard nothing for longer than the server keeps one,
@@ -330,6 +479,16 @@ impl<H: Handler> Session<H> {
     pub(crate) fn finish(&mut self) {
         for (topic, epoch) in self.holes_where(|_| true) {
             self.give_up(&topic, epoch, GapReason::Closed);
+        }
+        // What waits for its topics goes with the client; the outbox's
+        // messages too, unless a file keeps them for the next.
+        let waiting: Vec<Queued> = self.waiting.drain(..).collect();
+        for frame in &waiting {
+            self.dropped(frame, "closed");
+        }
+        if let Some(outbox) = &mut self.outbox {
+            let outcomes = outbox.close();
+            self.report_outcomes(outcomes);
         }
     }
 
@@ -545,6 +704,9 @@ impl<H: Handler> Session<H> {
             "server_hello" => self.on_server_hello(message),
             "subscription_update" => self.on_subscription_reply(message),
             "error" => self.on_error(message),
+            "outbox" => self.on_outbox(message),
+            "ack" => self.on_ack(message),
+            "nack" => self.on_nack(message),
             _ => self.handler.message(message),
         }
     }
@@ -663,7 +825,7 @@ impl<H: Handler> Session<H> {
                 named,
             });
         let request = subscription(&[name], &[(name, from, streams)]);
-        self.outbox.push(Outgoing::Text(request));
+        self.to_write.push(Outgoing::Text(request));
     }
 
     /// Delivers what became in order; closes a filled hole.
@@ -793,12 +955,36 @@ impl<H: Handler> Session<H> {
 
     /// When the next hole gives up waiting.
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        self.next_deadline
+        match (self.next_deadline, self.outbox_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
-    /// Holes whose wait is over give up.
+    /// When the first message of the outbox not written yet runs out.
+    pub(crate) fn outbox_deadline(&self) -> Option<Instant> {
+        self.outbox
+            .as_ref()
+            .and_then(crate::outbox::Outbox::deadline)
+    }
+
+    /// Messages of the outbox that waited too long to be sent go, and the
+    /// application hears of them.
+    pub(crate) fn expire_outbox(&mut self, now: Instant) {
+        if let Some(outbox) = &mut self.outbox
+            && outbox.deadline().is_some_and(|at| at <= now)
+        {
+            let mut outcomes = crate::outbox::Outcomes::default();
+            outbox.expire(crate::outbox::now_ms(), &mut outcomes);
+            self.report_outcomes(outcomes);
+        }
+    }
+
+    /// Holes whose wait is over give up; messages of the outbox that waited
+    /// too long to be sent go.
     pub(crate) fn on_deadline(&mut self, now: Instant) {
         self.clock = now;
+        self.expire_outbox(now);
         // Nothing came back for these: the server application may not
         // answer recovery requests. After a few, the client stops asking.
         let unanswered = self
@@ -873,7 +1059,7 @@ impl<H: Handler> Session<H> {
             );
             push_json(&mut text, &topics);
             text.push_str("},\"v\":1}");
-            self.outbox.push(Outgoing::Text(text));
+            self.to_write.push(Outgoing::Text(text));
         }
     }
 
@@ -926,7 +1112,7 @@ impl<H: Handler> Session<H> {
             self.next_deadline = self.first_deadline();
         }
         let names: Vec<&str> = topics.iter().map(String::as_str).collect();
-        self.outbox
+        self.to_write
             .push(Outgoing::Text(subscription(&names, &positions)));
         // Holes in the topics' other streams ask for themselves.
         for (topic, epoch) in self.holes_where(|h| h.request.is_none()) {
@@ -1171,7 +1357,7 @@ impl<H: Handler> Session<H> {
         let pong = format!(
             r#"{{"c":"WSE","t":"PONG","p":{{"client_timestamp":{now},"server_timestamp":{echoed}}},"v":1}}"#
         );
-        self.outbox.push(Outgoing::Handshake(pong));
+        self.to_write.push(Outgoing::Handshake(pong));
     }
 
     fn on_server_ready(&mut self, message: &Message<'_>) {
@@ -1223,7 +1409,67 @@ impl<H: Handler> Session<H> {
         if let Some(ttl) = ready.details.features.history_ttl {
             self.history_ttl = Some(Duration::from_secs(ttl));
         }
+        self.server_answers = ready.details.features.acks;
         self.take_connection(connection_id, ready.details.user_id);
+    }
+
+    /// The server's answer to the outbox's hello: what it took, and its
+    /// name. What it took is delivered; the rest goes again, in order,
+    /// before anything new.
+    fn on_outbox(&mut self, message: &Message<'_>) {
+        #[derive(serde::Deserialize, Default)]
+        #[serde(default)]
+        struct Answer {
+            acked: u64,
+            node: String,
+            refused: Vec<Refused>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Refused {
+            s: u64,
+            from: Option<u64>,
+            code: Option<String>,
+        }
+        let answer = message.payload::<Answer>().unwrap_or_default();
+        let refused: Vec<(u64, u64, &str)> = answer
+            .refused
+            .iter()
+            .map(|r| {
+                let why = r.code.as_deref().unwrap_or("refused");
+                (r.from.unwrap_or(r.s), r.s, why)
+            })
+            .collect();
+        if let Some(outbox) = &mut self.outbox {
+            let outcomes = outbox.answered(answer.acked, &refused, &answer.node);
+            self.report_outcomes(outcomes);
+        }
+    }
+
+    /// The server took every message up to and with `s`.
+    fn on_ack(&mut self, message: &Message<'_>) {
+        #[derive(serde::Deserialize)]
+        struct Ack {
+            s: u64,
+        }
+        if let (Ok(ack), Some(outbox)) = (message.payload::<Ack>(), &mut self.outbox) {
+            let outcomes = outbox.acked(ack.s);
+            self.report_outcomes(outcomes);
+        }
+    }
+
+    /// The server refused messages `from` to `s` for good.
+    fn on_nack(&mut self, message: &Message<'_>) {
+        #[derive(serde::Deserialize)]
+        struct Nack {
+            s: u64,
+            from: Option<u64>,
+            code: Option<String>,
+        }
+        if let (Ok(nack), Some(outbox)) = (message.payload::<Nack>(), &mut self.outbox) {
+            let why = nack.code.as_deref().unwrap_or("refused");
+            let outcomes = outbox.refused(nack.from.unwrap_or(nack.s), nack.s, why);
+            self.report_outcomes(outcomes);
+        }
     }
 
     fn on_server_hello(&mut self, message: &Message<'_>) {
@@ -1262,7 +1508,7 @@ impl<H: Handler> Session<H> {
                     // message the session seals.
                     let th = self.sealing.as_ref().and_then(Sealing::transcript_hash);
                     match th.map(|th| self.keys.prove_session(&th)).transpose() {
-                        Ok(Some(Some(proof))) => self.outbox.insert(0, Outgoing::Text(proof)),
+                        Ok(Some(Some(proof))) => self.to_write.insert(0, Outgoing::Text(proof)),
                         Ok(_) => {}
                         Err(error) => self.fail(error),
                     }
@@ -1330,12 +1576,12 @@ impl<H: Handler> Session<H> {
             self.rewind_to_committed(&topics);
             self.send_subscription(&topics);
         }
-        // What was sent with no connection goes next, before what is sent
-        // from now on.
-        if let Some(store) = &self.shared.store {
-            for (id, text) in store.take_for(user_id.as_deref()) {
-                self.outbox.push(Outgoing::Kept { id, text });
-            }
+        // The outbox: another user's go, and the rest goes once the server
+        // said what it took (or at once, to a server that does not answer).
+        if let Some(outbox) = &mut self.outbox {
+            let outcomes = outbox.connected(user_id.as_deref(), crate::outbox::now_ms());
+            outbox.server_answers(self.server_answers);
+            self.report_outcomes(outcomes);
         }
         tracing::info!(
             "[WSE] connected as {connection_id} (recovery: {})",
@@ -1424,6 +1670,9 @@ fn is_protocol(kind: &str) -> bool {
             | "server_hello"
             | "subscription_update"
             | "error"
+            | "outbox"
+            | "ack"
+            | "nack"
     )
 }
 
@@ -1431,6 +1680,8 @@ fn is_protocol(kind: &str) -> bool {
 #[serde(default)]
 struct Features {
     recovery: bool,
+    /// The server answers the outbox (3.2).
+    acks: bool,
     /// Seconds a stream that receives nothing stays recoverable (3.1).
     history_ttl: Option<u64>,
 }
@@ -1536,7 +1787,11 @@ pub(crate) fn ping() -> String {
 
 /// The first frame of a connection, with the end-to-end offer when it
 /// opens a session.
-pub(crate) fn client_hello(compression: bool, e2e: Option<serde_json::Value>) -> String {
+pub(crate) fn client_hello(
+    compression: bool,
+    e2e: Option<serde_json::Value>,
+    outbox: Option<serde_json::Value>,
+) -> String {
     let mut p = serde_json::json!({
         "client_version": env!("CARGO_PKG_VERSION"),
         "protocol_version": 1,
@@ -1548,6 +1803,9 @@ pub(crate) fn client_hello(compression: bool, e2e: Option<serde_json::Value>) ->
     });
     if let Some(e2e) = e2e {
         p["e2e"] = e2e;
+    }
+    if let Some(outbox) = outbox {
+        p["outbox"] = outbox;
     }
     serde_json::json!({"c": "WSE", "t": "client_hello", "p": p, "v": 1}).to_string()
 }
@@ -1621,18 +1879,17 @@ mod tests {
         }
     }
 
-    /// The texts in the outbox, taken out.
+    /// The texts in the write queue, taken out.
     fn sent(session: &mut Session<Seen>) -> Vec<serde_json::Value> {
         session
-            .outbox
+            .to_write
             .drain(..)
-            .map(
-                |(Outgoing::Text(text)
-                 | Outgoing::Handshake(text)
-                 | Outgoing::Kept { text, .. })| {
-                    serde_json::from_str(text.as_str()).unwrap()
-                },
-            )
+            .map(|outgoing| match outgoing {
+                Outgoing::Text(text) | Outgoing::Handshake(text) => {
+                    serde_json::from_str(&text).unwrap()
+                }
+                Outgoing::Kept { text, .. } => serde_json::from_str(&text).unwrap(),
+            })
             .collect()
     }
 
@@ -1677,7 +1934,7 @@ mod tests {
                 .is_none()
         );
         // Not answered either: a server pings inside the session only.
-        assert!(s.outbox.is_empty());
+        assert!(s.to_write.is_empty());
         // A stamped protocol message moves no topic either.
         ready(&mut s, true);
         s.on_json(
@@ -1924,6 +2181,10 @@ mod tests {
             only_on: None,
             requires: (!requires.is_empty())
                 .then(|| requires.iter().map(|t| (*t).to_owned()).collect()),
+            id: kind.into(),
+            ttl: None,
+            counted: false,
+            clears: 0,
         };
         let kinds = |s: &mut Session<Seen>| -> Vec<String> {
             s.release_waiting();
@@ -2255,7 +2516,7 @@ mod tests {
             })
         );
         let hello: serde_json::Value =
-            serde_json::from_str(client_hello(true, None).as_str()).unwrap();
+            serde_json::from_str(client_hello(true, None, None).as_str()).unwrap();
         assert_eq!(hello["t"], "client_hello");
         assert_eq!(hello["p"]["features"]["compression"], true);
     }

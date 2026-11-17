@@ -90,6 +90,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   WseOffline dco_decode_box_autoadd_wse_offline(dynamic raw);
 
   @protected
+  WseSendOptions dco_decode_box_autoadd_wse_send_options(dynamic raw);
+
+  @protected
   int dco_decode_i_32(dynamic raw);
 
   @protected
@@ -183,6 +186,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   WseOffline dco_decode_wse_offline(dynamic raw);
 
   @protected
+  WseSendOptions dco_decode_wse_send_options(dynamic raw);
+
+  @protected
   WseStreamPosition dco_decode_wse_stream_position(dynamic raw);
 
   @protected
@@ -261,6 +267,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   WseOffline sse_decode_box_autoadd_wse_offline(SseDeserializer deserializer);
+
+  @protected
+  WseSendOptions sse_decode_box_autoadd_wse_send_options(
+    SseDeserializer deserializer,
+  );
 
   @protected
   int sse_decode_i_32(SseDeserializer deserializer);
@@ -370,6 +381,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   WseOffline sse_decode_wse_offline(SseDeserializer deserializer);
 
   @protected
+  WseSendOptions sse_decode_wse_send_options(SseDeserializer deserializer);
+
+  @protected
   WseStreamPosition sse_decode_wse_stream_position(
     SseDeserializer deserializer,
   );
@@ -464,6 +478,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_box_autoadd_wse_offline(
     WseOffline self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_wse_send_options(
+    WseSendOptions self,
     SseSerializer serializer,
   );
 
@@ -586,6 +606,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_wse_offline(WseOffline self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_wse_send_options(
+    WseSendOptions self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_wse_stream_position(

@@ -40,7 +40,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.13.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1815972506;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1873176362;
 
 // Section: executor
 
@@ -167,6 +167,52 @@ fn wire__crate__api__WseNativeClient_checkpoint_impl(
                 let api_that_guard = api_that_guard.unwrap();
                 let output_ok =
                     Ok::<_, ()>(crate::api::WseNativeClient::checkpoint(&*api_that_guard))?;
+                std::result::Result::Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__WseNativeClient_clear_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "WseNativeClient_clear",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<WseNativeClient>,
+            >>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, crate::api::WseError>((move || {
+                let mut api_that_guard = None;
+                let decode_indices_ =
+                    flutter_rust_bridge::for_generated::lockable_compute_decode_order(vec![
+                        flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                            &api_that, 0, false,
+                        ),
+                    ]);
+                for i in decode_indices_ {
+                    match i {
+                        0 => api_that_guard = Some(api_that.lockable_decode_sync_ref()),
+                        _ => unreachable!(),
+                    }
+                }
+                let api_that_guard = api_that_guard.unwrap();
+                let output_ok = crate::api::WseNativeClient::clear(&*api_that_guard)?;
                 std::result::Result::Ok(output_ok)
             })())
         },
@@ -966,6 +1012,70 @@ fn wire__crate__api__WseNativeClient_send_signed_impl(
         },
     )
 }
+fn wire__crate__api__WseNativeClient_send_with_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "WseNativeClient_send_with",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<WseNativeClient>,
+            >>::sse_decode(&mut deserializer);
+            let api_kind = <String>::sse_decode(&mut deserializer);
+            let api_json = <String>::sse_decode(&mut deserializer);
+            let api_options = <crate::api::WseSendOptions>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, crate::api::WseError>(
+                    (move || async move {
+                        let mut api_that_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                    &api_that, 0, false,
+                                )],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_that_guard =
+                                        Some(api_that.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_that_guard = api_that_guard.unwrap();
+                        let output_ok = crate::api::WseNativeClient::send_with(
+                            &*api_that_guard,
+                            api_kind,
+                            api_json,
+                            api_options,
+                        )
+                        .await?;
+                        std::result::Result::Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
 fn wire__crate__api__WseNativeClient_status_impl(
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -1256,6 +1366,60 @@ fn wire__crate__api__WseNativeClient_try_send_requiring_impl(
                     api_kind,
                     api_json,
                     api_topics,
+                )?;
+                std::result::Result::Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__WseNativeClient_try_send_with_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "WseNativeClient_try_send_with",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<WseNativeClient>,
+            >>::sse_decode(&mut deserializer);
+            let api_kind = <String>::sse_decode(&mut deserializer);
+            let api_json = <String>::sse_decode(&mut deserializer);
+            let api_options = <crate::api::WseSendOptions>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, crate::api::WseError>((move || {
+                let mut api_that_guard = None;
+                let decode_indices_ =
+                    flutter_rust_bridge::for_generated::lockable_compute_decode_order(vec![
+                        flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                            &api_that, 0, false,
+                        ),
+                    ]);
+                for i in decode_indices_ {
+                    match i {
+                        0 => api_that_guard = Some(api_that.lockable_decode_sync_ref()),
+                        _ => unreachable!(),
+                    }
+                }
+                let api_that_guard = api_that_guard.unwrap();
+                let output_ok = crate::api::WseNativeClient::try_send_with(
+                    &*api_that_guard,
+                    api_kind,
+                    api_json,
+                    api_options,
                 )?;
                 std::result::Result::Ok(output_ok)
             })())
@@ -1829,6 +1993,7 @@ impl SseDecode for crate::api::WseItem {
         let mut var_retryInMs = <Option<u64>>::sse_decode(deserializer);
         let mut var_attempt = <Option<u32>>::sse_decode(deserializer);
         let mut var_reasons = <Vec<String>>::sse_decode(deserializer);
+        let mut var_ids = <Vec<String>>::sse_decode(deserializer);
         let mut var_topics = <Vec<String>>::sse_decode(deserializer);
         let mut var_failed = <Vec<String>>::sse_decode(deserializer);
         let mut var_recoveries = <Vec<crate::api::WseTopicRecovery>>::sse_decode(deserializer);
@@ -1861,6 +2026,7 @@ impl SseDecode for crate::api::WseItem {
             retry_in_ms: var_retryInMs,
             attempt: var_attempt,
             reasons: var_reasons,
+            ids: var_ids,
             topics: var_topics,
             failed: var_failed,
             recoveries: var_recoveries,
@@ -1890,8 +2056,10 @@ impl SseDecode for crate::api::WseItemKind {
             9 => crate::api::WseItemKind::Resync,
             10 => crate::api::WseItemKind::Continuity,
             11 => crate::api::WseItemKind::CheckpointRejected,
-            12 => crate::api::WseItemKind::StorageFailed,
-            13 => crate::api::WseItemKind::Unknown,
+            12 => crate::api::WseItemKind::Delivered,
+            13 => crate::api::WseItemKind::NotDelivered,
+            14 => crate::api::WseItemKind::StorageFailed,
+            15 => crate::api::WseItemKind::Unknown,
             _ => unreachable!("Invalid variant for WseItemKind: {}", inner),
         };
     }
@@ -1900,13 +2068,31 @@ impl SseDecode for crate::api::WseItemKind {
 impl SseDecode for crate::api::WseOffline {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_disabled = <bool>::sse_decode(deserializer);
         let mut var_path = <Option<String>>::sse_decode(deserializer);
         let mut var_maxMessages = <u32>::sse_decode(deserializer);
+        let mut var_maxBytes = <u64>::sse_decode(deserializer);
         let mut var_maxAgeMs = <u64>::sse_decode(deserializer);
         return crate::api::WseOffline {
+            disabled: var_disabled,
             path: var_path,
             max_messages: var_maxMessages,
+            max_bytes: var_maxBytes,
             max_age_ms: var_maxAgeMs,
+        };
+    }
+}
+
+impl SseDecode for crate::api::WseSendOptions {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_id = <Option<String>>::sse_decode(deserializer);
+        let mut var_ttlMs = <u64>::sse_decode(deserializer);
+        let mut var_requires = <Vec<String>>::sse_decode(deserializer);
+        return crate::api::WseSendOptions {
+            id: var_id,
+            ttl_ms: var_ttlMs,
+            requires: var_requires,
         };
     }
 }
@@ -1990,15 +2176,16 @@ fn pde_ffi_dispatcher_primary_impl(
 ) {
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
-        5 => wire__crate__api__WseNativeClient_connect_impl(port, ptr, rust_vec_len, data_len),
-        6 => wire__crate__api__WseNativeClient_disconnect_impl(port, ptr, rust_vec_len, data_len),
-        8 => wire__crate__api__WseNativeClient_next_batch_impl(port, ptr, rust_vec_len, data_len),
-        14 => wire__crate__api__WseNativeClient_send_impl(port, ptr, rust_vec_len, data_len),
-        15 => wire__crate__api__WseNativeClient_send_live_impl(port, ptr, rust_vec_len, data_len),
-        16 => {
+        6 => wire__crate__api__WseNativeClient_connect_impl(port, ptr, rust_vec_len, data_len),
+        7 => wire__crate__api__WseNativeClient_disconnect_impl(port, ptr, rust_vec_len, data_len),
+        9 => wire__crate__api__WseNativeClient_next_batch_impl(port, ptr, rust_vec_len, data_len),
+        15 => wire__crate__api__WseNativeClient_send_impl(port, ptr, rust_vec_len, data_len),
+        16 => wire__crate__api__WseNativeClient_send_live_impl(port, ptr, rust_vec_len, data_len),
+        17 => {
             wire__crate__api__WseNativeClient_send_requiring_impl(port, ptr, rust_vec_len, data_len)
         }
-        17 => wire__crate__api__WseNativeClient_send_signed_impl(port, ptr, rust_vec_len, data_len),
+        18 => wire__crate__api__WseNativeClient_send_signed_impl(port, ptr, rust_vec_len, data_len),
+        19 => wire__crate__api__WseNativeClient_send_with_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -2014,25 +2201,27 @@ fn pde_ffi_dispatcher_sync_impl(
         1 => wire__crate__api__WseCancel_cancel_impl(ptr, rust_vec_len, data_len),
         2 => wire__crate__api__WseCancel_new_impl(ptr, rust_vec_len, data_len),
         3 => wire__crate__api__WseNativeClient_checkpoint_impl(ptr, rust_vec_len, data_len),
-        4 => wire__crate__api__WseNativeClient_commit_impl(ptr, rust_vec_len, data_len),
-        7 => wire__crate__api__WseNativeClient_kept_impl(ptr, rust_vec_len, data_len),
-        9 => wire__crate__api__WseNativeClient_pause_impl(ptr, rust_vec_len, data_len),
-        10 => wire__crate__api__WseNativeClient_reconnect_impl(ptr, rust_vec_len, data_len),
-        11 => wire__crate__api__WseNativeClient_resume_impl(ptr, rust_vec_len, data_len),
-        12 => wire__crate__api__WseNativeClient_resync_impl(ptr, rust_vec_len, data_len),
-        13 => wire__crate__api__WseNativeClient_resynced_impl(ptr, rust_vec_len, data_len),
-        18 => wire__crate__api__WseNativeClient_status_impl(ptr, rust_vec_len, data_len),
-        19 => wire__crate__api__WseNativeClient_subscribe_impl(ptr, rust_vec_len, data_len),
-        20 => wire__crate__api__WseNativeClient_topic_states_impl(ptr, rust_vec_len, data_len),
-        21 => wire__crate__api__WseNativeClient_try_send_impl(ptr, rust_vec_len, data_len),
-        22 => wire__crate__api__WseNativeClient_try_send_live_impl(ptr, rust_vec_len, data_len),
-        23 => {
+        4 => wire__crate__api__WseNativeClient_clear_impl(ptr, rust_vec_len, data_len),
+        5 => wire__crate__api__WseNativeClient_commit_impl(ptr, rust_vec_len, data_len),
+        8 => wire__crate__api__WseNativeClient_kept_impl(ptr, rust_vec_len, data_len),
+        10 => wire__crate__api__WseNativeClient_pause_impl(ptr, rust_vec_len, data_len),
+        11 => wire__crate__api__WseNativeClient_reconnect_impl(ptr, rust_vec_len, data_len),
+        12 => wire__crate__api__WseNativeClient_resume_impl(ptr, rust_vec_len, data_len),
+        13 => wire__crate__api__WseNativeClient_resync_impl(ptr, rust_vec_len, data_len),
+        14 => wire__crate__api__WseNativeClient_resynced_impl(ptr, rust_vec_len, data_len),
+        20 => wire__crate__api__WseNativeClient_status_impl(ptr, rust_vec_len, data_len),
+        21 => wire__crate__api__WseNativeClient_subscribe_impl(ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__WseNativeClient_topic_states_impl(ptr, rust_vec_len, data_len),
+        23 => wire__crate__api__WseNativeClient_try_send_impl(ptr, rust_vec_len, data_len),
+        24 => wire__crate__api__WseNativeClient_try_send_live_impl(ptr, rust_vec_len, data_len),
+        25 => {
             wire__crate__api__WseNativeClient_try_send_requiring_impl(ptr, rust_vec_len, data_len)
         }
-        24 => wire__crate__api__WseNativeClient_unsubscribe_impl(ptr, rust_vec_len, data_len),
-        25 => wire__crate__api__WseNativeClient_user_id_impl(ptr, rust_vec_len, data_len),
-        26 => wire__crate__api__generate_signing_key_impl(ptr, rust_vec_len, data_len),
-        27 => wire__crate__api__signing_public_key_impl(ptr, rust_vec_len, data_len),
+        26 => wire__crate__api__WseNativeClient_try_send_with_impl(ptr, rust_vec_len, data_len),
+        27 => wire__crate__api__WseNativeClient_unsubscribe_impl(ptr, rust_vec_len, data_len),
+        28 => wire__crate__api__WseNativeClient_user_id_impl(ptr, rust_vec_len, data_len),
+        29 => wire__crate__api__generate_signing_key_impl(ptr, rust_vec_len, data_len),
+        30 => wire__crate__api__signing_public_key_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -2197,6 +2386,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::WseItem {
             self.retry_in_ms.into_into_dart().into_dart(),
             self.attempt.into_into_dart().into_dart(),
             self.reasons.into_into_dart().into_dart(),
+            self.ids.into_into_dart().into_dart(),
             self.topics.into_into_dart().into_dart(),
             self.failed.into_into_dart().into_dart(),
             self.recoveries.into_into_dart().into_dart(),
@@ -2231,8 +2421,10 @@ impl flutter_rust_bridge::IntoDart for crate::api::WseItemKind {
             Self::Resync => 9.into_dart(),
             Self::Continuity => 10.into_dart(),
             Self::CheckpointRejected => 11.into_dart(),
-            Self::StorageFailed => 12.into_dart(),
-            Self::Unknown => 13.into_dart(),
+            Self::Delivered => 12.into_dart(),
+            Self::NotDelivered => 13.into_dart(),
+            Self::StorageFailed => 14.into_dart(),
+            Self::Unknown => 15.into_dart(),
             _ => unreachable!(),
         }
     }
@@ -2247,8 +2439,10 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::WseItemKind> for crate::api::
 impl flutter_rust_bridge::IntoDart for crate::api::WseOffline {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
+            self.disabled.into_into_dart().into_dart(),
             self.path.into_into_dart().into_dart(),
             self.max_messages.into_into_dart().into_dart(),
+            self.max_bytes.into_into_dart().into_dart(),
             self.max_age_ms.into_into_dart().into_dart(),
         ]
         .into_dart()
@@ -2257,6 +2451,23 @@ impl flutter_rust_bridge::IntoDart for crate::api::WseOffline {
 impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::WseOffline {}
 impl flutter_rust_bridge::IntoIntoDart<crate::api::WseOffline> for crate::api::WseOffline {
     fn into_into_dart(self) -> crate::api::WseOffline {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::WseSendOptions {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.id.into_into_dart().into_dart(),
+            self.ttl_ms.into_into_dart().into_dart(),
+            self.requires.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::WseSendOptions {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::WseSendOptions> for crate::api::WseSendOptions {
+    fn into_into_dart(self) -> crate::api::WseSendOptions {
         self
     }
 }
@@ -2698,6 +2909,7 @@ impl SseEncode for crate::api::WseItem {
         <Option<u64>>::sse_encode(self.retry_in_ms, serializer);
         <Option<u32>>::sse_encode(self.attempt, serializer);
         <Vec<String>>::sse_encode(self.reasons, serializer);
+        <Vec<String>>::sse_encode(self.ids, serializer);
         <Vec<String>>::sse_encode(self.topics, serializer);
         <Vec<String>>::sse_encode(self.failed, serializer);
         <Vec<crate::api::WseTopicRecovery>>::sse_encode(self.recoveries, serializer);
@@ -2726,8 +2938,10 @@ impl SseEncode for crate::api::WseItemKind {
                 crate::api::WseItemKind::Resync => 9,
                 crate::api::WseItemKind::Continuity => 10,
                 crate::api::WseItemKind::CheckpointRejected => 11,
-                crate::api::WseItemKind::StorageFailed => 12,
-                crate::api::WseItemKind::Unknown => 13,
+                crate::api::WseItemKind::Delivered => 12,
+                crate::api::WseItemKind::NotDelivered => 13,
+                crate::api::WseItemKind::StorageFailed => 14,
+                crate::api::WseItemKind::Unknown => 15,
                 _ => {
                     unimplemented!("");
                 }
@@ -2740,9 +2954,20 @@ impl SseEncode for crate::api::WseItemKind {
 impl SseEncode for crate::api::WseOffline {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.disabled, serializer);
         <Option<String>>::sse_encode(self.path, serializer);
         <u32>::sse_encode(self.max_messages, serializer);
+        <u64>::sse_encode(self.max_bytes, serializer);
         <u64>::sse_encode(self.max_age_ms, serializer);
+    }
+}
+
+impl SseEncode for crate::api::WseSendOptions {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <Option<String>>::sse_encode(self.id, serializer);
+        <u64>::sse_encode(self.ttl_ms, serializer);
+        <Vec<String>>::sse_encode(self.requires, serializer);
     }
 }
 

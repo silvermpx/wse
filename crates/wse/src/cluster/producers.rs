@@ -1,7 +1,8 @@
-//! Asking a peer what it took of a client's producer. A client that comes to
-//! this node from another names that node, and the server asks it once
+//! Asking a peer what it decided of a client's producer. A client that comes
+//! to this node from another names that node, and the server asks it once
 //! (`server::acks`): the peer hands the producer over and answers what it
-//! took, so a message the client sends again is not handed on twice.
+//! decided and the refusals behind that, so a message the client sends again
+//! is not handed on twice, and a refused one is not told taken.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -11,6 +12,10 @@ use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot};
 
 use super::protocol::encode_producer_query;
+use crate::server::Hole;
+
+/// What a peer decided of a producer, and the refusals behind it.
+type Decided = Option<(u64, Vec<Hole>)>;
 
 /// The links to the peers that answer for producers, and the questions out.
 #[derive(Default)]
@@ -19,7 +24,7 @@ pub(crate) struct ProducerLinks {
     /// link's end removes only its own entry.
     routes: DashMap<String, (mpsc::Sender<Bytes>, u64)>,
     next: AtomicU64,
-    waiting: DashMap<u64, oneshot::Sender<Option<u64>>>,
+    waiting: DashMap<u64, oneshot::Sender<Decided>>,
 }
 
 impl ProducerLinks {
@@ -38,15 +43,16 @@ impl ProducerLinks {
         self.routes.contains_key(peer)
     }
 
-    /// What `peer` took of `user`'s `producer`, handing it over; None when
-    /// it knows nothing of it, has no link, or does not answer in `within`.
+    /// What `peer` decided of `user`'s `producer`, handing it over; None
+    /// when it knows nothing of it, has no link, or does not answer in
+    /// `within`.
     pub(crate) async fn ask(
         &self,
         peer: &str,
         user: Option<&str>,
         producer: &str,
         within: Duration,
-    ) -> Option<u64> {
+    ) -> Decided {
         let tx = self.routes.get(peer).map(|route| route.0.clone())?;
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (answer, answered) = oneshot::channel();
@@ -68,9 +74,9 @@ impl ProducerLinks {
     }
 
     /// A peer's answer to question `id`.
-    pub(crate) fn answer(&self, id: u64, taken: Option<u64>) {
+    pub(crate) fn answer(&self, id: u64, decided: Decided) {
         if let Some((_, waiting)) = self.waiting.remove(&id) {
-            let _ = waiting.send(taken);
+            let _ = waiting.send(decided);
         }
     }
 }

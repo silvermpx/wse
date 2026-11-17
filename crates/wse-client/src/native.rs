@@ -197,22 +197,49 @@ pub struct NativeConfig {
     pub insecure: bool,
     /// recover-or-resync; None: best effort.
     pub delivery: Option<NativeDelivery>,
-    /// Messages sent with no connection wait for the next one; None: such a
-    /// send fails.
+    /// The outbox: where messages wait until the server answers for them.
+    /// None: in memory, with its defaults.
     pub offline: Option<NativeOffline>,
 }
 
-/// Messages sent with no connection, kept for the next one of the same user
-/// ([`crate::Offline`]).
+/// The outbox: every message sent, except a live or signed one, waits in it
+/// until the server answers for it ([`crate::Offline`]).
 #[derive(Clone, Debug, Default)]
 pub struct NativeOffline {
-    /// The file they are kept in, so that they outlive the app (in its own
+    /// No outbox: a message goes on the connection that is ready, or the
+    /// send fails as not connected, as before 3.2.
+    pub disabled: bool,
+    /// The file they wait in, so that they outlive the app (in its own
     /// storage); None keeps them in memory.
     pub path: Option<String>,
-    /// How many are kept at most (0: 1,000).
+    /// How many wait at most (0: 100,000).
     pub max_messages: u32,
-    /// How long one is kept, in milliseconds (0: an hour).
+    /// How many bytes of messages wait at most (0: 16 MiB).
+    pub max_bytes: u64,
+    /// How long one waits to be sent, in milliseconds (0: an hour).
     pub max_age_ms: u64,
+}
+
+/// How a message goes ([`crate::SendOptions`]).
+#[derive(Clone, Debug, Default)]
+pub struct NativeSendOptions {
+    /// Its id: the app's own, or a random UUID; the outcome names it.
+    pub id: Option<String>,
+    /// How long it may wait before it is first sent, in milliseconds (0:
+    /// the outbox's `max_age`).
+    pub ttl_ms: u64,
+    /// Topics that must each be continuous when it goes.
+    pub requires: Vec<String>,
+}
+
+impl From<NativeSendOptions> for crate::SendOptions {
+    fn from(native: NativeSendOptions) -> Self {
+        Self {
+            id: native.id,
+            ttl: (native.ttl_ms > 0).then(|| Duration::from_millis(native.ttl_ms)),
+            requires: native.requires,
+        }
+    }
 }
 
 /// The recover-or-resync delivery: a topic that is not continuous (a cold
@@ -316,19 +343,26 @@ fn config_of(
         delivery.max_held = native.max_held as usize;
         delivery
     });
-    config.offline = native.offline.map(|native| {
-        let mut offline = match native.path {
-            Some(path) => crate::Offline::in_file(path),
-            None => crate::Offline::in_memory(),
-        };
-        if native.max_messages > 0 {
-            offline.max_messages = native.max_messages as usize;
+    config.offline = match native.offline {
+        None => Some(crate::Offline::in_memory()),
+        Some(native) if native.disabled => None,
+        Some(native) => {
+            let mut offline = match native.path {
+                Some(path) => crate::Offline::in_file(path),
+                None => crate::Offline::in_memory(),
+            };
+            if native.max_messages > 0 {
+                offline.max_messages = native.max_messages as usize;
+            }
+            if native.max_bytes > 0 {
+                offline.max_bytes = usize::try_from(native.max_bytes).unwrap_or(usize::MAX);
+            }
+            if native.max_age_ms > 0 {
+                offline.max_age = Duration::from_millis(native.max_age_ms);
+            }
+            Some(offline)
         }
-        if native.max_age_ms > 0 {
-            offline.max_age = Duration::from_millis(native.max_age_ms);
-        }
-        offline
-    });
+    };
     config.token = native.token;
     if let Some(source) = tokens {
         config.token_provider = Some(TokenProvider::new(move || source.token()));
@@ -614,8 +648,19 @@ pub enum Item {
     CheckpointRejected {
         reason: String,
     },
-    /// The offline queue's file could not be written (`operation`): what is
-    /// kept stays in memory, and may not outlive the app.
+    /// The server took these messages of the outbox (their ids).
+    Delivered {
+        ids: Vec<String>,
+    },
+    /// These messages of the outbox will not be delivered, and why: the
+    /// server's refusal (`busy`, `rate_limited`, `missing`, `not_ready`),
+    /// `expired`, `user_changed` or `cleared`.
+    NotDelivered {
+        reason: String,
+        ids: Vec<String>,
+    },
+    /// The outbox's file could not be opened or written (`operation`): what
+    /// is kept stays in memory, and may not outlive the app.
     StorageFailed {
         operation: String,
         message: String,
@@ -756,6 +801,11 @@ fn item_of(incoming: Incoming) -> Item {
                 reason: c.reason,
             },
             Event::CheckpointRejected(c) => Item::CheckpointRejected { reason: c.reason },
+            Event::Delivered(ids) => Item::Delivered { ids },
+            Event::NotDelivered(n) => Item::NotDelivered {
+                reason: n.reason,
+                ids: n.ids,
+            },
             Event::StorageFailed(s) => Item::StorageFailed {
                 operation: s.operation,
                 message: s.message,
@@ -866,9 +916,52 @@ impl NativeClient {
         self.client.checkpoint()
     }
 
-    /// How many messages the offline queue keeps for the next connection.
+    /// How many messages wait in the outbox for the server's answer.
     pub fn kept(&self) -> u32 {
         u32::try_from(self.client.kept()).unwrap_or(u32::MAX)
+    }
+
+    /// The user signs out: every message in the outbox goes
+    /// ([`Item::NotDelivered`], `cleared`).
+    pub fn clear(&self) -> Result<(), NativeError> {
+        Ok(self.client.clear()?)
+    }
+
+    /// Sends `{"t": kind, "p": json}` with `options`; fails at once when the
+    /// outbox or the queue is full. Its id, which its outcome names.
+    pub fn try_send_with(
+        &self,
+        kind: &str,
+        json: &str,
+        options: NativeSendOptions,
+    ) -> Result<String, NativeError> {
+        let payload = raw_json(json)?;
+        Ok(self
+            .client
+            .try_send_with(kind, &*payload, &options.into())?)
+    }
+
+    /// [`NativeClient::try_send_with`], waiting for room in the queue;
+    /// `cancel` gives up the wait.
+    pub async fn send_with(
+        &self,
+        kind: String,
+        json: String,
+        options: NativeSendOptions,
+        cancel: &CancelToken,
+    ) -> Result<String, NativeError> {
+        let payload = raw_json(&json)?;
+        let client = self.client.clone();
+        let cancel = cancel.0.clone();
+        let options: crate::SendOptions = options.into();
+        on_runtime(async move {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(cancelled("send_with")),
+                sent = client.send_with(&kind, &*payload, &options) => sent.map_err(NativeError::from),
+            }
+        })
+        .await
     }
 
     /// recover-or-resync: the application brought the topics of `round` up

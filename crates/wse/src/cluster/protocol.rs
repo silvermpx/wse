@@ -7,6 +7,7 @@ use super::{
     COMPRESSION_THRESHOLD, FLAG_COMPRESSED, FLAG_HAS_RECOVERY, FLAG_REPLAYED, MAGIC,
     MAX_CLUSTER_PEERS, MAX_FRAME_SIZE, MAX_KNOWN_PEERS, PROTOCOL_VERSION, PROTOCOL_VERSION_MIN,
 };
+use crate::server::{Hole, MAX_HOLES, Refusal};
 
 // ---------------------------------------------------------------------------
 // Message types
@@ -263,17 +264,32 @@ pub(crate) fn encode_producer_query(
     buf.put_slice(producer);
 }
 
-/// Encode a PRODUCER_STATE: the answer to question `id`.
-/// Format: [header, payload_len=17][u64 LE id][u8 known][u64 LE taken]
-pub(crate) fn encode_producer_state(buf: &mut BytesMut, id: u64, taken: Option<u64>) {
-    buf.reserve(8 + 17);
+/// Encode a PRODUCER_STATE: the answer to question `id`, what the peer
+/// decided of the producer and the refusals behind it.
+/// Format: [header, payload_len][u64 LE id][u8 known][u64 LE mark]
+/// [u16 LE holes][per hole: u64 LE from, u64 LE to, u8 why]
+pub(crate) fn encode_producer_state(
+    buf: &mut BytesMut,
+    id: u64,
+    decided: Option<&(u64, Vec<Hole>)>,
+) {
+    let holes = decided.map_or(&[][..], |(_, holes)| &holes[..]);
+    let holes = &holes[..holes.len().min(MAX_HOLES)];
+    let payload_len = 17 + 2 + holes.len() * 17;
+    buf.reserve(8 + payload_len);
     buf.put_u8(MsgType::ProducerState as u8);
     buf.put_u8(0);
     buf.put_u16_le(0);
-    buf.put_u32_le(17);
+    buf.put_u32_le(payload_len as u32);
     buf.put_u64_le(id);
-    buf.put_u8(u8::from(taken.is_some()));
-    buf.put_u64_le(taken.unwrap_or(0));
+    buf.put_u8(u8::from(decided.is_some()));
+    buf.put_u64_le(decided.map_or(0, |(mark, _)| *mark));
+    buf.put_u16_le(holes.len() as u16);
+    for hole in holes {
+        buf.put_u64_le(hole.from);
+        buf.put_u64_le(hole.to);
+        buf.put_u8(hole.why.code());
+    }
 }
 
 pub(crate) fn encode_drain(buf: &mut BytesMut) {
@@ -664,10 +680,11 @@ pub(crate) enum ClusterFrame {
         user: Option<String>,
         producer: String,
     },
-    /// The answer: None when the peer knows nothing of it.
+    /// The answer: what the peer decided of it and the refusals behind
+    /// that; None when it knows nothing of it.
     ProducerState {
         id: u64,
-        taken: Option<u64>,
+        decided: Option<(u64, Vec<Hole>)>,
     },
     Unknown {
         msg_type: u8,
@@ -931,15 +948,29 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
             Some(ClusterFrame::ProducerQuery { id, user, producer })
         }
         Some(MsgType::ProducerState) => {
-            if data.remaining() < payload_len || payload_len < 17 {
+            if data.remaining() < payload_len || payload_len < 19 {
                 return None;
             }
-            let id = data.get_u64_le();
-            let known = data.get_u8() != 0;
-            let taken = data.get_u64_le();
+            let mut payload = data.split_to(payload_len);
+            let id = payload.get_u64_le();
+            let known = payload.get_u8() != 0;
+            let mark = payload.get_u64_le();
+            let count = usize::from(payload.get_u16_le()).min(MAX_HOLES);
+            if payload.remaining() < count * 17 {
+                return None;
+            }
+            let mut holes = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (from, to) = (payload.get_u64_le(), payload.get_u64_le());
+                let why = Refusal::from_code(payload.get_u8())?;
+                if from > to || to > mark {
+                    return None;
+                }
+                holes.push(Hole { from, to, why });
+            }
             Some(ClusterFrame::ProducerState {
                 id,
-                taken: known.then_some(taken),
+                decided: known.then_some((mark, holes)),
             })
         }
         None => {

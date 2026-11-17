@@ -478,7 +478,7 @@ Sent by the client right after the connection opens (without E2E the TypeScript 
 | `compression_threshold` | `int` | From which size the client wants messages compressed |
 | `e2e` | `object` | The E2E offer, see [End-to-End Encryption](#end-to-end-encryption) |
 | `encryption_public_key` | `string` | Instead of `e2e`: the first design's ECDH public key |
-| `outbox` | `object` | The client's outbox (3.2): `producer`, `node`, `written`, see [The client's outbox](#the-clients-outbox) |
+| `outbox` | `object` | The client's outbox (3.2): `producer`, `node`, `written`, `from`, see [The client's outbox](#the-clients-outbox) |
 
 ### Server Hello
 
@@ -533,13 +533,13 @@ The negotiated protocol version is the minimum of both sides.
 
 From 3.2 a client keeps each message it sends, except one sent live, until the server answers for it, and sends what was not answered again after a reconnect. The server confirms what its application took, drops a repeat of a message it took already and says what it refused, so the application takes each message once.
 
-**Numbers.** Each outbox is a producer with a random id, and each of its messages carries its number, `s`, from 1 up: `{"t":"order","p":{...},"id":"...","s":42}`. A client sends its messages in the order of their numbers; a number may be skipped (a message that expired before it was sent).
+**Numbers.** Each outbox is a producer with a random id, and each of its messages carries its number, `s`, from 1 up, first in the object: `{"s":42,"t":"order","p":{...},"id":"..."}`. A client sends its messages in the order of their numbers; a number may be skipped (a message that expired before it was sent). The number comes first so that the server can read it from the first bytes of a frame it does not parse (one its rate limit drops).
 
 **Hello.** The client names its outbox in `client_hello`:
 
 ```json
 {"c":"WSE","t":"client_hello","p":{ "...": "...",
-  "outbox": {"producer": "q3Jf...", "node": "019c53c4-...", "written": 41}
+  "outbox": {"producer": "q3Jf...", "node": "019c53c4-...", "written": 41, "from": 38}
 },"v":1}
 ```
 
@@ -548,14 +548,16 @@ From 3.2 a client keeps each message it sends, except one sent live, until the s
 | `producer` | The outbox's id, up to 64 characters |
 | `node` | The node the client was connected to last, as that node named itself (`null` the first time) |
 | `written` | The highest number the client wrote on an earlier connection without an answer |
+| `from` | The first number the client still waits to hear of: it heard of every refusal before it, and the server forgets those |
 
-Once the connection is admitted (`server_ready`), the server answers what it took of that producer and names itself; the client drops every message up to `acked` and sends the rest, in order, before anything new:
+Once the connection is admitted (`server_ready`), the server answers what it decided of that producer and names itself. Every message up to `acked` was taken or refused; `refused` lists the refusals among them the client may not have heard of (its connection went before their `nack`), in the form of a `nack`'s payload. The client tells its application of each, and sends the rest, in order, before anything new:
 
 ```json
-{"c":"WSE","t":"outbox","p":{"acked": 39, "node": "019c53d0-..."},"v":1}
+{"c":"WSE","t":"outbox","p":{"acked": 39, "node": "019c53d0-...",
+  "refused": [{"s": 38, "code": "busy"}]},"v":1}
 ```
 
-A producer is kept per user: another user's connection cannot reach it.
+`refused` is left out when there is none. A producer is kept per user: another user's connection cannot reach it. The server decides one producer's messages one at a time, its application's handler included, so a connection that comes back while a message is being decided is answered once the decision is in.
 
 **Answers.** The server answers after its application took a message (a Rust `Handler::message` returned, or the Python server queued it for `drain_inbound` or its callback), one `ack` for a batch of frames read, refusals first:
 
@@ -564,9 +566,9 @@ A producer is kept per user: another user's connection cannot reach it.
 {"c":"WSE","t":"nack","p":{"from":43,"s":44,"code":"rate_limited"},"v":1}
 ```
 
-`ack` confirms every message up to and with `s`; `nack` refuses `s` (or `from` to `s`) for good, and the client tells its application. The codes: `busy` (the application had no room for it), `rate_limited` (dropped by the client's rate limit), `missing` (a number skipped on the connection), `not_ready` (before the application took the connection). A repeat of a message taken already is confirmed again and not handed on.
+`ack` confirms every message up to and with `s`; `nack` refuses `s` (or `from` to `s`) for good, and the client tells its application. The codes: `busy` (the application had no room for it), `rate_limited` (dropped by the client's rate limit: refused at once, its number read from the frame's first bytes), `missing` (a number skipped on the connection), `not_ready` (before the application took the connection). A repeat of a message taken already is confirmed again and not handed on; a repeat of one refused is refused again. The answers are never dropped for the connection's outbound budget: a client waits for them, and is owed no more of them than its outbox holds.
 
-**What the server cannot tell.** A client that comes to another node names its last node: the new node asks it once what it took (the cluster's `PRODUCER_QUERY`), and that node stops taking messages of the producer. When the server cannot tell (the last node is gone or did not answer within 2 seconds, or the producer was silent for more than a day), the messages up to `written` reach the application with `"possible_repeat": true`, and the application checks the message's `id` against what it applied. That is the only case in which an application can see a message twice.
+**What the server cannot tell.** A client that comes to another node names its last node: the new node asks it once what it decided and refused (the cluster's `PRODUCER_QUERY`), and that node stops taking messages of the producer. When the server cannot tell (the last node is gone or did not answer within 2 seconds, or the producer was silent for more than a day), the messages up to `written` reach the application with `"possible_repeat": true`, and the application checks the message's `id` against what it applied. That is the only case in which an application can see a message twice.
 
 **A planned stop.** On `drain`, stop and `disconnect`, each connection stops taking messages, answers what it took and only then closes.
 

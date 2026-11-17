@@ -102,7 +102,14 @@ pub enum Event {
     /// realm, user, consumer or schema differs), or not one at all: recovery
     /// starts without it.
     CheckpointRejected(CheckpointRejected),
-    /// The file of the offline queue ([`Config::offline`]) could not be
+    /// The server took these messages of the outbox (their ids): it
+    /// confirmed them, or, a server older than 3.2, they were written.
+    Delivered(Vec<String>),
+    /// These messages of the outbox will not be delivered: the server
+    /// refused them, they waited too long, or the user changed or signed
+    /// out.
+    NotDelivered(NotDelivered),
+    /// The outbox's file ([`Config::offline`]) could not be opened or
     /// written: what is kept stays in memory, and may not outlive the
     /// application.
     ///
@@ -139,7 +146,18 @@ pub struct TopicContinuity {
     pub reason: Option<String>,
 }
 
-/// What failed in the offline queue's file (`operation`: `write`), and why.
+/// Messages of the outbox that will not be delivered, and why: the
+/// server's refusal (`busy`, `rate_limited`, `missing`, `not_ready`), or
+/// `expired`, `user_changed`, `cleared`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NotDelivered {
+    pub reason: String,
+    pub ids: Vec<String>,
+}
+
+/// What failed in the outbox's file (`operation`: `open` or `write`), and
+/// why.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StorageFailed {

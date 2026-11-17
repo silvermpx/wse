@@ -37,26 +37,47 @@
   Python. It goes once each topic is continuous on the connection, checked
   right before it goes, and is the sending user's.
 - Server (Rust and Python): it answers a client's outbox. A message the
-  client numbers in it (`s`) is confirmed (`ack`) once the application took
-  it, one `ack` per batch of frames; a repeat is confirmed again and not
-  handed on; a refused one is said (`nack`: `busy`, `rate_limited`,
-  `missing`, `not_ready`). It is kept per user and producer, one number each,
-  for a day. A client that comes to another node of a cluster names its last
-  node, which hands the producer over (cluster `PRODUCER_QUERY` and
-  `PRODUCER_STATE`, capability bit 5); what the server cannot tell reaches
-  the application marked `possible_repeat`. A planned stop (`drain`, stop,
-  `disconnect`) answers what was taken before it closes. A stale connection
-  of a producer that moved closes with 4409. The protocol is in
-  docs/PROTOCOL.md, "The client's outbox".
-- An offline queue in the Rust client (`Config::offline`) and the Swift,
-  Kotlin, Java and Dart packages (`offline`): what is sent while there is no
-  connection waits for the next connection of the same user and goes right
-  after the topics are subscribed again. In a file (`Offline::in_file`) it
-  outlives the application: a line written as the message is kept, synced to
-  the disk by a thread of its own, the file the client's alone while it runs.
-  At most `max_messages` (1,000) for at most `max_age` (an hour); `kept()`
-  says how many wait, and a file that cannot be written is an
-  `Event::StorageFailed`. In the browser the queue is in memory.
+  client numbers in it (`s`, first in the object) is confirmed (`ack`) once
+  the application took it, one `ack` per batch of up to 256 frames; a repeat
+  is confirmed again and not handed on; a refused one is said (`nack`:
+  `busy`, `rate_limited`, `missing`, `not_ready`), and refused again when it
+  comes again. One the rate limit drops is refused at once, its number read
+  from the frame's first bytes. The answers are never dropped for the
+  outbound budget. Per user and producer the server keeps the highest
+  message it decided and the refusals behind it the client may not have
+  heard of, for a day; a client that comes back is told both (`refused` in
+  the `outbox` answer, `from` in the hello). One producer's messages are
+  decided one at a time, so a connection that comes back meanwhile is
+  answered once the decision is in. A client that comes to another node of a
+  cluster names its last node, which hands the producer over with its
+  refusals (cluster `PRODUCER_QUERY` and `PRODUCER_STATE`, capability bit
+  5); what the server cannot tell reaches the application marked
+  `possible_repeat`. A planned stop (`drain`, stop, `disconnect`) answers
+  what was taken before it closes. A stale connection of a producer that
+  moved closes with 4409. A number counts only on a connection whose client
+  named its outbox: elsewhere `s` is the application's own field. The
+  protocol is in docs/PROTOCOL.md, "The client's outbox".
+- An outbox in the Rust client (`Config::offline`, in memory by default)
+  and the Swift, Kotlin, Java and Dart packages (`offline`; `sendWith`,
+  `clear`, the `Delivered` and `NotDelivered` items):
+  every message sent, except a live or signed one, waits until the server
+  answers for it and goes again after a reconnect, numbered, so a server of
+  3.2 takes each once. `Event::Delivered` and `Event::NotDelivered` (`busy`,
+  `rate_limited`, `missing`, `not_ready`, `expired`, `user_changed`,
+  `cleared`, `closed`) say what became of each by its id; `send_with` sends
+  with the application's own id, a `ttl` and topics it requires
+  (`SendOptions`) and returns the id; `clear()` empties it when the user
+  signs out. In a file (`Offline::in_file`) it outlives the application:
+  lines checked by a CRC-32 and a salt, read up to the first that does not
+  check, written a batch at once and synced by a thread of its own; a file
+  that cannot be opened or written is an `Event::StorageFailed`, and the
+  outbox goes on in memory. At most `max_messages` (100,000) and `max_bytes`
+  (16 MiB) wait: `send` waits for room, `try_send` fails with `Error::Full`.
+  A message waits at most `max_age` (an hour), or its `ttl`, to be written
+  first. A close waits up to a second for the server's answers. A message
+  is never copied for its number, and a batch goes to the socket at once:
+  200,000 messages to a local server go as fast with it as without it. With
+  a server older than 3.2 a message is gone once written, as before.
 - TypeScript: `wake()` and `close(deadlineMs)` for a client without a page
   (Node, Electron's main process, a worker): `wake()` connects at once when
   the application hears the network or the machine is back, and `close`
@@ -64,6 +85,10 @@
 
 ### Changed
 
+- Rust client (and Swift, Kotlin, Java, Dart): a send with no connection
+  waits in the outbox (in memory by default) instead of failing with
+  `NotConnected`; `Config::offline = None` (`disabled` in the packages)
+  keeps that.
 - Rust client (and Swift, Kotlin, Dart): every message carries an `id`, a
   random UUID, as from the TypeScript and Python clients.
 - Rust client: the events stream and a handler hear `Event::Continuity` when

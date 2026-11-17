@@ -129,6 +129,23 @@ class WseClientTest {
     }
 
     @Test
+    fun aMessageTheServerTookIsSaidDeliveredByItsId(): Unit = runBlocking {
+        val client = connectClient(WseConfig(url = url, insecure = true))
+        val events = client.events()
+        val id = client.sendWith("echo", """{"n":2}""", WseSendOptions(id = "mine-1"))
+        assertEquals("mine-1", id)
+        withTimeout(10_000) {
+            while (true) {
+                val item = events.next() ?: error("the events ended")
+                if (item is WseItem.Delivered && "mine-1" in item.ids) break
+            }
+        }
+        assertEquals(0u, client.kept())
+        client.clear()
+        client.disconnect(1_000u)
+    }
+
+    @Test
     fun wsGoesInTheClearOnlyWhenAsked(): Unit = runBlocking {
         assertFailsWith<WseException.Config> { connectClient(WseConfig(url = url)) }
     }

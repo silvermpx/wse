@@ -1,7 +1,8 @@
 //! The clients' outboxes on the server: a numbered message is confirmed once
 //! the application took it, a repeat is confirmed again and not handed on,
-//! a refused one is said, what the server cannot tell is marked, and a
-//! client that moves to another node of the cluster is not handed on twice.
+//! a refused one is said, and said again to a client that comes back without
+//! having heard, what the server cannot tell is marked, and a client that
+//! moves to another node of the cluster is not handed on twice.
 
 use std::time::Duration;
 
@@ -66,7 +67,11 @@ struct Node {
 }
 
 async fn node() -> Node {
-    let server = wse::Server::new(wse::Config::default()).unwrap();
+    node_with(wse::Config::default()).await
+}
+
+async fn node_with(config: wse::Config) -> Node {
+    let server = wse::Server::new(config).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (taken_tx, taken) = mpsc::unbounded_channel();
@@ -90,8 +95,21 @@ async fn node() -> Node {
 
 impl Node {
     /// A client of `user` with the outbox `outbox`, accepted: the server's
-    /// answer to its hello (what was taken, and the node's name).
+    /// answer to its hello (what was decided, and the node's name).
     async fn client(&mut self, user: &str, outbox: serde_json::Value) -> (Client, u64, String) {
+        let (ws, reply) = self.answered(user, outbox).await;
+        let acked = reply["acked"].as_u64().unwrap();
+        let node = reply["node"].as_str().unwrap().to_owned();
+        (ws, acked, node)
+    }
+
+    /// A client of `user` with the outbox `outbox`, accepted, and the
+    /// server's whole answer to its hello.
+    async fn answered(
+        &mut self,
+        user: &str,
+        outbox: serde_json::Value,
+    ) -> (Client, serde_json::Value) {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/wse", self.addr))
             .await
             .unwrap();
@@ -105,9 +123,7 @@ impl Node {
             .unwrap();
         assert!(self.server.publisher().accept(&conn_id, user).unwrap());
         let reply = next_of(&mut ws, "outbox").await;
-        let acked = reply["p"]["acked"].as_u64().unwrap();
-        let node = reply["p"]["node"].as_str().unwrap().to_owned();
-        (ws, acked, node)
+        (ws, reply["p"].clone())
     }
 
     async fn took(&mut self) -> Taken {
@@ -141,11 +157,10 @@ async fn next_of(ws: &mut Client, kind: &str) -> serde_json::Value {
     }
 }
 
+/// A numbered message, its number first, as a client sends it.
 async fn send(ws: &mut Client, kind: &str, s: u64) {
-    let message = serde_json::json!({"t": kind, "p": {}, "id": format!("m{s}"), "s": s});
-    ws.send(Message::Text(message.to_string().into()))
-        .await
-        .unwrap();
+    let message = format!(r#"{{"s":{s},"t":"{kind}","p":{{}},"id":"m{s}"}}"#);
+    ws.send(Message::Text(message.into())).await.unwrap();
 }
 
 /// Reads acks until one confirms `s`.
@@ -256,6 +271,103 @@ async fn what_the_server_cannot_tell_reaches_the_application_marked() {
     node.server.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_the_client_did_not_hear_of_is_told_when_it_comes_back() {
+    let mut node = node().await;
+    let (mut ws, _, name) = node
+        .client("ann", serde_json::json!({"producer": "p6"}))
+        .await;
+    send(&mut ws, "m", 1).await;
+    assert_eq!(node.took().await, taken("m", 1));
+    send(&mut ws, "refuse", 2).await;
+    send(&mut ws, "m", 3).await;
+    assert_eq!(node.took().await, taken("m", 3));
+    // Gone before the answers came.
+    drop(ws);
+
+    // Back, still waiting to hear of 2 and 3.
+    let outbox = serde_json::json!({"producer": "p6", "node": name, "written": 3, "from": 2});
+    let (mut ws, reply) = node.answered("ann", outbox).await;
+    assert_eq!(reply["acked"], 3);
+    assert_eq!(
+        reply["refused"],
+        serde_json::json!([{"s": 2, "code": "busy"}]),
+        "2 was refused, 3 taken"
+    );
+    // Sent again all the same: refused again, never handed on.
+    send(&mut ws, "m", 2).await;
+    let nack = next_of(&mut ws, "nack").await;
+    assert_eq!(
+        (nack["p"]["s"].as_u64(), nack["p"]["code"].as_str()),
+        (Some(2), Some("busy"))
+    );
+    node.took_nothing().await;
+    drop(ws);
+
+    // A client that heard of it is not told again.
+    let outbox = serde_json::json!({"producer": "p6", "node": name, "written": 3, "from": 4});
+    let (_ws, reply) = node.answered("ann", outbox).await;
+    assert_eq!(reply["acked"], 3);
+    assert!(reply.get("refused").is_none(), "{reply}");
+    node.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_over_the_rate_limit_is_refused_at_once() {
+    let mut config = wse::Config::default();
+    config.rate_limit_capacity = 2.0;
+    config.rate_limit_refill = 0.01;
+    let mut node = node_with(config).await;
+    let (mut ws, _, _) = node
+        .client("ann", serde_json::json!({"producer": "p8"}))
+        .await;
+    for s in 1..=4 {
+        send(&mut ws, "m", s).await;
+    }
+    // Nothing comes after 4: its refusal does not wait for a later message.
+    let mut refused = Vec::new();
+    while refused.last() != Some(&4) {
+        let nack = next_of(&mut ws, "nack").await;
+        assert_eq!(nack["p"]["code"], "rate_limited", "{nack}");
+        let to = nack["p"]["s"].as_u64().unwrap();
+        let from = nack["p"]["from"].as_u64().unwrap_or(to);
+        refused.extend(from..=to);
+    }
+    // What the bucket held was taken, the rest refused, in order.
+    let first = refused[0];
+    assert_eq!(refused, (first..=4).collect::<Vec<_>>());
+    for s in 1..first {
+        assert_eq!(node.took().await, taken("m", s));
+    }
+    node.took_nothing().await;
+    node.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_an_outbox_a_number_is_the_applications_own() {
+    let mut node = node().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/wse", node.addr))
+        .await
+        .unwrap();
+    let hello = serde_json::json!({"t": "client_hello", "p": {"protocol_version": 2}});
+    ws.send(Message::Text(hello.to_string().into()))
+        .await
+        .unwrap();
+    let conn_id = tokio::time::timeout(Duration::from_secs(5), node.connected.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(node.server.publisher().accept(&conn_id, "ann").unwrap());
+    send(&mut ws, "score", 3).await;
+    send(&mut ws, "score", 3).await;
+    // Both taken as they are, and no answer the client did not ask for.
+    assert_eq!(node.took().await, taken("score", 3));
+    assert_eq!(node.took().await, taken("score", 3));
+    let answered = tokio::time::timeout(Duration::from_millis(300), next_of(&mut ws, "ack")).await;
+    assert!(answered.is_err(), "no ack: {answered:?}");
+    node.server.stop().await;
+}
+
 /// Links `a` and `b` (on their WebSocket ports) and waits for the link.
 async fn link(a: &Node, b: &Node) {
     let secret = b"a-cluster-secret-of-at-least-32-bytes!".to_vec();
@@ -301,6 +413,29 @@ async fn a_client_that_moves_to_another_node_is_not_handed_on_twice() {
     // A handed the producer over: its stale connection takes nothing more.
     send(&mut on_a, "m", 5).await;
     a.took_nothing().await;
+    a.server.stop().await;
+    b.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_goes_with_the_client_to_another_node() {
+    let mut a = node().await;
+    let mut b = node().await;
+    link(&a, &b).await;
+
+    let (mut on_a, _, name_a) = a.client("ann", serde_json::json!({"producer": "p7"})).await;
+    send(&mut on_a, "refuse", 1).await;
+    send(&mut on_a, "m", 2).await;
+    assert_eq!(a.took().await, taken("m", 2));
+    // The answers not heard: the client goes to B with both.
+    let outbox = serde_json::json!({"producer": "p7", "node": name_a, "written": 2, "from": 1});
+    let (_on_b, reply) = b.answered("ann", outbox).await;
+    assert_eq!(reply["acked"], 2, "B asked A");
+    assert_eq!(
+        reply["refused"],
+        serde_json::json!([{"s": 1, "code": "busy"}])
+    );
+    b.took_nothing().await;
     a.server.stop().await;
     b.server.stop().await;
 }

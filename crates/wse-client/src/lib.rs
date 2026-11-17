@@ -23,14 +23,14 @@ mod handler;
 mod message;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub mod native;
-mod offline;
+mod outbox;
 mod policy;
 mod scan;
 mod security;
 mod sequencer;
 mod session;
 
-pub use client::{Client, Status};
+pub use client::{Client, SendOptions, Status};
 #[cfg(feature = "aws-lc")]
 pub use config::Encryption;
 pub use config::{Config, Format, Reconnect, TokenProvider};
@@ -38,10 +38,11 @@ pub use delivery::{Continuity, Delivery, StreamPosition, Subscription, TopicStat
 pub use error::Error;
 pub use events::{Events, Incoming, connect};
 pub use handler::{
-    CheckpointRejected, Connected, Disconnected, Event, Gap, GapReason, Handler, MaybeSend, Paused,
-    Recovery, Resync, ServerError, StorageFailed, Subscribed, TopicContinuity,
+    CheckpointRejected, Connected, Disconnected, Event, Gap, GapReason, Handler, MaybeSend,
+    NotDelivered, Paused, Recovery, Resync, ServerError, StorageFailed, Subscribed,
+    TopicContinuity,
 };
 pub use message::{Message, OwnedMessage, Position, Signature};
-pub use offline::Offline;
+pub use outbox::Offline;
 #[cfg(feature = "aws-lc")]
 pub use security::with_crypto::{generate_key, public_key, public_key_jwk};

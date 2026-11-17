@@ -137,13 +137,26 @@ topics is continuous on the connection, checked right before it goes (after a
 reconnect it waits for the resync); sends that require nothing go past it, and
 once the server takes a connection for another user it goes nowhere.
 
-With `offline = WseOffline(path = path)` (a file in the app's own storage)
-what is sent while there is no connection waits for the next connection of
-the same user and goes right after the topics are subscribed again; the file
-outlives the app. Without a path it waits in memory. At most `maxMessages`
-(1,000) wait, for at most `maxAgeMs` (an hour); `client.kept()` says how many
-wait. A live or signed message is never kept, and a file that cannot be
-written is a `WseItem.StorageFailed`.
+Every message sent, except a live or signed one, waits in the outbox until
+the server answers for it, goes again after a reconnect, and reaches the
+server's application once. `WseItem.Delivered` names the messages the server
+took (`ids`); `WseItem.NotDelivered` those it will not take and why
+(`reason`): the server refused it (`busy`, `rate_limited`, `missing`,
+`not_ready`), it was not written within its time (`expired`), it was the last
+user's (`user_changed`), the app cleared the outbox (`cleared`), or the
+client closed with it in memory (`closed`). `client.sendWith(kind, json,
+WseSendOptions(id = "order-17"))` sends with the app's own id and returns it;
+`client.clear()` empties the outbox on sign-out.
+
+The outbox is in memory by default. With `offline = WseOffline(path = path)`
+(a file in the app's own storage) it outlives the app. At most `maxMessages`
+(100,000) and `maxBytes` (16 MiB) wait, the ones not answered yet included:
+past either `send` waits for room and `trySend` throws `Full`. One not
+written within `maxAgeMs` (an hour), or its `ttlMs`, is dropped.
+`client.kept()` says how many wait. A file that cannot be opened or written
+is a `WseItem.StorageFailed`, and the outbox goes on in memory.
+`WseOffline(disabled = true)` has no outbox: a send with no connection
+fails, as before 3.2.
 
 `events()` is the client's stream, until it closes; one reader at a time. A
 reader let go and a new one go on from the same place. A
@@ -186,9 +199,10 @@ changes comes from `Wse.tokens(() -> fetchToken())`, a supplier of a
 recover-or-resync delivery is `Wse.config(url).delivery(Wse.delivery("board").checkpoint(saved).build())`;
 `Wse.resynced(client, resync)` and `Wse.commit(client, message)` answer its
 items, and `Wse.sendRequiring(client, kind, json, List.of("orders"))` sends
-once the topics are continuous. The offline queue is
-`Wse.config(url).offline(Wse.offline().path(file).build())`, and
-`Wse.kept(client)` says how many messages wait in it. Signed messages: `Wse.generateSigningKey()`, `Wse.signingPublicKey(key)`
+once the topics are continuous. The outbox in a file is
+`Wse.config(url).offline(Wse.offline().path(file).build())`, `Wse.kept(client)`
+says how many messages wait in it, and `Wse.sendWith(client, kind, json,
+Wse.sendOptions().id("order-17").build())` sends with the app's own id. Signed messages: `Wse.generateSigningKey()`, `Wse.signingPublicKey(key)`
 and `Wse.sendSigned(...)`. Kotlin's unsigned numbers are hidden from Java:
 `Wse.retryInMillis(...)`, `Wse.attempt(...)` and `Wse.closeCode(...)` give a
 `Disconnected` item's as plain numbers.

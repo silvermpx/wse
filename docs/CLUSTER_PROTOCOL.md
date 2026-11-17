@@ -80,7 +80,7 @@ The magic bytes `WSE\x00` prevent accidental connections from non-WSE services. 
 | 2 | CAP_PRESENCE | Presence sync support |
 | 3 | CAP_RECOVERY | MSG frames carry the origin's recovery position |
 | 4 | CAP_RESUME | Catch-up after a lost link (RESUME); offered by a node with recovery on |
-| 5 | CAP_PRODUCERS | A node asks another what it took of a client's outbox (PRODUCER_QUERY / PRODUCER_STATE) |
+| 5 | CAP_PRODUCERS | A node asks another what it decided of a client's outbox (PRODUCER_QUERY / PRODUCER_STATE) |
 
 The instance id is the name the node gives its clients in the `outbox` answer: a client that comes to another node names it, and that node asks it (see [PRODUCER_QUERY](#producer_query-0x0f-and-producer_state-0x10---a-clients-outbox-moves)).
 
@@ -223,13 +223,16 @@ PRODUCER_QUERY: [header: type=0x0F, payload_len=N]
 [2 bytes: user length (little-endian u16), 0xFFFF for none] [user]
 [2 bytes: producer length (little-endian u16)] [producer]
 
-PRODUCER_STATE: [header: type=0x10, payload_len=17]
+PRODUCER_STATE: [header: type=0x10, payload_len=19 + 17 × refusals]
 [8 bytes: question id (little-endian u64)]
 [1 byte: 1 when the node knew the producer, else 0]
-[8 bytes: the highest message it took (little-endian u64)]
+[8 bytes: the highest message it decided, taken or refused (little-endian u64)]
+[2 bytes: refusals (little-endian u16), at most 1024]
+per refusal: [8 bytes: first (LE u64)] [8 bytes: last (LE u64)]
+             [1 byte: why: 1 busy, 2 rate_limited, 3 missing, 4 not_ready]
 ```
 
-A client that reconnects to another node names the node it was on and the highest message it wrote there without an answer ([the client's outbox](PROTOCOL.md#the-clients-outbox)). When the new node links to that node with CAP_PRODUCERS, it asks once: the asked node hands the producer over (its connections still reading for it take nothing more, and close with 4409) and answers the highest message it took. The new node confirms everything up to that number and takes only what came after; without an answer within 2 seconds it takes the messages but marks them as possible repeats.
+A client that reconnects to another node names the node it was on and the highest message it wrote there without an answer ([the client's outbox](PROTOCOL.md#the-clients-outbox)). When the new node links to that node with CAP_PRODUCERS, it asks once: the asked node hands the producer over (its connections still reading for it take nothing more, and close with 4409) and answers the highest message it decided, with the refusals behind it its client may not have heard of. The new node confirms the rest up to that number, refuses a repeat of a refused one again, tells the client of the refusals in its `outbox` answer, and takes only what came after; without an answer within 2 seconds it takes the messages but marks them as possible repeats.
 
 ## Interest-Based Routing
 

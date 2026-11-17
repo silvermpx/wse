@@ -84,13 +84,27 @@ of the topics is continuous on the connection, checked right before it goes
 past it, and once the server takes a connection for another user it goes
 nowhere.
 
-With `offline: WseOffline(path: path)` (a file in the app's own storage) what
-is sent while there is no connection waits for the next connection of the
-same user and goes right after the topics are subscribed again; the file
-outlives the app. Without a path it waits in memory. At most `maxMessages`
-(1,000) wait, for at most `maxAgeMs` (an hour); `client.kept()` says how many
-wait. A live or signed message is never kept, and a file that cannot be
-written is a `.storageFailed` item.
+Every message sent, except a live or signed one, waits in the outbox until
+the server answers for it, goes again after a reconnect, and reaches the
+server's application once. `.delivered(ids:)` names the messages the server
+took; `.notDelivered(reason:ids:)` those it will not take and why: the server
+refused it (`busy`, `rate_limited`, `missing`, `not_ready`), it was not
+written within its time (`expired`), it was the last user's
+(`user_changed`), the app cleared the outbox (`cleared`), or the client
+closed with it in memory (`closed`).
+`client.sendWith(kind:json:options:)` sends with the app's own id
+(`WseSendOptions(id: "order-17")`) and returns it; `client.clear()` empties
+the outbox on sign-out.
+
+The outbox is in memory by default. With `offline: WseOffline(path: path)`
+(a file in the app's own storage) it outlives the app. At most
+`maxMessages` (100,000) and `maxBytes` (16 MiB) wait, the ones not answered
+yet included: past either `send` waits for room and `trySend` throws
+`.Full`. One not written within `maxAgeMs` (an hour), or its `ttlMs`, is
+dropped. `client.kept()` says how many wait. A file that cannot be opened
+or written is a `.storageFailed` item, and the outbox goes on in memory.
+`WseOffline(disabled: true)` has no outbox: a send with no connection
+fails, as before 3.2.
 
 `events()` is the client's stream, until it closes; one reader at a time.
 A Task cancelled while reading loses nothing: the next read gets the rest;

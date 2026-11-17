@@ -19,7 +19,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketConfig};
 use uuid::Uuid;
 
-use super::acks;
+use super::acks::{self, Refusal as Declined};
 use super::e2e::{decrypt_inbound, derive_connection_key};
 use super::e2e_session::{self, RecvState, SendState};
 use super::fanout::BEHIND_BYTES;
@@ -203,7 +203,7 @@ fn admit_after_session<H: Handler>(
 }
 
 /// Frames read in a row before the answers owed to the client's outbox go.
-const ACK_BATCH: usize = 64;
+const ACK_BATCH: usize = 256;
 
 /// What the read loop's paths need of their connection.
 #[derive(Clone, Copy)]
@@ -1087,10 +1087,10 @@ fn deliver<H: Handler>(
 }
 
 /// A client's JSON message to the application. One numbered in its
-/// outbox (`s`) is handed on once per producer: a repeat is confirmed
-/// again, one the server cannot tell about is marked `possible_repeat`, and
-/// one the application has no room for is refused, so the client hears what
-/// became of each.
+/// outbox (`s`) is handed on once per producer: a repeat is answered as the
+/// first one was, one the server cannot tell about is marked
+/// `possible_repeat`, and one the application has no room for is refused,
+/// so the client hears what became of each.
 fn deliver_json<H: Handler>(
     handler: &H,
     app: &mut Option<H::Connection>,
@@ -1099,43 +1099,87 @@ fn deliver_json<H: Handler>(
     mut val: serde_json::Value,
     size: usize,
 ) {
-    let Some(s) = acks::seq_of(&val) else {
+    // A number counts on a connection whose client named its outbox, once
+    // the server answered it: elsewhere `s` is the application's own field.
+    let (Some(link), Some(s)) = (conn.handle.out.acks.link.get(), acks::seq_of(&val)) else {
         deliver(handler, app, Inbound::Json(val), size);
         return;
     };
-    let link = conn.handle.out.acks.link.get();
-    pending.came(s, link.map_or(0, |link| link.start));
-    if let Some(link) = link {
-        match link.slot.claim(s) {
-            acks::Claim::First => {}
-            acks::Claim::Repeat => {
-                pending.taken(s);
-                return;
-            }
-            // Another node took the client's outbox over: this connection
-            // is a stale one.
-            acks::Claim::Moved => {
-                conn.closer.close(
-                    conn.tx,
-                    &conn.handle.out.pending,
-                    CLOSE_MOVED,
-                    "went on on another node",
-                );
-                return;
+    // The producer's lock, held until the message is decided: a connection
+    // of the same client that comes meanwhile hears the decision.
+    let mut slot = link.slot.lock();
+    let skipped = pending.skipped();
+    match slot.claim(s, skipped) {
+        acks::Claim::First { gap } => {
+            if let Some((from, to)) = gap {
+                pending.refuse(from, to, skipped);
             }
         }
-        if s <= link.unsure_until
-            && let Some(fields) = val.as_object_mut()
-        {
-            fields.insert("possible_repeat".to_owned(), serde_json::Value::Bool(true));
+        acks::Claim::Repeat => {
+            pending.taken(s);
+            return;
+        }
+        acks::Claim::Refused(why) => {
+            pending.refuse(s, s, why);
+            return;
+        }
+        // Another node took the client's outbox over: this connection is a
+        // stale one.
+        acks::Claim::Moved => {
+            drop(slot);
+            conn.closer.close(
+                conn.tx,
+                &conn.handle.out.pending,
+                CLOSE_MOVED,
+                "went on on another node",
+            );
+            return;
         }
     }
-    if app.is_none() {
-        pending.refuse(s, "not_ready");
+    if s <= link.unsure_until
+        && let Some(fields) = val.as_object_mut()
+    {
+        fields.insert("possible_repeat".to_owned(), serde_json::Value::Bool(true));
+    }
+    let refused = if app.is_none() {
+        Some(Declined::NotReady)
     } else if deliver(handler, app, Inbound::Json(val), size) {
-        pending.taken(s);
+        None
     } else {
-        pending.refuse(s, "busy");
+        Some(Declined::Busy)
+    };
+    match refused {
+        None => pending.taken(s),
+        Some(why) => {
+            slot.refuse(s, s, why);
+            pending.refuse(s, s, why);
+        }
+    }
+}
+
+/// A frame the rate limit dropped. A message of the client's outbox is
+/// refused at once, as it is decided, so the client hears of it now and
+/// never waits for an answer that would not come; any other frame counts
+/// against the next numbered one.
+fn refuse_dropped(conn: &Conn<'_>, pending: &mut acks::Pending, frame: &[u8]) {
+    let (Some(link), Some(s)) = (conn.handle.out.acks.link.get(), acks::number_in(frame)) else {
+        pending.dropped();
+        return;
+    };
+    let mut slot = link.slot.lock();
+    let skipped = pending.skipped();
+    match slot.claim(s, skipped) {
+        acks::Claim::First { gap } => {
+            if let Some((from, to)) = gap {
+                pending.refuse(from, to, skipped);
+            }
+            slot.refuse(s, s, Declined::RateLimited);
+            pending.refuse(s, s, Declined::RateLimited);
+        }
+        acks::Claim::Repeat => pending.taken(s),
+        acks::Claim::Refused(why) => pending.refuse(s, s, why),
+        // Its stale connection: what the closed one sends is not answered.
+        acks::Claim::Moved => {}
     }
 }
 
@@ -1151,8 +1195,11 @@ impl<H: Handler> Reader<'_, H> {
     /// What is owed of the client's outbox goes: refusals, then one `ack`.
     fn answer(&mut self) {
         let conn = self.conn;
+        // Never dropped for the outbound budget, unlike other replies: a
+        // client waits for them, and has no more of them owed than its own
+        // outbox holds.
         for answer in self.acks.answers() {
-            queue_reply(conn.handle, conn.max_pending, Message::Text(answer.into()));
+            conn.handle.send_control(Message::Text(answer.into()));
         }
         if let Some(link) = conn.handle.out.acks.link.get() {
             link.slot.touch(acks::now_ms());
@@ -1228,7 +1275,12 @@ impl<H: Handler> Reader<'_, H> {
             && matches!(msg, Message::Text(_) | Message::Binary(_))
             && !within_rate(&conn, inbound_limit, now)
         {
-            pending.dropped();
+            let frame: &[u8] = match &msg {
+                Message::Text(text) => text.as_bytes(),
+                Message::Binary(data) => data,
+                _ => &[],
+            };
+            refuse_dropped(&conn, pending, frame);
             return Flow::Next;
         }
         match msg {
@@ -1337,7 +1389,7 @@ impl<H: Handler> Reader<'_, H> {
                             // only within the rate limit.
                             Ok(Some(plaintext)) => {
                                 if !within_rate(&conn, inbound_limit, now) {
-                                    pending.dropped();
+                                    refuse_dropped(&conn, pending, &plaintext);
                                     return Flow::Next;
                                 }
                                 Some(Ok(plaintext))

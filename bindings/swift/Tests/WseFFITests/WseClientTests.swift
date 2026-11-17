@@ -262,6 +262,25 @@ final class WseClientTests: XCTestCase {
         try? FileManager.default.removeItem(atPath: path + ".lock")
     }
 
+    func testAMessageTheServerTookIsSaidDeliveredByItsId() async throws {
+        let client = try await WseClient.connect(WseConfig(url: url, insecure: true))
+        let events = client.events()
+        let id = try await client.sendWith(
+            kind: "echo", json: #"{"n":2}"#, options: WseSendOptions(id: "mine-1"))
+        XCTAssertEqual(id, "mine-1")
+        var delivered = false
+        for try await item in events {
+            if case let .delivered(ids) = item, ids.contains("mine-1") {
+                delivered = true
+                break
+            }
+        }
+        XCTAssertTrue(delivered)
+        XCTAssertEqual(client.kept(), 0)
+        try client.clear()
+        await client.disconnect(deadlineMs: 1_000)
+    }
+
     func testALoopLeftLeavesTheRestToTheNext() async throws {
         let client = try await WseClient.connect(WseConfig(url: url, insecure: true))
         try await client.send(kind: "echo", json: #"{"n":1}"#)

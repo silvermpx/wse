@@ -7,7 +7,7 @@ import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
 // These functions are ignored because they are not marked as `pub`: `continuity_of`, `of`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `fmt`, `from`, `from`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `fmt`, `from`, `from`, `from`
 
 /// A new ECDSA P-256 private key (PKCS#8 DER) for signed messages: keep it
 /// in the platform's keystore.
@@ -32,6 +32,11 @@ abstract class WseNativeClient implements RustOpaqueInterface {
   /// state and give back as `WseDelivery.checkpoint`.
   String checkpoint();
 
+  /// The user signs out: every message in the outbox, and every one sent
+  /// before this call, goes (`notDelivered`, `cleared`), and the user is
+  /// forgotten.
+  void clear();
+
   /// The consumer applied the message at `epoch`, `offset` of `topic`,
   /// handed out in `generation`: one of an earlier user counts for nobody.
   void commit({
@@ -54,7 +59,7 @@ abstract class WseNativeClient implements RustOpaqueInterface {
   /// a waiting next_batch gets the end.
   Future<void> disconnect({required BigInt deadlineMs});
 
-  /// How many messages the offline queue keeps for the next connection.
+  /// How many messages wait in the outbox for the server's answer.
   int kept();
 
   /// The next batch: `ack` acknowledges the last one (0: none yet); one not
@@ -97,6 +102,13 @@ abstract class WseNativeClient implements RustOpaqueInterface {
     String? nonce,
   });
 
+  /// `try_send_with`, waiting for room.
+  Future<String> sendWith({
+    required String kind,
+    required String json,
+    required WseSendOptions options,
+  });
+
   /// connecting, connected, reconnecting, paused or closed.
   String status();
 
@@ -117,6 +129,15 @@ abstract class WseNativeClient implements RustOpaqueInterface {
     required String kind,
     required String json,
     required List<String> topics,
+  });
+
+  /// Sends `{"t": kind, "p": json}` with `options`: its own id, how long it
+  /// may wait, the topics it requires. Its id, which its outcome names.
+  /// Fails at once when the outbox or the queue is full.
+  String trySendWith({
+    required String kind,
+    required String json,
+    required WseSendOptions options,
   });
 
   void unsubscribe({required List<String> topics});
@@ -173,8 +194,8 @@ class WseConfig {
   /// recover-or-resync; None: best effort.
   final WseDelivery? delivery;
 
-  /// Messages sent with no connection wait for the next one of the same
-  /// user; None: such a send fails.
+  /// The outbox, where every message waits until the server answers for
+  /// it; None: in memory, with its defaults.
   final WseOffline? offline;
 
   const WseConfig({
@@ -365,6 +386,9 @@ class WseItem {
   /// Paused: the reasons the client is paused for.
   final List<String> reasons;
 
+  /// Delivered and NotDelivered: the messages' ids.
+  final List<String> ids;
+
   /// Subscribed: the topics taken and refused, and per topic asked for with
   /// a position what was replayed.
   final List<String> topics;
@@ -407,6 +431,7 @@ class WseItem {
     this.retryInMs,
     this.attempt,
     required this.reasons,
+    required this.ids,
     required this.topics,
     required this.failed,
     required this.recoveries,
@@ -442,6 +467,7 @@ class WseItem {
       retryInMs.hashCode ^
       attempt.hashCode ^
       reasons.hashCode ^
+      ids.hashCode ^
       topics.hashCode ^
       failed.hashCode ^
       recoveries.hashCode ^
@@ -479,6 +505,7 @@ class WseItem {
           retryInMs == other.retryInMs &&
           attempt == other.attempt &&
           reasons == other.reasons &&
+          ids == other.ids &&
           topics == other.topics &&
           failed == other.failed &&
           recoveries == other.recoveries &&
@@ -511,45 +538,99 @@ enum WseItemKind {
   /// The saved checkpoint is not this client's (`reason`).
   checkpointRejected,
 
-  /// The offline queue's file could not be written (`name`: what failed,
+  /// The server took these messages of the outbox (`ids`).
+  delivered,
+
+  /// These messages of the outbox will not be delivered (`ids`), and why
+  /// (`reason`): the server's refusal (`busy`, `rate_limited`, `missing`,
+  /// `not_ready`), `expired`, `user_changed`, `cleared` or `closed`.
+  notDelivered,
+
+  /// The outbox's file could not be opened or written (`name`: what failed,
   /// `reason`: why): what is kept stays in memory, and may not outlive the
   /// app.
   storageFailed,
   unknown,
 }
 
-/// Messages sent with no connection, kept for the next one of the same
-/// user. They go right after the topics are subscribed again; a live or
-/// signed message is never kept.
+/// The outbox: every message sent, except a live or signed one, waits in it
+/// until the server answers for it, goes again after a reconnect, and
+/// reaches the server's application once; the delivered and notDelivered
+/// items say what became of each.
 class WseOffline {
-  /// The file they are kept in, so that they outlive the app (in its own
+  /// No outbox: a message goes on the connection that is ready, or the
+  /// send fails as not connected, as before 3.2.
+  final bool disabled;
+
+  /// The file they wait in, so that they outlive the app (in its own
   /// storage); the client's alone while it runs. None keeps them in memory.
   final String? path;
 
-  /// How many are kept at most (0: 1,000); past it a send fails as `full`.
+  /// How many wait at most, those not answered yet included (0: 100,000);
+  /// past it `send` waits for room and `trySend` fails as `full`.
   final int maxMessages;
 
-  /// How long one is kept, in milliseconds (0: an hour); an older one is
-  /// dropped.
+  /// How many bytes of messages wait at most (0: 16 MiB), as
+  /// `max_messages`.
+  final BigInt maxBytes;
+
+  /// How long one waits to be written first, in milliseconds (0: an
+  /// hour); one not written by then is dropped (`expired`).
   final BigInt maxAgeMs;
 
   const WseOffline({
+    required this.disabled,
     this.path,
     required this.maxMessages,
+    required this.maxBytes,
     required this.maxAgeMs,
   });
 
   @override
-  int get hashCode => path.hashCode ^ maxMessages.hashCode ^ maxAgeMs.hashCode;
+  int get hashCode =>
+      disabled.hashCode ^
+      path.hashCode ^
+      maxMessages.hashCode ^
+      maxBytes.hashCode ^
+      maxAgeMs.hashCode;
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
       other is WseOffline &&
           runtimeType == other.runtimeType &&
+          disabled == other.disabled &&
           path == other.path &&
           maxMessages == other.maxMessages &&
+          maxBytes == other.maxBytes &&
           maxAgeMs == other.maxAgeMs;
+}
+
+/// How a message goes (`sendWith`).
+class WseSendOptions {
+  /// Its id: the app's own, or a random UUID; its outcome names it.
+  final String? id;
+
+  /// How long it may wait to be written first, in milliseconds (0: the
+  /// outbox's `max_age_ms`).
+  final BigInt ttlMs;
+
+  /// Topics that must each be continuous when it goes.
+  final List<String> requires;
+
+  const WseSendOptions({this.id, required this.ttlMs, required this.requires});
+
+  @override
+  int get hashCode => id.hashCode ^ ttlMs.hashCode ^ requires.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is WseSendOptions &&
+          runtimeType == other.runtimeType &&
+          id == other.id &&
+          ttlMs == other.ttlMs &&
+          requires == other.requires;
 }
 
 /// Where a stream of a topic stands.

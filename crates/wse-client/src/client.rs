@@ -15,7 +15,7 @@ use crate::delivery::{self, Gate, TopicState};
 use crate::error::Error;
 use crate::handler::{Event, Handler, StorageFailed};
 use crate::message::Message;
-use crate::offline;
+use crate::outbox::{Outbox, Room};
 use crate::security::Keys;
 
 /// Where the client stands.
@@ -44,6 +44,8 @@ pub(crate) enum Control {
     /// The delivery's gate made something for the handler (held messages
     /// handed on): it goes to the handler now.
     Drain,
+    /// The user signed out: the outbox is emptied.
+    Clear,
     Close,
 }
 
@@ -69,6 +71,29 @@ pub(crate) struct Queued {
     /// Topics that must each be continuous when it goes: until then it
     /// waits, in order with the others that wait.
     pub(crate) requires: Option<Box<[String]>>,
+    /// Its id: the application's own, or a random one; what its outcome
+    /// names.
+    pub(crate) id: Box<str>,
+    /// How long it may wait before it is first sent; None: the outbox's
+    /// `max_age`.
+    pub(crate) ttl: Option<std::time::Duration>,
+    /// It took a place in the outbox's room, given back when it goes.
+    pub(crate) counted: bool,
+    /// The outbox's clears before it ([`Shared::clears`]): it goes nowhere
+    /// once the application cleared the outbox after it.
+    pub(crate) clears: u64,
+}
+
+impl Queued {
+    /// Its size as the application sent it: its place in the outbox's room
+    /// (the room for its number, before it, not counted).
+    pub(crate) fn size(&self) -> usize {
+        if self.counted {
+            self.text.len().saturating_sub(crate::outbox::HEADROOM)
+        } else {
+            self.text.len()
+        }
+    }
 }
 
 /// The user and connection a message was sent for.
@@ -78,23 +103,20 @@ struct SentFor {
     connection: u64,
     /// The server took the current connection.
     ready: bool,
+    clears: u64,
 }
 
 impl SentFor {
-    fn frame(&self, text: String) -> Queued {
+    fn frame(&self, id: Box<str>, text: String) -> Queued {
         Queued {
             text,
             user: self.user,
             only_on: None,
             requires: None,
-        }
-    }
-
-    /// For when each of `topics` is continuous.
-    fn requiring(&self, text: String, topics: Box<[String]>) -> Queued {
-        Queued {
-            requires: Some(topics),
-            ..self.frame(text)
+            id,
+            ttl: None,
+            counted: false,
+            clears: self.clears,
         }
     }
 
@@ -102,9 +124,26 @@ impl SentFor {
     fn live(&self, text: String) -> Queued {
         Queued {
             only_on: Some(self.connection),
-            ..self.frame(text)
+            ..self.frame(Box::default(), text)
         }
     }
+}
+
+/// How a message goes ([`Client::send_with`]).
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct SendOptions {
+    /// Its id: the application's own (one it keeps in its own outbox, say),
+    /// or a random UUID. The outcome events name it.
+    pub id: Option<String>,
+    /// How long it may wait before it is first sent: past it, it is dropped
+    /// and the application told ([`Event::NotDelivered`](crate::Event),
+    /// `expired`). Once written it waits for the server's answer whatever
+    /// its age. None: the outbox's `max_age`.
+    pub ttl: Option<std::time::Duration>,
+    /// Topics that must each be continuous when it goes (see
+    /// [`Client::send_requiring`]).
+    pub requires: Vec<String>,
 }
 
 /// What the handles and the connection's task share.
@@ -125,13 +164,15 @@ pub(crate) struct Shared {
     /// Stops the connection's task where it stands: a close past its
     /// deadline.
     stop: Mutex<Option<futures_util::future::AbortHandle>>,
-    /// Messages sent with no connection, for the next one
-    /// ([`Config::offline`]).
-    pub(crate) store: Option<offline::Store>,
+    /// The outbox's room ([`Config::offline`]): a send takes a place in it
+    /// before it is queued.
+    pub(crate) room: Option<Arc<Room>>,
+    /// Counts the times the application cleared the outbox.
+    pub(crate) clears: AtomicU64,
 }
 
 impl Shared {
-    pub(crate) fn new(token: Option<String>, store: Option<offline::Store>) -> Self {
+    pub(crate) fn new(token: Option<String>, room: Option<Arc<Room>>) -> Self {
         Self {
             ready: AtomicBool::new(false),
             users: AtomicU64::new(0),
@@ -140,7 +181,8 @@ impl Shared {
             token: Mutex::new(token),
             server_kid: Mutex::new(None),
             stop: Mutex::new(None),
-            store,
+            room,
+            clears: AtomicU64::new(0),
         }
     }
 }
@@ -227,12 +269,14 @@ impl Client {
         }));
         let before_handler = reader.is_none();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
-        let store = match &config.offline {
-            Some(offline) => Some(offline::Store::open(
-                offline,
-                storage_report(&gate, &control_tx, reader.clone()),
-            )?),
-            None => None,
+        let (room, outbox) = match &config.offline {
+            Some(offline) => {
+                let room = Arc::new(Room::new(offline));
+                let report = storage_report(&gate, &control_tx, reader.clone());
+                let outbox = Outbox::open(offline, Arc::clone(&room), report);
+                (Some(room), Some(outbox))
+            }
+            None => (None, None),
         };
         let wake = match reader {
             Some(reader) => Wake::Reader(reader),
@@ -244,7 +288,7 @@ impl Client {
         if let Some(mut key) = config.signing_key.take() {
             zeroize::Zeroize::zeroize(&mut key);
         }
-        let shared = Arc::new(Shared::new(config.token.clone(), store));
+        let shared = Arc::new(Shared::new(config.token.clone(), room));
         let (frames_tx, frames_rx) = mpsc::channel(config.send_queue);
         let (status_tx, status_rx) = watch::channel(Status::Connecting);
         let for_handler = Client {
@@ -271,7 +315,8 @@ impl Client {
         let handler = crate::delivery::Delivered::new(handler, Arc::clone(&gate), before_handler);
         let driver = Driver::new(
             config, handler, shared, keys, frames_rx, control_rx, status_tx,
-        );
+        )
+        .with_outbox(outbox);
         let run = async move {
             use futures_util::FutureExt;
             let driven = futures_util::future::Abortable::new(
@@ -307,36 +352,57 @@ impl Client {
     }
 
     /// Sends a message `{"t": kind, "p": payload}`; fails at once when the
-    /// queue is full.
+    /// outbox or the queue is full.
     pub fn try_send<P: Serialize + ?Sized>(&self, kind: &str, payload: &P) -> Result<(), Error> {
-        let id = message_id();
-        let text = encode(kind, payload, &id)?;
-        let Some(frame) = self.plain(&id, text)? else {
-            return Ok(());
-        };
-        self.frames.try_send(frame).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => Error::Full,
-            mpsc::error::TrySendError::Closed(_) => Error::Closed,
-        })
+        let frame = self.outgoing(kind, payload, &SendOptions::default())?;
+        self.try_put(frame)
     }
 
     /// Sends a message `{"t": kind, "p": payload}`, waiting for room in the
-    /// queue. With no connection it is kept for the next one, when
-    /// [`Config::offline`] says so.
+    /// queue. It waits in the outbox ([`Config::offline`], in memory by
+    /// default) until the server answers for it, and goes again after a
+    /// reconnect; with no outbox, a send with no connection fails with
+    /// [`Error::NotConnected`].
     pub async fn send<P: Serialize + ?Sized>(&self, kind: &str, payload: &P) -> Result<(), Error> {
-        let id = message_id();
-        let text = encode(kind, payload, &id)?;
-        let Some(frame) = self.plain(&id, text)? else {
-            return Ok(());
-        };
-        self.frames.send(frame).await.map_err(|_| Error::Closed)
+        let frame = self.outgoing(kind, payload, &SendOptions::default())?;
+        self.put(frame).await
+    }
+
+    /// [`Client::send`] with its `options`: its own id, how long it may
+    /// wait, the topics it requires. Returns its id, which its outcome names
+    /// ([`Event::Delivered`](crate::Event::Delivered),
+    /// [`Event::NotDelivered`](crate::Event::NotDelivered)).
+    pub async fn send_with<P: Serialize + ?Sized>(
+        &self,
+        kind: &str,
+        payload: &P,
+        options: &SendOptions,
+    ) -> Result<String, Error> {
+        let frame = self.outgoing(kind, payload, options)?;
+        let id = frame.id.to_string();
+        self.put(frame).await?;
+        Ok(id)
+    }
+
+    /// [`Client::send_with`], failing at once when the outbox or the queue
+    /// is full.
+    pub fn try_send_with<P: Serialize + ?Sized>(
+        &self,
+        kind: &str,
+        payload: &P,
+        options: &SendOptions,
+    ) -> Result<String, Error> {
+        let frame = self.outgoing(kind, payload, options)?;
+        let id = frame.id.to_string();
+        self.try_put(frame)?;
+        Ok(id)
     }
 
     /// Sends a message `{"t": kind, "p": payload}` on the connection that is
     /// ready now, or not at all: one this connection did not write is
-    /// dropped, never sent on a later connection. For commands that must not
-    /// run late (a valve, a door, an order). Fails at once when the queue is
-    /// full.
+    /// dropped, never sent on a later connection, and it never waits in the
+    /// outbox. For commands that must not run late (a valve, a door, an
+    /// order). Fails at once when the queue is full.
     pub fn try_send_live<P: Serialize + ?Sized>(
         &self,
         kind: &str,
@@ -385,16 +451,15 @@ impl Client {
         I: IntoIterator<Item = T>,
         T: Into<String>,
     {
-        let for_now = self.waiting_allowed()?;
-        let text = encode(kind, payload, &message_id())?;
-        let topics: Box<[String]> = topics.into_iter().map(Into::into).collect();
-        self.frames
-            .send(for_now.requiring(text, topics))
-            .await
-            .map_err(|_| Error::Closed)
+        let options = SendOptions {
+            requires: topics.into_iter().map(Into::into).collect(),
+            ..SendOptions::default()
+        };
+        self.send_with(kind, payload, &options).await.map(drop)
     }
 
-    /// [`Client::send_requiring`], failing at once when the queue is full.
+    /// [`Client::send_requiring`], failing at once when the outbox or the
+    /// queue is full.
     pub fn try_send_requiring<P, I, T>(
         &self,
         kind: &str,
@@ -406,25 +471,34 @@ impl Client {
         I: IntoIterator<Item = T>,
         T: Into<String>,
     {
-        let for_now = self.waiting_allowed()?;
-        let text = encode(kind, payload, &message_id())?;
-        let topics: Box<[String]> = topics.into_iter().map(Into::into).collect();
-        self.frames
-            .try_send(for_now.requiring(text, topics))
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => Error::Full,
-                mpsc::error::TrySendError::Closed(_) => Error::Closed,
-            })
+        let options = SendOptions {
+            requires: topics.into_iter().map(Into::into).collect(),
+            ..SendOptions::default()
+        };
+        self.try_send_with(kind, payload, &options).map(drop)
     }
 
-    /// Sends JSON text as it is: a message the application built itself.
-    /// With no connection it is kept for the next one, when
-    /// [`Config::offline`] says so.
+    /// Sends JSON text as it is: a message the application built itself, a
+    /// JSON object. It waits in the outbox as [`Client::send`] does.
     pub async fn send_raw(&self, json: impl Into<String>) -> Result<(), Error> {
-        let Some(frame) = self.plain(&message_id(), json.into())? else {
-            return Ok(());
+        let json = json.into();
+        let body = json.trim_start();
+        if !body.starts_with('{') {
+            return Err(Error::Encode("a message is a JSON object".to_owned()));
+        }
+        // Whole: the outbox keeps it, and its file holds it as it is.
+        serde_json::from_str::<serde::de::IgnoredAny>(body)
+            .map_err(|e| Error::Encode(format!("not JSON: {e}")))?;
+        let text = if self.shared.room.is_some() {
+            let mut text = String::with_capacity(crate::outbox::HEADROOM + body.len());
+            text.extend(std::iter::repeat_n(' ', crate::outbox::HEADROOM));
+            text.push_str(body);
+            text
+        } else {
+            json
         };
-        self.frames.send(frame).await.map_err(|_| Error::Closed)
+        let frame = self.queued(message_id().into_boxed_str(), text)?;
+        self.put(frame).await
     }
 
     /// Sends a signed message `{"t": kind, "p": payload}`: signed with
@@ -515,10 +589,20 @@ impl Client {
         self.control(Control::Unsubscribe(topics))
     }
 
-    /// How many messages the offline queue keeps for the next connection
+    /// How many messages wait in the outbox for the server's answer
     /// ([`Config::offline`]).
     pub fn kept(&self) -> usize {
-        self.shared.store.as_ref().map_or(0, offline::Store::len)
+        self.shared.room.as_ref().map_or(0, |room| room.count())
+    }
+
+    /// The user signs out: every message in the outbox, and every one sent
+    /// before this call, goes ([`Event::NotDelivered`](crate::Event),
+    /// `cleared`), and the user is forgotten, so nothing of theirs is sent as
+    /// the next one. One the server has in hand already is delivered if it
+    /// confirms it on the current connection.
+    pub fn clear(&self) -> Result<(), Error> {
+        self.shared.clears.fetch_add(1, Ordering::AcqRel);
+        self.control(Control::Clear)
     }
 
     /// Each topic held: whether the server took it, and whether its
@@ -656,6 +740,7 @@ impl Client {
             user: self.shared.users.load(Ordering::Acquire),
             connection: self.shared.connections.load(Ordering::Acquire),
             ready: self.shared.ready.load(Ordering::Acquire),
+            clears: self.shared.clears.load(Ordering::Acquire),
         };
         if !sent_for.ready && matches!(*self.status.borrow(), Status::Closed(_)) {
             return Err(Error::Closed);
@@ -673,29 +758,83 @@ impl Client {
         }
     }
 
-    /// [`Client::sent_for`] for a message that may wait for the next
-    /// connection in memory: with one, or with an offline queue.
-    fn waiting_allowed(&self) -> Result<SentFor, Error> {
-        let sent_for = self.sent_for()?;
-        if sent_for.ready || self.shared.store.is_some() {
-            Ok(sent_for)
+    /// A message to send: its id and its frame.
+    fn outgoing<P: Serialize + ?Sized>(
+        &self,
+        kind: &str,
+        payload: &P,
+        options: &SendOptions,
+    ) -> Result<Queued, Error> {
+        let id = options.id.clone().unwrap_or_else(message_id);
+        // For the outbox: after the room for the message's number.
+        let room = if self.shared.room.is_some() {
+            crate::outbox::HEADROOM
         } else {
-            Err(Error::NotConnected)
+            0
+        };
+        let text = if room == 0 {
+            encode(kind, payload, &id)?
+        } else {
+            encode_after(room, kind, payload, &id)?
+        };
+        let mut frame = self.queued(id.into_boxed_str(), text)?;
+        frame.ttl = options.ttl;
+        if !options.requires.is_empty() {
+            frame.requires = Some(options.requires.iter().cloned().collect());
+        }
+        Ok(frame)
+    }
+
+    /// A message for the outbox (its place in the room taken as it is put;
+    /// its text after the room for its number); without an outbox, for the
+    /// connection that is ready now.
+    fn queued(&self, id: Box<str>, text: String) -> Result<Queued, Error> {
+        let for_now = self.sent_for()?;
+        match &self.shared.room {
+            Some(_) => Ok(Queued {
+                counted: true,
+                ..for_now.frame(id, text)
+            }),
+            None if for_now.ready => Ok(for_now.frame(id, text)),
+            None => Err(Error::NotConnected),
         }
     }
 
-    /// A plain message: for the connection's queue (`Some`), or kept for
-    /// the next connection while there is none ([`Config::offline`]).
-    fn plain(&self, id: &str, text: String) -> Result<Option<Queued>, Error> {
-        let for_now = self.sent_for()?;
-        if for_now.ready {
-            return Ok(Some(for_now.frame(text)));
+    /// Queues `frame`, waiting for a place in the outbox and room in the
+    /// queue.
+    async fn put(&self, frame: Queued) -> Result<(), Error> {
+        let room = self.shared.room.as_ref().filter(|_| frame.counted);
+        let size = frame.size();
+        if let Some(room) = room {
+            room.wait_take(size).await?;
         }
-        match &self.shared.store {
-            // Given back: a connection takes messages now.
-            Some(store) => Ok(store.keep(id, text)?.map(|text| for_now.frame(text))),
-            None => Err(Error::NotConnected),
+        let sent = self.frames.send(frame).await;
+        if sent.is_err()
+            && let Some(room) = room
+        {
+            room.give_back(size);
         }
+        sent.map_err(|_| Error::Closed)
+    }
+
+    /// Queues `frame`, or fails at once when the outbox or the queue is full.
+    fn try_put(&self, frame: Queued) -> Result<(), Error> {
+        let room = self.shared.room.as_ref().filter(|_| frame.counted);
+        if let Some(room) = room
+            && !room.take(frame.size())
+        {
+            return Err(Error::Full);
+        }
+        self.frames.try_send(frame).map_err(|e| {
+            let (frame, error) = match e {
+                mpsc::error::TrySendError::Full(frame) => (frame, Error::Full),
+                mpsc::error::TrySendError::Closed(frame) => (frame, Error::Closed),
+            };
+            if let Some(room) = room {
+                room.give_back(frame.size());
+            }
+            error
+        })
     }
 
     fn control(&self, control: Control) -> Result<(), Error> {
@@ -728,6 +867,36 @@ fn encode<P: Serialize + ?Sized>(kind: &str, payload: &P, id: &str) -> Result<St
     .map_err(|e| Error::Encode(e.to_string()))
 }
 
+/// [`encode`] after `room` spaces, in one buffer: the outbox writes the
+/// message's number in them.
+fn encode_after<P: Serialize + ?Sized>(
+    room: usize,
+    kind: &str,
+    payload: &P,
+    id: &str,
+) -> Result<String, Error> {
+    #[derive(Serialize)]
+    struct Out<'a, P: ?Sized> {
+        t: &'a str,
+        p: &'a P,
+        id: &'a str,
+    }
+    let mut out = Vec::with_capacity(room + 64 + kind.len() + id.len());
+    out.resize(room, b' ');
+    serde_json::to_writer(
+        &mut out,
+        &Out {
+            t: kind,
+            p: payload,
+            id,
+        },
+    )
+    .map_err(|e| Error::Encode(e.to_string()))?;
+    // SAFETY: spaces, then what serde_json wrote, which is UTF-8 (its own
+    // `to_string` takes it so).
+    Ok(unsafe { String::from_utf8_unchecked(out) })
+}
+
 /// A message's id: a random UUID (version 4), as the TypeScript and Python
 /// clients give theirs.
 pub(crate) fn message_id() -> String {
@@ -752,12 +921,12 @@ pub(crate) fn message_id() -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn random_pair() -> (u64, u64) {
+pub(crate) fn random_pair() -> (u64, u64) {
     (fastrand::u64(..), fastrand::u64(..))
 }
 
 #[cfg(target_arch = "wasm32")]
-fn random_pair() -> (u64, u64) {
+pub(crate) fn random_pair() -> (u64, u64) {
     // 52 random bits a call: four calls fill both.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let bits = || (js_sys::Math::random() * (1u64 << 52) as f64) as u64;
@@ -770,11 +939,11 @@ fn storage_report(
     gate: &delivery::Shared,
     control: &mpsc::UnboundedSender<Control>,
     reader: Option<mpsc::UnboundedSender<()>>,
-) -> offline::Report {
+) -> crate::outbox::Report {
     let gate = Arc::clone(gate);
     let control = control.downgrade();
-    Box::new(move |operation, message| {
-        tracing::error!("[WSE] the offline queue: {operation} failed: {message}");
+    Arc::new(move |operation, message| {
+        tracing::error!("[WSE] the outbox's file: {operation} failed: {message}");
         delivery::lock(&gate).tell(Event::StorageFailed(StorageFailed {
             operation: operation.to_owned(),
             message,

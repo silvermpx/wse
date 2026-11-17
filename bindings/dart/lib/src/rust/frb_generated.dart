@@ -64,7 +64,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.13.0';
 
   @override
-  int get rustContentHash => 1815972506;
+  int get rustContentHash => 1873176362;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -81,6 +81,8 @@ abstract class RustLibApi extends BaseApi {
   WseCancel crateApiWseCancelNew();
 
   String crateApiWseNativeClientCheckpoint({required WseNativeClient that});
+
+  void crateApiWseNativeClientClear({required WseNativeClient that});
 
   void crateApiWseNativeClientCommit({
     required WseNativeClient that,
@@ -158,6 +160,13 @@ abstract class RustLibApi extends BaseApi {
     String? nonce,
   });
 
+  Future<String> crateApiWseNativeClientSendWith({
+    required WseNativeClient that,
+    required String kind,
+    required String json,
+    required WseSendOptions options,
+  });
+
   String crateApiWseNativeClientStatus({required WseNativeClient that});
 
   void crateApiWseNativeClientSubscribe({
@@ -186,6 +195,13 @@ abstract class RustLibApi extends BaseApi {
     required String kind,
     required String json,
     required List<String> topics,
+  });
+
+  String crateApiWseNativeClientTrySendWith({
+    required WseNativeClient that,
+    required String kind,
+    required String json,
+    required WseSendOptions options,
   });
 
   void crateApiWseNativeClientUnsubscribe({
@@ -304,6 +320,35 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  void crateApiWseNativeClientClear({required WseNativeClient that}) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWseNativeClient(
+            that,
+            serializer,
+          );
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 4)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_wse_error,
+        ),
+        constMeta: kCrateApiWseNativeClientClearConstMeta,
+        argValues: [that],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiWseNativeClientClearConstMeta =>
+      const TaskConstMeta(
+        debugName: "WseNativeClient_clear",
+        argNames: ["that"],
+      );
+
+  @override
   void crateApiWseNativeClientCommit({
     required WseNativeClient that,
     required String topic,
@@ -323,7 +368,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           sse_encode_u_32(epoch, serializer);
           sse_encode_u_64(offset, serializer);
           sse_encode_u_32(generation, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 4)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 5)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -359,7 +404,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 5,
+            funcId: 6,
             port: port_,
           );
         },
@@ -398,7 +443,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 6,
+            funcId: 7,
             port: port_,
           );
         },
@@ -429,7 +474,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             that,
             serializer,
           );
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 7)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 8)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_u_32,
@@ -474,7 +519,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 8,
+            funcId: 9,
             port: port_,
           );
         },
@@ -509,7 +554,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             serializer,
           );
           sse_encode_String(reason, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 9)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 10)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -538,7 +583,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             that,
             serializer,
           );
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 10)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 11)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -571,7 +616,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             serializer,
           );
           sse_encode_String(reason, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 11)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 12)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -604,7 +649,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             serializer,
           );
           sse_encode_list_String(topics, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 12)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 13)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -637,7 +682,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             serializer,
           );
           sse_encode_u_64(round, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 13)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 14)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -675,7 +720,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 14,
+            funcId: 15,
             port: port_,
           );
         },
@@ -715,7 +760,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 15,
+            funcId: 16,
             port: port_,
           );
         },
@@ -757,7 +802,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 16,
+            funcId: 17,
             port: port_,
           );
         },
@@ -799,7 +844,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 17,
+            funcId: 18,
             port: port_,
           );
         },
@@ -821,6 +866,48 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  Future<String> crateApiWseNativeClientSendWith({
+    required WseNativeClient that,
+    required String kind,
+    required String json,
+    required WseSendOptions options,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWseNativeClient(
+            that,
+            serializer,
+          );
+          sse_encode_String(kind, serializer);
+          sse_encode_String(json, serializer);
+          sse_encode_box_autoadd_wse_send_options(options, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 19,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_wse_error,
+        ),
+        constMeta: kCrateApiWseNativeClientSendWithConstMeta,
+        argValues: [that, kind, json, options],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiWseNativeClientSendWithConstMeta =>
+      const TaskConstMeta(
+        debugName: "WseNativeClient_send_with",
+        argNames: ["that", "kind", "json", "options"],
+      );
+
+  @override
   String crateApiWseNativeClientStatus({required WseNativeClient that}) {
     return handler.executeSync(
       SyncTask(
@@ -830,7 +917,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             that,
             serializer,
           );
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 18)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 20)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_String,
@@ -863,7 +950,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             serializer,
           );
           sse_encode_list_String(topics, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 19)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 21)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -894,7 +981,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             that,
             serializer,
           );
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 20)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 22)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_list_wse_topic_state,
@@ -929,7 +1016,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           );
           sse_encode_String(kind, serializer);
           sse_encode_String(json, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 21)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 23)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -964,7 +1051,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           );
           sse_encode_String(kind, serializer);
           sse_encode_String(json, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 22)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 24)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -1001,7 +1088,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           sse_encode_String(kind, serializer);
           sse_encode_String(json, serializer);
           sse_encode_list_String(topics, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 23)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 25)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -1021,6 +1108,43 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  String crateApiWseNativeClientTrySendWith({
+    required WseNativeClient that,
+    required String kind,
+    required String json,
+    required WseSendOptions options,
+  }) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerWseNativeClient(
+            that,
+            serializer,
+          );
+          sse_encode_String(kind, serializer);
+          sse_encode_String(json, serializer);
+          sse_encode_box_autoadd_wse_send_options(options, serializer);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 26)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_wse_error,
+        ),
+        constMeta: kCrateApiWseNativeClientTrySendWithConstMeta,
+        argValues: [that, kind, json, options],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiWseNativeClientTrySendWithConstMeta =>
+      const TaskConstMeta(
+        debugName: "WseNativeClient_try_send_with",
+        argNames: ["that", "kind", "json", "options"],
+      );
+
+  @override
   void crateApiWseNativeClientUnsubscribe({
     required WseNativeClient that,
     required List<String> topics,
@@ -1034,7 +1158,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             serializer,
           );
           sse_encode_list_String(topics, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 24)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 27)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -1063,7 +1187,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             that,
             serializer,
           );
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 25)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 28)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_opt_String,
@@ -1088,7 +1212,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       SyncTask(
         callFfi: () {
           final serializer = SseSerializer(generalizedFrbRustBinding);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 26)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 29)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_list_prim_u_8_strict,
@@ -1111,7 +1235,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         callFfi: () {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_list_prim_u_8_loose(key, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 27)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 30)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_String,
@@ -1249,6 +1373,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   WseOffline dco_decode_box_autoadd_wse_offline(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return dco_decode_wse_offline(raw);
+  }
+
+  @protected
+  WseSendOptions dco_decode_box_autoadd_wse_send_options(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_wse_send_options(raw);
   }
 
   @protected
@@ -1467,8 +1597,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   WseItem dco_decode_wse_item(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 31)
-      throw Exception('unexpected arr length: expect 31 but see ${arr.length}');
+    if (arr.length != 32)
+      throw Exception('unexpected arr length: expect 32 but see ${arr.length}');
     return WseItem(
       kind: dco_decode_wse_item_kind(arr[0]),
       name: dco_decode_opt_String(arr[1]),
@@ -1493,14 +1623,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       retryInMs: dco_decode_opt_box_autoadd_u_64(arr[20]),
       attempt: dco_decode_opt_box_autoadd_u_32(arr[21]),
       reasons: dco_decode_list_String(arr[22]),
-      topics: dco_decode_list_String(arr[23]),
-      failed: dco_decode_list_String(arr[24]),
-      recoveries: dco_decode_list_wse_topic_recovery(arr[25]),
-      first: dco_decode_opt_box_autoadd_u_64(arr[26]),
-      last: dco_decode_opt_box_autoadd_u_64(arr[27]),
-      round: dco_decode_opt_box_autoadd_u_64(arr[28]),
-      committed: dco_decode_list_wse_stream_position(arr[29]),
-      continuity: dco_decode_opt_box_autoadd_wse_continuity(arr[30]),
+      ids: dco_decode_list_String(arr[23]),
+      topics: dco_decode_list_String(arr[24]),
+      failed: dco_decode_list_String(arr[25]),
+      recoveries: dco_decode_list_wse_topic_recovery(arr[26]),
+      first: dco_decode_opt_box_autoadd_u_64(arr[27]),
+      last: dco_decode_opt_box_autoadd_u_64(arr[28]),
+      round: dco_decode_opt_box_autoadd_u_64(arr[29]),
+      committed: dco_decode_list_wse_stream_position(arr[30]),
+      continuity: dco_decode_opt_box_autoadd_wse_continuity(arr[31]),
     );
   }
 
@@ -1514,12 +1645,27 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   WseOffline dco_decode_wse_offline(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
+    if (arr.length != 5)
+      throw Exception('unexpected arr length: expect 5 but see ${arr.length}');
+    return WseOffline(
+      disabled: dco_decode_bool(arr[0]),
+      path: dco_decode_opt_String(arr[1]),
+      maxMessages: dco_decode_u_32(arr[2]),
+      maxBytes: dco_decode_u_64(arr[3]),
+      maxAgeMs: dco_decode_u_64(arr[4]),
+    );
+  }
+
+  @protected
+  WseSendOptions dco_decode_wse_send_options(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
     if (arr.length != 3)
       throw Exception('unexpected arr length: expect 3 but see ${arr.length}');
-    return WseOffline(
-      path: dco_decode_opt_String(arr[0]),
-      maxMessages: dco_decode_u_32(arr[1]),
-      maxAgeMs: dco_decode_u_64(arr[2]),
+    return WseSendOptions(
+      id: dco_decode_opt_String(arr[0]),
+      ttlMs: dco_decode_u_64(arr[1]),
+      requires: dco_decode_list_String(arr[2]),
     );
   }
 
@@ -1704,6 +1850,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   WseOffline sse_decode_box_autoadd_wse_offline(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return (sse_decode_wse_offline(deserializer));
+  }
+
+  @protected
+  WseSendOptions sse_decode_box_autoadd_wse_send_options(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_wse_send_options(deserializer));
   }
 
   @protected
@@ -2045,6 +2199,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_retryInMs = sse_decode_opt_box_autoadd_u_64(deserializer);
     var var_attempt = sse_decode_opt_box_autoadd_u_32(deserializer);
     var var_reasons = sse_decode_list_String(deserializer);
+    var var_ids = sse_decode_list_String(deserializer);
     var var_topics = sse_decode_list_String(deserializer);
     var var_failed = sse_decode_list_String(deserializer);
     var var_recoveries = sse_decode_list_wse_topic_recovery(deserializer);
@@ -2079,6 +2234,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       retryInMs: var_retryInMs,
       attempt: var_attempt,
       reasons: var_reasons,
+      ids: var_ids,
       topics: var_topics,
       failed: var_failed,
       recoveries: var_recoveries,
@@ -2100,14 +2256,27 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   WseOffline sse_decode_wse_offline(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_disabled = sse_decode_bool(deserializer);
     var var_path = sse_decode_opt_String(deserializer);
     var var_maxMessages = sse_decode_u_32(deserializer);
+    var var_maxBytes = sse_decode_u_64(deserializer);
     var var_maxAgeMs = sse_decode_u_64(deserializer);
     return WseOffline(
+      disabled: var_disabled,
       path: var_path,
       maxMessages: var_maxMessages,
+      maxBytes: var_maxBytes,
       maxAgeMs: var_maxAgeMs,
     );
+  }
+
+  @protected
+  WseSendOptions sse_decode_wse_send_options(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_id = sse_decode_opt_String(deserializer);
+    var var_ttlMs = sse_decode_u_64(deserializer);
+    var var_requires = sse_decode_list_String(deserializer);
+    return WseSendOptions(id: var_id, ttlMs: var_ttlMs, requires: var_requires);
   }
 
   @protected
@@ -2309,6 +2478,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_wse_offline(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_wse_send_options(
+    WseSendOptions self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_wse_send_options(self, serializer);
   }
 
   @protected
@@ -2612,6 +2790,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_opt_box_autoadd_u_64(self.retryInMs, serializer);
     sse_encode_opt_box_autoadd_u_32(self.attempt, serializer);
     sse_encode_list_String(self.reasons, serializer);
+    sse_encode_list_String(self.ids, serializer);
     sse_encode_list_String(self.topics, serializer);
     sse_encode_list_String(self.failed, serializer);
     sse_encode_list_wse_topic_recovery(self.recoveries, serializer);
@@ -2631,9 +2810,22 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   void sse_encode_wse_offline(WseOffline self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_bool(self.disabled, serializer);
     sse_encode_opt_String(self.path, serializer);
     sse_encode_u_32(self.maxMessages, serializer);
+    sse_encode_u_64(self.maxBytes, serializer);
     sse_encode_u_64(self.maxAgeMs, serializer);
+  }
+
+  @protected
+  void sse_encode_wse_send_options(
+    WseSendOptions self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_opt_String(self.id, serializer);
+    sse_encode_u_64(self.ttlMs, serializer);
+    sse_encode_list_String(self.requires, serializer);
   }
 
   @protected
@@ -2732,6 +2924,11 @@ class WseNativeClientImpl extends RustOpaque implements WseNativeClient {
   String checkpoint() =>
       RustLib.instance.api.crateApiWseNativeClientCheckpoint(that: this);
 
+  /// The user signs out: every message in the outbox, and every one sent
+  /// before this call, goes (`notDelivered`, `cleared`), and the user is
+  /// forgotten.
+  void clear() => RustLib.instance.api.crateApiWseNativeClientClear(that: this);
+
   /// The consumer applied the message at `epoch`, `offset` of `topic`,
   /// handed out in `generation`: one of an earlier user counts for nobody.
   void commit({
@@ -2752,7 +2949,7 @@ class WseNativeClientImpl extends RustOpaque implements WseNativeClient {
   Future<void> disconnect({required BigInt deadlineMs}) => RustLib.instance.api
       .crateApiWseNativeClientDisconnect(that: this, deadlineMs: deadlineMs);
 
-  /// How many messages the offline queue keeps for the next connection.
+  /// How many messages wait in the outbox for the server's answer.
   int kept() => RustLib.instance.api.crateApiWseNativeClientKept(that: this);
 
   /// The next batch: `ack` acknowledges the last one (0: none yet); one not
@@ -2822,6 +3019,18 @@ class WseNativeClientImpl extends RustOpaque implements WseNativeClient {
     nonce: nonce,
   );
 
+  /// `try_send_with`, waiting for room.
+  Future<String> sendWith({
+    required String kind,
+    required String json,
+    required WseSendOptions options,
+  }) => RustLib.instance.api.crateApiWseNativeClientSendWith(
+    that: this,
+    kind: kind,
+    json: json,
+    options: options,
+  );
+
   /// connecting, connected, reconnecting, paused or closed.
   String status() =>
       RustLib.instance.api.crateApiWseNativeClientStatus(that: this);
@@ -2856,6 +3065,20 @@ class WseNativeClientImpl extends RustOpaque implements WseNativeClient {
     kind: kind,
     json: json,
     topics: topics,
+  );
+
+  /// Sends `{"t": kind, "p": json}` with `options`: its own id, how long it
+  /// may wait, the topics it requires. Its id, which its outcome names.
+  /// Fails at once when the outbox or the queue is full.
+  String trySendWith({
+    required String kind,
+    required String json,
+    required WseSendOptions options,
+  }) => RustLib.instance.api.crateApiWseNativeClientTrySendWith(
+    that: this,
+    kind: kind,
+    json: json,
+    options: options,
   );
 
   void unsubscribe({required List<String> topics}) => RustLib.instance.api

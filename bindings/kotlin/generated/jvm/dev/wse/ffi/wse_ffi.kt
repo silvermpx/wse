@@ -716,6 +716,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_checkpoint(
     ): Int
+    external fun uniffi_wse_ffi_checksum_method_wseclient_clear(
+    ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_commit(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_connection_id(
@@ -744,6 +746,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_send_signed(
     ): Int
+    external fun uniffi_wse_ffi_checksum_method_wseclient_send_with(
+    ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_status(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_subscribe(
@@ -755,6 +759,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_wse_ffi_checksum_method_wseclient_try_send_live(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_try_send_requiring(
+    ): Int
+    external fun uniffi_wse_ffi_checksum_method_wseclient_try_send_with(
     ): Int
     external fun uniffi_wse_ffi_checksum_method_wseclient_unsubscribe(
     ): Int
@@ -801,6 +807,8 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_checkpoint(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+    external fun uniffi_wse_ffi_fn_method_wseclient_clear(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_commit(`ptr`: Long,`topic`: RustBuffer.ByValue,`epoch`: Int,`offset`: Long,`generation`: Int,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_connection_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
@@ -829,6 +837,8 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_wse_ffi_fn_method_wseclient_send_signed(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,`nonce`: RustBuffer.ByValue,`cancel`: Long,
     ): Long
+    external fun uniffi_wse_ffi_fn_method_wseclient_send_with(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,`options`: RustBuffer.ByValue,`cancel`: Long,
+    ): Long
     external fun uniffi_wse_ffi_fn_method_wseclient_status(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_wse_ffi_fn_method_wseclient_subscribe(`ptr`: Long,`topics`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -841,6 +851,8 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_try_send_requiring(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,`topics`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
+    external fun uniffi_wse_ffi_fn_method_wseclient_try_send_with(`ptr`: Long,`kind`: RustBuffer.ByValue,`json`: RustBuffer.ByValue,`options`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
     external fun uniffi_wse_ffi_fn_method_wseclient_unsubscribe(`ptr`: Long,`topics`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
     external fun uniffi_wse_ffi_fn_method_wseclient_user_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
@@ -996,6 +1008,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_checkpoint() and 0xFFFF) != 3771) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_clear() and 0xFFFF) != 14843) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_commit() and 0xFFFF) != 32229) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1005,7 +1020,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_disconnect() and 0xFFFF) != 49284) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_kept() and 0xFFFF) != 54727) {
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_kept() and 0xFFFF) != 28647) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_next_batch() and 0xFFFF) != 61381) {
@@ -1038,6 +1053,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_send_signed() and 0xFFFF) != 57399) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_send_with() and 0xFFFF) != 17266) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_status() and 0xFFFF) != 33306) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1047,13 +1065,16 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_topic_states() and 0xFFFF) != 63419) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_try_send() and 0xFFFF) != 33752) {
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_try_send() and 0xFFFF) != 47511) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_try_send_live() and 0xFFFF) != 32891) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_try_send_requiring() and 0xFFFF) != 1439) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_wse_ffi_checksum_method_wseclient_try_send_with() and 0xFFFF) != 22935) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_wse_ffi_checksum_method_wseclient_unsubscribe() and 0xFFFF) != 15024) {
@@ -1945,6 +1966,12 @@ public interface WseClientInterface {
     fun `checkpoint`(): kotlin.String
 
     /**
+     * The user signs out: every message in the outbox, and every one sent before this
+     * call, goes (`NotDelivered`, `cleared`), and the user is forgotten.
+     */
+    fun `clear`()
+
+    /**
      * The consumer applied the message at `epoch`, `offset` of `topic`,
      * handed out in `generation`: one of an earlier user counts for
      * nobody. `commit(message)` passes all four.
@@ -1959,7 +1986,7 @@ public interface WseClientInterface {
     suspend fun `disconnect`(`deadlineMs`: kotlin.ULong)
 
     /**
-     * How many messages the offline queue keeps for the next connection.
+     * How many messages wait in the outbox for the server's answer.
      */
     fun `kept`(): kotlin.UInt
 
@@ -2018,6 +2045,12 @@ public interface WseClientInterface {
      */
     suspend fun `sendSigned`(`kind`: kotlin.String, `json`: kotlin.String, `nonce`: kotlin.String?, `cancel`: WseCancel): kotlin.String
 
+    /**
+     * `try_send_with`, waiting for room; `cancel` gives up the wait (a message already
+     * queued still goes).
+     */
+    suspend fun `sendWith`(`kind`: kotlin.String, `json`: kotlin.String, `options`: WseSendOptions, `cancel`: WseCancel): kotlin.String
+
     fun `status`(): WseStatus
 
     fun `subscribe`(`topics`: List<kotlin.String>)
@@ -2029,7 +2062,8 @@ public interface WseClientInterface {
     fun `topicStates`(): List<WseTopicState>
 
     /**
-     * Sends `{"t": kind, "p": json}`; fails at once when the queue is full.
+     * Sends `{"t": kind, "p": json}`; fails at once when the outbox or the queue is
+     * full.
      */
     fun `trySend`(`kind`: kotlin.String, `json`: kotlin.String)
 
@@ -2048,6 +2082,13 @@ public interface WseClientInterface {
      * is full.
      */
     fun `trySendRequiring`(`kind`: kotlin.String, `json`: kotlin.String, `topics`: List<kotlin.String>)
+
+    /**
+     * Sends `{"t": kind, "p": json}` with `options`: its own id, how long it may wait,
+     * the topics it requires. Its id, which its outcome names. Fails at once when the
+     * outbox or the queue is full.
+     */
+    fun `trySendWith`(`kind`: kotlin.String, `json`: kotlin.String, `options`: WseSendOptions): kotlin.String
 
     fun `unsubscribe`(`topics`: List<kotlin.String>)
 
@@ -2176,6 +2217,23 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
 
 
     /**
+     * The user signs out: every message in the outbox, and every one sent before this
+     * call, goes (`NotDelivered`, `cleared`), and the user is forgotten.
+     */
+    @Throws(WseException::class)override fun `clear`()
+        =
+    callWithHandle {
+    uniffiRustCallWithError(WseException) { _status ->
+    UniffiLib.uniffi_wse_ffi_fn_method_wseclient_clear(
+        it,
+        _status)
+}
+    }
+
+
+
+
+    /**
      * The consumer applied the message at `epoch`, `offset` of `topic`,
      * handed out in `generation`: one of an earlier user counts for
      * nobody. `commit(message)` passes all four.
@@ -2235,7 +2293,7 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
 
 
     /**
-     * How many messages the offline queue keeps for the next connection.
+     * How many messages wait in the outbox for the server's answer.
      */override fun `kept`(): kotlin.UInt {
             return FfiConverterUInt.lift(
     callWithHandle {
@@ -2477,6 +2535,35 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
     )
     }
 
+
+    /**
+     * `try_send_with`, waiting for room; `cancel` gives up the wait (a message already
+     * queued still goes).
+     */
+    @Throws(WseException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `sendWith`(`kind`: kotlin.String, `json`: kotlin.String, `options`: WseSendOptions, `cancel`: WseCancel) : kotlin.String {
+        return uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_wse_ffi_fn_method_wseclient_send_with(
+                uniffiHandle,
+
+        FfiConverterString.lower(`kind`),
+        FfiConverterString.lower(`json`),
+        FfiConverterTypeWseSendOptions.lower(`options`),
+        FfiConverterTypeWseCancel.lower(`cancel`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_wse_ffi_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_wse_ffi_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.ffi_wse_ffi_rust_future_free_rust_buffer(future) },
+        // lift function
+        { FfiConverterString.lift(it) },
+        // Error FFI converter
+        WseException.ErrorHandler,
+    )
+    }
+
     override fun `status`(): WseStatus {
             return FfiConverterTypeWseStatus.lift(
     callWithHandle {
@@ -2523,7 +2610,8 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
 
 
     /**
-     * Sends `{"t": kind, "p": json}`; fails at once when the queue is full.
+     * Sends `{"t": kind, "p": json}`; fails at once when the outbox or the queue is
+     * full.
      */
     @Throws(WseException::class)override fun `trySend`(`kind`: kotlin.String, `json`: kotlin.String)
         =
@@ -2580,6 +2668,28 @@ open class WseClient: Disposable, AutoCloseable, WseClientInterface
 }
     }
 
+
+
+
+    /**
+     * Sends `{"t": kind, "p": json}` with `options`: its own id, how long it may wait,
+     * the topics it requires. Its id, which its outcome names. Fails at once when the
+     * outbox or the queue is full.
+     */
+    @Throws(WseException::class)override fun `trySendWith`(`kind`: kotlin.String, `json`: kotlin.String, `options`: WseSendOptions): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCallWithError(WseException) { _status ->
+    UniffiLib.uniffi_wse_ffi_fn_method_wseclient_try_send_with(
+        it,
+
+        FfiConverterString.lower(`kind`),
+        FfiConverterString.lower(`json`),
+        FfiConverterTypeWseSendOptions.lower(`options`),_status)
+}
+    }
+    )
+    }
 
 
 
@@ -3099,8 +3209,8 @@ data class WseConfig (
     val `delivery`: WseDelivery? = null
     ,
     /**
-     * Messages sent with no connection wait for the next one of the same user; none: such a
-     * send fails.
+     * The outbox, where every message waits until the server answers for it; none: in
+     * memory, with its defaults.
      */
     val `offline`: WseOffline? = null
 
@@ -3383,23 +3493,37 @@ public object FfiConverterTypeWseMessage: FfiConverterRustBuffer<WseMessage> {
 
 
 /**
- * Messages sent with no connection, kept for the next one of the same user. They go right
- * after the topics are subscribed again; a live or signed message is never kept.
+ * The outbox: every message sent, except a live or signed one, waits in it until the
+ * server answers for it, goes again after a reconnect, and reaches the server's
+ * application once; `Delivered` and `NotDelivered` say what became of each.
  */
 data class WseOffline (
     /**
-     * The file they are kept in, so that they outlive the app (in its own storage); the
+     * No outbox: a message goes on the connection that is ready, or the send fails as
+     * not connected, as before 3.2.
+     */
+    val `disabled`: kotlin.Boolean = false
+    ,
+    /**
+     * The file they wait in, so that they outlive the app (in its own storage); the
      * client's alone while it runs. None keeps them in memory.
      */
     val `path`: kotlin.String? = null
     ,
     /**
-     * How many are kept at most (0: 1,000); past it a send fails as `Full`.
+     * How many wait at most, those not answered yet included (0: 100,000); past it
+     * `send` waits for room and `try_send` fails as `Full`.
      */
     val `maxMessages`: kotlin.UInt = 0u
     ,
     /**
-     * How long one is kept, in milliseconds (0: an hour); an older one is dropped.
+     * How many bytes of messages wait at most (0: 16 MiB), as `max_messages`.
+     */
+    val `maxBytes`: kotlin.ULong = 0uL
+    ,
+    /**
+     * How long one waits to be written first, in milliseconds (0: an hour); one not
+     * written by then is dropped (`NotDelivered`, `expired`).
      */
     val `maxAgeMs`: kotlin.ULong = 0uL
 
@@ -3418,22 +3542,85 @@ data class WseOffline (
 public object FfiConverterTypeWseOffline: FfiConverterRustBuffer<WseOffline> {
     override fun read(buf: ByteBuffer): WseOffline {
         return WseOffline(
+            FfiConverterBoolean.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
         )
     }
 
     override fun allocationSize(value: WseOffline) = (
+            FfiConverterBoolean.allocationSize(value.`disabled`) +
             FfiConverterOptionalString.allocationSize(value.`path`) +
             FfiConverterUInt.allocationSize(value.`maxMessages`) +
+            FfiConverterULong.allocationSize(value.`maxBytes`) +
             FfiConverterULong.allocationSize(value.`maxAgeMs`)
     )
 
     override fun write(value: WseOffline, buf: ByteBuffer) {
+            FfiConverterBoolean.write(value.`disabled`, buf)
             FfiConverterOptionalString.write(value.`path`, buf)
             FfiConverterUInt.write(value.`maxMessages`, buf)
+            FfiConverterULong.write(value.`maxBytes`, buf)
             FfiConverterULong.write(value.`maxAgeMs`, buf)
+    }
+}
+
+
+
+/**
+ * How a message goes (`send_with`).
+ */
+data class WseSendOptions (
+    /**
+     * Its id: the app's own (one it keeps itself, say), or a random UUID; its outcome
+     * names it.
+     */
+    val `id`: kotlin.String? = null
+    ,
+    /**
+     * How long it may wait to be written first, in milliseconds (0: the outbox's
+     * `max_age_ms`).
+     */
+    val `ttlMs`: kotlin.ULong = 0uL
+    ,
+    /**
+     * Topics that must each be continuous when it goes.
+     */
+    val `requires`: List<kotlin.String> = listOf()
+
+){
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeWseSendOptions: FfiConverterRustBuffer<WseSendOptions> {
+    override fun read(buf: ByteBuffer): WseSendOptions {
+        return WseSendOptions(
+            FfiConverterOptionalString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterSequenceString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: WseSendOptions) = (
+            FfiConverterOptionalString.allocationSize(value.`id`) +
+            FfiConverterULong.allocationSize(value.`ttlMs`) +
+            FfiConverterSequenceString.allocationSize(value.`requires`)
+    )
+
+    override fun write(value: WseSendOptions, buf: ByteBuffer) {
+            FfiConverterOptionalString.write(value.`id`, buf)
+            FfiConverterULong.write(value.`ttlMs`, buf)
+            FfiConverterSequenceString.write(value.`requires`, buf)
     }
 }
 
@@ -4211,7 +4398,34 @@ sealed class WseItem {
     }
 
     /**
-     * The offline queue's file could not be written (`operation`): what is kept stays in
+     * The server took these messages of the outbox (their ids).
+     */
+    data class Delivered(
+        val `ids`: List<kotlin.String>) : WseItem()
+
+    {
+
+
+        companion object
+    }
+
+    /**
+     * These messages of the outbox will not be delivered, and why: the server's refusal
+     * (`busy`, `rate_limited`, `missing`, `not_ready`), `expired`, `user_changed`,
+     * `cleared` or `closed`.
+     */
+    data class NotDelivered(
+        val `reason`: kotlin.String,
+        val `ids`: List<kotlin.String>) : WseItem()
+
+    {
+
+
+        companion object
+    }
+
+    /**
+     * The outbox's file could not be opened or written (`operation`): what is kept stays in
      * memory, and may not outlive the app.
      */
     data class StorageFailed(
@@ -4307,11 +4521,18 @@ public object FfiConverterTypeWseItem : FfiConverterRustBuffer<WseItem>{
             12 -> WseItem.CheckpointRejected(
                 FfiConverterString.read(buf),
                 )
-            13 -> WseItem.StorageFailed(
+            13 -> WseItem.Delivered(
+                FfiConverterSequenceString.read(buf),
+                )
+            14 -> WseItem.NotDelivered(
+                FfiConverterString.read(buf),
+                FfiConverterSequenceString.read(buf),
+                )
+            15 -> WseItem.StorageFailed(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            14 -> WseItem.Unknown(
+            16 -> WseItem.Unknown(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
@@ -4422,6 +4643,21 @@ public object FfiConverterTypeWseItem : FfiConverterRustBuffer<WseItem>{
                 + FfiConverterString.allocationSize(value.`reason`)
             )
         }
+        is WseItem.Delivered -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterSequenceString.allocationSize(value.`ids`)
+            )
+        }
+        is WseItem.NotDelivered -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`reason`)
+                + FfiConverterSequenceString.allocationSize(value.`ids`)
+            )
+        }
         is WseItem.StorageFailed -> {
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
@@ -4520,14 +4756,25 @@ public object FfiConverterTypeWseItem : FfiConverterRustBuffer<WseItem>{
                 FfiConverterString.write(value.`reason`, buf)
                 Unit
             }
-            is WseItem.StorageFailed -> {
+            is WseItem.Delivered -> {
                 buf.putInt(13)
+                FfiConverterSequenceString.write(value.`ids`, buf)
+                Unit
+            }
+            is WseItem.NotDelivered -> {
+                buf.putInt(14)
+                FfiConverterString.write(value.`reason`, buf)
+                FfiConverterSequenceString.write(value.`ids`, buf)
+                Unit
+            }
+            is WseItem.StorageFailed -> {
+                buf.putInt(15)
                 FfiConverterString.write(value.`operation`, buf)
                 FfiConverterString.write(value.`message`, buf)
                 Unit
             }
             is WseItem.Unknown -> {
-                buf.putInt(14)
+                buf.putInt(16)
                 FfiConverterString.write(value.`name`, buf)
                 Unit
             }

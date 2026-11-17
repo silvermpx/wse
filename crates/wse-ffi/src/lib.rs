@@ -138,26 +138,62 @@ pub struct WseConfig {
     /// recover-or-resync; none: best effort.
     #[uniffi(default = None)]
     pub delivery: Option<WseDelivery>,
-    /// Messages sent with no connection wait for the next one of the same user; none: such a
-    /// send fails.
+    /// The outbox, where every message waits until the server answers for it; none: in
+    /// memory, with its defaults.
     #[uniffi(default = None)]
     pub offline: Option<WseOffline>,
 }
 
-/// Messages sent with no connection, kept for the next one of the same user. They go right
-/// after the topics are subscribed again; a live or signed message is never kept.
+/// The outbox: every message sent, except a live or signed one, waits in it until the
+/// server answers for it, goes again after a reconnect, and reaches the server's
+/// application once; `Delivered` and `NotDelivered` say what became of each.
 #[derive(uniffi::Record)]
 pub struct WseOffline {
-    /// The file they are kept in, so that they outlive the app (in its own storage); the
+    /// No outbox: a message goes on the connection that is ready, or the send fails as
+    /// not connected, as before 3.2.
+    #[uniffi(default = false)]
+    pub disabled: bool,
+    /// The file they wait in, so that they outlive the app (in its own storage); the
     /// client's alone while it runs. None keeps them in memory.
     #[uniffi(default = None)]
     pub path: Option<String>,
-    /// How many are kept at most (0: 1,000); past it a send fails as `Full`.
+    /// How many wait at most, those not answered yet included (0: 100,000); past it
+    /// `send` waits for room and `try_send` fails as `Full`.
     #[uniffi(default = 0)]
     pub max_messages: u32,
-    /// How long one is kept, in milliseconds (0: an hour); an older one is dropped.
+    /// How many bytes of messages wait at most (0: 16 MiB), as `max_messages`.
+    #[uniffi(default = 0)]
+    pub max_bytes: u64,
+    /// How long one waits to be written first, in milliseconds (0: an hour); one not
+    /// written by then is dropped (`NotDelivered`, `expired`).
     #[uniffi(default = 0)]
     pub max_age_ms: u64,
+}
+
+/// How a message goes (`send_with`).
+#[derive(uniffi::Record)]
+pub struct WseSendOptions {
+    /// Its id: the app's own (one it keeps itself, say), or a random UUID; its outcome
+    /// names it.
+    #[uniffi(default = None)]
+    pub id: Option<String>,
+    /// How long it may wait to be written first, in milliseconds (0: the outbox's
+    /// `max_age_ms`).
+    #[uniffi(default = 0)]
+    pub ttl_ms: u64,
+    /// Topics that must each be continuous when it goes.
+    #[uniffi(default = [])]
+    pub requires: Vec<String>,
+}
+
+impl From<WseSendOptions> for native::NativeSendOptions {
+    fn from(options: WseSendOptions) -> Self {
+        Self {
+            id: options.id,
+            ttl_ms: options.ttl_ms,
+            requires: options.requires,
+        }
+    }
 }
 
 /// The recover-or-resync delivery: a topic that is not continuous (a cold
@@ -315,8 +351,10 @@ impl From<WseConfig> for native::NativeConfig {
                 max_held: d.max_held,
             }),
             offline: c.offline.map(|o| native::NativeOffline {
+                disabled: o.disabled,
                 path: o.path,
                 max_messages: o.max_messages,
+                max_bytes: o.max_bytes,
                 max_age_ms: o.max_age_ms,
             }),
         }
@@ -489,7 +527,18 @@ pub enum WseItem {
     CheckpointRejected {
         reason: String,
     },
-    /// The offline queue's file could not be written (`operation`): what is kept stays in
+    /// The server took these messages of the outbox (their ids).
+    Delivered {
+        ids: Vec<String>,
+    },
+    /// These messages of the outbox will not be delivered, and why: the server's refusal
+    /// (`busy`, `rate_limited`, `missing`, `not_ready`), `expired`, `user_changed`,
+    /// `cleared` or `closed`.
+    NotDelivered {
+        reason: String,
+        ids: Vec<String>,
+    },
+    /// The outbox's file could not be opened or written (`operation`): what is kept stays in
     /// memory, and may not outlive the app.
     StorageFailed {
         operation: String,
@@ -615,6 +664,8 @@ impl From<native::Item> for WseItem {
                 reason,
             },
             native::Item::CheckpointRejected { reason } => Self::CheckpointRejected { reason },
+            native::Item::Delivered { ids } => Self::Delivered { ids },
+            native::Item::NotDelivered { reason, ids } => Self::NotDelivered { reason, ids },
             native::Item::StorageFailed { operation, message } => {
                 Self::StorageFailed { operation, message }
             }
@@ -668,9 +719,43 @@ pub async fn connect(
 
 #[uniffi::export]
 impl WseClient {
-    /// Sends `{"t": kind, "p": json}`; fails at once when the queue is full.
+    /// Sends `{"t": kind, "p": json}`; fails at once when the outbox or the queue is
+    /// full.
     pub fn try_send(&self, kind: String, json: String) -> Result<(), WseError> {
         Ok(self.0.try_send(&kind, &json)?)
+    }
+
+    /// Sends `{"t": kind, "p": json}` with `options`: its own id, how long it may wait,
+    /// the topics it requires. Its id, which its outcome names. Fails at once when the
+    /// outbox or the queue is full.
+    pub fn try_send_with(
+        &self,
+        kind: String,
+        json: String,
+        options: WseSendOptions,
+    ) -> Result<String, WseError> {
+        Ok(self.0.try_send_with(&kind, &json, options.into())?)
+    }
+
+    /// `try_send_with`, waiting for room; `cancel` gives up the wait (a message already
+    /// queued still goes).
+    pub async fn send_with(
+        &self,
+        kind: String,
+        json: String,
+        options: WseSendOptions,
+        cancel: Arc<WseCancel>,
+    ) -> Result<String, WseError> {
+        Ok(self
+            .0
+            .send_with(kind, json, options.into(), &cancel.0)
+            .await?)
+    }
+
+    /// The user signs out: every message in the outbox, and every one sent before this
+    /// call, goes (`NotDelivered`, `cleared`), and the user is forgotten.
+    pub fn clear(&self) -> Result<(), WseError> {
+        Ok(self.0.clear()?)
     }
 
     /// Sends `{"t": kind, "p": json}`, waiting for room in the queue;
@@ -791,7 +876,7 @@ impl WseClient {
         self.0.checkpoint()
     }
 
-    /// How many messages the offline queue keeps for the next connection.
+    /// How many messages wait in the outbox for the server's answer.
     pub fn kept(&self) -> u32 {
         self.0.kept()
     }

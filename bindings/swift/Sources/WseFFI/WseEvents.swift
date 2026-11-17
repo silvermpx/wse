@@ -31,11 +31,20 @@ public extension WseClient {
         commit(topic: topic, epoch: epoch, offset: offset, generation: message.generation)
     }
 
-    /// Sends `{"t": kind, "p": json}`, waiting for room in the queue.
-    /// Cancelling the Task gives up the wait; a message already queued still
-    /// goes.
+    /// Sends `{"t": kind, "p": json}`, waiting for room. It waits in the
+    /// outbox until the server answers for it (`.delivered` and
+    /// `.notDelivered` say what became of it) and goes again after a
+    /// reconnect. Cancelling the Task gives up the wait; a message already
+    /// queued still goes.
     func send(kind: String, json: String) async throws {
         try await cancellable { try await self.send(kind: kind, json: json, cancel: $0) }
+    }
+
+    /// `send` with `options`: its own id (the app's, say; a random UUID
+    /// without one), how long it may wait to be written first, the topics it
+    /// requires. Its id, which its outcome names.
+    func sendWith(kind: String, json: String, options: WseSendOptions = WseSendOptions()) async throws -> String {
+        try await cancellable { try await self.sendWith(kind: kind, json: json, options: options, cancel: $0) }
     }
 
     /// Sends once each of `topics` is continuous on the connection (see

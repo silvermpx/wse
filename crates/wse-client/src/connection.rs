@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
-use tokio_tungstenite::tungstenite::{self, Message as Frame};
+use tokio_tungstenite::tungstenite::{self, Message as Frame, Utf8Bytes};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use web_time::Instant;
 
@@ -122,7 +122,10 @@ impl<H: Handler> Driver<H> {
                             Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                             Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
                             Some(Control::Drain) => self.session.handler.drain(),
+                            Some(Control::Clear) => self.session.catch_up_clears(),
                         },
+                        // The outbox takes what is sent meanwhile.
+                        Some(frame) = self.frames.recv(), if self.session.keeps() => self.session.queue(frame),
                         // What is held for a gap is not held past its wait.
                         () = sleep_until(self.session.next_deadline()) => {
                             self.session.on_deadline(Instant::now());
@@ -156,7 +159,19 @@ impl<H: Handler> Driver<H> {
                 }
             }
         };
+        // What was sent before the close goes to the outbox: a file keeps it
+        // for the next client.
+        self.frames.close();
+        while let Ok(frame) = self.frames.try_recv() {
+            self.session.queue(frame);
+        }
         self.session.finish();
+        // The file is the next client's once this one says it closed.
+        self.session.outbox = None;
+        // A send that waits for a place in the outbox waits no longer.
+        if let Some(room) = &self.shared.room {
+            room.close();
+        }
         self.shared
             .ready
             .store(false, std::sync::atomic::Ordering::Release);
@@ -187,7 +202,10 @@ impl<H: Handler> Driver<H> {
                     Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                     Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
                     Some(Control::Drain) => self.session.handler.drain(),
+                    Some(Control::Clear) => self.session.catch_up_clears(),
                 },
+                // The outbox takes what is sent meanwhile.
+                Some(frame) = self.frames.recv(), if self.session.keeps() => self.session.queue(frame),
                 () = sleep_until(self.session.next_deadline()) => {
                     self.session.on_deadline(Instant::now());
                 }
@@ -199,18 +217,27 @@ impl<H: Handler> Driver<H> {
     /// is held for a gap waits too. False when it closed the client.
     async fn wait_paused(&mut self) -> bool {
         while !self.paused.is_empty() {
-            match self.control.recv().await {
-                None | Some(Control::Close) => return false,
-                Some(Control::Pause(reason)) => {
-                    self.paused.insert(reason);
+            tokio::select! {
+                control = self.control.recv() => match control {
+                    None | Some(Control::Close) => return false,
+                    Some(Control::Pause(reason)) => {
+                        self.paused.insert(reason);
+                    }
+                    Some(Control::Resume(reason)) => {
+                        self.paused.remove(&reason);
+                    }
+                    Some(Control::Reconnect) => {}
+                    Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
+                    Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
+                    Some(Control::Drain) => self.session.handler.drain(),
+                    Some(Control::Clear) => self.session.catch_up_clears(),
+                },
+                // The outbox takes what is sent meanwhile; what waited too
+                // long to be sent goes on time.
+                Some(frame) = self.frames.recv(), if self.session.keeps() => self.session.queue(frame),
+                () = sleep_until(self.session.outbox_deadline()) => {
+                    self.session.expire_outbox(Instant::now());
                 }
-                Some(Control::Resume(reason)) => {
-                    self.paused.remove(&reason);
-                }
-                Some(Control::Reconnect) => {}
-                Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
-                Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
-                Some(Control::Drain) => self.session.handler.drain(),
             }
         }
         true
@@ -225,9 +252,10 @@ impl<H: Handler> Driver<H> {
         let hello = session::client_hello(
             self.config.compression,
             sealing.as_ref().and_then(Sealing::hello),
+            self.session.outbox_hello(),
         );
         self.session.open(sealing);
-        self.session.outbox.push(Outgoing::Handshake(hello));
+        self.session.to_write.push(Outgoing::Handshake(hello));
         let ready_by = Instant::now() + self.config.ready_timeout;
         let beat = self.config.heartbeat;
         let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + beat, beat);
@@ -239,12 +267,12 @@ impl<H: Handler> Driver<H> {
         loop {
             if let Some(error) = self.session.fatal.take() {
                 // Nothing the failed frame asked for goes out.
-                self.session.outbox.clear();
+                self.session.to_write.clear();
                 self.close(&mut ws, CloseCode::Normal, "client error").await;
                 return Lost::Fatal(error);
             }
-            self.session.release_waiting();
-            if !self.session.outbox.is_empty() || flush {
+            self.session.before_write();
+            if !self.session.to_write.is_empty() || flush {
                 flush = false;
                 if let Err(lost) = self.write_in_time(&mut ws).await {
                     return lost;
@@ -301,7 +329,7 @@ impl<H: Handler> Driver<H> {
                             }
                         }
                         // What the frame asked for goes out first.
-                        if !self.session.outbox.is_empty()
+                        if !self.session.to_write.is_empty()
                             || self.session.fatal.is_some()
                             || self.session.became_ready
                         {
@@ -349,6 +377,7 @@ impl<H: Handler> Driver<H> {
                     Some(Control::Subscribe(topics)) => self.session.subscribe(topics),
                     Some(Control::Unsubscribe(topics)) => self.session.unsubscribe(topics),
                     Some(Control::Drain) => self.session.handler.drain(),
+                    Some(Control::Clear) => self.session.catch_up_clears(),
                 },
                 _ = heartbeat.tick() => {
                     // The machine slept: a new connection recovers what was
@@ -379,7 +408,7 @@ impl<H: Handler> Driver<H> {
                         // the server is alive: a sealed ping gets a sealed
                         // answer.
                         if self.session.ready {
-                            self.session.outbox.push(Outgoing::Text(session::ping()));
+                            self.session.to_write.push(Outgoing::Text(session::ping()));
                         }
                     } else {
                         let now = session::now_ms().to_be_bytes();
@@ -424,12 +453,19 @@ impl<H: Handler> Driver<H> {
     /// Sends are taken from the queue: the connection is ready, and the sends
     /// that wait for their topics leave room (they count against the queue).
     fn takes_frames(&self) -> bool {
-        self.session.ready && self.session.waiting() < self.config.send_queue
+        (self.session.ready || self.session.keeps())
+            && self.session.waiting() < self.config.send_queue
+    }
+
+    /// The connection's task with the outbox `outbox` (`Config::offline`).
+    pub(crate) fn with_outbox(mut self, outbox: Option<crate::outbox::Outbox>) -> Self {
+        self.session.outbox = outbox;
+        self
     }
 
     /// What the application sent before it closed goes out first.
     fn take_queued(&mut self) {
-        if self.session.ready {
+        if self.session.ready || self.session.keeps() {
             while let Ok(frame) = self.frames.try_recv() {
                 self.session.queue(frame);
             }
@@ -461,17 +497,23 @@ impl<H: Handler> Driver<H> {
             code: None,
             reason: e.to_string(),
         };
-        let mut went: Vec<Box<str>> = Vec::new();
-        for outgoing in self.session.outbox.drain(..) {
+        self.session.before_write();
+        let mut last_kept = None;
+        let mut to_write = std::mem::take(&mut self.session.to_write);
+        for outgoing in to_write.drain(..) {
             let (text, handshake, kept) = match outgoing {
-                Outgoing::Text(text) => (text, false, None),
-                Outgoing::Handshake(text) => (text, true, None),
-                Outgoing::Kept { id, text } => (text, false, Some(id)),
+                Outgoing::Text(text) => (Utf8Bytes::from(text), false, None),
+                Outgoing::Handshake(text) => (Utf8Bytes::from(text), true, None),
+                // The outbox's text, shared, not copied.
+                Outgoing::Kept { s, text } => match Utf8Bytes::try_from(text.into_bytes()) {
+                    Ok(text) => (text, false, Some(s)),
+                    Err(_) => continue,
+                },
             };
             let frame = match self.session.sealing.as_mut() {
                 Some(sealing) => match sealing.seal(&text) {
                     Ok(Some(sealed)) => Frame::Binary(sealed.into()),
-                    Ok(None) if handshake => Frame::Text(text.into()),
+                    Ok(None) if handshake => Frame::Text(text),
                     Ok(None) => {
                         tracing::error!("[WSE] a message before the end-to-end session not sent");
                         continue;
@@ -479,15 +521,19 @@ impl<H: Handler> Driver<H> {
                     Err(error @ Error::Encryption(_)) => return Err(Lost::Fatal(error)),
                     Err(error) => return Err(Lost::Failed(error)),
                 },
-                None => Frame::Text(text.into()),
+                None => Frame::Text(text),
             };
             ws.feed(frame).await.map_err(lost)?;
-            went.extend(kept);
+            if kept.is_some() {
+                last_kept = kept;
+            }
+        }
+        // The queue's room, kept for the next batch.
+        if self.session.to_write.is_empty() {
+            self.session.to_write = to_write;
         }
         ws.flush().await.map_err(lost)?;
-        if let Some(store) = &self.shared.store {
-            store.sent(&went);
-        }
+        self.session.wrote(last_kept);
         Ok(())
     }
 
@@ -502,6 +548,18 @@ impl<H: Handler> Driver<H> {
         // write it does not take is waited for.
         let _ = tokio::time::timeout(Duration::from_secs(1), async {
             let _ = self.write(ws).await;
+            // What the server owes the outbox: its answers come before the
+            // close, what they let go out goes, and the application hears
+            // what became of each.
+            while self.session.awaits_answers() {
+                match read(&mut self.session.handler, ws, true).await {
+                    Some(Ok(Frame::Close(_)) | Err(_)) | None => break,
+                    Some(Ok(frame)) => {
+                        self.on_frame(&frame);
+                    }
+                }
+                let _ = self.write(ws).await;
+            }
             ws.close(Some(frame)).await?;
             while ws.next().await.is_some() {}
             Ok::<_, tungstenite::Error>(())

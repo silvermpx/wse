@@ -2,24 +2,24 @@
 //! sends (`s`) per producer, one producer per outbox, and keeps each message
 //! until the server answers: `ack` (taken, up to and with a number) or
 //! `nack` (refused, and why). The server remembers, per user and producer,
-//! the highest message its application took: a repeat of one taken already
-//! is confirmed again and not handed on, and what it cannot tell (its state
-//! is gone) reaches the application marked as a possible repeat. A client
-//! that comes from another node names it, and that node is asked once.
+//! the highest message it decided and the refusals behind it its client may
+//! not have heard of: a repeat of one taken already is confirmed again and
+//! not handed on, a repeat of one refused is refused again, a client that
+//! comes back is told both, and what the server cannot tell (its state is
+//! gone) reaches the application marked as a possible repeat. A client that
+//! comes from another node names it, and that node is asked once.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
+use parking_lot::{Mutex, MutexGuard};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::state::{ConnectionHandle, SharedState};
 
-/// A producer's mark once another node took it over: what still reads for
-/// it here stops.
-const MOVED: u64 = 1 << 63;
-
-/// How long a producer's mark is kept after its last message: a client
+/// How long a producer's state is kept after its last message: a client
 /// that comes back later is told nothing is known of it.
 pub(crate) const KEPT_FOR_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -30,83 +30,190 @@ const ASK_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
 /// document.
 const MAX_ID_LEN: usize = 64;
 
-/// One producer's highest message taken on this node.
+/// Most runs of refusals a producer keeps until its client heard of them.
+/// A client hears of each refusal at once and says what it still waits for
+/// at each connection, so only a client that makes numbers up reaches it.
+pub(crate) const MAX_HOLES: usize = 1024;
+
+/// Why the server did not take a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// The application had no room for it.
+    Busy,
+    /// The rate limit dropped it before it was read.
+    RateLimited,
+    /// It never came, or came unreadable.
+    Missing,
+    /// It came before the application took the connection.
+    NotReady,
+}
+
+impl Refusal {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::RateLimited => "rate_limited",
+            Self::Missing => "missing",
+            Self::NotReady => "not_ready",
+        }
+    }
+
+    /// Its code in a cluster frame.
+    pub(crate) fn code(self) -> u8 {
+        match self {
+            Self::Busy => 1,
+            Self::RateLimited => 2,
+            Self::Missing => 3,
+            Self::NotReady => 4,
+        }
+    }
+
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Busy),
+            2 => Some(Self::RateLimited),
+            3 => Some(Self::Missing),
+            4 => Some(Self::NotReady),
+            _ => None,
+        }
+    }
+}
+
+/// Messages `from` to `to` of a producer, behind its mark, were refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Hole {
+    pub(crate) from: u64,
+    pub(crate) to: u64,
+    pub(crate) why: Refusal,
+}
+
+/// One producer on this node. Its lock is held while a message of it is
+/// decided, the application's handler included: a connection that comes
+/// back meanwhile is answered once the decision is in, never halfway.
 pub(crate) struct Slot {
-    mark: AtomicU64,
+    state: Mutex<SlotState>,
     /// Its last activity, in epoch milliseconds: the sweep drops it a day
     /// after.
     seen: AtomicU64,
 }
 
+/// What a producer's slot holds.
+pub(crate) struct SlotState {
+    /// The highest message decided: taken, or refused.
+    mark: u64,
+    /// Another node took the producer over: nothing more is taken here.
+    moved: bool,
+    /// The refusals behind the mark, in order, until the client heard of
+    /// them.
+    holes: VecDeque<Hole>,
+}
+
 /// Whether a message is handed on.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Claim {
-    /// The first time it came: handed on.
-    First,
+    /// The first time it came: handed on. Those it skipped are refused
+    /// (`gap`, first and last).
+    First { gap: Option<(u64, u64)> },
     /// Taken already: confirmed again, not handed on.
     Repeat,
+    /// Refused already: refused again.
+    Refused(Refusal),
     /// Another node took the producer over.
     Moved,
+}
+
+impl SlotState {
+    /// Claims message `s`: the first claim hands it on, any later one is
+    /// answered as the first was. What it skipped is refused for `skipped`.
+    pub(crate) fn claim(&mut self, s: u64, skipped: Refusal) -> Claim {
+        if self.moved {
+            return Claim::Moved;
+        }
+        if s <= self.mark {
+            return self.refusal_of(s).map_or(Claim::Repeat, Claim::Refused);
+        }
+        let gap = (s > self.mark + 1).then(|| (self.mark + 1, s - 1));
+        if let Some((from, to)) = gap {
+            self.refuse(from, to, skipped);
+        }
+        self.mark = s;
+        Claim::First { gap }
+    }
+
+    /// Messages `from` to `to`, behind the mark, were not taken.
+    pub(crate) fn refuse(&mut self, from: u64, to: u64, why: Refusal) {
+        if let Some(last) = self.holes.back_mut()
+            && last.why == why
+            && last.to + 1 == from
+        {
+            last.to = to;
+            return;
+        }
+        if self.holes.len() == MAX_HOLES {
+            self.holes.pop_front();
+        }
+        self.holes.push_back(Hole { from, to, why });
+    }
+
+    fn refusal_of(&self, s: u64) -> Option<Refusal> {
+        let at = self.holes.partition_point(|h| h.to < s);
+        self.holes.get(at).filter(|h| h.from <= s).map(|h| h.why)
+    }
+
+    /// The refusals from `from` on, for a client that still waits for
+    /// those: the ones before it it heard of, and they go.
+    fn told_from(&mut self, from: u64) -> Vec<Hole> {
+        let heard = self.holes.partition_point(|h| h.to < from);
+        self.holes.drain(..heard);
+        self.holes.iter().copied().collect()
+    }
+
+    /// What another node decided of the producer counts here too.
+    fn advance(&mut self, to: u64, holes: &[Hole]) {
+        if self.moved || to <= self.mark {
+            return;
+        }
+        let mark = self.mark;
+        for hole in holes.iter().filter(|h| h.from > mark && h.to <= to) {
+            self.refuse(hole.from, hole.to, hole.why);
+        }
+        self.mark = to;
+    }
+
+    /// The highest message decided here.
+    #[cfg(test)]
+    fn mark(&self) -> u64 {
+        self.mark
+    }
 }
 
 impl Slot {
     fn new(now: u64) -> Self {
         Self {
-            mark: AtomicU64::new(0),
+            state: Mutex::new(SlotState {
+                mark: 0,
+                moved: false,
+                holes: VecDeque::new(),
+            }),
             seen: AtomicU64::new(now),
         }
     }
 
-    /// Claims message `s`: its first claim hands it on, any later one is a
-    /// repeat. One compare-and-swap, no lock: two connections of the same
-    /// producer never hand on the same message.
-    pub(crate) fn claim(&self, s: u64) -> Claim {
-        let mut mark = self.mark.load(Ordering::Acquire);
-        loop {
-            if mark & MOVED != 0 {
-                return Claim::Moved;
-            }
-            if mark >= s {
-                return Claim::Repeat;
-            }
-            match self
-                .mark
-                .compare_exchange_weak(mark, s, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => return Claim::First,
-                Err(now) => mark = now,
-            }
-        }
+    /// The producer's state, while a message of it is decided.
+    pub(crate) fn lock(&self) -> MutexGuard<'_, SlotState> {
+        self.state.lock()
     }
 
-    /// The highest message taken here.
-    pub(crate) fn taken(&self) -> u64 {
-        self.mark.load(Ordering::Acquire) & !MOVED
-    }
-
-    /// Another node takes the producer over: what was taken here; from now
-    /// on nothing more is.
-    fn hand_over(&self) -> u64 {
-        self.mark.fetch_or(MOVED, Ordering::AcqRel) & !MOVED
+    /// Another node takes the producer over: what was decided here; from
+    /// now on nothing more is.
+    fn hand_over(&self) -> (u64, Vec<Hole>) {
+        let mut state = self.state.lock();
+        state.moved = true;
+        (state.mark, state.holes.iter().copied().collect())
     }
 
     fn moved(&self) -> bool {
-        self.mark.load(Ordering::Acquire) & MOVED != 0
-    }
-
-    /// What another node took counts as taken here too.
-    fn advance(&self, to: u64) {
-        let to = to & !MOVED;
-        let mut mark = self.mark.load(Ordering::Acquire);
-        while mark & MOVED == 0 && mark < to {
-            match self
-                .mark
-                .compare_exchange_weak(mark, to, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => return,
-                Err(now) => mark = now,
-            }
-        }
+        self.state.lock().moved
     }
 
     pub(crate) fn touch(&self, now: u64) {
@@ -148,51 +255,71 @@ impl Producers {
     }
 
     /// A peer asks for `user`'s `producer`, which went on there: what was
-    /// taken here, and nothing more is. None: nothing is known of it here.
-    pub(crate) fn hand_over(&self, user: Option<&str>, producer: &str) -> Option<u64> {
+    /// decided here, and nothing more is. None: nothing is known of it here.
+    pub(crate) fn hand_over(&self, user: Option<&str>, producer: &str) -> Option<(u64, Vec<Hole>)> {
         let key = (user.map(Box::from), Box::from(producer));
-        self.slots.get(&key).map(|slot| slot.hand_over())
+        let slot = self.slots.get(&key).map(|slot| Arc::clone(&slot))?;
+        Some(slot.hand_over())
     }
 
     /// The link of a connection whose hello is in: known here (the client
-    /// was here last), or not, and then unsure up to what it wrote.
-    fn link(&self, user: Option<&str>, hello: &Hello, here: bool, now: u64) -> Link {
+    /// was here last), or not, and then unsure up to what it wrote. With
+    /// it, the refusals the client may not have heard of.
+    fn link(&self, user: Option<&str>, hello: &Hello, here: bool, now: u64) -> (Link, Vec<Hole>) {
         let (slot, known) = self.attach(user, &hello.producer, now);
         if known && here {
-            let start = slot.taken();
-            Link {
+            let (start, told) = {
+                let mut state = slot.lock();
+                (state.mark, state.told_from(hello.from))
+            };
+            let link = Link {
                 slot,
                 start,
                 unsure_until: 0,
-            }
+            };
+            (link, told)
         } else {
-            Link {
+            let link = Link {
                 slot,
                 start: 0,
                 unsure_until: hello.written,
-            }
+            };
+            (link, Vec::new())
         }
     }
 
     /// The link of a client that came from another node, with what that
-    /// node took of it: None when it knew nothing or did not answer.
-    fn taken_over(&self, user: Option<&str>, hello: &Hello, taken: Option<u64>, now: u64) -> Link {
+    /// node decided of it: None when it knew nothing or did not answer.
+    fn taken_over(
+        &self,
+        user: Option<&str>,
+        hello: &Hello,
+        decided: Option<(u64, Vec<Hole>)>,
+        now: u64,
+    ) -> (Link, Vec<Hole>) {
         let (slot, _) = self.attach(user, &hello.producer, now);
-        match taken {
-            Some(taken) => {
-                slot.advance(taken);
-                let start = slot.taken();
-                Link {
+        match decided {
+            Some((mark, holes)) => {
+                let (start, told) = {
+                    let mut state = slot.lock();
+                    state.advance(mark, &holes);
+                    (state.mark, state.told_from(hello.from))
+                };
+                let link = Link {
                     slot,
                     start,
                     unsure_until: 0,
-                }
+                };
+                (link, told)
             }
-            None => Link {
-                slot,
-                start: 0,
-                unsure_until: hello.written,
-            },
+            None => {
+                let link = Link {
+                    slot,
+                    start: 0,
+                    unsure_until: hello.written,
+                };
+                (link, Vec::new())
+            }
         }
     }
 
@@ -212,6 +339,9 @@ pub(crate) struct Hello {
     /// The highest message it wrote on an earlier connection: one the
     /// server cannot tell about is up to it.
     pub(crate) written: u64,
+    /// The first message it still waits to hear of: refusals before it it
+    /// heard of. 0: it does not say.
+    pub(crate) from: u64,
 }
 
 impl Hello {
@@ -221,6 +351,12 @@ impl Hello {
         if producer.is_empty() || producer.len() > MAX_ID_LEN {
             return None;
         }
+        let number = |name: &str| {
+            outbox
+                .get(name)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
         Some(Self {
             producer: producer.into(),
             node: outbox
@@ -228,10 +364,8 @@ impl Hello {
                 .and_then(serde_json::Value::as_str)
                 .filter(|n| !n.is_empty() && n.len() <= MAX_ID_LEN)
                 .map(Box::from),
-            written: outbox
-                .get("written")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0),
+            written: number("written"),
+            from: number("from"),
         })
     }
 }
@@ -239,7 +373,7 @@ impl Hello {
 /// A connection's producer, once known.
 pub(crate) struct Link {
     pub(crate) slot: Arc<Slot>,
-    /// What the client was told was taken: where its messages on this
+    /// What the client was told was decided: where its messages on this
     /// connection go on from.
     pub(crate) start: u64,
     /// Up to this message the server cannot tell whether one was taken (on
@@ -283,8 +417,9 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 /// Starts the connection's producer once its hello and its admission are
-/// both in, and tells the client what was taken of it. A client that comes
-/// from another node this one links to: that node is asked first, once.
+/// both in, and tells the client what was decided of it. A client that
+/// comes from another node this one links to: that node is asked first,
+/// once.
 pub(crate) fn start(state: &Arc<SharedState>, handle: &ConnectionHandle, user: Option<&str>) {
     let Some(hello) = handle.out.acks.begin() else {
         return;
@@ -303,51 +438,81 @@ pub(crate) fn start(state: &Arc<SharedState>, handle: &ConnectionHandle, user: O
             let Some(hello) = handle.out.acks.hello.get() else {
                 return;
             };
-            let taken = state
+            let decided = state
                 .producer_links
                 .ask(&last, user.as_deref(), &hello.producer, ASK_WITHIN)
                 .await;
-            let link = state
-                .producers
-                .taken_over(user.as_deref(), hello, taken, now_ms());
-            finish(&state, &handle, link);
+            let (link, told) =
+                state
+                    .producers
+                    .taken_over(user.as_deref(), hello, decided, now_ms());
+            finish(&state, &handle, link, &told);
         });
         return;
     }
-    let link = state.producers.link(user, hello, last.is_none(), now_ms());
-    finish(state, handle, link);
+    let (link, told) = state.producers.link(user, hello, last.is_none(), now_ms());
+    finish(state, handle, link, &told);
 }
 
-/// The connection's producer is known: the client hears what was taken.
-fn finish(state: &SharedState, handle: &ConnectionHandle, link: Link) {
-    let reply = outbox_reply(link.start, &state.node_id);
+/// The connection's producer is known: the client hears what was decided.
+fn finish(state: &SharedState, handle: &ConnectionHandle, link: Link, told: &[Hole]) {
+    let reply = outbox_reply(link.start, &state.node_id, told);
     let _ = handle.out.acks.link.set(link);
     handle.send_control(Message::Text(reply.into()));
 }
 
-/// The server's answer to a client's outbox hello: what was taken of it,
-/// and the name this node goes by.
-fn outbox_reply(acked: u64, node: &str) -> String {
-    serde_json::json!({"c": "WSE", "t": "outbox", "p": {"acked": acked, "node": node}, "v": 1})
-        .to_string()
+/// The server's answer to a client's outbox hello: what was decided of it,
+/// the refusals among that it may not have heard of, and the name this node
+/// goes by.
+fn outbox_reply(acked: u64, node: &str, refused: &[Hole]) -> String {
+    let mut p = serde_json::json!({"acked": acked, "node": node});
+    if !refused.is_empty() {
+        p["refused"] = refused
+            .iter()
+            .map(|hole| {
+                let mut refusal = serde_json::json!({"s": hole.to, "code": hole.why.as_str()});
+                if hole.from != hole.to {
+                    refusal["from"] = hole.from.into();
+                }
+                refusal
+            })
+            .collect();
+    }
+    serde_json::json!({"c": "WSE", "t": "outbox", "p": p, "v": 1}).to_string()
 }
 
 /// A message's number in its producer's outbox, when it has one.
 pub(crate) fn seq_of(val: &serde_json::Value) -> Option<u64> {
     val.get("s")
         .and_then(serde_json::Value::as_u64)
-        .filter(|s| *s > 0 && *s & MOVED == 0)
+        .filter(|s| *s > 0 && *s < u64::MAX)
+}
+
+/// The number of an outbox message, read from its first bytes without
+/// parsing it: a client puts the number first (`{"s":N,`). For a frame the
+/// rate limit drops, which is not parsed.
+pub(crate) fn number_in(frame: &[u8]) -> Option<u64> {
+    let frame = frame
+        .strip_prefix(b"WSE")
+        .or_else(|| frame.strip_prefix(b"S"))
+        .or_else(|| frame.strip_prefix(b"U"))
+        .unwrap_or(frame);
+    let digits = frame.strip_prefix(b"{\"s\":")?;
+    let end = digits.iter().position(|b| !b.is_ascii_digit())?;
+    if end == 0 || end > 19 || !matches!(digits[end], b',' | b'}') {
+        return None;
+    }
+    let s: u64 = std::str::from_utf8(&digits[..end]).ok()?.parse().ok()?;
+    (s > 0).then_some(s)
 }
 
 /// What a connection has to answer since its last answer went.
 #[derive(Default)]
 pub(crate) struct Pending {
-    /// The last message read on this connection; 0 before the first.
-    last: u64,
     /// The highest message taken since the last answer; 0: none.
     ack: u64,
     /// Messages refused since the last answer: first, last, why.
-    nacks: Vec<(u64, u64, &'static str)>,
+    nacks: Vec<(u64, u64, Refusal)>,
     /// Frames the rate limit dropped since the last message.
     dropped: bool,
 }
@@ -363,19 +528,14 @@ impl Pending {
         self.dropped = true;
     }
 
-    /// Message `s` came; what came before it on this connection and was not
-    /// read (dropped by the rate limit, or never sent) is refused.
-    pub(crate) fn came(&mut self, s: u64, start: u64) {
-        let last = if self.last == 0 { start } else { self.last };
-        if s > last + 1 {
-            let why = if std::mem::take(&mut self.dropped) {
-                "rate_limited"
-            } else {
-                "missing"
-            };
-            self.refuse_range(last + 1, s - 1, why);
+    /// Why the messages a numbered one skipped did not come: the rate limit
+    /// dropped frames since the last, or they never came.
+    pub(crate) fn skipped(&mut self) -> Refusal {
+        if std::mem::take(&mut self.dropped) {
+            Refusal::RateLimited
+        } else {
+            Refusal::Missing
         }
-        self.last = self.last.max(s);
     }
 
     /// Message `s` was taken (or was already).
@@ -383,12 +543,8 @@ impl Pending {
         self.ack = self.ack.max(s);
     }
 
-    /// Message `s` is refused for `why`.
-    pub(crate) fn refuse(&mut self, s: u64, why: &'static str) {
-        self.refuse_range(s, s, why);
-    }
-
-    fn refuse_range(&mut self, from: u64, to: u64, why: &'static str) {
+    /// Messages `from` to `to` are refused for `why`.
+    pub(crate) fn refuse(&mut self, from: u64, to: u64, why: Refusal) {
         if let Some(last) = self.nacks.last_mut()
             && last.2 == why
             && last.1 + 1 == from
@@ -405,7 +561,7 @@ impl Pending {
         let ack = std::mem::take(&mut self.ack);
         self.nacks
             .drain(..)
-            .map(|(from, to, why)| nack(from, to, why))
+            .map(|(from, to, why)| nack(from, to, why.as_str()))
             .chain((ack > 0).then(|| format!(r#"{{"c":"WSE","t":"ack","p":{{"s":{ack}}},"v":1}}"#)))
     }
 }
@@ -422,16 +578,72 @@ fn nack(from: u64, to: u64, why: &str) -> String {
 mod tests {
     use super::*;
 
+    fn claim(slot: &Slot, s: u64) -> Claim {
+        slot.lock().claim(s, Refusal::Missing)
+    }
+
     #[test]
     fn a_message_is_handed_on_once() {
         let slot = Slot::new(0);
-        assert_eq!(slot.claim(1), Claim::First);
-        assert_eq!(slot.claim(1), Claim::Repeat);
-        assert_eq!(slot.claim(3), Claim::First);
-        assert_eq!(slot.claim(2), Claim::Repeat, "behind the mark");
-        assert_eq!(slot.hand_over(), 3);
-        assert_eq!(slot.claim(4), Claim::Moved);
-        assert_eq!(slot.taken(), 3);
+        assert_eq!(claim(&slot, 1), Claim::First { gap: None });
+        assert_eq!(claim(&slot, 1), Claim::Repeat);
+        assert_eq!(claim(&slot, 3), Claim::First { gap: Some((2, 2)) });
+        assert_eq!(
+            claim(&slot, 2),
+            Claim::Refused(Refusal::Missing),
+            "skipped: refused again"
+        );
+        assert_eq!(
+            slot.hand_over(),
+            (
+                3,
+                vec![Hole {
+                    from: 2,
+                    to: 2,
+                    why: Refusal::Missing
+                }]
+            )
+        );
+        assert_eq!(claim(&slot, 4), Claim::Moved);
+        assert_eq!(slot.lock().mark(), 3);
+    }
+
+    #[test]
+    fn a_refused_message_stays_refused_until_the_client_heard() {
+        let slot = Slot::new(0);
+        let mut state = slot.lock();
+        assert_eq!(state.claim(1, Refusal::Missing), Claim::First { gap: None });
+        state.refuse(1, 1, Refusal::Busy);
+        assert_eq!(state.claim(2, Refusal::Missing), Claim::First { gap: None });
+        state.refuse(2, 2, Refusal::Busy);
+        assert_eq!(state.claim(3, Refusal::Missing), Claim::First { gap: None });
+        assert_eq!(
+            state.claim(1, Refusal::Missing),
+            Claim::Refused(Refusal::Busy)
+        );
+        assert_eq!(state.claim(3, Refusal::Missing), Claim::Repeat);
+        assert_eq!(
+            state.told_from(0),
+            [Hole {
+                from: 1,
+                to: 2,
+                why: Refusal::Busy
+            }],
+            "one run"
+        );
+        // The client waits for nothing before 3: it heard of them.
+        assert!(state.told_from(3).is_empty());
+        assert_eq!(state.claim(1, Refusal::Missing), Claim::Repeat);
+    }
+
+    #[test]
+    fn a_client_that_makes_numbers_up_is_kept_within_bounds() {
+        let slot = Slot::new(0);
+        let mut state = slot.lock();
+        for n in 0..(MAX_HOLES as u64 + 10) {
+            state.claim(2 * n + 2, Refusal::Missing);
+        }
+        assert_eq!(state.holes.len(), MAX_HOLES);
     }
 
     #[test]
@@ -439,19 +651,28 @@ mod tests {
         let producers = Producers::default();
         let (ann, known) = producers.attach(Some("ann"), "p1", 0);
         assert!(!known);
-        ann.claim(5);
+        claim(&ann, 5);
         let (again, known) = producers.attach(Some("ann"), "p1", 0);
         assert!(known);
-        assert_eq!(again.taken(), 5);
+        assert_eq!(again.lock().mark(), 5);
         let (bob, known) = producers.attach(Some("bob"), "p1", 0);
         assert!(!known, "another user's producer of the same name");
-        assert_eq!(bob.taken(), 0);
+        assert_eq!(bob.lock().mark(), 0);
         // Handed over to another node: what comes back here starts over.
-        assert_eq!(producers.hand_over(Some("ann"), "p1"), Some(5));
+        let handed = producers.hand_over(Some("ann"), "p1").unwrap();
+        assert_eq!(handed.0, 5);
+        assert_eq!(
+            handed.1,
+            [Hole {
+                from: 1,
+                to: 4,
+                why: Refusal::Missing
+            }]
+        );
         assert_eq!(producers.hand_over(Some("cy"), "p1"), None);
         let (back, known) = producers.attach(Some("ann"), "p1", 0);
         assert!(!known);
-        assert_eq!(back.taken(), 0);
+        assert_eq!(back.lock().mark(), 0);
     }
 
     #[test]
@@ -466,13 +687,14 @@ mod tests {
 
     #[test]
     fn the_hello_names_the_producer_and_what_was_written() {
-        let p = serde_json::json!({"outbox": {"producer": "abc", "node": "n1", "written": 7}});
+        let p = serde_json::json!({"outbox": {"producer": "abc", "node": "n1", "written": 7, "from": 5}});
         assert_eq!(
             Hello::parse(Some(&p)),
             Some(Hello {
                 producer: "abc".into(),
                 node: Some("n1".into()),
-                written: 7
+                written: 7,
+                from: 5,
             })
         );
         let long = "x".repeat(MAX_ID_LEN + 1);
@@ -486,31 +708,65 @@ mod tests {
             producer: "p".into(),
             node: Some(node.into()),
             written,
+            from: 0,
         }
     }
 
     #[test]
     fn a_client_from_another_node_is_unsure_up_to_what_it_wrote() {
         let producers = Producers::default();
-        let link = producers.link(Some("ann"), &hello("other", 4), false, 0);
+        let (link, _) = producers.link(Some("ann"), &hello("other", 4), false, 0);
         assert_eq!((link.start, link.unsure_until), (0, 4));
 
-        // Back on this node, which took messages of it: they are known.
-        link.slot.claim(9);
-        let link = producers.link(Some("ann"), &hello("here", 11), true, 0);
+        // Back on this node, which decided messages of it: they are known,
+        // and so is what it refused.
+        {
+            let mut state = link.slot.lock();
+            state.claim(9, Refusal::Missing);
+            state.refuse(9, 9, Refusal::Busy);
+        }
+        let (link, told) = producers.link(Some("ann"), &hello("here", 11), true, 0);
         assert_eq!((link.start, link.unsure_until), (9, 0));
+        assert_eq!(
+            told,
+            [
+                Hole {
+                    from: 1,
+                    to: 8,
+                    why: Refusal::Missing
+                },
+                Hole {
+                    from: 9,
+                    to: 9,
+                    why: Refusal::Busy
+                },
+            ]
+        );
     }
 
     #[test]
-    fn what_the_last_node_took_counts_here() {
+    fn what_the_last_node_decided_counts_here() {
         let producers = Producers::default();
-        let link = producers.taken_over(Some("ann"), &hello("other", 12), Some(10), 0);
+        let holes = vec![Hole {
+            from: 7,
+            to: 7,
+            why: Refusal::Busy,
+        }];
+        let (link, told) = producers.taken_over(
+            Some("ann"),
+            &hello("other", 12),
+            Some((10, holes.clone())),
+            0,
+        );
         assert_eq!((link.start, link.unsure_until), (10, 0));
-        assert_eq!(link.slot.claim(10), Claim::Repeat);
-        assert_eq!(link.slot.claim(11), Claim::First);
+        assert_eq!(told, holes);
+        assert_eq!(claim(&link.slot, 10), Claim::Repeat);
+        assert_eq!(claim(&link.slot, 7), Claim::Refused(Refusal::Busy));
+        assert_eq!(claim(&link.slot, 11), Claim::First { gap: None });
         // The last node did not answer: unsure up to what was written.
-        let link = producers.taken_over(Some("bob"), &hello("other", 12), None, 0);
+        let (link, told) = producers.taken_over(Some("bob"), &hello("other", 12), None, 0);
         assert_eq!((link.start, link.unsure_until), (0, 12));
+        assert!(told.is_empty());
     }
 
     #[test]
@@ -523,15 +779,56 @@ mod tests {
     }
 
     #[test]
+    fn the_answer_tells_the_refusals_the_client_may_not_have_heard_of() {
+        let reply: serde_json::Value = serde_json::from_str(&outbox_reply(5, "n", &[])).unwrap();
+        assert_eq!(
+            reply,
+            serde_json::json!({"c": "WSE", "t": "outbox", "p": {"acked": 5, "node": "n"}, "v": 1})
+        );
+        let refused = [
+            Hole {
+                from: 2,
+                to: 3,
+                why: Refusal::RateLimited,
+            },
+            Hole {
+                from: 5,
+                to: 5,
+                why: Refusal::Busy,
+            },
+        ];
+        let reply: serde_json::Value =
+            serde_json::from_str(&outbox_reply(5, "n", &refused)).unwrap();
+        assert_eq!(
+            reply["p"]["refused"],
+            serde_json::json!([
+                {"from": 2, "s": 3, "code": "rate_limited"},
+                {"s": 5, "code": "busy"},
+            ])
+        );
+    }
+
+    #[test]
+    fn the_number_is_read_from_the_first_bytes() {
+        assert_eq!(number_in(br#"{"s":17,"t":"m"}"#), Some(17));
+        assert_eq!(number_in(br#"{"s":3}"#), Some(3));
+        assert_eq!(number_in(br#"WSE{"s":4,"t":"m"}"#), Some(4));
+        assert_eq!(number_in(br#"{"t":"m","s":17}"#), None, "not first");
+        assert_eq!(number_in(br#"{"s":0,"t":"m"}"#), None);
+        assert_eq!(number_in(br#"{"s":17"#), None, "cut short");
+        assert_eq!(number_in(br#"{"s":99999999999999999999,"t":"m"}"#), None);
+        assert_eq!(number_in(b""), None);
+    }
+
+    #[test]
     fn answers_put_refusals_before_the_ack() {
         let mut pending = Pending::default();
-        pending.came(1, 0);
         pending.taken(1);
         pending.dropped();
-        pending.came(4, 0);
+        let why = pending.skipped();
+        pending.refuse(2, 3, why);
         pending.taken(4);
-        pending.came(5, 0);
-        pending.refuse(5, "busy");
+        pending.refuse(5, 5, Refusal::Busy);
         let answers: Vec<String> = pending.answers().collect();
         assert_eq!(
             answers,
@@ -542,5 +839,6 @@ mod tests {
             ]
         );
         assert!(!pending.due());
+        assert_eq!(pending.skipped(), Refusal::Missing);
     }
 }

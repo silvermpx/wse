@@ -757,6 +757,12 @@ public protocol WseClientProtocol: AnyObject, Sendable {
     func checkpoint()  -> String
 
     /**
+     * The user signs out: every message in the outbox, and every one sent before this
+     * call, goes (`NotDelivered`, `cleared`), and the user is forgotten.
+     */
+    func clear() throws
+
+    /**
      * The consumer applied the message at `epoch`, `offset` of `topic`,
      * handed out in `generation`: one of an earlier user counts for
      * nobody. `commit(message)` passes all four.
@@ -771,7 +777,7 @@ public protocol WseClientProtocol: AnyObject, Sendable {
     func disconnect(deadlineMs: UInt64) async
 
     /**
-     * How many messages the offline queue keeps for the next connection.
+     * How many messages wait in the outbox for the server's answer.
      */
     func kept()  -> UInt32
 
@@ -830,6 +836,12 @@ public protocol WseClientProtocol: AnyObject, Sendable {
      */
     func sendSigned(kind: String, json: String, nonce: String?, cancel: WseCancel) async throws  -> String
 
+    /**
+     * `try_send_with`, waiting for room; `cancel` gives up the wait (a message already
+     * queued still goes).
+     */
+    func sendWith(kind: String, json: String, options: WseSendOptions, cancel: WseCancel) async throws  -> String
+
     func status()  -> WseStatus
 
     func subscribe(topics: [String]) throws
@@ -841,7 +853,8 @@ public protocol WseClientProtocol: AnyObject, Sendable {
     func topicStates()  -> [WseTopicState]
 
     /**
-     * Sends `{"t": kind, "p": json}`; fails at once when the queue is full.
+     * Sends `{"t": kind, "p": json}`; fails at once when the outbox or the queue is
+     * full.
      */
     func trySend(kind: String, json: String) throws
 
@@ -860,6 +873,13 @@ public protocol WseClientProtocol: AnyObject, Sendable {
      * is full.
      */
     func trySendRequiring(kind: String, json: String, topics: [String]) throws
+
+    /**
+     * Sends `{"t": kind, "p": json}` with `options`: its own id, how long it may wait,
+     * the topics it requires. Its id, which its outcome names. Fails at once when the
+     * outbox or the queue is full.
+     */
+    func trySendWith(kind: String, json: String, options: WseSendOptions) throws  -> String
 
     func unsubscribe(topics: [String]) throws
 
@@ -933,6 +953,18 @@ open func checkpoint() -> String  {
 }
 
     /**
+     * The user signs out: every message in the outbox, and every one sent before this
+     * call, goes (`NotDelivered`, `cleared`), and the user is forgotten.
+     */
+open func clear()throws   {try rustCallWithError(FfiConverterTypeWseError_lift) {
+        uniffiCallStatus in
+    uniffi_wse_ffi_fn_method_wseclient_clear(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+
+    /**
      * The consumer applied the message at `epoch`, `offset` of `topic`,
      * handed out in `generation`: one of an earlier user counts for
      * nobody. `commit(message)` passes all four.
@@ -979,7 +1011,7 @@ open func disconnect(deadlineMs: UInt64)async   {
 }
 
     /**
-     * How many messages the offline queue keeps for the next connection.
+     * How many messages wait in the outbox for the server's answer.
      */
 open func kept() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
@@ -1149,6 +1181,26 @@ open func sendSigned(kind: String, json: String, nonce: String?, cancel: WseCanc
         )
 }
 
+    /**
+     * `try_send_with`, waiting for room; `cancel` gives up the wait (a message already
+     * queued still goes).
+     */
+open func sendWith(kind: String, json: String, options: WseSendOptions, cancel: WseCancel)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_wse_ffi_fn_method_wseclient_send_with(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(kind),FfiConverterString.lower(json),FfiConverterTypeWseSendOptions_lower(options),FfiConverterTypeWseCancel_lower(cancel)
+                )
+            },
+            pollFunc: ffi_wse_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_wse_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_wse_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeWseError_lift
+        )
+}
+
 open func status() -> WseStatus  {
     return try!  FfiConverterTypeWseStatus_lift(try! rustCall() {
         uniffiCallStatus in
@@ -1181,7 +1233,8 @@ open func topicStates() -> [WseTopicState]  {
 }
 
     /**
-     * Sends `{"t": kind, "p": json}`; fails at once when the queue is full.
+     * Sends `{"t": kind, "p": json}`; fails at once when the outbox or the queue is
+     * full.
      */
 open func trySend(kind: String, json: String)throws   {try rustCallWithError(FfiConverterTypeWseError_lift) {
         uniffiCallStatus in
@@ -1224,6 +1277,23 @@ open func trySendRequiring(kind: String, json: String, topics: [String])throws  
         FfiConverterSequenceString.lower(topics),uniffiCallStatus
     )
 }
+}
+
+    /**
+     * Sends `{"t": kind, "p": json}` with `options`: its own id, how long it may wait,
+     * the topics it requires. Its id, which its outcome names. Fails at once when the
+     * outbox or the queue is full.
+     */
+open func trySendWith(kind: String, json: String, options: WseSendOptions)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeWseError_lift) {
+        uniffiCallStatus in
+    uniffi_wse_ffi_fn_method_wseclient_try_send_with(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(kind),
+        FfiConverterString.lower(json),
+        FfiConverterTypeWseSendOptions_lower(options),uniffiCallStatus
+    )
+})
 }
 
 open func unsubscribe(topics: [String])throws   {try rustCallWithError(FfiConverterTypeWseError_lift) {
@@ -1625,8 +1695,8 @@ public struct WseConfig: Equatable, Hashable {
      */
     public let delivery: WseDelivery?
     /**
-     * Messages sent with no connection wait for the next one of the same user; none: such a
-     * send fails.
+     * The outbox, where every message waits until the server answers for it; none: in
+     * memory, with its defaults.
      */
     public let offline: WseOffline?
 
@@ -1653,8 +1723,8 @@ public struct WseConfig: Equatable, Hashable {
          * recover-or-resync; none: best effort.
          */delivery: WseDelivery? = nil,
         /**
-         * Messages sent with no connection wait for the next one of the same user; none: such a
-         * send fails.
+         * The outbox, where every message waits until the server answers for it; none: in
+         * memory, with its defaults.
          */offline: WseOffline? = nil) {
         self.url = url
         self.token = token
@@ -2013,21 +2083,33 @@ public func FfiConverterTypeWseMessage_lower(_ value: WseMessage) -> RustBuffer 
 
 
 /**
- * Messages sent with no connection, kept for the next one of the same user. They go right
- * after the topics are subscribed again; a live or signed message is never kept.
+ * The outbox: every message sent, except a live or signed one, waits in it until the
+ * server answers for it, goes again after a reconnect, and reaches the server's
+ * application once; `Delivered` and `NotDelivered` say what became of each.
  */
 public struct WseOffline: Equatable, Hashable {
     /**
-     * The file they are kept in, so that they outlive the app (in its own storage); the
+     * No outbox: a message goes on the connection that is ready, or the send fails as
+     * not connected, as before 3.2.
+     */
+    public let disabled: Bool
+    /**
+     * The file they wait in, so that they outlive the app (in its own storage); the
      * client's alone while it runs. None keeps them in memory.
      */
     public let path: String?
     /**
-     * How many are kept at most (0: 1,000); past it a send fails as `Full`.
+     * How many wait at most, those not answered yet included (0: 100,000); past it
+     * `send` waits for room and `try_send` fails as `Full`.
      */
     public let maxMessages: UInt32
     /**
-     * How long one is kept, in milliseconds (0: an hour); an older one is dropped.
+     * How many bytes of messages wait at most (0: 16 MiB), as `max_messages`.
+     */
+    public let maxBytes: UInt64
+    /**
+     * How long one waits to be written first, in milliseconds (0: an hour); one not
+     * written by then is dropped (`NotDelivered`, `expired`).
      */
     public let maxAgeMs: UInt64
 
@@ -2035,17 +2117,28 @@ public struct WseOffline: Equatable, Hashable {
     // declare one manually.
     public init(
         /**
-         * The file they are kept in, so that they outlive the app (in its own storage); the
+         * No outbox: a message goes on the connection that is ready, or the send fails as
+         * not connected, as before 3.2.
+         */disabled: Bool = false,
+        /**
+         * The file they wait in, so that they outlive the app (in its own storage); the
          * client's alone while it runs. None keeps them in memory.
          */path: String? = nil,
         /**
-         * How many are kept at most (0: 1,000); past it a send fails as `Full`.
+         * How many wait at most, those not answered yet included (0: 100,000); past it
+         * `send` waits for room and `try_send` fails as `Full`.
          */maxMessages: UInt32 = UInt32(0),
         /**
-         * How long one is kept, in milliseconds (0: an hour); an older one is dropped.
+         * How many bytes of messages wait at most (0: 16 MiB), as `max_messages`.
+         */maxBytes: UInt64 = UInt64(0),
+        /**
+         * How long one waits to be written first, in milliseconds (0: an hour); one not
+         * written by then is dropped (`NotDelivered`, `expired`).
          */maxAgeMs: UInt64 = UInt64(0)) {
+        self.disabled = disabled
         self.path = path
         self.maxMessages = maxMessages
+        self.maxBytes = maxBytes
         self.maxAgeMs = maxAgeMs
     }
 
@@ -2065,15 +2158,19 @@ public struct FfiConverterTypeWseOffline: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseOffline {
         return
             try WseOffline(
+                disabled: FfiConverterBool.read(from: &buf),
                 path: FfiConverterOptionString.read(from: &buf),
                 maxMessages: FfiConverterUInt32.read(from: &buf),
+                maxBytes: FfiConverterUInt64.read(from: &buf),
                 maxAgeMs: FfiConverterUInt64.read(from: &buf)
         )
     }
 
     public static func write(_ value: WseOffline, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.disabled, into: &buf)
         FfiConverterOptionString.write(value.path, into: &buf)
         FfiConverterUInt32.write(value.maxMessages, into: &buf)
+        FfiConverterUInt64.write(value.maxBytes, into: &buf)
         FfiConverterUInt64.write(value.maxAgeMs, into: &buf)
     }
 }
@@ -2091,6 +2188,89 @@ public func FfiConverterTypeWseOffline_lift(_ buf: RustBuffer) throws -> WseOffl
 #endif
 public func FfiConverterTypeWseOffline_lower(_ value: WseOffline) -> RustBuffer {
     return FfiConverterTypeWseOffline.lower(value)
+}
+
+
+/**
+ * How a message goes (`send_with`).
+ */
+public struct WseSendOptions: Equatable, Hashable {
+    /**
+     * Its id: the app's own (one it keeps itself, say), or a random UUID; its outcome
+     * names it.
+     */
+    public let id: String?
+    /**
+     * How long it may wait to be written first, in milliseconds (0: the outbox's
+     * `max_age_ms`).
+     */
+    public let ttlMs: UInt64
+    /**
+     * Topics that must each be continuous when it goes.
+     */
+    public let requires: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Its id: the app's own (one it keeps itself, say), or a random UUID; its outcome
+         * names it.
+         */id: String? = nil,
+        /**
+         * How long it may wait to be written first, in milliseconds (0: the outbox's
+         * `max_age_ms`).
+         */ttlMs: UInt64 = UInt64(0),
+        /**
+         * Topics that must each be continuous when it goes.
+         */requires: [String] = []) {
+        self.id = id
+        self.ttlMs = ttlMs
+        self.requires = requires
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WseSendOptions: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWseSendOptions: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WseSendOptions {
+        return
+            try WseSendOptions(
+                id: FfiConverterOptionString.read(from: &buf),
+                ttlMs: FfiConverterUInt64.read(from: &buf),
+                requires: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: WseSendOptions, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.id, into: &buf)
+        FfiConverterUInt64.write(value.ttlMs, into: &buf)
+        FfiConverterSequenceString.write(value.requires, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWseSendOptions_lift(_ buf: RustBuffer) throws -> WseSendOptions {
+    return try FfiConverterTypeWseSendOptions.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWseSendOptions_lower(_ value: WseSendOptions) -> RustBuffer {
+    return FfiConverterTypeWseSendOptions.lower(value)
 }
 
 
@@ -2757,7 +2937,19 @@ public enum WseItem: Equatable, Hashable {
     case checkpointRejected(reason: String
     )
     /**
-     * The offline queue's file could not be written (`operation`): what is kept stays in
+     * The server took these messages of the outbox (their ids).
+     */
+    case delivered(ids: [String]
+    )
+    /**
+     * These messages of the outbox will not be delivered, and why: the server's refusal
+     * (`busy`, `rate_limited`, `missing`, `not_ready`), `expired`, `user_changed`,
+     * `cleared` or `closed`.
+     */
+    case notDelivered(reason: String, ids: [String]
+    )
+    /**
+     * The outbox's file could not be opened or written (`operation`): what is kept stays in
      * memory, and may not outlive the app.
      */
     case storageFailed(operation: String, message: String
@@ -2824,10 +3016,16 @@ public struct FfiConverterTypeWseItem: FfiConverterRustBuffer {
         case 12: return .checkpointRejected(reason: try FfiConverterString.read(from: &buf)
         )
 
-        case 13: return .storageFailed(operation: try FfiConverterString.read(from: &buf), message: try FfiConverterString.read(from: &buf)
+        case 13: return .delivered(ids: try FfiConverterSequenceString.read(from: &buf)
         )
 
-        case 14: return .unknown(name: try FfiConverterString.read(from: &buf)
+        case 14: return .notDelivered(reason: try FfiConverterString.read(from: &buf), ids: try FfiConverterSequenceString.read(from: &buf)
+        )
+
+        case 15: return .storageFailed(operation: try FfiConverterString.read(from: &buf), message: try FfiConverterString.read(from: &buf)
+        )
+
+        case 16: return .unknown(name: try FfiConverterString.read(from: &buf)
         )
 
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -2917,14 +3115,25 @@ public struct FfiConverterTypeWseItem: FfiConverterRustBuffer {
             FfiConverterString.write(reason, into: &buf)
 
 
-        case let .storageFailed(operation,message):
+        case let .delivered(ids):
             writeInt(&buf, Int32(13))
+            FfiConverterSequenceString.write(ids, into: &buf)
+
+
+        case let .notDelivered(reason,ids):
+            writeInt(&buf, Int32(14))
+            FfiConverterString.write(reason, into: &buf)
+            FfiConverterSequenceString.write(ids, into: &buf)
+
+
+        case let .storageFailed(operation,message):
+            writeInt(&buf, Int32(15))
             FfiConverterString.write(operation, into: &buf)
             FfiConverterString.write(message, into: &buf)
 
 
         case let .unknown(name):
-            writeInt(&buf, Int32(14))
+            writeInt(&buf, Int32(16))
             FfiConverterString.write(name, into: &buf)
 
         }
@@ -3906,6 +4115,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wse_ffi_checksum_method_wseclient_checkpoint() != 3771) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_wse_ffi_checksum_method_wseclient_clear() != 14843) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_wse_ffi_checksum_method_wseclient_commit() != 32229) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3915,7 +4127,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wse_ffi_checksum_method_wseclient_disconnect() != 49284) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_wse_ffi_checksum_method_wseclient_kept() != 54727) {
+    if (uniffi_wse_ffi_checksum_method_wseclient_kept() != 28647) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_method_wseclient_next_batch() != 61381) {
@@ -3948,6 +4160,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wse_ffi_checksum_method_wseclient_send_signed() != 57399) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_wse_ffi_checksum_method_wseclient_send_with() != 17266) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_wse_ffi_checksum_method_wseclient_status() != 33306) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3957,13 +4172,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_wse_ffi_checksum_method_wseclient_topic_states() != 63419) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_wse_ffi_checksum_method_wseclient_try_send() != 33752) {
+    if (uniffi_wse_ffi_checksum_method_wseclient_try_send() != 47511) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_method_wseclient_try_send_live() != 32891) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_method_wseclient_try_send_requiring() != 1439) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wse_ffi_checksum_method_wseclient_try_send_with() != 22935) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wse_ffi_checksum_method_wseclient_unsubscribe() != 15024) {

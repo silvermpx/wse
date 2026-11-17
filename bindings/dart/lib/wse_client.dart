@@ -158,14 +158,63 @@ class WseClient {
     return controller.stream;
   }
 
-  /// Sends `{"t": kind, "p": json}`, waiting for room in the queue.
+  /// Sends `{"t": kind, "p": json}`, waiting for room. It waits in the
+  /// outbox until the server answers for it (the delivered and
+  /// notDelivered items say what became of it) and goes again after a
+  /// reconnect.
   Future<void> send(String kind, String json) => _closed
       ? Future.error(_closedError)
       : _native.send(kind: kind, json: json);
 
-  /// Sends at once; throws when the queue is full.
+  /// Sends at once; throws when the outbox or the queue is full.
   void trySend(String kind, String json) =>
       _open.trySend(kind: kind, json: json);
+
+  /// [send] with its own [id] (the app's, say; a random UUID without one),
+  /// how long it may wait to be written first ([ttl]; the outbox's
+  /// `maxAge` without one), and the [requires] topics it waits for (see
+  /// [sendRequiring]). Its id, which its outcome names.
+  Future<String> sendWith(
+    String kind,
+    String json, {
+    String? id,
+    Duration? ttl,
+    List<String> requires = const [],
+  }) => _closed
+      ? Future.error(_closedError)
+      : _native.sendWith(
+          kind: kind,
+          json: json,
+          options: _options(id, ttl, requires),
+        );
+
+  /// [sendWith] at once; throws when the outbox or the queue is full.
+  String trySendWith(
+    String kind,
+    String json, {
+    String? id,
+    Duration? ttl,
+    List<String> requires = const [],
+  }) => _open.trySendWith(
+    kind: kind,
+    json: json,
+    options: _options(id, ttl, requires),
+  );
+
+  static rust.WseSendOptions _options(
+    String? id,
+    Duration? ttl,
+    List<String> requires,
+  ) => rust.WseSendOptions(
+    id: id,
+    ttlMs: BigInt.from(ttl?.inMilliseconds ?? 0),
+    requires: requires,
+  );
+
+  /// The user signs out: every message in the outbox, and every one sent
+  /// before this call, goes (notDelivered, `cleared`), and the user is
+  /// forgotten.
+  void clear() => _open.clear();
 
   /// Sends once each of [topics] is continuous on the connection (see
   /// [topicStates]); until then it waits, in order with the others that
@@ -238,7 +287,7 @@ class WseClient {
   /// as [wseDelivery]'s checkpoint.
   String checkpoint() => _open.checkpoint();
 
-  /// How many messages the offline queue keeps for the next connection
+  /// How many messages wait in the outbox for the server's answer
   /// ([wseOffline]).
   int get kept => _open.kept();
 
@@ -276,8 +325,8 @@ class WseClient {
 /// [serverIdentityKeys] pin the server of an end-to-end encrypted session;
 /// [signingKey] (PKCS#8, from [generateSigningKey]) signs what
 /// [WseClient.sendSigned] sends, and [serverSigningKeys] check what the
-/// server signs. With [offline], what is sent with no connection waits for
-/// the next one of the same user; without it, such a send fails.
+/// server signs. [offline] tunes the outbox, where every message waits until
+/// the server answers for it (in memory by default; [wseOffline]).
 rust.WseConfig wseConfig(
   String url, {
   String? token,
@@ -313,18 +362,25 @@ rust.WseConfig wseConfig(
   offline: offline,
 );
 
-/// Messages sent with no connection, kept for the next one of the same user:
-/// in the file at [path] (in the app's own storage), so that they outlive
-/// the app, or in memory without one. They go right after the topics are
-/// subscribed again; a live or signed message is never kept. At most
-/// [maxMessages] (1,000) for at most [maxAge] (an hour).
+/// The outbox: every message sent, except a live or signed one, waits in it
+/// until the server answers for it, goes again after a reconnect, and
+/// reaches the server's application once. In the file at [path] (in the
+/// app's own storage), so that they outlive the app, or in memory without
+/// one. At most [maxMessages] (100,000) and [maxBytes] (16 MiB) wait, the
+/// ones not answered yet included; one not written within [maxAge] (an
+/// hour) is dropped. [disabled]: no outbox, and a send with no connection
+/// fails, as before 3.2.
 rust.WseOffline wseOffline({
+  bool disabled = false,
   String? path,
   int maxMessages = 0,
+  int maxBytes = 0,
   Duration maxAge = Duration.zero,
 }) => rust.WseOffline(
+  disabled: disabled,
   path: path,
   maxMessages: maxMessages,
+  maxBytes: BigInt.from(maxBytes),
   maxAgeMs: BigInt.from(maxAge.inMilliseconds),
 );
 

@@ -70,13 +70,32 @@ between loses nothing, the next one gets the rest. `close()` sends what is
 queued and closes; a closed client's calls throw a `WseError` of kind
 `closed`.
 
-With `offline: wseOffline(path: file)` (a file in the app's own storage)
-what is sent while there is no connection waits for the next connection of
-the same user and goes right after the topics are subscribed again; the file
-outlives the app. Without a path it waits in memory. At most `maxMessages`
-(1,000) wait, for at most `maxAge` (an hour); `client.kept` says how many
-wait. A live or signed message is never kept, and a file that cannot be
-written is a `storageFailed` item (`name`: what failed, `reason`: why).
+## The outbox
+
+Every message sent, except a live or signed one, waits in the outbox until
+the server answers for it, goes again after a reconnect, and reaches the
+server's application once. The `delivered` item names the messages the
+server took (`ids`); `notDelivered` names those it will not take and why
+(`reason`): the server refused it (`busy`, `rate_limited`, `missing`,
+`not_ready`), it was not written within its time (`expired`), it was the
+last user's (`user_changed`), the app cleared the outbox (`cleared`), or
+the client closed with it in memory (`closed`).
+
+```dart
+final id = await client.sendWith('order', '{"item":"tea"}', id: 'order-17');
+// ... later, on sign-out:
+client.clear();
+```
+
+The outbox is in memory by default. With `offline: wseOffline(path: file)`
+(a file in the app's own storage) it outlives the app. At most
+`maxMessages` (100,000) and `maxBytes` (16 MiB) wait, the ones not answered
+yet included: past either `send` waits for room and `trySend` throws
+`full`. One not written within `maxAge` (an hour), or the `ttl` it was sent
+with, is dropped. `client.kept` says how many wait. A file that cannot be
+opened or written is a `storageFailed` item (`name`: what failed,
+`reason`: why), and the outbox goes on in memory. `wseOffline(disabled:
+true)` has no outbox: a send with no connection fails, as before 3.2.
 
 ## Topic states and recover-or-resync
 

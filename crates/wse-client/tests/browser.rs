@@ -133,12 +133,12 @@ async fn a_send_in_the_browser_waits_for_its_topic() {
     client.close().await;
 }
 
-/// What is sent with no connection waits in memory and goes on the next.
+/// What is sent with no connection waits in the outbox, in memory, and goes
+/// on the next.
 #[wasm_bindgen_test]
 async fn a_send_in_the_browser_with_no_connection_waits_for_the_next() {
     let url = given(URL, "WSE_TEST_URL");
-    let mut config = Config::new(url);
-    config.offline = Some(wse_client::Offline::in_memory());
+    let config = Config::new(url);
     let (client, mut events) = wse_client::connect(config).await.unwrap();
     client.pause("test").unwrap();
     while client.is_connected() {
@@ -152,6 +152,13 @@ async fn a_send_in_the_browser_with_no_connection_waits_for_the_next() {
     client.resume("test").unwrap();
     let echoed = message(&mut events, "echoed").await;
     assert_eq!(echoed.payload_value().unwrap()["n"], 1);
+    // It leaves the outbox once the server confirmed it.
+    for _ in 0..250 {
+        if client.kept() == 0 {
+            break;
+        }
+        gloo_timers::future::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(client.kept(), 0);
     client.close().await;
 }

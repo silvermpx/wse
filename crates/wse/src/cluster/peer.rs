@@ -194,14 +194,14 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
             Some(ClusterFrame::ProducerQuery { id, user, producer }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
                 // The client went on on the asking node: handed over.
-                let taken = ctx.producers.hand_over(user.as_deref(), &producer);
+                let decided = ctx.producers.hand_over(user.as_deref(), &producer);
                 let mut frame = BytesMut::new();
-                super::protocol::encode_producer_state(&mut frame, id, taken);
+                super::protocol::encode_producer_state(&mut frame, id, decided.as_ref());
                 let _ = peer_write_tx.try_send(frame.freeze());
             }
-            Some(ClusterFrame::ProducerState { id, taken }) => {
+            Some(ClusterFrame::ProducerState { id, decided }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);
-                ctx.producer_links.answer(id, taken);
+                ctx.producer_links.answer(id, decided);
             }
             Some(ClusterFrame::Unknown { msg_type }) => {
                 last_activity.store(epoch_ms(), Ordering::Relaxed);

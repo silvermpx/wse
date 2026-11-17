@@ -46,13 +46,17 @@ object Wse {
     fun delivery(consumer: String): WseDeliveryBuilder = WseDeliveryBuilder(consumer)
 
     /**
-     * The offline queue: messages sent with no connection wait for the next one of the same user, in
-     * memory or in a file ([WseOfflineBuilder.path]) that outlives the app.
+     * The outbox, where every message waits until the server answers for it: in memory by
+     * default, or in a file ([WseOfflineBuilder.path]) that outlives the app.
      */
     @JvmStatic
     fun offline(): WseOfflineBuilder = WseOfflineBuilder()
 
-    /** How many messages the offline queue keeps for the next connection. */
+    /** How a message goes ([sendWith]): its own id, how long it may wait, the topics it requires. */
+    @JvmStatic
+    fun sendOptions(): WseSendOptionsBuilder = WseSendOptionsBuilder()
+
+    /** How many messages wait in the outbox for the server's answer. */
     @JvmStatic
     fun kept(client: WseClient): Int = client.kept().coerceAtMost(Int.MAX_VALUE.toUInt()).toInt()
 
@@ -69,13 +73,21 @@ object Wse {
     fun connect(config: WseConfig, tokens: WseTokenSource? = null): CompletableFuture<WseClient> =
         calls.future { connectClient(config, tokens) }
 
-    /** Sends `{"t": kind, "p": json}`, waiting for room in the queue; a message already queued still goes. */
+    /**
+     * Sends `{"t": kind, "p": json}`, waiting for room; a message already queued still goes. It
+     * waits in the outbox until the server answers for it.
+     */
     @JvmStatic
     fun send(client: WseClient, kind: String, json: String): CompletableFuture<Void?> =
         calls.future {
             client.send(kind, json)
             null
         }
+
+    /** [send] with [options] ([sendOptions]); the future gives its id, which its outcome names. */
+    @JvmStatic
+    fun sendWith(client: WseClient, kind: String, json: String, options: WseSendOptions): CompletableFuture<String> =
+        calls.future { client.sendWith(kind, json, options) }
 
     /**
      * Sends once each of [topics] is continuous on the connection, waiting for room in the
@@ -243,7 +255,7 @@ class WseConfigBuilder internal constructor(private val url: String) {
     /** The recover-or-resync delivery ([Wse.delivery]); null: best effort. */
     fun delivery(delivery: WseDelivery?): WseConfigBuilder = apply { this.delivery = delivery }
 
-    /** The offline queue ([Wse.offline]); null: a send with no connection fails. */
+    /** The outbox ([Wse.offline]); null: in memory, with its defaults. */
     fun offline(offline: WseOffline?): WseConfigBuilder = apply { this.offline = offline }
 
     fun build(): WseConfig =
@@ -271,20 +283,53 @@ class WseConfigBuilder internal constructor(private val url: String) {
 
 /** A [WseOffline] for Java, field by field. */
 class WseOfflineBuilder internal constructor() {
+    private var disabled = false
     private var path: String? = null
     private var maxMessages = 0u
+    private var maxBytes = 0uL
     private var maxAge = 0uL
 
-    /** The file the messages are kept in, so that they outlive the app (in its own storage); null: memory. */
+    /** No outbox: a send with no connection fails, as before 3.2. */
+    fun disabled(): WseOfflineBuilder = apply { disabled = true }
+
+    /** The file the messages wait in, so that they outlive the app (in its own storage); null: memory. */
     fun path(path: String?): WseOfflineBuilder = apply { this.path = path }
 
-    /** How many are kept at most (0: 1,000); past it a send fails as `Full`. */
+    /** How many wait at most, those not answered yet included (0: 100,000). */
     fun maxMessages(messages: Int): WseOfflineBuilder = apply { maxMessages = count(messages) }
 
-    /** How long one is kept (zero: an hour); an older one is dropped. */
+    /** How many bytes of messages wait at most (0: 16 MiB). */
+    fun maxBytes(bytes: Long): WseOfflineBuilder = apply { maxBytes = bytes.coerceAtLeast(0).toULong() }
+
+    /** How long one waits to be written first (zero: an hour); one not written by then is dropped. */
     fun maxAge(age: Duration): WseOfflineBuilder = apply { maxAge = millis(age) }
 
-    fun build(): WseOffline = WseOffline(path, maxMessages, maxAge)
+    fun build(): WseOffline =
+        WseOffline(
+            disabled = disabled,
+            path = path,
+            maxMessages = maxMessages,
+            maxBytes = maxBytes,
+            maxAgeMs = maxAge,
+        )
+}
+
+/** A [WseSendOptions] for Java, field by field. */
+class WseSendOptionsBuilder internal constructor() {
+    private var id: String? = null
+    private var ttl = 0uL
+    private var requires: List<String> = emptyList()
+
+    /** Its id: the app's own, or a random UUID; its outcome names it. */
+    fun id(id: String?): WseSendOptionsBuilder = apply { this.id = id }
+
+    /** How long it may wait to be written first (zero: the outbox's `maxAge`). */
+    fun ttl(ttl: Duration): WseSendOptionsBuilder = apply { this.ttl = millis(ttl) }
+
+    /** Topics that must each be continuous when it goes. */
+    fun requires(topics: List<String>): WseSendOptionsBuilder = apply { requires = topics.toList() }
+
+    fun build(): WseSendOptions = WseSendOptions(id = id, ttlMs = ttl, requires = requires)
 }
 
 /** A [WseDelivery] for Java, field by field. */

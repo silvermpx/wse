@@ -111,6 +111,22 @@ class WseJavaTest {
     }
 
     @Test
+    void anOutcomeByItsIdFromJava() throws Exception {
+        WseConfig config = Wse.config(url).insecure(true).build();
+        WseClient client = Wse.connect(config).get(10, SECONDS);
+        WseEventReader events = Wse.events(client);
+        String id = Wse.sendWith(client, "echo", "{\"n\":2}", Wse.sendOptions().id("mine-1").build())
+            .get(10, SECONDS);
+        assertEquals("mine-1", id);
+        while (!(next(events) instanceof WseItem.Delivered delivered && delivered.getIds().contains("mine-1"))) {
+            // Not this message's outcome yet.
+        }
+        assertEquals(0, Wse.kept(client));
+        client.clear();
+        Wse.disconnect(client, Duration.ofSeconds(1)).get(10, SECONDS);
+    }
+
+    @Test
     void anOfflineQueueFromJava() throws Exception {
         WseConfig config = Wse.config(url)
             .insecure(true)

@@ -225,6 +225,26 @@ void main() {
     dir.deleteSync(recursive: true);
   });
 
+  test('a message the server took is said delivered by its id', () async {
+    final client = await WseClient.connect(wseConfig(url, insecure: true));
+    final items = StreamIterator(client.events());
+    final id = await client.sendWith('echo', '{"n":2}', id: 'mine-1');
+    expect(id, 'mine-1');
+    var delivered = false;
+    while (await items.moveNext()) {
+      final item = items.current;
+      if (item.kind == WseItemKind.delivered && item.ids.contains('mine-1')) {
+        delivered = true;
+        break;
+      }
+    }
+    expect(delivered, isTrue);
+    expect(client.kept, 0);
+    client.clear();
+    await items.cancel();
+    await client.close();
+  });
+
   test('a send that requires a topic waits for its resync', () async {
     final client = await WseClient.connect(
       wseConfig(

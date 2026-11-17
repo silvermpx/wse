@@ -133,10 +133,19 @@ fun WseClient.events(maxItems: UInt = 256u, maxBytes: UInt = 1u shl 20): WseEven
     }
 
 /**
- * Sends `{"t": kind, "p": json}`, waiting for room in the queue. Cancelling the
- * coroutine gives up the wait; a message already queued still goes.
+ * Sends `{"t": kind, "p": json}`, waiting for room. It waits in the outbox until the
+ * server answers for it (`WseItem.Delivered` and `WseItem.NotDelivered` say what became
+ * of it) and goes again after a reconnect. Cancelling the coroutine gives up the wait; a
+ * message already queued still goes.
  */
 suspend fun WseClient.send(kind: String, json: String) = send(kind, json, WseCancel())
+
+/**
+ * [send] with [options]: its own id (the app's, say; a random UUID without one), how long
+ * it may wait to be written first, the topics it requires. Its id, which its outcome names.
+ */
+suspend fun WseClient.sendWith(kind: String, json: String, options: WseSendOptions = WseSendOptions()): String =
+    sendWith(kind, json, options, WseCancel())
 
 /**
  * Sends once each of [topics] is continuous on the connection (see `topicStates()`),

@@ -461,10 +461,11 @@ async fn a_stopped_server_is_waited_for_and_the_client_comes_back() {
     };
     assert_eq!(lost.code, Some(1001));
     assert!(!client.is_connected());
-    assert_eq!(client.send("x", &json!({})).await, Err(Error::NotConnected));
+    // Sent meanwhile: it waits in the outbox for the next connection.
+    client.send("meanwhile", &json!({})).await.unwrap();
     // The same server again, on the same port.
     let listener = TcpListener::bind(&addr).await.unwrap();
-    let (tx, _heard) = mpsc::unbounded_channel();
+    let (tx, mut heard) = mpsc::unbounded_channel();
     stand.server.start(listener, App { heard: tx }).unwrap();
     loop {
         if let Event::Connected(again) = next_event(&mut events).await {
@@ -473,6 +474,16 @@ async fn a_stopped_server_is_waited_for_and_the_client_comes_back() {
         }
     }
     assert!(client.is_connected());
+    loop {
+        let got = tokio::time::timeout(Duration::from_secs(5), heard.recv())
+            .await
+            .expect("the application hears within 5 s")
+            .expect("the application alive");
+        if let Heard::Message(message) = got {
+            assert_eq!(message["t"], "meanwhile");
+            break;
+        }
+    }
     client.close().await;
     stand.server.stop().await;
 }
@@ -990,12 +1001,17 @@ async fn a_client_writing_flat_out_hears_why_it_was_closed() {
     client_config.reconnect.base_delay = Duration::from_secs(30);
     let (client, mut events) = wse_client::connect(client_config).await.unwrap();
 
-    // Writing when the server closes: its close frame still names why.
+    // Writing when the server closes: its close frame still names why. A
+    // full outbox (its messages not answered yet) is waited out.
     let flooder = client.clone();
     let flood = tokio::spawn(async move {
         let mut n = 0u64;
-        while flooder.send("flood", &json!({ "n": n })).await.is_ok() {
-            n += 1;
+        loop {
+            match flooder.send("flood", &json!({ "n": n })).await {
+                Ok(()) => n += 1,
+                Err(Error::Full) => tokio::time::sleep(Duration::from_millis(1)).await,
+                Err(_) => break,
+            }
         }
     });
     let disconnected = tokio::time::timeout(Duration::from_secs(15), async {

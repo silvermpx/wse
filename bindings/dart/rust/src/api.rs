@@ -65,23 +65,52 @@ pub struct WseConfig {
     pub insecure: bool,
     /// recover-or-resync; None: best effort.
     pub delivery: Option<WseDelivery>,
-    /// Messages sent with no connection wait for the next one of the same
-    /// user; None: such a send fails.
+    /// The outbox, where every message waits until the server answers for
+    /// it; None: in memory, with its defaults.
     pub offline: Option<WseOffline>,
 }
 
-/// Messages sent with no connection, kept for the next one of the same
-/// user. They go right after the topics are subscribed again; a live or
-/// signed message is never kept.
+/// The outbox: every message sent, except a live or signed one, waits in it
+/// until the server answers for it, goes again after a reconnect, and
+/// reaches the server's application once; the delivered and notDelivered
+/// items say what became of each.
 pub struct WseOffline {
-    /// The file they are kept in, so that they outlive the app (in its own
+    /// No outbox: a message goes on the connection that is ready, or the
+    /// send fails as not connected, as before 3.2.
+    pub disabled: bool,
+    /// The file they wait in, so that they outlive the app (in its own
     /// storage); the client's alone while it runs. None keeps them in memory.
     pub path: Option<String>,
-    /// How many are kept at most (0: 1,000); past it a send fails as `full`.
+    /// How many wait at most, those not answered yet included (0: 100,000);
+    /// past it `send` waits for room and `trySend` fails as `full`.
     pub max_messages: u32,
-    /// How long one is kept, in milliseconds (0: an hour); an older one is
-    /// dropped.
+    /// How many bytes of messages wait at most (0: 16 MiB), as
+    /// `max_messages`.
+    pub max_bytes: u64,
+    /// How long one waits to be written first, in milliseconds (0: an
+    /// hour); one not written by then is dropped (`expired`).
     pub max_age_ms: u64,
+}
+
+/// How a message goes (`sendWith`).
+pub struct WseSendOptions {
+    /// Its id: the app's own, or a random UUID; its outcome names it.
+    pub id: Option<String>,
+    /// How long it may wait to be written first, in milliseconds (0: the
+    /// outbox's `max_age_ms`).
+    pub ttl_ms: u64,
+    /// Topics that must each be continuous when it goes.
+    pub requires: Vec<String>,
+}
+
+impl From<WseSendOptions> for native::NativeSendOptions {
+    fn from(options: WseSendOptions) -> Self {
+        Self {
+            id: options.id,
+            ttl_ms: options.ttl_ms,
+            requires: options.requires,
+        }
+    }
 }
 
 /// The recover-or-resync delivery: a topic that is not continuous (a cold
@@ -217,7 +246,13 @@ pub enum WseItemKind {
     Continuity,
     /// The saved checkpoint is not this client's (`reason`).
     CheckpointRejected,
-    /// The offline queue's file could not be written (`name`: what failed,
+    /// The server took these messages of the outbox (`ids`).
+    Delivered,
+    /// These messages of the outbox will not be delivered (`ids`), and why
+    /// (`reason`): the server's refusal (`busy`, `rate_limited`, `missing`,
+    /// `not_ready`), `expired`, `user_changed`, `cleared` or `closed`.
+    NotDelivered,
+    /// The outbox's file could not be opened or written (`name`: what failed,
     /// `reason`: why): what is kept stays in memory, and may not outlive the
     /// app.
     StorageFailed,
@@ -270,6 +305,8 @@ pub struct WseItem {
     pub attempt: Option<u32>,
     /// Paused: the reasons the client is paused for.
     pub reasons: Vec<String>,
+    /// Delivered and NotDelivered: the messages' ids.
+    pub ids: Vec<String>,
     /// Subscribed: the topics taken and refused, and per topic asked for with
     /// a position what was replayed.
     pub topics: Vec<String>,
@@ -312,6 +349,7 @@ impl WseItem {
             retry_in_ms: None,
             attempt: None,
             reasons: Vec::new(),
+            ids: Vec::new(),
             topics: Vec::new(),
             failed: Vec::new(),
             recoveries: Vec::new(),
@@ -455,6 +493,15 @@ impl From<native::Item> for WseItem {
                 reason: Some(reason),
                 ..WseItem::of(WseItemKind::CheckpointRejected)
             },
+            native::Item::Delivered { ids } => WseItem {
+                ids,
+                ..WseItem::of(WseItemKind::Delivered)
+            },
+            native::Item::NotDelivered { reason, ids } => WseItem {
+                reason: Some(reason),
+                ids,
+                ..WseItem::of(WseItemKind::NotDelivered)
+            },
             native::Item::StorageFailed { operation, message } => WseItem {
                 name: Some(operation),
                 reason: Some(message),
@@ -516,8 +563,10 @@ impl WseNativeClient {
                 max_held: d.max_held,
             }),
             offline: config.offline.map(|o| native::NativeOffline {
+                disabled: o.disabled,
                 path: o.path,
                 max_messages: o.max_messages,
+                max_bytes: o.max_bytes,
                 max_age_ms: o.max_age_ms,
             }),
             ..native::NativeConfig::default()
@@ -533,6 +582,40 @@ impl WseNativeClient {
 
     pub async fn send(&self, kind: String, json: String) -> Result<(), WseError> {
         Ok(self.0.send(kind, json, &native::CancelToken::new()).await?)
+    }
+
+    /// Sends `{"t": kind, "p": json}` with `options`: its own id, how long it
+    /// may wait, the topics it requires. Its id, which its outcome names.
+    /// Fails at once when the outbox or the queue is full.
+    #[frb(sync)]
+    pub fn try_send_with(
+        &self,
+        kind: String,
+        json: String,
+        options: WseSendOptions,
+    ) -> Result<String, WseError> {
+        Ok(self.0.try_send_with(&kind, &json, options.into())?)
+    }
+
+    /// `try_send_with`, waiting for room.
+    pub async fn send_with(
+        &self,
+        kind: String,
+        json: String,
+        options: WseSendOptions,
+    ) -> Result<String, WseError> {
+        Ok(self
+            .0
+            .send_with(kind, json, options.into(), &native::CancelToken::new())
+            .await?)
+    }
+
+    /// The user signs out: every message in the outbox, and every one sent
+    /// before this call, goes (`notDelivered`, `cleared`), and the user is
+    /// forgotten.
+    #[frb(sync)]
+    pub fn clear(&self) -> Result<(), WseError> {
+        Ok(self.0.clear()?)
     }
 
     /// Sends `{"t": kind, "p": json}` once each of `topics` is continuous on the
@@ -645,7 +728,7 @@ impl WseNativeClient {
     }
 
     #[frb(sync)]
-    /// How many messages the offline queue keeps for the next connection.
+    /// How many messages wait in the outbox for the server's answer.
     pub fn kept(&self) -> u32 {
         self.0.kept()
     }

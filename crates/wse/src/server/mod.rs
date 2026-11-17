@@ -96,7 +96,7 @@ pub(crate) mod subscribe;
 #[cfg(feature = "python")]
 pub use py::RustWSEServer;
 
-pub(crate) use acks::Producers;
+pub(crate) use acks::{Hole, MAX_HOLES, Producers, Refusal};
 pub use cluster_link::{ClusterPeer, ClusterSettings, ClusterTls, DeadLetter};
 pub use config::{Config, ConfigError, JwtSettings, PresenceSettings, RecoverySettings};
 pub use control::{JwtKeys, Member, Recovered, Subscribe, TopicPosition};
