@@ -33,7 +33,7 @@ pub(crate) use producers::ProducerLinks;
 pub(crate) use protocol::encode_presence_full;
 pub(crate) use protocol::{
     ClusterFrame, PRESENCE_ROUND, PRESENCE_ROUND_FIRST, PRESENCE_ROUND_LAST, ResumePoint,
-    decode_frame, encode_drain, encode_hello, encode_msg, encode_msg_compressed,
+    ResumeTopic, decode_frame, encode_drain, encode_hello, encode_msg, encode_msg_compressed,
     encode_msg_with_recovery, encode_peer_announce, encode_peer_list, encode_ping, encode_pong,
     encode_presence_round, encode_presence_update, encode_replayed, encode_resume, encode_resync,
     encode_shutdown, encode_sub, encode_unsub, negotiate_capabilities, negotiate_version,
@@ -118,6 +118,11 @@ pub(crate) const CAP_RESUME: u32 = 1 << 4;
 /// A node asks another what it took of a client's producer, when the client
 /// comes to it from that node (PRODUCER_QUERY / PRODUCER_STATE).
 pub(crate) const CAP_PRODUCERS: u32 = 1 << 5;
+/// The catch-up covers the streams a node does not hold too: its RESUME
+/// request names the topics it has, each with how long ago its interest
+/// began, and the other sends what it published to them since (a stream
+/// begun while the link was down). Offered with CAP_RESUME.
+pub(crate) const CAP_RESUME_TOPICS: u32 = 1 << 6;
 
 /// Our capabilities bitmask
 pub(crate) const LOCAL_CAPABILITIES: u32 =
@@ -128,7 +133,7 @@ pub(crate) const LOCAL_CAPABILITIES: u32 =
 /// to send what came after).
 pub(crate) fn local_capabilities(ctx: &ClusterContext) -> u32 {
     if ctx.recovery.is_some() {
-        LOCAL_CAPABILITIES | CAP_RESUME
+        LOCAL_CAPABILITIES | CAP_RESUME | CAP_RESUME_TOPICS
     } else {
         LOCAL_CAPABILITIES
     }

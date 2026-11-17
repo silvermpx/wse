@@ -299,6 +299,71 @@ def test_messages_published_while_a_link_was_down_arrive_after_it(nodes):
     assert len({m["e"] for m in seen}) == 1
 
 
+async def next_connect(node):
+    """The connection id of the next client that connects to `node`."""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        for event in node.server.drain_inbound(16, 50):
+            if event[0] == "connect":
+                return event[1]
+        await asyncio.sleep(0.05)
+    raise AssertionError("no client connected")
+
+
+def test_a_stream_begun_while_a_link_was_down_arrives_after_it(nodes):
+    """A node publishes to a topic for the first time while its link to the
+    other is down: the other node's clients get it once the link is back, and
+    a client that comes back from before it recovers it there."""
+    websockets = pytest.importorskip("websockets")
+    origin, relay = nodes(recovery=True), nodes(recovery=True)
+    origin.join()
+
+    def publish(node, n):
+        node.server.broadcast("news", json.dumps({"t": "news", "p": {"n": n}}))
+
+    async def scenario():
+        blink = Blink(origin)
+        await blink.start()
+        try:
+            relay.join(blink)
+            await until(lambda: origin.peers == 1 and relay.peers == 1)
+            async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as live:
+                await subscribe_next_client(relay, ["news"])
+                await asyncio.sleep(0.5)  # the SUB reaches the origin
+                # The relay's own message: where a client stands before the gap.
+                publish(relay, 0)
+                (before,) = await messages_of_type(live, "news", 1)
+
+                blink.cut()
+                await until(lambda: origin.peers == 0 and relay.peers == 0)
+                # The origin's first messages of the topic.
+                publish(origin, 1)
+                publish(origin, 2)
+
+                blink.open = True
+                await until(lambda: origin.peers == 1 and relay.peers == 1, timeout=20.0)
+                seen = await messages_of_type(live, "news", 2)
+
+            async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as back:
+                conn_id = await next_connect(relay)
+                result = relay.server.subscribe_with_recovery(
+                    conn_id,
+                    ["news"],
+                    recover=True,
+                    positions={"news": {"epoch": before["e"], "offset": before["o"]}},
+                )
+                replayed = await messages_of_type(back, "news", 2)
+        finally:
+            blink.close()
+        return seen, result, replayed
+
+    seen, result, replayed = asyncio.run(scenario())
+    assert [m["p"]["n"] for m in seen] == [1, 2]
+    assert [m["o"] for m in seen] == [0, 1], "the stream from its first message"
+    assert result["topics"]["news"]["recovered"] is True
+    assert [m["p"]["n"] for m in replayed] == [1, 2]
+
+
 def test_a_signed_message_crosses_the_cluster_unchanged(nodes):
     websockets = pytest.importorskip("websockets")
     pytest.importorskip("cryptography")

@@ -15,14 +15,15 @@ use tokio_util::sync::CancellationToken;
 
 use super::protocol::write_framed;
 use super::{
-    CAP_RESUME, ClusterCommand, ClusterContext, ClusterFrame, ClusterMetrics, ClusterTlsConfig,
-    DispatchItem, HEARTBEAT_INTERVAL_SECS, HEARTBEAT_TIMEOUT_SECS, InterestUpdate, Link,
-    LinkRefused, MAX_BATCH_BYTES, MAX_FRAME_SIZE, MAX_RESUME_POINTS, PEER_DISPATCH_QUEUE_CAP,
-    PEER_SESSION_GENERATION, PRESENCE_ROUND, PRESENCE_ROUND_FIRST, PRESENCE_ROUND_LAST,
-    PROTOCOL_VERSION, PeerInfo, PeerRegistration, PresencePeerFrame, RESUME_TIMEOUT, ResumePoint,
-    RoundPart, claim_link, decode_frame, encode_hello, encode_peer_announce, encode_peer_list,
-    encode_ping, encode_pong, encode_replayed, encode_resume, epoch_ms, local_capabilities,
-    negotiate_capabilities, negotiate_version, release_link,
+    CAP_RESUME, CAP_RESUME_TOPICS, ClusterCommand, ClusterContext, ClusterFrame, ClusterMetrics,
+    ClusterTlsConfig, DispatchItem, HEARTBEAT_INTERVAL_SECS, HEARTBEAT_TIMEOUT_SECS,
+    InterestUpdate, Link, LinkRefused, MAX_BATCH_BYTES, MAX_FRAME_SIZE, MAX_RESUME_POINTS,
+    PEER_DISPATCH_QUEUE_CAP, PEER_SESSION_GENERATION, PRESENCE_ROUND, PRESENCE_ROUND_FIRST,
+    PRESENCE_ROUND_LAST, PROTOCOL_VERSION, PeerInfo, PeerRegistration, PresencePeerFrame,
+    RESUME_TIMEOUT, ResumePoint, ResumeTopic, RoundPart, claim_link, decode_frame, encode_hello,
+    encode_peer_announce, encode_peer_list, encode_ping, encode_pong, encode_replayed,
+    encode_resume, epoch_ms, local_capabilities, negotiate_capabilities, negotiate_version,
+    release_link,
 };
 use crate::reliability::{CircuitBreaker, ExponentialBackoff};
 
@@ -465,25 +466,39 @@ pub(super) async fn heartbeat_task(
 // Handshake helpers
 // ---------------------------------------------------------------------------
 
+/// What a peer's RESUME request asks for: where it stands in the streams it
+/// holds, and the topics it has (CAP_RESUME_TOPICS).
+#[derive(Debug, Default)]
+pub(super) struct Wanted {
+    points: Vec<ResumePoint>,
+    topics: Vec<ResumeTopic>,
+}
+
 /// The catch-up on a new link (CAP_RESUME): this node's RESUME request goes
 /// out while the peer's comes in, so a large one each way cannot stall on
-/// the other. The peer's request, or None when it did not come whole in time.
+/// the other. With CAP_RESUME_TOPICS (`peer_caps`) it names the topics this
+/// node has too. The peer's request, or None when it did not come whole in
+/// time.
 pub(super) async fn exchange_resume<R, W>(
     reader: &mut R,
     writer: &mut W,
     ctx: &ClusterContext,
-) -> Option<Vec<ResumePoint>>
+    peer_caps: u32,
+) -> Option<Wanted>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let points = ctx
-        .recovery
-        .as_ref()
-        .map(|rm| rm.foreign_positions())
-        .unwrap_or_default();
+    let (points, topics) = ctx.recovery.as_ref().map_or_else(Default::default, |rm| {
+        let topics = if peer_caps & CAP_RESUME_TOPICS != 0 {
+            rm.interests()
+        } else {
+            Vec::new()
+        };
+        (rm.foreign_positions(), topics)
+    });
     let mut request = BytesMut::new();
-    for frame in encode_resume(&points) {
+    for frame in encode_resume(&points, &topics) {
         write_framed(&mut request, &frame);
     }
     let send = async {
@@ -491,15 +506,22 @@ where
         writer.flush().await
     };
     let receive = async {
-        let mut wanted: Vec<ResumePoint> = Vec::new();
+        let mut wanted = Wanted::default();
         loop {
-            let Ok(Some(ClusterFrame::Resume { points, last })) = read_frame(reader).await else {
+            let Ok(Some(ClusterFrame::Resume {
+                points,
+                topics,
+                last,
+            })) = read_frame(reader).await
+            else {
                 return None;
             };
-            if wanted.len() + points.len() > MAX_RESUME_POINTS {
+            let asked = wanted.points.len() + wanted.topics.len();
+            if asked + points.len() + topics.len() > MAX_RESUME_POINTS {
                 return None;
             }
-            wanted.extend(points);
+            wanted.points.extend(points);
+            wanted.topics.extend(topics);
             if last {
                 return Some(wanted);
             }
@@ -531,12 +553,51 @@ where
         .map_err(|_| stalled())?
 }
 
+/// The replayed messages being written to a link, in batches.
+struct Replay {
+    out: BytesMut,
+    frame: BytesMut,
+    sent: u64,
+    bytes: u64,
+}
+
+impl Replay {
+    async fn push<W>(
+        &mut self,
+        writer: &mut W,
+        topic: &str,
+        position: (u32, u64),
+        data: &[u8],
+    ) -> std::io::Result<()>
+    where
+        W: AsyncWriteExt + Unpin,
+    {
+        let Ok(payload) = std::str::from_utf8(data) else {
+            return Ok(());
+        };
+        self.frame.clear();
+        if !encode_replayed(&mut self.frame, topic, payload, position.0, position.1) {
+            return Ok(());
+        }
+        write_framed(&mut self.out, &self.frame);
+        self.sent += 1;
+        if self.out.len() >= MAX_BATCH_BYTES {
+            write_progressing(writer, &self.out).await?;
+            self.bytes += self.out.len() as u64;
+            self.out.clear();
+        }
+        Ok(())
+    }
+}
+
 /// What the peer missed of the streams this node publishes, after where its
-/// RESUME request says it stands: written to the link before anything live
-/// goes to it.
+/// RESUME request says it stands, and of the topics it has, what this node
+/// published to them since its interest began in a stream it did not name
+/// (one begun while the link was down): written to the link before anything
+/// live goes to it.
 pub(super) async fn write_replay<W>(
     writer: &mut W,
-    wanted: &[ResumePoint],
+    wanted: &Wanted,
     ctx: &ClusterContext,
 ) -> std::io::Result<u64>
 where
@@ -545,32 +606,43 @@ where
     let Some(rm) = &ctx.recovery else {
         return Ok(0);
     };
-    let mut out = BytesMut::with_capacity(MAX_BATCH_BYTES);
-    let mut frame = BytesMut::new();
-    let (mut sent, mut bytes) = (0u64, 0u64);
-    for (topic, epoch, after) in wanted {
+    let mut replay = Replay {
+        out: BytesMut::with_capacity(MAX_BATCH_BYTES),
+        frame: BytesMut::new(),
+        sent: 0,
+        bytes: 0,
+    };
+    for (topic, epoch, after) in &wanted.points {
         for (offset, data) in rm.published_after(topic, *epoch, *after) {
-            let Ok(payload) = std::str::from_utf8(&data) else {
-                continue;
-            };
-            frame.clear();
-            if !encode_replayed(&mut frame, topic, payload, *epoch, offset) {
-                continue;
-            }
-            write_framed(&mut out, &frame);
-            sent += 1;
-            if out.len() >= MAX_BATCH_BYTES {
-                write_progressing(writer, &out).await?;
-                bytes += out.len() as u64;
-                out.clear();
-            }
+            replay.push(writer, topic, (*epoch, offset), &data).await?;
         }
     }
-    write_progressing(writer, &out).await?;
-    bytes += out.len() as u64;
-    ctx.metrics.messages_sent.fetch_add(sent, Ordering::Relaxed);
+    let named: std::collections::HashSet<(&str, u32)> = if wanted.topics.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        wanted
+            .points
+            .iter()
+            .map(|(topic, epoch, _)| (topic.as_str(), *epoch))
+            .collect()
+    };
+    for (topic, age) in &wanted.topics {
+        let named = |epoch: u32| named.contains(&(topic.as_str(), epoch));
+        let lately = rm.published_lately(topic, Duration::from_millis(*age), named);
+        let Some((epoch, messages)) = lately else {
+            continue;
+        };
+        for (offset, data) in messages {
+            replay.push(writer, topic, (epoch, offset), &data).await?;
+        }
+    }
+    write_progressing(writer, &replay.out).await?;
+    let bytes = replay.bytes + replay.out.len() as u64;
+    ctx.metrics
+        .messages_sent
+        .fetch_add(replay.sent, Ordering::Relaxed);
     ctx.metrics.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
-    Ok(sent)
+    Ok(replay.sent)
 }
 
 /// Hand a live link to the manager, which routes publishes, interest and
@@ -584,7 +656,7 @@ pub(super) async fn go_live<W>(
     writer: &mut W,
     peer_reg_tx: &mpsc::UnboundedSender<PeerRegistration>,
     link: (&str, mpsc::Sender<Bytes>, u32),
-    wanted: Option<Vec<ResumePoint>>,
+    wanted: Option<Wanted>,
     ctx: &ClusterContext,
 ) -> bool
 where
@@ -752,7 +824,7 @@ where
 
     // Catch-up: each node first says where it stands in the other's streams.
     let wanted = if peer_caps & CAP_RESUME != 0 {
-        let Some(wanted) = exchange_resume(&mut reader, &mut writer, ctx).await else {
+        let Some(wanted) = exchange_resume(&mut reader, &mut writer, ctx, peer_caps).await else {
             tracing::warn!("[WSE-Cluster] No RESUME from {peer_addr} within {RESUME_TIMEOUT:?}");
             release_link(&ctx.links, &peer_instance_id, session_gen);
             return Outcome::Failed;

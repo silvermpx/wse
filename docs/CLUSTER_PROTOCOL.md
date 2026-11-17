@@ -81,6 +81,7 @@ The magic bytes `WSE\x00` prevent accidental connections from non-WSE services. 
 | 3 | CAP_RECOVERY | MSG frames carry the origin's recovery position |
 | 4 | CAP_RESUME | Catch-up after a lost link (RESUME); offered by a node with recovery on |
 | 5 | CAP_PRODUCERS | A node asks another what it decided of a client's outbox (PRODUCER_QUERY / PRODUCER_STATE) |
+| 6 | CAP_RESUME_TOPICS | The catch-up covers streams the asking node does not hold: its RESUME request names its topics too (from 3.2) |
 
 The instance id is the name the node gives its clients in the `outbox` answer: a client that comes to another node names it, and that node asks it (see [PRODUCER_QUERY](#producer_query-0x0f-and-producer_state-0x10---a-clients-outbox-moves)).
 
@@ -211,9 +212,11 @@ TCP connection open so in-flight delivery can finish (lame-duck). See
 
 Where the sender stands in every stream other nodes relay to it: for each foreign recovery buffer, the topic, the origin's epoch and the last offset it holds with nothing missing before it. A request over the frame limit is split; flags `0x01` marks its last frame, and a node with nothing relayed to it sends one empty frame with that flag.
 
-When CAP_RESUME is negotiated, each node sends its request right after HELLO and reads the other's. Then it hands the link to its cluster manager and, once the manager routes publishes to it, sends the peer every message of its own streams the request names after the offset given (from the oldest still kept when some are gone) as MSG frames marked replayed, before anything live: what was published before the manager took the link is in this catch-up, what after it follows it, and a message in both is delivered once. Streams of other origins or of an earlier epoch (the node restarted) are skipped. A peer that does not send its whole request within 5 seconds is dropped, and redials.
+With CAP_RESUME_TOPICS, the frames flagged `0x02` follow those entries and name the topics the sender has (its subscribers', and those still kept for clients that may come back): each entry is the topic, an epoch of 0, and in place of the offset how long ago the sender's interest in it began, in milliseconds.
 
-So a link that drops and comes back loses nothing the origin still holds: the receiving node's subscribers get the missed messages in order, followed by the live ones, and its recovery buffers have no hole. A message shed on a full link is filled in the same way the next time the link comes up.
+When CAP_RESUME is negotiated, each node sends its request right after HELLO and reads the other's. Then it hands the link to its cluster manager and, once the manager routes publishes to it, sends the peer every message of its own streams the request names after the offset given (from the oldest still kept when some are gone) as MSG frames marked replayed, before anything live: what was published before the manager took the link is in this catch-up, what after it follows it, and a message in both is delivered once. Streams of other origins or of an earlier epoch (the node restarted) are skipped. For each topic the request names, a stream of its own the request does not name (one begun while the link was down, or one the peer never got a message of) is sent too: what it published to the topic since the peer's interest began, and up to 3 seconds before. A node marks where its arrival order stands once a second for that. A peer that does not send its whole request within 5 seconds is dropped, and redials.
+
+So a link that drops and comes back loses nothing the origin still holds: the receiving node's subscribers get the missed messages in order, followed by the live ones, and its recovery buffers have no hole, a stream the origin began while the link was down included. A message shed on a full link is filled in the same way the next time the link comes up.
 
 ### PRODUCER_QUERY (0x0F) and PRODUCER_STATE (0x10) - A Client's Outbox Moves
 

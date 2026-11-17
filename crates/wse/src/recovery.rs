@@ -55,6 +55,15 @@ impl Default for RecoveryConfig {
 /// How often expired and over-budget buffers are removed.
 pub(crate) const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often the arrival order is marked, and how many marks are kept at
+/// most (a day of them).
+pub(crate) const MARK_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_MARKS: usize = 86_400;
+
+/// How much before a peer's interest began the messages it is sent go back:
+/// a mark's interval, and the time its request took to come.
+const LATELY_MARGIN: Duration = Duration::from_secs(3);
+
 /// Largest per-topic message limit: 2^16 = 65536 messages.
 pub(crate) const MAX_BUFFER_SIZE_BITS: u32 = 16;
 
@@ -559,9 +568,13 @@ pub(crate) struct RecoveryManager {
     /// last message, in this order.
     arrival: AtomicU64,
     /// Where in that order this node's current, unbroken interest in each
-    /// topic began: other nodes relay a topic only while this node has it,
-    /// so the relayed streams are whole from there on only.
-    interest_since: DashMap<String, u64>,
+    /// topic began, and when: other nodes relay a topic only while this node
+    /// has it, so the relayed streams are whole from there on only.
+    interest_since: DashMap<String, (u64, Instant)>,
+    /// The arrival order once a second, back to the oldest message this
+    /// node holds of its own streams: what it published since a moment is
+    /// found by it.
+    marks: parking_lot::Mutex<VecDeque<(Instant, u64)>>,
     /// Per topic with buffers left, the latest arrival among the messages of
     /// its buffers removed (expired, or over the budget): a client whose last
     /// message came before it may have missed them, in a stream it never
@@ -579,6 +592,7 @@ impl RecoveryManager {
             foreign_epochs: DashMap::new(),
             arrival: AtomicU64::new(1),
             interest_since: DashMap::new(),
+            marks: parking_lot::Mutex::new(VecDeque::new()),
             removed_through: DashMap::new(),
             config,
             total_bytes: AtomicUsize::new(0),
@@ -856,7 +870,7 @@ impl RecoveryManager {
             let since = self
                 .interest_since
                 .get(topic)
-                .map_or(u64::MAX, |since| *since);
+                .map_or(u64::MAX, |since| since.0);
             seq.is_some_and(|seq| seq >= since)
         };
         let anchored_relayed = !self
@@ -943,7 +957,7 @@ impl RecoveryManager {
             offset: anchor.1,
         };
         let position = |epoch: u32| named.iter().find(|(e, _)| *e == epoch).map(|(_, o)| *o);
-        let since = self.interest_since.get(topic).map(|since| *since);
+        let since = self.interest_since.get(topic).map(|since| since.0);
         let foreign_epochs: Vec<u32> = self
             .foreign_epochs
             .get(topic)
@@ -1248,6 +1262,7 @@ impl RecoveryManager {
         for topic in gone {
             self.removed_through.remove(&topic);
         }
+        self.trim_marks();
     }
 
     /// Messages of `topic` up to arrival `seq` are not held here (a buffer
@@ -1267,8 +1282,88 @@ impl RecoveryManager {
     /// This node took an interest in `topic` (its first local subscriber,
     /// none lingering): other nodes relay it from now on.
     pub(crate) fn interest_began(&self, topic: &str) {
+        self.interest_since.insert(
+            topic.to_owned(),
+            (self.arrival.load(Ordering::Relaxed), Instant::now()),
+        );
+    }
+
+    /// The topics this node has, each with how long ago its current interest
+    /// began (milliseconds): a node it links to again sends what it
+    /// published to them since, the streams it did not name included.
+    pub(crate) fn interests(&self) -> Vec<(String, u64)> {
         self.interest_since
-            .insert(topic.to_owned(), self.arrival.load(Ordering::Relaxed));
+            .iter()
+            .map(|entry| {
+                let age = entry.value().1.elapsed().as_millis();
+                (entry.key().clone(), u64::try_from(age).unwrap_or(u64::MAX))
+            })
+            .collect()
+    }
+
+    /// Marks where the arrival order stands now, unless nothing arrived
+    /// since the last mark; called once a second.
+    pub(crate) fn mark(&self) {
+        let next = self.arrival.load(Ordering::Relaxed);
+        let mut marks = self.marks.lock();
+        if marks.back().is_some_and(|(_, last)| *last == next) {
+            return;
+        }
+        if marks.len() == MAX_MARKS {
+            marks.pop_front();
+        }
+        marks.push_back((Instant::now(), next));
+    }
+
+    /// Lets go the marks from before the oldest message this node holds of
+    /// its own streams, but the last of them.
+    fn trim_marks(&self) {
+        let oldest = self
+            .buffers
+            .iter()
+            .filter_map(|buf| buf.entries.front().map(|(_, seq)| *seq))
+            .min()
+            .unwrap_or(u64::MAX);
+        let mut marks = self.marks.lock();
+        while marks.len() > 1 && marks[1].1 <= oldest {
+            marks.pop_front();
+        }
+    }
+
+    /// The first arrival number given out after `at`, to a mark: 0 before
+    /// the first.
+    fn arrival_at(&self, at: Instant) -> u64 {
+        let marks = self.marks.lock();
+        let after = marks.partition_point(|(mark, _)| *mark <= at);
+        after.checked_sub(1).map_or(0, |i| marks[i].1)
+    }
+
+    /// What this node published to `topic` in the last `age` (and a little
+    /// before), with its stream's epoch and each message's offset, for a peer
+    /// that has the topic but never heard of the stream: None when this node
+    /// publishes none to it, or the peer named it (`named`).
+    pub(crate) fn published_lately(
+        &self,
+        topic: &str,
+        age: Duration,
+        named: impl Fn(u32) -> bool,
+    ) -> Option<(u32, Vec<(u64, Bytes)>)> {
+        let since = Instant::now()
+            .checked_sub(age.saturating_add(LATELY_MARGIN))
+            .map_or(0, |at| self.arrival_at(at));
+        let buf = self.buffers.get(topic)?;
+        if named(buf.epoch) {
+            return None;
+        }
+        let tail = buf.tail_offset();
+        let messages = buf
+            .entries
+            .iter()
+            .zip(tail..)
+            .filter(|((_, seq), _)| *seq >= since)
+            .map(|((data, _), offset)| (offset, data.clone()))
+            .collect();
+        Some((buf.epoch, messages))
     }
 
     /// This node no longer has `topic`: its relayed streams stop.
@@ -2116,6 +2211,61 @@ mod tests {
             replayed(mgr.recover_streams("room", (0xf, 0), &[(0xf, 0)])),
             None
         );
+    }
+
+    #[test]
+    fn a_peer_gets_what_this_node_published_since_its_interest_began() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.push("news", make_data("old"));
+        let (epoch, _) = mgr.get_position("news").unwrap();
+        // A minute ago the arrival order stood after "old".
+        let minute_ago = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+        mgr.marks
+            .lock()
+            .push_back((minute_ago, mgr.arrival.load(Ordering::Relaxed)));
+        mgr.push("news", make_data("new"));
+        // An interest of 30 s: what came after the mark before it.
+        let (sent_epoch, sent) = mgr
+            .published_lately("news", Duration::from_secs(30), |_| false)
+            .unwrap();
+        assert_eq!(sent_epoch, epoch);
+        assert_eq!(sent, vec![(1, make_data("new"))]);
+        // One older than every mark: all that is kept.
+        let (_, all) = mgr
+            .published_lately("news", Duration::from_secs(120), |_| false)
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        // A stream the peer named, or none here: nothing this way.
+        assert!(
+            mgr.published_lately("news", Duration::from_secs(30), |e| e == epoch)
+                .is_none()
+        );
+        assert!(
+            mgr.published_lately("other", Duration::from_secs(30), |_| false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_marks_go_back_as_far_as_this_node_holds_its_messages() {
+        // Two slots a topic.
+        let mgr = RecoveryManager::new(RecoveryConfig {
+            buffer_size_bits: 1,
+            ..RecoveryConfig::default()
+        });
+        for text in ["a", "b", "c"] {
+            mgr.mark();
+            mgr.push("news", make_data(text));
+        }
+        mgr.mark();
+        mgr.mark();
+        let marks = |mgr: &RecoveryManager| -> Vec<u64> {
+            mgr.marks.lock().iter().map(|(_, next)| *next).collect()
+        };
+        assert_eq!(marks(&mgr), [1, 2, 3, 4], "none while nothing came");
+        // "a" is gone: of the marks before "b", the last stays.
+        mgr.cleanup();
+        assert_eq!(marks(&mgr), [2, 3, 4]);
     }
 
     #[test]

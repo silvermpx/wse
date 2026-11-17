@@ -95,12 +95,23 @@ pub(crate) async fn serve<H: Handler>(
     if let Some(ref recovery) = shared.recovery {
         let rm = recovery.clone();
         let cleanup_state = shared.clone();
-        let stop = stop.clone();
+        let cleanup_stop = stop.clone();
         tasks.spawn(async move {
             let mut interval = tokio::time::interval(crate::recovery::CLEANUP_INTERVAL);
-            while tick(&mut interval, &stop).await {
+            while tick(&mut interval, &cleanup_stop).await {
                 rm.cleanup();
                 cleanup_state.sweep_interest_linger();
+            }
+        });
+        // Where the arrival order stands once a second: a peer that comes
+        // back is sent what this node published since its interest began.
+        let rm = recovery.clone();
+        let mark_stop = stop.clone();
+        tasks.spawn(async move {
+            let mut interval = tokio::time::interval(crate::recovery::MARK_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            while tick(&mut interval, &mark_stop).await {
+                rm.mark();
             }
         });
     }

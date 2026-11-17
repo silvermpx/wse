@@ -309,7 +309,7 @@ async fn handle_cluster_inbound_generic<S>(
 
     // Catch-up: each node first says where it stands in the other's streams.
     let wanted = if peer_caps & CAP_RESUME != 0 {
-        let Some(wanted) = exchange_resume(&mut reader, &mut writer, &ctx).await else {
+        let Some(wanted) = exchange_resume(&mut reader, &mut writer, &ctx, peer_caps).await else {
             tracing::warn!("[WSE-Cluster] No RESUME from inbound {addr} within {RESUME_TIMEOUT:?}");
             release_link(&ctx.links, &peer_instance_id, session_gen);
             return;

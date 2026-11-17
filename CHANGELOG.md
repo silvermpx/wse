@@ -129,6 +129,18 @@ conformance server every client is checked against.
   most, not 40 s).
 - Swift and Kotlin: a new reader of `events()` no longer gets the last
   reader's batch again.
+- Rust client (and Swift, Kotlin, Dart), natively and in the browser: a
+  message that came right behind 64 others read at once is no longer
+  dropped.
+- Server: a recovery after a message the memory budget left no room to
+  keep (of a new stream, relayed or its own) says `recovered: false`, and
+  so does the recovery of a client that names only its last position
+  (before 3.1) when another node's history of the topic is gone; both
+  replayed what was left as complete.
+- Cluster: a stream a node began while its link to another was down
+  reaches the other node's subscribers once the link is back
+  (`CAP_RESUME_TOPICS`); the catch-up covered only the streams the other
+  node held a message of.
 - Swift, Kotlin and Dart: once the client is closed, the events end with
   what the close said (the messages it will not deliver, the close itself);
   a reader waiting at the close no longer gets its end before them.

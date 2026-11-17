@@ -366,43 +366,61 @@ pub(crate) fn encode_replayed(
 
 /// The last RESUME frame of a node's request.
 pub(crate) const RESUME_LAST: u8 = 0x01;
+/// A RESUME frame that names the topics the node has (CAP_RESUME_TOPICS).
+pub(crate) const RESUME_TOPICS: u8 = 0x02;
 
 /// Where a node stands in the streams other nodes relay to it, as it asks on
 /// a new link for what it missed: (topic, the origin's epoch, the last offset
 /// it holds with nothing missing before it).
 pub(crate) type ResumePoint = (String, u32, u64);
 
-/// Encode a node's RESUME request: one frame or more, the last flagged.
+/// A topic the asking node has, and how long ago its interest in it began
+/// (milliseconds): what the other published to it since, of a stream not
+/// named, is sent too.
+pub(crate) type ResumeTopic = (String, u64);
+
+/// Encode a node's RESUME request: one frame or more, the last flagged; the
+/// frames of `topics` (flagged RESUME_TOPICS) after those of `points`.
 /// Format: [u8 type=0x0E][u8 flags][u16 LE 0][u32 LE payload_len][payload],
-/// the payload a run of [u16 LE topic_len][topic][u32 LE epoch][u64 LE offset].
-pub(crate) fn encode_resume(points: &[ResumePoint]) -> Vec<BytesMut> {
-    fn header(buf: &mut BytesMut) {
+/// the payload a run of [u16 LE topic_len][topic][u32 LE epoch][u64 LE offset];
+/// in a frame of topics the epoch is 0 and the offset the interest's age.
+pub(crate) fn encode_resume(points: &[ResumePoint], topics: &[ResumeTopic]) -> Vec<BytesMut> {
+    fn header(buf: &mut BytesMut, flags: u8) {
         buf.put_u8(MsgType::Resume as u8);
-        buf.put_u8(0);
+        buf.put_u8(flags);
         buf.put_u16_le(0);
         buf.put_u32_le(0);
     }
-    let mut frames = Vec::new();
-    let mut buf = BytesMut::new();
-    header(&mut buf);
-    for (topic, epoch, offset) in points {
-        let topic = topic.as_bytes();
+    fn entry(frames: &mut Vec<BytesMut>, buf: &mut BytesMut, flags: u8, at: (&str, u32, u64)) {
+        let topic = at.0.as_bytes();
         let Ok(len) = u16::try_from(topic.len()) else {
-            continue;
+            return;
         };
-        let entry = 2 + topic.len() + 12;
-        if buf.len() + entry > MAX_FRAME_SIZE && buf.len() > 8 {
-            frames.push(std::mem::take(&mut buf));
-            header(&mut buf);
+        if buf.len() + 2 + topic.len() + 12 > MAX_FRAME_SIZE && buf.len() > 8 {
+            frames.push(std::mem::take(buf));
+            header(buf, flags);
         }
         buf.put_u16_le(len);
         buf.put_slice(topic);
-        buf.put_u32_le(*epoch);
-        buf.put_u64_le(*offset);
+        buf.put_u32_le(at.1);
+        buf.put_u64_le(at.2);
+    }
+    let mut frames = Vec::new();
+    let mut buf = BytesMut::new();
+    header(&mut buf, 0);
+    for (topic, epoch, offset) in points {
+        entry(&mut frames, &mut buf, 0, (topic, *epoch, *offset));
+    }
+    if !topics.is_empty() {
+        frames.push(std::mem::take(&mut buf));
+        header(&mut buf, RESUME_TOPICS);
+        for (topic, age) in topics {
+            entry(&mut frames, &mut buf, RESUME_TOPICS, (topic, 0, *age));
+        }
     }
     frames.push(buf);
     if let Some(last) = frames.last_mut() {
-        last[1] = RESUME_LAST;
+        last[1] |= RESUME_LAST;
     }
     for frame in &mut frames {
         let len = (frame.len() - 8) as u32;
@@ -668,6 +686,8 @@ pub(crate) enum ClusterFrame {
     /// Part of a peer's request, on a new link, for what it missed.
     Resume {
         points: Vec<ResumePoint>,
+        /// The topics the node has (a frame flagged RESUME_TOPICS).
+        topics: Vec<ResumeTopic>,
         /// The request's last frame.
         last: bool,
     },
@@ -763,7 +783,7 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                 return None;
             }
             let mut payload = data.split_to(payload_len);
-            let mut points = Vec::new();
+            let (mut points, mut topics) = (Vec::new(), Vec::new());
             while payload.has_remaining() {
                 if payload.remaining() < 2 {
                     return None;
@@ -775,10 +795,15 @@ pub(crate) fn decode_frame(mut data: BytesMut) -> Option<ClusterFrame> {
                 let topic = String::from_utf8(payload.split_to(topic_len).to_vec()).ok()?;
                 let epoch = payload.get_u32_le();
                 let offset = payload.get_u64_le();
-                points.push((topic, epoch, offset));
+                if flags & RESUME_TOPICS != 0 {
+                    topics.push((topic, offset));
+                } else {
+                    points.push((topic, epoch, offset));
+                }
             }
             Some(ClusterFrame::Resume {
                 points,
+                topics,
                 last: flags & RESUME_LAST != 0,
             })
         }

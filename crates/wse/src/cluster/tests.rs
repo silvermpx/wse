@@ -1313,12 +1313,13 @@ fn test_msg_recovery_flag_with_compression() {
 #[test]
 fn a_resume_request_round_trips_in_frames_under_the_limit() {
     // None held: one frame, the last, naming nothing.
-    let frames = encode_resume(&[]);
+    let frames = encode_resume(&[], &[]);
     assert_eq!(frames.len(), 1);
     assert_eq!(
         decode_frame(frames[0].clone()),
         Some(ClusterFrame::Resume {
             points: Vec::new(),
+            topics: Vec::new(),
             last: true
         })
     );
@@ -1327,12 +1328,12 @@ fn a_resume_request_round_trips_in_frames_under_the_limit() {
     let points: Vec<ResumePoint> = (0..3000u64)
         .map(|i| (format!("{topic}{i}"), i as u32, i * 7))
         .collect();
-    let frames = encode_resume(&points);
+    let frames = encode_resume(&points, &[]);
     assert!(frames.len() > 1);
     let mut got = Vec::new();
     for (i, frame) in frames.into_iter().enumerate() {
         assert!(frame.len() <= MAX_FRAME_SIZE);
-        let Some(ClusterFrame::Resume { points, last }) = decode_frame(frame) else {
+        let Some(ClusterFrame::Resume { points, last, .. }) = decode_frame(frame) else {
             panic!("not a RESUME frame");
         };
         assert_eq!(last, got.len() + points.len() == 3000, "frame {i}");
@@ -1342,8 +1343,32 @@ fn a_resume_request_round_trips_in_frames_under_the_limit() {
 }
 
 #[test]
+fn a_resume_request_names_the_topics_after_the_streams() {
+    let points = vec![("news".to_owned(), 7, 41)];
+    let topics = vec![("news".to_owned(), 30_000), ("room".to_owned(), 5)];
+    let frames = encode_resume(&points, &topics);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(
+        decode_frame(frames[0].clone()),
+        Some(ClusterFrame::Resume {
+            points,
+            topics: Vec::new(),
+            last: false
+        })
+    );
+    assert_eq!(
+        decode_frame(frames[1].clone()),
+        Some(ClusterFrame::Resume {
+            points: Vec::new(),
+            topics,
+            last: true
+        })
+    );
+}
+
+#[test]
 fn a_truncated_resume_request_does_not_decode() {
-    let mut frame = encode_resume(&[("topic".to_owned(), 1, 2)]).remove(0);
+    let mut frame = encode_resume(&[("topic".to_owned(), 1, 2)], &[]).remove(0);
     let len = frame.len();
     frame.truncate(len - 3);
     let short = (frame.len() - 8) as u32;
