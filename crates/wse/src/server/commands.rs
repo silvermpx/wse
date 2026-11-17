@@ -110,6 +110,7 @@ pub(super) async fn process_commands(
             ServerCommand::BroadcastBytes { data } => {
                 fanout.broadcast(Outgoing::binary(Bytes::from(data))).await;
             }
+            ServerCommand::Presence(event) => state.tell_presence(event),
             ServerCommand::BroadcastLocal {
                 topic,
                 data,

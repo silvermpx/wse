@@ -599,7 +599,9 @@ async fn a_member_of_a_queue_group_that_unsubscribes_is_no_longer_present() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, mut connected) = mpsc::unbounded_channel();
-    server.start(listener, PresentInGroup { connected: tx }).unwrap();
+    server
+        .start(listener, PresentInGroup { connected: tx })
+        .unwrap();
     let publisher = server.publisher();
     let token = publisher
         .issue_token("alice", Duration::from_secs(60), serde_json::Map::new())
@@ -649,7 +651,10 @@ async fn a_stop_given_up_leaves_the_next_one_to_wait() {
     let again = SlowGoodbye {
         said: std::sync::Arc::clone(&said),
     };
-    assert!(matches!(server.start(listener, again), Err(wse::Error::Running)));
+    assert!(matches!(
+        server.start(listener, again),
+        Err(wse::Error::Running)
+    ));
     server.stop().await;
     assert_eq!(said.load(std::sync::atomic::Ordering::SeqCst), 3);
     assert_eq!(server.connection_count(), 0);

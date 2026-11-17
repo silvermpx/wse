@@ -682,6 +682,47 @@ def test_mutual_tls_refuses_certificate_without_address(nodes, tmp_path):
     assert not wait_for(lambda: a.peers or b.peers, timeout=3.0)
 
 
+def test_the_application_hears_of_a_user_who_joins_and_leaves_on_another_node(nodes):
+    websockets = pytest.importorskip("websockets")
+    from tests.conftest import JWT_AUDIENCE, JWT_ISSUER, JWT_SECRET, make_token
+
+    options = {
+        "presence_enabled": True,
+        "jwt_secret": JWT_SECRET,
+        "jwt_issuer": JWT_ISSUER,
+        "jwt_audience": JWT_AUDIENCE,
+    }
+    a, b = nodes(**options), nodes(**options)
+    a.join(b)
+    b.join(a)
+    assert wait_for(lambda: a.peers == 1 and b.peers == 1)
+    heard: list[tuple[str, str]] = []
+
+    def hear(node):
+        for event in node.server.drain_inbound(16, 50):
+            if event[0] in ("presence_join", "presence_leave"):
+                heard.append((event[0], event[2]["user_id"]))
+
+    async def scenario():
+        ws = await websockets.connect(
+            f"ws://127.0.0.1:{b.port}/wse",
+            additional_headers={"Authorization": f"Bearer {make_token('alice')}"},
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            joined = [e for e in b.server.drain_inbound(16, 50) if e[0] == "auth_connect"]
+            if joined:
+                b.server.subscribe_connection(joined[0][1], ["room"], {"here": True})
+                break
+            await asyncio.sleep(0.05)
+        await asyncio.to_thread(wait_for, lambda: hear(a) or ("presence_join", "alice") in heard)
+        await ws.close()
+        await asyncio.to_thread(wait_for, lambda: hear(a) or ("presence_leave", "alice") in heard)
+
+    asyncio.run(scenario())
+    assert heard == [("presence_join", "alice"), ("presence_leave", "alice")]
+
+
 def test_a_user_who_left_every_node_is_gone_from_all(nodes):
     websockets = pytest.importorskip("websockets")
     from tests.conftest import JWT_AUDIENCE, JWT_ISSUER, JWT_SECRET, make_token

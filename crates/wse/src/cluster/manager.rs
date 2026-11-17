@@ -92,7 +92,7 @@ pub(super) fn presence_round(pm: &PresenceManager) -> Vec<Bytes> {
 // ---------------------------------------------------------------------------
 
 /// Broadcast a presence event of a remote user to the topic's local
-/// subscribers.
+/// subscribers; a join or a leave reaches the application's handler too.
 fn tell_presence(
     server_cmd_tx: &Option<crate::server::Commands>,
     kind: &str,
@@ -101,6 +101,23 @@ fn tell_presence(
     data: &serde_json::Value,
 ) {
     if let Some(tx) = server_cmd_tx {
+        use crate::server::Presence;
+        let event = match kind {
+            "presence_join" => Some(Presence::Join {
+                topic: topic.clone(),
+                user_id: user_id.to_owned(),
+                data: data.clone(),
+            }),
+            "presence_leave" => Some(Presence::Leave {
+                topic: topic.clone(),
+                user_id: user_id.to_owned(),
+                data: data.clone(),
+            }),
+            _ => None,
+        };
+        if let Some(event) = event {
+            let _ = tx.send(crate::server::ServerCommand::Presence(event));
+        }
         let _ = tx.send(crate::server::ServerCommand::BroadcastLocal {
             topic,
             data: crate::server::format_presence_msg(kind, user_id, data),

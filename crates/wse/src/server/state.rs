@@ -588,6 +588,9 @@ pub(crate) enum ServerCommand {
         /// recovery position the message got here.
         publish: bool,
     },
+    /// A presence change another node made: the application's handler
+    /// hears of it, as of one made here.
+    Presence(super::handler::Presence),
     /// The application accepts a connection: `ready` (its server_ready) is
     /// sent, then broadcasts reach it and it may subscribe on its own.
     Accept {
