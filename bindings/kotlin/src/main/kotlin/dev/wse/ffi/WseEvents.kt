@@ -16,57 +16,62 @@ suspend fun connectClient(config: WseConfig, tokens: WseTokenSource? = null): Ws
     connect(config, tokens, WseCancel())
 
 /**
+ * Where the reading of a client's events stands, for as long as the client lives: the readers
+ * made of it one after another go on from one place. It holds no client, so it goes with it.
+ */
+internal class ReadState(val maxItems: UInt, val maxBytes: UInt) {
+    var batch: WseBatch? = null
+    var index = 0
+    var acknowledged: ULong = 0u
+    var ended = false
+    val reading = AtomicBoolean(false)
+}
+
+/**
  * The events of a client. A batch is acknowledged only once all of it was handed out, so a
- * collector cancelled in between gets the rest from the same object later, and nothing comes twice.
- * One reader at a time: a second reading at the same time gets [WseException.Busy].
+ * collector cancelled in between, or a reader let go, leaves the rest to the next one, and nothing
+ * comes twice. One reader at a time: a second reading at the same time gets [WseException.Busy].
  */
 class WseEvents internal constructor(
     private val client: WseClient,
-    private val maxItems: UInt = 256u,
-    private val maxBytes: UInt = 1u shl 20,
+    private val state: ReadState,
 ) {
-    private var batch: WseBatch? = null
-    private var index = 0
-    private var acknowledged: ULong = 0u
-    private var ended = false
-    private val reading = AtomicBoolean(false)
-
     /** Runs as an item is about to be handed over (tests cancel the collector there). */
     internal var handingOver: ((WseItem) -> Unit)? = null
 
     /** The next item, or null once the client closed. */
     suspend fun next(): WseItem? = reading {
         val item = peek() ?: return@reading null
-        index++
+        state.index++
         item
     }
 
     /** Runs `read` as the one reader, or throws [WseException.Busy]. */
     private inline fun <T> reading(read: () -> T): T {
-        if (!reading.compareAndSet(false, true)) throw WseException.Busy()
+        if (!state.reading.compareAndSet(false, true)) throw WseException.Busy()
         try {
             return read()
         } finally {
-            reading.set(false)
+            state.reading.set(false)
         }
     }
 
     /** The next item, not taken yet, or null once the client closed. */
     private suspend fun peek(): WseItem? {
         while (true) {
-            batch?.let { current ->
-                if (index < current.items.size) return current.items[index]
-                acknowledged = current.id
+            state.batch?.let { current ->
+                if (state.index < current.items.size) return current.items[state.index]
+                state.acknowledged = current.id
             }
-            if (ended) return null
-            val next = client.nextBatch(acknowledged, maxItems, maxBytes, WseCancel())
+            if (state.ended) return null
+            val next = client.nextBatch(state.acknowledged, state.maxItems, state.maxBytes, WseCancel())
             if (next.kind == WseBatchKind.END) {
-                ended = true
-                batch = null
+                state.ended = true
+                state.batch = null
                 return null
             }
-            batch = next
-            index = 0
+            state.batch = next
+            state.index = 0
         }
     }
 
@@ -91,23 +96,19 @@ class WseEvents internal constructor(
                 } catch (stopped: Throwable) {
                     // Stopped while running, the collector had it. Cancelled, it may not have
                     // (an operator in between checks before it hands on): it comes again.
-                    if (currentCoroutineContext().isActive) index++
+                    if (currentCoroutineContext().isActive) state.index++
                     throw stopped
                 }
-                index++
+                state.index++
             }
         }
     }
 }
 
-/** Each client's reader while one is held. */
+/** Each client's reader while one is held, and where its reading stands while the client lives. */
 private val readers = WeakHashMap<WseClient, WeakReference<WseEvents>>()
+private val states = WeakHashMap<WseClient, ReadState>()
 
-/**
- * What the server sends, in order, until the client closes. Every call reads the client's one
- * stream (with the limits of the first, while it is held): an item goes to one reader, and a second
- * reading at the same time gets [WseException.Busy].
- */
 /**
  * The consumer applied [message] (one of a topic): the checkpoint moves on through what was applied
  * without a hole. A message handed out before the events showed another user counts for nobody.
@@ -119,9 +120,16 @@ fun WseClient.commit(message: WseMessage) {
     commit(topic, epoch, offset, message.generation)
 }
 
+/**
+ * What the server sends, in order, until the client closes. Every call reads the client's one
+ * stream (with the limits of the first): an item goes to one reader, a reader let go and a new one
+ * go on from the same place, and a second reading at the same time gets [WseException.Busy].
+ */
 fun WseClient.events(maxItems: UInt = 256u, maxBytes: UInt = 1u shl 20): WseEvents =
     synchronized(readers) {
-        readers[this]?.get() ?: WseEvents(this, maxItems, maxBytes).also { readers[this] = WeakReference(it) }
+        readers[this]?.get()
+            ?: WseEvents(this, states.getOrPut(this) { ReadState(maxItems, maxBytes) })
+                .also { readers[this] = WeakReference(it) }
     }
 
 /**

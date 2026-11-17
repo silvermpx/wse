@@ -73,6 +73,10 @@
 - Rust client (and Swift, Kotlin, Dart): a connection that died while the
   device slept is made again at the first heartbeat after waking (15 s at
   most), not when the server's silence runs out (40 s).
+- Swift and Kotlin: a new reader of `events()` after the last one was let go
+  (a loop left with `break`, a reader collected) started again at the batch
+  the last one was in, so its items came twice. Where the reading stands is
+  the client's now, for as long as it lives, as in Dart.
 
 ## v3.1.0 (2026-11-16)
 

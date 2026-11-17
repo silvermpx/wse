@@ -2,6 +2,7 @@
 // its URL in WSE_TEST_URL.
 package dev.wse.ffi
 
+import java.lang.ref.WeakReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -150,6 +151,32 @@ class WseClientTest {
         assertEquals("""{"text":"hallo"}""", echoed)
         assertEquals(ticks.sorted(), ticks)
         client.disconnect(1_000u)
+    }
+
+    @Test
+    fun aReaderLetGoLeavesTheRestToTheNext(): Unit = runBlocking {
+        val client = connectClient(WseConfig(url = url, insecure = true))
+        client.send("echo", """{"n":1}""")
+        client.send("echo", """{"n":2}""")
+        // Both answers in one batch.
+        delay(300)
+        val gone = readOneEcho(client)
+        withTimeout(10_000) {
+            while (gone.get() != null) {
+                System.gc()
+                delay(10)
+            }
+        }
+        // A new reader, where the last one stopped.
+        assertEquals("""{"n":2}""", message(client.events(), "echoed").json)
+        client.disconnect(1_000u)
+    }
+
+    /** Reads the first echo with a reader of its own and lets the reader go. */
+    private suspend fun readOneEcho(client: WseClient): WeakReference<WseEvents> {
+        val events = client.events()
+        assertEquals("""{"n":1}""", message(events, "echoed").json)
+        return WeakReference(events)
     }
 
     @Test

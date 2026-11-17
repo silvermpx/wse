@@ -16,9 +16,9 @@ public extension WseClient {
     }
 
     /// What the server sends, in order, until the client closes. Every call
-    /// reads the client's one stream (with the limits of the first, while it
-    /// is held): an item goes to one reader, and a second reading at the
-    /// same time gets `WseError.Busy`.
+    /// reads the client's one stream (with the limits of the first): an item
+    /// goes to one reader, a loop left and a new one go on from the same
+    /// place, and a second reading at the same time gets `WseError.Busy`.
     func events(maxItems: UInt32 = 256, maxBytes: UInt32 = 1 << 20) -> WseEvents {
         WseEvents.of(self, maxItems: maxItems, maxBytes: maxBytes)
     }
@@ -69,9 +69,45 @@ private func cancellable<T>(_ call: (WseCancel) async throws -> T) async throws 
     }
 }
 
+/// Where the reading of a client's events stands, for as long as the client
+/// lives: the sequences made of it one after another go on from one place.
+final class WseReadState: @unchecked Sendable {
+    let maxItems: UInt32
+    let maxBytes: UInt32
+    var batch: WseBatch?
+    var index = 0
+    var acknowledged: UInt64 = 0
+    var ended = false
+    private let lock = NSLock()
+    private var reading = false
+
+    init(maxItems: UInt32, maxBytes: UInt32) {
+        self.maxItems = maxItems
+        self.maxBytes = maxBytes
+    }
+
+    /// The reading, for one caller at a time: false while another reads.
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if reading { return false }
+        reading = true
+        return true
+    }
+
+    func release() {
+        lock.lock()
+        defer { lock.unlock() }
+        reading = false
+    }
+}
+
+/// What a client's read state hangs on: it goes with the client.
+nonisolated(unsafe) private var readStateKey: UInt8 = 0
+
 /// The events of a client. A batch is acknowledged only once all of it was
-/// handed out, so a Task cancelled in between gets the rest from the same
-/// sequence later, and nothing is handed out twice.
+/// handed out, so a Task cancelled in between, or a loop left, gets the rest
+/// later, from this sequence or a new one, and nothing is handed out twice.
 public final class WseEvents: AsyncSequence, @unchecked Sendable {
     public typealias Element = WseItem
 
@@ -83,25 +119,24 @@ public final class WseEvents: AsyncSequence, @unchecked Sendable {
         readersLock.lock()
         defer { readersLock.unlock() }
         if let reader = readers.object(forKey: client) { return reader }
-        let reader = WseEvents(client: client, maxItems: maxItems, maxBytes: maxBytes)
+        let state: WseReadState
+        if let held = objc_getAssociatedObject(client, &readStateKey) as? WseReadState {
+            state = held
+        } else {
+            state = WseReadState(maxItems: maxItems, maxBytes: maxBytes)
+            objc_setAssociatedObject(client, &readStateKey, state, .OBJC_ASSOCIATION_RETAIN)
+        }
+        let reader = WseEvents(client: client, state: state)
         readers.setObject(reader, forKey: client)
         return reader
     }
 
     private let client: WseClient
-    private let maxItems: UInt32
-    private let maxBytes: UInt32
-    private var batch: WseBatch?
-    private var index = 0
-    private var acknowledged: UInt64 = 0
-    private var ended = false
-    private let lock = NSLock()
-    private var reading = false
+    private let state: WseReadState
 
-    private init(client: WseClient, maxItems: UInt32, maxBytes: UInt32) {
+    private init(client: WseClient, state: WseReadState) {
         self.client = client
-        self.maxItems = maxItems
-        self.maxBytes = maxBytes
+        self.state = state
     }
 
     public struct AsyncIterator: AsyncIteratorProtocol {
@@ -117,38 +152,29 @@ public final class WseEvents: AsyncSequence, @unchecked Sendable {
     }
 
     func next() async throws -> WseItem? {
-        lock.lock()
-        if reading {
-            lock.unlock()
-            throw WseError.Busy
-        }
-        reading = true
-        lock.unlock()
-        defer {
-            lock.lock()
-            reading = false
-            lock.unlock()
-        }
+        guard state.claim() else { throw WseError.Busy }
+        defer { state.release() }
         while true {
-            if let batch, index < batch.items.count {
-                index += 1
-                return batch.items[index - 1]
+            if let batch = state.batch, state.index < batch.items.count {
+                state.index += 1
+                return batch.items[state.index - 1]
             }
-            if ended { return nil }
-            if let batch { acknowledged = batch.id }
+            if state.ended { return nil }
+            if let batch = state.batch { state.acknowledged = batch.id }
             let cancel = WseCancel()
+            let (ack, maxItems, maxBytes) = (state.acknowledged, state.maxItems, state.maxBytes)
             let next = try await withTaskCancellationHandler {
-                try await client.nextBatch(ack: acknowledged, maxItems: maxItems, maxBytes: maxBytes, cancel: cancel)
+                try await client.nextBatch(ack: ack, maxItems: maxItems, maxBytes: maxBytes, cancel: cancel)
             } onCancel: {
                 cancel.cancel()
             }
             if case .end = next.kind {
-                ended = true
-                batch = nil
+                state.ended = true
+                state.batch = nil
                 return nil
             }
-            batch = next
-            index = 0
+            state.batch = next
+            state.index = 0
         }
     }
 }

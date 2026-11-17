@@ -238,6 +238,20 @@ final class WseClientTests: XCTestCase {
         await client.disconnect(deadlineMs: 1_000)
     }
 
+    func testALoopLeftLeavesTheRestToTheNext() async throws {
+        let client = try await WseClient.connect(WseConfig(url: url, insecure: true))
+        try await client.send(kind: "echo", json: #"{"n":1}"#)
+        try await client.send(kind: "echo", json: #"{"n":2}"#)
+        // Both answers in one batch; each loop takes one and lets its
+        // sequence go.
+        try await Task.sleep(nanoseconds: 300_000_000)
+        let first = try await message(client, "echoed")
+        XCTAssertEqual(first.json, #"{"n":1}"#)
+        let second = try await message(client, "echoed")
+        XCTAssertEqual(second.json, #"{"n":2}"#)
+        await client.disconnect(deadlineMs: 1_000)
+    }
+
     func testEveryCallReadsOneStreamOneReaderAtATime() async throws {
         // No topics: past its first items the server stays quiet.
         let client = try await WseClient.connect(WseConfig(url: url, insecure: true))
