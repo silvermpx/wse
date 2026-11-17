@@ -227,7 +227,14 @@ class Run:
                 )
                 continue
             live = bool(step.get("live"))
-            sent = await client.send(step["type"], payload, id=message_id, live=live)
+            sent = await client.send(
+                step["type"],
+                payload,
+                id=message_id,
+                live=live,
+                correlation_id=step.get("correlation_id"),
+                **({"priority": step["priority"]} if "priority" in step else {}),
+            )
             self.record(
                 {
                     "ev": "sent",
@@ -292,6 +299,7 @@ class Run:
                     "topic": event.topic,
                     "n": n if isinstance(n, int) else None,
                     "payload": payload,
+                    "cid": event.correlation_id,
                 }
             )
             # Applied: the checkpoint moves on.
@@ -319,7 +327,9 @@ class Run:
         if what == "messages":
             return len(messages(lambda e: e["topic"] == topic)) >= step["count"]
         if what == "message":
-            return bool(messages(lambda e: e["type"] == step["type"]))
+            return len(messages(lambda e: e["type"] == step["type"])) >= step.get(
+                "count", 1
+            )
         if what == "published":
             wanted = self.published.get(topic, [])[-step["last"] :]
             got = {e["n"] for e in messages(lambda e: e["topic"] == topic)}

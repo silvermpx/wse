@@ -1418,6 +1418,33 @@ private class AndroidSystemCleanable(
 /**
  * @suppress
  */
+public object FfiConverterUByte: FfiConverter<UByte, Byte> {
+    override fun lift(value: Byte): UByte {
+        return value.toUByte()
+    }
+
+    fun lift(value: Int): UByte {
+        return value.toUByte()
+    }
+
+    override fun read(buf: ByteBuffer): UByte {
+        return lift(buf.get())
+    }
+
+    override fun lower(value: UByte): Byte {
+        return value.toByte()
+    }
+
+    override fun allocationSize(value: UByte) = 1UL
+
+    override fun write(value: UByte, buf: ByteBuffer) {
+        buf.put(value.toByte())
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterUShort: FfiConverter<UShort, Short> {
     override fun lift(value: Short): UShort {
         return value.toUShort()
@@ -3429,6 +3456,21 @@ data class WseMessage (
     val `id`: kotlin.String?
     ,
     /**
+     * The id a request named, on its reply (`cid`).
+     */
+    val `correlationId`: kotlin.String?
+    ,
+    /**
+     * How urgent its sender said it is (`pri`).
+     */
+    val `priority`: kotlin.UByte?
+    ,
+    /**
+     * When it was sent, as its sender wrote it (`ts`).
+     */
+    val `timestamp`: kotlin.String?
+    ,
+    /**
      * The payload as JSON text (from msgpack too); None without one
      * (absent or null) or when it could not be decoded.
      */
@@ -3468,6 +3510,9 @@ public object FfiConverterTypeWseMessage: FfiConverterRustBuffer<WseMessage> {
             FfiConverterOptionalULong.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalUByte.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalTypeWseSignature.read(buf),
             FfiConverterUInt.read(buf),
@@ -3480,6 +3525,9 @@ public object FfiConverterTypeWseMessage: FfiConverterRustBuffer<WseMessage> {
             FfiConverterOptionalUInt.allocationSize(value.`epoch`) +
             FfiConverterOptionalULong.allocationSize(value.`offset`) +
             FfiConverterOptionalString.allocationSize(value.`id`) +
+            FfiConverterOptionalString.allocationSize(value.`correlationId`) +
+            FfiConverterOptionalUByte.allocationSize(value.`priority`) +
+            FfiConverterOptionalString.allocationSize(value.`timestamp`) +
             FfiConverterOptionalString.allocationSize(value.`json`) +
             FfiConverterOptionalString.allocationSize(value.`payloadError`) +
             FfiConverterOptionalTypeWseSignature.allocationSize(value.`signature`) +
@@ -3492,6 +3540,9 @@ public object FfiConverterTypeWseMessage: FfiConverterRustBuffer<WseMessage> {
             FfiConverterOptionalUInt.write(value.`epoch`, buf)
             FfiConverterOptionalULong.write(value.`offset`, buf)
             FfiConverterOptionalString.write(value.`id`, buf)
+            FfiConverterOptionalString.write(value.`correlationId`, buf)
+            FfiConverterOptionalUByte.write(value.`priority`, buf)
+            FfiConverterOptionalString.write(value.`timestamp`, buf)
             FfiConverterOptionalString.write(value.`json`, buf)
             FfiConverterOptionalString.write(value.`payloadError`, buf)
             FfiConverterOptionalTypeWseSignature.write(value.`signature`, buf)
@@ -3598,6 +3649,23 @@ data class WseSendOptions (
      * Topics that must each be continuous when it goes.
      */
     val `requires`: List<kotlin.String> = listOf()
+    ,
+    /**
+     * The id the app's reply names (`cid`): its request and its response.
+     */
+    val `correlationId`: kotlin.String? = null
+    ,
+    /**
+     * How urgent the app says it is (`pri`: 10 critical, 8 high, 5 normal, 3 low,
+     * 1 background; 0: none). For the server's app: the outbox keeps the order.
+     */
+    val `priority`: kotlin.UByte = 0u
+    ,
+    /**
+     * On the connection that is ready now, or not at all: never kept, never sent
+     * later. It takes no `ttl_ms` and requires no topics.
+     */
+    val `live`: kotlin.Boolean = false
 
 ){
 
@@ -3617,19 +3685,28 @@ public object FfiConverterTypeWseSendOptions: FfiConverterRustBuffer<WseSendOpti
             FfiConverterOptionalString.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterSequenceString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterUByte.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
     override fun allocationSize(value: WseSendOptions) = (
             FfiConverterOptionalString.allocationSize(value.`id`) +
             FfiConverterULong.allocationSize(value.`ttlMs`) +
-            FfiConverterSequenceString.allocationSize(value.`requires`)
+            FfiConverterSequenceString.allocationSize(value.`requires`) +
+            FfiConverterOptionalString.allocationSize(value.`correlationId`) +
+            FfiConverterUByte.allocationSize(value.`priority`) +
+            FfiConverterBoolean.allocationSize(value.`live`)
     )
 
     override fun write(value: WseSendOptions, buf: ByteBuffer) {
             FfiConverterOptionalString.write(value.`id`, buf)
             FfiConverterULong.write(value.`ttlMs`, buf)
             FfiConverterSequenceString.write(value.`requires`, buf)
+            FfiConverterOptionalString.write(value.`correlationId`, buf)
+            FfiConverterUByte.write(value.`priority`, buf)
+            FfiConverterBoolean.write(value.`live`, buf)
     }
 }
 
@@ -5034,6 +5111,38 @@ public object FfiConverterTypeWseTrust : FfiConverterRustBuffer<WseTrust>{
 }
 
 
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalUByte: FfiConverterRustBuffer<kotlin.UByte?> {
+    override fun read(buf: ByteBuffer): kotlin.UByte? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterUByte.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.UByte?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterUByte.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.UByte?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterUByte.write(value, buf)
+        }
+    }
+}
 
 
 

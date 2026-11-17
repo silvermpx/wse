@@ -101,6 +101,15 @@ pub struct WseSendOptions {
     pub ttl_ms: u64,
     /// Topics that must each be continuous when it goes.
     pub requires: Vec<String>,
+    /// The id the app's reply names (`cid`): its request and its response.
+    pub correlation_id: Option<String>,
+    /// How urgent the app says it is (`pri`: 10 critical, 8 high, 5 normal,
+    /// 3 low, 1 background; 0: none). For the server's app: the outbox
+    /// keeps the order.
+    pub priority: u8,
+    /// On the connection that is ready now, or not at all: never kept,
+    /// never sent later. It takes no `ttl_ms` and requires no topics.
+    pub live: bool,
 }
 
 impl From<WseSendOptions> for native::NativeSendOptions {
@@ -109,6 +118,9 @@ impl From<WseSendOptions> for native::NativeSendOptions {
             id: options.id,
             ttl_ms: options.ttl_ms,
             requires: options.requires,
+            correlation_id: options.correlation_id,
+            priority: options.priority,
+            live: options.live,
         }
     }
 }
@@ -276,6 +288,12 @@ pub struct WseItem {
     pub epoch: Option<u32>,
     pub offset: Option<u64>,
     pub id: Option<String>,
+    /// Message: the id a request named, on its reply (`cid`).
+    pub correlation_id: Option<String>,
+    /// Message: how urgent its sender said it is (`pri`).
+    pub priority: Option<u8>,
+    /// Message: when it was sent, as its sender wrote it (`ts`).
+    pub timestamp: Option<String>,
     /// Message: the payload as JSON text (None without one, absent or null,
     /// or when it could not be decoded); ServerError: its details.
     pub json: Option<String>,
@@ -332,6 +350,9 @@ impl WseItem {
             epoch: None,
             offset: None,
             id: None,
+            correlation_id: None,
+            priority: None,
+            timestamp: None,
             json: None,
             payload_error: None,
             generation: 0,
@@ -373,6 +394,9 @@ impl From<native::Item> for WseItem {
                     epoch: m.epoch,
                     offset: m.offset,
                     id: m.id,
+                    correlation_id: m.correlation_id,
+                    priority: m.priority,
+                    timestamp: m.timestamp,
                     json: m.json,
                     payload_error: m.payload_error,
                     generation: m.generation,

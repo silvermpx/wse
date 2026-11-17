@@ -273,15 +273,18 @@ impl Run {
                 self.record(json!({"ev": "sent", "id": id, "type": kind, "signed": true, "live": false, "ok": sent.is_ok()}));
                 continue;
             }
+            let mut options = SendOptions::default();
+            options.id = Some(id.clone());
+            options.correlation_id = step["correlation_id"].as_str().map(str::to_owned);
+            options.priority = step["priority"].as_u64().and_then(|p| u8::try_from(p).ok());
             if step["live"] == true {
-                let sent = self.client()?.try_send_live(&kind, &payload);
+                options.live = true;
+                let sent = self.client()?.try_send_with(&kind, &payload, &options);
                 self.record(
                     json!({"ev": "sent", "id": id, "type": kind, "live": true, "ok": sent.is_ok()}),
                 );
                 continue;
             }
-            let mut options = SendOptions::default();
-            options.id = Some(id.clone());
             let sent = self.client()?.send_with(&kind, &payload, &options).await;
             self.record(
                 json!({"ev": "sent", "id": id, "type": kind, "live": false, "ok": sent.is_ok()}),
@@ -336,6 +339,7 @@ impl Run {
                     "topic": topic,
                     "n": payload["n"].as_u64(),
                     "payload": payload,
+                    "cid": message.correlation_id(),
                 }));
                 // Applied: the checkpoint moves on.
                 if self.rr
@@ -395,7 +399,10 @@ impl Run {
             "messages" => {
                 messages(&|e| e["topic"] == *topic) as u64 >= step["count"].as_u64().unwrap_or(1)
             }
-            "message" => messages(&|e| e["type"] == step["type"]) > 0,
+            "message" => {
+                messages(&|e| e["type"] == step["type"])
+                    >= step["count"].as_u64().unwrap_or(1) as usize
+            }
             "published" => {
                 let last = step["last"].as_u64().unwrap_or(1) as usize;
                 let numbers = self

@@ -226,6 +226,30 @@ fn hold(rule: &Rule, trace: &Trace<'_>, log: &Log) -> Result<(), String> {
                 Err(format!("{} break(s) said where none was", breaks.len()))
             }
         }
+        // A request named its correlation id and priority: the server's
+        // application took both, and the client heard the reply naming it.
+        "correlated" => {
+            let cid = rule
+                .correlation_id
+                .as_deref()
+                .ok_or_else(|| "the rule names no correlation id".to_owned())?;
+            let taken = log
+                .taken
+                .iter()
+                .find(|t| t.cid.as_deref() == Some(cid) && kind.is_none_or(|k| t.kind == k))
+                .ok_or_else(|| format!("no message with correlation id {cid} was taken"))?;
+            if rule.priority.is_some() && taken.pri != rule.priority {
+                return Err(format!(
+                    "{cid} was taken with priority {:?}, not {:?}",
+                    taken.pri, rule.priority
+                ));
+            }
+            if trace.of("message").any(|(_, e)| e["cid"] == cid) {
+                Ok(())
+            } else {
+                Err(format!("no reply naming {cid} was heard"))
+            }
+        }
         "taken_once" => {
             let sent = trace.sent(kind);
             if sent.is_empty() {
@@ -404,6 +428,8 @@ mod tests {
             s: None,
             possible_repeat,
             signed: false,
+            cid: None,
+            pri: None,
         }
     }
 
@@ -644,5 +670,34 @@ mod tests {
         );
         assert!(judged(json!([{"rule": "signed_taken", "count": 1}]), &[], &log).is_empty());
         assert_eq!(judged(json!([{"rule": "nonsense"}]), &[], &log).len(), 1);
+    }
+
+    #[test]
+    fn a_request_is_taken_with_its_correlation_id_and_priority_and_its_reply_names_it() {
+        let mut log = Log {
+            taken: vec![Taken {
+                kind: "echo".to_owned(),
+                cid: Some("c-1".to_owned()),
+                pri: Some(8),
+                ..taken("e", 1, false)
+            }],
+            ..Log::default()
+        };
+        let reply = json!({"ev": "message", "type": "echoed", "cid": "c-1"});
+        let rule =
+            json!([{"rule": "correlated", "type": "echo", "correlation_id": "c-1", "priority": 8}]);
+        assert!(judged(rule.clone(), std::slice::from_ref(&reply), &log).is_empty());
+        // No reply names it.
+        let unnamed = json!({"ev": "message", "type": "echoed", "cid": null});
+        assert_eq!(judged(rule.clone(), &[unnamed], &log).len(), 1);
+        // Taken with another priority.
+        log.taken[0].pri = Some(5);
+        assert_eq!(
+            judged(rule.clone(), std::slice::from_ref(&reply), &log).len(),
+            1
+        );
+        // Never taken.
+        log.taken.clear();
+        assert_eq!(judged(rule, &[reply], &log).len(), 1);
     }
 }

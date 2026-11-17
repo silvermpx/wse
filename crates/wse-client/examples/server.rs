@@ -45,8 +45,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return true;
             };
             match message["t"].as_str() {
+                // The reply names the request's correlation id, as an
+                // application's reply does.
                 Some("echo") => {
-                    let echoed = json!({"t": "echoed", "p": message["p"]});
+                    let mut echoed = json!({"t": "echoed", "p": message["p"]});
+                    if let Some(cid) = message.get("cid").filter(|cid| cid.is_string()) {
+                        echoed["cid"] = cid.clone();
+                    }
                     let _ = self.publisher.send(conn, echoed.to_string());
                 }
                 Some("bind_key") => {

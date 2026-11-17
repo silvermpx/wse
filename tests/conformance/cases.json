@@ -60,6 +60,63 @@
       ]
     },
     {
+      "case": "send.correlation",
+      "about": "A request names its correlation id and priority, sent as any message and live: the server's application takes both, and its reply names the id back.",
+      "steps": [
+        {
+          "client": "connect"
+        },
+        {
+          "client": "wait",
+          "for": "ready"
+        },
+        {
+          "client": "send",
+          "type": "echo",
+          "id": "ask-1",
+          "payload": {
+            "text": "first"
+          },
+          "correlation_id": "order-7",
+          "priority": 8
+        },
+        {
+          "client": "send",
+          "type": "echo",
+          "id": "ask-2",
+          "payload": {
+            "text": "now"
+          },
+          "correlation_id": "order-8",
+          "priority": 10,
+          "live": true
+        },
+        {
+          "client": "wait",
+          "for": "message",
+          "type": "echoed",
+          "count": 2
+        },
+        {
+          "client": "close"
+        }
+      ],
+      "rules": [
+        {
+          "rule": "correlated",
+          "type": "echo",
+          "correlation_id": "order-7",
+          "priority": 8
+        },
+        {
+          "rule": "correlated",
+          "type": "echo",
+          "correlation_id": "order-8",
+          "priority": 10
+        }
+      ]
+    },
+    {
       "case": "topics.receive",
       "about": "Ten messages of a topic come in order, each once.",
       "server": {

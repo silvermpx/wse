@@ -87,6 +87,11 @@ final id = await client.sendWith('order', '{"item":"tea"}', id: 'order-17');
 client.clear();
 ```
 
+`sendWith` also names a request's `correlationId`, which the reply names
+back (the message item's `correlationId`), and its `priority` (10 critical,
+8 high, 5 normal, 3 low, 1 background), for the server's app; `live: true`
+sends on the connection that is ready now, or not at all.
+
 The outbox is in memory by default. With `offline: wseOffline(path: file)`
 (a file in the app's own storage) it outlives the app. At most
 `maxMessages` (100,000) and `maxBytes` (16 MiB) wait, the ones not answered

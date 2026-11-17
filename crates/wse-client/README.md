@@ -264,6 +264,14 @@ and `try_send` fails at once with `Error::Full`. `kept()` says how many
 wait. A send that requires topics waits in memory until they are
 continuous, and joins the outbox then.
 
+`SendOptions` also names a request's `correlation_id` (`cid`), which the
+server application's reply names back (`Message::correlation_id`), and its
+`priority` (`pri`: 10 critical, 8 high, 5 normal, 3 low, 1 background), for
+the server's application; the outbox keeps the order messages were sent in.
+With `live` the message goes on the connection that is ready now, or not at
+all, as `try_send_live` sends it, with the same id, correlation id and
+priority.
+
 `wse_client::connect` (and `Client::connect`) returns once the server took
 the connection, and fails when the first attempt does. For an application
 that may start without a network, `wse_client::start` (and `Client::start`)

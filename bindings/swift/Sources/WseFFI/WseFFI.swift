@@ -471,6 +471,22 @@ private let UNIFFI_CALLBACK_UNEXPECTED_ERROR: Int32 = 2
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
+    typealias FfiType = UInt8
+    typealias SwiftType = UInt8
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt8 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: UInt8, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt16: FfiConverterPrimitive {
     typealias FfiType = UInt16
     typealias SwiftType = UInt16
@@ -1985,6 +2001,18 @@ public struct WseMessage: Equatable, Hashable {
     public let offset: UInt64?
     public let id: String?
     /**
+     * The id a request named, on its reply (`cid`).
+     */
+    public let correlationId: String?
+    /**
+     * How urgent its sender said it is (`pri`).
+     */
+    public let priority: UInt8?
+    /**
+     * When it was sent, as its sender wrote it (`ts`).
+     */
+    public let timestamp: String?
+    /**
      * The payload as JSON text (from msgpack too); None without one
      * (absent or null) or when it could not be decoded.
      */
@@ -2004,6 +2032,15 @@ public struct WseMessage: Equatable, Hashable {
     // declare one manually.
     public init(kind: String, topic: String?, epoch: UInt32?, offset: UInt64?, id: String?,
         /**
+         * The id a request named, on its reply (`cid`).
+         */correlationId: String?,
+        /**
+         * How urgent its sender said it is (`pri`).
+         */priority: UInt8?,
+        /**
+         * When it was sent, as its sender wrote it (`ts`).
+         */timestamp: String?,
+        /**
          * The payload as JSON text (from msgpack too); None without one
          * (absent or null) or when it could not be decoded.
          */json: String?,
@@ -2019,6 +2056,9 @@ public struct WseMessage: Equatable, Hashable {
         self.epoch = epoch
         self.offset = offset
         self.id = id
+        self.correlationId = correlationId
+        self.priority = priority
+        self.timestamp = timestamp
         self.json = json
         self.payloadError = payloadError
         self.signature = signature
@@ -2046,6 +2086,9 @@ public struct FfiConverterTypeWseMessage: FfiConverterRustBuffer {
                 epoch: FfiConverterOptionUInt32.read(from: &buf),
                 offset: FfiConverterOptionUInt64.read(from: &buf),
                 id: FfiConverterOptionString.read(from: &buf),
+                correlationId: FfiConverterOptionString.read(from: &buf),
+                priority: FfiConverterOptionUInt8.read(from: &buf),
+                timestamp: FfiConverterOptionString.read(from: &buf),
                 json: FfiConverterOptionString.read(from: &buf),
                 payloadError: FfiConverterOptionString.read(from: &buf),
                 signature: FfiConverterOptionTypeWseSignature.read(from: &buf),
@@ -2059,6 +2102,9 @@ public struct FfiConverterTypeWseMessage: FfiConverterRustBuffer {
         FfiConverterOptionUInt32.write(value.epoch, into: &buf)
         FfiConverterOptionUInt64.write(value.offset, into: &buf)
         FfiConverterOptionString.write(value.id, into: &buf)
+        FfiConverterOptionString.write(value.correlationId, into: &buf)
+        FfiConverterOptionUInt8.write(value.priority, into: &buf)
+        FfiConverterOptionString.write(value.timestamp, into: &buf)
         FfiConverterOptionString.write(value.json, into: &buf)
         FfiConverterOptionString.write(value.payloadError, into: &buf)
         FfiConverterOptionTypeWseSignature.write(value.signature, into: &buf)
@@ -2209,6 +2255,20 @@ public struct WseSendOptions: Equatable, Hashable {
      * Topics that must each be continuous when it goes.
      */
     public let requires: [String]
+    /**
+     * The id the app's reply names (`cid`): its request and its response.
+     */
+    public let correlationId: String?
+    /**
+     * How urgent the app says it is (`pri`: 10 critical, 8 high, 5 normal, 3 low,
+     * 1 background; 0: none). For the server's app: the outbox keeps the order.
+     */
+    public let priority: UInt8
+    /**
+     * On the connection that is ready now, or not at all: never kept, never sent
+     * later. It takes no `ttl_ms` and requires no topics.
+     */
+    public let live: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -2223,10 +2283,24 @@ public struct WseSendOptions: Equatable, Hashable {
          */ttlMs: UInt64 = UInt64(0),
         /**
          * Topics that must each be continuous when it goes.
-         */requires: [String] = []) {
+         */requires: [String] = [],
+        /**
+         * The id the app's reply names (`cid`): its request and its response.
+         */correlationId: String? = nil,
+        /**
+         * How urgent the app says it is (`pri`: 10 critical, 8 high, 5 normal, 3 low,
+         * 1 background; 0: none). For the server's app: the outbox keeps the order.
+         */priority: UInt8 = UInt8(0),
+        /**
+         * On the connection that is ready now, or not at all: never kept, never sent
+         * later. It takes no `ttl_ms` and requires no topics.
+         */live: Bool = false) {
         self.id = id
         self.ttlMs = ttlMs
         self.requires = requires
+        self.correlationId = correlationId
+        self.priority = priority
+        self.live = live
     }
 
 
@@ -2247,7 +2321,10 @@ public struct FfiConverterTypeWseSendOptions: FfiConverterRustBuffer {
             try WseSendOptions(
                 id: FfiConverterOptionString.read(from: &buf),
                 ttlMs: FfiConverterUInt64.read(from: &buf),
-                requires: FfiConverterSequenceString.read(from: &buf)
+                requires: FfiConverterSequenceString.read(from: &buf),
+                correlationId: FfiConverterOptionString.read(from: &buf),
+                priority: FfiConverterUInt8.read(from: &buf),
+                live: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -2255,6 +2332,9 @@ public struct FfiConverterTypeWseSendOptions: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.id, into: &buf)
         FfiConverterUInt64.write(value.ttlMs, into: &buf)
         FfiConverterSequenceString.write(value.requires, into: &buf)
+        FfiConverterOptionString.write(value.correlationId, into: &buf)
+        FfiConverterUInt8.write(value.priority, into: &buf)
+        FfiConverterBool.write(value.live, into: &buf)
     }
 }
 
@@ -3487,6 +3567,30 @@ public func FfiConverterTypeWseTrust_lower(_ value: WseTrust) -> RustBuffer {
     return FfiConverterTypeWseTrust.lower(value)
 }
 
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt8: FfiConverterRustBuffer {
+    typealias SwiftType = UInt8?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt8.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt8.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
 
 #if swift(>=5.8)
 @_documentation(visibility: private)

@@ -1390,6 +1390,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  int dco_decode_box_autoadd_u_8(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as int;
+  }
+
+  @protected
   WseConfig dco_decode_box_autoadd_wse_config(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return dco_decode_wse_config(raw);
@@ -1495,6 +1501,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   BigInt? dco_decode_opt_box_autoadd_u_64(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_box_autoadd_u_64(raw);
+  }
+
+  @protected
+  int? dco_decode_opt_box_autoadd_u_8(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_u_8(raw);
   }
 
   @protected
@@ -1635,8 +1647,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   WseItem dco_decode_wse_item(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 32)
-      throw Exception('unexpected arr length: expect 32 but see ${arr.length}');
+    if (arr.length != 35)
+      throw Exception('unexpected arr length: expect 35 but see ${arr.length}');
     return WseItem(
       kind: dco_decode_wse_item_kind(arr[0]),
       name: dco_decode_opt_String(arr[1]),
@@ -1644,32 +1656,35 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       epoch: dco_decode_opt_box_autoadd_u_32(arr[3]),
       offset: dco_decode_opt_box_autoadd_u_64(arr[4]),
       id: dco_decode_opt_String(arr[5]),
-      json: dco_decode_opt_String(arr[6]),
-      payloadError: dco_decode_opt_String(arr[7]),
-      generation: dco_decode_u_32(arr[8]),
-      bytes: dco_decode_opt_list_prim_u_8_strict(arr[9]),
-      signedBody: dco_decode_opt_String(arr[10]),
-      signature: dco_decode_opt_String(arr[11]),
-      signatureKid: dco_decode_opt_String(arr[12]),
-      verified: dco_decode_bool(arr[13]),
-      connectionId: dco_decode_opt_String(arr[14]),
-      userId: dco_decode_opt_String(arr[15]),
-      reconnected: dco_decode_bool(arr[16]),
-      recovery: dco_decode_bool(arr[17]),
-      code: dco_decode_opt_box_autoadd_u_16(arr[18]),
-      reason: dco_decode_opt_String(arr[19]),
-      retryInMs: dco_decode_opt_box_autoadd_u_64(arr[20]),
-      attempt: dco_decode_opt_box_autoadd_u_32(arr[21]),
-      reasons: dco_decode_list_String(arr[22]),
-      ids: dco_decode_list_String(arr[23]),
-      topics: dco_decode_list_String(arr[24]),
-      failed: dco_decode_list_String(arr[25]),
-      recoveries: dco_decode_list_wse_topic_recovery(arr[26]),
-      first: dco_decode_opt_box_autoadd_u_64(arr[27]),
-      last: dco_decode_opt_box_autoadd_u_64(arr[28]),
-      round: dco_decode_opt_box_autoadd_u_64(arr[29]),
-      committed: dco_decode_list_wse_stream_position(arr[30]),
-      continuity: dco_decode_opt_box_autoadd_wse_continuity(arr[31]),
+      correlationId: dco_decode_opt_String(arr[6]),
+      priority: dco_decode_opt_box_autoadd_u_8(arr[7]),
+      timestamp: dco_decode_opt_String(arr[8]),
+      json: dco_decode_opt_String(arr[9]),
+      payloadError: dco_decode_opt_String(arr[10]),
+      generation: dco_decode_u_32(arr[11]),
+      bytes: dco_decode_opt_list_prim_u_8_strict(arr[12]),
+      signedBody: dco_decode_opt_String(arr[13]),
+      signature: dco_decode_opt_String(arr[14]),
+      signatureKid: dco_decode_opt_String(arr[15]),
+      verified: dco_decode_bool(arr[16]),
+      connectionId: dco_decode_opt_String(arr[17]),
+      userId: dco_decode_opt_String(arr[18]),
+      reconnected: dco_decode_bool(arr[19]),
+      recovery: dco_decode_bool(arr[20]),
+      code: dco_decode_opt_box_autoadd_u_16(arr[21]),
+      reason: dco_decode_opt_String(arr[22]),
+      retryInMs: dco_decode_opt_box_autoadd_u_64(arr[23]),
+      attempt: dco_decode_opt_box_autoadd_u_32(arr[24]),
+      reasons: dco_decode_list_String(arr[25]),
+      ids: dco_decode_list_String(arr[26]),
+      topics: dco_decode_list_String(arr[27]),
+      failed: dco_decode_list_String(arr[28]),
+      recoveries: dco_decode_list_wse_topic_recovery(arr[29]),
+      first: dco_decode_opt_box_autoadd_u_64(arr[30]),
+      last: dco_decode_opt_box_autoadd_u_64(arr[31]),
+      round: dco_decode_opt_box_autoadd_u_64(arr[32]),
+      committed: dco_decode_list_wse_stream_position(arr[33]),
+      continuity: dco_decode_opt_box_autoadd_wse_continuity(arr[34]),
     );
   }
 
@@ -1698,12 +1713,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   WseSendOptions dco_decode_wse_send_options(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 3)
-      throw Exception('unexpected arr length: expect 3 but see ${arr.length}');
+    if (arr.length != 6)
+      throw Exception('unexpected arr length: expect 6 but see ${arr.length}');
     return WseSendOptions(
       id: dco_decode_opt_String(arr[0]),
       ttlMs: dco_decode_u_64(arr[1]),
       requires: dco_decode_list_String(arr[2]),
+      correlationId: dco_decode_opt_String(arr[3]),
+      priority: dco_decode_u_8(arr[4]),
+      live: dco_decode_bool(arr[5]),
     );
   }
 
@@ -1860,6 +1878,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   BigInt sse_decode_box_autoadd_u_64(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return (sse_decode_u_64(deserializer));
+  }
+
+  @protected
+  int sse_decode_box_autoadd_u_8(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_u_8(deserializer));
   }
 
   @protected
@@ -2043,6 +2067,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  int? sse_decode_opt_box_autoadd_u_8(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_u_8(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
   WseContinuity? sse_decode_opt_box_autoadd_wse_continuity(
     SseDeserializer deserializer,
   ) {
@@ -2220,6 +2255,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_epoch = sse_decode_opt_box_autoadd_u_32(deserializer);
     var var_offset = sse_decode_opt_box_autoadd_u_64(deserializer);
     var var_id = sse_decode_opt_String(deserializer);
+    var var_correlationId = sse_decode_opt_String(deserializer);
+    var var_priority = sse_decode_opt_box_autoadd_u_8(deserializer);
+    var var_timestamp = sse_decode_opt_String(deserializer);
     var var_json = sse_decode_opt_String(deserializer);
     var var_payloadError = sse_decode_opt_String(deserializer);
     var var_generation = sse_decode_u_32(deserializer);
@@ -2255,6 +2293,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       epoch: var_epoch,
       offset: var_offset,
       id: var_id,
+      correlationId: var_correlationId,
+      priority: var_priority,
+      timestamp: var_timestamp,
       json: var_json,
       payloadError: var_payloadError,
       generation: var_generation,
@@ -2314,7 +2355,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_id = sse_decode_opt_String(deserializer);
     var var_ttlMs = sse_decode_u_64(deserializer);
     var var_requires = sse_decode_list_String(deserializer);
-    return WseSendOptions(id: var_id, ttlMs: var_ttlMs, requires: var_requires);
+    var var_correlationId = sse_decode_opt_String(deserializer);
+    var var_priority = sse_decode_u_8(deserializer);
+    var var_live = sse_decode_bool(deserializer);
+    return WseSendOptions(
+      id: var_id,
+      ttlMs: var_ttlMs,
+      requires: var_requires,
+      correlationId: var_correlationId,
+      priority: var_priority,
+      live: var_live,
+    );
   }
 
   @protected
@@ -2480,6 +2531,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   void sse_encode_box_autoadd_u_64(BigInt self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_u_64(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_u_8(int self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_8(self, serializer);
   }
 
   @protected
@@ -2662,6 +2719,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_opt_box_autoadd_u_8(int? self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_u_8(self, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_opt_box_autoadd_wse_continuity(
     WseContinuity? self,
     SseSerializer serializer,
@@ -2811,6 +2878,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_opt_box_autoadd_u_32(self.epoch, serializer);
     sse_encode_opt_box_autoadd_u_64(self.offset, serializer);
     sse_encode_opt_String(self.id, serializer);
+    sse_encode_opt_String(self.correlationId, serializer);
+    sse_encode_opt_box_autoadd_u_8(self.priority, serializer);
+    sse_encode_opt_String(self.timestamp, serializer);
     sse_encode_opt_String(self.json, serializer);
     sse_encode_opt_String(self.payloadError, serializer);
     sse_encode_u_32(self.generation, serializer);
@@ -2864,6 +2934,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_opt_String(self.id, serializer);
     sse_encode_u_64(self.ttlMs, serializer);
     sse_encode_list_String(self.requires, serializer);
+    sse_encode_opt_String(self.correlationId, serializer);
+    sse_encode_u_8(self.priority, serializer);
+    sse_encode_bool(self.live, serializer);
   }
 
   @protected

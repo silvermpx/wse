@@ -184,6 +184,17 @@ pub struct WseSendOptions {
     /// Topics that must each be continuous when it goes.
     #[uniffi(default = [])]
     pub requires: Vec<String>,
+    /// The id the app's reply names (`cid`): its request and its response.
+    #[uniffi(default = None)]
+    pub correlation_id: Option<String>,
+    /// How urgent the app says it is (`pri`: 10 critical, 8 high, 5 normal, 3 low,
+    /// 1 background; 0: none). For the server's app: the outbox keeps the order.
+    #[uniffi(default = 0)]
+    pub priority: u8,
+    /// On the connection that is ready now, or not at all: never kept, never sent
+    /// later. It takes no `ttl_ms` and requires no topics.
+    #[uniffi(default = false)]
+    pub live: bool,
 }
 
 impl From<WseSendOptions> for native::NativeSendOptions {
@@ -192,6 +203,9 @@ impl From<WseSendOptions> for native::NativeSendOptions {
             id: options.id,
             ttl_ms: options.ttl_ms,
             requires: options.requires,
+            correlation_id: options.correlation_id,
+            priority: options.priority,
+            live: options.live,
         }
     }
 }
@@ -441,6 +455,12 @@ pub struct WseMessage {
     pub epoch: Option<u32>,
     pub offset: Option<u64>,
     pub id: Option<String>,
+    /// The id a request named, on its reply (`cid`).
+    pub correlation_id: Option<String>,
+    /// How urgent its sender said it is (`pri`).
+    pub priority: Option<u8>,
+    /// When it was sent, as its sender wrote it (`ts`).
+    pub timestamp: Option<String>,
     /// The payload as JSON text (from msgpack too); None without one
     /// (absent or null) or when it could not be decoded.
     pub json: Option<String>,
@@ -560,6 +580,9 @@ impl From<native::Item> for WseItem {
                     epoch: m.epoch,
                     offset: m.offset,
                     id: m.id,
+                    correlation_id: m.correlation_id,
+                    priority: m.priority,
+                    timestamp: m.timestamp,
                     json: m.json,
                     payload_error: m.payload_error,
                     signature: m.signature.map(|s| WseSignature {

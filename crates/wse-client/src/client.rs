@@ -144,6 +144,47 @@ pub struct SendOptions {
     /// Topics that must each be continuous when it goes (see
     /// [`Client::send_requiring`]).
     pub requires: Vec<String>,
+    /// The id the application's reply names (`cid`): its request and its
+    /// response.
+    pub correlation_id: Option<String>,
+    /// How urgent the application says it is (`pri`; the other clients
+    /// name 10 critical, 8 high, 5 normal, 3 low, 1 background). It is for
+    /// the server's application: the outbox keeps the order messages were
+    /// sent in.
+    pub priority: Option<u8>,
+    /// On the connection that is ready now, or not at all, as
+    /// [`Client::try_send_live`]: never kept in the outbox. It waits for
+    /// nothing, so it takes no `ttl` and requires no topics.
+    pub live: bool,
+}
+
+/// What a message carries besides its type, payload and id.
+#[derive(Clone, Copy, Default)]
+struct Extra<'a> {
+    cid: Option<&'a str>,
+    pri: Option<u8>,
+}
+
+impl<'a> Extra<'a> {
+    fn of(options: &'a SendOptions) -> Self {
+        Self {
+            cid: options.correlation_id.as_deref(),
+            pri: options.priority,
+        }
+    }
+}
+
+/// A message as it goes: `{"t", "p", "id"}`, and its `cid` and `pri` when
+/// it has them.
+#[derive(Serialize)]
+struct Out<'a, P: ?Sized> {
+    t: &'a str,
+    p: &'a P,
+    id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cid: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pri: Option<u8>,
 }
 
 /// What the handles and the connection's task share.
@@ -397,7 +438,8 @@ impl Client {
     }
 
     /// [`Client::send`] with its `options`: its own id, how long it may
-    /// wait, the topics it requires. Returns its id, which its outcome names
+    /// wait, the topics it requires, its correlation id and priority, or
+    /// live. Returns its id, which its outcome names
     /// ([`Event::Delivered`](crate::Event::Delivered),
     /// [`Event::NotDelivered`](crate::Event::NotDelivered)).
     pub async fn send_with<P: Serialize + ?Sized>(
@@ -406,6 +448,11 @@ impl Client {
         payload: &P,
         options: &SendOptions,
     ) -> Result<String, Error> {
+        if options.live {
+            let (id, frame) = self.live_frame(kind, payload, options)?;
+            self.frames.send(frame).await.map_err(|_| Error::Closed)?;
+            return Ok(id);
+        }
         let frame = self.outgoing(kind, payload, options)?;
         let id = frame.id.to_string();
         self.put(frame).await?;
@@ -420,6 +467,14 @@ impl Client {
         payload: &P,
         options: &SendOptions,
     ) -> Result<String, Error> {
+        if options.live {
+            let (id, frame) = self.live_frame(kind, payload, options)?;
+            self.frames.try_send(frame).map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => Error::Full,
+                mpsc::error::TrySendError::Closed(_) => Error::Closed,
+            })?;
+            return Ok(id);
+        }
         let frame = self.outgoing(kind, payload, options)?;
         let id = frame.id.to_string();
         self.try_put(frame)?;
@@ -437,7 +492,7 @@ impl Client {
         payload: &P,
     ) -> Result<(), Error> {
         let for_now = self.ready()?;
-        let text = encode(kind, payload, &message_id())?;
+        let text = encode(kind, payload, &message_id(), Extra::default())?;
         self.frames
             .try_send(for_now.live(text))
             .map_err(|e| match e {
@@ -453,7 +508,7 @@ impl Client {
         payload: &P,
     ) -> Result<(), Error> {
         let for_now = self.ready()?;
-        let text = encode(kind, payload, &message_id())?;
+        let text = encode(kind, payload, &message_id(), Extra::default())?;
         self.frames
             .send(for_now.live(text))
             .await
@@ -800,10 +855,11 @@ impl Client {
         } else {
             0
         };
+        let extra = Extra::of(options);
         let text = if room == 0 {
-            encode(kind, payload, &id)?
+            encode(kind, payload, &id, extra)?
         } else {
-            encode_after(room, kind, payload, &id)?
+            encode_after(room, kind, payload, &id, extra)?
         };
         let mut frame = self.queued(id.into_boxed_str(), text)?;
         frame.ttl = options.ttl;
@@ -811,6 +867,26 @@ impl Client {
             frame.requires = Some(options.requires.iter().cloned().collect());
         }
         Ok(frame)
+    }
+
+    /// A live message as `options` say, for the connection that is ready
+    /// now; and its id.
+    fn live_frame<P: Serialize + ?Sized>(
+        &self,
+        kind: &str,
+        payload: &P,
+        options: &SendOptions,
+    ) -> Result<(String, Queued), Error> {
+        if !options.requires.is_empty() || options.ttl.is_some() {
+            return Err(Error::Config(
+                "a live message waits for nothing: it takes no ttl and requires no topics"
+                    .to_owned(),
+            ));
+        }
+        let for_now = self.ready()?;
+        let id = options.id.clone().unwrap_or_else(message_id);
+        let text = encode(kind, payload, &id, Extra::of(options))?;
+        Ok((id, for_now.live(text)))
     }
 
     /// A message for the outbox (its place in the room taken as it is put;
@@ -879,18 +955,19 @@ impl std::fmt::Debug for Client {
     }
 }
 
-/// `{"t": kind, "p": payload, "id": id}` in one pass.
-fn encode<P: Serialize + ?Sized>(kind: &str, payload: &P, id: &str) -> Result<String, Error> {
-    #[derive(Serialize)]
-    struct Out<'a, P: ?Sized> {
-        t: &'a str,
-        p: &'a P,
-        id: &'a str,
-    }
+/// `{"t": kind, "p": payload, "id": id}` and its extras, in one pass.
+fn encode<P: Serialize + ?Sized>(
+    kind: &str,
+    payload: &P,
+    id: &str,
+    extra: Extra<'_>,
+) -> Result<String, Error> {
     serde_json::to_string(&Out {
         t: kind,
         p: payload,
         id,
+        cid: extra.cid,
+        pri: extra.pri,
     })
     .map_err(|e| Error::Encode(e.to_string()))
 }
@@ -902,14 +979,10 @@ fn encode_after<P: Serialize + ?Sized>(
     kind: &str,
     payload: &P,
     id: &str,
+    extra: Extra<'_>,
 ) -> Result<String, Error> {
-    #[derive(Serialize)]
-    struct Out<'a, P: ?Sized> {
-        t: &'a str,
-        p: &'a P,
-        id: &'a str,
-    }
-    let mut out = Vec::with_capacity(room + 64 + kind.len() + id.len());
+    let mut out =
+        Vec::with_capacity(room + 80 + kind.len() + id.len() + extra.cid.map_or(0, str::len));
     out.resize(room, b' ');
     serde_json::to_writer(
         &mut out,
@@ -917,6 +990,8 @@ fn encode_after<P: Serialize + ?Sized>(
             t: kind,
             p: payload,
             id,
+            cid: extra.cid,
+            pri: extra.pri,
         },
     )
     .map_err(|e| Error::Encode(e.to_string()))?;

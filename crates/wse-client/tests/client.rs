@@ -11,7 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 use wse_client::{
-    Config, Error, Event, Events, Format, Incoming, OwnedMessage, Status, TokenProvider,
+    Config, Error, Event, Events, Format, Incoming, OwnedMessage, SendOptions, Status,
+    TokenProvider,
 };
 
 const SECRET: &str = "a-test-secret-of-at-least-thirty-two-bytes";
@@ -295,6 +296,47 @@ async fn the_server_application_hears_what_a_client_sends() {
     assert_eq!(got[0]["t"], "order");
     assert_eq!(got[0]["p"]["side"], "buy");
     assert_eq!(got[1]["t"], "cancel");
+    client.close().await;
+    stand.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_names_its_correlation_id_and_priority_kept_or_live() {
+    let mut stand = stand().await;
+    let (client, _events) = wse_client::connect(stand.config("erin")).await.unwrap();
+    let mut options = SendOptions::default();
+    options.correlation_id = Some("order-7".to_owned());
+    options.priority = Some(8);
+    client
+        .send_with("ask", &json!({"n": 1}), &options)
+        .await
+        .unwrap();
+    options.correlation_id = Some("order-8".to_owned());
+    options.priority = None;
+    options.live = true;
+    let id = client
+        .try_send_with("ask", &json!({"n": 2}), &options)
+        .unwrap();
+    // A live message goes straight to the connection, a kept one through
+    // the outbox: either may come first.
+    let mut got = std::collections::HashMap::new();
+    while got.len() < 2 {
+        if let Heard::Message(message) = stand.heard().await {
+            got.insert(
+                message["cid"].as_str().unwrap_or_default().to_owned(),
+                message,
+            );
+        }
+    }
+    assert_eq!(got["order-7"]["pri"], 8);
+    assert!(got["order-8"].get("pri").is_none());
+    assert_eq!(got["order-8"]["id"], id.as_str());
+    // A live message waits for nothing: no ttl, no topics to wait for.
+    options.ttl = Some(Duration::from_secs(1));
+    assert!(matches!(
+        client.try_send_with("ask", &json!({}), &options),
+        Err(Error::Config(_))
+    ));
     client.close().await;
     stand.server.stop().await;
 }

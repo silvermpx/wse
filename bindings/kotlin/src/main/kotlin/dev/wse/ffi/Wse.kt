@@ -328,6 +328,9 @@ class WseSendOptionsBuilder internal constructor() {
     private var id: String? = null
     private var ttl = 0uL
     private var requires: List<String> = emptyList()
+    private var correlationId: String? = null
+    private var priority: UByte = 0u
+    private var live = false
 
     /** Its id: the app's own, or a random UUID; its outcome names it. */
     fun id(id: String?): WseSendOptionsBuilder = apply { this.id = id }
@@ -338,7 +341,29 @@ class WseSendOptionsBuilder internal constructor() {
     /** Topics that must each be continuous when it goes. */
     fun requires(topics: List<String>): WseSendOptionsBuilder = apply { requires = topics.toList() }
 
-    fun build(): WseSendOptions = WseSendOptions(id = id, ttlMs = ttl, requires = requires)
+    /** The id the reply names (`cid`): the app's request and its response. */
+    fun correlationId(id: String?): WseSendOptionsBuilder = apply { correlationId = id }
+
+    /**
+     * How urgent the app says it is (`pri`: 10 critical, 8 high, 5 normal, 3 low, 1 background;
+     * 0 none). For the server's app: the outbox keeps the order.
+     */
+    fun priority(priority: Int): WseSendOptionsBuilder = apply {
+        require(priority in 0..255) { "a priority is 0 to 255, not $priority" }
+        this.priority = priority.toUByte()
+    }
+
+    /** On the connection that is ready now, or not at all: never kept, never sent later. */
+    fun live(live: Boolean): WseSendOptionsBuilder = apply { this.live = live }
+
+    fun build(): WseSendOptions = WseSendOptions(
+        id = id,
+        ttlMs = ttl,
+        requires = requires,
+        correlationId = correlationId,
+        priority = priority,
+        live = live,
+    )
 }
 
 /** A [WseDelivery] for Java, field by field. */

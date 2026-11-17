@@ -1818,6 +1818,17 @@ impl SseDecode for Option<u64> {
     }
 }
 
+impl SseDecode for Option<u8> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        if (<bool>::sse_decode(deserializer)) {
+            return Some(<u8>::sse_decode(deserializer));
+        } else {
+            return None;
+        }
+    }
+}
+
 impl SseDecode for Option<crate::api::WseContinuity> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -2012,6 +2023,9 @@ impl SseDecode for crate::api::WseItem {
         let mut var_epoch = <Option<u32>>::sse_decode(deserializer);
         let mut var_offset = <Option<u64>>::sse_decode(deserializer);
         let mut var_id = <Option<String>>::sse_decode(deserializer);
+        let mut var_correlationId = <Option<String>>::sse_decode(deserializer);
+        let mut var_priority = <Option<u8>>::sse_decode(deserializer);
+        let mut var_timestamp = <Option<String>>::sse_decode(deserializer);
         let mut var_json = <Option<String>>::sse_decode(deserializer);
         let mut var_payloadError = <Option<String>>::sse_decode(deserializer);
         let mut var_generation = <u32>::sse_decode(deserializer);
@@ -2045,6 +2059,9 @@ impl SseDecode for crate::api::WseItem {
             epoch: var_epoch,
             offset: var_offset,
             id: var_id,
+            correlation_id: var_correlationId,
+            priority: var_priority,
+            timestamp: var_timestamp,
             json: var_json,
             payload_error: var_payloadError,
             generation: var_generation,
@@ -2125,10 +2142,16 @@ impl SseDecode for crate::api::WseSendOptions {
         let mut var_id = <Option<String>>::sse_decode(deserializer);
         let mut var_ttlMs = <u64>::sse_decode(deserializer);
         let mut var_requires = <Vec<String>>::sse_decode(deserializer);
+        let mut var_correlationId = <Option<String>>::sse_decode(deserializer);
+        let mut var_priority = <u8>::sse_decode(deserializer);
+        let mut var_live = <bool>::sse_decode(deserializer);
         return crate::api::WseSendOptions {
             id: var_id,
             ttl_ms: var_ttlMs,
             requires: var_requires,
+            correlation_id: var_correlationId,
+            priority: var_priority,
+            live: var_live,
         };
     }
 }
@@ -2406,6 +2429,9 @@ impl flutter_rust_bridge::IntoDart for crate::api::WseItem {
             self.epoch.into_into_dart().into_dart(),
             self.offset.into_into_dart().into_dart(),
             self.id.into_into_dart().into_dart(),
+            self.correlation_id.into_into_dart().into_dart(),
+            self.priority.into_into_dart().into_dart(),
+            self.timestamp.into_into_dart().into_dart(),
             self.json.into_into_dart().into_dart(),
             self.payload_error.into_into_dart().into_dart(),
             self.generation.into_into_dart().into_dart(),
@@ -2498,6 +2524,9 @@ impl flutter_rust_bridge::IntoDart for crate::api::WseSendOptions {
             self.id.into_into_dart().into_dart(),
             self.ttl_ms.into_into_dart().into_dart(),
             self.requires.into_into_dart().into_dart(),
+            self.correlation_id.into_into_dart().into_dart(),
+            self.priority.into_into_dart().into_dart(),
+            self.live.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -2768,6 +2797,16 @@ impl SseEncode for Option<u64> {
     }
 }
 
+impl SseEncode for Option<u8> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.is_some(), serializer);
+        if let Some(value) = self {
+            <u8>::sse_encode(value, serializer);
+        }
+    }
+}
+
 impl SseEncode for Option<crate::api::WseContinuity> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -2929,6 +2968,9 @@ impl SseEncode for crate::api::WseItem {
         <Option<u32>>::sse_encode(self.epoch, serializer);
         <Option<u64>>::sse_encode(self.offset, serializer);
         <Option<String>>::sse_encode(self.id, serializer);
+        <Option<String>>::sse_encode(self.correlation_id, serializer);
+        <Option<u8>>::sse_encode(self.priority, serializer);
+        <Option<String>>::sse_encode(self.timestamp, serializer);
         <Option<String>>::sse_encode(self.json, serializer);
         <Option<String>>::sse_encode(self.payload_error, serializer);
         <u32>::sse_encode(self.generation, serializer);
@@ -3005,6 +3047,9 @@ impl SseEncode for crate::api::WseSendOptions {
         <Option<String>>::sse_encode(self.id, serializer);
         <u64>::sse_encode(self.ttl_ms, serializer);
         <Vec<String>>::sse_encode(self.requires, serializer);
+        <Option<String>>::sse_encode(self.correlation_id, serializer);
+        <u8>::sse_encode(self.priority, serializer);
+        <bool>::sse_encode(self.live, serializer);
     }
 }
 

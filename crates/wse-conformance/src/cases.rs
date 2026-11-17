@@ -48,6 +48,9 @@ pub struct Rule {
     pub kind: Option<String>,
     pub count: Option<usize>,
     pub payload: Option<Value>,
+    /// `correlated`: the correlation id and priority a request named.
+    pub correlation_id: Option<String>,
+    pub priority: Option<u64>,
 }
 
 /// The built-in catalog.

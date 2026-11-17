@@ -179,20 +179,27 @@ class WseClient {
 
   /// [send] with its own [id] (the app's, say; a random UUID without one),
   /// how long it may wait to be written first ([ttl]; the outbox's
-  /// `maxAge` without one), and the [requires] topics it waits for (see
-  /// [sendRequiring]). Its id, which its outcome names.
+  /// `maxAge` without one), the [requires] topics it waits for (see
+  /// [sendRequiring]), the [correlationId] the reply names (`cid`), how
+  /// urgent it is ([priority], `pri`: 10 critical, 8 high, 5 normal, 3 low,
+  /// 1 background; 0 none; the outbox keeps the order), or [live]: on the
+  /// connection that is ready now, or not at all. Its id, which its
+  /// outcome names.
   Future<String> sendWith(
     String kind,
     String json, {
     String? id,
     Duration? ttl,
     List<String> requires = const [],
+    String? correlationId,
+    int priority = 0,
+    bool live = false,
   }) => _closed
       ? Future.error(_closedError)
       : _native.sendWith(
           kind: kind,
           json: json,
-          options: _options(id, ttl, requires),
+          options: _options(id, ttl, requires, correlationId, priority, live),
         );
 
   /// [sendWith] at once; throws when the outbox or the queue is full.
@@ -202,21 +209,33 @@ class WseClient {
     String? id,
     Duration? ttl,
     List<String> requires = const [],
+    String? correlationId,
+    int priority = 0,
+    bool live = false,
   }) => _open.trySendWith(
     kind: kind,
     json: json,
-    options: _options(id, ttl, requires),
+    options: _options(id, ttl, requires, correlationId, priority, live),
   );
 
   static rust.WseSendOptions _options(
     String? id,
     Duration? ttl,
     List<String> requires,
-  ) => rust.WseSendOptions(
-    id: id,
-    ttlMs: BigInt.from(ttl?.inMilliseconds ?? 0),
-    requires: requires,
-  );
+    String? correlationId,
+    int priority,
+    bool live,
+  ) {
+    RangeError.checkValueInInterval(priority, 0, 255, 'priority');
+    return rust.WseSendOptions(
+      id: id,
+      ttlMs: BigInt.from(ttl?.inMilliseconds ?? 0),
+      requires: requires,
+      correlationId: correlationId,
+      priority: priority,
+      live: live,
+    );
+  }
 
   /// The user signs out: every message in the outbox, and every one sent
   /// before this call, goes (notDelivered, `cleared`), and the user is

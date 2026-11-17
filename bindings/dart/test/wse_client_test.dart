@@ -265,6 +265,40 @@ void main() {
     await client.close();
   });
 
+  test(
+    'a request names its correlation id, and the reply names it back',
+    () async {
+      final client = await WseClient.connect(wseConfig(url, insecure: true));
+      final items = StreamIterator(client.events());
+      await client.sendWith(
+        'echo',
+        '{"n":5}',
+        correlationId: 'order-7',
+        priority: 8,
+      );
+      await client.sendWith(
+        'echo',
+        '{"n":6}',
+        correlationId: 'order-8',
+        live: true,
+      );
+      final replies = <String?>{};
+      while (replies.length < 2 && await items.moveNext()) {
+        final item = items.current;
+        if (item.kind == WseItemKind.message && item.name == 'echoed') {
+          replies.add(item.correlationId);
+        }
+      }
+      expect(replies, {'order-7', 'order-8'});
+      expect(
+        () => client.sendWith('echo', '{}', priority: 256),
+        throwsRangeError,
+      );
+      await items.cancel();
+      await client.close();
+    },
+  );
+
   test('a send that requires a topic waits for its resync', () async {
     final client = await WseClient.connect(
       wseConfig(

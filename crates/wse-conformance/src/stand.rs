@@ -27,6 +27,9 @@ pub struct Taken {
     pub s: Option<u64>,
     pub possible_repeat: bool,
     pub signed: bool,
+    /// Its correlation id (`cid`) and priority (`pri`), when it named them.
+    pub cid: Option<String>,
+    pub pri: Option<u64>,
 }
 
 /// A message the case published on a topic: its number (`p.n`), counted on
@@ -70,6 +73,8 @@ impl Lab {
             s: message["s"].as_u64(),
             possible_repeat: message["possible_repeat"].as_bool() == Some(true),
             signed,
+            cid: message["cid"].as_str().map(str::to_owned),
+            pri: message["pri"].as_u64(),
         };
         lock(&self.log).taken.push(taken);
     }
@@ -104,8 +109,13 @@ impl wse::Handler for Lab {
         };
         self.take(conn, &message, false);
         match message["t"].as_str() {
+            // The reply names the request's correlation id, as an
+            // application's reply does.
             Some("echo") => {
-                let echoed = json!({"t": "echoed", "p": message["p"]});
+                let mut echoed = json!({"t": "echoed", "p": message["p"]});
+                if let Some(cid) = message.get("cid").filter(|cid| cid.is_string()) {
+                    echoed["cid"] = cid.clone();
+                }
                 let _ = self.publisher.send(&conn.id, echoed.to_string());
             }
             // The application binds the key the client signs with.

@@ -165,6 +165,23 @@ class WseClientTest {
     }
 
     @Test
+    fun aRequestNamesItsCorrelationIdAndTheReplyNamesItBack(): Unit = runBlocking {
+        val client = connectClient(WseConfig(url = url, insecure = true))
+        val events = client.events()
+        client.sendWith("echo", """{"n":5}""", WseSendOptions(correlationId = "order-7", priority = 8u))
+        client.sendWith("echo", """{"n":6}""", WseSendOptions(correlationId = "order-8", live = true))
+        val replies = mutableSetOf<String?>()
+        withTimeout(10_000) {
+            while (replies.size < 2) {
+                val item = events.next() ?: error("the events ended")
+                if (item is WseItem.Message && item.message.kind == "echoed") replies += item.message.correlationId
+            }
+        }
+        assertEquals(setOf<String?>("order-7", "order-8"), replies)
+        client.disconnect(1_000u)
+    }
+
+    @Test
     fun wsGoesInTheClearOnlyWhenAsked(): Unit = runBlocking {
         assertFailsWith<WseException.Config> { connectClient(WseConfig(url = url)) }
     }

@@ -553,31 +553,34 @@ impl Owner {
         let live = options.and_then(|o| o.live) == Some(true);
         let payload = frame.p.unwrap_or(NULL);
         let kind = frame.t.as_deref().unwrap_or_default();
-        let status = if kind.is_empty() {
-            "dropped"
-        } else if live {
+        let status = if kind.is_empty()
             // A live one goes on the connection the window saw ready, or not at all.
-            if state.ready && frame.c == Some(state.generation) {
-                match self.client.try_send_live(kind, payload) {
-                    Ok(()) => "sent",
-                    Err(_) => "dropped",
-                }
-            } else {
-                "dropped"
-            }
-        } else if options.and_then(|o| o.encrypted) == Some(true) && !self.shared.encrypts {
+            || (live && !(state.ready && frame.c == Some(state.generation)))
             // Asked to go encrypted on a connection that is not: it does not go.
+            || (options.and_then(|o| o.encrypted) == Some(true) && !self.shared.encrypts)
+        {
             "dropped"
         } else {
             let send = SendOptions {
                 id: id.map(str::to_owned),
                 ttl: options
                     .and_then(|o| o.ttl)
-                    .filter(|ttl| ttl.is_finite() && *ttl >= 0.0)
+                    .filter(|ttl| !live && ttl.is_finite() && *ttl >= 0.0)
                     .map(|ttl| Duration::from_millis(ttl as u64)),
                 requires: Vec::new(),
+                correlation_id: options.and_then(|o| o.correlation_id.clone()),
+                // The TypeScript client's priorities run 1 to 10.
+                priority: options
+                    .and_then(|o| o.priority)
+                    .filter(|p| p.is_finite())
+                    .map(|p| p.clamp(0.0, 255.0) as u8),
+                live,
             };
             match self.client.try_send_with(kind, payload, &send) {
+                Ok(id) if live => {
+                    let _ = id;
+                    "sent"
+                }
                 Ok(id) => {
                     state.sender.insert(id, att);
                     if self.client.is_connected() {
@@ -1123,6 +1126,8 @@ struct FrameOptions {
     ttl: Option<f64>,
     live: Option<bool>,
     encrypted: Option<bool>,
+    priority: Option<f64>,
+    correlation_id: Option<String>,
     nonce: Option<String>,
 }
 

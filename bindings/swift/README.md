@@ -94,7 +94,11 @@ written within its time (`expired`), it was the last user's
 closed with it in memory (`closed`).
 `client.sendWith(kind:json:options:)` sends with the app's own id
 (`WseSendOptions(id: "order-17")`) and returns it; `client.clear()` empties
-the outbox on sign-out.
+the outbox on sign-out. The options also name a request's `correlationId`,
+which the reply names back (`message.correlationId`), and its `priority`
+(10 critical, 8 high, 5 normal, 3 low, 1 background), for the server's
+app; `live: true` sends on the connection that is ready now, or not at
+all.
 
 The outbox is in memory by default. With `offline: WseOffline(path: path)`
 (a file in the app's own storage) it outlives the app. At most

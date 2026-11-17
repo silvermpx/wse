@@ -25,6 +25,13 @@
   adapters take as they take any. Only the top frame of a served window,
   at a URL the application allows (by default its own pages, never the
   web's), gets a port.
+- Rust, Swift, Kotlin and Dart: a send names its correlation id (`cid`)
+  and priority (`pri`), as the TypeScript and Python clients' do, and a
+  live one goes through the same options (`live`), with its id too; a
+  received message gives its correlation id, priority and time. The
+  outbox keeps the order messages were sent in. A conformance case
+  (`send.correlation`) checks it for every client: the server's
+  application takes both, kept or live, and the reply names the id back.
 - Example applications for Electron (`bindings/electron/example`) and
   Tauri (`bindings/tauri/example`): two windows on one connection, the
   connection's state, the ticks of a topic and echoes, each window able to

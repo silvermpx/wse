@@ -137,6 +137,22 @@ class WseJavaTest {
     }
 
     @Test
+    void aCorrelatedRequestFromJava() throws Exception {
+        WseConfig config = Wse.config(url).insecure(true).build();
+        WseClient client = Wse.connect(config).get(10, SECONDS);
+        WseEventReader events = Wse.events(client);
+        Wse.sendWith(client, "echo", "{\"n\":7}", Wse.sendOptions().correlationId("order-9").priority(3).build())
+            .get(10, SECONDS);
+        WseItem item = next(events);
+        while (!(item instanceof WseItem.Message message && message.getMessage().getKind().equals("echoed"))) {
+            item = next(events);
+        }
+        assertEquals("order-9", ((WseItem.Message) item).getMessage().getCorrelationId());
+        assertThrows(IllegalArgumentException.class, () -> Wse.sendOptions().priority(300));
+        Wse.disconnect(client, Duration.ofSeconds(1)).get(10, SECONDS);
+    }
+
+    @Test
     void anOfflineQueueFromJava() throws Exception {
         WseConfig config = Wse.config(url)
             .insecure(true)

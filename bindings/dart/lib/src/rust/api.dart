@@ -356,6 +356,15 @@ class WseItem {
   final BigInt? offset;
   final String? id;
 
+  /// Message: the id a request named, on its reply (`cid`).
+  final String? correlationId;
+
+  /// Message: how urgent its sender said it is (`pri`).
+  final int? priority;
+
+  /// Message: when it was sent, as its sender wrote it (`ts`).
+  final String? timestamp;
+
   /// Message: the payload as JSON text (None without one, absent or null,
   /// or when it could not be decoded); ServerError: its details.
   final String? json;
@@ -421,6 +430,9 @@ class WseItem {
     this.epoch,
     this.offset,
     this.id,
+    this.correlationId,
+    this.priority,
+    this.timestamp,
     this.json,
     this.payloadError,
     required this.generation,
@@ -457,6 +469,9 @@ class WseItem {
       epoch.hashCode ^
       offset.hashCode ^
       id.hashCode ^
+      correlationId.hashCode ^
+      priority.hashCode ^
+      timestamp.hashCode ^
       json.hashCode ^
       payloadError.hashCode ^
       generation.hashCode ^
@@ -495,6 +510,9 @@ class WseItem {
           epoch == other.epoch &&
           offset == other.offset &&
           id == other.id &&
+          correlationId == other.correlationId &&
+          priority == other.priority &&
+          timestamp == other.timestamp &&
           json == other.json &&
           payloadError == other.payloadError &&
           generation == other.generation &&
@@ -625,10 +643,35 @@ class WseSendOptions {
   /// Topics that must each be continuous when it goes.
   final List<String> requires;
 
-  const WseSendOptions({this.id, required this.ttlMs, required this.requires});
+  /// The id the app's reply names (`cid`): its request and its response.
+  final String? correlationId;
+
+  /// How urgent the app says it is (`pri`: 10 critical, 8 high, 5 normal,
+  /// 3 low, 1 background; 0: none). For the server's app: the outbox
+  /// keeps the order.
+  final int priority;
+
+  /// On the connection that is ready now, or not at all: never kept,
+  /// never sent later. It takes no `ttl_ms` and requires no topics.
+  final bool live;
+
+  const WseSendOptions({
+    this.id,
+    required this.ttlMs,
+    required this.requires,
+    this.correlationId,
+    required this.priority,
+    required this.live,
+  });
 
   @override
-  int get hashCode => id.hashCode ^ ttlMs.hashCode ^ requires.hashCode;
+  int get hashCode =>
+      id.hashCode ^
+      ttlMs.hashCode ^
+      requires.hashCode ^
+      correlationId.hashCode ^
+      priority.hashCode ^
+      live.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -637,7 +680,10 @@ class WseSendOptions {
           runtimeType == other.runtimeType &&
           id == other.id &&
           ttlMs == other.ttlMs &&
-          requires == other.requires;
+          requires == other.requires &&
+          correlationId == other.correlationId &&
+          priority == other.priority &&
+          live == other.live;
 }
 
 /// Where a stream of a topic stands.

@@ -204,7 +204,7 @@ class Run {
       case 'messages':
         return this.messages((e) => e.topic === step.topic).length >= step.count;
       case 'message':
-        return this.messages((e) => e.type === step.type).length > 0;
+        return this.messages((e) => e.type === step.type).length >= (step.count ?? 1);
       case 'published': {
         const wanted = (this.published.get(step.topic) ?? []).slice(-step.last);
         const got = new Set(this.messages((e) => e.topic === step.topic).map((e) => e.n));
@@ -261,6 +261,7 @@ class Run {
             topic: message.tp ?? null,
             n: typeof message.p?.n === 'number' ? message.p.n : null,
             payload: message.p,
+            cid: message.cid ?? null,
           });
           // Applied: the checkpoint moves on.
           if (rr && message.tp) client.commit(message);
@@ -319,7 +320,12 @@ class Run {
         this.record({ ev: 'sent', id, type: step.type, signed: true, live: false, ok: status !== 'dropped' });
         continue;
       }
-      const status = client.send(step.type, payload, { id, live: !!step.live });
+      const status = client.send(step.type, payload, {
+        id,
+        live: !!step.live,
+        correlation_id: step.correlation_id,
+        priority: step.priority,
+      });
       this.record({ ev: 'sent', id, type: step.type, live: !!step.live, ok: status !== 'dropped', status });
     }
   }

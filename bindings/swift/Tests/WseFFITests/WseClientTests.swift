@@ -298,6 +298,24 @@ final class WseClientTests: XCTestCase {
         await client.disconnect(deadlineMs: 1_000)
     }
 
+    func testARequestNamesItsCorrelationIdAndTheReplyNamesItBack() async throws {
+        let client = try await WseClient.connect(WseConfig(url: url, insecure: true))
+        let events = client.events()
+        _ = try await client.sendWith(
+            kind: "echo", json: #"{"n":5}"#, options: WseSendOptions(correlationId: "order-7", priority: 8))
+        _ = try await client.sendWith(
+            kind: "echo", json: #"{"n":6}"#, options: WseSendOptions(correlationId: "order-8", live: true))
+        var replies = Set<String>()
+        for try await item in events {
+            if case let .message(message) = item, message.kind == "echoed", let cid = message.correlationId {
+                replies.insert(cid)
+                if replies.count == 2 { break }
+            }
+        }
+        XCTAssertEqual(replies, ["order-7", "order-8"])
+        await client.disconnect(deadlineMs: 1_000)
+    }
+
     func testALoopLeftLeavesTheRestToTheNext() async throws {
         let client = try await WseClient.connect(WseConfig(url: url, insecure: true))
         try await client.send(kind: "echo", json: #"{"n":1}"#)

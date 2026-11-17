@@ -146,7 +146,11 @@ took (`ids`); `WseItem.NotDelivered` those it will not take and why
 user's (`user_changed`), the app cleared the outbox (`cleared`), or the
 client closed with it in memory (`closed`). `client.sendWith(kind, json,
 WseSendOptions(id = "order-17"))` sends with the app's own id and returns it;
-`client.clear()` empties the outbox on sign-out.
+`client.clear()` empties the outbox on sign-out. The options also name a
+request's `correlationId`, which the reply names back
+(`message.correlationId`), and its `priority` (10 critical, 8 high, 5 normal,
+3 low, 1 background), for the server's app; `live = true` sends on the
+connection that is ready now, or not at all.
 
 The outbox is in memory by default. With `offline = WseOffline(path = path)`
 (a file in the app's own storage) it outlives the app. At most `maxMessages`
@@ -208,7 +212,8 @@ items, and `Wse.sendRequiring(client, kind, json, List.of("orders"))` sends
 once the topics are continuous. The outbox in a file is
 `Wse.config(url).offline(Wse.offline().path(file).build())`, `Wse.kept(client)`
 says how many messages wait in it, and `Wse.sendWith(client, kind, json,
-Wse.sendOptions().id("order-17").build())` sends with the app's own id. Signed messages: `Wse.generateSigningKey()`, `Wse.signingPublicKey(key)`
+Wse.sendOptions().id("order-17").build())` sends with the app's own id
+(`.correlationId(...)`, `.priority(...)` and `.live(true)` too). Signed messages: `Wse.generateSigningKey()`, `Wse.signingPublicKey(key)`
 and `Wse.sendSigned(...)`. Kotlin's unsigned numbers are hidden from Java:
 `Wse.retryInMillis(...)`, `Wse.attempt(...)` and `Wse.closeCode(...)` give a
 `Disconnected` item's as plain numbers.

@@ -230,6 +230,12 @@ pub struct NativeSendOptions {
     pub ttl_ms: u64,
     /// Topics that must each be continuous when it goes.
     pub requires: Vec<String>,
+    /// The id the app's reply names (`cid`): its request and its response.
+    pub correlation_id: Option<String>,
+    /// How urgent the app says it is (`pri`, 1 to 10; 0: none).
+    pub priority: u8,
+    /// On the connection that is ready now, or not at all; never kept.
+    pub live: bool,
 }
 
 impl From<NativeSendOptions> for crate::SendOptions {
@@ -238,6 +244,9 @@ impl From<NativeSendOptions> for crate::SendOptions {
             id: native.id,
             ttl: (native.ttl_ms > 0).then(|| Duration::from_millis(native.ttl_ms)),
             requires: native.requires,
+            correlation_id: native.correlation_id,
+            priority: (native.priority > 0).then_some(native.priority),
+            live: native.live,
         }
     }
 }
@@ -563,6 +572,12 @@ pub struct NativeMessage {
     pub epoch: Option<u32>,
     pub offset: Option<u64>,
     pub id: Option<String>,
+    /// The id a request named, on its reply (`cid`).
+    pub correlation_id: Option<String>,
+    /// How urgent its sender said it is (`pri`).
+    pub priority: Option<u8>,
+    /// When it was sent, as its sender wrote it (`ts`).
+    pub timestamp: Option<String>,
     /// The payload as JSON text, from msgpack too; None without one (absent
     /// or null, in either format) or when it could not be decoded.
     pub json: Option<String>,
@@ -710,6 +725,9 @@ fn message_of(message: &OwnedMessage) -> NativeMessage {
         epoch: position.map(|p| p.epoch),
         offset: position.map(|p| p.offset),
         id: message.id().map(str::to_owned),
+        correlation_id: message.correlation_id().map(str::to_owned),
+        priority: message.priority(),
+        timestamp: message.timestamp().map(str::to_owned),
         json,
         payload_error,
         signature: message.signature().map(|s| NativeSignature {
