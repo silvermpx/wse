@@ -159,12 +159,16 @@ impl Wse {
         Ok(id)
     }
 
-    fn frames(&self, id: u64, frames: &[Box<RawValue>]) -> Result<(), String> {
+    /// Frames of webview `label`'s page for its window `id`. Another
+    /// webview's window is not there for it: the same answer as one let go,
+    /// so a page cannot tell which numbers other pages hold.
+    fn frames(&self, label: &str, id: u64, frames: &[Box<RawValue>]) -> Result<(), String> {
         let (owner, window) = {
             let inner = self.lock();
             let attached = inner
                 .attached
                 .get(&id)
+                .filter(|attached| attached.label == label)
                 .ok_or_else(|| "this page's window was let go".to_owned())?;
             (attached.owner.clone(), attached.window)
         };
@@ -174,8 +178,16 @@ impl Wse {
         Ok(())
     }
 
-    fn detach(&self, id: u64) {
-        let attached = self.lock().attached.remove(&id);
+    /// Webview `label`'s page lets its window `id` go; another webview's
+    /// stays.
+    fn detach(&self, label: &str, id: u64) {
+        let attached = {
+            let mut inner = self.lock();
+            match inner.attached.get(&id) {
+                Some(attached) if attached.label == label => inner.attached.remove(&id),
+                _ => None,
+            }
+        };
         if let Some(attached) = attached {
             attached.owner.detach(attached.window);
         }
@@ -224,14 +236,19 @@ fn attach<R: Runtime>(
 
 /// The frames a page sent, in order, for its window.
 #[tauri::command]
-fn frames(wse: State<'_, Wse>, att: u64, frames: Vec<Box<RawValue>>) -> Result<(), String> {
-    wse.frames(att, &frames)
+fn frames<R: Runtime>(
+    webview: Webview<R>,
+    wse: State<'_, Wse>,
+    att: u64,
+    frames: Vec<Box<RawValue>>,
+) -> Result<(), String> {
+    wse.frames(webview.label(), att, &frames)
 }
 
 /// A page lets its window go.
 #[tauri::command]
-fn detach(wse: State<'_, Wse>, att: u64) {
-    wse.detach(att);
+fn detach<R: Runtime>(webview: Webview<R>, wse: State<'_, Wse>, att: u64) {
+    wse.detach(webview.label(), att);
 }
 
 /// The plugin: register it with `tauri::Builder::plugin`.
@@ -332,6 +349,7 @@ mod tests {
     /// Takes what the page gets until `test` holds, acknowledging each batch.
     async fn until(
         wse: &Wse,
+        label: &str,
         id: u64,
         rx: &mut mpsc::UnboundedReceiver<Value>,
         test: impl Fn(&Value) -> bool,
@@ -342,7 +360,7 @@ mod tests {
                 .expect("a frame within 5 s")
                 .expect("the channel lives");
             if frame["k"] == "b" {
-                let _ = wse.frames(id, &frames(&[json!({"k": "ack", "s": frame["s"]})]));
+                let _ = wse.frames(label, id, &frames(&[json!({"k": "ack", "s": frame["s"]})]));
                 if let Some(item) = frame["items"]
                     .as_array()
                     .and_then(|items| items.iter().find(|item| test(item)))
@@ -366,6 +384,7 @@ mod tests {
         let (page, mut rx) = channel();
         let id = wse.attach("main", page).unwrap();
         wse.frames(
+            "main",
             id,
             &frames(&[
                 json!({"k": "hello", "v": 1, "agent": "test"}),
@@ -373,8 +392,8 @@ mod tests {
             ]),
         )
         .unwrap();
-        until(&wse, id, &mut rx, |f| f["k"] == "welcome").await;
-        let connected = until(&wse, id, &mut rx, |i| i["ev"] == "connected").await;
+        until(&wse, "main", id, &mut rx, |f| f["k"] == "welcome").await;
+        let connected = until(&wse, "main", id, &mut rx, |i| i["ev"] == "connected").await;
         assert_eq!(connected["user"], "ann");
         assert!(owner.client().is_connected());
         wse.close().await;
@@ -393,8 +412,14 @@ mod tests {
         assert_eq!(owner.attached(), 2);
         wse.let_go("main");
         assert_eq!(owner.attached(), 1);
-        assert!(wse.frames(gone, &frames(&[json!({"k": "bye"})])).is_err());
-        assert!(wse.frames(kept, &frames(&[json!({"k": "bye"})])).is_ok());
+        assert!(
+            wse.frames("main", gone, &frames(&[json!({"k": "bye"})]))
+                .is_err()
+        );
+        assert!(
+            wse.frames("settings", kept, &frames(&[json!({"k": "bye"})]))
+                .is_ok()
+        );
         assert_eq!(owner.attached(), 0);
         wse.close().await;
         server.stop().await;
@@ -408,16 +433,20 @@ mod tests {
         let (page, mut rx) = channel();
         let id = wse.attach("main", page).unwrap();
         wse.frames(
+            "main",
             id,
             &frames(&[json!({"k": "hello", "v": 1, "agent": "test"})]),
         )
         .unwrap();
-        until(&wse, id, &mut rx, |f| f["k"] == "welcome").await;
+        until(&wse, "main", id, &mut rx, |f| f["k"] == "welcome").await;
         // Another user's connection: the last one's pages end with it.
         let next = wse.start(config).await.unwrap();
-        let revoked = until(&wse, id, &mut rx, |f| f["k"] == "revoked").await;
+        let revoked = until(&wse, "main", id, &mut rx, |f| f["k"] == "revoked").await;
         assert_eq!(revoked["reason"], "owner_closed");
-        assert!(wse.frames(id, &frames(&[json!({"k": "bye"})])).is_err());
+        assert!(
+            wse.frames("main", id, &frames(&[json!({"k": "bye"})]))
+                .is_err()
+        );
         assert_eq!(next.attached(), 0);
         wse.close().await;
         server.stop().await;
@@ -431,17 +460,37 @@ mod tests {
         let (page, mut rx) = channel();
         let id = wse.attach("main", page).unwrap();
         wse.frames(
+            "main",
             id,
             &frames(&[json!({"k": "hello", "v": 1, "agent": "test"})]),
         )
         .unwrap();
-        until(&wse, id, &mut rx, |f| f["k"] == "welcome").await;
+        until(&wse, "main", id, &mut rx, |f| f["k"] == "welcome").await;
         wse.sign_out();
-        let revoked = until(&wse, id, &mut rx, |f| f["k"] == "revoked").await;
+        let revoked = until(&wse, "main", id, &mut rx, |f| f["k"] == "revoked").await;
         assert_eq!(revoked["reason"], "signed_out");
         assert!(wse.owner().is_none());
         let (late, _) = channel();
         assert!(wse.attach("main", late).is_err());
+        server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_page_cannot_use_the_window_of_another_webview() {
+        let (server, config) = server().await;
+        let wse = Wse::default();
+        let owner = wse.start(config).await.unwrap();
+        let (main, _main_rx) = channel();
+        let id = wse.attach("main", main).unwrap();
+        // Another webview names main's window: refused as one that is not
+        // there, and main's window stays.
+        let bye = frames(&[json!({"k": "bye"})]);
+        assert!(wse.frames("settings", id, &bye).is_err());
+        wse.detach("settings", id);
+        assert_eq!(owner.attached(), 1);
+        assert!(wse.frames("main", id, &bye).is_ok());
+        assert_eq!(owner.attached(), 0);
+        wse.close().await;
         server.stop().await;
     }
 }
