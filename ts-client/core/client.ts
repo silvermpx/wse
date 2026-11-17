@@ -218,6 +218,18 @@ function shallowSame(a: WSEClientSnapshot, b: WSEClientSnapshot): boolean {
 }
 
 /**
+ * The database of a scope's outbox: `<base>:<consumer>@<realm>`, as 3.1 named
+ * it, wherever that names one scope alone (no `@` in the base, neither `:`
+ * nor `@` in the consumer: the realm is what follows the first `@`, and the
+ * consumer what lies between it and the last `:` before it); else each part
+ * escaped, under a prefix of its own, so that no two scopes share a queue.
+ */
+function outboxDatabase(base: string, consumer: string, realm: string): string {
+  if (!base.includes('@') && !/[:@]/.test(consumer)) return `${base}:${consumer}@${realm}`;
+  return `wse%:${encodeURIComponent(base)}:${encodeURIComponent(consumer)}@${encodeURIComponent(realm)}`;
+}
+
+/**
  * Each client's own hand, for a bridge owner in this package: its outbox
  * flushed now (a window's topics came continuous).
  */
@@ -267,7 +279,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
       : (options.storage ?? memoryStorage());
   // The durable queue's scope: the storage's namespace, the consumer and the
   // realm. Without a consumer nothing is persisted.
-  const offlineDatabase = consumer && base.offlineDatabase ? `${base.offlineDatabase}:${consumer}@${realm ?? ''}` : null;
+  const offlineDatabase = consumer && base.offlineDatabase ? outboxDatabase(base.offlineDatabase, consumer, realm ?? '') : null;
   // What it keeps is its consumer's in its realm: another realm (staging
   // beside production) or consumer in the same namespace keeps its own.
   const storage = scopedStorage(base, offlineDatabase, scopeOf(consumer, realm));

@@ -95,6 +95,20 @@ describe('the durable outbox', () => {
     expect(c.state.getSnapshot().storage).toBe('memory');
   });
 
+  it('keeps each scope apart, whatever its parts hold of the separators', async () => {
+    const a = client({ storage: 'collision:alice', consumer: 'checkout', realm: 'prod' });
+    await vi.waitFor(() => expect(a.state.getSnapshot().storage).toBe('durable'));
+    expect(a.send('private', { secret: 'alice' }, { id: 'a' })).toBe('queued');
+    await vi.waitFor(async () => expect(Object.values(await stored('wse:collision:alice:checkout@prod'))).toEqual([['a']]));
+    a.destroy();
+    const b = client({ storage: 'collision', consumer: 'alice:checkout', realm: 'prod' });
+    await vi.waitFor(() => expect(b.state.getSnapshot().storage).toBe('durable'));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(b.kept()).toBe(0);
+    b.destroy();
+    await dropDb('wse:collision:alice:checkout@prod');
+  });
+
   it('keeps what was sent for the next client of the scope, until the server took it', async () => {
     const first = client({ consumer: 'checkout' });
     await vi.waitFor(() => expect(first.state.getSnapshot().storage).toBe('durable'));
