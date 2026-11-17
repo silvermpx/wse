@@ -320,6 +320,11 @@ fn run_lane(root: &Path, lane: &Lane, dir: &Path) -> Outcome {
         .arg(format!("set -euo pipefail\n{}", lane.script))
         .current_dir(root)
         .env("CARGO_TARGET_DIR", &target)
+        // A lane builds once: no incremental cache, and of the debug
+        // information the line tables alone (a panic still names its
+        // line). Each lane's build is a fraction of the size, and faster.
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_PROFILE_DEV_DEBUG", "line-tables-only")
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err)
