@@ -61,13 +61,21 @@ function answering(outbox: Outbox, acked = 0): void {
   outbox.answeredWith(acked, [], 'n1');
 }
 
-function due(outbox: Outbox): number[] {
-  const out: number[] = [];
-  outbox.due(0, noOutcomes(), (_message, s) => {
-    out.push(s!);
-    return true;
-  });
-  return out;
+/** The numbers handed to the connection, once the storage wrote that they may have gone. */
+async function due(outbox: Outbox): Promise<number[]> {
+  const hand = () => {
+    const out: number[] = [];
+    outbox.due(0, noOutcomes(), (_message, s) => {
+      out.push(s!);
+      return true;
+    });
+    return out;
+  };
+  const now = hand();
+  if (now.length > 0) return now;
+  await new Promise<void>((resolve) => (outbox.writable = resolve));
+  outbox.writable = null;
+  return hand();
 }
 
 /** What the storage holds of the messages, by number. */
@@ -88,7 +96,7 @@ describe('the outbox in the app storage (React Native)', () => {
     expect(first.durable).toBe(true);
     answering(first);
     for (const id of ['a', 'b', 'c']) add(first, id);
-    expect(due(first)).toEqual([1, 2, 3]);
+    expect(await due(first)).toEqual([1, 2, 3]);
     first.acked(1);
     first.close();
     await settled();
@@ -100,7 +108,7 @@ describe('the outbox in the app storage (React Native)', () => {
     expect(again.size).toBe(2);
     expect(again.hello()).toEqual({ producer: first.producer, node: 'n1', written: 3, from: 2 });
     answering(again, 1);
-    expect(due(again)).toEqual([2, 3]);
+    expect(await due(again)).toEqual([2, 3]);
     expect(add(again, 'd')).toBe(4);
     again.acked(4);
     again.close();
@@ -218,7 +226,7 @@ describe('the outbox in the app storage (React Native)', () => {
     await again.opened;
     expect(again.size).toBe(2);
     answering(again);
-    expect(due(again)).toEqual([1, 2]);
+    expect(await due(again)).toEqual([1, 2]);
     again.close();
     await settled();
     expect(messages(storage)).toEqual([1, 2]);

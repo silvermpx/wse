@@ -207,25 +207,32 @@ class StorageLog implements OutboxLog {
     }
   }
 
-  flush(): void {
-    if (this.sets.size === 0 && this.removes.size === 0 && !this.metaChanged) return;
-    if (this.metaChanged) this.sets.set(this.name, JSON.stringify(this.meta));
-    const batch = { sets: this.sets, removes: this.removes };
-    this.sets = new Map();
-    this.removes = new Set();
-    this.metaChanged = false;
-    if (this.waiting) {
-      // Behind the one that waits: one batch, the later change of a key winning.
-      for (const key of batch.removes) {
-        this.waiting.sets.delete(key);
-        this.waiting.removes.add(key);
+  flush(written?: () => void): void {
+    if (this.sets.size > 0 || this.removes.size > 0 || this.metaChanged) {
+      if (this.metaChanged) this.sets.set(this.name, JSON.stringify(this.meta));
+      const batch = { sets: this.sets, removes: this.removes };
+      this.sets = new Map();
+      this.removes = new Set();
+      this.metaChanged = false;
+      if (this.waiting) {
+        // Behind the one that waits: one batch, the later change of a key winning.
+        for (const key of batch.removes) {
+          this.waiting.sets.delete(key);
+          this.waiting.removes.add(key);
+        }
+        for (const [key, value] of batch.sets) {
+          this.waiting.removes.delete(key);
+          this.waiting.sets.set(key, value);
+        }
+      } else {
+        this.waiting = batch;
       }
-      for (const [key, value] of batch.sets) {
-        this.waiting.removes.delete(key);
-        this.waiting.sets.set(key, value);
-      }
-    } else {
-      this.waiting = batch;
+    }
+    if (written) {
+      // With what is handed last: the batch that waits, else the one that runs.
+      if (this.waiting) this.waitingWritten.push(written);
+      else if (this.busy) this.running.push(written);
+      else written();
     }
     this.kick();
   }
@@ -241,7 +248,8 @@ class StorageLog implements OutboxLog {
     return broken;
   }
 
-  rewrite(state: StoredOutbox): void {
+  rewrite(state: StoredOutbox, written?: () => void): void {
+    if (written) this.waitingWritten.push(written);
     this.meta.next = Math.max(this.meta.next, state.next);
     this.meta.written = state.written;
     this.meta.node = state.node;
@@ -268,6 +276,9 @@ class StorageLog implements OutboxLog {
 
   /** The waiting batch is a whole one: it clears what a failed batch left. */
   private rewriting = false;
+  /** Who hears that what was handed is written: with the batch that waits, and the one that runs. */
+  private waitingWritten: Array<() => void> = [];
+  private running: Array<() => void> = [];
 
   private kick(): void {
     if (this.busy || !this.waiting) return;
@@ -275,7 +286,12 @@ class StorageLog implements OutboxLog {
     const whole = this.rewriting;
     this.waiting = null;
     this.rewriting = false;
-    if (this.stale && !whole) return;
+    this.running = this.waitingWritten;
+    this.waitingWritten = [];
+    if (this.stale && !whole) {
+      this.running = [];
+      return;
+    }
     this.busy = true;
     // Removed first, then set. A batch never names a key in both, so an app
     // killed between the two loses no message kept before, and keeps none
@@ -289,11 +305,15 @@ class StorageLog implements OutboxLog {
         if (whole) this.stale = false;
         this.failing = false;
         for (const key of batch.removes) this.doomed.delete(Number(key.slice(this.prefix.length)));
+        const running = this.running;
+        this.running = [];
+        for (const told of running) told();
         this.kick();
         this.settle();
       },
       (error) => {
         this.busy = false;
+        this.running = [];
         this.fail(error);
         this.kick();
         this.settle();

@@ -335,6 +335,14 @@ class FileLog implements OutboxLog {
   private rewriteQueued: string | null = null;
   /** A write runs: an append (on `fd`), or the file anew. */
   private busy: 'append' | 'rewrite' | null = null;
+  /**
+   * Who hears that what was handed is written: with `queued`, with the
+   * rewrite handed, and with the write that runs.
+   */
+  private queuedWritten: Array<() => void> = [];
+  private rewriteWritten: Array<() => void> = [];
+  /** Null once the write that runs was told (or failed). */
+  private running: Array<() => void> | null = null;
   /** A write failed and the outbox was not told yet. */
   private broken = false;
   /** The file lacks what a failed write held: it is written anew before anything is appended. */
@@ -366,10 +374,18 @@ class FileLog implements OutboxLog {
     this.lines++;
   }
 
-  flush(): void {
-    if (this.batch.length === 0) return;
-    for (const line of this.batch) this.queued.push(line);
-    this.batch = [];
+  flush(written?: () => void): void {
+    if (this.batch.length > 0) {
+      for (const line of this.batch) this.queued.push(line);
+      this.batch = [];
+    }
+    if (written) {
+      // With what is handed last: what waits, else the write that runs.
+      if (this.rewriteQueued !== null) this.rewriteWritten.push(written);
+      else if (this.queued.length > 0) this.queuedWritten.push(written);
+      else if (this.busy && this.running) this.running.push(written);
+      else written();
+    }
     this.kick();
   }
 
@@ -383,7 +399,7 @@ class FileLog implements OutboxLog {
     return broken;
   }
 
-  rewrite(state: StoredOutbox): void {
+  rewrite(state: StoredOutbox, written?: () => void): void {
     const salt = randomBytes(16).toString('hex');
     const { data, lines } = encodeOutbox(state, salt);
     this.seed = saltSeed(salt);
@@ -391,8 +407,18 @@ class FileLog implements OutboxLog {
     // What waits to be appended is in it.
     this.batch = [];
     this.queued = [];
+    this.rewriteWritten.push(...this.queuedWritten);
+    this.queuedWritten = [];
+    if (written) this.rewriteWritten.push(written);
     this.rewriteQueued = data;
     this.kick();
+  }
+
+  /** What was handed with the write that runs is written: who waited for it hears so. */
+  private told(): void {
+    const running = this.running;
+    this.running = null;
+    for (const written of running ?? []) written();
   }
 
   /** The next write, once none runs. */
@@ -401,6 +427,8 @@ class FileLog implements OutboxLog {
     const data = this.rewriteQueued;
     if (data !== null) {
       this.rewriteQueued = null;
+      this.running = this.rewriteWritten;
+      this.rewriteWritten = [];
       this.busy = 'rewrite';
       this.writeAnew(data);
       return;
@@ -409,17 +437,24 @@ class FileLog implements OutboxLog {
     if (this.stale) {
       // In what is written anew.
       this.queued = [];
+      this.queuedWritten = [];
       return;
     }
     const bytes = Buffer.from(this.queued.join(''), 'utf8');
     this.queued = [];
+    this.running = this.queuedWritten;
+    this.queuedWritten = [];
     this.busy = 'append';
     const fd = this.fd;
     write(fd, bytes, 0, bytes.length, null, (error, written) => {
       if (error || written !== bytes.length) {
+        this.running = null;
         this.appended(fd, error ?? new Error(`wrote ${written} of ${bytes.length} bytes`));
         return;
       }
+      // Written, past a crash of the process: who waited for it hears so;
+      // the disk has it once synced, at once after.
+      if (!this.closed) this.told();
       fdatasync(fd, (error) => this.appended(fd, error));
     });
   }
@@ -451,10 +486,12 @@ class FileLog implements OutboxLog {
       }
       if (this.closed) return;
       if (error) {
+        this.running = null;
         this.fail(error);
       } else {
         this.stale = false;
         this.failing = false;
+        this.told();
       }
       this.kick();
     };

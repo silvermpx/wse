@@ -204,6 +204,9 @@ class IdbLog implements OutboxLog {
   /** Batches handed and not in a transaction yet. */
   private queued: Op[] = [];
   private queuedMeta = false;
+  /** Who hears that what was handed is written: with `queued`, and with the transaction that runs. */
+  private queuedWritten: Array<() => void> = [];
+  private running: Array<() => void> = [];
   private busy = false;
   private broken = false;
   /** A transaction failed: the database lacks what it held, and is written anew before anything is added. */
@@ -258,12 +261,19 @@ class IdbLog implements OutboxLog {
     }
   }
 
-  flush(): void {
-    if (this.ops.length === 0 && !this.metaChanged) return;
-    for (const op of this.ops) this.queued.push(op);
-    this.queuedMeta ||= this.metaChanged;
-    this.ops = [];
-    this.metaChanged = false;
+  flush(written?: () => void): void {
+    if (this.ops.length > 0 || this.metaChanged) {
+      for (const op of this.ops) this.queued.push(op);
+      this.queuedMeta ||= this.metaChanged;
+      this.ops = [];
+      this.metaChanged = false;
+    }
+    if (written) {
+      // With what is handed last: what waits, else the transaction that runs.
+      if (this.queued.length > 0 || this.queuedMeta) this.queuedWritten.push(written);
+      else if (this.busy) this.running.push(written);
+      else written();
+    }
     if (!this.busy) this.commit();
   }
 
@@ -277,7 +287,8 @@ class IdbLog implements OutboxLog {
     return broken;
   }
 
-  rewrite(state: StoredOutbox): void {
+  rewrite(state: StoredOutbox, written?: () => void): void {
+    if (written) this.queuedWritten.push(written);
     this.meta.next = Math.max(this.meta.next, state.next);
     this.meta.written = state.written;
     this.meta.node = state.node;
@@ -295,8 +306,10 @@ class IdbLog implements OutboxLog {
     if (this.queued.length === 0 && !this.queuedMeta) return;
     const ops = this.queued;
     const rewrites = ops.some((op) => 'rewrite' in op);
+    const written = this.queuedWritten;
     this.queued = [];
     this.queuedMeta = false;
+    this.queuedWritten = [];
     if (this.stale && !rewrites) return;
     let tx: IDBTransaction;
     try {
@@ -318,14 +331,19 @@ class IdbLog implements OutboxLog {
       return;
     }
     this.busy = true;
+    this.running = written;
     tx.oncomplete = () => {
       this.busy = false;
       if (rewrites) this.stale = false;
       this.failing = false;
+      const running = this.running;
+      this.running = [];
+      for (const told of running) told();
       if (!this.closed) this.commit();
     };
     const failed = () => {
       this.busy = false;
+      this.running = [];
       this.fail(tx.error ?? new Error('the transaction was aborted'));
       if (!this.closed) this.commit();
     };

@@ -147,14 +147,17 @@ export interface OutboxLog {
   add(record: StoredMessage): void;
   /** A change: into the batch. */
   put(line: OutboxLine): void;
-  /** The batch goes to be written. */
-  flush(): void;
+  /**
+   * The batch goes to be written; `written`, once it is (past a crash of the
+   * process), with every batch before it. Not when the write fails.
+   */
+  flush(written?: () => void): void;
   /** The batch is in what is written anew. */
   forget(): void;
   /** A write failed since the last time it was asked: the store is to be written anew. */
   takeBroken(): boolean;
-  /** Writes it anew, with `state` alone. */
-  rewrite(state: StoredOutbox): void;
+  /** Writes it anew, with `state` alone; `written`, once it is. */
+  rewrite(state: StoredOutbox, written?: () => void): void;
   /**
    * Writes what it was handed, at once, and lets the store go: another
    * client may take it.
@@ -252,6 +255,18 @@ export class Outbox {
   private node: string | null = null;
   /** The highest number handed to a connection: one above it never reached a server. */
   private written = 0;
+  /**
+   * Written ahead: the highest number the store was handed the mark of (that
+   * up to it, messages may have gone), and the highest one it wrote. A
+   * numbered message goes only once the store wrote its mark, so that after
+   * a crash its number is never another's.
+   */
+  private promised = 0;
+  private stored = 0;
+  /** A write of the store failed: messages go without waiting for it, until it is written anew. */
+  private degraded = false;
+  /** Hears that messages waiting for the store may go now (the client writes the outbox). */
+  writable: (() => void) | null = null;
   /** Written on the current connection and cleared before the server answered for them. */
   private limbo: Array<[number, string, number]> = [];
   /** The user of the last connection; undefined before the first. */
@@ -271,8 +286,6 @@ export class Outbox {
   private readonly onExpired?: (outcomes: Outcomes) => void;
   /** The store's log, while one is open. */
   private log: OutboxLog | null = null;
-  /** The highest number written that the store was told of. */
-  private loggedWritten = 0;
   /** A batch for the store waits for the end of this turn of the event loop. */
   private flushQueued = false;
   /** A write of the store failed: it is written anew, at most once a second. */
@@ -301,7 +314,15 @@ export class Outbox {
     this.producerId = options.producer ?? newProducer();
     this.onExpired = options.onExpired;
     this.store = options.store ?? null;
-    this.report = options.onStorageError ?? (() => {});
+    const told = options.onStorageError ?? (() => {});
+    this.report = (operation, error) => {
+      // What waits for the store goes without it, until it is written anew.
+      if (operation === 'write' && !this.degraded) {
+        this.degraded = true;
+        this.writable?.();
+      }
+      told(operation, error);
+    };
     this.onOpen = options.onOpen;
     if (this.store) this.open(this.store);
   }
@@ -423,7 +444,8 @@ export class Outbox {
     this.producerId = read.producer || this.producerId;
     this.node = read.node;
     this.written = read.written;
-    this.loggedWritten = read.written;
+    this.promised = read.written;
+    this.stored = read.written;
     this.next = Math.max(1, read.next);
     this.user = read.user ?? undefined;
     let earliest = Infinity;
@@ -454,7 +476,7 @@ export class Outbox {
     return {
       producer: this.producerId,
       node: this.node,
-      written: this.written,
+      written: Math.max(this.written, this.promised),
       next: this.next,
       user: typeof this.user === 'string' ? this.user : null,
       records: this.records.slice(this.head),
@@ -670,6 +692,12 @@ export class Outbox {
     let taken = 0;
     while (this.cursor < this.records.length) {
       const record = this.records[this.cursor];
+      // Written ahead: the store is handed the mark for every message kept
+      // now, and they go once it wrote it.
+      if (numbered && record.s > this.stored && this.log && !this.degraded) {
+        this.promise(this.records[this.records.length - 1].s);
+        break;
+      }
       const took = write(record.message, numbered ? record.s : undefined, record.json, record.requires, record.tag);
       if (!took) break;
       this.cursor++;
@@ -853,6 +881,20 @@ export class Outbox {
     this.flush();
   }
 
+  /** The store is to hold that messages up to `s` may have gone: in this turn's batch. */
+  private promise(s: number): void {
+    if (s <= this.promised) return;
+    this.promised = s;
+    this.put({ written: s });
+  }
+
+  /** The store wrote the marks up to `s`: what waited for them may go. */
+  private wrote(s: number): void {
+    if (s <= this.stored) return;
+    this.stored = s;
+    this.writable?.();
+  }
+
   /** The store gets the batch at the end of this turn of the event loop: the changes of a turn at once. */
   private flush(): void {
     if (!this.log || this.flushQueued) return;
@@ -873,10 +915,8 @@ export class Outbox {
   private flushNow(closing = false): void {
     const log = this.log;
     if (!log) return;
-    if (this.written > this.loggedWritten) {
-      this.loggedWritten = this.written;
-      log.put({ written: this.written });
-    }
+    const promised = this.promised;
+    const written = promised > this.stored ? () => this.wrote(promised) : undefined;
     if (log.takeBroken()) this.owedRewrite = true;
     if (this.owedRewrite) {
       const now = monotonic();
@@ -885,7 +925,13 @@ export class Outbox {
         this.healAt = now + 1000;
         if (this.healTimer) clearTimeout(this.healTimer);
         this.healTimer = null;
-        log.rewrite(this.state());
+        // Written anew, it holds what went meanwhile: messages wait for it again.
+        const state = this.state();
+        this.promised = state.written;
+        log.rewrite(state, () => {
+          this.degraded = false;
+          this.wrote(state.written);
+        });
       } else {
         log.forget();
         if (!this.healTimer) {
@@ -899,9 +945,9 @@ export class Outbox {
         }
       }
     } else if (log.lines > 2 * this.count + 64) {
-      log.rewrite(this.state());
+      log.rewrite(this.state(), written);
     } else {
-      log.flush();
+      log.flush(written);
     }
   }
 }

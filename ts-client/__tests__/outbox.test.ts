@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { noOutcomes, Outbox, type Outcomes } from '../services/Outbox';
+import { noOutcomes, Outbox, type OutboxLine, type OutboxStore, type Outcomes, type StoredOutbox } from '../services/Outbox';
 import type { WSMessage } from '../types';
 
 const limits = { maxMessages: 100, maxBytes: 1 << 20, maxAge: 3_600_000 };
@@ -205,5 +205,67 @@ describe('Outbox', () => {
     expect(outbox.size).toBe(0);
     add(outbox, 'next');
     expect(due(outbox)).toEqual([[5001, 'next']]);
+  });
+});
+
+/** A store whose writes the test confirms, or fails, by hand. */
+function handStore() {
+  const lines: OutboxLine[] = [];
+  const written: Array<() => void> = [];
+  let report: (operation: string, error: unknown) => void = () => {};
+  const store: OutboxStore = {
+    open: (_state, told) => {
+      report = told;
+      return {
+        read: null,
+        log: {
+          lines: 0,
+          add: () => {},
+          put: (line) => void lines.push(line),
+          flush: (done?: () => void) => void (done && written.push(done)),
+          forget: () => {},
+          takeBroken: () => false,
+          rewrite: (_state: StoredOutbox, done?: () => void) => void (done && written.push(done)),
+          close: () => {},
+        },
+      };
+    },
+  };
+  return {
+    store,
+    lines,
+    /** The store wrote what it was handed. */
+    write: () => written.splice(0).forEach((done) => done()),
+    fail: () => report('write', new Error('disk full')),
+  };
+}
+
+describe('Outbox, written ahead', () => {
+  it('hands a numbered message to the connection only once the store holds it and its mark', async () => {
+    const hand = handStore();
+    const outbox = new Outbox(limits, { store: hand.store });
+    let writable = 0;
+    outbox.writable = () => void writable++;
+    add(outbox, 'a', undefined, Date.now());
+    answering(outbox);
+    expect(due(outbox, Date.now())).toEqual([]);
+    await Promise.resolve();
+    expect(hand.lines).toContainEqual({ written: 1 });
+    hand.write();
+    expect(writable).toBe(1);
+    expect(due(outbox, Date.now())).toEqual([[1, 'a']]);
+  });
+
+  it('lets messages go without waiting once the store failed', async () => {
+    const hand = handStore();
+    const outbox = new Outbox(limits, { store: hand.store });
+    let writable = 0;
+    outbox.writable = () => void writable++;
+    add(outbox, 'a', undefined, Date.now());
+    answering(outbox);
+    expect(due(outbox, Date.now())).toEqual([]);
+    hand.fail();
+    expect(writable).toBe(1);
+    expect(due(outbox, Date.now())).toEqual([[1, 'a']]);
   });
 });

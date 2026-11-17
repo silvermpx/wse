@@ -59,6 +59,15 @@ function due(outbox: Outbox): number[] {
   return out;
 }
 
+/** The numbers handed to the connection, once the file holds that they may have gone. */
+async function dueWritten(outbox: Outbox): Promise<number[]> {
+  const now = due(outbox);
+  if (now.length > 0) return now;
+  await new Promise<void>((resolve) => (outbox.writable = resolve));
+  outbox.writable = null;
+  return due(outbox);
+}
+
 describe('the file of every client (tests/vectors/outbox.json)', () => {
   it('writes each line byte for byte as the vector has it', () => {
     const seed = saltSeed(vector.salt);
@@ -146,12 +155,12 @@ describe('the outbox in a file', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('keeps what waits for the next client, until the server took it', () => {
+  it('keeps what waits for the next client, until the server took it', async () => {
     const first = new Outbox(limits, { store: fileOutbox(path) });
     expect(first.durable).toBe(true);
     answering(first);
     for (const id of ['a', 'b', 'c']) add(first, id);
-    expect(due(first)).toEqual([1, 2, 3]);
+    expect(await dueWritten(first)).toEqual([1, 2, 3]);
     first.acked(1);
     first.close();
 

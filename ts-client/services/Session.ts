@@ -438,8 +438,10 @@ export class WSESession {
     this.ctx.state.getState().updateConfig({ maxReconnectAttempts: o.reconnection.maxAttempts });
     this.ctx.queue.getState().setCapacity(o.performance.maxQueueSize);
     this.ctx.queue.getState().setMemoryLimit(o.performance.memoryLimit);
-    // The client's outbox: made once, kept across its sessions.
-    ensureOutbox(this.ctx, o.offline);
+    // The client's outbox: made once, kept across its sessions. What waited
+    // for its store goes once the store wrote it.
+    const outbox = ensureOutbox(this.ctx, o.offline);
+    if (outbox) outbox.writable = () => this.processor.flushSoon();
 
     if (o.criticalHandlers.length > 0) {
       const missing = o.criticalHandlers.filter(h => !this.processor.isHandlerRegistered(h));
@@ -864,6 +866,8 @@ export class WSESession {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    const outbox = this.ctx.outbox.current;
+    if (outbox) outbox.writable = null;
 
     if (this.windowListener && typeof window !== 'undefined') {
       window.removeEventListener('wseRequestSnapshot', this.windowListener);
