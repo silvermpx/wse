@@ -96,6 +96,37 @@ void main() {
     await client.close();
   });
 
+  test(
+    'one reader at a time: a second listener is refused, the first keeps its place',
+    () async {
+      final client = await WseClient.connect(
+        wseConfig(url, topics: ['ticks'], insecure: true),
+      );
+      // A few items gather: the first batch holds more than one.
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      late final StreamSubscription<WseItem> first;
+      final paused = Completer<void>();
+      first = client.events().listen((_) {
+        if (paused.isCompleted) return;
+        // Paused with the rest of its batch in hand.
+        first.pause();
+        paused.complete();
+      });
+      await paused.future;
+      final refused = Completer<Object>();
+      final second = <WseItem>[];
+      client.events().listen(second.add, onError: refused.complete);
+      final error = await refused.future.timeout(const Duration(seconds: 5));
+      expect(error, isA<WseError>().having((e) => e.kind, 'kind', 'busy'));
+      expect(second, isEmpty);
+      first.resume();
+      await first.cancel();
+      // Let go: the next reader reads on.
+      expect(await client.events().first, isA<WseItem>());
+      await client.close();
+    },
+  );
+
   test('a live message goes on the ready connection', () async {
     final client = await WseClient.connect(wseConfig(url, insecure: true));
     client.trySendLive('valve', '{"open":true}');

@@ -64,6 +64,9 @@ class WseClient {
   rust.WseBatch? _batch;
   int _index = 0;
   bool _ended = false;
+
+  /// A listener reads the events: until it stops, another is refused (busy).
+  bool _reading = false;
   bool _closed = false;
   Future<void>? _closing;
 
@@ -95,8 +98,10 @@ class WseClient {
 
   /// What the server sends, in order, until the client closes. A batch is
   /// acknowledged only once all of it was handed out, so a listener that
-  /// stops in between gets the rest from the next one; one reader at a time.
-  /// Cancelling a listener that waits for the server ends the wait.
+  /// stops in between gets the rest from the next one. One reader at a time:
+  /// a stream listened to while another listens, paused or not, gets a
+  /// `busy` WseError and ends. Cancelling a listener that waits for the
+  /// server ends the wait.
   Stream<rust.WseItem> events({int maxItems = 256, int maxBytes = 1 << 20}) {
     late final StreamController<rust.WseItem> controller;
     Future<void>? pumping;
@@ -143,6 +148,7 @@ class WseClient {
       } catch (error, stack) {
         if (!cancelled) controller.addError(error, stack);
       }
+      _reading = false;
       if (!cancelled) await controller.close();
     }
 
@@ -153,7 +159,20 @@ class WseClient {
 
     controller = StreamController<rust.WseItem>(
       sync: true,
-      onListen: () => pumping = Future<void>.microtask(pump),
+      onListen: () {
+        if (_reading) {
+          controller.addError(
+            const rust.WseError(
+              kind: 'busy',
+              message: 'another listener reads the events: one at a time',
+            ),
+          );
+          controller.close();
+          return;
+        }
+        _reading = true;
+        pumping = Future<void>.microtask(pump);
+      },
       onResume: wake,
       onCancel: () {
         cancelled = true;
