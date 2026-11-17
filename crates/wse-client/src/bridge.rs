@@ -40,6 +40,7 @@ use serde_json::value::RawValue;
 
 use crate::handler::{Event, GapReason, Handler};
 use crate::message::Message;
+use crate::outbox::{Tagged, Tags};
 use crate::{Client, Config, Error, SendOptions};
 
 /// The protocol's major version: an owner and a window of others do not
@@ -188,6 +189,9 @@ struct Win {
     welcomed: bool,
     share: bool,
     holds: HashSet<String>,
+    /// Those of its topics the window said hold none of its sends back on
+    /// this connection: a send of it that requires one waits until then.
+    continuous: HashSet<String>,
     listens: HashSet<String>,
     queue: VecDeque<Arc<str>>,
     bytes: usize,
@@ -203,8 +207,6 @@ struct State {
     topics: HashMap<String, usize>,
     /// The topics the server took on this connection.
     active: HashSet<String>,
-    /// Whose send each outbox message is, by its id: its outcome goes there.
-    sender: HashMap<String, u64>,
     shares: usize,
     next: u64,
     generation: u64,
@@ -235,7 +237,6 @@ impl Owner {
                 windows: HashMap::new(),
                 topics: HashMap::new(),
                 active: HashSet::new(),
-                sender: HashMap::new(),
                 shares: 0,
                 next: 0,
                 generation: 0,
@@ -259,6 +260,11 @@ impl Owner {
             realm: bare(&config.url).unwrap_or_default(),
             runtime,
         });
+        // Each window's sends carry its number in the outbox: what became of
+        // them goes to it, whatever ids the windows chose.
+        config.tags = Some(Arc::new(WindowTags {
+            shared: Arc::clone(&shared),
+        }));
         let client = Client::start(
             config,
             Routes {
@@ -307,6 +313,7 @@ impl Owner {
                 welcomed: false,
                 share: false,
                 holds: HashSet::new(),
+                continuous: HashSet::new(),
                 listens: HashSet::new(),
                 queue: VecDeque::new(),
                 bytes: 0,
@@ -402,6 +409,18 @@ impl Owner {
             }
             "send" => self.send(&mut state, att, &frame),
             "sign" => self.sign(&state, att, frame),
+            "continuous" => {
+                // Said of a connection gone (before the window heard of its
+                // loss), it counts for nothing.
+                if !(state.ready && frame.generation == Some(state.generation)) {
+                    return;
+                }
+                if let Some(win) = state.windows.get_mut(&att) {
+                    win.continuous = frame.topics.unwrap_or_default().into_iter().collect();
+                }
+                // What of its sends waited for them may go now.
+                let _ = self.client.wake();
+            }
             "reconnect" => {
                 // A window asks at most once in five seconds.
                 let now = Instant::now();
@@ -570,7 +589,12 @@ impl Owner {
                     .and_then(|o| o.ttl)
                     .filter(|ttl| !live && ttl.is_finite() && *ttl >= 0.0)
                     .map(|ttl| Duration::from_millis(ttl as u64)),
-                requires: Vec::new(),
+                // Each time it goes, after a reconnect too, the window says
+                // whether they hold it back.
+                requires: options
+                    .filter(|_| !live)
+                    .and_then(|o| o.requires.clone())
+                    .unwrap_or_default(),
                 correlation_id: options.and_then(|o| o.correlation_id.clone()),
                 // The TypeScript client's priorities run 1 to 10.
                 priority: options
@@ -579,19 +603,14 @@ impl Owner {
                     .map(|p| p.clamp(0.0, 255.0) as u8),
                 live,
             };
-            match self.client.try_send_with(kind, payload, &send) {
-                Ok(id) if live => {
-                    let _ = id;
-                    "sent"
-                }
-                Ok(id) => {
-                    state.sender.insert(id, att);
-                    if self.client.is_connected() {
-                        "sent"
-                    } else {
-                        "queued"
-                    }
-                }
+            let sent = if live {
+                self.client.try_send_with(kind, payload, &send)
+            } else {
+                self.client.try_send_tagged(kind, payload, &send, att)
+            };
+            match sent {
+                Ok(_) if live || self.client.is_connected() => "sent",
+                Ok(_) => "queued",
                 Err(_) => "dropped",
             }
         };
@@ -661,7 +680,6 @@ impl Owner {
                 }
             }
         }
-        state.sender.retain(|_, sender| *sender != att);
         win.window.close();
     }
 }
@@ -798,10 +816,6 @@ impl Handler for Routes {
                 item.push_str("}}");
                 to_all(state, Arc::from(item), limits);
             }
-            Event::Delivered(ids) => outcome(state, "wseDelivered", None, ids, limits),
-            Event::NotDelivered(not) => {
-                outcome(state, "wseNotDelivered", Some(&not.reason), not.ids, limits);
-            }
             Event::StorageFailed(failed) => {
                 if failed.operation == "open" {
                     state.conn.storage = "unavailable";
@@ -829,7 +843,6 @@ impl Handler for Routes {
                 }
                 state.topics.clear();
                 state.active.clear();
-                state.sender.clear();
             }
             _ => {}
         }
@@ -843,6 +856,11 @@ fn lost(state: &mut State, limits: &Limits) {
     }
     state.ready = false;
     state.active.clear();
+    // Not continuous again until each window says so of the next connection
+    // (its resync done).
+    for win in state.windows.values_mut() {
+        win.continuous.clear();
+    }
     to_all(state, Arc::from(r#"{"ev":"lost"}"#), limits);
 }
 
@@ -866,33 +884,55 @@ fn to_all(state: &mut State, item: Arc<str>, limits: &Limits) {
     }
 }
 
-/// What became of windows' sends goes to the window that sent each.
-fn outcome(state: &mut State, name: &str, reason: Option<&str>, ids: Vec<String>, limits: &Limits) {
-    let mut by_window: HashMap<u64, Vec<String>> = HashMap::new();
-    for id in ids {
-        if let Some(att) = state.sender.remove(&id) {
-            by_window.entry(att).or_default().push(id);
+/// The windows' sends, each tagged with its window in the outbox.
+struct WindowTags {
+    shared: Arc<Shared>,
+}
+
+impl Tags for WindowTags {
+    /// What became of them goes to the window that sent each, as it came.
+    fn outcomes(&self, outcomes: Vec<Tagged>) {
+        let limits = &self.shared.limits;
+        let mut guard = self.shared.lock();
+        let State {
+            windows, active, ..
+        } = &mut *guard;
+        let mut outcomes = outcomes.into_iter().peekable();
+        while let Some(first) = outcomes.next() {
+            let mut ids = vec![first.id];
+            while let Some(next) =
+                outcomes.next_if(|n| n.tag == first.tag && n.reason == first.reason)
+            {
+                ids.push(next.id);
+            }
+            let Some(win) = windows.get_mut(&first.tag) else {
+                continue;
+            };
+            let mut item = String::from(r#"{"ev":"event","name":"#);
+            match &first.reason {
+                None => item.push_str(r#""wseDelivered","detail":{"#),
+                Some(reason) => {
+                    item.push_str(r#""wseNotDelivered","detail":{"reason":"#);
+                    push_str(&mut item, reason);
+                    item.push(',');
+                }
+            }
+            item.push_str(r#""ids":"#);
+            push_strings(&mut item, &ids);
+            item.push_str("}}");
+            enqueue(win, Arc::from(item), limits, active);
         }
     }
-    let State {
-        windows, active, ..
-    } = state;
-    for (att, ids) in by_window {
-        let Some(win) = windows.get_mut(&att) else {
-            continue;
-        };
-        let mut item = String::from(r#"{"ev":"event","name":"#);
-        push_str(&mut item, name);
-        item.push_str(r#","detail":{"#);
-        if let Some(reason) = reason {
-            item.push_str(r#""reason":"#);
-            push_str(&mut item, reason);
-            item.push(',');
-        }
-        item.push_str(r#""ids":"#);
-        push_strings(&mut item, &ids);
-        item.push_str("}}");
-        enqueue(win, Arc::from(item), limits, active);
+
+    /// A topic it requires that the window holds and has not said continuous
+    /// on this connection holds it back; one the window let go of, nothing.
+    fn holds_back(&self, tag: u64, topics: &[String]) -> bool {
+        let state = self.shared.lock();
+        state.windows.get(&tag).is_some_and(|win| {
+            topics
+                .iter()
+                .any(|topic| win.holds.contains(topic) && !win.continuous.contains(topic))
+        })
     }
 }
 
@@ -1120,6 +1160,9 @@ struct Frame<'a> {
     p: Option<&'a RawValue>,
     o: Option<FrameOptions>,
     c: Option<u64>,
+    /// The connection a window's word on its topics is of.
+    #[serde(rename = "gen")]
+    generation: Option<u64>,
 }
 
 /// A send's or a signed send's options, as they cross.
@@ -1132,6 +1175,7 @@ struct FrameOptions {
     priority: Option<f64>,
     correlation_id: Option<String>,
     nonce: Option<String>,
+    requires: Option<Vec<String>>,
 }
 
 #[cfg(test)]

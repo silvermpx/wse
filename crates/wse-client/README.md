@@ -333,7 +333,9 @@ channel the application carries. The owner subscribes the union of the
 windows' topics, hands each window what it holds and listens to in batches
 it acknowledges (a window that falls behind holds back only itself, and
 past its limits hears its topics broke off), sends the windows' messages
-through its outbox, and routes each outcome to the window that sent it. It
+through its outbox, and routes each outcome to the window that sent it,
+whatever ids the windows chose. After a reconnect, a window's send that
+requires topics waits in the outbox until that window resynced them. It
 connects while a window, or the application (`Owner::retain`), shares the
 connection. The token, the keys and the outbox stay with the owner; no frame
 carries them.

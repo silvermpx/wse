@@ -58,6 +58,11 @@ export interface SendFrameOptions {
   live?: boolean;
   encrypted?: boolean;
   correlation_id?: string;
+  /**
+   * Topics continuous in the window when it goes, each time it goes: the
+   * owner holds it, after a reconnect, until the window says they are.
+   */
+  requires?: string[];
 }
 
 /** What a window asks of its owner. */
@@ -78,6 +83,11 @@ export type WindowFrame =
    */
   | { k: 'send'; n: number; t: string; p: unknown; o: SendFrameOptions; c: number; a: number }
   | { k: 'sign'; n: number; t: string; p: unknown; o: SignedMessageOptions; a: number }
+  /**
+   * The topics the window holds that hold none of its sends back now, on the
+   * connection `gen` names (after each change, and at each connection).
+   */
+  | { k: 'continuous'; gen: number; topics: string[] }
   | { k: 'reconnect' }
   | { k: 'wake' }
   | { k: 'signOut' }
@@ -115,8 +125,11 @@ export function isWindowFrame(f: unknown): f is WindowFrame {
         isObject(f.o) &&
         typeof f.o.id === 'string' &&
         (f.o.ttl === undefined || isNumber(f.o.ttl)) &&
-        (f.o.priority === undefined || isNumber(f.o.priority))
+        (f.o.priority === undefined || isNumber(f.o.priority)) &&
+        (f.o.requires === undefined || isNames(f.o.requires))
       );
+    case 'continuous':
+      return isNumber(f.gen) && isNames(f.topics);
     case 'sign':
       return isNumber(f.n) && typeof f.t === 'string' && isNumber(f.a) && isObject(f.o);
     case 'reconnect':

@@ -263,7 +263,15 @@ impl<H: Handler> Session<H> {
                 let ttl = frame
                     .until
                     .map(|until| Duration::from_millis(until.saturating_sub(now)));
-                outbox.add(frame.id, frame.text, size, ttl, now, frame.requires);
+                outbox.add(
+                    frame.id,
+                    frame.text,
+                    size,
+                    ttl,
+                    now,
+                    frame.requires,
+                    frame.tag,
+                );
             }
             None => self.to_write.push(Outgoing::Text(frame.text)),
         }
@@ -286,10 +294,9 @@ impl<H: Handler> Session<H> {
         if let Some(room) = &self.shared.room {
             room.give_back(frame.size());
         }
-        self.handler.event(Event::NotDelivered(NotDelivered {
-            reason: why.to_owned(),
-            ids: vec![frame.id.to_string()],
-        }));
+        let mut outcomes = crate::outbox::Outcomes::default();
+        outcomes.refuse(why, frame.id.clone(), frame.tag);
+        self.report_outcomes(outcomes);
     }
 
     /// What the outbox has to write on this connection goes in its turn.
@@ -300,16 +307,23 @@ impl<H: Handler> Session<H> {
         let mut outcomes = crate::outbox::Outcomes::default();
         let to_write = &mut self.to_write;
         let gate = self.handler.gate();
+        let tags = self.shared.tags.as_deref();
         outbox.due(
             crate::outbox::now_ms(),
             &mut outcomes,
-            |topics| !delivery::lock(gate).holds_back(topics),
+            // A window's send, as its window says (the gate let go meanwhile:
+            // the owner takes its own lock).
+            |topics, tag| match tags {
+                Some(tags) if tag != 0 => !tags.holds_back(tag, topics),
+                _ => !delivery::lock(gate).holds_back(topics),
+            },
             |s, text| to_write.push(Outgoing::Kept { s, text }),
         );
         self.report_outcomes(outcomes);
     }
 
-    /// What became of messages of the outbox, to the application.
+    /// What became of messages of the outbox, to the application; of a
+    /// bridge owner's windows' sends, to the owner.
     fn report_outcomes(&mut self, outcomes: crate::outbox::Outcomes) {
         if !outcomes.delivered.is_empty() {
             self.handler.event(Event::Delivered(outcomes.delivered));
@@ -317,6 +331,11 @@ impl<H: Handler> Session<H> {
         for (reason, ids) in outcomes.not_delivered {
             self.handler
                 .event(Event::NotDelivered(NotDelivered { reason, ids }));
+        }
+        if !outcomes.tagged.is_empty()
+            && let Some(tags) = &self.shared.tags
+        {
+            tags.outcomes(outcomes.tagged);
         }
     }
 
@@ -2239,6 +2258,7 @@ mod tests {
             until: None,
             counted: false,
             clears: 0,
+            tag: 0,
         };
         let kinds = |s: &mut Session<Seen>| -> Vec<String> {
             s.release_waiting();
@@ -2694,6 +2714,7 @@ mod tests {
             until: None,
             counted: true,
             clears: 0,
+            tag: 0,
         });
         s.before_write();
         assert!(kept(&s), "continuous: it goes");

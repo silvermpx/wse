@@ -384,3 +384,159 @@ describe('the owner, at its windows’ edge', () => {
     expect(o.attached).toBe(1);
   });
 });
+
+describe('the outcomes and topics of the windows’ sends', () => {
+  it('says each window the outcome of its own send, whatever ids the other windows chose', async () => {
+    const o = owner();
+    const a = window(o);
+    const b = window(o);
+    const heardA: string[][] = [];
+    const heardB: string[][] = [];
+    a.on('wseDelivered', (d: { ids: string[] }) => heardA.push(d.ids));
+    b.on('wseDelivered', (d: { ids: string[] }) => heardB.push(d.ids));
+    a.retain();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const ws = FakeWebSocket.last();
+    await serve(ws);
+    a.send('order', { n: 1 }, { id: 'order-1' });
+    b.send('order', { n: 2 }, { id: 'order-1' });
+    await vi.waitFor(() => expect(ws.messagesOfType('order')).toHaveLength(2));
+    ws.serverSend({ c: 'WSE', t: 'ack', p: { s: 2 } });
+    await vi.waitFor(() => {
+      expect(heardA).toEqual([['order-1']]);
+      expect(heardB).toEqual([['order-1']]);
+    });
+    expect([a.kept(), b.kept()]).toEqual([0, 0]);
+  });
+
+  it('says a window’s outcome to that window alone, not to the owner’s application as its own', async () => {
+    const o = owner();
+    const a = window(o);
+    const heardByOwner: string[] = [];
+    o.client.on('wseDelivered', (d: { ids: string[] }) => heardByOwner.push(...d.ids));
+    const heard: string[][] = [];
+    a.on('wseDelivered', (d: { ids: string[] }) => heard.push(d.ids));
+    a.retain();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const ws = FakeWebSocket.last();
+    await serve(ws);
+    a.send('order', { n: 1 }, { id: 'order-1' });
+    await vi.waitFor(() => expect(ws.messagesOfType('order')).toHaveLength(1));
+    o.client.send('note', { n: 2 }, { id: 'note-1' });
+    await vi.waitFor(() => expect(ws.messagesOfType('note')).toHaveLength(1));
+    ws.serverSend({ c: 'WSE', t: 'ack', p: { s: 2 } });
+    await vi.waitFor(() => expect(heard).toEqual([['order-1']]));
+    expect(heardByOwner).toEqual(['note-1']);
+  });
+
+  it('says a window its send ran out of time while the owner waited for a connection', async () => {
+    const o = owner();
+    const a = window(o);
+    const notDelivered: Array<{ reason: string; ids: string[] }> = [];
+    a.on('wseNotDelivered', (d: { reason: string; ids: string[] }) => notDelivered.push(d));
+    a.retain();
+    a.subscribe(['prices']);
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    await settle();
+    a.send('cancel', { id: 9 }, { requires: ['prices'], ttl: 20, id: 'cancel-9' });
+    await settle();
+    await settle();
+    const ws = FakeWebSocket.last();
+    await serve(ws);
+    await vi.waitFor(() => expect(notDelivered).toEqual([{ reason: 'expired', ids: ['cancel-9'] }]));
+    expect(ws.messagesOfType('cancel')).toHaveLength(0);
+  });
+
+  it('says a window what became of a send it made while no one held the connection', async () => {
+    const o = owner();
+    const a = window(o);
+    const heard: string[][] = [];
+    a.on('wseDelivered', (d: { ids: string[] }) => heard.push(d.ids));
+    await settle();
+    // No share: the owner's client runs no connection, and keeps it for the next.
+    a.send('order', { n: 1 }, { id: 'order-1' });
+    await settle();
+    a.retain();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const ws = FakeWebSocket.last();
+    await serve(ws);
+    await vi.waitFor(() => expect(ws.messagesOfType('order')).toHaveLength(1));
+    ws.serverSend({ c: 'WSE', t: 'ack', p: { s: 1 } });
+    await vi.waitFor(() => expect(heard).toEqual([['order-1']]));
+  });
+
+  it('says a window the outcome of a send to a server that does not answer, said as it is sent', async () => {
+    const o = owner();
+    const a = window(o);
+    const heard: string[][] = [];
+    a.on('wseDelivered', (d: { ids: string[] }) => heard.push(d.ids));
+    a.retain();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const ws = FakeWebSocket.last();
+    ws.serverOpen();
+    ws.serverSend(serverReadyMessage({ user_id: 'ann', features: { recovery: true, encryption: false } }));
+    await settle();
+    a.send('order', { n: 1 }, { id: 'plain-1' });
+    await vi.waitFor(() => expect(heard).toEqual([['plain-1']]));
+    expect(a.kept()).toBe(0);
+  });
+
+  it('takes a window’s word on its topics for the connection it names, not one said before a loss', async () => {
+    const o = owner();
+    let sink: { frame(f: unknown): void } | undefined;
+    o.attach({ post: () => {}, listen: (s) => (sink = s as never), close: () => {} });
+    const feed = (f: unknown) => sink!.frame(f);
+    feed({ k: 'hello', v: 1, agent: 'test' });
+    feed({ k: 'share', on: true });
+    feed({ k: 'hold', topics: ['prices'] });
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const first = FakeWebSocket.last();
+    await serve(first);
+    const send = { k: 'send', n: 1, t: 'cancel', p: { id: 9 }, c: 1, a: 0, o: { id: 'cancel-9', requires: ['prices'] } };
+    feed({ k: 'continuous', gen: 1, topics: ['prices'] });
+    feed(send);
+    await vi.waitFor(() => expect(first.messagesOfType('cancel')).toHaveLength(1));
+    first.serverClose(1006);
+    // Said before the window heard of the loss, it comes after it.
+    feed({ k: 'continuous', gen: 1, topics: ['prices'] });
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2), { timeout: 2_000 });
+    const second = FakeWebSocket.last();
+    await serve(second);
+    await settle();
+    expect(second.messagesOfType('cancel')).toHaveLength(0);
+    feed({ k: 'continuous', gen: 2, topics: ['prices'] });
+    await vi.waitFor(() => expect(second.messagesOfType('cancel')).toHaveLength(1));
+  });
+
+  it('after a reconnect, holds a window’s send that requires topics until that window resynced them', async () => {
+    const o = owner();
+    const resynced: Array<() => void> = [];
+    const a = window(o, {
+      consumer: 'board',
+      delivery: { mode: 'recover-or-resync', resync: () => new Promise<void>((resolve) => resynced.push(resolve)) },
+    });
+    a.retain();
+    a.subscribe(['prices']);
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const first = FakeWebSocket.last();
+    await serve(first);
+    first.serverSend(reply(['prices']));
+    await vi.waitFor(() => expect(resynced).toHaveLength(1));
+    resynced[0]();
+    await settle();
+    a.send('cancel', { id: 9 }, { requires: ['prices'], id: 'cancel-9' });
+    await vi.waitFor(() => expect(first.messagesOfType('cancel')).toHaveLength(1));
+    // The connection goes before its answer; on the next one the window's
+    // prices is not continuous until it resynced it.
+    first.serverClose(1006);
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2), { timeout: 2_000 });
+    const second = FakeWebSocket.last();
+    await serve(second);
+    second.serverSend(reply(['prices']));
+    await vi.waitFor(() => expect(resynced).toHaveLength(2));
+    await settle();
+    expect(second.messagesOfType('cancel')).toHaveLength(0);
+    resynced[1]();
+    await vi.waitFor(() => expect(second.messagesOfType('cancel')).toHaveLength(1));
+  });
+});

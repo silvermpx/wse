@@ -8,7 +8,7 @@
 // share nothing. The default client (useWSE) gets the page's: the zustand
 // stores, the window's events and the `wse_` keys of localStorage.
 
-import type { Outbox } from '../services/Outbox.js';
+import type { Outbox, TaggedOutcome } from '../services/Outbox.js';
 import { createStore, type StoreApi } from './store.js';
 import { createWSEState, type WSEStore } from './state/wseState.js';
 import { createQueueState, type MessageQueueStore } from './state/queueState.js';
@@ -52,6 +52,13 @@ export interface ClientContext {
   readonly outbox: OutboxSlot;
   /** Hears every message the client hands the application (a bridge owner forwards them). */
   readonly tap?: (message: WSMessage) => void;
+  /** Hears what became of tagged messages (a bridge owner routes them to their windows). */
+  readonly tagged?: (entries: TaggedOutcome[]) => void;
+  /**
+   * A tagged message that requires topics waits while this says one is not
+   * continuous for its tag (a bridge owner asks the window that sent it).
+   */
+  readonly taggedHoldsBack?: (tag: number, topics: readonly string[]) => boolean;
   readonly queue: StoreApi<MessageQueueStore>;
   readonly security: SecurityManager;
   readonly owner: OwnerGeneration;
@@ -237,6 +244,8 @@ export interface ContextOptions {
   delivery?: DeliveryGate;
   leaseHolder?: string;
   tap?: (message: WSMessage) => void;
+  tagged?: (entries: TaggedOutcome[]) => void;
+  taggedHoldsBack?: (tag: number, topics: readonly string[]) => boolean;
 }
 
 /** A context of its own: new stores, keys and owner. */
@@ -253,6 +262,8 @@ export function createClientContext(options: ContextOptions = {}): ClientContext
     unremoved: new Set(),
     outbox: { current: null },
     tap: options.tap,
+    tagged: options.tagged,
+    taggedHoldsBack: options.taggedHoldsBack,
   };
 }
 

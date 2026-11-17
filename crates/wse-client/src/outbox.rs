@@ -260,6 +260,27 @@ struct Record {
     text: ByteString,
     /// Its place in the room: the size of the message as it was sent.
     size: usize,
+    /// A bridge owner's window that sent it ([`Tags`]), in memory alone: 0
+    /// for the application's own.
+    tag: u64,
+}
+
+/// A bridge owner of this crate: told what became of its windows' sends,
+/// each tagged with its window, and asked whether a window holds one back.
+pub(crate) trait Tags: Send + Sync {
+    /// What became of tagged messages, in the order it came.
+    fn outcomes(&self, outcomes: Vec<Tagged>);
+    /// A message of window `tag` that requires `topics` waits while this
+    /// says one of them is not continuous for it.
+    fn holds_back(&self, tag: u64, topics: &[String]) -> bool;
+}
+
+/// What became of a tagged message: delivered (`reason` None), or not and why.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Tagged {
+    pub(crate) tag: u64,
+    pub(crate) id: String,
+    pub(crate) reason: Option<String>,
 }
 
 /// What became of messages: delivered, or not and why.
@@ -268,6 +289,9 @@ pub(crate) struct Outcomes {
     pub(crate) delivered: Vec<String>,
     /// Not delivered: the reason, and the ids.
     pub(crate) not_delivered: Vec<(String, Vec<String>)>,
+    /// Those of tagged messages, in the order they came: theirs alone, the
+    /// application's events do not name them.
+    pub(crate) tagged: Vec<Tagged>,
 }
 
 impl Outcomes {
@@ -279,9 +303,33 @@ impl Outcomes {
                 None => self.not_delivered.push((why, ids)),
             }
         }
+        self.tagged.extend(other.tagged);
     }
 
-    fn refused(&mut self, why: &str, id: Box<str>) {
+    /// `id` (of window `tag`, or the application's: 0) was delivered.
+    pub(crate) fn deliver(&mut self, id: Box<str>, tag: u64) {
+        if tag == 0 {
+            self.delivered.push(id.into());
+        } else {
+            self.tagged.push(Tagged {
+                tag,
+                id: id.into(),
+                reason: None,
+            });
+        }
+    }
+
+    /// `id` (of window `tag`, or the application's: 0) was not delivered,
+    /// for `why`.
+    pub(crate) fn refuse(&mut self, why: &str, id: Box<str>, tag: u64) {
+        if tag != 0 {
+            self.tagged.push(Tagged {
+                tag,
+                id: id.into(),
+                reason: Some(why.to_owned()),
+            });
+            return;
+        }
         match self.not_delivered.iter_mut().find(|(w, _)| w == why) {
             Some((_, ids)) => ids.push(id.into()),
             None => self.not_delivered.push((why.to_owned(), vec![id.into()])),
@@ -317,7 +365,7 @@ pub(crate) struct Outbox {
     /// Written on the current connection and cleared before the server
     /// answered for them: its answer on it says what became of them, and
     /// they are not delivered when it ends first.
-    limbo: VecDeque<(u64, Box<str>)>,
+    limbo: VecDeque<(u64, Box<str>, u64)>,
     /// When the first message not written yet runs out (ms since the
     /// epoch), u64::MAX for none, and when that is for the connection's
     /// timer.
@@ -513,6 +561,7 @@ impl Outbox {
     /// Keeps a message the application sent, `text` a JSON object after
     /// [`HEADROOM`] spaces, its place of `size` bytes in the room taken
     /// already: its number. It goes at the next [`Outbox::due`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn add(
         &mut self,
         id: Box<str>,
@@ -521,6 +570,7 @@ impl Outbox {
         ttl: Option<Duration>,
         now: u64,
         requires: Option<Box<[String]>>,
+        tag: u64,
     ) -> u64 {
         let s = self.next;
         self.next += 1;
@@ -536,6 +586,7 @@ impl Outbox {
             requires,
             text: number_in_place(s, text),
             size,
+            tag,
         };
         if record.until < self.earliest {
             self.earliest = record.until;
@@ -614,9 +665,9 @@ impl Outbox {
         let (gone, bytes) = self.take_front(s, &mut outcomes);
         self.room.give_back_many(gone, bytes);
         self.cursor = self.cursor.saturating_sub(gone);
-        while self.limbo.front().is_some_and(|(n, _)| *n <= s) {
-            if let Some((_, id)) = self.limbo.pop_front() {
-                outcomes.delivered.push(id.into());
+        while self.limbo.front().is_some_and(|(n, _, _)| *n <= s) {
+            if let Some((_, id, tag)) = self.limbo.pop_front() {
+                outcomes.deliver(id, tag);
             }
         }
         if gone > 0 {
@@ -630,10 +681,10 @@ impl Outbox {
     pub(crate) fn refused(&mut self, from: u64, to: u64, why: &str) -> Outcomes {
         let mut outcomes = Outcomes::default();
         self.remove_where(why, &mut outcomes, |_, r| (from..=to).contains(&r.s));
-        self.limbo.retain_mut(|(n, id)| {
+        self.limbo.retain_mut(|(n, id, tag)| {
             let keep = !(from..=to).contains(n);
             if !keep {
-                outcomes.refused(why, std::mem::take(id));
+                outcomes.refuse(why, std::mem::take(id), *tag);
             }
             keep
         });
@@ -649,7 +700,7 @@ impl Outbox {
         &mut self,
         now: u64,
         outcomes: &mut Outcomes,
-        continuous: impl Fn(&[String]) -> bool,
+        continuous: impl Fn(&[String], u64) -> bool,
         mut out: impl FnMut(u64, ByteString),
     ) {
         if self.ready && (self.answered || self.plain) {
@@ -663,7 +714,11 @@ impl Outbox {
                     // Its topics not continuous on this connection (a
                     // reconnect's resync not done): it waits in its place,
                     // and what comes after it with it.
-                    if record.requires.as_deref().is_some_and(|t| !continuous(t)) {
+                    if record
+                        .requires
+                        .as_deref()
+                        .is_some_and(|t| !continuous(t, record.tag))
+                    {
                         break;
                     }
                     let text = if numbered {
@@ -708,7 +763,7 @@ impl Outbox {
         while self.records.front().is_some_and(|r| r.s <= s) {
             if let Some(record) = self.records.pop_front() {
                 bytes += record.size;
-                outcomes.delivered.push(record.id.into());
+                outcomes.deliver(record.id, record.tag);
                 gone += 1;
             }
         }
@@ -733,7 +788,7 @@ impl Outbox {
             let (count, mut bytes) = (self.records.len(), 0);
             for record in self.records.drain(..) {
                 bytes += record.size;
-                outcomes.refused("closed", record.id);
+                outcomes.refuse("closed", record.id, record.tag);
             }
             self.room.give_back_many(count, bytes);
             self.earliest = u64::MAX;
@@ -751,8 +806,8 @@ impl Outbox {
         self.plain = false;
         self.cursor = 0;
         self.flushed = 0;
-        for (_, id) in self.limbo.drain(..) {
-            outcomes.refused("cleared", id);
+        for (_, id, tag) in self.limbo.drain(..) {
+            outcomes.refuse("cleared", id, tag);
         }
         self.flush();
         outcomes
@@ -771,9 +826,9 @@ impl Outbox {
             numbers.push(record.s);
             let id = std::mem::take(&mut record.id);
             if record.s <= in_hand {
-                self.limbo.push_back((record.s, id));
+                self.limbo.push_back((record.s, id, record.tag));
             } else {
-                outcomes.refused("cleared", id);
+                outcomes.refuse("cleared", id, record.tag);
             }
         }
         self.room.give_back_many(numbers.len(), bytes);
@@ -830,7 +885,7 @@ impl Outbox {
             let keep = !gone(at, r);
             if !keep {
                 bytes += r.size;
-                outcomes.refused(why, std::mem::take(&mut r.id));
+                outcomes.refuse(why, std::mem::take(&mut r.id), r.tag);
                 numbers.push(r.s);
                 if at < cursor {
                     before += 1;
@@ -1560,6 +1615,7 @@ mod file {
                         requires,
                         size: super::unnumbered(text).len(),
                         text: text.into(),
+                        tag: 0,
                     });
                 }
                 Line::Written(n) => {
@@ -1606,7 +1662,7 @@ mod tests {
     fn add(outbox: &mut Outbox, id: &str) -> u64 {
         let json = format!(r#"{{"t":"m","p":{{}},"id":"{id}"}}"#);
         assert!(outbox.room.take(json.len()));
-        outbox.add(id.into(), kept(&json), json.len(), None, 0, None)
+        outbox.add(id.into(), kept(&json), json.len(), None, 0, None, 0)
     }
 
     /// What goes to the connection's writer now.
@@ -1615,7 +1671,7 @@ mod tests {
         outbox.due(
             now,
             outcomes,
-            |_| true,
+            |_, _| true,
             |s, text| out.push((s, text.to_string())),
         );
         out
@@ -1765,6 +1821,7 @@ mod tests {
             Some(Duration::from_millis(5)),
             0,
             None,
+            0,
         );
         add(&mut outbox, "on time");
         assert!(outbox.deadline().is_some(), "a timer for the late one");
@@ -1833,6 +1890,7 @@ mod tests {
             Some(Duration::from_millis(5)),
             0,
             None,
+            0,
         );
         let mut outcomes = Outcomes::default();
         assert_eq!(numbers(&due(&mut outbox, 0, &mut outcomes)), [1]);
@@ -2116,6 +2174,7 @@ mod tests {
                             }),
                             text: text.into(),
                             size: 0,
+                            tag: 0,
                         };
                         file::encode_add(&mut out, salt, &record);
                     }

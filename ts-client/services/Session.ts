@@ -41,7 +41,7 @@ import { NetworkMonitor } from './NetworkMonitor.js';
 import { AdaptiveQualityManager, QueryClientLike } from './AdaptiveQualityManager.js';
 import type { OfflineQueue } from './OfflineQueue.js';
 import { indexedDbOutbox } from './IndexedDbOutbox.js';
-import { Outbox, reportOutcomes, type OutboxStore } from './Outbox.js';
+import { OUTBOX_TAG, Outbox, reportOutcomes, type OutboxStore } from './Outbox.js';
 
 /** What a client tells of a storage that failed: what it did, and the error's name. */
 export function storageErrorDetail(operation: string, error: unknown) {
@@ -257,7 +257,7 @@ export function ensureOutbox(ctx: ClientContext, offline: OfflineConfig): Outbox
     },
     {
       // What runs out on its own timer is said, with a connection or without.
-      onExpired: (outcomes) => reportOutcomes(ctx.emit, outcomes),
+      onExpired: (outcomes) => reportOutcomes(ctx.emit, outcomes, ctx.tagged),
       store: outboxStoreFor(ctx, offline) ?? undefined,
       // Said after this turn: a store is opened as the client is made,
       // before the application listens.
@@ -728,6 +728,7 @@ export class WSESession {
       offline: !!options.offline && this.options.offline.enabled,
       ttl: options.ttl,
       requires: options.requires,
+      tag: (options as { [OUTBOX_TAG]?: number })[OUTBOX_TAG],
     });
   }
 
@@ -822,7 +823,7 @@ export class WSESession {
   /** What waits in the outbox goes, not delivered (`cleared`). */
   async clearOfflineQueue(): Promise<void> {
     const outbox = this.ctx.outbox.current;
-    if (outbox) reportOutcomes(this.ctx.emit, outbox.clear());
+    if (outbox) reportOutcomes(this.ctx.emit, outbox.clear(), this.ctx.tagged);
   }
 
   /** How many messages wait in the outbox for the server's answer. */

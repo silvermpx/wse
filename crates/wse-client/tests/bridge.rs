@@ -14,7 +14,11 @@ use wse_client::bridge::{Limits, Options, Owner, Window};
 
 const SECRET: &str = "a-test-secret-of-at-least-thirty-two-bytes";
 
-struct App;
+/// The server's application: it takes every message, and tells the test
+/// the type of each when asked to.
+struct App {
+    seen: Option<mpsc::UnboundedSender<String>>,
+}
 
 impl wse::Handler for App {
     type Connection = ();
@@ -23,7 +27,10 @@ impl wse::Handler for App {
         Some(())
     }
 
-    fn message(&self, _conn: &mut (), _message: wse::Inbound, _size: usize) -> bool {
+    fn message(&self, _conn: &mut (), message: wse::Inbound, _size: usize) -> bool {
+        if let (Some(seen), wse::Inbound::Json(message)) = (&self.seen, message) {
+            let _ = seen.send(message["t"].as_str().unwrap_or_default().to_owned());
+        }
         true
     }
 
@@ -43,6 +50,11 @@ struct Stand {
 /// A server that validates tokens, answers subscriptions and keeps topic
 /// histories (so it stamps each topic message with its position).
 async fn stand() -> Stand {
+    stand_seeing(None).await
+}
+
+/// [`stand`], telling `seen` the type of each message it takes.
+async fn stand_seeing(seen: Option<mpsc::UnboundedSender<String>>) -> Stand {
     let mut config = wse::Config::default();
     config.jwt = Some(wse::JwtSettings::new(SECRET));
     config.client_subscriptions = true;
@@ -50,7 +62,7 @@ async fn stand() -> Stand {
     let server = wse::Server::new(config).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/wse", listener.local_addr().unwrap());
-    server.start(listener, App).unwrap();
+    server.start(listener, App { seen }).unwrap();
     let publisher = server.publisher();
     Stand {
         server,
@@ -430,4 +442,105 @@ async fn a_window_never_hears_the_credentials_of_the_endpoint() {
         assert!(!heard.contains(secret), "{secret} in {heard}");
     }
     owner.close().await;
+}
+
+/// What the window heard of its sends delivered: the ids of each event.
+fn delivered(w: &TestWindow) -> Vec<Value> {
+    w.items
+        .iter()
+        .filter(|i| i["ev"] == "event" && i["name"] == "wseDelivered")
+        .map(|i| i["detail"]["ids"].clone())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn windows_that_chose_the_same_id_each_hear_what_became_of_their_own_send() {
+    let stand = stand().await;
+    let owner = stand.owner(Options::default()).await;
+    let mut a = TestWindow::new(&owner);
+    let mut b = TestWindow::new(&owner);
+    a.send(json!({"k": "share", "on": true}));
+    a.until("connected", |w| w.has_item(|i| i["ev"] == "connected"))
+        .await;
+    b.until("connected", |w| w.has_item(|i| i["ev"] == "connected"))
+        .await;
+    a.send(json!({"k": "send", "n": 1, "t": "order", "p": {"n": 1}, "o": {"id": "order-1"}, "c": 1, "a": 0}));
+    b.send(json!({"k": "send", "n": 1, "t": "order", "p": {"n": 2}, "o": {"id": "order-1"}, "c": 1, "a": 0}));
+    a.until("its outcome", |w| !delivered(w).is_empty()).await;
+    b.until("its outcome", |w| !delivered(w).is_empty()).await;
+    a.settle(200).await;
+    b.settle(200).await;
+    assert_eq!(delivered(&a), [json!(["order-1"])]);
+    assert_eq!(delivered(&b), [json!(["order-1"])]);
+    owner.close().await;
+    stand.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_that_requires_topics_waits_after_a_reconnect_until_its_window_says_so_of_that_connection()
+ {
+    let (seen_tx, mut seen) = mpsc::unbounded_channel();
+    let stand = stand_seeing(Some(seen_tx)).await;
+    let owner = stand.owner(Options::default()).await;
+    let mut a = TestWindow::new(&owner);
+    a.send(json!({"k": "share", "on": true}));
+    a.send(json!({"k": "hold", "topics": ["prices"]}));
+    a.until("prices taken", |w| w.subscribed("prices")).await;
+    a.send(json!({"k": "continuous", "gen": 1, "topics": ["prices"]}));
+    // The connection goes; the send comes while it is made again.
+    a.send(json!({"k": "reconnect"}));
+    a.until("lost", |w| w.has_item(|i| i["ev"] == "lost")).await;
+    a.send(json!({"k": "send", "n": 1, "t": "cancel", "p": {"id": 9}, "o": {"id": "cancel-9", "requires": ["prices"]}, "c": 1, "a": 0}));
+    // Said before the window heard of the loss, it comes after it.
+    a.send(json!({"k": "continuous", "gen": 1, "topics": ["prices"]}));
+    a.until("prices taken again", |w| {
+        w.items.iter().filter(|i| i["ev"] == "subscribed").count() == 2
+    })
+    .await;
+    a.settle(300).await;
+    let mut types = Vec::new();
+    while let Ok(kind) = seen.try_recv() {
+        types.push(kind);
+    }
+    assert!(
+        !types.iter().any(|t| t == "cancel"),
+        "it went before the window said so of this connection: {types:?}"
+    );
+    a.send(json!({"k": "continuous", "gen": 2, "topics": ["prices"]}));
+    let went = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(kind) = seen.recv().await {
+            if kind == "cancel" {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(went, Ok(true), "it never went once the window said so");
+    a.until("delivered", |w| delivered(w) == [json!(["cancel-9"])])
+        .await;
+    owner.close().await;
+    stand.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_that_runs_out_waiting_for_its_topics_is_said_so_to_its_window() {
+    let stand = stand().await;
+    let owner = stand.owner(Options::default()).await;
+    let mut a = TestWindow::new(&owner);
+    a.send(json!({"k": "share", "on": true}));
+    a.until("connected", |w| w.has_item(|i| i["ev"] == "connected"))
+        .await;
+    a.send(json!({"k": "send", "n": 1, "t": "cancel", "p": {}, "o": {"id": "late", "requires": ["orders"], "ttl": 100}, "c": 1, "a": 0}));
+    a.until("expired", |w| {
+        w.has_item(|i| {
+            i["name"] == "wseNotDelivered"
+                && i["detail"]["reason"] == "expired"
+                && i["detail"]["ids"] == json!(["late"])
+        })
+    })
+    .await;
+    assert!(delivered(&a).is_empty());
+    owner.close().await;
+    stand.server.stop().await;
 }

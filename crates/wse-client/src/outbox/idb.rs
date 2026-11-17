@@ -250,6 +250,7 @@ fn record_of(row: &JsValue) -> Option<Record> {
         requires: requires_of(row)?,
         size: json.len(),
         text: numbered(s, &json).into(),
+        tag: 0,
     })
 }
 

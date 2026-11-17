@@ -42,7 +42,7 @@ import { generateId } from '../utils/id.js';
 import { createClientContext, type ClientContext } from '../core/context.js';
 import type { SendResult } from './ConnectionManager.js';
 import type { OfflineQueue } from './OfflineQueue.js';
-import { noOutcomes, reportOutcomes, type Outbox, type Outcomes } from './Outbox.js';
+import { noOutcomes, refuse, reportOutcomes, type Outbox, type Outcomes } from './Outbox.js';
 
 /** What the processor needs from the connection (ConnectionManager implements it). */
 export interface ProcessorConnection {
@@ -1938,7 +1938,14 @@ export class MessageProcessor {
   enqueueOutgoing(
     message: WSMessage,
     priority: number = MessagePriority.NORMAL,
-    options: { offline?: boolean; ttl?: number; liveOn?: number; requires?: readonly string[]; system?: boolean } = {},
+    options: {
+      offline?: boolean;
+      ttl?: number;
+      liveOn?: number;
+      requires?: readonly string[];
+      system?: boolean;
+      tag?: number;
+    } = {},
   ): SendStatus {
     if (this.destroyed) return 'dropped';
     // Made for the user whose data the page holds now: once another user's
@@ -1976,7 +1983,7 @@ export class MessageProcessor {
       !options.system &&
       (!requires || (cm?.isTransportReady() && this.continuous(requires)))
     ) {
-      return this.keep(outbox, message, options.ttl, requires);
+      return this.keep(outbox, message, options.ttl, requires, options.tag);
     }
 
     // Fast path keeps latency low; it is skipped while anything older is
@@ -1997,14 +2004,16 @@ export class MessageProcessor {
       }
     }
 
-    return this.enqueueInMemory(message, priority, expiresAt, owner, options.liveOn, requires) ? 'queued' : 'dropped';
+    return this.enqueueInMemory(message, priority, expiresAt, owner, options.liveOn, requires, Date.now(), options.tag)
+      ? 'queued'
+      : 'dropped';
   }
 
   /**
    * A message for the outbox: numbered, kept until the server answers for
    * it, and out at once when the connection takes it.
    */
-  private keep(outbox: Outbox, message: WSMessage, ttl?: number, requires?: readonly string[]): SendStatus {
+  private keep(outbox: Outbox, message: WSMessage, ttl?: number, requires?: readonly string[], tag?: number): SendStatus {
     let json: string;
     try {
       json = JSON.stringify(message);
@@ -2013,7 +2022,7 @@ export class MessageProcessor {
       logger.error(`Dropping message ${message.t}: it cannot be serialised`, error);
       return 'dropped';
     }
-    if (outbox.add(message, json, ttl, Date.now(), requires) === 0) {
+    if (outbox.add(message, json, ttl, Date.now(), requires, tag) === 0) {
       this.countDropped(1);
       logger.warn(`The outbox is full; message ${message.t} dropped`);
       return 'dropped';
@@ -2030,10 +2039,10 @@ export class MessageProcessor {
     if (!cm || !cm.isTransportReady()) return false;
     const outcomes = noOutcomes();
     let all = true;
-    outbox.due(Date.now(), outcomes, (message, s, json, requires) => {
+    outbox.due(Date.now(), outcomes, (message, s, json, requires, tag) => {
       // Its topics not continuous on this connection (a reconnect's resync
       // not done): it waits in its place, and what comes after it with it.
-      if (requires && this.holdsBack(requires)) return false;
+      if (requires && this.holdsBack(requires, tag)) return false;
       // Written now, or once its encryption is done: a server that does not
       // answer took it then, not when the connection accepted it.
       let handed = false;
@@ -2056,7 +2065,7 @@ export class MessageProcessor {
 
   /** What became of the outbox's messages, to the application. */
   private report(outcomes: Outcomes): void {
-    reportOutcomes(this.ctx.emit, outcomes);
+    reportOutcomes(this.ctx.emit, outcomes, this.ctx.tagged);
   }
 
   /**
@@ -2111,8 +2120,12 @@ export class MessageProcessor {
     return this.ctx.delivery?.continuous(topics) ?? true;
   }
 
-  /** A topic of `topics` the client holds is not continuous. */
-  private holdsBack(topics: readonly string[]): boolean {
+  /**
+   * A topic of `topics` the client holds is not continuous; for a tagged
+   * message, as its tag's holder says (a bridge owner's window).
+   */
+  private holdsBack(topics: readonly string[], tag?: number): boolean {
+    if (tag && this.ctx.taggedHoldsBack) return this.ctx.taggedHoldsBack(tag, topics);
     return this.ctx.delivery?.holdsBack(topics) ?? false;
   }
 
@@ -2124,6 +2137,7 @@ export class MessageProcessor {
     liveOn?: number,
     requires?: readonly string[],
     timestamp: number = Date.now(),
+    tag?: number,
   ): boolean {
     if (this.destroyed) return false;
     if (owner !== this.ctx.owner.current()) {
@@ -2148,6 +2162,7 @@ export class MessageProcessor {
       owner,
       liveOn,
       requires,
+      tag,
     };
 
     if (!queueStore.enqueue(queued)) {
@@ -2309,7 +2324,9 @@ export class MessageProcessor {
           // With the outbox's outcomes on, the application hears of it, as
           // of one that ran out in the outbox.
           if (this.ctx.outbox.current && batch[i].id) {
-            this.ctx.emit('wseNotDelivered', { reason: 'expired', ids: [batch[i].id] });
+            const outcomes = noOutcomes();
+            refuse(outcomes, 'expired', batch[i].id, batch[i].tag);
+            this.report(outcomes);
           }
           continue;
         }
@@ -2331,7 +2348,7 @@ export class MessageProcessor {
         const outbox = this.ctx.outbox.current;
         if (outbox && liveOn === undefined && !this.system.has(wire)) {
           const left = batch[i].expiresAt;
-          this.keep(outbox, wire, left !== undefined ? Math.max(0, left - nowMs) : undefined, batch[i].requires);
+          this.keep(outbox, wire, left !== undefined ? Math.max(0, left - nowMs) : undefined, batch[i].requires, batch[i].tag);
           continue;
         }
         this.handedOver.set(wire, {

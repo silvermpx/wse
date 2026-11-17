@@ -9,10 +9,18 @@
 // window's own sends. It runs anywhere the core client runs: Electron's main
 // process, a utility process, a worker, Node.
 
-import { createWSEClient, type Lease, type WSEClient, type WSEClientOptions } from '../core/client.js';
+import {
+  clientInternals,
+  createWSEClient,
+  type Lease,
+  type OwnerHooks,
+  type WSEClient,
+  type WSEClientOptions,
+} from '../core/client.js';
+import { OUTBOX_TAG, type TaggedOutcome } from '../services/Outbox.js';
 import { logger } from '../utils/logger.js';
 import type { WSEClientSnapshot } from '../core/client.js';
-import type { WSMessage } from '../types.js';
+import type { MessageOptions, WSMessage } from '../types.js';
 import type { OwnerChannel } from './channel.js';
 import {
   BRIDGE_PROTOCOL,
@@ -70,6 +78,11 @@ interface Attachment {
   closed: boolean;
   share: Lease | null;
   holds: Set<string>;
+  /**
+   * Those of its topics the window said hold none of its sends back on this
+   * connection: a send of it that requires one waits until then.
+   */
+  continuous: Set<string>;
   listens: Set<string>;
   queue: Queued[];
   queueBytes: number;
@@ -119,8 +132,6 @@ export function createBridgeOwner(options: BridgeOwnerOptions = {}): BridgeOwner
   const attachments = new Map<number, Attachment>();
   /** Each topic the windows hold: how many, and the client's lease of it. */
   const topics = new Map<string, { count: number; lease: Lease }>();
-  /** Whose send each outbox message is, by its id: its outcome goes there. */
-  const sender = new Map<string, number>();
   let nextAtt = 1;
   let gen = 0;
   let user: string | null = null;
@@ -138,7 +149,35 @@ export function createBridgeOwner(options: BridgeOwnerOptions = {}): BridgeOwner
     }
   };
 
-  const client = createWSEClient({ ...clientOptions, onEveryMessage: route });
+  /**
+   * What became of the windows' sends: each carries its window's tag in the
+   * outbox, so its outcome goes to that window whatever ids the windows chose.
+   */
+  const routeTagged = (entries: TaggedOutcome[]) => {
+    let at = 0;
+    while (at < entries.length) {
+      const { tag, reason } = entries[at];
+      const ids: string[] = [];
+      while (at < entries.length && entries[at].tag === tag && entries[at].reason === reason) ids.push(entries[at++].id);
+      const a = attachments.get(tag);
+      if (!a) continue;
+      const item: BridgeItem =
+        reason === null
+          ? { ev: 'event', name: 'wseDelivered', detail: { ids } }
+          : { ev: 'event', name: 'wseNotDelivered', detail: { reason, ids } };
+      enqueue(a, item, 0);
+    }
+  };
+
+  /** A window's send that requires topics waits while one it holds is not continuous for it. */
+  const taggedHoldsBack = (tag: number, topics: readonly string[]) => {
+    const a = attachments.get(tag);
+    if (!a) return false;
+    return topics.some((topic) => a.holds.has(topic) && !a.continuous.has(topic));
+  };
+
+  const hooks: OwnerHooks = { onEveryMessage: route, onTagged: routeTagged, taggedHoldsBack };
+  const client = createWSEClient({ ...clientOptions, ...hooks } as WSEClientOptions);
   // What windows bind their checkpoints to: the endpoint without what it
   // carries of credentials (a user, a password, a token in its query).
   const realm = clientOptions.realm ?? bare(clientOptions.endpoints?.[0] ?? null);
@@ -227,7 +266,6 @@ export function createBridgeOwner(options: BridgeOwnerOptions = {}): BridgeOwner
     a.share?.release();
     a.share = null;
     for (const topic of [...a.holds]) drop(a, topic);
-    for (const [id, att] of sender) if (att === a.att) sender.delete(id);
     a.queue = [];
     a.channel.close();
   };
@@ -296,8 +334,7 @@ export function createBridgeOwner(options: BridgeOwnerOptions = {}): BridgeOwner
           a.channel.post({ k: 'sent', n: f.n, status: 'dropped', id: f.o.id });
           return;
         }
-        const status = client.send(f.t, f.p, { ...f.o });
-        if (status !== 'dropped' && !f.o.live) sender.set(f.o.id, a.att);
+        const status = client.send(f.t, f.p, { ...f.o, [OUTBOX_TAG]: a.att } as MessageOptions);
         a.channel.post({ k: 'sent', n: f.n, status, id: f.o.id });
         return;
       }
@@ -312,6 +349,13 @@ export function createBridgeOwner(options: BridgeOwnerOptions = {}): BridgeOwner
         );
         return;
       }
+      case 'continuous':
+        // Said of a connection gone (before the window heard of its loss), it counts for nothing.
+        if (!ready || f.gen !== gen) return;
+        a.continuous = new Set(f.topics);
+        // What of its sends waited for them may go now.
+        clientInternals.get(client)?.flush();
+        return;
       case 'reconnect': {
         // A window asks at most once in five seconds.
         const now = Date.now();
@@ -344,6 +388,8 @@ export function createBridgeOwner(options: BridgeOwnerOptions = {}): BridgeOwner
     conn = next;
     if (ready && !snapshot.ready) {
       ready = false;
+      // Not continuous again until each window says so (its resync done).
+      for (const a of attachments.values()) a.continuous.clear();
       toAll({ ev: 'lost' });
     }
     if (!changed) return;
@@ -371,23 +417,6 @@ export function createBridgeOwner(options: BridgeOwnerOptions = {}): BridgeOwner
     }
   });
   // What became of a window's sends goes to that window alone.
-  const outcome = (name: string) => (detail: { ids: string[]; reason?: string }) => {
-    const byWindow = new Map<number, string[]>();
-    for (const id of detail.ids) {
-      const att = sender.get(id);
-      if (att === undefined) continue;
-      sender.delete(id);
-      const ids = byWindow.get(att);
-      if (ids) ids.push(id);
-      else byWindow.set(att, [id]);
-    }
-    for (const [att, ids] of byWindow) {
-      const a = attachments.get(att);
-      if (a) enqueue(a, { ev: 'event', name, detail: { ...detail, ids } }, 0);
-    }
-  };
-  client.on('wseDelivered', outcome('wseDelivered'));
-  client.on('wseNotDelivered', outcome('wseNotDelivered'));
   for (const name of FORWARDED) client.on(name, (detail) => toAll({ ev: 'event', name, detail }));
 
   const owner: BridgeOwner = {
@@ -408,6 +437,7 @@ export function createBridgeOwner(options: BridgeOwnerOptions = {}): BridgeOwner
         closed: false,
         share: null,
         holds: new Set(),
+        continuous: new Set(),
         listens: new Set(),
         queue: [],
         queueBytes: 0,

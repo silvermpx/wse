@@ -114,9 +114,11 @@ describe('Tauri', () => {
     client.subscribe(['prices']);
     await vi.waitFor(() => expect(client.bridge.phase).toBe('attached'));
     const frames = commands.filter((c) => c.command === 'plugin:realtime|frames').flatMap((c) => c.frames);
-    expect(frames).toEqual(['hello', 'listen', 'share', 'hold']);
-    // The first command carries hello; what came meanwhile goes in the next.
-    expect(commands.filter((c) => c.command === 'plugin:realtime|frames').length).toBeLessThanOrEqual(2);
+    // Welcomed, the window says which of its topics are continuous.
+    expect(frames).toEqual(['hello', 'listen', 'share', 'hold', 'continuous']);
+    // The first command carries hello; what came meanwhile goes in the next,
+    // and what the welcome brought (the continuous topics) in a third.
+    expect(commands.filter((c) => c.command === 'plugin:realtime|frames').length).toBeLessThanOrEqual(3);
     await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
   });
 

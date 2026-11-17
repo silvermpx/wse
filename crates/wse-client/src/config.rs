@@ -301,6 +301,9 @@ pub struct Config {
     /// The reasons the client starts paused for: no connection is made until
     /// they are cleared (the bridge's owner, until a window shares it).
     pub(crate) paused: Vec<String>,
+    /// The bridge's owner: what became of its windows' sends, and whether a
+    /// window holds one back.
+    pub(crate) tags: Option<std::sync::Arc<dyn crate::outbox::Tags>>,
     /// This client's ECDSA P-256 private key (PKCS#8, PEM or DER) for
     /// [`Client::send_signed`](crate::Client::send_signed). The server
     /// learns its public key from the token's `cnf` claim or from its
@@ -397,6 +400,7 @@ impl Config {
             offline: Some(crate::Offline::in_memory()),
             committed: None,
             paused: Vec::new(),
+            tags: None,
             #[cfg(feature = "aws-lc")]
             signing_key: None,
             #[cfg(feature = "aws-lc")]

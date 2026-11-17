@@ -233,11 +233,13 @@ holds and listens to, in batches it acknowledges as it takes them: at most two i
 that falls behind holds back only its own queue, and one past 10,000 messages (or 64 MiB) loses its
 queue and hears its topics broke off (`wseOverloaded`; a recover-or-resync window resyncs them).
 A window's sends go through the owner's outbox, and what became of each (`wseDelivered`,
-`wseNotDelivered`) reaches that window alone. What depends on the application stays in the window:
-its listeners, the delivery's barrier, resync, commit and checkpoint, the sends that wait for their
-topics. A window's `pause` holds back its stream and gives its share of the connection back, so the
-connection ends when no one else holds one, as a client of its own does; `signOut` signs every
-window out. No frame carries a token, a key or a cookie.
+`wseNotDelivered`) reaches that window alone, whatever ids the windows chose. What depends on the
+application stays in the window: its listeners, the delivery's barrier, resync, commit and
+checkpoint, the sends that wait for their topics; after a reconnect, a window's send that requires
+topics waits in the owner's outbox until that window resynced them. A window's `pause` holds back
+its stream and gives its share of the connection back, so the connection ends when no one else
+holds one, as a client of its own does; `signOut` signs every window out. No frame carries a
+token, a key or a cookie.
 
 ## Electron
 

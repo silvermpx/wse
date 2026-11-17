@@ -19,23 +19,58 @@
 import type { WSMessage } from '../types.js';
 import { generateId } from '../utils/id.js';
 
+/**
+ * A message's tag (`client.send(type, payload, { [OUTBOX_TAG]: n })`), kept
+ * with it in memory: what a bridge owner names the window that sent it by.
+ * Its outcome comes back with it ([TaggedOutcome]).
+ */
+export const OUTBOX_TAG: unique symbol = Symbol('wse.outboxTag');
+
+/** What became of a tagged message: delivered (`reason` null), or not and why. */
+export interface TaggedOutcome {
+  tag: number;
+  id: string;
+  reason: string | null;
+}
+
 /** What became of messages: delivered, or not and why (the reason, the ids). */
 export interface Outcomes {
   delivered: string[];
   notDelivered: Map<string, string[]>;
+  /** Those of tagged messages, each with its tag, in the order they came: theirs alone. */
+  tagged: TaggedOutcome[];
 }
 
 export function noOutcomes(): Outcomes {
-  return { delivered: [], notDelivered: new Map() };
+  return { delivered: [], notDelivered: new Map(), tagged: [] };
 }
 
-/** Tells the application what became of messages: `wseDelivered` and `wseNotDelivered`. */
-export function reportOutcomes(emit: (type: string, detail?: unknown) => void, outcomes: Outcomes): void {
+/**
+ * Tells the application what became of messages: `wseDelivered` and
+ * `wseNotDelivered`; those of tagged messages go to `tagged` alone (a
+ * window's, to the window that sent it).
+ */
+export function reportOutcomes(
+  emit: (type: string, detail?: unknown) => void,
+  outcomes: Outcomes,
+  tagged?: (entries: TaggedOutcome[]) => void,
+): void {
   if (outcomes.delivered.length > 0) emit('wseDelivered', { ids: outcomes.delivered });
   for (const [reason, ids] of outcomes.notDelivered) emit('wseNotDelivered', { reason, ids });
+  if (tagged && outcomes.tagged.length > 0) tagged(outcomes.tagged);
 }
 
-function refuse(outcomes: Outcomes, why: string, id: string): void {
+function deliver(outcomes: Outcomes, id: string, tag = 0): void {
+  if (tag) outcomes.tagged.push({ tag, id, reason: null });
+  else outcomes.delivered.push(id);
+}
+
+/** `id` (tagged `tag`, or not) was not delivered, for `why`. */
+export function refuse(outcomes: Outcomes, why: string, id: string, tag = 0): void {
+  if (tag) {
+    outcomes.tagged.push({ tag, id, reason: why });
+    return;
+  }
   const ids = outcomes.notDelivered.get(why);
   if (ids) ids.push(id);
   else outcomes.notDelivered.set(why, [id]);
@@ -46,6 +81,7 @@ function merge(into: Outcomes, from: Outcomes): void {
   for (const [why, ids] of from.notDelivered) {
     for (const id of ids) refuse(into, why, id);
   }
+  for (const entry of from.tagged) into.tagged.push(entry);
 }
 
 export interface OutboxLimits {
@@ -171,6 +207,8 @@ export function unnumbered(text: string): string {
 interface Kept extends StoredMessage {
   message: WSMessage;
   size: number;
+  /** Its tag ([OUTBOX_TAG]), in memory alone: 0 or none for one not tagged. */
+  tag?: number;
 }
 
 /**
@@ -215,7 +253,7 @@ export class Outbox {
   /** The highest number handed to a connection: one above it never reached a server. */
   private written = 0;
   /** Written on the current connection and cleared before the server answered for them. */
-  private limbo: Array<[number, string]> = [];
+  private limbo: Array<[number, string, number]> = [];
   /** The user of the last connection; undefined before the first. */
   private user: string | null | undefined = undefined;
   private ready = false;
@@ -493,6 +531,7 @@ export class Outbox {
     ttl: number | undefined,
     now: number,
     requires?: readonly string[],
+    tag?: number,
   ): number {
     const size = json.length;
     if (this.count + 1 > this.limits.maxMessages || this.bytes + size > this.limits.maxBytes) return 0;
@@ -510,6 +549,7 @@ export class Outbox {
       json,
       message,
       size,
+      tag: tag || undefined,
     };
     this.records.push(record);
     this.count++;
@@ -579,7 +619,7 @@ export class Outbox {
       gone++;
       this.count--;
       this.bytes -= record.size;
-      outcomes.delivered.push(record.id);
+      deliver(outcomes, record.id, record.tag);
     }
     // The answer to a hello may take what this connection did not write yet.
     if (this.cursor < this.head) this.cursor = this.head;
@@ -588,7 +628,8 @@ export class Outbox {
       this.put({ ack: s });
     }
     while (this.limbo.length > 0 && this.limbo[0][0] <= s) {
-      outcomes.delivered.push(this.limbo.shift()![1]);
+      const [, id, tag] = this.limbo.shift()!;
+      deliver(outcomes, id, tag);
     }
     return outcomes;
   }
@@ -597,9 +638,9 @@ export class Outbox {
   refused(from: number, to: number, why: string): Outcomes {
     const outcomes = noOutcomes();
     this.removeWhere(why, outcomes, (_, r) => r.s >= from && r.s <= to);
-    this.limbo = this.limbo.filter(([n, id]) => {
+    this.limbo = this.limbo.filter(([n, id, tag]) => {
       const keep = n < from || n > to;
-      if (!keep) refuse(outcomes, why, id);
+      if (!keep) refuse(outcomes, why, id, tag);
       return keep;
     });
     return outcomes;
@@ -620,6 +661,7 @@ export class Outbox {
       s: number | undefined,
       json: string,
       requires?: readonly string[],
+      tag?: number,
     ) => boolean | 'later',
   ): void {
     if (!this.ready || !(this.answered || this.plain) || this.opening) return;
@@ -628,7 +670,7 @@ export class Outbox {
     let taken = 0;
     while (this.cursor < this.records.length) {
       const record = this.records[this.cursor];
-      const took = write(record.message, numbered ? record.s : undefined, record.json, record.requires);
+      const took = write(record.message, numbered ? record.s : undefined, record.json, record.requires, record.tag);
       if (!took) break;
       this.cursor++;
       if (numbered) {
@@ -639,7 +681,7 @@ export class Outbox {
         this.head = this.cursor;
         this.count--;
         this.bytes -= record.size;
-        outcomes.delivered.push(record.id);
+        deliver(outcomes, record.id, record.tag);
         taken = record.s;
       }
     }
@@ -673,7 +715,7 @@ export class Outbox {
       this.head++;
       this.count--;
       this.bytes -= record.size;
-      outcomes.delivered.push(record.id);
+      deliver(outcomes, record.id, record.tag);
       taken = record.s;
     }
     this.compact();
@@ -696,7 +738,7 @@ export class Outbox {
     this.answered = false;
     this.plain = false;
     this.cursor = this.head;
-    for (const [, id] of this.limbo) refuse(outcomes, 'cleared', id);
+    for (const [, id, tag] of this.limbo) refuse(outcomes, 'cleared', id, tag);
     this.limbo = [];
     return outcomes;
   }
@@ -713,7 +755,9 @@ export class Outbox {
     if (this.log) {
       this.letGo();
     } else if (!kept) {
-      for (let i = this.head; i < this.records.length; i++) refuse(outcomes, 'closed', this.records[i].id);
+      for (let i = this.head; i < this.records.length; i++) {
+        refuse(outcomes, 'closed', this.records[i].id, this.records[i].tag);
+      }
     }
     if (!this.opening) this.reset();
     return outcomes;
@@ -730,8 +774,8 @@ export class Outbox {
     for (let i = this.head; i < this.records.length; i++) {
       const record = this.records[i];
       numbers.push(record.s);
-      if (this.answered && i < this.cursor) this.limbo.push([record.s, record.id]);
-      else refuse(outcomes, 'cleared', record.id);
+      if (this.answered && i < this.cursor) this.limbo.push([record.s, record.id, record.tag ?? 0]);
+      else refuse(outcomes, 'cleared', record.id, record.tag);
     }
     this.reset();
     this.unlogged = [];
@@ -780,7 +824,7 @@ export class Outbox {
       if (gone(i, record)) {
         this.count--;
         this.bytes -= record.size;
-        refuse(outcomes, why, record.id);
+        refuse(outcomes, why, record.id, record.tag);
         numbers.push(record.s);
         if (i < this.cursor) cursor--;
       } else {

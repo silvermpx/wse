@@ -155,6 +155,7 @@ export function createBridgeClient(
     changed: () => {
       refresh();
       release();
+      reportContinuous();
     },
     storage,
   });
@@ -201,6 +202,22 @@ export function createBridgeClient(
   };
 
   // -- the owner's frames -------------------------------------------------------
+
+  /**
+   * The topics it holds that hold none of its sends back, told the owner as
+   * they change and at each connection: a send of the window that requires
+   * one goes from the owner's outbox, after a reconnect too, only once the
+   * window said so of that connection.
+   */
+  let toldContinuous: string | null = null;
+  const reportContinuous = () => {
+    if (phase !== 'attached') return;
+    const topics = [...topicShares.keys()].filter((topic) => !delivery.holdsBack([topic])).sort();
+    const key = `${gen}\u0000${topics.join('\u0000')}`;
+    if (key === toldContinuous) return;
+    toldContinuous = key;
+    post({ k: 'continuous', gen, topics });
+  };
 
   /** The window was let go (refused, signed out, its owner gone): nothing more is handed on. */
   const over = () => phase === 'refused' || phase === 'revoked' || phase === 'closed';
@@ -252,6 +269,7 @@ export function createBridgeClient(
         user = item.user;
         emit('wseConnected', { user: item.user, reconnected: item.gen > 1 });
         refresh();
+        reportContinuous();
         return;
       case 'lost':
         delivery.connectionLost();
@@ -299,6 +317,7 @@ export function createBridgeClient(
         user = f.account.user;
         gen = f.gen;
         refresh();
+        reportContinuous();
         return;
       case 'refused':
         end('refused', `the owner refused the window: ${f.reason}${f.detail ? ` (${f.detail})` : ''}`);
@@ -407,6 +426,8 @@ export function createBridgeClient(
         // What is left of its time: it counts from its send.
         ttl: until !== undefined ? Math.max(0, until - Date.now()) : sendOptions.ttl,
         live: sendOptions.live,
+        // The owner holds it, after a reconnect, until the window says they are continuous.
+        requires: !sendOptions.live && sendOptions.requires?.length ? [...sendOptions.requires] : undefined,
         encrypted: sendOptions.encrypted,
         correlation_id: sendOptions.correlation_id,
       },

@@ -83,6 +83,9 @@ pub(crate) struct Queued {
     /// The outbox's clears before it ([`Shared::clears`]): it goes nowhere
     /// once the application cleared the outbox after it.
     pub(crate) clears: u64,
+    /// The bridge owner's window that sent it ([`crate::outbox::Tags`]): 0
+    /// for the application's own.
+    pub(crate) tag: u64,
 }
 
 impl Queued {
@@ -118,6 +121,7 @@ impl SentFor {
             until: None,
             counted: false,
             clears: self.clears,
+            tag: 0,
         }
     }
 
@@ -211,6 +215,9 @@ pub(crate) struct Shared {
     pub(crate) room: Option<Arc<Room>>,
     /// Counts the times the application cleared the outbox.
     pub(crate) clears: AtomicU64,
+    /// A bridge owner of this crate: its windows' sends' outcomes, and
+    /// whether a window holds one back.
+    pub(crate) tags: Option<Arc<dyn crate::outbox::Tags>>,
 }
 
 impl Shared {
@@ -225,6 +232,7 @@ impl Shared {
             stop: Mutex::new(None),
             room,
             clears: AtomicU64::new(0),
+            tags: None,
         }
     }
 }
@@ -353,7 +361,9 @@ impl Client {
         if let Some(mut key) = config.signing_key.take() {
             zeroize::Zeroize::zeroize(&mut key);
         }
-        let shared = Arc::new(Shared::new(config.token.clone(), room));
+        let mut shared = Shared::new(config.token.clone(), room);
+        shared.tags = config.tags.take();
+        let shared = Arc::new(shared);
         let (frames_tx, frames_rx) = mpsc::channel(config.send_queue);
         let (status_tx, status_rx) = watch::channel(Status::Connecting);
         let for_handler = Client {
@@ -477,6 +487,24 @@ impl Client {
             return Ok(id);
         }
         let frame = self.outgoing(kind, payload, options)?;
+        let id = frame.id.to_string();
+        self.try_put(frame)?;
+        Ok(id)
+    }
+
+    /// [`Client::try_send_with`] for window `tag` of a bridge owner: the
+    /// message carries it in the outbox, and what became of it goes to the
+    /// owner ([`crate::outbox::Tags`]) with it, not to the handler.
+    #[cfg(all(feature = "bridge", not(target_arch = "wasm32")))]
+    pub(crate) fn try_send_tagged<P: Serialize + ?Sized>(
+        &self,
+        kind: &str,
+        payload: &P,
+        options: &SendOptions,
+        tag: u64,
+    ) -> Result<String, Error> {
+        let mut frame = self.outgoing(kind, payload, options)?;
+        frame.tag = tag;
         let id = frame.id.to_string();
         self.try_put(frame)?;
         Ok(id)
@@ -739,7 +767,7 @@ impl Client {
 
     /// What the gate made goes to the application, and the sends that wait
     /// for their topics are looked at again.
-    fn wake(&self) -> Result<(), Error> {
+    pub(crate) fn wake(&self) -> Result<(), Error> {
         if let Wake::Reader(reader) = &self.wake {
             // A stream nobody reads any more has nobody to tell.
             let _ = reader.send(());

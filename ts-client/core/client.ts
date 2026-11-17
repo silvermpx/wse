@@ -9,7 +9,7 @@
 // are its own: two clients on one page share nothing. Frameworks hold it
 // through their adapters (wse-client/react, /vue, /svelte).
 
-import { reportOutcomes } from '../services/Outbox.js';
+import { OUTBOX_TAG, reportOutcomes, type TaggedOutcome } from '../services/Outbox.js';
 import {
   ConnectionState,
   MessagePriority,
@@ -87,11 +87,22 @@ export interface WSEClientOptions extends UseWSEConfig {
    * date (see core/delivery.ts).
    */
   delivery?: DeliveryOptions;
+}
+
+/**
+ * What a bridge owner of this package gives its client besides its options
+ * (none of the application's).
+ */
+export interface OwnerHooks {
   /**
    * Hears every message the client hands the application, of every type and
    * topic, before its listeners: what a bridge owner forwards to its windows.
    */
   onEveryMessage?: (message: WSMessage) => void;
+  /** What became of tagged messages, each with its tag: a bridge owner routes them to their windows. */
+  onTagged?: (entries: TaggedOutcome[]) => void;
+  /** Whether a tagged message that requires `topics` waits: a bridge owner asks its window. */
+  taggedHoldsBack?: (tag: number, topics: readonly string[]) => boolean;
 }
 
 /** A share of a client (or of its topics), released once. */
@@ -206,7 +217,14 @@ function shallowSame(a: WSEClientSnapshot, b: WSEClientSnapshot): boolean {
   );
 }
 
+/**
+ * Each client's own hand, for a bridge owner in this package: its outbox
+ * flushed now (a window's topics came continuous).
+ */
+export const clientInternals = new WeakMap<WSEClient, { flush(): void }>();
+
 export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
+  const hooks: OwnerHooks = options as OwnerHooks;
   checkDeliveryOptions(options.delivery, options.consumer);
   const auth = options.auth && options.auth.trim() !== '' ? options.auth : 'cookie';
   const listeners = new Map<string, Set<(detail: any) => void>>();
@@ -263,7 +281,9 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
       holdsBack: (topics) => delivery.holdsBack(topics),
     },
     leaseHolder: offlineDatabase ? generateId() : undefined,
-    tap: options.onEveryMessage,
+    tap: hooks.onEveryMessage,
+    tagged: hooks.onTagged,
+    taggedHoldsBack: hooks.taggedHoldsBack,
   });
   if (pageless && typeof indexedDB === 'undefined') ctx.state.getState().setStorageState('unavailable');
   // The queue's limits hold from the first send, before anything starts.
@@ -517,11 +537,13 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
       return 'dropped';
     }
     const message = buildMessage(type, payload, sendOptions);
+    // A bridge owner's window's: what becomes of it goes to that window.
+    const tag = (sendOptions as { [OUTBOX_TAG]?: number })[OUTBOX_TAG];
     // Kept in the outbox, numbered now, for the next connection; one that
     // requires topics waits in the queue until they are continuous.
     const outbox = sendOptions.requires?.length ? null : ensureOutbox(ctx, resolveOptions(options).offline);
     if (outbox) {
-      if (outbox.add(message, JSON.stringify(message), sendOptions.ttl, Date.now()) === 0) {
+      if (outbox.add(message, JSON.stringify(message), sendOptions.ttl, Date.now(), undefined, tag) === 0) {
         logger.warn(`The outbox is full; message ${type} dropped`);
         return 'dropped';
       }
@@ -541,6 +563,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
       expiresAt: expiryOf(sendOptions),
       owner: ctx.owner.current(),
       requires: sendOptions.requires && sendOptions.requires.length > 0 ? sendOptions.requires : undefined,
+      tag,
     });
     return ok ? 'queued' : 'dropped';
   };
@@ -579,8 +602,8 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     // and the application hears of each.
     const outbox = ctx.outbox.current;
     if (outbox) {
-      if (clear) reportOutcomes(emit, outbox.clear());
-      reportOutcomes(emit, outbox.close());
+      if (clear) reportOutcomes(emit, outbox.clear(), ctx.tagged);
+      reportOutcomes(emit, outbox.close(), ctx.tagged);
       outbox.dispose();
     }
     if (clear) delivery.forget();
@@ -597,7 +620,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
   };
 
   wired = true;
-  return {
+  const client: WSEClient = {
     retain,
     state,
     store: ctx.state,
@@ -657,6 +680,8 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     signOut: () => end(true),
     destroy: () => end(false),
   };
+  clientInternals.set(client, { flush: () => live()?.processor.flushSoon() });
+  return client;
 }
 
 function stringsOf(value: unknown): string[] {

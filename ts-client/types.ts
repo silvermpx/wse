@@ -349,6 +349,8 @@ export interface QueuedMessage {
   liveOn?: number;
   /** Topics that must be continuous when it goes (MessageOptions.requires): it stays queued until then. */
   requires?: readonly string[];
+  /** Its outbox tag (a bridge owner's name of the window that sent it). */
+  tag?: number;
 }
 
 export interface MessageOptions {
