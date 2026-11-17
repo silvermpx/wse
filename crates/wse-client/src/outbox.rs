@@ -1389,6 +1389,15 @@ mod file {
         (crc32(&[salt, json]) == crc).then_some(json)
     }
 
+    /// A line of a kind a later version writes, an object of one key this
+    /// one does not know: skipped. A change it must not skip is a new
+    /// format (`wse_outbox`).
+    fn unknown_kind(json: &[u8]) -> bool {
+        const KNOWN: [&str; 6] = ["add", "written", "ack", "drop", "user", "node"];
+        serde_json::from_slice::<std::collections::BTreeMap<String, &RawValue>>(json)
+            .is_ok_and(|line| line.len() == 1 && line.keys().all(|k| !KNOWN.contains(&k.as_str())))
+    }
+
     /// What a file holds, read up to the first line that does not check: a
     /// tail cut short, or left from an older file, is not read. None: not a
     /// file of this format.
@@ -1411,16 +1420,29 @@ mod file {
             if line.is_empty() {
                 continue;
             }
-            let Some(line) =
-                checked(line, salt).and_then(|json| serde_json::from_slice::<Line<'_>>(json).ok())
-            else {
+            let Some(json) = checked(line, salt) else {
                 tracing::warn!("[WSE] the outbox's file ends in a line that does not check");
                 break;
             };
+            let line = match serde_json::from_slice::<Line<'_>>(json) {
+                Ok(line) => line,
+                Err(_) if unknown_kind(json) => continue,
+                Err(_) => {
+                    tracing::warn!("[WSE] the outbox's file ends in a line that does not check");
+                    break;
+                }
+            };
             match line {
                 Line::Add(record) => {
-                    read.next = read.next.max(record.s + 1);
                     let text = record.text.get();
+                    // A message is a JSON object.
+                    if !text.starts_with('{') {
+                        tracing::warn!(
+                            "[WSE] the outbox's file ends in a line that does not check"
+                        );
+                        break;
+                    }
+                    read.next = read.next.max(record.s + 1);
                     read.records.push_back(Record {
                         s: record.s,
                         id: record.id,
@@ -1435,8 +1457,18 @@ mod file {
                     read.written = read.written.max(n);
                     read.next = read.next.max(n + 1);
                 }
-                Line::Ack(n) => read.records.retain(|r| r.s > n),
-                Line::Drop(numbers) => read.records.retain(|r| !numbers.contains(&r.s)),
+                // The records are in the order of their numbers: what an
+                // answer took is at the front.
+                Line::Ack(n) => {
+                    while read.records.front().is_some_and(|r| r.s <= n) {
+                        read.records.pop_front();
+                    }
+                }
+                Line::Drop(mut numbers) => {
+                    numbers.sort_unstable();
+                    read.records
+                        .retain(|r| numbers.binary_search(&r.s).is_err());
+                }
                 Line::User(user) => read.user = user,
                 Line::Node(node) => read.node = Some(node.into()),
             }

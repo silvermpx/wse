@@ -92,6 +92,11 @@
   crates/wse-client/tests/vectors/outbox.json, holds it for every client),
   locked as the Rust client locks it; a file that cannot be opened or
   written is a `storage_failed` event.
+- The outbox's file, in every client: a line of a kind a later version
+  writes is skipped, and a line whose value is not of its kind ends the
+  reading, as a line that does not check does (the Python client failed to
+  open such a file). Acks and drops are read in one pass, so a file with a
+  long drop line opens at once.
 - TypeScript: the outbox, as in the Rust client (`offline.enabled`, on by
   default): every message sent, except a live or signed one, waits until
   the server answers for it, numbered, and goes again after a reconnect; a

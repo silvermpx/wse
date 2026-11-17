@@ -626,6 +626,10 @@ def _read(data: bytes) -> _Read | None:
         user=None,
         records=[],
     )
+    # The records are in the order of their numbers: what an answer took is
+    # at the front, before ``first``.
+    records: list[_Kept] = []
+    first = 0
     for line in lines[1:]:
         if not line:
             continue
@@ -638,33 +642,60 @@ def _read(data: bytes) -> _Read | None:
             logger.warning("The outbox's file ends in a line that does not check")
             break
         ((kind, value),) = item.items()
-        if kind == "add" and isinstance(value, dict):
-            record = _record(body.decode(), value)
-            if record is None:
-                logger.warning("The outbox's file ends in a line that does not check")
-                break
-            read.next = max(read.next, record.s + 1)
-            read.records.append(record)
-        elif kind == "written":
-            read.written = max(read.written, int(value))
-            read.next = max(read.next, int(value) + 1)
-        elif kind == "ack":
-            read.records = [r for r in read.records if r.s > int(value)]
-        elif kind == "drop":
-            gone = set(value)
-            read.records = [r for r in read.records if r.s not in gone]
-        elif kind == "user":
-            read.user = value
-        elif kind == "node":
-            read.node = value
+        try:
+            if kind == "add":
+                record = _record(body.decode(), value)
+                if record is None:
+                    raise ValueError(kind)
+                read.next = max(read.next, record.s + 1)
+                records.append(record)
+            elif kind == "written":
+                written = _number(value)
+                read.written = max(read.written, written)
+                read.next = max(read.next, written + 1)
+            elif kind == "ack":
+                acked = _number(value)
+                while first < len(records) and records[first].s <= acked:
+                    first += 1
+            elif kind == "drop":
+                if not isinstance(value, list):
+                    raise ValueError(kind)
+                gone = {_number(n) for n in value}
+                records = [r for r in records[first:] if r.s not in gone]
+                first = 0
+            elif kind == "user":
+                if value is not None and not isinstance(value, str):
+                    raise ValueError(kind)
+                read.user = value
+            elif kind == "node":
+                if not isinstance(value, str):
+                    raise ValueError(kind)
+                read.node = value
+            # A line of a kind a later version writes is skipped: a change it
+            # must not skip is a new format (``wse_outbox``).
+        except (TypeError, ValueError):
+            logger.warning("The outbox's file ends in a line that does not check")
+            break
+    read.records = records[first:]
     return read
 
 
-def _record(body: str, value: dict) -> _Kept | None:
+def _number(value: object) -> int:
+    """A number of the file: a whole number, not below zero."""
+    if type(value) is not int or value < 0:
+        raise ValueError(value)
+    return value
+
+
+def _record(body: str, value: object) -> _Kept | None:
     """A message kept, as read: its text taken as it was written."""
     try:
-        s, message_id = int(value["s"]), str(value["id"])
-        at, until, owned = int(value["at"]), int(value["until"]), value["owned"] is True
+        if not isinstance(value, dict) or not isinstance(value["id"], str):
+            return None
+        s, message_id = _number(value["s"]), value["id"]
+        at, until, owned = _number(value["at"]), _number(value["until"]), value["owned"]
+        if not isinstance(owned, bool) or not isinstance(value["text"], dict):
+            return None
     except (KeyError, TypeError, ValueError):
         return None
     prefix = '{"add":{"s":%d,"id":%s,"at":%d,"until":%d,"owned":%s,"text":' % (

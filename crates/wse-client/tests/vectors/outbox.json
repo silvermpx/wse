@@ -88,6 +88,30 @@
       "user": "ann"
     },
     {
+      "why": "a line of a kind it does not know (a later version's): skipped",
+      "file": "867f5eda {\"wse_outbox\":1,\"salt\":\"0123456789abcdef0123456789abcdef\",\"producer\":\"producer-1\",\"next\":4}\n2dd0375e {\"node\":\"n1\"}\ndceed878 {\"written\":2}\ndbd0a8aa {\"user\":\"ann\"}\ne8cc59a7 {\"note\":{\"from\":\"a later version\"}}\n91e00581 {\"add\":{\"s\":2,\"id\":\"b\",\"at\":1000,\"until\":3601000,\"owned\":true,\"text\":{\"s\":2,\"c\":\"U\",\"t\":\"order\",\"p\":{\"n\":2,\"note\":\"tea \\u00e9\"},\"id\":\"b\"}}}\n84e84bee {\"add\":{\"s\":3,\"id\":\"c\",\"at\":2000,\"until\":3602000,\"owned\":true,\"text\":{\"s\":3,\"t\":\"m\",\"p\":{},\"id\":\"c\"}}}\n74529c3b {\"ack\":2}\ndf00c56e {\"drop\":[7,9]}\nec158378 {\"user\":null}\ndbd0a8aa {\"user\":\"ann\"}\n",
+      "records": [
+        "c"
+      ],
+      "user": "ann"
+    },
+    {
+      "why": "a line whose value is not of its kind: read up to it",
+      "file": "867f5eda {\"wse_outbox\":1,\"salt\":\"0123456789abcdef0123456789abcdef\",\"producer\":\"producer-1\",\"next\":4}\n2dd0375e {\"node\":\"n1\"}\ndceed878 {\"written\":2}\ndbd0a8aa {\"user\":\"ann\"}\n91e00581 {\"add\":{\"s\":2,\"id\":\"b\",\"at\":1000,\"until\":3601000,\"owned\":true,\"text\":{\"s\":2,\"c\":\"U\",\"t\":\"order\",\"p\":{\"n\":2,\"note\":\"tea \\u00e9\"},\"id\":\"b\"}}}\n1f2154a8 {\"ack\":\"two\"}\n84e84bee {\"add\":{\"s\":3,\"id\":\"c\",\"at\":2000,\"until\":3602000,\"owned\":true,\"text\":{\"s\":3,\"t\":\"m\",\"p\":{},\"id\":\"c\"}}}\n74529c3b {\"ack\":2}\ndf00c56e {\"drop\":[7,9]}\nec158378 {\"user\":null}\ndbd0a8aa {\"user\":\"ann\"}\n",
+      "records": [
+        "b"
+      ],
+      "user": "ann"
+    },
+    {
+      "why": "a message that is not a JSON object: read up to it",
+      "file": "867f5eda {\"wse_outbox\":1,\"salt\":\"0123456789abcdef0123456789abcdef\",\"producer\":\"producer-1\",\"next\":4}\n2dd0375e {\"node\":\"n1\"}\ndceed878 {\"written\":2}\ndbd0a8aa {\"user\":\"ann\"}\n91e00581 {\"add\":{\"s\":2,\"id\":\"b\",\"at\":1000,\"until\":3601000,\"owned\":true,\"text\":{\"s\":2,\"c\":\"U\",\"t\":\"order\",\"p\":{\"n\":2,\"note\":\"tea \\u00e9\"},\"id\":\"b\"}}}\naa6514ed {\"add\":{\"s\":3,\"id\":\"c\",\"at\":2000,\"until\":3602000,\"owned\":true,\"text\":5}}\n74529c3b {\"ack\":2}\ndf00c56e {\"drop\":[7,9]}\nec158378 {\"user\":null}\ndbd0a8aa {\"user\":\"ann\"}\n",
+      "records": [
+        "b"
+      ],
+      "user": "ann"
+    },
+    {
       "why": "a head that does not check: not a file of this format",
       "file": "ffffffff {\"wse_outbox\":1,\"salt\":\"0123456789abcdef0123456789abcdef\",\"producer\":\"producer-1\",\"next\":4}\n2dd0375e {\"node\":\"n1\"}\ndceed878 {\"written\":2}\ndbd0a8aa {\"user\":\"ann\"}\n91e00581 {\"add\":{\"s\":2,\"id\":\"b\",\"at\":1000,\"until\":3601000,\"owned\":true,\"text\":{\"s\":2,\"c\":\"U\",\"t\":\"order\",\"p\":{\"n\":2,\"note\":\"tea \\u00e9\"},\"id\":\"b\"}}}\n84e84bee {\"add\":{\"s\":3,\"id\":\"c\",\"at\":2000,\"until\":3602000,\"owned\":true,\"text\":{\"s\":3,\"t\":\"m\",\"p\":{},\"id\":\"c\"}}}\n74529c3b {\"ack\":2}\ndf00c56e {\"drop\":[7,9]}\nec158378 {\"user\":null}\ndbd0a8aa {\"user\":\"ann\"}\n",
       "records": null
