@@ -13,10 +13,14 @@
 // first E2E design, which the server still speaks to older clients.
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createWSEClient } from '../core/client.js';
+import { fileOutbox } from '../node/index.js';
 import {
   acquireSession,
   destroyCurrentSession,
@@ -307,6 +311,42 @@ describe.skipIf(!PYTHON || typeof WebSocket === 'undefined')('real RustWSEServer
     await vi.waitFor(() => expect(echoes.some((p) => p.n === 2)).toBe(true), { timeout: 5_000 });
     lease.release();
     client.destroy();
+  }, 30_000);
+
+  it('keeps what waits in a file for the next client, and the server takes it once', async () => {
+    destroyCurrentSession({ clearUserData: true });
+    const path = join(mkdtempSync(join(tmpdir(), 'wse-outbox-')), 'queue');
+    const options = {
+      endpoints: [endpoint],
+      reconnection: { baseDelay: 100, maxDelay: 300 },
+      offline: { store: fileOutbox(path) },
+    };
+    // Sent with no server: in the file as the client ends.
+    const first = createWSEClient(options);
+    expect(first.send('echo', { n: 31 }, { id: 'kept-1' })).toBe('queued');
+    first.destroy();
+
+    const before = events.filter((e) => e.event === 'echo').length;
+    const second = createWSEClient(options);
+    expect(second.kept()).toBe(1);
+    const delivered: string[] = [];
+    second.on('wseDelivered', (detail) => delivered.push(...detail.ids));
+    const lease = second.retain();
+    await vi.waitFor(() => expect(delivered).toContain('kept-1'), { timeout: 10_000 });
+    lease.release();
+    second.destroy();
+
+    // Nothing goes twice.
+    const third = createWSEClient(options);
+    expect(third.kept()).toBe(0);
+    const again = third.retain();
+    await vi.waitFor(() => expect(third.state.getSnapshot().ready).toBe(true), { timeout: 10_000 });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const echoes = events.filter((e) => e.event === 'echo').slice(before);
+    expect(echoes.filter((e) => e.payload?.n === 31)).toHaveLength(1);
+    expect(typeof echoes[0].s).toBe('number');
+    again.release();
+    third.destroy();
   }, 30_000);
 
   it('speaks msgpack with the server both ways', async () => {

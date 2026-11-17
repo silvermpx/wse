@@ -21,6 +21,12 @@ vi.mock('@angular/common', () => {
 vi.mock('solid-js', () => {
   throw new Error('wse-client/core imported solid-js');
 });
+// Node's own modules are wse-client/node's alone: the core runs in browsers.
+for (const name of ['node:fs', 'node:net', 'node:zlib', 'node:crypto', 'node:path']) {
+  vi.doMock(name, () => {
+    throw new Error(`wse-client/core imported ${name}`);
+  });
+}
 
 describe('wse-client/core', () => {
   it('imports without React, Angular, Solid, zustand or the page', async () => {

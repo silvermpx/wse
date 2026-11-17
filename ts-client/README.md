@@ -353,6 +353,7 @@ useWSE('cookie', ['notifications'], {
     maxBytes: 16 * 1024 * 1024,               // bytes of messages that wait at most
     maxAge: 3600000,                          // ms a message may wait to be written first
     persistToStorage: true,                   // { offline: true } sends outlive the page (IndexedDB)
+    // store: fileOutbox(path),               // Node, Electron's main process: the outbox in a file
   },
 
   diagnostics: {
@@ -463,7 +464,32 @@ its time (`expired`), it was the last user's (`user_changed`), the user signed o
 the client ended with it (`closed`). The outbox sends in the order of sending, whatever the
 priority. `close(deadlineMs)` waits for the server's answers too. With a server older than 3.2 a
 message is gone once written, as before. `offline: { enabled: false }` has no outbox: a message
-that cannot go out at once waits in the outgoing queue, in priority then FIFO order.
+that cannot go out at once waits in the outgoing queue, in priority then FIFO order. `kept()` says
+how many messages wait for the server's answer.
+
+In Node and in Electron's main process the outbox can live in a file, so that what waits outlives
+the process:
+
+```ts
+import { createWSEClient } from 'wse-client/core';
+import { fileOutbox } from 'wse-client/node';
+
+const client = createWSEClient({
+  endpoints: ['wss://api.example.com/wse'],
+  offline: { store: fileOutbox('/var/lib/app/wse-outbox') },
+});
+```
+
+It is the file the Rust and Python clients write: each line checked with a CRC-32 and a salt, read
+up to the first that does not check. The event loop never waits for the disk: a batch of lines goes
+to the file and to the disk once per turn of the loop, the next batch taking what came meanwhile,
+and the file is written anew once what went outweighs what is kept. When the process ends, what is
+not written yet is written at once. The file is the client's alone while the process runs: the
+system holds it for the process (a lock on `wse-outbox.lock` on macOS, the file opened for this
+process alone on Windows, an abstract socket named after the file on Linux) and lets go when the
+process ends, however it ends. A file that cannot be opened or written is a `wseStorageError` event
+and the outbox goes on in memory; `state.getSnapshot().storage` reads `durable` while the file
+holds it. `destroy()` leaves what waits in the file for the next client, `signOut()` clears it.
 
 `'dropped'` means the outbox (or the outgoing queue) was full or the message cannot be sent safely
 (see encryption).

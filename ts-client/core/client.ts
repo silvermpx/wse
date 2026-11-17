@@ -131,6 +131,8 @@ export interface WSEClient {
   subscribe(topics: string[], options?: { recover?: boolean }): Lease;
   send(type: string, payload: unknown, options?: MessageOptions): SendStatus;
   sendSigned(type: string, payload: unknown, options?: SignedMessageOptions): Promise<SendStatus>;
+  /** How many messages wait in the outbox for the server's answer. */
+  kept(): number;
   reconnect(): void;
   /**
    * The network or the machine is back: a client waiting out its backoff
@@ -257,7 +259,10 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
   });
   if (pageless && typeof indexedDB === 'undefined') ctx.state.getState().setStorageState('unavailable');
   // The queue's limits hold from the first send, before anything starts.
-  const { performance } = resolveOptions(options);
+  const { performance, offline } = resolveOptions(options);
+  // An outbox in a store is opened at once: what the last process left waits
+  // in it from the start, and its expiry runs.
+  if (offline.store) ensureOutbox(ctx, offline);
   ctx.queue.getState().setCapacity(performance.maxQueueSize);
   ctx.queue.getState().setMemoryLimit(performance.memoryLimit);
   const sequencer = new EventSequencer();
@@ -608,6 +613,7 @@ export function createWSEClient(options: WSEClientOptions = {}): WSEClient {
     },
     subscribe,
     send,
+    kept: () => ctx.outbox.current?.size ?? 0,
     sendSigned: (type, payload, signOptions) => {
       const current = done ? null : live();
       if (!current) {

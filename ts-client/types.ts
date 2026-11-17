@@ -3,6 +3,9 @@
 // =============================================================================
 
 import type { SignatureProof } from './utils/signing.js';
+import type { OutboxStore } from './services/Outbox.js';
+
+export type { OutboxStore };
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -174,6 +177,13 @@ export interface OfflineConfig {
   persistToStorage: boolean;
   /** How many bytes of messages (their JSON) wait at most (default 16 MiB). */
   maxBytes?: number;
+  /**
+   * Where the outbox keeps its messages, so that they outlive the process:
+   * `fileOutbox(path)` of `wse-client/node` (Node, Electron's main process).
+   * Default: in memory. One that cannot be opened or written is a
+   * `wseStorageError` event, and the outbox goes on in memory.
+   */
+  store?: OutboxStore;
 }
 
 export interface DiagnosticsConfig {

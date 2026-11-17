@@ -106,7 +106,15 @@
   and `offline.maxBytes` (16 MiB) wait; one not written within its `ttl`
   or `offline.maxAge` runs out on the outbox's own timer, with a connection
   or without. It sends in the order of sending, whatever the priority;
-  `close(deadlineMs)` waits for the server's answers, `signOut()` clears it.
+  `close(deadlineMs)` waits for the server's answers, `signOut()` clears it,
+  `kept()` says how many wait. In Node and Electron's main process
+  `offline.store: fileOutbox(path)` (`wse-client/node`) keeps it in a file
+  that outlives the process, in the Rust client's format; the event loop
+  never waits for the disk, and what is not written yet is written as the
+  process ends. The system holds the file for the process (a lock on
+  macOS and the BSDs, an exclusive open on Windows, an abstract socket on
+  Linux); a file that cannot be opened or written is a `wseStorageError`
+  event.
 - TypeScript: `wake()` and `close(deadlineMs)` for a client without a page
   (Node, Electron's main process, a worker): `wake()` connects at once when
   the application hears the network or the machine is back, and `close`

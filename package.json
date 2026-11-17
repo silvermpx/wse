@@ -46,6 +46,11 @@
       "import": "./dist/npm/react-native/index.js",
       "default": "./dist/npm/react-native/index.js"
     },
+    "./node": {
+      "types": "./dist/npm/node/index.d.ts",
+      "import": "./dist/npm/node/index.js",
+      "default": "./dist/npm/node/index.js"
+    },
     "./package.json": "./package.json"
   },
   "typesVersions": {
@@ -70,6 +75,9 @@
       ],
       "react-native": [
         "./dist/npm/react-native/index.d.ts"
+      ],
+      "node": [
+        "./dist/npm/node/index.d.ts"
       ]
     }
   },

@@ -243,17 +243,34 @@ export function resolveOptions(config: UseWSEConfig | undefined): ResolvedWSEOpt
  */
 export function ensureOutbox(ctx: ClientContext, offline: OfflineConfig): Outbox | null {
   if (!offline.enabled) return null;
-  // What runs out on its own timer is said, with a connection or without.
-  ctx.outbox.current ??= new Outbox(
+  if (ctx.outbox.current) return ctx.outbox.current;
+  const outbox = new Outbox(
     {
       maxMessages: offline.maxSize,
       maxBytes: offline.maxBytes ?? 16 * 1024 * 1024,
       maxAge: offline.maxAge,
     },
-    undefined,
-    (outcomes) => reportOutcomes(ctx.emit, outcomes),
+    {
+      // What runs out on its own timer is said, with a connection or without.
+      onExpired: (outcomes) => reportOutcomes(ctx.emit, outcomes),
+      store: offline.store,
+      // Said after this turn: a store is opened as the client is made,
+      // before the application listens.
+      onStorageError: (operation, error) =>
+        queueMicrotask(() => ctx.emit('wseStorageError', storageErrorDetail(operation, error))),
+    },
   );
-  return ctx.outbox.current;
+  ctx.outbox.current = outbox;
+  if (offline.store) {
+    // Where what waits lives: in the store, or in memory when it failed.
+    const state = outbox.durable ? 'durable' : 'unavailable';
+    const store = ctx.state.getState();
+    if (store.storageState !== state) {
+      store.setStorageState(state);
+      queueMicrotask(() => ctx.emit('wseStorage', { state }));
+    }
+  }
+  return outbox;
 }
 
 export function uniqueTopics(topics: unknown): string[] {

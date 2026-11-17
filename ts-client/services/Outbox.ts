@@ -10,6 +10,11 @@
 // per outbox, and the server drops a repeat, so its application takes each
 // message once. A server that does not answer takes a message once it is
 // written, as before.
+//
+// With a store (`fileOutbox` of `wse-client/node`) what it holds outlives the
+// process: the store gets each change as a line, a batch of them once per
+// turn of the event loop, and is written anew once what went outweighs what
+// is kept.
 
 import type { WSMessage } from '../types.js';
 
@@ -51,17 +56,104 @@ export interface OutboxLimits {
   maxAge: number;
 }
 
-/** A message kept. */
-interface Kept {
+/** A message as a store keeps it. */
+export interface StoredMessage {
   s: number;
   id: string;
-  message: WSMessage;
-  /** Its JSON as it was made: written as it is, after its number. */
-  json: string;
+  /** When it was sent (epoch ms). */
+  at: number;
   /** Until when it may wait to be written first (epoch ms). */
   until: number;
   /** Sent after a connection of the last user: that user's alone. */
   owned: boolean;
+  /** Its JSON as the client made it, without its number. */
+  json: string;
+}
+
+/** What a store holds. */
+export interface StoredOutbox {
+  producer: string;
+  /** The node the client was connected to last, as it named itself. */
+  node: string | null;
+  /** The highest number handed to a connection. */
+  written: number;
+  /** Above every number used. */
+  next: number;
+  /** The user of the last connection; null: none, or none known. */
+  user: string | null;
+  records: readonly StoredMessage[];
+}
+
+/** What a store held when it was opened, each message as read too. */
+export interface ReadOutbox extends StoredOutbox {
+  records: Array<StoredMessage & { message: WSMessage }>;
+}
+
+/** A change to what a store holds, besides a message kept. */
+export type OutboxLine =
+  | { written: number }
+  | { ack: number }
+  | { drop: number[] }
+  | { user: string | null }
+  | { node: string };
+
+/** A store, open: the outbox's changes go to it as lines. */
+export interface OutboxLog {
+  /** The lines in the store, those handed and not written yet included. */
+  readonly lines: number;
+  /** A message kept: into the batch. */
+  add(record: StoredMessage): void;
+  /** A change: into the batch. */
+  put(line: OutboxLine): void;
+  /** The batch goes to be written. */
+  flush(): void;
+  /** The batch is in what is written anew. */
+  forget(): void;
+  /** A write failed since the last time it was asked: the store is to be written anew. */
+  takeBroken(): boolean;
+  /** Writes it anew, with `state` alone. */
+  rewrite(state: StoredOutbox): void;
+  /**
+   * Writes what it was handed, at once, and lets the store go: another
+   * client may take it.
+   */
+  close(): void;
+}
+
+/**
+ * Where an outbox keeps what it holds, so that it outlives the process:
+ * `fileOutbox(path)` of `wse-client/node`.
+ */
+export interface OutboxStore {
+  /**
+   * Opens it, the outbox's alone from now on: what it held (null: nothing,
+   * or not of this format) and its log. `state` says what the outbox holds
+   * whenever the store must write it anew (the process ends); `report` hears
+   * of a write that failed. Throws when it cannot be had.
+   */
+  open(
+    state: () => StoredOutbox,
+    report: (operation: string, error: unknown) => void,
+  ): { read: ReadOutbox | null; log: OutboxLog };
+}
+
+/** The message with its number first: `{"s":N,` before the rest. */
+export function numbered(s: number, json: string): string {
+  return json.length > 2 ? `{"s":${s},${json.slice(1)}` : `{"s":${s}}`;
+}
+
+/** The message without its number (`{"s":N,` taken off the front). */
+export function unnumbered(text: string): string {
+  if (!text.startsWith('{"s":')) return text;
+  let at = 5;
+  while (at < text.length && text.charCodeAt(at) >= 48 && text.charCodeAt(at) <= 57) at++;
+  if (text.charCodeAt(at) === 44) at++; // ','
+  return `{${text.slice(at)}`;
+}
+
+/** A message kept. */
+interface Kept extends StoredMessage {
+  message: WSMessage;
   size: number;
 }
 
@@ -72,6 +164,25 @@ function newProducer(): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+/** Monotonic ms, for how often a broken store is written anew. */
+function monotonic(): number {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
+export interface OutboxOptions {
+  /** The producer's id (default: a random one, or the store's). */
+  producer?: string;
+  /**
+   * Hears of the messages that ran out on the outbox's own timer (none: they
+   * go when the connection next looks).
+   */
+  onExpired?: (outcomes: Outcomes) => void;
+  /** Where it keeps what it holds, to outlive the process. */
+  store?: OutboxStore;
+  /** The store could not be opened (`open`) or written (`write`): what waits stays in memory. */
+  onStorageError?: (operation: string, error: unknown) => void;
+}
+
 export class Outbox {
   /** The records, oldest first, from `head` on (taken off the front by moving it). */
   private records: Kept[] = [];
@@ -79,7 +190,7 @@ export class Outbox {
   /** Records from here on did not go to the current connection yet (an absolute index). */
   private cursor = 0;
   private next = 1;
-  readonly producer: string;
+  private producerId: string;
   /** The node the client was connected to last, as it named itself. */
   private node: string | null = null;
   /** The highest number handed to a connection: one above it never reached a server. */
@@ -100,17 +211,87 @@ export class Outbox {
   /** Its timer, with or without a connection, when someone hears what ran out. */
   private timer: ReturnType<typeof setTimeout> | null = null;
   private timerAt = Infinity;
+  private readonly onExpired?: (outcomes: Outcomes) => void;
+  /** The store's log, while one is open. */
+  private log: OutboxLog | null = null;
+  /** The highest number written that the store was told of. */
+  private loggedWritten = 0;
+  /** A batch for the store waits for the end of this turn of the event loop. */
+  private flushQueued = false;
+  /** A write of the store failed: it is written anew, at most once a second. */
+  private owedRewrite = false;
+  private healAt = 0;
 
-  /**
-   * `onExpired` hears of the messages that ran out on the outbox's own timer
-   * (none: they go when the connection next looks).
-   */
   constructor(
     private readonly limits: OutboxLimits,
-    producer?: string,
-    private readonly onExpired?: (outcomes: Outcomes) => void,
+    options: OutboxOptions = {},
   ) {
-    this.producer = producer ?? newProducer();
+    this.producerId = options.producer ?? newProducer();
+    this.onExpired = options.onExpired;
+    if (options.store) {
+      const report = options.onStorageError ?? (() => {});
+      try {
+        const { read, log } = options.store.open(() => this.state(), report);
+        this.log = log;
+        if (read) this.restore(read);
+        // Written anew at once: a tail a crash left goes, under a new salt.
+        log.rewrite(this.state());
+      } catch (error) {
+        report('open', error);
+      }
+    }
+  }
+
+  /** The producer's id: the hello names it. */
+  get producer(): string {
+    return this.producerId;
+  }
+
+  /** A store holds what it holds: it outlives the process. */
+  get durable(): boolean {
+    return this.log !== null;
+  }
+
+  /** Takes up what the store held. */
+  private restore(read: ReadOutbox): void {
+    this.producerId = read.producer || this.producerId;
+    this.node = read.node;
+    this.written = read.written;
+    this.loggedWritten = read.written;
+    this.next = Math.max(1, read.next);
+    this.user = read.user ?? undefined;
+    let earliest = Infinity;
+    for (const r of read.records) {
+      const record: Kept = {
+        s: r.s,
+        id: r.id,
+        at: r.at,
+        until: r.until,
+        owned: r.owned,
+        json: r.json,
+        message: r.message,
+        size: r.json.length,
+      };
+      this.records.push(record);
+      this.count++;
+      this.bytes += record.size;
+      this.taken.add(record.message);
+      if (record.s > this.written && record.until < earliest) earliest = record.until;
+    }
+    this.earliestMs = earliest;
+    this.arm();
+  }
+
+  /** What it holds, for the store to write anew. */
+  private state(): StoredOutbox {
+    return {
+      producer: this.producerId,
+      node: this.node,
+      written: this.written,
+      next: this.next,
+      user: typeof this.user === 'string' ? this.user : null,
+      records: this.records.slice(this.head),
+    };
   }
 
   /** Its timer stops: the client ended. */
@@ -163,7 +344,7 @@ export class Outbox {
   /** What the client's hello says of it. */
   hello(): Record<string, unknown> {
     const first = this.records[this.head];
-    return { producer: this.producer, node: this.node, written: this.written, from: first ? first.s : this.next };
+    return { producer: this.producerId, node: this.node, written: this.written, from: first ? first.s : this.next };
   }
 
   /** When the first message not written yet runs out (epoch ms), or null. */
@@ -180,22 +361,29 @@ export class Outbox {
     if (this.count + 1 > this.limits.maxMessages || this.bytes + size > this.limits.maxBytes) return 0;
     const s = this.next++;
     const wait = ttl !== undefined && Number.isFinite(ttl) && ttl >= 0 ? ttl : this.limits.maxAge;
-    const until = now + wait;
-    this.records.push({
+    // Whole ms, as a store writes them.
+    const until = Math.min(Math.round(now + wait), Number.MAX_SAFE_INTEGER);
+    const record: Kept = {
       s,
       id: message.id ?? String(s),
-      message,
-      json,
+      at: Math.round(now),
       until,
       owned: typeof this.user === 'string',
+      json,
+      message,
       size,
-    });
+    };
+    this.records.push(record);
     this.count++;
     this.bytes += size;
     this.taken.add(message);
     if (until < this.earliestMs) {
       this.earliestMs = until;
       this.arm();
+    }
+    if (this.log) {
+      this.log.add(record);
+      this.flush();
     }
     return s;
   }
@@ -204,11 +392,12 @@ export class Outbox {
   connected(user: string | null, now: number): Outcomes {
     const outcomes = noOutcomes();
     this.ready = true;
-    if (this.user !== undefined && this.user !== user) {
+    if (this.user === undefined || this.user !== user) {
       // What was sent before any connection goes on any.
-      this.removeWhere('user_changed', outcomes, (_, r) => r.owned);
+      if (this.user !== undefined) this.removeWhere('user_changed', outcomes, (_, r) => r.owned);
+      this.user = user;
+      this.put({ user });
     }
-    this.user = user;
     if (this.earliestMs <= now) this.expire(now, outcomes);
     return outcomes;
   }
@@ -228,7 +417,10 @@ export class Outbox {
     for (const [from, to, why] of refused) merge(outcomes, this.refused(from, to, why));
     merge(outcomes, this.acked(acked));
     this.answered = true;
-    this.node = node;
+    if (this.node !== node) {
+      this.node = node;
+      this.put({ node });
+    }
     return outcomes;
   }
 
@@ -247,7 +439,10 @@ export class Outbox {
     }
     // The answer to a hello may take what this connection did not write yet.
     if (this.cursor < this.head) this.cursor = this.head;
-    if (gone > 0) this.compact();
+    if (gone > 0) {
+      this.compact();
+      this.put({ ack: s });
+    }
     while (this.limbo.length > 0 && this.limbo[0][0] <= s) {
       outcomes.delivered.push(this.limbo.shift()![1]);
     }
@@ -280,9 +475,10 @@ export class Outbox {
     if (!this.ready || !(this.answered || this.plain)) return;
     if (this.earliestMs <= now) this.expire(now, outcomes);
     const numbered = this.answered;
+    let taken = 0;
     while (this.cursor < this.records.length) {
       const record = this.records[this.cursor];
-      if (!write(record.message, numbered ? record.s : undefined, record.json)) return;
+      if (!write(record.message, numbered ? record.s : undefined, record.json)) break;
       this.cursor++;
       if (numbered) {
         if (record.s > this.written) this.written = record.s;
@@ -293,9 +489,14 @@ export class Outbox {
         this.count--;
         this.bytes -= record.size;
         outcomes.delivered.push(record.id);
+        taken = record.s;
       }
     }
-    if (!numbered) this.compact();
+    if (!numbered && taken > 0) {
+      this.compact();
+      this.put({ ack: taken });
+    }
+    this.flush();
   }
 
   /** The server owes an answer on this connection: for messages it has, or to the hello while some wait. */
@@ -318,10 +519,20 @@ export class Outbox {
     return outcomes;
   }
 
-  /** The client ends: what waits goes with it (`closed`). */
+  /**
+   * The client ends. In memory what waits goes with it (`closed`); in a
+   * store it waits for the next client, the store written at once.
+   */
   close(): Outcomes {
     const outcomes = this.disconnected();
-    for (let i = this.head; i < this.records.length; i++) refuse(outcomes, 'closed', this.records[i].id);
+    const log = this.log;
+    if (log) {
+      this.flushNow();
+      this.log = null;
+      log.close();
+    } else {
+      for (let i = this.head; i < this.records.length; i++) refuse(outcomes, 'closed', this.records[i].id);
+    }
     this.reset();
     return outcomes;
   }
@@ -333,13 +544,17 @@ export class Outbox {
    */
   clear(): Outcomes {
     const outcomes = noOutcomes();
+    const numbers: number[] = [];
     for (let i = this.head; i < this.records.length; i++) {
       const record = this.records[i];
+      numbers.push(record.s);
       if (this.answered && i < this.cursor) this.limbo.push([record.s, record.id]);
       else refuse(outcomes, 'cleared', record.id);
     }
     this.reset();
+    if (numbers.length > 0) this.put({ drop: numbers });
     this.user = undefined;
+    this.put({ user: null });
     return outcomes;
   }
 
@@ -370,6 +585,7 @@ export class Outbox {
   /** Removes the records `gone` names (by absolute index and record), telling why. */
   private removeWhere(why: string, outcomes: Outcomes, gone: (at: number, record: Kept) => boolean): void {
     const kept: Kept[] = [];
+    const numbers: number[] = [];
     let cursor = this.cursor - this.head;
     for (let i = this.head; i < this.records.length; i++) {
       const record = this.records[i];
@@ -377,6 +593,7 @@ export class Outbox {
         this.count--;
         this.bytes -= record.size;
         refuse(outcomes, why, record.id);
+        numbers.push(record.s);
         if (i < this.cursor) cursor--;
       } else {
         kept.push(record);
@@ -385,6 +602,7 @@ export class Outbox {
     this.records = kept;
     this.head = 0;
     this.cursor = cursor;
+    if (numbers.length > 0) this.put({ drop: numbers });
   }
 
   /** The records taken off the front go once they outweigh the rest. */
@@ -393,6 +611,52 @@ export class Outbox {
       this.records = this.records.slice(this.head);
       this.cursor -= this.head;
       this.head = 0;
+    }
+  }
+
+  /** A change for the store's batch. */
+  private put(line: OutboxLine): void {
+    if (!this.log) return;
+    this.log.put(line);
+    this.flush();
+  }
+
+  /** The store gets the batch at the end of this turn of the event loop: the changes of a turn at once. */
+  private flush(): void {
+    if (!this.log || this.flushQueued) return;
+    this.flushQueued = true;
+    queueMicrotask(() => {
+      this.flushQueued = false;
+      this.flushNow();
+    });
+  }
+
+  /**
+   * Hands the batch to the store; writes it anew instead once what went
+   * outweighs what is kept, or after a write failed (the batch is in what is
+   * written anew).
+   */
+  private flushNow(): void {
+    const log = this.log;
+    if (!log) return;
+    if (this.written > this.loggedWritten) {
+      this.loggedWritten = this.written;
+      log.put({ written: this.written });
+    }
+    if (log.takeBroken()) this.owedRewrite = true;
+    if (this.owedRewrite) {
+      const now = monotonic();
+      if (now >= this.healAt) {
+        this.owedRewrite = false;
+        this.healAt = now + 1000;
+        log.rewrite(this.state());
+      } else {
+        log.forget();
+      }
+    } else if (log.lines > 2 * this.count + 64) {
+      log.rewrite(this.state());
+    } else {
+      log.flush();
     }
   }
 }
