@@ -1038,7 +1038,11 @@ export class ConnectionManager {
    * required; never drops silently -- the caller re-queues on anything but
    * 'sent'/'error'.
    */
-  trySend(message: WSMessage, s?: number, json?: string): SendResult {
+  /**
+   * `written` is called once the frame is on the socket: at once, or after
+   * its encryption (never when the socket went before).
+   */
+  trySend(message: WSMessage, s?: number, json?: string, written?: () => void): SendResult {
     if (!this.isTransportReady()) {
       return 'not_ready';
     }
@@ -1116,6 +1120,7 @@ export class ConnectionManager {
               return;
             }
             ws.send(frame);
+            written?.();
           } finally {
             this.sealed(size, socketId);
           }
@@ -1124,10 +1129,12 @@ export class ConnectionManager {
         // The JSON value as msgpack, so both formats carry the same message.
         const frame = packMessage(JSON.parse(data));
         ws.send(frame);
+        written?.();
         this.recordSent(frame.byteLength);
         return 'sent';
       } else {
         ws.send(data);
+        written?.();
       }
     } catch (error) {
       logger.error('[ConnectionManager] Failed to send message:', errorMessage(error));

@@ -159,3 +159,45 @@ it('a send sealed for one user never goes on the next one’s connection', async
     release();
   }
 });
+
+it('to a server that does not answer, a kept message is delivered once written, not once accepted', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let held = false;
+  const encrypt = SecurityManager.prototype.encryptForTransport;
+  const spy = vi
+    .spyOn(SecurityManager.prototype, 'encryptForTransport')
+    .mockImplementation(async function (this: SecurityManager, data: string) {
+      const frame = await encrypt.call(this, data);
+      if (data.includes('held_order') && !held) {
+        held = true;
+        await gate;
+      }
+      return frame;
+    });
+  const c = client({ offline: { enabled: true } });
+  const delivered: string[] = [];
+  c.on('wseDelivered', (detail: { ids: string[] }) => delivered.push(...detail.ids));
+  try {
+    c.retain();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const a = await open(c, 'alice');
+    c.send('order', { held_order: true }, { id: 'kept' });
+    await vi.waitFor(() => expect(held).toBe(true));
+    // Being sealed: not written, so not delivered, and still kept.
+    expect(delivered).toEqual([]);
+    expect(c.kept()).toBe(1);
+    // The connection goes before it is written: it goes on the next one.
+    a.ws.serverClose(1006);
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+    const b = await open(c, 'alice');
+    release();
+    await vi.waitFor(() => expect(delivered).toEqual(['kept']));
+    expect(await a.orders()).toEqual([]);
+    expect(await b.orders()).toEqual([{ held_order: true }]);
+    expect(c.kept()).toBe(0);
+  } finally {
+    release();
+    spy.mockRestore();
+  }
+});

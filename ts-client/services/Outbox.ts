@@ -609,13 +609,18 @@ export class Outbox {
    * Hands the connection's writer the messages it did not take yet, in
    * order, each with its number and the topics it requires, once the server
    * took the connection and its mode is known; the writer says whether it
-   * took each (false: stop, the rest waits). What waited too long to be sent
-   * goes instead.
+   * took each (false: stop, the rest waits; `later`: it is written later,
+   * [wroteLater]). What waited too long to be sent goes instead.
    */
   due(
     now: number,
     outcomes: Outcomes,
-    write: (message: WSMessage, s: number | undefined, json: string, requires?: readonly string[]) => boolean,
+    write: (
+      message: WSMessage,
+      s: number | undefined,
+      json: string,
+      requires?: readonly string[],
+    ) => boolean | 'later',
   ): void {
     if (!this.ready || !(this.answered || this.plain) || this.opening) return;
     if (this.earliestMs <= now) this.expire(now, outcomes);
@@ -623,11 +628,12 @@ export class Outbox {
     let taken = 0;
     while (this.cursor < this.records.length) {
       const record = this.records[this.cursor];
-      if (!write(record.message, numbered ? record.s : undefined, record.json, record.requires)) break;
+      const took = write(record.message, numbered ? record.s : undefined, record.json, record.requires);
+      if (!took) break;
       this.cursor++;
       if (numbered) {
         if (record.s > this.written) this.written = record.s;
-      } else {
+      } else if (took === true) {
         // A server that does not answer took what was written.
         this.records[this.cursor - 1] = undefined as unknown as Kept;
         this.head = this.cursor;
@@ -642,6 +648,37 @@ export class Outbox {
       this.put({ ack: taken });
     }
     this.flush();
+  }
+
+  /**
+   * A message the writer took for later is on the socket now (its encryption
+   * is done): a server that does not answer took it, and those handed before
+   * it. The writer writes them in the order they were handed.
+   */
+  wroteLater(message: WSMessage): Outcomes {
+    const outcomes = noOutcomes();
+    if (!this.plain || this.answered) return outcomes;
+    let at = -1;
+    for (let i = this.head; i < this.cursor; i++) {
+      if (this.records[i]?.message === message) {
+        at = i;
+        break;
+      }
+    }
+    if (at < 0) return outcomes;
+    let taken = 0;
+    while (this.head <= at) {
+      const record = this.records[this.head];
+      this.records[this.head] = undefined as unknown as Kept;
+      this.head++;
+      this.count--;
+      this.bytes -= record.size;
+      outcomes.delivered.push(record.id);
+      taken = record.s;
+    }
+    this.compact();
+    this.put({ ack: taken });
+    return outcomes;
   }
 
   /** The server owes an answer on this connection: for messages it has, or to the hello while some wait. */

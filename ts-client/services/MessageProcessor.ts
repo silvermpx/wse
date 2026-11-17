@@ -46,7 +46,7 @@ import { noOutcomes, reportOutcomes, type Outbox, type Outcomes } from './Outbox
 
 /** What the processor needs from the connection (ConnectionManager implements it). */
 export interface ProcessorConnection {
-  trySend(message: WSMessage, s?: number, json?: string): SendResult;
+  trySend(message: WSMessage, s?: number, json?: string, written?: () => void): SendResult;
   sendControl(data: string | ArrayBuffer): boolean;
   isTransportReady(): boolean;
   /** Which socket is current: a new number for each one opened. */
@@ -2034,8 +2034,18 @@ export class MessageProcessor {
       // Its topics not continuous on this connection (a reconnect's resync
       // not done): it waits in its place, and what comes after it with it.
       if (requires && this.holdsBack(requires)) return false;
-      const result = cm.trySend(message, s, json);
-      if (result === 'sent') return true;
+      // Written now, or once its encryption is done: a server that does not
+      // answer took it then, not when the connection accepted it.
+      let handed = false;
+      let wrote = false;
+      const result = cm.trySend(message, s, json, () => {
+        if (handed) this.report(outbox.wroteLater(message));
+        else wrote = true;
+      });
+      if (result === 'sent') {
+        handed = true;
+        return wrote ? true : 'later';
+      }
       all = false;
       if (result === 'rate_limited') this.scheduleFlush(cm.getRetryAfterMs());
       return false;
