@@ -44,7 +44,7 @@ run_for() {
   wait "$pid"
 }
 
-# The integration test on an iOS simulator. Flutter 3.50 can miss the line
+# The integration test file $1 on an iOS simulator. Flutter 3.50 can miss the line
 # with the app's VM Service in the simulator's log and then wait for it
 # forever: the build done, and no test ever runs (flutter/flutter#181771,
 # fixed after 3.50). The expanded reporter names each test as it starts, so
@@ -55,7 +55,7 @@ simulator_test() {
   local stall="${IOS_STALL_SECONDS:-240}" output pid code=1 run stalled
   for run in 1 2 3; do
     output="$(mktemp)"
-    "$flutter" test "$tests" -d "$device" --reporter expanded --suppress-analytics "${defines[@]}" \
+    "$flutter" test "$1" -d "$device" --reporter expanded --suppress-analytics "${defines[@]}" \
       > >(tee "$output") 2>&1 &
     pid=$!
     stalled=""
@@ -100,7 +100,9 @@ done
 # A phone's system reaches the conformance server's control channel, and so
 # each case's server, by this machine's name there: an Android emulator's
 # 10.0.2.2, an iOS simulator's own loopback.
-tests=integration_test/app_test.dart
+# Each file runs in a flutter test of its own: two files in one, on an
+# Android emulator, can leave the second without its Dart Development Service.
+tests=(integration_test/app_test.dart)
 conformance=""
 case "$device" in
   emulator-*) system=android control_host=10.0.2.2 ;;
@@ -119,7 +121,7 @@ if [[ "${MODE:-debug}" == debug && -n "$system" ]]; then
   control="$(sed -n 's/.*"control":"ws:\/\/127.0.0.1:\([0-9]*\)\/control".*/\1/p' "$conformance/serve.log")"
   [[ -n "$control" ]] || { cat "$conformance/serve.log" >&2; exit 1; }
   control="ws://$control_host:$control/control"
-  tests=integration_test
+  tests+=(integration_test/conformance_test.dart)
 fi
 # An Android emulator reaches the host's ports through adb.
 if [[ "$device" == emulator-* ]]; then
@@ -143,11 +145,13 @@ cd "$here"
 "$flutter" pub get --suppress-analytics > /dev/null
 case "${MODE:-debug}" in
   debug)
-    if [[ "$device" =~ ^[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}$ ]]; then
-      simulator_test
-    else
-      "$flutter" test "$tests" -d "$device" --suppress-analytics "${defines[@]}"
-    fi
+    for test in "${tests[@]}"; do
+      if [[ "$device" =~ ^[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}$ ]]; then
+        simulator_test "$test"
+      else
+        "$flutter" test "$test" -d "$device" --suppress-analytics "${defines[@]}"
+      fi
+    done
     if [[ -n "$conformance" ]]; then
       "$target/debug/wse-conformance" check --manifest "$root/tests/conformance/dart-$system.json" \
         --reports "$conformance"
