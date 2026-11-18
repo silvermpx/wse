@@ -489,7 +489,7 @@
     },
     {
       "case": "outbox.cut_in_flight",
-      "about": "The connection is cut while messages are on their way: after the reconnect each is taken once, none lost, and each said delivered.",
+      "about": "The connection is cut while messages are on their way: after the reconnect each is taken once, none lost, and each said delivered, with one sent once it was cut.",
       "needs": [
         "outbox"
       ],
@@ -508,6 +508,14 @@
         },
         {
           "server": "kick"
+        },
+        {
+          "client": "send",
+          "type": "order",
+          "id": "after-cut",
+          "payload": {
+            "n": 51
+          }
         },
         {
           "client": "wait",
@@ -530,6 +538,10 @@
         },
         {
           "rule": "delivered_all",
+          "type": "order"
+        },
+        {
+          "rule": "unanswered_at_cut",
           "type": "order"
         }
       ]
@@ -704,6 +716,10 @@
           "payload": {
             "text": "packed"
           }
+        },
+        {
+          "rule": "taken_msgpack",
+          "type": "echo"
         }
       ]
     },
@@ -747,6 +763,10 @@
           "payload": {
             "sealed": true
           }
+        },
+        {
+          "rule": "taken_sealed",
+          "type": "echo"
         }
       ]
     },

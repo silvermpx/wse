@@ -30,6 +30,10 @@ pub struct Taken {
     /// Its correlation id (`cid`) and priority (`pri`), when it named them.
     pub cid: Option<String>,
     pub pri: Option<u64>,
+    /// How its connection spoke, as the server took it: MessagePack, and an
+    /// end-to-end session.
+    pub msgpack: bool,
+    pub sealed: bool,
 }
 
 /// A message the case published on a topic: its number (`p.n`), counted on
@@ -53,6 +57,8 @@ struct Conn {
     id: String,
     index: u64,
     user: Option<String>,
+    msgpack: bool,
+    sealed: bool,
 }
 
 /// Takes every connection, logs what it takes, answers `echo` with
@@ -75,6 +81,8 @@ impl Lab {
             signed,
             cid: message["cid"].as_str().map(str::to_owned),
             pri: message["pri"].as_u64(),
+            msgpack: conn.msgpack,
+            sealed: conn.sealed,
         };
         lock(&self.log).taken.push(taken);
     }
@@ -100,6 +108,8 @@ impl wse::Handler for Lab {
             id: (**connect.conn_id).clone(),
             index: log.connections,
             user: connect.user_id.map(str::to_owned),
+            msgpack: connect.msgpack(),
+            sealed: connect.sealed(),
         })
     }
 

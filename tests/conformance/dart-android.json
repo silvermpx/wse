@@ -1,6 +1,6 @@
 {
   "about": "The Dart package on an Android emulator (bindings/dart/example, run-integration-tests.sh): its client on the Rust client's native layer, in a Flutter app.",
   "agents": {
-    "dart-android": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] }
+    "dart-android": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"], "runtime": ["dart"], "os": ["android"] }
   }
 }

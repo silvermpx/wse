@@ -1,6 +1,6 @@
 {
   "about": "The Electron package in a real Electron (lane and CI job electron): each case's client a window's page, the owner in the main process.",
   "agents": {
-    "electron": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] }
+    "electron": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"], "runtime": ["electron"] }
   }
 }

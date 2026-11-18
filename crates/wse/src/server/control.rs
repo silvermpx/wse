@@ -210,6 +210,19 @@ fn recover(
 }
 
 impl Connect<'_> {
+    /// The client speaks MessagePack (it asked for `format=msgpack`): its
+    /// messages come, and what it is sent goes, as MessagePack frames.
+    pub fn msgpack(&self) -> bool {
+        self.handle.msgpack
+    }
+
+    /// The connection is an end-to-end session (the client opened it with
+    /// the server's key): every frame either way is sealed, and the server
+    /// takes no other.
+    pub fn sealed(&self) -> bool {
+        self.state.conn_sealed.contains(self.conn_id.as_str())
+    }
+
     /// Subscribe the connection to `topics` as the application learns of
     /// it: the topics its ACL allows; the ones it took.
     pub fn subscribe(

@@ -10,9 +10,10 @@
 //!
 //! fails (exit 1) unless every agent the manifest names passed every case
 //! its features reach, its report naming what ran it (version, runtime,
-//! system, architecture) and, with `--source`, coming from that commit (the
-//! one the server was started in). `wse-conformance cases` prints the
-//! built-in catalog.
+//! system, architecture, of the runtime and system the manifest names) and
+//! coming from the commit `--source` names, or else the one checked out
+//! where the check runs (the server names the one it was started in).
+//! `wse-conformance cases` prints the built-in catalog.
 //!
 //! Beside the control channel, `/bridge` serves a window of the bridge's
 //! Rust owner: the TypeScript driver runs the cases through it.
@@ -95,13 +96,14 @@ async fn main() -> ExitCode {
             else {
                 return usage();
             };
-            let source = option(&args, "--source");
-            match report::check(
-                manifest.as_ref(),
-                reports.as_ref(),
-                &catalog,
-                source.as_deref(),
-            ) {
+            // The reports are of this commit's build: the one named, or the
+            // one checked out where the check runs.
+            let source = option(&args, "--source").unwrap_or_else(source_commit);
+            if source.is_empty() {
+                eprintln!("conformance: no commit to check the reports against: --source COMMIT");
+                return ExitCode::FAILURE;
+            }
+            match report::check(manifest.as_ref(), reports.as_ref(), &catalog, &source) {
                 Ok(problems) if problems.is_empty() => {
                     println!("conformance: every agent passed what it must");
                     ExitCode::SUCCESS

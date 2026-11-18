@@ -136,16 +136,30 @@ struct Manifest {
 #[derive(Deserialize)]
 struct Needed {
     features: Vec<String>,
+    /// What the agent's runtime and system must say, one of these words of
+    /// each (in any case): a report of another platform is no evidence of
+    /// this one. None: any.
+    #[serde(default)]
+    runtime: Vec<String>,
+    #[serde(default)]
+    os: Vec<String>,
 }
 
-/// Every agent the manifest names has a report, claims at least the
-/// features named for it, and passed every case those features reach.
-/// What fails, one line each; none: the run holds.
+/// `value` has one of `words`, in any case; none needed: it has.
+fn names_one(value: &str, words: &[String]) -> bool {
+    let value = value.to_lowercase();
+    words.is_empty() || words.iter().any(|w| value.contains(&w.to_lowercase()))
+}
+
+/// Every agent the manifest names has a report from `source`, of the
+/// runtime and system named for it, claims at least the features named for
+/// it, and passed every case those features reach. What fails, one line
+/// each; none: the run holds.
 pub fn check(
     manifest: &Path,
     reports: &Path,
     catalog: &Catalog,
-    source: Option<&str>,
+    source: &str,
 ) -> Result<Vec<String>, String> {
     let manifest: Manifest = serde_json::from_str(
         &std::fs::read_to_string(manifest).map_err(|e| format!("{}: {e}", manifest.display()))?,
@@ -180,9 +194,17 @@ pub fn check(
                 problems.push(format!("{agent}: the report names no {field}"));
             }
         }
-        if let Some(source) = source
-            && report.source != source
-        {
+        for (field, value, words) in [
+            ("runtime", &named.runtime, &needed.runtime),
+            ("os", &named.os, &needed.os),
+        ] {
+            if !value.trim().is_empty() && !names_one(value, words) {
+                problems.push(format!(
+                    "{agent}: the report's {field} is {value:?}, not one of {words:?}"
+                ));
+            }
+        }
+        if report.source != source {
             problems.push(format!(
                 "{agent}: the report comes from {}, not {source}",
                 if report.source.is_empty() {
@@ -226,8 +248,13 @@ mod tests {
     use super::*;
 
     /// The reports in a directory of their own, checked against a manifest
-    /// that needs `agent` with no features: what the check says.
-    fn checked(report: serde_json::Value, source: Option<&str>) -> Vec<String> {
+    /// that needs `agent` with no features (and `needed`'s runtime and
+    /// system): what the check says.
+    fn checked_as(
+        report: serde_json::Value,
+        source: &str,
+        needed: serde_json::Value,
+    ) -> Vec<String> {
         let dir = std::env::temp_dir().join(format!(
             "wse-conformance-report-{}-{}",
             std::process::id(),
@@ -236,9 +263,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let manifest = dir.join("manifest.json");
         let agent = report["agent"].as_str().unwrap_or_default().to_owned();
+        let mut needs = serde_json::json!({"features": []});
+        if let Some(extra) = needed.as_object() {
+            for (key, value) in extra {
+                needs[key] = value.clone();
+            }
+        }
         std::fs::write(
             &manifest,
-            serde_json::json!({"agents": {agent: {"features": []}}}).to_string(),
+            serde_json::json!({"agents": {agent: needs}}).to_string(),
         )
         .unwrap();
         let reports = dir.join("reports");
@@ -250,6 +283,10 @@ mod tests {
         problems
     }
 
+    fn checked(report: serde_json::Value, source: &str) -> Vec<String> {
+        checked_as(report, source, serde_json::Value::Null)
+    }
+
     fn whole(agent: &str) -> serde_json::Value {
         serde_json::json!({
             "agent": agent, "version": "3.2.0", "runtime": "swift", "os": "iOS 27.2",
@@ -259,11 +296,11 @@ mod tests {
 
     #[test]
     fn a_report_names_what_ran_it() {
-        assert!(checked(whole("whole"), None).is_empty());
+        assert!(checked(whole("whole"), "4398651abc").is_empty());
         for field in ["version", "runtime", "os", "arch"] {
             let mut report = whole(&format!("no-{field}"));
             report.as_object_mut().unwrap().remove(field);
-            let problems = checked(report, None);
+            let problems = checked(report, "4398651abc");
             assert_eq!(problems.len(), 1, "{field}: {problems:?}");
             assert!(problems[0].contains(field), "{problems:?}");
         }
@@ -271,10 +308,25 @@ mod tests {
 
     #[test]
     fn a_report_comes_from_the_source_asked_for() {
-        assert!(checked(whole("this-source"), Some("4398651abc")).is_empty());
-        assert_eq!(checked(whole("other-source"), Some("1e2d7fd")).len(), 1);
+        assert!(checked(whole("this-source"), "4398651abc").is_empty());
+        assert_eq!(checked(whole("other-source"), "1e2d7fd").len(), 1);
         let mut unnamed = whole("no-source");
         unnamed.as_object_mut().unwrap().remove("source");
-        assert_eq!(checked(unnamed, Some("4398651abc")).len(), 1);
+        assert_eq!(checked(unnamed, "4398651abc").len(), 1);
+    }
+
+    #[test]
+    fn a_report_is_of_the_runtime_and_system_its_agent_runs_on() {
+        let ios = serde_json::json!({"runtime": ["swift"], "os": ["ios"]});
+        assert!(checked_as(whole("on-ios"), "4398651abc", ios.clone()).is_empty());
+        let mut linux = whole("on-linux");
+        linux["os"] = "Linux 6.8".into();
+        linux["runtime"] = "node 24.22.3".into();
+        let problems = checked_as(linux, "4398651abc", ios);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems[0].contains("runtime") && problems[1].contains("os"),
+            "{problems:?}"
+        );
     }
 }

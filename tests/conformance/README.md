@@ -49,8 +49,9 @@ A WebSocket of JSON requests, `{id, op, ...}`, each answered `{id, ok, ...}`:
 - `bye`: the report, `<agent>.json` and `<agent>.junit.xml` (also written when the channel
   closes): what the driver said it is, the commit the server was started in (`source`, git's
   `HEAD`) and the server's version, and each case's verdict. `check` fails a report that names
-  no version, runtime, system or architecture, and with `--source COMMIT` one from another
-  commit.
+  no version, runtime, system or architecture, one whose runtime or system is not the one its
+  manifest names for the agent (`runtime`, `os`: words one of which it must have, in any case),
+  and one from another commit than `--source COMMIT`, or than git's `HEAD` where it runs.
 
 ## The trace
 
@@ -64,6 +65,9 @@ when the driver could not go on.
 
 `connections`, `echoed`, `order`, `no_duplicates`, `all_published_delivered`, `no_silent_loss`,
 `break_said`, `no_break`, `taken_once`, `taken_in_order`, `delivered_all`, `never_taken`,
-`signed_taken`, `held_until_resynced` and `back_within` (the client is back within a time after
-the server cut or restarted). In every case a timeout or a driver that could not go on fails, and
+`signed_taken`, `held_until_resynced`, `back_within` (the client is back within a time after
+the server cut or restarted), `unanswered_at_cut` (the server cut the connection while a send was
+not answered yet, and the client came back after it), and `taken_msgpack` and `taken_sealed` (the
+messages of a type came in MessagePack, or in an end-to-end session, as the server took them,
+whatever the driver says). In every case a timeout or a driver that could not go on fails, and
 so does an outcome (`delivered`, `not_delivered`) of a message the application never sent.

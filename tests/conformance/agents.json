@@ -1,10 +1,10 @@
 {
   "about": "The clients a release needs checked, and the features each must claim: a driver that stops claiming one fails the check, and every case those features reach must pass.",
   "agents": {
-    "ts-core": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] },
-    "ts-bridge": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] },
-    "rust-bridge": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] },
-    "rust-client": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] },
-    "python": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] }
+    "ts-core": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"], "runtime": ["node"] },
+    "ts-bridge": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"], "runtime": ["node"] },
+    "rust-bridge": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"], "runtime": ["node"] },
+    "rust-client": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"], "runtime": ["tokio"] },
+    "python": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"], "runtime": ["python"] }
   }
 }

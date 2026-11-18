@@ -97,6 +97,15 @@ server every client is checked against.
   packages run in CI and in the release: Angular 20 to 22 and Solid 1.9 and
   2.0 on Linux; Electron and Tauri, React's hooks in two windows, on Linux,
   macOS and Windows.
+- Server (Rust): `Connect::msgpack()` and `Connect::sealed()` say how a
+  connection speaks: MessagePack, and an end-to-end session in which every
+  frame either way is sealed.
+- Conformance: the judge holds `format.msgpack` and `e2e.pinned` to the
+  server's view of the connection (`taken_msgpack`, `taken_sealed`), and
+  `outbox.cut_in_flight` to a send unanswered at the cut and a client back
+  after it (`unanswered_at_cut`); `check` binds each report to the commit
+  checked out (or `--source`) and to the runtime and system its manifest
+  names for the agent.
 
 ### Changed
 

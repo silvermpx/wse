@@ -1,6 +1,6 @@
 {
   "about": "Tauri's plugin in a real Tauri webview (lane and CI job tauri): each case's client a page's, the owner on the Rust side.",
   "agents": {
-    "tauri": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] }
+    "tauri": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"], "runtime": ["tauri"] }
   }
 }

@@ -1,6 +1,6 @@
 {
   "about": "The Kotlin package on an Android emulator (bindings/kotlin/android, run-emulator-tests.sh): its client on the Rust client's native layer, in an Android app.",
   "agents": {
-    "kotlin-android": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"] }
+    "kotlin-android": { "features": ["outbox", "start", "live", "msgpack", "e2e", "signing", "recover_or_resync"], "runtime": ["android"], "os": ["android"] }
   }
 }

@@ -330,6 +330,61 @@ fn hold(rule: &Rule, case: &Case, trace: &Trace<'_>, log: &Log) -> Result<(), St
             }
             Ok(())
         }
+        // The messages of the type came the way the case's connect asked:
+        // as the server took them, not as the driver says.
+        "taken_msgpack" | "taken_sealed" => {
+            let taken: Vec<_> = log
+                .taken
+                .iter()
+                .filter(|t| kind.is_none_or(|k| t.kind == k))
+                .collect();
+            if taken.is_empty() {
+                return Err("nothing of the kind was taken".to_owned());
+            }
+            let (how, off) = if rule.rule == "taken_msgpack" {
+                (
+                    "as MessagePack",
+                    taken.iter().filter(|t| !t.msgpack).count(),
+                )
+            } else {
+                ("sealed", taken.iter().filter(|t| !t.sealed).count())
+            };
+            if off == 0 {
+                Ok(())
+            } else {
+                Err(format!("{off} of the {} taken came not {how}", taken.len()))
+            }
+        }
+        "unanswered_at_cut" => {
+            // The server cut the connection while a send was not answered
+            // yet, and the client came back after it.
+            let (cut, _) = trace
+                .of("step")
+                .find(|(_, s)| s["server"] == "kick" || s["server"] == "restart")
+                .ok_or("the case cut nothing")?;
+            let sent: Vec<String> = trace
+                .of("sent")
+                .filter(|(at, e)| *at < cut && e["ok"] == true && e["live"] != true)
+                .filter(|(_, e)| kind.is_none_or(|k| e["type"] == k))
+                .filter_map(|(_, e)| e["id"].as_str().map(str::to_owned))
+                .collect();
+            let answered: HashSet<String> = trace
+                .0
+                .iter()
+                .take(cut)
+                .filter(|e| e["ev"] == "delivered" || e["ev"] == "not_delivered")
+                .flat_map(|e| e["ids"].as_array().cloned().unwrap_or_default())
+                .filter_map(|id| id.as_str().map(str::to_owned))
+                .collect();
+            if sent.is_empty() || sent.iter().all(|id| answered.contains(id)) {
+                return Err("every send was answered before the cut".to_owned());
+            }
+            if trace.of("ready").any(|(at, _)| at > cut) {
+                Ok(())
+            } else {
+                Err("the client never came back after the cut".to_owned())
+            }
+        }
         "never_taken" => {
             let kind = kind.ok_or_else(|| "the rule names no type".to_owned())?;
             let taken = log.taken.iter().filter(|t| t.kind == kind).count();
@@ -461,6 +516,8 @@ mod tests {
             signed: false,
             cid: None,
             pri: None,
+            msgpack: false,
+            sealed: false,
         }
     }
 
@@ -470,6 +527,54 @@ mod tests {
 
     fn judged(rules: Value, trace: &[Value], log: &Log) -> Vec<String> {
         judge(&case(rules), trace, log)
+    }
+
+    #[test]
+    fn a_mode_counts_as_the_server_took_it_not_as_the_driver_says() {
+        let rules = json!([{"rule": "taken_msgpack", "type": "order"}, {"rule": "taken_sealed", "type": "order"}]);
+        let plain = Log {
+            taken: vec![taken("a", 1, false)],
+            ..Log::default()
+        };
+        assert_eq!(judged(rules.clone(), &[], &plain).len(), 2);
+        let mut both = taken("a", 1, false);
+        both.msgpack = true;
+        both.sealed = true;
+        let log = Log {
+            taken: vec![both],
+            ..Log::default()
+        };
+        assert!(judged(rules.clone(), &[], &log).is_empty());
+        // Nothing taken is no evidence either.
+        assert_eq!(judged(rules, &[], &Log::default()).len(), 2);
+    }
+
+    #[test]
+    fn a_cut_counts_in_flight_only_with_a_send_unanswered_and_the_client_back() {
+        let rules = json!([{"rule": "unanswered_at_cut", "type": "order"}]);
+        let log = Log::default();
+        let kick = || json!({"ev": "step", "server": "kick"});
+        let ready = || json!({"ev": "ready"});
+        let delivered = |ids: &[&str]| json!({"ev": "delivered", "ids": ids});
+        // Sent, cut, back, answered: in flight.
+        let in_flight = [
+            ready(),
+            sent("a"),
+            sent("b"),
+            delivered(&["a"]),
+            kick(),
+            ready(),
+            delivered(&["b"]),
+        ];
+        assert!(judged(rules.clone(), &in_flight, &log).is_empty());
+        // Everything answered before the cut.
+        let settled = [ready(), sent("a"), delivered(&["a"]), kick(), ready()];
+        assert_eq!(judged(rules.clone(), &settled, &log).len(), 1);
+        // Cut, but the client never came back.
+        let gone = [ready(), sent("a"), kick(), delivered(&["a"])];
+        assert_eq!(judged(rules.clone(), &gone, &log).len(), 1);
+        // Nothing cut.
+        assert_eq!(judged(rules, &[ready(), sent("a")], &log).len(), 1);
     }
 
     #[test]
