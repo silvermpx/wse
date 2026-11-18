@@ -358,6 +358,9 @@ class AsyncWSEClient:
         self._url = url
         self._token = token
         self._initial_topics = list(topics) if topics else []
+        # The initial topics are subscribed once, on the client's first
+        # connection: from then on the topics are the application's.
+        self._initial_pending = bool(self._initial_topics)
         self._subscribed_topics: set[str] = set()
         # The reasons the application paused the client for (none: not paused).
         self._paused: set[str] = set()
@@ -716,10 +719,14 @@ class AsyncWSEClient:
         await self._await_handshake()
         self._connection.arm_reconnect()
 
-        # Auto-subscribe to initial topics. If the connection dropped right
-        # after the handshake, the next connection subscribes them.
-        if self._initial_topics and not await self.subscribe(self._initial_topics):
-            self._subscribed_topics.update(self._initial_topics)
+        # The initial topics, on the client's first connection; a later one
+        # keeps the topics as the application left them. If the connection
+        # dropped right after the handshake, the next connection subscribes
+        # them.
+        if self._initial_pending:
+            self._initial_pending = False
+            if not await self.subscribe(self._initial_topics):
+                self._subscribed_topics.update(self._initial_topics)
 
     async def start(self) -> None:
         """Starts, and returns at once: the connection is made in the
@@ -735,7 +742,9 @@ class AsyncWSEClient:
         ):
             return
         self._reset_stream()
-        self._subscribed_topics.update(self._initial_topics)
+        if self._initial_pending:
+            self._initial_pending = False
+            self._subscribed_topics.update(self._initial_topics)
         self._connection.start()
 
     def _begin(self) -> None:

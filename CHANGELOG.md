@@ -153,6 +153,10 @@ server every client is checked against.
   said `queued` and waited for good.
 - Python: a connection for another user starts the topics over and drops
   the last user's queue; `SyncWSEClient` takes `cookie_name`.
+- Python: the initial `topics` are subscribed on the client's first
+  connection only: `connect()` again, on an open connection, after a drop or
+  once the client was closed, keeps the topics as the application left them,
+  where it subscribed a topic unsubscribed since.
 - Python: `SyncWSEClient.connect()` after the connection dropped returns
   once it is up again (or raises), as after `start()`; it returned at once.
   An `AsyncWSEClient.connect()` that gave up waiting (a timeout around it)

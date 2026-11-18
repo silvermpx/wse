@@ -591,6 +591,27 @@ class TestTheStreamsEnd:
             assert client.is_ready
             await client.disconnect()
 
+    async def test_a_connect_again_keeps_the_topics_as_they_are(self):
+        async with FakeWSEServer() as server:
+            client = make_client(server.url, topics=["prices"])
+            await client.connect()
+            await until(lambda: "prices" in client.subscribed_topics)
+            await client.unsubscribe(["prices"])
+            # On the open connection, and once it was closed and opened again.
+            await client.connect()
+            await client.disconnect()
+            await client.connect()
+            await asyncio.sleep(0.2)
+            assert "prices" not in client.subscribed_topics
+            subscribes = [
+                m
+                for conn in server.connections
+                for m in conn.find("subscription_update")
+                if m["p"].get("action") == "subscribe"
+            ]
+            assert len(subscribes) == 1, subscribes
+            await client.disconnect()
+
     async def test_a_connect_that_gives_up_waiting_waits_no_more(self):
         async with FakeWSEServer(upgrade_delay=lambda _index: 0.5) as server:
             client = make_client(server.url)

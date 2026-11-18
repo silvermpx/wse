@@ -832,6 +832,9 @@ class SyncWSEClient:
                     self._client_kwargs["delivery"] = replace(
                         self._delivery, checkpoint=client.checkpoint()
                     )
+                if session.connected:
+                    # And with the topics as the application left them.
+                    self._client_kwargs["topics"] = sorted(client.subscribed_topics)
                 try:
                     await client.disconnect()
                 except BaseException:

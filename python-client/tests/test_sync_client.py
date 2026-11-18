@@ -389,6 +389,37 @@ class TestSyncOutbox:
             assert client.is_ready
             client.close()
 
+    def test_a_connect_again_keeps_the_topics_as_they_are(self):
+        # Open, after a drop, and after the client was closed and opened again.
+        for how in ("open", "dropped", "reopened"):
+            st = ServerThread(upgrade_delay=lambda index: 0.0 if index == 0 else 0.35)
+            with st as srv:
+                client = SyncWSEClient(srv.url, reconnect=FAST, topics=["prices"])
+                client.connect(timeout=5)
+                wait_until(lambda: "prices" in client.subscribed_topics)
+                client.unsubscribe(["prices"])
+                wait_until(lambda: "prices" not in client.subscribed_topics)
+                if how == "dropped":
+                    st.call(srv.connections[0].ws.close(1001))
+                    wait_until(lambda: not client.is_connected)
+                if how == "reopened":
+                    client.close()
+                client.connect(timeout=5)
+                time.sleep(0.2)
+                assert "prices" not in client.subscribed_topics, how
+                asked = [
+                    m
+                    for conn in srv.connections[1:]
+                    if how != "open"
+                    for m in conn.find("subscription_update")
+                ] + [
+                    m
+                    for m in srv.connections[0].find("subscription_update")
+                    if m["p"].get("action") == "subscribe"
+                ][1:]
+                assert asked == [], (how, asked)
+                client.close()
+
     def test_a_connect_made_while_one_is_on_its_way_gets_its_outcome(self):
         st = ServerThread(upgrade_delay=lambda _index: 0.25)
         with st as srv:
