@@ -142,13 +142,17 @@ export function createBridgeClient(
   let shareTimer: ReturnType<typeof setTimeout> | null = null;
   let nextSend = 1;
   const paused: string[] = [];
-  /** Batches held while the window is paused: not acknowledged, so the owner holds the rest. */
-  let pausedBatches: Array<{ s: number; items: BridgeItem[] }> = [];
-  let done = false;
   /**
-   * The window signed out and waits for its owner to let it go: what the
-   * owner knows became of its sends comes first. Until it gives up waiting.
+   * The batches it has not taken all of yet, in order: held while the
+   * window is paused, or while it takes the one before (a listener's doing
+   * can bring the next at once, over a channel that hands a frame on as it
+   * is posted). Each is acknowledged once taken, so the owner holds the
+   * rest; `next` is how far it was taken.
    */
+  let batches: Array<{ s: number; items: BridgeItem[]; next: number }> = [];
+  /** It takes batches: one that comes meanwhile waits its turn. */
+  let taking = false;
+  let done = false;
   /**
    * Signed out, the owner not having let the window go yet: of what comes,
    * only what became of its sends is taken. Until the owner says, a send's
@@ -275,8 +279,8 @@ export function createBridgeClient(
     // changes: the window is let go first, so a send from a listener of it
     // is dropped, and a listener of its state that signs out finds them
     // settled.
-    const outcomes = pausedBatches.flatMap((b) => b.items.filter(isOutcome));
-    pausedBatches = [];
+    const outcomes = batches.flatMap((b) => b.items.slice(b.next).filter(isOutcome));
+    batches = [];
     for (const resolve of signs.values()) resolve('dropped');
     signs.clear();
     // What waited for its topics never reached the owner: it goes. So does
@@ -362,17 +366,31 @@ export function createBridgeClient(
     }
   };
 
-  const batch = (s: number, items: BridgeItem[]) => {
-    if (over()) return;
-    for (const item of items) {
-      // A listener let the window go: nothing more of the batch is handed on.
-      if (done || over()) return;
-      // A listener signed out: of the rest, only what became of its sends.
-      if (signingOut && !isOutcome(item)) continue;
-      take(item);
+  /** Takes the batches it has, in order, unless it is paused. */
+  const takeBatches = () => {
+    if (taking) return;
+    taking = true;
+    try {
+      while (paused.length === 0 && batches.length > 0) {
+        const b = batches[0];
+        while (b.next < b.items.length) {
+          // A listener let the window go: nothing more is handed on, and
+          // what became of its sends was said as it went.
+          if (done || over()) return;
+          const item = b.items[b.next++];
+          // A listener signed out: of the rest, only what became of its sends.
+          if (signingOut && !isOutcome(item)) continue;
+          take(item);
+        }
+        if (done || over()) return;
+        // Counted before the owner hears: it may send the next at once.
+        batches.shift();
+        took = b.s;
+        post({ k: 'ack', s: b.s });
+      }
+    } finally {
+      taking = false;
     }
-    took = s;
-    post({ k: 'ack', s });
   };
 
   const frame = (f: OwnerFrame) => {
@@ -399,14 +417,14 @@ export function createBridgeClient(
           for (const item of f.items) if (isOutcome(item)) take(item);
           return;
         }
-        if (f.s !== took + pausedBatches.length + 1) {
-          logger.error(`[bridge] batch ${f.s} after ${took + pausedBatches.length}: the window stops`);
+        if (f.s !== took + batches.length + 1) {
+          logger.error(`[bridge] batch ${f.s} after ${took + batches.length}: the window stops`);
           end('revoked', 'protocol');
           port?.close();
           return;
         }
-        if (paused.length > 0) pausedBatches.push({ s: f.s, items: f.items });
-        else batch(f.s, f.items);
+        batches.push({ s: f.s, items: f.items, next: 0 });
+        takeBatches();
         return;
       case 'sent': {
         const sign = signs.get(f.n);
@@ -667,7 +685,9 @@ export function createBridgeClient(
     wake: () => post({ k: 'wake' }),
     close: async (deadlineMs: number) => {
       const until = Date.now() + Math.max(0, deadlineMs);
-      while (!done && pendingCount + waiting.length > 0 && Date.now() < until) {
+      // Once the window was let go (its owner gone, refused or revoked it),
+      // no outcome comes any more: what it has not heard of stays unknown.
+      while (!done && !over() && pendingCount + waiting.length > 0 && Date.now() < until) {
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
       client.destroy();
@@ -688,9 +708,7 @@ export function createBridgeClient(
       }
       // What came meanwhile, in order (the connection's end among it, when
       // the window's share was the last); the owner held the rest.
-      const held = pausedBatches;
-      pausedBatches = [];
-      for (const b of held) batch(b.s, b.items);
+      takeBatches();
       share();
       refresh();
     },

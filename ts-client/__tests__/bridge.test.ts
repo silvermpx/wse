@@ -309,6 +309,91 @@ describe('a window, its owner’s frames given by hand', () => {
     }
   });
 
+  /**
+   * A window over a channel that hands each frame on as it is posted, its
+   * owner played by `answer`: what the owner posts back reaches the window
+   * at once, in the middle of what the window is doing.
+   */
+  function overSyncChannel(answer: (f: WindowFrame, feed: (f: unknown) => void) => void) {
+    let sink: { frame(f: unknown): void; close(): void } | undefined;
+    const feed = (f: unknown) => sink!.frame(f);
+    const client = createBridgeClient({
+      listen: (s) => {
+        sink = s as never;
+      },
+      post: (f) => answer(f, feed),
+      close: () => {},
+    });
+    windows.push(client);
+    feed({ k: 'welcome', v: 1, att: 1, limits: {}, realm: 'test', account: { epoch: 0, user: 'ann' }, conn, gen: 1 });
+    return { client, feed };
+  }
+
+  const note = (n: number) => ({ m: { t: 'note', p: { n } } });
+
+  /** An owner that signs every window out the moment one asks. */
+  const signsOutAtOnce = (f: WindowFrame, feed: (f: unknown) => void) => {
+    if (f.k === 'signOut') feed({ k: 'revoked', reason: 'signed_out' });
+  };
+
+  it('says what the server confirmed later in the batch, signed out by a listener over a channel that answers at once', () => {
+    const { client, feed } = overSyncChannel(signsOutAtOnce);
+    const said = outcomesOf(client);
+    const notes: number[] = [];
+    client.onMessage('note', (m) => {
+      notes.push((m.p as { n: number }).n);
+      if (notes.length === 1) client.signOut();
+    });
+    expect(client.send('order', { n: 1 }, { id: 'confirmed' })).toBe('queued');
+    feed({ k: 'b', s: 1, items: [note(1), confirmed, note(2)] });
+    expect(said).toEqual([['delivered', { ids: ['confirmed'] }]]);
+    expect(notes).toEqual([1]);
+    expect(client.kept()).toBe(0);
+  });
+
+  it('says what the server confirmed in a batch it held paused, signed out by a listener as it resumes', () => {
+    const { client, feed } = overSyncChannel(signsOutAtOnce);
+    const said = outcomesOf(client);
+    const notes: number[] = [];
+    client.onMessage('note', (m) => {
+      notes.push((m.p as { n: number }).n);
+      if (notes.length === 1) client.signOut();
+    });
+    expect(client.send('order', { n: 1 }, { id: 'confirmed' })).toBe('queued');
+    client.pause('hidden');
+    feed({ k: 'b', s: 1, items: [note(1)] });
+    feed({ k: 'b', s: 2, items: [confirmed] });
+    feed({ k: 'b', s: 3, items: [note(2)] });
+    client.resume('hidden');
+    expect(said).toEqual([['delivered', { ids: ['confirmed'] }]]);
+    expect(notes).toEqual([1]);
+  });
+
+  it('takes a batch that comes while it takes the one before, after it, in order', () => {
+    // The owner answers a subscription with a batch at once, before the
+    // window acknowledged the batch it is taking.
+    const { client, feed } = overSyncChannel((f, feedBack) => {
+      if (f.k === 'hold') feedBack({ k: 'b', s: 2, items: [note(2)] });
+    });
+    const notes: number[] = [];
+    client.onMessage('note', (m) => {
+      notes.push((m.p as { n: number }).n);
+      if (notes.length === 1) client.subscribe(['more']);
+    });
+    feed({ k: 'b', s: 1, items: [note(1), note(3)] });
+    expect(notes).toEqual([1, 3, 2]);
+    expect(client.bridge.phase).toBe('attached');
+  });
+
+  it('closes at once once its owner is gone, whatever it still waits to hear of', async () => {
+    const { client, gone } = byHand();
+    expect(client.send('order', { n: 1 }, { id: 'unknown' })).toBe('queued');
+    gone();
+    const started = Date.now();
+    await client.close(1_000);
+    expect(Date.now() - started).toBeLessThan(200);
+  });
+
   it('says nothing of a send its owner went without telling of, signed out after', () => {
     const { client, gone } = byHand();
     const said = outcomesOf(client);

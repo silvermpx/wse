@@ -224,7 +224,13 @@ server every client is checked against.
   `wseDelivered` as well: what the server answered is said first, once.
   Signed out after its owner went without saying, it says nothing of the
   send, where it said `cleared`; a window its owner refused hears that its
-  sends never went (`closed`).
+  sends never went (`closed`). Over a channel that hands a frame on as it is
+  posted, a window signed out from a listener in the middle of a batch, or
+  as it resumes, says what the server answered of its sends in the rest of
+  that batch and in the batches it held before `cleared`, where it said only
+  `cleared`; a batch that comes while it takes the one before waits its
+  turn, where the window stopped. `close()` of a window its owner let go
+  ends at once, where it waited out its deadline.
 - Outbox: a message whose bytes were held up on a connection the client
   left is no longer taken once the client is back on another and was told
   the server had not taken it. The connection whose hello came last holds
