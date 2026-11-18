@@ -29,13 +29,13 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let msgpack_size = payload_msgpack.len();
     let compressed_size = payload_compressed.len();
 
-    println!("  Payload sizes:");
-    println!("    JSON:       {} bytes", json_size);
-    println!(
+    say!("  Payload sizes:");
+    say!("    JSON:       {} bytes", json_size);
+    say!(
         "    MsgPack:    {} bytes (M: prefix + msgpack)",
         msgpack_size
     );
-    println!(
+    say!(
         "    Compressed: {} bytes (C: prefix + zlib)",
         compressed_size
     );
@@ -43,7 +43,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut all_results = Vec::new();
 
     for &n in &tiers {
-        println!("\n  === {} connections ===", n);
+        say!("\n  === {} connections ===", n);
 
         // --- JSON ---
         let json_result = run_format(
@@ -89,14 +89,14 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             let j_rate = j.msg_per_sec();
             let m_rate = m.msg_per_sec();
             let c_rate = c.msg_per_sec();
-            println!("\n    Summary @ {} connections:", n);
-            println!("      JSON:       {} msg/s", stats::fmt_rate(j_rate));
-            println!(
+            say!("\n    Summary @ {} connections:", n);
+            say!("      JSON:       {} msg/s", stats::fmt_rate(j_rate));
+            say!(
                 "      MsgPack:    {} msg/s ({:+.1}%)",
                 stats::fmt_rate(m_rate),
                 (m_rate / j_rate - 1.0) * 100.0
             );
-            println!(
+            say!(
                 "      Compressed: {} msg/s ({:+.1}%)",
                 stats::fmt_rate(c_rate),
                 (c_rate / j_rate - 1.0) * 100.0

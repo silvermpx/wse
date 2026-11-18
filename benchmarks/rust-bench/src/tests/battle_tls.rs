@@ -55,10 +55,12 @@ impl CheckResult {
     fn check(&mut self, name: &str, condition: bool) {
         if condition {
             self.passed += 1;
-            println!("    [PASS] {}", name);
+            say!("    [PASS] {}", name);
         } else {
             self.failed += 1;
-            println!("    [FAIL] {}", name);
+            // Said in the run's exit code, however the test ends.
+            crate::report::failed();
+            say!("    [FAIL] {}", name);
         }
     }
 }
@@ -94,7 +96,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut checks = CheckResult::new();
 
     // Verify connectivity to Server B
-    print!("  Checking Server B (:{})... ", port2);
+    say_on!("  Checking Server B (:{})... ", port2);
     match protocol::connect_and_handshake(
         &cli.host,
         port2,
@@ -106,7 +108,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => {
             protocol::close_all(vec![ws]).await;
-            println!("OK");
+            say!("OK");
         }
         Err(e) => {
             eprintln!("FAILED: {e}");
@@ -127,8 +129,8 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 1: Verify TLS cluster health (query Server B -- not flooded)
     // =========================================================================
-    println!("\n  Phase 1: Verify TLS cluster health (Server B)");
-    println!("    (Server A health skipped -- publisher floods 500K/s to all connections)");
+    say!("\n  Phase 1: Verify TLS cluster health (Server B)");
+    say!("    (Server A health skipped -- publisher floods 500K/s to all connections)");
 
     let mut ws_health = match protocol::connect_and_handshake(
         &cli.host,
@@ -164,7 +166,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             unknown == 0,
         );
     } else {
-        println!("    WARNING: No health response from Server B");
+        say!("    WARNING: No health response from Server B");
         checks.check("TLS cluster connected (Server B)", false);
         checks.check("No unknown message types over TLS", false);
     }
@@ -174,9 +176,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 2: Connect clients to Server B and subscribe
     // =========================================================================
-    println!(
+    say!(
         "\n  Phase 2: Connect {} clients to Server B (:{})",
-        BATTLE_CLIENTS, port2
+        BATTLE_CLIENTS,
+        port2
     );
 
     let mut connections = protocol::connect_batch(
@@ -199,7 +202,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
 
     if connections.len() < BATTLE_CLIENTS / 2 {
-        println!(
+        say!(
             "    ABORT: too few connections ({}/{})",
             connections.len(),
             BATTLE_CLIENTS
@@ -214,7 +217,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 3: Subscribe to topics on Server B
     // =========================================================================
-    println!("\n  Phase 3: Subscribe to topics on Server B");
+    say!("\n  Phase 3: Subscribe to topics on Server B");
 
     // All subscribe to "battle_all"
     for ws in connections.iter_mut() {
@@ -224,7 +227,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         });
         let _ = ws.send(Message::Text(cmd.to_string().into())).await;
     }
-    println!("    All {} subscribed to 'battle_all'", actual);
+    say!("    All {} subscribed to 'battle_all'", actual);
 
     // First half also subscribes to "battle_half" + "battle.*"
     for ws in connections[..half].iter_mut() {
@@ -234,13 +237,13 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         });
         let _ = ws.send(Message::Text(cmd.to_string().into())).await;
     }
-    println!(
+    say!(
         "    First {} also subscribed to 'battle_half' + 'battle.*'",
         half
     );
 
     // Settle
-    println!(
+    say!(
         "    Waiting {}ms for cluster subscription propagation...",
         SUBSCRIBE_SETTLE_MS
     );
@@ -252,7 +255,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 4: Receive and measure
     // =========================================================================
-    println!(
+    say!(
         "\n  Phase 4: Receive for {}s over TLS cluster",
         duration.as_secs()
     );
@@ -291,7 +294,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 5: Verify cross-instance delivery over TLS
     // =========================================================================
-    println!("\n  Phase 5: Verify cross-instance delivery over TLS");
+    say!("\n  Phase 5: Verify cross-instance delivery over TLS");
 
     let g1_all = g1_counts.all.load(Ordering::Relaxed);
     let g1_ball = g1_counts.battle_all.load(Ordering::Relaxed);
@@ -303,11 +306,15 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let g2_bhalf = g2_counts.battle_half.load(Ordering::Relaxed);
     let g2_bglob = g2_counts.battle_glob.load(Ordering::Relaxed);
 
-    println!(
+    say!(
         "    Group 1 ({} clients, all topics): all={}, battle_all={}, battle_half={}, glob={}",
-        half, g1_all, g1_ball, g1_bhalf, g1_bglob
+        half,
+        g1_all,
+        g1_ball,
+        g1_bhalf,
+        g1_bglob
     );
-    println!(
+    say!(
         "    Group 2 ({} clients, battle_all only): all={}, battle_all={}, battle_half={}, glob={}",
         actual - half,
         g2_all,
@@ -334,12 +341,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let total_bytes = g1_counts.total_bytes.load(Ordering::Relaxed)
         + g2_counts.total_bytes.load(Ordering::Relaxed);
     let del_per_sec = total as f64 / duration.as_secs_f64();
-    println!(
+    say!(
         "\n    Total deliveries: {} ({}/s)",
         total,
         stats::fmt_rate(del_per_sec)
     );
-    println!(
+    say!(
         "    Bandwidth: {}",
         stats::fmt_bytes_per_sec(total_bytes as f64 / duration.as_secs_f64())
     );
@@ -351,16 +358,16 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Summary
     // =========================================================================
-    println!(
+    say!(
         "\n  Result: {}/{} checks passed",
         checks.passed,
         checks.passed + checks.failed
     );
     if checks.failed > 0 {
-        println!("  FAILED");
+        say!("  FAILED");
         crate::report::failed();
     } else {
-        println!("  PASSED");
+        say!("  PASSED");
     }
 
     Vec::new()

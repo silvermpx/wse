@@ -25,10 +25,12 @@ impl CheckResult {
     fn check(&mut self, name: &str, condition: bool) {
         if condition {
             self.passed += 1;
-            println!("    [PASS] {}", name);
+            say!("    [PASS] {}", name);
         } else {
             self.failed += 1;
-            println!("    [FAIL] {}", name);
+            // Said in the run's exit code, however the test ends.
+            crate::report::failed();
+            say!("    [FAIL] {}", name);
         }
     }
 }
@@ -102,7 +104,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 1: Connect clients with DIFFERENT user IDs
     // =========================================================================
-    println!(
+    say!(
         "\n  Phase 1: Connect {} clients (different users)",
         PRESENCE_CLIENTS
     );
@@ -122,7 +124,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         {
             Ok(ws) => clients.push(ws),
             Err(e) => {
-                println!("    [FAIL] Failed to connect client {}: {}", i, e);
+                say!("    [FAIL] Failed to connect client {}: {}", i, e);
                 checks.check("All clients connected", false);
                 protocol::close_all(clients).await;
                 return Vec::new();
@@ -137,7 +139,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 2: Subscribe first 3 clients with presence data
     // =========================================================================
-    println!(
+    say!(
         "\n  Phase 2: Subscribe 3 clients to '{}' with presence",
         PRESENCE_TOPIC
     );
@@ -163,7 +165,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 3: Verify presence_join events
     // =========================================================================
-    println!("\n  Phase 3: Verify presence_join events");
+    say!("\n  Phase 3: Verify presence_join events");
 
     // Use hard deadline (3s) - battle server may be flooding, so per-message
     // timeout won't work. Drain all messages within deadline looking for joins.
@@ -186,7 +188,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 4: Query presence via battle_cmd
     // =========================================================================
-    println!("\n  Phase 4: Query presence members");
+    say!("\n  Phase 4: Query presence members");
 
     let query_msg = serde_json::json!({
         "t": "battle_cmd",
@@ -202,7 +204,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
     let mut query_members = 0usize;
     if let Some(parsed) = drain_for_type_with_data(&mut clients[0], "presence_result", 3000).await {
-        println!(
+        say!(
             "    presence_result payload: {}",
             serde_json::to_string(&parsed).unwrap_or_default()
         );
@@ -218,10 +220,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             .and_then(|m| m.as_array())
         {
             query_members = members.len();
-            println!("    NOTE: members is array, not object");
+            say!("    NOTE: members is array, not object");
         }
     } else {
-        println!("    WARNING: No presence_result response received");
+        say!("    WARNING: No presence_result response received");
     }
     checks.check(
         &format!("Presence query shows 3 members (got {})", query_members),
@@ -231,7 +233,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 5: Disconnect client 2, verify presence_leave
     // =========================================================================
-    println!("\n  Phase 5: Disconnect client 2, verify presence_leave");
+    say!("\n  Phase 5: Disconnect client 2, verify presence_leave");
 
     let _ = clients[2].close(None).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -245,7 +247,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 6: Update presence data for client 1
     // =========================================================================
-    println!("\n  Phase 6: Update presence data for client 1");
+    say!("\n  Phase 6: Update presence data for client 1");
 
     let update_msg = serde_json::json!({
         "t": "battle_cmd",
@@ -269,23 +271,23 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 7: Clean up
     // =========================================================================
-    println!("\n  Phase 7: Clean up");
+    say!("\n  Phase 7: Clean up");
 
     for client in &mut clients {
         let _ = client.close(None).await;
     }
-    println!("    All clients disconnected");
+    say!("    All clients disconnected");
 
     // =========================================================================
     // Summary
     // =========================================================================
     let total = checks.passed + checks.failed;
-    println!("\n  Result: {}/{} checks passed", checks.passed, total);
+    say!("\n  Result: {}/{} checks passed", checks.passed, total);
     if checks.failed > 0 {
-        println!("  FAILED");
+        say!("  FAILED");
         crate::report::failed();
     } else {
-        println!("  PASSED");
+        say!("  PASSED");
     }
 
     Vec::new()

@@ -22,10 +22,12 @@ impl CheckResult {
     fn check(&mut self, name: &str, condition: bool) {
         if condition {
             self.passed += 1;
-            println!("    [PASS] {}", name);
+            say!("    [PASS] {}", name);
         } else {
             self.failed += 1;
-            println!("    [FAIL] {}", name);
+            // Said in the run's exit code, however the test ends.
+            crate::report::failed();
+            say!("    [FAIL] {}", name);
         }
     }
 }
@@ -80,7 +82,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 1: Connect to Server B (subscriber side)
     // =========================================================================
-    println!("\n  Phase 1: Connect to Server B (:{})", port2);
+    say!("\n  Phase 1: Connect to Server B (:{})", port2);
 
     let mut ws_b = match protocol::connect_and_handshake(
         &cli.host,
@@ -97,7 +99,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             return Vec::new();
         }
     };
-    println!("    Connected to Server B (:{})", port2);
+    say!("    Connected to Server B (:{})", port2);
 
     // Wait for cluster to settle
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -105,7 +107,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 2: Query health for basic cluster status
     // =========================================================================
-    println!("\n  Phase 2: Query health snapshot");
+    say!("\n  Phase 2: Query health snapshot");
 
     let health = query_health(&mut ws_b, 5).await;
     if let Some(ref h) = health {
@@ -124,7 +126,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             peer_count >= 1,
         );
     } else {
-        println!("    WARNING: No health response from Server B");
+        say!("    WARNING: No health response from Server B");
         checks.check("cluster_connected == true", false);
         checks.check("cluster_peer_count >= 1", false);
     }
@@ -132,7 +134,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 3: Query cluster_info for peer details
     // =========================================================================
-    println!("\n  Phase 3: Query cluster_info");
+    say!("\n  Phase 3: Query cluster_info");
 
     let info_cmd = serde_json::json!({
         "t": "battle_cmd",
@@ -151,7 +153,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             .and_then(|p| p.as_array());
 
         if let Some(peers) = peers {
-            println!("    cluster_info returned {} peers", peers.len());
+            say!("    cluster_info returned {} peers", peers.len());
 
             checks.check(
                 &format!("cluster_info has >= 1 peer (got {})", peers.len()),
@@ -159,7 +161,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             );
 
             if let Some(first_peer) = peers.first() {
-                println!(
+                say!(
                     "    Peer details: {}",
                     serde_json::to_string_pretty(first_peer).unwrap_or_default()
                 );
@@ -190,23 +192,23 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             checks.check("cluster_info returned peer array", false);
         }
     } else {
-        println!("    WARNING: No cluster_info response");
+        say!("    WARNING: No cluster_info response");
         checks.check("cluster_info response received", false);
     }
 
     // =========================================================================
     // Clean up
     // =========================================================================
-    println!("\n  Clean up");
+    say!("\n  Clean up");
     protocol::close_all(vec![ws_b]).await;
 
     let total = checks.passed + checks.failed;
-    println!("\n  Result: {}/{} checks passed", checks.passed, total);
+    say!("\n  Result: {}/{} checks passed", checks.passed, total);
     if checks.failed > 0 {
-        println!("  FAILED");
+        say!("  FAILED");
         crate::report::failed();
     } else {
-        println!("  PASSED");
+        say!("  PASSED");
     }
 
     Vec::new()

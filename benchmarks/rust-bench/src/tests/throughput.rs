@@ -25,7 +25,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut results = Vec::new();
 
     for &n in &tiers {
-        println!("\n  --- {} connections ---", n);
+        say!("\n  --- {} connections ---", n);
 
         let connections = protocol::connect_batch(
             &cli.host,
@@ -38,7 +38,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .await;
 
         if connections.is_empty() {
-            println!("    FAILED: no connections");
+            say!("    FAILED: no connections");
             crate::report::failed();
             continue;
         }
@@ -77,17 +77,17 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         let mb_per_sec = bytes as f64 / elapsed / 1_000_000.0;
         let per_conn = msg_per_sec / actual as f64;
 
-        println!("    Duration: {:.2}s", elapsed);
-        println!(
+        say!("    Duration: {:.2}s", elapsed);
+        say!(
             "    Messages: {} ({}/s)",
             stats::fmt_num(sent),
             stats::fmt_rate(msg_per_sec)
         );
-        println!(
+        say!(
             "    Bandwidth: {}",
             stats::fmt_bytes_per_sec(bytes as f64 / elapsed)
         );
-        println!("    Per-connection: {:.0} msg/s", per_conn);
+        say!("    Per-connection: {:.0} msg/s", per_conn);
 
         results.push(TierResult {
             tier: n,
@@ -106,7 +106,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         });
 
         protocol::close_all(ws_list).await;
-        println!();
+        say!();
     }
 
     report::print_throughput_table(&results);

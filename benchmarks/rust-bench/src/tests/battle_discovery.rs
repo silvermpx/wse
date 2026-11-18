@@ -24,10 +24,12 @@ impl CheckResult {
     fn check(&mut self, name: &str, condition: bool) {
         if condition {
             self.passed += 1;
-            println!("    [PASS] {}", name);
+            say!("    [PASS] {}", name);
         } else {
             self.failed += 1;
-            println!("    [FAIL] {}", name);
+            // Said in the run's exit code, however the test ends.
+            crate::report::failed();
+            say!("    [FAIL] {}", name);
         }
     }
 }
@@ -77,8 +79,8 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 1: Connect to Server C (subscriber side -- not flooded)
     // =========================================================================
-    println!("\n  Phase 1: Connect to Server C (:{})", port3);
-    println!("    (Server A/B health skipped -- publishers flood 500K/s to all connections)");
+    say!("\n  Phase 1: Connect to Server C (:{})", port3);
+    say!("    (Server A/B health skipped -- publishers flood 500K/s to all connections)");
 
     let mut ws_c = match protocol::connect_and_handshake(
         &cli.host,
@@ -105,15 +107,15 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             return Vec::new();
         }
     };
-    println!("    Connected to Server C (:{})", port3);
+    say!("    Connected to Server C (:{})", port3);
 
     // =========================================================================
     // Phase 2: Wait for gossip propagation and verify on Server C
     // =========================================================================
-    println!("\n  Phase 2: Wait for gossip propagation (10s)");
+    say!("\n  Phase 2: Wait for gossip propagation (10s)");
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    println!("    Querying health on Server C...");
+    say!("    Querying health on Server C...");
     let health_c = query_health(&mut ws_c, 5).await;
 
     if let Some(ref h) = health_c {
@@ -130,9 +132,11 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             .and_then(|v| v.as_u64())
             .unwrap_or(u64::MAX);
 
-        println!(
+        say!(
             "    Server C: peer_count={}, connected={}, unknown_types={}",
-            peers, connected, unknown
+            peers,
+            connected,
+            unknown
         );
 
         checks.check(
@@ -151,7 +155,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             unknown == 0,
         );
     } else {
-        println!("    Server C: NO HEALTH RESPONSE");
+        say!("    Server C: NO HEALTH RESPONSE");
         checks.check("Server C cluster_peer_count >= 2", false);
         checks.check("Server C cluster_connected == true", false);
         checks.check("Server C cluster_unknown_message_types == 0", false);
@@ -160,7 +164,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 3: Verify message delivery A -> C (full mesh)
     // =========================================================================
-    println!("\n  Phase 3: Verify A -> C message delivery via gossip mesh");
+    say!("\n  Phase 3: Verify A -> C message delivery via gossip mesh");
 
     // Subscribe ws_c to battle_all to receive messages from A's publish loop.
     // A publishes to battle_all in round-robin. With gossip discovery, A should
@@ -171,10 +175,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         "p": {"action": "subscribe", "topics": ["battle_all"]}
     });
     let _ = ws_c.send(Message::Text(cmd.to_string().into())).await;
-    println!("    Subscribed to 'battle_all'");
+    say!("    Subscribed to 'battle_all'");
 
     // Wait for RESYNC propagation through the gossip mesh
-    println!("    Waiting 5s for RESYNC propagation...");
+    say!("    Waiting 5s for RESYNC propagation...");
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Receive on ws_c for 5 seconds
@@ -217,7 +221,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 4: Verify delivery metrics on Server C
     // =========================================================================
-    println!("\n  Phase 4: Verify delivery metrics on Server C");
+    say!("\n  Phase 4: Verify delivery metrics on Server C");
 
     let health_post = query_health(&mut ws_c, 5).await;
     if let Some(ref h) = health_post {
@@ -242,16 +246,16 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Summary
     // =========================================================================
-    println!(
+    say!(
         "\n  Result: {}/{} checks passed",
         checks.passed,
         checks.passed + checks.failed
     );
     if checks.failed > 0 {
-        println!("  FAILED");
+        say!("  FAILED");
         crate::report::failed();
     } else {
-        println!("  PASSED");
+        say!("  PASSED");
     }
 
     Vec::new()

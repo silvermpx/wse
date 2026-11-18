@@ -19,7 +19,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut results = Vec::new();
 
     // Phase 1: Exponential probe — double until failure
-    println!("\n  Phase 1: Exponential probe (doubling)");
+    say!("\n  Phase 1: Exponential probe (doubling)");
     let mut current = 1_000;
     let mut last_success = 0;
     let mut first_failure = max;
@@ -29,15 +29,17 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         let error_rate = errors as f64 / current as f64;
 
         if ok && error_rate < 0.05 {
-            println!(
+            say!(
                 "    {} conns: OK ({} errors, {:.0} conn/s)",
-                current, errors, rate
+                current,
+                errors,
+                rate
             );
             last_success = current;
             results.push(make_result(current, current - errors, errors, rate));
             current *= 2;
         } else {
-            println!(
+            say!(
                 "    {} conns: FAIL ({} errors = {:.1}%)",
                 current,
                 errors,
@@ -50,19 +52,20 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     }
 
     if last_success == 0 {
-        println!("\n    Could not establish even 1000 connections.");
+        say!("\n    Could not establish even 1000 connections.");
         return results;
     }
 
     if first_failure == max && last_success >= max / 2 {
-        println!("\n    All probes succeeded up to max ({}).", max);
+        say!("\n    All probes succeeded up to max ({}).", max);
         return results;
     }
 
     // Phase 2: Binary search between last_success and first_failure
-    println!(
+    say!(
         "\n  Phase 2: Binary search [{} - {}]",
-        last_success, first_failure
+        last_success,
+        first_failure
     );
     let mut lo = last_success;
     let mut hi = first_failure;
@@ -79,14 +82,16 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         let error_rate = errors as f64 / mid as f64;
 
         if ok && error_rate < 0.05 {
-            println!(
+            say!(
                 "    {} conns: OK ({} errors, {:.0} conn/s)",
-                mid, errors, rate
+                mid,
+                errors,
+                rate
             );
             lo = mid;
             results.push(make_result(mid, mid - errors, errors, rate));
         } else {
-            println!(
+            say!(
                 "    {} conns: FAIL ({} errors = {:.1}%)",
                 mid,
                 errors,
@@ -100,9 +105,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 
-    println!(
+    say!(
         "\n  Result: Max stable connections = ~{} (error boundary at {})",
-        lo, hi
+        lo,
+        hi
     );
 
     results

@@ -24,10 +24,12 @@ impl CheckResult {
     fn check(&mut self, name: &str, condition: bool) {
         if condition {
             self.passed += 1;
-            println!("    [PASS] {}", name);
+            say!("    [PASS] {}", name);
         } else {
             self.failed += 1;
-            println!("    [FAIL] {}", name);
+            // Said in the run's exit code, however the test ends.
+            crate::report::failed();
+            say!("    [FAIL] {}", name);
         }
     }
 }
@@ -62,7 +64,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 1: Connect to Server B (subscriber side -- not flooded)
     // =========================================================================
-    println!("\n  Phase 1: Connect to Server B (:{})", port2);
+    say!("\n  Phase 1: Connect to Server B (:{})", port2);
 
     let mut ws_b = match protocol::connect_and_handshake(
         &cli.host,
@@ -79,20 +81,20 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             return Vec::new();
         }
     };
-    println!("    Connected to Server B (:{})", port2);
+    say!("    Connected to Server B (:{})", port2);
 
     // =========================================================================
     // Phase 2: Query cluster health on Server B
     // =========================================================================
-    println!("\n  Phase 2: Query cluster health (Server B)");
-    println!("    (Server A health skipped -- publisher floods 500K/s to all connections)");
+    say!("\n  Phase 2: Query cluster health (Server B)");
+    say!("    (Server A health skipped -- publisher floods 500K/s to all connections)");
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let health_b = query_health(&mut ws_b, 5).await;
 
     if let Some(ref h) = health_b {
-        println!(
+        say!(
             "    Server B health: {}",
             serde_json::to_string_pretty(h).unwrap_or_default()
         );
@@ -131,7 +133,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             bytes_received > 0,
         );
     } else {
-        println!("    WARNING: No health response from Server B");
+        say!("    WARNING: No health response from Server B");
         checks.check("cluster_connected == true", false);
         checks.check("cluster_peer_count >= 1", false);
         checks.check("cluster_unknown_message_types == 0", false);
@@ -141,7 +143,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 3: Verify topic routing works (proves CAP_INTEREST_ROUTING)
     // =========================================================================
-    println!("\n  Phase 3: Verify topic routing (CAP_INTEREST_ROUTING)");
+    say!("\n  Phase 3: Verify topic routing (CAP_INTEREST_ROUTING)");
 
     // Subscribe ws_b to "battle_all" -- a topic the server actually publishes to
     let cmd = serde_json::json!({
@@ -149,10 +151,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         "p": {"action": "subscribe", "topics": ["battle_all"]}
     });
     let _ = ws_b.send(Message::Text(cmd.to_string().into())).await;
-    println!("    Subscribed to 'battle_all'");
+    say!("    Subscribed to 'battle_all'");
 
     // Wait for subscription to propagate via RESYNC
-    println!("    Waiting 3s for RESYNC propagation...");
+    say!("    Waiting 3s for RESYNC propagation...");
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Receive messages for 5s -- Server A publishes "battle_all" in its round-robin.
@@ -196,7 +198,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 4: Verify cluster metrics after traffic
     // =========================================================================
-    println!("\n  Phase 4: Verify cluster delivery metrics");
+    say!("\n  Phase 4: Verify cluster delivery metrics");
 
     let health_post = query_health(&mut ws_b, 5).await;
     if let Some(ref h) = health_post {
@@ -221,16 +223,16 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Summary
     // =========================================================================
-    println!(
+    say!(
         "\n  Result: {}/{} checks passed",
         checks.passed,
         checks.passed + checks.failed
     );
     if checks.failed > 0 {
-        println!("  FAILED");
+        say!("  FAILED");
         crate::report::failed();
     } else {
-        println!("  PASSED");
+        say!("  PASSED");
     }
 
     Vec::new()

@@ -24,10 +24,12 @@ impl CheckResult {
     fn check(&mut self, name: &str, condition: bool) {
         if condition {
             self.passed += 1;
-            println!("    [PASS] {}", name);
+            say!("    [PASS] {}", name);
         } else {
             self.failed += 1;
-            println!("    [FAIL] {}", name);
+            // Said in the run's exit code, however the test ends.
+            crate::report::failed();
+            say!("    [FAIL] {}", name);
         }
     }
 }
@@ -66,7 +68,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 1: Connect health + subscriber connections to Server B
     // =========================================================================
-    println!(
+    say!(
         "\n  Phase 1: Connect to Server B (:{}) and verify cluster",
         port2
     );
@@ -106,7 +108,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             return Vec::new();
         }
     };
-    println!("    Connected 2 connections to Server B (:{})", port2);
+    say!("    Connected 2 connections to Server B (:{})", port2);
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -126,7 +128,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             unknown == 0,
         );
     } else {
-        println!("    WARNING: No health response from Server B");
+        say!("    WARNING: No health response from Server B");
         checks.check("Cluster connected (Server B)", false);
         checks.check("No unknown message types", false);
     }
@@ -134,7 +136,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 2: Subscribe and start counting messages
     // =========================================================================
-    println!("\n  Phase 2: Subscribe and start counting messages");
+    say!("\n  Phase 2: Subscribe and start counting messages");
 
     // Subscribe the subscriber connection (triggers RESYNC to Server A)
     let cmd = serde_json::json!({
@@ -142,10 +144,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         "p": {"action": "subscribe", "topics": ["battle_all"]}
     });
     let _ = ws_sub.send(Message::Text(cmd.to_string().into())).await;
-    println!("    Subscribed to battle_all (subscriber conn)");
+    say!("    Subscribed to battle_all (subscriber conn)");
 
     // Wait for RESYNC propagation
-    println!("    Waiting 3s for RESYNC propagation...");
+    say!("    Waiting 3s for RESYNC propagation...");
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Record initial bytes_received via health connection
@@ -154,12 +156,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .as_ref()
         .and_then(|h| h.get("cluster_bytes_received").and_then(|v| v.as_u64()))
         .unwrap_or(0);
-    println!("    Initial cluster_bytes_received: {}", initial_bytes);
+    say!("    Initial cluster_bytes_received: {}", initial_bytes);
 
     // =========================================================================
     // Phase 3: Count messages on subscriber for duration
     // =========================================================================
-    println!("\n  Phase 3: Count messages for {}s", duration.as_secs());
+    say!("\n  Phase 3: Count messages for {}s", duration.as_secs());
 
     let msg_count = Arc::new(AtomicU64::new(0));
     let counter = msg_count.clone();
@@ -187,12 +189,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // Wait for the counting task to finish
     let ws_sub = count_handle.await.unwrap();
     let received = msg_count.load(Ordering::Relaxed);
-    println!("    Subscriber received {} messages", received);
+    say!("    Subscriber received {} messages", received);
 
     // =========================================================================
     // Phase 4: Verify compression via metrics
     // =========================================================================
-    println!("\n  Phase 4: Verify compression ratio");
+    say!("\n  Phase 4: Verify compression ratio");
 
     let final_health = query_health(&mut ws_health, 5).await;
     let final_bytes = final_health
@@ -222,13 +224,15 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // Total messages = delivered + dropped (all messages that arrived via cluster wire)
     let total_msgs = delivered_delta + dropped_delta + received;
 
-    println!("    Final cluster_bytes_received: {}", final_bytes);
-    println!("    Delta bytes: {}", bytes_delta);
-    println!(
+    say!("    Final cluster_bytes_received: {}", final_bytes);
+    say!("    Delta bytes: {}", bytes_delta);
+    say!(
         "    Cluster delivered_delta={}, dropped_delta={}, subscriber_received={}",
-        delivered_delta, dropped_delta, received
+        delivered_delta,
+        dropped_delta,
+        received
     );
-    println!("    Total messages estimate: {}", total_msgs);
+    say!("    Total messages estimate: {}", total_msgs);
 
     // Check 1: Cluster bytes are flowing
     checks.check(
@@ -259,9 +263,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // 500K/s * 1024 bytes = 500 MB/s uncompressed.
     let estimated_uncompressed_mbps =
         (received as f64 / duration.as_secs() as f64) * 1024.0 / (1024.0 * 1024.0) * 10.0; // ~10x drop factor
-    println!(
+    say!(
         "    Wire throughput: {:.1} MB/s (estimated uncompressed: {:.0} MB/s)",
-        mb_per_sec, estimated_uncompressed_mbps
+        mb_per_sec,
+        estimated_uncompressed_mbps
     );
     // Wire throughput should be less than estimated uncompressed throughput
     // if compression is working. Use a generous threshold.
@@ -279,16 +284,16 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Summary
     // =========================================================================
-    println!(
+    say!(
         "\n  Result: {}/{} checks passed",
         checks.passed,
         checks.passed + checks.failed
     );
     if checks.failed > 0 {
-        println!("  FAILED");
+        say!("  FAILED");
         crate::report::failed();
     } else {
-        println!("  PASSED");
+        say!("  PASSED");
     }
 
     Vec::new()

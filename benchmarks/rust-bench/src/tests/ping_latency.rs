@@ -23,7 +23,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut results = Vec::new();
 
     for &n in &tiers {
-        println!("\n  --- {} concurrent connections ---", n);
+        say!("\n  --- {} concurrent connections ---", n);
 
         let connections = protocol::connect_batch(
             &cli.host,
@@ -36,7 +36,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .await;
 
         if connections.is_empty() {
-            println!("    FAILED: no connections");
+            say!("    FAILED: no connections");
             crate::report::failed();
             continue;
         }
@@ -59,7 +59,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             ws_list.push(ws);
         }
 
-        println!("    Total pings: {}", merged.len());
+        say!("    Total pings: {}", merged.len());
         merged.print_summary("    ");
 
         results.push(TierResult {
@@ -75,7 +75,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         });
 
         protocol::close_all(ws_list).await;
-        println!();
+        say!();
     }
 
     results

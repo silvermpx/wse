@@ -33,10 +33,12 @@ impl CheckResult {
     fn check(&mut self, name: &str, condition: bool) {
         if condition {
             self.passed += 1;
-            println!("    [PASS] {}", name);
+            say!("    [PASS] {}", name);
         } else {
             self.failed += 1;
-            println!("    [FAIL] {}", name);
+            // Said in the run's exit code, however the test ends.
+            crate::report::failed();
+            say!("    [FAIL] {}", name);
         }
     }
 }
@@ -193,7 +195,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Test 1: Key exchange handshake
     // =========================================================================
-    println!("\n  Test 1: ECDH key exchange handshake");
+    say!("\n  Test 1: ECDH key exchange handshake");
 
     let client_secret = EphemeralSecret::generate();
     let client_pubkey = PublicKey::from(&client_secret);
@@ -208,7 +210,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut ws = match connect_raw(&cli.host, cli.port, &token).await {
         Ok(ws) => ws,
         Err(e) => {
-            println!("    [FAIL] Could not connect: {}", e);
+            say!("    [FAIL] Could not connect: {}", e);
             return vec![];
         }
     };
@@ -263,12 +265,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let shared_secret = client_secret.diffie_hellman(&server_pubkey);
     let cipher = derive_cipher(shared_secret.raw_secret_bytes().as_slice());
 
-    println!("    Shared secret derived, AES-GCM-256 cipher ready");
+    say!("    Shared secret derived, AES-GCM-256 cipher ready");
 
     // =========================================================================
     // Test 2: Encrypted message round-trip
     // =========================================================================
-    println!("\n  Test 2: Encrypted message round-trip");
+    say!("\n  Test 2: Encrypted message round-trip");
 
     // Send an encrypted battle_cmd health query
     let health_cmd = r#"{"t":"battle_cmd","p":{"action":"health"}}"#;
@@ -292,7 +294,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Test 3: Unencrypted connection still works (opt-out)
     // =========================================================================
-    println!("\n  Test 3: Encryption opt-out (unencrypted connection)");
+    say!("\n  Test 3: Encryption opt-out (unencrypted connection)");
 
     let mut ws_plain = match protocol::connect_and_handshake(
         &cli.host,
@@ -305,7 +307,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => ws,
         Err(e) => {
-            println!("    [FAIL] Could not connect unencrypted: {}", e);
+            say!("    [FAIL] Could not connect unencrypted: {}", e);
             return vec![];
         }
     };
@@ -323,12 +325,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Test 4: Invalid encryption key rejection
     // =========================================================================
-    println!("\n  Test 4: Invalid encryption key rejection");
+    say!("\n  Test 4: Invalid encryption key rejection");
 
     let mut ws_bad = match connect_raw(&cli.host, cli.port, &token).await {
         Ok(ws) => ws,
         Err(e) => {
-            println!("    [FAIL] Could not connect: {}", e);
+            say!("    [FAIL] Could not connect: {}", e);
             return vec![];
         }
     };
@@ -379,7 +381,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Test 5: send_event encryption (server -> encrypted client)
     // =========================================================================
-    println!("\n  Test 5: send_event to encrypted connection");
+    say!("\n  Test 5: send_event to encrypted connection");
 
     // Connect with encryption again
     let client_secret2 = EphemeralSecret::generate();
@@ -389,7 +391,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut ws_enc = match connect_raw(&cli.host, cli.port, &token).await {
         Ok(ws) => ws,
         Err(e) => {
-            println!("    [FAIL] Could not connect: {}", e);
+            say!("    [FAIL] Could not connect: {}", e);
             return vec![];
         }
     };
@@ -455,12 +457,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Summary
     let total = checks.passed + checks.failed;
-    println!("\n  Result: {}/{} checks passed", checks.passed, total);
+    say!("\n  Result: {}/{} checks passed", checks.passed, total);
     if checks.failed > 0 {
-        println!("  FAILED");
+        say!("  FAILED");
         crate::report::failed();
     } else {
-        println!("  PASSED");
+        say!("  PASSED");
     }
 
     Vec::new()

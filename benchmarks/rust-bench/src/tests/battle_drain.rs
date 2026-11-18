@@ -24,10 +24,12 @@ impl CheckResult {
     fn check(&mut self, name: &str, condition: bool) {
         if condition {
             self.passed += 1;
-            println!("    [PASS] {}", name);
+            say!("    [PASS] {}", name);
         } else {
             self.failed += 1;
-            println!("    [FAIL] {}", name);
+            // Said in the run's exit code, however the test ends.
+            crate::report::failed();
+            say!("    [FAIL] {}", name);
         }
     }
 }
@@ -97,7 +99,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 1: Connect clients and subscribe
     // =========================================================================
-    println!("\n  Phase 1: Connect {} clients", CLIENT_COUNT);
+    say!("\n  Phase 1: Connect {} clients", CLIENT_COUNT);
 
     let mut clients: Vec<WsStream> = Vec::new();
     for i in 0..CLIENT_COUNT {
@@ -114,7 +116,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         {
             Ok(ws) => clients.push(ws),
             Err(e) => {
-                println!("    [FAIL] Failed to connect client {}: {}", i, e);
+                say!("    [FAIL] Failed to connect client {}: {}", i, e);
             }
         }
     }
@@ -139,7 +141,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 2: Verify server is handling messages
     // =========================================================================
-    println!("\n  Phase 2: Verify server accepts messages");
+    say!("\n  Phase 2: Verify server accepts messages");
 
     // Publish a few messages to confirm the server is alive
     let pub_cmd = serde_json::json!({
@@ -176,7 +178,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 3: Trigger drain via battle_cmd
     // =========================================================================
-    println!("\n  Phase 3: Trigger graceful drain (0.5s delay)");
+    say!("\n  Phase 3: Trigger graceful drain (0.5s delay)");
 
     let drain_cmd = serde_json::json!({
         "t": "battle_cmd",
@@ -196,7 +198,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 4: Wait for Close frames on all clients
     // =========================================================================
-    println!("\n  Phase 4: Wait for Close frames (10s deadline)");
+    say!("\n  Phase 4: Wait for Close frames (10s deadline)");
 
     let mut close_codes: Vec<Option<u16>> = Vec::new();
     let mut handles = Vec::new();
@@ -217,9 +219,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let received_close = close_codes.iter().filter(|c| c.is_some()).count();
     let correct_code = close_codes.iter().filter(|c| **c == Some(4300)).count();
 
-    println!(
+    say!(
         "    {}/{} received Close frame, {}/{} had code 4300",
-        received_close, CLIENT_COUNT, correct_code, CLIENT_COUNT
+        received_close,
+        CLIENT_COUNT,
+        correct_code,
+        CLIENT_COUNT
     );
 
     checks.check(
@@ -237,7 +242,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 5: Verify new connections are rejected
     // =========================================================================
-    println!("\n  Phase 5: Verify new connections rejected after drain");
+    say!("\n  Phase 5: Verify new connections rejected after drain");
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -267,16 +272,16 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Clean up
     // =========================================================================
-    println!("\n  Clean up");
+    say!("\n  Clean up");
     protocol::close_all(clients_back).await;
 
     let total = checks.passed + checks.failed;
-    println!("\n  Result: {}/{} checks passed", checks.passed, total);
+    say!("\n  Result: {}/{} checks passed", checks.passed, total);
     if checks.failed > 0 {
-        println!("  FAILED");
+        say!("  FAILED");
         crate::report::failed();
     } else {
-        println!("  PASSED");
+        say!("  PASSED");
     }
 
     Vec::new()

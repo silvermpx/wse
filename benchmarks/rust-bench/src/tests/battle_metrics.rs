@@ -22,10 +22,12 @@ impl CheckResult {
     fn check(&mut self, name: &str, condition: bool) {
         if condition {
             self.passed += 1;
-            println!("    [PASS] {}", name);
+            say!("    [PASS] {}", name);
         } else {
             self.failed += 1;
-            println!("    [FAIL] {}", name);
+            // Said in the run's exit code, however the test ends.
+            crate::report::failed();
+            say!("    [FAIL] {}", name);
         }
     }
 }
@@ -107,7 +109,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 1: Connect and subscribe
     // =========================================================================
-    println!("\n  Phase 1: Connect 3 clients and subscribe");
+    say!("\n  Phase 1: Connect 3 clients and subscribe");
 
     let mut clients: Vec<WsStream> = Vec::new();
     for i in 0..3 {
@@ -124,7 +126,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         {
             Ok(ws) => clients.push(ws),
             Err(e) => {
-                println!("    [FAIL] Failed to connect client {}: {}", i, e);
+                say!("    [FAIL] Failed to connect client {}: {}", i, e);
             }
         }
     }
@@ -152,7 +154,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 2: Publish controlled traffic to both topics
     // =========================================================================
-    println!("\n  Phase 2: Publish controlled traffic");
+    say!("\n  Phase 2: Publish controlled traffic");
 
     // Publish 500 messages to battle_all
     let pub_all = serde_json::json!({
@@ -184,7 +186,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .ok();
     let _ = drain_for_type(&mut clients[0], "publish_ack", 5000).await;
 
-    println!("    Published 500 to battle_all, 300 to battle_half");
+    say!("    Published 500 to battle_all, 300 to battle_half");
 
     // Drain the received messages so they don't interfere
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -205,7 +207,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 3: Query Prometheus metrics via battle_cmd
     // =========================================================================
-    println!("\n  Phase 3: Query Prometheus metrics");
+    say!("\n  Phase 3: Query Prometheus metrics");
 
     let metrics_cmd = serde_json::json!({
         "t": "battle_cmd",
@@ -227,17 +229,17 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
         if metrics_text.is_empty() {
             checks.check("Prometheus metrics returned data", false);
-            println!("    WARNING: Empty metrics response");
+            say!("    WARNING: Empty metrics response");
         } else {
             checks.check("Prometheus metrics returned data", true);
 
             let line_count = metrics_text.lines().count();
-            println!("    Metrics response: {} lines", line_count);
+            say!("    Metrics response: {} lines", line_count);
 
             // =========================================================================
             // Phase 4: Verify standard metrics
             // =========================================================================
-            println!("\n  Phase 4: Verify standard metrics");
+            say!("\n  Phase 4: Verify standard metrics");
 
             let connections = parse_prometheus_value(metrics_text, "wse_connections ");
             checks.check(
@@ -269,7 +271,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             // =========================================================================
             // Phase 5: Verify per-topic metrics
             // =========================================================================
-            println!("\n  Phase 5: Verify per-topic metrics");
+            say!("\n  Phase 5: Verify per-topic metrics");
 
             let battle_all_count =
                 parse_prometheus_labeled(metrics_text, "wse_topic_messages_total", "battle_all");
@@ -298,17 +300,17 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Clean up
     // =========================================================================
-    println!("\n  Clean up");
+    say!("\n  Clean up");
     protocol::close_all(clients).await;
-    println!("    All clients disconnected");
+    say!("    All clients disconnected");
 
     let total = checks.passed + checks.failed;
-    println!("\n  Result: {}/{} checks passed", checks.passed, total);
+    say!("\n  Result: {}/{} checks passed", checks.passed, total);
     if checks.failed > 0 {
-        println!("  FAILED");
+        say!("  FAILED");
         crate::report::failed();
     } else {
-        println!("  PASSED");
+        say!("  PASSED");
     }
 
     Vec::new()

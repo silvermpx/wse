@@ -33,7 +33,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // Verify connectivity to both servers
     let token = crate::jwt::generate_bench_token(cli.secret.as_bytes(), "bench-user");
 
-    print!("    Checking Server A (:{})... ", cli.port);
+    say_on!("    Checking Server A (:{})... ", cli.port);
     match protocol::connect_and_handshake(
         &cli.host,
         cli.port,
@@ -45,7 +45,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => {
             protocol::close_all(vec![ws]).await;
-            println!("OK");
+            say!("OK");
         }
         Err(e) => {
             eprintln!("FAILED: {e}");
@@ -54,7 +54,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         }
     }
 
-    print!("    Checking Server B (:{})... ", port2);
+    say_on!("    Checking Server B (:{})... ", port2);
     match protocol::connect_and_handshake(
         &cli.host,
         port2,
@@ -66,7 +66,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => {
             protocol::close_all(vec![ws]).await;
-            println!("OK");
+            say!("OK");
         }
         Err(e) => {
             eprintln!("FAILED: {e}");
@@ -84,9 +84,13 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     for &n in &tiers {
         let half = n / 2;
         let half_b = n - half; // handles odd numbers
-        println!(
+        say!(
             "\n  --- {} subscribers ({} on A:{}, {} on B:{}) ---",
-            n, half, cli.port, half_b, port2
+            n,
+            half,
+            cli.port,
+            half_b,
+            port2
         );
 
         // Connect half to Server A, half to Server B (in parallel)
@@ -114,14 +118,17 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         let actual = actual_a + actual_b;
 
         if actual == 0 {
-            println!("    FAILED: no connections");
+            say!("    FAILED: no connections");
             crate::report::failed();
             continue;
         }
 
-        println!(
+        say!(
             "    Split: A={}/{}, B={}/{}",
-            actual_a, half, actual_b, half_b
+            actual_a,
+            half,
+            actual_b,
+            half_b
         );
 
         // Merge all connections for unified measurement
@@ -146,27 +153,27 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         let published_per_sec = deliveries_per_sec / actual as f64;
         let raw_gaps = result.total_gaps.load(Ordering::Relaxed);
 
-        println!("    Duration:       {:.2}s", result.elapsed);
-        println!(
+        say!("    Duration:       {:.2}s", result.elapsed);
+        say!(
             "    Published:      {}/s (Server A -> local + Cluster -> Server B)",
             stats::fmt_rate(published_per_sec)
         );
-        println!(
+        say!(
             "    Deliveries:     {}/s (fan-out: {} x {} subs across 2 nodes)",
             stats::fmt_rate(deliveries_per_sec),
             stats::fmt_rate(published_per_sec),
             actual
         );
-        println!(
+        say!(
             "    Bandwidth:      {}",
             stats::fmt_bytes_per_sec(result.total_bytes as f64 / result.elapsed)
         );
         if raw_gaps > 0 {
-            println!("    Seq gaps:       ~{} unique messages lost", raw_gaps);
+            say!("    Seq gaps:       ~{} unique messages lost", raw_gaps);
         }
 
         if !result.latency.is_empty() {
-            println!("    Delivery latency:");
+            say!("    Delivery latency:");
             result.latency.print_summary("      ");
         }
 
@@ -185,9 +192,9 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         };
         if let (Some(a), Some(b)) = (da, db) {
             if a + b == 0 {
-                println!("    Server drops:   0 (ok)");
+                say!("    Server drops:   0 (ok)");
             } else {
-                println!("    Server drops:   A={}, B={}", a, b);
+                say!("    Server drops:   A={}, B={}", a, b);
             }
         }
 
@@ -216,7 +223,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
         protocol::close_all(result.connections).await;
         tokio::time::sleep(Duration::from_secs(2)).await;
-        println!();
+        say!();
     }
 
     report::print_fanout_table(&results);

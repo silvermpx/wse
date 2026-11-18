@@ -24,10 +24,12 @@ impl CheckResult {
     fn check(&mut self, name: &str, condition: bool) {
         if condition {
             self.passed += 1;
-            println!("    [PASS] {}", name);
+            say!("    [PASS] {}", name);
         } else {
             self.failed += 1;
-            println!("    [FAIL] {}", name);
+            // Said in the run's exit code, however the test ends.
+            crate::report::failed();
+            say!("    [FAIL] {}", name);
         }
     }
 }
@@ -111,7 +113,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Step 1: Connect and seed the recovery buffer
     // =========================================================================
-    println!("\n  Step 1: Connect and seed recovery buffer");
+    say!("\n  Step 1: Connect and seed recovery buffer");
 
     let token = crate::jwt::generate_bench_token(cli.secret.as_bytes(), "recovery-user");
     let mut ws = match protocol::connect_and_handshake(
@@ -125,7 +127,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => ws,
         Err(e) => {
-            println!("    [FAIL] Failed to connect: {}", e);
+            say!("    [FAIL] Failed to connect: {}", e);
             return Vec::new();
         }
     };
@@ -159,7 +161,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
 
     if seeded == 0 {
-        println!("    ABORT: Could not seed recovery buffer");
+        say!("    ABORT: Could not seed recovery buffer");
         let _ = ws.close(None).await;
         return Vec::new();
     }
@@ -167,7 +169,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Step 2: Subscribe with recovery (initial, get epoch/offset)
     // =========================================================================
-    println!("\n  Step 2: Subscribe with recovery (initial)");
+    say!("\n  Step 2: Subscribe with recovery (initial)");
 
     let subscribe_msg = serde_json::json!({
         "t": "battle_cmd",
@@ -206,7 +208,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
 
     if !has_recovery_info {
-        println!("    ABORT: No recovery info from server. Is --recovery enabled?");
+        say!("    ABORT: No recovery info from server. Is --recovery enabled?");
         let _ = ws.close(None).await;
         return Vec::new();
     }
@@ -214,7 +216,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Step 3: Publish more messages while subscribed (we receive them)
     // =========================================================================
-    println!("\n  Step 3: Publish 20 more messages (we receive these)");
+    say!("\n  Step 3: Publish 20 more messages (we receive these)");
 
     let more_msg = serde_json::json!({
         "t": "battle_cmd",
@@ -256,17 +258,17 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .and_then(|r| r.get("offset"))
         .and_then(|o| o.as_u64())
         .unwrap_or(offset.unwrap_or(0));
-    println!("    Last known offset before disconnect: {}", last_offset);
+    say!("    Last known offset before disconnect: {}", last_offset);
 
     // =========================================================================
     // Step 4: Disconnect and publish messages we'll miss
     // =========================================================================
-    println!("\n  Step 4: Disconnect");
+    say!("\n  Step 4: Disconnect");
     let _ = ws.close(None).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Connect a second helper connection to trigger publish while first is disconnected
-    println!("    Publishing 100 messages while disconnected...");
+    say!("    Publishing 100 messages while disconnected...");
     let mut helper = match protocol::connect_and_handshake(
         &cli.host,
         cli.port,
@@ -278,7 +280,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => ws,
         Err(e) => {
-            println!("    [FAIL] Failed to connect helper: {}", e);
+            say!("    [FAIL] Failed to connect helper: {}", e);
             return Vec::new();
         }
     };
@@ -313,7 +315,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Step 5: Reconnect with recovery
     // =========================================================================
-    println!("\n  Step 5: Reconnect and subscribe with recover=true");
+    say!("\n  Step 5: Reconnect and subscribe with recover=true");
 
     let mut ws2 = match protocol::connect_and_handshake(
         &cli.host,
@@ -326,7 +328,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => ws,
         Err(e) => {
-            println!("    [FAIL] Failed to reconnect: {}", e);
+            say!("    [FAIL] Failed to reconnect: {}", e);
             return Vec::new();
         }
     };
@@ -354,7 +356,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Step 6: Verify recovery response
     // =========================================================================
-    println!("\n  Step 6: Verify recovery response");
+    say!("\n  Step 6: Verify recovery response");
 
     let recovery_response = drain_for_type(&mut ws2, "subscription_update", 5000).await;
 
@@ -384,7 +386,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Step 7: Verify health shows recovery stats
     // =========================================================================
-    println!("\n  Step 7: Verify recovery health stats");
+    say!("\n  Step 7: Verify recovery health stats");
 
     if let Some(health) = protocol::query_health(&mut ws2, 3).await {
         let recovery_topics = health
@@ -410,17 +412,17 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Clean up
     // =========================================================================
-    println!("\n  Clean up");
+    say!("\n  Clean up");
     let _ = ws2.close(None).await;
-    println!("    Client disconnected");
+    say!("    Client disconnected");
 
     let total = checks.passed + checks.failed;
-    println!("\n  Result: {}/{} checks passed", checks.passed, total);
+    say!("\n  Result: {}/{} checks passed", checks.passed, total);
     if checks.failed > 0 {
-        println!("  FAILED");
+        say!("  FAILED");
         crate::report::failed();
     } else {
-        println!("  PASSED");
+        say!("  PASSED");
     }
 
     Vec::new()

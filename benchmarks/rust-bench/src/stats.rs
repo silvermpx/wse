@@ -62,22 +62,22 @@ impl LatencyHistogram {
     /// Print a formatted latency summary.
     pub fn print_summary(&self, indent: &str) {
         if self.is_empty() {
-            println!("{indent}NO DATA");
+            say!("{indent}NO DATA");
             return;
         }
-        println!("{indent}p50:    {:>10.2} ms", self.percentile_ms(50.0));
-        println!("{indent}p95:    {:>10.2} ms", self.percentile_ms(95.0));
-        println!("{indent}p99:    {:>10.2} ms", self.percentile_ms(99.0));
+        say!("{indent}p50:    {:>10.2} ms", self.percentile_ms(50.0));
+        say!("{indent}p95:    {:>10.2} ms", self.percentile_ms(95.0));
+        say!("{indent}p99:    {:>10.2} ms", self.percentile_ms(99.0));
         if self.len() >= 100 {
-            println!("{indent}p99.9:  {:>10.2} ms", self.percentile_ms(99.9));
+            say!("{indent}p99.9:  {:>10.2} ms", self.percentile_ms(99.9));
         }
         if self.len() >= 1000 {
-            println!("{indent}p99.99: {:>10.2} ms", self.percentile_ms(99.99));
+            say!("{indent}p99.99: {:>10.2} ms", self.percentile_ms(99.99));
         }
-        println!("{indent}min:    {:>10.2} ms", self.min_ms());
-        println!("{indent}max:    {:>10.2} ms", self.max_ms());
-        println!("{indent}mean:   {:>10.2} ms", self.mean_ms());
-        println!("{indent}stdev:  {:>10.2} ms", self.stdev_ms());
+        say!("{indent}min:    {:>10.2} ms", self.min_ms());
+        say!("{indent}max:    {:>10.2} ms", self.max_ms());
+        say!("{indent}mean:   {:>10.2} ms", self.mean_ms());
+        say!("{indent}stdev:  {:>10.2} ms", self.stdev_ms());
     }
 
     /// Return summary as JSON-serializable struct.
@@ -136,10 +136,10 @@ pub fn fmt_rate(n: f64) -> String {
 }
 
 pub fn print_header(title: &str, detail: &str) {
-    println!("\n{}", "=".repeat(70));
-    println!("  {title}");
+    say!("\n{}", "=".repeat(70));
+    say!("  {title}");
     if !detail.is_empty() {
-        println!("  {detail}");
+        say!("  {detail}");
     }
-    println!("{}", "=".repeat(70));
+    say!("{}", "=".repeat(70));
 }

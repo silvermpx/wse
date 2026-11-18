@@ -33,7 +33,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
     // Verify connectivity to Server B (subscribers connect here)
     let token = crate::jwt::generate_bench_token(cli.secret.as_bytes(), "bench-user");
-    print!("    Checking Server B (:{})... ", port2);
+    say_on!("    Checking Server B (:{})... ", port2);
     match protocol::connect_and_handshake(
         &cli.host,
         port2,
@@ -45,7 +45,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => {
             protocol::close_all(vec![ws]).await;
-            println!("OK");
+            say!("OK");
         }
         Err(e) => {
             eprintln!("FAILED: {e}");
@@ -67,9 +67,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut results = Vec::new();
 
     for &n in &tiers {
-        println!(
+        say!(
             "\n  --- {} subscribers on Server B (:{}) [TLS cluster] ---",
-            n, port2
+            n,
+            port2
         );
 
         // Connect all clients to Server B
@@ -84,7 +85,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .await;
 
         if connections.is_empty() {
-            println!("    FAILED: no connections to Server B");
+            say!("    FAILED: no connections to Server B");
             continue;
         }
 
@@ -108,27 +109,27 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         let published_per_sec = deliveries_per_sec / actual as f64;
         let raw_gaps = result.total_gaps.load(Ordering::Relaxed);
 
-        println!("    Duration:       {:.2}s", result.elapsed);
-        println!(
+        say!("    Duration:       {:.2}s", result.elapsed);
+        say!(
             "    Published:      {}/s (Server A -> TLS Cluster -> Server B)",
             stats::fmt_rate(published_per_sec)
         );
-        println!(
+        say!(
             "    Deliveries:     {}/s (fan-out: {} x {} subs)",
             stats::fmt_rate(deliveries_per_sec),
             stats::fmt_rate(published_per_sec),
             actual
         );
-        println!(
+        say!(
             "    Bandwidth:      {}",
             stats::fmt_bytes_per_sec(result.total_bytes as f64 / result.elapsed)
         );
         if raw_gaps > 0 {
-            println!("    Seq gaps:       ~{} unique messages lost", raw_gaps);
+            say!("    Seq gaps:       ~{} unique messages lost", raw_gaps);
         }
 
         if !result.latency.is_empty() {
-            println!("    Delivery latency (publish A -> TLS Cluster -> B -> WS):");
+            say!("    Delivery latency (publish A -> TLS Cluster -> B -> WS):");
             result.latency.print_summary("      ");
         }
 
@@ -147,9 +148,9 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         };
         if let (Some(a), Some(b)) = (da, db) {
             if a + b == 0 {
-                println!("    Server drops:   0 (ok)");
+                say!("    Server drops:   0 (ok)");
             } else {
-                println!("    Server drops:   A={}, B={}", a, b);
+                say!("    Server drops:   A={}, B={}", a, b);
             }
         }
 
@@ -178,7 +179,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         protocol::close_all(result.connections).await;
         // Cooldown: let server finish tearing down connections before next tier
         tokio::time::sleep(Duration::from_secs(2)).await;
-        println!();
+        say!();
     }
 
     report::print_fanout_table(&results);

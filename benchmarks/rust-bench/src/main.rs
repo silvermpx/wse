@@ -1,3 +1,26 @@
+/// What the run says as it goes: on stdout, or on stderr when stdout is the
+/// report's alone (`--output json`).
+macro_rules! say {
+    ($($arg:tt)*) => {
+        if crate::report::json() {
+            eprintln!($($arg)*)
+        } else {
+            println!($($arg)*)
+        }
+    };
+}
+
+/// [`say!`] without the end of the line.
+macro_rules! say_on {
+    ($($arg:tt)*) => {
+        if crate::report::json() {
+            eprint!($($arg)*)
+        } else {
+            print!($($arg)*)
+        }
+    };
+}
+
 mod config;
 mod jwt;
 mod preflight;
@@ -13,22 +36,23 @@ use report::TierResult;
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    report::set_json(matches!(cli.output, config::OutputFormat::Json));
 
-    println!("WSE Benchmark Suite (Rust)");
-    println!("=========================");
-    println!("  Server:  {}:{}", cli.host, cli.port);
-    println!("  Secret:  {}...", &cli.secret[..8.min(cli.secret.len())]);
-    println!("  Duration: {}s per tier", cli.duration);
+    say!("WSE Benchmark Suite (Rust)");
+    say!("=========================");
+    say!("  Server:  {}:{}", cli.host, cli.port);
+    say!("  Secret:  {}...", &cli.secret[..8.min(cli.secret.len())]);
+    say!("  Duration: {}s per tier", cli.duration);
 
     if let Some(ref tiers) = cli.tiers {
-        println!("  Custom tiers: {:?}", tiers);
+        say!("  Custom tiers: {:?}", tiers);
     }
 
     // Preflight checks
     preflight::check_os_limits(cli.max_connections);
 
     // Verify connectivity with a single connection
-    print!("  Connectivity check: ");
+    say_on!("  Connectivity check: ");
     let token = jwt::generate_bench_token(cli.secret.as_bytes(), "bench-user");
     match protocol::connect_and_handshake(
         &cli.host,
@@ -41,7 +65,7 @@ async fn main() {
     {
         Ok(ws) => {
             protocol::close_all(vec![ws]).await;
-            println!("OK (connected, server_ready received)");
+            say!("OK (connected, server_ready received)");
         }
         Err(e) => {
             eprintln!("FAILED: {}", e);
@@ -64,7 +88,7 @@ async fn main() {
     };
     report::write(cli.output, &results);
 
-    println!("\nDone.");
+    say!("\nDone.");
     // A check that failed fails the run, for whatever runs it.
     if report::any_failed() {
         eprintln!("A check failed: see FAILED above.");
@@ -103,7 +127,7 @@ async fn run_single_test(cli: &Cli, test: TestName) -> Vec<TierResult> {
 }
 
 async fn run_full_suite(cli: &Cli) -> Vec<(String, Vec<TierResult>)> {
-    println!("\n  Running full benchmark suite...");
+    say!("\n  Running full benchmark suite...");
     let suite = [
         TestName::ConnectionStorm,
         TestName::PingLatency,
@@ -126,6 +150,6 @@ async fn run_full_suite(cli: &Cli) -> Vec<(String, Vec<TierResult>)> {
 }
 
 async fn pause_between_tests() {
-    println!("\n  [Cooling down 3s before next test...]");
+    say!("\n  [Cooling down 3s before next test...]");
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 }

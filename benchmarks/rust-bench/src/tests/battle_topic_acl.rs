@@ -24,10 +24,12 @@ impl CheckResult {
     fn check(&mut self, name: &str, condition: bool) {
         if condition {
             self.passed += 1;
-            println!("    [PASS] {}", name);
+            say!("    [PASS] {}", name);
         } else {
             self.failed += 1;
-            println!("    [FAIL] {}", name);
+            // Said in the run's exit code, however the test ends.
+            crate::report::failed();
+            say!("    [FAIL] {}", name);
         }
     }
 }
@@ -107,7 +109,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 1: Connect 4 clients with different ACL rules
     // =========================================================================
-    println!("\n  Phase 1: Connect 4 clients with different ACL rules");
+    say!("\n  Phase 1: Connect 4 clients with different ACL rules");
 
     let mut clients: Vec<WsStream> = Vec::new();
     let labels = ["allow-exact", "allow-glob", "deny-half", "no-acl"];
@@ -126,9 +128,11 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         {
             Ok(ws) => clients.push(ws),
             Err(e) => {
-                println!(
+                say!(
                     "    [FAIL] Failed to connect client {} ({}): {}",
-                    i, label, e
+                    i,
+                    label,
+                    e
                 );
                 checks.check("All clients connected", false);
                 protocol::close_all(clients).await;
@@ -144,7 +148,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 2: Set ACL on first 3 clients
     // =========================================================================
-    println!("\n  Phase 2: Set topic ACL rules");
+    say!("\n  Phase 2: Set topic ACL rules");
 
     // Client A: allow=["battle_all"] (exact match only)
     let acl_a = serde_json::json!({
@@ -180,12 +184,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let _ = drain_for_type(&mut clients[2], "acl_set", 3000).await;
 
     // Client D: no ACL (unrestricted)
-    println!("    ACL rules set on clients A, B, C (D = unrestricted)");
+    say!("    ACL rules set on clients A, B, C (D = unrestricted)");
 
     // =========================================================================
     // Phase 3: Subscribe all clients to both topics
     // =========================================================================
-    println!("\n  Phase 3: Subscribe all clients to battle_all + battle_half");
+    say!("\n  Phase 3: Subscribe all clients to battle_all + battle_half");
 
     for client in clients.iter_mut() {
         let cmd = serde_json::json!({
@@ -205,7 +209,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 4: Publish messages to both topics
     // =========================================================================
-    println!(
+    say!(
         "\n  Phase 4: Publish {} messages to each topic",
         PUBLISH_COUNT
     );
@@ -223,7 +227,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => ws,
         Err(e) => {
-            println!("    [FAIL] Failed to connect publisher: {}", e);
+            say!("    [FAIL] Failed to connect publisher: {}", e);
             protocol::close_all(clients).await;
             return Vec::new();
         }
@@ -262,7 +266,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 5: Collect messages from all clients
     // =========================================================================
-    println!("\n  Phase 5: Collect messages (5s deadline)");
+    say!("\n  Phase 5: Collect messages (5s deadline)");
 
     let mut results: Vec<(u64, u64)> = Vec::new();
     for client in clients.iter_mut() {
@@ -271,16 +275,19 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     }
 
     for (i, (all_c, half_c)) in results.iter().enumerate() {
-        println!(
+        say!(
             "    Client {} ({}): battle_all={}, battle_half={}",
-            i, labels[i], all_c, half_c
+            i,
+            labels[i],
+            all_c,
+            half_c
         );
     }
 
     // =========================================================================
     // Phase 6: Verify ACL enforcement
     // =========================================================================
-    println!("\n  Phase 6: Verify ACL enforcement");
+    say!("\n  Phase 6: Verify ACL enforcement");
 
     // Client A: allow=["battle_all"] -> receives battle_all only
     let (a_all, a_half) = results[0];
@@ -329,18 +336,18 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Clean up
     // =========================================================================
-    println!("\n  Clean up");
+    say!("\n  Clean up");
     let _ = publisher.close(None).await;
     protocol::close_all(clients).await;
-    println!("    All clients disconnected");
+    say!("    All clients disconnected");
 
     let total = checks.passed + checks.failed;
-    println!("\n  Result: {}/{} checks passed", checks.passed, total);
+    say!("\n  Result: {}/{} checks passed", checks.passed, total);
     if checks.failed > 0 {
-        println!("  FAILED");
+        say!("  FAILED");
         crate::report::failed();
     } else {
-        println!("  PASSED");
+        say!("  PASSED");
     }
 
     Vec::new()

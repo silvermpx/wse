@@ -29,10 +29,12 @@ impl CheckResult {
     fn check(&mut self, name: &str, condition: bool) {
         if condition {
             self.passed += 1;
-            println!("    [PASS] {}", name);
+            say!("    [PASS] {}", name);
         } else {
             self.failed += 1;
-            println!("    [FAIL] {}", name);
+            // Said in the run's exit code, however the test ends.
+            crate::report::failed();
+            say!("    [FAIL] {}", name);
         }
     }
 }
@@ -103,7 +105,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 1: Connect worker clients (queue group "workers")
     // =========================================================================
-    println!("\n  Phase 1: Connect {} queue group workers", WORKER_COUNT);
+    say!("\n  Phase 1: Connect {} queue group workers", WORKER_COUNT);
 
     let mut workers: Vec<WsStream> = Vec::new();
     for i in 0..WORKER_COUNT {
@@ -120,7 +122,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         {
             Ok(ws) => workers.push(ws),
             Err(e) => {
-                println!("    [FAIL] Failed to connect worker {}: {}", i, e);
+                say!("    [FAIL] Failed to connect worker {}: {}", i, e);
                 checks.check("All workers connected", false);
                 protocol::close_all(workers).await;
                 return Vec::new();
@@ -156,7 +158,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 2: Connect fanout clients (normal subscribers)
     // =========================================================================
-    println!("\n  Phase 2: Connect {} fanout subscribers", FANOUT_COUNT);
+    say!("\n  Phase 2: Connect {} fanout subscribers", FANOUT_COUNT);
 
     let mut fanout_clients: Vec<WsStream> = Vec::new();
     for i in 0..FANOUT_COUNT {
@@ -173,7 +175,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         {
             Ok(ws) => fanout_clients.push(ws),
             Err(e) => {
-                println!("    [FAIL] Failed to connect fanout {}: {}", i, e);
+                say!("    [FAIL] Failed to connect fanout {}: {}", i, e);
                 checks.check("All fanout clients connected", false);
                 protocol::close_all(workers).await;
                 protocol::close_all(fanout_clients).await;
@@ -209,7 +211,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 3: Publish messages via a separate connection
     // =========================================================================
-    println!("\n  Phase 3: Publish {} messages", PUBLISH_COUNT);
+    say!("\n  Phase 3: Publish {} messages", PUBLISH_COUNT);
 
     let mut publisher = match protocol::connect_and_handshake(
         &cli.host,
@@ -222,7 +224,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     {
         Ok(ws) => ws,
         Err(e) => {
-            println!("    [FAIL] Failed to connect publisher: {}", e);
+            say!("    [FAIL] Failed to connect publisher: {}", e);
             protocol::close_all(workers).await;
             protocol::close_all(fanout_clients).await;
             return Vec::new();
@@ -257,7 +259,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 4: Collect messages from all clients
     // =========================================================================
-    println!("\n  Phase 4: Collect messages (5s deadline)");
+    say!("\n  Phase 4: Collect messages (5s deadline)");
 
     // Collect worker counts in parallel using spawned tasks
     let worker_counts = Arc::new(
@@ -304,7 +306,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 5: Verify results
     // =========================================================================
-    println!("\n  Phase 5: Verify distribution");
+    say!("\n  Phase 5: Verify distribution");
 
     let worker_msg_counts: Vec<u64> = (0..WORKER_COUNT)
         .map(|i| worker_counts[i].load(Ordering::Relaxed))
@@ -316,9 +318,9 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let worker_total: u64 = worker_msg_counts.iter().sum();
     let _fanout_total: u64 = fanout_msg_counts.iter().sum();
 
-    println!("    Worker counts: {:?}", worker_msg_counts);
-    println!("    Fanout counts: {:?}", fanout_msg_counts);
-    println!("    Worker aggregate: {}", worker_total);
+    say!("    Worker counts: {:?}", worker_msg_counts);
+    say!("    Fanout counts: {:?}", fanout_msg_counts);
+    say!("    Worker aggregate: {}", worker_total);
 
     // Check that each fanout client received all messages
     for (i, &count) in fanout_msg_counts.iter().enumerate() {
@@ -368,7 +370,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 6: Query queue group info
     // =========================================================================
-    println!("\n  Phase 6: Query queue group info");
+    say!("\n  Phase 6: Query queue group info");
 
     let info_cmd = serde_json::json!({
         "t": "battle_cmd",
@@ -407,19 +409,19 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Clean up
     // =========================================================================
-    println!("\n  Clean up");
+    say!("\n  Clean up");
     let _ = publisher.close(None).await;
     protocol::close_all(workers_back).await;
     protocol::close_all(fanout_back).await;
-    println!("    All clients disconnected");
+    say!("    All clients disconnected");
 
     let total = checks.passed + checks.failed;
-    println!("\n  Result: {}/{} checks passed", checks.passed, total);
+    say!("\n  Result: {}/{} checks passed", checks.passed, total);
     if checks.failed > 0 {
-        println!("  FAILED");
+        say!("  FAILED");
         crate::report::failed();
     } else {
-        println!("  PASSED");
+        say!("  PASSED");
     }
 
     Vec::new()

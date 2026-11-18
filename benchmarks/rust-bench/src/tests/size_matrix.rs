@@ -27,7 +27,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     for &size in sizes {
         let payload = protocol::build_payload(size);
         let actual_size = payload.len();
-        println!(
+        say!(
             "\n  === Payload: {} ({} bytes actual) ===",
             format_size(size),
             actual_size

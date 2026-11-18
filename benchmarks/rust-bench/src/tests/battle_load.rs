@@ -63,7 +63,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut results = Vec::new();
 
     for &n in &tiers {
-        println!("\n  === {} subscribers ===", n);
+        say!("\n  === {} subscribers ===", n);
 
         // Connect
         let mut connections = protocol::connect_batch(
@@ -78,19 +78,20 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
         let actual = connections.len();
         if actual < n / 2 {
-            println!(
+            say!(
                 "    SKIPPED: only {}/{} connected (ulimit or server max-connections?)",
-                actual, n
+                actual,
+                n
             );
             protocol::close_all(connections).await;
             continue;
         }
         if actual < n {
-            println!("    WARNING: {}/{} connected", actual, n);
+            say!("    WARNING: {}/{} connected", actual, n);
         }
 
         // Subscribe all to "battle_all"
-        print!("    Subscribing to topic... ");
+        say_on!("    Subscribing to topic... ");
         for ws in connections.iter_mut() {
             let cmd = serde_json::json!({
                 "t": "battle_cmd",
@@ -98,7 +99,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             });
             let _ = ws.send(Message::Text(cmd.to_string().into())).await;
         }
-        println!("done");
+        say!("done");
 
         // Settle + warmup
         tokio::time::sleep(Duration::from_millis(SUBSCRIBE_SETTLE_MS)).await;
@@ -143,28 +144,28 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         let ba_ok = ba_count > 0;
         let topic_ok = topic_count > 0;
 
-        println!("    Duration:       {:.2}s", elapsed);
-        println!(
+        say!("    Duration:       {:.2}s", elapsed);
+        say!(
             "    Deliveries:     {}/s ({} total)",
             stats::fmt_rate(del_per_sec),
             received
         );
-        println!(
+        say!(
             "    Bandwidth:      {}",
             stats::fmt_bytes_per_sec(bytes as f64 / elapsed)
         );
-        println!(
+        say!(
             "    broadcast_all:  {} {}",
             ba_count,
             if ba_ok { "[OK]" } else { "[FAIL]" }
         );
-        println!(
+        say!(
             "    topic msgs:     {} {}",
             topic_count,
             if topic_ok { "[OK]" } else { "[FAIL]" }
         );
         if unique_gaps > 0 {
-            println!("    Seq gaps:       ~{} unique", unique_gaps);
+            say!("    Seq gaps:       ~{} unique", unique_gaps);
         }
 
         let merged_latency = match Arc::try_unwrap(latency) {
@@ -178,7 +179,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         };
 
         if !merged_latency.is_empty() {
-            println!("    Delivery latency:");
+            say!("    Delivery latency:");
             merged_latency.print_summary("      ");
         }
 
@@ -206,17 +207,23 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         });
 
         protocol::close_all(ws_list).await;
-        println!();
+        say!();
     }
 
     // Summary table
     if !results.is_empty() {
-        println!("\n  Load Test Summary:");
-        println!(
+        say!("\n  Load Test Summary:");
+        say!(
             "  {:<12} {:<12} {:<15} {:<10} {:<10} {:<10} {:<8}",
-            "Subscribers", "Connected", "Del/s", "p50", "p99", "Gaps", "Status"
+            "Subscribers",
+            "Connected",
+            "Del/s",
+            "p50",
+            "p99",
+            "Gaps",
+            "Status"
         );
-        println!("  {}", "-".repeat(75));
+        say!("  {}", "-".repeat(75));
         for r in &results {
             let ok = r
                 .extra
@@ -241,7 +248,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
                 Some(lat) => (format!("{:.1}ms", lat.p50), format!("{:.1}ms", lat.p99)),
                 None => ("-".to_string(), "-".to_string()),
             };
-            println!(
+            say!(
                 "  {:<12} {:<12} {:<15} {:<10} {:<10} {:<10} {:<8}",
                 r.tier,
                 r.connected,

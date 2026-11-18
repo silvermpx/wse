@@ -27,7 +27,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut results = Vec::new();
 
     for &n in &tiers {
-        println!("\n  --- {} connections for {}s ---", n, hold_secs);
+        say!("\n  --- {} connections for {}s ---", n, hold_secs);
 
         let connections = protocol::connect_batch(
             &cli.host,
@@ -40,7 +40,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .await;
 
         if connections.is_empty() {
-            println!("    FAILED: no connections");
+            say!("    FAILED: no connections");
             crate::report::failed();
             continue;
         }
@@ -92,15 +92,15 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         let disc_count = disconnected.load(Ordering::Relaxed);
         let survival_rate = (actual - disc_count) as f64 / actual as f64 * 100.0;
 
-        println!(
+        say!(
             "    Survival: {}/{} ({:.1}%)",
             actual - disc_count,
             actual,
             survival_rate
         );
-        println!("    Total PINGs: {}", total_pings);
+        say!("    Total PINGs: {}", total_pings);
         if !merged.is_empty() {
-            println!("    PING/PONG latency:");
+            say!("    PING/PONG latency:");
             merged.print_summary("      ");
         }
 
@@ -125,7 +125,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         });
 
         protocol::close_all(ws_list).await;
-        println!();
+        say!();
     }
 
     results

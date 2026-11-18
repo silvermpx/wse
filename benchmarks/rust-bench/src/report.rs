@@ -5,6 +5,18 @@ use crate::stats::LatencyHistogram;
 /// A check of a run failed: the run says so in its exit code.
 static FAILED: AtomicBool = AtomicBool::new(false);
 
+/// Stdout is the JSON report's alone (`--output json`): what the run says
+/// as it goes is on stderr.
+static JSON: AtomicBool = AtomicBool::new(false);
+
+pub fn set_json(json: bool) {
+    JSON.store(json, Ordering::Relaxed);
+}
+
+pub fn json() -> bool {
+    JSON.load(Ordering::Relaxed)
+}
+
 /// A check failed (it was printed FAILED).
 pub fn failed() {
     FAILED.store(true, Ordering::Relaxed);
@@ -80,14 +92,14 @@ pub fn write(format: crate::config::OutputFormat, results: &[(String, Vec<TierRe
         }
         OutputFormat::Markdown => {
             for (test, tiers) in results {
-                println!("\n### {test}\n");
-                println!("| Tier | Connected | Errors | Msg/s | p50 ms | p99 ms |");
-                println!("|---:|---:|---:|---:|---:|---:|");
+                say!("\n### {test}\n");
+                say!("| Tier | Connected | Errors | Msg/s | p50 ms | p99 ms |");
+                say!("|---:|---:|---:|---:|---:|---:|");
                 for tier in tiers {
                     let (p50, p99) = tier.latency.as_ref().map_or(("-".into(), "-".into()), |l| {
                         (format!("{:.2}", l.p50), format!("{:.2}", l.p99))
                     });
-                    println!(
+                    say!(
                         "| {} | {} | {} | {:.0} | {p50} | {p99} |",
                         tier.tier,
                         tier.connected,
@@ -120,8 +132,8 @@ impl TierResult {
 
 /// Print a markdown-style summary table for throughput tests.
 pub fn print_throughput_table(results: &[TierResult]) {
-    println!("\n  | Connections | Msg/s | MB/s | Per-conn msg/s | Errors |");
-    println!("  |-----------|-------|------|---------------|--------|");
+    say!("\n  | Connections | Msg/s | MB/s | Per-conn msg/s | Errors |");
+    say!("  |-----------|-------|------|---------------|--------|");
     for r in results {
         let msg_s = r.msg_per_sec();
         let per_conn = if r.connected > 0 {
@@ -129,7 +141,7 @@ pub fn print_throughput_table(results: &[TierResult]) {
         } else {
             0.0
         };
-        println!(
+        say!(
             "  | {:>9} | {:>11} | {:>8.1} | {:>13.0} | {:>6} |",
             format_num(r.tier),
             format_num(msg_s as usize),
@@ -147,36 +159,36 @@ pub fn print_matrix_table(
     results: &std::collections::HashMap<(usize, usize), TierResult>,
 ) {
     // Header
-    print!("\n  | Size \\ Conns");
+    say_on!("\n  | Size \\ Conns");
     for t in tiers {
-        print!(" | {:>7}", format_num(*t));
+        say_on!(" | {:>7}", format_num(*t));
     }
-    println!(" |");
+    say!(" |");
 
-    print!("  |----------");
+    say_on!("  |----------");
     for _ in tiers {
-        print!("|--------");
+        say_on!("|--------");
     }
-    println!("|");
+    say!("|");
 
     // Rows
     for &size in sizes {
-        print!("  | {:>8}", format_bytes(size));
+        say_on!("  | {:>8}", format_bytes(size));
         for &tier in tiers {
             if let Some(r) = results.get(&(size, tier)) {
                 let msg_s = r.msg_per_sec();
                 if msg_s >= 1_000_000.0 {
-                    print!(" | {:>5.1}M", msg_s / 1_000_000.0);
+                    say_on!(" | {:>5.1}M", msg_s / 1_000_000.0);
                 } else if msg_s >= 1_000.0 {
-                    print!(" | {:>5.1}K", msg_s / 1_000.0);
+                    say_on!(" | {:>5.1}K", msg_s / 1_000.0);
                 } else {
-                    print!(" | {:>6.0}", msg_s);
+                    say_on!(" | {:>6.0}", msg_s);
                 }
             } else {
-                print!(" |    N/A");
+                say_on!(" |    N/A");
             }
         }
-        println!(" |");
+        say!(" |");
     }
 }
 
@@ -202,10 +214,10 @@ fn format_bytes(n: usize) -> String {
 
 /// Print a markdown-style table for fan-out test results.
 pub fn print_fanout_table(results: &[TierResult]) {
-    println!(
+    say!(
         "\n  | Subscribers | Published/s | Deliveries/s | MB/s   | p50     | p95     | p99     | Gaps |"
     );
-    println!(
+    say!(
         "  |------------|------------|-------------|--------|---------|---------|---------|------|"
     );
     for r in results {
@@ -246,7 +258,7 @@ pub fn print_fanout_table(results: &[TierResult]) {
             ("N/A".into(), "N/A".into(), "N/A".into())
         };
 
-        println!(
+        say!(
             "  | {:>10} | {:>10} | {:>11} | {:>6.1} | {:>7} | {:>7} | {:>7} | {:>4} |",
             format_num(r.tier),
             format_num(published_s as usize),

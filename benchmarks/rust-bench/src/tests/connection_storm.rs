@@ -19,7 +19,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut results = Vec::new();
 
     for &n in &tiers {
-        println!("\n  --- {} connections ---", n);
+        say!("\n  --- {} connections ---", n);
 
         let errors = Arc::new(AtomicUsize::new(0));
         let total_start = Instant::now();
@@ -124,7 +124,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             n,
             err_count
         );
-        println!("    Total time: {:.2}s", total_secs);
+        say!("    Total time: {:.2}s", total_secs);
 
         // Build histogram
         let mut hist = LatencyHistogram::new();
@@ -134,7 +134,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
         if !all_latencies.is_empty() {
             let rate = all_latencies.len() as f64 / total_secs;
-            println!("    Accept rate: {:.0} conn/s", rate);
+            say!("    Accept rate: {:.0} conn/s", rate);
             hist.print_summary("    ");
         }
 
@@ -154,7 +154,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
         // Cleanup
         protocol::close_all(connections).await;
-        println!();
+        say!();
     }
 
     results

@@ -2,7 +2,7 @@ use std::fs;
 
 /// Check OS-level limits and print warnings if they might bottleneck.
 pub fn check_os_limits(max_connections: usize) {
-    println!("\n  Preflight checks:");
+    say!("\n  Preflight checks:");
 
     // File descriptor limit
     #[cfg(unix)]
@@ -10,13 +10,15 @@ pub fn check_os_limits(max_connections: usize) {
         let fd_limit = rlimit_nofile();
         let needed = max_connections * 2 + 1000; // client + server FDs + headroom
         if fd_limit < needed as u64 {
-            println!(
+            say!(
                 "    [WARN] ulimit -n = {} (need ~{} for {} connections)",
-                fd_limit, needed, max_connections
+                fd_limit,
+                needed,
+                max_connections
             );
-            println!("           Run: ulimit -n {}", needed);
+            say!("           Run: ulimit -n {}", needed);
         } else {
-            println!("    [OK] ulimit -n = {} (need ~{})", fd_limit, needed);
+            say!("    [OK] ulimit -n = {} (need ~{})", fd_limit, needed);
         }
     }
 
@@ -25,31 +27,35 @@ pub fn check_os_limits(max_connections: usize) {
         let available = hi - lo;
         let per_ip = available as usize;
         let ips_needed = max_connections.div_ceil(per_ip);
-        println!(
+        say!(
             "    [OK] port range {}-{} ({} ports/IP, {} source IPs needed for {})",
-            lo, hi, available, ips_needed, max_connections
+            lo,
+            hi,
+            available,
+            ips_needed,
+            max_connections
         );
     }
 
     // somaxconn
     if let Some(val) = read_sysctl_u64("/proc/sys/net/core/somaxconn") {
         if val < 65535 {
-            println!("    [WARN] somaxconn = {} (recommend 65535)", val);
+            say!("    [WARN] somaxconn = {} (recommend 65535)", val);
         } else {
-            println!("    [OK] somaxconn = {}", val);
+            say!("    [OK] somaxconn = {}", val);
         }
     }
 
     // tcp_tw_reuse
     if let Some(val) = read_sysctl_u64("/proc/sys/net/ipv4/tcp_tw_reuse") {
         if val == 0 {
-            println!("    [WARN] tcp_tw_reuse = 0 (recommend 1)");
+            say!("    [WARN] tcp_tw_reuse = 0 (recommend 1)");
         } else {
-            println!("    [OK] tcp_tw_reuse = {}", val);
+            say!("    [OK] tcp_tw_reuse = {}", val);
         }
     }
 
-    println!();
+    say!();
 }
 
 #[cfg(unix)]

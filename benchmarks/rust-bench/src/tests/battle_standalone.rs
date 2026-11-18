@@ -55,10 +55,12 @@ impl CheckResult {
     fn check(&mut self, name: &str, condition: bool) {
         if condition {
             self.passed += 1;
-            println!("    [PASS] {}", name);
+            say!("    [PASS] {}", name);
         } else {
             self.failed += 1;
-            println!("    [FAIL] {}", name);
+            // Said in the run's exit code, however the test ends.
+            crate::report::failed();
+            say!("    [FAIL] {}", name);
         }
     }
 }
@@ -83,7 +85,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 1: Connect
     // =========================================================================
-    println!("\n  Phase 1: Connect {} clients", BATTLE_CLIENTS);
+    say!("\n  Phase 1: Connect {} clients", BATTLE_CLIENTS);
 
     let mut connections = protocol::connect_batch(
         &cli.host,
@@ -101,7 +103,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
 
     if connections.len() < BATTLE_CLIENTS / 2 {
-        println!("    ABORT: too few connections, cannot continue");
+        say!("    ABORT: too few connections, cannot continue");
         protocol::close_all(connections).await;
         return Vec::new();
     }
@@ -112,7 +114,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 2: Subscribe to topics
     // =========================================================================
-    println!("\n  Phase 2: Subscribe to topics");
+    say!("\n  Phase 2: Subscribe to topics");
 
     // All clients subscribe to "battle_all"
     for ws in connections.iter_mut() {
@@ -122,7 +124,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         });
         let _ = ws.send(Message::Text(cmd.to_string().into())).await;
     }
-    println!("    All {} subscribed to 'battle_all'", connections.len());
+    say!("    All {} subscribed to 'battle_all'", connections.len());
 
     // First half also subscribes to "battle_half" and "battle.*" (glob)
     for ws in connections[..half].iter_mut() {
@@ -132,7 +134,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         });
         let _ = ws.send(Message::Text(cmd.to_string().into())).await;
     }
-    println!(
+    say!(
         "    First {} also subscribed to 'battle_half' + 'battle.*'",
         half
     );
@@ -146,7 +148,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 3: Receive and measure
     // =========================================================================
-    println!(
+    say!(
         "\n  Phase 3: Receive for {}s, verify delivery",
         duration.as_secs()
     );
@@ -189,7 +191,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 4: Verify correctness
     // =========================================================================
-    println!("\n  Phase 4: Verify correctness");
+    say!("\n  Phase 4: Verify correctness");
 
     let g1_all = g1_counts.all.load(Ordering::Relaxed);
     let g1_ball = g1_counts.battle_all.load(Ordering::Relaxed);
@@ -201,11 +203,15 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let g2_bhalf = g2_counts.battle_half.load(Ordering::Relaxed);
     let g2_bglob = g2_counts.battle_glob.load(Ordering::Relaxed);
 
-    println!(
+    say!(
         "    Group 1 ({} clients, all topics): all={}, battle_all={}, battle_half={}, glob={}",
-        half, g1_all, g1_ball, g1_bhalf, g1_bglob
+        half,
+        g1_all,
+        g1_ball,
+        g1_bhalf,
+        g1_bglob
     );
-    println!(
+    say!(
         "    Group 2 ({} clients, battle_all only): all={}, battle_all={}, battle_half={}, glob={}",
         actual - half,
         g2_all,
@@ -238,12 +244,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let total_bytes = g1_counts.total_bytes.load(Ordering::Relaxed)
         + g2_counts.total_bytes.load(Ordering::Relaxed);
     let del_per_sec = total as f64 / duration.as_secs_f64();
-    println!(
+    say!(
         "\n    Total deliveries: {} ({}/s)",
         total,
         stats::fmt_rate(del_per_sec)
     );
-    println!(
+    say!(
         "    Bandwidth: {}",
         stats::fmt_bytes_per_sec(total_bytes as f64 / duration.as_secs_f64())
     );
@@ -251,11 +257,11 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Phase 5: Disconnect handling
     // =========================================================================
-    println!("\n  Phase 5: Disconnect handling");
+    say!("\n  Phase 5: Disconnect handling");
 
     // Close Group 1
     protocol::close_all(g1_streams).await;
-    println!("    Dropped {} connections (Group 1)", half);
+    say!("    Dropped {} connections (Group 1)", half);
 
     // Reset counters and verify Group 2 still receives for 3s
     let g2_post = Arc::new(ChannelCounts::new());
@@ -278,9 +284,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         "Remaining clients receive after peer disconnect",
         post_all + post_ball > 0,
     );
-    println!(
+    say!(
         "    Remaining group (3s): all={}, battle_all={}",
-        post_all, post_ball
+        post_all,
+        post_ball
     );
 
     // Cleanup
@@ -289,16 +296,16 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     // =========================================================================
     // Summary
     // =========================================================================
-    println!(
+    say!(
         "\n  Result: {}/{} checks passed",
         checks.passed,
         checks.passed + checks.failed
     );
     if checks.failed > 0 {
-        println!("  FAILED");
+        say!("  FAILED");
         crate::report::failed();
     } else {
-        println!("  PASSED");
+        say!("  PASSED");
     }
 
     Vec::new()

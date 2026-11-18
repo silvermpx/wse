@@ -30,7 +30,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let mut results = Vec::new();
 
     for &n in &tiers {
-        println!("\n  --- {} subscribers ---", n);
+        say!("\n  --- {} subscribers ---", n);
 
         let connections = protocol::connect_batch(
             &cli.host,
@@ -43,22 +43,23 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .await;
 
         if connections.is_empty() {
-            println!("    FAILED: no connections");
+            say!("    FAILED: no connections");
             crate::report::failed();
             continue;
         }
 
         let actual = connections.len();
         if actual < n / 2 {
-            println!(
+            say!(
                 "    SKIPPED: only {}/{} connected (server max-connections too low?)",
-                actual, n
+                actual,
+                n
             );
             protocol::close_all(connections).await;
             continue;
         }
         if actual < n {
-            println!("    WARNING: {}/{} connected", actual, n);
+            say!("    WARNING: {}/{} connected", actual, n);
         }
         // Capture drops counter before measurement for per-tier delta
         let drops_before =
@@ -71,27 +72,27 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         let published_per_sec = deliveries_per_sec / actual as f64;
         let raw_gaps = result.total_gaps.load(Ordering::Relaxed);
 
-        println!("    Duration:       {:.2}s", result.elapsed);
-        println!(
+        say!("    Duration:       {:.2}s", result.elapsed);
+        say!(
             "    Published:      {}/s (unique messages from server)",
             stats::fmt_rate(published_per_sec)
         );
-        println!(
+        say!(
             "    Deliveries:     {}/s (fan-out: {} x {} subs)",
             stats::fmt_rate(deliveries_per_sec),
             stats::fmt_rate(published_per_sec),
             actual
         );
-        println!(
+        say!(
             "    Bandwidth:      {}",
             stats::fmt_bytes_per_sec(result.total_bytes as f64 / result.elapsed)
         );
         if raw_gaps > 0 {
-            println!("    Seq gaps:       ~{} unique messages lost", raw_gaps);
+            say!("    Seq gaps:       ~{} unique messages lost", raw_gaps);
         }
 
         if !result.latency.is_empty() {
-            println!("    Delivery latency:");
+            say!("    Delivery latency:");
             result.latency.print_summary("      ");
         }
 
@@ -102,8 +103,8 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             _ => drops_after,
         };
         match tier_drops {
-            Some(0) => println!("    Server drops:   0 (ok)"),
-            Some(d) => println!("    Server drops:   {} (slow consumer drops)", d),
+            Some(0) => say!("    Server drops:   0 (ok)"),
+            Some(d) => say!("    Server drops:   {} (slow consumer drops)", d),
             None => {} // metrics endpoint not available, skip silently
         }
 
@@ -131,7 +132,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         protocol::close_all(result.connections).await;
         // Cooldown: let server finish tearing down connections before next tier
         tokio::time::sleep(Duration::from_secs(2)).await;
-        println!();
+        say!();
     }
 
     report::print_fanout_table(&results);
