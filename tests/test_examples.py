@@ -55,3 +55,36 @@ def test_the_broadcast_example_takes_the_official_clients_subscriptions(server_p
         for thread in threads:
             thread.join(timeout=5)
         server.stop()
+
+
+def test_the_benchmark_fails_when_the_server_refuses_its_login():
+    """A login the server refuses is no benchmark: the run ends with an
+    error, never as a run that measured nothing."""
+    pytest.importorskip("httpx")
+    pytest.importorskip("websockets")
+    import http.server
+    import subprocess
+    import sys
+
+    class Refuse(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.send_response(401)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    bench = pathlib.Path(__file__).resolve().parents[1] / "benchmarks" / "bench_wse.py"
+    with http.server.HTTPServer(("127.0.0.1", 0), Refuse) as fake:
+        threading.Thread(target=fake.handle_request, daemon=True).start()
+        run = subprocess.run(
+            [sys.executable, str(bench), "--host", "127.0.0.1", "--port", str(fake.server_port)]
+            + ["--email", "e", "--password", "p"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    assert "FATAL" in run.stdout, run.stdout + run.stderr
+    assert run.returncode != 0

@@ -305,7 +305,7 @@ async def main(host: str, port: int, login_url: str, email: str, password: str):
     token = await get_jwt_token(host, port, login_url, email, password)
     if not token:
         print("  FATAL: Cannot get JWT token. Is the server running?")
-        return
+        raise SystemExit(1)
     print(f"  Token: {token[:20]}...")
     if not await authenticated(host, port, token):
         print("  FATAL: the server did not take the token (no server_ready)")
