@@ -39,13 +39,11 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         )
         .await;
 
-        if connections.is_empty() {
-            say!("    FAILED: no connections");
-            crate::report::failed();
+        let actual = connections.len();
+        crate::report::short("connections", actual as u64, n as u64);
+        if actual == 0 {
             continue;
         }
-
-        let actual = connections.len();
         let disconnected = Arc::new(AtomicUsize::new(0));
         let duration = std::time::Duration::from_secs(hold_secs);
 
@@ -90,15 +88,15 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
 
         let elapsed = start.elapsed().as_secs_f64();
         let disc_count = disconnected.load(Ordering::Relaxed);
-        let survival_rate = (actual - disc_count) as f64 / actual as f64 * 100.0;
+        // A connection whose task died held nothing.
+        let held = ws_list.len().saturating_sub(disc_count);
+        let survival_rate = held as f64 / actual as f64 * 100.0;
+        let answered = merged.len();
 
-        say!(
-            "    Survival: {}/{} ({:.1}%)",
-            actual - disc_count,
-            actual,
-            survival_rate
-        );
-        say!("    Total PINGs: {}", total_pings);
+        say!("    Survival: {}/{} ({:.1}%)", held, actual, survival_rate);
+        say!("    Total PINGs: {} ({} answered)", total_pings, answered);
+        crate::report::short("connections held", held as u64, n as u64);
+        crate::report::short("pings answered", answered, total_pings);
         if !merged.is_empty() {
             say!("    PING/PONG latency:");
             merged.print_summary("      ");
@@ -107,10 +105,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         results.push(TierResult {
             tier: n,
             connected: actual,
-            errors: disc_count,
+            errors: n - held,
             duration_secs: elapsed,
             messages_sent: total_pings,
-            messages_received: total_pings.saturating_sub(disc_count as u64),
+            messages_received: answered,
             bytes_sent: 0,
             latency: if merged.is_empty() {
                 None

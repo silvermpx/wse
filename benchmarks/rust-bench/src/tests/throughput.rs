@@ -37,13 +37,11 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         )
         .await;
 
-        if connections.is_empty() {
-            say!("    FAILED: no connections");
-            crate::report::failed();
+        let actual = connections.len();
+        crate::report::short("connections", actual as u64, n as u64);
+        if actual == 0 {
             continue;
         }
-
-        let actual = connections.len();
         let total_sent = Arc::new(AtomicU64::new(0));
         let total_bytes = Arc::new(AtomicU64::new(0));
         let duration = std::time::Duration::from_secs(cli.duration);
@@ -63,11 +61,15 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             }));
         }
 
-        let ws_list: Vec<WsStream> = futures_util::future::join_all(handles)
+        // A sender whose connection failed (or whose task died) did not last
+        // the run.
+        let ended: Vec<(WsStream, bool)> = futures_util::future::join_all(handles)
             .await
             .into_iter()
             .filter_map(|r| r.ok())
             .collect();
+        let lasted = ended.iter().filter(|(_, lasted)| *lasted).count();
+        let ws_list: Vec<WsStream> = ended.into_iter().map(|(ws, _)| ws).collect();
 
         let elapsed = start.elapsed().as_secs_f64();
         let sent = total_sent.load(Ordering::Relaxed);
@@ -88,11 +90,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             stats::fmt_bytes_per_sec(bytes as f64 / elapsed)
         );
         say!("    Per-connection: {:.0} msg/s", per_conn);
+        crate::report::short("senders through the run", lasted as u64, n as u64);
 
         results.push(TierResult {
             tier: n,
             connected: actual,
-            errors: n - actual,
+            errors: n - lasted,
             duration_secs: elapsed,
             messages_sent: sent,
             messages_received: 0,
@@ -120,14 +123,16 @@ async fn send_loop(
     duration: std::time::Duration,
     total_sent: Arc<AtomicU64>,
     total_bytes: Arc<AtomicU64>,
-) -> WsStream {
+) -> (WsStream, bool) {
     let deadline = tokio::time::Instant::now() + duration;
     let mut local_sent = 0u64;
     let mut local_bytes = 0u64;
+    let mut lasted = true;
     let msg = Message::Text(payload.to_string().into());
 
     while tokio::time::Instant::now() < deadline {
         if ws.send(msg.clone()).await.is_err() {
+            lasted = false;
             break;
         }
         local_sent += 1;
@@ -141,5 +146,5 @@ async fn send_loop(
 
     total_sent.fetch_add(local_sent, Ordering::Relaxed);
     total_bytes.fetch_add(local_bytes, Ordering::Relaxed);
-    ws
+    (ws, lasted)
 }

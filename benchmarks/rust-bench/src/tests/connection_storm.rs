@@ -125,6 +125,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             err_count
         );
         say!("    Total time: {:.2}s", total_secs);
+        crate::report::short("connections", connections.len() as u64, n as u64);
 
         // Build histogram
         let mut hist = LatencyHistogram::new();

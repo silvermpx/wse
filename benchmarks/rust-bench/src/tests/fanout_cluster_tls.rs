@@ -84,12 +84,11 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         )
         .await;
 
-        if connections.is_empty() {
-            say!("    FAILED: no connections to Server B");
+        let actual = connections.len();
+        crate::report::short("subscribers connected to Server B", actual as u64, n as u64);
+        if actual == 0 {
             continue;
         }
-
-        let actual = connections.len();
 
         // Capture drops counters before measurement for per-tier delta
         let drops_a_before =
@@ -98,11 +97,14 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             protocol::query_slow_consumer_drops(&cli.host, cli.metrics_port_for(port2)).await;
 
         // Server A publishes, Server B fans out to our clients via TLS Cluster
+        // (a cluster link is TLS, always: there is no plaintext one to fall
+        // back to).
         let result = super::fanout_broadcast::measure_fanout(
             connections,
             std::time::Duration::from_secs(cli.duration),
         )
         .await;
+        result.short_of(n);
 
         let deliveries_per_sec = result.total_received as f64 / result.elapsed;
         let mb_per_sec = result.total_bytes as f64 / result.elapsed / 1_000_000.0;

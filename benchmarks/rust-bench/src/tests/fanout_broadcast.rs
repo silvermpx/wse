@@ -42,30 +42,19 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         )
         .await;
 
-        if connections.is_empty() {
-            say!("    FAILED: no connections");
-            crate::report::failed();
-            continue;
-        }
-
         let actual = connections.len();
-        if actual < n / 2 {
-            say!(
-                "    SKIPPED: only {}/{} connected (server max-connections too low?)",
-                actual,
-                n
-            );
-            protocol::close_all(connections).await;
-            continue;
+        if crate::report::short("subscribers connected", actual as u64, n as u64) {
+            say!("    (server max-connections too low?)");
         }
-        if actual < n {
-            say!("    WARNING: {}/{} connected", actual, n);
+        if actual == 0 {
+            continue;
         }
         // Capture drops counter before measurement for per-tier delta
         let drops_before =
             protocol::query_slow_consumer_drops(&cli.host, cli.metrics_port_for(cli.port)).await;
 
         let result = measure_fanout(connections, Duration::from_secs(cli.duration)).await;
+        result.short_of(n);
 
         let deliveries_per_sec = result.total_received as f64 / result.elapsed;
         let mb_per_sec = result.total_bytes as f64 / result.elapsed / 1_000_000.0;
@@ -146,6 +135,41 @@ pub(crate) struct FanoutResult {
     pub elapsed: f64,
     pub latency: LatencyHistogram,
     pub connections: Vec<WsStream>,
+    /// Subscribers whose connection lasted the whole run.
+    pub through: usize,
+    /// Subscribers that got anything at all.
+    pub receiving: usize,
+}
+
+impl FanoutResult {
+    /// Two measurements of one run (each node's subscribers): taken as one.
+    pub(crate) fn with(mut self, other: FanoutResult) -> FanoutResult {
+        self.total_received += other.total_received;
+        self.total_bytes += other.total_bytes;
+        self.total_gaps
+            .fetch_add(other.total_gaps.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.elapsed = self.elapsed.max(other.elapsed);
+        self.latency.merge(&other.latency);
+        self.connections.extend(other.connections);
+        self.through += other.through;
+        self.receiving += other.receiving;
+        self
+    }
+
+    /// The tier asked for `wanted` subscribers: one that did not last the
+    /// run, or got nothing, fails it.
+    pub(crate) fn short_of(&self, wanted: usize) {
+        crate::report::short(
+            "subscribers through the run",
+            self.through as u64,
+            wanted as u64,
+        );
+        crate::report::short(
+            "subscribers that got messages",
+            self.receiving as u64,
+            wanted as u64,
+        );
+    }
 }
 
 pub(crate) async fn measure_fanout(connections: Vec<WsStream>, duration: Duration) -> FanoutResult {
@@ -211,11 +235,15 @@ pub(crate) async fn measure_fanout(connections: Vec<WsStream>, duration: Duratio
         )));
     }
 
-    let ws_list: Vec<WsStream> = futures_util::future::join_all(handles)
+    // A subscriber whose task died lasted nothing and got nothing.
+    let ended: Vec<(WsStream, bool, u64)> = futures_util::future::join_all(handles)
         .await
         .into_iter()
         .filter_map(|r| r.ok())
         .collect();
+    let through = ended.iter().filter(|(_, lasted, _)| *lasted).count();
+    let receiving = ended.iter().filter(|(_, _, got)| *got > 0).count();
+    let ws_list: Vec<WsStream> = ended.into_iter().map(|(ws, _, _)| ws).collect();
 
     // Use deadline-based elapsed, not join_all wall time (task teardown inflates it)
     let elapsed = duration.as_secs_f64().min(start.elapsed().as_secs_f64());
@@ -238,6 +266,8 @@ pub(crate) async fn measure_fanout(connections: Vec<WsStream>, duration: Duratio
         elapsed,
         latency: merged_latency,
         connections: ws_list,
+        through,
+        receiving,
     }
 }
 
@@ -249,8 +279,9 @@ pub(crate) async fn receive_loop(
     total_gaps: Arc<AtomicU64>,
     latency: Arc<Mutex<LatencyHistogram>>,
     measurement_start_us: u64,
-) -> WsStream {
+) -> (WsStream, bool, u64) {
     let mut local_received = 0u64;
+    let mut lasted = true;
     let mut local_bytes = 0u64;
     let mut local_gaps = 0u64;
     let mut local_hist = LatencyHistogram::new();
@@ -267,6 +298,11 @@ pub(crate) async fn receive_loop(
                 if let Some(parsed) = parse_wse_message(&msg) {
                     local_bytes += msg.len() as u64;
                     local_received += 1;
+                    // A reader whose socket is never empty yields now and
+                    // then, so the others are read too.
+                    if local_received.is_multiple_of(64) {
+                        tokio::task::yield_now().await;
+                    }
 
                     // Latency: only measure for messages published after measurement started
                     // (stale messages from pipeline backlog would show multi-second latency)
@@ -301,7 +337,10 @@ pub(crate) async fn receive_loop(
                     }
                 }
             }
-            Ok(Some(Err(_))) | Ok(None) => break,
+            Ok(Some(Err(_))) | Ok(None) => {
+                lasted = false;
+                break;
+            }
             Err(_) => break, // duration ended
         }
     }
@@ -317,5 +356,5 @@ pub(crate) async fn receive_loop(
         hist.merge(&local_hist);
     }
 
-    ws
+    (ws, lasted, local_received)
 }

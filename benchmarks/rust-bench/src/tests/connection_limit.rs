@@ -1,7 +1,9 @@
 use crate::config::Cli;
-use crate::protocol;
+use crate::protocol::{self, WsStream};
 use crate::report::TierResult;
 use crate::stats;
+use futures_util::{FutureExt, StreamExt};
+use tokio_tungstenite::tungstenite::protocol::Message;
 
 /// Test 7: Connection Limit Finder
 /// Binary search for the absolute maximum connections the server can handle.
@@ -18,13 +20,13 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let max = cli.max_connections;
     let mut results = Vec::new();
 
-    // Phase 1: Exponential probe — double until failure
+    // Phase 1: Exponential probe — double until failure, the max itself last
     say!("\n  Phase 1: Exponential probe (doubling)");
-    let mut current = 1_000;
+    let mut current = 1_000.min(max);
     let mut last_success = 0;
     let mut first_failure = max;
 
-    while current <= max {
+    loop {
         let (ok, errors, rate) = probe_connections(cli, &token, current).await;
         let error_rate = errors as f64 / current as f64;
 
@@ -37,7 +39,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             );
             last_success = current;
             results.push(make_result(current, current - errors, errors, rate));
-            current *= 2;
+            if current == max {
+                break;
+            }
+            current = (current * 2).min(max);
         } else {
             say!(
                 "    {} conns: FAIL ({} errors = {:.1}%)",
@@ -52,11 +57,14 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     }
 
     if last_success == 0 {
-        say!("\n    Could not establish even 1000 connections.");
+        fail!(
+            "\n    FAILED: could not hold even {} connections.",
+            1_000.min(max)
+        );
         return results;
     }
 
-    if first_failure == max && last_success >= max / 2 {
+    if last_success == max {
         say!("\n    All probes succeeded up to max ({}).", max);
         return results;
     }
@@ -114,11 +122,13 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     results
 }
 
-/// Try to establish `n` connections, return (success, error_count, rate).
+/// Try to establish `n` connections and hold them a few seconds: whether
+/// any held, how many did not (failed, or gone during the hold), and the
+/// rate they connected at.
 async fn probe_connections(cli: &Cli, token: &str, n: usize) -> (bool, usize, f64) {
     let start = std::time::Instant::now();
 
-    let connections = protocol::connect_batch(
+    let mut connections = protocol::connect_batch(
         &cli.host,
         cli.port,
         token,
@@ -130,12 +140,18 @@ async fn probe_connections(cli: &Cli, token: &str, n: usize) -> (bool, usize, f6
 
     let elapsed = start.elapsed().as_secs_f64();
     let connected = connections.len();
-    let errors = n - connected;
     let rate = connected as f64 / elapsed;
 
-    // Hold for a few seconds to verify stability
+    // Hold for a few seconds to verify stability: one that ended meanwhile
+    // did not hold.
+    let mut held = 0;
     if connected > 0 {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        for ws in &mut connections {
+            if still_up(ws) {
+                held += 1;
+            }
+        }
     }
 
     protocol::close_all(connections).await;
@@ -143,7 +159,19 @@ async fn probe_connections(cli: &Cli, token: &str, n: usize) -> (bool, usize, f6
     // Allow OS to reclaim resources
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-    (connected > 0, errors, rate)
+    (held > 0, n - held, rate)
+}
+
+/// Whether a connection held is still up: nothing waiting in it says it
+/// ended (what the server sent meanwhile is read past).
+fn still_up(ws: &mut WsStream) -> bool {
+    loop {
+        match ws.next().now_or_never() {
+            None => return true,
+            Some(Some(Ok(Message::Close(_)))) | Some(Some(Err(_))) | Some(None) => return false,
+            Some(Some(Ok(_))) => {}
+        }
+    }
 }
 
 fn make_result(tier: usize, connected: usize, errors: usize, rate: f64) -> TierResult {

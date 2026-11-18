@@ -116,10 +116,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         let actual_a = conns_a.len();
         let actual_b = conns_b.len();
         let actual = actual_a + actual_b;
+        crate::report::short("subscribers connected to A", actual_a as u64, half as u64);
+        crate::report::short("subscribers connected to B", actual_b as u64, half_b as u64);
 
         if actual == 0 {
-            say!("    FAILED: no connections");
-            crate::report::failed();
             continue;
         }
 
@@ -131,22 +131,23 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             half_b
         );
 
-        // Merge all connections for unified measurement
-        let mut connections = conns_a;
-        connections.extend(conns_b);
-
         // Capture drops counters before measurement
         let drops_a_before =
             protocol::query_slow_consumer_drops(&cli.host, cli.metrics_port_for(cli.port)).await;
         let drops_b_before =
             protocol::query_slow_consumer_drops(&cli.host, cli.metrics_port_for(port2)).await;
 
-        // Measure: Server A publishes, both servers fan out to their local clients
-        let result = super::fanout_broadcast::measure_fanout(
-            connections,
-            std::time::Duration::from_secs(cli.duration),
-        )
-        .await;
+        // Measure: Server A publishes, both servers fan out to their local
+        // clients; each side is measured as well as both together, so B
+        // getting nothing over the cluster does not hide behind A.
+        let duration = std::time::Duration::from_secs(cli.duration);
+        let (on_a, on_b) = tokio::join!(
+            super::fanout_broadcast::measure_fanout(conns_a, duration),
+            super::fanout_broadcast::measure_fanout(conns_b, duration)
+        );
+        on_a.short_of(half);
+        on_b.short_of(half_b);
+        let result = on_a.with(on_b);
 
         let deliveries_per_sec = result.total_received as f64 / result.elapsed;
         let mb_per_sec = result.total_bytes as f64 / result.elapsed / 1_000_000.0;

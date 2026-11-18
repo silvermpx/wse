@@ -27,6 +27,23 @@ pub fn any_failed() -> bool {
     FAILED.load(Ordering::Relaxed)
 }
 
+/// A tier got less than it asked for (connections, answers, deliveries,
+/// stages): it says so and fails the run, so a measurement cut short is
+/// never taken for a whole one. True when it is short.
+pub fn short(what: &str, got: u64, wanted: u64) -> bool {
+    if got >= wanted {
+        return false;
+    }
+    failed();
+    let line = format!("    FAILED: {what}: {got} of {wanted}");
+    if json() {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
+    }
+    true
+}
+
 /// Single tier result (used across all tests).
 /// Each field goes into the JSON report (`--output json`).
 #[derive(Clone, serde::Serialize)]

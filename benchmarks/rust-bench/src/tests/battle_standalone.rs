@@ -1,8 +1,8 @@
 use crate::config::Cli;
-use crate::protocol::{self, parse_wse_message, WsStream};
+use crate::protocol::{self, WsStream};
 use crate::report::TierResult;
 use crate::stats;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -177,16 +177,24 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     }
 
     // Wait for all receive tasks to finish
-    let g1_streams: Vec<WsStream> = futures_util::future::join_all(g1_handles)
-        .await
-        .into_iter()
-        .filter_map(|r| r.ok())
-        .collect();
-    let g2_streams: Vec<WsStream> = futures_util::future::join_all(g2_handles)
-        .await
-        .into_iter()
-        .filter_map(|r| r.ok())
-        .collect();
+    // A client whose task died lasted nothing and got nothing.
+    let (g1_streams, g1_seen): (Vec<WsStream>, Vec<super::Seen>) =
+        futures_util::future::join_all(g1_handles)
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .unzip();
+    let (g2_streams, g2_seen): (Vec<WsStream>, Vec<super::Seen>) =
+        futures_util::future::join_all(g2_handles)
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .unzip();
+    let g1_size = half;
+    let g2_size = actual - half;
+    let every = |seen: &[super::Seen], size: usize, holds: fn(&super::Seen) -> bool| {
+        super::count(seen, holds) == size
+    };
 
     // =========================================================================
     // Phase 4: Verify correctness
@@ -221,21 +229,45 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     );
 
     // broadcast_all delivery
-    checks.check("Group 1 received broadcast_all", g1_all > 0);
-    checks.check("Group 2 received broadcast_all", g2_all > 0);
+    // Every client lasted the window: isolation on a dead socket holds for nothing.
+    checks.check(
+        "Group 1: every client lasted the window",
+        every(&g1_seen, g1_size, |s| s.lasted),
+    );
+    checks.check(
+        "Group 2: every client lasted the window",
+        every(&g2_seen, g2_size, |s| s.lasted),
+    );
+    checks.check(
+        "Group 1: every client received broadcast_all",
+        every(&g1_seen, g1_size, |s| s.all > 0),
+    );
+    checks.check(
+        "Group 2: every client received broadcast_all",
+        every(&g2_seen, g2_size, |s| s.all > 0),
+    );
 
     // Topic delivery
-    checks.check("Group 1 received 'battle_all' topic", g1_ball > 0);
-    checks.check("Group 2 received 'battle_all' topic", g2_ball > 0);
+    checks.check(
+        "Group 1: every client received 'battle_all' topic",
+        every(&g1_seen, g1_size, |s| s.battle_all > 0),
+    );
+    checks.check(
+        "Group 2: every client received 'battle_all' topic",
+        every(&g2_seen, g2_size, |s| s.battle_all > 0),
+    );
 
     // Topic isolation -- battle_half
-    checks.check("Group 1 received 'battle_half' topic", g1_bhalf > 0);
+    checks.check(
+        "Group 1: every client received 'battle_half' topic",
+        every(&g1_seen, g1_size, |s| s.battle_half > 0),
+    );
     checks.check("Group 2 isolated from 'battle_half'", g2_bhalf == 0);
 
     // Glob pattern matching -- battle.* matches battle.glob_test
     checks.check(
-        "Group 1 received 'battle.glob_test' via glob 'battle.*'",
-        g1_bglob > 0,
+        "Group 1: every client received 'battle.glob_test' via glob 'battle.*'",
+        every(&g1_seen, g1_size, |s| s.battle_glob > 0),
     );
     checks.check("Group 2 isolated from 'battle.glob_test'", g2_bglob == 0);
 
@@ -272,17 +304,20 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         let counts = g2_post.clone();
         post_handles.push(tokio::spawn(battle_receive_loop(ws, post_deadline, counts)));
     }
-    let remaining: Vec<WsStream> = futures_util::future::join_all(post_handles)
-        .await
-        .into_iter()
-        .filter_map(|r| r.ok())
-        .collect();
+    let (remaining, post_seen): (Vec<WsStream>, Vec<super::Seen>) =
+        futures_util::future::join_all(post_handles)
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .unzip();
 
     let post_all = g2_post.all.load(Ordering::Relaxed);
     let post_ball = g2_post.battle_all.load(Ordering::Relaxed);
     checks.check(
-        "Remaining clients receive after peer disconnect",
-        post_all + post_ball > 0,
+        "Every remaining client receives after peer disconnect",
+        every(&post_seen, g2_size, |s| {
+            s.lasted && s.all + s.battle_all > 0
+        }),
     );
     say!(
         "    Remaining group (3s): all={}, battle_all={}",
@@ -311,51 +346,24 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
     Vec::new()
 }
 
-/// Receive messages until deadline, categorize by channel, accumulate counts.
+/// Receive messages until deadline, categorize by channel, accumulate counts:
+/// what each client got, and the group's totals.
 async fn battle_receive_loop(
-    mut ws: WsStream,
+    ws: WsStream,
     deadline: tokio::time::Instant,
     counts: Arc<ChannelCounts>,
-) -> WsStream {
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-
-        match tokio::time::timeout(remaining, ws.next()).await {
-            Ok(Some(Ok(msg))) => {
-                counts
-                    .total_bytes
-                    .fetch_add(msg.len() as u64, Ordering::Relaxed);
-
-                if let Some(parsed) = parse_wse_message(&msg) {
-                    if let Some(ch) = parsed
-                        .get("p")
-                        .and_then(|p| p.get("ch"))
-                        .and_then(|v| v.as_str())
-                    {
-                        match ch {
-                            "all" => {
-                                counts.all.fetch_add(1, Ordering::Relaxed);
-                            }
-                            "battle_all" => {
-                                counts.battle_all.fetch_add(1, Ordering::Relaxed);
-                            }
-                            "battle_half" => {
-                                counts.battle_half.fetch_add(1, Ordering::Relaxed);
-                            }
-                            "battle.glob_test" => {
-                                counts.battle_glob.fetch_add(1, Ordering::Relaxed);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            Ok(Some(Err(_))) | Ok(None) => break,
-            Err(_) => break, // deadline reached
-        }
-    }
-    ws
+) -> (WsStream, super::Seen) {
+    let (ws, seen) = super::receive_channels(ws, deadline).await;
+    counts.all.fetch_add(seen.all, Ordering::Relaxed);
+    counts
+        .battle_all
+        .fetch_add(seen.battle_all, Ordering::Relaxed);
+    counts
+        .battle_half
+        .fetch_add(seen.battle_half, Ordering::Relaxed);
+    counts
+        .battle_glob
+        .fetch_add(seen.battle_glob, Ordering::Relaxed);
+    counts.total_bytes.fetch_add(seen.bytes, Ordering::Relaxed);
+    (ws, seen)
 }

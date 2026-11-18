@@ -77,29 +77,27 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         .await;
 
         let actual = connections.len();
-        if actual < n / 2 {
-            say!(
-                "    SKIPPED: only {}/{} connected (ulimit or server max-connections?)",
-                actual,
-                n
-            );
-            protocol::close_all(connections).await;
-            continue;
+        if crate::report::short("subscribers connected", actual as u64, n as u64) {
+            say!("    (ulimit or server max-connections?)");
         }
-        if actual < n {
-            say!("    WARNING: {}/{} connected", actual, n);
+        if actual == 0 {
+            continue;
         }
 
         // Subscribe all to "battle_all"
         say_on!("    Subscribing to topic... ");
+        let mut asked = 0usize;
         for ws in connections.iter_mut() {
             let cmd = serde_json::json!({
                 "t": "battle_cmd",
                 "p": {"action": "subscribe", "topics": ["battle_all"]}
             });
-            let _ = ws.send(Message::Text(cmd.to_string().into())).await;
+            if ws.send(Message::Text(cmd.to_string().into())).await.is_ok() {
+                asked += 1;
+            }
         }
         say!("done");
+        crate::report::short("subscribe requests sent", asked as u64, actual as u64);
 
         // Settle + warmup
         tokio::time::sleep(Duration::from_millis(SUBSCRIBE_SETTLE_MS)).await;
@@ -119,11 +117,15 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             handles.push(tokio::spawn(load_receive_loop(ws, deadline, ctrs, lat)));
         }
 
-        let ws_list: Vec<WsStream> = futures_util::future::join_all(handles)
+        // A subscriber whose task died lasted nothing and got nothing.
+        let ended: Vec<(WsStream, bool, bool)> = futures_util::future::join_all(handles)
             .await
             .into_iter()
             .filter_map(|r| r.ok())
             .collect();
+        let through = ended.iter().filter(|(_, lasted, _)| *lasted).count();
+        let both = ended.iter().filter(|(_, _, both)| *both).count();
+        let ws_list: Vec<WsStream> = ended.into_iter().map(|(ws, _, _)| ws).collect();
 
         let elapsed = start.elapsed().as_secs_f64();
 
@@ -140,12 +142,15 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             gaps
         };
 
-        // Correctness checks
+        // Correctness checks: every subscriber lasted the run and got both
+        // kinds of messages.
         let ba_ok = ba_count > 0;
         let topic_ok = topic_count > 0;
         if !ba_ok || !topic_ok {
             crate::report::failed();
         }
+        crate::report::short("subscribers through the run", through as u64, n as u64);
+        crate::report::short("subscribers that got both kinds", both as u64, n as u64);
 
         say!("    Duration:       {:.2}s", elapsed);
         say!(
@@ -189,7 +194,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         results.push(TierResult {
             tier: n,
             connected: actual,
-            errors: n - actual,
+            errors: n - through,
             duration_secs: elapsed,
             messages_sent: 0,
             messages_received: received,
@@ -272,8 +277,9 @@ async fn load_receive_loop(
     deadline: tokio::time::Instant,
     counters: Arc<LoadCounters>,
     latency: Arc<Mutex<LatencyHistogram>>,
-) -> WsStream {
+) -> (WsStream, bool, bool) {
     let mut local_received = 0u64;
+    let mut lasted = true;
     let mut local_bytes = 0u64;
     let mut local_ba = 0u64;
     let mut local_topic = 0u64;
@@ -291,6 +297,11 @@ async fn load_receive_loop(
             Ok(Some(Ok(msg))) => {
                 local_bytes += msg.len() as u64;
                 local_received += 1;
+                // A reader whose socket is never empty yields now and then,
+                // so the others are read too.
+                if local_received.is_multiple_of(64) {
+                    tokio::task::yield_now().await;
+                }
 
                 if let Some(parsed) = parse_wse_message(&msg) {
                     // Channel categorization
@@ -334,7 +345,10 @@ async fn load_receive_loop(
                     }
                 }
             }
-            Ok(Some(Err(_))) | Ok(None) => break,
+            Ok(Some(Err(_))) | Ok(None) => {
+                lasted = false;
+                break;
+            }
             Err(_) => break,
         }
     }
@@ -355,5 +369,5 @@ async fn load_receive_loop(
         hist.merge(&local_hist);
     }
 
-    ws
+    (ws, lasted, local_ba > 0 && local_topic > 0)
 }

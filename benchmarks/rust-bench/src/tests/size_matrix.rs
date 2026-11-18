@@ -46,12 +46,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             )
             .await;
 
-            if connections.is_empty() {
+            let actual = connections.len();
+            if actual == 0 {
                 fail_err!("FAILED");
                 continue;
             }
-
-            let actual = connections.len();
+            crate::report::short("connections", actual as u64, n as u64);
             let total_sent = Arc::new(AtomicU64::new(0));
             let total_bytes = Arc::new(AtomicU64::new(0));
             let duration = std::time::Duration::from_secs(burst_secs);
@@ -70,11 +70,15 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
                 }));
             }
 
-            let ws_list: Vec<WsStream> = futures_util::future::join_all(handles)
+            // A sender whose connection failed (or whose task died) did not
+            // last the burst.
+            let ended: Vec<(WsStream, bool)> = futures_util::future::join_all(handles)
                 .await
                 .into_iter()
                 .filter_map(|r| r.ok())
                 .collect();
+            let lasted = ended.iter().filter(|(_, lasted)| *lasted).count();
+            let ws_list: Vec<WsStream> = ended.into_iter().map(|(ws, _)| ws).collect();
 
             let elapsed = start.elapsed().as_secs_f64();
             let sent = total_sent.load(Ordering::Relaxed);
@@ -83,11 +87,12 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             let mb_s = bytes as f64 / elapsed / 1_000_000.0;
 
             eprintln!("{} msg/s, {:.1} MB/s", stats::fmt_rate(msg_s), mb_s);
+            crate::report::short("senders through the burst", lasted as u64, n as u64);
 
             let tier_result = TierResult {
                 tier: n,
                 connected: actual,
-                errors: n - actual,
+                errors: n - lasted,
                 duration_secs: elapsed,
                 messages_sent: sent,
                 messages_received: 0,
@@ -124,14 +129,16 @@ async fn matrix_send_loop(
     duration: std::time::Duration,
     total_sent: Arc<AtomicU64>,
     total_bytes: Arc<AtomicU64>,
-) -> WsStream {
+) -> (WsStream, bool) {
     let deadline = tokio::time::Instant::now() + duration;
     let mut local_sent = 0u64;
     let mut local_bytes = 0u64;
+    let mut lasted = true;
     let msg = Message::Text(payload.to_string().into());
 
     while tokio::time::Instant::now() < deadline {
         if ws.send(msg.clone()).await.is_err() {
+            lasted = false;
             break;
         }
         local_sent += 1;
@@ -144,7 +151,7 @@ async fn matrix_send_loop(
 
     total_sent.fetch_add(local_sent, Ordering::Relaxed);
     total_bytes.fetch_add(local_bytes, Ordering::Relaxed);
-    ws
+    (ws, lasted)
 }
 
 fn format_size(n: usize) -> String {
