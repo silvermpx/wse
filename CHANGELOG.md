@@ -249,7 +249,10 @@ server every client is checked against.
   one place however it is spelled: an IPv4 address and its IPv4-mapped IPv6
   form (as a dual-stack listener sees it), a host name in any case, a port
   however it is written (`044015` is `44015`); a link-local IPv6 address
-  keeps its zone, so two nodes on two links are not one place.
+  keeps its zone, so two nodes on two links are not one place. A zone is
+  given by its number: `connect_cluster()` refuses one by an interface's
+  name (`%lo0`), which no link could be dialed by and which was another
+  place than its number.
 - Cluster: a node that stops no longer loses what it published just before
   the stop. Its run leaves the cluster once it takes no more publishes,
   after every one it took, and waits (two seconds at most) for each link to

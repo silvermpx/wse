@@ -853,3 +853,16 @@ fn a_message_published_while_a_connection_subscribes_reaches_it() {
         }
     }
 }
+
+/// An IPv6 zone is given by its number: one by an interface's name is
+/// refused, whatever else the address is.
+#[test]
+fn a_cluster_address_with_a_zone_by_name_is_refused() {
+    let named = super::cluster_link::names_a_zone;
+    assert!(named("[fe80::1%lo0]:7000"));
+    assert!(named("[fe80::1%]:7000"));
+    assert!(!named("[fe80::1%1]:7000"));
+    assert!(!named("[::1]:7000"));
+    assert!(!named("localhost:7000"));
+    assert!(!named("10.0.0.1:7000"));
+}

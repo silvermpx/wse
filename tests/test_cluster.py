@@ -1076,6 +1076,34 @@ def test_a_node_whose_port_comes_back_written_otherwise_is_the_same_place(nodes)
             assert answer["recovered"] is False or 2 in numbers, (first, then, answer)
 
 
+def test_an_ipv6_zone_is_given_by_its_number(nodes):
+    """A zone by an interface's name (%lo0) cannot be dialed, and would be
+    another place than the same zone by its number (%1): the cluster refuses
+    it, in this node's address, its peers and its seeds, before it starts."""
+    zoned = f"[fe80::1%lo0]:{_next_port()}"
+    for settings in (
+        {"cluster_addr": zoned},
+        {"peers": [zoned]},
+        {"seeds": [zoned], "cluster_addr": "10.0.0.1:9999"},
+    ):
+        node = nodes()
+        options = {
+            "peers": [],
+            "cluster_port": node.cluster_port,
+            "cluster_secret": SECRET,
+            **settings,
+        }
+        with pytest.raises(ValueError, match="by its number"):
+            node.server.connect_cluster(**options)
+    node = nodes()
+    node.server.connect_cluster(
+        peers=[],
+        cluster_port=node.cluster_port,
+        cluster_secret=SECRET,
+        cluster_addr=f"[fe80::1%1]:{node.cluster_port}",
+    )
+
+
 def test_two_nodes_at_one_link_local_address_on_two_links_are_two_places(nodes):
     """Two nodes give one link-local address and port, on two links (zones):
     they are two nodes, both up, and the relay's clients lose nothing when

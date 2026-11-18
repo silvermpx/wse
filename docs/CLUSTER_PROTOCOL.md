@@ -79,6 +79,8 @@ The magic bytes `WSE\x00` prevent accidental connections from non-WSE services. 
 
 `reached_at` says where the node's peers reach it: its cluster address (`cluster_addr`), or `:port`, the port its peers' links come in on, on the address its own links come from. A node that takes a link in knows the dialer by it as a dialer knows a node by the address it dials. A node before 3.2 sends none and reads no further than the capabilities.
 
+A node compares these addresses as places, however they are spelled: an IPv4 address and its IPv4-mapped IPv6 form (as a dual-stack listener sees it) are one, an IPv6 address is written one way, a host name is one whatever its case (or a trailing dot), and a port is a number (`044015` is `44015`). A link-local IPv6 address keeps its zone, so two nodes on two links stay two. A zone is given by its number (`[fe80::1%2]:9999`): `connect_cluster()` refuses one by an interface's name, in `cluster_addr`, `peers` or `seeds`.
+
 **Capabilities**:
 
 | Bit | Name | Description |

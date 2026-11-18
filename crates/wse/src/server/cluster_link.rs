@@ -97,6 +97,18 @@ pub struct DeadLetter {
     pub error: String,
 }
 
+/// Whether `addr` gives an IPv6 zone by an interface's name
+/// (`[fe80::1%eth0]:7000`). The cluster takes a zone by its number only
+/// (`[fe80::1%2]:7000`): a link cannot be dialed by the name, and a node
+/// that gave the name once and the number after would be two places.
+pub(super) fn names_a_zone(addr: &str) -> bool {
+    addr.rsplit_once(':')
+        .and_then(|(host, _)| host.strip_prefix('['))
+        .and_then(|host| host.strip_suffix(']'))
+        .and_then(|host| host.split_once('%'))
+        .is_some_and(|(_, zone)| zone.parse::<u32>().is_err())
+}
+
 /// Join the cluster: on the current tokio runtime, with the server
 /// running.
 pub(crate) fn connect(
@@ -111,6 +123,17 @@ pub(crate) fn connect(
     if settings.seeds.is_some() && settings.cluster_addr.is_none() {
         return Err(Error::Cluster(
             "seeds= requires cluster_addr= so peers can connect back to this node".to_owned(),
+        ));
+    }
+    if let Some(addr) = settings
+        .peers
+        .iter()
+        .chain(settings.seeds.iter().flatten())
+        .chain(settings.cluster_addr.iter())
+        .find(|addr| names_a_zone(addr))
+    {
+        return invalid(&format!(
+            "{addr}: give an IPv6 zone by its number ([fe80::1%2]:9999), not by an interface's name"
         ));
     }
     // Links are TLS, always: a plaintext cluster would take anyone who
