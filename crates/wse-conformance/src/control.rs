@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::cases::{Case, Catalog};
 use crate::oracle;
 use crate::report::{Agent, Report, Verdict};
-use crate::stand::{Stand, lock_log};
+use crate::stand::{Log, Stand, lock_log};
 
 /// The case a session runs now.
 struct Running {
@@ -239,7 +239,11 @@ impl Session {
         running.stand.stop().await;
         let failures = {
             let log = lock_log(&running.stand.log);
-            oracle::judge(&running.case, &running.trace, &log)
+            let failures = oracle::judge(&running.case, &running.trace, &log);
+            if !failures.is_empty() {
+                self.keep_trace(&running.case.case, &running.trace, &log, &failures);
+            }
+            failures
         };
         let verdict = if failures.is_empty() { "pass" } else { "fail" };
         self.verdicts.retain(|v| v.case != running.case.case);
@@ -251,6 +255,27 @@ impl Session {
             ms: u64::try_from(running.started.elapsed().as_millis()).unwrap_or(u64::MAX),
         });
         Ok(json!({"case": running.case.case, "verdict": verdict, "failures": failures}))
+    }
+
+    /// A case that failed leaves what its driver saw beside the report
+    /// (`<agent>.<case>.trace.jsonl`: an event a line, the server's log of
+    /// it last), so it can be read where it ran, an emulator's case too.
+    fn keep_trace(&self, case: &str, trace: &[Value], log: &Log, failures: &[String]) {
+        use std::fmt::Write as _;
+        let agent = self
+            .agent
+            .as_ref()
+            .map_or("driver", |agent| agent.agent.as_str());
+        let mut lines = String::new();
+        for event in trace {
+            let _ = writeln!(lines, "{event}");
+        }
+        let server = json!({"failures": failures, "server": log});
+        let _ = writeln!(lines, "{server}");
+        let path = self.out.join(format!("{agent}.{case}.trace.jsonl"));
+        if let Err(why) = std::fs::write(&path, lines) {
+            eprintln!("wse-conformance: {}: {why}", path.display());
+        }
     }
 
     /// The report, written: where.
