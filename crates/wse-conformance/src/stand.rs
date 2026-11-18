@@ -269,8 +269,19 @@ impl Stand {
             }
             "kick" => {
                 let publisher = self.publisher()?;
-                for conn in publisher.connections() {
-                    let _ = publisher.disconnect(&conn);
+                let kicked = publisher.connections();
+                for conn in &kicked {
+                    let _ = publisher.disconnect(conn);
+                }
+                // A cut, not a request for one: a closing connection still
+                // sends what it has queued, so the step ends once they are
+                // gone and nothing the next step publishes goes on them.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while publisher.connections().iter().any(|c| kicked.contains(c)) {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err("the connections kicked did not go in 10 s".to_owned());
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 Ok(json!({}))
             }
@@ -302,5 +313,49 @@ impl Stand {
         if let Some(server) = self.server.take() {
             server.stop().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    use super::*;
+
+    /// A kick is a cut, not a request for one: once the step ends, the
+    /// connections are gone and nothing the next step publishes goes on them.
+    #[tokio::test]
+    async fn a_kick_ends_once_its_connections_are_gone() {
+        let mut stand = Stand::open(ServerSettings::default()).await.unwrap();
+        let about = stand.about(&["ann"], "127.0.0.1").unwrap();
+        let mut request = about["url"]
+            .as_str()
+            .unwrap()
+            .into_client_request()
+            .unwrap();
+        let bearer = format!("Bearer {}", about["tokens"]["ann"].as_str().unwrap());
+        request
+            .headers_mut()
+            .insert("authorization", bearer.parse().unwrap());
+        let socket = tokio::net::TcpStream::connect(stand.addr).await.unwrap();
+        let (ws, _) = tokio_tungstenite::client_async(request, socket)
+            .await
+            .unwrap();
+        // The client reads, and so answers the server's close at once.
+        let reading = tokio::spawn(async move {
+            let mut ws = ws;
+            while ws.next().await.is_some() {}
+        });
+        let publisher = stand.publisher().unwrap().clone();
+        while publisher.connections().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let kicked = publisher.connections();
+        stand.act(&json!({"server": "kick"})).await.unwrap();
+        let left = publisher.connections();
+        assert!(left.iter().all(|c| !kicked.contains(c)), "{left:?}");
+        reading.abort();
+        stand.stop().await;
     }
 }
