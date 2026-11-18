@@ -84,11 +84,11 @@ async fn connect(cli: &Cli, port: u16, token: &str) -> Option<WsStream> {
 ///
 /// Requires: 3 servers
 ///   python benchmarks/bench_battle_server.py --mode cluster --port 5006 \
-///       --cluster-port 6006 --cluster-addr 127.0.0.1:6006
-///   python benchmarks/bench_battle_server.py --mode cluster --port 5007 --peers 127.0.0.1:6006 \
-///       --cluster-port 6007 --cluster-addr 127.0.0.1:6007
+///       --cluster-port 7006 --cluster-addr 127.0.0.1:7006
+///   python benchmarks/bench_battle_server.py --mode cluster --port 5007 --peers 127.0.0.1:7006 \
+///       --cluster-port 7007 --cluster-addr 127.0.0.1:7007
 ///   python benchmarks/bench_battle_server.py --mode cluster-subscribe --port 5008 \
-///       --cluster-port 6008 --cluster-addr 127.0.0.1:6008 --seeds 127.0.0.1:6007
+///       --cluster-port 7008 --cluster-addr 127.0.0.1:7008 --seeds 127.0.0.1:7007
 pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let port2 = cli.port2();
     let port3 = cli.port3();
@@ -113,11 +113,11 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
         eprintln!(
             "\n  Start 3 servers (in this order):\n    \
             python benchmarks/bench_battle_server.py --mode cluster --port {} \
-            --cluster-port 6006 --cluster-addr 127.0.0.1:6006\n    \
-            python benchmarks/bench_battle_server.py --mode cluster --port {} --peers 127.0.0.1:6006 \
-            --cluster-port 6007 --cluster-addr 127.0.0.1:6007\n    \
+            --cluster-port 7006 --cluster-addr 127.0.0.1:7006\n    \
+            python benchmarks/bench_battle_server.py --mode cluster --port {} --peers 127.0.0.1:7006 \
+            --cluster-port 7007 --cluster-addr 127.0.0.1:7007\n    \
             python benchmarks/bench_battle_server.py --mode cluster-subscribe --port {} \
-            --cluster-port 6008 --cluster-addr 127.0.0.1:6008 --seeds 127.0.0.1:6007",
+            --cluster-port 7008 --cluster-addr 127.0.0.1:7008 --seeds 127.0.0.1:7007",
             cli.port, port2, port3
         );
         return Vec::new();

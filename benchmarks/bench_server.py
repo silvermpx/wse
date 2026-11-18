@@ -8,6 +8,7 @@ Usage:
     python benchmarks/bench_server.py --port 9000
     python benchmarks/bench_server.py --max-connections 5000
     python benchmarks/bench_server.py --token-only      # print JWT token and exit
+    python benchmarks/bench_server.py --no-drain        # drop clients' messages in Rust
 """
 
 import argparse
@@ -35,7 +36,7 @@ def generate_token(user_id: str = "bench-user") -> str:
     return rust_jwt_encode(claims, JWT_SECRET)
 
 
-async def run_server(port: int, max_connections: int):
+async def run_server(port: int, max_connections: int, drain: bool):
     server = RustWSEServer(
         "0.0.0.0",
         port,
@@ -44,9 +45,15 @@ async def run_server(port: int, max_connections: int):
         jwt_issuer=JWT_ISSUER,
         jwt_audience=JWT_AUDIENCE,
     )
+    # Clients' messages go to the drain loop below. Without drain mode the
+    # server reads, parses and drops them, with no Python: its ingest ceiling.
+    if drain:
+        server.enable_drain_mode()
     server.start()
     print(f"[bench-server] Rust WSE listening on 0.0.0.0:{port}")
-    print(f"[bench-server] Max connections: {max_connections}")
+    print(
+        f"[bench-server] Max connections: {max_connections}, drain mode {'on' if drain else 'off'}"
+    )
 
     token = generate_token()
     print(f"[bench-server] JWT token: {token}")
@@ -79,13 +86,18 @@ def main():
     parser.add_argument("--port", type=int, default=5006)
     parser.add_argument("--max-connections", type=int, default=5000)
     parser.add_argument("--token-only", action="store_true", help="Just print a JWT token and exit")
+    parser.add_argument(
+        "--no-drain",
+        action="store_true",
+        help="Leave drain mode off: clients' messages are read, parsed and dropped in Rust",
+    )
     args = parser.parse_args()
 
     if args.token_only:
         print(generate_token())
         return
 
-    asyncio.run(run_server(args.port, args.max_connections))
+    asyncio.run(run_server(args.port, args.max_connections, not args.no_drain))
 
 
 if __name__ == "__main__":

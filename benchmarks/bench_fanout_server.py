@@ -20,10 +20,10 @@ Usage:
     wse-bench --test fanout-cluster --port 5006 --port2 5007
 
     # Test 12: Multi-Instance Fan-out with TLS (separate cluster ports)
-    python benchmarks/bench_fanout_server.py --mode cluster --port 5006 --peers 127.0.0.1:6007 \\
-        --cluster-port 6006 --cluster-addr 127.0.0.1:6006 --generate-tls
-    python benchmarks/bench_fanout_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:6006 \\
-        --cluster-port 6007 --cluster-addr 127.0.0.1:6007 \\
+    python benchmarks/bench_fanout_server.py --mode cluster --port 5006 --peers 127.0.0.1:7007 \\
+        --cluster-port 7006 --cluster-addr 127.0.0.1:7006 --generate-tls
+    python benchmarks/bench_fanout_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:7006 \\
+        --cluster-port 7007 --cluster-addr 127.0.0.1:7007 \\
         --tls-cert /tmp/wse_tls_test/server.crt --tls-key /tmp/wse_tls_test/server.key --tls-ca /tmp/wse_tls_test/ca.crt
     wse-bench --test fanout-cluster-tls --port 5006 --port2 5007
 """

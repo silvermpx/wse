@@ -50,10 +50,10 @@ impl ChannelCounts {
 /// making health queries unreliable on that side. All health checks use Server B.
 ///
 /// Requires: 2 cluster servers with TLS and separate cluster ports
-///   python benchmarks/bench_battle_server.py --mode cluster --port 5006 --peers 127.0.0.1:6007 \
-///       --cluster-port 6006 --cluster-addr 127.0.0.1:6006 --generate-tls
-///   python benchmarks/bench_battle_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:6006 \
-///       --cluster-port 6007 --cluster-addr 127.0.0.1:6007 \
+///   python benchmarks/bench_battle_server.py --mode cluster --port 5006 --peers 127.0.0.1:7007 \
+///       --cluster-port 7006 --cluster-addr 127.0.0.1:7006 --generate-tls
+///   python benchmarks/bench_battle_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:7006 \
+///       --cluster-port 7007 --cluster-addr 127.0.0.1:7007 \
 ///       --tls-cert /tmp/wse_tls_test/server.crt --tls-key /tmp/wse_tls_test/server.key --tls-ca /tmp/wse_tls_test/ca.crt
 pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let port2 = cli.port2();
@@ -90,10 +90,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             crate::report::failed();
             eprintln!(
                 "\n  Start servers with TLS (separate cluster ports):\n    \
-                python benchmarks/bench_battle_server.py --mode cluster --port {} --peers 127.0.0.1:6007 \
-                --cluster-port 6006 --cluster-addr 127.0.0.1:6006 --generate-tls\n    \
-                python benchmarks/bench_battle_server.py --mode cluster-subscribe --port {} --peers 127.0.0.1:6006 \
-                --cluster-port 6007 --cluster-addr 127.0.0.1:6007 \
+                python benchmarks/bench_battle_server.py --mode cluster --port {} --peers 127.0.0.1:7007 \
+                --cluster-port 7006 --cluster-addr 127.0.0.1:7006 --generate-tls\n    \
+                python benchmarks/bench_battle_server.py --mode cluster-subscribe --port {} --peers 127.0.0.1:7006 \
+                --cluster-port 7007 --cluster-addr 127.0.0.1:7007 \
                 --tls-cert /tmp/wse_tls_test/server.crt --tls-key /tmp/wse_tls_test/server.key --tls-ca /tmp/wse_tls_test/ca.crt",
                 cli.port, port2
             );

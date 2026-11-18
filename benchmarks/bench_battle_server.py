@@ -32,19 +32,19 @@ Usage:
     wse-bench --test battle-cluster --port 5006 --port2 5007
 
     # Cluster with TLS (cluster links on their own ports)
-    python benchmarks/bench_battle_server.py --mode cluster --port 5006 --peers 127.0.0.1:6007 \\
-        --cluster-port 6006 --cluster-addr 127.0.0.1:6006 --generate-tls
-    python benchmarks/bench_battle_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:6006 \\
-        --cluster-port 6007 --cluster-addr 127.0.0.1:6007 \\
+    python benchmarks/bench_battle_server.py --mode cluster --port 5006 --peers 127.0.0.1:7007 \\
+        --cluster-port 7006 --cluster-addr 127.0.0.1:7006 --generate-tls
+    python benchmarks/bench_battle_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:7006 \\
+        --cluster-port 7007 --cluster-addr 127.0.0.1:7007 \\
         --tls-cert /tmp/wse_tls_test/server.crt --tls-key /tmp/wse_tls_test/server.key --tls-ca /tmp/wse_tls_test/ca.crt
 
     # Cluster with gossip discovery (3 nodes)
-    python benchmarks/bench_battle_server.py --mode cluster --port 5006 --peers 127.0.0.1:6007 \\
-        --cluster-port 6006 --cluster-addr 127.0.0.1:6006
-    python benchmarks/bench_battle_server.py --mode cluster --port 5007 --peers 127.0.0.1:6006 \\
-        --cluster-port 6007 --cluster-addr 127.0.0.1:6007
+    python benchmarks/bench_battle_server.py --mode cluster --port 5006 --peers 127.0.0.1:7007 \\
+        --cluster-port 7006 --cluster-addr 127.0.0.1:7006
+    python benchmarks/bench_battle_server.py --mode cluster --port 5007 --peers 127.0.0.1:7006 \\
+        --cluster-port 7007 --cluster-addr 127.0.0.1:7007
     python benchmarks/bench_battle_server.py --mode cluster-subscribe --port 5008 \\
-        --cluster-port 6008 --cluster-addr 127.0.0.1:6008 --seeds 127.0.0.1:6007
+        --cluster-port 7008 --cluster-addr 127.0.0.1:7008 --seeds 127.0.0.1:7007
 """
 
 import argparse
@@ -430,7 +430,7 @@ def main():
     parser.add_argument("--cluster-addr", default=None,
                         help="Cluster advertise address host:port (required with --seeds)")
     parser.add_argument("--seeds", nargs="+", default=None,
-                        help="Seed addresses for gossip discovery, e.g. 127.0.0.1:6007")
+                        help="Seed addresses for gossip discovery, e.g. 127.0.0.1:7007")
 
     args = parser.parse_args()
 

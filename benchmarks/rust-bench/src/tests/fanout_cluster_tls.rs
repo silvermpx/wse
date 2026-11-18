@@ -15,10 +15,10 @@ use std::time::Duration;
 ///   Benchmark clients connect to Server B via plain WebSocket.
 ///
 /// Requires:
-///   bench_fanout_server.py --mode cluster --port 5006 --peers 127.0.0.1:6007 \
-///       --cluster-port 6006 --cluster-addr 127.0.0.1:6006 --generate-tls
-///   bench_fanout_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:6006 \
-///       --cluster-port 6007 --cluster-addr 127.0.0.1:6007 \
+///   bench_fanout_server.py --mode cluster --port 5006 --peers 127.0.0.1:7007 \
+///       --cluster-port 7006 --cluster-addr 127.0.0.1:7006 --generate-tls
+///   bench_fanout_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:7006 \
+///       --cluster-port 7007 --cluster-addr 127.0.0.1:7007 \
 ///       --tls-cert /tmp/wse_tls_test/server.crt --tls-key /tmp/wse_tls_test/server.key --tls-ca /tmp/wse_tls_test/ca.crt
 pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let port2 = cli.port2();
@@ -52,10 +52,10 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             crate::report::failed();
             eprintln!(
                 "\n    Start servers with TLS (separate cluster ports):\n    \
-                python benchmarks/bench_fanout_server.py --mode cluster --port {} --peers 127.0.0.1:6007 \\\n      \
-                --cluster-port 6006 --cluster-addr 127.0.0.1:6006 --generate-tls\n    \
-                python benchmarks/bench_fanout_server.py --mode cluster-subscribe --port {} --peers 127.0.0.1:6006 \\\n      \
-                --cluster-port 6007 --cluster-addr 127.0.0.1:6007 \\\n      \
+                python benchmarks/bench_fanout_server.py --mode cluster --port {} --peers 127.0.0.1:7007 \\\n      \
+                --cluster-port 7006 --cluster-addr 127.0.0.1:7006 --generate-tls\n    \
+                python benchmarks/bench_fanout_server.py --mode cluster-subscribe --port {} --peers 127.0.0.1:7006 \\\n      \
+                --cluster-port 7007 --cluster-addr 127.0.0.1:7007 \\\n      \
                 --tls-cert /tmp/wse_tls_test/server.crt --tls-key /tmp/wse_tls_test/server.key --tls-ca /tmp/wse_tls_test/ca.crt",
                 cli.port, port2
             );

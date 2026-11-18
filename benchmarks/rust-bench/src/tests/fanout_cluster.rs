@@ -18,7 +18,7 @@ use std::time::Duration;
 ///
 /// Requires:
 ///   bench_fanout_server.py --mode cluster --port 5006 --peers 127.0.0.1:7007 --cluster-port 7006 --cluster-addr 127.0.0.1:7006
-///   bench_fanout_server.py --mode cluster --port 5007 --peers 127.0.0.1:7006 --cluster-port 7007 --cluster-addr 127.0.0.1:7007
+///   bench_fanout_server.py --mode cluster-subscribe --port 5007 --peers 127.0.0.1:7006 --cluster-port 7007 --cluster-addr 127.0.0.1:7007
 pub async fn run(cli: &Cli) -> Vec<TierResult> {
     let port2 = cli.port2();
 
@@ -72,7 +72,7 @@ pub async fn run(cli: &Cli) -> Vec<TierResult> {
             fail_err!("FAILED: {e}");
             crate::report::failed();
             eprintln!(
-                "\n    Start Server B: python benchmarks/bench_fanout_server.py --mode cluster --port {port2} --peers 127.0.0.1:{}", cli.port
+                "\n    Start Server B: python benchmarks/bench_fanout_server.py --mode cluster-subscribe --port {port2} --peers 127.0.0.1:{}", cli.port
             );
             return Vec::new();
         }
