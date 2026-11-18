@@ -37,6 +37,11 @@ pub struct ServerSettings {
     /// A signing key, for signed messages both ways.
     #[serde(default)]
     pub signing: bool,
+    /// The application holds the first message of this type until the
+    /// case cuts the connection (`kick`, `stop`, `restart`): what the
+    /// client sends meanwhile waits unanswered, however fast the server
+    /// would answer it.
+    pub hold: Option<String>,
 }
 
 /// A rule the judge holds the case to.

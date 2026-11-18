@@ -4,7 +4,8 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -67,6 +68,49 @@ struct Conn {
 struct Lab {
     publisher: wse::Publisher,
     log: Arc<Mutex<Log>>,
+    hold: Option<Arc<Hold>>,
+}
+
+/// The first message of a type, held by the application until the case
+/// cuts the connection.
+struct Hold {
+    kind: String,
+    taken: AtomicBool,
+    cut: Mutex<bool>,
+    came: Condvar,
+}
+
+/// How long a message is held at most: a case that never cuts still ends.
+const HELD_AT_MOST: Duration = Duration::from_secs(10);
+
+impl Hold {
+    fn new(kind: String) -> Self {
+        Self {
+            kind,
+            taken: AtomicBool::new(false),
+            cut: Mutex::new(false),
+            came: Condvar::new(),
+        }
+    }
+
+    /// A message of `kind` came: the first of its type waits for the cut.
+    /// Its connection's task waits here; the server's other tasks go on on
+    /// the runtime's other threads.
+    fn first(&self, kind: &str) {
+        if kind != self.kind || self.taken.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        tokio::task::block_in_place(|| {
+            let cut = lock(&self.cut);
+            let _ = self.came.wait_timeout_while(cut, HELD_AT_MOST, |cut| !*cut);
+        });
+    }
+
+    /// The case cut the connection: the message held goes on.
+    fn release(&self) {
+        *lock(&self.cut) = true;
+        self.came.notify_all();
+    }
 }
 
 impl Lab {
@@ -88,8 +132,8 @@ impl Lab {
     }
 }
 
-fn lock(log: &Mutex<Log>) -> std::sync::MutexGuard<'_, Log> {
-    log.lock()
+fn lock<T>(held: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    held.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -117,6 +161,9 @@ impl wse::Handler for Lab {
         let wse::Inbound::Json(message) = message else {
             return true;
         };
+        if let Some(hold) = &self.hold {
+            hold.first(message["t"].as_str().unwrap_or_default());
+        }
         self.take(conn, &message, false);
         match message["t"].as_str() {
             // The reply names the request's correlation id, as an
@@ -164,6 +211,7 @@ pub struct Stand {
     pub log: Arc<Mutex<Log>>,
     /// The next number of each topic.
     next: HashMap<String, u64>,
+    hold: Option<Arc<Hold>>,
 }
 
 impl Stand {
@@ -174,6 +222,7 @@ impl Stand {
             .map_err(|e| e.to_string())?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         let key = || wse::protocol::crypto::generate_p256_pkcs8().map_err(|e| e.to_string());
+        let hold = settings.hold.clone().map(|kind| Arc::new(Hold::new(kind)));
         let mut stand = Self {
             e2e_key: settings.e2e.then(key).transpose()?,
             signing_key: settings.signing.then(key).transpose()?,
@@ -183,6 +232,7 @@ impl Stand {
             publisher: None,
             log: Arc::default(),
             next: HashMap::new(),
+            hold,
         };
         stand.start(listener)?;
         Ok(stand)
@@ -204,6 +254,7 @@ impl Stand {
         let lab = Lab {
             publisher: publisher.clone(),
             log: Arc::clone(&self.log),
+            hold: self.hold.clone(),
         };
         server.start(listener, lab).map_err(|e| e.to_string())?;
         self.server = Some(server);
@@ -283,6 +334,9 @@ impl Stand {
                 for conn in &kicked {
                     let _ = publisher.disconnect(conn);
                 }
+                // What the application held for the cut goes on, and its
+                // connection closes after it.
+                self.release();
                 // A cut, not a request for one: a closing connection still
                 // sends what it has queued, so the step ends once they are
                 // gone and nothing the next step publishes goes on them.
@@ -317,8 +371,15 @@ impl Stand {
         }
     }
 
+    fn release(&self) {
+        if let Some(hold) = &self.hold {
+            hold.release();
+        }
+    }
+
     /// The server goes; its port with it until a restart.
     pub async fn stop(&mut self) {
+        self.release();
         self.publisher = None;
         if let Some(server) = self.server.take() {
             server.stop().await;
@@ -365,6 +426,84 @@ mod tests {
         stand.act(&json!({"server": "kick"})).await.unwrap();
         let left = publisher.connections();
         assert!(left.iter().all(|c| !kicked.contains(c)), "{left:?}");
+        reading.abort();
+        stand.stop().await;
+    }
+
+    /// The first message of the type the case holds is not answered before
+    /// the cut, however fast the server is: the client's send is on its way
+    /// when the connection goes. The application takes it at the cut.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_message_held_for_the_cut_is_not_answered_before_it() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let settings = ServerSettings {
+            hold: Some("order".to_owned()),
+            ..ServerSettings::default()
+        };
+        let mut stand = Stand::open(settings).await.unwrap();
+        let about = stand.about(&["ann"], "127.0.0.1").unwrap();
+        let mut request = about["url"]
+            .as_str()
+            .unwrap()
+            .into_client_request()
+            .unwrap();
+        let bearer = format!("Bearer {}", about["tokens"]["ann"].as_str().unwrap());
+        request
+            .headers_mut()
+            .insert("authorization", bearer.parse().unwrap());
+        let socket = tokio::net::TcpStream::connect(stand.addr).await.unwrap();
+        let (ws, _) = tokio_tungstenite::client_async(request, socket)
+            .await
+            .unwrap();
+        let (mut write, mut read) = ws.split();
+        // What the server says, by type; the client reads on, and so answers
+        // the server's close.
+        let (said, mut heard) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let reading = tokio::spawn(async move {
+            while let Some(Ok(frame)) = read.next().await {
+                if let Message::Text(text) = frame
+                    && let Some(json) = text.find('{').map(|at| &text[at..])
+                    && let Ok(value) = serde_json::from_str::<Value>(json)
+                {
+                    let _ = said.send(value["t"].as_str().unwrap_or_default().to_owned());
+                }
+            }
+        });
+        let hello = json!({"t": "client_hello", "p": {"protocol_version": 2, "outbox": {"producer": "p1"}}});
+        write
+            .send(Message::Text(hello.to_string().into()))
+            .await
+            .unwrap();
+        loop {
+            let kind = tokio::time::timeout(Duration::from_secs(5), heard.recv())
+                .await
+                .expect("the outbox answered")
+                .unwrap();
+            if kind == "outbox" {
+                break;
+            }
+        }
+        let order = r#"{"s":1,"t":"order","p":{},"id":"m1"}"#;
+        write.send(Message::Text(order.into())).await.unwrap();
+        let answered = tokio::time::timeout(Duration::from_millis(300), async {
+            while let Some(kind) = heard.recv().await {
+                if kind == "ack" {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(answered.is_err(), "answered while held");
+        assert!(lock(&stand.log).taken.is_empty());
+
+        stand.act(&json!({"server": "kick"})).await.unwrap();
+        let taken: Vec<String> = lock(&stand.log)
+            .taken
+            .iter()
+            .map(|t| t.kind.clone())
+            .collect();
+        assert_eq!(taken, ["order"]);
         reading.abort();
         stand.stop().await;
     }

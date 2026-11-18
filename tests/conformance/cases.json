@@ -493,6 +493,9 @@
       "needs": [
         "outbox"
       ],
+      "server": {
+        "hold": "order"
+      },
       "steps": [
         {
           "client": "connect"

@@ -3,8 +3,10 @@
 Every WSE client is checked against one server and one judge, so that the clients do the same things
 the same way.
 
-- `cases.json`: the cases. Each has a server of its own (its history, its keys), steps for the
-  client and for the server in one list, and the rules it is judged by.
+- `cases.json`: the cases. Each has a server of its own (`server`: its history, `recovery`; its
+  keys, `e2e` and `signing`; `hold`, a type whose first message the application holds until the
+  case cuts the connection, so what the client sends meanwhile is unanswered at the cut), steps
+  for the client and for the server in one list, and the rules it is judged by.
 - `agents.json`: the clients a release needs, and the features each must claim. A case a client's
   features do not reach is not applicable to it; every case they reach must pass.
 - `crates/wse-conformance`: the server and the judge. A driver connects to its control channel,
