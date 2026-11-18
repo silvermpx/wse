@@ -209,6 +209,13 @@ server every client is checked against.
   for a message is made again, and catches up, instead of dropping it. A
   node that went without SHUTDOWN while its link was down, another node now
   at its address, is no longer taken to have published nothing meanwhile.
+- Cluster: a node that stops no longer loses what it published just before
+  the stop. Its run leaves the cluster once it takes no more publishes,
+  after every one it took, and waits (two seconds at most) for each link to
+  write what it had, SHUTDOWN last, and close; the Python server's stop
+  ended its runtime before the links had. The node that hears SHUTDOWN
+  delivers what came before it, and only then takes the end as clean, so a
+  node that comes up in its place leaves its clients' recovery as it was.
 - Swift, Kotlin and Dart: once the client is closed, the events end with
   what the close said (the messages it will not deliver, the close itself);
   a reader waiting at the close no longer gets its end before them.

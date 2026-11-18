@@ -1998,6 +1998,7 @@ async fn a_cancelled_link_stops_writing_to_a_peer_that_stopped_reading() {
         rx,
         ours,
         cancel.clone(),
+        tokio_util::sync::CancellationToken::new(),
         Arc::new(ClusterMetrics::new()),
     ));
     for _ in 0..4 {
@@ -2010,4 +2011,51 @@ async fn a_cancelled_link_stops_writing_to_a_peer_that_stopped_reading() {
         .await
         .expect("the writer stops once the link is cancelled")
         .unwrap();
+}
+
+/// A node that leaves: its link's writer finishes the batch it was cut
+/// short in, writes what was queued after it (the SHUTDOWN last, on a
+/// stop), then closes its side, so the peer reads every frame whole.
+#[tokio::test]
+async fn a_link_of_a_node_that_leaves_writes_its_frames_whole_then_closes() {
+    use tokio::io::AsyncReadExt;
+    let (ours, mut theirs) = tokio::io::duplex(1024);
+    let (tx, rx) = mpsc::channel::<Bytes>(16);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let leaving = tokio_util::sync::CancellationToken::new();
+    let writer = tokio::spawn(super::peer::peer_writer(
+        rx,
+        ours,
+        cancel.clone(),
+        leaving.clone(),
+        Arc::new(ClusterMetrics::new()),
+    ));
+    let frames: Vec<Bytes> = (0u8..4).map(|n| Bytes::from(vec![n; 3000])).collect();
+    // More than the socket takes: the writer waits in the middle of it.
+    tx.send(frames[0].clone()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    for frame in &frames[1..] {
+        tx.send(frame.clone()).await.unwrap();
+    }
+    leaving.cancel();
+    cancel.cancel();
+
+    let mut wire = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        theirs.read_to_end(&mut wire),
+    )
+    .await
+    .expect("the link closes")
+    .unwrap();
+    let mut read = &wire[..];
+    for (n, frame) in frames.iter().enumerate() {
+        assert!(read.len() >= 4, "frame {n} missing");
+        let len = u32::from_be_bytes(read[..4].try_into().unwrap()) as usize;
+        assert!(read.len() >= 4 + len, "frame {n} cut short");
+        assert_eq!(&read[4..4 + len], &frame[..], "frame {n}");
+        read = &read[4 + len..];
+    }
+    assert!(read.is_empty(), "nothing after the frames");
+    writer.await.unwrap();
 }

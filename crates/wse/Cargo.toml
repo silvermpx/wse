@@ -122,6 +122,10 @@ required-features = ["server"]
 name = "acks"
 required-features = ["server"]
 
+[[test]]
+name = "cluster"
+required-features = ["server"]
+
 [[example]]
 name = "chat"
 required-features = ["server"]

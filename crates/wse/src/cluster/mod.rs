@@ -159,6 +159,9 @@ const FLAG_REPLAYED: u8 = 0x04;
 const FLAG_ARRIVAL: u8 = 0x08;
 /// How long a new link waits for the peer's RESUME request.
 const RESUME_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a node that leaves the cluster waits for its links to say
+/// SHUTDOWN and close, before its run ends.
+pub(crate) const LEAVE_WITHIN: Duration = Duration::from_secs(2);
 /// Positions a RESUME request may name: more than any node's recovery
 /// buffers hold within their memory budget.
 const MAX_RESUME_POINTS: usize = 1 << 20;
@@ -176,6 +179,9 @@ enum DispatchItem {
     /// The peer's catch-up covers what it published up to this arrival:
     /// once what came before it is delivered.
     CaughtUp(u64),
+    /// The peer said SHUTDOWN: it published nothing more, and its end is
+    /// clean once what came before it is delivered.
+    Shutdown,
 }
 
 // Minimum payload size for compression to be worthwhile (bytes).

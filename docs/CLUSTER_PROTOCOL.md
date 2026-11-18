@@ -98,7 +98,7 @@ Negotiated capabilities are the bitwise AND of both peers. A feature is only act
 [header: type=0x05, all other fields zero]
 ```
 
-Sent when a node is shutting down cleanly. The receiver ends the link at once instead of waiting for the heartbeat timeout, and drops the sender's interest and presence. A peer that dials the node keeps dialing it with backoff, so it is back as soon as the node restarts (a peer learned through gossip is given up after 10 failed attempts). After sending SHUTDOWN to all peers, the node cancels all peer tasks immediately.
+Sent when a node leaves the cluster: once its run takes no more publishes, after every one it took. Each link writes what it still had, SHUTDOWN last, closes its side and reads on until the peer closes (a second at most); the run ends once every link closed, within two seconds. A link that ended for its own reason (one too full for a message, say) says nothing, and its peer takes the end as unclean. The receiver ends the link at once instead of waiting for the heartbeat timeout, delivers what came before SHUTDOWN, then takes the end as clean, and drops the sender's interest and presence. A peer that dials the node keeps dialing it with backoff, so it is back as soon as the node restarts (a peer learned through gossip is given up after 10 failed attempts).
 
 ### SUB (0x06) - Topic Subscribe
 
@@ -344,7 +344,7 @@ Gossip is lightweight: PeerAnnounce and PeerList go out when links come up, and 
 | Heartbeat | PING every 5s, timeout 15s |
 | Circuit breaker | 10-failure threshold, 60s reset |
 | Reconnect | Exponential backoff: 1s initial, 1.5x multiplier, 60s max, with jitter |
-| Graceful shutdown | SHUTDOWN frame sent to all peers, then immediate cancel |
+| Graceful shutdown | Once the run takes no more publishes: what each link had, SHUTDOWN last, then its close; waited for up to 2s |
 | Dead letter queue | 1,000 entries, FIFO eviction |
 | Write batching | 64 KB batch limit per flush |
 | Catch-up | After a lost link, each node gets what it missed of the other's streams before anything live ([RESUME](#resume-0x0e---catch-up-after-a-lost-link)), as far as the origin's recovery buffers still hold it |

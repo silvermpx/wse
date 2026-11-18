@@ -715,6 +715,8 @@ pub(crate) struct SharedState {
     pub(super) conn_topics: DashMap<String, DashSet<String>>,
     // Cluster protocol
     pub(super) cluster_cmd_tx: arc_swap::ArcSwapOption<mpsc::UnboundedSender<ClusterCommand>>,
+    /// The cluster manager's task, while this node is in a cluster.
+    pub(super) cluster_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) cluster_metrics: Arc<ClusterMetrics>,
     pub(super) cluster_dlq: Arc<std::sync::Mutex<ClusterDlq>>,
     pub(crate) cluster_instance_id: std::sync::Mutex<Option<String>>,
@@ -972,6 +974,7 @@ impl SharedState {
             fanout: std::sync::RwLock::new(None),
             conn_topics: DashMap::new(),
             cluster_cmd_tx: arc_swap::ArcSwapOption::empty(),
+            cluster_task: parking_lot::Mutex::new(None),
             cluster_metrics: Arc::new(ClusterMetrics::new()),
             cluster_dlq: Arc::new(std::sync::Mutex::new(ClusterDlq::new(1000))),
             cluster_instance_id: std::sync::Mutex::new(None),

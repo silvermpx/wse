@@ -8,7 +8,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use rustls::pki_types::ServerName;
 use socket2::{SockRef, TcpKeepalive};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -35,6 +35,7 @@ pub(super) async fn peer_writer<W: AsyncWriteExt + Unpin>(
     mut rx: mpsc::Receiver<Bytes>,
     mut writer: W,
     cancel: CancellationToken,
+    leaving: CancellationToken,
     metrics: Arc<ClusterMetrics>,
 ) {
     // Whichever of a link's tasks ends first ends the link: its cleanup then
@@ -65,21 +66,58 @@ pub(super) async fn peer_writer<W: AsyncWriteExt + Unpin>(
         // flush() is required for TLS -- rustls buffers encrypted data internally
         // and only writes to the TCP socket on flush. For plain TCP this is a no-op.
         // A peer that stops reading fills the socket: the write waits on it
-        // only until the link is cancelled (its heartbeat ran out, say).
+        // only until the link is cancelled (its heartbeat ran out, say). The
+        // buffer is consumed as it is written: what a cancel leaves of the
+        // batch stays in it, whole frames behind the part on the wire.
         let written = tokio::select! {
             written = async {
-                writer.write_all(&buf).await?;
+                writer.write_all_buf(&mut buf).await?;
                 writer.flush().await
             } => written,
             () = cancel.cancelled() => break,
         };
         if written.is_err() {
-            break;
+            return;
         }
         metrics.bytes_sent.fetch_add(bytes_count, Ordering::Relaxed);
-        buf.clear();
+    }
+    if leaving.is_cancelled() {
+        // The node leaves: the rest of the batch and what was queued after
+        // it go out, the SHUTDOWN last, within a moment, then this side
+        // closes, so the peer reads all of it.
+        rx.close();
+        let _ =
+            tokio::time::timeout(LINK_END_WITHIN, write_out(&mut writer, &mut buf, &mut rx)).await;
     }
 }
+
+/// What a link of a node that leaves still writes: the rest of `buf`, then
+/// what is queued, a batch at a time, then its close.
+async fn write_out<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    buf: &mut BytesMut,
+    rx: &mut mpsc::Receiver<Bytes>,
+) -> std::io::Result<()> {
+    loop {
+        while buf.len() < MAX_BATCH_BYTES {
+            match rx.try_recv() {
+                Ok(data) => write_framed(buf, &data),
+                Err(_) => break,
+            }
+        }
+        if buf.is_empty() {
+            break;
+        }
+        writer.write_all_buf(buf).await?;
+    }
+    writer.flush().await?;
+    writer.shutdown().await
+}
+
+/// How long a link of a node that leaves still writes what was queued for
+/// it, and reads what the peer still sends (so closing does not reset what
+/// this side wrote last).
+const LINK_END_WITHIN: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Per-peer reader task
@@ -199,7 +237,9 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
             }
             Some(ClusterFrame::Shutdown) => {
                 tracing::info!("[WSE-Cluster] Peer sent SHUTDOWN");
-                heard.shut_down();
+                // Its end is clean once what came before it is delivered:
+                // the dispatch task says so when it gets there.
+                let _ = to_manager(&dispatch_tx, DispatchItem::Shutdown, &cancel).await;
                 break;
             }
             Some(ClusterFrame::Drain) => {
@@ -334,6 +374,21 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
             }
         }
     }
+    // A node that leaves reads on, a moment, until the peer closes: a
+    // socket closed with what the peer sent unread resets the link, and the
+    // peer could lose what this side wrote last (its SHUTDOWN).
+    if ctx.leaving.is_cancelled() {
+        let _ = tokio::time::timeout(LINK_END_WITHIN, async {
+            while let Ok(unread) = reader.fill_buf().await {
+                let unread = unread.len();
+                if unread == 0 {
+                    break;
+                }
+                reader.consume(unread);
+            }
+        })
+        .await;
+    }
 }
 
 /// Hand an update to the manager, waiting while its queue is full: a peer
@@ -341,6 +396,8 @@ pub(super) async fn peer_reader<R: AsyncReadExt + Unpin>(
 /// not buffered without bound. False once the link ends.
 async fn to_manager<T>(tx: &mpsc::Sender<T>, item: T, cancel: &CancellationToken) -> bool {
     tokio::select! {
+        // An item with room for it goes, even once the link ends.
+        biased;
         sent = tx.send(item) => sent.is_ok(),
         () = cancel.cancelled() => false,
     }
@@ -381,8 +438,11 @@ pub(super) async fn peer_dispatch_task(
     let mut batch: Vec<DispatchItem> = Vec::with_capacity(64);
 
     loop {
-        // Wait for first message (blocking)
+        // What the reader took goes first, the link's end after it: a
+        // message read before the end is still delivered, and a SHUTDOWN is
+        // only taken once all that came before it is here.
         let msg = tokio::select! {
+            biased;
             m = dispatch_rx.recv() => m,
             () = cancel.cancelled() => break,
         };
@@ -414,6 +474,10 @@ pub(super) async fn peer_dispatch_task(
                 }
                 DispatchItem::CaughtUp(through) => {
                     heard.caught_up(through);
+                    continue;
+                }
+                DispatchItem::Shutdown => {
+                    heard.shut_down();
                     continue;
                 }
             };
@@ -1042,6 +1106,7 @@ where
         peer_write_rx,
         writer,
         peer_cancel.clone(),
+        global_cancel.clone(),
         ctx.metrics.clone(),
     ));
 
@@ -1239,6 +1304,8 @@ pub(super) struct PeerSpawnCtx {
     pub(super) global_cancel: CancellationToken,
     pub(super) tls_config: Option<Arc<arc_swap::ArcSwap<ClusterTlsConfig>>>,
     pub(super) peer_reg_tx: mpsc::UnboundedSender<PeerRegistration>,
+    /// The manager's link tasks: a dial task runs among them.
+    pub(super) links: tokio_util::task::TaskTracker,
 }
 
 impl PeerSpawnCtx {
@@ -1246,7 +1313,7 @@ impl PeerSpawnCtx {
     /// dialed for as long as the node runs; one learned through gossip is
     /// given up after it stays unreachable.
     pub(super) fn spawn(&self, peer_addr: String, is_static: bool) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(peer_connection_task(
+        self.links.spawn(peer_connection_task(
             peer_addr,
             self.instance_id.clone(),
             is_static,

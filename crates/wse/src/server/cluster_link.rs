@@ -228,9 +228,11 @@ pub(crate) fn connect(
         producer_links: Arc::clone(&shared.producer_links),
         heard: Arc::new(dashmap::DashMap::new()),
         incarnations: Arc::new(dashmap::DashMap::new()),
+        leaving: tokio_util::sync::CancellationToken::new(),
     };
 
-    tokio::spawn(cluster::cluster_manager(
+    // Waited for when the run ends: the node leaves the cluster then.
+    let manager = tokio::spawn(cluster::cluster_manager(
         peers,
         instance_id,
         (cmd_rx, interest_rx),
@@ -246,6 +248,7 @@ pub(crate) fn connect(
                 .map(|commands| (*commands).clone()),
         ),
     ));
+    *shared.cluster_task.lock() = Some(manager);
     Ok(())
 }
 

@@ -229,12 +229,15 @@ class Blink:
                 while data := await src.read(65536):
                     dst.write(data)
                     await dst.drain()
+                # The other side closed: so does this one, after what it sent.
+                if dst.can_write_eof():
+                    dst.write_eof()
             except ConnectionError:
-                pass
-            finally:
                 dst.transport.abort()
 
         await asyncio.gather(pipe(down_reader, up_writer), pipe(up_reader, down_writer))
+        for writer in pair:
+            writer.close()
         self.links.discard(pair)
 
     def cut(self):

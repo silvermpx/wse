@@ -12,7 +12,6 @@ use pyo3::sync::RwLockExt;
 use tokio::net::TcpListener;
 
 use super::RustWSEServer;
-use crate::cluster::ClusterCommand;
 use crate::pylock::lock;
 use crate::server::run;
 use crate::server::{Publisher, ServerCommand};
@@ -203,30 +202,30 @@ impl RustWSEServer {
             return Ok(());
         };
         let on_own_runtime = self.on_own_runtime();
-        // Shutdown cluster
-        if let Some(tx) = self.shared.cluster_cmd_tx.load_full() {
-            let _ = tx.send(ClusterCommand::Shutdown);
-        }
+        // The run leaves the cluster as it ends, after every publish its
+        // command task took.
         if let Ok(tx) = self.command_tx() {
             let _ = tx.command(ServerCommand::Shutdown);
         }
         self.running.store(false, Ordering::SeqCst);
         // From a callback the server thread is not joined: it waits for its
-        // callbacks, this one included. It stops by itself, and the next
-        // start() (or stop() from another thread) waits for it.
+        // callbacks, this one included. It stops by itself, cleaning up as
+        // it ends, and the next start() (or stop() from another thread)
+        // waits for it.
         let panicked = if on_own_runtime {
             *self.stopping.lock() = self.runtime().map(|h| h.id());
             *server_thread = Some(handle);
             false
         } else {
             // Detached while the server closes its connections (up to three
-            // seconds): other Python threads keep running, and a start() from
-            // another thread waits for the `lifecycle` lock without holding
-            // up the interpreter.
-            py.detach(move || handle.join().is_err())
+            // seconds) and leaves the cluster: other Python threads keep
+            // running, and a start() from another thread waits for the
+            // `lifecycle` lock without holding up the interpreter.
+            let panicked = py.detach(move || handle.join().is_err());
+            run::stopped(&self.shared);
+            panicked
         };
         self.cmd_tx.store(None);
-        run::stopped(&self.shared);
         *self.rt_handle.write() = None;
         drop(server_thread);
         if panicked {

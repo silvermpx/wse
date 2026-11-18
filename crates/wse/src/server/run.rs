@@ -377,6 +377,7 @@ pub(crate) async fn serve<H: Handler>(
     // refused, and comes back as soon as a server is there again.
     drop(listener);
     let _ = cmd_handle.await;
+    leave_cluster(&shared).await;
     // The command task closed every connection: the periodic tasks end, and
     // the connections finish their cleanup.
     stop.cancel();
@@ -387,6 +388,22 @@ pub(crate) async fn serve<H: Handler>(
     // (`stop`, or the server dropped).
     stopped(&shared);
     tracing::info!("[WSE] Shut down");
+}
+
+/// Out of the cluster once the command task is done: every publish it took
+/// is on its way to the peers, and the links say SHUTDOWN after them and
+/// close. Waited for a moment, so the peers know this node left on purpose
+/// before its runtime goes.
+async fn leave_cluster(shared: &SharedState) {
+    let manager = shared.cluster_task.lock().take();
+    let Some(manager) = manager else {
+        return;
+    };
+    if let Some(tx) = shared.cluster_cmd_tx.load_full() {
+        let _ = tx.send(crate::cluster::ClusterCommand::Shutdown);
+    }
+    let within = crate::cluster::LEAVE_WITHIN + Duration::from_millis(500);
+    let _ = tokio::time::timeout(within, manager).await;
 }
 
 /// The next tick of a periodic task; false once its run is stopping.

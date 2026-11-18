@@ -10,17 +10,18 @@ use bytes::{Bytes, BytesMut};
 use dashmap::{DashMap, DashSet};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use super::inbound::{InboundGate, InboundLinks, InboundSessionCtx, accept_cluster_links};
 use super::peer::PeerSpawnCtx;
 use super::{
     CAP_ARRIVAL, CAP_COMPRESSION, CAP_INTEREST_ROUTING, CAP_PRESENCE, CAP_RECOVERY,
     CLUSTER_RESYNC_INTERVAL_SECS, ClusterCommand, ClusterContext, ClusterDlq, ClusterDlqEntry,
-    ClusterTlsConfig, InterestUpdate, MANAGER_QUEUE_CAP, MAX_CLUSTER_PEERS, MAX_FRAME_SIZE,
-    MAX_KNOWN_PEERS, MAX_REMOTE_INTEREST_PER_PEER, PRESENCE_ROUND_FIRST, PRESENCE_ROUND_LAST,
-    PeerInterest, PeerRegistration, PresencePeerFrame, encode_drain, encode_msg_full,
-    encode_peer_announce, encode_presence_round, encode_presence_update, encode_resync,
-    encode_shutdown, encode_sub, encode_unsub,
+    ClusterTlsConfig, InterestUpdate, LEAVE_WITHIN, MANAGER_QUEUE_CAP, MAX_CLUSTER_PEERS,
+    MAX_FRAME_SIZE, MAX_KNOWN_PEERS, MAX_REMOTE_INTEREST_PER_PEER, PRESENCE_ROUND_FIRST,
+    PRESENCE_ROUND_LAST, PeerInterest, PeerRegistration, PresencePeerFrame, encode_drain,
+    encode_msg_full, encode_peer_announce, encode_presence_round, encode_presence_update,
+    encode_resync, encode_shutdown, encode_sub, encode_unsub,
 };
 use crate::presence::PresenceManager;
 
@@ -145,7 +146,10 @@ pub(crate) async fn cluster_manager(
 ) {
     let (mut cmd_rx, mut interest_rx) = channels;
     let (inbound_links, presence, server_cmd_tx) = cluster_opts;
-    let global_cancel = CancellationToken::new();
+    let global_cancel = ctx.leaving.clone();
+    // Every link's task, dialed or come in: waited for when the node leaves,
+    // so each says SHUTDOWN and closes before the run ends.
+    let links = TaskTracker::new();
 
     // Remote interest: the topics each peer has subscribers for. A peer with
     // no entry yet (no RESYNC received) gets every publish.
@@ -212,6 +216,7 @@ pub(crate) async fn cluster_manager(
         global_cancel: global_cancel.clone(),
         tls_config: tls_config.clone(),
         peer_reg_tx: peer_reg_tx.clone(),
+        links: links.clone(),
     };
 
     for peer_addr in &peers {
@@ -229,10 +234,11 @@ pub(crate) async fn cluster_manager(
         ctx: ctx.clone(),
         peer_reg_tx: peer_reg_tx.clone(),
         global_cancel: global_cancel.clone(),
+        links: links.clone(),
     };
     match inbound_links {
         InboundLinks::Listener(listener) => {
-            tokio::spawn(accept_cluster_links(
+            links.spawn(accept_cluster_links(
                 listener,
                 tls_config.clone(),
                 gate,
@@ -242,15 +248,15 @@ pub(crate) async fn cluster_manager(
         InboundLinks::MainPort(mut handed_over) => {
             let cancel = global_cancel.clone();
             let tls = tls_config.clone();
-            tokio::spawn(async move {
+            links.spawn(async move {
                 loop {
                     tokio::select! {
                         link = handed_over.recv() => {
                             let Some((stream, addr)) = link else { break };
                             if let Some(admitted) = gate.admit(addr) {
-                                let inbound = inbound.clone();
+                                let session = inbound.clone();
                                 let tls = tls.as_ref().map(|holder| holder.load_full());
-                                tokio::spawn(async move {
+                                inbound.links.spawn(async move {
                                     match tls {
                                         Some(tls) => match tokio::time::timeout(
                                             Duration::from_secs(5),
@@ -258,7 +264,7 @@ pub(crate) async fn cluster_manager(
                                         )
                                         .await
                                         {
-                                            Ok(Ok(stream)) => inbound.run(stream, addr, admitted).await,
+                                            Ok(Ok(stream)) => session.run(stream, addr, admitted).await,
                                             Ok(Err(e)) => tracing::warn!(
                                                 "[WSE-Cluster] TLS accept failed from {addr}: {e}"
                                             ),
@@ -266,7 +272,7 @@ pub(crate) async fn cluster_manager(
                                                 "[WSE-Cluster] TLS accept timeout from {addr}"
                                             ),
                                         },
-                                        None => inbound.run(stream, addr, admitted).await,
+                                        None => session.run(stream, addr, admitted).await,
                                     }
                                 });
                             }
@@ -425,7 +431,13 @@ pub(crate) async fn cluster_manager(
                         let mut shutdown_data = BytesMut::new();
                         encode_shutdown(&mut shutdown_data);
                         let shutdown_bytes = shutdown_data.freeze();
-                        for (peer_addr, tx, _, _) in &peer_txs {
+                        for (peer_addr, tx, _, link) in &peer_txs {
+                            // A link that ends for its own reason (one that
+                            // had no room for a message, say) says nothing:
+                            // the peer takes its end as unclean.
+                            if link.is_cancelled() {
+                                continue;
+                            }
                             if tx.try_send(shutdown_bytes.clone()).is_err() {
                                 tracing::warn!("[WSE-Cluster] Could not send SHUTDOWN to {peer_addr}");
                             }
@@ -757,10 +769,11 @@ pub(crate) async fn cluster_manager(
         });
     }
 
-    // Wait for all dial tasks to finish
-    for (_, task) in dialing {
-        let _ = task.await;
-    }
+    // Each link writes what it had, its SHUTDOWN last, and closes: waited
+    // for a moment, so the peers know this node left before its run ends.
+    drop(dialing);
+    links.close();
+    let _ = tokio::time::timeout(LEAVE_WITHIN, links.wait()).await;
     // Out of the cluster: the users other nodes had present are gone here.
     if let Some(pm) = &presence {
         for (topic, user_id, data) in pm.purge_remote() {

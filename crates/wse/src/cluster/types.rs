@@ -188,6 +188,9 @@ pub(crate) struct ClusterContext {
     /// another node now, after a link that ended without SHUTDOWN, took
     /// what it published meanwhile with it.
     pub incarnations: Arc<DashMap<String, String>>,
+    /// Cancelled once this node leaves the cluster: every link ends, the
+    /// ones that may saying SHUTDOWN.
+    pub leaving: CancellationToken,
 }
 
 /// What a node heard of a peer: the last of the peer's arrivals it heard of

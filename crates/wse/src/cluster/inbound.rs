@@ -13,6 +13,7 @@ use socket2::SockRef;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use super::peer::{
     exchange_resume, go_live, heartbeat_task, peer_dispatch_task, peer_reader, peer_writer,
@@ -134,6 +135,8 @@ pub(super) struct InboundSessionCtx {
     pub(super) ctx: ClusterContext,
     pub(super) peer_reg_tx: mpsc::UnboundedSender<PeerRegistration>,
     pub(super) global_cancel: CancellationToken,
+    /// The manager's link tasks: a session runs among them.
+    pub(super) links: TaskTracker,
 }
 
 impl InboundSessionCtx {
@@ -183,8 +186,8 @@ pub(super) async fn accept_cluster_links(
         let _ = sock.set_send_buffer_size(262_144);
         let _ = sock.set_recv_buffer_size(262_144);
         let tls_snap = tls.as_ref().map(|holder| holder.load_full());
-        let inbound = inbound.clone();
-        tokio::spawn(async move {
+        let session = inbound.clone();
+        inbound.links.spawn(async move {
             match tls_snap {
                 Some(tls_cfg) => {
                     match tokio::time::timeout(
@@ -193,14 +196,14 @@ pub(super) async fn accept_cluster_links(
                     )
                     .await
                     {
-                        Ok(Ok(tls_stream)) => inbound.run(tls_stream, addr, admitted).await,
+                        Ok(Ok(tls_stream)) => session.run(tls_stream, addr, admitted).await,
                         Ok(Err(e)) => {
                             tracing::warn!("[WSE-Cluster] TLS accept failed from {addr}: {e}");
                         }
                         Err(_) => tracing::warn!("[WSE-Cluster] TLS accept timeout from {addr}"),
                     }
                 }
-                None => inbound.run(stream, addr, admitted).await,
+                None => session.run(stream, addr, admitted).await,
             }
         });
     }
@@ -224,6 +227,7 @@ async fn handle_cluster_inbound_generic<S>(
         ctx,
         peer_reg_tx,
         global_cancel,
+        ..
     } = session;
     let instance_id: &str = &instance_id;
     let local_caps = local_capabilities(&ctx);
@@ -406,6 +410,7 @@ async fn handle_cluster_inbound_generic<S>(
         write_rx,
         writer,
         cancel.clone(),
+        global_cancel.clone(),
         ctx.metrics.clone(),
     ));
 

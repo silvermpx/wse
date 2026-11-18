@@ -12,7 +12,6 @@ use super::handler::Handler;
 use super::publisher::{Error, Publisher};
 use super::run;
 use super::state::{ServerCommand, SharedState};
-use crate::cluster::ClusterCommand;
 
 /// A WSE server: its configuration and state, from `new` until it is
 /// dropped. It serves on a listener once started, and can start again after
@@ -102,10 +101,9 @@ impl Server {
         run::stopped(&self.shared);
     }
 
+    /// The run ends once its command task took what came before: it leaves
+    /// the cluster then, after every publish it took.
     fn shut_down(&self) {
-        if let Some(tx) = self.shared.cluster_cmd_tx.load_full() {
-            let _ = tx.send(ClusterCommand::Shutdown);
-        }
         let _ = self.publisher().command(ServerCommand::Shutdown);
         self.running.store(false, Ordering::SeqCst);
     }
