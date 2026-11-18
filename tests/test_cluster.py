@@ -474,6 +474,50 @@ def test_a_message_no_node_kept_while_a_link_was_down_is_never_said_recovered(no
         assert answer["recovered"] is False, answer
 
 
+def test_a_message_a_node_had_no_room_to_keep_is_not_delivered_again_after_a_lost_link(nodes):
+    """A node with no room left for history delivers what a peer relays to it
+    live; once a lost link is back, the catch-up brings what it missed, and
+    nothing it delivered already a second time."""
+    websockets = pytest.importorskip("websockets")
+    origin = nodes(recovery=True)
+    relay = nodes(recovery=True, recovery_memory_budget=1)
+    origin.join()
+
+    def price(n):
+        return json.dumps({"t": "price", "p": {"n": n}})
+
+    async def scenario():
+        blink = Blink(origin)
+        await blink.start()
+        try:
+            relay.join(blink)
+            await until(lambda: origin.peers == 1 and relay.peers == 1)
+            async with websockets.connect(f"ws://127.0.0.1:{relay.port}/wse") as live:
+                await subscribe_next_client(relay, ["prices:*", "setup"])
+                await asyncio.sleep(0.35)  # the SUB reaches the origin
+                # The relay's budget is used up: what is relayed to it is not kept.
+                relay.server.broadcast_local("setup", json.dumps({"t": "setup", "p": {}}))
+                await messages_of_type(live, "setup", 1)
+                origin.server.broadcast("prices:open", price(0))
+                got = await messages_of_type(live, "price", 1)
+                blink.cut()
+                await until(lambda: origin.peers == 0 and relay.peers == 0)
+                origin.server.broadcast("prices:open", price(1))
+                await asyncio.sleep(0.3)
+                blink.open = True
+                await until(lambda: origin.peers == 1 and relay.peers == 1, timeout=20.0)
+                await asyncio.sleep(0.4)
+                origin.server.broadcast("prices:open", price(2))
+                while got[-1]["p"]["n"] != 2:
+                    got.extend(await messages_of_type(live, "price", 1))
+        finally:
+            blink.close()
+        return got
+
+    got = asyncio.run(scenario())
+    assert [message["p"]["n"] for message in got] == [0, 1, 2], got
+
+
 def test_a_message_its_origin_had_no_room_to_keep_is_never_said_recovered(nodes):
     """The origin of a message had no room left for its history and sent it
     on with no position: a client of the other node whose last message of the

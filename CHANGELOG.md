@@ -154,6 +154,10 @@ server every client is checked against.
   link was down is told to the other node after the catch-up (LOST): a
   recovery from before it there says `recovered: false`, where it said it
   missed nothing.
+- Cluster: a node with no room left for history no longer delivers a
+  message relayed to it twice once a lost link is back: its catch-up request
+  names where it stands in the streams it keeps no buffer of, and what was
+  delivered of them already is not delivered again.
 - Swift, Kotlin and Dart: once the client is closed, the events end with
   what the close said (the messages it will not deliver, the close itself);
   a reader waiting at the close no longer gets its end before them.

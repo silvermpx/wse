@@ -210,7 +210,7 @@ TCP connection open so in-flight delivery can finish (lame-duck). See
    [8 bytes: offset (little-endian u64)]]
 ```
 
-Where the sender stands in every stream other nodes relay to it: for each foreign recovery buffer, the topic, the origin's epoch and the last offset it holds with nothing missing before it. A request over the frame limit is split; flags `0x01` marks its last frame, and a node with nothing relayed to it sends one empty frame with that flag.
+Where the sender stands in every stream other nodes relay to it: for each foreign recovery buffer, the topic, the origin's epoch and the last offset it holds with nothing missing before it; for a stream it holds no buffer of (no room in its memory budget for one, or the buffer was removed), the last offset it delivered with nothing missing before it, for 100,000 such streams. What it delivered of those streams is not delivered again when a peer sends it again, within the last 64 offsets past that one. A request over the frame limit is split; flags `0x01` marks its last frame, and a node with nothing relayed to it sends one empty frame with that flag.
 
 With CAP_RESUME_TOPICS, the frames flagged `0x02` follow those entries and name the topics the sender has (its subscribers', and those still kept for clients that may come back): each entry is the topic, an epoch of 0, and in place of the offset how long ago the sender's interest in it began, in milliseconds.
 

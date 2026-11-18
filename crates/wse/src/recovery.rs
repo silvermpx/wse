@@ -66,6 +66,8 @@ const LATELY_MARGIN: Duration = Duration::from_secs(3);
 
 /// Most topics with no buffer left whose removed history is kept, for the
 /// peers that may ask after a lost link; past them, any topic counts as one.
+/// As many relayed streams with no buffer have where this node stands in
+/// them kept.
 const MAX_UNKEPT_TOPICS: usize = 100_000;
 
 /// Largest per-topic message limit: 2^16 = 65536 messages.
@@ -300,6 +302,95 @@ impl TopicRecoveryBuffer {
 // This buffer stores those messages keyed by the origin node's epoch so that a
 // client reconnecting to *this* node can recover using the original epoch/offset
 // even though the messages originated elsewhere.
+
+/// Where this node stands in a stream relayed to it that it holds no buffer
+/// of (no room to make one, or it was removed): every offset up to
+/// `through` was delivered, and of the 64 after it, each `above` has a bit
+/// for. A peer whose link was lost is asked after `through`, and what it
+/// sends again of them is not delivered twice.
+struct Delivered {
+    epoch: u32,
+    through: u64,
+    above: u64,
+    at: Instant,
+}
+
+impl Delivered {
+    fn first(epoch: u32, offset: u64) -> Self {
+        Self {
+            epoch,
+            through: offset,
+            above: 0,
+            at: Instant::now(),
+        }
+    }
+
+    /// Where a buffer removed stood: what it held, and what it let go of.
+    fn of(buf: &ForeignRecoveryBuffer) -> Option<Self> {
+        if !buf.initialized {
+            return None;
+        }
+        let through = buf
+            .contiguous_through()
+            .or_else(|| buf.head_offset.checked_sub(1))?;
+        let above = buf
+            .entries
+            .iter()
+            .flatten()
+            .filter(|entry| entry.offset > through && entry.offset - through <= 64)
+            .fold(0u64, |above, entry| {
+                above | 1 << (entry.offset - through - 1)
+            });
+        Some(Self {
+            epoch: buf.epoch,
+            through,
+            above,
+            at: buf.last_write,
+        })
+    }
+
+    /// `offset` is delivered: false when it was already. One more than 64
+    /// past `through` moves the window on, and gives up on what it leaves
+    /// behind undelivered.
+    fn deliver(&mut self, offset: u64) -> bool {
+        self.at = Instant::now();
+        if offset <= self.through {
+            return false;
+        }
+        let mut ahead = offset - self.through - 1;
+        if ahead >= 64 {
+            let shift = ahead - 63;
+            self.above = self.above.checked_shr(shift.min(64) as u32).unwrap_or(0);
+            self.through += shift;
+            ahead = 63;
+        }
+        let bit = 1u64 << ahead;
+        if self.above & bit != 0 {
+            return false;
+        }
+        self.above |= bit;
+        let run = self.above.trailing_ones();
+        self.through += u64::from(run);
+        self.above = self.above.checked_shr(run).unwrap_or(0);
+        true
+    }
+
+    fn has(&self, offset: u64) -> bool {
+        offset <= self.through || {
+            let ahead = offset - self.through - 1;
+            ahead < 64 && self.above & (1 << ahead) != 0
+        }
+    }
+
+    /// Something after `offset` was delivered.
+    fn any_after(&self, offset: u64) -> bool {
+        if offset < self.through {
+            return true;
+        }
+        let ahead = offset - self.through;
+        ahead < 64 && self.above.checked_shr(ahead as u32).unwrap_or(0) != 0
+    }
+}
 
 struct ForeignRecoveryBuffer {
     entries: Box<[Option<RecoveryEntry>]>,
@@ -589,6 +680,9 @@ pub(crate) struct RecoveryManager {
     /// The latest arrival not kept of a topic that found no room among
     /// `MAX_UNKEPT_TOPICS`, and when: it counts for every topic.
     removed_any: parking_lot::Mutex<Option<(u64, Instant)>>,
+    /// Per relayed stream with no buffer here ("topic\0epoch"), where this
+    /// node stands in it.
+    relayed_unkept: DashMap<String, Delivered>,
     config: RecoveryConfig,
     total_bytes: AtomicUsize,
 }
@@ -604,6 +698,7 @@ impl RecoveryManager {
             marks: parking_lot::Mutex::new(VecDeque::new()),
             removed_through: DashMap::new(),
             removed_any: parking_lot::Mutex::new(None),
+            relayed_unkept: DashMap::new(),
             config,
             total_bytes: AtomicUsize::new(0),
         }
@@ -723,6 +818,25 @@ impl RecoveryManager {
             None if self.total_bytes.load(Ordering::Relaxed)
                 >= self.config.global_memory_budget =>
             {
+                if !self.deliver_unkept(key, origin_epoch, origin_offset) {
+                    return false;
+                }
+                self.note_removed(
+                    foreign_topic(key),
+                    self.arrival.fetch_add(1, Ordering::Relaxed),
+                );
+                return true;
+            }
+            // Delivered before, with no buffer to hold it then: not again,
+            // and no buffer yet while some of what was delivered comes after
+            // it (a buffer begun here would take them for new).
+            None if let Some(mut delivered) = self.relayed_unkept.get_mut(key)
+                && (delivered.has(origin_offset) || delivered.any_after(origin_offset)) =>
+            {
+                if !delivered.deliver(origin_offset) {
+                    return false;
+                }
+                drop(delivered);
                 self.note_removed(
                     foreign_topic(key),
                     self.arrival.fetch_add(1, Ordering::Relaxed),
@@ -742,6 +856,10 @@ impl RecoveryManager {
                 }),
         };
 
+        if created {
+            // The buffer stands where it was, from now on.
+            self.relayed_unkept.remove(key);
+        }
         if created && let Some((topic, _)) = key.split_once('\0') {
             let mut epochs = self.foreign_epochs.entry(topic.to_owned()).or_default();
             if !epochs.contains(&origin_epoch) {
@@ -774,14 +892,34 @@ impl RecoveryManager {
     /// epoch, the last offset held with nothing missing before it). A peer
     /// whose link was lost sends what came after it once the link is back.
     pub(crate) fn foreign_positions(&self) -> Vec<(String, u32, u64)> {
-        self.foreign_buffers
-            .iter()
-            .filter_map(|entry| {
-                let (topic, _) = entry.key().split_once('\0')?;
-                let through = entry.value().contiguous_through()?;
-                Some((topic.to_owned(), entry.value().epoch, through))
-            })
-            .collect()
+        let held = self.foreign_buffers.iter().filter_map(|entry| {
+            let (topic, _) = entry.key().split_once('\0')?;
+            let through = entry.value().contiguous_through()?;
+            Some((topic.to_owned(), entry.value().epoch, through))
+        });
+        let unkept = self.relayed_unkept.iter().filter_map(|entry| {
+            let (topic, _) = entry.key().split_once('\0')?;
+            Some((topic.to_owned(), entry.value().epoch, entry.value().through))
+        });
+        held.chain(unkept).collect()
+    }
+
+    /// A message of a relayed stream with no buffer here, and no room for
+    /// one: false when it was delivered already.
+    fn deliver_unkept(&self, key: &str, epoch: u32, offset: u64) -> bool {
+        if let Some(mut delivered) = self.relayed_unkept.get_mut(key) {
+            return delivered.deliver(offset);
+        }
+        if self.relayed_unkept.len() >= MAX_UNKEPT_TOPICS {
+            return true;
+        }
+        match self.relayed_unkept.entry(key.to_owned()) {
+            dashmap::Entry::Occupied(mut delivered) => delivered.get_mut().deliver(offset),
+            dashmap::Entry::Vacant(slot) => {
+                slot.insert(Delivered::first(epoch, offset));
+                true
+            }
+        }
     }
 
     /// What this node published to `topic` in its stream `epoch` after
@@ -1281,6 +1419,8 @@ impl RecoveryManager {
             *any = None;
         }
         drop(any);
+        self.relayed_unkept
+            .retain(|_, delivered| delivered.at.elapsed() <= ttl);
         self.trim_marks();
     }
 
@@ -1487,12 +1627,18 @@ impl RecoveryManager {
     /// meanwhile waits for both, then names the stream again. The buffer's
     /// lock is taken before the streams', as a relay takes them.
     fn remove_foreign(&self, key: &str) -> Option<ForeignRecoveryBuffer> {
-        let (_, removed) = self.foreign_buffers.remove_if(key, |key, removed| {
+        let (key, removed) = self.foreign_buffers.remove_if(key, |key, removed| {
             #[cfg(test)]
             REMOVING.with_borrow(|hook| hook.as_ref().map(|hook| hook()));
             self.forget_foreign(key, removed.epoch);
             true
         })?;
+        // What it delivered is not delivered again.
+        if let Some(delivered) = Delivered::of(&removed)
+            && self.relayed_unkept.len() < MAX_UNKEPT_TOPICS
+        {
+            self.relayed_unkept.insert(key, delivered);
+        }
         Some(removed)
     }
 
@@ -1882,6 +2028,70 @@ mod tests {
         // The hole filled: from the newest on.
         mgr.push_foreign("a", make_data("x"), 7, 3);
         assert!(mgr.foreign_positions().contains(&("a".to_owned(), 7, 5)));
+    }
+
+    #[test]
+    fn a_window_of_delivered_offsets_tells_what_is_new() {
+        let mut delivered = Delivered::first(7, 5);
+        assert!(!delivered.deliver(5) && !delivered.deliver(0));
+        assert!(delivered.deliver(7), "a hole at 6");
+        assert_eq!((delivered.through, delivered.above), (5, 0b10));
+        assert!(!delivered.deliver(7));
+        assert!(delivered.any_after(6) && !delivered.any_after(7));
+        assert!(delivered.deliver(6));
+        assert_eq!((delivered.through, delivered.above), (7, 0));
+        // Far ahead: the window moves on, and gives up on the hole behind.
+        assert!(delivered.deliver(200));
+        assert_eq!(delivered.through, 136);
+        assert!(delivered.has(200) && !delivered.has(199));
+        assert!(!delivered.deliver(200));
+        assert!(delivered.deliver(137));
+        assert_eq!(delivered.through, 137);
+        let mut edge = Delivered::first(7, u64::MAX - 1);
+        assert!(edge.deliver(u64::MAX) && !edge.deliver(u64::MAX));
+    }
+
+    #[test]
+    fn a_stream_relayed_with_no_room_to_keep_it_is_not_delivered_twice() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        mgr.push("setup", make_data("s"));
+        let budget = mgr.total_bytes();
+        let mgr = with_budget(mgr, budget);
+        assert!(mgr.push_foreign("prices:open", make_data("0"), 7, 0));
+        assert!(mgr.foreign_buffers.is_empty());
+        // A peer is asked after it, and sends it again all the same.
+        assert!(
+            mgr.foreign_positions()
+                .contains(&("prices:open".to_owned(), 7, 0))
+        );
+        assert!(!mgr.push_foreign("prices:open", make_data("0"), 7, 0));
+        assert!(mgr.push_foreign("prices:open", make_data("2"), 7, 2));
+        // Room again: what was delivered after a message is no buffer's yet.
+        let mgr = with_budget(mgr, usize::MAX);
+        assert!(mgr.push_foreign("prices:open", make_data("1"), 7, 1));
+        assert!(mgr.foreign_buffers.is_empty());
+        assert!(!mgr.push_foreign("prices:open", make_data("2"), 7, 2));
+        assert!(mgr.push_foreign("prices:open", make_data("3"), 7, 3));
+        assert_eq!(mgr.foreign_buffers.len(), 1);
+        assert!(mgr.relayed_unkept.is_empty());
+        assert!(!mgr.push_foreign("prices:open", make_data("1"), 7, 1));
+    }
+
+    #[test]
+    fn a_relayed_buffer_removed_leaves_where_this_node_stood() {
+        let mgr = RecoveryManager::new(RecoveryConfig::default());
+        for offset in [0, 1, 3] {
+            mgr.push_foreign("a", make_data("x"), 7, offset);
+        }
+        // Over the budget: the buffer goes.
+        let mgr = with_budget(mgr, 0);
+        mgr.cleanup();
+        assert!(mgr.foreign_buffers.is_empty());
+        assert!(mgr.foreign_positions().contains(&("a".to_owned(), 7, 1)));
+        for offset in [0, 1, 3] {
+            assert!(!mgr.push_foreign("a", make_data("x"), 7, offset));
+        }
+        assert!(mgr.push_foreign("a", make_data("x"), 7, 2));
     }
 
     #[test]
