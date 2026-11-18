@@ -442,13 +442,17 @@ async fn a_window_signed_out_while_behind_hears_what_became_of_its_send_first() 
         .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while owner.client().kept() > 0 {
-        assert!(tokio::time::Instant::now() < deadline, "the server's answer");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the server's answer"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     slow.settle(100).await;
     assert_eq!(slow.held.len(), 2, "the outcome waits at the owner");
     owner.sign_out();
-    slow.until("revoked", |w| w.has_frame(|f| f["k"] == "revoked")).await;
+    slow.until("revoked", |w| w.has_frame(|f| f["k"] == "revoked"))
+        .await;
     // A last batch with it, before the window is let go.
     assert_eq!(slow.held.len(), 3, "{:?}", slow.held);
     let last = &slow.held[2];
