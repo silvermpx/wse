@@ -86,6 +86,8 @@ interface Attachment {
   listens: Set<string>;
   queue: Queued[];
   queueBytes: number;
+  /** Of the queue, the outcomes of the window's sends: never dropped, and not counted against its limits. */
+  queueOutcomes: number;
   /** The last batch handed, and the last the window took. */
   handed: number;
   took: number;
@@ -116,6 +118,11 @@ function connOf(snapshot: WSEClientSnapshot): ConnState {
     lastError: snapshot.lastError,
     storage: snapshot.storage,
   };
+}
+
+/** What became of a window's send: said once, and the window waits for it. */
+function isOutcome(item: BridgeItem): boolean {
+  return 'ev' in item && item.ev === 'event' && (item.name === 'wseDelivered' || item.name === 'wseNotDelivered');
 }
 
 function sizeOf(message: WSMessage): number {
@@ -190,11 +197,14 @@ export function createBridgeOwner(options: BridgeOwnerOptions = {}): BridgeOwner
   const enqueue = (a: Attachment, item: BridgeItem, bytes: number) => {
     a.queue.push({ item, bytes });
     a.queueBytes += bytes;
-    if (a.queue.length > limits.queueItems || a.queueBytes > limits.queueBytes) {
+    if (isOutcome(item)) a.queueOutcomes++;
+    if (a.queue.length - a.queueOutcomes > limits.queueItems || a.queueBytes > limits.queueBytes) {
       // The window fell behind past its limits: its queue goes, and what it
-      // holds broke off; the connection and the other windows go on.
+      // holds broke off; the connection and the other windows go on. What
+      // became of its sends is said all the same: once, and it waits for it.
       logger.warn(`[bridge] window ${a.att} fell behind: its queue of ${a.queue.length} dropped`);
-      a.queue = [{ item: { ev: 'overflow', topics: [...a.holds] }, bytes: 0 }];
+      const outcomes = a.queue.filter((q) => isOutcome(q.item));
+      a.queue = [{ item: { ev: 'overflow', topics: [...a.holds] }, bytes: 0 }, ...outcomes];
       a.queueBytes = 0;
       const active = activeOf(a);
       if (active.length > 0) a.queue.push({ item: { ev: 'subscribed', taken: active, refused: [] }, bytes: 0 });
@@ -222,6 +232,7 @@ export function createBridgeOwner(options: BridgeOwnerOptions = {}): BridgeOwner
       }
       const taken = a.queue.splice(0, count);
       a.queueBytes -= bytes;
+      if (a.queueOutcomes > 0) for (const q of taken) if (isOutcome(q.item)) a.queueOutcomes--;
       a.handed++;
       a.channel.post({ k: 'b', s: a.handed, items: taken.map((q) => q.item) });
     }
@@ -441,6 +452,7 @@ export function createBridgeOwner(options: BridgeOwnerOptions = {}): BridgeOwner
         listens: new Set(),
         queue: [],
         queueBytes: 0,
+        queueOutcomes: 0,
         handed: 0,
         took: 0,
         pumping: false,

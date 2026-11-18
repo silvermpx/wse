@@ -195,6 +195,10 @@ struct Win {
     listens: HashSet<String>,
     queue: VecDeque<Arc<str>>,
     bytes: usize,
+    /// Of the queue, the outcomes of the window's sends and their bytes:
+    /// never dropped, and not counted against its limits.
+    outcomes: usize,
+    outcome_bytes: usize,
     /// The last batch handed, and the last the window took.
     handed: u64,
     took: u64,
@@ -317,6 +321,8 @@ impl Owner {
                 listens: HashSet::new(),
                 queue: VecDeque::new(),
                 bytes: 0,
+                outcomes: 0,
+                outcome_bytes: 0,
                 handed: 0,
                 took: 0,
                 reconnected: None,
@@ -936,19 +942,32 @@ impl Tags for WindowTags {
     }
 }
 
+/// What became of a window's send: said once, and the window waits for it.
+fn is_outcome(item: &str) -> bool {
+    item.starts_with(r#"{"ev":"event","name":"wseDelivered""#)
+        || item.starts_with(r#"{"ev":"event","name":"wseNotDelivered""#)
+}
+
 /// An item for a window: past its limits its queue goes, and what it holds
-/// broke off; the connection and the other windows go on.
+/// broke off; the connection and the other windows go on. What became of
+/// its sends is said all the same.
 fn enqueue(win: &mut Win, item: Arc<str>, limits: &Limits, active: &HashSet<String>) {
     win.bytes += item.len();
+    if is_outcome(&item) {
+        win.outcomes += 1;
+        win.outcome_bytes += item.len();
+    }
     win.queue.push_back(item);
-    if win.queue.len() > limits.queue_items || win.bytes > limits.queue_bytes {
-        win.queue.clear();
-        win.bytes = 0;
+    if win.queue.len() - win.outcomes > limits.queue_items
+        || win.bytes - win.outcome_bytes > limits.queue_bytes
+    {
+        let outcomes: Vec<Arc<str>> = win.queue.drain(..).filter(|i| is_outcome(i)).collect();
         let holds: Vec<&String> = win.holds.iter().collect();
         let mut overflow = String::from(r#"{"ev":"overflow","topics":"#);
         push_strings(&mut overflow, &holds);
         overflow.push('}');
         win.queue.push_back(Arc::from(overflow));
+        win.queue.extend(outcomes);
         let taken: Vec<&String> = holds.into_iter().filter(|t| active.contains(*t)).collect();
         if !taken.is_empty() {
             let mut subscribed = String::from(r#"{"ev":"subscribed","taken":"#);
@@ -980,6 +999,10 @@ fn pump(win: &mut Win, limits: &Limits) {
         for (at, item) in win.queue.drain(..count).enumerate() {
             if at > 0 {
                 frame.push(',');
+            }
+            if win.outcomes > 0 && is_outcome(&item) {
+                win.outcomes -= 1;
+                win.outcome_bytes -= item.len();
             }
             frame.push_str(&item);
         }

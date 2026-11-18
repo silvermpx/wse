@@ -586,3 +586,40 @@ describe('a window, as its application reads it', () => {
     await vi.waitFor(() => expect(w.store.getState().activeTopics).toEqual([]));
   });
 });
+
+describe('a window behind its owner', () => {
+  it('hears what became of its send though its queue overflowed', async () => {
+    const o = owner({ limits: { queueItems: 4, inFlight: 1, batchItems: 1 } });
+    const w = window(o);
+    // Another window holds the connection while this one is paused.
+    const other = window(o);
+    other.retain();
+    w.retain();
+    await settle();
+    const ws = FakeWebSocket.last();
+    await serve(ws);
+    const lease = w.subscribe(['prices']);
+    await vi.waitFor(() => expect(ws.messagesOfType('subscription_update').length).toBeGreaterThan(0));
+    ws.serverSend(reply(['prices']));
+    await vi.waitFor(() => expect(w.state.getSnapshot().topicStates.prices.subscription).toBe('active'));
+    const outcomes: string[] = [];
+    w.on('wseDelivered', (d: { ids: string[] }) => outcomes.push(...d.ids));
+    w.on('wseNotDelivered', (d: { reason: string; ids: string[] }) => outcomes.push(`${d.reason}:${d.ids}`));
+    w.send('order', { n: 1 }, { id: 'kept' });
+    await vi.waitFor(() => expect(ws.messagesOfType('order')).toHaveLength(1));
+    const s = ws.messagesOfType('order')[0].s as number;
+    // Paused, with a batch in hand: what comes waits at the owner, its
+    // send's outcome among it.
+    w.pause('test');
+    ws.serverSend({ c: 'U', t: 'tick', tp: 'prices', p: { n: -1 } });
+    await settle();
+    ws.serverSend({ c: 'WSE', t: 'ack', p: { s } });
+    await vi.waitFor(() => expect(o.client.kept()).toBe(0));
+    for (let n = 0; n < 20; n++) ws.serverSend({ c: 'U', t: 'tick', tp: 'prices', p: { n } });
+    await settle();
+    w.resume('test');
+    await vi.waitFor(() => expect(outcomes).toEqual(['kept']));
+    expect(w.kept()).toBe(0);
+    lease.release();
+  });
+});

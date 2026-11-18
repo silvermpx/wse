@@ -370,6 +370,60 @@ async fn a_window_that_falls_behind_loses_its_queue_alone() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_behind_hears_what_became_of_its_send_though_its_queue_overflowed() {
+    let stand = stand().await;
+    let mut options = Options::default();
+    let mut limits = Limits::default();
+    limits.queue_items = 20;
+    options.limits = limits;
+    let owner = stand.owner(options).await;
+    let mut slow = TestWindow::new(&owner);
+    let mut quick = TestWindow::new(&owner);
+    slow.send(json!({"k": "share", "on": true}));
+    slow.send(json!({"k": "hold", "topics": ["prices"]}));
+    quick.send(json!({"k": "hold", "topics": ["prices"]}));
+    slow.until("taken", |w| w.subscribed("prices")).await;
+    quick.until("taken", |w| w.subscribed("prices")).await;
+    // Behind, with batches in hand: its send's outcome waits at the owner.
+    slow.holding = true;
+    for n in 1..=4 {
+        stand.publish("prices", n);
+    }
+    quick
+        .until("the first four", |w| w.messages("prices").len() == 4)
+        .await;
+    slow.send(json!({"k": "send", "n": 1, "t": "order", "p": {"n": 1}, "o": {"id": "kept"}, "c": 1, "a": 0}));
+    slow.until("sent", |w| w.has_frame(|f| f["k"] == "sent" && f["n"] == 1))
+        .await;
+    // What comes next outgrows its queue.
+    for ten in 0..6 {
+        for n in ten * 10 + 5..=ten * 10 + 14 {
+            stand.publish("prices", n);
+        }
+        let seen = usize::try_from(ten * 10 + 14).unwrap();
+        quick
+            .until("each ten", |w| w.messages("prices").len() == seen)
+            .await;
+    }
+    slow.settle(200).await;
+    slow.holding = false;
+    for batch in std::mem::take(&mut slow.held) {
+        slow.take(batch);
+    }
+    slow.until("delivered", |w| {
+        w.has_item(|i| {
+            i["ev"] == "event"
+                && i["name"] == "wseDelivered"
+                && i["detail"]["ids"] == json!(["kept"])
+        })
+    })
+    .await;
+    assert!(slow.has_item(|i| i["ev"] == "overflow"));
+    owner.close().await;
+    stand.server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_window_of_another_protocol_is_refused_and_one_that_breaks_it_let_go() {
     let stand = stand().await;
     let owner = stand.owner(Options::default()).await;
