@@ -279,6 +279,39 @@ fn an_encrypted_connection_gets_its_own_sealed_frame() {
     assert_eq!(key.open_nonce_prefixed(&body[2..]).unwrap(), b"{\"x\":1}");
 }
 
+/// A send says how many bytes it queued: the frame as it goes, in msgpack
+/// for a connection that asked for it, its header as long as it is.
+#[test]
+fn a_send_says_the_bytes_of_the_frame_it_queued() {
+    use tokio_tungstenite::tungstenite::protocol::Message;
+
+    let (mut packed, mut rx) = make_handle();
+    packed.msgpack = true;
+    let drops = AtomicU64::new(0);
+    let json = format!(
+        "{{\"t\":\"note\",\"p\":{{\"text\":\"{}\"}}}}",
+        "x".repeat(150)
+    );
+    let sent = packed.send_one(Message::Text(json.clone().into()), 0, &drops);
+    let Ok(WsFrame::Msg(Message::Binary(frame))) = rx.try_recv() else {
+        panic!("expected a msgpack frame");
+    };
+    let header = if frame.len() < 126 { 2 } else { 4 };
+    assert_eq!(sent, Some(header + frame.len()));
+    assert!(frame.len() < json.len());
+
+    // Text as it is: a payload of 125 bytes has a header of 2, one of 126 of 4.
+    let (plain, mut rx) = make_handle();
+    for (len, header) in [(125, 2), (126, 4)] {
+        let text = "y".repeat(len);
+        assert_eq!(
+            plain.send_one(Message::Text(text.into()), 0, &drops),
+            Some(header + len)
+        );
+        rx.try_recv().unwrap();
+    }
+}
+
 #[test]
 fn a_msgpack_connection_gets_json_as_msgpack() {
     use tokio_tungstenite::tungstenite::protocol::Message;
@@ -320,8 +353,16 @@ fn a_msgpack_connection_gets_json_as_msgpack() {
     assert_eq!(&queued(&packed).concat()[2..], b"raw");
 
     // Its own sends too (a replay, a reply); text that is not JSON as is.
-    assert!(packed.send_one(Message::Text("{\"t\":\"x\"}".into()), 0, &drops));
-    assert!(packed.send_one(Message::Text("plain".into()), 0, &drops));
+    assert!(
+        packed
+            .send_one(Message::Text("{\"t\":\"x\"}".into()), 0, &drops)
+            .is_some()
+    );
+    assert!(
+        packed
+            .send_one(Message::Text("plain".into()), 0, &drops)
+            .is_some()
+    );
     match rx2.try_recv() {
         Ok(WsFrame::Msg(Message::Binary(b))) => assert_eq!(&b[..2], b"M:"),
         _ => panic!("expected a msgpack frame"),

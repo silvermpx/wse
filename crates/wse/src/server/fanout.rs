@@ -209,15 +209,21 @@ impl ConnectionHandle {
         true
     }
 
-    /// Queue a frame on the control queue, counted in the outbound budget.
-    fn queue(&self, frame: WsFrame) -> bool {
+    /// Queue a frame on the control queue, counted in the outbound budget:
+    /// its bytes as it goes, when queued.
+    fn queue_sized(&self, frame: WsFrame) -> Option<usize> {
         let bytes = ws_frame_size(&frame);
         self.out.pending.fetch_add(bytes, Ordering::Relaxed);
         if self.tx.send(frame).is_err() {
             self.out.pending.fetch_sub(bytes, Ordering::Relaxed);
-            return false;
+            return None;
         }
-        true
+        Some(bytes)
+    }
+
+    /// Queue a frame on the control queue, counted in the outbound budget.
+    fn queue(&self, frame: WsFrame) -> bool {
+        self.queue_sized(frame).is_some()
     }
 
     /// Queue a message the server makes on its own (a ping, a reply, an
@@ -235,17 +241,18 @@ impl ConnectionHandle {
 
     /// Send one message to this connection alone, in order with its other
     /// direct sends: sealed with its E2E key when it has one. A connection
-    /// over its outbound budget drops it (counted in `slow_drops`). True
-    /// when queued.
+    /// over its outbound budget drops it (counted in `slow_drops`). The
+    /// bytes of the frame queued (in msgpack, sealed, its header too), when
+    /// it was.
     pub(crate) fn send_one(
         &self,
         msg: Message,
         max_pending: usize,
         slow_drops: &AtomicU64,
-    ) -> bool {
+    ) -> Option<usize> {
         if max_pending > 0 && self.out.pending.load(Ordering::Relaxed) >= max_pending {
             slow_drops.fetch_add(1, Ordering::Relaxed);
-            return false;
+            return None;
         }
         self.send_owed(msg)
     }
@@ -254,7 +261,7 @@ impl ConnectionHandle {
     /// answer to its request): never dropped for the outbound budget. One
     /// for each request it made; a connection that stays over its budget is
     /// closed as too slow to read.
-    pub(crate) fn send_owed(&self, msg: Message) -> bool {
+    pub(crate) fn send_owed(&self, msg: Message) -> Option<usize> {
         // JSON text in msgpack, for a connection that asked for msgpack.
         let msg = match msg {
             Message::Text(text) if self.msgpack => match to_msgpack(text.as_bytes()) {
@@ -265,21 +272,16 @@ impl ConnectionHandle {
         };
         let frame = match (self.out.cipher.get(), msg) {
             (Some(Seal::Legacy(cipher)), Message::Text(text)) => {
-                match e2e_message(cipher, text.as_bytes()) {
-                    Some(sealed) => WsFrame::Msg(sealed),
-                    None => return false,
-                }
+                WsFrame::Msg(e2e_message(cipher, text.as_bytes())?)
             }
-            (Some(Seal::Legacy(cipher)), Message::Binary(data)) => match e2e_message(cipher, &data)
-            {
-                Some(sealed) => WsFrame::Msg(sealed),
-                None => return false,
-            },
+            (Some(Seal::Legacy(cipher)), Message::Binary(data)) => {
+                WsFrame::Msg(e2e_message(cipher, &data)?)
+            }
             (Some(Seal::Session), Message::Text(text)) => WsFrame::Seal(Bytes::from(text)),
             (Some(Seal::Session), Message::Binary(data)) => WsFrame::Seal(data),
             (_, msg) => WsFrame::Msg(msg),
         };
-        self.queue(frame)
+        self.queue_sized(frame)
     }
 
     /// Append a frame to the broadcast buffer; the write task is woken when

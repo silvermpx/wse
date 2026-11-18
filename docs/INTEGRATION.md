@@ -1090,7 +1090,7 @@ async def metrics():
 | `wse_messages_received_total` | Messages received from clients |
 | `wse_messages_sent_total` | Messages the application sent to one connection (`send_event`, `send`, `send_bytes`); broadcasts and topic messages are not counted |
 | `wse_bytes_received_total` | Bytes received from clients |
-| `wse_bytes_sent_total` | Bytes of those messages, as framed |
+| `wse_bytes_sent_total` | Bytes of those messages as they go: each frame as written (in msgpack for a connection that asked for it, sealed in an E2E session), its WebSocket header included |
 | `wse_connections_accepted_total` | Total connections accepted |
 | `wse_connections_rejected_total` | Connections rejected (max limit or auth failure) |
 | `wse_auth_failures_total` | JWT authentication failures |

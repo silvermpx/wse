@@ -4,6 +4,8 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
+use crate::protocol::e2e::SEALED_OVERHEAD;
+
 // ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
@@ -23,15 +25,25 @@ pub(crate) enum WsFrame {
 /// Counts payload + estimated framing overhead (~4 bytes for most messages).
 #[inline]
 pub(super) fn ws_frame_size(frame: &WsFrame) -> usize {
+    // A server's frame (unmasked): its header as long as the payload needs.
+    let framed = |len: usize| {
+        let header = if len < 126 {
+            2
+        } else if len <= 0xFFFF {
+            4
+        } else {
+            10
+        };
+        header + len
+    };
     match frame {
-        // Header, tag and frame overhead of a sealed frame.
-        WsFrame::Seal(plaintext) => plaintext.len() + 36,
+        WsFrame::Seal(plaintext) => framed(plaintext.len() + SEALED_OVERHEAD),
         WsFrame::InstallSeal(_) => 0,
         WsFrame::Msg(msg) => match msg {
-            Message::Text(s) => s.len() + 4,
-            Message::Binary(b) => b.len() + 4,
-            Message::Ping(p) | Message::Pong(p) => p.len() + 4,
-            Message::Close(frame) => 8 + frame.as_ref().map_or(0, |f| f.reason.len()),
+            Message::Text(s) => framed(s.len()),
+            Message::Binary(b) => framed(b.len()),
+            Message::Ping(p) | Message::Pong(p) => framed(p.len()),
+            Message::Close(frame) => framed(frame.as_ref().map_or(0, |f| 2 + f.reason.len())),
             Message::Frame(_) => 16,
         },
     }

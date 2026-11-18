@@ -512,11 +512,14 @@ impl SharedState {
                     let Ok(text) = Utf8Bytes::try_from(payload.clone()) else {
                         break;
                     };
-                    if !handle.send_one(
-                        Message::Text(text),
-                        self.max_outbound_queue_bytes,
-                        self.slow_consumer_drops.shard(usize::from(handle.lane)),
-                    ) {
+                    if handle
+                        .send_one(
+                            Message::Text(text),
+                            self.max_outbound_queue_bytes,
+                            self.slow_consumer_drops.shard(usize::from(handle.lane)),
+                        )
+                        .is_none()
+                    {
                         break;
                     }
                     queued += 1;
@@ -659,11 +662,14 @@ impl SharedState {
             let Ok(text) = Utf8Bytes::try_from(payload) else {
                 return starting(before);
             };
-            if !handle.send_one(
-                Message::Text(text),
-                self.max_outbound_queue_bytes,
-                self.slow_consumer_drops.shard(usize::from(handle.lane)),
-            ) {
+            if handle
+                .send_one(
+                    Message::Text(text),
+                    self.max_outbound_queue_bytes,
+                    self.slow_consumer_drops.shard(usize::from(handle.lane)),
+                )
+                .is_none()
+            {
                 return starting(before);
             }
         }

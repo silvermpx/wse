@@ -8,10 +8,9 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-use super::frames::ws_frame_size;
 use super::{
-    CLOSE_GOING_AWAY, CLOSE_NORMAL, Fanout, Outgoing, ServerCommand, SharedState, WsFrame,
-    count_message, stamp_recovery_fields,
+    CLOSE_GOING_AWAY, CLOSE_NORMAL, Fanout, Outgoing, ServerCommand, SharedState, count_message,
+    stamp_recovery_fields,
 };
 use crate::cluster::ClusterCommand;
 
@@ -51,14 +50,13 @@ pub(super) async fn process_commands(
             ServerCommand::SendText { conn_id, data } => {
                 let guard = state.connections.read();
                 if let Some(h) = guard.get(&conn_id) {
-                    let message = Message::Text(data.into());
-                    let bytes = ws_frame_size(&WsFrame::Msg(message.clone())) as u64;
-                    if h.send_one(
-                        message,
+                    // Counted as it goes: in msgpack, sealed, framed.
+                    if let Some(bytes) = h.send_one(
+                        Message::Text(data.into()),
                         state.max_outbound_queue_bytes,
                         state.slow_consumer_drops.shard(usize::from(h.lane)),
                     ) {
-                        state.count_sent(bytes);
+                        state.count_sent(bytes as u64);
                     }
                 }
             }
@@ -85,29 +83,27 @@ pub(super) async fn process_commands(
             ServerCommand::SendBytes { conn_id, data } => {
                 let guard = state.connections.read();
                 if let Some(h) = guard.get(&conn_id) {
-                    let message = Message::Binary(data.into());
-                    let bytes = ws_frame_size(&WsFrame::Msg(message.clone())) as u64;
-                    if h.send_one(
-                        message,
+                    // Counted as it goes: in msgpack, sealed, framed.
+                    if let Some(bytes) = h.send_one(
+                        Message::Binary(data.into()),
                         state.max_outbound_queue_bytes,
                         state.slow_consumer_drops.shard(usize::from(h.lane)),
                     ) {
-                        state.count_sent(bytes);
+                        state.count_sent(bytes as u64);
                     }
                 }
             }
             ServerCommand::SendPrebuilt { conn_id, message } => {
                 let guard = state.connections.read();
                 if let Some(h) = guard.get(&conn_id) {
-                    let bytes = ws_frame_size(&WsFrame::Msg(message.clone())) as u64;
-                    // Sealed for the connection's E2E key, if it has one.
-                    if h.send_one(
+                    // Sealed for the connection's E2E key, if it has one;
+                    // counted once really queued, as it goes.
+                    if let Some(bytes) = h.send_one(
                         message,
                         state.max_outbound_queue_bytes,
                         state.slow_consumer_drops.shard(usize::from(h.lane)),
                     ) {
-                        // Counted once really queued.
-                        state.count_sent(bytes);
+                        state.count_sent(bytes as u64);
                     }
                 }
             }

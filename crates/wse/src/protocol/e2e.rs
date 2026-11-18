@@ -34,6 +34,9 @@ pub const FRAME_DATA: u8 = 0;
 const FRAME_CLOSE: u8 = 1;
 const HEADER_LEN: usize = 14;
 const TAG_LEN: usize = 16;
+/// What a sealed frame carries past its plaintext: `E:`, the header and the
+/// tag.
+pub const SEALED_OVERHEAD: usize = 2 + HEADER_LEN + TAG_LEN;
 /// Frames per direction over the session: a JavaScript Number holds them.
 const SEQ_MAX: u64 = (1 << 53) - 1;
 /// A sender moves to the next epoch's key after this many frames...
