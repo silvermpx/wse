@@ -183,6 +183,12 @@ jobs:
       - name: Comments and engine boundary
         run: cargo xtask lint
 
+      # A release check that cannot fail checks nothing: its cases, the
+      # failing ones among them (a platform's wheel missing, a tag spelled
+      # unlike the packages' version).
+      - name: The release checks' own cases
+        run: python3 .github/scripts/test_release_preflight.py
+
       - name: Commit messages
         env:
           EVENT: ${{ github.event_name }}
