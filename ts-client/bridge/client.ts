@@ -106,6 +106,15 @@ export function createBridgeClient(
     else pending.delete(id);
     pendingCount--;
   };
+  /** What the owner held of the window's sends went with the user: said once. */
+  const signedOut = () => {
+    if (pendingCount === 0) return;
+    const ids: string[] = [];
+    for (const [id, n] of pending) for (let i = 0; i < n; i++) ids.push(id);
+    pending.clear();
+    pendingCount = 0;
+    emit('wseNotDelivered', { reason: 'cleared', ids });
+  };
   /**
    * Sends waiting for the topics they require to be continuous, each with
    * the time it may wait (ms since the epoch), counted from its send.
@@ -328,7 +337,11 @@ export function createBridgeClient(
 
   const batch = (s: number, items: BridgeItem[]) => {
     if (over()) return;
-    for (const item of items) take(item);
+    for (const item of items) {
+      // A listener let the window go: nothing more of the batch is handed on.
+      if (done || over()) return;
+      take(item);
+    }
     took = s;
     post({ k: 'ack', s });
   };
@@ -375,6 +388,7 @@ export function createBridgeClient(
         return;
       }
       case 'revoked':
+        if (f.reason === 'signed_out') signedOut();
         end('revoked', f.reason);
         if (f.reason === 'signed_out') {
           delivery.forget();
@@ -386,6 +400,13 @@ export function createBridgeClient(
 
   const open = (opened: WindowChannel) => {
     if (done) {
+      // Let go before its channel opened: a sign-out still reaches the owner,
+      // which signs every window out; the rest of what waited is moot.
+      if (early.some((f) => f.k === 'signOut')) {
+        opened.post({ k: 'hello', v: BRIDGE_PROTOCOL, agent: options.agent ?? 'window' });
+        opened.post({ k: 'signOut' });
+      }
+      early = [];
       opened.close();
       return;
     }
@@ -585,7 +606,9 @@ export function createBridgeClient(
         return 'queued';
       }
       go(type, payload, sendOptions);
-      return snapshot.ready ? 'sent' : 'queued';
+      // Handed to the owner: a live one goes now or not at all; the rest
+      // waits in the owner's outbox, which says what became of it.
+      return sendOptions.live ? 'sent' : 'queued';
     },
     sendSigned: (type, payload, signOptions: SignedMessageOptions = {}) => {
       if (done || phase !== 'attached') return Promise.resolve('dropped');
@@ -635,6 +658,7 @@ export function createBridgeClient(
     signOut: () => {
       if (done) return;
       post({ k: 'signOut' });
+      signedOut();
       delivery.forget();
       storage.clear();
       finish();

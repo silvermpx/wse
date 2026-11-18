@@ -11,6 +11,7 @@ import {
   type BridgeClient,
   type BridgeOwner,
   type OwnerFrame,
+  type WindowChannel,
   type WindowFrame,
 } from '../bridge/index.js';
 import type { ResyncRequest } from '../core/delivery.js';
@@ -102,7 +103,8 @@ describe('the window bridge', () => {
     await settle();
     await serve(FakeWebSocket.last());
     await vi.waitFor(() => expect(a.state.getSnapshot().ready).toBe(true));
-    expect(a.send('order', { n: 1 }, { id: 'from-a' })).toBe('sent');
+    // Handed to the owner's outbox: its outcome comes as an event.
+    expect(a.send('order', { n: 1 }, { id: 'from-a' })).toBe('queued');
     expect(a.kept()).toBe(1);
     const ws = FakeWebSocket.last();
     await vi.waitFor(() => expect(ws.appTextMessages().map((m) => m.id)).toEqual(['from-a']));
@@ -621,5 +623,79 @@ describe('a window behind its owner', () => {
     await vi.waitFor(() => expect(outcomes).toEqual(['kept']));
     expect(w.kept()).toBe(0);
     lease.release();
+  });
+});
+
+describe('a window let go', () => {
+  it('says a send is queued, the owner taking it or saying it did not', async () => {
+    const o = owner({ offline: { enabled: true, maxSize: 1 } });
+    const w = window(o);
+    const refused: unknown[] = [];
+    w.on('wseNotDelivered', (d) => refused.push(d));
+    w.retain();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const ws = FakeWebSocket.last();
+    await serve(ws);
+    await vi.waitFor(() => expect(w.state.getSnapshot().ready).toBe(true));
+    expect(w.send('work', { n: 1 }, { id: 'first' })).toBe('queued');
+    await vi.waitFor(() => expect(ws.messagesOfType('work')).toHaveLength(1));
+    // The owner's outbox has no room: never said sent.
+    expect(w.send('work', { n: 2 }, { id: 'second' })).toBe('queued');
+    await vi.waitFor(() => expect(refused).toEqual([{ reason: 'dropped', ids: ['second'] }]));
+    expect(ws.messagesOfType('work').map((m) => m.id)).toEqual(['first']);
+  });
+
+  it('hears once that what the owner held of it will not go when the owner signs out', async () => {
+    const o = owner();
+    const w = window(o);
+    const refused: unknown[] = [];
+    w.on('wseNotDelivered', (d) => refused.push(d));
+    await vi.waitFor(() => expect(w.bridge.phase).toBe('attached'));
+    w.send('draft', { text: 'hello' }, { id: 'draft-1' });
+    await vi.waitFor(() => expect(o.client.kept()).toBe(1));
+    o.signOut();
+    await vi.waitFor(() => expect(w.bridge.phase).toBe('revoked'));
+    await settle();
+    expect(refused).toEqual([{ reason: 'cleared', ids: ['draft-1'] }]);
+    expect(w.kept()).toBe(0);
+  });
+
+  it('hands on nothing more of a batch once a listener signed out', async () => {
+    const o = owner({ limits: { inFlight: 1, batchItems: 16 } });
+    o.client.retain();
+    const w = window(o);
+    const seen: number[] = [];
+    w.onMessage('note', (m) => {
+      seen.push((m.p as { n: number }).n);
+      if ((m.p as { n: number }).n === 1) w.signOut();
+    });
+    w.retain();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const ws = FakeWebSocket.last();
+    await serve(ws);
+    // Held while paused: one batch of three when the window is back.
+    w.pause('hidden');
+    await settle();
+    for (const n of [0, 1, 2]) ws.serverSend({ c: 'U', t: 'note', p: { n }, v: 1 });
+    await settle();
+    w.resume('hidden');
+    await vi.waitFor(() => expect(w.bridge.phase).toBe('closed'));
+    await settle();
+    expect(seen).toEqual([0, 1]);
+  });
+
+  it('signs out through the owner when it signs out before its channel opened', async () => {
+    const o = owner();
+    const other = window(o);
+    await vi.waitFor(() => expect(other.bridge.phase).toBe('attached'));
+    let open: (channel: WindowChannel) => void = () => {};
+    const late = createBridgeClient(() => new Promise<WindowChannel>((resolve) => (open = resolve)));
+    windows.push(late);
+    late.signOut();
+    const { port1, port2 } = new MessageChannel();
+    o.attach(messagePortChannel<OwnerFrame, WindowFrame>(port1 as never));
+    open(messagePortChannel<WindowFrame, OwnerFrame>(port2 as never));
+    await vi.waitFor(() => expect(other.bridge.phase).toBe('revoked'));
+    expect(other.bridge.reason).toBe('signed_out');
   });
 });
