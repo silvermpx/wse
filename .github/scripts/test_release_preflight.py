@@ -42,29 +42,49 @@ WHEEL_PLATFORMS = {
 FREE_THREADED = ("cp314t", "cp315t")
 
 
+# Where release.yml's publishing jobs take each file from: the artifact
+# (the directory the gate downloads it into) that holds it.
+MOBILE_HOMES = {
+    "Swift XCFramework": "swift-package",
+    "Swift XCFramework checksum": "swift-package",
+    "Android library": "android-package",
+    "Dart package": "dart-package",
+}
+
+
 def release_files() -> list[str]:
-    """Every file a release of VERSION holds."""
-    names = [*rp._mobile_files(VERSION), f"wse-client-jvm-{VERSION}.jar"]
+    """Every file a release of VERSION holds, under its artifact."""
+    files = [
+        f"{MOBILE_HOMES.get(kind, 'dart-binaries-' + kind.rsplit(' ', 1)[-1])}/{name}"
+        for name, kind in rp._mobile_files(VERSION).items()
+    ]
+    files.append(f"jvm-package/wse-client-jvm-{VERSION}.jar")
     for platform, free_threaded in WHEEL_PLATFORMS.items():
-        names.append(f"wse_server-{VERSION}-cp312-abi3-{platform}.whl")
+        files.append(f"wheels-{platform}/wse_server-{VERSION}-cp312-abi3-{platform}.whl")
         if free_threaded:
             for tag in FREE_THREADED:
-                names.append(f"wse_server-{VERSION}-{tag[:-1]}-{tag}-{platform}.whl")
-    names += [
-        f"wse_server-{VERSION}.tar.gz",
-        f"wse_client-{VERSION}-py3-none-any.whl",
-        f"wse_client-{VERSION}.tar.gz",
-        f"wse-client-{VERSION}.tgz",
+                files.append(
+                    f"wheels-{platform}/wse_server-{VERSION}-{tag[:-1]}-{tag}-{platform}.whl"
+                )
+    files += [
+        f"sdist/wse_server-{VERSION}.tar.gz",
+        f"python-client-dist/wse_client-{VERSION}-py3-none-any.whl",
+        f"python-client-dist/wse_client-{VERSION}.tar.gz",
+        f"npm-package/wse-client-{VERSION}.tgz",
+        # What Maven Central gets beside the JAR, in an artifact of its own.
+        f"jvm-maven-repository/wse-client-jvm/{VERSION}/wse-client-jvm-{VERSION}.pom",
     ]
-    return names
+    return files
 
 
 def check_artifacts(names: list[str]) -> tuple[int, str]:
-    """The artifact check over a directory holding ``names``: its exit code
-    and what it printed."""
+    """The artifact check over a download of the run's artifacts holding
+    ``names`` (each under its artifact): its exit code and what it printed."""
     with tempfile.TemporaryDirectory() as directory:
         for name in names:
-            (Path(directory) / name).touch()
+            path = Path(directory) / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             code = rp.cmd_artifacts(
@@ -91,28 +111,53 @@ class Artifacts(unittest.TestCase):
         self.assertIn("no wse-server wheel for macOS arm64 cp315t", out)
 
     def test_one_wheel_for_all_platforms_is_no_release(self) -> None:
-        names = [
-            n for n in release_files() if not n.startswith("wse_server-") or "macosx_11_0_arm64" in n
-        ]
+        names = [n for n in release_files() if "/wse_server-" not in n or "macosx_11_0_arm64" in n]
         code, out = check_artifacts(names)
         self.assertEqual(code, 1)
         self.assertIn("Linux x86_64 (glibc) abi3", out)
 
     def test_a_release_without_the_jvm_library_fails(self) -> None:
-        names = [n for n in release_files() if n != f"wse-client-jvm-{VERSION}.jar"]
+        names = [n for n in release_files() if not n.endswith(f"wse-client-jvm-{VERSION}.jar")]
         code, out = check_artifacts(names)
         self.assertEqual(code, 1)
         self.assertIn("no JVM library", out)
 
+    def test_a_jvm_library_only_beside_maven_centrals_files_is_no_release(self) -> None:
+        # The Maven job takes the JAR from jvm-package: a copy elsewhere is not it.
+        names = [n for n in release_files() if not n.startswith("jvm-package/")]
+        names.append(f"jvm-maven-repository/wse-client-jvm/{VERSION}/wse-client-jvm-{VERSION}.jar")
+        code, out = check_artifacts(names)
+        self.assertEqual(code, 1)
+        self.assertIn("no JVM library", out)
+
+    def test_a_file_outside_its_artifact_does_not_count(self) -> None:
+        names = [n for n in release_files() if not n.startswith("npm-package/")]
+        names.append(f"sdist/wse-client-{VERSION}.tgz")
+        code, out = check_artifacts(names)
+        self.assertEqual(code, 1)
+        self.assertIn("no npm tarball", out)
+
+    def test_an_abi3_wheel_for_a_newer_python_than_the_package_needs_is_no_release(self) -> None:
+        # requires-python is >=3.12: an abi3 wheel of 3.13 leaves 3.12 out.
+        names = [
+            n.replace("-cp312-abi3-macosx_11_0_arm64", "-cp313-abi3-macosx_11_0_arm64")
+            for n in release_files()
+        ]
+        code, out = check_artifacts(names)
+        self.assertEqual(code, 1)
+        self.assertIn("no wse-server wheel for macOS arm64 abi3", out)
+
     def test_a_release_without_a_dart_library_fails(self) -> None:
         gone = f"wse_dart-{VERSION}-aarch64-linux-android.so"
-        names = [n for n in release_files() if n != gone]
+        names = [n for n in release_files() if not n.endswith(gone)]
         code, out = check_artifacts(names)
         self.assertEqual(code, 1)
         self.assertIn("no Dart library aarch64-linux-android", out)
 
     def test_a_file_of_another_version_fails(self) -> None:
-        code, out = check_artifacts([*release_files(), "wse_client-3.1.0.tar.gz"])
+        code, out = check_artifacts(
+            [*release_files(), "python-client-dist/wse_client-3.1.0.tar.gz"]
+        )
         self.assertEqual(code, 1)
         self.assertIn("does not carry the release version", out)
 

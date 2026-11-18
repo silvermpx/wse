@@ -29,6 +29,7 @@ Standard library only (Python 3.11+), so it runs on any runner Python.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -560,19 +561,60 @@ SERVER_WHEELS: dict[str, tuple[tuple[str, ...], bool]] = {
 FREE_THREADED = ("cp314t", "cp315t")
 
 
+def abi3_tag() -> str:
+    """The Python tag of the abi3 wheels: the oldest CPython the package
+    takes (pyproject.toml's requires-python), so none is left out."""
+    with open(ROOT / "pyproject.toml", "rb") as fh:
+        needs = str(tomllib.load(fh)["project"]["requires-python"])
+    m = re.fullmatch(r">=\s*3\.(\d+)", needs.strip())
+    if not m:
+        raise CheckError(f"requires-python {needs!r} names no oldest CPython 3")
+    return f"cp3{m.group(1)}"
+
+
 def missing_server_wheels(names: list[str]) -> list[str]:
     """The wse-server wheels of SERVER_WHEELS that ``names`` lack."""
     wheels = [n for n in names if n.startswith("wse_server-") and n.endswith(".whl")]
+    abi3 = f"-{abi3_tag()}-abi3-"
     missing = []
     for platform, (fragments, free_threaded) in SERVER_WHEELS.items():
         mine = [w for w in wheels if all(f in w for f in fragments)]
-        if not any("-abi3-" in w for w in mine):
+        if not any(abi3 in w for w in mine):
             missing.append(f"{platform} abi3")
         if free_threaded:
             for tag in FREE_THREADED:
                 if not any(f"-{tag}-" in w for w in mine):
                     missing.append(f"{platform} {tag}")
     return missing
+
+
+# The artifact the files of each kind are published from: release.yml's
+# jobs download them by these names, and a copy in another artifact is not
+# what they publish.
+HOMES = {
+    "wse-server wheels": "wheels-*",
+    "wse-server sdist": "sdist",
+    "wse-client wheel": "python-client-dist",
+    "wse-client sdist": "python-client-dist",
+    "npm tarball": "npm-package",
+    "Swift XCFramework": "swift-package",
+    "Swift XCFramework checksum": "swift-package",
+    "Android library": "android-package",
+    "Dart package": "dart-package",
+    "JVM library": "jvm-package",
+}
+
+
+def _home(kind: str) -> str:
+    """The artifact the files of *kind* are published from."""
+    return "dart-binaries-*" if kind.startswith("Dart library ") else HOMES[kind]
+
+
+def _artifact(path: Path, base: Path) -> str:
+    """The artifact *path* came in: the directory under the download *base*
+    it is in ("" for a file directly in it)."""
+    parts = path.relative_to(base).parts
+    return parts[0] if len(parts) > 1 else ""
 
 
 def _maven_companion(name: str, base: str) -> bool:
@@ -597,11 +639,23 @@ def cmd_artifacts(args: argparse.Namespace) -> int:
     jvm = f"wse-client-jvm-{args.npm_version}"
     counts = dict.fromkeys([*kinds.values(), *mobile.values(), "JVM library"], 0)
     errors = 0
-    files = sorted(p for d in args.dirs for p in Path(d).rglob("*") if p.is_file())
-    for path in files:
+    files = sorted((p, Path(d)) for d in args.dirs for p in Path(d).rglob("*") if p.is_file())
+    # The wheels in their artifacts, for the platforms' check.
+    homed: list[str] = []
+
+    def at_home(kind: str, path: Path, base: Path) -> bool:
+        """Counted when *path* is in the artifact *kind* is published from."""
+        if fnmatch.fnmatchcase(_artifact(path, base), _home(kind)):
+            counts[kind] += 1
+            return True
+        print(f"  {'elsewhere':<9}  {path}  (published from {_home(kind)})")
+        return False
+
+    for path, base in files:
         if path.name == f"{jvm}.jar":
-            counts["JVM library"] += 1
-            print(f"  {'ok':<9}  {path}")
+            # A copy beside Maven Central's files is theirs, not the one published.
+            if at_home("JVM library", path, base):
+                print(f"  {'ok':<9}  {path}")
             continue
         if _maven_companion(path.name, jvm):
             print(f"  {'ok':<9}  {path}")
@@ -614,8 +668,8 @@ def cmd_artifacts(args: argparse.Namespace) -> int:
             )
             continue
         if path.name in mobile:
-            counts[mobile[path.name]] += 1
-            print(f"  {'ok':<9}  {path}")
+            if at_home(mobile[path.name], path, base):
+                print(f"  {'ok':<9}  {path}")
             continue
         if path.name.startswith(_MOBILE_PREFIXES):
             errors += 1
@@ -637,7 +691,8 @@ def cmd_artifacts(args: argparse.Namespace) -> int:
             errors += 1
             gh_error(str(path), None, f"unexpected release file {path.name}")
             continue
-        counts[kind] += 1
+        if at_home(kind, path, base) and kind == "wse-server wheels":
+            homed.append(path.name)
         if dist.startswith("npm:"):
             ok = version == args.npm_version
         else:
@@ -657,7 +712,7 @@ def cmd_artifacts(args: argparse.Namespace) -> int:
                 ".github/workflows/release.yml", None, f"no {kind} among the release artifacts"
             )
     # Every platform's wheels: one of them missing is no release.
-    for wheel in missing_server_wheels([p.name for p in files]):
+    for wheel in missing_server_wheels(homed):
         errors += 1
         gh_error(
             ".github/workflows/release.yml",
